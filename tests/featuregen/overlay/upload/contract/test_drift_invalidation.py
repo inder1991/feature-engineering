@@ -414,3 +414,164 @@ def test_mc_recurred_drift_after_reclear_reinvalidates(db):
     _promote_all_blocking(db, c.contract_id)                       # re-clear: moves the epoch past it
     assert invalidate_contracts_for(db, changed=[ref]) == 1        # the RECURRED drift re-invalidates
     assert _invalidated_count(db, c.contract_id) == 2
+
+
+# ══════════════ Composition-audit (stale-serve cluster) — findings [3] / [4] / [5] ════════════════════
+from datetime import UTC, datetime  # noqa: E402
+
+from featuregen.contracts.envelopes import IdentityEnvelope  # noqa: E402
+from featuregen.overlay.upload.features import (  # noqa: E402
+    FeatureSpec,
+    list_features,
+    register_feature,
+)
+from featuregen.overlay.upload.field_correction import (  # noqa: E402
+    apply_field_correction,
+    read_field_cas,
+)
+from featuregen.overlay.upload.ingest import ingest_source_lock_key  # noqa: E402
+from featuregen.overlay.upload.lineage import lineage_graph  # noqa: E402
+
+
+@pytest.fixture
+def probe_conn(_dsn):
+    """A SECOND autocommit session on the same DB — each ``pg_try_advisory_xact_lock`` probe is its own
+    single-statement tx, so a successful probe releases immediately (mirrors test_ingest_concurrency)."""
+    with psycopg.connect(_dsn, autocommit=True) as c:
+        yield c
+
+
+def _try_lock(probe, key: int) -> bool:
+    return probe.execute("SELECT pg_try_advisory_xact_lock(%s)", (key,)).fetchone()[0]
+
+
+# ── [3] confirm_contract source-locks the drift baseline (single + cross-catalog) ─────────────────────
+def test_confirm_contract_holds_the_per_source_lock_across_the_baseline(db, probe_conn):
+    """[3]: confirm captures its H2c drift baseline on READ COMMITTED. It must hold the SAME per-source
+    ingest lock ``ingest_upload`` takes, so a concurrent same-source ingest cannot COMMIT a drift between
+    validate_minimum and the dependency-hash writes. The confirm tx stays open (test conn commits
+    nothing), so a second session's try-lock on the derives catalog's key reports CONTENDED."""
+    _bank(db)
+    confirm_contract(db, _draft(), actor="ds1")
+    assert _try_lock(probe_conn, ingest_source_lock_key("bank")) is False   # derives catalog: HELD
+    assert _try_lock(probe_conn, ingest_source_lock_key("other")) is True   # different source: free
+    db.rollback()                                                           # tx-scoped: released at end
+    assert _try_lock(probe_conn, ingest_source_lock_key("bank")) is True
+
+
+def test_confirm_contract_source_locks_every_derives_join_catalog(db, probe_conn):
+    """[3]: a CROSS-catalog draft must lock EVERY catalog in its derives/join set (sorted, before the
+    feature lock) — both alpha and zeta are held across the confirm, not just one."""
+    build_graph(db, "alpha", [CanonicalRow("alpha", "events", "amount", "numeric")])
+    build_graph(db, "zeta", [
+        CanonicalRow("zeta", "grain_tbl", "id", "integer", is_grain=True),
+        CanonicalRow("zeta", "grain_tbl", "ts", "timestamp", as_of=True)])
+    draft = ContractDraft(
+        "xcat_lockset", "Cross-catalog sum.", "grain_tbl", "sum", "ts",
+        ["public.events.amount", "public.grain_tbl.id"],
+        derives_pairs=(("alpha", "public.events.amount"), ("zeta", "public.grain_tbl.id")))
+    confirm_contract(db, draft, actor="ds1")
+    assert _try_lock(probe_conn, ingest_source_lock_key("alpha")) is False   # both derives catalogs HELD
+    assert _try_lock(probe_conn, ingest_source_lock_key("zeta")) is False
+
+
+# ── [4] list_features + lineage serve the READ-GATED stamp, never the mutable feature row ─────────────
+def test_list_features_serves_read_gated_stamp_not_mutable_feature_row(db):
+    """[4]: GET /features (list_features) must serve the pointer's contract routed through the read gate,
+    not ``feature.verification`` (never demoted by drift). A drifted current contract lists DOWNGRADED."""
+    _bank_nev(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+
+    listed = {f["feature_id"]: f for f in list_features(db)}[c.feature_id]
+    assert listed["verification"] == "DATA-CHECKED"                 # gated, not the mutable stamp
+    assert listed["effective_verification"] == "DATA-CHECKED"
+
+    # DRIFT a dependency WITHOUT an INVALIDATED (projection lag) — the mutable feature row stays the
+    # promoted DESIGN-CHECKED, but the LIST must serve the gated (downgraded) stamp.
+    db.execute("UPDATE graph_node SET declared_type = 'text' "
+               "WHERE catalog_source = 'bank' AND object_ref = 'public.accounts.balance'")
+    assert db.execute("SELECT verification FROM feature WHERE feature_id = %s",
+                      (c.feature_id,)).fetchone()[0] == "DESIGN-CHECKED"   # mutable stamp NOT demoted
+    listed2 = {f["feature_id"]: f for f in list_features(db)}[c.feature_id]
+    assert listed2["verification"] == "UNVERIFIED"                  # DOWNGRADED, not DESIGN-/DATA-CHECKED
+    assert listed2["effective_validation_status"] == "needs_external_validation"
+
+
+def test_list_features_directly_registered_feature_keeps_honest_stamp(db):
+    """[4]: a feature with NO governing contract keeps its honest ``feature`` stamp (UNVERIFIED) and
+    carries no gated effective fields — the gate only overrides a governed feature."""
+    fid = register_feature(db, FeatureSpec(name="direct_only_feat"))
+    listed = {f["feature_id"]: f for f in list_features(db)}[fid]
+    assert listed["verification"] == "UNVERIFIED"
+    assert "effective_verification" not in listed
+
+
+def test_lineage_feature_stamp_serves_read_gated_stamp_not_mutable(db):
+    """[4]: the lineage graph's feature node stamp is routed through the pointer + read gate, so a
+    drifted feature shows a DOWNGRADED stamp on the lineage surface — matching Feature 360 + the list."""
+    _bank_nev(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+
+    def _feat_stamp():
+        g = lineage_graph(db, "bank", "public.accounts.balance", now=datetime(2026, 7, 20, tzinfo=UTC),
+                          direction="both", depth=2, layers={"features"}, roles=())
+        node = next(n for n in g["nodes"]
+                    if n.get("kind") == "feature" and n.get("feature_id") == c.feature_id)
+        return node["verification"]
+
+    assert _feat_stamp() == "DATA-CHECKED"                          # gated
+    db.execute("UPDATE graph_node SET declared_type = 'text' "
+               "WHERE catalog_source = 'bank' AND object_ref = 'public.accounts.balance'")
+    assert _feat_stamp() == "UNVERIFIED"                            # DOWNGRADED on the lineage graph
+    assert db.execute("SELECT verification FROM feature WHERE feature_id = %s",
+                      (c.feature_id,)).fetchone()[0] == "DESIGN-CHECKED"   # mutable stamp NOT demoted
+
+
+# ── [5] a projecting F3 correction emits INVALIDATED on a dependent confirmed contract ────────────────
+def _admin(subject):
+    return IdentityEnvelope(subject=subject, actor_kind="human", authenticated=True,
+                            auth_method="oidc", role_claims=("platform-admin",))
+
+
+def _correct(db, action, actor, idem, **body):
+    cas = read_field_cas(db, source="bank", object_ref="public.accounts.balance", field="definition")
+    return apply_field_correction(
+        db, source="bank", object_ref="public.accounts.balance", field="definition", action=action,
+        actor=actor, idempotency_key=idem, expected_latest_decision_id=cas["latest_decision_id"],
+        expected_evidence_set_hash=cas["evidence_set_hash"],
+        expected_policy_version=cas["policy_version"], **body)
+
+
+def test_field_correction_projecting_emits_invalidated_on_dependent_contract(db):
+    """[5]: a four-eyes correction (propose_override then confirm_override) that re-projects a
+    graph_node display column a confirmed contract depends on must emit a DURABLE + AUDITED INVALIDATED
+    on that contract — consistent with the ingest dropped-field wire (not a silent per-read downgrade)."""
+    _bank(db)
+    c = confirm_contract(db, _draft(), actor="ds1")           # derives public.accounts.balance
+    assert _invalidated_count(db, c.contract_id) == 0
+
+    p = _correct(db, "propose_override", _admin("human_a"), "p1", replacement_value="net of fees")
+    assert p["accepted"] is True
+    r = _correct(db, "confirm_override", _admin("human_b"), "c1", replacement_value="net of fees")
+    assert r["accepted"] is True                             # projected the corrected definition
+
+    # the correction's eager wire appended an INVALIDATED (durable + auditable on /contracts)...
+    assert _invalidated_count(db, c.contract_id) >= 1
+    reasons = [r_[0] for r_ in db.execute(
+        "SELECT payload->>'reason' FROM feature_contract_validation_event "
+        "WHERE contract_id = %s AND event_type = 'INVALIDATED'", (c.contract_id,)).fetchall()]
+    assert "METADATA_CORRECTED" in reasons
+    # ...and the read gate agrees (the definition drifted vs the confirm baseline).
+    assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
+
+
+def test_field_correction_propose_only_does_not_invalidate(db):
+    """[5]: propose_override is NON-projecting (it only surfaces a pending proposal), so it must NOT
+    invalidate a dependent contract — only a projecting confirm/reject does."""
+    _bank(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    p = _correct(db, "propose_override", _admin("human_a"), "p1", replacement_value="net of fees")
+    assert p["accepted"] is True
+    assert _invalidated_count(db, c.contract_id) == 0        # a bare proposal never invalidates

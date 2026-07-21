@@ -85,6 +85,18 @@ def feature_contract_lock_key(feature_name: str) -> int:
         "big", signed=True)
 
 
+def _confirm_lock_catalogs(draft: ContractDraft) -> list[str]:
+    """[3] — the SORTED, normalized set of catalogs ``confirm_contract`` must SOURCE-LOCK to protect its
+    H2c drift baseline: every catalog in the draft's derives set + every join step that names a
+    ``catalog_source`` (a step without one contributes none). Each is ``.strip().lower()``-normalized (so
+    a case/whitespace variant collapses to the SAME ``ingest_source_lock_key`` an ingest of that source
+    takes) and the result is SORTED, giving a deterministic lock order — the deadlock-safety half of the
+    fix, matching the ingest / F3 discipline (source locks first, in a consistent order)."""
+    catalogs = {cs for cs, _ in draft.derives_pairs}
+    catalogs |= {step["catalog_source"] for step in draft.join_path if step.get("catalog_source")}
+    return sorted({c.strip().lower() for c in catalogs})
+
+
 def _contract_input_items(conn, draft: ContractDraft):
     """H2b — expand the RECONCILED draft into role-labelled input items (the immutable lineage a contract
     version was built from). Yields ``(source, graph_ref, logical_ref, physical_ref, role, decision_id,
@@ -476,13 +488,28 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     role-labelled ``contract_input_column`` + ``contract_metadata_dependency`` lineage, so the H2c read
     gate detects drift on ANY physical column the governed contract reads (the C-1 gap, closed here).
     ``templates`` (default ALL_TEMPLATES) is injectable for tests that plan over a fixture recipe."""
-    # H2b STEP 1 — ADVISORY LOCK FIRST, before ANY feature lookup or validate_minimum. Serializes
+    # [3] STEP 0 — SOURCE-LOCK THE DRIFT BASELINE FIRST. confirm runs on READ COMMITTED (the route keeps
+    # it off REPEATABLE READ, MF-2), and ingest_upload / apply_field_correction serialize their writes on
+    # ``ingest_source_lock_key``. Without taking those same source locks, a same-source ingest could COMMIT
+    # a drift BETWEEN validate_minimum (which clears the checks against the pre-upload graph) and the
+    # dependency-hash writes (which re-read graph_node per READ COMMITTED and see the POST-upload state) —
+    # a contract validated one way but baselined another, permanently inconsistent. Take the per-source
+    # lock for EVERY catalog in the draft's derives/join set (grain/as_of resolve to a derives catalog, so
+    # they are covered), SORTED and BEFORE the per-feature lock: the SAME global lock order ingest and F3
+    # use (source locks first, then the finer feature/column lock), so no writer can deadlock. The lock
+    # set is read off the draft alone (no DB read), so it is taken before any state is observed.
+    # Local import: the ingest module is heavy + central — a module-level import risks a cycle.
+    from featuregen.overlay.upload.ingest import ingest_source_lock_key
+    for cs in _confirm_lock_catalogs(draft):
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (ingest_source_lock_key(cs),))
+    # H2b STEP 1 — the per-feature ADVISORY LOCK, before ANY feature lookup or validate_minimum. Serializes
     # concurrent confirms of the SAME feature identity so their pointer CAS (STEP 5) cannot interleave:
     # two first-confirms can't both register the feature (B4 proliferation), and a re-confirm can't lose
     # the pointer advance. pg_advisory_xact_lock binds to the CALLER's transaction (confirm never opens
     # its own) and releases on its COMMIT/ROLLBACK. Taken BEFORE the per-feature reads so the whole
-    # read-decide-write of the pointer is serialized. (Ordered before the global validation-projection
-    # checkpoint lock taken later in _seed_validation_lifecycle — a consistent lock order, no deadlock.)
+    # read-decide-write of the pointer is serialized. (Ordered AFTER the source locks above and before the
+    # global validation-projection checkpoint lock taken later in _seed_validation_lifecycle — a
+    # consistent lock order, no deadlock.)
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (feature_contract_lock_key(draft.feature_name),))
     tref = target_ref if target_ref is not None else draft.target_ref   # M3: fall back to the draft's
     check = validate_minimum(conn, draft, target_ref=tref, now=now, roles=roles)
@@ -931,6 +958,24 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
             "history": _contract_history(conn, row[1], contract_id)}
 
 
+def feature_current_contract(conn, feature_id: str) -> str | None:
+    """The feature's CURRENT contract_id — the AUTHORITATIVE ``feature_current_contract`` pointer,
+    falling back to latest-by-version (deterministic tie-break) ONLY for a pre-H2b legacy feature with
+    no pointer. This is the ONE resolution every feature-level read surface (Feature 360 / the registry
+    ``list_features`` / the lineage graph) routes through ``contract_read_status``, so NO surface serves
+    the mutable ``feature.verification`` row as authority (the [4] double-authority hole). ``None`` for a
+    directly-registered feature with no governing contract (which keeps its honest ``feature`` stamp)."""
+    pointer = conn.execute(
+        "SELECT contract_id FROM feature_current_contract WHERE feature_id = %s",
+        (feature_id,)).fetchone()
+    if pointer is not None:
+        return pointer[0]
+    row = conn.execute(
+        "SELECT contract_id FROM contract WHERE feature_id = %s "
+        "ORDER BY version DESC, contract_id DESC LIMIT 1", (feature_id,)).fetchone()
+    return row[0] if row is not None else None
+
+
 def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:
     """Feature 360: everything about one feature in a single view — its definition + verification stamp
     + lineage (from get_feature, READ-SCOPED by roles), the governed contract's narrative + join path,
@@ -946,20 +991,12 @@ def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:
     feat = get_feature(conn, feature_id, roles=roles)
     if feat is None:
         return None
-    # Resolve the CURRENT contract via the pointer (authoritative); fall back to latest-by-version
-    # (deterministic tie-break) only for a pre-H2b legacy feature with no pointer.
-    pointer = conn.execute(
-        "SELECT contract_id FROM feature_current_contract WHERE feature_id = %s",
-        (feature_id,)).fetchone()
-    if pointer is not None:
-        row = conn.execute(
-            "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
-            "WHERE contract_id = %s", (pointer[0],)).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
-            "WHERE feature_id = %s ORDER BY version DESC, contract_id DESC LIMIT 1",
-            (feature_id,)).fetchone()
+    # Resolve the CURRENT contract via the shared pointer resolution (authoritative pointer, latest-by-
+    # version fallback for a pre-H2b legacy feature) — the SAME resolver list_features / lineage use.
+    current_id = feature_current_contract(conn, feature_id)
+    row = conn.execute(
+        "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
+        "WHERE contract_id = %s", (current_id,)).fetchone() if current_id is not None else None
     contract = None
     hypothesis = None
     eff_status = eff_verif = None

@@ -81,10 +81,12 @@ _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
 )
 
 # The anchor graph_node columns this read model surfaces (identity + display metadata + fact links).
+# entity_status / entity_fact_key / entity_fact_event_id back the F12 entity-authority gate below.
 _ANCHOR_COLUMNS = (
     "catalog_source, object_ref, kind, table_name, column_name, schema_name, data_type, "
     "declared_type, definition, is_grain, is_as_of, concept, domain, sensitivity, additivity, "
-    "unit, currency, entity, grain_fact_event_id, availability_fact_event_id"
+    "unit, currency, entity, entity_status, entity_fact_key, entity_fact_event_id, "
+    "grain_fact_event_id, availability_fact_event_id"
 )
 
 
@@ -142,13 +144,25 @@ def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) ->
     for label, flat_col, c1_field in _METADATA_FIELDS:
         display_value = anchor.get(flat_col)
         ov = read_operational_value(conn, logical_ref, c1_field)
-        fields[label] = {
+        entry = {
             "value": display_value,
             "authority": _authority_label(ov, display_value),
             "c1_status": ov.status,
             "provenance": ov.decision_event_id or ov.fact_event_id,
             "selected_evidence_ids": list(ov.selected_evidence_ids),
         }
+        # [F12] composition-audit — ``entity`` is governed by the E3 SECOND gate
+        # (``entity_status='VERIFIED'``, the same gate ``verified_entity_of`` and this payload's OWN
+        # relationships.semantic subsection apply), which C1 cannot model (entity has no fact/decision
+        # wiring in read_operational_value — it reads as an advisory hint). A bank-confirmed entity
+        # must render ``governed`` WITH its fact provenance, and a just-withdrawn (demoted) one falls
+        # back to the plain hint label — so one payload's two sections can never disagree.
+        if label == "entity" and anchor.get("entity_status") == "VERIFIED" \
+                and display_value is not None:
+            entry["authority"] = "governed"
+            entry["provenance"] = (anchor.get("entity_fact_event_id")
+                                   or anchor.get("entity_fact_key"))
+        fields[label] = entry
     return {"fields": fields}
 
 

@@ -258,3 +258,66 @@ def test_reset_and_replay_reproduces_identical_state(db):
     proj.rebuild(db)
 
     assert _snapshot(db) == synchronous   # replay parity: byte-for-byte the synchronous state
+
+
+# --- 8) [5] composition-audit: E3 entity apply/demote invalidates dependent contracts --------------
+
+def _entity_contract(db):
+    """A confirmed contract deriving from the entity column ``public.party.cust_id`` (grain-less count),
+    so its H2c reverse-dependency hashes ``graph_node.entity`` — the value E3 rewrites."""
+    from featuregen.overlay.upload.contract.author import ContractDraft
+    from featuregen.overlay.upload.contract.govern import confirm_contract
+    draft = ContractDraft("party_count", "Count of parties.", None, "count", None,
+                          ["public.party.cust_id"],
+                          derives_pairs=((SOURCE, "public.party.cust_id"),))
+    return confirm_contract(db, draft, actor="ds1")
+
+
+def _inv_count(db, contract_id):
+    return db.execute(
+        "SELECT count(*) FROM feature_contract_validation_event "
+        "WHERE contract_id = %s AND event_type = 'INVALIDATED'", (contract_id,)).fetchone()[0]
+
+
+def test_e3_entity_confirm_invalidates_dependent_contract(db):
+    """[5]: confirming a governed entity_assignment CHANGES ``graph_node.entity`` (account -> customer)
+    on a column a confirmed contract depends on — E3's sync projection must emit a DURABLE + AUDITED
+    INVALIDATED, and the read gate must downgrade (not a silent, unexplained per-read demotion)."""
+    from featuregen.overlay.upload.contract.govern import contract_read_status
+    _build_entity_graph(db, file_entity="account")
+    c = _entity_contract(db)                                  # baseline: entity == "account"
+    assert _inv_count(db, c.contract_id) == 0
+
+    seed_verified_via_command(db, ref=_entity_col(), fact_type="entity_assignment",
+                              value={"entity_id": "customer"}, owner="user:alice")
+    assert _node(db)[0] == "customer"                         # the governed entity changed
+
+    assert _inv_count(db, c.contract_id) >= 1                 # eager INVALIDATED appended
+    reasons = [r[0] for r in db.execute(
+        "SELECT payload->>'reason' FROM feature_contract_validation_event "
+        "WHERE contract_id = %s AND event_type = 'INVALIDATED'", (c.contract_id,)).fetchall()]
+    assert "ENTITY_BINDING_CHANGED" in reasons
+    assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
+
+
+def test_e3_benign_reproject_does_not_spuriously_invalidate(db):
+    """[5] the GUARD: a re-ingest reproject that RESTORES the governed entity a clean contract was
+    confirmed against must NOT durably invalidate it — even for a DIVERGENT source file. The
+    invalidation is flag-gated to the genuine-change paths, so the benign reproject leaves it alone."""
+    from featuregen.overlay.upload.contract.govern import contract_read_status
+    _build_entity_graph(db, file_entity="account")
+    seed_verified_via_command(db, ref=_entity_col(), fact_type="entity_assignment",
+                              value={"entity_id": "customer"}, owner="user:alice")
+    assert _node(db)[0] == "customer"
+    c = _entity_contract(db)                                  # baseline: entity == "customer" (clean)
+    assert contract_read_status(db, c.contract_id) != ("needs_external_validation", "UNVERIFIED")
+    assert _inv_count(db, c.contract_id) == 0
+
+    # A re-upload whose file declares a DIFFERENT entity; build_graph wipes to "household", the
+    # reproject RESTORES the governed "customer" (VERIFIED wins). Net committed entity == baseline.
+    _build_entity_graph(db, file_entity="household")
+    reproject_semantic_bindings(db, source=SOURCE)
+    assert _node(db)[0] == "customer"
+
+    assert _inv_count(db, c.contract_id) == 0                 # reproject did NOT spuriously invalidate
+    assert contract_read_status(db, c.contract_id) != ("needs_external_validation", "UNVERIFIED")

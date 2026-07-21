@@ -76,12 +76,35 @@ def feature_freshness(conn, feature_id: str, *, now: datetime,
 
 
 def list_features(conn, *, limit: int = 50) -> list[dict]:
-    """The registered-feature inventory (registry READ surface — the catalog was write-only)."""
+    """The registered-feature inventory (registry READ surface — the catalog was write-only).
+
+    [4] composition-audit (double-authority): a GOVERNED feature's ``verification`` is the READ-GATED
+    effective stamp — its CURRENT contract (the ``feature_current_contract`` pointer) routed through
+    ``contract_read_status`` (drift-aware, fail-closed) — NEVER the mutable ``feature.verification``
+    column (confirm promotes it to DESIGN-CHECKED; drift NEVER demotes it). A drifted/invalidated
+    feature therefore lists DOWNGRADED, matching Feature 360 + the contract surfaces, not a stale
+    promoted stamp. A directly-registered feature (no governing contract) keeps its honest ``feature``
+    stamp. One dependency check per feature (mirrors ``list_contracts``), never one per dependency."""
+    # Local import: govern imports features at module load, so a module-level import here would cycle.
+    from featuregen.overlay.upload.contract.govern import (
+        contract_read_status,
+        feature_current_contract,
+    )
     rows = conn.execute(
         "SELECT feature_id, name, grain_table, aggregation, as_of_column, verification, created_at "
         "FROM feature ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
-    return [{"feature_id": r[0], "name": r[1], "grain_table": r[2], "aggregation": r[3],
-             "as_of_column": r[4], "verification": r[5], "created_at": r[6].isoformat()} for r in rows]
+    out: list[dict] = []
+    for r in rows:
+        item = {"feature_id": r[0], "name": r[1], "grain_table": r[2], "aggregation": r[3],
+                "as_of_column": r[4], "verification": r[5], "created_at": r[6].isoformat()}
+        contract_id = feature_current_contract(conn, r[0])
+        if contract_id is not None:
+            eff_status, eff_verif = contract_read_status(conn, contract_id)
+            item["verification"] = eff_verif          # the gated truth, never the mutable feature stamp
+            item["effective_validation_status"] = eff_status
+            item["effective_verification"] = eff_verif
+        out.append(item)
+    return out
 
 
 def get_feature(conn, feature_id: str, *, roles: Iterable[str] = ()) -> dict | None:

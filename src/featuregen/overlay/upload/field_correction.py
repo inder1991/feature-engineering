@@ -54,21 +54,41 @@ from featuregen.overlay.field_evidence import (
 )
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.concepts import is_known_concept
+from featuregen.overlay.upload.contract.invalidation import (
+    REASON_METADATA_CORRECTED,
+    ChangedRef,
+    invalidate_contracts_for,
+)
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_resolution import (
     FIELD_POLICY_VERSION,
     RESOLVER_VERSION,
     _evidence_set_hash,
+    _graph_key,
     resolve_and_project,
     stale_and_clear_field,
 )
 from featuregen.overlay.upload.ingest import ingest_source_lock_key
+from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.security.audit import record_denial
 
 ACTIONS: frozenset[str] = frozenset(
     {"confirm_existing", "propose_override", "confirm_override", "reject"}
 )
+
+# [5] the PROJECTING actions — each re-projects (or clears) the field's governed display column, which
+# H2c hashes as contract-dependency state. ``propose_override`` is the sole non-projecting action (it
+# only surfaces a pending proposal), so it never invalidates a dependent contract.
+_PROJECTING_ACTIONS: frozenset[str] = frozenset({"confirm_existing", "confirm_override", "reject"})
+
+# [F11] the correctable fields whose INGESTION-STAGE counterpart the D2 semantic-binding shortlist
+# consumed (``concept`` drives the currency-code + monetary groups; ``business_term``/``term_type``
+# are the curated term facets in the fingerprint material). A projecting correction on one of these
+# changes the premise the table's CURRENT candidate set was authored against — a change the ``sbf-v1``
+# fingerprint can NEVER observe (it hashes Pass-A inputs, which an unchanged re-upload cache-replays),
+# so the correction command itself must retire the current set.
+_SHORTLIST_INPUT_FIELDS: frozenset[str] = frozenset({"concept", "business_term", "term_type"})
 
 # Per-field value bound (chars); ``definition`` gets a longer prose ceiling, everything else a short
 # scalar bound. A value outside the bound (or empty/whitespace-only) is REFUSED before any write.
@@ -299,6 +319,35 @@ def apply_field_correction(
 
     if isinstance(projected, dict):  # a four-eyes/authz deny envelope — return it (audit commits)
         return projected
+
+    # 8. [5] composition-audit — a PROJECTING correction (confirm_override / confirm_existing / reject)
+    #    just re-projected (or cleared) a graph_node display column that H2c hashes as contract-
+    #    dependency state. EAGERLY append INVALIDATED to every dependent confirmed contract (SAME tx), so
+    #    the read-gate downgrade is DURABLE + AUDITED (an invalidation_reason on /contracts) + round-trip-
+    #    proof — consistent with the ingest dropped-field wire, closing the "two deliveries, opposite
+    #    durability" gap. ``propose_override`` does NOT project, so it is absent from _PROJECTING_ACTIONS.
+    #    ``object_ref`` is the PUBLIC-FLATTENED graph ref the dependency rows store (the SAME key
+    #    ``_graph_key`` derives for the display projection and the ingest wire uses).
+    if action in _PROJECTING_ACTIONS:
+        graph_ref = _graph_key(norm_source, logical_ref)[1]
+        invalidate_contracts_for(conn, changed=[ChangedRef(
+            catalog_source=norm_source, reason=REASON_METADATA_CORRECTED, object_ref=graph_ref)])
+        # 9. [F11] composition-audit — the D2 semantic-binding shortlist consumed this field's
+        #    INGESTION-STAGE counterpart, and its ``sbf-v1`` fingerprint hashes Pass-A inputs, which an
+        #    unchanged re-upload cache-replays — NO later ingest can ever observe this correction. So a
+        #    projecting correction on a shortlist-consumed field retires the table's CURRENT candidate
+        #    set HERE: flip it to 'unverifiable' (candidate_set_id NULL), the SAME CAS the ingest I-B
+        #    dropped-table wire uses. The immutable set stays in the WORM store as history; the F2b
+        #    asset subsection (which serves on cur.status='current') stops rendering stale-premise
+        #    candidates. Idempotent; a table with no current set is untouched.
+        if field in _SHORTLIST_INPUT_FIELDS:
+            _src, schema, table, _column = parse_ref(logical_ref)
+            conn.execute(
+                "UPDATE current_semantic_binding_candidate_set "
+                "SET status = 'unverifiable', candidate_set_id = NULL, projected_at = %s "
+                "WHERE catalog_source = %s AND table_graph_ref = %s "
+                "AND candidate_set_id IS NOT NULL",
+                (datetime.now(UTC), norm_source, f"{schema}.{table}"))
     return _success_body(conn, logical_ref, field, action, actor, projected=projected)
 
 

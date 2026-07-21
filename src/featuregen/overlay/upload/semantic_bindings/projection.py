@@ -45,6 +45,11 @@ from featuregen.overlay.identity import _norm, _ref_from_payload, fact_key
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.resolve import resolve_fact
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.contract.invalidation import (
+    REASON_ENTITY_BINDING_CHANGED,
+    ChangedRef,
+    invalidate_contracts_for,
+)
 from featuregen.overlay.upload.graph import rebuild_search_doc
 from featuregen.projections.runner import (
     projection_lag,
@@ -79,14 +84,21 @@ def _clamp_status(status: str) -> str:
 # The one idempotent projector — every driver routes through here.
 # ==================================================================================================
 def project_semantic_binding_fact(conn: DbConn, *, source: str, ref, fact_type: str,
-                                  now: datetime | None = None) -> None:
+                                  now: datetime | None = None,
+                                  emit_invalidation: bool = True) -> None:
     """Clear-then-set ONE semantic-binding fact onto its operational surface, IDEMPOTENTLY.
 
     ``resolve_fact`` serves VERIFIED-only (the first gate — expiry + drift-freshness read-time guards
     fold in); anything else DEMOTES (fail-closed). Mirrors ``project_confirmed_joins`` /
     ``project_table_facts_for_ref``. ``now`` is threaded so ingest keeps ONE clock basis for
     resolve_fact's read-time guards (resolving on the real clock would drift-stale a fact whose
-    watermark was attested under an injected ingest clock)."""
+    watermark was attested under an injected ingest clock).
+
+    [5] ``emit_invalidation`` (default True) — an entity apply/demote that CHANGES ``graph_node.entity``
+    (a value H2c hashes as contract-dependency state) eagerly invalidates dependent contracts (durable +
+    audited). The GENUINE-change callers (sync confirm, async reject/expire/drift demote, a direct apply)
+    keep the default; the benign build_graph reproject + the replay fold pass ``False`` — they reproduce
+    identical committed state, so they must NEVER spuriously invalidate a contract that isn't drifted."""
     now = now or datetime.now(UTC)
     adapter = current_catalog_adapter()
     key = fact_key(ref, fact_type)
@@ -94,9 +106,10 @@ def project_semantic_binding_fact(conn: DbConn, *, source: str, ref, fact_type: 
     verified = resolved.status == "VERIFIED" and resolved.value is not None
     if fact_type == ENTITY_ASSIGNMENT:
         if verified:
-            _apply_verified_entity(conn, source, ref, resolved, key)
+            _apply_verified_entity(conn, source, ref, resolved, key,
+                                   emit_invalidation=emit_invalidation)
         else:
-            _demote_entity(conn, key)
+            _demote_entity(conn, key, emit_invalidation=emit_invalidation)
     elif fact_type == CURRENCY_BINDING:
         if verified:
             _apply_verified_currency(conn, source, ref, resolved, key, now)
@@ -104,10 +117,24 @@ def project_semantic_binding_fact(conn: DbConn, *, source: str, ref, fact_type: 
             _demote_currency(conn, key, _clamp_status(resolved.status), now)
 
 
-def _apply_verified_entity(conn: DbConn, source: str, ref, resolved, key: str) -> None:
+def _invalidate_entity_change(conn: DbConn, source: str, obj_ref: str) -> None:
+    """[5] EAGERLY invalidate every confirmed contract that depends on ``graph_node.entity`` for this
+    column node — the value just changed (a genuine confirm/demote), and ``entity`` is in H2c's
+    ``_STATE_COLUMNS``. Makes the read-gate downgrade DURABLE + AUDITED + round-trip-proof, consistent
+    with the ingest dropped-field wire. A no-op (returns 0) when no confirmed contract depends on it."""
+    invalidate_contracts_for(conn, changed=[ChangedRef(
+        catalog_source=source, reason=REASON_ENTITY_BINDING_CHANGED, object_ref=obj_ref)])
+
+
+def _apply_verified_entity(conn: DbConn, source: str, ref, resolved, key: str,
+                           *, emit_invalidation: bool = True) -> None:
     """Set the effective governed entity on the subject column node + provenance links; PRESERVE the
     file's declared entity; rebuild search_doc. VERIFIED WINS — a conflicting file declaration is a
-    recorded divergence (``declared_entity <> entity``), never an overwrite."""
+    recorded divergence (``declared_entity <> entity``), never an overwrite.
+
+    [5] ``emit_invalidation`` (default True) — when this apply actually CHANGES the effective ``entity``
+    value (``current_entity != governed``), eagerly invalidate dependent contracts. The benign
+    reproject/replay pass ``False`` (they reproduce identical state and must not spuriously invalidate)."""
     obj_ref = _col_endpoint(ref.table, ref.column)
     governed = resolved.value["entity_id"]
     confirmed_event_id = (resolved.provenance or {}).get("confirmed_event_id")
@@ -132,6 +159,8 @@ def _apply_verified_entity(conn: DbConn, source: str, ref, resolved, key: str) -
         "WHERE catalog_source = %s AND object_ref = %s",
         (governed, declared, key, confirmed_event_id, source, obj_ref))
     rebuild_search_doc(conn, source, obj_ref)
+    if emit_invalidation and current_entity != governed:   # the H2c-hashed entity value actually moved
+        _invalidate_entity_change(conn, source, obj_ref)
     if declared is not None and _norm(declared) != _norm(governed):
         # DIVERGENCE: the file declared a DIFFERENT entity than the governed one. The governed value
         # stands in `entity` (VERIFIED wins); the file value stays in `declared_entity` — the two
@@ -142,10 +171,19 @@ def _apply_verified_entity(conn: DbConn, source: str, ref, resolved, key: str) -
                        source, obj_ref, declared, governed)
 
 
-def _demote_entity(conn: DbConn, key: str) -> None:
+def _demote_entity(conn: DbConn, key: str, *, emit_invalidation: bool = True) -> None:
     """RESTORE the file's declared entity as the effective display context, CLEAR governed provenance,
     rebuild search_doc — never data loss. Located by ``entity_fact_key`` (no ref needed); a fact that
-    never projected matches no node (no-op)."""
+    never projected matches no node (no-op).
+
+    [5] ``emit_invalidation`` (default True) — when this demote (reject/expire/drift/withdraw) actually
+    CHANGES the effective ``entity`` (the governed value differed from the restored file value), eagerly
+    invalidate dependent contracts. The benign reproject/replay pass ``False``."""
+    # Capture the pre-image (only when we may need it) so we can tell whether the effective entity value
+    # actually moves — restoring an identical declared value is NOT a drift the read gate would see.
+    before = conn.execute(
+        "SELECT catalog_source, object_ref, entity, declared_entity FROM graph_node "
+        "WHERE entity_fact_key = %s", (key,)).fetchall() if emit_invalidation else []
     rows = conn.execute(
         "UPDATE graph_node SET entity = declared_entity, declared_entity = NULL, "
         "entity_fact_key = NULL, entity_fact_event_id = NULL, entity_status = NULL "
@@ -153,6 +191,10 @@ def _demote_entity(conn: DbConn, key: str) -> None:
         (key,)).fetchall()
     for src, obj_ref in rows:
         rebuild_search_doc(conn, src, obj_ref)
+    if emit_invalidation:
+        for src, obj_ref, old_entity, declared in before:
+            if old_entity != declared:                 # the H2c-hashed entity value actually moved
+                _invalidate_entity_change(conn, src, obj_ref)
 
 
 def _apply_verified_currency(conn: DbConn, source: str, ref, resolved, key: str,
@@ -194,7 +236,8 @@ def demote_semantic_binding(conn: DbConn, *, fact_key: str, fact_type: str, stat
     by ``overlay.expiry.demote_projected_semantic_binding`` (which savepoints + fail-softs it)."""
     now = now or datetime.now(UTC)
     if fact_type == ENTITY_ASSIGNMENT:
-        _demote_entity(conn, fact_key)
+        # [5] a GENUINE demote (reject/expire/drift) — invalidate dependent contracts on a real change.
+        _demote_entity(conn, fact_key, emit_invalidation=True)
     elif fact_type == CURRENCY_BINDING:
         _demote_currency(conn, fact_key, _clamp_status(status), now)
 
@@ -233,7 +276,10 @@ def reproject_semantic_bindings(conn: DbConn, *, source: str, now: datetime | No
     non-VERIFIED fact demotes/no-ops, a pure-declared catalog enumerates nothing and writes nothing."""
     now = now or datetime.now(UTC)
     for ref, fact_type in list_semantic_binding_refs(conn, source):
-        project_semantic_binding_fact(conn, source=source, ref=ref, fact_type=fact_type, now=now)
+        # [5] emit_invalidation=False — a build_graph reproject RESTORES the SAME governed state from the
+        # facts (VERIFIED wins); it must never spuriously invalidate a contract that isn't drifted.
+        project_semantic_binding_fact(conn, source=source, ref=ref, fact_type=fact_type, now=now,
+                                      emit_invalidation=False)
 
 
 # ==================================================================================================
@@ -274,7 +320,10 @@ def project_verified_semantic_binding(conn: DbConn, source: str, ref, fact_type:
                 logger.warning("semantic binding: overlay projection lags after drain — deferring "
                                "projection of a verified %s in %s", fact_type, source)
                 return "pending"
-            project_semantic_binding_fact(conn, source=source, ref=ref, fact_type=fact_type, now=now)
+            # [5] the SYNC confirm path is a GENUINE entity change — invalidate dependent contracts on a
+            # real value move (the default; only the reproject/replay rebuild paths suppress it).
+            project_semantic_binding_fact(conn, source=source, ref=ref, fact_type=fact_type, now=now,
+                                          emit_invalidation=True)
         operational = (_entity_is_operational(conn, source, ref, key)
                        if fact_type == ENTITY_ASSIGNMENT
                        else _currency_is_operational(conn, key))
@@ -350,7 +399,11 @@ class SemanticBindingProjection:
             raise ProjectionApplyError(
                 "overlay_fact", event.aggregate_id,
                 f"undecodable semantic-binding ref: {exc}") from exc
-        project_semantic_binding_fact(conn, source=ref.catalog_source, ref=ref, fact_type=fact_type)
+        # [5] emit_invalidation=False — this fold re-projects the fact's CURRENT state (a live catch-up
+        # re-applies what the sync path already emitted; a from-zero rebuild reproduces identical state).
+        # The sync confirm + async demote paths own the genuine-change invalidation; the fold must not.
+        project_semantic_binding_fact(conn, source=ref.catalog_source, ref=ref, fact_type=fact_type,
+                                      emit_invalidation=False)
 
     def reset(self, conn: DbConn) -> None:
         """Restore EVERY governed entity node to its file display context + truncate the edge table so

@@ -43,6 +43,17 @@ REASON_FIELD_DECISION_CONFLICT = "FIELD_DECISION_CONFLICT"
 REASON_FACT_STALE = "FACT_STALE"
 REASON_FACT_EXPIRED = "FACT_EXPIRED"
 REASON_FACT_REJECTED = "FACT_REJECTED"
+# A human F3 field correction projected a governed display column (definition/concept/domain/…) that H2c
+# hashes as contract-dependency state. The read gate already downgrades on the hash change; this reason
+# makes the demotion DURABLE + AUDITED (an invalidation_reason on /contracts) + round-trip-proof —
+# consistent with the ingest dropped-field wire, so the same state change never has opposite durability
+# across deliveries.
+REASON_METADATA_CORRECTED = "METADATA_CORRECTED"
+# An E3 entity apply/demote rewrote ``graph_node.entity`` (also an H2c-hashed dependency column) — a
+# governed entity_assignment confirmed, expired, rejected, or drift-staled. Same durability/audit intent
+# as METADATA_CORRECTED, under a DISTINCT reason so /contracts can attribute the demotion to the entity
+# binding rather than a scalar field correction.
+REASON_ENTITY_BINDING_CHANGED = "ENTITY_BINDING_CHANGED"
 # H2c SEAM (not wired): POLICY_VERSION_CHANGED. ``field_resolution.FIELD_POLICY_VERSION`` is a
 # COMPILE-TIME constant — there is no runtime "policy bumped" event/call site to hook, so a bump ships
 # as a code change + migration/replay, at which point a batch invalidate_contracts_for over the affected
