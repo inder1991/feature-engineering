@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from featuregen.overlay.upload.object_ref import _norm
+from featuregen.overlay.upload.object_ref import _norm, is_reserved_source_name
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
 
 if TYPE_CHECKING:
@@ -127,6 +127,14 @@ def validate_rows(rows: list[CanonicalRow],
         return ValidationResult(structural_error="empty upload: no rows")
     if all(not r.source for r in rows):
         return ValidationResult(structural_error="no row has a source")
+    # A RESERVED ``__…__`` source is the gate console's internal-fixture namespace — never a user
+    # upload. Reject the WHOLE upload fail-closed (the route boundary rejects it too via
+    # normalize_source_name; this backstops any direct ingest_upload caller) so a real catalog can
+    # never share graph rows / locks with the rolled-back gold/drift fixtures (finding [8]).
+    if catalog_source is not None and is_reserved_source_name(catalog_source):
+        return ValidationResult(
+            structural_error=f"source '{catalog_source}' is reserved for internal fixtures and "
+            "cannot be used as a catalog source")
 
     # `type` is a hard requirement unless the profile explicitly does not attest it (a glossary).
     type_required = profile is None or profile.attests("type")

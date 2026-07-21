@@ -30,22 +30,42 @@ def _norm(value: str) -> str:
     return value.strip().lower()
 
 
+def is_reserved_source_name(source: str) -> bool:
+    """True iff ``source`` (after the ``_norm`` fold) is a RESERVED internal-fixture name — the
+    double-underscore-wrapped ``__…__`` form (e.g. ``__gate_gold__``).
+
+    The 3C.1 gate console seeds its gold / drift fixtures under a reserved source so its real
+    ``build_graph`` (``DELETE FROM graph_node WHERE catalog_source = …``) and its watermark writes
+    can NEVER touch — or lock, and thereby deadlock — a real customer catalog that happens to share
+    the fixture's old name (a bank naming its core-banking extract ``core``). A USER upload naming a
+    reserved source is rejected at the write boundary (:func:`normalize_source_name` +
+    ``validate_rows``), so the two name spaces can never collide."""
+    normalized = source.strip().lower()
+    return len(normalized) >= 4 and normalized.startswith("__") and normalized.endswith("__")
+
+
 def normalize_source_name(source: str) -> str:
     """Strip + lower-case a catalog source id (the ``_norm`` fold every identity component gets) AND
-    fail closed on a name that is not a single URL path segment.
+    fail closed on a name that is not a single URL path segment, or that is a RESERVED name.
 
     ``source`` is ONE path segment across the whole API (``/sources/{source}/...``,
     ``/catalog/assets/{source}/{object_ref:path}``, ``/uploads`` Form field). A '/' or a '%' in it
     would (percent-)decode across the route boundary — uvicorn percent-decodes ``%2F`` to ``/``
     BEFORE routing — and mis-split ``{source}/{object_ref:path}``, reading or writing a DIFFERENT
-    source. Reject both at the WRITE boundary rather than loosening any route. Raises ``ValueError``
-    on an empty name or one containing '/' or '%'."""
+    source. Reject both at the WRITE boundary rather than loosening any route. A ``__…__`` RESERVED
+    name (:func:`is_reserved_source_name`) is also rejected, so a user upload can never share a
+    catalog with the gate console's internal fixtures. Raises ``ValueError`` on an empty name, one
+    containing '/' or '%', or a reserved name."""
     normalized = source.strip().lower()
     if not normalized:
         raise ValueError("source is required")
     if "/" in normalized or "%" in normalized:
         raise ValueError(
             "source must be a single path segment: '/' and '%' are not allowed in a source name")
+    if is_reserved_source_name(normalized):
+        raise ValueError(
+            "source name is reserved: names wrapped in double underscores (e.g. '__gate_gold__') "
+            "are reserved for internal fixtures and cannot be used as a catalog source")
     return normalized
 
 

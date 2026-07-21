@@ -18,6 +18,7 @@ from featuregen.overlay.upload.planner.contract_eval import (
     evaluate,
 )
 from featuregen.overlay.upload.planner.contract_gold import (
+    GATE_GOLD_SOURCE,
     GOLD_CASES,
     compile_gold_case,
     run_gold_case,
@@ -109,17 +110,20 @@ def run_double_compile(conn) -> StabilityResult:
 
 
 _DRIFT_SEED = [
-    (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
-    (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+    (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "account_id", "integer", is_grain=True),
+     "account_id"),
+    (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "balance", "numeric"), "monetary_stock"),
 ]
 
 
 def _fingerprint(conn) -> str:
     from types import SimpleNamespace
     mini = SimpleNamespace(
-        columns_by_catalog={"core": {c.object_ref: c for c in _load_columns(conn, "core", ())}},
-        realizations_by_catalog={"core": derive_catalog_realizations(conn, "core").realizations})
-    return compiler_input_fingerprint(mini, "core")
+        columns_by_catalog={GATE_GOLD_SOURCE: {
+            c.object_ref: c for c in _load_columns(conn, GATE_GOLD_SOURCE, ())}},
+        realizations_by_catalog={
+            GATE_GOLD_SOURCE: derive_catalog_realizations(conn, GATE_GOLD_SOURCE).realizations})
+    return compiler_input_fingerprint(mini, GATE_GOLD_SOURCE)
 
 
 def run_drift_checks(conn) -> float:
@@ -130,22 +134,26 @@ def run_drift_checks(conn) -> float:
     classes = ("additivity_rebuild", "version_bump")
     for cls in classes:
         with _rolled_back(conn):
-            build_graph(conn, "core", [r for r, _ in _DRIFT_SEED],
+            build_graph(conn, GATE_GOLD_SOURCE, [r for r, _ in _DRIFT_SEED],
                         concepts={content_hash(r): cn for r, cn in _DRIFT_SEED})
-            stored = StoredEvidenceV1(fingerprints={"core": _fingerprint(conn)},
-                                      head_seqs={"core": 3}, versions=_VERSIONS)
+            stored = StoredEvidenceV1(fingerprints={GATE_GOLD_SOURCE: _fingerprint(conn)},
+                                      head_seqs={GATE_GOLD_SOURCE: 3}, versions=_VERSIONS)
             if cls == "additivity_rebuild":
                 mutated = [
-                    (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
-                    (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_flow"),  # was stock
+                    (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "account_id", "integer",
+                                  is_grain=True), "account_id"),
+                    (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "balance", "numeric"),
+                     "monetary_flow"),  # was stock
                 ]
-                build_graph(conn, "core", [r for r, _ in mutated],
+                build_graph(conn, GATE_GOLD_SOURCE, [r for r, _ in mutated],
                             concepts={content_hash(r): cn for r, cn in mutated})
-                cur = CurrentEvidenceV1(fingerprints={"core": _fingerprint(conn)},
-                                        head_seqs={"core": 3}, checkpoint=100, versions=_VERSIONS)
+                cur = CurrentEvidenceV1(fingerprints={GATE_GOLD_SOURCE: _fingerprint(conn)},
+                                        head_seqs={GATE_GOLD_SOURCE: 3}, checkpoint=100,
+                                        versions=_VERSIONS)
             else:  # version_bump: the producer/compiler version set changed
-                cur = CurrentEvidenceV1(fingerprints={"core": _fingerprint(conn)}, head_seqs={"core": 3},
-                                        checkpoint=100, versions=(*_VERSIONS, ("extra", "9.9.9")))
+                cur = CurrentEvidenceV1(fingerprints={GATE_GOLD_SOURCE: _fingerprint(conn)},
+                                        head_seqs={GATE_GOLD_SOURCE: 3}, checkpoint=100,
+                                        versions=(*_VERSIONS, ("extra", "9.9.9")))
             if compare(stored, cur) is not ReplayFreshness.current:
                 detected += 1
     return detected / len(classes)

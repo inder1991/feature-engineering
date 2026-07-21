@@ -55,6 +55,7 @@ from featuregen.projections.runner import (
     projection_lag,
     rebuild_projection,
     run_projection,
+    try_lock_checkpoint_nowait,
 )
 from featuregen.runtime.observability import counters
 
@@ -313,6 +314,17 @@ def project_verified_semantic_binding(conn: DbConn, source: str, ref, fact_type:
     key = fact_key(ref, fact_type)
     try:
         with conn.transaction():  # savepoint: a projection fault must not roll back the confirm
+            if not try_lock_checkpoint_nowait(conn, "overlay"):
+                # A concurrent ingest holds the 'overlay' checkpoint row to commit (its in-tx drain
+                # across the D4/Pass-B LLM stages) — draining here would BLOCK the confirm behind the
+                # whole multi-minute ingest tx (audit finding [9]). Defer to the same fail-closed
+                # projection-lag path: the fact stays VERIFIED and the next caught-up ingest
+                # reproject makes the binding operational.
+                counters.incr("overlay.semantic_binding.projection_skipped_lock")
+                logger.warning("semantic binding: overlay checkpoint lock held by an in-flight "
+                               "ingest — deferring projection of a verified %s in %s", fact_type,
+                               source)
+                return "pending"
             while run_projection(conn, OverlayProjection()) >= 500:
                 pass
             if projection_lag(conn, "overlay") != 0:

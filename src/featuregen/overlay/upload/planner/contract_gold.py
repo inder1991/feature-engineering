@@ -39,6 +39,14 @@ from featuregen.overlay.upload.templates import Need, Template
 
 GOLD_SET_VERSION = "1.0.0"
 _GOLD_NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+# The gold/drift fixtures seed on the LIVE connection (inside a rolled-back tx — the writes revert,
+# the ROW LOCKS are real while held). Namespacing them under a RESERVED source (``__gate_gold__``,
+# rejected as a user upload name by normalize_source_name / validate_rows) means build_graph's
+# ``DELETE FROM graph_node WHERE catalog_source = …`` and the drift-watermark UPSERT can never wipe
+# or lock a real customer catalog — closing the AB-BA deadlock a bank naming its catalog 'core' hit
+# (composition audit finding [8]). Source-independent by construction: GOLD_SET_HASH hashes only
+# object_refs (schema.table.column), so the reserved name does NOT move the signed gate artifact.
+GATE_GOLD_SOURCE = "__gate_gold__"
 _TEMPLATE = Template(
     id="gold_probe", family="balance_stock", intent="gold-set probe",
     needs=(Need("m", "monetary_flow"), Need("entity", "customer_id")), params={},
@@ -64,19 +72,23 @@ def _seed(conn) -> None:
     """A single-catalog accounts→customers roll-up (accounts N:1 customers) covering every additivity
     class, plus fresh watermarks so a clean contract's freshness axis resolves."""
     rows = [
-        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
-        (CanonicalRow("core", "accounts", "customer_id", "integer",
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "account_id", "integer", is_grain=True),
+         "account_id"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "customer_id", "integer",
                       joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
-        (CanonicalRow("core", "accounts", "amount", "numeric"), "monetary_flow"),
-        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
-        (CanonicalRow("core", "accounts", "rate", "numeric"), "monetary_rate"),
-        (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "amount", "numeric"), "monetary_flow"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "balance", "numeric"), "monetary_stock"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "rate", "numeric"), "monetary_rate"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "customers", "customer_id", "integer", is_grain=True),
+         "customer_id"),
     ]
-    build_graph(conn, "core", [r for r, _ in rows], concepts={content_hash(r): cn for r, cn in rows})
+    build_graph(conn, GATE_GOLD_SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): cn for r, cn in rows})
     conn.execute(
         "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq)"
-        " VALUES ('core', %s, 'gold', 1) ON CONFLICT (catalog_source) DO UPDATE SET"
-        " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq", (_GOLD_NOW,))
+        " VALUES (%s, %s, 'gold', 1) ON CONFLICT (catalog_source) DO UPDATE SET"
+        " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
+        (GATE_GOLD_SOURCE, _GOLD_NOW))
     conn.execute(
         "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES ('overlay', 1)"
         " ON CONFLICT (projection_name) DO UPDATE SET checkpoint_seq = EXCLUDED.checkpoint_seq")
@@ -86,26 +98,26 @@ def _binding(recipe_id: str, need_role: str, obj_ref: str, concept: str) -> c.In
     return c.IngredientBindingV1(
         recipe_id=recipe_id, need_role=need_role, concept=concept, required_grains=(),
         join_role=str(JoinRole.MEASURE), temporal_role=str(TemporalRole.NONE),
-        bound_catalog_source="core", bound_object_ref=obj_ref, actual_source_grain=None,
+        bound_catalog_source=GATE_GOLD_SOURCE, bound_object_ref=obj_ref, actual_source_grain=None,
         binding_quality=c.BindingQuality.exact_concept, safety=c.BindingSafety.safe, reason_codes=())
 
 
 def _build_plan(ctx, case: GoldCase) -> c.BindingPlanV1:
-    (realization,) = ctx.realizations_by_catalog["core"]
+    (realization,) = ctx.realizations_by_catalog[GATE_GOLD_SOURCE]
     source_key = c.IngredientBindingV1(
         recipe_id=case.case_id, need_role="source_key", concept="customer_id", required_grains=(),
         join_role=str(JoinRole.SOURCE_ENTITY_KEY), temporal_role=str(TemporalRole.NONE),
-        bound_catalog_source="core", bound_object_ref="public.accounts.customer_id",
+        bound_catalog_source=GATE_GOLD_SOURCE, bound_object_ref="public.accounts.customer_id",
         actual_source_grain=None, binding_quality=c.BindingQuality.exact_concept,
         safety=c.BindingSafety.safe, reason_codes=())
     measures = tuple(_binding(case.case_id, role, ref, concept) for role, ref, concept in case.measures)
     segments = (
-        c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, "core",
+        c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, GATE_GOLD_SOURCE,
                                from_entity="account", to_entity="customer", cardinality="many_to_one"),
-        c.BindingPathSegmentV1(c.SegmentKind.intra_catalog_realization, "core",
+        c.BindingPathSegmentV1(c.SegmentKind.intra_catalog_realization, GATE_GOLD_SOURCE,
                                realization_ref=realization.realization_id))
     return c.make_binding_plan(
-        recipe_id=case.case_id, target_entity="customer", catalog_source="core",
+        recipe_id=case.case_id, target_entity="customer", catalog_source=GATE_GOLD_SOURCE,
         ingredient_bindings=(source_key, *measures), path_segments=segments,
         resolution_status=c.PlanResolutionStatus.resolved,
         path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,

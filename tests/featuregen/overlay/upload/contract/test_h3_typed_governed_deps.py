@@ -226,32 +226,34 @@ def test_realization_signature_resolves_then_drifts_on_cardinality_and_drop(db):
     ``graph_edge`` (a real hash at confirm → promotable), a cardinality retype CHANGES it (drift), and
     dropping the edge yields ``MISSING`` (drift). Uses the gold single-catalog accounts→customers N:1
     realization."""
+    from featuregen.overlay.upload.planner.contract_gold import GATE_GOLD_SOURCE
     from featuregen.overlay.upload.planner.contract_gold import _seed as _gold_seed
     _gold_seed(db)
-    (real,) = derive_catalog_realizations(db, "core").realizations
+    (real,) = derive_catalog_realizations(db, GATE_GOLD_SOURCE).realizations
     marker = realization_marker(real.realization_id)
 
     at_confirm = confirm_dependency_hash(
-        db, contract_id="c1", catalog_source="core", graph_ref=marker, logical_ref=marker,
+        db, contract_id="c1", catalog_source=GATE_GOLD_SOURCE, graph_ref=marker, logical_ref=marker,
         decision_id=None, fact_id=None, event_id=None)
-    dep_row = {"contract_id": "c1", "catalog_source": "core", "graph_ref": marker,
+    dep_row = {"contract_id": "c1", "catalog_source": GATE_GOLD_SOURCE, "graph_ref": marker,
                "logical_ref": marker, "decision_id": None, "fact_id": None, "event_id": None}
 
-    sig = _realization_signature(db, "core", marker)
+    sig = _realization_signature(db, GATE_GOLD_SOURCE, marker)
     assert sig != _MISSING and sig["realization"] is True and sig["cardinality"]   # RESOLVES (no poison)
     assert current_dependency_hash(db, dep_row) == at_confirm                      # stable → not drifted
 
     # retype the realization's cardinality on its declared edge → the signature changes → drift.
     from_key, _, to_key = real.realization_id.partition(":")[2].partition("->")
-    db.execute("UPDATE graph_edge SET cardinality = '1:N' WHERE catalog_source = 'core' "
-               "AND kind = 'joins' AND from_ref = %s AND to_ref = %s", (from_key, to_key))
-    assert _realization_signature(db, "core", marker) != sig
+    db.execute("UPDATE graph_edge SET cardinality = '1:N' WHERE catalog_source = %s "
+               "AND kind = 'joins' AND from_ref = %s AND to_ref = %s",
+               (GATE_GOLD_SOURCE, from_key, to_key))
+    assert _realization_signature(db, GATE_GOLD_SOURCE, marker) != sig
     assert current_dependency_hash(db, dep_row) != at_confirm
 
     # drop the edge entirely → MISSING → drift.
-    db.execute("DELETE FROM graph_edge WHERE catalog_source = 'core' AND kind = 'joins' "
-               "AND from_ref = %s AND to_ref = %s", (from_key, to_key))
-    assert _realization_signature(db, "core", marker) == _MISSING
+    db.execute("DELETE FROM graph_edge WHERE catalog_source = %s AND kind = 'joins' "
+               "AND from_ref = %s AND to_ref = %s", (GATE_GOLD_SOURCE, from_key, to_key))
+    assert _realization_signature(db, GATE_GOLD_SOURCE, marker) == _MISSING
     assert current_dependency_hash(db, dep_row) != at_confirm
 
 

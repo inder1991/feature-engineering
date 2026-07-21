@@ -74,9 +74,36 @@ def test_drift_checks_detect_every_controlled_mutation(db):
 
 
 def test_drivers_leave_no_durable_catalog_state(db):
-    # the controlled drivers seed 'core' but roll it back — no rows survive
+    # the controlled drivers seed the RESERVED __gate_gold__ source but roll it back — no rows survive
     run_gold_suite(db)
     run_double_compile(db)
     run_drift_checks(db)
-    remaining = db.execute("SELECT count(*) FROM graph_node WHERE catalog_source = 'core'").fetchone()[0]
+    remaining = db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = '__gate_gold__'").fetchone()[0]
     assert remaining == 0
+
+
+def test_gold_seed_targets_reserved_source_and_leaves_a_real_core_untouched(db):
+    """[8] A bank naming its catalog 'core' must be UNTOUCHED by the gate console. The gold fixture
+    now seeds the RESERVED __gate_gold__ source, so `build_graph`'s DELETE-this-source-then-reinsert
+    can no longer wipe (or lock) the real 'core' graph rows. Discriminating: the OLD seed built
+    'core' — its DELETE would drop the real row and its 6 fixture rows would replace it."""
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.enrich import content_hash
+    from featuregen.overlay.upload.graph import build_graph
+    from featuregen.overlay.upload.planner import contract_gold
+
+    real = CanonicalRow("core", "customers", "id", "integer", is_grain=True)
+    build_graph(db, "core", [real], concepts={content_hash(real): "customer_id"})
+    core_before = db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = 'core'").fetchone()[0]
+    assert core_before > 0
+
+    contract_gold._seed(db)   # seed the gold fixture DIRECTLY (no rollback wrapper)
+
+    assert db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = '__gate_gold__'"
+    ).fetchone()[0] > 0                                        # gold rows land under the reserved source
+    assert db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = 'core'"
+    ).fetchone()[0] == core_before                            # the real 'core' catalog is UNTOUCHED

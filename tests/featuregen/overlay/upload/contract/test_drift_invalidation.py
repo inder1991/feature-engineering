@@ -230,6 +230,63 @@ def test_two_upload_drop_invalidates_dependent_contract_via_ingest_wire(db):
     assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
 
 
+def _two_col_retire_glossary(balance_def, amount_def):
+    header = ("physical_name,business_term,description_business_definition,data_domain,"
+              "bian_path,fibo_path\n")
+    return (header
+            + f'public.accounts.balance,Account Balance,"{balance_def}",Deposits,,\n'
+            + f'public.accounts.amount,Txn Amount,"{amount_def}",Deposits,,\n')
+
+
+def test_multi_column_drift_defers_to_a_single_end_of_ingest_invalidation(db, monkeypatch):
+    """[13] A re-upload dropping the load-bearing facet of TWO columns must invalidate BOTH dependent
+    contracts, but emit the invalidation ONCE at the END of ingest_upload — not per-retire mid-ingest
+    (where `invalidate_contracts_for`'s feature_validation checkpoint FOR UPDATE lock contended with
+    the D4 LLM stages). Discriminating: the OLD per-retire wire called `invalidate_contracts_for` once
+    per dropped column (twice here); the deferred wire batches both ChangedRefs into one call."""
+    from datetime import timedelta
+
+    import featuregen.overlay.upload.ingest as ingest_mod
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+        profiler_require_restricted_role=False))
+
+    _retire_ingest(db, _two_col_retire_glossary(_PROFILED, _PROFILED))   # upload 1: both load-bearing
+
+    c_bal = confirm_contract(db, ContractDraft(
+        "h2c_bal_multi", "Count of balances.", None, "count", None, ["public.accounts.balance"],
+        derives_pairs=((_RETIRE_SRC, "public.accounts.balance"),)), actor="ds1")
+    c_amt = confirm_contract(db, ContractDraft(
+        "h2c_amt_multi", "Count of amounts.", None, "count", None, ["public.accounts.amount"],
+        derives_pairs=((_RETIRE_SRC, "public.accounts.amount"),)), actor="ds1")
+    assert _invalidated_count(db, c_bal.contract_id) == 0
+    assert _invalidated_count(db, c_amt.contract_id) == 0
+
+    calls: list[list] = []
+    real = ingest_mod.invalidate_contracts_for
+
+    def _spy(conn, *, changed):
+        changed = list(changed)
+        calls.append(changed)
+        return real(conn, changed=changed)
+
+    monkeypatch.setattr(ingest_mod, "invalidate_contracts_for", _spy)
+
+    _retire_ingest(db, _two_col_retire_glossary(_PLAIN, _PLAIN))        # upload 2: drops BOTH facets
+
+    # DEFERRED: exactly ONE invalidate_contracts_for call, at the end of ingest_upload...
+    assert len(calls) == 1
+    # ...carrying BOTH drifted refs (batched, not one call per retired column)...
+    refs = {cr.object_ref for cr in calls[0]}
+    assert {"public.accounts.balance", "public.accounts.amount"} <= refs
+    # ...and correctness is preserved: BOTH dependent contracts are invalidated.
+    assert _invalidated_count(db, c_bal.contract_id) >= 1
+    assert _invalidated_count(db, c_amt.contract_id) >= 1
+
+
 # ── TEST 5 — an unaffected contract (depends only on ref Y) is NOT invalidated by a drift on ref X ────
 def test_unaffected_contract_is_not_invalidated(db):
     _bank(db)

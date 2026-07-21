@@ -1062,7 +1062,8 @@ def _write_technical_source_evidence(
 
 
 def _retire_dropped_field_decisions(conn, *, source: str, logical_ref: str,
-                                    fields: tuple[str, ...], now: datetime | None) -> None:
+                                    fields: tuple[str, ...], now: datetime | None,
+                                    changed_sink: list[ChangedRef] | None = None) -> None:
     """Retire the DECISION of every ``fields`` member the new upload DROPPED (Delivery B closing
     gate; generalized for review M-2 — the technical path passes ``_TECHNICAL_SOURCE_FIELDS``, the
     glossary parser path ``_PARSER_FIELDS``).
@@ -1096,8 +1097,21 @@ def _retire_dropped_field_decisions(conn, *, source: str, logical_ref: str,
         # this eager emit is not the sole safety. object_ref is the PUBLIC-FLATTENED graph ref the
         # dependency rows store (the same key `_graph_key` derives for the display projection).
         object_ref = _graph_key(source, logical_ref)[1]
-        invalidate_contracts_for(conn, changed=[ChangedRef(
-            catalog_source=source, reason=REASON_FIELD_DECISION_RETIRED, object_ref=object_ref)])
+        changed = ChangedRef(catalog_source=source, reason=REASON_FIELD_DECISION_RETIRED,
+                             object_ref=object_ref)
+        if changed_sink is not None:
+            # [13] DEFER the eager invalidation to end-of-ingest. `invalidate_contracts_for` takes the
+            # single feature_validation `projection_checkpoints` row FOR UPDATE (held to ingest
+            # commit) — taken here, per-retire mid-ingest, it contends with the D4 semantic-binding
+            # LLM stages and blocks every contract confirm for the D4 deadline + ingest tail. Collect
+            # the ChangedRef so ingest_upload emits ONE invalidate_contracts_for after the D4 stages
+            # (the checkpoint lock is then taken once, briefly, at the tail). Same contracts get
+            # invalidated — just later in the SAME tx; the read-time dependency gate covers the interim
+            # fail-closed.
+            changed_sink.append(changed)
+        else:
+            # Legacy / direct-caller path (helper unit tests): emit immediately, unchanged.
+            invalidate_contracts_for(conn, changed=[changed])
 
 
 def _write_glossary_parser_evidence(
@@ -1226,7 +1240,8 @@ def _project_semantic_terms(conn, *, source: str, object_ref: str, rec: Glossary
 def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                               glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
                               concepts: dict[str, str] | None, snapshot_id: str,
-                              now: datetime | None, stats: dict | None = None) -> int:
+                              now: datetime | None, stats: dict | None = None,
+                              changed_sink: list[ChangedRef] | None = None) -> int:
     """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
     revalidation on a material change, project ``semantic_terms`` into search (Task 8), then
     resolve-and-project + a readiness diagnostic (spec §6.3).
@@ -1300,7 +1315,8 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
             # (or a still-present facet) keeps the field untouched.
             with conn.transaction():
                 _retire_dropped_field_decisions(
-                    conn, source=source, logical_ref=logical_ref, fields=_PARSER_FIELDS, now=now)
+                    conn, source=source, logical_ref=logical_ref, fields=_PARSER_FIELDS, now=now,
+                    changed_sink=changed_sink)
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,
@@ -1423,7 +1439,8 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
 
 
 def _ingest_technical_evidence(conn, *, source: str, rows: list[CanonicalRow],
-                               producer_ref: str, now: datetime | None) -> int:
+                               producer_ref: str, now: datetime | None,
+                               changed_sink: list[ChangedRef] | None = None) -> int:
     """Attach the TECHNICAL upload's per-column SOURCE evidence (Delivery B item 8), flag
     human-confirmation revalidation on a material change, then resolve-and-project — the
     technical-path mirror of :func:`_ingest_glossary_evidence`'s column loop. Runs ONLY when
@@ -1464,7 +1481,7 @@ def _ingest_technical_evidence(conn, *, source: str, rows: list[CanonicalRow],
             with conn.transaction():
                 _retire_dropped_field_decisions(
                     conn, source=source, logical_ref=logical_ref,
-                    fields=_TECHNICAL_SOURCE_FIELDS, now=now)
+                    fields=_TECHNICAL_SOURCE_FIELDS, now=now, changed_sink=changed_sink)
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,
@@ -2025,6 +2042,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
                          started_at=stage_started)
 
+    # [13] end-of-ingest DEFERRED contract invalidations. `_retire_dropped_field_decisions`
+    # (invoked per-column below) COLLECTS a ChangedRef here instead of calling
+    # `invalidate_contracts_for` inline — that call takes the single feature_validation checkpoint
+    # row FOR UPDATE (held to ingest commit) and, taken per-retire mid-ingest, would contend with the
+    # D4 semantic-binding LLM stages and block every contract confirm for the D4 deadline + tail. One
+    # emit at the tail (after the D4 stages) takes the lock once, briefly.
+    deferred_invalidations: list[ChangedRef] = []
     if glossary is not None and bindings is not None and snapshot_id is not None:
         # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
         # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
@@ -2035,7 +2059,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             contained = _ingest_glossary_evidence(
                 conn, source=catalog_source, rows=vr.good, glossary=glossary,
                 bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now,
-                stats=glossary_stats)
+                stats=glossary_stats, changed_sink=deferred_invalidations)
             # The helper CONTAINS per-column failures (savepoint + warning); `partial` surfaces
             # them instead of laundering the outer no-raise as success (#22). A table-term schema
             # mismatch is NOT a failure (the upload still succeeds) but IS surfaced in the detail so
@@ -2070,7 +2094,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         try:
             _ingest_technical_evidence(
                 conn, source=catalog_source, rows=vr.good,
-                producer_ref=ingestion_run_id or mint_id("ing"), now=now)
+                producer_ref=ingestion_run_id or mint_id("ing"), now=now,
+                changed_sink=deferred_invalidations)
         except Exception:  # noqa: BLE001
             logger.warning("advisory technical evidence wiring failed for %r — facts + graph "
                            "intact", catalog_source, exc_info=True)
@@ -2209,6 +2234,23 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                      reason_code="requires_candidates")
     else:
         record_stage(stage_recorder, "semantic_binding_proposals", "disabled")
+
+    # [13] Emit the DEFERRED contract invalidations collected by `_retire_dropped_field_decisions`
+    # in ONE call, AFTER the D4 semantic-binding stages above — so the feature_validation checkpoint
+    # lock is taken once, briefly, at the ingest tail rather than per-retire mid-ingest (where it
+    # contended with the D4 LLM stages, blocking every contract confirm for the D4 deadline + tail).
+    # Same contracts get invalidated, just later in the SAME tx. Savepoint + fail-soft: this eager
+    # emit is defense-in-depth (the read-time dependency gate already covers drift fail-closed), so a
+    # fault here must never roll back the already-committed facts + graph.
+    if deferred_invalidations:
+        try:
+            with conn.transaction():
+                invalidate_contracts_for(conn, changed=deferred_invalidations)
+        except Exception:  # noqa: BLE001 — invalidation is defense-in-depth; the read gate covers it
+            counters.incr("overlay.contract_invalidation.deferred_error")
+            logger.warning("deferred end-of-ingest contract invalidation failed for %r — facts "
+                           "intact; the read-time dependency gate still fails closed on the drift",
+                           catalog_source, exc_info=True)
 
     # DRAIN before the end-of-ingest re-projections (full-chain e2e finding, 2026-07-15): the
     # governed seams above (_propose_governed_joins / Pass C / Pass B) appended OVERLAY_FACT_PROPOSED
