@@ -1,0 +1,4 @@
+table,column,type,is_grain,definition,entity
+e2e_accounts,account_id,integer,y,Primary key of the e2e accounts table,Account
+e2e_accounts,balance,double,n,Current balance of the account,Account
+e2e_accounts,opened_at,date,n,Date the account was opened,Account
