@@ -292,7 +292,8 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     Wide tables (#1): an item whose ``column_profiles`` exceeds ``_MAX_COLUMN_PROFILES`` cannot egress
     as one giant item, so it is routed through the TWO-PHASE path (phase-1 per-chunk summaries -> a
     single phase-2 synthesis over the summaries + a complete roster). NARROW tables (``<=64`` profiles)
-    keep today's single-call fast path byte-for-byte. A wide table that fails to summarize every chunk,
+    keep today's single-call fast path byte-for-byte. A wide table synthesizes over whatever chunk
+    summaries LANDED (the roster is complete regardless); only a table with ZERO chunk summaries,
     or whose synthesis is invalid, simply never appears in the returned dict — the caller then reports
     the honest partial/failed outcome (no phantom "resolved").
 
@@ -392,11 +393,14 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     advisory input keyed by chunk ref and record no per-field dispositions.
 
     Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
-    (no fact output) — every chunk item is egress-safe. Phase 2: for each table whose chunks ALL
-    summarized, run ONE synthesis over its chunk summaries + a compact complete roster of STRUCTURED
-    ``{column, operational_type, declared_type}`` entries + the table's ``table_definition`` (when
-    the assembled item carried one). A table missing any chunk summary is dropped (never partially
-    synthesized) so the caller reports it honestly as unresolved."""
+    (no fact output) — every chunk item is egress-safe. Phase 2: for each table with AT LEAST ONE
+    chunk summary, run ONE synthesis over whatever chunk summaries LANDED + a compact complete roster
+    of STRUCTURED ``{column, operational_type, declared_type}`` entries + the table's
+    ``table_definition`` (when the assembled item carried one). The roster is built from ALL profiles,
+    so a budget-skipped chunk summary (advisory phase-2 input, not a governed fact) never starves the
+    synthesis — the ``overlay.table_synth.wide.partial_summaries`` counter records the shortfall. Only
+    a table with ZERO landed summaries is dropped (``wide.zero_summaries``) so the caller reports it
+    honestly as unresolved."""
     chunk_items: list[BatchItem] = []
     chunk_refs_by_table: dict[str, list[str]] = {}
     columns_by_ref: dict[str, set[str]] = {}
@@ -443,13 +447,26 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
 
     phase2_items: list[BatchItem] = []
     for table, refs in chunk_refs_by_table.items():
-        if not all(r in summaries for r in refs):
-            # An incomplete summary set for a wide table -> no synthesis (never a partial/guessed one).
-            counters.incr("overlay.table_synth.wide.incomplete_summaries")
-            logger.info("table_synth wide %r summarized %d/%d chunks — no synthesis (honest miss)",
-                        table, sum(r in summaries for r in refs), len(refs))
+        present = [r for r in refs if r in summaries]
+        if not present:
+            # ZERO chunks summarized for a wide table -> no synthesis (never a guessed one): the
+            # phase-2 call would have no advisory grounding at all. Only this all-missing case drops
+            # the table; the caller then reports it honestly as unresolved.
+            counters.incr("overlay.table_synth.wide.zero_summaries")
+            logger.info("table_synth wide %r summarized 0/%d chunks — no synthesis (honest miss)",
+                        table, len(refs))
             continue
-        chunk_summaries = [json.loads(summaries[r]) for r in refs]
+        if len(present) < len(refs):
+            # SOME chunks summarized: proceed to phase 2 on the LANDED summaries. This is SAFE
+            # because the phase-2 item carries the COMPLETE column_roster built from ALL profiles
+            # (above), independent of the summaries — a chunk summary is explicitly advisory phase-2
+            # input, not a governed fact. Dropping the whole (e.g. 126-col) table because one chunk's
+            # summary call was budget-skipped would stamp all five dispositions not_evaluated and
+            # fail Pass B, so we synthesize over whatever summaries arrived.
+            counters.incr("overlay.table_synth.wide.partial_summaries")
+            logger.info("table_synth wide %r summarized %d/%d chunks — synthesizing on the partial "
+                        "summaries (roster is complete)", table, len(present), len(refs))
+        chunk_summaries = [json.loads(summaries[r]) for r in present]
         metadata: dict = {"table": table, "chunk_summaries": chunk_summaries,
                           "column_roster": roster_by_table[table]}
         if table in table_def_by_table:
