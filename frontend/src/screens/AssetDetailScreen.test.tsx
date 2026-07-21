@@ -41,17 +41,17 @@ function fixture(): api.AssetDetail {
         // governed: value present AND attested by the source.
         currency: {
           value: 'USD', authority: 'governed', c1_status: 'confirmed',
-          provenance: 'source_declared', selected_evidence_ids: ['ev-c1'],
+          provenance: 'source_declared', evidence_provenance: null, selected_evidence_ids: ['ev-c1'],
         },
         // hint: value present but only LLM-proposed — authority is NOT 'governed'.
         entity: {
           value: 'Account', authority: 'hint', c1_status: 'proposed',
-          provenance: 'llm_proposed', selected_evidence_ids: [],
+          provenance: 'llm_proposed', evidence_provenance: null, selected_evidence_ids: [],
         },
         // missing: value present but NOTHING attested it — must read as unattested, not "present".
         unit: {
           value: 'dollars', authority: 'missing', c1_status: 'none',
-          provenance: null, selected_evidence_ids: [],
+          provenance: null, evidence_provenance: null, selected_evidence_ids: [],
         },
       },
     },
@@ -224,6 +224,26 @@ describe('asset detail — authority rendered from the response, never from the 
     expect(authorityChip('llm proposed', 'gj-proposed')).toBeTruthy()
     // value present but authority "missing" → unattested, NOT a present/governed state.
     expect(authorityChip('unattested', 'gj-none')).toBeTruthy()
+  })
+
+  it('falls back to the evidence author when there is no decision, only "unattested" when truly nothing', async () => {
+    getAssetDetail.mockResolvedValue({
+      detail: {
+        ...fixture(),
+        effective_metadata: { fields: {
+          concept: { value: 'monetary_flow', authority: 'hint', c1_status: 'no_decision',
+                     provenance: null, evidence_provenance: 'AI proposed', selected_evidence_ids: [] },
+          unit:    { value: null, authority: 'missing', c1_status: 'no_decision',
+                     provenance: null, evidence_provenance: null, selected_evidence_ids: [] },
+        } },
+      },
+      etag: 'etag-1',
+    })
+    renderScreen()
+    await screen.findByRole('group', { name: /asset sections/i })
+    await userEvent.click(screen.getByRole('button', { name: 'Metadata & evidence' }))
+    expect(authorityChip('AI proposed', 'gj-proposed')).toBeTruthy()   // known author, not "unattested"
+    expect(authorityChip('unattested', 'gj-none')).toBeTruthy()        // genuinely nothing
   })
 })
 

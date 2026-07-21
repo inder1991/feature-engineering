@@ -1580,6 +1580,7 @@ export interface EffectiveMetadataField {
   authority: string
   c1_status: string
   provenance: string | null
+  evidence_provenance: string | null
   selected_evidence_ids: string[]
 }
 

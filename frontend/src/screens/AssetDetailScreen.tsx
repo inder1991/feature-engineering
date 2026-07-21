@@ -53,6 +53,14 @@ function provenanceLabel(provenance: string | null): string {
   return PROVENANCE_LABEL[provenance] ?? provenance.replaceAll('_', ' ')
 }
 
+// The badge shows the value's author: the governed decision provenance if any, else the evidence-layer
+// author (source attested / AI proposed / rulebook proposed), else "unattested" only when truly nothing.
+function attestedByLabel(field: EffectiveMetadataField): string {
+  if (field.provenance) return provenanceLabel(field.provenance)
+  if (field.evidence_provenance) return field.evidence_provenance
+  return 'unattested'
+}
+
 // governed = a verified, load-bearing attestation (solid ok); hint = a proposal not yet governed
 // (accent); missing = nothing attested (quiet). Unknown authorities stay quiet, never break.
 const AUTHORITY_TONE: Record<string, string> = {
@@ -336,7 +344,7 @@ function AuthorityBadge({ field }: { field: EffectiveMetadataField }) {
       className={`badge ${authorityTone(field.authority)}`}
       title={`authority: ${field.authority} · c1: ${field.c1_status}`}
     >
-      {provenanceLabel(field.provenance)}
+      {attestedByLabel(field)}
     </span>
   )
 }
@@ -467,7 +475,7 @@ function MetadataTab({
             </div>
             <p className="adg-field-value mono">{fieldValueText(field)}</p>
             <p className="adg-auth-meta">
-              Attested by <strong>{provenanceLabel(field.provenance)}</strong>. This is a fact about
+              Attested by <strong>{attestedByLabel(field)}</strong>. This is a fact about
               who attested the value, not about whether a value is present.
             </p>
 
