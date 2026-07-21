@@ -23,9 +23,14 @@ IAM_MANAGE = "iam:manage"              # administer users / groups / roles
 # overlay's dual-owner confirm. This constant exists for future reconciliation of that gate into the
 # permission model.
 GOVERNANCE_CONFIRM = "governance:confirm"
+# Read SAFE LLM-call audit summaries (which task/dispatch touched a ref, versions, outcome, times).
+# RESTRICTED: raw/redacted LLM inputs, raw outputs and repair bodies are NEVER exposed by this — they
+# stay in the audit store. Granted only to platform_admin + an explicitly provisioned audit role, so a
+# catalog_viewer / data_owner / feature_engineer cannot read the LLM audit trail.
+AUDIT_READ = "audit:read"
 
 ALL_PERMISSIONS = frozenset({CATALOG_READ, CATALOG_WRITE, FEATURE_READ, FEATURE_GENERATE, IAM_MANAGE,
-                             GOVERNANCE_CONFIRM})
+                             GOVERNANCE_CONFIRM, AUDIT_READ})
 
 # ---- Roles (bundles) ----------------------------------------------------------------------------
 ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
@@ -37,6 +42,9 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     "feature_engineer": frozenset({CATALOG_READ, FEATURE_READ, FEATURE_GENERATE}),
     # identity administrator: manages access only (separation of duties from data + feature work)
     "access_admin": frozenset({IAM_MANAGE}),
+    # explicitly provisioned audit reader: may read SAFE LLM-call audit summaries and nothing else.
+    # Deliberately NOT bundled into catalog_viewer / data_owner / feature_engineer.
+    "audit_reader": frozenset({AUDIT_READ}),
     # superuser
     "platform_admin": ALL_PERMISSIONS,
 }

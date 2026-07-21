@@ -40,7 +40,7 @@ from dataclasses import asdict
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import IdentityEnvelope
-from featuregen.identity.permissions import CATALOG_READ, has_permission
+from featuregen.identity.permissions import AUDIT_READ, CATALOG_READ, has_permission
 from featuregen.overlay.identity import _norm
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.column_readiness import column_readiness
@@ -61,7 +61,11 @@ _HISTORY_RUN_LIMIT = 20
 # are selectable via the route's ``include`` param. ``relationships.semantic`` is F1 (unavailable).
 _F0_SECTIONS: tuple[str, ...] = (
     "identity", "effective_metadata", "evidence", "relationships", "readiness", "history", "actions",
+    "audit",
 )
+
+# The subject-linked LLM-audit-summaries section returns at most this many newest dispatches.
+_AUDIT_SUMMARY_LIMIT = 50
 
 # effective_metadata fields: (label, graph_node flat column, C1 field_name). The DISPLAY value comes
 # from the flat column (the decision log stores only a hash); the AUTHORITY/provenance comes from C1.
@@ -450,6 +454,41 @@ def _history_section(conn: DbConn, source: str, object_ref: str) -> dict:
     return {"runs": runs, "truncated": truncated}
 
 
+def _audit_section(conn: DbConn, source: str, object_ref: str, logical_ref: str) -> dict:
+    """F2-audit: subject-linked LLM-call audit SUMMARIES for this ref — which dispatches touched it,
+    their task/stage/provider/model/versions, transport outcome and timestamps.
+
+    SAFE-ONLY: this returns NO ``redacted_input`` (the egress-approved request body), NO raw model
+    output, and NO repair body — those stay in the restricted audit store and are never surfaced here.
+    The caller reaches this function ONLY after the ``audit:read`` gate in :func:`build_asset_detail`
+    (a caller without it gets the section listed in ``unavailable_sections`` instead — no hidden
+    count). Bounded to the newest :data:`_AUDIT_SUMMARY_LIMIT` dispatches; the reverse lookup rides the
+    1016 ``llm_dispatch_subject (catalog_source, object_ref | logical_ref)`` indexes."""
+    rows = conn.execute(
+        "SELECT d.dispatch_ref, d.task, d.stage, d.provider, d.model, d.prompt_version, "
+        "       d.schema_version, d.created_at, s.field_names, o.outcome, o.recorded_at "
+        "FROM llm_dispatch_subject s "
+        "JOIN llm_dispatch d ON d.dispatch_ref = s.dispatch_ref "
+        "LEFT JOIN LATERAL ("
+        "    SELECT outcome, recorded_at FROM llm_dispatch_outcome oo "
+        "    WHERE oo.dispatch_ref = s.dispatch_ref ORDER BY oo.recorded_at DESC LIMIT 1"
+        ") o ON true "
+        "WHERE s.catalog_source = %s AND (s.object_ref = %s OR s.logical_ref = %s) "
+        "ORDER BY d.created_at DESC, d.dispatch_ref "
+        "LIMIT %s",
+        (source, object_ref, logical_ref, _AUDIT_SUMMARY_LIMIT + 1),
+    ).fetchall()
+    truncated = len(rows) > _AUDIT_SUMMARY_LIMIT
+    summaries = [
+        {"dispatch_ref": dref, "task": task, "stage": stage, "provider": provider, "model": model,
+         "prompt_version": prompt_v, "schema_version": schema_v, "created_at": created_at,
+         "field_names": field_names, "outcome": outcome, "outcome_at": recorded_at}
+        for (dref, task, stage, provider, model, prompt_v, schema_v, created_at, field_names,
+             outcome, recorded_at) in rows[:_AUDIT_SUMMARY_LIMIT]
+    ]
+    return {"status": "available", "summaries": summaries, "truncated": truncated}
+
+
 def _consistency_token(body: dict) -> str:
     """A content-hash fingerprint of the assembled snapshot — the ``consistency_token`` and HTTP
     ``ETag``. Canonical JSON (sorted keys, ``default=str`` for datetimes) so the same snapshot
@@ -531,6 +570,16 @@ def build_asset_detail(
         # F0: no server-calculated commands yet — the correction command is Delivery F0-T4.
         body["actions"] = []
         built.append("actions")
+
+    if "audit" in requested:
+        # Separately authorized (F2-audit): the LLM-audit-summaries section needs audit:read. A caller
+        # without it gets the section named in unavailable_sections — explicit, NO 403, NO hidden count
+        # (exactly the feature:read gating contract). SAFE summaries only; raw inputs/outputs restricted.
+        if has_permission(roles, AUDIT_READ):
+            body["audit"] = _audit_section(conn, norm_source, anchor["object_ref"], logical_ref)
+            built.append("audit")
+        else:
+            unavailable.append("audit")
 
     body["included_sections"] = built
     body["unavailable_sections"] = unavailable
