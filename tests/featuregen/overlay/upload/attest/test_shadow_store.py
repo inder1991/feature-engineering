@@ -10,13 +10,19 @@ from featuregen.overlay.upload.attest.shadow_store import ObservationV1, ShadowR
 
 _NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
+_DEFAULT_SAMPLED_KEYS = (
+    ("ftr_export::t.c1", "concept"),
+    ("ftr_export::t.c2", "concept"),
+)
 
-def _run(run_id: str = "srun_1", column_count: int = 2) -> ShadowRunV1:
+
+def _run(run_id: str = "srun_1",
+        sampled_keys: tuple[tuple[str, str], ...] = _DEFAULT_SAMPLED_KEYS) -> ShadowRunV1:
     return ShadowRunV1(
         shadow_run_id=run_id, catalog_source="ftr_export", gold_version_hash="gvh_1",
         model_ids={"proposer": "claude-sonnet-5", "reclassifier": "claude-sonnet-5"},
         signal_versions={"grounding": "1.0.0", "fusion": "1.0.0"}, started_at=_NOW,
-        column_count=column_count)
+        sampled_keys=sampled_keys)
 
 
 def _observation(logical_ref: str = "ftr_export::t.c1", field_name: str = "concept",
@@ -50,20 +56,38 @@ def test_run_and_observations_roundtrip(conn) -> None:
     ss.write_observation(conn, _observation(logical_ref="ftr_export::t.c2"))
     rec = ss.reconcile(conn, "srun_1")
     assert rec.expected == 2 and rec.present == 2
+    assert rec.missing == ()
     assert rec.complete is True
 
 
 def test_reconcile_incomplete_when_observation_missing(conn) -> None:
-    ss.write_shadow_run(conn, _run(run_id="srun_2", column_count=2))
+    ss.write_shadow_run(conn, _run(run_id="srun_2"))
     ss.write_observation(conn, _observation(logical_ref="ftr_export::t.c1", run_id="srun_2"))
     rec = ss.reconcile(conn, "srun_2")
     assert rec.expected == 2 and rec.present == 1
+    assert rec.missing == (("ftr_export::t.c2", "concept"),)
+    assert rec.complete is False
+
+
+def test_reconcile_detects_key_substitution_capture_loss(conn) -> None:
+    """The count-based check this replaces would have falsely reported complete here: 2 sampled keys
+    (A, B), 2 observations written — but for A and a WRONG key C, never B. A present-but-unexpected
+    observation must NOT satisfy a missing expected key."""
+    key_a = ("ftr_export::t.c1", "concept")
+    key_b = ("ftr_export::t.c2", "concept")
+    key_c = ("ftr_export::t.wrong", "concept")   # never sampled — substituted in by mistake
+    ss.write_shadow_run(conn, _run(run_id="srun_sub", sampled_keys=(key_a, key_b)))
+    ss.write_observation(conn, _observation(logical_ref=key_a[0], field_name=key_a[1], run_id="srun_sub"))
+    ss.write_observation(conn, _observation(logical_ref=key_c[0], field_name=key_c[1], run_id="srun_sub"))
+    rec = ss.reconcile(conn, "srun_sub")
+    assert rec.expected == 2 and rec.present == 2   # counts coincidentally agree ...
+    assert rec.missing == (key_b,)                  # ... but the set check catches the substitution
     assert rec.complete is False
 
 
 # ── WORM ──
 def test_observation_update_is_rejected(conn) -> None:
-    ss.write_shadow_run(conn, _run(run_id="srun_3", column_count=1))
+    ss.write_shadow_run(conn, _run(run_id="srun_3", sampled_keys=(("ftr_export::t.c1", "concept"),)))
     ss.write_observation(conn, _observation(logical_ref="ftr_export::t.c1", run_id="srun_3"))
     with pytest.raises(psycopg.errors.RaiseException), conn.transaction():
         conn.execute(

@@ -11,8 +11,12 @@ Three tables:
   * ``attestation_gold_label``       — human ground truth. PK (logical_ref, field_name); a re-submission
                                         of an existing key is a no-op (never an update).
   * ``attestation_shadow_run``       — one row per run (the dispatch manifest): catalog, gold-set
-                                        version, model/signal versions, and the declared ``column_count``
-                                        reconcile compares captured observations against.
+                                        version, model/signal versions, and the declared ``sampled_keys``
+                                        — the explicit expected SET of (logical_ref, field_name) pairs —
+                                        that ``reconcile`` compares captured observations against by set
+                                        membership (not just count: a scalar count alone cannot detect
+                                        key-substitution capture loss, where an observation is written
+                                        for a wrong/extra key while a genuinely-sampled key is missing).
   * ``attestation_shadow_observation`` — one row per (run, logical_ref, field_name). Stores NO gold
                                         value — correctness is a READ-TIME JOIN to
                                         ``attestation_gold_label``, so an observation is never
@@ -27,7 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -53,7 +57,13 @@ class ShadowRunV1:
     model_ids: Mapping[str, str]
     signal_versions: Mapping[str, str]
     started_at: datetime
-    column_count: int
+    # The explicit EXPECTED SET of (logical_ref, field_name) pairs sampled for this run — the durable
+    # manifest ``reconcile`` checks by set membership, not merely by count.
+    sampled_keys: Sequence[tuple[str, str]]
+
+    @property
+    def column_count(self) -> int:
+        return len(self.sampled_keys)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,10 +88,11 @@ class ReconcileV1:
     shadow_run_id: str
     expected: int
     present: int
+    missing: tuple[tuple[str, str], ...]
 
     @property
     def complete(self) -> bool:
-        return self.present == self.expected
+        return not self.missing and self.present == self.expected
 
 
 def write_gold_label(conn, *, catalog_source: str, logical_ref: str, field_name: str,
@@ -101,21 +112,29 @@ def write_gold_label(conn, *, catalog_source: str, logical_ref: str, field_name:
          adjudicated_by, notes, payload_hash(payload)))
 
 
+def _sampled_keys_payload(rec: ShadowRunV1) -> list[dict[str, str]]:
+    return [{"logical_ref": logical_ref, "field_name": field_name}
+            for logical_ref, field_name in rec.sampled_keys]
+
+
 def write_shadow_run(conn, rec: ShadowRunV1) -> None:
-    """Append the run manifest — idempotent on shadow_run_id."""
+    """Append the run manifest — idempotent on shadow_run_id. ``sampled_keys`` is the durable,
+    explicit EXPECTED SET ``reconcile`` checks observations against by set membership."""
     model_ids = dict(rec.model_ids)
     signal_versions = dict(rec.signal_versions)
+    sampled_keys = _sampled_keys_payload(rec)
     payload = {"catalog_source": rec.catalog_source, "gold_version_hash": rec.gold_version_hash,
               "model_ids": model_ids, "signal_versions": signal_versions,
-              "column_count": rec.column_count}
+              "sampled_keys": sampled_keys, "column_count": rec.column_count}
     conn.execute(
         "INSERT INTO attestation_shadow_run "
         "(shadow_run_id, catalog_source, gold_version_hash, model_ids, signal_versions, started_at, "
-        " column_count, payload_hash) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        " sampled_keys, sampled_keys_hash, column_count, payload_hash) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (shadow_run_id) DO NOTHING",
         (rec.shadow_run_id, rec.catalog_source, rec.gold_version_hash, Jsonb(model_ids),
-         Jsonb(signal_versions), rec.started_at, rec.column_count, payload_hash(payload)))
+         Jsonb(signal_versions), rec.started_at, Jsonb(sampled_keys), payload_hash(sampled_keys),
+         rec.column_count, payload_hash(payload)))
 
 
 def write_observation(conn, obs: ObservationV1) -> None:
@@ -142,14 +161,22 @@ def write_observation(conn, obs: ObservationV1) -> None:
 
 
 def reconcile(conn, shadow_run_id: str) -> ReconcileV1:
-    """The DURABLE capture-integrity signal: the run's declared ``column_count`` vs the distinct
-    (logical_ref, field_name) observations actually captured for it."""
+    """The DURABLE capture-integrity signal: a SET-membership check, not a count comparison. A scalar
+    count alone cannot detect key-substitution capture loss (an observation written for a wrong/extra
+    key while a genuinely-sampled key is missing can leave the counts coincidentally equal), so this
+    compares the run's declared ``sampled_keys`` EXPECTED SET against the observed
+    (logical_ref, field_name) keys actually captured for it, and reports which sampled keys — if any —
+    have no matching observation."""
     run = conn.execute(
-        "SELECT column_count FROM attestation_shadow_run WHERE shadow_run_id = %s",
+        "SELECT sampled_keys FROM attestation_shadow_run WHERE shadow_run_id = %s",
         (shadow_run_id,)).fetchone()
     if run is None:
-        return ReconcileV1(shadow_run_id, expected=0, present=0)
-    present = conn.execute(
-        "SELECT count(DISTINCT (logical_ref, field_name)) FROM attestation_shadow_observation "
-        "WHERE shadow_run_id = %s", (shadow_run_id,)).fetchone()[0]
-    return ReconcileV1(shadow_run_id, expected=int(run[0]), present=int(present))
+        return ReconcileV1(shadow_run_id, expected=0, present=0, missing=())
+    expected_keys = {(row["logical_ref"], row["field_name"]) for row in run[0]}
+    present_rows = conn.execute(
+        "SELECT DISTINCT logical_ref, field_name FROM attestation_shadow_observation "
+        "WHERE shadow_run_id = %s", (shadow_run_id,)).fetchall()
+    present_keys = {(logical_ref, field_name) for logical_ref, field_name in present_rows}
+    missing = tuple(sorted(expected_keys - present_keys))
+    return ReconcileV1(shadow_run_id, expected=len(expected_keys), present=len(present_keys),
+                       missing=missing)

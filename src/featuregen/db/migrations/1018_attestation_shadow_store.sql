@@ -13,8 +13,14 @@
 --                                     is a no-op (ON CONFLICT DO NOTHING in the writer), never an update.
 --   * attestation_shadow_run       — one row per shadow run (the dispatch manifest): which catalog,
 --                                     which gold-set version, which model/signal versions, and the
---                                     declared `column_count` — the durable "expected" bound reconcile
---                                     compares captured observations against.
+--                                     declared `sampled_keys` — the durable, explicit EXPECTED SET
+--                                     (an array of {logical_ref, field_name} objects) reconcile compares
+--                                     captured observations against by set membership, not just count
+--                                     (a scalar count alone cannot detect key-substitution capture loss:
+--                                     an observation written for a wrong/extra key can coincidentally
+--                                     make the counts agree while a genuinely-sampled key is missing).
+--                                     `column_count` mirrors `jsonb_array_length(sampled_keys)` and is
+--                                     kept as a redundant, CHECK-enforced cross-field guard.
 --   * attestation_shadow_observation — one row per (shadow_run, logical_ref, field_name). Stores NO
 --                                     gold value — correctness is a READ-TIME JOIN to
 --                                     attestation_gold_label, so an observation is never contaminated by
@@ -60,14 +66,18 @@ CREATE OR REPLACE TRIGGER attestation_gold_label_no_mutation
 
 -- ── attestation_shadow_run — the dispatch manifest ──
 CREATE TABLE IF NOT EXISTS attestation_shadow_run (
-    shadow_run_id     text        PRIMARY KEY,
-    catalog_source    text        NOT NULL,
-    gold_version_hash text        NOT NULL,
-    model_ids         jsonb       NOT NULL CHECK (jsonb_typeof(model_ids) = 'object'),
-    signal_versions   jsonb       NOT NULL CHECK (jsonb_typeof(signal_versions) = 'object'),
-    started_at        timestamptz NOT NULL DEFAULT now(),
-    column_count      int         NOT NULL CHECK (column_count >= 0),
-    payload_hash      text        NOT NULL
+    shadow_run_id      text        PRIMARY KEY,
+    catalog_source     text        NOT NULL,
+    gold_version_hash  text        NOT NULL,
+    model_ids          jsonb       NOT NULL CHECK (jsonb_typeof(model_ids) = 'object'),
+    signal_versions    jsonb       NOT NULL CHECK (jsonb_typeof(signal_versions) = 'object'),
+    started_at         timestamptz NOT NULL DEFAULT now(),
+    sampled_keys       jsonb       NOT NULL CHECK (jsonb_typeof(sampled_keys) = 'array'),
+    sampled_keys_hash  text        NOT NULL,
+    column_count       int         NOT NULL CHECK (column_count >= 0),
+    payload_hash       text        NOT NULL,
+    CONSTRAINT attestation_shadow_run_column_count_matches_keys
+        CHECK (column_count = jsonb_array_length(sampled_keys))
 );
 CREATE INDEX IF NOT EXISTS attestation_shadow_run_source_idx
     ON attestation_shadow_run (catalog_source);
