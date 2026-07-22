@@ -84,14 +84,20 @@ def parse_proposal_v1(raw: Mapping[str, Any]) -> TypedFormulaProposalV1:
     Order matters: JSON-Schema shape FIRST, then dataclass construction,
     then semantic validation. Raises SchemaError on any violation.
     """
-    data = _plain(raw)
-    error = best_match(_validator().iter_errors(data))
-    if error is not None:
-        raise SchemaError(
-            f"proposal shape invalid at {error.json_path}: {error.message}"
-        )
-    proposal = _build_proposal(data)
-    validate_semantics(proposal)
+    try:
+        data = _plain(raw)
+        error = best_match(_validator().iter_errors(data))
+        if error is not None:
+            raise SchemaError(
+                f"proposal shape invalid at {error.json_path}: {error.message}"
+            )
+        proposal = _build_proposal(data)
+        validate_semantics(proposal)
+    except RecursionError:
+        # Untrusted input must not escape the boundary as a stack blowout:
+        # nesting far beyond MAX_FILTER_DEPTH fails closed like any other
+        # shape violation.
+        raise SchemaError("proposal nesting too deep to validate") from None
     return proposal
 
 

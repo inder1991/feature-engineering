@@ -365,3 +365,14 @@ class TestSemanticComposition:
         raw = raw_unary_proposal(operand="core::bank.customers.balance")
         with pytest.raises(SchemaError, match="not contained"):
             parse_proposal_v1(raw)
+
+    def test_absurdly_deep_filter_nesting_fails_closed_as_schema_error(self):
+        node: dict = {
+            "kind": "predicate",
+            "op": "is_null",
+            "left": CHANNEL,
+        }
+        for _ in range(5000):
+            node = {"kind": "bool", "op": "not", "children": [node]}
+        with pytest.raises(SchemaError):
+            parse_proposal_v1(raw_unary_proposal(filter=node))
