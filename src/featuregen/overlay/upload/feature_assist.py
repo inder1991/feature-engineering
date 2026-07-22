@@ -583,11 +583,13 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
     for ref in known:
         col = ref.rsplit(".", 1)[-1]
         by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
-    # The model returns derives_from as EITHER a bare string (a single object_ref) or a list — measured
-    # both from Opus. Normalize to a list so a single-ref string is not iterated character-by-character
-    # (which would silently un-ground it — the string-form was 100% of a live run's UNGROUNDED misses).
+    # The model returns derives_from as EITHER a JSON list OR a single string — and measured on Opus, that
+    # string is frequently a COMMA/semicolon/newline-separated list of several refs
+    # ("public.t.a, public.t.b, public.t.c"). Split it so a multi-column feature grounds on ALL its
+    # columns; a bare string wrapped whole would only ever match its LAST ref via the suffix resolver,
+    # silently collapsing a 5-column feature to 1 (the cause of the mis-grounded free-form features).
     if isinstance(raw_refs, str):
-        raw_refs = [raw_refs]
+        raw_refs = [p.strip() for p in re.split(r"[,;\n]", raw_refs) if p.strip()]
     elif not isinstance(raw_refs, list):
         raw_refs = []
     out: list[str] = []
