@@ -48,8 +48,7 @@ logger = logging.getLogger(__name__)
 FEATUREGEN_LLM_XCAT_SHADOW = "FEATUREGEN_LLM_XCAT_SHADOW"
 
 MAX_RAW_OPERANDS = 8      # gross payload cap (DoS guard, applied to the RAW operand list)
-BOUNDED_PLANS = 64        # finite compile-plan budget for A
-BUDGET_SECONDS = 30.0     # finite wall-clock deadline for A
+BOUNDED_PLANS = 64        # compile-plan budget passed to A (soft: A only DECREMENTS it per compile)
 
 
 class XCatShadowDisabledError(Exception):
@@ -137,9 +136,13 @@ def govern_llm_idea(
         return normalized
 
     # 6. Bounded + savepoint-isolated plan. A plan failure must not poison the outer transaction.
+    #    Per-request bounding is STRUCTURAL — the single-operand shape (one compile), the operand
+    #    cap, the savepoint, and A's internal enumeration caps — NOT budget-enforced: A only
+    #    DECREMENTS ``remaining`` (never checks it) and never reads the deadline on a direct
+    #    ``plan_multi_source`` call, so a wall-clock deadline here would be decorative (a synchronous
+    #    compile can't be interrupted mid-call). The budget is passed for A-contract completeness.
     budget = budget or CompileBudget(
-        remaining=BOUNDED_PLANS, deadline_monotonic=time.monotonic() + BUDGET_SECONDS,
-        clock=time.monotonic)
+        remaining=BOUNDED_PLANS, deadline_monotonic=float("inf"), clock=time.monotonic)
     try:
         with conn.transaction():  # savepoint
             result = plan_multi_source(

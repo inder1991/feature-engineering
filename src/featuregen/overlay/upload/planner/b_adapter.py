@@ -51,6 +51,9 @@ from featuregen.overlay.upload.planner.b_role_policy import (
     RolePolicyRejection,
     computation_role,
 )
+from featuregen.overlay.upload.planner.b_role_policy import (
+    reason_to_b_disposition as role_reason_to_b_disposition,
+)
 from featuregen.overlay.upload.planner.b_scope import RequestContextV1
 from featuregen.overlay.upload.planner.b_source_grain import (
     SourceBindingRejection,
@@ -184,7 +187,7 @@ def normalize_feature_idea(
         return BDisposition.concept_not_in_registry
     role = computation_role(c)
     if isinstance(role, RolePolicyRejection):
-        return BDisposition.role_not_aggregatable
+        return role_reason_to_b_disposition(role.reason)
     if role != _REQUIRED_ROLE[op.path_aggregation]:
         return BDisposition.role_not_aggregatable
 
