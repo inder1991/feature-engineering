@@ -552,3 +552,113 @@ class TestTypedLiteralParse:
         node = eq_pred(op=FilterPredicateOp.IN, right_literal=None, right_set=entries)
         with pytest.raises(SchemaError, match="integer"):
             validate_semantics(proposal_with_filter(node))
+
+
+# ------------------------------------------- parameters + operator type compat
+
+def make_param(**over) -> ParameterDecl:
+    kw = dict(
+        name="min_amount",
+        type=LiteralType.DECIMAL,
+        param_class=ParamClass.SEMANTIC,
+        classification="internal",
+        nullable=False,
+        allowed_set=None,
+        allowed_min=None,
+        allowed_max=None,
+    )
+    kw.update(over)
+    return ParameterDecl(**kw)
+
+
+class TestParameterRules:
+    def test_allowed_min_above_max_rejected(self):
+        p = make_proposal(
+            parameters=(make_param(allowed_min="10.00", allowed_max="9.99"),)
+        )
+        with pytest.raises(SchemaError, match="allowed_min"):
+            validate_semantics(p)
+
+    def test_allowed_min_max_compared_as_typed_values_not_strings(self):
+        # "9" > "10" lexicographically; as integers 9 <= 10 must PASS.
+        p = make_proposal(
+            parameters=(
+                make_param(name="days", type=LiteralType.INTEGER, allowed_min="9", allowed_max="10"),
+            )
+        )
+        assert validate_semantics(p) is None
+
+    def test_allowed_set_empty_rejected(self):
+        p = make_proposal(parameters=(make_param(allowed_set=()),))
+        with pytest.raises(SchemaError, match="allowed_set"):
+            validate_semantics(p)
+
+    def test_allowed_bound_must_parse_to_declared_type(self):
+        p = make_proposal(
+            parameters=(make_param(type=LiteralType.INTEGER, allowed_min="1.5"),)
+        )
+        with pytest.raises(SchemaError, match="integer"):
+            validate_semantics(p)
+
+    def test_name_regex_enforced(self):
+        for bad_name in ("MinAmount", "9lives", "_x", "a" * 65, ""):
+            p = make_proposal(parameters=(make_param(name=bad_name),))
+            with pytest.raises(SchemaError, match="name"):
+                validate_semantics(p)
+        p = make_proposal(parameters=(make_param(name="a1_ok"),))
+        assert validate_semantics(p) is None
+
+    def test_duplicate_names_rejected(self):
+        p = make_proposal(parameters=(make_param(), make_param()))
+        with pytest.raises(SchemaError, match="unique"):
+            validate_semantics(p)
+
+    def test_unresolved_parameter_ref_rejected(self):
+        node = eq_pred(
+            op=FilterPredicateOp.GREATER_OR_EQUAL,
+            left=AMT,
+            right_literal=None,
+            right_param=ParameterRef(name="undeclared"),
+        )
+        with pytest.raises(SchemaError, match="undeclared"):
+            validate_semantics(proposal_with_filter(node))
+
+
+class TestOrderedComparisonTypeCompatibility:
+    def test_ordered_op_rejects_string_literal(self):
+        node = eq_pred(
+            op=FilterPredicateOp.GREATER_THAN,
+            right_literal=TypedLiteral(type=LiteralType.STRING, value="pos"),
+        )
+        with pytest.raises(SchemaError, match="greater_than"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_ordered_op_rejects_boolean_literal(self):
+        node = eq_pred(
+            op=FilterPredicateOp.LESS_OR_EQUAL,
+            right_literal=TypedLiteral(type=LiteralType.BOOLEAN, value="true"),
+        )
+        with pytest.raises(SchemaError, match="less_or_equal"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_ordered_op_rejects_string_param(self):
+        node = eq_pred(
+            op=FilterPredicateOp.LESS_THAN,
+            left=AMT,
+            right_literal=None,
+            right_param=ParameterRef(name="channel_name"),
+        )
+        p = make_proposal(
+            body=UnaryBody(expr=make_expr(filter=node)),
+            parameters=(make_param(name="channel_name", type=LiteralType.STRING),),
+        )
+        with pytest.raises(SchemaError, match="less_than"):
+            validate_semantics(p)
+
+    def test_ordered_op_accepts_date_literal(self):
+        node = eq_pred(
+            op=FilterPredicateOp.GREATER_OR_EQUAL,
+            left=EVENT_TS,
+            right_literal=TypedLiteral(type=LiteralType.DATE, value="2026-01-01"),
+        )
+        assert validate_semantics(proposal_with_filter(node)) is None

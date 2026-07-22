@@ -330,15 +330,64 @@ class TypedFormulaV1:
 
 _NO_RIGHT_OPS = frozenset({FilterPredicateOp.IS_NULL, FilterPredicateOp.IS_NOT_NULL})
 _SET_OPS = frozenset({FilterPredicateOp.IN, FilterPredicateOp.NOT_IN})
+_ORDERED_OPS = frozenset(
+    {
+        FilterPredicateOp.GREATER_THAN,
+        FilterPredicateOp.GREATER_OR_EQUAL,
+        FilterPredicateOp.LESS_THAN,
+        FilterPredicateOp.LESS_OR_EQUAL,
+    }
+)
+_ORDERABLE_TYPES = frozenset({LiteralType.INTEGER, LiteralType.DECIMAL, LiteralType.DATE})
+_PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 def validate_semantics(p: TypedFormulaProposalV1) -> None:
     """Raise SchemaError on any §A semantic-rule violation; return None if valid."""
+    params = _check_parameters(p.parameters)
     _check_decimal(p.decimal)
     for i, key in enumerate(p.grain.keys):
         _require_column_ref(key, f"grain.keys[{i}]")
     for path, expr in _body_expressions(p.body):
-        _check_expression(path, expr)
+        _check_expression(path, expr, params)
+
+
+def _check_parameters(
+    parameters: tuple[ParameterDecl, ...],
+) -> dict[str, ParameterDecl]:
+    declared: dict[str, ParameterDecl] = {}
+    for i, decl in enumerate(parameters):
+        path = f"parameters[{i}]"
+        if not isinstance(decl, ParameterDecl):
+            raise SchemaError(f"{path}: expected a ParameterDecl, got {type(decl).__name__}")
+        if not isinstance(decl.name, str) or not _PARAM_NAME_RE.fullmatch(decl.name):
+            raise SchemaError(
+                f"{path}: name {decl.name!r} must match ^[a-z][a-z0-9_]{{0,63}}$"
+            )
+        if decl.name in declared:
+            raise SchemaError(f"{path}: parameter names must be unique; {decl.name!r} repeats")
+        if decl.allowed_set is not None:
+            if len(decl.allowed_set) == 0:
+                raise SchemaError(f"{path}: allowed_set must be non-empty when present")
+            for j, entry in enumerate(decl.allowed_set):
+                _parse_typed_value(decl.type, entry, f"{path}.allowed_set[{j}]")
+        lo = (
+            _parse_typed_value(decl.type, decl.allowed_min, f"{path}.allowed_min")
+            if decl.allowed_min is not None
+            else None
+        )
+        hi = (
+            _parse_typed_value(decl.type, decl.allowed_max, f"{path}.allowed_max")
+            if decl.allowed_max is not None
+            else None
+        )
+        if lo is not None and hi is not None and lo > hi:
+            raise SchemaError(
+                f"{path}: allowed_min {decl.allowed_min!r} must be <= "
+                f"allowed_max {decl.allowed_max!r}"
+            )
+        declared[decl.name] = decl
+    return declared
 
 
 def _check_decimal(decimal: DecimalPolicy) -> None:
@@ -455,7 +504,9 @@ def _body_expressions(
     raise SchemaError(f"body must be UnaryBody | RatioBody | DiffBody, got {type(body).__name__}")
 
 
-def _check_expression(path: str, expr: AggregateExpression) -> None:
+def _check_expression(
+    path: str, expr: AggregateExpression, params: dict[str, ParameterDecl]
+) -> None:
     # Body discriminator [c3]: `aggregation` is ALWAYS an AggregateFunction,
     # never a FinalOperation (nor a raw string).
     if not isinstance(expr.aggregation, AggregateFunction):
@@ -480,7 +531,7 @@ def _check_expression(path: str, expr: AggregateExpression) -> None:
     )
     if expr.filter is not None:
         predicate_count = _check_filter_node(
-            expr.filter, f"{path}.filter", depth=1, table_ref=table_ref
+            expr.filter, f"{path}.filter", depth=1, table_ref=table_ref, params=params
         )
         if predicate_count > MAX_PREDICATES:
             raise SchemaError(
@@ -489,14 +540,20 @@ def _check_expression(path: str, expr: AggregateExpression) -> None:
             )
 
 
-def _check_filter_node(node: FilterNode, path: str, depth: int, table_ref: LogicalRef) -> int:
+def _check_filter_node(
+    node: FilterNode,
+    path: str,
+    depth: int,
+    table_ref: LogicalRef,
+    params: dict[str, ParameterDecl],
+) -> int:
     """Enforce the [c9] predicate/bool invariants; return the predicate count."""
     if depth > MAX_FILTER_DEPTH:
         raise SchemaError(
             f"{path}: filter tree depth {depth} exceeds MAX_FILTER_DEPTH={MAX_FILTER_DEPTH}"
         )
     if isinstance(node, FilterPredicate):
-        _check_predicate(node, path)
+        _check_predicate(node, path, params)
         _require_contained_column(node.left, f"{path}.left", table_ref)
         return 1
     if isinstance(node, FilterBool):
@@ -511,7 +568,7 @@ def _check_filter_node(node: FilterNode, path: str, depth: int, table_ref: Logic
                 f"got {len(node.children)}"
             )
         return sum(
-            _check_filter_node(child, f"{path}.children[{i}]", depth + 1, table_ref)
+            _check_filter_node(child, f"{path}.children[{i}]", depth + 1, table_ref, params)
             for i, child in enumerate(node.children)
         )
     raise SchemaError(
@@ -519,7 +576,9 @@ def _check_filter_node(node: FilterNode, path: str, depth: int, table_ref: Logic
     )
 
 
-def _check_predicate(node: FilterPredicate, path: str) -> None:
+def _check_predicate(
+    node: FilterPredicate, path: str, params: dict[str, ParameterDecl]
+) -> None:
     if node.op in _NO_RIGHT_OPS:
         if not (node.right_literal is None and node.right_param is None and node.right_set is None):
             raise SchemaError(f"{path}: '{node.op.value}' takes no right-hand side")
@@ -549,5 +608,22 @@ def _check_predicate(node: FilterPredicate, path: str) -> None:
         raise SchemaError(
             f"{path}: '{node.op.value}' requires exactly one of right_literal | right_param"
         )
+    right_type: LiteralType
     if node.right_literal is not None:
         _check_typed_literal(node.right_literal, f"{path}.right_literal")
+        right_type = node.right_literal.type
+    else:
+        # right_param.name must resolve to a declared ParameterDecl [c9]
+        name = node.right_param.name
+        if name not in params:
+            raise SchemaError(
+                f"{path}.right_param: {name!r} does not resolve to a declared ParameterDecl"
+            )
+        right_type = params[name].type
+    # predicate-operator type compatibility: ordered comparisons only against
+    # orderable (integer/decimal/date) literals or params
+    if node.op in _ORDERED_OPS and right_type not in _ORDERABLE_TYPES:
+        raise SchemaError(
+            f"{path}: '{node.op.value}' requires an integer/decimal/date "
+            f"right-hand side, got {right_type.value!r}"
+        )
