@@ -37,7 +37,9 @@ The feature-generation catalog stops at a design-checked *definition*: a name, `
 ```
 Catalog (existing)                    Feature Materialization (new)
 ─────────────────                     ─────────────────────────────
-design-checked feature   ──spec──▶   1. Structured Feature Spec (YAML)  ◀── LLM-propose + human-confirm
+design-checked feature   ──spec──▶   1. Typed formula + authoring pipeline
+                                          (LLM-1 author → structural-validate → LLM-2 critic →
+                                           governance compiler → RESOLVED/NEEDS_REVIEW/REJECTED → freeze)
 definition                            2. Domain pipeline (Kedro)
                                           raw → intermediate → primary → feature → model_input
                                           (features batched by grain+cadence into shared Spark passes)
@@ -72,11 +74,63 @@ status: design-checked
 spec_version: 1
 ```
 
-**Where the structure comes from (the prose→structured bridge).** Two paths, mirroring the catalog's "LLM proposes / human confirms" model:
-- **Recipe features:** the recipe already encodes window/filter/operation deterministically → the spec is emitted directly, no LLM.
-- **Free-form features:** an LLM structuring step reads the prose description + `derives_from` + the named aggregation and *proposes* a structured spec; a human confirms/edits it before it can run. The spec is never authored silently from prose.
+The spec above is the **deployment wrapper** (domain, cadence, priority, routing). Its heart is the **typed formula** — the computation contract — authored by the pipeline below. Domain params the definition can't know (`home_country`, thresholds) live in a per-domain config, not the feature.
 
-Domain params that the definition can't know (e.g. `home_country`, thresholds) live in a per-domain config, not the feature.
+#### The typed formula (what the LLM authors — NOT SQL/PySpark)
+
+```json
+{
+  "operation": "ratio",
+  "grain": {"entity": "customer", "keys": ["ftr:public.comp_financial_tran_repos_dly.cif_id"]},
+  "window": {"type": "trailing", "length": 90, "unit": "day"},
+  "time_operand": "ftr:public.comp_financial_tran_repos_dly.tran_date",
+  "numerator":   {"aggregation": "sum", "operand": "ftr:public.comp_financial_tran_repos_dly.tran_amt_aed",
+                  "filter": {"operation": "not_equal",
+                             "left": "ftr:public.comp_financial_tran_repos_dly.counter_party_bank_cntry",
+                             "right_parameter": "home_country"}},
+  "denominator": {"aggregation": "sum", "operand": "ftr:public.comp_financial_tran_repos_dly.tran_amt_aed"},
+  "zero_denominator": "null"
+}
+```
+
+The formula names **exact `catalog:schema.table.column` operands** and typed operations only — never raw SQL/PySpark. The runtime compiler turns it into Spark; the LLM never writes execution code.
+
+#### The formula-authoring pipeline (LLM authors, deterministic governs)
+
+**Guiding principle:** the second LLM is a **critic, not a validator**. Two LLMs can confidently agree on the same wrong formula. Final authority is deterministic checks + targeted human review — never "two models agreed."
+
+```
+Feature intent (free-form) OR recipe definition
+        ↓
+LLM 1 — Formula AUTHOR  (ReAct loop; READ/VALIDATE tools only)
+        ↓
+Deterministic STRUCTURAL validation   (schema, operation vocabulary, column identity, operand completeness)
+        ↓
+LLM 2 — Independent semantic CRITIC   (structured findings only, not a rewrite)
+        ↓
+Deterministic GOVERNANCE COMPILER     (types/units/currency · grain/cardinality · verified joins/lineage ·
+                                       time anchor/leakage · null & divide-by-zero · authorization/freshness)
+        ↓
+RESOLVED  /  NEEDS_REVIEW  /  REJECTED
+        ↓  (RESOLVED)
+Freeze + version the formula  →  compile to PySpark  →  execute (LLM-free at runtime)
+```
+
+**LLM 1 — author (ReAct, restricted tools).** Iterates until `validate_draft_formula` reports no structural omissions. Tools are strictly read/validate; it holds **no** tool that approves, executes, or mutates a governance fact:
+`search_columns` · `get_column_metadata` · `get_governed_grain` · `get_time_anchor` · `get_verified_lineage` · `list_supported_operations` · `validate_draft_formula`.
+
+**Deterministic structural validation** (between the two LLMs, so the critic reviews a structurally-sound draft): operation is in the supported vocabulary; every operand is a real `catalog:schema.table.column`; the operation's operands are complete (a ratio has numerator AND denominator; a windowed op has a `time_operand`).
+
+**LLM 2 — independent critic.** Genuinely independent, or it's theatre: separate prompt + context construction; a **different model tier/family** where possible; it is **not shown LLM 1's reasoning**; it returns **structured findings** (not a rewritten formula); it must compare **every** business requirement in the intent against the formula's operands (missing operand? numerator/denominator direction correct? filter matches intent?). A finding routes the feature to `NEEDS_REVIEW`, it does not silently rewrite.
+
+**Deterministic governance compiler** = the existing gauntlet + two-axis gate: types/units/currency consistency, grain & cardinality, VERIFIED joins & lineage (`resolve_fact` / `approved_join`), time-anchor & leakage (trailing-only), null / divide-by-zero behavior (`zero_denominator`), authorization & freshness. Its verdict — `RESOLVED / NEEDS_REVIEW / REJECTED` — is the final authority.
+
+#### Recipe vs free-form (author once, run forever)
+
+- **Recipe features:** the formula is authored **once at recipe-authoring time**, validated + approved, then **frozen and versioned**. It is NOT regenerated per run — runtime just compiles the frozen formula. (A recipe whose logic is already deterministic can skip LLM 1 and enter at structural validation.)
+- **Free-form features:** the identical pipeline runs when the user proposes the idea. On `RESOLVED`, the formula can be **promoted into a reusable recipe** — so the recipe library grows itself from validated free-form work.
+
+**This is where the scale comes from:** LLMs author thousands of candidate formulas; deterministic checks auto-clear the straightforward ones; humans review only disagreements, ambiguous mappings, novel operations, and high-risk features; approved formulas become reusable frozen assets; and **runtime execution stays deterministic and LLM-free.**
 
 ### Component 2 — Grain model & per-grain tables
 
@@ -145,7 +199,7 @@ df = (txn
 1. **`business_dt` density = full periodic snapshot per entity** (configurable cadence), not active-only. Simple, predictable, complete history for retraining; it is the biggest cost lever, so it is a single config (`snapshot_scope: all | active`) that can be flipped per domain.
 2. **Batch by `(grain, cadence)` first, priority second.** Two features sharing grain+cadence MUST share a pass; priority only orders groups.
 3. **Option C (spec-driven + rendered code)**, not per-feature generated files — efficiency + auditability.
-4. **Free-form specs are LLM-proposed + human-confirmed**, never authored silently from prose; recipe specs are deterministic.
+4. **Formula authoring = LLM author (LLM 1) + independent LLM critic (LLM 2) + deterministic validators/compiler as final authority.** The critic is a critic, NOT a validator — "two models agreed" is never accepted as correctness. LLM 1 has read/validate-only tools; runtime is LLM-free. Accepted formulas are frozen + versioned; validated free-form formulas are promotable into reusable recipes.
 5. **One table per grain**, routed by the spec's `entity`.
 6. **Offline/batch only** — no online store in this spec.
 
@@ -166,7 +220,14 @@ df = (txn
 
 ## Phasing (for the implementation plan)
 
-- **Phase 1 (MVP):** Feature Spec dataclass + YAML load; the `aml` domain, `customer` grain, one daily group; `raw→…→model_input` for that path; `compute_feature_group` for `sum/count/ratio` + trailing window; one Hive table; basic hooks. Prove `cross_border_value_ratio_90d` end-to-end on a Spark-local fixture.
+- **Phase 1 (MVP — prove the authoring workflow + one feature end-to-end):**
+  1. Typed-formula dataclass + `sum/count/ratio` + trailing window; deterministic structural validation.
+  2. LLM 1 (author, restricted ReAct tools over existing catalog reads) generates the formula.
+  3. LLM 2 (independent critic) critiques it → structured findings.
+  4. Deterministic governance compiler decides `RESOLVED / NEEDS_REVIEW / REJECTED` (reuse the gauntlet + two-axis gate).
+  5. **Gold check:** compare the generated formula against a curated *expected* formula for the first few gold features (B-Gate-1-style harness).
+  6. Materialize ONLY after all required checks pass: `raw→…→model_input`, `compute_feature_group`, one Hive `aml_customer_features` table, basic hooks — proving `cross_border_value_ratio_90d` end-to-end on a Spark-local fixture.
+  7. **Freeze** the accepted formula as an immutable, versioned asset.
 - **Phase 2:** code renderer + render≡execute test; profiling node + `feature_stats`; run-metrics table.
-- **Phase 3:** multi-grain routing (customer×product, account); the spec-structuring step (recipe-deterministic first, LLM-propose for free-form); group→schedule map emission.
+- **Phase 3:** multi-grain routing (customer×product, account); recipe-authoring flow (author-once + freeze) and free-form→recipe promotion; group→schedule map emission.
 - **Phase 4:** write-back of stats into catalog search; additional operations (zscore, delta, proportion); `snapshot_scope: active`.
