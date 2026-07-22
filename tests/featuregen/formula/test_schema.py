@@ -662,3 +662,47 @@ class TestOrderedComparisonTypeCompatibility:
             right_literal=TypedLiteral(type=LiteralType.DATE, value="2026-01-01"),
         )
         assert validate_semantics(proposal_with_filter(node)) is None
+
+
+# ------------------------------------------- window policy + version pins
+
+class TestWindowPolicy:
+    def _with_window(self, **over):
+        return make_proposal(body=UnaryBody(expr=make_expr(window=make_window(**over))))
+
+    def test_length_below_one_rejected(self):
+        with pytest.raises(SchemaError, match="length"):
+            validate_semantics(self._with_window(length=0))
+
+    def test_empty_timezone_rejected(self):
+        with pytest.raises(SchemaError, match="timezone"):
+            validate_semantics(self._with_window(timezone=""))
+
+    def test_unknown_iana_timezone_rejected(self):
+        with pytest.raises(SchemaError, match="timezone"):
+            validate_semantics(self._with_window(timezone="Mars/Olympus_Mons"))
+
+    def test_named_iana_timezone_accepted(self):
+        assert validate_semantics(self._with_window(timezone="America/New_York")) is None
+
+    def test_missing_start_inclusivity_rejected(self):
+        with pytest.raises(SchemaError, match="start_inclusive"):
+            validate_semantics(self._with_window(start_inclusive=None))
+
+    def test_missing_end_inclusivity_rejected(self):
+        with pytest.raises(SchemaError, match="end_inclusive"):
+            validate_semantics(self._with_window(end_inclusive=None))
+
+
+class TestVersionPins:
+    def test_unknown_formula_schema_version_rejected(self):
+        with pytest.raises(SchemaError, match="formula_schema_version"):
+            validate_semantics(make_proposal(formula_schema_version=99))
+
+    def test_unknown_operation_grammar_version_rejected(self):
+        with pytest.raises(SchemaError, match="operation_grammar_version"):
+            validate_semantics(make_proposal(operation_grammar_version=0))
+
+    def test_unknown_canonicalization_version_rejected(self):
+        with pytest.raises(SchemaError, match="canonicalization_version"):
+            validate_semantics(make_proposal(canonicalization_version=-1))

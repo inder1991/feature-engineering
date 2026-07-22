@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 LogicalRef = str  # canonical "source::schema.table[.column]", normalized before hashing
 
@@ -344,12 +345,42 @@ _PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 def validate_semantics(p: TypedFormulaProposalV1) -> None:
     """Raise SchemaError on any §A semantic-rule violation; return None if valid."""
+    _check_version_pins(p)
     params = _check_parameters(p.parameters)
     _check_decimal(p.decimal)
     for i, key in enumerate(p.grain.keys):
         _require_column_ref(key, f"grain.keys[{i}]")
     for path, expr in _body_expressions(p.body):
         _check_expression(path, expr, params)
+
+
+def _check_version_pins(p: TypedFormulaProposalV1) -> None:
+    """The identity versions must be known ints (v1 pins exactly one value each)."""
+    pins = (
+        ("formula_schema_version", p.formula_schema_version, FORMULA_SCHEMA_VERSION),
+        ("operation_grammar_version", p.operation_grammar_version, OPERATION_GRAMMAR_VERSION),
+        ("canonicalization_version", p.canonicalization_version, CANONICALIZATION_VERSION),
+    )
+    for name, value, known in pins:
+        if not isinstance(value, int) or isinstance(value, bool) or value != known:
+            raise SchemaError(f"{name}: {value!r} is not a known version (expected {known})")
+
+
+def _check_window(window: WindowPolicy, path: str) -> None:
+    if not isinstance(window.length, int) or isinstance(window.length, bool) or window.length < 1:
+        raise SchemaError(f"{path}.length: {window.length!r} must be an int >= 1")
+    if not isinstance(window.timezone, str) or not window.timezone:
+        raise SchemaError(f"{path}.timezone: a non-empty IANA timezone is required")
+    try:
+        ZoneInfo(window.timezone)
+    except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+        raise SchemaError(
+            f"{path}.timezone: {window.timezone!r} is not a known IANA timezone"
+        ) from exc
+    if not isinstance(window.start_inclusive, Inclusivity):
+        raise SchemaError(f"{path}.start_inclusive: an Inclusivity value is required")
+    if not isinstance(window.end_inclusive, Inclusivity):
+        raise SchemaError(f"{path}.end_inclusive: an Inclusivity value is required")
 
 
 def _check_parameters(
@@ -529,6 +560,7 @@ def _check_expression(
     _require_contained_column(
         expr.window.event_time_ref, f"{path}.window.event_time_ref", table_ref
     )
+    _check_window(expr.window, f"{path}.window")
     if expr.filter is not None:
         predicate_count = _check_filter_node(
             expr.filter, f"{path}.filter", depth=1, table_ref=table_ref, params=params
