@@ -2,7 +2,7 @@
 
 Mirrors the single-source ``shadow_store.py`` (migration 0999) — a dispatch MANIFEST (the expected
 intent-id set, written first), one INTENT_RESULT per (run, intent), and, extending 0999, one
-CANDIDATE per candidate plan + one OPERAND_OBS per (plan, slot). Migration ``1010``. The store is
+CANDIDATE per candidate plan + one OPERAND_OBS per (plan, slot). Migration ``1019``. The store is
 planner telemetry — NOT a governed overlay_fact — and is written only when the multi-source assembly
 shadow flag is on. Capture integrity is proven by reconciling the manifest against the intent_result
 rows (the durable loss signal — never a circular self-report).

@@ -1,4 +1,4 @@
-"""Phase 3C.2b-i-A · Task 10 — the multi-source assembly shadow STORE (migration 1010).
+"""Phase 3C.2b-i-A · Task 10 — the multi-source assembly shadow STORE (migration 1019).
 
 Mirrors ``test_shadow_store.py`` (the single-source 0999 store): a durable, append-only (WORM)
 telemetry store proven by manifest<->result reconciliation, extended with PER-CANDIDATE +

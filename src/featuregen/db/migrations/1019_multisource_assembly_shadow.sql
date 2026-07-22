@@ -1,4 +1,4 @@
--- src/featuregen/db/migrations/1010_multisource_assembly_shadow.sql
+-- src/featuregen/db/migrations/1019_multisource_assembly_shadow.sql
 -- Phase 3C.2b-i-A · Task 10 — multi-source assembly SHADOW telemetry (mirrors 0999_planner_shadow_store).
 -- Durable, append-only (WORM) capture of the multi-source assembly planner's output so the exact-plan +
 -- determinism gate is computable AFTER the process exits, with provable capture integrity. Four tables:
