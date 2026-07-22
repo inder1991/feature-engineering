@@ -526,8 +526,20 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["results"]},
     # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
-    ("feature_ideas", 1): {"type": "object", "additionalProperties": True,
-                           "properties": {"features": {"type": "array"}}},
+    # The feature ITEM shape is declared (with derives_from REQUIRED) so the closed wire schema forces
+    # the model to return the column refs — an untyped `features` array let the model omit them
+    # entirely (every candidate then rejected UNGROUNDED). Canonical stays permissive for validation.
+    ("feature_ideas", 1): {
+        "type": "object", "additionalProperties": True,
+        "properties": {"features": {"type": "array", "items": {
+            "type": "object", "additionalProperties": True,
+            "properties": {"name": {"type": "string"},
+                           "derives_from": {"type": "array", "items": {"type": "string"}},
+                           "aggregation": {"type": "string"},
+                           "grain_table": {"type": "string"},
+                           "description": {"type": "string"},
+                           "rationale": {"type": "string"}},
+            "required": ["name", "derives_from", "aggregation"]}}}},
     # Properties declared (the keys `recipe()` reads) so the wire projection can CLOSE the object —
     # Anthropic structured output rejects an open (no-property) object. Canonical stays permissive.
     ("feature_recipe", 1): {"type": "object", "additionalProperties": True,
