@@ -9,7 +9,32 @@ from __future__ import annotations
 import pytest
 
 from featuregen.formula.parse import parse_proposal_v1
-from featuregen.formula.schema import SchemaError
+from featuregen.formula.schema import (
+    AggregateExpression,
+    AggregateFunction,
+    DecimalPolicy,
+    ExpectedOutput,
+    FilterBool,
+    FilterBoolOp,
+    FilterPredicate,
+    FilterPredicateOp,
+    Grain,
+    Inclusivity,
+    LiteralType,
+    ParamClass,
+    ParameterDecl,
+    ParameterRef,
+    RatioBody,
+    RoundingMode,
+    SchemaError,
+    SourceRelation,
+    TypedFormulaProposalV1,
+    TypedLiteral,
+    UnaryBody,
+    WindowPolicy,
+    ZeroDenominator,
+)
+from featuregen.formula import schema as s
 
 # ---------------------------------------------------------------- raw builders
 
@@ -132,3 +157,173 @@ class TestShapeGate:
     def test_non_object_root_rejected(self):
         with pytest.raises(SchemaError):
             parse_proposal_v1([raw_ratio_proposal()])  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------- construction
+
+TYPED_WINDOW = WindowPolicy(
+    event_time_ref=EVENT_TS,
+    basis=s.WindowBasis.TRAILING,
+    length=90,
+    unit=s.WindowUnit.DAY,
+    start_inclusive=Inclusivity.INCLUSIVE,
+    end_inclusive=Inclusivity.EXCLUSIVE,
+    timezone="UTC",
+    empty_window=s.EmptyWindowResult.NULL,
+    null_input=s.NullInput.IGNORE,
+)
+
+
+def typed_expr(**over) -> AggregateExpression:
+    kw = dict(
+        aggregation=AggregateFunction.SUM,
+        operand=AMT,
+        source_relation=SourceRelation(table_ref=TXN_TABLE),
+        filter=None,
+        window=TYPED_WINDOW,
+    )
+    kw.update(over)
+    return AggregateExpression(**kw)
+
+
+class TestConstruction:
+    def test_ratio_with_both_slots_accepted(self):
+        parsed = parse_proposal_v1(raw_ratio_proposal())
+        assert isinstance(parsed, TypedFormulaProposalV1)
+        assert isinstance(parsed.body, RatioBody)
+
+    def test_cross_border_value_ratio_90d_round_trip(self):
+        parsed = parse_proposal_v1(raw_ratio_proposal())
+        expected = TypedFormulaProposalV1(
+            formula_schema_version=1,
+            operation_grammar_version=1,
+            canonicalization_version=1,
+            grain=Grain(entity="customer", keys=(CUSTOMER_KEY,)),
+            body=RatioBody(
+                numerator=typed_expr(
+                    filter=FilterPredicate(
+                        op=FilterPredicateOp.EQUAL,
+                        left=CROSS_BORDER,
+                        right_literal=TypedLiteral(
+                            type=LiteralType.BOOLEAN, value="true"
+                        ),
+                    )
+                ),
+                denominator=typed_expr(),
+                zero_denominator=ZeroDenominator.NULL,
+            ),
+            parameters=(),
+            decimal=DecimalPolicy(
+                precision=18,
+                scale=6,
+                rounding=RoundingMode.HALF_EVEN,
+                overflow=s.OverflowBehavior.ERROR,
+            ),
+            expected_output=ExpectedOutput(
+                output_type="decimal", unit="ratio", currency=None
+            ),
+        )
+        assert parsed == expected
+
+    def test_full_surface_bool_filter_params_round_trip(self):
+        raw = raw_unary_proposal(
+            filter={
+                "kind": "bool",
+                "op": "and",
+                "children": [
+                    {
+                        "kind": "predicate",
+                        "op": "greater_or_equal",
+                        "left": AMT,
+                        "right_param": {"name": "min_amount"},
+                    },
+                    {
+                        "kind": "predicate",
+                        "op": "in",
+                        "left": CHANNEL,
+                        "right_set": [
+                            {"type": "string", "value": "pos"},
+                            {"type": "string", "value": "atm"},
+                        ],
+                    },
+                ],
+            }
+        )
+        raw["parameters"] = [
+            {
+                "name": "min_amount",
+                "type": "decimal",
+                "param_class": "semantic",
+                "classification": "internal",
+                "nullable": False,
+                "allowed_min": "0",
+            }
+        ]
+        raw["expected_output"] = None
+        parsed = parse_proposal_v1(raw)
+        expected = TypedFormulaProposalV1(
+            formula_schema_version=1,
+            operation_grammar_version=1,
+            canonicalization_version=1,
+            grain=Grain(entity="customer", keys=(CUSTOMER_KEY,)),
+            body=UnaryBody(
+                expr=typed_expr(
+                    filter=FilterBool(
+                        op=FilterBoolOp.AND,
+                        children=(
+                            FilterPredicate(
+                                op=FilterPredicateOp.GREATER_OR_EQUAL,
+                                left=AMT,
+                                right_param=ParameterRef(name="min_amount"),
+                            ),
+                            FilterPredicate(
+                                op=FilterPredicateOp.IN,
+                                left=CHANNEL,
+                                right_set=(
+                                    TypedLiteral(
+                                        type=LiteralType.STRING, value="pos"
+                                    ),
+                                    TypedLiteral(
+                                        type=LiteralType.STRING, value="atm"
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                )
+            ),
+            parameters=(
+                ParameterDecl(
+                    name="min_amount",
+                    type=LiteralType.DECIMAL,
+                    param_class=ParamClass.SEMANTIC,
+                    classification="internal",
+                    nullable=False,
+                    allowed_set=None,
+                    allowed_min="0",
+                    allowed_max=None,
+                ),
+            ),
+            decimal=DecimalPolicy(
+                precision=18,
+                scale=6,
+                rounding=RoundingMode.HALF_EVEN,
+                overflow=s.OverflowBehavior.ERROR,
+            ),
+            expected_output=None,
+        )
+        assert parsed == expected
+
+    def test_parsed_enums_are_typed_not_raw_strings(self):
+        parsed = parse_proposal_v1(raw_ratio_proposal())
+        assert isinstance(parsed.body, RatioBody)
+        assert isinstance(parsed.body.zero_denominator, ZeroDenominator)
+        num = parsed.body.numerator
+        assert isinstance(num.aggregation, AggregateFunction)
+        assert isinstance(num.window.basis, s.WindowBasis)
+        assert isinstance(num.window.start_inclusive, Inclusivity)
+        assert isinstance(num.filter, FilterPredicate)
+        assert isinstance(num.filter.op, FilterPredicateOp)
+        assert isinstance(num.filter.right_literal.type, LiteralType)
+        assert isinstance(parsed.grain.keys, tuple)
+        assert isinstance(parsed.parameters, tuple)
