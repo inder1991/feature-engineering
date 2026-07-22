@@ -39,6 +39,17 @@ from featuregen.overlay.upload.templates import Need, Template
 
 GOLD_SET_VERSION = "1.0.0"
 _GOLD_NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+# The gold/drift fixtures seed on the LIVE connection (inside a rolled-back tx — the writes revert,
+# the ROW LOCKS are real while held). Namespacing them under a RESERVED source (``__gate_gold__``,
+# rejected as a user upload name by normalize_source_name / validate_rows) means build_graph's
+# ``DELETE FROM graph_node WHERE catalog_source = …`` and the drift-watermark UPSERT can never wipe
+# or lock a real customer catalog — closing the AB-BA deadlock a bank naming its catalog 'core' hit
+# (composition audit finding [8]). Source-independent by construction: GOLD_SET_HASH hashes only
+# object_refs (schema.table.column), so the reserved name does NOT move the signed gate artifact.
+# SHARED-INFRA RULE ([8] gap (a)): _seed may touch ONLY rows namespaced under this source — never a
+# shared infrastructure row like projection_checkpoints('overlay'), which every in-flight ingest
+# holds FOR UPDATE from its first in-tx drain to commit (across the multi-minute LLM stages).
+GATE_GOLD_SOURCE = "__gate_gold__"
 _TEMPLATE = Template(
     id="gold_probe", family="balance_stock", intent="gold-set probe",
     needs=(Need("m", "monetary_flow"), Need("entity", "customer_id")), params={},
@@ -62,50 +73,61 @@ class GoldCase:
 
 def _seed(conn) -> None:
     """A single-catalog accounts→customers roll-up (accounts N:1 customers) covering every additivity
-    class, plus fresh watermarks so a clean contract's freshness axis resolves."""
+    class, plus a fresh PER-FIXTURE drift watermark so a clean contract's freshness axis resolves.
+
+    The watermark's ``head_seq`` is 0 — the honest head for a fixture whose graph rows are seeded
+    directly (no events were appended), and exactly what ``_write_watermark`` records over an empty
+    event stream. It makes ``revalidate_freshness``'s LAG check (``checkpoint < head``) hold against
+    ANY live checkpoint value, so the fixture needs NO checkpoint write of its own. The old seed
+    instead UPSERTed the SHARED ``projection_checkpoints('overlay')`` row to satisfy its fabricated
+    ``head_seq = 1`` — but an in-flight ``ingest_upload`` holds that exact row FOR UPDATE from its
+    first in-tx drain until commit (across the multi-minute Pass-A/B/D4 LLM stages), so every gate
+    evaluation STALLED behind every live upload ([8] gap (a)). ``_checkpoint_seq``'s plain SELECT
+    read of the live row never blocks (MVCC)."""
     rows = [
-        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
-        (CanonicalRow("core", "accounts", "customer_id", "integer",
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "account_id", "integer", is_grain=True),
+         "account_id"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "customer_id", "integer",
                       joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
-        (CanonicalRow("core", "accounts", "amount", "numeric"), "monetary_flow"),
-        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
-        (CanonicalRow("core", "accounts", "rate", "numeric"), "monetary_rate"),
-        (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "amount", "numeric"), "monetary_flow"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "balance", "numeric"), "monetary_stock"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "rate", "numeric"), "monetary_rate"),
+        (CanonicalRow(GATE_GOLD_SOURCE, "customers", "customer_id", "integer", is_grain=True),
+         "customer_id"),
     ]
-    build_graph(conn, "core", [r for r, _ in rows], concepts={content_hash(r): cn for r, cn in rows})
+    build_graph(conn, GATE_GOLD_SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): cn for r, cn in rows})
     conn.execute(
         "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq)"
-        " VALUES ('core', %s, 'gold', 1) ON CONFLICT (catalog_source) DO UPDATE SET"
-        " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq", (_GOLD_NOW,))
-    conn.execute(
-        "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES ('overlay', 1)"
-        " ON CONFLICT (projection_name) DO UPDATE SET checkpoint_seq = EXCLUDED.checkpoint_seq")
+        " VALUES (%s, %s, 'gold', 0) ON CONFLICT (catalog_source) DO UPDATE SET"
+        " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
+        (GATE_GOLD_SOURCE, _GOLD_NOW))
 
 
 def _binding(recipe_id: str, need_role: str, obj_ref: str, concept: str) -> c.IngredientBindingV1:
     return c.IngredientBindingV1(
         recipe_id=recipe_id, need_role=need_role, concept=concept, required_grains=(),
         join_role=str(JoinRole.MEASURE), temporal_role=str(TemporalRole.NONE),
-        bound_catalog_source="core", bound_object_ref=obj_ref, actual_source_grain=None,
+        bound_catalog_source=GATE_GOLD_SOURCE, bound_object_ref=obj_ref, actual_source_grain=None,
         binding_quality=c.BindingQuality.exact_concept, safety=c.BindingSafety.safe, reason_codes=())
 
 
 def _build_plan(ctx, case: GoldCase) -> c.BindingPlanV1:
-    (realization,) = ctx.realizations_by_catalog["core"]
+    (realization,) = ctx.realizations_by_catalog[GATE_GOLD_SOURCE]
     source_key = c.IngredientBindingV1(
         recipe_id=case.case_id, need_role="source_key", concept="customer_id", required_grains=(),
         join_role=str(JoinRole.SOURCE_ENTITY_KEY), temporal_role=str(TemporalRole.NONE),
-        bound_catalog_source="core", bound_object_ref="public.accounts.customer_id",
+        bound_catalog_source=GATE_GOLD_SOURCE, bound_object_ref="public.accounts.customer_id",
         actual_source_grain=None, binding_quality=c.BindingQuality.exact_concept,
         safety=c.BindingSafety.safe, reason_codes=())
     measures = tuple(_binding(case.case_id, role, ref, concept) for role, ref, concept in case.measures)
     segments = (
-        c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, "core",
+        c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, GATE_GOLD_SOURCE,
                                from_entity="account", to_entity="customer", cardinality="many_to_one"),
-        c.BindingPathSegmentV1(c.SegmentKind.intra_catalog_realization, "core",
+        c.BindingPathSegmentV1(c.SegmentKind.intra_catalog_realization, GATE_GOLD_SOURCE,
                                realization_ref=realization.realization_id))
     return c.make_binding_plan(
-        recipe_id=case.case_id, target_entity="customer", catalog_source="core",
+        recipe_id=case.case_id, target_entity="customer", catalog_source=GATE_GOLD_SOURCE,
         ingredient_bindings=(source_key, *measures), path_segments=segments,
         resolution_status=c.PlanResolutionStatus.resolved,
         path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
@@ -174,6 +196,22 @@ def _gold_set_hash() -> str:
 GOLD_SET_HASH = _gold_set_hash()
 
 
+def _isolate_agg_declarations(ctx, case: GoldCase):
+    """M-4 hermeticity: ``build_compiler_context`` LOADS the mutable production aggregation registry
+    (``recipe_aggregation_declaration``), so a gold case — whose ``case_id`` doubles as its plan's
+    ``recipe_id`` — could be SHADOWED by a production declaration sharing that id, or inherit a production
+    cardinality CONFLICT that ``dataclasses.replace(agg_declarations=...)`` alone would NOT clear (the
+    conflict set survives the replace). Assert no id collision, then replace with ONLY this case's
+    declarations AND an EMPTY ``agg_declaration_conflicts`` — done UNCONDITIONALLY (even for an empty
+    ``case.agg``) so every gold compile is hermetic regardless of production registry state."""
+    prod_recipes = ({k[0] for k in ctx.agg_declarations}
+                    | {k[0] for k in ctx.agg_declaration_conflicts})
+    assert case.case_id not in prod_recipes, (
+        f"gold case_id {case.case_id!r} collides with a production recipe_id — namespace the gold case")
+    return dataclasses.replace(ctx, agg_declarations=dict(case.agg),
+                               agg_declaration_conflicts=frozenset())
+
+
 def run_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = _seed
                   ) -> tuple[str, ExpectedVerdict, ActualVerdict]:
     """Seed the fixture, run the REAL compile pipeline over the case's plan, and return the
@@ -183,8 +221,7 @@ def run_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = _see
     seed(conn)
     scope = resolve_catalog_scope(conn, roles=(), target_entity="customer", now=_GOLD_NOW)
     ctx = build_compiler_context(conn, scope, (), _GOLD_NOW)
-    if case.agg:
-        ctx = dataclasses.replace(ctx, agg_declarations=dict(case.agg))
+    ctx = _isolate_agg_declarations(ctx, case)
     plan = _build_plan(ctx, case)
     compiled = compile_contract(conn, ctx, plan, _TEMPLATE,
                                 base_envelope=_envelope(conn, scope, case.case_id, "customer"))
@@ -213,8 +250,7 @@ def compile_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = 
     seed(conn)
     scope = resolve_catalog_scope(conn, roles=(), target_entity="customer", now=_GOLD_NOW)
     ctx = build_compiler_context(conn, scope, (), _GOLD_NOW)
-    if case.agg:
-        ctx = dataclasses.replace(ctx, agg_declarations=dict(case.agg))
+    ctx = _isolate_agg_declarations(ctx, case)
     plan = _build_plan(ctx, case)
     compiled = compile_contract(conn, ctx, plan, _TEMPLATE,
                                 base_envelope=_envelope(conn, scope, case.case_id, "customer"))

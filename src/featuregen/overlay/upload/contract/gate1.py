@@ -13,10 +13,12 @@ import logging
 import os
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 
+from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
@@ -24,8 +26,10 @@ from featuregen.overlay.upload.contract._serial import (
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.feature_assist import (
+    ExternalRequirementPreview,
     FeatureIdea,
     FeatureSet,
+    RoleBinding,
     SetRecommendation,
     _candidate_columns,
     _validate_idea,
@@ -33,6 +37,10 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_features,
     recommend_set,
     set_signals,
+)
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    build_metadata_snapshot,
+    capture_column_snapshot,
 )
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
@@ -176,7 +184,12 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         validated, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
                                         roles=roles)
         if rej is None:
-            ideas.append(validated)   # [F9] keep the VALIDATOR's idea (carries status + requirements)
+            # [F9] keep the VALIDATOR's idea (carries status + requirements), then SERVER-STAMP the H1a
+            # recipe provenance: generation_source + recipe_id come from the grounded TEMPLATE id (the
+            # server's own knowledge of the recipe path), never from the LLM/candidate raw. recipe_id
+            # then survives the Gate-1 considered-set round-trip (persist → reload) via the (de)serializers.
+            ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
+                                 planner_applicability="not_applicable_single_catalog"))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
         else:
@@ -276,7 +289,12 @@ def _governed_idea_from_result(result: BindingPlanningResultV1, template: Templa
         derives_from=[ref for _cs, ref in pairs], aggregation=template.aggregation,
         grain_table=None, derives_pairs=pairs, verification="DESIGN-CHECKED", critic_note="",
         rationale=rationale, plan_envelope=envelope,
-        origin="governed_planner", path_authority="governed_cross_catalog")
+        origin="governed_planner", path_authority="governed_cross_catalog",
+        # H1a: the governed cross-catalog path is a RECIPE path with a compiled physical plan. Derive the
+        # H1a metadata from the SERVER's envelope — planner_applicability is "applicable_cross_catalog"
+        # BECAUSE a governed plan_envelope is present (the path_authority↔planner_applicability mapping).
+        generation_source="recipe", recipe_id=envelope.recipe_id,
+        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id)
 
 
 def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
@@ -291,7 +309,14 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
     tmpls = templates if templates is not None else ALL_TEMPLATES
     by_id = {t.id: t for t in tmpls}
     scope = resolve_catalog_scope(conn, roles=roles, target_entity=target_entity, now=now)
-    compile_ctx = build_compiler_context(conn, scope, roles, now)
+    # Delivery H3b: on the REPEATABLE READ feature-generation connection (C0-T2) the planner's candidate
+    # discovery reads columns from the C0 immutable snapshot — a frozen ``_load_columns`` capture over the
+    # SAME torn-free graph_node view the C0 metadata snapshot seals — never a fresh live read. Byte-
+    # identical to live ``_load_columns`` for the frozen state, so physical_plan_id is unchanged. A READ
+    # COMMITTED caller (direct gate1 unit tests) takes NO snapshot and keeps the live read (additive).
+    column_source = (capture_column_snapshot(conn, scope.authorized_catalog_sources, roles)
+                     if _on_repeatable_read(conn) else None)
+    compile_ctx = build_compiler_context(conn, scope, roles, now, column_source=column_source)
     budget = CompileBudget(remaining=MAX_COMPILES_PER_RUN,
                            deadline_monotonic=time.monotonic() + COMPILE_BUDGET.total_seconds(),
                            clock=time.monotonic)
@@ -338,12 +363,80 @@ def _reject_cross_catalog_llm(alternatives: list[FeatureSet]) -> tuple[list[Feat
     return filtered, rejections
 
 
+# ── Delivery C0 Task 5: the immutable metadata snapshot at considered-set time ──────────────────────
+# When the considered set is built on the feature-generation connection (REPEATABLE READ, C0-T2), mint a
+# generation run, snapshot the in-scope catalog state the set derives from (C0-T3), and record the
+# lineage on the contract_considered row so /contract/draft + /contract/confirm reload the SERVER
+# snapshot the set was authored against. Gated on the connection ACTUALLY running under REPEATABLE READ:
+# a plain READ COMMITTED caller (the direct-call gate1 unit tests, any non-feature-gen path) legitimately
+# takes NO snapshot — the snapshot is only meaningful/possible under the torn-free feature-gen isolation,
+# and ``build_metadata_snapshot`` hard-asserts it (so this guard is what keeps those callers additive
+# rather than a hard SnapshotIsolationError). The route always uses the REPEATABLE READ feature-gen conn,
+# so production ALWAYS snapshots.
+_REPEATABLE_READ = "repeatable read"
+
+
+def _on_repeatable_read(conn) -> bool:
+    """True when this connection runs under REPEATABLE READ — the feature-generation isolation the C0
+    snapshot requires. ``SHOW`` reflects the level the (already-started) transaction is running at."""
+    return conn.execute("SHOW transaction_isolation").fetchone()[0] == _REPEATABLE_READ
+
+
+def _candidate_refs(cs: ConsideredSet) -> list[tuple[str, str]]:
+    """The union of ``(catalog_source, object_ref)`` the considered set's candidates DERIVE FROM — the
+    anchor plus every alternative feature's ``derives_pairs`` — deduped + sorted so the snapshot's read
+    scope is deterministic. This is exactly the in-scope catalog surface the set was built against."""
+    refs: set[tuple[str, str]] = set()
+    if cs.anchor is not None:
+        refs.update(cs.anchor.derives_pairs)
+    for s in cs.alternatives:
+        for f in s.features:
+            refs.update(f.derives_pairs)
+    return sorted(refs)
+
+
+def _run_actor(intent: Intent) -> dict:
+    """The generation-run manifest actor as a jsonb dict, reusing the intent's actor serialization
+    (``feature_generation_run.actor`` is NOT NULL). A scalar subject is wrapped; ``None`` → ``{}``."""
+    raw = _actor_json(intent.actor)
+    if raw is None:
+        return {}
+    value = json.loads(raw)
+    return value if isinstance(value, dict) else {"subject": value}
+
+
+def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
+                                 generation_run_id: str | None, roles, catalog_source: str | None,
+                                 is_live: bool) -> tuple[str | None, str | None, str | None]:
+    """Mint the generation run (if not supplied), build the immutable catalog snapshot (C0-T3) over the
+    considered set's candidate refs, and return the ``(generation_run_id, snapshot_id, content_hash)``
+    lineage to record on the contract_considered row. Runs ONLY under REPEATABLE READ (returns all-None
+    otherwise). Built BEFORE the considered-set INSERT so a projection-lagged view aborts the whole
+    considered set (``CatalogProjectionUnavailable`` propagates to the route → 503) with NO row written —
+    the snapshot and the considered set commit atomically in the one feature transaction."""
+    if not _on_repeatable_read(conn):
+        return None, None, None
+    run_id = generation_run_id or mint_id("fgr")
+    refs = _candidate_refs(cs)
+    read_scope_hash = canonical_hash({
+        "refs": [list(r) for r in refs],   # already sorted, deduped
+        "roles": sorted(str(r) for r in roles),
+    })
+    snapshot = build_metadata_snapshot(
+        conn, generation_run_id=run_id, refs=refs, read_scope_hash=read_scope_hash,
+        actor=_run_actor(intent),
+        flags={"intake_mode": intent.intake_mode, "catalog_source": catalog_source,
+               "is_live": bool(is_live)})
+    return run_id, snapshot.snapshot_id, snapshot.content_hash
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          objective: str = "", feedback: str | None = None, now=None,
                          applicability: ApplicabilityResult | None = None,
                          is_live: bool = False, target_entity: str | None = None,
-                         templates: Sequence[Template] | None = None) -> ConsideredSet:
+                         templates: Sequence[Template] | None = None,
+                         generation_run_id: str | None = None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -361,7 +454,13 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     plan envelope), its unresolved ones and every cross-catalog LLM alternative become rejections. With
     ``is_live`` false the whole governed branch is skipped — byte-identical to today. ``templates``
     (default ``ALL_TEMPLATES``) narrows the recipe registry the governed lens plans over (tests inject
-    a fixture template); it never affects the single-catalog template lens."""
+    a fixture template); it never affects the single-catalog template lens.
+
+    ``generation_run_id`` (Delivery C0 Task 5) — when the caller already minted a run (the scoped route
+    reuses its generation run), the C0 metadata snapshot is anchored to it; otherwise, on a REPEATABLE
+    READ feature-generation connection, a fresh ``fgr`` run is minted. Either way the snapshot lineage is
+    recorded on the contract_considered row (see :func:`_persist_considered_snapshot`). On a READ
+    COMMITTED connection no snapshot is taken (additive — the lineage columns stay NULL)."""
     persist_intent(conn, intent, target_ref)
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
@@ -418,7 +517,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         ideas = recommend_features(
             conn, intent.redacted_definition, client, entity=entity, catalog_source=catalog_source,
             roles=roles, target_ref=target_ref, now=now, target=1)
-        anchor = ideas[0] if ideas else None
+        # H1a: the definition anchor is the USER's own definition run through the validated loop — the
+        # server-assigned generation_source for the user-anchor path is "user_defined" (distinct from the
+        # LLM alternatives' "llm_freeform" and the recipe lens's "recipe"). Never read from LLM output.
+        anchor = replace(ideas[0], generation_source="user_defined") if ideas else None
         # 3C.2a fail-closed: on a live entity-scoped run (catalog_source is None) the definition anchor is
         # generated over the WHOLE cross-catalog candidate pool, so it CAN span >1 catalog with NO
         # governed physical plan. Mirror the alternatives filter: drop such an anchor (it must never be
@@ -435,10 +537,20 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                        grounded_template_ids=grounded_template_ids,
                        rejected_template_ids=rejected_template_ids,
                        binding_quality_by_template=binding_quality_by_template)
+    # Delivery C0 Task 5: build the immutable catalog snapshot the set was authored against BEFORE the
+    # considered-set INSERT — a projection-lagged view raises here (→ route 503) with NO considered-set
+    # row written, and the snapshot + considered set commit atomically in the one feature transaction.
+    snap_run_id, snap_id, snap_hash = _persist_considered_snapshot(
+        conn, cs, intent, generation_run_id=generation_run_id, roles=roles,
+        catalog_source=catalog_source, is_live=is_live)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
-        "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
-        "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
-        (intent.intent_id, json.dumps(_snapshot(conn, cs))))
+        "INSERT INTO contract_considered "
+        "(intent_id, considered, generation_run_id, snapshot_id, snapshot_content_hash) "
+        "VALUES (%s, %s::jsonb, %s, %s, %s) "
+        "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered, "
+        "generation_run_id = EXCLUDED.generation_run_id, snapshot_id = EXCLUDED.snapshot_id, "
+        "snapshot_content_hash = EXCLUDED.snapshot_content_hash",
+        (intent.intent_id, json.dumps(_snapshot(conn, cs)), snap_run_id, snap_id, snap_hash))
     return cs
 
 
@@ -456,18 +568,44 @@ def _option_ids(cs: ConsideredSet) -> set[str]:
 def _idea_json(f: FeatureIdea | None) -> dict | None:
     if f is None:
         return None
-    return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
-            "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
-            "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
-            "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
-            "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
-            "validation_status": f.validation_status,   # 3A-ii honest tri-state (NEW axis)
-            "requirements": requirements_to_json(f.requirements),
-            "derives_pairs": [list(p) for p in f.derives_pairs],   # for server-side reconstruction
-            # 3C.2a carry-forward: provenance + the governed plan envelope (null for LLM/single-catalog
-            # options), persisted with the considered set so drafting reconstructs the EXACT plan.
-            "origin": f.origin, "path_authority": f.path_authority,
-            "plan_envelope": f.plan_envelope.to_json() if f.plan_envelope else None}
+    d = {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+         "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
+         "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
+         "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
+         "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
+         "validation_status": f.validation_status,   # 3A-ii honest tri-state (NEW axis)
+         "requirements": requirements_to_json(f.requirements),
+         "derives_pairs": [list(p) for p in f.derives_pairs],   # for server-side reconstruction
+         # 3C.2a carry-forward: provenance + the governed plan envelope (null for LLM/single-catalog
+         # options), persisted with the considered set so drafting reconstructs the EXACT plan.
+         "origin": f.origin, "path_authority": f.path_authority,
+         "plan_envelope": f.plan_envelope.to_json() if f.plan_envelope else None}
+    # H1a carry-through: emitted ONLY when non-default so a pre-H1a idea's persisted bytes are
+    # byte-identical (mirrors the C2-C3 requirement-`params` and 3C.2a plan-envelope only-when-present
+    # strategy). recipe_id MUST round-trip here — it is what survives the Gate-1 considered-set reload.
+    if f.generation_source != "llm_freeform":
+        d["generation_source"] = f.generation_source
+    if f.recipe_id is not None:
+        d["recipe_id"] = f.recipe_id
+    if f.candidate_status:
+        d["candidate_status"] = f.candidate_status
+    if f.input_role_bindings:
+        d["input_role_bindings"] = [b.to_json() for b in f.input_role_bindings]
+    if f.external_requirement_previews:
+        d["external_requirement_previews"] = [p.to_json() for p in f.external_requirement_previews]
+    if f.metadata_snapshot_id is not None:
+        d["metadata_snapshot_id"] = f.metadata_snapshot_id
+    if f.metadata_input_fingerprint is not None:
+        d["metadata_input_fingerprint"] = f.metadata_input_fingerprint
+    if f.binding_fact_keys:
+        d["binding_fact_keys"] = list(f.binding_fact_keys)
+    if f.planner_applicability != "not_applicable_nonrecipe":
+        d["planner_applicability"] = f.planner_applicability
+    if f.physical_plan_id is not None:
+        d["physical_plan_id"] = f.physical_plan_id
+    if f.planner_declaration_id is not None:
+        d["planner_declaration_id"] = f.planner_declaration_id
+    return d
 
 
 def _snapshot(conn, cs: ConsideredSet) -> dict:
@@ -519,7 +657,22 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         requirements=requirements_from_json(d.get("requirements", [])),
         # 3C.2a: absent keys (pre-3C snapshots) deserialize to the defaults — behaviour-neutral.
         origin=d.get("origin", "llm"), path_authority=d.get("path_authority", "single_or_llm"),
-        plan_envelope=PlanEnvelopeV1.from_json(d["plan_envelope"]) if d.get("plan_envelope") else None)
+        plan_envelope=PlanEnvelopeV1.from_json(d["plan_envelope"]) if d.get("plan_envelope") else None,
+        # H1a: absent keys (pre-H1a snapshots) deserialize to the defaults — behaviour-neutral. recipe_id
+        # is restored here so a recipe-sourced idea keeps its registry id across the Gate-1 round-trip.
+        generation_source=d.get("generation_source", "llm_freeform"),
+        recipe_id=d.get("recipe_id"),
+        candidate_status=d.get("candidate_status", ""),
+        input_role_bindings=tuple(RoleBinding.from_json(b) for b in d.get("input_role_bindings", ())),
+        external_requirement_previews=tuple(
+            ExternalRequirementPreview.from_json(p)
+            for p in d.get("external_requirement_previews", ())),
+        metadata_snapshot_id=d.get("metadata_snapshot_id"),
+        metadata_input_fingerprint=d.get("metadata_input_fingerprint"),
+        binding_fact_keys=tuple(str(k) for k in d.get("binding_fact_keys", ())),
+        planner_applicability=d.get("planner_applicability", "not_applicable_nonrecipe"),
+        physical_plan_id=d.get("physical_plan_id"),
+        planner_declaration_id=d.get("planner_declaration_id"))
 
 
 def chosen_feature(conn, intent_id: str, chosen_source: str,
@@ -548,6 +701,20 @@ def chosen_feature(conn, intent_id: str, chosen_source: str,
            for m in matches[1:]):
         return None   # ambiguous same-name options — cannot safely reconstruct
     return _idea_from_json(first)
+
+
+def considered_snapshot_lineage(conn, intent_id: str) -> dict | None:
+    """The SERVER-persisted C0 metadata-snapshot lineage recorded on the considered set for this intent
+    (Delivery C0 Task 5): the ``generation_run_id`` + immutable ``snapshot_id`` / ``content_hash`` the
+    set was authored against. /contract/draft + /contract/confirm reload THIS server value — a client
+    never supplies a snapshot id (the draft/confirm request models carry none, so there is nothing to
+    trust). Returns None when no snapshot was recorded (a READ COMMITTED / pre-C0 considered set)."""
+    row = conn.execute(
+        "SELECT generation_run_id, snapshot_id, snapshot_content_hash "
+        "FROM contract_considered WHERE intent_id = %s", (intent_id,)).fetchone()
+    if row is None or row[1] is None:
+        return None
+    return {"generation_run_id": row[0], "snapshot_id": row[1], "content_hash": row[2]}
 
 
 def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_option_id: str,

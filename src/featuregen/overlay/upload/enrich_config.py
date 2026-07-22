@@ -47,7 +47,9 @@ def stage_deadline_s() -> float:
     ``run_batched`` STOPS issuing new chunks and reports ``timed_out`` (partial), so a slow provider
     can't hold the source advisory lock across the whole ingest. Default 240s
     (env ``OVERLAY_ENRICH_STAGE_DEADLINE_S``). This is a STAGE ceiling above the per-call timeout
-    (``FEATUREGEN_LLM_TIMEOUT``, default 60s) and the per-run wallclock budget."""
+    (``FEATUREGEN_LLM_TIMEOUT``, default 60s); the per-run wallclock budget defaults to this SAME 240s
+    so a single slow chunk can't trip ``over_budget()`` and abort the rest of the run before the stage
+    deadline is even reached — the two are one coherent ceiling."""
     return float(os.environ.get("OVERLAY_ENRICH_STAGE_DEADLINE_S", "240"))
 
 
@@ -70,7 +72,32 @@ def budget(short: str) -> Budget:
         max_batch_attempts=_int("OVERLAY_ENRICH_MAX_BATCH_ATTEMPTS", 2),
         max_single_fallback=_int("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", 8),
         max_provider_calls=_int("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", 32),
-        wallclock_budget_ms=_int("OVERLAY_ENRICH_WALLCLOCK_BUDGET_MS", 20000),
+        wallclock_budget_ms=_int("OVERLAY_ENRICH_WALLCLOCK_BUDGET_MS", 240000),
         keep_threshold=float(os.environ.get("OVERLAY_ENRICH_KEEP_THRESHOLD", "0.75")),
         min_split=_int("OVERLAY_ENRICH_MIN_SPLIT", 4),
+    )
+
+
+# ── Delivery D3 — the semantic-binding LLM SELECTION task (overlay.semantic_bindings) bounds. ─────
+# A SEPARATE audited failure domain from Pass A/B: exceeding ANY of these makes the semantic stage
+# partial/failed (truthful counts), NEVER a crash, and NEVER touches core ingestion / Pass B. Kept
+# conservative (isolation boundaries, not throughput maxima) — the LLM only re-ranks the deterministic
+# D2 shortlist, so a small candidate/byte cap loses no real signal while bounding what egresses.
+@dataclass(frozen=True)
+class SemanticBindingBounds:
+    max_candidates_per_table: int   # how many D2 candidates a table may present to the model
+    max_provider_calls: int         # run-level ceiling on semantic-binding provider calls
+    max_input_bytes: int            # cap on the serialized model-facing payload (pre-dispatch gate)
+    deadline_s: float               # wall-clock ceiling; a call attempted past it is a no-dispatch
+
+
+def semantic_binding_bounds() -> SemanticBindingBounds:
+    """The D3 bounds, env-overridable. Each is a fail-soft ISOLATION boundary: crossing it yields a
+    ``partial`` (candidate cap — the capped subset is still ranked) or ``failed`` (byte / call / dead-
+    line — no dispatch) semantic set with truthful counts, never an exception into ingestion."""
+    return SemanticBindingBounds(
+        max_candidates_per_table=_int("OVERLAY_SEMBIND_MAX_CANDIDATES", 40),
+        max_provider_calls=_int("OVERLAY_SEMBIND_MAX_PROVIDER_CALLS", 8),
+        max_input_bytes=_int("OVERLAY_SEMBIND_MAX_INPUT_BYTES", 16000),
+        deadline_s=float(os.environ.get("OVERLAY_SEMBIND_DEADLINE_S", "60")),
     )

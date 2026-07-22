@@ -8,12 +8,12 @@ threads the resolved ``is_live`` boolean into ``build_considered_set``; flag-off
 Task 7 — the §9 acceptance map (one entry per spec item; existing Task-3/5/6 tests are REFERENCED, not
 duplicated; the new tests here add only the HTTP-surface coverage that was missing):
 
-1. Flag off → existing response + permissive draft path, byte-identical:
-   NEW ``test_s9_item1_flag_off_draft_rides_permissive_cross_catalog_path`` (HTTP 200 end to end) +
+1. Flag off → existing considered-set response shape (byte-identical); a no-envelope cross-catalog CHOICE
+   is now refused at draft (I-1 draft/confirm parity — it can never be confirmed, so it is not draftable):
+   NEW ``test_s9_item1_flag_off_response_shape_and_cross_catalog_draft_refused`` +
    ``test_flag_off_threads_is_live_false`` (this file), ``test_flag_off_skips_the_governed_branch_
-   entirely`` (test_gate1_governed_lens), ``test_cross_catalog_without_envelope_draws_permissive_path_
-   when_not_live`` / ``test_single_catalog_feature_drafts_as_before`` (test_draft_rebinding), and the
-   headline check: the FULL suite passes unchanged (behaviour-neutral).
+   entirely`` (test_gate1_governed_lens), ``test_cross_catalog_without_envelope_is_rejected_at_draft`` /
+   ``test_single_catalog_feature_drafts_as_before`` (test_draft_rebinding).
 2. Flag on + approved → governed options surface with ``path_authority`` + a plan envelope:
    NEW ``test_full_flag_on_cross_catalog_flow_never_invokes_permissive_path``
    (test_no_permissive_path_when_live — asserts the HTTP response JSON) + builder-level
@@ -37,9 +37,9 @@ duplicated; the new tests here add only the HTTP-surface coverage that was missi
    + ``test_governed_feature_with_drifted_plan_raises_stale`` (test_draft_rebinding) +
    ``test_draft_route_maps_stale_plan_to_409`` / ``test_confirm_route_rechecks_freshness_and_maps_
    stale_to_409`` (test_contract).
-7. Missing/tampered plan identity fails closed:
-   NEW ``test_s9_item7_cross_catalog_option_without_envelope_cannot_confirm_once_live`` (HTTP confirm)
-   + ``test_cross_catalog_without_envelope_is_rejected_at_draft_when_live`` (test_draft_rebinding) +
+7. Missing/tampered plan identity fails closed (I-1: refused at DRAFT — draft/confirm parity):
+   NEW ``test_s9_item7_cross_catalog_option_without_envelope_cannot_be_drafted`` (HTTP draft 422)
+   + ``test_cross_catalog_without_envelope_is_rejected_at_draft`` (test_draft_rebinding) +
    ``test_draft_route_maps_cross_catalog_without_envelope_to_422`` (test_contract).
 8. ``find_cross_catalog_path`` never invoked while live:
    NEW tests/featuregen/overlay/upload/contract/test_no_permissive_path_when_live.py (the structural
@@ -71,7 +71,11 @@ from featuregen.overlay.upload.contract.gate1 import (
     GOVERNED_CROSS_CATALOG_PLAN_REQUIRED,
     ConsideredSet,
 )
-from featuregen.overlay.upload.contract.live_activation import record_decision, record_evaluation
+from featuregen.overlay.upload.contract.live_activation import (
+    CROSS_CATALOG_GROUNDING_NOT_ENABLED,
+    record_decision,
+    record_evaluation,
+)
 from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet, SetsReport
 from featuregen.overlay.upload.graph import build_graph
 
@@ -233,11 +237,12 @@ def _stub_report(monkeypatch, *ideas: FeatureIdea) -> None:
         lambda *a, **k: SetsReport(sets=[FeatureSet("monetary", list(ideas))], rejections=[]))
 
 
-# ── §9 item 1: flag OFF → today's response + the permissive draft path, HTTP 200 ──────────────────────
-def test_s9_item1_flag_off_draft_rides_permissive_cross_catalog_path(make_client, conn, monkeypatch):
+# ── §9 item 1: flag OFF → today's considered-set response; drafting the cross-catalog choice is refused ─
+def test_s9_item1_flag_off_response_shape_and_cross_catalog_draft_refused(make_client, conn, monkeypatch):
     """§9 item 1 — flag OFF: the considered-set response carries EXACTLY today's keys (no 3C.2a
-    additions) and a cross-catalog choice drafts over HTTP via the permissive entity-bridged
-    ``find_cross_catalog_path`` path (HTTP 200) — byte-identical to pre-3C.2a."""
+    additions). I-1: a no-envelope cross-catalog choice is now REFUSED at /contract/draft (422,
+    ``CROSS_CATALOG_GROUNDING_NOT_ENABLED``) — draft/confirm parity, since confirm always rejects it —
+    rather than drafting a permissive path the user could never confirm."""
     monkeypatch.delenv(FLAG, raising=False)
     _cross_catalog_llm_seed(conn)
     _stub_report(monkeypatch, _cross_llm_idea())
@@ -252,11 +257,10 @@ def test_s9_item1_flag_off_draft_rides_permissive_cross_catalog_path(make_client
     assert not any(r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in body["rejections"])
     dr = client.post("/contract/draft", json={
         "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "cross_llm", "why": "flag-off permissive"}, headers=AUTH)
-    assert dr.status_code == 200, dr.text
-    join_path = dr.json()["draft"]["join_path"]
-    # the permissive entity-bridged shape: accounts --entity(Customer)--> card_accounts
-    assert any(step.get("kind") == "entity" and step.get("via") == "Customer" for step in join_path)
+        "chosen_option_id": "cross_llm", "why": "flag-off cross-catalog"}, headers=AUTH)
+    assert dr.status_code == 422, dr.text
+    assert CROSS_CATALOG_GROUNDING_NOT_ENABLED in dr.json()["detail"]
+    assert "governed plan envelope" in dr.json()["detail"]   # names the missing prerequisite
 
 
 # ── §9 item 3: an unresolved governed recipe surfaces as a STRUCTURED rejection over HTTP ─────────────
@@ -310,13 +314,12 @@ def test_s9_item4_cross_catalog_llm_candidate_cannot_reach_drafting(make_client,
     assert dr.status_code == 422, dr.text   # never offered → never draftable
 
 
-# ── §9 item 7: a cross-catalog option with NO valid envelope fails closed at the governing write ──────
-def test_s9_item7_cross_catalog_option_without_envelope_cannot_confirm_once_live(
+# ── §9 item 7: a cross-catalog option with NO valid envelope fails closed — now at DRAFT (I-1 parity) ──
+def test_s9_item7_cross_catalog_option_without_envelope_cannot_be_drafted(
         make_client, conn, monkeypatch):
-    """§9 item 7 — missing plan identity fails closed at CONFIRM: a cross-catalog option drafted
-    flag-OFF (permissive, no envelope) cannot be confirmed once the deployment flips live — the
-    governing write rejects it (422, regenerate under the governed planner), never a permissive
-    confirmation riding a pre-flip draft."""
+    """§9 item 7 — missing plan identity fails closed. I-1 moves the refusal EARLIER: a no-envelope
+    cross-catalog option is now rejected at /contract/draft (flag-off) with the same umbrella reason
+    confirm uses, so the wasted draft-then-fail-at-confirm path is closed. Nothing is ever governed."""
     monkeypatch.delenv(FLAG, raising=False)
     _cross_catalog_llm_seed(conn)
     _stub_report(monkeypatch, _cross_llm_idea())
@@ -328,16 +331,9 @@ def test_s9_item7_cross_catalog_option_without_envelope_cannot_confirm_once_live
     dr = client.post("/contract/draft", json={
         "intent_id": intent_id, "chosen_source": "alternative",
         "chosen_option_id": "cross_llm", "why": ""}, headers=AUTH)
-    assert dr.status_code == 200, dr.text            # flag-off: the permissive draft still works
-    draft = dr.json()["draft"]
-    draft["intent_id"] = intent_id
-    # the flip lands BETWEEN draft and confirm: flag on + this deployment activation-approved
-    monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(DEP, "d1")
-    _approve(conn)
-    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
-    assert cr.status_code == 422, cr.text
-    assert "governed plan envelope" in cr.json()["detail"]
+    assert dr.status_code == 422, dr.text            # I-1: refused at draft, flag-off, no permissive path
+    assert CROSS_CATALOG_GROUNDING_NOT_ENABLED in dr.json()["detail"]
+    assert "governed plan envelope" in dr.json()["detail"]
     assert conn.execute("SELECT count(*) FROM contract").fetchone()[0] == 0   # nothing governed
 
 
@@ -456,6 +452,13 @@ def test_confirm_persists_server_envelope_join_path_not_client_forged(make_clien
     monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _governed_chosen)
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.current)
+    # This test's SUBJECT is the route's join_path server-derivation (routes/contract.py, BEFORE
+    # confirm_contract), not the confirm-time plan rebuild — its ``_fresh_envelope`` is a synthetic single-
+    # catalog envelope (no target_entity, recipe not in the registry) that is intentionally not rebuildable.
+    # Stub the rebuild so the confirm reaches the persist step (H3 I-2 otherwise fail-closes a not-rebuildable
+    # plan). ``(None, None)`` = no read-set lineage to persist, exactly as the pre-H3 skip did here.
+    monkeypatch.setattr("featuregen.overlay.upload.contract.govern.revalidate_governed_plan",
+                        lambda *a, **k: (None, None))
     # the client forges a join_path that does NOT match the server envelope's ordered_path
     forged = [{"kind": "governed_segment", "segment": "FORGED:evil:bridge",
                "catalog_source": "FORGED", "segment_kind": "evil", "ref": "bridge"}]

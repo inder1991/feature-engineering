@@ -421,19 +421,37 @@ class _Builder:
         return self._as_of[(source, table)]
 
     def _feature_stamp(self, feature_id: str) -> tuple[str | None, str | None]:
-        """The feature's registered verification stamp (0968 — e.g. DESIGN-CHECKED) and the causal
-        WHY it was born: the hypothesis behind its latest governed contract (feature -> latest
-        contract -> contract_intent), the same chain Feature 360 reads. rationale is None for a
-        directly-registered feature (no hypothesis-driven contract) and is dropped by _prune."""
+        """The feature's verification stamp + the causal WHY it was born (the hypothesis behind its
+        CURRENT governed contract).
+
+        [4] composition-audit (double-authority): a GOVERNED feature's stamp is the READ-GATED effective
+        verification — its current contract (the ``feature_current_contract`` pointer) routed through
+        ``contract_read_status`` — NEVER the mutable ``feature.verification`` column (confirm promotes it,
+        drift never demotes it). So a drifted feature shows a DOWNGRADED stamp on the lineage graph,
+        matching Feature 360. A directly-registered feature (no contract) keeps its honest ``feature``
+        stamp; rationale is None for a feature with no hypothesis-driven contract (dropped by _prune)."""
+        # Local import: the govern module is heavy + adjacent to this layer — a function-local import
+        # keeps the lineage module free of the contract-layer import graph.
+        from featuregen.overlay.upload.contract.govern import (
+            contract_read_status,
+            feature_current_contract,
+        )
         row = self.conn.execute(
-            "SELECT f.verification, "
-            "  (SELECT ci.hypothesis FROM contract c "
-            "     LEFT JOIN contract_intent ci ON ci.intent_id = c.intent_id "
-            "   WHERE c.feature_id = f.feature_id ORDER BY c.version DESC LIMIT 1) "
-            "FROM feature f WHERE f.feature_id = %s", (feature_id,)).fetchone()
+            "SELECT verification FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
         if row is None:
             return None, None
-        return row[0], (row[1] or None)
+        verification = row[0]
+        rationale = None
+        contract_id = feature_current_contract(self.conn, feature_id)
+        if contract_id is not None:
+            _eff_status, eff_verif = contract_read_status(self.conn, contract_id)
+            verification = eff_verif                    # the gated truth, never the mutable feature stamp
+            hyp = self.conn.execute(
+                "SELECT ci.hypothesis FROM contract c "
+                "LEFT JOIN contract_intent ci ON ci.intent_id = c.intent_id "
+                "WHERE c.contract_id = %s", (contract_id,)).fetchone()
+            rationale = (hyp[0] if hyp else None) or None
+        return verification, rationale
 
     # ---- freshness (drift watermark vs 24h, same rule as search/feature_freshness) ----------
     def _watermark(self, source: str) -> datetime | None:

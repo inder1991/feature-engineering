@@ -1,5 +1,5 @@
 """Phase 2 — Gate #1 bridge: considered-set from the loop + recorded human choice."""
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,6 +13,7 @@ from featuregen.overlay.upload.contract.gate1 import (
 )
 from featuregen.overlay.upload.contract.intake import submit_intent
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.feature_assist import _candidate_columns, _validate_idea
 from featuregen.overlay.upload.graph import build_graph
 
 NOW = datetime(2026, 7, 5, tzinfo=UTC)
@@ -236,3 +237,51 @@ def test_no_templates_lens_when_catalog_grounds_nothing(db):
                               target_ref="public.accounts.churned", now=NOW)
     assert all(s.lens != "templates" for s in cs.alternatives)                  # no template grounded
     assert cs.alternatives                                                      # LLM lenses still there
+
+
+# ── H1a: recipe_id survives Gate 1 + generation_source is SERVER-assigned ──────────────────────────
+def test_recipe_id_survives_gate1_round_trip(db):
+    # A recipe-sourced (grounded template) candidate carries a server-stamped generation_source="recipe"
+    # + recipe_id; both MUST survive the considered-set persist → reload round-trip (Gate 1). Read the id
+    # from the in-memory set (no hard-coded template id), then assert the reloaded idea keeps it.
+    _bank_churn(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    tmpl_feat = next(f for s in cs.alternatives if s.lens == "templates" for f in s.features
+                     if f.name == "balance_trend_90d")
+    assert tmpl_feat.generation_source == "recipe"     # SERVER-assigned recipe label
+    assert tmpl_feat.recipe_id                          # a registry recipe id was stamped
+    assert confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="balance_trend_90d",
+                         actor="ds1", why="grounded template fits") == "balance_trend_90d"
+    feat = chosen_feature(db, intent.intent_id, "alternative", "balance_trend_90d")
+    assert feat is not None
+    assert feat.recipe_id == tmpl_feat.recipe_id        # recipe_id survived persist → reload (Gate 1)
+    assert feat.generation_source == "recipe"
+
+
+def test_definition_anchor_generation_source_is_user_defined(db):
+    _bank(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops",
+                           definition="90-day average balance per customer", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    assert cs.anchor is not None and cs.anchor.generation_source == "user_defined"
+
+
+def test_generation_source_is_server_assigned_not_from_raw(db):
+    # The server-authority invariant: a candidate arriving on the free-form path with a CLIENT/LLM-set
+    # recipe_id + generation_source="recipe" is NOT upgraded — the validator builds the idea from
+    # server-known fields only, so it stays generation_source="llm_freeform" with recipe_id=None.
+    _bank(db)
+    cols = _candidate_columns(db, "bank", roles=())
+    known = {c["object_ref"] for c in cols}
+    src_of: dict[str, set[str]] = {}
+    for c in cols:
+        src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
+    poisoned = {"name": "sneaky", "derives_from": ["public.accounts.balance"], "aggregation": "avg",
+                "recipe_id": "attacker_recipe", "generation_source": "recipe"}
+    idea, rej = _validate_idea(db, poisoned, known, src_of, None, NOW, timedelta(hours=24), roles=())
+    assert rej is None and idea is not None
+    assert idea.generation_source == "llm_freeform"    # server default for the free-form path
+    assert idea.recipe_id is None                       # client-supplied recipe_id ignored

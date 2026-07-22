@@ -106,6 +106,14 @@ export interface IngestResult {
   join_candidates?: number
   passb_proposed?: number
   passb_abstained?: number
+  // D4 semantic-binding counts (behind OVERLAY_SEMANTIC_BINDING_CANDIDATES/_PROPOSALS; all 0 when
+  // off). candidates = persisted candidate rows (all dispositions); proposed = strong candidates
+  // routed to an E1 DRAFT fact; abstained = strong candidates whose propose was not accepted (a
+  // re-upload duplicate); failed = tables whose candidate/proposal work hit its fail-soft except.
+  semantic_binding_candidates?: number
+  semantic_binding_proposed?: number
+  semantic_binding_abstained?: number
+  semantic_binding_failed?: number
   // CLIENT-attached from the X-Ingestion-Run-Id response header, never a body field: the id of
   // the per-stage run record behind GET /ingestion-runs/{id}. Optional so existing fixtures and
   // callers keep compiling; null when the server sent no header.
@@ -1527,4 +1535,382 @@ export function evaluateGate(body: {
   until: string
 }): Promise<GateEvaluation> {
   return post('/gate/evaluate', body)
+}
+
+// ---- asset detail read model (Delivery F/G) + field-correction command ------------------------
+// GET /catalog/assets/{source}/{object_ref:path} returns the bounded sections about ONE catalog
+// asset (identity + effective_metadata + evidence + relationships + readiness + history + actions
+// + audit), assembled under ONE REPEATABLE READ snapshot. The ETag header carries that snapshot's
+// consistency_token — the OCC token a client revalidates against. POST .../fields/{field}/decisions
+// is the generic scalar field-correction command (confirm_existing | propose_override |
+// confirm_override | reject) with a CAS triple; a CAS conflict fails closed with HTTP 409, which the
+// shared error path surfaces as a catchable ApiError(409) so the caller can reload the fresh CAS and
+// retry.
+//
+// object_ref rides a {object_ref:path} route: it is dotted (public.accounts.balance) and MAY be
+// pathful (schema/table.col). Encode each SLASH-separated segment (dots survive, real path slashes
+// stay separators, and a hostile char like #/space/% is percent-encoded) — never encode the whole
+// ref, which would double-encode a legitimate path slash to %2F and 404 the path route.
+//
+// Every section but identity is selectable via `include`, so each is OPTIONAL on the response; the
+// no-include default builds them all. version/source/object_ref/kind + the *_sections lists +
+// consistency_token are ALWAYS present.
+
+export type AssetKind = 'table' | 'column'
+
+// The physical + logical identity from the anchor graph_node row (ALWAYS built).
+export interface AssetIdentity {
+  graph_ref: string
+  object_ref: string
+  logical_ref: string
+  source: string
+  kind: AssetKind
+  schema_name: string | null
+  table: string | null
+  column: string | null
+  operational_type: string | null   // the numeric-usable operational data_type
+  declared_type: string | null      // the source-declared SQL type (non-operational)
+  is_grain: boolean
+  is_as_of: boolean
+}
+
+// One display field + its C1 authority/provenance. `authority` is governed | hint | missing.
+export interface EffectiveMetadataField {
+  value: string | null
+  authority: string
+  c1_status: string
+  provenance: string | null
+  evidence_provenance: string | null
+  selected_evidence_ids: string[]
+}
+
+// A column asset carries a field per label (concept/definition/domain/additivity/unit/currency/
+// entity/type); a table asset carries an empty `fields` plus a `note` (no per-field metadata).
+export interface EffectiveMetadataSection {
+  fields: Record<string, EffectiveMetadataField>
+  note?: string
+}
+
+// One per-field proposal, bucketed by lifecycle.
+export interface EvidenceProposal {
+  evidence_id: string
+  producer: string
+  strength: string
+  proposed_value: string | null
+  confidence_band: string | null
+}
+
+// A field's latest decision head.
+export interface LatestFieldDecision {
+  decision_event_id: string
+  event_type: string
+  conflict_status: string | null
+  load_bearing: boolean
+  decided_at: string
+}
+
+export interface EvidenceSection {
+  // Keyed by field_name; the inner map is keyed by lifecycle (active/stale/rejected/superseded +
+  // any other lifecycle a newer backend emits — kept an open string key so it renders, not breaks).
+  proposals_by_field: Record<string, Record<string, EvidenceProposal[]>>
+  latest_decision_by_field: Record<string, LatestFieldDecision>
+}
+
+// ---- relationships subsections ----
+export interface ContainmentColumn {
+  object_ref: string
+  column: string | null
+  data_type: string | null
+  sensitivity: string | null
+}
+
+export interface Containment {
+  table: { object_ref: string; table: string }
+  columns: ContainmentColumn[]   // sibling columns (column anchor) or child columns (table anchor)
+}
+
+export interface AssetApprovedJoin {
+  from_ref: string
+  to_ref: string
+  cardinality: string | null
+  status: string
+  approved_join_fact_key: string | null
+}
+
+// A VERIFIED entity assignment on the anchor column.
+export interface SemanticEntityEdge {
+  kind: 'entity_assignment'
+  status: string
+  object_ref: string
+  entity: string
+  fact_key: string | null
+  confirmed_event_id: string | null
+  available_actions: string[]
+}
+
+// A VERIFIED column-to-column semantic edge (e.g. a currency binding) touching the anchor.
+export interface SemanticColumnEdge {
+  kind: string   // the binding kind (never 'entity_assignment')
+  status: string
+  from_ref: string
+  to_ref: string
+  fact_key: string
+  confirmed_event_id: string | null
+  available_actions: string[]
+}
+
+// Narrow with `edge.kind === 'entity_assignment'` (or `'object_ref' in edge`) to the entity arm.
+export type SemanticVerifiedEdge = SemanticEntityEdge | SemanticColumnEdge
+
+export interface SemanticCandidate {
+  candidate_id: string
+  binding_kind: string
+  disposition: string
+  reason_codes: string[]
+  subject_graph_ref: string
+  target_graph_ref: string
+  proposed_value: string | null
+  fact_key: string | null
+  fact_status: string | null
+  available_actions: string[]
+}
+
+export interface SemanticDivergence {
+  kind: string   // e.g. entity_divergence
+  object_ref: string
+  declared_entity: string
+  governed_entity: string
+  fact_key: string | null
+}
+
+// The SEMANTIC subsection is a UNION so the UI renders "unavailable" honestly: a caller lacking
+// catalog:read gets {status:'unavailable'} (also named in unavailable_sections), never an empty-
+// success that reads as "no semantic links". Everyone else gets a real (possibly empty) available
+// subsection; a table anchor is always available-but-empty (bindings attach to columns).
+export type SemanticSubsection =
+  | { status: 'unavailable' }
+  | {
+      status: 'available'
+      verified_edges: SemanticVerifiedEdge[]
+      candidates: SemanticCandidate[]
+      divergences: SemanticDivergence[]
+    }
+
+export interface Relationships {
+  containment: Containment
+  approved_joins: AssetApprovedJoin[]
+  semantic: SemanticSubsection
+}
+
+// ---- readiness section ----
+export interface ColumnRequirement {
+  requirement_id: string
+  status: 'confirmed' | 'proposed' | 'missing' | 'conflicting' | 'review'
+  blocking: boolean
+  authority: string
+  c1_status: string | null
+  evidence_ids: string[]
+  fact_event_id: string | null
+  decision_event_id: string | null
+  external_preview: boolean
+  reason: string
+}
+
+export interface ColumnCapability {
+  use: string
+  operational_status: 'ready' | 'blocked' | 'unavailable'
+  requirements: ColumnRequirement[]
+}
+
+// The per-column capability MATRIX (five independent capabilities); null for a table asset.
+export interface ColumnCapabilities {
+  source: string
+  object_ref: string
+  logical_ref: string
+  as_measure: ColumnCapability
+  as_entity_key: ColumnCapability
+  as_event_time: ColumnCapability
+  as_grain_key: ColumnCapability
+  as_join_key: ColumnCapability
+}
+
+export interface ReadinessRequirement {
+  requirement_id: string
+  scope: string
+  status: 'confirmed' | 'proposed' | 'missing' | 'conflicting'
+  blocking: boolean
+  cause: string
+  authority_required: string
+}
+
+// The parent-table blocker diagnostic (readiness.FeatureReadiness at TABLE scope).
+export interface TableDiagnostic {
+  scope: string
+  operational_status: 'ready' | 'blocked'
+  blocking_requirements: ReadinessRequirement[]
+  review_requirements: ReadinessRequirement[]
+  advisory_gaps: string[]
+  summary_scores: Record<string, number>
+}
+
+export interface ReadinessSection {
+  column_capabilities: ColumnCapabilities | null
+  table_diagnostic: TableDiagnostic
+}
+
+// ---- history section ----
+export interface AssetHistoryStage {
+  stage: string
+  attempt: number
+  state: string
+  reason_code: string | null
+}
+
+export interface AssetHistoryRun {
+  ingestion_run_id: string
+  relation: string
+  at: string
+  status: string
+  origin_type: string
+  started_at: string | null
+  completed_at: string | null
+  stages: AssetHistoryStage[]
+}
+
+export interface HistorySection {
+  runs: AssetHistoryRun[]
+  truncated: boolean
+}
+
+// ---- audit section (separately gated by audit:read; ABSENT + named in unavailable_sections
+// otherwise — no hidden count). SAFE summaries only: never a redacted_input or raw model output.
+export interface AuditSummary {
+  dispatch_ref: string
+  task: string
+  stage: string
+  provider: string
+  model: string
+  prompt_version: string
+  schema_version: string
+  created_at: string
+  field_names: string[] | null
+  outcome: string | null
+  outcome_at: string | null
+}
+
+export interface AuditSection {
+  status: 'available'
+  summaries: AuditSummary[]
+  truncated: boolean
+}
+
+export interface AssetDetail {
+  version: string
+  source: string
+  object_ref: string
+  kind: AssetKind
+  identity: AssetIdentity
+  // Selectable sections — OPTIONAL because `include` can build a subset (the default builds all).
+  effective_metadata?: EffectiveMetadataSection
+  evidence?: EvidenceSection
+  relationships?: Relationships
+  readiness?: ReadinessSection
+  history?: HistorySection
+  // Server-calculated commands the caller may run; F0 keeps this empty.
+  actions?: unknown[]
+  audit?: AuditSection
+  included_sections: string[]
+  unavailable_sections: string[]
+  // The snapshot fingerprint, echoed as the ETag header (the OCC token).
+  consistency_token: string
+}
+
+// Encode a {object_ref:path} value: encodeURIComponent EACH slash-separated segment, then rejoin
+// with '/'. Dots survive (encodeURIComponent leaves them untouched), a real path slash stays a
+// separator, and a hostile char inside a segment (#, space, %) is percent-encoded — without
+// double-encoding the path slashes to %2F (which the :path route would then fail to match / 404).
+function encodeObjectRefPath(objectRef: string): string {
+  return objectRef.split('/').map(encodeURIComponent).join('/')
+}
+
+// GET the bounded asset detail. `include` names the sections to build (repeatable; default = all).
+// Uses requestWithResponse so the ETag header (the snapshot's consistency token) rides back out:
+// RETURNS { detail, etag }. The etag is the OCC token a follow-up read revalidates against; it also
+// lives verbatim in detail.consistency_token (the ETag header adds the HTTP quote wrapper).
+export async function getAssetDetail(
+  source: string,
+  objectRef: string,
+  include?: readonly string[],
+): Promise<{ detail: AssetDetail; etag: string }> {
+  let path = `/catalog/assets/${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`
+  if (include && include.length > 0) {
+    // list[str] Query on the route reads a REPEATED include= param, so append one per section.
+    const params = new URLSearchParams()
+    for (const section of include) params.append('include', section)
+    path += `?${params}`
+  }
+  const { body, response } = await requestWithResponse<AssetDetail>(path)
+  // The ETag header carries the quoted consistency token; fall back to the body token if a proxy
+  // stripped the header, so the caller always gets an OCC token to echo.
+  const etag = response.headers.get('ETag') ?? body.consistency_token
+  return { detail: body, etag }
+}
+
+// ---- field-correction command (Delivery F) ----
+export type FieldDecisionAction =
+  'confirm_existing' | 'propose_override' | 'confirm_override' | 'reject'
+
+// The correction command as the UI holds it (camelCase). The expected_* triple is the CAS anchor the
+// field was loaded at (the field's evidence-set + decision head + policy version); ANY drift fails
+// closed with 409. expectedLatestDecisionId is null for a field with no decision head yet.
+export interface FieldDecisionRequest {
+  action: FieldDecisionAction
+  selectedEvidenceIds?: string[]
+  replacementValue?: string | null
+  reason?: string | null
+  idempotencyKey: string
+  expectedLatestDecisionId: string | null
+  expectedEvidenceSetHash: string
+  expectedPolicyVersion: string
+}
+
+// The command result: the outcome + the NEW CAS anchor (so the client can chain a follow-up command
+// without a re-read) + the actions still callable on the field.
+export interface FieldDecisionResult {
+  field: string
+  action: string
+  outcome: string   // confirmed | proposed | rejected | replayed
+  replayed: boolean
+  projected: boolean
+  latest_decision_id: string | null
+  evidence_set_hash: string
+  policy_version: string
+  actions: string[]
+}
+
+// POST one scalar field-correction. Maps the camelCase request to the backend snake_case body
+// (defaults mirror the server model: selected_evidence_ids [], replacement_value/reason null). A CAS
+// conflict (a concurrent decision/evidence/policy drift) fails closed as HTTP 409, and a four-eyes /
+// authz denial as 403 — the shared error path throws BOTH as a catchable ApiError carrying that
+// status, so the caller can catch a 409 to reload the asset (fresh CAS) and retry.
+export function postFieldDecision(
+  source: string,
+  objectRef: string,
+  field: string,
+  req: FieldDecisionRequest,
+): Promise<FieldDecisionResult> {
+  return post(
+    `/catalog/assets/${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`
+      + `/fields/${encodeURIComponent(field)}/decisions`,
+    {
+      action: req.action,
+      selected_evidence_ids: req.selectedEvidenceIds ?? [],
+      replacement_value: req.replacementValue ?? null,
+      reason: req.reason ?? null,
+      idempotency_key: req.idempotencyKey,
+      expected_latest_decision_id: req.expectedLatestDecisionId,
+      expected_evidence_set_hash: req.expectedEvidenceSetHash,
+      expected_policy_version: req.expectedPolicyVersion,
+    },
+  )
 }

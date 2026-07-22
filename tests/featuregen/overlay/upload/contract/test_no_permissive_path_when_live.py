@@ -28,10 +28,11 @@ from tests.featuregen.api.test_contract_live_cross_catalog import (
     _governed_scoped_body,
     _inject_fixture_template,
 )
+from tests.featuregen.overlay.upload.planner.test_plan import _txn_template
 from tests.featuregen.overlay.upload.planner.test_shadow_capture import _cross_seed
 
 from featuregen.api.app import create_app
-from featuregen.api.deps import get_conn
+from featuregen.api.deps import get_conn, get_feature_gen_conn
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -48,6 +49,7 @@ def client(db, monkeypatch):
         yield db
 
     app.dependency_overrides[get_conn] = _test_conn
+    app.dependency_overrides[get_feature_gen_conn] = _test_conn   # feature-gen routes (C0) → same conn
     with TestClient(app) as c:
         yield c
 
@@ -85,6 +87,12 @@ def test_full_flag_on_cross_catalog_flow_never_invokes_permissive_path(
     _cross_seed(db)                   # ops + rev + a VERIFIED bridge → a resolvable cross-catalog plan
     _fresh_now(db, "ops", "rev")      # fresh as of the route's real wall clock
     _inject_fixture_template(monkeypatch)
+    # H3 (I-2): the confirm-time governed-plan REBUILD (revalidate_governed_plan) reads the production
+    # ALL_TEMPLATES registry; inject the planner-fixture recipe there too so the governed confirm REBUILDS
+    # + revalidates (the production path). Without it the fixture recipe is not-rebuildable and the I-2
+    # fail-closed 409s — a governed confirm must never finalize on a plan it cannot re-verify.
+    monkeypatch.setattr("featuregen.overlay.upload.contract.governed_plan.ALL_TEMPLATES",
+                        (_txn_template(),))
 
     # 1. considered-set (entity-scoped): the governed option surfaces with structured authority + the
     #    compiled plan envelope riding the response JSON (§9 item 2).

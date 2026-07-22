@@ -82,6 +82,42 @@ def test_dispatch_matches_flag():
     assert serialize_feature_idea(idea, feature_context=True) == serialize_feature_idea_v2(idea)
 
 
+def _recipe_idea() -> FeatureIdea:
+    from featuregen.overlay.upload.feature_assist import RoleBinding
+    return FeatureIdea(
+        name="balance_trend_90d", description="", derives_from=["public.accounts.balance"],
+        aggregation="trend_90d", grain_table="accounts",
+        generation_source="recipe", recipe_id="retail_churn.balance_trend",
+        candidate_status="considered",
+        input_role_bindings=(RoleBinding(role="entity", ref=("bank", "public.accounts.customer_id"),
+                                         authority="governed"),),
+        planner_applicability="not_applicable_single_catalog")
+
+
+def test_v1_never_leaks_h1a_fields_even_when_set():
+    # H1a metadata must NEVER appear in the flag-OFF (v1) response — byte-identity depends on it.
+    out = serialize_feature_idea_v1(_recipe_idea())
+    assert list(out.keys()) == _PRE_SLICE3_KEYS
+    for leaked in ("generation_source", "recipe_id", "candidate_status", "input_role_bindings",
+                   "planner_applicability", "physical_plan_id", "metadata_snapshot_id"):
+        assert leaked not in out
+
+
+def test_v2_carries_h1a_fields_only_when_non_default():
+    # A plain idea's v2 carries NO H1a keys (byte-stable); a recipe idea surfaces its server labels.
+    plain = serialize_feature_idea_v2(_idea_with_new_fields())
+    for k in ("generation_source", "recipe_id", "candidate_status", "input_role_bindings",
+              "planner_applicability", "physical_plan_id"):
+        assert k not in plain
+    recipe = serialize_feature_idea_v2(_recipe_idea())
+    assert recipe["generation_source"] == "recipe"
+    assert recipe["recipe_id"] == "retail_churn.balance_trend"
+    assert recipe["candidate_status"] == "considered"
+    assert recipe["planner_applicability"] == "not_applicable_single_catalog"
+    assert recipe["input_role_bindings"] == [
+        {"role": "entity", "authority": "governed", "ref": ["bank", "public.accounts.customer_id"]}]
+
+
 def _recommend_fake() -> FakeLLM:
     return FakeLLM(script={
         "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),

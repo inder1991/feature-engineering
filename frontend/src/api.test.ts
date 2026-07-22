@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, completeSemantics, contractConfirm, contractConsideredSet, contractDraft,
-  type ContractDraft, createIntegration, createSync, deleteIntegration, deleteSync,
-  discoverServices, type DiscoveredService, type FeatureIdea, getIntegration,
+  ApiError, type AssetDetail, completeSemantics, contractConfirm, contractConsideredSet,
+  contractDraft, type ContractDraft, createIntegration, createSync, deleteIntegration, deleteSync,
+  discoverServices, type DiscoveredService, type FeatureIdea, getAssetDetail, getIntegration,
   getSemanticsPending, getSync, importSync, type Integration, type LineageGraph, lineageGraph,
-  listContracts, listIntegrations, listSyncs, patchIntegration, patchSync, previewSync,
-  recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog, type Sync,
+  listContracts, listIntegrations, listSyncs, patchIntegration, patchSync, postFieldDecision,
+  previewSync, recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog, type Sync,
   type SyncPreview, uploadFile,
 } from './api'
 import { setSession } from './session'
@@ -756,5 +756,173 @@ describe('governed contract flow client', () => {
     await listContracts(25)
     const [url] = fetchMock.mock.calls[0]
     expect(url).toBe('/contracts?limit=25')
+  })
+})
+
+// A minimal-but-valid asset detail: every ALWAYS-present top-level field + identity, no optional
+// sections (a no-include GET would carry them, but the transport-layer contract is the same).
+const DETAIL: AssetDetail = {
+  version: 'asset-detail/v1',
+  source: 'deposits',
+  object_ref: 'public.accounts.balance',
+  kind: 'column',
+  identity: {
+    graph_ref: 'public.accounts.balance',
+    object_ref: 'public.accounts.balance',
+    logical_ref: 'deposits::public.accounts.balance',
+    source: 'deposits',
+    kind: 'column',
+    schema_name: 'public',
+    table: 'accounts',
+    column: 'balance',
+    operational_type: 'numeric',
+    declared_type: 'DECIMAL(18,2)',
+    is_grain: false,
+    is_as_of: false,
+  },
+  actions: [],
+  included_sections: ['identity'],
+  unavailable_sections: [],
+  consistency_token: 'tok-abc',
+}
+
+describe('asset detail + field-correction client (Delivery F/G)', () => {
+  it('getAssetDetail builds the {object_ref:path} URL and returns the parsed detail + the ETag header', async () => {
+    // The route sets ETag = "{consistency_token}" (quoted); getAssetDetail reads that header verbatim
+    // via requestWithResponse — the OCC token G2 revalidates against.
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify(DETAIL), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ETag: '"tok-abc"' },
+      }))
+    const { detail, etag } = await getAssetDetail('deposits', 'public.accounts.balance')
+    expect(detail).toEqual(DETAIL)
+    expect(etag).toBe('"tok-abc"')
+    const [url, init] = fetchMock.mock.calls[0]
+    // dots survive (encodeURIComponent leaves them), no include param, a plain GET.
+    expect(url).toBe('/catalog/assets/deposits/public.accounts.balance')
+    expect(init.method).toBeUndefined()
+    expect(init.headers['X-User']).toBe('ana')
+  })
+
+  it('getAssetDetail falls back to the body consistency_token when a proxy stripped the ETag header', async () => {
+    fetchMock.mockImplementation(ok(DETAIL))   // ok() sets no ETag header
+    const { etag } = await getAssetDetail('deposits', 'public.accounts.balance')
+    expect(etag).toBe('tok-abc')
+  })
+
+  it('getAssetDetail appends each include section as a repeated include= query param', async () => {
+    fetchMock.mockImplementation(ok(DETAIL))
+    await getAssetDetail('deposits', 'public.accounts.balance', ['identity', 'evidence'])
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      '/catalog/assets/deposits/public.accounts.balance?include=identity&include=evidence')
+  })
+
+  it('encodes each object_ref path segment — dots + real path slashes survive, hostile chars encoded', async () => {
+    fetchMock.mockImplementation(ok(DETAIL))
+    // `source` is a SINGLE path segment: a '/' or '%' in it is rejected at the WRITE boundary
+    // (POST /uploads, connector-sync target_source), so a slash-bearing source can never exist to
+    // reach this read — hence a plain single-segment source here. object_ref is a :path — its slash
+    // stays a separator, dots survive, and the '#' is percent-encoded per-segment (NOT the whole
+    // ref, which would double-encode the path slash to %2F and 404 the path route).
+    await getAssetDetail('cards', 'schema/accounts.balance#v2')
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe('/catalog/assets/cards/schema/accounts.balance%23v2')
+  })
+
+  it('surfaces a 404 for an unknown or read-scope-hidden asset as ApiError', async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail: 'asset not found' }), { status: 404 }))
+    await expect(getAssetDetail('deposits', 'public.x.y')).rejects.toMatchObject({
+      status: 404, detail: 'asset not found' })
+  })
+
+  it('postFieldDecision posts the snake_case body to the decisions endpoint and returns the result', async () => {
+    const result = {
+      field: 'definition', action: 'propose_override', outcome: 'proposed', replayed: false,
+      projected: false, latest_decision_id: null, evidence_set_hash: 'h2',
+      policy_version: 'fp-1', actions: ['confirm_override', 'reject'],
+    }
+    fetchMock.mockImplementation(ok(result))
+    const got = await postFieldDecision('deposits', 'public.accounts.balance', 'definition', {
+      action: 'propose_override',
+      replacementValue: 'the customer ledger balance in GBP',
+      reason: 'clearer wording',
+      idempotencyKey: 'idem-1',
+      expectedLatestDecisionId: 'dec-9',
+      expectedEvidenceSetHash: 'h1',
+      expectedPolicyVersion: 'fp-1',
+    })
+    expect(got).toEqual(result)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/catalog/assets/deposits/public.accounts.balance/fields/definition/decisions')
+    expect(init.method).toBe('POST')
+    expect(init.headers['Content-Type']).toBe('application/json')
+    // camelCase → snake_case, with the server-model defaults filled (selected_evidence_ids []).
+    expect(JSON.parse(init.body)).toEqual({
+      action: 'propose_override',
+      selected_evidence_ids: [],
+      replacement_value: 'the customer ledger balance in GBP',
+      reason: 'clearer wording',
+      idempotency_key: 'idem-1',
+      expected_latest_decision_id: 'dec-9',
+      expected_evidence_set_hash: 'h1',
+      expected_policy_version: 'fp-1',
+    })
+  })
+
+  it('postFieldDecision carries selectedEvidenceIds and a null expectedLatestDecisionId (fresh field)', async () => {
+    fetchMock.mockImplementation(ok({}))
+    await postFieldDecision('deposits', 'public.accounts.balance', 'concept', {
+      action: 'confirm_existing',
+      selectedEvidenceIds: ['ev-1', 'ev-2'],
+      idempotencyKey: 'idem-2',
+      expectedLatestDecisionId: null,
+      expectedEvidenceSetHash: 'h1',
+      expectedPolicyVersion: 'fp-1',
+    })
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body)).toEqual({
+      action: 'confirm_existing',
+      selected_evidence_ids: ['ev-1', 'ev-2'],
+      replacement_value: null,
+      reason: null,
+      idempotency_key: 'idem-2',
+      expected_latest_decision_id: null,
+      expected_evidence_set_hash: 'h1',
+      expected_policy_version: 'fp-1',
+    })
+  })
+
+  it('surfaces a CAS-conflict 409 as a catchable ApiError so the caller can reload the fresh CAS + retry', async () => {
+    const detail = 'the field changed since you loaded it (concurrent decision, evidence, or '
+      + 'policy) — refresh and retry'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 409 }))
+    const err = await postFieldDecision('deposits', 'public.accounts.balance', 'definition', {
+      action: 'confirm_existing',
+      selectedEvidenceIds: ['ev-1'],
+      idempotencyKey: 'idem-3',
+      expectedLatestDecisionId: 'stale',
+      expectedEvidenceSetHash: 'stale',
+      expectedPolicyVersion: 'fp-1',
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err).toMatchObject({ status: 409, detail })
+  })
+
+  it('surfaces a four-eyes / authz denial 403 as a catchable ApiError', async () => {
+    const detail = 'four_eyes: the confirmer is the proposer of the selected evidence'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 403 }))
+    await expect(postFieldDecision('deposits', 'public.accounts.balance', 'definition', {
+      action: 'confirm_existing',
+      selectedEvidenceIds: ['ev-1'],
+      idempotencyKey: 'idem-4',
+      expectedLatestDecisionId: 'dec-1',
+      expectedEvidenceSetHash: 'h1',
+      expectedPolicyVersion: 'fp-1',
+    })).rejects.toMatchObject({ status: 403, detail })
   })
 })

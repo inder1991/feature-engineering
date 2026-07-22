@@ -1,3 +1,5 @@
+import pytest
+
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash, enrich_concepts
@@ -146,6 +148,47 @@ def test_garbage_domain_and_definition_are_rejected(db):
     })
     assert draft_definitions(db, rows, listish) == {}     # list-stringified -> rejected
     assert classify_domains(db, rows, listish) == {}
+
+
+@pytest.mark.parametrize("echo", [
+    "overlay.enrich.domain",       # the exact 07-17 prompt-echo garbage that got durably cached
+    "overlay.enrich.concept",      # any internal task id
+    "featuregen.overlay.upload",   # a bare dotted-lowercase token shaped like a task id
+    "overlay_domain",              # the reserved overlay_ namespace
+])
+def test_prompt_echo_domain_is_rejected_and_not_cached(db, echo):
+    """07-17 bug: the model echoed its own task name and 'overlay.enrich.domain' was durably cached
+    as a business domain (stage 'succeeded'). The domain acceptor must reject a prompt/task echo or
+    an internal dotted identifier — treated as failure, so NOT cached (M3) — while domains stay
+    open-vocabulary (no controlled list)."""
+    from featuregen.overlay.upload.enrich import classify_domains
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]
+    client = FakeLLM(script={"overlay.enrich.domain": FakeResponse(output={"domain": echo})})
+    assert classify_domains(db, rows, client) == {}                                     # rejected
+    assert db.execute("SELECT count(*) FROM enrichment_domain").fetchone()[0] == 0      # NOT cached
+
+
+def test_prompt_echo_domain_is_rejected_in_single_mode(db, monkeypatch):
+    """The single-fallback path must apply the SAME plausibility gate as batch (domain defaults to
+    batch, so pin single to exercise the fallback acceptor)."""
+    monkeypatch.setenv("OVERLAY_ENRICH_DOMAIN_MODE", "single")
+    from featuregen.overlay.upload.enrich import classify_domains
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]
+    client = FakeLLM(script={"overlay.enrich.domain":
+                             FakeResponse(output={"domain": "overlay.enrich.domain"})})
+    assert classify_domains(db, rows, client) == {}
+    assert db.execute("SELECT count(*) FROM enrichment_domain").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("domain", ["banking_payments_transactions", "Compliance"])
+def test_legitimate_open_vocab_domain_is_accepted_and_cached(db, domain):
+    """Domains are open-vocabulary: a real business domain (snake_case or a plain word) is still
+    accepted and cached — only prompt/task echoes and internal identifiers are filtered out."""
+    from featuregen.overlay.upload.enrich import classify_domains
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]
+    client = FakeLLM(script={"overlay.enrich.domain": FakeResponse(output={"domain": domain})})
+    assert classify_domains(db, rows, client)["accounts"] == domain                     # accepted
+    assert db.execute("SELECT count(*) FROM enrichment_domain").fetchone()[0] == 1      # cached
 
 
 def test_concept_inputs_exclude_free_text_definition(db):

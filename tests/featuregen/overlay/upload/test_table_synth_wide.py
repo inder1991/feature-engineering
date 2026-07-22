@@ -22,6 +22,11 @@ from featuregen.overlay.upload.enrich_batch import BatchItem
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES, _item_egress_ok
 from featuregen.overlay.upload.ingest import _enrichment_outcome
 from featuregen.overlay.upload.table_synth import synthesize_tables
+from featuregen.runtime.observability import counters
+
+
+def _counter(name):
+    return counters.snapshot()["counters"].get(name, 0)
 
 
 class _RecordingLLM(FakeLLM):
@@ -138,22 +143,71 @@ def test_narrow_table_keeps_the_fast_path(db):
     assert not [r for r in client.requests if r.task == "table_synth_summary"]   # fast path
 
 
-def test_wide_missing_chunk_summary_is_honest_no_phantom(db):
-    """Phase-1 loses a chunk (chunk1 unreturned) -> the table never fully summarizes -> NO phantom
-    resolved, and phase-2 synthesis is not even attempted for it. The stage reports failed."""
+def test_wide_partial_chunk_summary_still_synthesizes(db):
+    """[enrich-fix passb-gate] Phase-1 loses ONE chunk (chunk1 unreturned) but chunk0 DID summarize.
+    The complete roster is built from ALL profiles (independent of summaries — an advisory phase-2
+    input), so phase-2 STILL runs over the full roster + whatever summaries LANDED and yields REAL
+    grain/availability dispositions. The whole 126-col table is no longer dropped to five
+    ``not_evaluated`` (the ingrun_01KY2VN3787R302JGCDM45MHW8 Pass B failure)."""
+    n = 126
+    profiles = _profiles(n)
+    cols = {f"c{i}" for i in range(n)}
+    synthesis = {"grain_columns": ["c0"], "as_of_column": "c1", "as_of_basis": "posted_at",
+                 "table_role": "fact", "primary_entity": "transaction",
+                 "event_or_snapshot": "event"}
+    client = _RecordingLLM({
+        "table_synth_summary": FakeResponse(output={"results": [
+            {"ref": "ftr#chunk0", "summary": _summary(grain_candidates=["c0"])}]}),  # chunk1 MISSING
+        "table_synth": FakeResponse(output={"results": [{"ref": "ftr", "synthesis": synthesis}]}),
+    })
+    dispositions: list[dict] = []
+    items = [BatchItem("ftr", {"table": "ftr", "column_profiles": profiles})]
+    before = _counter("overlay.table_synth.wide.partial_summaries")
+    out = synthesize_tables(db, client, items, columns_by_table={"ftr": cols}, actor=None,
+                            dispositions=dispositions)
+
+    # phase 2 WAS attempted (was: the whole table dropped) and produced the table-level synthesis
+    assert set(out) == {"ftr"}
+    assert out["ftr"]["grain"] == {"columns": ["c0"], "is_unique": True}
+    assert out["ftr"]["availability_time"] == {"column": "c1", "basis": "posted_at"}
+
+    # REAL per-field dispositions — NOT five not_evaluated
+    by_field = {d["field"]: d["status"] for d in dispositions if d["table"] == "ftr"}
+    assert by_field["grain"] == "accepted"
+    assert by_field["availability_time"] == "accepted"
+    assert "not_evaluated" not in by_field.values()
+
+    # the honesty counter fired exactly once (present<refs, present>0)
+    assert _counter("overlay.table_synth.wide.partial_summaries") == before + 1
+
+    # phase 2 = exactly ONE synthesis over the COMPLETE roster + only the LANDED summary
+    synth_reqs = [r for r in client.requests if r.task == "table_synth"]
+    assert len(synth_reqs) == 1
+    meta = _items_of(synth_reqs[0])[0]
+    assert len(meta["column_roster"]) == n            # complete roster from ALL profiles
+    assert len(meta["chunk_summaries"]) == 1          # only the chunk that landed
+    state, _reason, _detail = _enrichment_outcome(out, expected=1)
+    assert state == "succeeded"
+
+
+def test_wide_zero_chunk_summaries_is_skipped(db):
+    """[enrich-fix passb-gate] A wide table where NO chunk summarized is STILL skipped honestly —
+    no phantom resolve, no phase-2 synthesis attempted, and the zero-summary skip counter fires.
+    Zero landed summaries is the only remaining drop condition."""
     n = 126
     profiles = _profiles(n)
     cols = {f"c{i}" for i in range(n)}
     client = _RecordingLLM({
-        "table_synth_summary": FakeResponse(output={"results": [
-            {"ref": "ftr#chunk0", "summary": _summary(grain_candidates=["c0"])}]}),  # chunk1 MISSING
+        "table_synth_summary": FakeResponse(output={"results": []}),  # BOTH chunks MISSING
         "table_synth": FakeResponse(output={"results": [
             {"ref": "ftr", "synthesis": {"grain_columns": ["c0"]}}]}),
     })
     items = [BatchItem("ftr", {"table": "ftr", "column_profiles": profiles})]
+    before = _counter("overlay.table_synth.wide.zero_summaries")
     out = synthesize_tables(db, client, items, columns_by_table={"ftr": cols}, actor=None)
     assert out == {}                                        # never a phantom "resolved"
     assert not [r for r in client.requests if r.task == "table_synth"]   # no synthesis attempted
+    assert _counter("overlay.table_synth.wide.zero_summaries") == before + 1
     state, reason, _ = _enrichment_outcome(out, expected=1)
     assert state == "failed" and reason == "no_items_resolved"    # honest stage report
 

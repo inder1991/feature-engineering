@@ -21,15 +21,20 @@ def test_entity_suggest_list_and_apply(make_client, conn):
     assert lst.status_code == 200
     hit = lst.json()[0]
     assert hit["column"] == "cust_ref" and hit["suggested_entity"] == "Customer"
+    # E4: apply PROPOSES a governed entity_assignment (E1) instead of the retired legacy UPDATE.
     ap = client.post("/entity/apply",
                      json={"catalog_source": "deposits", "object_ref": hit["object_ref"]}, headers=AUTH)
-    assert ap.status_code == 200 and ap.json()["applied"] is True
-    # applied -> no longer pending; the graph now carries the entity
-    assert client.get("/entity/suggestions", params={"catalog_source": "deposits"},
-                      headers=AUTH).json() == []
+    assert ap.status_code == 200
+    body = ap.json()
+    assert body["proposed"] is True and body["fact_key"]
+    assert body["governance_status"] == "pending_confirmation"
+    # governed, not auto-applied: the suggestion stays pending and the graph is NOT written until a
+    # distinct owner/admin confirms the fact (four-eyes).
+    still = client.get("/entity/suggestions", params={"catalog_source": "deposits"}, headers=AUTH)
+    assert [h["object_ref"] for h in still.json()] == [hit["object_ref"]]
     assert conn.execute(
         "SELECT entity FROM graph_node WHERE catalog_source='deposits' AND object_ref=%s",
-        (hit["object_ref"],)).fetchone()[0] == "Customer"
+        (hit["object_ref"],)).fetchone()[0] is None
 
 
 def test_entity_apply_missing_suggestion_404(make_client, conn):

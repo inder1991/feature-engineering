@@ -26,6 +26,7 @@ from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
+from featuregen.idgen import mint_id
 from featuregen.intake.llm import (
     STATUS_FAILED,
     LLMClient,
@@ -41,6 +42,11 @@ from featuregen.intake.redaction import (
     assert_llm_safe,
     build_llm_inputs,
     redact_free_text,
+)
+from featuregen.overlay.upload.dispatch_audit import (
+    AuditingClient,
+    DispatchAuditContext,
+    link_llm_call,
 )
 from featuregen.overlay.upload.enrich_batch import (
     EGRESS,
@@ -377,7 +383,7 @@ def consume_audit_degradations() -> int:
     return n
 
 
-def _record_llm_call_durable(conn, **record_kwargs) -> None:
+def _record_llm_call_durable(conn, **record_kwargs) -> str:
     """Finding #20: by the time this runs, content has ALREADY egressed to the provider — so the
     immutable llm_call record must NOT share the upload transaction's fate (a later graph/DB
     failure in the same request would erase the evidence that data left the system). Mirror of the
@@ -395,20 +401,23 @@ def _record_llm_call_durable(conn, **record_kwargs) -> None:
     hazard, so egress-block events stay on the request conn.
 
     Best-effort fallback: if the separate connection cannot be opened/committed, the record is
-    written on the request conn — transactional evidence beats none — and the failure is logged."""
+    written on the request conn — transactional evidence beats none — and the failure is logged.
+
+    Returns the ``llm_call_ref`` of the row written (record_llm_call mints + returns it) so the
+    caller can associate the logical call to its dispatches/run (C5-T4 ``link_llm_call``)."""
     dsn = get_settings().dsn
     if dsn:
         try:
             with psycopg.connect(dsn) as audit_conn:  # own tx, committed on `with` exit
-                record_llm_call(audit_conn, **record_kwargs)
-            return
+                ref = record_llm_call(audit_conn, **record_kwargs)
+            return ref
         except Exception:  # noqa: BLE001 — degraded audit must never fail the (done) provider call
             logger.exception(
                 "durable llm_call audit write failed; falling back to the request connection")
             # #13 gap D: the degradation is COUNTED (per request context) so the enrichment stage
             # that carried this call can report audit_degraded instead of a log-only trace.
             _AUDIT_DEGRADED.set(_AUDIT_DEGRADED.get() + 1)
-    record_llm_call(conn, **record_kwargs)
+    return record_llm_call(conn, **record_kwargs)
 
 # Structural output schemas for the three enrichment tasks (single string field each).
 _SCHEMAS: dict[tuple[str, int], dict] = {
@@ -634,7 +643,9 @@ def register_enrichment_schemas(conn) -> None:
 def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                             catalog_metadata: dict, instruction: str,
                             actor: IdentityEnvelope | None = None,
-                            prompt_version: int = 1, schema_version: int = 1) -> dict | None:
+                            prompt_version: int = 1, schema_version: int = 1,
+                            dispatch_audit: DispatchAuditContext | None = None,
+                            cacheable_metadata_keys: tuple[str, ...] = ()) -> dict | None:
     """Run one governed metadata-only call and return the VALIDATED output dict, or None on any egress
     block / non-success. Attaches the registered output-schema (so a real provider does NOT fail closed),
     runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
@@ -642,7 +653,12 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
 
     ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
     v1 behavior): the resolved output-schema, the stamped request versions, and the validation all use
-    them, so a versioned enrichment call cannot silently egress under the v1 contract."""
+    them, so a versioned enrichment call cannot silently egress under the v1 contract.
+
+    ``dispatch_audit`` (C5-T3): the INGESTION call sites thread a ``DispatchAuditContext`` so every
+    PHYSICAL provider attempt (initial + each repair/retry re-call inside ``drive_structured_call``)
+    is pre-dispatch audited via the ``AuditingClient`` wrapper, fail-closed. ``None`` (contract
+    authoring / feature generation) keeps today's behavior byte-identical — no dispatch audit."""
     actor = actor or _ENRICH_ACTOR
     reg = DocumentSchemaRegistry(conn)
     schema = reg.schema_for(schema_id, schema_version)
@@ -683,7 +699,11 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
         output_schema_id=schema_id, output_schema_version=schema_version,
         generation_settings=_generation_settings(),   # from env — NOT a hard-coded fake/test
-        output_schema=schema)
+        output_schema=schema,
+        # perf (vocab-caching): the single-mode concept path (and the batch's per-item fallback) also
+        # carry the static vocabulary; mark it as the cached shared prefix so it isn't re-billed per
+        # call. Empty () (definition/domain, contract authoring, feature gen) is byte-for-byte today.
+        cacheable_metadata_keys=cacheable_metadata_keys)
 
     try:
         assert_llm_safe(req)              # §9.4 egress backstop
@@ -692,9 +712,19 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         _audit_egress_block(conn, task=task, actor=actor, reason=str(exc))
         return None                       # hard fail closed — no dispatch, no cache
 
+    # C5-T3: with an ingestion-audit context, wrap the client so EVERY physical attempt is audited
+    # BEFORE egress (fail-closed on AuditUnavailable — the provider is never called). The
+    # logical_call_ref is minted ONCE per logical call so its retry/repair attempts share it
+    # (UNIQUE(logical_call_ref, attempt_no)). With no context, the client is used untouched.
+    dispatch_client: LLMClient = client
+    auditing_client: AuditingClient | None = None
+    if dispatch_audit is not None:
+        auditing_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
+                                         redaction_version=redaction_version)
+        dispatch_client = auditing_client
     outcome = drive_structured_call(
-        client, req, lambda output: reg.validate(schema_id, schema_version, output))
-    _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
+        dispatch_client, req, lambda output: reg.validate(schema_id, schema_version, output))
+    llm_call_ref = _record_llm_call_durable(   # #20: evidence survives an upload-tx rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
         input_redaction=({"redacted_spans": spans, "sample_strip": sample_audits}
@@ -702,6 +732,23 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
         validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
+    if dispatch_audit is not None and auditing_client is not None:
+        # C5-T4 eligibility ordering: record → link → return. The llm_call is durable (above) and
+        # the dispatch/run associations commit HERE — before the output is handed back as eligible
+        # for cache/evidence. C5-T6: an outcome-audit (link) FAILURE DISCARDS the result — the
+        # provider output is not eligible for cache/evidence until the logical outcome audit
+        # committed. The pre-dispatch authorization + the immutable llm_call are already durable, so
+        # this loses convenience joins + defers the enrichment, never evidence. Scoped to the
+        # dispatch_audit-present (ingestion) path ONLY; with dispatch_audit=None this whole branch
+        # is skipped and behavior is byte-identical.
+        if not link_llm_call(llm_call_ref=llm_call_ref,
+                             dispatch_refs=auditing_client.dispatch_refs,
+                             ingestion_run_id=dispatch_audit.ingestion_run_id,
+                             stage=dispatch_audit.stage):
+            logger.warning("enrichment call %s (schema %s) audit-degraded: the logical outcome "
+                           "audit did not commit — discarding the enrichment result", task,
+                           schema_id)
+            return None                   # discard — not eligible for cache/evidence
 
     if outcome.status == STATUS_FAILED:
         logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
@@ -713,14 +760,19 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
 def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                         catalog_metadata: dict, out_key: str, instruction: str,
                         actor: IdentityEnvelope | None = None,
-                        prompt_version: int = 1, schema_version: int = 1) -> str | None:
+                        prompt_version: int = 1, schema_version: int = 1,
+                        dispatch_audit: DispatchAuditContext | None = None,
+                        cacheable_metadata_keys: tuple[str, ...] = ()) -> str | None:
     """Single-string convenience over `audited_structured_call`: returns the trimmed `out_key` field, or
     None on any egress block / non-success / empty output (so the caller never caches a failure).
-    ``prompt_version``/``schema_version`` (default ``1``) thread straight to the structured seam."""
+    ``prompt_version``/``schema_version`` (default ``1``) thread straight to the structured seam.
+    ``dispatch_audit`` (C5-T5) threads straight through too, so an INGESTION single/fallback call
+    pre-dispatch audits every physical attempt; ``None`` (the default) is byte-identical to today."""
     out = audited_structured_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
         catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
-        prompt_version=prompt_version, schema_version=schema_version)
+        prompt_version=prompt_version, schema_version=schema_version,
+        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys)
     if not out:
         return None
     val = str(out.get(out_key, "")).strip()
@@ -937,13 +989,23 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                        shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
                        accept, actor: IdentityEnvelope | None = None,
                        extract=None, ref_aware: bool = False,
-                       prompt_version: int = 1, schema_version: int = 1) -> BatchCallResult:
+                       prompt_version: int = 1, schema_version: int = 1,
+                       dispatch_audit: DispatchAuditContext | None = None) -> BatchCallResult:
     """One GOVERNED batch call (spec C4/C9): per-item egress filter -> batch-level egress guard ->
     schema-validated array call -> one immutable llm_call with a per-item outcome summary. Returns a
     BatchCallResult whose outcomes classify every requested ref (via validate_batch_results).
 
     ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
-    v1 behavior): output-schema resolution, the stamped request versions, and validation all use them."""
+    v1 behavior): output-schema resolution, the stamped request versions, and validation all use them.
+
+    ``dispatch_audit`` (C5-T5): the INGESTION batch call sites thread a ``DispatchAuditContext`` so
+    every PHYSICAL provider attempt is pre-dispatch audited (fail-closed) and the recorded llm_call
+    is linked back to its dispatches + run — the same C5-T3/T4 wiring ``audited_structured_call``
+    carries (this seam drives the provider itself, so it cannot delegate there). The context's
+    ``subjects`` describe the items SUBMITTED to this call; an item the per-item egress gate excludes
+    is still listed — over-attribution is the conservative direction (an auditor sees every object
+    the caller intended the dispatch to be about; nothing that egressed is ever missing). ``None``
+    (non-ingestion callers) keeps today's behavior byte-identical — no dispatch audit."""
     actor = actor or _ENRICH_ACTOR
     # [F7] SHAPE gate only pre-redaction: an item with a forbidden key / wrong structure never
     # reaches the sanitizer, but a merely-long definition is NOT excluded here — sanitization may
@@ -1001,7 +1063,13 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                               raw_input_classification="contains_pii" if all_spans else "clean")
     req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
                      output_schema_id=schema_id, output_schema_version=schema_version,
-                     generation_settings=_generation_settings(), output_schema=schema)
+                     generation_settings=_generation_settings(), output_schema=schema,
+                     # perf (vocab-caching): the shared_metadata keys (the ~276-concept classification
+                     # vocabulary) are a STATIC prefix identical across every chunk — mark them so the
+                     # adapter sends the block ONCE under cache_control and chunks 2..N reuse it,
+                     # instead of re-billing ~23K input tokens per chunk. Empty shared_metadata
+                     # (definition/domain) -> () -> byte-for-byte today.
+                     cacheable_metadata_keys=tuple(shared_metadata))
 
     try:
         assert_llm_safe(req)                      # batch-level egress backstop (spec C9)
@@ -1012,7 +1080,17 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                                          extract=extract, ref_aware=ref_aware)
         return BatchCallResult(tuple(egress_outcomes) + tuple(missing), 0, 0, 0)
 
-    outcome = drive_structured_call(client, req,
+    # C5-T5: with an ingestion-audit context, wrap the client so EVERY physical batch attempt is
+    # audited BEFORE egress (fail-closed on AuditUnavailable — the provider is never called),
+    # exactly like audited_structured_call's seam. The logical_call_ref is minted ONCE per batch
+    # call so its retry/repair attempts share it (UNIQUE(logical_call_ref, attempt_no)).
+    dispatch_client: LLMClient = client
+    auditing_client: AuditingClient | None = None
+    if dispatch_audit is not None:
+        auditing_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
+                                         redaction_version=redaction_version)
+        dispatch_client = auditing_client
+    outcome = drive_structured_call(dispatch_client, req,
                                     lambda o: reg.validate(schema_id, schema_version, o))
     # A repair-exhausted / truncated batch (STATUS_FAILED) carries an UNVERIFIED body — do not harvest
     # it. Treat it as empty so validate_batch_results marks every requested ref MISSING and the
@@ -1027,7 +1105,7 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     summary = {"requested": [it.ref for it in included],
                "outcomes": {o.ref: o.status for o in item_outcomes}}
     cost = dict(outcome.cost_metadata or {})
-    _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
+    llm_call_ref = _record_llm_call_durable(   # #20: evidence survives an upload-tx rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
         input_redaction=({"redacted_spans": all_spans, "sample_strip": all_sample_audits}
@@ -1037,6 +1115,27 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
         validation_result=outcome.validation_result,
         repair_attempts=list(outcome.repair_attempts), latency_ms=None,
         cost_metadata={**cost, "batch": summary}, created_by=identity_to_jsonb(actor))
+    if dispatch_audit is not None and auditing_client is not None:
+        # C5-T4 eligibility ordering (mirrors audited_structured_call): record → link → return.
+        # C5-T6: an outcome-audit (link) FAILURE DISCARDS the result — mark every INCLUDED ref
+        # MISSING so nothing is harvested/cached (the same all-MISSING discard the STATUS_FAILED
+        # path above uses), leaving the fallback ladder to recover it. The pre-dispatch
+        # authorization + the immutable llm_call are already durable; only the convenience linkage
+        # failed. Scoped to the dispatch_audit-present (ingestion) path ONLY; with
+        # dispatch_audit=None this branch is skipped and behavior is byte-identical.
+        if not link_llm_call(llm_call_ref=llm_call_ref,
+                             dispatch_refs=auditing_client.dispatch_refs,
+                             ingestion_run_id=dispatch_audit.ingestion_run_id,
+                             stage=dispatch_audit.stage):
+            logger.warning("batch %s (schema %s) audit-degraded: the logical outcome audit did not "
+                           "commit — discarding the enrichment result", task, schema_id)
+            discarded = validate_batch_results(included, [], out_key, accept,
+                                               extract=extract, ref_aware=ref_aware)
+            return BatchCallResult(
+                outcomes=tuple(egress_outcomes) + tuple(discarded),
+                provider_calls=outcome.provider_calls,
+                input_tokens=int(cost.get("input_tokens", 0)),
+                output_tokens=int(cost.get("output_tokens", 0)))
 
     return BatchCallResult(
         outcomes=tuple(egress_outcomes) + tuple(item_outcomes),

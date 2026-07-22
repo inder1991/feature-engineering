@@ -37,7 +37,9 @@ CONFIRMER = {"X-User": "priya", "X-Roles": "platform-admin"}   # require_confirm
 # the response header ("never a body field") — so it must NOT appear in this set.
 INGEST_RESULT_KEYS = {"status", "reason", "asserted", "changed_objects", "quarantined", "flagged",
                       "objects_stored", "tables", "columns", "containment_edges", "facts_asserted",
-                      "join_candidates", "passb_proposed", "passb_abstained"}
+                      "join_candidates", "passb_proposed", "passb_abstained",
+                      "semantic_binding_candidates", "semantic_binding_proposed",
+                      "semantic_binding_abstained", "semantic_binding_failed"}
 
 # IngestionRun (api.ts): the fields the client reads off GET /ingestion-runs/{id}. Keyed `id` —
 # NOT `run_id` — the exact contract the #15 bug violated.
@@ -50,7 +52,9 @@ INGESTION_RUN_TS_KEYS = {
 # fail here and force a deliberate lockstep look at api.ts.
 INGESTION_RUN_WIRE_KEYS = INGESTION_RUN_TS_KEYS | {
     "file_sha256", "pre_source_fingerprint", "post_source_fingerprint",
-    "fingerprint_algo_version", "effective_config", "heartbeat_at", "objects", "facts"}
+    "fingerprint_algo_version", "effective_config", "heartbeat_at", "objects", "facts",
+    # Delivery B item 9 (source-profile provenance): wire-only until the client reads them
+    "source_type", "profile_version"}
 # IngestionStage (api.ts)
 INGESTION_STAGE_KEYS = {"stage", "attempt", "state", "reason_code", "detail",
                         "started_at", "completed_at"}

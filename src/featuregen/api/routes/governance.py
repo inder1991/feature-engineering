@@ -54,6 +54,17 @@ from featuregen.overlay.upload.join_governance import (
     project_verified_join,
     read_join_approvals,
 )
+from featuregen.overlay.upload.semantic_binding_governance import (
+    SemanticBindingGovernanceNotFound,
+    correct_binding,
+    list_semantic_binding_proposals,
+    load_semantic_binding_confirmation_context,
+    request_reverify,
+    withdraw_binding,
+)
+from featuregen.overlay.upload.semantic_bindings.projection import (
+    project_verified_semantic_binding,
+)
 from featuregen.overlay.upload.table_fact_governance import (
     TableFactGovernanceNotFound,
     list_open_table_fact_proposals_governance,
@@ -84,6 +95,33 @@ class ConfirmTableFactRequest(BaseModel):
 class RejectTableFactRequest(BaseModel):
     category: Literal["wrong_grain_columns", "wrong_as_of_column", "not_unique",
                       "needs_data_check"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ConfirmSemanticBindingRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class RejectSemanticBindingRequest(BaseModel):
+    category: Literal["wrong_entity", "wrong_currency_column", "not_a_binding", "needs_data_check"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ReverifySemanticBindingRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class WithdrawSemanticBindingRequest(BaseModel):
+    category: Literal["no_longer_valid", "wrong_binding", "superseded", "needs_data_check"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class CorrectSemanticBindingRequest(BaseModel):
+    # The corrected binding value: {"entity_id": <known entity>} for an entity_assignment, or
+    # {"currency_column": {catalog_source, object_kind, schema, table, column}} for a
+    # currency_binding. Shape is VALIDATED by the E1 write gate inside correct_binding
+    # (fail-closed) — a bad value touches nothing.
+    value: dict
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -273,3 +311,153 @@ def reject_table_fact(fact_key: str, body: RejectTableFactRequest, conn: _Conn,
         return JSONResponse(status_code=409,
                             content={"detail": _deny_to_detail(result.denied_reason)})
     return {"governance_status": "REJECTED", "category": body.category}
+
+
+# ══════════════ Semantic-binding routes (Delivery E, Task E2 — owner-or-admin four-eyes) ══════════
+# The governed entity_assignment / currency_binding facts D2 proposes + E3 projects. Mirrors the
+# join + table-fact surfaces (require_confirmer, idempotency_key, target-event CAS, _deny_audited,
+# return-the-409), with two additions: the GET lists BOTH pending AND VERIFIED bindings (so the
+# asset UI can offer reverify/withdraw/correct), and the three VERIFIED-binding actions reuse the
+# overlay's own expiry/reverify transition + reject_fact/propose_fact — never hand-writing fact
+# state. Owner-or-admin authority (E1) is enforced inside confirm_fact/reject_fact and re-checked in
+# the reverify/withdraw/correct service; the route claim gate stays require_confirmer (like peers).
+
+
+def _load_semantic_binding_context_or_404(conn: psycopg.Connection, fact_key: str,
+                                          roles) -> dict:
+    """The fact_type-VALIDATED + READ-SCOPED context bridge: a fact_key that is not a loadable
+    entity_assignment/currency_binding proposal — OR one whose subject/currency-target column is
+    sensitivity-hidden from the caller's ``roles`` (audit finding [1]) — 404s BEFORE any command
+    dispatch, so this surface can never approve a join/grain/policy fact NOR mutate a governed
+    binding on a column the read-scoped F0/F3 peers deny the same caller."""
+    ensure_upload_catalog_adapter()
+    try:
+        return load_semantic_binding_confirmation_context(conn, fact_key, roles=roles)
+    except SemanticBindingGovernanceNotFound:
+        raise HTTPException(status_code=404,
+                            detail="No such semantic-binding proposal.") from None
+
+
+@router.get("/sources/{source}/governance/semantic-bindings",
+            dependencies=[Depends(require_confirmer)])
+def list_semantic_bindings(source: str, conn: _Conn, identity: _Identity,
+                           limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    ensure_upload_catalog_adapter()
+    # READ-SCOPED (finding [1]): the caller's role_claims drop any binding on a sensitivity-hidden
+    # subject/currency-target column, so a platform-admin without pii_reader gets no existence oracle.
+    proposals = list_semantic_binding_proposals(
+        conn, source, limit=limit, roles=identity.role_claims)
+    return {"source": source.strip().lower(), "proposals": proposals, "next_cursor": None}
+
+
+@router.post("/governance/semantic-bindings/{fact_key}/confirm",
+             dependencies=[Depends(require_confirmer)])
+def confirm_semantic_binding(fact_key: str, body: ConfirmSemanticBindingRequest, conn: _Conn,
+                             identity: _Identity) -> dict:
+    """Confirm a DRAFT (or re-affirm a REVERIFY/STALE) governed semantic binding → VERIFIED via
+    E1's confirm_fact (which triggers E3's projection). SINGLE authorized confirmer (owner-or-admin,
+    E1), four-eyes preserved: the proposer (the D2 service candidate, or the correcting human) can
+    never be the confirmer. Reports the operational projection honestly ("projected"/"pending")."""
+    ctx = _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
+    cmd = Command(
+        action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "note": _clean(body.note)},
+        actor=identity, idempotency_key=f"confirm:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = confirm_fact(conn, cmd)
+    if not result.accepted:
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row and
+        # releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
+    status = fold_overlay_state(load_fact(conn, fact_key)).status
+    projection = "not_applicable"
+    if status == "VERIFIED":
+        # The confirm just VERIFIED the binding — make it operational NOW (drain-then-project,
+        # idempotent + fail-soft; confirm_fact already projected internally, this reports honestly).
+        projection = project_verified_semantic_binding(
+            conn, ctx["ref"].catalog_source, ctx["ref"], ctx["fact_type"], now=None)
+    return {"governance_status": status, "operational_projection": projection}
+
+
+@router.post("/governance/semantic-bindings/{fact_key}/reject",
+             dependencies=[Depends(require_confirmer)])
+def reject_semantic_binding(fact_key: str, body: RejectSemanticBindingRequest, conn: _Conn,
+                            identity: _Identity) -> dict:
+    ctx = _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
+    # `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics key);
+    # `reason` carries ONLY the free-text note (or None) — same shape as the join/table-fact reject.
+    cmd = Command(
+        action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "reason": _clean(body.note),
+              "category": body.category},
+        actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = reject_fact(conn, cmd)
+    if not result.accepted:
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
+    # A pre-VERIFIED reject has no projection (no-op); a REVERIFY/STALE reject demotes (E3).
+    return {"governance_status": "REJECTED", "category": body.category,
+            "operational_projection": "demoted"}
+
+
+@router.post("/governance/semantic-bindings/{fact_key}/reverify",
+             dependencies=[Depends(require_confirmer)])
+def reverify_semantic_binding(fact_key: str, body: ReverifySemanticBindingRequest, conn: _Conn,
+                              identity: _Identity) -> dict:
+    """Reopen a fresh re-verification cycle on a VERIFIED binding (VERIFIED → REVERIFY), demoting
+    the projection until an authorized human re-confirms via the confirm route. Reuses the overlay's
+    own expiry/reverify transition — never hand-writes fact state. Four-eyes on the re-confirm is the
+    platform ``proposer ≠ confirmer`` rule ONLY (reverify does not re-propose, so the requester/original
+    confirmer may re-confirm); use the correct route to force a genuinely distinct human."""
+    del body  # a bounded reviewer note field is accepted for surface symmetry; not persisted here
+    _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)  # 404 opaque before any state change
+    result = request_reverify(conn, fact_key=fact_key, actor=identity)
+    if not result["accepted"]:
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result["denied_reason"])})
+    return {"governance_status": result["governance_status"],
+            "operational_projection": result["operational_projection"]}
+
+
+@router.post("/governance/semantic-bindings/{fact_key}/withdraw",
+             dependencies=[Depends(require_confirmer)])
+def withdraw_semantic_binding(fact_key: str, body: WithdrawSemanticBindingRequest, conn: _Conn,
+                              identity: _Identity) -> dict:
+    """Retire a VERIFIED binding → REJECTED + demote (restore the file entity / demote the currency
+    edge). Dispatches through the overlay reject_fact after the sanctioned reverify reopen."""
+    _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
+    result = withdraw_binding(conn, fact_key=fact_key, actor=identity,
+                              category=body.category, note=_clean(body.note))
+    if not result["accepted"]:
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result["denied_reason"])})
+    return {"governance_status": "REJECTED", "category": body.category,
+            "operational_projection": result["operational_projection"]}
+
+
+@router.post("/governance/semantic-bindings/{fact_key}/correct",
+             dependencies=[Depends(require_confirmer)])
+def correct_semantic_binding(fact_key: str, body: CorrectSemanticBindingRequest, conn: _Conn,
+                             identity: _Identity) -> dict:
+    """Correct a VERIFIED binding: retire the prior value and open a NEW proposal for the corrected
+    value — requiring a DIFFERENT authorized human to confirm (four-eyes: the correcting human is
+    the proposer). The corrected value is validated against the E1 write gate before any retire."""
+    _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
+    result = correct_binding(conn, fact_key=fact_key, actor=identity,
+                             value=body.value, note=_clean(body.note))
+    if not result["accepted"]:
+        if result.get("rollback_required"):
+            # The corrected value passed the write gate but the re-proposal was denied (e.g. a
+            # sticky fingerprint) AFTER the prior value was retired — RAISE so get_conn rolls the
+            # retire back and the binding is left unharmed (atomic correct).
+            raise HTTPException(status_code=409, detail=_deny_to_detail(result["denied_reason"]))
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result["denied_reason"])})
+    return {"governance_status": "PROPOSED", "fact_key": result["fact_key"],
+            "proposed_event_id": result["proposed_event_id"],
+            "requires_distinct_confirmer": True,
+            "operational_projection": result["operational_projection"]}

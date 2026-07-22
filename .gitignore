@@ -21,3 +21,4 @@ build/
 
 # local worktrees (frontend session, etc.)
 .claude/worktrees/
+deploy/kind/.llm-key

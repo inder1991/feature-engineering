@@ -304,6 +304,21 @@ def test_sync_target_source_required(client):
     assert _create_sync(client, iid, target_source="  ").status_code == 400
 
 
+def test_sync_target_source_slash_or_percent_rejected_400(client):
+    """G-I-2: target_source IS the catalog source, one path segment across the whole API — a '/' or
+    '%' would (percent-)decode across the {source}/... routes and feed a DIFFERENT catalog. Reject
+    it at the connector WRITE boundary (create AND patch), the same rule POST /uploads applies."""
+    iid, sid = _configured_sync(client)
+    for bad in ("cards/legacy", "cards%2Flegacy"):
+        created = _create_sync(client, iid, service_name="svc_bad", target_source=bad)
+        assert created.status_code == 400
+        assert "single path segment" in created.json()["detail"]
+        patched = client.patch(f"/integrations/{iid}/syncs/{sid}",
+                               json={"target_source": bad}, headers=OWNER)
+        assert patched.status_code == 400
+        assert "single path segment" in patched.json()["detail"]
+
+
 def test_sync_ids_stripped_before_store(client):
     """#16: service/source ids are stripped BEFORE they are stored — ' cards ' and 'cards' must be
     ONE catalog, and a padded service name must occupy the same one-sync-per-service slot."""
@@ -674,6 +689,23 @@ def test_import_records_ingested_connector_run_linked_from_import_row(client, co
     assert conn.execute(
         "SELECT ingestion_run_id FROM integration_import WHERE import_id = %s",
         (res.json()["import_id"],)).fetchone()[0] == run_id
+
+
+def test_import_records_connector_source_profile_provenance(client):
+    """M-3 / migration 1004 traceability: the connector's glossary=None path writes SOURCE/ATTESTED
+    technical evidence, so its run must record which capability profile governed it —
+    source_type='connector' + the profile version, never NULL (pre-fix, both were NULL because
+    open_run/terminalize_run were called without them)."""
+    from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
+
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 200
+
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert run["source_type"] == "connector"
+    assert run["profile_version"] == SOURCE_CAPABILITY_PROFILE_VERSION
 
 
 def test_import_response_body_unchanged_run_id_rides_the_header_only(client):

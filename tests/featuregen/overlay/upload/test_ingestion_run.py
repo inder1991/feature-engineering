@@ -25,6 +25,7 @@ from featuregen.overlay.upload.ingestion_run import (
     terminalize_run,
     terminalize_run_durable,
 )
+from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
 
 _NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 _LATER = _NOW + timedelta(seconds=30)
@@ -240,6 +241,46 @@ def test_reconcile_is_idempotent(db, no_dsn) -> None:
         ["in_progress", "abandoned"]
 
 
+# ── source-profile provenance (Delivery B item 9) ─────────────────────────────────────────────────
+
+
+def test_open_run_records_source_profile_when_known(db, no_dsn) -> None:
+    """A caller that already knows its capability profile at open records it there; the default
+    (the upload route, which opens BEFORE parse) honestly leaves both NULL — never fabricated."""
+    run_id = _open(db, source_type="ftr_glossary",
+                   profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
+    run = get_run(db, run_id)
+    assert run["source_type"] == "ftr_glossary"
+    assert run["profile_version"] == SOURCE_CAPABILITY_PROFILE_VERSION
+    unknown = get_run(db, _open(db))
+    assert unknown["source_type"] is None and unknown["profile_version"] is None
+
+
+def test_terminalize_records_source_profile_for_a_technical_upload(db, no_dsn) -> None:
+    """The upload route's shape: the run opens before parse (profile unknown at open), and
+    terminalize lands the selected profile on the manifest row."""
+    run_id = _open(db)
+    assert get_run(db, run_id)["source_type"] is None
+    assert terminalize_run(db, run_id, status="ingested", now=_LATER, row_count=9,
+                           source_type="technical_csv",
+                           profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
+    run = get_run(db, run_id)
+    assert run["source_type"] == "technical_csv"
+    assert run["profile_version"] == SOURCE_CAPABILITY_PROFILE_VERSION
+
+
+def test_terminalize_without_profile_never_blanks_open_recorded_values(db, no_dsn) -> None:
+    """Fill-only COALESCE: a terminalize that does NOT know the profile (here the abandon sweep)
+    must never blank a value recorded at open — write-once, not last-writer-wins."""
+    run_id = _open(db, now=_NOW - timedelta(hours=2), source_type="technical_csv",
+                   profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
+    assert reconcile_ingestion_runs(db, now=_NOW, lease_timeout=_LEASE) == 1
+    run = get_run(db, run_id)
+    assert run["status"] == "abandoned"
+    assert run["source_type"] == "technical_csv"
+    assert run["profile_version"] == SOURCE_CAPABILITY_PROFILE_VERSION
+
+
 # ── effective config snapshot ─────────────────────────────────────────────────────────────────────
 
 
@@ -256,6 +297,8 @@ def test_effective_config_snapshot_is_allowlisted(monkeypatch) -> None:
         "governed_joins": True,   # OVERLAY_PASS_C implies the governed joins_to seam
         "pass_c": True,
         "table_synth": False,
+        "semantic_binding_candidates": False,
+        "semantic_binding_proposals": False,
         "llm_provider": "anthropic",
         "llm_model": "claude-sonnet-5",
     }

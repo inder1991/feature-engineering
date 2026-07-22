@@ -31,7 +31,11 @@ def test_glossary_upload_proposes_then_confirms_grain(overlay_conn, human_actor,
     assert any(x.status == "proposed" and "grain" in x.requirement_id
                for x in rd.review_requirements)
 
-    _confirm_grain(overlay_conn, "src", "txn", ["txn_id"], actor=human_actor)  # human confirms
+    # SOURCE-provenance four-eyes (program-audit F2/F10): the UPLOADING admin may not confirm the
+    # grain their own upload shaped — a DIFFERENT platform-admin human confirms.
+    from tests.featuregen._helpers import mint_test_identity
+    second_admin = mint_test_identity(subject="user:admin-2", role_claims=("platform-admin",))
+    _confirm_grain(overlay_conn, "src", "txn", ["txn_id"], actor=second_admin)
 
     # re-ingest projects the confirmed grain load-bearing onto graph_node
     ingest_upload(overlay_conn, "src", glossary_rows.rows, actor=human_actor,

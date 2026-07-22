@@ -130,10 +130,16 @@ def complete_semantics(conn, catalog_source: str, object_ref: str, *,
     provided = {name: value for name, value in (
         ("additivity", additivity), ("unit", unit), ("currency", currency),
         ("entity", entity), ("is_as_of", is_as_of)) if value is not None}
+    # READ-SCOPE (audit finding [7]): resolve the node UNDER the actor's sensitivity scope, the SAME
+    # filter list_semantics_pending applies. A column whose sensitivity the caller can't see is
+    # INDISTINGUISHABLE from a missing one (both -> None -> the route 404s), so a data_owner without
+    # pii_reader can neither confirm a hidden pii column's existence nor WRITE to it — closing the
+    # unscoped-write existence-oracle the read-scoped F0/F3 peers already deny.
     node = conn.execute(
         "SELECT object_ref, table_name FROM graph_node WHERE catalog_source = %s "
-        "AND lower(object_ref) = lower(%s) AND kind = 'column'",
-        (catalog_source, object_ref)).fetchone()
+        "AND lower(object_ref) = lower(%s) AND kind = 'column' "
+        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        (catalog_source, object_ref, allowed_sensitivities(actor.role_claims))).fetchone()
     if node is None:
         return None
     ref, table = node

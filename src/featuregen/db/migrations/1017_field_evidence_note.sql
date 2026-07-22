@@ -1,0 +1,13 @@
+-- 1017_field_evidence_note.sql — persist the reviewer's free-text rationale on a field correction.
+--
+-- Delivery F review M-9: the field-correction command (POST .../fields/{field}/decisions) accepts a
+-- 2000-char ``reason`` note, but ``apply_field_correction`` used to ``del note`` ("no column") — the
+-- reviewer's rationale was accepted and silently dropped. Every correction action (propose_override /
+-- confirm_override / confirm_existing / reject) APPENDS exactly one immutable HUMAN ``field_evidence``
+-- row for the human's action, so that row is the uniform, append-only home for the note — no threading
+-- through the resolver, and no decision-log change. This adds a nullable ``note`` column there.
+--
+-- Additive + idempotent (ADD COLUMN IF NOT EXISTS); nullable, so every prior row and every non-human
+-- producer (source / parser / llm / taxonomy — which never carry a reviewer note) reads NULL. No
+-- backfill, no data change to existing rows.
+ALTER TABLE field_evidence ADD COLUMN IF NOT EXISTS note text;

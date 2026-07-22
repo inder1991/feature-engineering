@@ -35,6 +35,11 @@ class PlanEnvelopeV1:
     catalog_fingerprint: dict[str, str]
     compiler_version: dict[str, str]
     input_stamps: tuple[dict[str, Any], ...]   # serialized CatalogStateStampV1 set (the freshness source)
+    # H3c — the grain the governed plan planned toward. Carried so the confirm-time revalidation can
+    # REBUILD the exact plan (``plan_bindings`` needs the target grain) and reproduce the SAME
+    # physical_plan_id / declaration id. Additive (default None): it is NOT part of any id material,
+    # so it never moves an id; pre-H3c snapshots deserialize to None (behaviour-neutral).
+    target_entity: str | None = None
 
     def to_json(self) -> dict:
         return {
@@ -45,7 +50,8 @@ class PlanEnvelopeV1:
             "contract_reason_codes": list(self.contract_reason_codes),
             "catalog_fingerprint": dict(self.catalog_fingerprint),
             "compiler_version": dict(self.compiler_version),
-            "input_stamps": [dict(s) for s in self.input_stamps]}
+            "input_stamps": [dict(s) for s in self.input_stamps],
+            "target_entity": self.target_entity}
 
     @staticmethod
     def from_json(d: dict) -> PlanEnvelopeV1:
@@ -58,7 +64,8 @@ class PlanEnvelopeV1:
             contract_reason_codes=tuple(d.get("contract_reason_codes", [])),
             catalog_fingerprint=dict(d.get("catalog_fingerprint", {})),
             compiler_version=dict(d.get("compiler_version", {})),
-            input_stamps=tuple(dict(s) for s in d.get("input_stamps", [])))
+            input_stamps=tuple(dict(s) for s in d.get("input_stamps", [])),
+            target_entity=d.get("target_entity"))
 
 
 def _ordered_path(plan: BindingPlanV1) -> tuple[str, ...]:
@@ -87,7 +94,8 @@ def plan_envelope_from_result(result: BindingPlanningResultV1) -> PlanEnvelopeV1
         input_stamps=tuple({"catalog_source": s.catalog_source,
                             "compiler_input_fingerprint": s.compiler_input_fingerprint,
                             "head_seq": s.head_seq, "projection_checkpoint": s.projection_checkpoint}
-                           for s in stamps))
+                           for s in stamps),
+        target_entity=result.target_entity)   # H3c: the grain the confirm-time rebuild plans toward
 
 
 def recheck_plan_freshness(conn, envelope: PlanEnvelopeV1,

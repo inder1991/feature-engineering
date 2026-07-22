@@ -27,10 +27,15 @@ from featuregen.overlay.authority import (
     _actor_is_authority,
     proposer_ne_confirmer,
     resolve_authority,
+    uploader_ne_confirmer,
 )
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.config import current_overlay_config
-from featuregen.overlay.expiry import demote_projected_join_edges, schedule_expiry
+from featuregen.overlay.expiry import (
+    demote_projected_join_edges,
+    demote_projected_semantic_binding,
+    schedule_expiry,
+)
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
@@ -106,6 +111,17 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return _deny_audited(
             conn, cmd, key, "four-eyes: a proposer may not confirm the same fact"
         )
+    # Program-audit F2/F10 (the M-7 SOURCE-provenance standard): a service-proposed fact whose
+    # value was AUTHORED by the uploading human (recorded as `source_uploader` on the proposal —
+    # semantic bindings + Pass B grain/availability) may not be confirmed by that same human.
+    # `proposed_by` is the service actor, so the check above cannot see them; this one does. Any
+    # OTHER authorized human single-confirms exactly as before (two distinct humans, not dual).
+    if not uploader_ne_confirmer(stream, cmd.actor):
+        return _deny_audited(
+            conn, cmd, key,
+            "four-eyes: the uploading principal who declared this value may not confirm it; "
+            "a different reviewer must confirm",
+        )
     proposed = _latest_proposed(stream)
     # The confirmer may override the value on a REVERIFY/STALE correction. Validate the FINAL value
     # (override or original) BEFORE appending OVERLAY_FACT_CONFIRMED so a malformed
@@ -119,6 +135,17 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         default_value = state.prior_value
     else:
         default_value = proposed.payload["proposed_value"]
+    # E1/E2 four-eyes (D+E review I-F): a governed SEMANTIC binding value must change only through the
+    # propose→(distinct)confirm flow (correct_binding). An explicit `args["value"]` override here would
+    # let ONE authorized human author AND approve a new value in a single command on a REVERIFY/STALE
+    # binding — exactly the single-party authorship `enter_fact` already denies for these types. Deny
+    # the override (defense-in-depth; no route exposes it today). A no-override confirm re-affirms the
+    # prior/proposed value below.
+    if fact_type in ("entity_assignment", "currency_binding") and "value" in args:
+        return _deny_audited(
+            conn, cmd, key,
+            "value override denied on a semantic-binding confirm: a value change must go through "
+            "propose→confirm (correct_binding), never single-party author+approve")
     value = args.get("value", default_value)
     try:
         validate_fact_value(fact_type, value, use_case=use_case)
@@ -184,6 +211,16 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # Arm the SP-0 overlay_expiry timer on this fact-key stream.
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
+    if fact_type in ("entity_assignment", "currency_binding"):
+        # E3: the confirm just reached VERIFIED — make the governed semantic binding operational
+        # SYNCHRONOUSLY (drain-then-project, fail-soft; "pending" defers to the next caught-up
+        # reproject). A reverify/renewal re-confirm re-projects the reaffirmed value too. Lazy import
+        # across the overlay/upload boundary (mirrors the reject/expiry demote hooks).
+        from featuregen.overlay.upload.semantic_bindings.projection import (
+            project_verified_semantic_binding,
+        )
+
+        project_verified_semantic_binding(conn, ref.catalog_source, ref, fact_type, now=None)
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 
 
@@ -253,6 +290,10 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         # Async demotion hook (Phase 3A Task 8): a pre-VERIFIED reject has no projected edge (the
         # UPDATE matches nothing); a REVERIFY/STALE reject re-stamps the demoted edge REJECTED.
         demote_projected_join_edges(conn, key, "REJECTED")
+    elif fact_type in ("entity_assignment", "currency_binding"):
+        # E3: a pre-VERIFIED reject has no projection (no-op); a REVERIFY/STALE reject demotes the
+        # governed semantic binding (restore the file entity / demote the currency edge).
+        demote_projected_semantic_binding(conn, key, fact_type, "REJECTED")
     _close_fact_tasks(conn, key, reason="fact rejected")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))
 
@@ -281,6 +322,15 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     if join_err is not None:
         return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
     key = fact_key(ref, fact_type, use_case)
+    # Delivery E four-eyes (E1): a governed semantic fact may NOT be single-party self-confirmed —
+    # one principal must not both propose AND approve the same value. enter_fact is the audited
+    # single-party exception to four-eyes; deny it here so these types always take the two-party
+    # propose->confirm flow (service/LLM proposer + a DISTINCT human confirmer).
+    if fact_type in ("entity_assignment", "currency_binding"):
+        return _deny_audited(
+            conn, cmd, key,
+            "governed semantic fact requires the two-party propose/confirm flow (four-eyes)",
+        )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     # Direct self-confirm is restricted to OWNER-KNOWN facts (§3.4): there is no platform-admin
     # enter_fact authz row (only data_owner/compliance), so an unowned fact — which resolves to the

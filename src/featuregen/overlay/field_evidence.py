@@ -99,6 +99,7 @@ def record_field_evidence(
     evidence_spans: Sequence[str] = (),
     confidence_band: str | None = None,
     lifecycle: EvidenceLifecycle | str = EvidenceLifecycle.ACTIVE,
+    note: str | None = None,
 ) -> str:
     """Record one immutable per-field proposal (spec §5.1) and return its ``fev_`` evidence_id.
 
@@ -107,7 +108,9 @@ def record_field_evidence(
     ``proposed_value`` is stored verbatim as jsonb and ``proposed_value_hash`` is its order-
     independent :func:`canonical_hash`. ``producer`` / ``strength`` / ``lifecycle`` accept either the
     Phase-0 enum or its string value — each is validated and normalized to its ``.value`` on the way
-    in. ``evidence_spans`` persists as a jsonb list and round-trips as a tuple on read."""
+    in. ``evidence_spans`` persists as a jsonb list and round-trips as a tuple on read. ``note`` (F
+    review M-9) is a nullable free-text reviewer rationale — set only by the human field-correction
+    command; every other producer leaves it ``None``, so the INSERT stays behaviourally unchanged."""
     evidence_id = mint_id("fev")
     conn.execute(
         """
@@ -115,8 +118,8 @@ def record_field_evidence(
             (evidence_id, logical_ref, field_name, proposed_value, proposed_value_hash,
              producer, strength, lifecycle, producer_ref, producer_item_ref,
              producer_configuration_hash, evidence_spans, confidence_band,
-             source_snapshot_id, input_hash)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             source_snapshot_id, input_hash, note)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             evidence_id, logical_ref, field_name, Jsonb(proposed_value),
@@ -124,7 +127,7 @@ def record_field_evidence(
             EvidenceProducer(producer).value, AssertionStrength(strength).value,
             EvidenceLifecycle(lifecycle).value, producer_ref, producer_item_ref,
             producer_configuration_hash, Jsonb(list(evidence_spans)), confidence_band,
-            source_snapshot_id, input_hash,
+            source_snapshot_id, input_hash, note,
         ),
     )
     return evidence_id

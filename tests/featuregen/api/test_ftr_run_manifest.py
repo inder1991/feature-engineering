@@ -18,6 +18,7 @@ from tests.featuregen.api._helpers import upload_csv
 from tests.featuregen.overlay.upload.test_ftr_adapter import _FTR_CSV, _row
 
 from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
+from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
 
 # Three extra data rows on top of the 3-row base fixture (2 columns + the table term), each
 # exercising ONE counter of the breakdown:
@@ -55,6 +56,11 @@ def test_ftr_run_manifest_honest_row_count_and_parse_breakdown(client, conn):
         (run_id,)).fetchone()
     assert row_count == 6
     assert quarantined_count == 1
+
+    # Delivery B item 9: an FTR upload's run records the glossary capability profile it ran under.
+    assert conn.execute(
+        "SELECT source_type, profile_version FROM ingestion_run WHERE id = %s",
+        (run_id,)).fetchone() == ("ftr_glossary", SOURCE_CAPABILITY_PROFILE_VERSION)
 
     # R5-8: the parse-stage detail explains what sanitization did, honestly split.
     state, detail = conn.execute(

@@ -71,6 +71,7 @@ RESOLUTION_CATEGORY_MAP: dict[ReasonCode, ReasonCategory] = {
     ReasonCode.aggregation_axis_unsupported: ReasonCategory.topology_or_model,
     ReasonCode.aggregation_incompatible_with_additivity: ReasonCategory.topology_or_model,
     ReasonCode.additivity_source_conflict: ReasonCategory.topology_or_model,
+    ReasonCode.aggregation_declaration_conflict: ReasonCategory.topology_or_model,
     ReasonCode.unsupported_multi_grain_ingredients: ReasonCategory.topology_or_model,
     ReasonCode.missing_realization: ReasonCategory.topology_or_model,
     ReasonCode.unsanctioned_bridge: ReasonCategory.topology_or_model,

@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from featuregen.api.deps import (
     get_conn,
+    get_feature_gen_conn,
     get_identity,
     get_llm,
     require_feature_generate,
@@ -32,6 +33,7 @@ from featuregen.overlay.upload.contract.author import (
     ContractDraft,
     CrossCatalogPlanRequired,
     StalePlan,
+    _as_of_column,
     _envelope_join_path,
     draft_contract,
 )
@@ -39,6 +41,7 @@ from featuregen.overlay.upload.contract.gate1 import (
     _intent_scoped_applicability_enabled,
     build_considered_set,
     chosen_feature,
+    considered_snapshot_lineage,
     gate1_choice,
     intent_target_ref,
     persist_intent,
@@ -46,18 +49,25 @@ from featuregen.overlay.upload.contract.gate1 import (
 )
 from featuregen.overlay.upload.contract.govern import (
     Contract,
+    ContractPointerConflict,
     ContractValidationError,
+    binding_exposure,
+    binding_hash,
     confirm_contract,
+    confirmed_role_bindings,
     get_contract_detail,
     list_contracts,
 )
+from featuregen.overlay.upload.contract.governed_plan import GovernedPlanDrift
 from featuregen.overlay.upload.contract.intake import (
     IntentValidationError,
     redact_free_text,
     submit_intent,
 )
 from featuregen.overlay.upload.contract.live_activation import (
+    CROSS_CATALOG_GROUNDING_NOT_ENABLED,
     LiveActivationNotReady,
+    cross_catalog_grounding_enabled,
     is_live_cross_catalog_enabled,
     require_live_ready,
 )
@@ -67,6 +77,7 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_confirmed_scope,
     record_recognition_attempt,
 )
+from featuregen.overlay.upload.feature_metadata_snapshot import CatalogProjectionUnavailable
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
 from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.planner.shadow import run_shadow_planner
@@ -110,6 +121,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
+# Delivery C0: ONLY the considered-set route BUILDS the C0 metadata snapshot, so ONLY it needs the
+# REPEATABLE READ (_FeatureGenConn) torn-free view. MF-2: /contract/draft, /contract/confirm and
+# /contract/recognitions do NOT build a snapshot — they only RELOAD server lineage / re-run the MCV — so
+# they stay on the default _Conn (READ COMMITTED). Putting them on REPEATABLE READ gave them no benefit
+# and turned designed 409 races (a concurrent re-confirm / double-submit) into uncaught 40001
+# SerializationFailure 500s. The read-only /contracts list/detail routes also stay on _Conn.
+_FeatureGenConn = Annotated[psycopg.Connection, Depends(get_feature_gen_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 _LLM = Annotated[LLMClient, Depends(get_llm)]
 
@@ -127,6 +145,13 @@ class DraftIn(BaseModel):
     derives_pairs: list[tuple[str, str]] = []
     join_path: list[dict] = []
     intent_id: str | None = None   # server re-reads target_ref + links the contract via this
+    # H1b Gate-1 role-binding confirmation: the binding_hash the client SAW at /contract/draft. At
+    # confirm the server recomputes the CURRENT binding_hash from its authoritative reconciled bindings
+    # and 409s if it differs (bindings drifted since draft — re-review). LEGACY DEGRADATION: absent
+    # (None) ⟹ the gate is SKIPPED (a pre-H1b client that never fetched a hash is not broken); a client
+    # that sends it gets the fail-closed gate. Requirement ids / "passed" are NEVER accepted here — the
+    # server mints durable ids at confirm (Pydantic ignores any such extra body fields).
+    expected_binding_hash: str | None = None
 
     def to_draft(self) -> ContractDraft:
         return ContractDraft(
@@ -312,7 +337,7 @@ def _ranking_json(r: RankedRecipe) -> dict:
             "initial_view_reasons": [c.value for c in r.initial_view_reasons]}
 
 
-def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity,
+def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
                            client: _LLM) -> dict:
     """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
     run, PERSISTS the confirmed scope in the API layer BEFORE the builder (the canonical run→scope
@@ -413,11 +438,22 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     # unset — no DB query). ``target_entity`` is the confirmed-scope grain the governed planner plans to,
     # exactly the entity the log-only shadow planner already uses below.
     is_live = is_live_cross_catalog_enabled(conn)
-    cs = build_considered_set(
-        conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-        roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=now, applicability=applicability,
-        is_live=is_live, target_entity=scope.target_entity)
+    # Delivery C0 Task 5: anchor the metadata snapshot to THIS run (the scoped path already minted it
+    # in step 4). A projection-lagged catalog aborts the whole considered set — feature generation must
+    # not proceed on a stale projected view — surfaced as 503 CATALOG_PROJECTION_UNAVAILABLE.
+    try:
+        cs = build_considered_set(
+            conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
+            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
+            feedback=body.feedback, now=now, applicability=applicability,
+            is_live=is_live, target_entity=scope.target_entity,
+            generation_run_id=generation_run_id)
+    except CatalogProjectionUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
+    except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
+        raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
+            status_code=409,
+            detail="a concurrent request updated this intent; re-fetch and retry") from e
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
@@ -470,7 +506,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
 
 
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
-def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
+def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
+                   client: _LLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
     the intent. Every option shown has passed the gauntlet.
@@ -498,15 +535,26 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
         except LiveActivationNotReady as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
     is_live = is_live_cross_catalog_enabled(conn)
-    cs = build_considered_set(
-        conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-        roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
+    # Delivery C0 Task 5: on the REPEATABLE READ feature-gen conn the builder mints an ``fgr`` run and
+    # snapshots the in-scope catalog state, recording the lineage on the considered set. A
+    # projection-lagged catalog aborts here → 503 (feature generation never proceeds on a stale view).
+    try:
+        cs = build_considered_set(
+            conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
+            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
+            feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
+    except CatalogProjectionUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
+    except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
+        raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
+            status_code=409,
+            detail="a concurrent request updated this intent; re-fetch and retry") from e
     return _considered_set_response(intent, cs)
 
 
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
-def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
+def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
+                 client: _LLM) -> dict:
     """Phase-1B Gate #1 recognition: classify the objective's governed use-case scope from the
     REDACTED hypothesis/goal (recognition NEVER sees catalog columns) and persist an append-only
     recognition attempt — BEFORE any generation run exists. Decoupled from generation: no
@@ -569,22 +617,36 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
                         chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
     target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
-    # 3C.2a — the live-activation boolean is resolved ONLY here (the route boundary) and threaded down.
-    # FLAG-OFF (default) → byte-identical: a cross-catalog feature draws the permissive
-    # find_cross_catalog_path path exactly as before. FLAG-ON fail-closed: a governed feature drafts its
-    # compiled plan envelope's path, rechecked for freshness under the REQUEST's roles (the set it compiled
-    # under — else it would spuriously drift); a drifted plan → 409 (regenerate, never a substitute path),
-    # and a cross-catalog feature with no governed envelope → 422 (regenerate under the governed planner).
-    is_live = is_live_cross_catalog_enabled(conn)
+    # 3C.2a authoring fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked
+    # for freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
+    # a drifted plan → 409 (regenerate, never a substitute path). I-1 draft/confirm parity: a cross-catalog
+    # feature with NO governed envelope is refused at draft with the SAME umbrella reason confirm uses
+    # (``CROSS_CATALOG_GROUNDING_NOT_ENABLED``) whatever the deployment state, so a user never drafts
+    # something confirm will always reject; ``find_cross_catalog_path`` is never invoked from a draft (3C.2b).
     try:
         d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
-                           actor=identity, is_live=is_live)
+                           actor=identity)
     except StalePlan as e:
         raise HTTPException(status_code=409, detail="plan stale, regenerate") from e
     except CrossCatalogPlanRequired as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise HTTPException(
+            status_code=422,
+            detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: cross-catalog feature requires a governed "
+                   "plan envelope") from e
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
-    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
+    # Delivery C0 Task 5: carry the SERVER-persisted snapshot lineage forward (the run + immutable
+    # snapshot the considered set was authored against). Reloaded from the server considered-set row —
+    # the request model carries no client snapshot id, so there is nothing client-supplied to trust.
+    # Null on a READ COMMITTED / pre-C0 considered set. This is ADDITIVE — the validator is unchanged.
+    snapshot = considered_snapshot_lineage(conn, body.intent_id)
+    # H1b — expose the exact role bindings (role / column-ref / source / authority / warnings) + the
+    # overall binding_hash the human is confirming. The confirm requires this hash and 409s if the
+    # server's authoritative bindings drift before finalize (see /contract/confirm). Computed over the
+    # SERVER-authoritative reconciled draft `d`, so it equals the confirm-time recompute unless the
+    # underlying catalog state actually drifts. READ-ONLY (no global authority write).
+    bindings = confirmed_role_bindings(conn, d)
+    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id, "snapshot": snapshot,
+            "bindings": binding_exposure(bindings), "binding_hash": binding_hash(bindings)}
 
 
 @router.get("/contracts", dependencies=[Depends(require_feature_read)])
@@ -635,8 +697,15 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # NEEDS_EXTERNAL_VALIDATION -> DESIGN_CHECKED at the GOVERNING write. Overwrite both from the SERVER-
     # reconstructed chosen (the same server-authoritative pattern as join_path below), so the re-run
     # always reasons over the operands the human actually chose.
+    # H1b: reconcile as_of_column SERVER-side too (mirroring grain_table/derives_from). The as_of role
+    # is a confirmed binding; deriving it from the server chosen (never the client body) makes the
+    # persisted bindings + the binding_hash fully server-authoritative and stable draft→confirm, so an
+    # honest confirm can never be derailed and a tampered as_of is simply ignored (like grain_table).
+    _catalogs = {cs for cs, _ref in chosen.derives_pairs}
+    _grain_catalog = next(iter(_catalogs)) if len(_catalogs) == 1 else None
     draft = replace(draft, grain_table=chosen.grain_table,
-                    derives_from=list(chosen.derives_from))
+                    derives_from=list(chosen.derives_from),
+                    as_of_column=_as_of_column(conn, chosen.grain_table, _grain_catalog))
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
     # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The
@@ -644,27 +713,94 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # is_live guard. The cross-catalog-without-envelope 422 fires ONLY when the deployment is flag-on-and-
     # approved; FLAG-OFF a cross-catalog feature confirms via the permissive path, byte-identical to before.
     env = chosen.plan_envelope
+    # H1c — does the candidate SPAN more than one catalog_source? Computed from the SERVER-reconstructed
+    # chosen feature's ``derives_pairs`` (``_catalogs`` above — the same set H1b hashes), never the client
+    # body. F3: when a governed ``plan_envelope`` is present the span MUST also fold in the envelope's OWN
+    # participating catalogs (``catalog_sources``) and its ordered-path catalogs — a governed plan can
+    # BRIDGE >1 catalog while its derives_pairs read-set stays single-catalog, and that bridge is exactly
+    # the cross-catalog participation the interlock must gate. Union everything so ANY multi-catalog
+    # participation trips the interlock (fail-closed). A cross-catalog contract may be governed ONLY under
+    # the full interlock; anything short of it fails closed with ``CROSS_CATALOG_GROUNDING_NOT_ENABLED``.
+    span_catalogs = set(_catalogs)
+    if env is not None:
+        span_catalogs |= set(env.catalog_sources)
+        span_catalogs |= {seg.split(":", 1)[0] for seg in env.ordered_path if seg}
+    cross_catalog = len(span_catalogs) > 1
     if env is not None:
         if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
             raise HTTPException(status_code=409, detail="plan stale, regenerate")
+        # H1c fail-closed — a CROSS-catalog governed contract may be finalized ONLY while cross-catalog
+        # grounding is GENUINELY enabled for this deployment AT THE GOVERNING WRITE: the durable
+        # live-activation interlock (flag + PASS enablement + APPROVE + version vector) AND a valid signed
+        # 3C gate artifact must BOTH still hold. Activation can be revoked / the signed artifact can expire
+        # between draft and confirm, so re-check HERE (reusing the existing interlock + verifier) and refuse
+        # rather than finalize a cross-catalog contract whose enablement lapsed. A single-catalog governed
+        # plan needs no cross-catalog enablement — this sub-check is scoped to ``cross_catalog`` and is
+        # byte-identical for every single-catalog / flag-off envelope.
+        if cross_catalog and not cross_catalog_grounding_enabled(conn):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: live cross-catalog grounding is not "
+                       "enabled for this deployment (missing/stale activation or signed 3C gate artifact)")
         # 3C.2a fail-closed: a governed contract's persisted join_path is RE-DERIVED from the SERVER
         # envelope's ordered_path, NEVER the client body — the match-check above validates
         # name/derives_pairs/aggregation but NOT join_path, so a replay carrying a FABRICATED path (which
         # the freshness recheck still passes) would otherwise be persisted as the "governed" bridge. Scoped
         # strictly to the envelope-present case (single-catalog / flag-off drafts keep their client path).
         draft = replace(draft, join_path=tuple(_envelope_join_path(env.ordered_path)))
-    elif (is_live_cross_catalog_enabled(conn)
-          and len({cs for cs, _ref in chosen.derives_pairs}) > 1):
-        raise HTTPException(status_code=422,
-                            detail="cross-catalog feature requires a governed plan envelope")
+    elif cross_catalog:
+        # H1c fail-closed — a cross-catalog candidate with NO governed plan envelope can NEVER be governed,
+        # whatever the deployment state: it has no governed physical plan to author from, and the governing
+        # write must NEVER fall back to the permissive ``find_cross_catalog_path``. This closes the hole
+        # where a flag-off / unapproved multi-catalog confirm fell through to ``confirm_contract`` on the
+        # client-supplied permissive join_path. (Supersedes the prior is_live-gated 422: a no-envelope
+        # cross-catalog candidate is now refused unconditionally — the strongest fail-closed. The detail
+        # still names the governed plan envelope, the specific missing prerequisite.)
+        raise HTTPException(
+            status_code=422,
+            detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: cross-catalog feature requires a governed "
+                   "plan envelope")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
+    # Delivery C0 Task 5: reload the SERVER snapshot lineage the considered set was authored against and
+    # bind the governing write to it in the audit trail (a regulator can prove EXACTLY what catalog state
+    # this contract was authored against). Reloaded from the server considered-set row — the confirm
+    # request model (DraftIn) carries no client snapshot id, so no client value is ever trusted. ADDITIVE:
+    # the confirm-time MCV re-run + Slice-3 tamper-fix (grain_table/derives_from/join_path above) are
+    # UNCHANGED — re-sourcing the validator onto the snapshot is a later delivery (C2–C4/H).
+    lineage = considered_snapshot_lineage(conn, body.intent_id)
+    if lineage is not None:
+        logger.info("governing contract for intent %s against snapshot %s (run %s, content_hash %s)",
+                    body.intent_id, lineage["snapshot_id"], lineage["generation_run_id"],
+                    lineage["content_hash"])
+    # H1b — the GATE-1 ROLE-BINDING analog of the plan-staleness 409. Recompute the CURRENT binding_hash
+    # from the SERVER-authoritative reconciled bindings (the exact set confirm will persist) and, when the
+    # client sent the hash it saw at draft, fail closed (409) if they differ — a binding drifted between
+    # draft and confirm (a column retyped, a fact retired/expired, an authority changed). This is confirm-
+    # time REVALIDATION: the per-binding state signature (H2c) folds each referenced fact's current
+    # governed state, so an expired/unauthorized fact moves the hash and never finalizes on the drifted
+    # binding set. LEGACY DEGRADATION: a body with no `expected_binding_hash` skips the gate (unchanged).
+    current_binding_hash = binding_hash(confirmed_role_bindings(conn, draft))
+    if (body.expected_binding_hash is not None
+            and current_binding_hash != body.expected_binding_hash):
+        raise HTTPException(status_code=409, detail="bindings changed, re-review")
     try:
         return confirm_contract(conn, draft, actor=identity.subject,
                                 roles=identity.role_claims,   # the CONFIRMER's authority reaches the
                                 #                               re-run's join-authority disposition
-                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
+                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id,
+                                confirmed_binding_hash=current_binding_hash,
+                                # H3c — the governed plan (from the SERVER-reconstructed chosen feature,
+                                # never the client body): confirm_contract REBUILDS it against the current
+                                # snapshot, requires the SAME physical_plan_id + declaration id + a fresh
+                                # verdict, and persists its full read set as role-labelled lineage.
+                                plan_envelope=env)
+    except GovernedPlanDrift as e:   # H3c — the rebuilt plan drifted (id / freshness) → regenerate
+        raise HTTPException(status_code=409, detail="plan drifted, regenerate") from e
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    except ContractPointerConflict as e:   # M-a: the pointer CAS lost a race -> conflict, not 500
+        raise HTTPException(status_code=409,
+                            detail="a contract pointer conflict occurred; re-fetch and retry") from e
     except psycopg.errors.UniqueViolation as e:   # concurrent double-confirm -> conflict, not 500
         raise HTTPException(status_code=409,
                             detail="a contract version conflict occurred; re-fetch and retry") from e

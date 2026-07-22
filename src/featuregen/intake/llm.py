@@ -36,6 +36,15 @@ class LLMRequest:
     # N11 — the resolved structural JSON schema, attached by call_llm from the registry so the real
     # adapter can enforce structured output (output_config.format). NOT part of the idempotency key.
     output_schema: dict | None = None
+    # perf (vocab-caching): keys within ``inputs[catalog_metadata]`` that form a LARGE, STATIC prefix
+    # shared byte-for-byte across every chunk of a wide-table batch (the ~276-concept classification
+    # vocabulary). The Anthropic adapter lifts these into a ``system`` block carrying an ephemeral
+    # ``cache_control`` breakpoint so chunks 2..N reuse the cached prefix instead of re-billing the
+    # vocabulary as ~23K fresh input tokens (and ~37s) per chunk. Empty ``()`` = today's single-user-
+    # message rendering (the default). A WIRE hint only: excluded from the idempotency key
+    # (compute_input_hash reads ``inputs``, not request fields), never stored on the llm_call audit,
+    # and never removed from ``inputs`` — the redacted inputs the guard/audit see are unchanged.
+    cacheable_metadata_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

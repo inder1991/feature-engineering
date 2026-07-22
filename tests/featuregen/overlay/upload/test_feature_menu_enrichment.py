@@ -6,7 +6,7 @@ FEATUREGEN_FEATURE_CONTEXT is off."""
 from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.column_authority import logical_ref_of
+from featuregen.overlay.upload.column_authority import logical_ref_of, read_column_facts
 from featuregen.overlay.upload.feature_assist import (
     _candidate_columns,
     _enriched_menu,
@@ -111,7 +111,7 @@ def test_feature_context_enabled_reads_env(monkeypatch):
 def test_enriched_menu_wraps_governed_fields_and_flag_gates(db, monkeypatch):
     _bank_graph(db)
     # Govern amount.additivity via the decision log (display value stays the flat column).
-    _govern_additivity(db, logical_ref_of("bank", "public.transactions.amount"), "additive")
+    _govern_additivity(db, logical_ref_of(db, "bank", "public.transactions.amount"), "additive")
 
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
     assert feature_context_enabled() is False
@@ -144,6 +144,22 @@ def test_enriched_menu_wraps_governed_fields_and_flag_gates(db, monkeypatch):
     assert acct["is_grain"] == {"value": "true", "authority": "governed"}
     txn_date = next(m for m in menu if m["object_ref"] == "public.transactions.txn_date")
     assert txn_date["is_as_of"] == {"value": "true", "authority": "governed"}
+
+
+def test_enriched_menu_shows_hint_not_governed_for_a_drifted_value(db):
+    # C1: the menu's GOVERNED-clearing facts come from read_operational_value, so "governed" shows
+    # ONLY for a hash-verified resolved read. Approve additivity = non_additive, then DRIFT the flat
+    # value to "additive": the OLD permissive read_column_facts still tags it governed, but C1
+    # hash-mismatches → the menu shows a "hint", never a false "governed".
+    _bank_graph(db)
+    lref = logical_ref_of(db, "bank", "public.transactions.amount")
+    _govern_additivity(db, lref, "non_additive")   # approved value ≠ the flat graph value below
+    db.execute("UPDATE graph_node SET additivity = 'additive' "
+               "WHERE object_ref = 'public.transactions.amount'")
+    assert read_column_facts(db, lref, "additivity").authority == "governed"   # OLD-reader control
+    menu = _enriched_menu(db, _candidate_columns(db, "bank", roles=()))
+    amount = next(m for m in menu if m["object_ref"] == "public.transactions.amount")
+    assert amount["additivity"] == {"value": None, "authority": "hint"}   # C1 refuses the drift
 
 
 def test_flag_off_menu_content_is_byte_identical_thin_projection(db, monkeypatch):

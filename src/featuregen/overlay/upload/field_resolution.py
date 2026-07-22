@@ -36,7 +36,7 @@ Phase-3 structural-fusion concern.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
 from featuregen.contracts import DbConn
@@ -329,7 +329,8 @@ def _active_field_names(conn: DbConn, logical_ref: str) -> set[str]:
 
 
 def resolve_and_project(
-    conn: DbConn, *, source: str, logical_refs: Sequence[str], now: datetime | None = None
+    conn: DbConn, *, source: str, logical_refs: Sequence[str],
+    fields: Iterable[str] | None = None, now: datetime | None = None
 ) -> None:
     """Resolve every policy field with active evidence for each ``logical_ref`` and project the
     display values into ``graph_node`` (spec §4/§6/§8).
@@ -338,10 +339,19 @@ def resolve_and_project(
     Generic fields go through :func:`_resolve_generic_field`; ``sensitivity`` (triggered by a
     ``sensitivity`` or a taxonomy ``sensitivity_floor`` proposal) goes through the §7 special case.
     ``sensitivity_floor`` is an INPUT to the sensitivity decision (``policy_for`` returns ``None``),
-    never resolved as a field of its own."""
+    never resolved as a field of its own.
+
+    ``fields`` (F review C-1) RESTRICTS the re-resolution to the named fields — the field-correction
+    command passes ``fields=[field]`` so confirming ONE field never re-resolves (and can never revert)
+    a SIBLING field's confirmed decision under a concurrent writer. ``None`` (the DEFAULT, every ingest
+    caller) resolves EVERY active field exactly as before — byte-for-byte unchanged. A ``field`` with
+    no active evidence is skipped whether or not it is named (the projection reads the active set)."""
     now = now or datetime.now(UTC)
+    selected = None if fields is None else frozenset(fields)
     for logical_ref in logical_refs:
         present = _active_field_names(conn, logical_ref)
+        if selected is not None:
+            present = present & selected
         for field_name in sorted(present):
             if field_name in (_SENSITIVITY_FIELD, _SENSITIVITY_FLOOR_FIELD):
                 continue  # sensitivity handled by its §7 special case below

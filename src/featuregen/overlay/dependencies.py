@@ -50,6 +50,18 @@ def fact_dependencies(
             deps.add((from_src, f"{from_obj}.{pair['from_col']}"))
             deps.add((to_src, f"{to_obj}.{pair['to_col']}"))
         return deps
+    if fact_type == facts.CURRENCY_BINDING:
+        # The subject measure column (the keyed object_ref) PLUS the target currency column — both
+        # under the fact's single catalog_source (the write gate forces same source/schema/table). A
+        # drop/rename/retype of EITHER stales the binding (mirrors approved_join indexing endpoint
+        # columns). The currency target lives in `value['currency_column']` (a CatalogObjectRef).
+        cc = value["currency_column"]
+        return {
+            (catalog_source, object_ref),
+            (catalog_source, f"{table_obj(cc)}.{cc['column']}"),
+        }
+    # entity_assignment falls through to the single-object default below: its only catalog referent is
+    # the subject column itself (`entity_id` names a governed-vocabulary entity, not a catalog object).
     deps = {(catalog_source, object_ref)}
     if fact_type == facts.GRAIN:
         deps |= {(catalog_source, f"{object_ref}.{c}") for c in value.get("columns", [])}

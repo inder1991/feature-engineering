@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from featuregen.overlay.upload import enrich_config
+from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.runtime.observability import counters
 
 # NOTE: `audited_batch_call` / `audited_enrich_call` are imported LAZILY inside run_batched /
@@ -116,7 +117,8 @@ def chunk_items(items: list[BatchItem], *, max_items: int,
 
 def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchItem, shared_metadata,
                      accept, actor, ref_aware: bool = False,
-                     prompt_version: int = 1, schema_version: int = 1) -> tuple[str | None, str]:
+                     prompt_version: int = 1, schema_version: int = 1,
+                     dispatch_audit: DispatchAuditContext | None = None) -> tuple[str | None, str]:
     """One per-item fallback through the existing single seam. Returns (value|None, status).
 
     A ``ref_aware`` (structured) task has NO single-call fallback in Phase 2: the flat single schema
@@ -125,7 +127,10 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
 
     ``prompt_version``/``schema_version`` (default ``1``) thread through to the single seam so a
     versioned batch that degrades to per-item fallback runs under the SAME contract, never silently
-    retrying under v1 — the prompt_id label is versioned to match (``_v1`` at the default)."""
+    retrying under v1 — the prompt_id label is versioned to match (``_v1`` at the default).
+
+    ``dispatch_audit`` (C5-T5): the run's per-ITEM context (this one item's subject), so a batch that
+    degrades to the single seam stays run+subject attributed; ``None`` is byte-identical."""
     if ref_aware:
         return None, MISSING
     from featuregen.overlay.upload.enrich_llm import audited_enrich_call  # lazy (import cycle)
@@ -134,7 +139,12 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
         conn, client, task=task, prompt_id=f"overlay_{single_prompt}_v{prompt_version}",
         schema_id=f"overlay_{single_prompt}", out_key=out_key,
         catalog_metadata={**shared_metadata, **item.metadata}, instruction=instruction, actor=actor,
-        prompt_version=prompt_version, schema_version=schema_version)
+        prompt_version=prompt_version, schema_version=schema_version,
+        dispatch_audit=dispatch_audit,
+        # perf (vocab-caching): a batch that degrades to per-item fallback still carries the static
+        # shared_metadata (the concept vocabulary) on every item — mark it as the cached shared prefix
+        # so those fallback calls reuse it too rather than re-billing it each time.
+        cacheable_metadata_keys=tuple(shared_metadata))
     if raw is None:
         return None, FALLBACK_FAILED
     value, _reason = accept(raw)
@@ -146,7 +156,9 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 accept: Accept, actor, extract=None, ref_aware: bool = False,
                 prompt_version: int = 1, schema_version: int = 1,
                 now: Callable[[], float] = time.monotonic, deadline_s: float | None = None,
-                report: dict | None = None) -> dict[str, str]:
+                report: dict | None = None,
+                ingestion_run_id: str | None = None, dispatch_stage: str | None = None,
+                dispatch_subjects: Mapping[str, dict] | None = None) -> dict[str, str]:
     """Chunk `items`, call the governed batch seam, and walk the bounded degradation ladder
     (spec C4): salvage valid -> retry a failed chunk -> adaptive split -> capped single fallback ->
     leave remainder uncached. Returns {ref: accepted_value} for items resolved this run.
@@ -162,7 +174,14 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
     returned as a PARTIAL result, no exception is raised, and the caller's ingest stage degrades to
     partial while the already-asserted facts still commit. ``deadline_s=None`` (the default) leaves
     the guard fully inert, preserving today's behavior byte-for-byte; the enrichment entry points
-    pass ``enrich_config.stage_deadline_s()`` so production has a concrete ceiling."""
+    pass ``enrich_config.stage_deadline_s()`` so production has a concrete ceiling.
+
+    C5-T5 — dispatch attribution: with ``ingestion_run_id`` set, every PHYSICAL call this ladder
+    issues (each chunk, retry, split, and single fallback) carries a ``DispatchAuditContext`` built
+    for exactly the items IN that call — ``dispatch_stage`` (falling back to ``task``) as the stage,
+    and ``dispatch_subjects`` (a ``{ref: subject}`` mapping) supplying each item's
+    ``{catalog_source, object_ref, logical_ref, field_names}`` subject. ``ingestion_run_id=None``
+    (every direct caller) threads ``dispatch_audit=None`` — byte-for-byte today's behavior."""
     from featuregen.overlay.upload.enrich_llm import audited_batch_call  # lazy (import cycle)
     b = enrich_config.budget(short)
     max_items = enrich_config.max_items(short)
@@ -171,6 +190,20 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
     calls = 0
     resolved: dict[str, str] = {}
     fallback_used = 0
+    # Refs actually SENT to the provider (any batch chunk this ladder issued). Its complement over
+    # `items` is the honest budget/deadline `not_attempted` count — items the cutoff skipped WITHOUT
+    # ever dispatching them, so they were never "failed", just never tried.
+    dispatched: set[str] = set()
+
+    def _ctx_for(call_items: list[BatchItem]) -> DispatchAuditContext | None:
+        # One context per PHYSICAL call, scoped to exactly the items it carries — a retried or
+        # split chunk (or a single fallback) attributes its own subjects, never the whole run's.
+        if ingestion_run_id is None:
+            return None
+        subs = dispatch_subjects or {}
+        return DispatchAuditContext(
+            ingestion_run_id=ingestion_run_id, stage=dispatch_stage or task,
+            subjects=tuple(subs[it.ref] for it in call_items if it.ref in subs))
 
     def over_budget() -> bool:
         return (calls >= b.max_provider_calls
@@ -181,11 +214,13 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         if not chunk or over_budget():
             counters.incr(f"overlay.enrich.{short}.batch.budget_exhausted") if chunk else None
             return
+        dispatched.update(it.ref for it in chunk)   # this chunk is now being sent to the provider
         res = audited_batch_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
                                  shared_metadata=shared_metadata, items=chunk, out_key=out_key,
                                  instruction=instruction, accept=accept, actor=actor,
                                  extract=extract, ref_aware=ref_aware,
-                                 prompt_version=prompt_version, schema_version=schema_version)
+                                 prompt_version=prompt_version, schema_version=schema_version,
+                                 dispatch_audit=_ctx_for(chunk))
         calls += res.provider_calls
         counters.incr(f"overlay.enrich.{short}.batch.calls")
         for o in res.outcomes:
@@ -235,7 +270,8 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                                               shared_metadata=shared_metadata, accept=accept,
                                               actor=actor, ref_aware=ref_aware,
                                               prompt_version=prompt_version,
-                                              schema_version=schema_version)
+                                              schema_version=schema_version,
+                                              dispatch_audit=_ctx_for([it]))
             if value is not None:
                 resolved[it.ref] = value
 
@@ -250,4 +286,12 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 report["timed_out"] = True
             break
         process(chunk, 0)
+    # Honest truncation signal (#22): items the budget/deadline cutoff skipped WITHOUT dispatch — the
+    # complement of everything this ladder actually sent. The caller threads it into the stage detail
+    # so a truncated run is labeled `truncated`, not `items_failed`. (The in-memory `budget_exhausted`
+    # counter is metrics-only and never persisted; present only when non-zero.)
+    if report is not None:
+        not_attempted = len({it.ref for it in items} - dispatched)
+        if not_attempted:
+            report["not_attempted"] = not_attempted
     return resolved

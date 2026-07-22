@@ -117,20 +117,27 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
             created_by=identity_to_jsonb(cmd.actor),  # a dict, never a raw IdentityEnvelope
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
+    payload: dict[str, object] = {
+        "catalog_object_ref": asdict(ref),
+        "object_ref": display_object_ref(ref),
+        "fact_type": fact_type,
+        "use_case": use_case,
+        "proposed_value": proposed_value,
+        "proposal_fingerprint": fp,
+        "evidence_ref": evidence_ref,
+        "proposed_by": cmd.actor.subject,
+    }
+    # SOURCE-provenance four-eyes (program-audit F2/F10): an ingest stage proposing an
+    # uploader-authored value under the SERVICE actor records the uploading HUMAN principal here;
+    # `confirm_fact` (via `uploader_ne_confirmer`) bars that principal from confirming their own
+    # declared value. Absent for every other caller — the payload is byte-identical when unset.
+    if args.get("source_uploader"):
+        payload["source_uploader"] = args["source_uploader"]
     draft = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_PROPOSED",
-        payload={
-            "catalog_object_ref": asdict(ref),
-            "object_ref": display_object_ref(ref),
-            "fact_type": fact_type,
-            "use_case": use_case,
-            "proposed_value": proposed_value,
-            "proposal_fingerprint": fp,
-            "evidence_ref": evidence_ref,
-            "proposed_by": cmd.actor.subject,
-        },
+        payload=payload,
         actor=cmd.actor,
         # Pin OCC to the observed head: a fresh propose expects an empty stream (0); the only
         # non-fresh propose that proceeds is a re-propose after REJECTED — pin it to the rejected

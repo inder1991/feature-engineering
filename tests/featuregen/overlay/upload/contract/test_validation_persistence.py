@@ -12,7 +12,10 @@ import pytest
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, CanonicalRow
-from featuregen.overlay.upload.contract._serial import requirements_to_json
+from featuregen.overlay.upload.contract._serial import (
+    requirements_from_json,
+    requirements_to_json,
+)
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import ConsideredSet, _snapshot, chosen_feature
 from featuregen.overlay.upload.contract.govern import confirm_contract
@@ -297,6 +300,50 @@ def test_needs_external_validation_survives_gate1_to_persisted_contract(db):
     ]                                                    # the RE-RUN's real requirements (RF-C2)
     assert row[1] == requirements_to_json(check.requirements)
     assert row[2] == "DESIGN-CHECKED"                    # the SEPARATE verification axis intact
+
+
+def test_requirements_json_no_param_shape_is_byte_identical():
+    """I-1d: the base serialized shape for a no-param requirement stays {code, operand, detail} — the
+    typed params are emitted ADDITIVELY (only when present), so no-param requirements (all but
+    ADDITIVITY today) are byte-identical to pre-fix and the persisted contract.requirements column /
+    snapshot shape is preserved."""
+    from featuregen.overlay.upload.validation_requirements import build_requirement
+    r = build_requirement(code="TYPE_IS_NUMERIC", operand=("bank", "public.accounts.balance"),
+                          detail="operational type unknown; numeric declared hint")
+    assert requirements_to_json((r,)) == [
+        {"code": "TYPE_IS_NUMERIC", "operand": ["bank", "public.accounts.balance"],
+         "detail": "operational type unknown; numeric declared hint"}]
+
+
+def test_requirements_json_round_trip_preserves_typed_params():
+    """I-1d: an ADDITIVITY requirement's TYPED operation param survives the snapshot round trip, and the
+    re-materialized requirement is registry-valid — reconstructed through the sanctioned factory, its
+    schema_version resolves, params equal the original."""
+    from featuregen.overlay.upload.validation_requirements import build_requirement, schema_for
+    r = build_requirement(code="ADDITIVITY_SUPPORTS_OPERATION",
+                          operand=("ledger", "public.postings.amount"),
+                          detail="additivity not governed-confirmed", params={"operation": "sum"})
+    serialized = requirements_to_json((r,))
+    assert serialized[0]["params"] == [["operation", "sum"]]   # typed param carried through
+    back = requirements_from_json(serialized)
+    assert back == (r,)                                        # registry-valid, params preserved
+    assert back[0].params == (("operation", "sum"),)
+    schema_for(back[0].code, back[0].schema_version)           # version resolves (would raise if not)
+
+
+def test_requirements_from_json_tolerates_legacy_rows_without_params():
+    """I-1d: a LEGACY serialized row (no params / no schema_version) still deserializes — even for a
+    code the registry now requires params for (ADDITIVITY): it must NOT raise, falling back to the raw
+    value object rather than crashing snapshot restore."""
+    legacy = [
+        {"code": "TYPE_IS_NUMERIC", "operand": ["bank", "public.t.c"], "detail": "d"},
+        {"code": "ADDITIVITY_SUPPORTS_OPERATION", "operand": ["ledger", "public.t.amount"],
+         "detail": "legacy, no params"},
+    ]
+    reqs = requirements_from_json(legacy)                      # must not raise
+    assert [r.code for r in reqs] == ["TYPE_IS_NUMERIC", "ADDITIVITY_SUPPORTS_OPERATION"]
+    assert reqs[0].schema_version == "v1" and reqs[0].params == ()
+    assert reqs[1].params == ()                               # tolerated legacy ADDITIVITY, no crash
 
 
 def test_confirm_grain_feature_persists_faithful_grain_requirement(db):

@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+from psycopg.errors import LockNotAvailable
 from psycopg.rows import dict_row
 
 from featuregen.contracts import DbConn, Projection, ProjectionApplyError
 from featuregen.events.serde import row_to_event
 from featuregen.runtime.observability import counters
+
+
+def try_lock_checkpoint_nowait(conn: DbConn, name: str) -> bool:
+    """Try to take the named projection's ``projection_checkpoints`` row lock WITHOUT blocking.
+
+    Returns True when the lock is held (to the end of the caller's transaction, so a following
+    ``run_projection`` re-locks the same row for free) and False when a concurrent holder — typically
+    an in-flight ``ingest_upload`` whose in-tx ``_drain_projection`` holds the 'overlay' checkpoint
+    row until commit — already has it. NEVER blocks and NEVER leaves the caller's transaction
+    aborted: the ``FOR UPDATE NOWAIT`` runs in its OWN savepoint, so a ``LockNotAvailable`` (SQLSTATE
+    55P03) rolls back cleanly (a row lock survives the savepoint RELEASE on success; only a ROLLBACK
+    drops it).
+
+    The human confirm surfaces' synchronous drain-then-project uses this so a confirm whose drain
+    cannot get the checkpoint lock DEFERS to its fail-closed projection-lag path instead of
+    serializing behind a multi-minute ingest transaction (composition audit finding [9])."""
+    try:
+        with conn.transaction():
+            conn.execute(
+                "SELECT 1 FROM projection_checkpoints WHERE projection_name = %s FOR UPDATE NOWAIT",
+                (name,))
+        return True
+    except LockNotAvailable:
+        return False
 
 
 def _ensure_checkpoint(conn: DbConn, name: str, is_analytics: bool) -> None:

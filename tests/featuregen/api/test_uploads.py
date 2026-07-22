@@ -80,6 +80,26 @@ def test_whitespace_only_source_400(client):
     assert res.status_code == 400
 
 
+def test_source_with_slash_rejected_400(client):
+    """G-I-2: `source` is ONE path segment across the whole API (/sources/{source}/...,
+    /catalog/assets/{source}/{object_ref:path}). A '/' in it would mis-split those routes and
+    read/write a DIFFERENT source, so it is rejected at the WRITE boundary — fail closed, never a
+    path-decoding hack that loosens the route."""
+    res = client.post("/uploads", data={"source": "cards/legacy"},
+                      files={"file": ("d.csv", DEPOSITS_CSV.encode(), "text/csv")}, headers=AUTH)
+    assert res.status_code == 400
+    assert "single path segment" in res.json()["detail"]
+
+
+def test_source_with_percent_rejected_400(client):
+    """G-I-2: a '%' is rejected too — uvicorn percent-decodes '%2F' to '/' BEFORE routing, so a
+    percent-bearing source name is the SAME cross-source hazard as a literal slash."""
+    res = client.post("/uploads", data={"source": "cards%2Flegacy"},
+                      files={"file": ("d.csv", DEPOSITS_CSV.encode(), "text/csv")}, headers=AUTH)
+    assert res.status_code == 400
+    assert "single path segment" in res.json()["detail"]
+
+
 def test_truncated_reupload_is_held(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
     tiny = "source,table,column,type,is_grain\ndeposits,accounts,id,integer,y\n"
@@ -210,7 +230,9 @@ def test_upload_response_body_unchanged_by_run_manifest(client):
     assert list(body.keys()) == ["status", "reason", "asserted", "changed_objects",
                                  "quarantined", "flagged", "objects_stored", "tables", "columns",
                                  "containment_edges", "facts_asserted", "join_candidates",
-                                 "passb_proposed", "passb_abstained"]
+                                 "passb_proposed", "passb_abstained",
+                                 "semantic_binding_candidates", "semantic_binding_proposed",
+                                 "semantic_binding_abstained", "semantic_binding_failed"]
     run_id = res.headers["X-Ingestion-Run-Id"]
     assert run_id.encode() not in res.content
 
@@ -229,7 +251,9 @@ def test_upload_response_body_byte_identical_with_stage_reports(client):
         "quarantined": 0,
         "flagged": "first upload of 'deposits' (9 objects) — review recommended",
         "objects_stored": 12, "tables": 3, "columns": 9, "containment_edges": 9,
-        "facts_asserted": 4, "join_candidates": 0, "passb_proposed": 0, "passb_abstained": 0}
+        "facts_asserted": 4, "join_candidates": 0, "passb_proposed": 0, "passb_abstained": 0,
+        "semantic_binding_candidates": 0, "semantic_binding_proposed": 0,
+        "semantic_binding_abstained": 0, "semantic_binding_failed": 0}
     assert res.content == json.dumps(
         expected, separators=(",", ":"), ensure_ascii=False).encode()
 

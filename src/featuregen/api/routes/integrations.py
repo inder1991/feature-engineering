@@ -82,6 +82,7 @@ from featuregen.connectors.openmetadata import (
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -91,6 +92,7 @@ from featuregen.overlay.upload.ingestion_run import (
     terminalize_run_durable,
 )
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
+from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
 from featuregen.overlay.upload.stage_report import StageRecorder, record_stage
 
 router = APIRouter()
@@ -383,11 +385,17 @@ def create_sync(integration_id: str, body: SyncIn, conn: _Conn, identity: _Ident
     # catalog. service_name is only STRIPPED (it keys the one-sync-per-service slot but names an
     # external OpenMetadata service, where case may matter to OM).
     service_name = body.service_name.strip()
-    target_source = body.target_source.strip().lower()
     if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
-    if not target_source:
+    if not body.target_source.strip():
         raise HTTPException(status_code=400, detail="target_source is required")
+    # target_source IS the catalog identity (#16): fold case AND fail CLOSED on a name that is not a
+    # single path segment ('/' or '%' would (percent-)decode across the {source}/... routes and feed
+    # a DIFFERENT catalog) — the same write-boundary rule POST /uploads applies.
+    try:
+        target_source = normalize_source_name(body.target_source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.tag_map_override is not None:
         _validate_tag_map(body.tag_map_override)
     if store.sync_exists_for_service(conn, integration_id, service_name):
@@ -432,8 +440,8 @@ def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
     # create_sync: catalog identity folds case, the external OM service name keeps it.
     service_name = (body.service_name if body.service_name is not None
                     else current["service_name"]).strip()
-    target_source = (body.target_source if body.target_source is not None
-                     else current["target_source"]).strip().lower()
+    target_source_raw = (body.target_source if body.target_source is not None
+                         else current["target_source"])
     table_naming = body.table_naming if body.table_naming is not None else current["table_naming"]
     database_filter = (body.database_filter if body.database_filter is not None
                        else current["database_filter"])
@@ -444,8 +452,13 @@ def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
 
     if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
-    if not target_source:
+    if not target_source_raw.strip():
         raise HTTPException(status_code=400, detail="target_source is required")
+    # Same write-boundary rule as create_sync: fold case AND reject a non-single-segment name.
+    try:
+        target_source = normalize_source_name(target_source_raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if tag_map_override is not None:
         _validate_tag_map(tag_map_override)
     if body.service_name is not None and store.sync_exists_for_service(
@@ -566,10 +579,16 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
     sync, integ = _resolve_sync(conn, sync_id)
     # authorization_decision records the gate outcome (review FIX 4): this line is reached only
     # after the route's require_catalog_write dependency passed (the connector's import gate).
+    # M-3 (migration 1004 traceability): the connector knows its provenance AT OPEN (no parse step
+    # selects a profile later, unlike POST /uploads), and its glossary=None path writes SOURCE/
+    # ATTESTED technical evidence — so the run records source_type + the capability-profile version
+    # here, never NULL.
     run_id = open_run(conn, origin_type="connector", catalog_source=sync["target_source"],
                       filename=None, actor=identity,
                       effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
-                      authorization_decision="granted:catalog_write")
+                      authorization_decision="granted:catalog_write",
+                      source_type="connector",
+                      profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
     response.headers[RUN_ID_HEADER] = run_id   # the success response; error paths set it below
     # FIX #4 (mirrors POST /uploads): the id ALSO rides request.state so a get_conn commit
     # failure in dependency teardown — which discards this response, header included — still
@@ -629,7 +648,11 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
         terminalize_run(conn, run_id, status=result.status, now=datetime.now(UTC),
                         row_count=len(translation.rows), quarantined_count=result.quarantined,
                         pre_fingerprint=pre_fingerprint, post_fingerprint=post_fingerprint,
-                        fingerprint_algo_version=fingerprint_algo)
+                        fingerprint_algo_version=fingerprint_algo,
+                        # M-3: fill-only (COALESCE) — mirrors how POST /uploads threads the pair,
+                        # and covers a degraded open_run that could not record them durably.
+                        source_type="connector",
+                        profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
         # #22: stages commit WITH the terminal state (savepointed + fail-contained inside flush,
         # so the JSON body below stays byte-for-byte unchanged).
         recorder.flush(conn, run_id, now=datetime.now(UTC))

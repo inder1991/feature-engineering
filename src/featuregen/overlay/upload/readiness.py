@@ -26,7 +26,7 @@ requirement list, never the gate").
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -43,6 +43,7 @@ from featuregen.overlay.field_decision import FieldDecisionEvent, read_field_dec
 from featuregen.overlay.field_evidence import read_active_field_evidence
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.object_ref import parse_ref
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 # --- Cause labels (the review-#13 must-fix). A blocking requirement always carries exactly one. ----
 CAUSE_NOT_PROMOTED = "not_promoted_in_phase1"
@@ -212,14 +213,76 @@ def _render_authority(pred: AuthorityPredicate | None) -> str:
     return "unknown"
 
 
+def _hidden_columns(conn: DbConn, norm_source: str, roles: Iterable[str]) -> set[str]:
+    """The public-flattened ``public.<table>.<column>`` graph_node object_refs whose column carries a
+    sensitivity these ``roles`` can't see (:func:`allowed_sensitivities`) — mirrors
+    :func:`asset_detail._load_anchor`'s predicate. A column with NO graph_node row contributes
+    NOTHING (the sensitivity tag lives only on graph_node, so nothing sensitivity-restricted is known
+    about it), so nothing legitimately-visible is ever over-dropped downstream."""
+    allowed = allowed_sensitivities(roles)
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+            "AND sensitivity IS NOT NULL AND NOT (sensitivity = ANY(%s))",
+            (norm_source, allowed),
+        ).fetchall()
+    }
+
+
+def _public_flat(ref: str) -> str:
+    """The ``public.<table>[.<column>]`` graph_node object_ref rendering of a logical/evidence ref
+    (public-flattened, mirroring ``logical_ref_of`` / ``build_graph`` / asset_detail) — the key a
+    sensitivity-hidden membership test compares on."""
+    _src, _schema, table, column = parse_ref(ref)
+    return ".".join(["public", table, *([column] if column else [])])
+
+
+def _read_scoped_refs(
+    conn: DbConn, norm_source: str, refs: list[str], roles: Iterable[str]
+) -> list[str]:
+    """Drop every ``logical_ref`` whose ``graph_node`` COLUMN carries a sensitivity these ``roles``
+    can't see (F1 read-scope leak fix). Mirrors :func:`asset_detail._load_anchor`'s predicate — a ref
+    is HIDDEN iff its column node has a non-null ``sensitivity`` that is NOT in
+    :func:`allowed_sensitivities`. Refs with no matching column node are KEPT (nothing sensitivity-
+    restricted is known about them), so this never over-drops a legitimately-visible decided ref.
+
+    Because it prunes the ref UNIVERSE, a hidden sibling column can never surface anywhere downstream
+    of readiness — not as a ``field:...`` requirement_id, an ``advisory_gaps`` entry, or a
+    ``summary_scores`` count — for a caller who can't see it."""
+    if not refs:
+        return refs
+    hidden = _hidden_columns(conn, norm_source, roles)
+    if not hidden:
+        return refs
+    return [ref for ref in refs if _public_flat(ref) not in hidden]
+
+
+def _pair_hides_column(pair: tuple[str, str], hidden: set[str]) -> bool:
+    """Whether either endpoint of a relationship ``pair`` (``normalize_ref`` column refs) names a
+    sensitivity-hidden column — so the WHOLE pair (and the join it represents) is omitted for a caller
+    who can't see the column, exactly as asset_detail's approved_joins OMIT a join to a hidden
+    endpoint. Prevents a hidden pii column from surfacing as a confirmed/proposed/weak/conflicting
+    pair in the relationship diagnostic."""
+    return any(_public_flat(endpoint) in hidden for endpoint in pair)
+
+
 def _scoped_refs(
-    conn: DbConn, *, source: str, subset: str | Sequence[str] | None
+    conn: DbConn, *, source: str, subset: str | Sequence[str] | None,
+    roles: Iterable[str] | None = None,
 ) -> list[str]:
     """The in-scope ``logical_ref`` set — the universe readiness reports on (the refs Task 8 recorded
     decisions for), filtered to this ``source`` and narrowed by ``subset``.
 
     ``subset`` is ``None`` (the whole catalog source), a TABLE selector string, or an explicit
     sequence of logical_refs (a TABLE call the caller already resolved to refs).
+
+    ``roles`` is the READ-SCOPE seam (F1): ``None`` (the default) preserves today's behaviour — every
+    decided ref for the source. A non-None ``roles`` (even an empty iterable — a caller with no
+    sensitivity role) prunes refs whose column node is sensitivity-hidden from those roles
+    (:func:`_read_scoped_refs`), so a hidden sibling never leaks its name/existence/count through the
+    readiness diagnostic. Applied BEFORE the subset match so table derivation, the per-field loop, and
+    the counts all see only the visible universe.
 
     A string TABLE selector is SCHEMA-AWARE (Task-9 review fix — matching on the table name alone
     over-reported across two same-named tables in different schemas). It may be written:
@@ -232,6 +295,8 @@ def _scoped_refs(
     norm_source = source.strip().lower()
     rows = conn.execute("SELECT DISTINCT logical_ref FROM field_decision_event").fetchall()
     refs = [r[0] for r in rows if parse_ref(r[0])[0] == norm_source]
+    if roles is not None:
+        refs = _read_scoped_refs(conn, norm_source, refs, roles)
     if subset is None:
         return sorted(refs)
     if isinstance(subset, str):
@@ -343,6 +408,7 @@ def compute_readiness(
     source: str,
     scope: ReadinessScopeType,
     subset: str | Sequence[str] | None = None,
+    roles: Iterable[str] | None = None,
 ) -> FeatureReadiness:
     """Compute a scoped, blocker-based readiness DIAGNOSTIC for ``source`` (spec §9).
 
@@ -363,8 +429,14 @@ def compute_readiness(
     SCHEMA-AWARE selector (``"schema.table"``, or a bare ``"table"`` when unambiguous within a single
     schema; see :func:`_scoped_refs`) or an explicit logical_ref list. A non-None ``subset`` that
     matches NOTHING yields a single ``subset_not_found`` blocker (never a false "ready"). GENERATION_RUN
-    / RECIPE gating is Phase 2+ and is stamped on the verdict but computed with the same diagnostic."""
-    refs = _scoped_refs(conn, source=source, subset=subset)
+    / RECIPE gating is Phase 2+ and is stamped on the verdict but computed with the same diagnostic.
+
+    ``roles`` is the READ-SCOPE seam (F1, default ``None`` = today's unscoped behaviour): when a
+    caller passes its roles, the in-scope ref universe is pruned of sensitivity-hidden columns
+    (:func:`_scoped_refs`), so no requirement_id, advisory gap, or count in the returned verdict ever
+    names or tallies a column the caller can't see. The per-table structural + join requirements are
+    emitted only for the tables that survive that prune."""
+    refs = _scoped_refs(conn, source=source, subset=subset, roles=roles)
 
     all_reqs: list[ReadinessRequirement] = []
     advisory: list[str] = []
@@ -412,7 +484,8 @@ def compute_readiness(
     if tables:
         rel_by_table = {
             (r.schema, r.table): r.status
-            for r in compute_relationship_readiness(conn, source=source, subset=subset)
+            for r in compute_relationship_readiness(
+                conn, source=source, subset=subset, roles=roles)
         }
     for schema, table in tables:
         for fact_name, authority in _PHASE1_UNPROMOTED:
@@ -631,6 +704,7 @@ def compute_relationship_readiness(
     *,
     source: str,
     subset: str | Sequence[str] | None = None,
+    roles: Iterable[str] | None = None,
 ) -> tuple[RelationshipReadiness, ...]:
     """The per-table RELATIONSHIP readiness diagnostic for ``source`` (spec §16) — READ-ONLY.
 
@@ -639,6 +713,13 @@ def compute_relationship_readiness(
     ``"schema.table"`` / unambiguous bare ``"table"`` selector, or an explicit ref list). A subset
     matching NO decided refs returns ``()`` — this view has no blocker vocabulary; use
     :func:`compute_readiness` for the gate-shaped subset_not_found diagnostic.
+
+    ``roles`` is the READ-SCOPE seam (F1 / audit finding [6], default ``None`` = today's unscoped
+    behaviour). A non-None ``roles`` (even an empty iterable) prunes BOTH the table universe
+    (:func:`_scoped_refs`) AND every candidate PAIR that names a sensitivity-hidden column
+    (:func:`_pair_hides_column`), so a hidden sibling column never surfaces as a confirmed / proposed
+    / weak / conflicting pair — and the folded per-table status reflects only the joins the caller can
+    see, exactly as asset_detail's approved_joins OMIT a join to a hidden endpoint.
 
     Derivation per table, from the two candidate stores (:func:`_relationship_candidates`):
 
@@ -655,11 +736,21 @@ def compute_relationship_readiness(
     from featuregen.overlay.store import load_fact
     from featuregen.overlay.upload.passc.lifecycle import _ACTIVE
 
-    tables = _tables_of(_scoped_refs(conn, source=source, subset=subset))
+    tables = _tables_of(_scoped_refs(conn, source=source, subset=subset, roles=roles))
     if not tables:
         return ()
     norm_source = source.strip().lower()
     facts, weak = _relationship_candidates(conn, norm_source)
+    if roles is not None:
+        # Read-scope the PAIRS (finding [6]): drop any fact/weak candidate whose column pair names a
+        # sensitivity-hidden endpoint, so the pair lists AND the folded status never reveal a join the
+        # caller can't see (a table whose only join is on a hidden column reads NO_CANDIDATES).
+        hidden = _hidden_columns(conn, norm_source, roles)
+        if hidden:
+            facts = {fk: entry for fk, entry in facts.items()
+                     if not _pair_hides_column(entry[0], hidden)}
+            weak = {pair: tabs for pair, tabs in weak.items()
+                    if not _pair_hides_column(pair, hidden)}
     status_of_key = {
         fk: fold_overlay_state(load_fact(conn, fk)).status for fk in facts
     }

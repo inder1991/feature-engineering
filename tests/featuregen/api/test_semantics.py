@@ -197,3 +197,21 @@ def test_complete_requires_catalog_write(client, conn):
     res = _complete(client, "public.balances.balance", {"entity": "Account"}, headers=VIEWER)
     assert res.status_code == 403
     assert _node(conn, "public.balances.balance") == (None, None, None, None, False)
+
+
+def test_complete_is_read_scoped_hidden_pii_column_404(client, conn):
+    """Audit finding [7]: complete_semantics resolves the node UNDER the actor's sensitivity scope.
+    A caller with catalog:write but NO pii_reader gets a 404 (hidden == missing, no existence
+    oracle) and writes NOTHING on a pii column; a pii_reader sees it and can complete it — matching
+    the read-scoped semantics-pending queue and the F3 field-correction gate."""
+    upload_csv(client, "hr", HR_CSV)
+    ref = "public.people.ssn"                          # sensitivity='pii' (HR_CSV)
+    # AUTH is platform_admin WITHOUT pii_reader: the hidden pii column is a 404, nothing written.
+    res = _complete(client, ref, {"entity": "Person"}, source="hr", headers=AUTH)
+    assert res.status_code == 404
+    assert _node(conn, ref, source="hr")[3] is None    # entity un-written (hidden == missing)
+    # A pii_reader sees the column and can complete its semantics.
+    res = _complete(client, ref, {"entity": "Person"}, source="hr", headers=PII_AUTH)
+    assert res.status_code == 200
+    assert res.json()["applied"] == {"entity": "Person"}
+    assert _node(conn, ref, source="hr")[3] == "Person"

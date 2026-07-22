@@ -29,12 +29,17 @@ from featuregen.overlay.upload.column_authority import (
     read_column_facts,
 )
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CATALOG_PROJECTION_UNAVAILABLE,
+    CatalogProjectionUnavailable,
+)
 from featuregen.overlay.upload.join_path import (
     JoinOutcome,
     JoinStep,
     classify_join_path,
     find_join_path,
 )
+from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
@@ -112,6 +117,13 @@ class Requirement:
     code: str                       # in REQUIREMENT_CODES
     operand: tuple[str, str]        # (catalog_source, object_ref) the requirement concerns
     detail: str = ""                # human-readable, no PII / no sample values
+    # C2-C3: a requirement is an IMMUTABLE VALUE OBJECT validated against the versioned
+    # ValidationRequirementSchema registry (see validation_requirements.py). These fields are ADDED
+    # LAST with defaults so every existing positional/keyword Requirement(code, operand, detail)
+    # construction stays byte-identical. `params` is a sorted tuple of (name, value) pairs — a
+    # HASHABLE, immutable representation (never a mutable dict) so the frozen dataclass stays hashable.
+    schema_version: str = "v1"      # which registry schema version this requirement was minted against
+    params: tuple[tuple[str, object], ...] = ()  # typed check parameters, sorted (name, value) pairs
 
 
 def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
@@ -197,14 +209,22 @@ _MENU_FACT_FIELDS = {
 }
 _MENU_IDENTITY_FIELDS = ("object_ref", "table", "column", "concept", "domain")
 _MENU_DEFINITION_FIELDS = ("definition", "semantic_terms")
+# The menu fields whose "governed" authority is LOAD-BEARING (they can clear a design check): the two
+# decision-governed fields + the two fact-governed fields. Their {value, authority} is sourced from C1
+# (read_operational_value) so the menu shows "governed" ONLY for a hash-verified status=="resolved" —
+# a drifted / forked / hash-mismatched read shows a "hint", never a false "governed". The remaining
+# menu facts (declared_type/entity/unit/currency) are hints by policy → stay on read_column_facts.
+_MENU_GOVERNED_FIELDS: frozenset[str] = frozenset(
+    {"logical_representation", "additivity", "is_grain", "is_as_of"})
 
 
 def _enriched_column(conn, c: dict) -> dict:
     """One flag-ON menu column: structural identity bare, definition-kind free text kept (sanitized
-    at egress in enrich_llm), and each governed/hint fact wrapped as OperationalColumnFacts
-    {value, authority} via read_column_facts (never a bare display value; spec §5). The candidate
-    dict carries the PUBLIC-FLATTENED object_ref, so the decision-log key is rebuilt through the
-    same logical_ref_of bridge the validator uses."""
+    at egress in enrich_llm), and each governed/hint fact wrapped as {value, authority} (never a bare
+    display value; spec §5). The GOVERNED-clearing facts come from C1 (read_operational_value) so the
+    menu never shows a false "governed" for a drifted/tampered value; the hint facts stay on
+    read_column_facts. The candidate dict carries the PUBLIC-FLATTENED object_ref, so the decision-log
+    key is rebuilt through the same logical_ref_of bridge the validator uses."""
     out: dict = {}
     for k in _MENU_IDENTITY_FIELDS:
         v = c.get(k)
@@ -214,10 +234,15 @@ def _enriched_column(conn, c: dict) -> dict:
         v = c.get(k)
         if v:
             out[k] = v
-    lref = logical_ref_of(c["catalog_source"], c["object_ref"])
+    lref = logical_ref_of(conn, c["catalog_source"], c["object_ref"])
     for menu_key, field_name in _MENU_FACT_FIELDS.items():
-        facts = read_column_facts(conn, lref, field_name)
-        out[menu_key] = {"value": facts.value, "authority": facts.authority}
+        if field_name in _MENU_GOVERNED_FIELDS:
+            ov = read_operational_value(conn, lref, field_name)
+            authority = "governed" if ov.status == "resolved" else "hint"
+            out[menu_key] = {"value": ov.value, "authority": authority}
+        else:
+            facts = read_column_facts(conn, lref, field_name)
+            out[menu_key] = {"value": facts.value, "authority": facts.authority}
     return out
 
 
@@ -380,6 +405,67 @@ def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
     return columns, table_context
 
 
+# ── H1a carry-through value objects ────────────────────────────────────────────────────────────────
+# Small, frozen, HASHABLE (tuple members only) value objects the feature assistant carries so H1b's
+# Gate-1 confirmation write and H3's planner have their metadata. H1a establishes the SHAPE only; H1b
+# mints the durable ids / persists the CONFIRMED bindings. Every field is defaulted so an idea that
+# carries none serializes byte-identically to the pre-H1a shape.
+@dataclass(frozen=True, slots=True)
+class RoleBinding:
+    """One role→source binding on a FeatureIdea (entity / time / currency / measure …). `ref` is the
+    (catalog_source, object_ref) the role bound to; `authority` is the governing authority (governed /
+    declared / hint); `confirmation_required` flags a binding the human must confirm at Gate 1."""
+    role: str = ""
+    ref: tuple[str, str] | None = None
+    evidence_ids: tuple[str, ...] = ()
+    fact_ids: tuple[str, ...] = ()
+    authority: str = ""
+    confirmation_required: bool = False
+
+    def to_json(self) -> dict:
+        d: dict = {"role": self.role, "authority": self.authority}
+        if self.ref is not None:
+            d["ref"] = [self.ref[0], self.ref[1]]
+        if self.evidence_ids:
+            d["evidence_ids"] = list(self.evidence_ids)
+        if self.fact_ids:
+            d["fact_ids"] = list(self.fact_ids)
+        if self.confirmation_required:
+            d["confirmation_required"] = True
+        return d
+
+    @staticmethod
+    def from_json(d: dict) -> RoleBinding:
+        ref = d.get("ref")
+        return RoleBinding(
+            role=str(d.get("role", "")),
+            ref=(str(ref[0]), str(ref[1])) if ref else None,
+            evidence_ids=tuple(str(x) for x in d.get("evidence_ids", ())),
+            fact_ids=tuple(str(x) for x in d.get("fact_ids", ())),
+            authority=str(d.get("authority", "")),
+            confirmation_required=bool(d.get("confirmation_required", False)))
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalRequirementPreview:
+    """A PREVIEW of an external-validation requirement carried on a candidate (content + schema version
+    + content hash). H1b mints the durable requirement ids from these previews; H1a only carries them."""
+    content: str = ""
+    schema_version: str = "v1"
+    content_hash: str = ""
+
+    def to_json(self) -> dict:
+        return {"content": self.content, "schema_version": self.schema_version,
+                "content_hash": self.content_hash}
+
+    @staticmethod
+    def from_json(d: dict) -> ExternalRequirementPreview:
+        return ExternalRequirementPreview(
+            content=str(d.get("content", "")),
+            schema_version=str(d.get("schema_version", "v1")),
+            content_hash=str(d.get("content_hash", "")))
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureIdea:
     name: str
@@ -417,6 +503,29 @@ class FeatureIdea:
     plan_envelope: PlanEnvelopeV1 | None = None
     origin: str = "llm"
     path_authority: str = "single_or_llm"
+    # ── H1a carry-through metadata (additive; all defaulted so every existing constructor + persisted
+    #    snapshot stays byte-identical). Consumed by H1b's Gate-1 confirmation write and H3's planner.
+    #    RECONCILES with the 3C.2a fields — it does NOT duplicate them:
+    #      • generation_source is the AUTHORITATIVE, SERVER-assigned generation-path label
+    #        (recipe | llm_freeform | user_defined). It is NEVER read from LLM/client output. `origin`
+    #        ("llm" / "governed_planner") is KEPT as-is for the 3C.2a envelope-path back-compat; the two
+    #        differ by design (origin = envelope provenance, generation_source = server path authority).
+    #      • planner_applicability is DERIVED from the governed plan_envelope + cross-catalog flag state:
+    #        a governed plan_envelope present ⟹ "applicable_cross_catalog"; a recipe idea with no
+    #        envelope ⟹ "not_applicable_single_catalog"; a non-recipe (llm_freeform) idea ⟹
+    #        "not_applicable_nonrecipe" (default); a recipe eligible-but-flag-off ⟹ "gated_off". It maps
+    #        onto path_authority ("single_or_llm" / "governed_cross_catalog") without repurposing it.
+    generation_source: str = "llm_freeform"
+    recipe_id: str | None = None
+    candidate_status: str = ""
+    input_role_bindings: tuple[RoleBinding, ...] = ()
+    external_requirement_previews: tuple[ExternalRequirementPreview, ...] = ()
+    metadata_snapshot_id: str | None = None            # the C0 snapshot this idea was grounded on
+    metadata_input_fingerprint: str | None = None
+    binding_fact_keys: tuple[str, ...] = ()            # entity/time/currency fact keys used
+    planner_applicability: str = "not_applicable_nonrecipe"
+    physical_plan_id: str | None = None
+    planner_declaration_id: str | None = None
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
@@ -492,7 +601,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             if wm is None or wm < now - fresh_within:
                 return None, Rejection(RejectCode.STALE, f"stale source: {src}")
 
+    # C2-C3: every requirement below is minted through the SANCTIONED, registry-validated factory
+    # (validation_requirements.build_requirement) — the deterministic code picks code + typed params
+    # from server-known refs; a bad code/param is a PROGRAMMER error (raises), never swallowed. Imported
+    # here (function-local) because validation_requirements imports REQUIREMENT_CODES/Requirement from
+    # this module — a module-top import would be a circular import at load time.
+    from featuregen.overlay.upload.validation_requirements import build_requirement
+
     aggregation = raw.get("aggregation")
+    operation = _norm_agg(aggregation)   # the normalized operation string (server-known, not the LLM's)
     grain_table = raw.get("grain_table")
     catalogs = {p[0] for p in pairs}
     requirements: list[Requirement] = []
@@ -500,29 +617,45 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     time_operand: tuple[str, str] | None = None
 
     # ── disposition: numeric type (a numeric op's measure must be numeric; declared_type is a HINT
-    #    that may only reject/needs-check, never clear — only operational data_type clears) ──
+    #    that may only reject/needs-check, never clear). Read the operational type through C1
+    #    (read_operational_value) so its tamper gate protects the clear: C1 fails CLOSED with
+    #    value=None exactly on a DRIFTED / ambiguous head (GATE 2 hash_mismatch — the graph type
+    #    drifted from its approved decision — or GATE 1 fork), so such a value no longer clears. A
+    #    genuinely governed (resolved, hash-verified) type clears; an UNGOVERNED type is a numeric
+    #    HINT that clears exactly as before (logical_representation is often ungoverned on the upload
+    #    path — consistent-state behavior is preserved; only the drifted case is newly fail-closed).
+    #    projection_unavailable ABORTS (never serve a stale type). ──
     if _needs_numeric(aggregation):
         for src, d in pairs:
-            lref = logical_ref_of(src, d)
-            if _is_numeric(read_column_facts(conn, lref, "logical_representation").value):
+            lref = logical_ref_of(conn, src, d)
+            ov = _governed_read(conn, lref, "logical_representation")
+            if _is_numeric(ov.value):   # value is None on the C1 drift/fork fail-closed → won't clear
                 continue
             declared = read_column_facts(conn, lref, "declared_type").value
             if declared and not _is_numeric(declared):
                 return None, Rejection(RejectCode.NON_NUMERIC,
                                        f"declared type {declared!r} of {d} is not numeric")
-            requirements.append(Requirement("TYPE_IS_NUMERIC", (src, d),
-                                            "operational type unknown; numeric declared hint"))
+            requirements.append(build_requirement(
+                code="TYPE_IS_NUMERIC", operand=(src, d),
+                detail="operational type unknown; numeric declared hint", params=None))
 
-    # ── disposition: additivity — only a GOVERNED semi/non-additive rejects; an unresolved
-    #    (file-declared / hint) additivity is honest needs-check (spec [F6]) ──
+    # ── disposition: additivity — only a GOVERNED (status=="resolved", hash-verified) semi/non-
+    #    additive rejects; ANY other C1 status (no_decision/no_value/not_operational/conflict/fork/
+    #    hash_mismatch/retired) is an honest needs-check (spec [F6]). THE FIX: a graph value that
+    #    DRIFTED from its approved decision (e.g. mutated to "additive") now hash-mismatches → status
+    #    != "resolved" → does NOT clear (emits ADDITIVITY_SUPPORTS_OPERATION), where the old permissive
+    #    read_column_facts served it as governed-additive and wrongly cleared. ──
     if _is_additive_unsafe(aggregation):
         for src, d in pairs:
-            facts = read_column_facts(conn, logical_ref_of(src, d), "additivity")
-            if facts.authority == "governed" and facts.value in ("semi_additive", "non_additive"):
-                return None, Rejection(RejectCode.ADDITIVITY, f"unsafe additive aggregation of {d}")
-            if facts.authority != "governed":
-                requirements.append(Requirement("ADDITIVITY_SUPPORTS_OPERATION", (src, d),
-                                                "additivity not governed-confirmed"))
+            ov = _governed_read(conn, logical_ref_of(conn, src, d), "additivity")
+            if ov.status == "resolved":
+                if ov.value in ("semi_additive", "non_additive"):
+                    return None, Rejection(RejectCode.ADDITIVITY,
+                                           f"unsafe additive aggregation of {d}")
+            else:
+                requirements.append(build_requirement(
+                    code="ADDITIVITY_SUPPORTS_OPERATION", operand=(src, d),
+                    detail="additivity not governed-confirmed", params={"operation": operation}))
 
     # ── disposition: unit / currency — DISTINCT hint fields (never folded): a hint may TIGHTEN
     #    (a positive contradiction rejects; absence needs-checks) but never CLEAR — matching
@@ -537,11 +670,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     if len(pairs) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
         for src, d in pairs:
             if not meta[d]["unit"]:
-                requirements.append(Requirement("UNIT_CONSISTENT", (src, d),
-                                                "unit unknown across a combining op"))
+                requirements.append(build_requirement(
+                    code="UNIT_CONSISTENT", operand=(src, d),
+                    detail="unit unknown across a combining op", params=None))
             if not meta[d]["currency"]:
-                requirements.append(Requirement("CURRENCY_CONSISTENT", (src, d),
-                                                "currency unknown across a combining op"))
+                # currency is UNKNOWN here (that is the mint condition), so no bound currency_ref is
+                # available — pass none; currency_ref is OPTIONAL in the registry (C2C3-T1 tweak).
+                requirements.append(build_requirement(
+                    code="CURRENCY_CONSISTENT", operand=(src, d),
+                    detail="currency unknown across a combining op", params={}))
 
     # ── disposition: temporal — a windowed feature needs a governed-VERIFIED as-of column; a table
     #    with NO as-of column at all is still a hard reject (future-leakage risk) ──
@@ -556,10 +693,11 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                 return None, Rejection(RejectCode.NO_POINT_IN_TIME,
                                        f"no point-in-time basis for {d} (future-leakage risk)")
             time_operand = (src, aref)
-            facts = read_column_facts(conn, logical_ref_of(src, aref), "is_as_of")
-            if facts.authority != "governed":
-                requirements.append(Requirement("TEMPORAL_IS_POPULATED", (src, aref),
-                                                "as-of column declared, not governed-verified"))
+            ov = _governed_read(conn, logical_ref_of(conn, src, aref), "is_as_of")
+            if ov.status != "resolved":
+                requirements.append(build_requirement(
+                    code="TEMPORAL_IS_POPULATED", operand=(src, aref),
+                    detail="as-of column declared, not governed-verified", params=None))
 
     # ── disposition: grain — a grain feature needs a governed-VERIFIED grain column ──
     if grain_table and len(catalogs) == 1:
@@ -567,10 +705,11 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         gref = _grain_column_ref(conn, gcat, grain_table)
         if gref is not None:
             grain_operand = (gcat, gref)
-            facts = read_column_facts(conn, logical_ref_of(gcat, gref), "is_grain")
-            if facts.authority != "governed":
-                requirements.append(Requirement("GRAIN_IS_UNIQUE", (gcat, gref),
-                                                "grain declared, not governed-verified"))
+            ov = _governed_read(conn, logical_ref_of(conn, gcat, gref), "is_grain")
+            if ov.status != "resolved":
+                requirements.append(build_requirement(
+                    code="GRAIN_IS_UNIQUE", operand=(gcat, gref),
+                    detail="grain declared, not governed-verified", params=None))
 
     # ── disposition: cross-table join authority (spec §7). A measure in a different table than the
     #    grain needs a real path; UNVERIFIED -> JOIN_CONNECTIVITY, no-path / read-scope-denied -> reject ──
@@ -586,8 +725,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                     return None, Rejection(RejectCode.JOIN_DENIED,
                                            f"join {grain_table} -> {d} crosses a read-scope-denied hop")
                 if outcome.kind == JoinOutcome.UNVERIFIED:
-                    requirements.append(Requirement("JOIN_CONNECTIVITY", (src, d),
-                                                    "join authorized but not verified"))
+                    requirements.append(build_requirement(
+                        code="JOIN_CONNECTIVITY", operand=(src, d),
+                        detail="join authorized but not verified", params=None))
 
     # ── finalize (tri-state) ──
     status = "NEEDS_EXTERNAL_VALIDATION" if requirements else "DESIGN_CHECKED"
@@ -598,6 +738,26 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         operation_kind=_norm_agg(aggregation), measure_refs=tuple(pairs),
         grain_ref=grain_operand, time_ref=time_operand, window=_window_of(aggregation),
         grouping_refs=(), validation_status=status, requirements=tuple(requirements)), None
+
+
+def _governed_read(conn, logical_ref: str, field_name: str):
+    """The C1 authority read for a GOVERNED-clearing check on the customer feature path.
+
+    Delegates to :func:`read_operational_value` — the tamper-gated read (fork / hash-verify vs the
+    approved decision's ``load_bearing_value_hash`` / projection-health). ONLY ``status=="resolved"``
+    is a governed, hash-verified value that may CLEAR a design check; every other status is a
+    non-authoritative hint that can only tighten (needs-check) — so a graph value that DRIFTED from
+    its approved decision (``hash_mismatch``), a forked head (``fork``), or a retired decision
+    (``retired``) can no longer masquerade as governed and wrongly clear.
+
+    ``projection_unavailable`` ABORTS generation: re-raise :class:`CatalogProjectionUnavailable`
+    (which the feature-gen route maps to a retryable 503) so we NEVER serve a stale projected value."""
+    ov = read_operational_value(conn, logical_ref, field_name)
+    if ov.status == "projection_unavailable":
+        raise CatalogProjectionUnavailable(
+            CATALOG_PROJECTION_UNAVAILABLE,
+            ov.conflict_status or "load-bearing catalog projection unavailable")
+    return ov
 
 
 def _norm_agg(aggregation: str | None) -> str:

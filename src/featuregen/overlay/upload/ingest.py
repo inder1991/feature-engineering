@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay import facts
@@ -31,6 +31,11 @@ from featuregen.overlay.upload.canonical import (
     ValidationResult,
     validate_rows,
 )
+from featuregen.overlay.upload.contract.invalidation import (
+    REASON_FIELD_DECISION_RETIRED,
+    ChangedRef,
+    invalidate_contracts_for,
+)
 from featuregen.overlay.upload.enrich import (
     classify_domains,
     content_hash,
@@ -39,7 +44,13 @@ from featuregen.overlay.upload.enrich import (
     suppressed_definition_hashes,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
-from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, resolve_and_project
+from featuregen.overlay.upload.field_resolution import (
+    FIELD_POLICY_VERSION,
+    _graph_key,
+    is_feature_eligible,
+    resolve_and_project,
+    stale_and_clear_field,
+)
 from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload, join_path
 from featuregen.overlay.upload.graph import (
@@ -65,8 +76,10 @@ from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_read
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.sample_parser import ParsedProfile, reconcile_profile
 from featuregen.overlay.upload.sanitize import redact_text
+from featuregen.overlay.upload.semantic_bindings.projection import reproject_semantic_bindings
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
+    TECHNICAL_CSV_PROFILE,
     SourceCapabilityProfile,
     strength_for,
 )
@@ -103,6 +116,23 @@ def pass_c_enabled() -> bool:
     directly to avoid an import cycle), so a declared join's raw edge is written display_only AND
     routed to an approved_join proposal — never stranded display-only."""
     return os.environ.get("OVERLAY_PASS_C", "0") == "1"
+
+
+def semantic_binding_candidates_enabled() -> bool:
+    """Feature switch for the D4 semantic-binding CANDIDATE stage (Delivery D), default OFF. ON runs
+    D2's deterministic shortlist (+ D3's audited LLM select when a client is present), persists the
+    immutable candidate set via D1's store, and CAS-projects it as the table's current set. NEVER
+    promotes a fact to VERIFIED (candidates are proposals, not facts); flag-off is byte-identical."""
+    return os.environ.get("OVERLAY_SEMANTIC_BINDING_CANDIDATES", "0") == "1"
+
+
+def semantic_binding_proposals_enabled() -> bool:
+    """Feature switch for the D4 semantic-binding PROPOSAL stage (Delivery D), default OFF. ON maps a
+    strong candidate to an E1 governed DRAFT fact (entity_assignment / currency_binding) + the
+    candidate->proposal link. INVALID unless :func:`semantic_binding_candidates_enabled` is ALSO on —
+    a proposal has no persisted candidate to link, so the combo is rejected as a clear no-op. NEVER
+    VERIFIED: proposals stay DRAFT for E2's human four-eyes surface."""
+    return os.environ.get("OVERLAY_SEMANTIC_BINDING_PROPOSALS", "0") == "1"
 
 
 # #21 — per-call ceiling on the events one _drain_projection call may process. The drain runs
@@ -158,20 +188,38 @@ class IngestResult:
     join_candidates: int = 0
     passb_proposed: int = 0
     passb_abstained: int = 0
+    # D4 semantic-binding truthful counts (additive, `=0` defaults so every POSITIONAL reject/held
+    # constructor site still builds). `semantic_binding_candidates` = candidate rows this upload
+    # PERSISTED (all dispositions — strong/weak/rejected, never silently dropped); `proposed` = strong
+    # candidates routed to an E1 DRAFT fact + link (accepted); `abstained` = strong candidates whose
+    # propose_fact was NOT accepted (a duplicate of an already-pending/verified fact on re-upload —
+    # expected, not an error); `failed` = tables whose candidate/proposal work hit its fail-soft
+    # except (contained, upload still succeeds). All 0 when both flags are off (byte-identical).
+    semantic_binding_candidates: int = 0
+    semantic_binding_proposed: int = 0
+    semantic_binding_abstained: int = 0
+    semantic_binding_failed: int = 0
 
 
-def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0
-                        ) -> tuple[str, str | None, dict]:
+def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
+                        not_attempted: int = 0) -> tuple[str, str | None, dict]:
     """``(state, reason_code, detail)`` for a per-item stage (#22) — the honest account. ``None``
-    (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING is
-    ``failed``; SOME items unresolved — or the stage caught per-item failures INTERNALLY (the
-    concept-evidence writes, batch discards, Pass B) — is ``partial``: an outer success is NOT
-    evidence that every item succeeded. Counts ride in ``detail`` (never row data).
+    (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING (and
+    nothing merely truncated) is ``failed``; SOME items unresolved — or the stage caught per-item
+    failures INTERNALLY (the concept-evidence writes, batch discards, Pass B) — is ``partial``: an
+    outer success is NOT evidence that every item succeeded. Counts ride in ``detail`` (never row data).
 
     A Pass B ABSTENTION (a parseable synthesis with no grain AND no as-of) is RESOLVED, not a failure
     — some tables genuinely have no single grain/as-of. Its count rides in ``detail["abstained"]``
     (present only when non-zero, like ``unresolved``). Only dict-valued stages (Pass B) can abstain;
-    string-valued stages (concept/definition/domain) never match, so their detail is unchanged."""
+    string-valued stages (concept/definition/domain) never match, so their detail is unchanged.
+
+    ``not_attempted`` (from ``run_batched``'s ``report``): items the budget/deadline cutoff skipped
+    WITHOUT ever dispatching them. They were NOT tried, so branding them ``items_failed`` is a lie.
+    When unresolved is (partly) truncation, its count rides in ``detail["not_attempted"]`` and — if
+    there is no GENUINE dispatched failure — the reason_code is the distinct, honest ``truncated``.
+    ``items_failed`` stays reserved for items actually dispatched and rejected/failed (a run with
+    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``)."""
     if result is None:
         return "failed", "exception", {"expected": expected}
     detail: dict = {"resolved": len(result), "expected": expected}
@@ -185,10 +233,18 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
         detail["abstained"] = abstained
     if internal_failures:
         detail["internal_failures"] = internal_failures
-    if expected and not result:
+    # Truncated items were never dispatched, so they can never exceed the unresolved count; clamp
+    # defensively (a reused cache HIT resolves even when later chunks were cut off).
+    not_attempted = min(max(not_attempted, 0), unresolved)
+    if not_attempted:
+        detail["not_attempted"] = not_attempted
+    dispatched_failures = unresolved - not_attempted   # unresolved items that WERE tried
+    if expected and not result and not not_attempted:
         return "failed", "no_items_resolved", detail
-    if unresolved or internal_failures:
+    if dispatched_failures or internal_failures:
         return "partial", "items_failed", detail
+    if not_attempted:
+        return "partial", "truncated", detail
     return "succeeded", None, detail
 
 
@@ -254,6 +310,14 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
         if prior is not None and prior != value:
             outcome = "changed"
     # New fact, a changed value, or a non-VERIFIED (STALE/REVERIFY/REJECTED) stream -> (re)assert.
+    # H2c SEAM: wire fact-lifecycle drift -> invalidate_contracts_for here (a governed grain/availability
+    # fact whose value CHANGED, or that STALEd/EXPIRED/REJECTED, should INVALIDATE contracts bound to it
+    # via ChangedRef(fact_id=..., reason=FACT_STALE/FACT_EXPIRED/FACT_REJECTED)). NOT wired yet: reverse-
+    # dep rows carry fact_id=NULL until a draft binds governed-fact ids (# H1b), so a fact-keyed
+    # invalidate would match nothing; and there is no single fact-transition hook (the lifecycle is an
+    # event fold across join_governance/table_fact/operational_facts projections). Deferred, not forced.
+    # The read-time gate already covers grain/as_of facts fail-closed (is_grain/is_as_of are in the
+    # dependency graph_node state signature, so a drift-STALEd grain fact flips the hash).
     base = stream[-1].stream_version if stream else 0
     draft = append_overlay_event(conn, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED,
         actor=actor, expected_version=base, payload={
@@ -469,6 +533,201 @@ def _run_pass_c(conn, catalog_source: str, rows: list[CanonicalRow], *,
     return sum(1 for ev in evidences if ev.bucket != "suppressed")
 
 
+# ── D4 semantic-binding ingest wiring (Delivery D). Two savepointed fail-soft stages behind
+# OVERLAY_SEMANTIC_BINDING_CANDIDATES / _PROPOSALS (default OFF), inserted after glossary/Pass B and
+# before the projection drain. They NEVER abort the upload or touch feature/contract rows, and never
+# promote a fact to VERIFIED (proposals are DRAFT for E2's human gate). A re-ingest fingerprint
+# invalidation runs ALWAYS (even flag-off / no client, NO LLM) so disabling the producer can't freeze
+# a stale current set. Mirrors the Pass C savepoint + except pattern above. ──
+
+
+def _semantic_binding_prep(conn, catalog_source: str, rows: list[CanonicalRow], *,
+                           glossary: GlossaryUpload | None, bindings: dict | None,
+                           concepts: dict | None, definitions: dict | None,
+                           domains: dict | None) -> list:
+    """Assemble ``(table_view, pass_c, fingerprint)`` per table from the SAME metadata Pass B reads —
+    the deterministic inputs the D2 shortlist + D1 fingerprint consume. PURE of LLM (build_table_views
+    is a pure builder; ``_pass_c_columns`` reads only the graph for the column entity — NO provider
+    call), so it is safe on the always-run invalidation path (no client, flag-off). ``pass_c`` is keyed
+    by each view column's schema-preserving ``logical_ref`` (what the shortlist/validate/fingerprint
+    expect); ``pass_b`` is intentionally omitted (None) — the shortlist derives currency/measure roles
+    from the column metadata itself, and a consistent None keeps the fingerprint stable across the
+    store and invalidation calls."""
+    from featuregen.overlay.upload.column_view import build_table_views
+    from featuregen.overlay.upload.passc.identifiers import is_join_key_eligible
+    from featuregen.overlay.upload.semantic_bindings.shortlist import PassCIdentifier
+    from featuregen.overlay.upload.semantic_bindings.store import table_fingerprint
+
+    views = build_table_views(rows, glossary=glossary, bindings=bindings, concepts=concepts,
+                              definitions=definitions, domains=domains)
+    # One ColMeta per column (join-key eligibility + resolved entity) — computed ONCE for the upload.
+    colmetas = {(_lc(cm.table), _lc(cm.column)): cm
+                for cm in _pass_c_columns(conn, catalog_source, rows,
+                                          concepts=concepts, glossary=glossary)}
+    out = []
+    for view in views.values():
+        pass_c: dict[str, object] = {}
+        for col in view.columns:
+            cm = colmetas.get((_lc(col.table), _lc(col.column)))
+            if cm is not None:
+                pass_c[col.logical_ref] = PassCIdentifier(
+                    join_key_eligible=is_join_key_eligible(cm), entity=(cm.column_entity or None))
+        out.append((view, pass_c, table_fingerprint(view, pass_c=pass_c)))
+    return out
+
+
+def _invalidate_stale_semantic_binding_sets(conn, catalog_source: str, prepared: list, *,
+                                            now: datetime | None) -> int:
+    """Re-ingest invalidation (Delivery D, runs ALWAYS — even disabled/no-client, NO LLM): for every
+    table in this upload whose live metadata fingerprint no longer matches its CURRENT candidate set,
+    flip currentness to ``unverifiable`` via D1's CAS (the immutable set is KEPT as history). A cheap
+    indexed guard means a source that never ran the producer pays one SELECT and writes nothing
+    (flag-off byte-identical); only a source that ALREADY holds a current set can go stale. Disabling
+    the producer must NOT freeze a stale current set. Returns how many sets were invalidated."""
+    from featuregen.overlay.upload.semantic_bindings.store import table_graph_ref
+    from featuregen.overlay.upload.semantic_bindings.store_projection import (
+        invalidate_current_set_if_stale,
+    )
+
+    if conn.execute(
+        "SELECT 1 FROM current_semantic_binding_candidate_set "
+        "WHERE catalog_source = %s AND candidate_set_id IS NOT NULL LIMIT 1",
+        (catalog_source,)).fetchone() is None:
+        return 0   # no current set can be stale — nothing to invalidate (byte-identical when never on)
+    invalidated = 0
+    for view, _pass_c, fingerprint in prepared:
+        outcome = invalidate_current_set_if_stale(
+            conn, catalog_source=catalog_source, table_graph_ref=table_graph_ref(view),
+            table_fingerprint_now=fingerprint, now=now)
+        if outcome is not None and outcome.status == "unverifiable":
+            invalidated += 1
+    # I-B: a table DROPPED from this re-upload is absent from `prepared`, so the loop above never
+    # re-evaluates it — and `build_graph` already wiped its nodes — yet its `current` candidate set
+    # would stay `status='current'` forever, serving candidates for a table that no longer exists.
+    # Flip every current set of this source whose table is NOT in this upload to `unverifiable` (the
+    # immutable set stays as history — the CAS's whole purpose). One UPDATE, same savepoint, NO LLM.
+    present = [table_graph_ref(view) for view, _pass_c, _fp in prepared]
+    dropped = conn.execute(
+        "UPDATE current_semantic_binding_candidate_set "
+        "SET status = 'unverifiable', candidate_set_id = NULL, projected_at = %s "
+        "WHERE catalog_source = %s AND candidate_set_id IS NOT NULL AND table_graph_ref <> ALL(%s) "
+        "RETURNING table_graph_ref",
+        (now or datetime.now(UTC), catalog_source, present)).fetchall()
+    return invalidated + len(dropped)
+
+
+def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: list, *,
+                                          client, actor, ingestion_run_id: str | None,
+                                          now: datetime | None) -> tuple[int, list, int, int]:
+    """The CANDIDATE stage body (caller owns the savepoint + except). Per table: validate the D2
+    shortlist, persist the immutable candidate set via D1's store, and CAS-project it current; run
+    D3's audited LLM select as ADDITIONAL evidence (persisted as its own immutable set, never made
+    current — the governed proposal path stays deterministic) only when a client is present. Returns
+    ``(candidates_total, proposable, llm_failed, llm_partial)``: ``proposable`` is a list of
+    ``(candidate_set_id, strong_candidates)`` for the proposal stage; ``llm_failed`` counts tables
+    whose D3 stage hit a BLOCKING bound (byte/call/deadline) or provider fault; ``llm_partial`` counts
+    tables whose D3 set was ``partial`` (candidate-cap overflow, still ranked). The caller marks the
+    stage ``partial`` when either is non-zero, WITHOUT changing upload acceptance. NEVER promotes a
+    fact to VERIFIED.
+
+    I-D — the D3 RUN-LEVEL bounds are enforced HERE (they were dead when the caller omitted them): a
+    shared per-run provider-call budget (``max_provider_calls``) and a wall-clock ``deadline`` are
+    threaded into every ``enrich_semantic_bindings`` call, so a wide upload can never make one provider
+    call per table. When the budget/deadline is spent the remaining tables ABSTAIN (a ``failed`` D3
+    set, no dispatch) — the deterministic candidate set is still persisted + current for every table."""
+    from featuregen.overlay.upload import enrich_config
+    from featuregen.overlay.upload.semantic_bindings.shortlist import shortlist
+    from featuregen.overlay.upload.semantic_bindings.store import store_shortlist, table_graph_ref
+    from featuregen.overlay.upload.semantic_bindings.store_projection import (
+        stale_orphaned_proposals,
+    )
+    from featuregen.overlay.upload.semantic_bindings.types import STRONG
+    from featuregen.overlay.upload.semantic_bindings.validate import validate_candidates
+
+    run_id = ingestion_run_id or mint_id("ing")
+    candidates_total = 0
+    llm_failed = 0
+    llm_partial = 0
+    proposable: list = []
+    # I-D run-level bounds: ONE budget + ONE wall-clock deadline shared across every table's D3 call.
+    bounds = enrich_config.semantic_binding_bounds()
+    now_basis = now or datetime.now(UTC)
+    deadline = now_basis + timedelta(seconds=bounds.deadline_s)
+    provider_calls_made = 0
+    for view, pass_c, fingerprint in prepared:
+        deterministic = validate_candidates(
+            shortlist(view, None, pass_c), view, pass_c=pass_c)
+        store_res = store_shortlist(
+            conn, table_view=view, candidates=deterministic, catalog_source=catalog_source,
+            ingestion_run_id=run_id, attempt_no=1, metadata_input_fingerprint=fingerprint,
+            pass_c=pass_c, now=now)
+        # I-C: `store_shortlist` just CAS-projected this upload's set current, so every candidate of a
+        # PRIOR set for this table has now left the current set (each re-upload mints a new set id).
+        # Retire the linked DRAFT proposals those departed candidates orphaned — a VERIFIED fact is
+        # untouched (its link SURVIVES as the durable divergence signal; only its own governed deps
+        # invalidate it). Runs before the proposal stage re-links this upload's current candidates.
+        stale_orphaned_proposals(conn, catalog_source=catalog_source,
+                                 table_graph_ref=table_graph_ref(view))
+        candidates_total += len(deterministic)
+        strong = [c for c in deterministic if c.disposition == STRONG]
+        proposable.append((store_res.persist.candidate_set_id, strong))
+        if client is not None:
+            # D3 audited LLM SELECT — its own separate fail-soft domain (never raises), persisted as a
+            # distinct immutable set for audit. NOT projected current: the deterministic set remains
+            # the authority for the governed proposal path (the LLM can only re-rank, never invent).
+            # A bound overflow (byte/call/deadline) or provider fault -> a ``failed`` set with truthful
+            # counts; the deterministic candidate set (persisted + current above) is unaffected.
+            from featuregen.overlay.upload.semantic_bindings.enrich import enrich_semantic_bindings
+            er = enrich_semantic_bindings(
+                conn, client, table_view=view, candidates=deterministic,
+                catalog_source=catalog_source, ingestion_run_id=run_id, attempt_no=1,
+                pass_c=pass_c, actor=actor, bounds=bounds,
+                calls_remaining=bounds.max_provider_calls - provider_calls_made,
+                deadline=deadline, now=now_basis)
+            # A committed ``llm_call_ref`` is the durable signal a provider call actually landed
+            # (empty-shortlist / budget / deadline / byte / egress-blocked returns leave it None and
+            # make NO provider round-trip) — decrement the shared budget only on a real call.
+            if er.llm_call_ref is not None:
+                provider_calls_made += 1
+            if er.completion_status == "failed":
+                llm_failed += 1               # blocking bound (incl. budget-refused ABSTAIN) / fault
+            elif er.completion_status == "partial":
+                llm_partial += 1              # M-2: candidate-cap overflow — the capped subset ranked
+    return candidates_total, proposable, llm_failed, llm_partial
+
+
+def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tuple[int, int]:
+    """The PROPOSAL stage body (caller owns the savepoint + except). For each STRONG candidate in the
+    persisted current set, map it to an E1 governed DRAFT fact (``propose``) + the candidate->proposal
+    link — proposal ONLY after ``propose_fact`` succeeds. NEVER confirms: the fact stays DRAFT for
+    E2's human four-eyes gate, so this can never create a VERIFIED fact. Returns
+    ``(proposed, abstained)`` — a not-accepted propose (a duplicate of an already-pending/verified
+    fact on re-upload) is ``abstained``, expected and counted, never an error."""
+    from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
+    from featuregen.overlay.upload.semantic_bindings.propose import propose as _sb_propose
+    from featuregen.overlay.upload.semantic_bindings.store import candidate_id_for
+
+    # Proposals ride the SERVICE proposer so four-eyes holds against a human confirmer — but the
+    # VALUE is authored by the uploaded file, so the uploading HUMAN is recorded as provenance
+    # (`source_uploader`) and barred from confirming their own declared binding (program-audit F2:
+    # without this, one platform-admin could upload a file declaring a governed binding and then
+    # confirm it single-handedly — field_correction's M-7 SOURCE-provenance hole on this surface).
+    uploader = actor.subject if getattr(actor, "actor_kind", None) == "human" else None
+    proposed = abstained = 0
+    for candidate_set_id, strong in proposable:
+        if not candidate_set_id:
+            continue
+        for cand in strong:
+            cid = candidate_id_for(cand, candidate_set_id=candidate_set_id)
+            outcome = _sb_propose(conn, cand, candidate_id=cid, actor=_ENRICH_ACTOR,
+                                  idempotency_key=cid, source_uploader=uploader)
+            if outcome.accepted:
+                proposed += 1
+            else:
+                abstained += 1
+    return proposed, abstained
+
+
 # ── Glossary ingest wiring (spec §6.3 / §U). GUARDED: only runs for a glossary upload (a `glossary`
 # sidecar is passed in); a non-glossary upload takes none of this and is byte-for-byte unchanged. ──
 
@@ -478,12 +737,27 @@ _GLOSSARY_CONFLICT_SEVERITY = "metadata_conflict"
 # The SOURCE fields whose change on a re-upload is MATERIAL enough to invalidate a prior human
 # confirmation (spec §6.3). A glossary attests no physical type, so `definition` is its material axis.
 _MATERIAL_FIELDS = frozenset({"definition"})
+# The TECHNICAL-CSV material axis (review M-1): the OPERATIONAL human-confirmable technical fields
+# (currency/unit/sensitivity/additivity — all PREFER_CONFIRMED, carrying the
+# CONFIRMATION_PENDING_REVALIDATION disqualifier) plus definition. A source re-declaration that
+# changes or drops ANY of these must flag a prior human confirmation pending revalidation — the
+# glossary-derived `_MATERIAL_FIELDS` (definition-only) left e.g. a source currency flip (EUR vs a
+# human-confirmed USD) silently non-material, so the stale human value stayed operational with no
+# review signal. NOT `entity`: it is RECOMMENDATION-only advisory (`_ENTITY_ADVISORY`), never
+# operational, so it needs no revalidation flag.
+_TECHNICAL_MATERIAL_FIELDS = frozenset(
+    {"definition", "currency", "unit", "sensitivity", "additivity"})
 
 # The full set of fields each producer can assert for a glossary column. On a re-upload we reconcile
 # these against the fields the NEW upload actually provides: a field the new upload NO LONGER asserts
 # (present->absent) must have its prior ACTIVE rows STALED, else a dropped value stays load-bearing
 # (Task-10 Important-3). Kept in sync with `_write_glossary_source_evidence` / `_parser_evidence`.
 _SOURCE_FIELDS: tuple[str, ...] = ("definition", "domain", "business_term", "bian_path", "fibo_path")
+# The SOURCE fields a TECHNICAL CSV declares per column (Delivery B item 8) — the technical mirror of
+# `_SOURCE_FIELDS`, reconciled present->absent the same way. Kept in sync with
+# `_write_technical_source_evidence` and TECHNICAL_CSV_PROFILE.attested_fields.
+_TECHNICAL_SOURCE_FIELDS: tuple[str, ...] = (
+    "definition", "sensitivity", "additivity", "unit", "currency", "entity")
 _PARSER_FIELDS: tuple[str, ...] = ("logical_representation", "semantic_type")
 # The full set of behavioural fields TAXONOMY can DERIVE from a concept (see `derive_concept_evidence`).
 # `additivity` is conditional (skipped for an `n/a` concept), so a reclassification to a non-additive
@@ -764,6 +1038,97 @@ def _write_glossary_source_evidence(
     return material_changed
 
 
+def _write_technical_source_evidence(
+    conn, *, logical_ref: str, row: CanonicalRow, producer_ref: str, snapshot_id: str
+) -> bool:
+    """Write SOURCE evidence for a TECHNICAL-CSV column at the technical profile's per-field strength
+    (all six fields ATTESTED — the structural source vouches for them, spec §U.1), so a declared
+    unit/currency/entity/sensitivity/additivity/definition can be governed and become operationally
+    load-bearing through the evidence machinery instead of living ONLY as `graph_node` flat columns
+    (Delivery B item 8). The exact technical mirror of :func:`_write_glossary_source_evidence`:
+    present->absent reconciliation stales a field the new upload dropped, and the return says whether
+    the column's MATERIAL changed vs the prior upload — a material field staled by a changed value
+    (present->present) OR dropped entirely (present->absent). Material here is
+    ``_TECHNICAL_MATERIAL_FIELDS`` (M-1): every operational human-confirmable technical field, not
+    just the glossary's definition axis."""
+    material_changed = False
+    present: set[str] = set()
+    for field_name, value in (("definition", row.definition), ("sensitivity", row.sensitivity),
+                              ("additivity", row.additivity), ("unit", row.unit),
+                              ("currency", row.currency), ("entity", row.entity)):
+        if not value:
+            continue
+        present.add(field_name)
+        staled = _write_producer_field(
+            conn, logical_ref=logical_ref, field_name=field_name, value=value,
+            producer=EvidenceProducer.SOURCE,
+            strength=strength_for(TECHNICAL_CSV_PROFILE, field_name),
+            producer_ref=producer_ref, snapshot_id=snapshot_id, material=value,
+        )
+        if field_name in _TECHNICAL_MATERIAL_FIELDS and staled > 0:
+            material_changed = True
+    dropped = _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.SOURCE,
+        all_fields=_TECHNICAL_SOURCE_FIELDS, present=present,
+    )
+    if dropped & _TECHNICAL_MATERIAL_FIELDS:
+        material_changed = True
+    return material_changed
+
+
+def _retire_dropped_field_decisions(conn, *, source: str, logical_ref: str,
+                                    fields: tuple[str, ...], now: datetime | None,
+                                    changed_sink: list[ChangedRef] | None = None) -> None:
+    """Retire the DECISION of every ``fields`` member the new upload DROPPED (Delivery B closing
+    gate; generalized for review M-2 — the technical path passes ``_TECHNICAL_SOURCE_FIELDS``, the
+    glossary parser path ``_PARSER_FIELDS``).
+
+    ``_stale_absent_fields`` stales the dropped field's EVIDENCE, and ``build_graph`` recreates the
+    flat display columns from the new rows — but ``resolve_and_project`` iterates only fields with
+    ACTIVE evidence, so the field's PRIOR load-bearing decision stayed the latest and
+    ``is_feature_eligible`` kept serving the dropped value (a stale load-bearing value).
+    :func:`overlay.upload.field_resolution.stale_and_clear_field` is the documented lifecycle step
+    for exactly this (Pass B uses it for dropped advisory table facts): it records a STALED decision
+    superseding the prior one and clears/repoints the display link. Guarded to fields that (a) have
+    NO active evidence from ANY producer — an active HUMAN row keeps the field resolvable, and the
+    pending-revalidation DISQUALIFIER (not a stale) is what blocks it — and (b) still confer a
+    load-bearing value, so never-declared fields (and already-retired ones) write no spurious STALED
+    decisions. Must run BEFORE the round's ``resolve_and_project`` (same request tx), which then
+    skips the evidence-less field and cannot re-project the cleared value."""
+    retired = False
+    for field_name in fields:
+        if read_active_field_evidence(conn, logical_ref, field_name):
+            continue
+        if not is_feature_eligible(conn, logical_ref, field_name):
+            continue
+        stale_and_clear_field(conn, source=source, logical_ref=logical_ref,
+                              field_name=field_name, now=now)
+        retired = True
+    if retired:
+        # H2c PRIMARY DRIFT WIRE — a dropped/retyped column retired a load-bearing field DECISION a
+        # confirmed contract may depend on. EAGERLY append INVALIDATED to every affected contract
+        # version (defense-in-depth). The read-time gate already covers this fail-closed (the column's
+        # graph_node was deleted/changed by build_graph, so its dependency hash no longer matches), so
+        # this eager emit is not the sole safety. object_ref is the PUBLIC-FLATTENED graph ref the
+        # dependency rows store (the same key `_graph_key` derives for the display projection).
+        object_ref = _graph_key(source, logical_ref)[1]
+        changed = ChangedRef(catalog_source=source, reason=REASON_FIELD_DECISION_RETIRED,
+                             object_ref=object_ref)
+        if changed_sink is not None:
+            # [13] DEFER the eager invalidation to end-of-ingest. `invalidate_contracts_for` takes the
+            # single feature_validation `projection_checkpoints` row FOR UPDATE (held to ingest
+            # commit) — taken here, per-retire mid-ingest, it contends with the D4 semantic-binding
+            # LLM stages and blocks every contract confirm for the D4 deadline + ingest tail. Collect
+            # the ChangedRef so ingest_upload emits ONE invalidate_contracts_for after the D4 stages
+            # (the checkpoint lock is then taken once, briefly, at the tail). Same contracts get
+            # invalidated — just later in the SAME tx; the read-time dependency gate covers the interim
+            # fail-closed.
+            changed_sink.append(changed)
+        else:
+            # Legacy / direct-caller path (helper unit tests): emit immediately, unchanged.
+            invalidate_contracts_for(conn, changed=[changed])
+
+
 def _write_glossary_parser_evidence(
     conn, *, logical_ref: str, logical_representation: str, semantic_type: str,
     declared_type: str, column: str, snapshot_id: str
@@ -801,8 +1166,10 @@ def _write_glossary_parser_evidence(
             producer=EvidenceProducer.PARSER, strength=AssertionStrength.SUPPORTED,
             producer_ref=snapshot_id, snapshot_id=snapshot_id, material=value,
         )
-    # Reconcile absent parser fields: an edited upload that drops its sample-profile facet leaves
-    # the prior logical_representation/semantic_type ACTIVE + load-bearing unless we stale it here.
+    # Reconcile absent parser fields: stale the PARSER evidence an edited upload no longer asserts.
+    # This retires the EVIDENCE only — `resolve_and_project` iterates only fields with ACTIVE
+    # evidence, so the prior load-bearing DECISION would stay latest (M-2); the ingest loop retires
+    # it via `_retire_dropped_field_decisions(fields=_PARSER_FIELDS)` before resolve_and_project.
     _stale_absent_fields(
         conn, logical_ref=logical_ref, producer=EvidenceProducer.PARSER,
         all_fields=_PARSER_FIELDS, present=present,
@@ -888,7 +1255,8 @@ def _project_semantic_terms(conn, *, source: str, object_ref: str, rec: Glossary
 def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                               glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
                               concepts: dict[str, str] | None, snapshot_id: str,
-                              now: datetime | None, stats: dict | None = None) -> int:
+                              now: datetime | None, stats: dict | None = None,
+                              changed_sink: list[ChangedRef] | None = None) -> int:
     """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
     revalidation on a material change, project ``semantic_terms`` into search (Task 8), then
     resolve-and-project + a readiness diagnostic (spec §6.3).
@@ -953,6 +1321,20 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory glossary PARSER evidence failed for %s", logical_ref,
+                           exc_info=True)
+        try:
+            # M-2 — the parser mirror of the technical retire: a dropped sample facet's prior
+            # load-bearing logical_representation/semantic_type DECISION must be retired here,
+            # BEFORE this round's resolve_and_project (which skips evidence-less fields and would
+            # leave the stale decision the latest). Guarded inside the helper: an active HUMAN row
+            # (or a still-present facet) keeps the field untouched.
+            with conn.transaction():
+                _retire_dropped_field_decisions(
+                    conn, source=source, logical_ref=logical_ref, fields=_PARSER_FIELDS, now=now,
+                    changed_sink=changed_sink)
+        except Exception:  # noqa: BLE001
+            contained_failures += 1
+            logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,
                            exc_info=True)
         if concepts is not None:
             try:
@@ -1068,6 +1450,67 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                         len(readiness.review_requirements))
     except Exception:  # noqa: BLE001
         logger.warning("advisory readiness diagnostic failed for %r", source, exc_info=True)
+    return contained_failures
+
+
+def _ingest_technical_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                               producer_ref: str, now: datetime | None,
+                               changed_sink: list[ChangedRef] | None = None) -> int:
+    """Attach the TECHNICAL upload's per-column SOURCE evidence (Delivery B item 8), flag
+    human-confirmation revalidation on a material change, then resolve-and-project — the
+    technical-path mirror of :func:`_ingest_glossary_evidence`'s column loop. Runs ONLY when
+    ``glossary is None`` (the glossary path writes its own source evidence; running both would
+    double-write the overlapping fields).
+
+    Refs are keyed exactly like the technical graph: schema-less ``normalize_ref`` (public-
+    flattened), so ``resolve_and_project``'s ``_graph_key`` reaches the same node ``build_graph``
+    wrote. Every stage is savepointed and fail-soft (the glossary loop's failure-class table): a
+    per-column failure logs and is contained; the upload's FACTS and raw graph are never rolled
+    back. Returns the number of CONTAINED failures."""
+    contained_failures = 0
+    attachable_refs: list[str] = []
+    for row in rows:
+        logical_ref = normalize_ref(source, None, row.table, row.column)
+        material_changed = False
+        try:
+            with conn.transaction():
+                material_changed = _write_technical_source_evidence(
+                    conn, logical_ref=logical_ref, row=row,
+                    producer_ref=producer_ref, snapshot_id=producer_ref)
+        except Exception:  # noqa: BLE001 — evidence-write failure: warn + continue (facts intact)
+            contained_failures += 1
+            logger.warning("advisory technical SOURCE evidence failed for %s", logical_ref,
+                           exc_info=True)
+        if material_changed:
+            try:
+                with conn.transaction():
+                    _flag_human_confirmed_revalidation(
+                        conn, logical_ref=logical_ref, snapshot_id=producer_ref, now=now)
+            except Exception:  # noqa: BLE001
+                contained_failures += 1
+                logger.warning("advisory revalidation flag failed for %s", logical_ref,
+                               exc_info=True)
+        try:
+            # A dropped field's prior LOAD-BEARING decision must be retired here, BEFORE the round's
+            # resolve_and_project (which skips evidence-less fields and would leave it the latest).
+            with conn.transaction():
+                _retire_dropped_field_decisions(
+                    conn, source=source, logical_ref=logical_ref,
+                    fields=_TECHNICAL_SOURCE_FIELDS, now=now, changed_sink=changed_sink)
+        except Exception:  # noqa: BLE001
+            contained_failures += 1
+            logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,
+                           exc_info=True)
+        attachable_refs.append(logical_ref)
+    if not attachable_refs:
+        return contained_failures
+    try:
+        with conn.transaction():
+            resolve_and_project(conn, source=source, logical_refs=attachable_refs, now=now)
+    except Exception:  # noqa: BLE001 — resolver failure: continue with the raw graph (degraded)
+        contained_failures += 1
+        logger.warning("advisory resolve_and_project failed for %r — graph left with raw nodes "
+                       "(degraded)", source, exc_info=True)
     return contained_failures
 
 
@@ -1294,6 +1737,15 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     record_stage(stage_recorder, "fact_assertion", "succeeded", detail={"asserted": asserted},
                  started_at=stage_started)
 
+    # [13] the end-of-ingest DEFERRED contract-invalidation collector, declared BEFORE the drift
+    # scan: BOTH mid-ingest invalidation sites — the drift STALE-demote of a governed entity binding
+    # (detect_catalog_changes below, [13]x[5]) and `_retire_dropped_field_decisions` (the glossary/
+    # technical evidence stages) — COLLECT ChangedRefs here instead of calling
+    # `invalidate_contracts_for` inline. That call takes the single feature_validation checkpoint
+    # row FOR UPDATE (held to ingest commit); taken here, BEFORE the Pass-A/B/D4 LLM stages, it
+    # would block every contract confirm for the whole multi-minute LLM window. ONE emit at the
+    # ingest tail takes the lock once, briefly.
+    deferred_invalidations: list[ChangedRef] = []
     stage_started = datetime.now(UTC)
     _drain_projection(conn)   # catch up (bounded, #21) BEFORE the diff reads the dependency index
     drift_lagged = False
@@ -1309,7 +1761,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         changes = []
         drift_lagged = True
     else:
-        changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
+        changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False,
+                                         changed_sink=deferred_invalidations)
         _drain_projection(conn)
     # Changed catalog OBJECTS (drift kinds that retire something), not facts staled (#30): each such
     # change stales its dependent facts inside detect_catalog_changes, but this counts the objects.
@@ -1399,28 +1852,35 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         try:
             # Glossary carry-forward (Task 6): thread the sidecar + bindings + snapshot so Pass A
             # writes item-level LLM concept evidence. Non-glossary keeps the exact original call.
+            # C5-T5: `ingestion_run_id` threads into every enrichment stage so each LLM dispatch is
+            # pre-audited + attributed to THIS run and the object subjects it enriches. `None`
+            # (a direct caller with no run) dispatches unattributed — byte-for-byte as before.
             with conn.transaction():
                 concepts = (
                     enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
                                     bindings=bindings, source_snapshot_id=snapshot_id,
-                                    stats=concept_stats)
+                                    stats=concept_stats, ingestion_run_id=ingestion_run_id)
                     if is_glossary
-                    else enrich_concepts(conn, vr.good, client, actor, stats=concept_stats)
+                    else enrich_concepts(conn, vr.good, client, actor, stats=concept_stats,
+                                         ingestion_run_id=ingestion_run_id)
                 )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
             concepts, len({content_hash(r) for r in vr.good}),
-            internal_failures=concept_stats.get("evidence_write_failures", 0))
+            internal_failures=concept_stats.get("evidence_write_failures", 0),
+            not_attempted=concept_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_concept", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
+        def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         try:
             with conn.transaction():
                 # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
                 # blanks (suppressed ≠ missing — never silently LLM-drafted); None for technical.
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
-                                                glossary=glossary)
+                                                glossary=glossary,
+                                                ingestion_run_id=ingestion_run_id, stats=def_stats)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
@@ -1428,16 +1888,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # Honest expected count (R5-3): suppressed blanks are deliberately NOT drafted, so they
             # must not be counted as unresolved items degrading the stage to "partial".
             len({content_hash(r) for r in vr.good if not r.definition}
-                - suppressed_definition_hashes(vr.good, glossary)))
+                - suppressed_definition_hashes(vr.good, glossary)),
+            not_attempted=def_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
+        domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         try:
             with conn.transaction():
-                domains = classify_domains(conn, vr.good, client, actor)
+                domains = classify_domains(conn, vr.good, client, actor,
+                                           ingestion_run_id=ingestion_run_id, stats=domain_stats)
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
-        state, reason, detail = _enrichment_outcome(domains, len({r.table for r in vr.good}))
+        state, reason, detail = _enrichment_outcome(
+            domains, len({r.table for r in vr.good}),
+            not_attempted=domain_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
     stage_started = datetime.now(UTC)
@@ -1521,6 +1986,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # assembled table that never resolved gets five `not_evaluated` records below ([F12]).
         # Persisted as `pass_b` stage detail — a JSON-safe list of small records, never row data.
         dispositions: list[dict] = []
+        passb_stats: dict = {}   # honest-labeling: budget/deadline not_attempted (table-granular)
         try:
             # TWO savepoints (exactly like the Pass A stages and the governed-join seam
             # above): a DB abort inside either must not
@@ -1548,15 +2014,24 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 cols: dict[str, set[str]] = {}
                 for r in vr.good:
                     cols.setdefault(r.table.strip().lower(), set()).add(r.column)
+                # Computed HERE (pure — no DB) so the C5-T5 dispatch subjects key each table under
+                # the SAME schema its fact proposals use below; reused by the propose block.
+                schema_by_table = _schema_by_table(glossary)
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor,     # LLM-call attribution only
-                                              dispositions=dispositions)
+                                              dispositions=dispositions,
+                                              # C5-T5: run + table-subject dispatch attribution
+                                              ingestion_run_id=ingestion_run_id,
+                                              catalog_source=catalog_source,
+                                              schema_by_table=schema_by_table, stats=passb_stats)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
                 # upload) so readiness sees ONE (schema, table) pair per physical table.
-                schema_by_table = _schema_by_table(glossary)
-                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes.
+                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes;
+                # the uploading HUMAN is recorded as `source_uploader` so the confirm gate bars the
+                # file's author from single-handedly confirming the grain/availability their own
+                # upload shaped (program-audit F10 — same rule as the semantic-binding surface).
                 # The SAME collector threads in so the [F9] staling flips land on the records the
                 # accept appended (prior_value_staled is live on the ingest path, not just tests):
                 # `now` is the same threaded round timestamp resolve_and_project uses below, so
@@ -1565,7 +2040,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
                                      source_snapshot_id=synth_snapshot,
                                      schema_by_table=schema_by_table,
-                                     dispositions=dispositions, now=now)
+                                     dispositions=dispositions, now=now,
+                                     source_uploader=(
+                                         actor.subject
+                                         if getattr(actor, "actor_kind", None) == "human"
+                                         else None))
                 # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
                 # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
                 # this explicit call or table_role/primary_entity/event_or_snapshot never project
@@ -1584,7 +2063,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     add_not_evaluated(dispositions, it.ref)
             # Pass B swallows per-table failures internally (an unsynthesized table is simply
             # absent from `syntheses`), so the report compares against the assembled items (#22).
-            state, reason, detail = _enrichment_outcome(syntheses, len(items))
+            state, reason, detail = _enrichment_outcome(
+                syntheses, len(items), not_attempted=passb_stats.get("not_attempted", 0))
             detail["dispositions"] = dispositions      # the durable per-field account (Task 3)
             record_stage(stage_recorder, "pass_b", state, reason_code=reason,
                          detail=_with_audit_degradations(detail), started_at=stage_started)
@@ -1595,6 +2075,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
                          started_at=stage_started)
 
+    # [13] `_retire_dropped_field_decisions` (invoked per-column below) also COLLECTS into
+    # `deferred_invalidations` (declared above the drift scan) instead of emitting inline — see the
+    # collector's comment; the single flush happens at the ingest tail, after the D4 stages.
     if glossary is not None and bindings is not None and snapshot_id is not None:
         # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
         # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
@@ -1605,7 +2088,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             contained = _ingest_glossary_evidence(
                 conn, source=catalog_source, rows=vr.good, glossary=glossary,
                 bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now,
-                stats=glossary_stats)
+                stats=glossary_stats, changed_sink=deferred_invalidations)
             # The helper CONTAINS per-column failures (savepoint + warning); `partial` surfaces
             # them instead of laundering the outer no-raise as success (#22). A table-term schema
             # mismatch is NOT a failure (the upload still succeeds) but IS surfaced in the detail so
@@ -1628,6 +2111,176 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                          started_at=stage_started)
     else:
         record_stage(stage_recorder, "glossary_evidence", "not_applicable")
+    if glossary is None:
+        # Technical-source evidence (Delivery B item 8) — the non-glossary mirror of the block
+        # above: the declared unit/currency/entity/sensitivity/additivity/definition become SOURCE
+        # evidence + a resolved decision, not just graph_node flat columns. `producer_ref` is the
+        # route's durable ingestion_run_id when threaded; a direct caller (None) gets a minted
+        # fallback so technical evidence ALWAYS carries a producer_ref (same `mint_id("ing")`
+        # namespace the glossary snapshot uses). Belt-and-braces fail-soft like the glossary block:
+        # the helper savepoints every stage, and this outer guard makes a stray failure a warning
+        # rather than a rollback of the already-committed facts + graph.
+        try:
+            _ingest_technical_evidence(
+                conn, source=catalog_source, rows=vr.good,
+                producer_ref=ingestion_run_id or mint_id("ing"), now=now,
+                changed_sink=deferred_invalidations)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory technical evidence wiring failed for %r — facts + graph "
+                           "intact", catalog_source, exc_info=True)
+
+    # ── D4 semantic-binding stages (Delivery D): candidate -> proposal, savepointed fail-soft, behind
+    # OVERLAY_SEMANTIC_BINDING_CANDIDATES / _PROPOSALS (default OFF). Placed AFTER glossary/Pass B and
+    # BEFORE the projection drain, so the DRAIN below catches up any DRAFT proposal events (the same
+    # reason the Pass C / Pass B seams sit above the drain). Each stage OWNS its savepoint + except
+    # (the Pass C pattern): a DB/provider/egress fault is contained — the upload always ingests, and
+    # feature/contract rows are never touched. NEITHER flag promotes a fact to VERIFIED. Flag-off is
+    # byte-identical (a truthful `disabled` stage entry; NO candidate rows). ──
+    sembind_candidates = sembind_proposed = sembind_abstained = sembind_failed = 0
+    sembind_proposable: list = []
+    # I-E / M-3 truthfulness flags: `prep_failed` means the input assembly threw (so the candidate
+    # stage did NOT succeed and must not run its body over an empty list); `candidate_stage_failed`
+    # means no persisted candidate exists to link, so the proposal stage is `not_applicable`, not a
+    # vacuous `succeeded`.
+    sembind_prep_failed = False
+    sembind_candidate_stage_failed = False
+    candidates_on = semantic_binding_candidates_enabled()
+    # The re-ingest invalidation must run ALWAYS (even flag-off / no client, NO LLM), but only a
+    # source that ALREADY holds a current candidate set can go stale — so a cheap indexed guard
+    # decides whether the heavier metadata prep is needed at all. Flag-off with no prior set: one
+    # SELECT, no prep, no writes -> byte-identical.
+    has_current_semantic_set = conn.execute(
+        "SELECT 1 FROM current_semantic_binding_candidate_set "
+        "WHERE catalog_source = %s AND candidate_set_id IS NOT NULL LIMIT 1",
+        (catalog_source,)).fetchone() is not None
+    sembind_prepared: list = []
+    if candidates_on or has_current_semantic_set:
+        stage_started = datetime.now(UTC)
+        try:
+            with conn.transaction():
+                sembind_prepared = _semantic_binding_prep(
+                    conn, catalog_source, vr.good, glossary=glossary, bindings=bindings,
+                    concepts=concepts, definitions=definitions, domains=domains)
+        except Exception:  # noqa: BLE001 — advisory: metadata prep never fails an upload
+            counters.incr("overlay.semantic_binding.prep.error")
+            logger.warning("advisory semantic-binding metadata prep failed for %r — facts + graph "
+                           "intact", catalog_source, exc_info=True)
+            sembind_prepared = []
+            sembind_prep_failed = True
+    if has_current_semantic_set:
+        # OWN savepoint: the re-ingest invalidation (D1 CAS) must never abort the upload. NO LLM call
+        # — a metadata change flips a now-mismatched current set to `unverifiable`, keeping the
+        # immutable set as history. Runs regardless of the flags (disabling can't freeze a stale set).
+        # I-E: UNCONDITIONAL on the prior current set — it runs even when the producer errored (prep
+        # threw, `sembind_prepared == []`) or is disabled. With no live fingerprints to compare, an
+        # empty `prepared` fail-closes every current set of this source to `unverifiable` (we cannot
+        # attest any still matches its live metadata), never freezing a stale set through this upload.
+        try:
+            with conn.transaction():
+                _invalidate_stale_semantic_binding_sets(
+                    conn, catalog_source, sembind_prepared, now=now)
+        except Exception:  # noqa: BLE001 — advisory: invalidation never fails an upload
+            counters.incr("overlay.semantic_binding.invalidation.error")
+            logger.warning("advisory semantic-binding re-ingest invalidation failed for %r — facts "
+                           "+ graph intact", catalog_source, exc_info=True)
+
+    if candidates_on and sembind_prep_failed:
+        # I-E: the input assembly threw, so the candidate stage did NOT succeed. Record it truthfully
+        # as `failed` (never run the body over `[]`, which would falsely report `succeeded` with zero
+        # counts) — the unconditional invalidation above still ran; the proposal stage is downstream
+        # `not_applicable` (M-3).
+        stage_started = datetime.now(UTC)
+        counters.incr("overlay.semantic_binding.candidates.error")
+        sembind_proposable = []
+        sembind_failed += 1
+        sembind_candidate_stage_failed = True
+        record_stage(stage_recorder, "semantic_binding_candidates", "failed",
+                     reason_code="prep_exception", started_at=stage_started)
+    elif candidates_on:
+        stage_started = datetime.now(UTC)
+        try:
+            with conn.transaction():   # OWN savepoint + except — the Pass C fail-soft pattern
+                sembind_candidates, sembind_proposable, sembind_llm_failed, sembind_llm_partial = (
+                    _run_semantic_binding_candidate_stage(
+                        conn, catalog_source, sembind_prepared, client=client, actor=actor,
+                        ingestion_run_id=ingestion_run_id, now=now))
+            # A D3 BLOCKING bound / provider fault (`llm_failed`) OR a candidate-cap `partial`
+            # (`llm_partial`, M-2) marks the stage `partial` (the deterministic set is still persisted
+            # + current) WITHOUT changing upload acceptance — the isolation boundary. Only a genuine
+            # failure counts toward `sembind_failed`; a `partial` set is not a failure.
+            sembind_failed += sembind_llm_failed
+            sembind_bounded = sembind_llm_failed or sembind_llm_partial
+            record_stage(stage_recorder, "semantic_binding_candidates",
+                         "partial" if sembind_bounded else "succeeded",
+                         reason_code="llm_bound" if sembind_bounded else None,
+                         detail={"candidates": sembind_candidates, "tables": len(sembind_prepared),
+                                 "llm_failed": sembind_llm_failed,
+                                 "llm_partial": sembind_llm_partial},
+                         started_at=stage_started)
+        except Exception:  # noqa: BLE001 — advisory: the candidate stage never fails an upload
+            counters.incr("overlay.semantic_binding.candidates.error")
+            logger.warning("advisory semantic-binding candidate stage failed for %r — facts + graph "
+                           "intact", catalog_source, exc_info=True)
+            sembind_proposable = []
+            sembind_failed += 1
+            sembind_candidate_stage_failed = True
+            record_stage(stage_recorder, "semantic_binding_candidates", "failed",
+                         reason_code="exception", started_at=stage_started)
+    else:
+        record_stage(stage_recorder, "semantic_binding_candidates", "disabled")
+
+    if semantic_binding_proposals_enabled() and candidates_on and sembind_candidate_stage_failed:
+        # M-3: the candidate stage failed (prep threw or the body aborted), so there is no persisted
+        # candidate for a proposal to link. Record the proposal stage truthfully as `not_applicable`
+        # with a reason — not a vacuous `succeeded` over an empty proposable list. (`skipped` is not a
+        # legal STAGE_STATES member; `not_applicable` is the sibling of the requires_candidates no-op.)
+        record_stage(stage_recorder, "semantic_binding_proposals", "not_applicable",
+                     reason_code="upstream_failed", started_at=datetime.now(UTC))
+    elif semantic_binding_proposals_enabled() and candidates_on:
+        stage_started = datetime.now(UTC)
+        try:
+            with conn.transaction():   # OWN savepoint + except — proposals are DRAFT-only, never VERIFIED
+                sembind_proposed, sembind_abstained = _run_semantic_binding_proposal_stage(
+                    conn, sembind_proposable, actor=actor)
+            record_stage(stage_recorder, "semantic_binding_proposals", "succeeded",
+                         detail={"proposed": sembind_proposed, "abstained": sembind_abstained},
+                         started_at=stage_started)
+        except Exception:  # noqa: BLE001 — advisory: the proposal stage never fails an upload
+            counters.incr("overlay.semantic_binding.proposals.error")
+            logger.warning("advisory semantic-binding proposal stage failed for %r — facts + graph "
+                           "intact", catalog_source, exc_info=True)
+            sembind_failed += 1
+            record_stage(stage_recorder, "semantic_binding_proposals", "failed",
+                         reason_code="exception", started_at=stage_started)
+    elif semantic_binding_proposals_enabled():
+        # Proposals ON without candidates — the INVALID combo. A proposal has no persisted candidate
+        # to link, so it is rejected as a clear no-op (never a silent skip, never a VERIFIED fact).
+        counters.incr("overlay.semantic_binding.proposals.requires_candidates")
+        logger.warning("OVERLAY_SEMANTIC_BINDING_PROPOSALS is on but "
+                       "OVERLAY_SEMANTIC_BINDING_CANDIDATES is off — proposals require candidates; "
+                       "no proposal emitted (invalid flag combination)")
+        record_stage(stage_recorder, "semantic_binding_proposals", "not_applicable",
+                     reason_code="requires_candidates")
+    else:
+        record_stage(stage_recorder, "semantic_binding_proposals", "disabled")
+
+    # [13] Emit the DEFERRED contract invalidations — collected by BOTH mid-ingest sites (the drift
+    # STALE-demote of governed entity bindings, [13]x[5], and `_retire_dropped_field_decisions`) —
+    # in ONE call, AFTER the D4 semantic-binding stages above: the feature_validation checkpoint
+    # lock is taken once, briefly, at the ingest tail rather than mid-ingest (where it was held
+    # across the Pass-A/B/D4 LLM stages, blocking every contract confirm for the whole window).
+    # Same contracts get invalidated, just later in the SAME tx. Savepoint + fail-soft: this eager
+    # emit is defense-in-depth (the read-time dependency gate already covers drift fail-closed), so a
+    # fault here must never roll back the already-committed facts + graph.
+    if deferred_invalidations:
+        try:
+            with conn.transaction():
+                invalidate_contracts_for(conn, changed=deferred_invalidations)
+        except Exception:  # noqa: BLE001 — invalidation is defense-in-depth; the read gate covers it
+            counters.incr("overlay.contract_invalidation.deferred_error")
+            logger.warning("deferred end-of-ingest contract invalidation failed for %r — facts "
+                           "intact; the read-time dependency gate still fails closed on the drift",
+                           catalog_source, exc_info=True)
 
     # DRAIN before the end-of-ingest re-projections (full-chain e2e finding, 2026-07-15): the
     # governed seams above (_propose_governed_joins / Pass C / Pass B) appended OVERLAY_FACT_PROPOSED
@@ -1724,6 +2377,34 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "join_projection", "failed", reason_code="exception",
                          started_at=stage_started)
 
+    # semantic-binding re-projection (E3): build_graph wiped graph_node (entity + the governed
+    # entity columns), so a VERIFIED entity_assignment / currency_binding confirmed in a PRIOR cycle
+    # must be re-projected from its FACT — a re-ingest MUST NOT erase a governed binding (mirrors the
+    # approved-join reapply above). UNCONDITIONAL (not flag-gated) and byte-for-byte safe when no
+    # governed binding exists: list_semantic_binding_refs enumerates nothing and writes nothing. Same
+    # projection-lag guard: resolve_fact reads the overlay_fact_state read model, and a lagging model
+    # could serve a stale status — skip and let the next caught-up ingest re-project (the async
+    # demotion hook covers reject/expiry/drift latency).
+    if projection_lag(conn, "overlay") > 0:
+        counters.incr("overlay.semantic_binding.reproject.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping semantic-binding "
+                       "re-projection (re-runs when the projection catches up)", catalog_source)
+        record_stage(stage_recorder, "semantic_binding_projection", "lagged",
+                     reason_code="projection_lag")
+    else:
+        stage_started = datetime.now(UTC)
+        try:
+            with conn.transaction():   # savepoint: a projection fault must not roll back facts
+                reproject_semantic_bindings(conn, source=catalog_source, now=now)
+            record_stage(stage_recorder, "semantic_binding_projection", "succeeded",
+                         started_at=stage_started)
+        except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
+            counters.incr("overlay.semantic_binding.reproject.error")
+            logger.warning("advisory semantic-binding re-projection failed for %r — facts intact",
+                           catalog_source, exc_info=True)
+            record_stage(stage_recorder, "semantic_binding_projection", "failed",
+                         reason_code="exception", started_at=stage_started)
+
     if governed_joins_enabled():
         # Governed-join DRIFT detection (advisory): a re-upload that RETARGETS or DROPS a joins_to
         # humans VERIFIED is surfaced as a governed_join_divergence row — NEVER a state change on
@@ -1770,7 +2451,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         objects_stored=tables + columns, tables=tables, columns=columns,
                         containment_edges=columns, facts_asserted=asserted,
                         join_candidates=join_candidate_count, passb_proposed=passb_proposed,
-                        passb_abstained=passb_abstained)
+                        passb_abstained=passb_abstained,
+                        semantic_binding_candidates=sembind_candidates,
+                        semantic_binding_proposed=sembind_proposed,
+                        semantic_binding_abstained=sembind_abstained,
+                        semantic_binding_failed=sembind_failed)
 
 
 def _bool(v) -> bool:

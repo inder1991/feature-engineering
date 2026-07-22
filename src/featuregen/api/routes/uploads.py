@@ -31,6 +31,7 @@ from featuregen.overlay.upload.glossary_reader import (
     read_glossary,
 )
 from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
+from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -41,6 +42,8 @@ from featuregen.overlay.upload.ingestion_run import (
 )
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
+    SOURCE_CAPABILITY_PROFILE_VERSION,
+    TECHNICAL_CSV_PROFILE,
     SourceCapabilityProfile,
 )
 from featuregen.overlay.upload.stage_report import StageRecorder, record_stage
@@ -123,9 +126,14 @@ def create_upload(
     # object_ref._norm — before anything downstream sees it: 'sales', 'sales ' and 'Sales' must be
     # ONE catalog (#16). A merely-stripped 'Sales' would miss the prior 'sales' refs and bypass the
     # large-change brake as a "first upload" while its facts still keyed on the lowered stream.
-    source = source.strip().lower()
-    if not source:
-        raise HTTPException(status_code=400, detail="source is required")
+    # normalize_source_name folds case (as above) AND fails CLOSED on a name that is not a single
+    # path segment: a '/' or '%' would (percent-)decode across the {source}/{object_ref:path} route
+    # boundary (uvicorn decodes %2F to '/' before routing) and read/write a DIFFERENT source — reject
+    # it here at the write boundary rather than loosening any route.
+    try:
+        source = normalize_source_name(source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Design #3: open the durable run manifest BEFORE parse, on an independent committing
     # connection, so a parse/oversize/unsupported failure still has a queryable run row. The
     # effective_config flag snapshot is pinned HERE, once — never re-read from env mid-run.
@@ -146,6 +154,7 @@ def create_upload(
     recorder = StageRecorder()
     parse_started = datetime.now(UTC)           # #13 gap A: parse's start instant, kept for the
     file_sha256: str | None = None              # error paths too. Stays before the capped read.
+    selected_profile: SourceCapabilityProfile | None = None   # None until parse selects one
     failure_status = "rejected"                 # pre-ingest failure = the FILE was rejected...
     try:
         data = _read_capped(file)
@@ -156,6 +165,12 @@ def create_upload(
             raise
         except Exception as exc:   # a malformed file is a client error, not a 500
             raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
+        # Delivery B item 9 (source-profile provenance): record WHICH capability profile governs
+        # this run. `_read_rows` returns profile=None for the technical/xlsx path, where ingest
+        # writes its source evidence at TECHNICAL_CSV_PROFILE strengths — record that same
+        # effective profile, never a fabricated one. The run opened BEFORE parse (design #3), so
+        # the pair lands at terminalize; a pre-parse failure honestly leaves both NULL.
+        selected_profile = profile or TECHNICAL_CSV_PROFILE
         # A1 resolution #6: an FTR upload's sanitize provenance rides the PARSE stage detail —
         # ingest_upload takes no prepared metadata, so this is the one honest place to record how
         # many sample clauses/PII spans parse removed and under which sanitizer/redactor versions.
@@ -230,7 +245,9 @@ def create_upload(
                         quarantined_count=result.quarantined,
                         file_sha256=file_sha256, pre_fingerprint=pre_fingerprint,
                         post_fingerprint=post_fingerprint,
-                        fingerprint_algo_version=fingerprint_algo)
+                        fingerprint_algo_version=fingerprint_algo,
+                        source_type=selected_profile.source_type,
+                        profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
         # #22: the stage reports commit WITH the terminal state on the request connection
         # (flush is savepointed + fail-contained, so it can neither 500 the upload nor change
         # the response body — which stays exactly the IngestResult serialization).
@@ -248,7 +265,10 @@ def create_upload(
         terminalize_run_durable(
             run_id, status=failure_status, now=datetime.now(UTC), file_sha256=file_sha256,
             redacted_failure_code=type(exc.__cause__ or exc).__name__,
-            reason_code=f"http_{exc.status_code}", fallback_conn=conn)
+            reason_code=f"http_{exc.status_code}",
+            source_type=selected_profile.source_type if selected_profile else None,
+            profile_version=(SOURCE_CAPABILITY_PROFILE_VERSION if selected_profile else None),
+            fallback_conn=conn)
         recorder.flush_durable(run_id, now=datetime.now(UTC), fallback_conn=conn)
         exc.headers = {**(exc.headers or {}), _RUN_ID_HEADER: run_id}
         raise
@@ -262,7 +282,10 @@ def create_upload(
         terminalize_run_durable(
             run_id, status="failed", now=datetime.now(UTC), file_sha256=file_sha256,
             redacted_failure_code=type(exc).__name__,
-            reason_code="unhandled_exception", fallback_conn=conn)
+            reason_code="unhandled_exception",
+            source_type=selected_profile.source_type if selected_profile else None,
+            profile_version=(SOURCE_CAPABILITY_PROFILE_VERSION if selected_profile else None),
+            fallback_conn=conn)
         # #22: flush the stages REACHED before the fault, durably — a failed run still explains
         # how far it got. Best-effort; a lost flush never masks the real failure.
         recorder.flush_durable(run_id, now=datetime.now(UTC), fallback_conn=conn)

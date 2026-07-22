@@ -39,7 +39,11 @@ from featuregen.overlay.upload.table_fact_projection import (
     _WORKLIST_READER,
     project_table_facts_for_ref,
 )
-from featuregen.projections.runner import projection_lag, run_projection
+from featuregen.projections.runner import (
+    projection_lag,
+    run_projection,
+    try_lock_checkpoint_nowait,
+)
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
@@ -268,6 +272,17 @@ def project_verified_table_fact(conn: DbConn, source: str, ref, fact_type: str, 
     flag_col, event_col = columns
     try:
         with conn.transaction():   # savepoint: a projection fault must not roll back the confirm
+            if not try_lock_checkpoint_nowait(conn, "overlay"):
+                # A concurrent ingest holds the 'overlay' checkpoint row to commit (its in-tx drain
+                # across the D4/Pass-B LLM stages) — draining here would BLOCK the confirm behind the
+                # whole multi-minute ingest tx (audit finding [9]). Defer to the same fail-closed
+                # projection-lag path: the fact stays VERIFIED and the next caught-up ingest
+                # reproject makes the grain/as-of operational.
+                counters.incr("overlay.table_fact_governance.projection_skipped_lock")
+                logger.warning("table-fact governance: overlay checkpoint lock held by an in-flight "
+                               "ingest — deferring projection of a verified %s in %r to the next "
+                               "caught-up ingest", fact_type, source)
+                return "pending"
             while run_projection(conn, OverlayProjection()) >= 500:
                 pass               # one pass caps at 500 events — loop until caught up
             if projection_lag(conn, "overlay") != 0:

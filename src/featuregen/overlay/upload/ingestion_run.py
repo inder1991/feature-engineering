@@ -59,7 +59,8 @@ _RUN_COLUMNS = (
     "id, origin_type, catalog_source, filename, file_sha256, actor_subject, actor_role_claims, "
     "authorization_decision, pre_source_fingerprint, post_source_fingerprint, "
     "fingerprint_algo_version, effective_config, row_count, quarantined_count, status, "
-    "started_at, completed_at, heartbeat_at, redacted_failure_code")
+    "started_at, completed_at, heartbeat_at, redacted_failure_code, source_type, "
+    "profile_version")
 
 
 def _effective_config_snapshot() -> dict:
@@ -69,13 +70,20 @@ def _effective_config_snapshot() -> dict:
     never be added here. The flag helpers are imported lazily: ingest.py is a heavy module and
     this one is imported by the route layer."""
     from featuregen.overlay.upload.graph import governed_joins_enabled
-    from featuregen.overlay.upload.ingest import pass_c_enabled, table_synth_enabled
+    from featuregen.overlay.upload.ingest import (
+        pass_c_enabled,
+        semantic_binding_candidates_enabled,
+        semantic_binding_proposals_enabled,
+        table_synth_enabled,
+    )
 
     return {
         "config_schema_version": 1,
         "governed_joins": governed_joins_enabled(),
         "pass_c": pass_c_enabled(),
         "table_synth": table_synth_enabled(),
+        "semantic_binding_candidates": semantic_binding_candidates_enabled(),
+        "semantic_binding_proposals": semantic_binding_proposals_enabled(),
         "llm_provider": os.environ.get("FEATUREGEN_LLM_PROVIDER") or None,
         "llm_model": os.environ.get("FEATUREGEN_LLM_MODEL") or None,
     }
@@ -113,13 +121,16 @@ def _clean_filename(filename: str | None) -> str | None:
 
 def _insert_run(conn, run_id: str, *, origin_type: str, catalog_source: str,
                 filename: str | None, actor: IdentityEnvelope, effective_config: dict,
-                now: datetime, authorization_decision: str | None) -> None:
+                now: datetime, authorization_decision: str | None,
+                source_type: str | None, profile_version: str | None) -> None:
     conn.execute(
         "INSERT INTO ingestion_run (id, origin_type, catalog_source, filename, actor_subject, "
-        "actor_role_claims, effective_config, authorization_decision, status, started_at, "
-        "heartbeat_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'in_progress', %s, %s)",
+        "actor_role_claims, effective_config, authorization_decision, source_type, "
+        "profile_version, status, started_at, heartbeat_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'in_progress', %s, %s)",
         (run_id, origin_type, catalog_source, _clean_filename(filename), actor.subject,
-         list(actor.role_claims), Jsonb(effective_config), authorization_decision, now, now))
+         list(actor.role_claims), Jsonb(effective_config), authorization_decision, source_type,
+         profile_version, now, now))
     _append_status_event(conn, run_id, status="in_progress", at=now, reason_code=None)
 
 
@@ -132,12 +143,18 @@ def _append_status_event(conn, run_id: str, *, status: str, at: datetime,
 
 def open_run(conn, *, origin_type: str, catalog_source: str, filename: str | None,
              actor: IdentityEnvelope, effective_config: dict, now: datetime,
-             authorization_decision: str | None = None) -> str:
+             authorization_decision: str | None = None, source_type: str | None = None,
+             profile_version: str | None = None) -> str:
     """Mint + durably record an ``in_progress`` run; returns the run id.
 
     ``authorization_decision`` records the permission-gate outcome that admitted the request
     (review FIX 4): a route reaches open_run only AFTER its gate passed, so it states that
     honestly — e.g. ``"granted:catalog_write"`` for POST /uploads and the connector import.
+
+    ``source_type`` / ``profile_version`` (Delivery B item 9) record the source capability
+    profile that governs the run, WHEN the caller already knows it at open. The upload route
+    opens its run BEFORE parse, so the profile is unknown here — it records both at terminalize
+    instead, and NULL at open is the honest "not yet selected", never a fabricated default.
 
     Independent-commit rule: the INSERT goes on a FRESH connection from ``get_settings().dsn``,
     committed immediately, so the run row survives the request transaction rolling back (a parse
@@ -147,7 +164,8 @@ def open_run(conn, *, origin_type: str, catalog_source: str, filename: str | Non
     run_id = mint_id("ingrun")
     kwargs = dict(origin_type=origin_type, catalog_source=catalog_source, filename=filename,
                   actor=actor, effective_config=effective_config, now=now,
-                  authorization_decision=authorization_decision)
+                  authorization_decision=authorization_decision, source_type=source_type,
+                  profile_version=profile_version)
     dsn = get_settings().dsn
     if dsn:
         try:
@@ -167,11 +185,17 @@ def terminalize_run(conn, run_id: str, *, status: str, now: datetime,
                     post_fingerprint: str | None = None,
                     fingerprint_algo_version: str | None = None,
                     redacted_failure_code: str | None = None,
-                    reason_code: str | None = None) -> bool:
+                    reason_code: str | None = None, source_type: str | None = None,
+                    profile_version: str | None = None) -> bool:
     """Transition an ``in_progress`` run to a terminal status ON THE GIVEN CONNECTION (an
     ``ingested`` terminalize must commit atomically with the ingest transaction — never record
     ``ingested`` for a tx that then fails). Returns True when this call performed the transition;
     False when the run was already terminal (or unknown) — idempotent-safe, nothing clobbered.
+
+    ``source_type`` / ``profile_version`` (Delivery B item 9) are FILL-ONLY (``COALESCE``): the
+    upload route learns its capability profile at parse, after open, so they normally land here —
+    but a terminalize that does NOT know the profile (the abandon sweep, a pre-parse failure)
+    must never blank a value a caller recorded at open. Write-once, never overwritten to NULL.
 
     Isolation assumption (review FIX 5): the success path's atomic
     ``UPDATE ... WHERE status = 'in_progress'`` relies on READ COMMITTED (the Postgres default)
@@ -187,10 +211,13 @@ def terminalize_run(conn, run_id: str, *, status: str, now: datetime,
         "UPDATE ingestion_run SET status = %s, completed_at = %s, heartbeat_at = %s, "
         "row_count = %s, quarantined_count = %s, file_sha256 = %s, "
         "pre_source_fingerprint = %s, post_source_fingerprint = %s, "
-        "fingerprint_algo_version = %s, redacted_failure_code = %s "
+        "fingerprint_algo_version = %s, redacted_failure_code = %s, "
+        "source_type = COALESCE(%s, source_type), "
+        "profile_version = COALESCE(%s, profile_version) "
         "WHERE id = %s AND status = 'in_progress' RETURNING id",
         (status, now, now, row_count, quarantined_count, file_sha256, pre_fingerprint,
-         post_fingerprint, fingerprint_algo_version, redacted_failure_code, run_id)).fetchone()
+         post_fingerprint, fingerprint_algo_version, redacted_failure_code, source_type,
+         profile_version, run_id)).fetchone()
     if row is None:
         return False
     _append_status_event(conn, run_id, status=status, at=now, reason_code=reason_code)
@@ -203,7 +230,8 @@ def terminalize_run_durable(run_id: str, *, status: str, now: datetime,
                             post_fingerprint: str | None = None,
                             fingerprint_algo_version: str | None = None,
                             redacted_failure_code: str | None = None,
-                            reason_code: str | None = None, fallback_conn=None) -> None:
+                            reason_code: str | None = None, source_type: str | None = None,
+                            profile_version: str | None = None, fallback_conn=None) -> None:
     """``terminalize_run`` on a FRESH independent connection — the route's exception path, where
     the request transaction is rolling back and would take the terminal state down with it.
     Best-effort: no DSN / failed connect degrades to ``fallback_conn`` when given (the test
@@ -212,7 +240,8 @@ def terminalize_run_durable(run_id: str, *, status: str, now: datetime,
                   quarantined_count=quarantined_count, file_sha256=file_sha256,
                   pre_fingerprint=pre_fingerprint, post_fingerprint=post_fingerprint,
                   fingerprint_algo_version=fingerprint_algo_version,
-                  redacted_failure_code=redacted_failure_code, reason_code=reason_code)
+                  redacted_failure_code=redacted_failure_code, reason_code=reason_code,
+                  source_type=source_type, profile_version=profile_version)
     dsn = get_settings().dsn
     if dsn:
         try:

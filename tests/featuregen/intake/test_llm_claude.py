@@ -159,6 +159,90 @@ def test_claude_adapter_without_usage_still_returns_cleanly(monkeypatch):
     assert out.cost_metadata == {}
 
 
+# ---- perf (vocab-caching): a large STATIC shared prefix rides a cached `system` block ------------
+
+
+def _vocab_request(vocab):
+    """A concept-batch-shaped request whose catalog carries the static vocabulary + volatile items,
+    with the vocabulary marked as the shared cacheable prefix."""
+    from dataclasses import replace
+
+    return replace(
+        _schema_request({"provider": "anthropic", "model": "claude-sonnet-5"}),
+        inputs={"redacted_intent": "classify each column",
+                "catalog_metadata": {"vocabulary": vocab,
+                                     "items": [{"ref": "h1", "column": "balance"}]},
+                "raw_input_classification": "clean"},
+        cacheable_metadata_keys=("vocabulary",))
+
+
+def test_wire_prompt_lifts_cacheable_vocab_into_a_cached_system_block():
+    """SDK-FREE: the marked vocabulary is lifted into a `system` text block carrying an ephemeral
+    `cache_control` breakpoint (so Anthropic caches the prefix and chunks 2..N read it cheaply),
+    while the volatile per-item metadata rides the user turn and the vocab is NOT re-sent there."""
+    from featuregen.intake.llm_claude import _wire_prompt
+
+    vocab = [{"name": f"c{i}"} for i in range(50)]
+    system, user = _wire_prompt(_vocab_request(vocab))
+    assert system is not None and len(system) == 1
+    block = system[0]
+    assert block["cache_control"] == {"type": "ephemeral"}
+    assert "c0" in block["text"] and "c49" in block["text"]   # the whole vocab rides the cached block
+    assert "c0" not in user                                    # ...and is NOT re-sent in the user turn
+    assert "balance" in user                                   # the volatile per-item metadata is
+
+
+def test_wire_prompt_without_cacheable_keys_is_a_single_user_message():
+    """No cacheable keys (definition/domain batch, single-mode, non-enrichment callers) → no system
+    block; the whole payload rides one user message — byte-for-byte today's rendering."""
+    from featuregen.intake.llm_claude import _wire_prompt
+
+    system, user = _wire_prompt(_bare_request())              # cacheable_metadata_keys defaults to ()
+    assert system is None
+    assert user.startswith("Structure the following intent")
+
+
+def test_claude_adapter_sends_vocab_as_a_cached_system_block(monkeypatch):
+    """End-to-end at the adapter: a request that marks the vocab cacheable makes the SDK call carry a
+    `system` block with `cache_control`, and the volatile user turn no longer re-sends the vocab."""
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def _create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text='{"results": []}')],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+
+    adapter = _stub_adapter(monkeypatch, _create)
+    vocab = [{"name": f"c{i}"} for i in range(50)]
+    adapter.call(_vocab_request(vocab))
+    assert "system" in captured
+    assert captured["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "c0" in captured["system"][0]["text"]
+    assert "c0" not in captured["messages"][0]["content"]     # sent once, up front — not per chunk
+
+
+def test_claude_adapter_without_cacheable_keys_sends_no_system(monkeypatch):
+    """No regression: a request with no cacheable keys passes no `system` kwarg to the SDK — the
+    outbound shape is byte-for-byte today's single-user-message call."""
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def _create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text='{"concept": "monetary_amount"}')])
+
+    adapter = _stub_adapter(monkeypatch, _create)
+    adapter.call(_schema_request({"provider": "anthropic", "model": "claude-sonnet-5"}))
+    assert "system" not in captured
+
+
 @pytest.mark.skipif(
     not __import__("os").environ.get("FEATUREGEN_LLM_SMOKE"),
     reason="config-gated live Claude smoke test; never gated in CI (D5, §15)",

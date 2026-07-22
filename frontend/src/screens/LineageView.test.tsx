@@ -426,6 +426,190 @@ describe('lineage view', () => {
     expect(drawer.querySelector('time')).toHaveAttribute('datetime', vouched)
   })
 
+  // ---- column-centric anchor, capped cards, honest empty state ---------------------------
+  describe('column anchor, caps, empty state', () => {
+    // The real customer shape: one 127-column table. balance is the anchor; cust_id joins out.
+    const WIDE_COLS: api.LineageNode[] = [
+      col('deposits', 'accounts', 'id', { grain: true }),
+      col('deposits', 'accounts', 'posted_at', { as_of: true }),
+      col('deposits', 'accounts', 'balance', { concept: 'money_amount' }),
+      col('deposits', 'accounts', 'cust_id'),
+      // col_120 carries an entity-key marker: it must outrank plain columns in the capped view
+      ...Array.from({ length: 123 }, (_, i) =>
+        col('deposits', 'accounts', `col_${i + 1}`, i + 1 === 120 ? { entity: 'Customer' } : {}),
+      ),
+    ]
+    const WIDE: api.LineageGraph = {
+      nodes: [
+        tbl('deposits', 'accounts'),
+        ...WIDE_COLS,
+        tbl('deposits', 'customers'),
+        col('deposits', 'customers', 'cust_id', { grain: true }),
+      ],
+      edges: [
+        ...WIDE_COLS.map(c => contains('deposits', 'accounts', c.column as string)),
+        contains('deposits', 'customers', 'cust_id'),
+        {
+          from: 'deposits:public.accounts.cust_id', to: 'deposits:public.customers.cust_id',
+          layer: 'joins', kind: 'join', cardinality: 'N:1', resolved: true,
+        },
+      ],
+      truncated: false,
+    }
+    const TABLE_ANCHOR: api.SearchHit = {
+      ...ANCHOR, object_ref: 'public.accounts', column: null, kind: 'table',
+    }
+
+    it('renders a column anchor as its own node with a containment edge and a compact table card', async () => {
+      lineageGraph.mockResolvedValue(WIDE)
+      const { container } = render(<LineageView anchor={ANCHOR} />)
+      await screen.findByText('accounts')
+
+      // the anchored column is a distinct node: kind chip, name (the match), and its concept
+      const anchorCard = container.querySelector('.ln-card--anchor') as HTMLElement
+      expect(anchorCard).not.toBeNull()
+      expect(within(anchorCard).getByText('column')).toBeInTheDocument()
+      expect(within(anchorCard).getByRole('button', { name: 'balance' })).toHaveAttribute(
+        'aria-current', 'true',
+      )
+      expect(within(anchorCard).getByText('money_amount')).toBeInTheDocument()
+
+      // a quiet structural containment edge ties the column node to its table card
+      expect(container.querySelector('.ln-edge--contain')).not.toBeNull()
+      const a11y = screen.getByRole('region', { name: 'Edges as text' })
+      expect(within(a11y).getByText('balance belongs to accounts')).toBeInTheDocument()
+
+      // the owning table renders compact: a count chip and only the structural spine plus
+      // edge-endpoint columns as rows, never the 127-row tower
+      expect(screen.getByText('127 columns')).toBeInTheDocument()
+      const tableCard = screen.getByText('accounts').closest('.ln-card') as HTMLElement
+      expect(within(tableCard).getAllByRole('listitem').length).toBeLessThanOrEqual(8)
+      expect(within(tableCard).getByRole('button', { name: 'cust_id' })).toBeInTheDocument()
+      expect(within(tableCard).queryByText('col_50')).not.toBeInTheDocument()
+      // the anchored column renders ONLY as the anchor node, not as a row in the card
+      expect(within(tableCard).queryByRole('button', { name: 'balance' })).not.toBeInTheDocument()
+      // compact keeps the caret (collapsed by default) and the expand-neighbors chip
+      expect(screen.getByRole('button', { name: 'Show accounts columns' })).toBeInTheDocument()
+      expect(
+        screen.getByRole('button', { name: 'Expand neighbors of accounts' }),
+      ).toBeInTheDocument()
+      // drawable edges exist, so no empty-state panel
+      expect(screen.queryByText(/No joins proposed or approved yet/)).not.toBeInTheDocument()
+    })
+
+    it('caps an expanded table card at 8 rows with a "+N more columns" scroll expander', async () => {
+      lineageGraph.mockResolvedValue(WIDE)
+      const { container } = render(<LineageView anchor={TABLE_ANCHOR} />)
+      await screen.findByText('accounts')
+
+      // table anchors keep the table-card-centric layout: no anchor-column node
+      expect(container.querySelector('.ln-card--anchor')).toBeNull()
+      const card = screen.getByText('accounts').closest('.ln-card') as HTMLElement
+      expect(within(card).getAllByRole('listitem').length).toBe(8)
+      // edge-endpoint columns rank into the capped head of the list
+      expect(within(card).getByRole('button', { name: 'cust_id' })).toBeInTheDocument()
+      expect(within(card).queryByText('col_50')).not.toBeInTheDocument()
+
+      // within "the rest", marker-carrying columns (grain, as-of, entity key) outrank input
+      // order: late col_120 (entity) makes the capped 8, plain col_50 does not
+      expect(within(card).getByRole('button', { name: 'col_120' })).toBeInTheDocument()
+
+      await userEvent.click(within(card).getByRole('button', { name: '+119 more columns' }))
+      expect(within(card).getAllByRole('listitem').length).toBe(127)
+      expect(within(card).queryByRole('button', { name: /more columns/ })).not.toBeInTheDocument()
+      // the full list scrolls inside the card instead of growing without bound
+      expect(card.querySelector('.ln-cols--scroll')).not.toBeNull()
+
+      // collapsing resets to the capped view
+      await userEvent.click(screen.getByRole('button', { name: 'Hide accounts columns' }))
+      await userEvent.click(screen.getByRole('button', { name: 'Show accounts columns' }))
+      expect(within(card).getAllByRole('listitem').length).toBe(8)
+      expect(within(card).getByRole('button', { name: '+119 more columns' })).toBeInTheDocument()
+    })
+
+    it('explains an empty canvas per toggled-on layer instead of drawing nothing', async () => {
+      const LEAN: api.LineageGraph = {
+        nodes: [
+          tbl('deposits', 'accounts'),
+          col('deposits', 'accounts', 'balance'),
+          col('deposits', 'accounts', 'posted_at', { as_of: true }),
+        ],
+        edges: [
+          contains('deposits', 'accounts', 'balance'),
+          contains('deposits', 'accounts', 'posted_at'),
+        ],
+        truncated: false,
+      }
+      lineageGraph.mockResolvedValue(LEAN)
+      const { unmount } = render(<LineageView anchor={ANCHOR} />)
+      await screen.findByText('accounts')
+
+      expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
+      expect(
+        screen.getByText(/Proposals appear here after uploads are enriched/),
+      ).toBeInTheDocument()
+      expect(screen.getByText(/No verified entity bridge yet/)).toBeInTheDocument()
+      expect(screen.getByText(/No features are derived from this column yet/)).toBeInTheDocument()
+      expect(screen.getAllByRole('link', { name: 'Governance screen' }).length).toBe(2)
+      expect(screen.getByRole('link', { name: 'Workbench' })).toBeInTheDocument()
+
+      // the lines respect the layer toggles
+      await userEvent.click(screen.getByLabelText('Joins'))
+      expect(screen.queryByText(/No joins proposed or approved yet/)).not.toBeInTheDocument()
+      expect(screen.getByText(/No verified entity bridge yet/)).toBeInTheDocument()
+      await userEvent.click(screen.getByLabelText('Joins'))
+      expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
+
+      // links use the app's hash routes
+      await userEvent.click(screen.getAllByRole('link', { name: 'Governance screen' })[0])
+      expect(window.location.hash).toBe('#/governance')
+      window.location.hash = ''
+      unmount()
+
+      // a table anchor adapts the ref word where the copy names the anchor
+      lineageGraph.mockResolvedValue({
+        nodes: [tbl('deposits', 'accounts'), col('deposits', 'accounts', 'id', { grain: true })],
+        edges: [contains('deposits', 'accounts', 'id')],
+        truncated: false,
+      })
+      render(<LineageView anchor={TABLE_ANCHOR} />)
+      await screen.findByText('accounts')
+      expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
+      expect(screen.getByText(/No features are derived from this table yet/)).toBeInTheDocument()
+    })
+
+    it('keeps the panel away when a declared join draws as a ghost edge', async () => {
+      // A resolved=false join is drawable lineage (stub card + dashed edge), not emptiness.
+      const PENDING: api.LineageGraph = {
+        nodes: [
+          tbl('deposits', 'accounts'),
+          col('deposits', 'accounts', 'balance'),
+          col('deposits', 'accounts', 'ledger_id'),
+          {
+            id: 'deposits:public.ledger.entry_id', kind: 'column',
+            object_ref: 'public.ledger.entry_id', table: 'ledger', column: 'entry_id',
+            grain: false, as_of: false, stale: false, resolved: false,
+          },
+        ],
+        edges: [
+          contains('deposits', 'accounts', 'balance'),
+          contains('deposits', 'accounts', 'ledger_id'),
+          {
+            from: 'deposits:public.accounts.ledger_id', to: 'deposits:public.ledger.entry_id',
+            layer: 'joins', kind: 'join', resolved: false,
+          },
+        ],
+        truncated: false,
+      }
+      lineageGraph.mockResolvedValue(PENDING)
+      render(<LineageView anchor={ANCHOR} />)
+      await screen.findByText('accounts')
+      expect(screen.getByText(/declared join target; not uploaded yet/i)).toBeInTheDocument()
+      expect(screen.queryByText(/No joins proposed or approved yet/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/No verified entity bridge yet/)).not.toBeInTheDocument()
+    })
+  })
+
   // ---- self-join sanity ------------------------------------------------------------------
   it('renders a declared self-join without crashing (a well-formed loop)', async () => {
     const self: api.LineageGraph = {

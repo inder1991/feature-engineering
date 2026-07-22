@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from featuregen.overlay.upload import enrich_config, table_vocab
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.taxonomy.dimensions import known_entities
 from featuregen.runtime.observability import counters
 
@@ -244,8 +245,41 @@ def make_summary_accept(columns_by_ref: dict[str, set[str]]):
     return accept
 
 
+def _table_dispatch_subject(catalog_source: str, schema: str | None, table: str,
+                            columns: list[str]) -> dict:
+    """One ``llm_dispatch_subject`` mapping (C5-T5) for a Pass B table item: the table's
+    schema-aware evidence identity (the SAME ``schema_by_table`` schema its fact proposals key
+    under) with ``field_names`` = the column names this physical request carries. Attribution
+    strings only — never row data."""
+    logical_ref = normalize_ref(catalog_source, schema, table)
+    return {"catalog_source": catalog_source, "object_ref": logical_ref.split("::", 1)[1],
+            "logical_ref": logical_ref, "field_names": sorted(columns)}
+
+
+def _dispatch_subjects_for(items: list[BatchItem], *, catalog_source: str | None,
+                           schema_by_table: dict[str, str] | None) -> dict[str, dict] | None:
+    """The ``{ref: subject}`` mapping for a synthesis batch (C5-T5): one TABLE subject per item,
+    ``field_names`` drawn from whichever roster the item carries (full ``column_profiles`` on the
+    narrow/summary path, the compact ``column_roster`` on the wide phase-2 path). ``None`` when the
+    caller supplied no ``catalog_source`` (a direct/test call) — no subjects to attribute."""
+    if catalog_source is None:
+        return None
+    sbt = schema_by_table or {}
+    out: dict[str, dict] = {}
+    for it in items:
+        descs = it.metadata.get("column_profiles") or it.metadata.get("column_roster") or []
+        cols = [d.get("column") for d in descs if isinstance(d, dict) and d.get("column")]
+        table = it.metadata.get("table") or it.ref
+        out[it.ref] = _table_dispatch_subject(catalog_source, sbt.get(table), table, cols)
+    return out
+
+
 def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table, actor,
-                      dispositions: list[dict] | None = None) -> dict[str, dict]:
+                      dispositions: list[dict] | None = None,
+                      ingestion_run_id: str | None = None,
+                      catalog_source: str | None = None,
+                      schema_by_table: dict[str, str] | None = None,
+                      stats: dict | None = None) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
@@ -259,7 +293,8 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     Wide tables (#1): an item whose ``column_profiles`` exceeds ``_MAX_COLUMN_PROFILES`` cannot egress
     as one giant item, so it is routed through the TWO-PHASE path (phase-1 per-chunk summaries -> a
     single phase-2 synthesis over the summaries + a complete roster). NARROW tables (``<=64`` profiles)
-    keep today's single-call fast path byte-for-byte. A wide table that fails to summarize every chunk,
+    keep today's single-call fast path byte-for-byte. A wide table synthesizes over whatever chunk
+    summaries LANDED (the roster is complete regardless); only a table with ZERO chunk summaries,
     or whose synthesis is invalid, simply never appears in the returned dict — the caller then reports
     the honest partial/failed outcome (no phantom "resolved").
 
@@ -267,7 +302,16 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     intentionally NOT consulted here. Pass B is BATCH-ONLY: a ref_aware task has no single-call
     seam (run_batched skips the single fallback for ref_aware), so there is no "single" execution
     path a mode switch could select. Only the FEATURE switch (``OVERLAY_TABLE_SYNTH``,
-    ``ingest.table_synth_enabled``) gates Pass B."""
+    ``ingest.table_synth_enabled``) gates Pass B.
+
+    ``stats`` (optional out-param — return shape unchanged): accumulates ``not_attempted``, the count
+    of TABLES the budget/deadline cutoff skipped WITHOUT dispatching their synthesis (narrow path +
+    wide phase-2), so the caller labels a truncated Pass B ``truncated`` rather than ``items_failed``.
+
+    C5-T5 — ``ingestion_run_id`` + ``catalog_source`` (+ ``schema_by_table``, the Pass-B fact-key
+    schema map): with a run id, every Pass B dispatch (chunk summaries AND syntheses) is pre-audited
+    and attributed to the run + its TABLE subjects under stage ``pass_b``. ``ingestion_run_id=None``
+    (every direct/test caller) is byte-for-byte today's behavior."""
     narrow = [it for it in items
               if len(it.metadata.get("column_profiles") or []) <= _MAX_COLUMN_PROFILES]
     wide = [it for it in items
@@ -277,16 +321,26 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
         # Today's exact path: one synthesis batch over the full profiles (fast path, byte-for-byte).
         resolved.update(_run_synthesis(conn, client, narrow, columns_by_table=columns_by_table,
                                        actor=actor, instruction=_INSTRUCTION,
-                                       dispositions=dispositions))
+                                       dispositions=dispositions,
+                                       ingestion_run_id=ingestion_run_id,
+                                       catalog_source=catalog_source,
+                                       schema_by_table=schema_by_table, stats=stats))
     if wide:
         resolved.update(_synthesize_wide_tables(conn, client, wide,
                                                 columns_by_table=columns_by_table, actor=actor,
-                                                dispositions=dispositions))
+                                                dispositions=dispositions,
+                                                ingestion_run_id=ingestion_run_id,
+                                                catalog_source=catalog_source,
+                                                schema_by_table=schema_by_table, stats=stats))
     return resolved
 
 
 def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, actor, instruction,
-                   dispositions: list[dict] | None = None) -> dict[str, dict]:
+                   dispositions: list[dict] | None = None,
+                   ingestion_run_id: str | None = None,
+                   catalog_source: str | None = None,
+                   schema_by_table: dict[str, str] | None = None,
+                   stats: dict | None = None) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
@@ -302,6 +356,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     resolved ref is excluded from every retry/split chunk, and only a parseable-dict raw — which
     always resolves — appends records)."""
     accept = make_ref_accept(columns_by_table, dispositions=dispositions)
+    batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
         prompt_id="overlay_table_synth_v3", schema_id="overlay_table_synth_batch",
@@ -310,7 +365,15 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
         deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+        report=batch_report,
+        ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
+        dispatch_subjects=_dispatch_subjects_for(items, catalog_source=catalog_source,
+                                                 schema_by_table=schema_by_table),
     )
+    # ACCUMULATE (narrow + wide-phase-2 both funnel here): these table-granular refs are exactly
+    # Pass B's expected unit, so a truncated synthesis surfaces as the stage's `not_attempted`.
+    if stats is not None and batch_report.get("not_attempted"):
+        stats["not_attempted"] = stats.get("not_attempted", 0) + batch_report["not_attempted"]
     return {table: json.loads(raw) for table, raw in resolved.items()}
 
 
@@ -333,17 +396,24 @@ def _roster_entry(desc: dict) -> dict:
 
 
 def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, columns_by_table, actor,
-                            dispositions: list[dict] | None = None) -> dict[str, dict]:
+                            dispositions: list[dict] | None = None,
+                            ingestion_run_id: str | None = None,
+                            catalog_source: str | None = None,
+                            schema_by_table: dict[str, str] | None = None,
+                            stats: dict | None = None) -> dict[str, dict]:
     """Two-phase synthesis for tables wider than the egress cap (#1). ``dispositions`` threads to
     the PHASE-2 synthesis only (whose refs are the table names); the phase-1 chunk summaries are
     advisory input keyed by chunk ref and record no per-field dispositions.
 
     Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
-    (no fact output) — every chunk item is egress-safe. Phase 2: for each table whose chunks ALL
-    summarized, run ONE synthesis over its chunk summaries + a compact complete roster of STRUCTURED
-    ``{column, operational_type, declared_type}`` entries + the table's ``table_definition`` (when
-    the assembled item carried one). A table missing any chunk summary is dropped (never partially
-    synthesized) so the caller reports it honestly as unresolved."""
+    (no fact output) — every chunk item is egress-safe. Phase 2: for each table with AT LEAST ONE
+    chunk summary, run ONE synthesis over whatever chunk summaries LANDED + a compact complete roster
+    of STRUCTURED ``{column, operational_type, declared_type}`` entries + the table's
+    ``table_definition`` (when the assembled item carried one). The roster is built from ALL profiles,
+    so a budget-skipped chunk summary (advisory phase-2 input, not a governed fact) never starves the
+    synthesis — the ``overlay.table_synth.wide.partial_summaries`` counter records the shortfall. Only
+    a table with ZERO landed summaries is dropped (``wide.zero_summaries``) so the caller reports it
+    honestly as unresolved."""
     chunk_items: list[BatchItem] = []
     chunk_refs_by_table: dict[str, list[str]] = {}
     columns_by_ref: dict[str, set[str]] = {}
@@ -381,17 +451,35 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
         extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,
         deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+        # C5-T5: each chunk item attributes to its TABLE (the real catalog object), field_names =
+        # the chunk's columns — a wide table's summary dispatches stay subject-attributed.
+        ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
+        dispatch_subjects=_dispatch_subjects_for(chunk_items, catalog_source=catalog_source,
+                                                 schema_by_table=schema_by_table),
     )
 
     phase2_items: list[BatchItem] = []
     for table, refs in chunk_refs_by_table.items():
-        if not all(r in summaries for r in refs):
-            # An incomplete summary set for a wide table -> no synthesis (never a partial/guessed one).
-            counters.incr("overlay.table_synth.wide.incomplete_summaries")
-            logger.info("table_synth wide %r summarized %d/%d chunks — no synthesis (honest miss)",
-                        table, sum(r in summaries for r in refs), len(refs))
+        present = [r for r in refs if r in summaries]
+        if not present:
+            # ZERO chunks summarized for a wide table -> no synthesis (never a guessed one): the
+            # phase-2 call would have no advisory grounding at all. Only this all-missing case drops
+            # the table; the caller then reports it honestly as unresolved.
+            counters.incr("overlay.table_synth.wide.zero_summaries")
+            logger.info("table_synth wide %r summarized 0/%d chunks — no synthesis (honest miss)",
+                        table, len(refs))
             continue
-        chunk_summaries = [json.loads(summaries[r]) for r in refs]
+        if len(present) < len(refs):
+            # SOME chunks summarized: proceed to phase 2 on the LANDED summaries. This is SAFE
+            # because the phase-2 item carries the COMPLETE column_roster built from ALL profiles
+            # (above), independent of the summaries — a chunk summary is explicitly advisory phase-2
+            # input, not a governed fact. Dropping the whole (e.g. 126-col) table because one chunk's
+            # summary call was budget-skipped would stamp all five dispositions not_evaluated and
+            # fail Pass B, so we synthesize over whatever summaries arrived.
+            counters.incr("overlay.table_synth.wide.partial_summaries")
+            logger.info("table_synth wide %r summarized %d/%d chunks — synthesizing on the partial "
+                        "summaries (roster is complete)", table, len(present), len(refs))
+        chunk_summaries = [json.loads(summaries[r]) for r in present]
         metadata: dict = {"table": table, "chunk_summaries": chunk_summaries,
                           "column_roster": roster_by_table[table]}
         if table in table_def_by_table:
@@ -399,9 +487,14 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         phase2_items.append(BatchItem(ref=table, metadata=metadata))
     if not phase2_items:
         return {}
+    # `stats` threads to PHASE-2 only (table-granular refs = Pass B's `not_attempted` unit). Phase-1
+    # summary truncation is chunk-granular; a wholly-unsummarized wide table already surfaces as
+    # unresolved (`wide.zero_summaries`), so it is deliberately not recounted here.
     return _run_synthesis(conn, client, phase2_items, columns_by_table=columns_by_table,
                           actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION,
-                          dispositions=dispositions)
+                          dispositions=dispositions, ingestion_run_id=ingestion_run_id,
+                          catalog_source=catalog_source, schema_by_table=schema_by_table,
+                          stats=stats)
 
 
 _TYPE_FIELDS_NOTE = (
@@ -501,15 +594,19 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                          source_snapshot_id: str,
                          schema_by_table: dict[str, str] | None = None,
                          dispositions: list[dict] | None = None,
-                         now: datetime | None = None) -> None:
+                         now: datetime | None = None,
+                         source_uploader: str | None = None) -> None:
     """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
     table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
     active claim governs the key (VERIFIED / a pending proposal); otherwise lets propose_fact
     adjudicate re-proposal after a terminal state, logging any denial as a conflict diagnostic.
 
     ``actor`` MUST be the service actor (``_ENRICH_ACTOR``) so a human confirmer later satisfies
-    four-eyes. ``source_snapshot_id`` keys producer-scoped staleness for the advisory evidence (a
-    NOT-NULL column).
+    four-eyes. ``source_uploader`` is the uploading HUMAN principal's subject (or None): the
+    grain/availability operands are shaped by the uploader's own file, so the proposal records that
+    principal and ``confirm_fact`` bars them from confirming it single-handedly (program-audit F10
+    — the same M-7 SOURCE-provenance rule as the semantic-binding surface). ``source_snapshot_id``
+    keys producer-scoped staleness for the advisory evidence (a NOT-NULL column).
 
     ``schema_by_table`` maps a NORMALIZED table name to the real (non-public) schema its glossary
     column decisions are keyed under. The advisory table-field evidence MUST be keyed under that SAME
@@ -579,9 +676,13 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                 continue
             try:
                 # Command needs ALL 6 fields (envelopes.py); mirror _propose_governed_joins exactly.
+                # `source_uploader` (when a human uploaded) is the F10 four-eyes provenance.
+                args: dict[str, object] = {"ref": ref, "fact_type": fact_type,
+                                           "proposed_value": value}
+                if source_uploader:
+                    args["source_uploader"] = source_uploader
                 result = propose_fact(conn, Command(
-                    "propose_fact", "overlay_fact", None,
-                    {"ref": ref, "fact_type": fact_type, "proposed_value": value},
+                    "propose_fact", "overlay_fact", None, args,
                     actor, proposal_fingerprint(value)))
                 if result.accepted:
                     counters.incr(f"overlay.table_synth.{fact_type}.proposed")

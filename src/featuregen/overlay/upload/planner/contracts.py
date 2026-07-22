@@ -286,6 +286,9 @@ class ReasonCode(StrEnum):
     aggregation_ordering_column_missing = "aggregation_ordering_column_missing"   # 3B.4: take_latest has no bound ordering column available+surviving at its hop
     additivity_source_conflict = "additivity_source_conflict"
     physical_cardinality_unavailable = "physical_cardinality_unavailable"
+    # H3a: >= 2 active declarations overlap for one (recipe_id, need_role) in the durable registry —
+    # a governance conflict, never a silent pick (the compile fails aggregation for that key).
+    aggregation_declaration_conflict = "aggregation_declaration_conflict"
     # 3B.3c — temporal declaration (C3)
     temporal_anchor_missing = "temporal_anchor_missing"
     temporal_anchor_ambiguous = "temporal_anchor_ambiguous"

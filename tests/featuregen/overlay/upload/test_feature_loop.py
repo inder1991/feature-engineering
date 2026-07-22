@@ -43,7 +43,9 @@ def _govern_additivity(db, source, table, column, value):
 def test_loop_rejects_leaky_and_unsafe_keeps_good(db):
     _bank(db)
     _fresh_watermark(db, "bank", NOW)
-    _govern_additivity(db, "bank", "accounts", "balance", "non_additive")
+    # A GOVERNED-unsafe measure: the decision must match the graph's file-declared value
+    # ("semi_additive"), else C1 hash-mismatches (a drifted value can't hard-reject — it needs-checks).
+    _govern_additivity(db, "bank", "accounts", "balance", "semi_additive")
     client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
         {"name": "leaky", "derives_from": ["public.accounts.churned"]},                 # leaks target
         {"name": "unsafe", "derives_from": ["public.accounts.balance"],
