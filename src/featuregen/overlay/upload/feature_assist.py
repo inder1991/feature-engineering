@@ -583,9 +583,16 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
     for ref in known:
         col = ref.rsplit(".", 1)[-1]
         by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
+    # The model returns derives_from as EITHER a bare string (a single object_ref) or a list — measured
+    # both from Opus. Normalize to a list so a single-ref string is not iterated character-by-character
+    # (which would silently un-ground it — the string-form was 100% of a live run's UNGROUNDED misses).
+    if isinstance(raw_refs, str):
+        raw_refs = [raw_refs]
+    elif not isinstance(raw_refs, list):
+        raw_refs = []
     out: list[str] = []
     seen: set[str] = set()
-    for r in raw_refs if isinstance(raw_refs, list) else []:
+    for r in raw_refs:
         if not isinstance(r, str):
             continue
         resolved = r if r in known else by_col.get(r.rsplit(".", 1)[-1])
