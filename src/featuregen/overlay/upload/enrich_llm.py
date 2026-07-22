@@ -535,9 +535,11 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["results"]},
     # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
-    # The feature ITEM shape is declared (with derives_from REQUIRED) so the closed wire schema forces
-    # the model to return the column refs — an untyped `features` array let the model omit them
-    # entirely (every candidate then rejected UNGROUNDED). Canonical stays permissive for validation.
+    # The feature ITEM shape is DECLARED so the closed wire schema gives the model a `derives_from`
+    # slot to fill — an untyped `features` array let the model omit the column refs entirely (every
+    # candidate then rejected UNGROUNDED). NOT `required`: the canonical stays permissive so response
+    # validation is lenient (the deterministic `_vet` gauntlet, not the schema, filters candidates);
+    # declaring the property + the prompt is enough for the model to populate it (verified on Opus).
     ("feature_ideas", 1): {
         "type": "object", "additionalProperties": True,
         "properties": {"features": {"type": "array", "items": {
@@ -547,16 +549,11 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                            "aggregation": {"type": "string"},
                            "grain_table": {"type": "string"},
                            "description": {"type": "string"},
-                           "rationale": {"type": "string"}},
-            "required": ["name", "derives_from", "aggregation"]}}}},
-    # Properties declared (the keys `recipe()` reads) so the wire projection can CLOSE the object —
-    # Anthropic structured output rejects an open (no-property) object. Canonical stays permissive.
-    ("feature_recipe", 1): {"type": "object", "additionalProperties": True,
-                            "properties": {"derives_from": {"type": "array"},
-                                           "grain_table": {"type": "string"},
-                                           "join_table": {"type": "string"},
-                                           "aggregation": {"type": "string"},
-                                           "as_of_column": {"type": "string"}}},
+                           "rationale": {"type": "string"}}}}}},
+    # Left permissive (like on main): the recipe (NL-query) path is NOT the considered-set flow, and
+    # declaring typed properties here rejects a fake's null optional fields (grain/join/as_of) in
+    # response validation. Its wire schema stays open — a pre-existing limit, not this fix's scope.
+    ("feature_recipe", 1): {"type": "object", "additionalProperties": True},
     ("leakage", 1): {"type": "object", "additionalProperties": True,
                      "properties": {"leaks": {"type": "array"}}},
     # Properties declared (the keys `recommend_feature_sets`'s SetRecommendation reads) so the wire
