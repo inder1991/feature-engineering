@@ -13,6 +13,14 @@ data:
   # LLM provider ON: enables concept enrichment + Pass B synthesis. The ANTHROPIC_API_KEY itself is
   # supplied from the 'featuregen-llm' Secret via the Deployment env below — NEVER stored here.
   FEATUREGEN_LLM_PROVIDER: "anthropic"
+  # Feature-generation + enrichment run on Opus 4.8 (overrides the claude-sonnet-5 code default) —
+  # the governed feature-gen journey wants the strongest model at the proposal step.
+  FEATUREGEN_LLM_MODEL: "claude-opus-4-8"
+  # Drift-freshness SLA = 30 days. This single-node demo cluster runs NO periodic drift scanner, so
+  # the default 60-min SLA makes resolve_fact REVERIFY(drift_stale_pending_scan) as soon as a VERIFIED
+  # fact's watermark ages past an hour — which silently drops is_grain/as_of and starves the planner.
+  # A long SLA keeps VERIFIED facts resolvable for the demo. (Real deploys run a scanner instead.)
+  OVERLAY_DRIFT_FRESHNESS_SLA_MIN: "43200"
   # Pass C — deterministic governed join DISCOVERY (implies governed-join routing for declared joins).
   # Declared/discovered joins become approved_join PROPOSALS awaiting two distinct platform-admins in
   # the Governance review screen. (No ANTHROPIC_API_KEY here — see the note on OVERLAY_TABLE_SYNTH.)
