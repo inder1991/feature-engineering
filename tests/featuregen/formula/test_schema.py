@@ -447,3 +447,108 @@ class TestSameTableContainment:
         )
         with pytest.raises(SchemaError, match="body.denominator"):
             validate_semantics(make_proposal(body=body))
+
+
+# ------------------------------------------- body / operand / decimal / literals
+
+class TestBodyDiscriminator:
+    def test_aggregation_rejects_final_operation(self):
+        # FinalOperation.RATIO is a StrEnum member of the WRONG enum: the body
+        # discriminator says `aggregation` is always an AggregateFunction.
+        p = make_proposal(
+            body=UnaryBody(expr=make_expr(aggregation=FinalOperation.RATIO))
+        )
+        with pytest.raises(SchemaError, match="AggregateFunction"):
+            validate_semantics(p)
+
+    def test_aggregation_rejects_raw_string(self):
+        p = make_proposal(body=UnaryBody(expr=make_expr(aggregation="sum")))
+        with pytest.raises(SchemaError, match="AggregateFunction"):
+            validate_semantics(p)
+
+
+class TestCountRowsOperand:
+    def test_count_rows_with_operand_rejected(self):
+        p = make_proposal(
+            body=UnaryBody(
+                expr=make_expr(aggregation=AggregateFunction.COUNT_ROWS, operand=AMT)
+            )
+        )
+        with pytest.raises(SchemaError, match="count_rows"):
+            validate_semantics(p)
+
+    def test_non_count_rows_without_operand_rejected(self):
+        p = make_proposal(
+            body=UnaryBody(
+                expr=make_expr(aggregation=AggregateFunction.COUNT_DISTINCT, operand=None)
+            )
+        )
+        with pytest.raises(SchemaError, match="operand"):
+            validate_semantics(p)
+
+
+class TestDecimalPolicy:
+    def test_negative_scale_rejected(self):
+        p = make_proposal(
+            decimal=DecimalPolicy(
+                precision=18, scale=-1,
+                rounding=RoundingMode.HALF_EVEN, overflow=s.OverflowBehavior.ERROR,
+            )
+        )
+        with pytest.raises(SchemaError, match="scale"):
+            validate_semantics(p)
+
+    def test_precision_below_scale_rejected(self):
+        p = make_proposal(
+            decimal=DecimalPolicy(
+                precision=2, scale=5,
+                rounding=RoundingMode.HALF_EVEN, overflow=s.OverflowBehavior.ERROR,
+            )
+        )
+        with pytest.raises(SchemaError, match="precision"):
+            validate_semantics(p)
+
+
+class TestTypedLiteralParse:
+    def _filter_with_literal(self, lit: TypedLiteral, op=FilterPredicateOp.EQUAL):
+        return proposal_with_filter(eq_pred(op=op, right_literal=lit))
+
+    def test_integer_literal_must_parse(self):
+        bad = TypedLiteral(type=LiteralType.INTEGER, value="1.5")
+        with pytest.raises(SchemaError, match="integer"):
+            validate_semantics(self._filter_with_literal(bad))
+        ok = TypedLiteral(type=LiteralType.INTEGER, value="-42")
+        assert validate_semantics(self._filter_with_literal(ok)) is None
+
+    def test_decimal_literal_must_parse(self):
+        for bad_value in ("abc", "NaN", "1e5"):
+            bad = TypedLiteral(type=LiteralType.DECIMAL, value=bad_value)
+            with pytest.raises(SchemaError, match="decimal"):
+                validate_semantics(self._filter_with_literal(bad))
+        ok = TypedLiteral(type=LiteralType.DECIMAL, value="10.25")
+        assert validate_semantics(self._filter_with_literal(ok)) is None
+
+    def test_boolean_literal_must_be_canonical(self):
+        for bad_value in ("True", "1", "yes"):
+            bad = TypedLiteral(type=LiteralType.BOOLEAN, value=bad_value)
+            with pytest.raises(SchemaError, match="boolean"):
+                validate_semantics(self._filter_with_literal(bad))
+        ok = TypedLiteral(type=LiteralType.BOOLEAN, value="false")
+        assert validate_semantics(self._filter_with_literal(ok)) is None
+
+    def test_date_literal_must_be_iso(self):
+        for bad_value in ("2026-13-40", "22/07/2026", "20260722"):
+            bad = TypedLiteral(type=LiteralType.DATE, value=bad_value)
+            with pytest.raises(SchemaError, match="date"):
+                validate_semantics(self._filter_with_literal(bad))
+        ok = TypedLiteral(type=LiteralType.DATE, value="2026-07-22")
+        assert validate_semantics(self._filter_with_literal(ok)) is None
+
+    def test_in_list_literals_are_each_parsed(self):
+        entries = (
+            TypedLiteral(type=LiteralType.INTEGER, value="1"),
+            TypedLiteral(type=LiteralType.INTEGER, value="two"),
+        )
+        node = eq_pred(op=FilterPredicateOp.IN, right_literal=None, right_set=entries)
+        with pytest.raises(SchemaError, match="integer"):
+            validate_semantics(proposal_with_filter(node))

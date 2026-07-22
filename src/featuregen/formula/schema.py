@@ -10,7 +10,10 @@ carries NO ``.column``; operand/filter/event-time refs carry exactly one.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 LogicalRef = str  # canonical "source::schema.table[.column]", normalized before hashing
@@ -331,10 +334,66 @@ _SET_OPS = frozenset({FilterPredicateOp.IN, FilterPredicateOp.NOT_IN})
 
 def validate_semantics(p: TypedFormulaProposalV1) -> None:
     """Raise SchemaError on any §A semantic-rule violation; return None if valid."""
+    _check_decimal(p.decimal)
     for i, key in enumerate(p.grain.keys):
         _require_column_ref(key, f"grain.keys[{i}]")
     for path, expr in _body_expressions(p.body):
         _check_expression(path, expr)
+
+
+def _check_decimal(decimal: DecimalPolicy) -> None:
+    if decimal.scale < 0:
+        raise SchemaError(f"decimal: scale {decimal.scale} must be >= 0")
+    if decimal.precision < decimal.scale:
+        raise SchemaError(
+            f"decimal: precision {decimal.precision} must be >= scale {decimal.scale}"
+        )
+
+
+# ---- typed-literal parsing (canonical string forms only) ----
+
+_INTEGER_RE = re.compile(r"^-?[0-9]+$")
+_DECIMAL_RE = re.compile(r"^-?[0-9]+(\.[0-9]+)?$")  # no exponent/NaN/Infinity
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")  # extended ISO only (no YYYYMMDD)
+
+
+def _parse_typed_value(literal_type: LiteralType, value: str, path: str):
+    """Parse a canonical value string to its LiteralType; raise SchemaError if it doesn't."""
+    if not isinstance(value, str):
+        raise SchemaError(f"{path}: literal value must be a canonical string, got {value!r}")
+    if literal_type is LiteralType.STRING:
+        return value
+    if literal_type is LiteralType.INTEGER:
+        if not _INTEGER_RE.fullmatch(value):
+            raise SchemaError(f"{path}: {value!r} is not a canonical integer literal")
+        return int(value)
+    if literal_type is LiteralType.DECIMAL:
+        if not _DECIMAL_RE.fullmatch(value):
+            raise SchemaError(f"{path}: {value!r} is not a canonical decimal literal")
+        try:
+            return Decimal(value)
+        except InvalidOperation as exc:  # pragma: no cover - regex already gates this
+            raise SchemaError(f"{path}: {value!r} is not a canonical decimal literal") from exc
+    if literal_type is LiteralType.BOOLEAN:
+        if value not in ("true", "false"):
+            raise SchemaError(
+                f"{path}: {value!r} is not a canonical boolean literal ('true'/'false')"
+            )
+        return value == "true"
+    if literal_type is LiteralType.DATE:
+        if not _DATE_RE.fullmatch(value):
+            raise SchemaError(f"{path}: {value!r} is not an ISO date literal (YYYY-MM-DD)")
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise SchemaError(f"{path}: {value!r} is not an ISO date literal") from exc
+    raise SchemaError(f"{path}: unknown literal type {literal_type!r}")
+
+
+def _check_typed_literal(lit: TypedLiteral, path: str) -> None:
+    if not isinstance(lit, TypedLiteral) or not isinstance(lit.type, LiteralType):
+        raise SchemaError(f"{path}: expected a TypedLiteral with a LiteralType")
+    _parse_typed_value(lit.type, lit.value, path)
 
 
 # ---- logical_ref parsing ("source::schema.table[.column]") ----
@@ -397,6 +456,21 @@ def _body_expressions(
 
 
 def _check_expression(path: str, expr: AggregateExpression) -> None:
+    # Body discriminator [c3]: `aggregation` is ALWAYS an AggregateFunction,
+    # never a FinalOperation (nor a raw string).
+    if not isinstance(expr.aggregation, AggregateFunction):
+        raise SchemaError(
+            f"{path}.aggregation: {expr.aggregation!r} must be an AggregateFunction "
+            "(FinalOperation is the body shape only)"
+        )
+    # COUNT_ROWS <-> operand is None [c9]
+    if expr.aggregation is AggregateFunction.COUNT_ROWS:
+        if expr.operand is not None:
+            raise SchemaError(f"{path}.operand: 'count_rows' takes no operand")
+    elif expr.operand is None:
+        raise SchemaError(
+            f"{path}.operand: '{expr.aggregation.value}' requires an operand"
+        )
     _require_table_ref(expr.source_relation.table_ref, f"{path}.source_relation.table_ref")
     table_ref = expr.source_relation.table_ref
     if expr.operand is not None:
@@ -465,6 +539,8 @@ def _check_predicate(node: FilterPredicate, path: str) -> None:
                 f"{path}: right_set size {len(node.right_set)} exceeds "
                 f"MAX_IN_LIST={MAX_IN_LIST}"
             )
+        for i, entry in enumerate(node.right_set):
+            _check_typed_literal(entry, f"{path}.right_set[{i}]")
         return
     # all remaining ops: exactly ONE of right_literal | right_param
     if node.right_set is not None:
@@ -473,3 +549,5 @@ def _check_predicate(node: FilterPredicate, path: str) -> None:
         raise SchemaError(
             f"{path}: '{node.op.value}' requires exactly one of right_literal | right_param"
         )
+    if node.right_literal is not None:
+        _check_typed_literal(node.right_literal, f"{path}.right_literal")
