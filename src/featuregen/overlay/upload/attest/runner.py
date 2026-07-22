@@ -26,10 +26,14 @@ its file-declared definition, its attested BIAN/FIBO path, and a DERIVED sample-
 (``semantic_type``/``logical_representation`` — the same safe facets
 :func:`~featuregen.overlay.upload.attest.reclassify._value_shape` derives for the LLM egress path)
 — never the AI's proposed concept and never a raw value. The definition text is additionally run
-through :func:`~featuregen.overlay.upload.sample_parser.strip_sample_values` — the SAME data-leak
-backstop the enrichment egress path applies to a glossary description before ANY consumer sees it —
-so an embedded "representative values such as ..." clause in a raw/technical-upload description can
-never reach the worksheet either.
+through :func:`~featuregen.overlay.upload.sanitize.sanitize_definition` — the SAME data-leak
+backstop (clause-strip + fail-closed data-marker scan + PII redaction) the LLM enrichment egress
+path applies to a glossary description before ANY consumer sees it — so an embedded "representative
+values such as ..." clause AND a bare raw value sitting in ordinary prose (e.g. an account number
+mentioned outside any such clause) are both handled exactly as the LLM path would handle them: a
+recognized clause is excised, PII is redacted, and a definition the sanitizer cannot prove safe
+(``suspected_unhandled`` / a redactor that fails closed) is dropped from the row entirely (``None``)
+rather than emitted verbatim.
 """
 from __future__ import annotations
 
@@ -61,7 +65,7 @@ from featuregen.overlay.upload.attest.shadow_store import (
 )
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.sample_parser import strip_sample_values
+from featuregen.overlay.upload.sanitize import sanitize_definition
 
 # The only field run_shadow scores (see module docstring: "Concept-only scope").
 _CONCEPT_FIELD = "concept"
@@ -241,7 +245,11 @@ def emit_gold_worksheet(
         logical_ref = logical_ref_of(conn, catalog_source, object_ref)
         definition = _str_value(_latest_active_evidence(conn, logical_ref, "definition"))
         if definition:
-            definition = strip_sample_values(definition)   # data-leak backstop — see module docstring
+            # I-1: route through the SAME sanitizer the LLM egress path uses (strip + fail-closed
+            # data-marker scan + PII redaction) — see module docstring. A blanked field (an
+            # unhandled sample-values marker, or a redactor that failed closed) is never emitted
+            # verbatim; it is dropped to None rather than leaking the raw text.
+            definition = sanitize_definition(definition).clean or None
         bian_path = _str_value(_latest_active_evidence(conn, logical_ref, "bian_path"))
         fibo_path = _str_value(_latest_active_evidence(conn, logical_ref, "fibo_path"))
         shape = _sample_shape(conn, logical_ref)

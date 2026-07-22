@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 
 import psycopg
@@ -83,6 +84,17 @@ def test_reconcile_detects_key_substitution_capture_loss(conn) -> None:
     assert rec.expected == 2 and rec.present == 2   # counts coincidentally agree ...
     assert rec.missing == (key_b,)                  # ... but the set check catches the substitution
     assert rec.complete is False
+
+
+# ── risk_tier CHECK (N-4) ──
+def test_write_observation_rejects_unknown_risk_tier(conn) -> None:
+    """N-4: ``risk_tier`` is CHECK-constrained to the two values ``runner._risk_tier`` ever emits
+    ('low'/'high') so a future typo'd tier can't silently never-match 'low' and vanish from the
+    auto-attested set undetected."""
+    ss.write_shadow_run(conn, _run(run_id="srun_bad_tier"))
+    bad = dataclasses.replace(_observation(run_id="srun_bad_tier"), risk_tier="bogus")
+    with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+        ss.write_observation(conn, bad)
 
 
 # ── WORM ──

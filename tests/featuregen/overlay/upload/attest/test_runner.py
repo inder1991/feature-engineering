@@ -14,6 +14,7 @@ from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.graph import build_graph
 
 _RAW_SSN_VALUE = "123-45-6789"
+_RAW_ACCOUNT_VALUE = "1234567890"
 
 
 def _seed(conn, logical_ref: str, field_name: str, value, *, n: int,
@@ -201,6 +202,42 @@ def test_emit_gold_worksheet_payload_excludes_ai_concept_and_raw_values(overlay_
         # sentence ahead of it survives; no raw value anywhere in the residual.
         assert row.definition == "The customer's SSN."
         assert _RAW_SSN_VALUE not in row.definition
+
+
+def _seed_prose_pii_catalog(conn, source: str) -> str:
+    """A single column whose definition embeds a raw PII value in ORDINARY PROSE, outside any
+    ``values such as ...`` clause — the shape ``strip_sample_values`` does NOT touch (it only
+    excises a recognized sample-values clause). Exercises the PII-REDACTION leg of
+    ``sanitize_definition`` specifically (I-1), distinct from ``_seed_catalog``'s ssn column, which
+    exercises the clause-strip leg."""
+    build_graph(conn, source, [
+        CanonicalRow(source, "accounts", "acct_desc", "text"),
+    ], domains={"accounts": "payments"})
+    ref = f"{source}::public.accounts.acct_desc"
+    _seed(conn, ref, "definition",
+         f"The account number is {_RAW_ACCOUNT_VALUE} for this customer.",
+         n=1, producer="source", strength="attested")
+    return ref
+
+
+def test_emit_gold_worksheet_definition_redacts_inline_pii_outside_sample_clause(
+        overlay_conn) -> None:
+    """I-1: a raw value embedded in ordinary prose (no ``values such as`` clause at all) must be
+    scrubbed from the emitted worksheet exactly as the LLM egress path (``sanitize_definition``)
+    would scrub it. ``strip_sample_values`` alone (clause-strip only, no PII scan) leaves it
+    verbatim — a PII-to-spreadsheet leak this test pins shut. Must FAIL against the old
+    ``strip_sample_values``-only code."""
+    source = "run_src_pii_prose"
+    ref = _seed_prose_pii_catalog(overlay_conn, source)
+
+    rows = R.emit_gold_worksheet(overlay_conn, source, size=120, seed=1)
+
+    matching = [r for r in rows if r.logical_ref == ref and r.field_name == "concept"]
+    assert matching
+    for row in matching:
+        assert row.definition is not None
+        assert _RAW_ACCOUNT_VALUE not in row.definition
+        assert row.definition == "The [REDACTED:ACCOUNT] for this customer."
 
 
 def test_ingest_gold_worksheet_writes_only_adjudicated_rows(overlay_conn) -> None:

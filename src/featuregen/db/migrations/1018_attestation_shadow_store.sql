@@ -106,7 +106,9 @@ CREATE TABLE IF NOT EXISTS attestation_shadow_observation (
     grounding_coverage  numeric     NOT NULL CHECK (grounding_coverage >= 0 AND grounding_coverage <= 1),
     grounding_conflict  boolean     NOT NULL,
     confidence          numeric     NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
-    risk_tier           text        NOT NULL,
+    -- N-4: constrained to the two values `runner._risk_tier` ever emits, so a future typo'd tier
+    -- can't silently never-match 'low' and vanish from the auto-attested set undetected.
+    risk_tier           text        NOT NULL CHECK (risk_tier IN ('low', 'high')),
     payload_hash        text        NOT NULL,
     created_at          timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (shadow_run_id, logical_ref, field_name),

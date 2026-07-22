@@ -200,8 +200,19 @@ def _build_cell(rows: list[_JoinedRow], *, threshold: float, split: str, field_n
 
 def shadow_report(conn: DbConn, shadow_run_id: str) -> ReportV1:
     """Build the full threshold-sweep x split x field report for one shadow run. READ-ONLY: SELECTs
-    only, no write. Re-running this after ``attestation_gold_label`` changes (a corrected/late-arrived
-    label) reflects the new state immediately — the observation carries no cached gold value."""
+    only, no write.
+
+    N-2 (re-score scope): the "re-score without re-run" guarantee applies ONLY to GOLD-LABEL
+    corrections. Re-running this after ``attestation_gold_label`` changes (a corrected/late-arrived
+    label) reflects the new state immediately, because the observation carries no cached gold value
+    — it is joined live. ``risk_tier``, by contrast, is the FROZEN run-time tier the observation was
+    written with (``runner._risk_tier`` at ``run_shadow`` time) and is what the auto-attest gate
+    (``confidence >= T AND risk_tier == 'low'``) actually reads; a taxonomy correction made AFTER the
+    run does not change it and so cannot move a column into or out of the gated auto-attested set.
+    The ``triaged_low_n``/``defaulted_low_n`` split, however, reads TAXONOMY evidence LIVE
+    (:func:`_low_risk_triaged`) — so a post-run sensitivity correction CAN flip a column from
+    ``defaulted_low`` to ``triaged_low`` in that split without moving it out of (or into) the
+    frozen-``risk_tier``-gated auto-attested population."""
     rows = _joined_rows(conn, shadow_run_id)
     field_names = tuple(sorted({r.field_name for r in rows}))
 
