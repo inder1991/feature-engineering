@@ -1,233 +1,151 @@
-# Feature Materialization Pipeline — Design Spec
+# Feature Materialization Pipeline — Design Spec (rev 2)
 
-**Goal:** Turn a governed, design-checked feature definition (from the existing feature-generation catalog) into a production PySpark/Kedro pipeline that computes it — and many sibling features — at scale, lands the results in per-grain feature tables keyed by `(entity…, business_dt)`, profiles them, and pushes the stats back into catalog search.
+**Goal:** Turn a governed, design-checked feature definition into an **immutable, versioned formula artifact** and a production PySpark pipeline that computes it (and its compatible siblings) point-in-time-correctly at scale, lands results in **atomically-versioned** per-grain tables keyed by `(entity…, business_dt)`, and profiles them under read-scope back into a feature-search projection.
 
-**One line:** The catalog decides *what* a feature is; this system decides *how it is computed and where it lands*.
+**One line:** The catalog decides *what* a feature is; this system authors the *how* (a governed typed formula), freezes it as an immutable artifact, and executes it deterministically and LLM-free.
 
-**Tech stack:** Kedro (nodes/pipelines/catalog/hooks), PySpark (compute), HDFS Parquet (raw→feature layers), Hive (model-input / consumption layer). This is a **new module**, separate from the FastAPI/Postgres catalog app; it integrates with the catalog through two narrow seams (the Feature Spec in, the feature stats out).
+**Tech stack:** Kedro (nodes/pipelines/hooks), PySpark (compute), an **atomic table format — Apache Iceberg** (snapshot isolation, partition-level commits, time-travel; Delta/Hudi acceptable) for feature/model_input layers, HDFS Parquet for raw/intermediate/primary. New module; integrates with the catalog through an **explicit protocol** (§8), not a loose seam.
+
+> **rev-2 note.** This revision makes first-class what rev-1 left implied: the immutable materialization identity (§3), the formula→planner adapter and single IR (§2), the point-in-time model (§5), validation-vs-production dispatch (§6), atomic storage + restatement (§7), and the external protocol (§8). Findings 1-15 from review are each resolved and cited inline as `[Fn]`.
 
 ---
 
 ## Global Constraints
 
-- **Grain of every feature = `(entity key(s) …, business_dt)`** — one row per entity per snapshot date. The lookback window (e.g. 90d) is a computation input, NOT part of the grain.
-- **`business_dt`** (a.k.a. inference date) is mandatory on every feature and every final table. It is the point-in-time the feature was computed *as of*; all windows are trailing and end at `business_dt` (no look-ahead / no leakage).
-- **Layers (Kedro data-engineering convention):** `raw → intermediate → primary → feature → model_input`. `raw`…`feature` = HDFS Parquet; `model_input` = Hive (or pluggable).
-- **One final table per grain**, not one global table. A feature routes to its grain's table by its spec.
-- **Batching:** features that share `(grain, cadence)` are computed in ONE Spark pass. This is the core efficiency requirement ("multiple features at once").
-- **Auditability (bank requirement):** the engine is spec-driven (Option C) but can *render* the exact PySpark/SQL it runs for any feature on demand — no per-feature source files to maintain, full transparency for audit.
-- **Point-in-time correctness:** trailing windows only; a feature computed for `business_dt = D` may read only rows with `tran_date ≤ D`.
+- **Canonical operand identity is the `logical_ref`: `source::schema.table[.column]`** — the `::` scheme separator is load-bearing and round-trippable (`object_ref.py:23`). Formulas MUST use it verbatim; no alternate identity format. `[F2]`
+- **Grain = `(entity key(s) …, business_dt)`**, exactly one row per entity per snapshot date. The window is a compute input, not grain. Every materialization node MUST reduce to one row per grain key. `[F5]`
+- **Point-in-time = knowledge time, not just event time.** A feature for `business_dt = D` may read only facts *known as of D* (availability/ingestion ≤ D), not merely `tran_date ≤ D`. `[F5]`
+- **Governance status is server-derived and drift-aware — never a field in the formula/spec.** The formula YAML/JSON carries NO `status`. Dispatch reads the current contract status at run time. `[F6]`
+- **Runtime is deterministic and LLM-free.** LLMs author formulas offline; execution compiles a frozen artifact.
+- **Every production value is attributable** to `(feature_version_id, business_dt, materialization_revision, run_id, input_snapshot_ids, formula_hash, compiler_version)`. Late corrections **append a new revision**; historical values are never silently rewritten. `[F7]`
 
 ---
 
-## Why (motivation)
+## §1 Typed formula + authoring pipeline (LLM authors, deterministic governs)
 
-The feature-generation catalog stops at a design-checked *definition*: a name, `derives_from` columns, a *named* aggregation string, and a prose description. Nothing computes it. There is no structured computation spec (the catalog code itself flags this: *"naming-based detection is inherently incomplete — the real fix is structured aggregation metadata"*). This system supplies the missing structure and the compute platform, so a data scientist who selects a feature gets a real, scheduled, audited column — not a one-off notebook.
+**Principle:** the second LLM is a **critic, not a validator** — two models agreeing is not correctness. Final authority is deterministic checks + a human policy (§4).
 
-## Scope / non-goals
-
-**In scope:** the Feature Spec contract; the spec-structuring step (prose → structured); the Kedro/PySpark engine; per-grain tables; domain pipelines + feature groups + schedule metadata; run-metric hooks; feature profiling (EDA) + write-back to search; code rendering.
-
-**Out of scope (this spec):** model training/scoring; a real-time/online feature store (this is batch/offline); the orchestrator itself (we emit a group→schedule map that Airflow/cron consumes; we don't build the scheduler); backfill tooling beyond a `business_dt` range parameter.
-
----
-
-## Architecture (Option C — spec-driven engine with code rendering)
-
-```
-Catalog (existing)                    Feature Materialization (new)
-─────────────────                     ─────────────────────────────
-design-checked feature   ──spec──▶   1. Typed formula + authoring pipeline
-                                          (LLM-1 author → structural-validate → LLM-2 critic →
-                                           governance compiler → RESOLVED/NEEDS_REVIEW/REJECTED → freeze)
-definition                            2. Domain pipeline (Kedro)
-                                          raw → intermediate → primary → feature → model_input
-                                          (features batched by grain+cadence into shared Spark passes)
-                                      3. Per-grain feature tables  (cif / cif+product / account …)
-                                      4. Profiling (EDA) node ──stats──▶  back into Catalog search
-                                      5. Hooks: run logs, runtime, row counts, per-node metrics
-                                      6. Code renderer: spec → exact PySpark/SQL (audit view)
-```
-
-### Component 1 — The Structured Feature Spec
-
-The machine-readable contract every downstream component consumes. YAML, one per feature, version-stamped. Example (`cross_border_value_ratio_90d`):
-
-```yaml
-feature: cross_border_value_ratio_90d
-domain: aml
-entity: [cif_id]                 # grain keys (excluding business_dt, which is always implied)
-as_of: tran_date                 # the point-in-time column in the source
-window: {length: 90, unit: day, type: trailing}
-source: ftr.public.comp_financial_tran_repos_dly
-params:
-  home_country: 'AE'             # domain param — cross-border = counter_party_bank_cntry != home_country
-filters:
-  is_cross_border: "counter_party_bank_cntry != {home_country}"
-operation:
-  type: ratio
-  numerator:   {agg: sum, column: tran_amt_aed, where: is_cross_border}
-  denominator: {agg: sum, column: tran_amt_aed}
-cadence: daily                   # scheduling: daily | weekly | monthly
-priority: 1
-status: design-checked
-spec_version: 1
-```
-
-The spec above is the **deployment wrapper** (domain, cadence, priority, routing). Its heart is the **typed formula** — the computation contract — authored by the pipeline below. Domain params the definition can't know (`home_country`, thresholds) live in a per-domain config, not the feature.
-
-#### The typed formula (what the LLM authors — NOT SQL/PySpark)
+The **typed formula** names exact `logical_ref` operands and typed operations only — never SQL/PySpark:
 
 ```json
 {
   "operation": "ratio",
-  "grain": {"entity": "customer", "keys": ["ftr:public.comp_financial_tran_repos_dly.cif_id"]},
+  "grain": {"entity": "customer", "keys": ["ftr::public.comp_financial_tran_repos_dly.cif_id"]},
   "window": {"type": "trailing", "length": 90, "unit": "day"},
-  "time_operand": "ftr:public.comp_financial_tran_repos_dly.tran_date",
-  "numerator":   {"aggregation": "sum", "operand": "ftr:public.comp_financial_tran_repos_dly.tran_amt_aed",
+  "time_operand": "ftr::public.comp_financial_tran_repos_dly.tran_date",
+  "numerator":   {"aggregation": "sum", "operand": "ftr::public.comp_financial_tran_repos_dly.tran_amt_aed",
                   "filter": {"operation": "not_equal",
-                             "left": "ftr:public.comp_financial_tran_repos_dly.counter_party_bank_cntry",
+                             "left": "ftr::public.comp_financial_tran_repos_dly.counter_party_bank_cntry",
                              "right_parameter": "home_country"}},
-  "denominator": {"aggregation": "sum", "operand": "ftr:public.comp_financial_tran_repos_dly.tran_amt_aed"},
-  "zero_denominator": "null"
+  "denominator": {"aggregation": "sum", "operand": "ftr::public.comp_financial_tran_repos_dly.tran_amt_aed"},
+  "zero_denominator": "null",
+  "parameters": ["home_country"]
 }
 ```
 
-The formula names **exact `catalog:schema.table.column` operands** and typed operations only — never raw SQL/PySpark. The runtime compiler turns it into Spark; the LLM never writes execution code.
+Note: operands use `::`; parameters are **declared but not valued** here (values live in a versioned deployment binding, §10). No `status`, no bare columns, no free-text filter. `[F2][F6][F9][F10]`
 
-#### The formula-authoring pipeline (LLM authors, deterministic governs)
-
-**Guiding principle:** the second LLM is a **critic, not a validator**. Two LLMs can confidently agree on the same wrong formula. Final authority is deterministic checks + targeted human review — never "two models agreed."
+**Pipeline** (unchanged shape from rev-1, corrected authority):
 
 ```
-Feature intent (free-form) OR recipe definition
-        ↓
-LLM 1 — Formula AUTHOR  (ReAct loop; READ/VALIDATE tools only)
-        ↓
-Deterministic STRUCTURAL validation   (schema, operation vocabulary, column identity, operand completeness)
-        ↓
-LLM 2 — Independent semantic CRITIC   (structured findings only, not a rewrite)
-        ↓
-Deterministic GOVERNANCE COMPILER     (types/units/currency · grain/cardinality · verified joins/lineage ·
-                                       time anchor/leakage · null & divide-by-zero · authorization/freshness)
-        ↓
-RESOLVED  /  NEEDS_REVIEW  /  REJECTED
-        ↓  (RESOLVED)
-Freeze + version the formula  →  compile to PySpark  →  execute (LLM-free at runtime)
+intent (free-form) OR recipe  →  LLM-1 AUTHOR (ReAct; read/validate tools only)
+  →  deterministic STRUCTURAL validation  (operation vocab · every operand a real logical_ref · operand completeness)
+  →  LLM-2 INDEPENDENT CRITIC (structured findings; different tier; no shared context; no rewrite)
+  →  §2 GOVERNANCE COMPILER (formula→planner adapter → typed IR → governed verdict)
+  →  RESOLVED / NEEDS_REVIEW / REJECTED  →  §4 human policy  →  §3 FREEZE as immutable artifact
 ```
 
-**LLM 1 — author (ReAct, restricted tools).** Iterates until `validate_draft_formula` reports no structural omissions. Tools are strictly read/validate; it holds **no** tool that approves, executes, or mutates a governance fact:
-`search_columns` · `get_column_metadata` · `get_governed_grain` · `get_time_anchor` · `get_verified_lineage` · `list_supported_operations` · `validate_draft_formula`.
+LLM-1 tools (read/validate only; never approve/execute/mutate governance): `search_columns`, `get_column_metadata`, `get_governed_grain`, `get_time_anchor`, `get_verified_lineage`, `list_supported_operations`, `validate_draft_formula`. These are **seven catalog-integration surfaces** — the integration is a defined protocol (§8), not "two seams". `[F8]`
 
-**Deterministic structural validation** (between the two LLMs, so the critic reviews a structurally-sound draft): operation is in the supported vocabulary; every operand is a real `catalog:schema.table.column`; the operation's operands are complete (a ratio has numerator AND denominator; a windowed op has a `time_operand`).
+Recipe: authored once, frozen (§3), never regenerated at runtime. Free-form: same pipeline at proposal; on approval, promotable into a recipe.
 
-**LLM 2 — independent critic.** Genuinely independent, or it's theatre: separate prompt + context construction; a **different model tier/family** where possible; it is **not shown LLM 1's reasoning**; it returns **structured findings** (not a rewritten formula); it must compare **every** business requirement in the intent against the formula's operands (missing operand? numerator/denominator direction correct? filter matches intent?). A finding routes the feature to `NEEDS_REVIEW`, it does not silently rewrite.
+## §2 Formula → planner adapter + single compiler IR (the hard component, first-class) `[F3][F14]`
 
-**Deterministic governance compiler** = the existing gauntlet + two-axis gate: types/units/currency consistency, grain & cardinality, VERIFIED joins & lineage (`resolve_fact` / `approved_join`), time-anchor & leakage (trailing-only), null / divide-by-zero behavior (`zero_denominator`), authorization & freshness. Its verdict — `RESOLVED / NEEDS_REVIEW / REJECTED` — is the final authority.
+Today `compile_contract` consumes `BindingPlanV1 + Template` and multi-source consumes `MultiSourcePlannerIntentV1`; **none consumes a formula AST / filter tree / numerator / denominator / zero-denominator**. So this is a NEW, explicit adapter, not "reuse":
 
-#### Recipe vs free-form (author once, run forever)
+```
+TypedFormulaV1  →  FormulaPlannerIntentV1  →  (existing governed binding + physical-plan machinery)  →  FormulaExecutionIRV1
+```
 
-- **Recipe features:** the formula is authored **once at recipe-authoring time**, validated + approved, then **frozen and versioned**. It is NOT regenerated per run — runtime just compiles the frozen formula. (A recipe whose logic is already deterministic can skip LLM 1 and enter at structural validation.)
-- **Free-form features:** the identical pipeline runs when the user proposes the idea. On `RESOLVED`, the formula can be **promoted into a reusable recipe** — so the recipe library grows itself from validated free-form work.
+- `FormulaPlannerIntentV1` translates the formula's operands/operations into the planner's binding intent, **preserving exact logical_refs** so governance (resolve_fact, approved_join, lineage) applies unchanged.
+- `FormulaExecutionIRV1` is the **single compiled IR**. Both the Spark executor and the code renderer consume it — we do NOT independently implement "interpret" and "render". We persist the **IR hash + the Spark logical plan**; the rendered text is *equivalent audit output*, not the literal executed code. `[F14]`
+- The governance compiler over the IR performs the existing gauntlet checks (types/units/currency, grain/cardinality, VERIFIED joins/lineage, time-anchor/leakage, null & divide-by-zero, authorization, freshness) and emits `RESOLVED / NEEDS_REVIEW / REJECTED`.
 
-**This is where the scale comes from:** LLMs author thousands of candidate formulas; deterministic checks auto-clear the straightforward ones; humans review only disagreements, ambiguous mappings, novel operations, and high-risk features; approved formulas become reusable frozen assets; and **runtime execution stays deterministic and LLM-free.**
+## §3 Immutable materialization identity `[F1]`
 
-### Component 2 — Grain model & per-grain tables
+The frozen formula is an **immutable artifact referenced from `feature_versions.required_artifact_refs`** (`0060_aggregates_lifecycle.sql`, write-once trigger) — NOT a separate YAML versioning system. The artifact binds:
 
-A feature's `entity` decides its grain and therefore its target table. Every table is keyed by `(entity…, business_dt)`:
+`feature_id` · `feature_version_id` · `contract_id` + contract version · metadata snapshot/fingerprint · planner declaration + physical-plan IDs · formula-schema + operation-policy + compiler versions · **formula content hash** · **deployment-configuration hash**.
 
-| grain | table (model_input, Hive) | keys |
-|---|---|---|
-| customer | `aml_customer_features` | `cif_id, business_dt` |
-| customer × product | `aml_customer_product_features` | `cif_id, product_id, business_dt` |
-| account | `aml_account_features` | `foracid, business_dt` |
+Two identical formulas → same content hash → same artifact; any change (operand, param binding, compiler version) → new immutable version. This is what "freeze + version" means, concretely.
 
-Routing is automatic: the engine reads `entity` from each spec and appends the feature as a column in the matching grain's table. New grains create new tables; no manual wiring.
+## §4 Human-confirmation policy (LLM agreement never authorizes production) `[F4]`
 
-### Component 3 — Domain pipelines, feature groups, scheduling
+The human approved a feature *idea/prose contract*, not necessarily this exact numerator/denominator/filter/temporal interpretation. Confirmation is the governance gate (`contract/govern.py`). One explicit policy per feature class:
 
-- **Domain = a Kedro modular pipeline** (`aml`, `fraud`, `credit_risk`). Owns its raw→…→model_input layers and its feature groups.
-- **Feature group = `(domain, grain, cadence)`** — the batching + scheduling unit. All customer-grain, daily AML features compute in ONE Spark pass over the transaction table. `priority` orders groups against each other but does not split a group.
-- The pipeline emits a **group→schedule map** (`{group_id: {cadence, priority, grain, table}}`) that an external orchestrator consumes. We do not build the scheduler.
+- **Novel free-form formula → human confirms** the exact typed formula before freeze.
+- **Approved reusable formula template → deterministic bindings may reuse it** without re-confirmation.
+- **Low-risk formulas → auto-freeze ONLY under an approved auto-resolution policy** (declared risk tier + operation on an allow-list).
+- **High-risk / critic-disputed / novel-operation → always human review.**
 
-### Component 4 — Nodes & layers (kept simple)
+`RESOLVED` from the compiler routes into this policy; it does not go straight to freeze.
 
-Per domain, a small, fixed set of node types (pure `DataFrame → DataFrame` functions):
+## §5 Point-in-time model `[F5]`
 
-1. `build_intermediate` — type/clean the raw source (parse `tran_date`, cast amounts), derive shared flags. → `int.*` Parquet.
-2. `build_primary` — canonical per-event fact at the source grain with shared derivations. → `prm.*` Parquet.
-3. `compute_feature_group` — the batched engine: given the primary fact + a group's specs + a `business_dt`, compute ALL of the group's features in one windowed pass. → `fea.<group>` Parquet.
-4. `assemble_model_input` — union/join the group's features into the per-grain `model_input` Hive table for `business_dt`.
-5. `profile_features` — the EDA node (Component 6).
+Correctness requires modelling knowledge time, not just event time:
 
-`compute_feature_group` is the only "smart" node: it interprets specs (window, filter, aggregation, operation) into Spark window/aggregate expressions. Everything else is plumbing.
+- **Event time vs availability/knowledge time** — the feature sees a row only if its *availability/ingestion* timestamp ≤ `business_dt`, not merely `tran_date ≤ business_dt`.
+- **Posting/ingestion timestamps, source timezone + business-day cutoff, backdated txns & reversals, SCD2 joins, a late-arrival restatement horizon.**
+- **An entity × business_date spine** drives the output: the compute LEFT-JOINs windowed aggregates onto the spine and **reduces to exactly one row per `(entity…, business_dt)`** (rev-1's rolling-per-row example was wrong).
 
-### Component 5 — Hooks (run metrics)
+## §6 Validation vs production execution (separate) `[F6]`
 
-Kedro hooks (`before_node_run` / `after_node_run` / `on_pipeline_error`) capture, per run and per node: `run_id`, `business_dt`, `group_id`, `rows_in/out`, `runtime_s`, `spark_stages`, `status`, and any error. Written to a `pipeline_run_metrics` table (Parquet/Hive) and structured logs. This is the observability the catalog side lacked.
+A DESIGN-CHECKED / NEEDS_EXTERNAL_VALIDATION formula may run only to *earn evidence*, never to land in production:
 
-### Component 6 — Profiling (EDA) + write-back to search
+- **Validation run:** current contract + requirements → isolated output → external evidence.
+- **Production run:** ACTIVE feature version + required stamp → production store.
 
-After a group's `model_input` table lands, `profile_features` computes per-feature stats: `count, null_rate, min, max, mean, p50, p95, distinct, histogram, last_refreshed, business_dt`. Written to a `feature_stats` table and **pushed back into the catalog's search/metadata surface**, so browsing a feature shows a distribution sparkline, min/max, and freshness *before* the DS runs anything — closing the loop to where they discovered it.
+Dispatch reads the **current drift-aware contract status server-side immediately before dispatch** (drift recheck), not any status baked into an artifact. `[F8]`
 
-### Component 7 — Code rendering (audit)
+## §7 Storage, retry, restatement `[F7][F13]`
 
-A pure function `render(spec) → PySpark string` (and a SQL variant) produces the exact code the engine runs for a feature. Used for audit/review; never executed from the string (the engine runs the interpreted plan directly). Guarantees "show your work" without N maintained files.
+Plain Parquet has no atomic partition replacement → adopt **Apache Iceberg** (snapshot isolation, atomic commits, time-travel). Every commit records: `feature_version_id, business_dt, materialization_revision, run_id, attempt, input_snapshot_ids, formula_hash, compiler_hash, commit_status, superseded_revision`. Late-data corrections **append an auditable new `materialization_revision`**; old values remain for reproducibility. Tables are **versioned physical group tables/snapshots with an active wide VIEW** — a new formula version never overwrites a live column's semantics while old models depend on it. `[F13]`
+
+## §8 External-platform protocol `[F8]`
+
+The catalog ↔ materialization contract is explicit: authenticated materialization-request endpoint/event · idempotency key · immutable-artifact retrieval + hash verification · run acceptance/status/failure protocol · retry/timeout/cancellation rules · frozen input snapshots · result manifest + authenticated attestation · outbox/reconciliation when either side is down · external-requirement-result ingestion · **drift recheck immediately before dispatch**. (This is also where the seven LLM-1 tool surfaces are governed.)
+
+## §9 Batching by execution signature (not by grain/cadence) `[F11][F12]`
+
+Features sharing `(domain, grain, cadence)` may still differ in source, joins, temporal basis, or window — unsafe to co-batch. Batch by an **execution signature**: `physical_plan_shape + landing_grain + PIT_basis + compatible_source_snapshot + cadence`. Each formula is **precompiled independently**; structurally-invalid formulas are excluded *before* the shared Spark plan is built. A runtime Spark failure fails the whole group transaction; the retry **quarantines the failing formula** and rebuilds the group. `[F12]`
+
+## §10 Deployment binding + parameters `[F9][F10]`
+
+The immutable formula declares parameters (`home_country`, thresholds) but does not value them. A **versioned deployment/run binding** supplies values and **contributes to the run hash** — a parameter change is a new run identity and can change feature values. Cadence, resources, and target routing live in this binding, not in the formula. `[F9][F10]`
+
+## §11 Profiling under privacy/authority `[F15]`
+
+Histograms/min/max/distinct can leak restricted data. Feature stats are **versioned, classification-tagged, read-scoped, and run-tied**. Since `search()` only covers `graph_node` (`search.py:133`), feature discovery gets its **own feature-search projection** (not shoehorned into graph_node) that respects read scope.
 
 ---
 
-## Data flow (worked example: `cross_border_value_ratio_90d`, `business_dt = 2026-07-22`)
+## Layers & worked example
 
-1. `raw.ftr_transactions` (Parquet) → 2. `int.transactions_typed` (dates parsed, amounts cast, `is_cross_border` derived) → 3. `prm.customer_txn_facts` (canonical per-txn at cif grain) → 4. `compute_feature_group('aml.customer.daily', business_dt)` computes this feature **and every other customer-grain daily AML feature** in one 90d-window pass → `fea.aml_customer_daily` → 5. `assemble_model_input` → `aml_customer_features` (Hive), the feature as one column keyed by `(cif_id, business_dt)` → 6. `profile_features` writes its distribution/min/max/freshness → catalog search.
-
-Rendered PySpark (audit view) for this feature:
-```python
-w90 = Window.partitionBy("cif_id").orderBy(F.col("tran_date").cast("long")).rangeBetween(-90*86400, 0)
-df = (txn
-  .withColumn("is_cross_border", F.col("counter_party_bank_cntry") != F.lit("AE"))
-  .withColumn("xb_amt", F.when(F.col("is_cross_border"), F.col("tran_amt_aed")).otherwise(0.0))
-  .withColumn("num_90d", F.sum("xb_amt").over(w90))
-  .withColumn("den_90d", F.sum("tran_amt_aed").over(w90))
-  .withColumn("cross_border_value_ratio_90d",
-              F.when(F.col("den_90d") > 0, F.col("num_90d")/F.col("den_90d"))))
-```
-
----
-
-## Key decisions
-
-1. **`business_dt` density = full periodic snapshot per entity** (configurable cadence), not active-only. Simple, predictable, complete history for retraining; it is the biggest cost lever, so it is a single config (`snapshot_scope: all | active`) that can be flipped per domain.
-2. **Batch by `(grain, cadence)` first, priority second.** Two features sharing grain+cadence MUST share a pass; priority only orders groups.
-3. **Option C (spec-driven + rendered code)**, not per-feature generated files — efficiency + auditability.
-4. **Formula authoring = LLM author (LLM 1) + independent LLM critic (LLM 2) + deterministic validators/compiler as final authority.** The critic is a critic, NOT a validator — "two models agreed" is never accepted as correctness. LLM 1 has read/validate-only tools; runtime is LLM-free. Accepted formulas are frozen + versioned; validated free-form formulas are promotable into reusable recipes.
-5. **One table per grain**, routed by the spec's `entity`.
-6. **Offline/batch only** — no online store in this spec.
+`raw → intermediate → primary → feature → model_input`; raw/int/prm = HDFS Parquet, feature/model_input = Iceberg. For `cross_border_value_ratio_90d` at `business_dt=D`: spine(cif × D) LEFT-JOIN a 90d-trailing, availability-filtered aggregate over `prm.customer_txn_facts`, one row per `(cif_id, D)`, committed as an Iceberg revision, attributable to its frozen formula artifact.
 
 ## Error handling
 
-- A spec that references a column not in the source, or an unsupported operation → the group fails that feature (recorded in metrics with a reason), and continues the other features in the group (one bad spec must not sink the batch).
-- A Spark job failure → `on_pipeline_error` records the run as failed with the stage; the `model_input` write is transactional per `business_dt` partition (a failed run leaves no partial partition).
-- Missing source data for a `business_dt` → the group is skipped for that date with a recorded reason, not a silent empty write.
+Invalid formula → excluded pre-batch, recorded with reason (§9). Spark failure → group transaction fails, retry quarantines the culprit (§9). Missing source for a `business_dt` → skipped with reason, no partial commit (§7). Drift at dispatch → held, not run (§6/§8).
 
 ## Testing
 
-- **Spec interpretation:** unit tests that `compute_feature_group` turns a spec into the correct Spark expression (golden expected values on a tiny fixture DataFrame), including window boundaries (no leakage: a row at `business_dt` sees only `tran_date ≤ business_dt`).
-- **Rendering:** `render(spec)` output parses and, run on the fixture, produces identical values to the interpreted engine (render ≡ execute).
-- **Routing:** a spec's `entity` lands it in the correct grain table.
-- **Hooks/metrics:** a run emits the expected metric rows.
-- **Profiling:** stats match hand-computed values on the fixture.
-- Local runs use Spark local mode + small Parquet fixtures; no cluster needed for tests.
+Formula→IR golden tests (window boundaries prove no look-ahead AND availability ≤ D); render ≡ execute over the same IR; routing lands a feature in the correct grain table; gold-formula comparison vs curated expected formula for first features (B-Gate-1-style); Iceberg commit/restatement appends a revision (never overwrites); profiling read-scope respected. Spark local mode + tiny fixtures.
 
-## Phasing (for the implementation plan)
+## Phasing (revised)
 
-- **Phase 1 (MVP — prove the authoring workflow + one feature end-to-end):**
-  1. Typed-formula dataclass + `sum/count/ratio` + trailing window; deterministic structural validation.
-  2. LLM 1 (author, restricted ReAct tools over existing catalog reads) generates the formula.
-  3. LLM 2 (independent critic) critiques it → structured findings.
-  4. Deterministic governance compiler decides `RESOLVED / NEEDS_REVIEW / REJECTED` (reuse the gauntlet + two-axis gate).
-  5. **Gold check:** compare the generated formula against a curated *expected* formula for the first few gold features (B-Gate-1-style harness).
-  6. Materialize ONLY after all required checks pass: `raw→…→model_input`, `compute_feature_group`, one Hive `aml_customer_features` table, basic hooks — proving `cross_border_value_ratio_90d` end-to-end on a Spark-local fixture.
-  7. **Freeze** the accepted formula as an immutable, versioned asset.
-- **Phase 2:** code renderer + render≡execute test; profiling node + `feature_stats`; run-metrics table.
-- **Phase 3:** multi-grain routing (customer×product, account); recipe-authoring flow (author-once + freeze) and free-form→recipe promotion; group→schedule map emission.
-- **Phase 4:** write-back of stats into catalog search; additional operations (zscore, delta, proportion); `snapshot_scope: active`.
+1. **Formula-authoring shadow** — LLM author + independent critic + typed AST + deterministic structural validation + gold-set scoring. **No execution.**
+2. **Governance compiler** — formula→planner adapter (§2), exact operand preservation, authoritative metadata reads, typed execution IR (§2), immutable artifact identity (§3), human-confirmation policy (§4).
+3. **Materialization walking skeleton** — one frozen formula, entity-date spine + PIT model (§5), atomic versioned Iceberg output + retry/restatement (§7).
+4. **External round trip** — authenticated request, run manifest, attestation, requirement-result ingestion, DATA-CHECKED promotion (§6/§8).
+5. **Batching & scale** — execution-signature compatibility (§9), multiple features, multiple grains.
+6. **Profiling & product** — privacy-controlled stats + feature-search projection (§11).
