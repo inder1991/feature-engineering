@@ -537,6 +537,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                        grounded_template_ids=grounded_template_ids,
                        rejected_template_ids=rejected_template_ids,
                        binding_quality_by_template=binding_quality_by_template)
+    logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
+                "anchor=%s, recommended_lens=%s",
+                intent.intent_id, catalog_source, tuple(roles),
+                {a.lens: len(a.features) for a in alternatives}, len(rejections),
+                bool(anchor), recommendation.recommended_lens if recommendation else None)
     # Delivery C0 Task 5: build the immutable catalog snapshot the set was authored against BEFORE the
     # considered-set INSERT — a projection-lagged view raises here (→ route 503) with NO considered-set
     # row written, and the snapshot + considered set commit atomically in the one feature transaction.

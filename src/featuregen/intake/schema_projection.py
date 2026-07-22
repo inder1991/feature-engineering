@@ -56,6 +56,14 @@ def _project(node: object) -> object:
     if (node.get("type") == "object" or "properties" in node) \
             and node.get("additionalProperties", True) is True:
         node["additionalProperties"] = False
+    # 3b) wire-only strictness: the CANONICAL schema stays permissive so RESPONSE validation is lenient
+    #     (a single incomplete item must not fail the whole response — the deterministic gauntlet filters
+    #     per-item), but the WIRE must force the model to emit load-bearing keys (e.g. feature_ideas'
+    #     `derives_from`, without which every idea is UNGROUNDED). `x-wire-required` carries that intent
+    #     on the canonical (an unknown keyword the response validator ignores) and becomes `required`
+    #     (a supported keyword) here on the wire only.
+    if "x-wire-required" in node:
+        node["required"] = node.pop("x-wire-required")
     # 4) recurse into nested schema containers
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(node.get(key), dict):

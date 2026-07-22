@@ -535,21 +535,32 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["results"]},
     # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
-    # The feature ITEM shape is DECLARED so the closed wire schema gives the model a `derives_from`
-    # slot to fill — an untyped `features` array let the model omit the column refs entirely (every
-    # candidate then rejected UNGROUNDED). NOT `required`: the canonical stays permissive so response
-    # validation is lenient (the deterministic `_vet` gauntlet, not the schema, filters candidates);
-    # declaring the property + the prompt is enough for the model to populate it (verified on Opus).
+    # The feature ITEM shape is DECLARED and `derives_from` is REQUIRED **on the wire** — merely
+    # declaring it (no requirement) let Opus omit the column refs / return an empty array on every idea,
+    # so all candidates were rejected UNGROUNDED (verified by capturing the raw output: derives_from=[]
+    # for 29/29 ideas). ``x-wire-required`` is a wire-ONLY hint: schema_projection converts it to
+    # ``required`` in the closed schema sent to Anthropic (forcing the model to fill the key), while the
+    # CANONICAL here stays permissive so RESPONSE validation is lenient — a single incomplete item must
+    # not fail the whole response; the deterministic ``_vet`` gauntlet filters per-item. A verbose
+    # `description` tells the model to copy the exact object_ref from the columns menu; ``_validate_idea``
+    # also resolves a bare column name to its object_ref so the model's ref FORMAT can't un-ground a
+    # feature. (Array ``minItems`` can't help — Anthropic rejects it, so schema_projection strips it.)
     ("feature_ideas", 1): {
         "type": "object", "additionalProperties": True,
         "properties": {"features": {"type": "array", "items": {
             "type": "object", "additionalProperties": True,
             "properties": {"name": {"type": "string"},
-                           "derives_from": {"type": "array", "items": {"type": "string"}},
+                           "derives_from": {"type": "array", "items": {"type": "string"},
+                                            "description": "REQUIRED, non-empty. The source column(s) "
+                                            "this feature is computed from — copy the EXACT object_ref "
+                                            "string(s) from the provided columns menu (format "
+                                            "public.<table>.<column>). A feature with no source "
+                                            "columns cannot be grounded and is discarded."},
                            "aggregation": {"type": "string"},
                            "grain_table": {"type": "string"},
                            "description": {"type": "string"},
-                           "rationale": {"type": "string"}}}}}},
+                           "rationale": {"type": "string"}},
+            "x-wire-required": ["name", "derives_from", "aggregation"]}}}},
     # Left permissive (like on main): the recipe (NL-query) path is NOT the considered-set flow, and
     # declaring typed properties here rejects a fake's null optional fields (grain/join/as_of) in
     # response validation. Its wire schema stays open — a pre-existing limit, not this fix's scope.

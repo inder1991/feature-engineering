@@ -74,6 +74,7 @@ class RejectCode:
     """Machine-readable gauntlet rejection codes (SP-12 reserved single-scorer/rejection-enum hook).
     Deterministic-gate codes plus the loop's quality codes (redundant / already-registered / critic)."""
     UNGROUNDED = "UNGROUNDED"
+    MALFORMED_ITEM = "MALFORMED_ITEM"       # LLM returned a non-object feature item (guarded, not fatal)
     AMBIGUOUS_CATALOG = "AMBIGUOUS_CATALOG"
     UNKNOWN_COLUMN = "UNKNOWN_COLUMN"
     LEAKAGE = "LEAKAGE"
@@ -572,6 +573,28 @@ def _grain_column_ref(conn, catalog_source: str, table: str) -> str | None:
     return row[0] if row else None
 
 
+def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
+    """Resolve each LLM-proposed ``derives_from`` entry to a real catalog ``object_ref``. Exact match
+    first; else a UNIQUE bare-column-name / suffix match, so a model that emits ``actual_tran_amt``
+    (or ``public.t.actual_tran_amt`` verbatim) both ground to the same object_ref — the model's
+    reference FORMAT must not silently un-ground an otherwise-valid feature. Ambiguous column names
+    (same name in >1 table) and unknown refs are dropped. Order-preserving + de-duplicated."""
+    by_col: dict[str, str | None] = {}
+    for ref in known:
+        col = ref.rsplit(".", 1)[-1]
+        by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in raw_refs if isinstance(raw_refs, list) else []:
+        if not isinstance(r, str):
+            continue
+        resolved = r if r in known else by_col.get(r.rsplit(".", 1)[-1])
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
                    target_ref: str | None, now: datetime | None, fresh_within: timedelta,
                    *, roles: Iterable[str] = ()):
@@ -580,7 +603,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     resolved operands — or (None, Rejection) for REJECTED (deterministically invalid / unauthorized).
     `roles` gates cross-table join authority (a read-scope-DENIED hop rejects). `src_of` maps
     object_ref -> the candidate catalog source(s), used to resolve each derive's catalog (B3)."""
-    derives = [d for d in raw.get("derives_from", []) if d in known]
+    derives = _ground_refs(raw.get("derives_from", []), known)
     if not derives:
         return None, Rejection(RejectCode.UNGROUNDED, "ungrounded")
     pairs: list[tuple[str, str]] = []
@@ -823,6 +846,13 @@ def _vet(conn, raw: dict, known: set[str], src_of: dict[str, set[str]], register
          target_ref, now, fresh_within, *, roles: Iterable[str] = ()) -> FeatureIdea | None:
     """Gauntlet + dedup for one raw candidate. Returns the FeatureIdea to accept, or None (recording a
     structured rejection in `avoid`). Shared by the generation loop and the single critic-fix pass."""
+    if not isinstance(raw, dict):
+        # The LLM occasionally returns a feature as a bare string instead of an object; treat it as a
+        # structured rejection rather than letting `raw.get(...)` raise AttributeError and kill the run.
+        logger.warning("feature idea was a %s, not an object: %r", type(raw).__name__, raw)
+        avoid.append({"name": str(raw)[:80], "reason": "LLM returned a non-object feature item",
+                      "code": RejectCode.MALFORMED_ITEM})
+        return None
     idea, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within, roles=roles)
     if rej is not None:
         avoid.append({"name": raw.get("name", ""), "reason": rej.message, "code": rej.code})
@@ -944,7 +974,16 @@ def _generate(conn, objective: str, client: LLMClient, *,
     if issues:
         accepted = [f if f.name not in issues else replace(f, critic_note=issues[f.name])
                     for f in accepted]
-    return accepted[:target], avoid
+    kept = accepted[:target]
+    if kept or avoid:
+        from collections import Counter as _Counter
+        by_code = _Counter(r.get("code") for r in avoid)
+        logger.info(
+            "feature-gen free-form [%s]: %d kept, %d rejected%s",
+            objective if len(objective) <= 80 else objective[:79] + "…",
+            len(kept), len(avoid),
+            (" (" + ", ".join(f"{c}×{n}" for c, n in by_code.most_common()) + ")") if by_code else "")
+    return kept, avoid
 
 
 def recommend_features(conn, objective: str, client: LLMClient, *,
