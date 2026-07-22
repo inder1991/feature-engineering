@@ -10,15 +10,22 @@ data:
   FEATUREGEN_AUTH_STUB: "1"
   # Belt-and-braces: the initContainer already migrates; the app also auto-applies on boot (idempotent).
   FEATUREGEN_AUTO_MIGRATE: "1"
+  # LLM provider ON: enables concept enrichment + Pass B synthesis. The ANTHROPIC_API_KEY itself is
+  # supplied from the 'featuregen-llm' Secret via the Deployment env below — NEVER stored here.
+  FEATUREGEN_LLM_PROVIDER: "anthropic"
   # Pass C — deterministic governed join DISCOVERY (implies governed-join routing for declared joins).
   # Declared/discovered joins become approved_join PROPOSALS awaiting two distinct platform-admins in
   # the Governance review screen. (No ANTHROPIC_API_KEY here — see the note on OVERLAY_TABLE_SYNTH.)
   OVERLAY_PASS_C: "1"
   # Pass B — governed table synthesis (grain/availability as PROPOSED-only, human-gated facts). The
-  # two-phase wide-table fix now handles the 126-column table. Like concept enrichment, Pass B only
-  # actually runs when an LLM provider is configured; this env has NO provider key, so the flag
-  # readies Pass B but it stays inert (skipped_no_client) until an ANTHROPIC_API_KEY is added.
+  # two-phase wide-table fix handles the 126-column table. Now that the LLM provider is configured
+  # above, Pass B (and concept enrichment) run for real — proposals are still human-gated.
   OVERLAY_TABLE_SYNTH: "1"
+  # D4 semantic-binding stages (Delivery D): candidate shortlist then LLM-select proposals for
+  # entity_assignment / currency_binding, human-gated in the Governance review screen. Proposals
+  # REQUIRE candidates (the code warns if proposals is on while candidates is off), so both are on.
+  OVERLAY_SEMANTIC_BINDING_CANDIDATES: "1"
+  OVERLAY_SEMANTIC_BINDING_PROPOSALS: "1"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -52,6 +59,12 @@ spec:
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: { name: backend-config }
+          env:
+            # Live LLM key from the imperatively-created Secret (kubectl create secret generic
+            # featuregen-llm). Kept out of the ConfigMap and out of git entirely.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef: { name: featuregen-llm, key: ANTHROPIC_API_KEY }
           ports:
             - containerPort: 8000
           readinessProbe:
