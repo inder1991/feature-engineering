@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from featuregen.formula import schema as s
 from featuregen.formula.parse import parse_proposal_v1
 from featuregen.formula.schema import (
     AggregateExpression,
@@ -34,7 +35,6 @@ from featuregen.formula.schema import (
     WindowPolicy,
     ZeroDenominator,
 )
-from featuregen.formula import schema as s
 
 # ---------------------------------------------------------------- raw builders
 
