@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "featuregen://formula/proposal_v1.schema.json",
+  "title": "TypedFormulaProposalV1",
+  "type": "object",
+  "properties": {
+    "formula_schema_version": {"const": 1},
+    "operation_grammar_version": {"const": 1},
+    "canonicalization_version": {"const": 1},
+    "grain": {"$ref": "#/$defs/grain"},
+    "body": {"$ref": "#/$defs/formulaBody"},
+    "parameters": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/parameterDecl"}
+    },
+    "decimal": {"$ref": "#/$defs/decimalPolicy"},
+    "expected_output": {
+      "anyOf": [{"$ref": "#/$defs/expectedOutput"}, {"type": "null"}]
+    }
+  },
+  "required": [
+    "formula_schema_version",
+    "operation_grammar_version",
+    "canonicalization_version",
+    "grain",
+    "body",
+    "parameters",
+    "decimal"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "logicalRef": {"type": "string", "minLength": 1},
+    "typedLiteral": {
+      "type": "object",
+      "properties": {
+        "type": {"enum": ["string", "integer", "decimal", "boolean", "date"]},
+        "value": {"type": "string"}
+      },
+      "required": ["type", "value"],
+      "additionalProperties": false
+    },
+    "parameterRef": {
+      "type": "object",
+      "properties": {"name": {"type": "string", "minLength": 1}},
+      "required": ["name"],
+      "additionalProperties": false
+    },
+    "filterNode": {
+      "oneOf": [
+        {"$ref": "#/$defs/filterBool"},
+        {"$ref": "#/$defs/filterPredicate"}
+      ]
+    },
+    "filterBool": {
+      "type": "object",
+      "properties": {
+        "kind": {"const": "bool"},
+        "op": {"enum": ["and", "or", "not"]},
+        "children": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/filterNode"},
+          "minItems": 1
+        }
+      },
+      "required": ["kind", "op", "children"],
+      "additionalProperties": false
+    },
+    "filterPredicate": {
+      "type": "object",
+      "properties": {
+        "kind": {"const": "predicate"},
+        "op": {
+          "enum": [
+            "equal",
+            "not_equal",
+            "greater_than",
+            "greater_or_equal",
+            "less_than",
+            "less_or_equal",
+            "in",
+            "not_in",
+            "is_null",
+            "is_not_null"
+          ]
+        },
+        "left": {"$ref": "#/$defs/logicalRef"},
+        "right_literal": {
+          "anyOf": [{"$ref": "#/$defs/typedLiteral"}, {"type": "null"}]
+        },
+        "right_param": {
+          "anyOf": [{"$ref": "#/$defs/parameterRef"}, {"type": "null"}]
+        },
+        "right_set": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {"$ref": "#/$defs/typedLiteral"},
+              "minItems": 1
+            },
+            {"type": "null"}
+          ]
+        }
+      },
+      "required": ["kind", "op", "left"],
+      "additionalProperties": false
+    },
+    "sourceRelation": {
+      "type": "object",
+      "properties": {"table_ref": {"$ref": "#/$defs/logicalRef"}},
+      "required": ["table_ref"],
+      "additionalProperties": false
+    },
+    "grain": {
+      "type": "object",
+      "properties": {
+        "entity": {"type": "string", "minLength": 1},
+        "keys": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/logicalRef"},
+          "minItems": 1
+        }
+      },
+      "required": ["entity", "keys"],
+      "additionalProperties": false
+    },
+    "windowPolicy": {
+      "type": "object",
+      "properties": {
+        "event_time_ref": {"$ref": "#/$defs/logicalRef"},
+        "basis": {"enum": ["trailing", "calendar_period"]},
+        "length": {"type": "integer", "minimum": 1},
+        "unit": {"enum": ["day", "week", "month", "quarter", "year"]},
+        "start_inclusive": {"enum": ["inclusive", "exclusive"]},
+        "end_inclusive": {"enum": ["inclusive", "exclusive"]},
+        "timezone": {"type": "string", "minLength": 1},
+        "empty_window": {"enum": ["null", "zero", "error"]},
+        "null_input": {"enum": ["ignore", "propagate", "zero"]}
+      },
+      "required": [
+        "event_time_ref",
+        "basis",
+        "length",
+        "unit",
+        "start_inclusive",
+        "end_inclusive",
+        "timezone",
+        "empty_window",
+        "null_input"
+      ],
+      "additionalProperties": false
+    },
+    "decimalPolicy": {
+      "type": "object",
+      "properties": {
+        "precision": {"type": "integer", "minimum": 1},
+        "scale": {"type": "integer", "minimum": 0},
+        "rounding": {
+          "enum": ["half_up", "half_even", "down", "up", "floor", "ceiling"]
+        },
+        "overflow": {"enum": ["error", "saturate"]}
+      },
+      "required": ["precision", "scale", "rounding", "overflow"],
+      "additionalProperties": false
+    },
+    "aggregateExpression": {
+      "type": "object",
+      "properties": {
+        "aggregation": {
+          "enum": ["sum", "count_rows", "count_non_null", "count_distinct"]
+        },
+        "operand": {
+          "anyOf": [{"$ref": "#/$defs/logicalRef"}, {"type": "null"}]
+        },
+        "source_relation": {"$ref": "#/$defs/sourceRelation"},
+        "filter": {
+          "anyOf": [{"$ref": "#/$defs/filterNode"}, {"type": "null"}]
+        },
+        "window": {"$ref": "#/$defs/windowPolicy"}
+      },
+      "required": ["aggregation", "source_relation", "window"],
+      "additionalProperties": false
+    },
+    "formulaBody": {
+      "oneOf": [
+        {"$ref": "#/$defs/unaryBody"},
+        {"$ref": "#/$defs/ratioBody"},
+        {"$ref": "#/$defs/diffBody"}
+      ]
+    },
+    "unaryBody": {
+      "type": "object",
+      "properties": {
+        "final_operation": {"const": "identity"},
+        "expr": {"$ref": "#/$defs/aggregateExpression"}
+      },
+      "required": ["final_operation", "expr"],
+      "additionalProperties": false
+    },
+    "ratioBody": {
+      "type": "object",
+      "properties": {
+        "final_operation": {"const": "ratio"},
+        "numerator": {"$ref": "#/$defs/aggregateExpression"},
+        "denominator": {"$ref": "#/$defs/aggregateExpression"},
+        "zero_denominator": {"enum": ["null", "zero", "error"]}
+      },
+      "required": ["final_operation", "numerator", "denominator", "zero_denominator"],
+      "additionalProperties": false
+    },
+    "diffBody": {
+      "type": "object",
+      "properties": {
+        "final_operation": {"const": "difference"},
+        "minuend": {"$ref": "#/$defs/aggregateExpression"},
+        "subtrahend": {"$ref": "#/$defs/aggregateExpression"}
+      },
+      "required": ["final_operation", "minuend", "subtrahend"],
+      "additionalProperties": false
+    },
+    "parameterDecl": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "type": {"enum": ["string", "integer", "decimal", "boolean", "date"]},
+        "param_class": {"enum": ["semantic", "operational"]},
+        "classification": {"type": "string"},
+        "nullable": {"type": "boolean"},
+        "allowed_set": {
+          "anyOf": [
+            {"type": "array", "items": {"type": "string"}},
+            {"type": "null"}
+          ]
+        },
+        "allowed_min": {"type": ["string", "null"]},
+        "allowed_max": {"type": ["string", "null"]}
+      },
+      "required": ["name", "type", "param_class", "classification", "nullable"],
+      "additionalProperties": false
+    },
+    "expectedOutput": {
+      "type": "object",
+      "properties": {
+        "output_type": {"type": ["string", "null"]},
+        "unit": {"type": ["string", "null"]},
+        "currency": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}

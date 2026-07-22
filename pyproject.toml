@@ -63,6 +63,9 @@ where = ["src"]
 # ships zero migrations and an installed release silently applies nothing to the schema.
 [tool.setuptools.package-data]
 "featuregen.db" = ["migrations/*.sql"]
+# The strict proposal JSON Schema is runtime data loaded from disk by
+# featuregen.formula.parse — without this the wheel ships no shape gate.
+"featuregen.formula" = ["*.schema.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
