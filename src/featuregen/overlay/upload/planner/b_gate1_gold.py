@@ -74,11 +74,6 @@ B_GATE1_MIN_POSITIVE_SHAPES = 2
 _SCHEMA = "public"
 
 
-def _data_owner() -> IdentityEnvelope:
-    return IdentityEnvelope(subject="upload", actor_kind="human", authenticated=True,
-                            auth_method="oidc", role_claims=("data_owner",))
-
-
 def _seal() -> None:
     """Register the same overlay config the T9 seeding seals (drift SLA 24h, no restricted profiler
     role) so the drift-freshness gate + grain gate route exactly as the proven chain."""
@@ -102,7 +97,7 @@ def _stand_up(conn: DbConn, source: str, table: str,
     spike.ingest_representative_table(
         conn, source,
         [CanonicalRow(source, table, col, typ, as_of=as_of) for col, _c, typ, as_of in columns],
-        actor=_data_owner(), now=now)
+        actor=service_actor, now=now)
     for col, concept, _typ, _as_of in columns:
         if concept is not None:
             spike.human_confirm_concept(conn, source=source, schema=None, table=table, column=col,

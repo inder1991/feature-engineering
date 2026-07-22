@@ -60,7 +60,8 @@ def _adapter():
 def test_gate_passes(db: DbConn, service_actor: IdentityEnvelope, human_actor: IdentityEnvelope,
                      monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FEATUREGEN_LLM_XCAT_SHADOW, "1")
-    report = run_b_gate1(db, _adapter(), service_actor=service_actor, human_actor=human_actor)
+    report = run_b_gate1(db, _adapter(), service_actor=service_actor, human_actor=human_actor,
+                         feature_engineer=_feature_engineer())
 
     assert report.passed, report.failures
     assert report.positive_coverage_ok
@@ -130,7 +131,7 @@ def test_non_vacuity_reject_all_fails_coverage(
         return BDisposition.structural_need_ungoverned
 
     report = run_b_gate1(db, _adapter(), service_actor=service_actor, human_actor=human_actor,
-                         govern_fn=_reject_all)
+                         feature_engineer=_feature_engineer(), govern_fn=_reject_all)
     assert not report.positive_coverage_ok
     assert report.positive_shapes_covered == ()
     assert not report.passed

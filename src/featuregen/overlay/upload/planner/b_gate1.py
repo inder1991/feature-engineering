@@ -95,13 +95,6 @@ class BGate1Report:
     failures: tuple[str, ...] = field(default_factory=tuple)
 
 
-def _feature_engineer() -> IdentityEnvelope:
-    """A ``feature_engineer`` principal — authenticated + carrying ``feature:generate`` (the role
-    ``govern_llm_idea``'s auth precondition clears)."""
-    return IdentityEnvelope(subject="fe", actor_kind="human", authenticated=True,
-                            auth_method="oidc", role_claims=("feature_engineer",))
-
-
 def _disposition_of(result: object | None) -> BDisposition | None:
     """The ``BDisposition`` a captured outcome carries (a ``GovernedResult``'s is ``governed``), or
     ``None`` for a raised/absent outcome."""
@@ -330,7 +323,8 @@ def run_fault_controls(
 # ── the runner (seed → run each case twice + the fault controls → evaluate) ───────────────────────
 def run_b_gate1(
         conn: DbConn, adapter: CatalogAdapter, *, service_actor: IdentityEnvelope,
-        human_actor: IdentityEnvelope, now: datetime = GOLD_NOW, fresh_within: object = FRESH_WITHIN,
+        human_actor: IdentityEnvelope, feature_engineer: IdentityEnvelope,
+        now: datetime = GOLD_NOW, fresh_within: object = FRESH_WITHIN,
         cases: Sequence[BGate1Case] = CORRECTNESS_GOLD,
         controls: Sequence[BFaultControl] = FAULT_CONTROLS,
         seed_fn: Callable[..., None] = seed_correctness_gold,
@@ -344,7 +338,7 @@ def run_b_gate1(
     (positive coverage collapses); ``seed_fn`` is injectable for the same reason. The fault controls
     always use the REAL ``govern_llm_idea`` (their point is the real service's fault classification)."""
     cases = tuple(cases)
-    actor = _feature_engineer()
+    actor = feature_engineer
     seed_fn(conn, service_actor=service_actor, human_actor=human_actor, now=now)
 
     case_runs: dict[str, tuple[_Outcome, _Outcome]] = {}
