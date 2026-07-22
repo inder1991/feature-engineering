@@ -314,6 +314,14 @@ class TestConstruction:
         )
         assert parsed == expected
 
+    def test_parse_does_not_mutate_raw_input(self):
+        raw = raw_ratio_proposal()
+        import copy
+
+        snapshot = copy.deepcopy(raw)
+        parse_proposal_v1(raw)
+        assert raw == snapshot
+
     def test_parsed_enums_are_typed_not_raw_strings(self):
         parsed = parse_proposal_v1(raw_ratio_proposal())
         assert isinstance(parsed.body, RatioBody)
@@ -327,3 +335,33 @@ class TestConstruction:
         assert isinstance(num.filter.right_literal.type, LiteralType)
         assert isinstance(parsed.grain.keys, tuple)
         assert isinstance(parsed.parameters, tuple)
+
+
+# ------------------------------------------------- semantic-layer composition
+
+
+class TestSemanticComposition:
+    """Shape-valid dicts must still pass Task-1 validate_semantics."""
+
+    def test_equal_with_both_right_literal_and_right_set_rejected(self):
+        raw = raw_unary_proposal(
+            filter={
+                "kind": "predicate",
+                "op": "equal",
+                "left": CHANNEL,
+                "right_literal": {"type": "string", "value": "pos"},
+                "right_set": [{"type": "string", "value": "pos"}],
+            }
+        )
+        with pytest.raises(SchemaError, match="right_set"):
+            parse_proposal_v1(raw)
+
+    def test_count_rows_with_operand_rejected_by_semantics(self):
+        raw = raw_unary_proposal(aggregation="count_rows", operand=AMT)
+        with pytest.raises(SchemaError, match="takes no operand"):
+            parse_proposal_v1(raw)
+
+    def test_cross_table_operand_rejected_by_semantics(self):
+        raw = raw_unary_proposal(operand="core::bank.customers.balance")
+        with pytest.raises(SchemaError, match="not contained"):
+            parse_proposal_v1(raw)

@@ -56,6 +56,7 @@ from featuregen.formula.schema import (
     WindowPolicy,
     WindowUnit,
     ZeroDenominator,
+    validate_semantics,
 )
 
 _SCHEMA_PATH = Path(__file__).with_name("proposal_v1.schema.json")
@@ -89,7 +90,9 @@ def parse_proposal_v1(raw: Mapping[str, Any]) -> TypedFormulaProposalV1:
         raise SchemaError(
             f"proposal shape invalid at {error.json_path}: {error.message}"
         )
-    return _build_proposal(data)
+    proposal = _build_proposal(data)
+    validate_semantics(proposal)
+    return proposal
 
 
 # ---- construction (shape-validated dict -> frozen dataclasses) ----
