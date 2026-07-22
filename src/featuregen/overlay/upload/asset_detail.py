@@ -578,7 +578,7 @@ def build_asset_detail(
         return None
 
     requested = set(include) if include is not None else set(_F0_SECTIONS)
-    logical_ref = logical_ref_of(norm_source, anchor["object_ref"])
+    logical_ref = logical_ref_of(conn, norm_source, anchor["object_ref"])
     is_column = anchor["kind"] == "column"
 
     unavailable: list[str] = []

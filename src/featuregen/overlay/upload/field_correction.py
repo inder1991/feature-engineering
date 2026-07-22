@@ -188,7 +188,7 @@ def read_field_cas(conn: DbConn, *, source: str, object_ref: str, field: str) ->
     (public-flattened, the way graph.build_graph stores object_ref). The three values are exactly what
     the command re-checks — a concurrent evidence append moves ``evidence_set_hash`` even when the
     decision head is unchanged, so a command issued against a stale anchor fails closed (409)."""
-    logical_ref = logical_ref_of(source.strip().lower(), object_ref.lower())
+    logical_ref = logical_ref_of(conn, source.strip().lower(), object_ref.lower())
     latest, set_hash, policy_version = _current_cas(conn, logical_ref, field)
     return {"latest_decision_id": latest, "evidence_set_hash": set_hash,
             "policy_version": policy_version}
@@ -264,7 +264,7 @@ def apply_field_correction(
         (norm_source, object_ref, allowed)).fetchone()
     if anchor is None:
         raise FieldCorrectionError(404, "asset not found")
-    logical_ref = logical_ref_of(norm_source, object_ref.lower())
+    logical_ref = logical_ref_of(conn, norm_source, object_ref.lower())
 
     # 3. Serialize this correction against BOTH the ingest writer (I-2) AND sibling corrections on this
     #    column (C-1). CONSISTENT lock ordering — the SOURCE lock FIRST, then the finer column lock —

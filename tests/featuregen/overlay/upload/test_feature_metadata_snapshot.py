@@ -26,7 +26,11 @@ _SRC = "bank"
 _TABLE = "accounts"
 _BAL_OBJ = "public.accounts.balance"
 _ASOF_OBJ = "public.accounts.as_of_date"
-_BAL_REF = normalize_ref(_SRC, "public", _TABLE, "balance")
+# The balance column is seeded with schema_name="finance" (see _seed_graph /
+# test_snapshot_drift_seals_non_governed), so its REAL logical_ref is schema-preserving, not
+# public — this is what logical_ref_of now resolves it to (was hardcoded "public"; the fix this
+# suite exercises), and it is the key every decision/evidence read below must match.
+_BAL_REF = normalize_ref(_SRC, "finance", _TABLE, "balance")
 _ASOF_REF = normalize_ref(_SRC, "public", _TABLE, "as_of_date")
 _REFS = [(_SRC, _BAL_OBJ), (_SRC, _ASOF_OBJ)]
 

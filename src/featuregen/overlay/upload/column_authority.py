@@ -7,10 +7,13 @@ authority is a boolean derived from is_feature_eligible (additivity/logical_repr
 governed *_fact_event_id link (is_grain/is_as_of). unit/currency/entity/declared_type are hints: a
 hint may only TIGHTEN a validator check (reject / needs-check), never CLEAR one.
 
-Accepted edge (reconciliation #8): the graph_node key is rebuilt PUBLIC-FLATTENED (matching how
-``graph.build_graph`` stores object_refs), so a non-``public``-schema source that recorded a
-schema-preserving decision falls back to ``authority="hint"`` — conservative (never wrongly clears
-a check). All in-repo uploads use ``public``; a schema-preserving reader is a later refinement.
+Schema identity: the graph_node key itself is PUBLIC-FLATTENED (matching how ``graph.build_graph``
+stores object_refs), but :func:`logical_ref_of` looks up the REAL (pre-flatten) schema from
+``graph_node.schema_name`` to rebuild the SCHEMA-PRESERVING ``logical_ref`` that
+``field_evidence``/``field_decision_event`` are actually keyed under (a non-``public``-schema source,
+e.g. FTR, records decisions under its real schema — see ``field_resolution.py`` / ``object_ref.py``).
+``schema_name`` NULL (public/technical upload) or the graph_node row absent both fall back to
+``"public"``, so that path stays byte-identical.
 """
 from __future__ import annotations
 
@@ -50,17 +53,27 @@ class OperationalColumnFacts:
     provenance: str | None     # a *_decision_id or *_fact_event_id, else None
 
 
-def logical_ref_of(catalog_source: str, object_ref: str) -> str:
-    """Rebuild the (public-flattened) logical_ref for a graph_node ``(catalog_source, object_ref)``
-    so the same string keys the decision log via is_feature_eligible. graph_node object_refs are
-    stored public-flattened (``public.table.column``), so this mirrors that flattening."""
+def logical_ref_of(conn: DbConn, catalog_source: str, object_ref: str) -> str:
+    """Rebuild the SCHEMA-PRESERVING logical_ref for a graph_node ``(catalog_source, object_ref)``
+    so the same string keys the decision log / field_evidence (via is_feature_eligible). graph_node
+    object_refs are stored PUBLIC-FLATTENED (``public.table.column``), but the REAL (pre-flatten)
+    schema a non-``public`` source declared lives in ``graph_node.schema_name`` — read it here (a
+    single PK lookup) rather than assuming ``"public"``, so a real-schema upload's evidence/decisions
+    (keyed under their schema-preserving logical_ref, per ``field_resolution.py`` / ``object_ref.py``)
+    are actually reachable. ``normalize_ref`` (not string concatenation) so the case-folding EXACTLY
+    matches how the writers keyed the row. Falls back to ``"public"`` when ``schema_name`` is NULL or
+    the graph_node row is absent — public/technical uploads stay byte-identical."""
     parts = object_ref.split(".")
     if len(parts) >= 3:
-        schema, table, column = parts[-3], parts[-2], parts[-1]
+        table, column = parts[-2], parts[-1]
     elif len(parts) == 2:
-        schema, table, column = "public", parts[0], parts[1]
+        table, column = parts[0], parts[1]
     else:
-        schema, table, column = "public", object_ref, ""
+        table, column = object_ref, ""
+    row = conn.execute(
+        "SELECT schema_name FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (catalog_source, object_ref)).fetchone()
+    schema = row[0] if row is not None and row[0] else "public"
     return normalize_ref(catalog_source, schema, table, column or None)
 
 

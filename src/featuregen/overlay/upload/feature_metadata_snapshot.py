@@ -324,7 +324,7 @@ def _build_item(
     None, provenance dropped). A projection-lagged read ABORTS the whole snapshot (the same abort the
     up-front :func:`check_projection_readiness` gate raises) — never seal a stale projected value. The
     hint-by-policy fields (unit/currency/entity/declared_type) stay on ``read_column_facts``."""
-    logical_ref = logical_ref_of(catalog_source, object_ref)
+    logical_ref = logical_ref_of(conn, catalog_source, object_ref)
     facts = read_column_facts(conn, logical_ref, field)
     if field in _C1_GOVERNED_FIELDS:
         # Function-local import: operational_facts imports check_projection_readiness /

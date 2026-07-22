@@ -41,8 +41,30 @@ def _govern(db, field_name, value):
         supersedes_event_id=None)
 
 
-def test_logical_ref_of_round_trips_public_flattened_ref():
-    assert logical_ref_of(_SRC, _OBJ) == _REF
+def test_logical_ref_of_round_trips_public_flattened_ref(db):
+    assert logical_ref_of(db, _SRC, _OBJ) == _REF
+
+
+def test_logical_ref_of_is_schema_aware_for_a_real_schema_column(db):
+    """The bug: logical_ref_of used to hardcode schema="public" no matter what the graph_node
+    actually declared, so evidence/decisions recorded under a real (non-public) schema's
+    schema-preserving logical_ref were never readable. It must now read graph_node.schema_name."""
+    _col(db, schema_name="DPL_EIB_COMPLIANCE")
+    expected = normalize_ref(_SRC, "DPL_EIB_COMPLIANCE", "accounts", "balance")
+    assert expected == "bank::dpl_eib_compliance.accounts.balance"
+    assert logical_ref_of(db, _SRC, _OBJ) == expected
+
+
+def test_logical_ref_of_falls_back_to_public_when_schema_name_is_null(db):
+    # An explicit graph_node row with schema_name NULL (public/technical upload) must still resolve
+    # to the public-flattened ref — unchanged behavior.
+    _col(db)   # schema_name defaults NULL
+    assert logical_ref_of(db, _SRC, _OBJ) == _REF
+
+
+def test_logical_ref_of_falls_back_to_public_when_no_graph_node_row_exists(db):
+    # No row at all (e.g. a stale/derived object_ref) must not raise or crash — fall back to public.
+    assert logical_ref_of(db, _SRC, _OBJ) == _REF
 
 
 def test_additivity_hint_without_a_governing_decision(db):

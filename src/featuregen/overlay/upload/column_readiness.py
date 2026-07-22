@@ -422,7 +422,7 @@ def column_readiness(
     advisory gates would let pass as 'ready'.
     """
     norm_source = source.strip().lower()
-    logical_ref = logical_ref_of(norm_source, object_ref)
+    logical_ref = logical_ref_of(conn, norm_source, object_ref)
     try:
         check_projection_readiness(conn)
     except CatalogProjectionUnavailable as exc:

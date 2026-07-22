@@ -111,7 +111,7 @@ def test_feature_context_enabled_reads_env(monkeypatch):
 def test_enriched_menu_wraps_governed_fields_and_flag_gates(db, monkeypatch):
     _bank_graph(db)
     # Govern amount.additivity via the decision log (display value stays the flat column).
-    _govern_additivity(db, logical_ref_of("bank", "public.transactions.amount"), "additive")
+    _govern_additivity(db, logical_ref_of(db, "bank", "public.transactions.amount"), "additive")
 
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
     assert feature_context_enabled() is False
@@ -152,7 +152,7 @@ def test_enriched_menu_shows_hint_not_governed_for_a_drifted_value(db):
     # value to "additive": the OLD permissive read_column_facts still tags it governed, but C1
     # hash-mismatches → the menu shows a "hint", never a false "governed".
     _bank_graph(db)
-    lref = logical_ref_of("bank", "public.transactions.amount")
+    lref = logical_ref_of(db, "bank", "public.transactions.amount")
     _govern_additivity(db, lref, "non_additive")   # approved value ≠ the flat graph value below
     db.execute("UPDATE graph_node SET additivity = 'additive' "
                "WHERE object_ref = 'public.transactions.amount'")

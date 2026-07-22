@@ -234,7 +234,7 @@ def _enriched_column(conn, c: dict) -> dict:
         v = c.get(k)
         if v:
             out[k] = v
-    lref = logical_ref_of(c["catalog_source"], c["object_ref"])
+    lref = logical_ref_of(conn, c["catalog_source"], c["object_ref"])
     for menu_key, field_name in _MENU_FACT_FIELDS.items():
         if field_name in _MENU_GOVERNED_FIELDS:
             ov = read_operational_value(conn, lref, field_name)
@@ -627,7 +627,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    projection_unavailable ABORTS (never serve a stale type). ──
     if _needs_numeric(aggregation):
         for src, d in pairs:
-            lref = logical_ref_of(src, d)
+            lref = logical_ref_of(conn, src, d)
             ov = _governed_read(conn, lref, "logical_representation")
             if _is_numeric(ov.value):   # value is None on the C1 drift/fork fail-closed → won't clear
                 continue
@@ -647,7 +647,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    read_column_facts served it as governed-additive and wrongly cleared. ──
     if _is_additive_unsafe(aggregation):
         for src, d in pairs:
-            ov = _governed_read(conn, logical_ref_of(src, d), "additivity")
+            ov = _governed_read(conn, logical_ref_of(conn, src, d), "additivity")
             if ov.status == "resolved":
                 if ov.value in ("semi_additive", "non_additive"):
                     return None, Rejection(RejectCode.ADDITIVITY,
@@ -693,7 +693,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                 return None, Rejection(RejectCode.NO_POINT_IN_TIME,
                                        f"no point-in-time basis for {d} (future-leakage risk)")
             time_operand = (src, aref)
-            ov = _governed_read(conn, logical_ref_of(src, aref), "is_as_of")
+            ov = _governed_read(conn, logical_ref_of(conn, src, aref), "is_as_of")
             if ov.status != "resolved":
                 requirements.append(build_requirement(
                     code="TEMPORAL_IS_POPULATED", operand=(src, aref),
@@ -705,7 +705,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         gref = _grain_column_ref(conn, gcat, grain_table)
         if gref is not None:
             grain_operand = (gcat, gref)
-            ov = _governed_read(conn, logical_ref_of(gcat, gref), "is_grain")
+            ov = _governed_read(conn, logical_ref_of(conn, gcat, gref), "is_grain")
             if ov.status != "resolved":
                 requirements.append(build_requirement(
                     code="GRAIN_IS_UNIQUE", operand=(gcat, gref),
