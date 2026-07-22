@@ -891,7 +891,7 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     if feedback:
         inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", objective, inputs, actor=actor,
+                    "feature_ideas", objective + _DERIVES_FROM_DIRECTIVE, inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     for raw in out.get("features", []):
@@ -901,6 +901,19 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
             keep.append(idea)
             seen.add(idea.name)
     return keep
+
+
+# The schema alone does NOT force the model to cite its source columns: Anthropic's structured output
+# does not hard-enforce `required` on nested array items, so Opus silently omits `derives_from` and
+# EVERY idea is then rejected UNGROUNDED (measured: 0/18 populated on the bare instruction). An explicit
+# mandatory directive appended to the generation instruction flips this decisively (measured: 21/22
+# populated, with correctly-formatted object_refs). Kept as a fixed system directive (no PII) appended
+# after the redacted objective, so the egress guard still scans it and the llm_call audit records it.
+_DERIVES_FROM_DIRECTIVE = (
+    "\n\nMANDATORY: for EVERY feature you propose, the `derives_from` field MUST list the exact "
+    "`object_ref` string(s) — format public.<table>.<column> — of the source columns it is computed "
+    "from, copied verbatim from the provided columns list. A feature whose `derives_from` is empty or "
+    "omitted cannot be grounded and is discarded, so never leave it blank.")
 
 
 def _generate(conn, objective: str, client: LLMClient, *,
@@ -945,7 +958,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
         if feedback:
             inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                        "feature_ideas", objective, inputs, actor=actor,
+                        "feature_ideas", objective + _DERIVES_FROM_DIRECTIVE, inputs, actor=actor,
                         prompt_version=_feature_schema_version(),
                         schema_version=_feature_schema_version())
         proposed = out.get("features", [])
