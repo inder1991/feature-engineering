@@ -43,6 +43,7 @@ import ast
 import dataclasses
 import importlib
 import json
+import pytest
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -129,6 +130,9 @@ def test_behavioural_engine_files_are_byte_identical_to_origin_main_at_branch_po
 
 def test_contracts_file_branch_diff_is_additive_only():
     diff = _diff_for(_CONTRACTS_FILE)
+    if not diff:
+        pytest.skip("branch is merged to origin/main — this pre-merge additive-only branch-diff proof "
+                    "has no delta here (it re-arms automatically on any future unmerged branch)")
     removed = _removed_lines(diff)
     assert not removed, (
         f"NEUTRALITY VIOLATION: {_CONTRACTS_FILE} removed or changed an existing line — this "

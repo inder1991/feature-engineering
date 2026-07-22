@@ -188,6 +188,10 @@ def create_app_from_env() -> FastAPI:
     FEATUREGEN_LLM_PROVIDER=anthropic; otherwise the app runs without an LLM client
     (ingest un-enriched, assist endpoints 503). Never falls back to FakeLLM (D5)."""
     from featuregen.intake.llm_claude import ClaudeConfig, build_claude_llm
+    from featuregen.runtime.logging_setup import configure_logging
 
+    # Real process entrypoint: install formatted logging so the pipeline's step/decision/LLM logs
+    # are actually emitted (the app configured none before, so everything below WARNING was dropped).
+    configure_logging()
     cfg = ClaudeConfig.from_env()
     return create_app(llm_client=build_claude_llm(cfg) if cfg.enabled else None)
