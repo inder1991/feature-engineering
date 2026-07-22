@@ -27,6 +27,7 @@ class _Resp:
     """A tiny status-carrying stub for APIStatusError construction."""
 
     request = None
+    headers: dict = {}   # anthropic>=0.117 APIStatusError.__init__ reads response.headers.get("request-id")
 
     def __init__(self, status_code):
         self.status_code = status_code
