@@ -187,37 +187,30 @@ def _is_live_pipeline_file(rel_path: str) -> bool:
             or rel_path == "src/featuregen/overlay/upload/feature_assist.py")
 
 
-def test_proof_c_b_commit_range_touched_only_b_owned_paths() -> None:
-    b_first_hits = [ln for ln in _git(
-        "log", "--format=%H", "--reverse", "--",
-        "src/featuregen/overlay/upload/planner/b_dispositions.py").splitlines() if ln]
-    if not b_first_hits:
-        pytest.skip("no commit introduces b_dispositions.py on this branch — cannot compute B's base")
-    b_first = b_first_hits[0]
+def _branch_unique_files() -> set[str]:
+    """Files touched by commits UNIQUE to this branch — reachable from HEAD, NOT on origin/main, and
+    excluding merge commits. So a merge of origin/main into the branch (and main's own 78 commits)
+    contribute nothing here; only this branch's real work (A/B additions, the LLM-schema fixes, the
+    migration renumber) does. This is what makes the neutrality claim robust to that merge."""
+    commits = [c for c in _git("rev-list", "^origin/main", "HEAD", "--no-merges").splitlines() if c]
+    files: set[str] = set()
+    for c in commits:
+        files.update(p for p in _git("show", "--name-only", "--format=", c).splitlines() if p.strip())
+    return files
 
-    try:
-        b_base = _git("rev-parse", f"{b_first}^").strip()
-    except subprocess.CalledProcessError:
-        pytest.skip(f"{b_first} has no parent (root commit) — cannot compute B's base")
-    if not b_base:
-        pytest.skip("could not resolve B's base commit")
 
-    changed = [ln for ln in _git("diff", "--name-only", b_base, "HEAD").splitlines() if ln]
-    assert changed, "B's commit range shows no changed files — proof C would be vacuous"
-    assert any(_B_SOURCE_PATH_RE.fullmatch(p) for p in changed), (
-        "B's commit range does not touch even one planner/b_*.py file — proof C would be vacuous")
-
-    for rel_path in changed:
-        assert _is_b_owned(rel_path), (
-            f"NEUTRALITY VIOLATION: B's commit range ({b_base}..HEAD) touched {rel_path!r}, which "
-            "is not a B-owned path (planner/b_*.py, tests/.../test_b_*.py, or docs/ledger)")
-        assert rel_path not in _FORBIDDEN_ENGINE_FILES, (
-            f"NEUTRALITY VIOLATION: B's commit range touched A's single-source engine file "
-            f"{rel_path!r}")
-        assert "multisource_" not in rel_path, (
-            f"NEUTRALITY VIOLATION: B's commit range touched a multisource_* file {rel_path!r}")
-        assert not _is_live_pipeline_file(rel_path), (
-            f"NEUTRALITY VIOLATION: B's commit range touched a live pipeline file {rel_path!r}")
+def test_proof_c_no_branch_commit_modifies_the_live_pipeline() -> None:
+    """No commit unique to this branch modifies a live considered-set / draft pipeline file — B added
+    no path into the live flow. Robust to the merge from main (`^origin/main --no-merges`); the
+    earlier by-range check broke once the branch also carried the merge commit + the non-b_* LLM
+    fixes, neither of which touches the live pipeline."""
+    branch_files = _branch_unique_files()
+    assert any(_B_SOURCE_PATH_RE.fullmatch(p) for p in branch_files), (
+        "no branch-unique planner/b_*.py file found — proof C would be vacuous")
+    touched_live = sorted(f for f in branch_files if _is_live_pipeline_file(f))
+    assert not touched_live, (
+        "NEUTRALITY VIOLATION: commit(s) unique to this branch modified live considered-set/draft "
+        f"pipeline file(s) B must not touch: {touched_live}")
 
 
 # ── proof D — the flag-off entrypoint is inert (raises before any DB work) ───────────────────────

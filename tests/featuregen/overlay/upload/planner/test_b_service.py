@@ -119,6 +119,10 @@ def _seed_chain(db: DbConn, sa: IdentityEnvelope, ha: IdentityEnvelope, *,
         db, intent_id=f"i_{run_id}", generation_run_id=run_id, recognition_id=None,
         scope=ConfirmedScope(primary=None, unscoped=True, target_entity="customer"),
         use_case_origins={}, confirmation_source="user_confirmed", confirmed_by="ds1")
+    # Drain the overlay projection so the gauntlet's projection-freshness guard
+    # (feature_assist.CatalogProjectionUnavailable — added on main) sees checkpoint == head,
+    # exactly as a real request would once the projector has caught up after the seeding writes.
+    spike._drain(db)
 
 
 def _sum_proposal() -> RawFeatureProposalV1:
