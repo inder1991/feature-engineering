@@ -230,6 +230,12 @@ class TestValidProposals:
         )
         assert validate_semantics(p) is None
 
+    def test_valid_filter_at_max_depth_passes(self):
+        node: s.FilterNode = eq_pred()
+        for _ in range(s.MAX_FILTER_DEPTH - 1):  # depth: predicate=1, each NOT +1
+            node = FilterBool(op=FilterBoolOp.NOT, children=(node,))
+        assert validate_semantics(proposal_with_filter(node)) is None
+
     def test_valid_filtered_ratio_proposal_passes(self):
         param = ParameterDecl(
             name="min_amount",
@@ -259,3 +265,102 @@ class TestValidProposals:
             zero_denominator=s.ZeroDenominator.NULL,
         )
         assert validate_semantics(make_proposal(body=body, parameters=(param,))) is None
+
+
+# ------------------------------------------- predicate invariants + limits
+
+def lit_str(v: str = "pos") -> TypedLiteral:
+    return TypedLiteral(type=LiteralType.STRING, value=v)
+
+
+class TestPredicateInvariants:
+    def test_is_null_rejects_any_right_side(self):
+        node = FilterPredicate(
+            op=FilterPredicateOp.IS_NULL, left=CHANNEL, right_literal=lit_str()
+        )
+        with pytest.raises(SchemaError, match="is_null"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_is_not_null_rejects_right_param(self):
+        node = FilterPredicate(
+            op=FilterPredicateOp.IS_NOT_NULL,
+            left=CHANNEL,
+            right_param=ParameterRef(name="x"),
+        )
+        with pytest.raises(SchemaError, match="is_not_null"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_in_requires_right_set(self):
+        node = FilterPredicate(
+            op=FilterPredicateOp.IN, left=CHANNEL, right_literal=lit_str()
+        )
+        with pytest.raises(SchemaError, match="right_set"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_in_rejects_empty_right_set(self):
+        node = FilterPredicate(op=FilterPredicateOp.NOT_IN, left=CHANNEL, right_set=())
+        with pytest.raises(SchemaError, match="non-empty"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_in_rejects_right_set_over_max_in_list(self):
+        entries = tuple(lit_str(f"v{i:03d}") for i in range(s.MAX_IN_LIST + 1))
+        node = FilterPredicate(op=FilterPredicateOp.IN, left=CHANNEL, right_set=entries)
+        with pytest.raises(SchemaError, match="MAX_IN_LIST"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_comparison_rejects_no_right_operand(self):
+        node = FilterPredicate(op=FilterPredicateOp.EQUAL, left=CHANNEL)
+        with pytest.raises(SchemaError, match="exactly one"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_comparison_rejects_both_right_operands(self):
+        node = FilterPredicate(
+            op=FilterPredicateOp.EQUAL,
+            left=CHANNEL,
+            right_literal=lit_str(),
+            right_param=ParameterRef(name="x"),
+        )
+        with pytest.raises(SchemaError, match="exactly one"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_comparison_rejects_right_set(self):
+        node = FilterPredicate(
+            op=FilterPredicateOp.EQUAL,
+            left=CHANNEL,
+            right_literal=lit_str(),
+            right_set=(lit_str(),),
+        )
+        with pytest.raises(SchemaError, match="right_set"):
+            validate_semantics(proposal_with_filter(node))
+
+
+class TestFilterShapeLimits:
+    def test_not_requires_exactly_one_child(self):
+        node = FilterBool(op=FilterBoolOp.NOT, children=(eq_pred(), eq_pred()))
+        with pytest.raises(SchemaError, match="exactly 1 child"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_and_requires_at_least_two_children(self):
+        node = FilterBool(op=FilterBoolOp.AND, children=(eq_pred(),))
+        with pytest.raises(SchemaError, match="at least 2"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_or_requires_at_least_two_children(self):
+        node = FilterBool(op=FilterBoolOp.OR, children=())
+        with pytest.raises(SchemaError, match="at least 2"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_filter_depth_over_max_rejected(self):
+        node: s.FilterNode = eq_pred()
+        for _ in range(s.MAX_FILTER_DEPTH):  # predicate=1 + 4 NOTs = depth 5
+            node = FilterBool(op=FilterBoolOp.NOT, children=(node,))
+        with pytest.raises(SchemaError, match="MAX_FILTER_DEPTH"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_predicate_count_over_max_rejected(self):
+        node = FilterBool(
+            op=FilterBoolOp.AND,
+            children=tuple(eq_pred() for _ in range(s.MAX_PREDICATES + 1)),
+        )
+        with pytest.raises(SchemaError, match="MAX_PREDICATES"):
+            validate_semantics(proposal_with_filter(node))

@@ -325,6 +325,93 @@ class TypedFormulaV1:
 
 # ---- semantic validation ----
 
+_NO_RIGHT_OPS = frozenset({FilterPredicateOp.IS_NULL, FilterPredicateOp.IS_NOT_NULL})
+_SET_OPS = frozenset({FilterPredicateOp.IN, FilterPredicateOp.NOT_IN})
+
+
 def validate_semantics(p: TypedFormulaProposalV1) -> None:
     """Raise SchemaError on any §A semantic-rule violation; return None if valid."""
-    return None
+    for path, expr in _body_expressions(p.body):
+        _check_expression(path, expr)
+
+
+def _body_expressions(
+    body: FormulaBody,
+) -> tuple[tuple[str, AggregateExpression], ...]:
+    """The body's expressions keyed by canonical internal path. [c4]"""
+    if isinstance(body, UnaryBody):
+        return (("body.expr", body.expr),)
+    if isinstance(body, RatioBody):
+        return (("body.numerator", body.numerator), ("body.denominator", body.denominator))
+    if isinstance(body, DiffBody):
+        return (("body.minuend", body.minuend), ("body.subtrahend", body.subtrahend))
+    raise SchemaError(f"body must be UnaryBody | RatioBody | DiffBody, got {type(body).__name__}")
+
+
+def _check_expression(path: str, expr: AggregateExpression) -> None:
+    if expr.filter is not None:
+        predicate_count = _check_filter_node(expr.filter, f"{path}.filter", depth=1)
+        if predicate_count > MAX_PREDICATES:
+            raise SchemaError(
+                f"{path}.filter: {predicate_count} predicates exceeds "
+                f"MAX_PREDICATES={MAX_PREDICATES}"
+            )
+
+
+def _check_filter_node(node: FilterNode, path: str, depth: int) -> int:
+    """Enforce the [c9] predicate/bool invariants; return the predicate count."""
+    if depth > MAX_FILTER_DEPTH:
+        raise SchemaError(
+            f"{path}: filter tree depth {depth} exceeds MAX_FILTER_DEPTH={MAX_FILTER_DEPTH}"
+        )
+    if isinstance(node, FilterPredicate):
+        _check_predicate(node, path)
+        return 1
+    if isinstance(node, FilterBool):
+        if node.op is FilterBoolOp.NOT:
+            if len(node.children) != 1:
+                raise SchemaError(
+                    f"{path}: 'not' requires exactly 1 child, got {len(node.children)}"
+                )
+        elif len(node.children) < 2:
+            raise SchemaError(
+                f"{path}: '{node.op.value}' requires at least 2 children, "
+                f"got {len(node.children)}"
+            )
+        return sum(
+            _check_filter_node(child, f"{path}.children[{i}]", depth + 1)
+            for i, child in enumerate(node.children)
+        )
+    raise SchemaError(
+        f"{path}: filter node must be FilterPredicate | FilterBool, got {type(node).__name__}"
+    )
+
+
+def _check_predicate(node: FilterPredicate, path: str) -> None:
+    if node.op in _NO_RIGHT_OPS:
+        if not (node.right_literal is None and node.right_param is None and node.right_set is None):
+            raise SchemaError(f"{path}: '{node.op.value}' takes no right-hand side")
+        return
+    if node.op in _SET_OPS:
+        if node.right_literal is not None or node.right_param is not None:
+            raise SchemaError(
+                f"{path}: '{node.op.value}' takes exactly right_set "
+                "(no right_literal/right_param)"
+            )
+        if node.right_set is None:
+            raise SchemaError(f"{path}: '{node.op.value}' requires right_set")
+        if len(node.right_set) == 0:
+            raise SchemaError(f"{path}: '{node.op.value}' requires a non-empty right_set")
+        if len(node.right_set) > MAX_IN_LIST:
+            raise SchemaError(
+                f"{path}: right_set size {len(node.right_set)} exceeds "
+                f"MAX_IN_LIST={MAX_IN_LIST}"
+            )
+        return
+    # all remaining ops: exactly ONE of right_literal | right_param
+    if node.right_set is not None:
+        raise SchemaError(f"{path}: '{node.op.value}' does not take right_set")
+    if (node.right_literal is None) == (node.right_param is None):
+        raise SchemaError(
+            f"{path}: '{node.op.value}' requires exactly one of right_literal | right_param"
+        )
