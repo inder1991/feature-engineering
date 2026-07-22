@@ -16,6 +16,13 @@ data:
   # Feature-generation + enrichment run on Opus 4.8 (overrides the claude-sonnet-5 code default) —
   # the governed feature-gen journey wants the strongest model at the proposal step.
   FEATUREGEN_LLM_MODEL: "claude-opus-4-8"
+  # max_tokens ceiling for every LLM call. Opus 4.8 runs adaptive thinking at effort=high, and
+  # THINKING TOKENS COUNT AGAINST max_tokens — the 4096 default gets consumed by thinking, truncating
+  # the structured feature_ideas output → the truncation retry re-bills the whole (expensive) call and
+  # exhausts the retry budget ("failed_into_clarification"). 32000 gives thinking + output ample room so
+  # the call succeeds in ONE shot (no costly retries). NB: setting this above the model's real output
+  # ceiling makes the provider 400 the request outright, so this is the safe practical max, not higher.
+  FEATUREGEN_LLM_MAX_TOKENS: "32000"
   # Drift-freshness SLA = 30 days. This single-node demo cluster runs NO periodic drift scanner, so
   # the default 60-min SLA makes resolve_fact REVERIFY(drift_stale_pending_scan) as soon as a VERIFIED
   # fact's watermark ages past an hour — which silently drops is_grain/as_of and starves the planner.
