@@ -103,6 +103,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Test idioms we use deliberately.
 "tests/**" = ["B011", "B017", "B007", "E402"]
+# Vendored VERBATIM from trailofbits/rfc8785.py (see its header); style-only
+# findings are not worth diverging from the audited upstream bytes.
+"src/featuregen/formula/_jcs.py" = ["UP006", "UP007", "PIE790", "B904"]
 
 [tool.mypy]
 python_version = "3.11"
