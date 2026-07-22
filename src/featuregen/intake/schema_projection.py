@@ -49,7 +49,14 @@ def _project(node: object) -> object:
     for kw in list(node):
         if kw in PROVIDER_UNSUPPORTED_KEYWORDS:
             del node[kw]
-    # 3) recurse into nested schema containers
+    # 3) Anthropic structured output requires CLOSED objects: an object with `additionalProperties`
+    #    true (or the open default, absent) is rejected — it must be false. Force it closed on the
+    #    wire; a typed sub-schema (dict) form is LEFT for the recursion below (a legitimate map the
+    #    model may return). The canonical schema keeps its permissive shape for RESPONSE validation.
+    if (node.get("type") == "object" or "properties" in node) \
+            and node.get("additionalProperties", True) is True:
+        node["additionalProperties"] = False
+    # 4) recurse into nested schema containers
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(node.get(key), dict):
             node[key] = {k: _project(v) for k, v in node[key].items()}
@@ -96,6 +103,12 @@ def provider_incompatibilities(schema: object, _path: str = "$") -> list[str]:
     t, enum = schema.get("type"), schema.get("enum")
     if isinstance(t, list) and "null" in t and isinstance(enum, list):
         problems.append(f"nullable-enum at {_path}")
+    # Anthropic rejects an OPEN object (`additionalProperties: true`, or the open default of absence).
+    # This is the guard's blind spot that let permissive feature schemas reach the wire. A typed
+    # sub-schema (dict) form is left to the recursion below, not flagged here.
+    if (schema.get("type") == "object" or "properties" in schema) \
+            and schema.get("additionalProperties", True) is True:
+        problems.append(f"open-object at {_path}")
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(schema.get(key), dict):
             for k, v in schema[key].items():

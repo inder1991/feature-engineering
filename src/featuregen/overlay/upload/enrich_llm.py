@@ -528,10 +528,21 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
     ("feature_ideas", 1): {"type": "object", "additionalProperties": True,
                            "properties": {"features": {"type": "array"}}},
-    ("feature_recipe", 1): {"type": "object", "additionalProperties": True},
+    # Properties declared (the keys `recipe()` reads) so the wire projection can CLOSE the object —
+    # Anthropic structured output rejects an open (no-property) object. Canonical stays permissive.
+    ("feature_recipe", 1): {"type": "object", "additionalProperties": True,
+                            "properties": {"derives_from": {"type": "array"},
+                                           "grain_table": {"type": "string"},
+                                           "join_table": {"type": "string"},
+                                           "aggregation": {"type": "string"},
+                                           "as_of_column": {"type": "string"}}},
     ("leakage", 1): {"type": "object", "additionalProperties": True,
                      "properties": {"leaks": {"type": "array"}}},
-    ("feature_set_rec", 1): {"type": "object", "additionalProperties": True},
+    # Properties declared (the keys `recommend_feature_sets`'s SetRecommendation reads) so the wire
+    # projection can CLOSE the object — Anthropic rejects an open object. Canonical stays permissive.
+    ("feature_set_rec", 1): {"type": "object", "additionalProperties": True,
+                             "properties": {"recommended_lens": {"type": "string"},
+                                            "reasoning": {"type": "string"}}},
     # LLM-2 candidate critic (SP-12 item 5): {"issues": [{"name","issue"}]} — advisory quality/fit notes.
     ("feature_candidate_critique", 1): {"type": "object", "additionalProperties": True,
                                         "properties": {"issues": {"type": "array"}}},
