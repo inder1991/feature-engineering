@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 import psycopg
 
@@ -648,6 +649,49 @@ def register_enrichment_schemas(conn) -> None:
         reg.register_schema(name, ver, schema, _OWNER)
 
 
+@dataclass(frozen=True, slots=True)
+class AuditedStructuredResult:
+    """The FULL disposition of one governed structured call (Child-1 Task 3).
+
+    ``output`` is exactly what ``audited_structured_call`` returns (the validated dict, or None on
+    egress block / provider failure / outcome-audit discard). ``llm_call_ref`` is the immutable
+    audit row written for the call — None only on a pre-dispatch block the caller did not ask to
+    have recorded (``record_egress_block=False``, the enrichment default). ``provider_calls``
+    counts the PHYSICAL provider requests issued (initial + repairs/retries; 0 when blocked before
+    dispatch). ``usage`` is the outcome's provider-reported cost metadata (input/output tokens…);
+    {} when nothing was dispatched."""
+    output: dict | None
+    llm_call_ref: str | None
+    provider_calls: int
+    usage: dict
+
+
+def _record_blocked_call(conn, *, run_id: str, task: str, prompt_id: str, prompt_version: int,
+                         schema_id: str, schema_version: int, actor: IdentityEnvelope,
+                         reason: str) -> str:
+    """Record the immutable llm_call row for a call BLOCKED before dispatch (the
+    ``record_egress_block=True`` path of ``drive_audited_structured_call``). CONTENT-FREE by
+    construction: the blocked payload failed the egress contract, so nothing from it may be
+    persisted on the audit row — the stored request carries EMPTY inputs, and only the guard's
+    REASON (a label/diagnostic, never the content itself) rides ``validation_result``. Durable via
+    ``_record_llm_call_durable`` for the same #20 reason as a dispatched call: the evidence that a
+    block happened must survive the request tx. IN ADDITION to (never instead of) the
+    ``EGRESS_BLOCKED`` security event the block site already records."""
+    redaction = RedactionResult(text="", redaction_version=_REDACTION_VERSION,
+                                redacted_spans=(), disposition="ok")
+    inputs = build_llm_inputs(redaction, catalog_metadata={}, raw_input_classification="clean")
+    req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
+                     output_schema_id=schema_id, output_schema_version=schema_version,
+                     generation_settings=_generation_settings())
+    return _record_llm_call_durable(
+        conn, run_id=run_id, request=req, input_hash=compute_input_hash(inputs),
+        redaction_version=_REDACTION_VERSION, input_redaction={},
+        raw_output={"output": None, "self_reported_scores": {}},
+        validation_result={"result": "egress_blocked", "reason": reason},
+        repair_attempts=[], latency_ms=None, cost_metadata=None,
+        created_by=identity_to_jsonb(actor))
+
+
 def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                             catalog_metadata: dict, instruction: str,
                             actor: IdentityEnvelope | None = None,
@@ -659,6 +703,10 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
     LLM node — enrichment, contract authoring/refine, and contract critique.
 
+    Output-only view over ``drive_audited_structured_call`` (which carries the full disposition —
+    llm_call_ref/provider_calls/usage — for callers like formula authoring that need it); this
+    signature and its ``dict | None`` return are unchanged for the MANY existing callers.
+
     ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
     v1 behavior): the resolved output-schema, the stamped request versions, and the validation all use
     them, so a versioned enrichment call cannot silently egress under the v1 contract.
@@ -667,7 +715,45 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     PHYSICAL provider attempt (initial + each repair/retry re-call inside ``drive_structured_call``)
     is pre-dispatch audited via the ``AuditingClient`` wrapper, fail-closed. ``None`` (contract
     authoring / feature generation) keeps today's behavior byte-identical — no dispatch audit."""
+    return drive_audited_structured_call(
+        conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+        catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
+        prompt_version=prompt_version, schema_version=schema_version,
+        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys).output
+
+
+def drive_audited_structured_call(
+        conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
+        catalog_metadata: dict, instruction: str,
+        actor: IdentityEnvelope | None = None,
+        prompt_version: int = 1, schema_version: int = 1,
+        dispatch_audit: DispatchAuditContext | None = None,
+        cacheable_metadata_keys: tuple[str, ...] = (),
+        run_id: str = ENRICHMENT_RUN_ID,
+        record_egress_block: bool = False) -> AuditedStructuredResult:
+    """The outcome-returning core of ``audited_structured_call`` (same governance, richer return —
+    mirrors ``drive_structured_call`` naming). Two ADDITIVE knobs beyond that seam's parameters,
+    both defaulting to the historical behavior so ``audited_structured_call`` stays byte-identical:
+
+    * ``run_id`` — the audit run bucket the immutable llm_call is recorded under (default
+      ``ENRICHMENT_RUN_ID``). Formula authoring threads its ``authoring_run_id`` so every provider
+      call is queryable per authoring run.
+    * ``record_egress_block`` — when True, a call blocked BEFORE dispatch (free-text redaction
+      fail-closed, feature-context adapter block, or the ``assert_llm_safe`` backstop) still writes
+      a CONTENT-FREE llm_call row (``_record_blocked_call``) so the result carries an audited
+      ``llm_call_ref`` for the block itself. False (default) keeps the enrichment behavior:
+      security-event only, no llm_call row, ``llm_call_ref=None``."""
     actor = actor or _ENRICH_ACTOR
+
+    def _blocked(reason: str) -> AuditedStructuredResult:
+        ref = None
+        if record_egress_block:
+            ref = _record_blocked_call(
+                conn, run_id=run_id, task=task, prompt_id=prompt_id,
+                prompt_version=prompt_version, schema_id=schema_id,
+                schema_version=schema_version, actor=actor, reason=reason)
+        return AuditedStructuredResult(output=None, llm_call_ref=ref, provider_calls=0, usage={})
+
     reg = DocumentSchemaRegistry(conn)
     schema = reg.schema_for(schema_id, schema_version)
     if schema is None:                      # self-register on first use (idempotent) so a real
@@ -683,7 +769,7 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
                        task, schema_id)
         _audit_egress_block(conn, task=task, actor=actor,
                             reason="glossary free-text redaction failed closed")
-        return None                       # hard fail closed — no dispatch, no cache
+        return _blocked("glossary free-text redaction failed closed")  # no dispatch, no cache
     # [F4] the nested feature-menu adapter (spec §5) — fires on EVERY call (RF-I6: including the
     # contract-draft `_column_defs` shape, which it sanitizes rather than blocks); inert (same
     # object) on payloads without a feature menu.
@@ -693,7 +779,7 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
                        task, schema_id)
         _audit_egress_block(conn, task=task, actor=actor,
                             reason="feature-context egress adapter failed closed")
-        return None                       # hard fail closed — no dispatch, no cache
+        return _blocked("feature-context egress adapter failed closed")  # no dispatch, no cache
     safe_metadata = ctx_meta
     spans = spans + ctx_spans
     sample_audits = sample_audits + ctx_sample_audits
@@ -718,7 +804,7 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     except EgressViolation as exc:
         logger.warning("egress guard blocked %s (schema %s); no dispatch", task, schema_id)
         _audit_egress_block(conn, task=task, actor=actor, reason=str(exc))
-        return None                       # hard fail closed — no dispatch, no cache
+        return _blocked(str(exc))         # hard fail closed — no dispatch, no cache
 
     # C5-T3: with an ingestion-audit context, wrap the client so EVERY physical attempt is audited
     # BEFORE egress (fail-closed on AuditUnavailable — the provider is never called). The
@@ -733,13 +819,14 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     outcome = drive_structured_call(
         dispatch_client, req, lambda output: reg.validate(schema_id, schema_version, output))
     llm_call_ref = _record_llm_call_durable(   # #20: evidence survives an upload-tx rollback
-        conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
+        conn, run_id=run_id, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
         input_redaction=({"redacted_spans": spans, "sample_strip": sample_audits}
                          if (spans or sample_audits) else {}),
         raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
         validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
+    usage = dict(outcome.cost_metadata or {})
     if dispatch_audit is not None and auditing_client is not None:
         # C5-T4 eligibility ordering: record → link → return. The llm_call is durable (above) and
         # the dispatch/run associations commit HERE — before the output is handed back as eligible
@@ -756,13 +843,20 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
             logger.warning("enrichment call %s (schema %s) audit-degraded: the logical outcome "
                            "audit did not commit — discarding the enrichment result", task,
                            schema_id)
-            return None                   # discard — not eligible for cache/evidence
+            # discard — not eligible for cache/evidence. The llm_call is durable + the provider was
+            # called, so the ref/provider_calls/usage are surfaced even though output is withheld.
+            return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
+                                           provider_calls=outcome.provider_calls, usage=usage)
 
     if outcome.status == STATUS_FAILED:
         logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
                        outcome.validation_result)
-        return None                       # provider/repair failure -> don't cache
-    return outcome.output if isinstance(outcome.output, dict) else None
+        # provider/repair failure -> don't cache the (unverified) output; the call is still audited.
+        return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
+                                       provider_calls=outcome.provider_calls, usage=usage)
+    output = outcome.output if isinstance(outcome.output, dict) else None
+    return AuditedStructuredResult(output=output, llm_call_ref=llm_call_ref,
+                                   provider_calls=outcome.provider_calls, usage=usage)
 
 
 def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
