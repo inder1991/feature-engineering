@@ -30,6 +30,10 @@ dependencies = [
     # The OpenMetadata connector's real transport (behind an injectable fetch seam; tests
     # never touch the network). Promoted from dev — it was already a test dependency.
     "httpx>=0.27",
+    # The formula schema validates a WindowPolicy.timezone as a real IANA zone via zoneinfo.ZoneInfo;
+    # python:3.11-slim (the deploy base) ships no system tz database, so declare the data package
+    # explicitly — otherwise ZoneInfo raises ZoneInfoNotFoundError and the whole formula suite errors.
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
