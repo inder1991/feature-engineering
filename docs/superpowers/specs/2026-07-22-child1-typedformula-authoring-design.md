@@ -1,174 +1,154 @@
-# Child Spec 1 — TypedFormula Authoring (shadow, no execution) — rev 2
+# Child Spec 1 — TypedFormula Authoring (shadow, no execution) — rev 3
 
-**Parent:** `2026-07-22-feature-materialization-pipeline-design.md` (Program #1). **Findings:** #4, #13 (parent) + 15 Child-1 review findings, resolved inline as `[cN]`.
+**Parent:** `2026-07-22-feature-materialization-pipeline-design.md` (Program #1). Findings from three review rounds resolved inline as `[cN]`.
 
-**Goal:** Publish the **normative, closed** `TypedFormulaProposalV1` / `TypedFormulaV1` schemas, their closed enums, exact canonicalization + `formula_content_hash`, a **new** formula operation contract + a **new** formula-level output resolver (the existing `b_operation`/`b_output_policy` do not cover this), and the offline authoring loop (author → structural-validate → independent critic → C1-authoritative output resolution → gold gate) with a **multi-axis result** and deterministic disposition. **No execution, no storage of a formula/version artifact** — only append-only `llm_call` + authoring-trace records.
+**Goal:** Freeze the normative, closed `TypedFormulaProposalV1` / `TypedFormulaV1` contract (exact enums, discriminated JSON unions, predicate invariants, RFC-8785 canonicalization, path-derived hashing), an operation-specific output-authority matrix over C1, a new operation/additivity contract, and the offline author→structural-validate→independent-critic→C1-resolve→gold loop with a multi-axis result. **No execution; no durable formula/version artifact.**
 
-**Verified adapter facts (drive this rev):** `SupportedOperation` is single-operand (`b_operation.py:54`); `OutputPolicyV1` = `{output_type, output_additivity, external_type_required}`, no unit/currency, per-operand (`b_output_policy.py:71`); C1 `read_operational_value` carries `resolved/not_operational/projection_unavailable/fork/hash_mismatch` (`operational_facts.py`) which `b_output_policy` does not fully consume. → Child-1 defines a **new** operation contract + a **new** C1-based formula resolver, with a compatibility mapping to the old ones. `[c2][c3][c4]`
+**Verified adapter facts:** `SupportedOperation` is single-operand (`b_operation.py:54`); `OutputPolicyV1={output_type,output_additivity,external_type_required}` per-operand (`b_output_policy.py:71`); **C1 governs `unit`/`currency` as HINTS → `not_operational`** (`operational_facts.py:45`); **`derive_output_additivity` wrongly marks `count_distinct` additive** (`b_output_policy.py:126`). → Child-1 defines new contracts + an operation-specific authority matrix + a corrected additivity rule.
 
 ---
 
-## §A Normative schemas (frozen, slotted dataclasses; JSON is their canonical serialization)
-
-Every object is closed: `additionalProperties: false`, unknown fields → `INVALID_FORMULA`. `LogicalRef = str` (canonical `source::schema.table.column`, normalized before hashing).
+## §A Normative schemas (frozen slotted dataclasses; JSON = canonical serialization; every object `additionalProperties:false`)
 
 ```python
-# ---- enums (closed) --------------------------------------------------------
-class FormulaOperation(StrEnum):           # §B vocabulary
-    SUM=…; COUNT_ROWS=…; COUNT_NON_NULL=…; COUNT_DISTINCT=…; RATIO=…; DIFFERENCE=…
-class WindowBasis(StrEnum):     TRAILING=…; CALENDAR_PERIOD=…
-class WindowUnit(StrEnum):      DAY=…; WEEK=…; MONTH=…; QUARTER=…; YEAR=…
-class Inclusivity(StrEnum):     INCLUSIVE=…; EXCLUSIVE=…
-class EmptyWindowResult(StrEnum): NULL=…; ZERO=…; ERROR=…
-class NullInput(StrEnum):       IGNORE=…; PROPAGATE=…; ZERO=…
-class ZeroDenominator(StrEnum): NULL=…; ZERO=…; ERROR=…
-class RoundingMode(StrEnum):    HALF_UP=…; HALF_EVEN=…; DOWN=…; UP=…; FLOOR=…; CEILING=…
-class OverflowBehavior(StrEnum):ERROR=…; SATURATE=…
-class LiteralType(StrEnum):     STRING=…; INTEGER=…; DECIMAL=…; BOOLEAN=…; DATE=…
-class ParamClass(StrEnum):      SEMANTIC=…; OPERATIONAL=…
-class FilterBoolOp(StrEnum):    AND=…; OR=…; NOT=…
-class FilterPredicateOp(StrEnum): EQUAL=…; NOT_EQUAL=…; GREATER_THAN=…; GREATER_OR_EQUAL=…; \
-                                  LESS_THAN=…; LESS_OR_EQUAL=…; IN=…; NOT_IN=…; IS_NULL=…; IS_NOT_NULL=…
+LogicalRef = str  # canonical "source::schema.table[.column]" (object_ref.py:23), normalized before hashing
 
-# ---- leaves ----------------------------------------------------------------
-@frozen class TypedLiteral:  type: LiteralType; value: str      # value ALWAYS a canonical string (decimals too)
-@frozen class ParameterDecl: name: str; type: LiteralType; param_class: ParamClass; classification: str; \
-                             nullable: bool; allowed_set: tuple[str,...] | None; \
-                             allowed_min: str | None; allowed_max: str | None      # [c14]
-@frozen class ParameterRef:  name: str                          # resolves to a declared ParameterDecl
+# ---- enums (exact string values are the serialized form; casing fixed by canonicalization_version) ----
+class AggregateFunction(StrEnum):   # [c3] the per-expression aggregate ONLY
+    SUM="sum"; COUNT_ROWS="count_rows"; COUNT_NON_NULL="count_non_null"; COUNT_DISTINCT="count_distinct"
+class FinalOperation(StrEnum):      # [c3] the formula body shape ONLY
+    IDENTITY="identity"; RATIO="ratio"; DIFFERENCE="difference"
+class WindowBasis(StrEnum):     TRAILING="trailing"; CALENDAR_PERIOD="calendar_period"
+class WindowUnit(StrEnum):      DAY="day"; WEEK="week"; MONTH="month"; QUARTER="quarter"; YEAR="year"
+class Inclusivity(StrEnum):     INCLUSIVE="inclusive"; EXCLUSIVE="exclusive"
+class EmptyWindowResult(StrEnum): NULL="null"; ZERO="zero"; ERROR="error"
+class NullInput(StrEnum):       IGNORE="ignore"; PROPAGATE="propagate"; ZERO="zero"
+class ZeroDenominator(StrEnum): NULL="null"; ZERO="zero"; ERROR="error"
+class RoundingMode(StrEnum):    HALF_UP="half_up"; HALF_EVEN="half_even"; DOWN="down"; UP="up"; FLOOR="floor"; CEILING="ceiling"
+class OverflowBehavior(StrEnum):ERROR="error"; SATURATE="saturate"
+class LiteralType(StrEnum):     STRING="string"; INTEGER="integer"; DECIMAL="decimal"; BOOLEAN="boolean"; DATE="date"
+class ParamClass(StrEnum):      SEMANTIC="semantic"; OPERATIONAL="operational"
+class FilterKind(StrEnum):      BOOL="bool"; PREDICATE="predicate"   # JSON discriminator [c9]
+class FilterBoolOp(StrEnum):    AND="and"; OR="or"; NOT="not"
+class FilterPredicateOp(StrEnum):
+    EQUAL="equal"; NOT_EQUAL="not_equal"; GREATER_THAN="greater_than"; GREATER_OR_EQUAL="greater_or_equal"
+    LESS_THAN="less_than"; LESS_OR_EQUAL="less_or_equal"; IN="in"; NOT_IN="not_in"; IS_NULL="is_null"; IS_NOT_NULL="is_not_null"
+class AdditivityClass(StrEnum): ADDITIVE="additive"; NON_ADDITIVE="non_additive"; SEMI_ADDITIVE="semi_additive"
 
-# ---- filter AST (recursive union; leaves reference one LogicalRef + a literal/param) -------------
-@frozen class FilterPredicate: op: FilterPredicateOp; left: LogicalRef; \
-                               right_literal: TypedLiteral | None; right_param: ParameterRef | None; \
-                               right_set: tuple[TypedLiteral,...] | None            # IN/NOT_IN only
-@frozen class FilterBool:      op: FilterBoolOp; children: tuple["FilterNode",...]  # NOT → exactly 1 child
-FilterNode = FilterPredicate | FilterBool
-#   HARD LIMITS (schema constants): MAX_FILTER_DEPTH=4, MAX_PREDICATES=16, MAX_IN_LIST=64  [c1]
+# ---- leaves ----
+@frozen class TypedLiteral:  type: LiteralType; value: str                # value ALWAYS canonical string
+@frozen class ParameterDecl: name: str; type: LiteralType; param_class: ParamClass; classification: str
+                             nullable: bool; allowed_set: tuple[str,...] | None
+                             allowed_min: str | None; allowed_max: str | None      # [c14]  name matches /^[a-z][a-z0-9_]{0,63}$/, UNIQUE
+@frozen class ParameterRef:  name: str
 
-# ---- source + grain --------------------------------------------------------
-@frozen class SourceRelation: catalog_source: str; logical_table: str  # the governed counted/aggregated rowset [c6]
-@frozen class Grain:          entity: str; keys: tuple[LogicalRef,...]  # excludes business_dt (always implied)
+# ---- filter AST (discriminated union on `kind`) [c9] ----
+@frozen class FilterPredicate:   # kind="predicate"
+    op: FilterPredicateOp; left: LogicalRef
+    right_literal: TypedLiteral | None; right_param: ParameterRef | None; right_set: tuple[TypedLiteral,...] | None
+@frozen class FilterBool:        # kind="bool"
+    op: FilterBoolOp; children: tuple["FilterNode",...]
+FilterNode = FilterPredicate | FilterBool   # serialized with an explicit "kind" field
+# PREDICATE INVARIANTS (validator) [c9]:
+#   IS_NULL/IS_NOT_NULL -> right_literal=right_param=right_set=None
+#   IN/NOT_IN           -> exactly right_set (non-empty, ≤ MAX_IN_LIST), sorted+deduped
+#   all other ops       -> exactly ONE of right_literal | right_param
+#   NOT (bool)          -> exactly 1 child;  AND/OR -> ≥2 children
+#   right_param.name must resolve to a declared ParameterDecl
+# HARD LIMITS (schema constants): MAX_FILTER_DEPTH=4, MAX_PREDICATES=16, MAX_IN_LIST=64
 
-# ---- windowed aggregate expression (an operand slot) -----------------------
-@frozen class AggregateExpression:
-    expression_id: str                     # UNIQUE within a formula; distinct expressions may share a LogicalRef [c5]
-    aggregation: FormulaOperation          # one of SUM/COUNT_ROWS/COUNT_NON_NULL/COUNT_DISTINCT
-    operand: LogicalRef | None             # None only for COUNT_ROWS
-    source_relation: SourceRelation        # identity-bearing; required even for COUNT_ROWS [c6]
-    filter: FilterNode | None
-    window: "WindowPolicy"
-
+# ---- source, grain, window ----
+@frozen class SourceRelation: table_ref: LogicalRef   # a TABLE logical_ref (no .column); source is implicit in it [c8]
+@frozen class Grain:          entity: str; keys: tuple[LogicalRef,...]   # ORDER IS SEMANTIC (§D); excludes business_dt
 @frozen class WindowPolicy:
+    event_time_ref: LogicalRef                          # [c1] the column ordering the window (identity-bearing)
     basis: WindowBasis; length: int; unit: WindowUnit
-    start_inclusive: Inclusivity; end_inclusive: Inclusivity
-    timezone: str                          # IANA tz for calendar/cutoff resolution
+    start_inclusive: Inclusivity; end_inclusive: Inclusivity; timezone: str
     empty_window: EmptyWindowResult; null_input: NullInput
-
 @frozen class DecimalPolicy: precision: int; scale: int; rounding: RoundingMode; overflow: OverflowBehavior
 
-# ---- the operation body (ordered slots) ------------------------------------
-@frozen class UnaryOp:  operation: FormulaOperation; expr: AggregateExpression                 # SUM/COUNT_*
-@frozen class RatioOp:  operation: FormulaOperation; numerator: AggregateExpression; \
-                        denominator: AggregateExpression; zero_denominator: ZeroDenominator     # ordered [c5]
-@frozen class DiffOp:   operation: FormulaOperation; minuend: AggregateExpression; \
-                        subtrahend: AggregateExpression                                          # ordered
-OperationBody = UnaryOp | RatioOp | DiffOp
+# ---- aggregate expression (an operand slot). NO expression_id — internal id is its canonical PATH [c4] ----
+@frozen class AggregateExpression:
+    aggregation: AggregateFunction                      # [c3] cannot be a final op
+    operand: LogicalRef | None                          # None IFF aggregation==COUNT_ROWS [c9]
+    source_relation: SourceRelation                     # required (incl. COUNT_ROWS) [c6]; every operand/filter/event_time_ref MUST be reachable from table_ref
+    filter: FilterNode | None
+    window: WindowPolicy
 
-# ---- the two top-level objects --------------------------------------------
-@frozen class ExpectedOutput:    output_type: str | None; unit: str | None; currency: str | None  # advisory [c9]
-@frozen class TypedFormulaProposalV1:                       # what LLM-1 authors
+# ---- body: discriminated union on final_operation [c3] ----
+@frozen class UnaryBody: final_operation=IDENTITY; expr: AggregateExpression
+@frozen class RatioBody: final_operation=RATIO; numerator: AggregateExpression; denominator: AggregateExpression; zero_denominator: ZeroDenominator
+@frozen class DiffBody:  final_operation=DIFFERENCE; minuend: AggregateExpression; subtrahend: AggregateExpression
+FormulaBody = UnaryBody | RatioBody | DiffBody          # serialized with "final_operation" discriminator
+
+# ---- top level ----
+@frozen class ExpectedOutput: output_type: str | None; unit: str | None; currency: str | None   # advisory
+@frozen class TypedFormulaProposalV1:
     formula_schema_version: int; operation_grammar_version: int; canonicalization_version: int
-    grain: Grain; body: OperationBody; parameters: tuple[ParameterDecl,...]
-    decimal: DecimalPolicy; expected_output: ExpectedOutput | None
-
-@frozen class FormulaOutputPolicyV1:                        # NEW formula-level resolver output [c3]
-    output_type: str; unit: str | None; currency: str | None
-    output_additivity: AdditivityClass; external_type_required: bool
-@frozen class TypedFormulaV1:                               # AUTHORITATIVE (identity object)
-    formula_schema_version: int; operation_grammar_version: int
-    output_policy_version: int; canonicalization_version: int   # IDENTITY-bearing versions ONLY [c7]
-    grain: Grain; body: OperationBody; parameters: tuple[ParameterDecl,...]
-    decimal: DecimalPolicy; output: FormulaOutputPolicyV1
-    # NOTE: NO capability_policy_version, NO feature/contract/call ids, NO timestamps here. [c7]
+    grain: Grain; body: FormulaBody; parameters: tuple[ParameterDecl,...]; decimal: DecimalPolicy
+    expected_output: ExpectedOutput | None
+@frozen class FormulaOutputPolicyV1: output_type: str; unit: str|None; currency: str|None; output_additivity: AdditivityClass; external_type_required: bool
+@frozen class TypedFormulaV1:                            # AUTHORITATIVE identity object
+    formula_schema_version: int; operation_grammar_version: int; output_policy_version: int; canonicalization_version: int
+    grain: Grain; body: FormulaBody; parameters: tuple[ParameterDecl,...]; decimal: DecimalPolicy; output: FormulaOutputPolicyV1
+    # NO capability_policy_version, NO ids/timestamps/critic/provenance [c7]
 ```
 
-## §B Operation vocabulary + compatibility matrix `[c2]`
+Internal expression paths (for messages/diffs, NOT in the hash): `body.expr`, `body.numerator`, `body.denominator`, `body.minuend`, `body.subtrahend`. `[c4]`
 
-New `FormulaOperation` contract; explicit mapping to `b_operation` (do NOT widen `SupportedOperation` in place):
+## §B Operation → b_operation compatibility `[c2/round2]`
+`SUM→PathAggregation.sum`; `COUNT_DISTINCT→count_distinct`; `COUNT_ROWS`/`COUNT_NON_NULL` are **new** (split of b_operation's generic `count`); `RATIO`/`DIFFERENCE` are **new** `FinalOperation`s (b_operation defers them). `min/max/avg/stddev` out; derived-temporal out-of-vocabulary. Do not widen `SupportedOperation` in place.
 
-| FormulaOperation | slots | b_operation compatibility |
+## §C Output authority — operation-specific required-field matrix over C1 `[c2]`
+`resolve_formula_output_policy(conn, body, decimal, now) -> FormulaOutputPolicyV1`. Per-expression reads use C1 `read_operational_value`; **only the fields the operation actually needs are required** (unit/currency are C1 HINTS, so requiring them universally is wrong):
+
+| op | required authority | output unit/currency |
 |---|---|---|
-| `SUM` | `expr(operand)` | maps → `PathAggregation.sum` |
-| `COUNT_ROWS` | — (needs `source_relation`) | **new** — b_operation has no rows-count |
-| `COUNT_NON_NULL` | `expr(operand)` | **new** — splits b_operation's generic `count` |
-| `COUNT_DISTINCT` | `expr(operand)` | maps → `PathAggregation.count_distinct` |
-| `RATIO` | `numerator`,`denominator` | **new** ordered op (b_operation *defers* ratio) |
-| `DIFFERENCE` | `minuend`,`subtrahend` | **new** ordered op (b_operation *defers* difference) |
+| `COUNT_ROWS` | source_relation reachable + grain | dimensionless |
+| `COUNT_NON_NULL` | operand existence | dimensionless |
+| `COUNT_DISTINCT` | operand existence/type | dimensionless |
+| `SUM` | numeric type (C1) + additivity | inherit operand unit/currency **iff the output contract requires them**, else carry as hint |
+| `RATIO` | numeric both operands + units/currency **cancel** | dimensionless (mismatch that can't cancel → `NEEDS_AUTHORITY` or typed external requirement) |
+| `DIFFERENCE` | numeric both + **exactly compatible** unit/currency | that unit/currency (incompatible → `INVALID_FORMULA`) |
 
-`min`/`max`/`avg`/`stddev` are **out** of Child-1; derived-temporal (`trend`/`velocity`/`growth`/`zscore`) are **out of vocabulary but shape-accommodated** at a later `operation_grammar_version`. A trailing-window `SUM` is in-vocabulary (window is a first-class `WindowPolicy`, not a windowed *op*).
+When a *required* field is unavailable, emit a **typed external requirement** (e.g. `UNIT_PROVISIONING_REQUIRED`) rather than an indiscriminate `NEEDS_AUTHORITY`; a *hint-only* field never forces `NEEDS_AUTHORITY`. Any C1 `fork`/`hash_mismatch`/`projection_unavailable` on a required field → fail closed → `NEEDS_AUTHORITY`.
 
-## §C Output resolution — a NEW formula-level resolver over C1 `[c3][c4]`
+## §D Additivity — corrected `[c5]`
+Override `derive_output_additivity`'s unsafe rule: `COUNT_DISTINCT` = **NON_ADDITIVE by default** (distinct(A∪B)≠distinct(A)+distinct(B) without proven disjointness). `RATIO` = non-additive. `DIFFERENCE` = non-additive unless a proven rule applies. `COUNT_ROWS`/`COUNT_NON_NULL` = additive only across **disjoint** row partitions (else non-additive). `SUM` = governed input/path additivity.
 
-`b_output_policy.OutputPolicyV1` is per-operand and lacks unit/currency; it cannot resolve a ratio/difference. Define:
+## §E Canonicalization + hashing — RFC 8785 (JCS) + rules `[c4][c10]`
+Base: **RFC 8785 JSON Canonicalization Scheme** (UTF-8, lexicographic key sort, minimal number/string forms) with **NFC Unicode normalization**. Additional pinned rules: decimals/integers/dates/booleans as canonical strings (never floats); `LogicalRef` normalized (`_norm`) first; `IN` `right_set` and `allowed_set` sorted+deduplicated; **grain `keys` order is semantic (preserved)**; ordered slots (numerator/denominator, minuend/subtrahend) preserved; **associative `AND`/`OR` flattened then children sorted by canonical child hash** (not just immediate-children sort); `parameters` sorted by `name`; `NOT` never flattened; unknown fields + duplicate parameter names rejected. Internal expression paths are NOT serialized. `formula_content_hash = sha256(JCS(TypedFormulaV1))` — identity-versions in, **capability version + all provenance out** `[c7]`.
 
-```
-resolve_formula_output_policy(conn, body, decimal_policy, now) -> FormulaOutputPolicyV1
-```
-- For each `AggregateExpression`, read **operand type/unit/currency/additivity via C1 `read_operational_value`** (NOT `read_column_facts`); any `not_operational | projection_unavailable | fork | hash_mismatch` → **fail closed → `NEEDS_AUTHORITY`**. `[c4]`
-- Derive the **final** output: `RATIO` → dimensionless (unit/currency cancel iff numerator/denominator units match, else `NEEDS_AUTHORITY`); `DIFFERENCE`/`SUM` → operand unit/currency (mismatch across ordered slots → `INVALID_FORMULA`); additivity via the existing `derive_output_additivity` per expression then combined by operation. Reuse `resolve_output_policy` per operand where useful, but final type/unit/currency/additivity are derived here.
-- The LLM's `expected_output` is **advisory only** and never sets authoritative fields (§F).
-
-## §D Canonicalization + hashing (exact) `[c7][c13]`
-
-Canonical JSON: UTF-8, **sorted object keys**, no insignificant whitespace, exact enum casing, decimals as canonical strings (never binary floats), `LogicalRef` normalized first, unknown fields rejected, **duplicate `expression_id` rejected** (repeated `LogicalRef` across distinct slots/expressions is allowed `[c5]`). **Order rules:** ordered slots (numerator/denominator, minuend/subtrahend) preserved; **commutative `AND`/`OR` children sorted** by canonical child hash before serialization `[c13]`; `parameters` sorted by `name`; `IN` sets sorted+deduplicated.
-
-```
-formula_content_hash = sha256(canonical_json(TypedFormulaV1))
-```
-Covers `TypedFormulaV1` material ONLY — identity-bearing versions included; **`formula_capability_policy_version` and all outcome/provenance are OUTSIDE** the object and the hash `[c7]`. A capability-policy bump therefore cannot change the hash; a grammar/operand/output-policy/canonicalization change does.
-
-## §E Authoring result — multi-axis, not one verdict `[c9][c10]`
-
+## §F Authoring result — multi-axis + corrected fold `[c6][c7]`
 ```python
 @frozen class AuthoringResult:
     structural_status: Literal["ok","invalid_formula","unsupported_operation"]
-    capability_status: Literal["ok","unsupported_capability"]      # multi-source off in v1
-    output_status:     Literal["resolved","needs_authority","invalid_output"]
-    expectation_status:Literal["match","mismatch","not_provided"]  # advisory expected_output vs resolved [c9]
-    critic_status:     Literal["clean","advisory","blocking"]      # §G [c10]
-    technical_status:  Literal["ok","technical_failure"]           # LLM/tool/infra — never a semantic verdict [c11]
-    authoring_disposition: Literal["RESOLVED","NEEDS_REVIEW","REJECTED","UNSUPPORTED","TECHNICAL_FAILURE"]
+    capability_status: Literal["ok","unsupported_capability"]
+    output_status:     Literal["resolved","needs_authority","invalid_output","external_requirement"]
+    expectation_status:Literal["match","mismatch","not_provided"]
+    critic_status:     Literal["clean","advisory","blocking"]
+    technical_status:  Literal["ok","technical_failure"]
+    authoring_disposition: Literal["RESOLVED","NEEDS_REVIEW","UNSUPPORTED","REJECTED","TECHNICAL_FAILURE"]
     disposition_policy_version: int
+    candidate_formula: TypedFormulaV1 | None      # [c7-round3] present for RESOLVED AND reviewable NEEDS_REVIEW
+    candidate_formula_hash: str | None
 ```
-`authoring_disposition` is a **pure function** of the axes (pinned by `disposition_policy_version`): any `technical_status=technical_failure` → `TECHNICAL_FAILURE`; `structural=invalid_formula|unsupported_operation` OR `output=invalid_output` → `REJECTED`; `capability=unsupported_capability` → `UNSUPPORTED`; `output=needs_authority` OR `critic=blocking` OR `expectation=mismatch` → `NEEDS_REVIEW`; else → `RESOLVED`. An **advisory** expectation mismatch never makes a valid authoritative formula `REJECTED` `[c9]`.
+Pure-function fold (`disposition_policy_version`): `technical_failure`→`TECHNICAL_FAILURE`; `invalid_formula` or `output=invalid_output`→`REJECTED`; **`unsupported_operation` or `capability=unsupported_capability`→`UNSUPPORTED`** `[c6]`; `output∈{needs_authority,external_requirement}` or `critic=blocking` or `expectation=mismatch`→`NEEDS_REVIEW` (with the candidate formula + hash `[c7-r3]`); else `RESOLVED`. "Authoritative" = deterministically resolved (Child 1); "approved/frozen" = Child 2.
 
-## §F Expected-output disposition `[c9]`
+## §G Independent critic — closed finding codes `[c11]`
+Separate context/tier, no LLM-1 reasoning, structured findings only. **Closed v1 finding codes + fixed severity** (`critic_policy_version`): `MISSING_REQUIRED_OPERAND`(blocking), `WRONG_SLOT_DIRECTION`(blocking), `FILTER_INTENT_MISMATCH`(blocking), `WINDOW_INTENT_MISMATCH`(blocking), `EXTRA_UNJUSTIFIED_OPERAND`(advisory), `WEAK_PROXY`(advisory). Malformed / unknown-code / duplicate findings → the finding is dropped and a `technical_status` note recorded (a malformed critic never blocks or clears). Any blocking finding → `critic_status=blocking` (prevents auto-`RESOLVED`), never mutates the formula. `critic_findings_hash` recorded.
 
-`NEEDS_AUTHORITY` (authoritative output unresolvable from C1) ≠ `EXPECTATION_MISMATCH` (authoritative output resolved but differs from the LLM's advisory expectation → `expectation_status=mismatch` → `NEEDS_REVIEW`) ≠ `INVALID_FORMULA` (the formula semantics are themselves invalid). The authoritative `output` always comes from §C, never the proposal.
-
-## §G Independent critic → closed findings → disposition `[c10]`
-
-Critic (separate context/tier, no LLM-1 reasoning/trace, structured findings only) emits from a **closed finding-code enum** (e.g. `MISSING_OPERAND`, `WRONG_SLOT_DIRECTION`, `FILTER_MISMATCH`, `WINDOW_MISMATCH`, `INTENT_UNMET`), each classified **blocking | advisory** by a `critic_policy_version`. A **blocking** finding sets `critic_status=blocking` → `NEEDS_REVIEW` and **prevents an auto-`RESOLVED`** — it does not itself mutate the formula. `critic_findings_hash` is recorded.
-
-## §H LLM audit + trace — corrected `[c11][c12][c15]`
-
-- **A ReAct author run is MANY provider calls**, each an immutable `llm_call` record. The trace carries `author_call_ids[]`, `critic_call_ids[]`, and **ordered steps** `{llm_call | tool_call | tool_result}`. `[c12]`
-- Tool results stored as **canonical redacted result + its hash** (hash-only is allowed only when it references another immutable, retrievable artifact). `[c12]`
-- **Replay is precisely scoped** `[c11]`: guaranteed = exact reconstruction of each original call, the stored raw output, deterministic **re-validation** of that stored output, and a new replay linked to the original. NOT guaranteed = re-authoring reproduces the same formula (LLMs are stochastic).
-- **Storage boundary** `[c15]`: Child-1 writes NO durable formula/version artifact, but DOES write append-only `llm_call` + one authoring-trace per `authoring_run_id`. If a durable `llm_call` exists but the final trace write fails → the trace is marked `incomplete` for that `authoring_run_id` (append-only; never leaves an orphan pretending success); the run is `TECHNICAL_FAILURE`.
+## §H Audit + trace — manifest-first event log `[c12][c15]`
+Insert an **`authoring_run` manifest FIRST** (`authoring_run_id`, versions, intent hash). Then an append-only **`authoring_trace_event`** log: `STARTED → LLM_CALL_RECORDED | TOOL_CALLED | TOOL_RESULT_RECORDED | CRITIC_RECORDED → COMPLETED | FAILED`. The read model derives **incomplete** = a run with no terminal (`COMPLETED`/`FAILED`) event — this survives process death and durable `llm_call` rows outliving the request tx (no attempt to update a row that may not exist `[c12]`). Author/critic calls are many immutable `llm_call` records (`author_call_ids[]`, `critic_call_ids[]`); tool results stored as canonical **redacted** result + hash. Replay is scoped to reconstruction + re-validation of stored output + a linked new attempt — **not** re-authoring reproducing the same formula `[c11-r2]`.
 
 ## §I LLM-1 tools (governed catalog-authoring API)
+Seven read/validate-only tools (`search_columns`, `get_column_metadata`, `get_governed_grain`, `get_time_anchor`, `get_verified_lineage`, `list_supported_operations`, `validate_draft_formula`); `get_time_anchor` now has a home (`WindowPolicy.event_time_ref`). Read-scoped; metadata-only egress; tool results are data not instructions; versions stamped; bounded iterations + token budget (exceed→`technical_failure`); coercion telemetry captured.
 
-Seven read/validate-only tools (none approves/executes/mutates governance): `search_columns`, `get_column_metadata`, `get_governed_grain`, `get_time_anchor`, `get_verified_lineage`, `list_supported_operations`, `validate_draft_formula`. Read-scoped; metadata-only egress; tool results are data not instructions (prompt-injection); versions stamped (schema/grammar/model/prompt); bounded ReAct iterations + token/cost budget (exceed → `technical_failure`); coercion telemetry captured.
-
-## §J Gold gate `[c13]`
-
-`(intent, expected TypedFormulaV1)` pairs. Compare by **canonical structural equality** (`formula_content_hash` after the §D commutative-normalization; ordered slots preserved). The gate reports, per operation: **positive shapes** (≥1 each of SUM/COUNT_*/RATIO/DIFFERENCE), **negative/unsupported** cases (multi-source→UNSUPPORTED, avg→UNSUPPORTED_OPERATION, over-deep filter→INVALID), **critic-miss adversarial** cases, plus **false-resolve rate** and **operand-preservation rate** against pinned thresholds. B-Gate-1-style non-vacuity. Includes a **key-gated real-provider** schema/tool integration test (FakeLLM proves plumbing only).
+## §J Gold gate — pinned v1 thresholds `[c13]`
+Curated `(intent, expected TypedFormulaV1)`. Compare by canonical structural equality (post-§E). **v1 gates (all must hold):** false-resolve rate = **0**; operand-preservation rate = **1.0**; required positive exact matches = **all** curated cases (≥1 each of SUM/COUNT_ROWS/COUNT_NON_NULL/COUNT_DISTINCT/RATIO/DIFFERENCE); unsupported/reject classifications = **1.0** (multi-source→UNSUPPORTED, avg→UNSUPPORTED_OPERATION, over-deep filter→INVALID); blocking-critic recall on curated adversarial cases = **1.0**; technical failures in the clean gold population = **0**. The **real-provider** schema/tool test is an **enablement gate** (key-gated), NOT a normal deterministic unit-test dependency; FakeLLM covers plumbing.
 
 ## §K Testing
-
-Canonicalization stability + hash invariance (capability bump ≠ hash change; grammar/operand/output change = hash change; commutative AND reorder = same hash; ordered-slot swap = different hash); duplicate `expression_id` rejected but shared `LogicalRef` across slots accepted (the ratio example); unknown field / over-limit filter → `INVALID_FORMULA`; multi-source → `UNSUPPORTED_CAPABILITY`; avg → `UNSUPPORTED_OPERATION`; C1 `hash_mismatch`/`fork`/`projection_unavailable` on an operand → `NEEDS_AUTHORITY` (not silent clear); advisory expectation mismatch → `NEEDS_REVIEW`, formula still authoritative; blocking critic finding → `NEEDS_REVIEW`, no auto-RESOLVED; param type-checks against its compared column/literal `[c14]`; multi-call ReAct trace records all `llm_call` ids + ordered steps; trace-write-failure → `incomplete` + `TECHNICAL_FAILURE`; gold gate thresholds per operation. Offline (FakeLLM) except the one key-gated provider test.
+Canonicalization: JCS+NFC stable; capability bump ≠ hash; grammar/operand/output/window/event_time change = hash; associative AND flatten+reorder = same hash; ordered-slot swap ≠ hash; grain-key reorder ≠ hash (order semantic). Schema: unknown field/over-limit filter/predicate-invariant violation → `INVALID_FORMULA`; body discriminator rejects `aggregation=RATIO`; `COUNT_ROWS` requires no operand + a `source_relation`; every ref reachable from `table_ref`. Authority: SUM(amount) resolves via the §C matrix (no false `NEEDS_AUTHORITY` from hint-only unit); DIFFERENCE of incompatible units → `INVALID_FORMULA`; RATIO non-cancelling units → external requirement; C1 `hash_mismatch`/`fork` on a required field → `NEEDS_AUTHORITY`. Additivity: COUNT_DISTINCT → non-additive. Disposition: `unsupported_operation`→`UNSUPPORTED` (not REJECTED); reviewable `NEEDS_REVIEW` returns `candidate_formula`+hash. Critic: blocking finding → no auto-RESOLVED; malformed finding → dropped, non-blocking. Trace: manifest-first; missing terminal event → incomplete; multi-call ReAct records all ids. Gold: thresholds per operation. Offline (FakeLLM) except the key-gated provider test.
 
 ## §L Deliverable boundary
-
-Output: an `AuthoringResult` + (when `RESOLVED`) an authoritative `TypedFormulaV1` + `formula_content_hash` + the `authoring_run_id` trace + gold score. **Not** frozen into `feature_versions` (Child #2), **not** compiled (#3), **not** executed (#5).
+Output = an `AuthoringResult` (+ `candidate_formula`/hash for RESOLVED or reviewable NEEDS_REVIEW) + the `authoring_run_id` trace + gold score. **Not** frozen into `feature_versions` (Child #2), **not** compiled (#3), **not** executed (#5).
