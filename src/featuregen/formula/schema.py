@@ -190,7 +190,7 @@ class FilterPredicate:
 @dataclass(frozen=True, slots=True)
 class FilterBool:
     op: FilterBoolOp
-    children: tuple["FilterNode", ...]
+    children: tuple[FilterNode, ...]
     kind: FilterKind = field(default=FilterKind.BOOL, init=False)
 
 
@@ -646,6 +646,11 @@ def _check_predicate(
         right_type = node.right_literal.type
     else:
         # right_param.name must resolve to a declared ParameterDecl [c9]
+        if not isinstance(node.right_param, ParameterRef):
+            raise SchemaError(
+                f"{path}.right_param: expected a ParameterRef, "
+                f"got {type(node.right_param).__name__}"
+            )
         name = node.right_param.name
         if name not in params:
             raise SchemaError(

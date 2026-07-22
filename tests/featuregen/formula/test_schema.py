@@ -14,7 +14,6 @@ from featuregen.formula.schema import (
     AggregateFunction,
     DecimalPolicy,
     DiffBody,
-    ExpectedOutput,
     FilterBool,
     FilterBoolOp,
     FilterPredicate,
@@ -706,3 +705,10 @@ class TestVersionPins:
     def test_unknown_canonicalization_version_rejected(self):
         with pytest.raises(SchemaError, match="canonicalization_version"):
             validate_semantics(make_proposal(canonicalization_version=-1))
+
+
+class TestSelfReviewHardening:
+    def test_right_param_of_wrong_type_raises_schema_error_not_attribute_error(self):
+        node = eq_pred(right_literal=None, right_param="min_amount")  # raw string, not ParameterRef
+        with pytest.raises(SchemaError, match="ParameterRef"):
+            validate_semantics(proposal_with_filter(node))
