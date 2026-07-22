@@ -74,7 +74,7 @@ want frontend && restart_wait frontend
 # ── 6. verify the running image actually serves the code (not just "pod is up") ─────────────────────
 log "verify"
 kubectl -n "$NS" get pods -o wide
-( kubectl -n "$NS" port-forward svc/backend 8000:8000 >/dev/null 2>&1 & ) ; PF=$!
+kubectl -n "$NS" port-forward svc/backend 8000:8000 >/dev/null 2>&1 & PF=$!
 sleep 3
 HEALTH="$(curl -s -m 5 localhost:8000/health || true)"
 ROUTES="$(curl -s -m 5 localhost:8000/openapi.json | grep -c '/catalog/assets' || echo 0)"
