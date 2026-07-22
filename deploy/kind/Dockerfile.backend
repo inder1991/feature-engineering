@@ -10,7 +10,11 @@ COPY src ./src
 # The `llm` extra pulls the anthropic SDK — a PRODUCTION-only lazy import (CI uses FakeLLM), version-
 # bounded in pyproject — so FEATUREGEN_LLM_PROVIDER=anthropic resolves a client instead of failing
 # closed. Editable so the on-disk migration .sql files are still found at runtime.
-RUN pip install -e ".[llm]"
+# --no-build-isolation reuses the setuptools/wheel installed above instead of re-fetching them in a
+# fresh PEP 517 env (that isolated fetch is what fails on a slow PyPI with a confusing "No matching
+# distribution ... (from versions: none)"). --timeout/--retries make the anthropic + runtime-dep
+# downloads patient on slow-but-working networks.
+RUN pip install --timeout 120 --retries 5 --no-build-isolation -e ".[llm]"
 
 EXPOSE 8000
 CMD ["uvicorn", "--factory", "featuregen.api.app:create_app_from_env", "--host", "0.0.0.0", "--port", "8000"]
