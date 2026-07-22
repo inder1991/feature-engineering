@@ -331,8 +331,56 @@ _SET_OPS = frozenset({FilterPredicateOp.IN, FilterPredicateOp.NOT_IN})
 
 def validate_semantics(p: TypedFormulaProposalV1) -> None:
     """Raise SchemaError on any §A semantic-rule violation; return None if valid."""
+    for i, key in enumerate(p.grain.keys):
+        _require_column_ref(key, f"grain.keys[{i}]")
     for path, expr in _body_expressions(p.body):
         _check_expression(path, expr)
+
+
+# ---- logical_ref parsing ("source::schema.table[.column]") ----
+
+def _split_logical_ref(ref: LogicalRef, path: str) -> tuple[str, list[str]]:
+    """Split a canonical logical_ref into (source, dotted object parts)."""
+    if not isinstance(ref, str) or "::" not in ref:
+        raise SchemaError(f"{path}: logical_ref {ref!r} must be 'source::schema.table[.column]'")
+    source, _, rest = ref.partition("::")
+    if not source or not rest or "::" in rest:
+        raise SchemaError(f"{path}: logical_ref {ref!r} must be 'source::schema.table[.column]'")
+    parts = rest.split(".")
+    if len(parts) not in (2, 3) or any(not part for part in parts):
+        raise SchemaError(
+            f"{path}: logical_ref {ref!r} must have non-empty "
+            "'schema.table' or 'schema.table.column' after '::'"
+        )
+    return source, parts
+
+
+def _require_table_ref(ref: LogicalRef, path: str) -> None:
+    _, parts = _split_logical_ref(ref, path)
+    if len(parts) != 2:
+        raise SchemaError(f"{path}: {ref!r} must be a table logical_ref (no .column)")
+
+
+def _require_column_ref(ref: LogicalRef, path: str) -> str:
+    """Validate a column logical_ref; return its table logical_ref prefix."""
+    source, parts = _split_logical_ref(ref, path)
+    if len(parts) != 3:
+        raise SchemaError(f"{path}: {ref!r} must be a column logical_ref ('schema.table.column')")
+    return f"{source}::{parts[0]}.{parts[1]}"
+
+
+def _require_contained_column(ref: LogicalRef, path: str, table_ref: LogicalRef) -> None:
+    """Same-table containment: the column must live in the expression's table.
+
+    Pure same-table only — cross-table reachability (joins over VERIFIED
+    bridges) is explicitly DEFERRED to governed planning (Child 3).
+    """
+    column_table = _require_column_ref(ref, path)
+    if column_table != table_ref:
+        raise SchemaError(
+            f"{path}: {ref!r} is not contained in the expression's "
+            f"source_relation.table_ref {table_ref!r}"
+        )
 
 
 def _body_expressions(
@@ -349,8 +397,17 @@ def _body_expressions(
 
 
 def _check_expression(path: str, expr: AggregateExpression) -> None:
+    _require_table_ref(expr.source_relation.table_ref, f"{path}.source_relation.table_ref")
+    table_ref = expr.source_relation.table_ref
+    if expr.operand is not None:
+        _require_contained_column(expr.operand, f"{path}.operand", table_ref)
+    _require_contained_column(
+        expr.window.event_time_ref, f"{path}.window.event_time_ref", table_ref
+    )
     if expr.filter is not None:
-        predicate_count = _check_filter_node(expr.filter, f"{path}.filter", depth=1)
+        predicate_count = _check_filter_node(
+            expr.filter, f"{path}.filter", depth=1, table_ref=table_ref
+        )
         if predicate_count > MAX_PREDICATES:
             raise SchemaError(
                 f"{path}.filter: {predicate_count} predicates exceeds "
@@ -358,7 +415,7 @@ def _check_expression(path: str, expr: AggregateExpression) -> None:
             )
 
 
-def _check_filter_node(node: FilterNode, path: str, depth: int) -> int:
+def _check_filter_node(node: FilterNode, path: str, depth: int, table_ref: LogicalRef) -> int:
     """Enforce the [c9] predicate/bool invariants; return the predicate count."""
     if depth > MAX_FILTER_DEPTH:
         raise SchemaError(
@@ -366,6 +423,7 @@ def _check_filter_node(node: FilterNode, path: str, depth: int) -> int:
         )
     if isinstance(node, FilterPredicate):
         _check_predicate(node, path)
+        _require_contained_column(node.left, f"{path}.left", table_ref)
         return 1
     if isinstance(node, FilterBool):
         if node.op is FilterBoolOp.NOT:
@@ -379,7 +437,7 @@ def _check_filter_node(node: FilterNode, path: str, depth: int) -> int:
                 f"got {len(node.children)}"
             )
         return sum(
-            _check_filter_node(child, f"{path}.children[{i}]", depth + 1)
+            _check_filter_node(child, f"{path}.children[{i}]", depth + 1, table_ref)
             for i, child in enumerate(node.children)
         )
     raise SchemaError(

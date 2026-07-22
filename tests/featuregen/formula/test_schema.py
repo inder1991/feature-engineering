@@ -364,3 +364,86 @@ class TestFilterShapeLimits:
         )
         with pytest.raises(SchemaError, match="MAX_PREDICATES"):
             validate_semantics(proposal_with_filter(node))
+
+
+# ------------------------------------------- ref arity + same-table containment
+
+class TestRefArity:
+    def test_table_ref_with_column_rejected(self):
+        p = make_proposal(
+            body=UnaryBody(expr=make_expr(source_relation=SourceRelation(table_ref=AMT)))
+        )
+        with pytest.raises(SchemaError, match="table"):
+            validate_semantics(p)
+
+    def test_operand_ref_without_column_rejected(self):
+        p = make_proposal(body=UnaryBody(expr=make_expr(operand=TXN_TABLE)))
+        with pytest.raises(SchemaError, match="column"):
+            validate_semantics(p)
+
+    def test_ref_without_source_separator_rejected(self):
+        p = make_proposal(body=UnaryBody(expr=make_expr(operand="bank.transactions.amount")))
+        with pytest.raises(SchemaError, match="::"):
+            validate_semantics(p)
+
+    def test_ref_with_empty_segment_rejected(self):
+        p = make_proposal(body=UnaryBody(expr=make_expr(operand="core::bank..amount")))
+        with pytest.raises(SchemaError):
+            validate_semantics(p)
+
+    def test_filter_left_must_be_column_ref(self):
+        with pytest.raises(SchemaError, match="column"):
+            validate_semantics(proposal_with_filter(eq_pred(left=TXN_TABLE)))
+
+    def test_event_time_ref_must_be_column_ref(self):
+        p = make_proposal(
+            body=UnaryBody(expr=make_expr(window=make_window(event_time_ref=TXN_TABLE)))
+        )
+        with pytest.raises(SchemaError, match="column"):
+            validate_semantics(p)
+
+    def test_grain_key_must_be_column_ref(self):
+        p = make_proposal(grain=Grain(entity="customer", keys=(TXN_TABLE,)))
+        with pytest.raises(SchemaError, match="column"):
+            validate_semantics(p)
+
+
+class TestSameTableContainment:
+    # Cross-table reachability is DEFERRED to governed planning (Child 3);
+    # Child-1 enforces pure same-table containment only.
+    def test_operand_from_other_table_rejected(self):
+        p = make_proposal(body=UnaryBody(expr=make_expr(operand=OTHER_TABLE_COL)))
+        with pytest.raises(SchemaError, match="source_relation"):
+            validate_semantics(p)
+
+    def test_filter_left_from_other_table_rejected(self):
+        with pytest.raises(SchemaError, match="source_relation"):
+            validate_semantics(proposal_with_filter(eq_pred(left=OTHER_TABLE_COL)))
+
+    def test_nested_filter_left_from_other_table_rejected(self):
+        node = FilterBool(
+            op=FilterBoolOp.AND,
+            children=(eq_pred(), FilterBool(op=FilterBoolOp.NOT, children=(eq_pred(left=OTHER_TABLE_COL),))),
+        )
+        with pytest.raises(SchemaError, match="source_relation"):
+            validate_semantics(proposal_with_filter(node))
+
+    def test_event_time_ref_from_other_table_rejected(self):
+        p = make_proposal(
+            body=UnaryBody(
+                expr=make_expr(window=make_window(event_time_ref=OTHER_TABLE_COL))
+            )
+        )
+        with pytest.raises(SchemaError, match="source_relation"):
+            validate_semantics(p)
+
+    def test_each_ratio_expression_checked_independently(self):
+        body = RatioBody(
+            numerator=make_expr(),
+            denominator=make_expr(
+                aggregation=AggregateFunction.COUNT_NON_NULL, operand=OTHER_TABLE_COL
+            ),
+            zero_denominator=s.ZeroDenominator.NULL,
+        )
+        with pytest.raises(SchemaError, match="body.denominator"):
+            validate_semantics(make_proposal(body=body))
