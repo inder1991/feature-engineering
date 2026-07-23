@@ -8,47 +8,9 @@ additivity).
 """
 from __future__ import annotations
 
-import pytest
-
 from datetime import UTC, datetime
 
-from featuregen.formula.operations import to_path_aggregation
-from featuregen.formula.output_authority import (
-    ExprFacts,
-    ExternalRequirement,
-    InvalidOutput,
-    NeedsAuthority,
-    PartitionProof,
-    formula_additivity,
-    resolve_formula_output_policy,
-)
-from featuregen.formula.schema import (
-    AdditivityClass,
-    AggregateExpression,
-    AggregateFunction,
-    DecimalPolicy,
-    DiffBody,
-    ExpectedOutput,
-    FormulaOutputPolicyV1,
-    OverflowBehavior,
-    RoundingMode,
-    SourceRelation,
-    TypedFormulaProposalV1,
-    UnaryBody,
-)
-from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-from featuregen.overlay.field_authority import InfluenceTier
-from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
-from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.field_resolution import resolve_and_project
-from featuregen.overlay.upload.graph import build_graph
-from featuregen.overlay.upload.object_ref import normalize_ref
-from featuregen.overlay.upload.operational_facts import (
-    OperationalValue,
-    read_operational_value,
-)
-from featuregen.overlay.upload.planner.multisource_contracts import PathAggregation
-
+import pytest
 from tests.featuregen.formula.c1_fixtures import (
     seed_fork,
     seed_hash_mismatch,
@@ -65,6 +27,34 @@ from tests.featuregen.formula.factories import (
     sum_expression,
     trailing_90d_window,
 )
+
+from featuregen.formula.operations import to_path_aggregation
+from featuregen.formula.output_authority import (
+    ExprFacts,
+    ExternalRequirement,
+    InvalidOutput,
+    NeedsAuthority,
+    PartitionProof,
+    formula_additivity,
+    resolve_formula_output_policy,
+)
+from featuregen.formula.schema import (
+    AdditivityClass,
+    AggregateExpression,
+    AggregateFunction,
+    DiffBody,
+    ExpectedOutput,
+    FormulaOutputPolicyV1,
+    SourceRelation,
+    TypedFormulaProposalV1,
+    UnaryBody,
+)
+from featuregen.overlay.field_authority import InfluenceTier
+from featuregen.overlay.upload.operational_facts import (
+    OperationalValue,
+    read_operational_value,
+)
+from featuregen.overlay.upload.planner.multisource_contracts import PathAggregation
 
 _NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -251,4 +241,37 @@ def test_difference_compatible_units_resolves_to_that_unit(db):
 
     assert isinstance(result, FormulaOutputPolicyV1)
     assert result.unit == "dollars"
+    assert result.output_additivity is AdditivityClass.NON_ADDITIVE
+
+
+# ── §C — RATIO requires units/currency to CANCEL ───────────────────────────────────────────────────
+def test_ratio_non_cancelling_units_needs_external_provisioning(db):
+    """RATIO whose numerator/denominator units do NOT cancel (dollars per count) cannot be resolved to
+    a dimensionless value from governed facts alone (§C) → a TYPED external requirement, not an
+    indiscriminate NEEDS_AUTHORITY."""
+    num_unit = _seed_unit_hint(db, "t6_ratio_num", "dollars")
+    den_unit = _seed_unit_hint(db, "t6_ratio_den", "count")
+    facts = {
+        "body.numerator": ExprFacts(unit=num_unit),
+        "body.denominator": ExprFacts(unit=den_unit),
+    }
+    result = resolve_formula_output_policy(
+        _proposal(ratio_of_sums()), per_expr_facts=facts, grain_facts={}, now=_NOW)
+
+    assert result == ExternalRequirement("UNIT_PROVISIONING_REQUIRED")
+
+
+def test_ratio_cancelling_units_resolves_dimensionless(db):
+    """RATIO of two SAME-unit operands cancels to a DIMENSIONLESS value (§C)."""
+    num_unit = _seed_unit_hint(db, "t6_ratio2_num", "dollars")
+    den_unit = _seed_unit_hint(db, "t6_ratio2_den", "dollars")
+    facts = {
+        "body.numerator": ExprFacts(unit=num_unit),
+        "body.denominator": ExprFacts(unit=den_unit),
+    }
+    result = resolve_formula_output_policy(
+        _proposal(ratio_of_sums()), per_expr_facts=facts, grain_facts={}, now=_NOW)
+
+    assert isinstance(result, FormulaOutputPolicyV1)
+    assert result.unit is None                             # cancelled → dimensionless
     assert result.output_additivity is AdditivityClass.NON_ADDITIVE

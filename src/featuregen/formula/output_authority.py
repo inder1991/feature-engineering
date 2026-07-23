@@ -344,5 +344,25 @@ def _resolve_difference(
         external_type_required=external_type_required)
 
 
-def _resolve_ratio(body: RatioBody, per_expr_facts):
-    raise NotImplementedError  # implemented in the RATIO cycle
+def _resolve_ratio(
+    body: RatioBody, per_expr_facts
+) -> FormulaOutputPolicyV1 | NeedsAuthority | ExternalRequirement | InvalidOutput:
+    """§C RATIO — numeric both operands + units/currency CANCEL → dimensionless. A mismatch that
+    cannot cancel is a TYPED external requirement (``UNIT_PROVISIONING_REQUIRED`` /
+    ``CURRENCY_PROVISIONING_REQUIRED``), not an indiscriminate NEEDS_AUTHORITY."""
+    num = _expr_facts(per_expr_facts, "body.numerator")
+    den = _expr_facts(per_expr_facts, "body.denominator")
+    needs = _needs_authority(
+        [num.additivity, num.output_type, den.additivity, den.output_type])
+    if needs is not None:
+        return needs
+
+    if isinstance(_same_dimension(num.unit, den.unit), _Incompatible):
+        return ExternalRequirement("UNIT_PROVISIONING_REQUIRED")
+    if isinstance(_same_dimension(num.currency, den.currency), _Incompatible):
+        return ExternalRequirement("CURRENCY_PROVISIONING_REQUIRED")
+
+    additivity = formula_additivity(body, per_expr_facts=per_expr_facts, partition_proof=_NO_PROOF)
+    return FormulaOutputPolicyV1(
+        output_type=_RATIO_OUTPUT_TYPE, unit=None, currency=None, output_additivity=additivity,
+        external_type_required=False)
