@@ -158,3 +158,33 @@ def seed_hash_mismatch(db, *, source: str = "c1fx_hash_mismatch", table: str = "
         "UPDATE graph_node SET additivity = %s WHERE catalog_source = %s AND object_ref = %s",
         ["tampered_value", source, col.object_ref])
     return SeededColumn(col.logical_ref, "additivity", "hash_mismatch", source, table, column)
+
+
+# ── projection_unavailable (GATE 3): the load-bearing overlay projection is DEGRADED ──────────────
+def seed_projection_unavailable(db, *, source: str = "c1fx_proj_unavailable",
+                                table: str = "accounts", column: str = "balance") -> SeededColumn:
+    """``status="projection_unavailable"``: a CLEAN resolved column (same seeding as
+    :func:`seed_resolved`), then the overlay projection is marked DEGRADED (the marker the store
+    runner's ``_mark_degraded`` writes) — GATE 3 refuses to trust ANY downstream read.
+
+    GLOBAL: GATE 3 runs before any per-column read, so while the degradation marker is present
+    EVERY ``read_operational_value`` in this database returns ``projection_unavailable``. Seed this
+    fixture LAST, or call :func:`clear_projection_unavailable` to restore the other fixtures'
+    readability (this fixture's own column then reads ``resolved`` — its seeding is clean)."""
+    col = seed_resolved(db, source=source, table=table, column=column)
+    db.execute(
+        "INSERT INTO projection_degraded "
+        "(projection_name, aggregate, aggregate_id, reason, poison_seq) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        ["overlay", "overlay_fact", "c1-fixture-poison", "poison", 1])
+    return SeededColumn(
+        col.logical_ref, "additivity", "projection_unavailable", source, table, column)
+
+
+def clear_projection_unavailable(db) -> None:
+    """Remove :func:`seed_projection_unavailable`'s degradation marker: GATE 3 keys off LIVE
+    projection health, so every fixture column becomes readable again (the degraded fixture's own
+    column reads ``resolved``)."""
+    db.execute(
+        "DELETE FROM projection_degraded WHERE projection_name = %s AND aggregate_id = %s",
+        ["overlay", "c1-fixture-poison"])

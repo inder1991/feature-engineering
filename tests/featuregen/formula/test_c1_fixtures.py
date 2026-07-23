@@ -11,10 +11,12 @@ from __future__ import annotations
 from featuregen.overlay.upload.operational_facts import read_operational_value
 
 from tests.featuregen.formula.c1_fixtures import (
+    clear_projection_unavailable,
     seed_conflict,
     seed_fork,
     seed_hash_mismatch,
     seed_no_value,
+    seed_projection_unavailable,
     seed_resolved,
 )
 
@@ -67,3 +69,17 @@ def test_seed_hash_mismatch_reads_hash_mismatch(db):
     assert ov.conflict_status == "value_hash_mismatch"
     assert ov.value is None                           # the tampered value is never served
     assert ov.decision_event_id is not None           # audit ref carried, no authority served
+
+
+# ── projection_unavailable (GATE 3): the load-bearing overlay projection is degraded ──────────────
+def test_seed_projection_unavailable_reads_projection_unavailable(db):
+    col = seed_projection_unavailable(db)
+    ov = _read(db, col)
+    assert ov.status == "projection_unavailable" == col.expected_status
+    assert "DEGRADED" in ov.conflict_status
+    assert ov.value is None and ov.producer is None   # nothing trusted on a degraded projection
+
+    # Clearing the degradation restores the underlying clean resolved column — the gate keyed off
+    # LIVE projection health, and the fixture's seeding really was the clean governed path.
+    clear_projection_unavailable(db)
+    assert _read(db, col).status == "resolved"
