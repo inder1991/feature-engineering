@@ -9,9 +9,11 @@ from __future__ import annotations
 import pytest
 from tests.featuregen.formula import factories as f
 
+from featuregen.formula.canonical import formula_content_hash
 from featuregen.formula.result import (
     DISPOSITION_POLICY_VERSION,
     AuthoringAxes,
+    IncoherentResultError,
     derive_disposition,
 )
 from featuregen.formula.schema import TypedFormulaProposalV1
@@ -70,6 +72,65 @@ def test_unsupported_capability_folds_to_unsupported_and_carries_the_reason():
     assert result.capability_reason == "cross_source_relation"
     assert result.candidate_formula is None
     assert result.candidate_formula_hash is None
+
+
+# ---- RESOLVED + reviewable NEEDS_REVIEW (a real TypedFormulaV1 exists) ----
+
+
+def test_all_ok_folds_to_resolved_with_formula_and_computed_hash():
+    formula = f.base_formula()
+    result = derive_disposition(_axes(), authoring_run_id=RUN_ID, candidate_formula=formula)
+    assert result.authoring_disposition == "RESOLVED"
+    assert result.candidate_formula is formula
+    assert result.candidate_formula_hash == formula_content_hash(formula)
+    assert result.candidate_proposal is None
+    assert result.authoring_run_id == RUN_ID
+
+
+def test_blocking_critic_with_resolved_output_is_reviewable_and_carries_the_formula():
+    formula = f.base_formula()
+    result = derive_disposition(
+        _axes(critic_status="blocking"),
+        authoring_run_id=RUN_ID,
+        candidate_formula=formula,
+        critic_findings_hash="c1d2e3",
+    )
+    assert result.authoring_disposition == "NEEDS_REVIEW"
+    assert result.candidate_formula is formula
+    assert result.candidate_formula_hash == formula_content_hash(formula)
+    assert result.critic_findings_hash == "c1d2e3"
+    assert result.candidate_proposal is None
+    assert result.authoring_run_id == RUN_ID
+
+
+def test_expectation_mismatch_with_resolved_output_is_reviewable_with_the_formula():
+    formula = f.base_formula()
+    result = derive_disposition(
+        _axes(expectation_status="mismatch"), authoring_run_id=RUN_ID, candidate_formula=formula
+    )
+    assert result.authoring_disposition == "NEEDS_REVIEW"
+    assert result.candidate_formula is formula
+    assert result.candidate_formula_hash == formula_content_hash(formula)
+
+
+def test_resolved_without_a_candidate_formula_raises_incoherent():
+    with pytest.raises(IncoherentResultError, match="candidate_formula"):
+        derive_disposition(_axes(), authoring_run_id=RUN_ID)
+
+
+def test_resolved_with_a_candidate_proposal_raises_incoherent():
+    with pytest.raises(IncoherentResultError, match="candidate_proposal"):
+        derive_disposition(
+            _axes(),
+            authoring_run_id=RUN_ID,
+            candidate_formula=f.base_formula(),
+            candidate_proposal=_proposal(),
+        )
+
+
+def test_reviewable_needs_review_without_a_formula_raises_incoherent():
+    with pytest.raises(IncoherentResultError, match="candidate_formula"):
+        derive_disposition(_axes(critic_status="blocking"), authoring_run_id=RUN_ID)
 
 
 def test_unsupported_result_echoes_the_axes_it_was_folded_from():

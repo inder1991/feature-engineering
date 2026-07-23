@@ -182,6 +182,20 @@ def derive_disposition(
                 f"{disposition} carries no candidate_formula — an authoritative "
                 "TypedFormulaV1 cannot accompany a non-authored outcome"
             )
+    elif disposition == "RESOLVED" or axes.output_status not in _UNRESOLVED_OUTPUT:
+        # RESOLVED, or a reviewable NEEDS_REVIEW whose output DID resolve (blocking
+        # critic / expectation mismatch): a real TypedFormulaV1 is the ONLY artifact.
+        if candidate_formula is None:
+            raise IncoherentResultError(
+                f"{disposition} with a resolved output requires the authored "
+                "candidate_formula — a result claiming resolution without a "
+                "TypedFormulaV1 is incoherent"
+            )
+        if candidate_proposal is not None:
+            raise IncoherentResultError(
+                f"{disposition} with a resolved output carries the TypedFormulaV1 "
+                "only — candidate_proposal must be None"
+            )
 
     return AuthoringResult(
         structural_status=axes.structural_status,
