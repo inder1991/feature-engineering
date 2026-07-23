@@ -298,6 +298,56 @@ def build_critic_metadata(conn, intent: AuthoringIntent, proposal: TypedFormulaP
     }
 
 
+# ---- the critic call ---------------------------------------------------------------------------
+
+
+def _register_critic_schema(conn) -> None:
+    """Idempotently register the findings output schema so the audited seam can resolve and
+    validate it (its self-registration fallback covers only the enrichment schemas)."""
+    DocumentSchemaRegistry(conn).register_schema(
+        CRITIC_SCHEMA_ID, CRITIC_SCHEMA_VERSION, CRITIC_FINDINGS_V1_SCHEMA, _SCHEMA_OWNER)
+
+
+def _parse_findings(output: dict | None) -> tuple[list[CriticFinding], bool, list[str]]:
+    """``(kept findings, is_technical_failure, notes)`` from the critic's validated output.
+
+    FAIL-CLOSED: ``output=None`` (egress-blocked / provider-failed / repair-exhausted) or any
+    STRUCTURAL malformation — no list-valued ``findings``, a non-object entry, a missing/non-string
+    code — is a technical failure with NO findings kept (never a clean critic). Only two things are
+    tolerantly dropped, each with a note: a well-formed finding whose code is outside the closed
+    set, and a duplicate ``(code, target)``. Severity always comes from ``_SEVERITY`` — an emitted
+    severity is ignored, not even read."""
+    if output is None:
+        return [], True, []                     # already audited by the seam; nothing to parse
+    raw = output.get("findings") if isinstance(output, Mapping) else None
+    if not isinstance(raw, list):
+        return [], True, ["malformed critic response: no list-valued 'findings'"]
+    kept: list[CriticFinding] = []
+    seen: set[tuple[CriticFindingCode, str | None]] = set()
+    notes: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("code"), str):
+            return [], True, [f"malformed critic finding at index {index}"]
+        try:
+            code = CriticFindingCode(entry["code"])
+        except ValueError:
+            notes.append(f"dropped finding with unknown code {entry['code']!r} "
+                         "(outside the closed set)")
+            continue
+        operand = entry.get("operand")
+        operand = operand if isinstance(operand, str) and operand else None
+        detail = entry.get("detail")
+        detail = detail if isinstance(detail, str) and detail else None
+        target = (code, operand)
+        if target in seen:
+            notes.append(f"dropped duplicate finding {code.value} for target {operand!r}")
+            continue
+        seen.add(target)
+        kept.append(CriticFinding(code=code, severity=_SEVERITY[code],
+                                  operand=operand, detail=detail))
+    return kept, False, notes
+
+
 def critique(
     conn,
     intent: AuthoringIntent,
@@ -308,6 +358,23 @@ def critique(
     actor: IdentityEnvelope | None = None,
     authoring_run_id: str,
 ) -> tuple[list[CriticFinding], str, bool]:
-    """Run the independent critic once; return ``(findings, critic_findings_hash,
-    is_technical_failure)``."""
-    raise NotImplementedError
+    """Run the independent critic ONCE over ``proposal`` against ``intent``.
+
+    Returns ``(findings, critic_findings_hash, is_technical_failure)``. The single provider call
+    goes through the Task-3 audited seam under ``authoring_run_id`` with the independently-built
+    context (see ``build_critic_metadata`` — never the author's reasoning or tool trace). A
+    malformed/unparseable response or a ``None`` output is ``([], hash-over-[], True)`` — a
+    technical failure, NEVER a clean critic. The proposal is never mutated; the hash is computed
+    on every path so Task 12 always has a value."""
+    _register_critic_schema(conn)
+    result = audited_formula_call(
+        conn, client, authoring_run_id=authoring_run_id, task=CRITIC_TASK,
+        prompt_id=CRITIC_PROMPT_ID, schema_id=CRITIC_SCHEMA_ID,
+        instruction=CRITIC_INSTRUCTION,
+        catalog_metadata=build_critic_metadata(conn, intent, proposal, roles=tuple(roles)),
+        actor=actor, schema_version=CRITIC_SCHEMA_VERSION)
+    findings, is_technical_failure, notes = _parse_findings(result.output)
+    for note in notes:
+        logger.warning("critic (run %s, call %s): %s",
+                       authoring_run_id, result.llm_call_ref, note)
+    return findings, critic_findings_hash(findings), is_technical_failure
