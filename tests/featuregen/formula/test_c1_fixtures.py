@@ -13,6 +13,7 @@ from featuregen.overlay.upload.operational_facts import read_operational_value
 from tests.featuregen.formula.c1_fixtures import (
     seed_conflict,
     seed_fork,
+    seed_hash_mismatch,
     seed_no_value,
     seed_resolved,
 )
@@ -56,3 +57,13 @@ def test_seed_fork_reads_fork(db):
     assert ov.status == "fork" == col.expected_status
     assert ov.conflict_status == "forked_decision_head"
     assert ov.value is None and ov.producer is None   # fail-closed: no operational value served
+
+
+# ── hash_mismatch (GATE 2): the flat value tampered out from under the decision ───────────────────
+def test_seed_hash_mismatch_reads_hash_mismatch(db):
+    col = seed_hash_mismatch(db)
+    ov = _read(db, col)
+    assert ov.status == "hash_mismatch" == col.expected_status
+    assert ov.conflict_status == "value_hash_mismatch"
+    assert ov.value is None                           # the tampered value is never served
+    assert ov.decision_event_id is not None           # audit ref carried, no authority served

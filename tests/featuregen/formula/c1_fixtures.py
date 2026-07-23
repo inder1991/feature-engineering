@@ -144,3 +144,17 @@ def seed_fork(db, *, source: str = "c1fx_fork", table: str = "accounts",
     _record_resolved_decision(db, ref, load_bearing="non_additive", now=_T1)
     _record_resolved_decision(db, ref, load_bearing="additive", now=_T1)
     return SeededColumn(ref, "additivity", "fork", source, table, column)
+
+
+# ── hash_mismatch (GATE 2): the flat display value tampered out from under the decision ───────────
+def seed_hash_mismatch(db, *, source: str = "c1fx_hash_mismatch", table: str = "accounts",
+                       column: str = "balance") -> SeededColumn:
+    """``status="hash_mismatch"``: a CLEAN resolved ``additivity`` decision (same seeding as
+    :func:`seed_resolved`), then the flat ``graph_node`` column is tampered out from under it —
+    ``canonical_hash(value)`` no longer matches the decision's ``load_bearing_value_hash``, so
+    GATE 2 fails closed with ``value_hash_mismatch``."""
+    col = seed_resolved(db, source=source, table=table, column=column)
+    db.execute(
+        "UPDATE graph_node SET additivity = %s WHERE catalog_source = %s AND object_ref = %s",
+        ["tampered_value", source, col.object_ref])
+    return SeededColumn(col.logical_ref, "additivity", "hash_mismatch", source, table, column)
