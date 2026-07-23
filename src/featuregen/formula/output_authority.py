@@ -25,11 +25,12 @@ from datetime import datetime
 
 from featuregen.formula.schema import (
     AdditivityClass,
-    AggregateExpression,
     AggregateFunction,
     DiffBody,
     FormulaBody,
+    FormulaOutputPolicyV1,
     RatioBody,
+    TypedFormulaProposalV1,
     UnaryBody,
 )
 from featuregen.overlay.upload.operational_facts import OperationalValue
@@ -184,3 +185,99 @@ def formula_additivity(
             return AdditivityClass.SEMI_ADDITIVE
         return AdditivityClass.NON_ADDITIVE
     return AdditivityClass.NON_ADDITIVE  # pragma: no cover - AggregateFunction is closed
+
+
+# ── §C output-authority resolver over C1 governed facts ─────────────────────────────────────────────
+
+# No partition proof is available at resolve time, so the resolved additivity is the CONSERVATIVE
+# (unproven) class; a caller with a real proof calls :func:`formula_additivity` directly.
+_NO_PROOF = PartitionProof()
+
+_COUNT_FUNCTIONS = frozenset(
+    {AggregateFunction.COUNT_ROWS, AggregateFunction.COUNT_NON_NULL, AggregateFunction.COUNT_DISTINCT}
+)
+
+
+def _is_numeric_logical_type(value: object | None) -> bool:
+    base = (str(value) if value is not None else "").lower().split("(")[0].strip()
+    return base in _NUMERIC_LOGICAL_TYPES
+
+
+def _numeric_output_type(ov: OperationalValue | None) -> tuple[str, bool]:
+    """``(output_type, external_type_required)`` for an operand's C1 type read (§C SUM/DIFFERENCE).
+
+    A GOVERNED numeric type (``status="resolved"``) clears external validation; an
+    ungoverned-but-numeric value still yields the type but must be externally type-validated (matching
+    ``b_output_policy``'s conservative degrade); a non-numeric / absent type → ``"unknown"`` +
+    ``external_type_required=True`` (never a silent numeric claim)."""
+    value = ov.value if ov is not None else None
+    governed = ov is not None and ov.status == _RESOLVED
+    if value is not None and _is_numeric_logical_type(value):
+        return str(value), not governed
+    return _UNKNOWN_TYPE, True
+
+
+def _hint_value(ov: OperationalValue | None) -> str | None:
+    """The carried HINT value (unit/currency). HINTS never force NEEDS_AUTHORITY (§C); a fail-closed
+    read simply carries ``None``."""
+    if ov is None or ov.value is None:
+        return None
+    return str(ov.value)
+
+
+def resolve_formula_output_policy(
+    proposal: TypedFormulaProposalV1,
+    *,
+    per_expr_facts,
+    grain_facts,
+    now: datetime,
+) -> FormulaOutputPolicyV1 | NeedsAuthority | ExternalRequirement | InvalidOutput:
+    """Resolve the AUTHORITATIVE output policy from the C1 governed facts in ``per_expr_facts`` (§C).
+
+    ``per_expr_facts`` maps each expression PATH (``body.expr`` / ``body.numerator`` / … ) to its
+    already-read :class:`ExprFacts`; ``grain_facts`` maps each grain-key ``logical_ref`` to its C1
+    read. Returns a :class:`FormulaOutputPolicyV1` on success, else the typed non-success arm
+    (:class:`NeedsAuthority` / :class:`ExternalRequirement` / :class:`InvalidOutput`). The proposal's
+    advisory ``expected_output`` is NEVER read — the policy is a pure function of the governed facts
+    and the body's operation."""
+    del now  # no freshness read here (the C1 facts were already read under their own gates)
+    body: FormulaBody = proposal.body
+    if isinstance(body, UnaryBody):
+        return _resolve_unary(body, per_expr_facts, grain_facts)
+    if isinstance(body, DiffBody):
+        return _resolve_difference(body, per_expr_facts)
+    if isinstance(body, RatioBody):
+        return _resolve_ratio(body, per_expr_facts)
+    return InvalidOutput("unknown_body")  # pragma: no cover - FormulaBody is a closed union
+
+
+def _resolve_unary(
+    body: UnaryBody, per_expr_facts, grain_facts
+) -> FormulaOutputPolicyV1 | NeedsAuthority | ExternalRequirement | InvalidOutput:
+    agg = body.expr.aggregation
+    facts = _expr_facts(per_expr_facts, "body.expr")
+    additivity = formula_additivity(body, per_expr_facts=per_expr_facts, partition_proof=_NO_PROOF)
+
+    if agg in _COUNT_FUNCTIONS:
+        # §C — COUNT_* are DIMENSIONLESS. COUNT_ROWS also needs the grain to be readable.
+        return FormulaOutputPolicyV1(
+            output_type=_COUNT_OUTPUT_TYPE, unit=None, currency=None,
+            output_additivity=additivity, external_type_required=False)
+
+    if agg is AggregateFunction.SUM:
+        # §C — SUM: numeric type + additivity; unit/currency are HINTS (carried, never blocking).
+        output_type, external_type_required = _numeric_output_type(facts.output_type)
+        return FormulaOutputPolicyV1(
+            output_type=output_type, unit=_hint_value(facts.unit),
+            currency=_hint_value(facts.currency), output_additivity=additivity,
+            external_type_required=external_type_required)
+
+    return InvalidOutput("unsupported_aggregation")  # pragma: no cover - AggregateFunction is closed
+
+
+def _resolve_difference(body: DiffBody, per_expr_facts):
+    raise NotImplementedError  # implemented in the DIFFERENCE cycle
+
+
+def _resolve_ratio(body: RatioBody, per_expr_facts):
+    raise NotImplementedError  # implemented in the RATIO cycle

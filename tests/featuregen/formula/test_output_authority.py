@@ -10,34 +10,85 @@ from __future__ import annotations
 
 import pytest
 
+from datetime import UTC, datetime
+
 from featuregen.formula.operations import to_path_aggregation
 from featuregen.formula.output_authority import (
     ExprFacts,
+    ExternalRequirement,
+    InvalidOutput,
+    NeedsAuthority,
     PartitionProof,
     formula_additivity,
+    resolve_formula_output_policy,
 )
 from featuregen.formula.schema import (
     AdditivityClass,
     AggregateExpression,
     AggregateFunction,
+    DecimalPolicy,
     DiffBody,
+    ExpectedOutput,
+    FormulaOutputPolicyV1,
+    OverflowBehavior,
+    RoundingMode,
     SourceRelation,
+    TypedFormulaProposalV1,
     UnaryBody,
 )
+from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_authority import InfluenceTier
+from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.field_resolution import resolve_and_project
+from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.operational_facts import (
     OperationalValue,
     read_operational_value,
 )
 from featuregen.overlay.upload.planner.multisource_contracts import PathAggregation
 
+from tests.featuregen.formula.c1_fixtures import (
+    seed_fork,
+    seed_hash_mismatch,
+    seed_not_operational,
+    seed_projection_unavailable,
+    seed_resolved,
+)
 from tests.featuregen.formula.factories import (
     AMOUNT_REF,
     TABLE_REF,
+    customer_grain,
+    default_decimal,
     ratio_of_sums,
     sum_expression,
     trailing_90d_window,
 )
+
+_NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+
+def _proposal(body, *, expected_output: ExpectedOutput | None = None) -> TypedFormulaProposalV1:
+    return TypedFormulaProposalV1(
+        formula_schema_version=1, operation_grammar_version=1, canonicalization_version=1,
+        grain=customer_grain(), body=body, parameters=(), decimal=default_decimal(),
+        expected_output=expected_output)
+
+
+def _seed_unit_hint(db, source: str, unit_value: str) -> OperationalValue:
+    """A REAL C1 HINT read of ``unit`` = ``unit_value`` (status ``not_operational``, value carried):
+    the Task-5 ``seed_not_operational`` gives the live-hint decision; the flat ``unit`` column is then
+    populated the way ingest writes hint metadata (the C1 read surfaces the flat value)."""
+    col = seed_not_operational(db, source=source)
+    db.execute(
+        "UPDATE graph_node SET unit = %s WHERE catalog_source = %s AND object_ref = %s",
+        [unit_value, col.source, col.object_ref])
+    return read_operational_value(db, col.logical_ref, "unit")
+
+
+def _read(db, col, field: str) -> OperationalValue:
+    return read_operational_value(db, col.logical_ref, field)
 
 
 # ── small builders ────────────────────────────────────────────────────────────────────────────────
@@ -121,3 +172,27 @@ def test_sum_carries_governed_additive_input_with_a_path_proof():
 )
 def test_to_path_aggregation_maps_the_supported_vocabulary(fn, expected):
     assert to_path_aggregation(fn) is expected
+
+
+# ── §C — SUM resolves from governed facts; a HINT-only unit never forces NEEDS_AUTHORITY ───────────
+def test_sum_resolves_without_demanding_hint_only_unit(db):
+    """SUM(amount): unit is a C1 HINT (``not_operational``), so the resolver must NOT block on it;
+    output_type comes from the operand's governed facts, and the advisory ``expected_output`` (which
+    here deliberately CONTRADICTS the governed facts) is never consulted."""
+    add_col = seed_resolved(db, source="t6_sum_add")            # governed additivity = non_additive
+    facts = {"body.expr": ExprFacts(
+        additivity=_read(db, add_col, "additivity"),           # resolved / governed
+        output_type=_read(db, add_col, "logical_representation"),  # value "numeric"
+        unit=_seed_unit_hint(db, "t6_sum_unit", "dollars"),    # HINT, value carried
+    )}
+    advisory = ExpectedOutput(output_type="percentage", unit="euros", currency="EUR")
+    proposal = _proposal(UnaryBody(expr=sum_expression()), expected_output=advisory)
+
+    result = resolve_formula_output_policy(
+        proposal, per_expr_facts=facts, grain_facts={}, now=_NOW)
+
+    assert isinstance(result, FormulaOutputPolicyV1)
+    assert result.output_type == "numeric"                     # governed fact — NOT "percentage"
+    assert result.unit == "dollars"                            # HINT carried — NOT advisory "euros"
+    assert result.currency is None                             # no currency fact — NOT advisory "EUR"
+    assert result.output_additivity is AdditivityClass.NON_ADDITIVE
