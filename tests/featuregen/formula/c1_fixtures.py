@@ -89,3 +89,18 @@ def seed_no_value(db, *, source: str = "c1fx_no_value", table: str = "accounts",
                      EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
     resolve_and_project(db, source=source, logical_refs=[ref])
     return SeededColumn(ref, "business_term", "no_value", source, table, column)
+
+
+# ── conflict: two top-strength evidences that DISAGREE on a governed field ────────────────────────
+def seed_conflict(db, *, source: str = "c1fx_conflict", table: str = "accounts",
+                  column: str = "balance") -> SeededColumn:
+    """``status="conflict"``: two source-ATTESTED ``additivity`` evidences with DISTINCT values tied
+    at the top strength — the real resolver records a genuine ``conflict`` decision (it cannot pick
+    one value)."""
+    ref = _build_column(db, source, table, column)
+    _record_evidence(db, ref, "additivity", "additive",
+                     EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    _record_evidence(db, ref, "additivity", "non_additive",
+                     EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=source, logical_refs=[ref])
+    return SeededColumn(ref, "additivity", "conflict", source, table, column)

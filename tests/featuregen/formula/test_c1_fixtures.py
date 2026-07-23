@@ -11,6 +11,7 @@ from __future__ import annotations
 from featuregen.overlay.upload.operational_facts import read_operational_value
 
 from tests.featuregen.formula.c1_fixtures import (
+    seed_conflict,
     seed_no_value,
     seed_resolved,
 )
@@ -37,3 +38,11 @@ def test_seed_no_value_reads_no_value(db):
     assert ov.status == "no_value" == col.expected_status
     assert ov.conflict_status == "influence_not_operational"
     assert ov.decision_event_id is not None           # the decision exists; it is just not operational
+
+
+# ── conflict: two top-strength evidences that disagree — the resolver cannot pick one ─────────────
+def test_seed_conflict_reads_conflict(db):
+    col = seed_conflict(db)
+    ov = _read(db, col)
+    assert ov.status == "conflict" == col.expected_status
+    assert ov.conflict_status == "conflict"           # the resolver's genuine conflict reason
