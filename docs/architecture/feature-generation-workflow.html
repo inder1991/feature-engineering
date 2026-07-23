@@ -1,0 +1,1236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feature Generation Architecture</title>
+  <style>
+    :root {
+      --paper: #f5f7f3;
+      --surface: #ffffff;
+      --surface-2: #eef2ed;
+      --ink: #17201b;
+      --muted: #627068;
+      --line: #ccd5ce;
+      --line-strong: #88968d;
+      --green: #287a4b;
+      --green-bg: #e4f2e9;
+      --blue: #315f9b;
+      --blue-bg: #e7effa;
+      --amber: #8a6408;
+      --amber-bg: #fff1c9;
+      --coral: #a94435;
+      --coral-bg: #fae8e3;
+      --gray: #69716d;
+      --gray-bg: #ecefed;
+      --violet: #71558e;
+      --violet-bg: #f0eafa;
+      --shadow: 0 14px 38px rgba(23, 32, 27, 0.08);
+      --zoom: 1;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button, input { font: inherit; }
+
+    button:focus-visible, input:focus-visible, .node:focus-visible {
+      outline: 3px solid rgba(49, 95, 155, 0.35);
+      outline-offset: 2px;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+    }
+
+    .topbar {
+      min-height: 74px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 14px 24px;
+      color: #f8fbf9;
+      background: #17201b;
+      border-bottom: 1px solid #2c3931;
+    }
+
+    .identity {
+      min-width: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 4px;
+      color: #9fc7ad;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(20px, 2.3vw, 30px);
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    .baseline {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      font-size: 12px;
+      color: #cbd5ce;
+    }
+
+    .commit {
+      padding: 5px 8px;
+      border: 1px solid #526158;
+      border-radius: 4px;
+      color: #f7faf8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .controlbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      min-height: 66px;
+      padding: 10px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .filters {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow-x: auto;
+      scrollbar-width: thin;
+      padding: 2px 0;
+    }
+
+    .filter {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--surface);
+      color: var(--muted);
+      cursor: pointer;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .filter:hover { border-color: var(--line-strong); color: var(--ink); }
+
+    .filter.active {
+      border-color: #17201b;
+      background: #17201b;
+      color: #fff;
+    }
+
+    .view-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+    }
+
+    .flow-button {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--surface-2);
+      color: var(--ink);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .zoom {
+      display: grid;
+      grid-template-columns: auto 92px 42px;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .zoom input { accent-color: var(--green); }
+    .zoom output { color: var(--ink); text-align: right; }
+
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 330px;
+      overflow: hidden;
+    }
+
+    .viewport {
+      position: relative;
+      overflow: auto;
+      min-width: 0;
+      background-color: var(--paper);
+      background-image:
+        linear-gradient(#dfe5df 1px, transparent 1px),
+        linear-gradient(90deg, #dfe5df 1px, transparent 1px);
+      background-size: 24px 24px;
+      scrollbar-color: #98a69d transparent;
+    }
+
+    .scaled-world {
+      position: relative;
+      width: calc(1880px * var(--zoom));
+      height: calc(1110px * var(--zoom));
+    }
+
+    .world {
+      position: absolute;
+      inset: 0 auto auto 0;
+      width: 1880px;
+      height: 1110px;
+      transform: scale(var(--zoom));
+      transform-origin: 0 0;
+    }
+
+    .lane {
+      position: absolute;
+      top: 34px;
+      width: 244px;
+      height: 1018px;
+      border: 1px solid rgba(120, 136, 126, 0.48);
+      border-top: 4px solid var(--lane);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .lane::before {
+      content: attr(data-label);
+      position: absolute;
+      top: 13px;
+      left: 14px;
+      right: 14px;
+      color: var(--lane);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .lane::after {
+      content: attr(data-summary);
+      position: absolute;
+      top: 33px;
+      left: 14px;
+      right: 14px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    #edge-layer {
+      position: absolute;
+      inset: 0;
+      width: 1880px;
+      height: 1110px;
+      overflow: visible;
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    .edge {
+      fill: none;
+      stroke: #708078;
+      stroke-width: 2;
+      opacity: 0.62;
+      marker-end: url(#arrow);
+      transition: opacity 180ms ease, stroke-width 180ms ease, stroke 180ms ease;
+    }
+
+    .edge.shadow-edge {
+      stroke: var(--amber);
+      stroke-dasharray: 7 6;
+    }
+
+    .edge.planned-edge {
+      stroke: var(--gray);
+      stroke-dasharray: 3 6;
+    }
+
+    .edge.control-edge {
+      stroke: var(--violet);
+      stroke-dasharray: 2 7;
+      opacity: 0.36;
+    }
+
+    .edge.active-edge {
+      stroke: var(--green);
+      stroke-width: 3;
+      opacity: 0.96;
+    }
+
+    .flowing .edge:not(.control-edge) {
+      stroke-dasharray: 9 7;
+      animation: travel 1.25s linear infinite;
+    }
+
+    .flowing .edge.shadow-edge { animation-duration: 1.8s; }
+    .flowing .edge.planned-edge { animation-duration: 2.4s; }
+
+    @keyframes travel {
+      to { stroke-dashoffset: -32; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .flowing .edge { animation: none; }
+      .pulse { animation: none !important; }
+    }
+
+    .node {
+      position: absolute;
+      z-index: 3;
+      width: 204px;
+      min-height: 84px;
+      padding: 12px 12px 11px;
+      border: 1px solid var(--node-border);
+      border-left: 5px solid var(--node-border);
+      border-radius: 6px;
+      background: var(--node-bg);
+      color: var(--ink);
+      box-shadow: 0 4px 14px rgba(23, 32, 27, 0.07);
+      cursor: pointer;
+      text-align: left;
+      transition: transform 160ms ease, box-shadow 160ms ease, opacity 180ms ease;
+    }
+
+    .node:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 9px 20px rgba(23, 32, 27, 0.12);
+    }
+
+    .node.selected {
+      border-color: #17201b;
+      box-shadow: 0 0 0 3px rgba(23, 32, 27, 0.18), 0 9px 20px rgba(23, 32, 27, 0.12);
+    }
+
+    .node.dimmed { opacity: 0.13; }
+
+    .node-title {
+      display: block;
+      margin-right: 48px;
+      font-size: 13px;
+      line-height: 1.25;
+      font-weight: 800;
+    }
+
+    .node-meta {
+      display: block;
+      margin-top: 7px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+
+    .status {
+      position: absolute;
+      top: 9px;
+      right: 8px;
+      padding: 3px 5px;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--node-border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 8px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .node[data-status="implemented"] {
+      --node-border: var(--green);
+      --node-bg: var(--green-bg);
+    }
+
+    .node[data-status="shadow"] {
+      --node-border: var(--amber);
+      --node-bg: var(--amber-bg);
+    }
+
+    .node[data-status="inflight"] {
+      --node-border: var(--blue);
+      --node-bg: var(--blue-bg);
+    }
+
+    .node[data-status="planned"] {
+      --node-border: var(--gray);
+      --node-bg: var(--gray-bg);
+      border-style: dashed;
+      border-left-style: solid;
+    }
+
+    .node[data-status="external"] {
+      --node-border: var(--coral);
+      --node-bg: var(--coral-bg);
+    }
+
+    .node[data-status="control"] {
+      --node-border: var(--violet);
+      --node-bg: var(--violet-bg);
+    }
+
+    .inspector {
+      position: relative;
+      z-index: 5;
+      overflow: auto;
+      padding: 20px;
+      border-left: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: -10px 0 28px rgba(23, 32, 27, 0.05);
+    }
+
+    .inspector-kicker {
+      margin: 0 0 7px;
+      color: var(--green);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .inspector h2 {
+      margin: 0;
+      font-size: 21px;
+      line-height: 1.18;
+      letter-spacing: 0;
+    }
+
+    .inspector-summary {
+      margin: 12px 0 18px;
+      color: #47554d;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .fact {
+      padding: 13px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .fact-label {
+      display: block;
+      margin-bottom: 7px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .fact-value {
+      display: block;
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      color: #24392c;
+    }
+
+    .path-list {
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .path-list li {
+      padding: 7px 8px;
+      border-left: 3px solid var(--line-strong);
+      background: var(--surface-2);
+      overflow-wrap: anywhere;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px 12px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      background: var(--swatch);
+    }
+
+    .counts {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 7px;
+      margin-top: 16px;
+    }
+
+    .count {
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--paper);
+    }
+
+    .count strong {
+      display: block;
+      font-size: 20px;
+      line-height: 1;
+    }
+
+    .count span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      font-weight: 800;
+    }
+
+    @media (max-width: 980px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 9px;
+      }
+
+      .baseline { justify-content: flex-start; }
+
+      .controlbar {
+        grid-template-columns: 1fr;
+        padding: 9px 14px;
+      }
+
+      .view-controls { justify-content: space-between; }
+
+      .workspace {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(520px, 68vh) auto;
+        overflow: visible;
+      }
+
+      .inspector {
+        max-height: none;
+        border-top: 1px solid var(--line);
+        border-left: 0;
+        box-shadow: 0 -8px 24px rgba(23, 32, 27, 0.05);
+      }
+    }
+
+    @media (max-width: 560px) {
+      .topbar { padding: 13px 14px; }
+      .controlbar { gap: 8px; }
+      .view-controls { align-items: flex-end; }
+      .zoom { grid-template-columns: auto 72px 38px; }
+      .flow-button { padding-inline: 8px; }
+      .workspace { grid-template-rows: minmax(500px, 64vh) auto; }
+      .inspector { padding: 17px 14px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="identity">
+        <p class="eyebrow">FeatureGen / architecture control room</p>
+        <h1>Feature Generation Workflow</h1>
+      </div>
+      <div class="baseline">
+        <span>Implemented baseline</span>
+        <span class="commit">origin/main 3668b93</span>
+        <span>Formula critic</span>
+        <span class="commit">in flight 1c01bfc</span>
+      </div>
+    </header>
+
+    <section class="controlbar" aria-label="Architecture view controls">
+      <nav class="filters" aria-label="Workflow stages">
+        <button class="filter active" data-filter="all" type="button">All systems</button>
+        <button class="filter" data-filter="ingestion" type="button">Ingestion</button>
+        <button class="filter" data-filter="catalog" type="button">Catalog authority</button>
+        <button class="filter" data-filter="generation" type="button">Feature generation</button>
+        <button class="filter" data-filter="governance" type="button">Governance</button>
+        <button class="filter" data-filter="formula" type="button">TypedFormula</button>
+        <button class="filter" data-filter="materialization" type="button">Materialization</button>
+      </nav>
+      <div class="view-controls">
+        <button id="flow-toggle" class="flow-button" type="button" aria-pressed="true">Pause flow</button>
+        <label class="zoom">
+          <span>Zoom</span>
+          <input id="zoom-control" type="range" min="60" max="120" value="90" step="5">
+          <output id="zoom-output">90%</output>
+        </label>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <div id="viewport" class="viewport" aria-label="Interactive feature generation architecture">
+        <div class="scaled-world">
+          <div id="world" class="world flowing">
+            <svg id="edge-layer" viewBox="0 0 1880 1110" aria-hidden="true">
+              <defs>
+                <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5"
+                        markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="#708078"></path>
+                </marker>
+              </defs>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <aside class="inspector" aria-live="polite">
+        <p id="inspector-kicker" class="inspector-kicker">System view</p>
+        <h2 id="inspector-title">End-to-end feature generation</h2>
+        <p id="inspector-summary" class="inspector-summary">
+          The live platform governs metadata, proposes features, validates contracts, and records
+          lineage. Formula authoring is under construction; compilation and data execution remain
+          outside the platform.
+        </p>
+        <div class="fact">
+          <span class="fact-label">Authority boundary</span>
+          <span id="inspector-authority" class="fact-value">
+            Flat graph values support discovery. Evidence, decisions, verified facts and approved
+            joins provide load-bearing authority.
+          </span>
+        </div>
+        <div class="fact">
+          <span class="fact-label">Primary code</span>
+          <ul id="inspector-code" class="path-list">
+            <li><code>src/featuregen/overlay/upload/ingest.py</code></li>
+            <li><code>src/featuregen/overlay/upload/feature_assist.py</code></li>
+            <li><code>src/featuregen/overlay/upload/contract/</code></li>
+            <li><code>src/featuregen/formula/</code></li>
+          </ul>
+        </div>
+        <div class="fact">
+          <span class="fact-label">Durable state</span>
+          <span id="inspector-store" class="fact-value">
+            PostgreSQL graph, authority, audit, intent, contract, feature and shadow stores.
+          </span>
+        </div>
+        <div class="legend" aria-label="Implementation status legend">
+          <span class="legend-item"><i class="swatch" style="--swatch:var(--green)"></i>Implemented</span>
+          <span class="legend-item"><i class="swatch" style="--swatch:var(--amber)"></i>Shadow</span>
+          <span class="legend-item"><i class="swatch" style="--swatch:var(--blue)"></i>In flight</span>
+          <span class="legend-item"><i class="swatch" style="--swatch:var(--gray)"></i>Planned</span>
+          <span class="legend-item"><i class="swatch" style="--swatch:var(--coral)"></i>External</span>
+        </div>
+        <div id="status-counts" class="counts" aria-label="Visible component counts"></div>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const lanes = [
+      { id: "sources", label: "1 / Inputs", summary: "People, files and external metadata", x: 24, color: "#526779" },
+      { id: "ingestion", label: "2 / Ingestion", summary: "Normalize, validate, enrich and persist", x: 286, color: "#287a4b" },
+      { id: "catalog", label: "3 / Catalog authority", summary: "Graph discovery plus governed evidence", x: 548, color: "#71558e" },
+      { id: "generation", label: "4 / Generate", summary: "Intent, LLM ideas, recipes and checks", x: 810, color: "#315f9b" },
+      { id: "governance", label: "5 / Govern", summary: "Human choice, contract and registry", x: 1072, color: "#287a4b" },
+      { id: "formula", label: "6 / TypedFormula", summary: "Closed formula authoring contract", x: 1334, color: "#8a6408" },
+      { id: "materialization", label: "7 / Execute", summary: "External compile, run and attest", x: 1596, color: "#a94435" }
+    ];
+
+    const nodes = [
+      {
+        id: "file", lane: "sources", y: 105, title: "CSV, XLSX and FTR glossary",
+        meta: "POST /uploads", status: "implemented", groups: ["ingestion"],
+        summary: "Schema and glossary files enter through bounded readers. The FTR adapter preserves schema identity, sanitizes definitions and emits a semantic sidecar.",
+        authority: "The selected SourceCapabilityProfile determines which uploaded claims may become evidence and at what strength.",
+        code: ["api/routes/uploads.py", "overlay/upload/csv_reader.py", "overlay/upload/excel_reader.py", "overlay/upload/ftr_adapter.py"],
+        store: "ingestion_run manifest, later graph/evidence writes and quarantine rows."
+      },
+      {
+        id: "openmetadata", lane: "sources", y: 220, title: "OpenMetadata connector",
+        meta: "preview -> approve import", status: "implemented", groups: ["ingestion"],
+        summary: "The connector discovers services, previews a translated catalog and imports only after fingerprint-checked approval.",
+        authority: "Connector translation still enters the same validate and ingest spine; it does not bypass source-profile or drift controls.",
+        code: ["api/routes/integrations.py", "connectors/openmetadata.py", "connectors/store.py"],
+        store: "integration configuration, sync records and ingestion-run linkage."
+      },
+      {
+        id: "feature_engineer", lane: "sources", y: 390, title: "Feature engineer",
+        meta: "Workbench hypothesis and objective", status: "implemented", groups: ["generation", "governance"],
+        summary: "The feature engineer submits the goal, confirms scope, compares proposals and chooses what may advance to a governed contract.",
+        authority: "User input steers generation but never supplies operational authority, read roles or a trusted join path.",
+        code: ["frontend/src/screens/WorkbenchScreen.tsx", "frontend/src/api.ts"],
+        store: "contract_intent, confirmed scope, considered set and Gate 1 choice."
+      },
+      {
+        id: "admin", lane: "sources", y: 505, title: "Data owner and confirmer",
+        meta: "Governance and field decisions", status: "implemented", groups: ["catalog", "governance"],
+        summary: "Authorized reviewers confirm joins, table facts, semantic bindings, field corrections and final contract governance.",
+        authority: "Four-eyes, separation-of-duties and CAS checks are evaluated from the server-derived identity.",
+        code: ["api/routes/governance.py", "api/routes/assets.py", "authz/", "identity/"],
+        store: "append-only fact, decision, validation and security-audit records."
+      },
+      {
+        id: "customer_data", lane: "sources", y: 705, title: "Customer data",
+        meta: "Never enters FeatureGen", status: "external", groups: ["materialization"],
+        summary: "Actual rows remain in the customer's execution platform. FeatureGen receives metadata and, later, signed validation observations.",
+        authority: "Data-dependent claims cannot be promoted by metadata or an LLM. They require external measurement.",
+        code: ["External platform contract is planned"],
+        store: "No customer row data is stored in FeatureGen."
+      },
+
+      {
+        id: "run_manifest", lane: "ingestion", y: 85, title: "Durable run manifest",
+        meta: "open before parse", status: "implemented", groups: ["ingestion"],
+        summary: "Every upload or import opens an ingestion run before parsing so success, rejection, hold and failure remain queryable.",
+        authority: "The run pins effective flags, actor, source profile, fingerprints, counts and stage outcomes.",
+        code: ["overlay/upload/ingestion_run.py", "overlay/upload/stage_report.py"],
+        store: "ingestion_run, ingestion_run_status_event, ingestion_run_stage, run object/fact provenance."
+      },
+      {
+        id: "adapters", lane: "ingestion", y: 190, title: "Adapter and canonical row",
+        meta: "CanonicalRow + GlossaryRecord", status: "implemented", groups: ["ingestion"],
+        summary: "Input-specific readers map into one canonical structural row plus an optional schema-preserving glossary sidecar.",
+        authority: "Representation mapping is deterministic. Identity failures are quarantined rather than guessed.",
+        code: ["overlay/upload/canonical.py", "overlay/upload/glossary_reader.py", "overlay/upload/source_profile.py"],
+        store: "Transient typed rows; durable provenance is written by the ingest spine."
+      },
+      {
+        id: "validation", lane: "ingestion", y: 305, title: "Validation, brake and quarantine",
+        meta: "fail closed before graph writes", status: "implemented", groups: ["ingestion"],
+        summary: "Profile-aware validation handles malformed identity, duplicates, conflicts and structural limits; the large-change brake blocks unsafe source replacement.",
+        authority: "Quarantined rows never enter graph or evidence. Held uploads require review or corrected re-upload.",
+        code: ["overlay/upload/canonical.py", "overlay/upload/brake.py", "overlay/upload/review_queue.py"],
+        store: "quarantine_row and conflict-review records."
+      },
+      {
+        id: "pass_a", lane: "ingestion", y: 430, title: "Source facts and Pass A enrichment",
+        meta: "concept / definition / domain", status: "implemented", groups: ["ingestion", "catalog"],
+        summary: "Source facts are asserted, then configured LLM calls enrich concept, definition and domain under bounded batch policies.",
+        authority: "LLM output remains proposed or advisory. Source and human evidence retain stronger authority.",
+        code: ["overlay/upload/ingest.py", "overlay/upload/enrich.py", "overlay/upload/enrich_batch.py"],
+        store: "overlay facts/evidence, enrichment cache, llm_call and dispatch provenance."
+      },
+      {
+        id: "graph_build", lane: "ingestion", y: 555, title: "Graph construction",
+        meta: "build_graph", status: "implemented", groups: ["ingestion", "catalog"],
+        summary: "Validated rows become table and column nodes with containment and declared join edges, preserving source and schema metadata.",
+        authority: "Graph values support discovery and display. Governed decisions and fact links determine operational use.",
+        code: ["overlay/upload/graph.py", "overlay/upload/object_ref.py"],
+        store: "graph_node and graph_edge."
+      },
+      {
+        id: "pass_bc", lane: "ingestion", y: 680, title: "Pass B, Pass C and semantic candidates",
+        meta: "flagged, fail-contained stages", status: "shadow", groups: ["ingestion", "catalog"],
+        summary: "Table synthesis proposes grain and availability; Pass C discovers join candidates; semantic-binding stages persist deterministic and LLM-assisted candidates.",
+        authority: "These stages propose. Human confirmation and projection are required before they become load-bearing.",
+        code: ["overlay/upload/table_synth.py", "overlay/upload/passc/", "overlay/upload/semantic_bindings/"],
+        store: "candidate sets, proposed overlay facts and stage dispositions."
+      },
+      {
+        id: "projection", lane: "ingestion", y: 825, title: "Projection, drift and terminal status",
+        meta: "drain -> reproject -> terminalize", status: "implemented", groups: ["ingestion", "catalog"],
+        summary: "The ingest tail drains authority projections, rebuilds table/join/semantic links, detects drift and records honest final counts.",
+        authority: "Projection lag is surfaced and operational reads fail closed when load-bearing projection state is unavailable.",
+        code: ["overlay/projection.py", "overlay/upload/table_fact_projection.py", "overlay/upload/join_drift.py"],
+        store: "projection checkpoints, degraded markers, drift watermarks and final ingestion-run state."
+      },
+
+      {
+        id: "catalog_graph", lane: "catalog", y: 85, title: "Catalog graph and search",
+        meta: "search / asset / lineage", status: "implemented", groups: ["catalog", "generation"],
+        summary: "Read-scoped APIs expose faceted search, bounded asset detail, lineage, readiness, feature impact and governance dashboards.",
+        authority: "Sensitive objects are hidden as if absent. Search freshness fails closed; lineage can show stale nodes with explicit status.",
+        code: ["api/routes/search.py", "api/routes/assets.py", "api/routes/lineage.py", "overlay/upload/asset_detail.py"],
+        store: "Graph projection plus read-time joins to authority and registry tables."
+      },
+      {
+        id: "evidence", lane: "catalog", y: 215, title: "Evidence and field decisions",
+        meta: "source / human / LLM lifecycle", status: "implemented", groups: ["catalog", "generation", "governance"],
+        summary: "Lifecycle-active field evidence is resolved under per-field influence policies and recorded in append-only decision events.",
+        authority: "Only policy-approved source-attested or human-confirmed evidence may become load-bearing; recommendation fields remain advisory.",
+        code: ["overlay/field_evidence.py", "overlay/upload/field_resolution.py", "overlay/upload/field_policies.py"],
+        store: "field_evidence, field_decision_event and graph-node decision links."
+      },
+      {
+        id: "operational", lane: "catalog", y: 350, title: "Verified operational reader C1",
+        meta: "read_operational_value", status: "implemented", groups: ["catalog", "generation", "formula"],
+        summary: "C1 verifies projection health, decision-head uniqueness and evidence/value hashes before returning operational metadata.",
+        authority: "Fork, hash mismatch, retirement or projection unavailability removes the operational value instead of falling back to display metadata.",
+        code: ["overlay/upload/operational_facts.py", "overlay/upload/column_authority.py"],
+        store: "Reads decision, evidence, fact and projection state without creating authority."
+      },
+      {
+        id: "governed_relations", lane: "catalog", y: 495, title: "Governed relationships",
+        meta: "grain / availability / joins / semantics", status: "implemented", groups: ["catalog", "generation", "governance"],
+        summary: "Confirmed table facts, approved joins, entity bridges and semantic bindings form the planner's governed topology.",
+        authority: "A display graph edge is not an operational join. The planner consumes only verified relationship authority.",
+        code: ["overlay/upload/join_governance.py", "overlay/upload/bridge_projection.py", "overlay/upload/semantic_bindings/"],
+        store: "overlay fact state, approved join projections and semantic_binding_edge."
+      },
+      {
+        id: "audit_runtime", lane: "catalog", y: 650, title: "Audit, auth and worker runtime",
+        meta: "cross-cutting control plane", status: "control", groups: ["ingestion", "catalog", "generation", "governance", "formula"],
+        summary: "Identity, permissions, four-eyes checks, redaction, immutable audits, worker projections, retries and run reconciliation protect every stage.",
+        authority: "Caller roles and authority labels are never trusted from request bodies.",
+        code: ["api/deps.py", "identity/", "authz/", "security/audit.py", "runtime/worker.py"],
+        store: "security_audit, append-only events, outbox/timers, projection checkpoints and metrics."
+      },
+      {
+        id: "postgres", lane: "catalog", y: 825, title: "PostgreSQL system of record",
+        meta: "WORM + projections + registry", status: "implemented", groups: ["ingestion", "catalog", "generation", "governance", "formula"],
+        summary: "One database holds graph projections, governance history, audit, intents, contracts, features and shadow telemetry.",
+        authority: "Write-once triggers and application-role revokes protect immutable records; mutable pointers use explicit CAS models.",
+        code: ["db/migrations/", "events/store.py", "overlay/store.py", "aggregates/"],
+        store: "All implemented durable platform state."
+      },
+
+      {
+        id: "intent", lane: "generation", y: 80, title: "Intent, scope and ranking",
+        meta: "recognize -> confirm -> rank", status: "implemented", groups: ["generation"],
+        summary: "The objective is recognized against the use-case taxonomy; a human may confirm scope and soft dimensions before deterministic recipe ranking.",
+        authority: "Recognition is advisory until human confirmation. Soft dimensions rank but never narrow eligibility.",
+        code: ["overlay/upload/taxonomy/recognizer.py", "overlay/upload/taxonomy/ranking.py", "contract/scope_records.py"],
+        store: "contract_intent, recognition attempts, confirmed scope and dimension records."
+      },
+      {
+        id: "metadata_snapshot", lane: "generation", y: 200, title: "Metadata snapshot and context",
+        meta: "repeatable read / deterministic relevance", status: "implemented", groups: ["generation"],
+        summary: "A repeatable metadata snapshot assembles read-scoped column views and selects bounded, relevant context for generation.",
+        authority: "Operational fields and display hints stay distinct. Field-aware egress removes unsafe content before the provider call.",
+        code: ["overlay/upload/feature_metadata_snapshot.py", "overlay/upload/column_view.py", "overlay/upload/feature_assist.py"],
+        store: "catalog_metadata_snapshot and considered-set snapshot binding."
+      },
+      {
+        id: "llm_ideas", lane: "generation", y: 330, title: "LLM feature proposals",
+        meta: "generate -> critic -> repair", status: "implemented", groups: ["generation"],
+        summary: "A bounded author loop proposes free-form features and strategy sets; an independent candidate critic may request bounded repairs.",
+        authority: "The LLM proposes names, operands and coarse operations. It cannot approve identity, joins, freshness or feature safety.",
+        code: ["overlay/upload/feature_assist.py", "api/routes/assist.py", "intake/llm.py"],
+        store: "Immutable llm_call audit; proposals remain transient until considered-set persistence."
+      },
+      {
+        id: "gauntlet", lane: "generation", y: 460, title: "Deterministic feature gauntlet",
+        meta: "ground, reject or require validation", status: "implemented", groups: ["generation", "governance"],
+        summary: "Exact source-qualified operands are checked for existence, leakage, freshness, PIT, type, additivity, units, currency and connectivity.",
+        authority: "The output is DESIGN_CHECKED, NEEDS_EXTERNAL_VALIDATION with typed requirements, or REJECTED.",
+        code: ["overlay/upload/feature_assist.py", "overlay/upload/validation_requirements.py", "overlay/upload/join_path.py"],
+        store: "Validation state is persisted when the selected proposal becomes a contract."
+      },
+      {
+        id: "recipe_planner", lane: "generation", y: 590, title: "Recipe and governed planner",
+        meta: "needs -> bindings -> plan -> compile", status: "implemented", groups: ["generation", "governance"],
+        summary: "Registered recipes provide typed needs. The deterministic planner discovers candidates, enumerates bindings, proves topology and compiles declarations.",
+        authority: "Recipe structure and confirmed graph authority dispose proposals; the LLM does not invent the physical plan.",
+        code: ["overlay/upload/templates.py", "overlay/upload/planner/plan.py", "overlay/upload/planner/declarations.py"],
+        store: "PlanEnvelopeV1 is persisted inside the considered-set snapshot for live governed options."
+      },
+      {
+        id: "planner_shadow", lane: "generation", y: 725, title: "Cross-catalog shadow harnesses",
+        meta: "planner / multi-source / LLM adapter", status: "shadow", groups: ["generation"],
+        summary: "Shadow paths measure planner contract resolution, multi-source assembly and normalization of LLM cross-catalog ideas.",
+        authority: "Shadow outcomes never surface to customers. Separate gold and population gates must pass before live activation.",
+        code: ["overlay/upload/planner/shadow.py", "overlay/upload/planner/multisource_shadow.py", "overlay/upload/planner/b_service.py"],
+        store: "planner_shadow_* and multisource_assembly_shadow_* telemetry."
+      },
+      {
+        id: "considered", lane: "generation", y: 870, title: "Considered set and human choice",
+        meta: "persisted Gate 1 snapshot", status: "implemented", groups: ["generation", "governance"],
+        summary: "LLM and recipe alternatives, rejections, ranking and plan envelopes are snapshotted before the human selects an option.",
+        authority: "Draft and confirm reconstruct the exact server-stored choice; a client cannot introduce an unoffered feature.",
+        code: ["overlay/upload/contract/gate1.py", "api/routes/contract.py"],
+        store: "contract_considered and contract_gate1_choice."
+      },
+
+      {
+        id: "draft", lane: "governance", y: 120, title: "Server-rebound contract draft",
+        meta: "POST /contract/draft", status: "implemented", groups: ["governance"],
+        summary: "The selected option is reconstructed from the considered set, governed plan freshness is rechecked and the LLM authors only the narrative definition.",
+        authority: "Cross-catalog drafts require a governed plan envelope. No permissive fallback is allowed.",
+        code: ["overlay/upload/contract/author.py", "api/routes/contract.py"],
+        store: "Draft is returned to the UI; the authoritative choice already exists in the considered snapshot."
+      },
+      {
+        id: "confirm", lane: "governance", y: 275, title: "Confirm and deterministic MCV",
+        meta: "POST /contract/confirm", status: "implemented", groups: ["governance"],
+        summary: "Confirm acquires source and feature locks, re-runs the minimum contract validator and rebuilds governed plans against current catalog state.",
+        authority: "Drift, leakage, unsafe joins or a client-tampered draft fail closed before any governed write.",
+        code: ["overlay/upload/contract/govern.py", "overlay/upload/contract/review.py", "overlay/upload/contract/governed_plan.py"],
+        store: "Immutable contract version, validation event, plan provenance and current pointer."
+      },
+      {
+        id: "registry", lane: "governance", y: 440, title: "Feature and contract registry",
+        meta: "DESIGN-CHECKED lineage", status: "implemented", groups: ["governance", "formula"],
+        summary: "Confirmation creates or reuses the feature, records exact derives-from and physical dependencies, and advances the current contract pointer.",
+        authority: "DESIGN-CHECKED means structurally safe under metadata authority. It is not a data-quality or usefulness claim.",
+        code: ["overlay/upload/features.py", "overlay/upload/contract/govern.py", "api/routes/features.py"],
+        store: "feature, feature_derives_from, contract, contract_input_column, dependencies and validation state."
+      },
+      {
+        id: "live_gate", lane: "governance", y: 600, title: "Live cross-catalog interlock",
+        meta: "flag + signed artifact + version match", status: "implemented", groups: ["generation", "governance"],
+        summary: "Customer-visible governed cross-catalog recipes require the environment flag and a valid signed gate artifact for the current deployment/version cohort.",
+        authority: "A missing, stale or invalid artifact fails closed. Plan drift requires regeneration, never substitution.",
+        code: ["overlay/upload/contract/live_activation.py", "overlay/upload/planner/gate_operate.py"],
+        store: "Gate evaluation/review data and external signed artifact reference."
+      },
+      {
+        id: "validation_ladder", lane: "governance", y: 770, title: "Verification ladder",
+        meta: "DESIGN -> DATA -> USEFULNESS", status: "implemented", groups: ["governance", "materialization"],
+        summary: "The registry models DESIGN-CHECKED, DATA-CHECKED and USEFULNESS-CHECKED, but only the first is minted by the current contract flow.",
+        authority: "Later stamps require external data validation and model/backtest evidence; they cannot be inferred by the catalog.",
+        code: ["governance/attributes.py", "db/migrations/0060_aggregates_lifecycle.sql"],
+        store: "feature_versions verification_stamp and contract validation projections."
+      },
+
+      {
+        id: "intent_adapter", lane: "formula", y: 85, title: "Feature to AuthoringIntent handoff",
+        meta: "integration not wired", status: "planned", groups: ["formula"],
+        summary: "A future adapter will convert the governed feature/contract into the minimal typed intent used by formula authoring.",
+        authority: "The handoff must preserve server-authoritative operands, grain and validation requirements.",
+        code: ["No production adapter or API route yet"],
+        store: "No authoring manifest table yet."
+      },
+      {
+        id: "formula_author", lane: "formula", y: 205, title: "Sequential-turn formula author",
+        meta: "AuthorTurnV1", status: "implemented", groups: ["formula"],
+        summary: "A bounded LLM loop emits either one governed tool call or a final raw TypedFormula proposal on each turn.",
+        authority: "Tool results are read-scoped metadata treated as data, never instructions. Every turn uses the audited call seam.",
+        code: ["formula/author.py", "formula/turns.py", "formula/audited.py"],
+        store: "llm_call rows under a supplied authoring run bucket; owning run persistence is still planned."
+      },
+      {
+        id: "formula_tools", lane: "formula", y: 330, title: "Seven governed authoring tools",
+        meta: "read and validate only", status: "implemented", groups: ["formula"],
+        summary: "Search, column metadata, grain, time anchor, verified lineage, operation vocabulary and draft validation are available to the author.",
+        authority: "Tools enforce read scope, metadata-only output and bounded argument/result schemas.",
+        code: ["formula/tools.py", "formula/proposal_v1.schema.json"],
+        store: "No governance mutation; canonical tool results are carried in the turn trail."
+      },
+      {
+        id: "formula_validation", lane: "formula", y: 455, title: "Strict formula validation",
+        meta: "parse -> semantics -> capability", status: "implemented", groups: ["formula"],
+        summary: "Untrusted JSON is parsed into frozen typed contracts, validated against the closed grammar and classified against the current capability policy.",
+        authority: "Unknown fields, malformed discriminators, unsupported multi-source shapes and out-of-policy operations cannot become a formula.",
+        code: ["formula/parse.py", "formula/schema.py", "formula/capability.py", "formula/operations.py"],
+        store: "Transient proposal and capability result."
+      },
+      {
+        id: "formula_output", lane: "formula", y: 580, title: "C1 output authority",
+        meta: "type / unit / currency / additivity", status: "implemented", groups: ["formula"],
+        summary: "Operation-specific rules derive authoritative output semantics or return typed authority/external requirements.",
+        authority: "Expected output from the LLM is advisory. Verified C1 reads and deterministic operation policies decide output.",
+        code: ["formula/output_authority.py", "formula/operations.py", "overlay/upload/operational_facts.py"],
+        store: "Transient FormulaOutputPolicy or typed unresolved outcome."
+      },
+      {
+        id: "formula_critic", lane: "formula", y: 705, title: "Independent formula critic",
+        meta: "closed finding codes", status: "inflight", groups: ["formula"],
+        summary: "A separate model/context reviews missing operands, slot direction, filters, windows, unjustified operands and weak proxies.",
+        authority: "The critic never mutates the formula. Blocking findings prevent automatic resolution; malformed responses fail closed.",
+        code: ["formula/critic.py on merge/b-slice-to-main"],
+        store: "Critic llm_call and findings hash; trace integration remains planned."
+      },
+      {
+        id: "formula_result", lane: "formula", y: 830, title: "Disposition and content identity",
+        meta: "RESOLVED / REVIEW / UNSUPPORTED", status: "implemented", groups: ["formula"],
+        summary: "Structural, capability, output, expectation, critic and technical axes fold into one honest result. Resolved formulas receive a canonical content hash.",
+        authority: "Unresolved output carries a proposal, never a fabricated authoritative TypedFormula.",
+        code: ["formula/result.py", "formula/canonical.py", "formula/_jcs.py"],
+        store: "Library result only; durable trace, formula version and API are not complete."
+      },
+      {
+        id: "formula_orchestrator", lane: "formula", y: 950, title: "Orchestrator, trace, gold gate and API",
+        meta: "Child 1 completion work", status: "planned", groups: ["formula"],
+        summary: "The remaining slice must wire all authoring stages, persist a manifest-first trace, evaluate real-provider gold cases and expose a controlled API.",
+        authority: "The gold gate must prove false-resolve zero and exact positive outcomes before formula authoring is enabled.",
+        code: ["Planned: formula/authoring.py, formula/trace.py, formula/gold.py and API route"],
+        store: "Planned authoring_run and append-only authoring_trace_event."
+      },
+
+      {
+        id: "freeze", lane: "materialization", y: 120, title: "Approve immutable formula version",
+        meta: "Child 2", status: "planned", groups: ["materialization"],
+        summary: "Human review will freeze the selected TypedFormula and bind its content hash, versions, contract and provenance.",
+        authority: "A candidate formula cannot execute until approval creates an immutable version.",
+        code: ["Planned child of the materialization design"],
+        store: "Planned formula-version artifact linked to feature_versions."
+      },
+      {
+        id: "compile", lane: "materialization", y: 275, title: "Compile and submit",
+        meta: "Child 3 and Child 4", status: "planned", groups: ["materialization"],
+        summary: "A platform-neutral compiler will lower the formula to a signed external submission with pinned operands, windows, grain and policy versions.",
+        authority: "Compilation must preserve formula identity and reject unsupported backend semantics.",
+        code: ["Planned compiler and external-platform adapter"],
+        store: "Planned immutable submission/outbox records."
+      },
+      {
+        id: "execute", lane: "materialization", y: 445, title: "External execution platform",
+        meta: "customer runtime", status: "external", groups: ["materialization"],
+        summary: "The customer platform compiles to its native engine, reads actual data, computes the feature and measures required validations.",
+        authority: "Execution is outside FeatureGen. The external platform is authoritative only for the observations it signs.",
+        code: ["External implementation"],
+        store: "Customer warehouse, lakehouse or feature-store runtime."
+      },
+      {
+        id: "attestation", lane: "materialization", y: 620, title: "Signed validation attestation",
+        meta: "round trip", status: "planned", groups: ["materialization", "governance"],
+        summary: "Signed observations will answer requirements such as numeric type, unique grain, temporal population, lag and row-level execution checks.",
+        authority: "FeatureGen re-derives the expected request and verifies signature, scope, formula hash and freshness before promotion.",
+        code: ["Planned attestation endpoint and verification store"],
+        store: "Planned append-only attestation and verification events."
+      },
+      {
+        id: "data_checked", lane: "materialization", y: 790, title: "DATA-CHECKED and usefulness",
+        meta: "future promotion", status: "planned", groups: ["materialization", "governance"],
+        summary: "Successful data checks can mint DATA-CHECKED; downstream backtesting and model evaluation can later mint USEFULNESS-CHECKED.",
+        authority: "No coverage or quality threshold is fabricated from metadata-only evidence.",
+        code: ["governance/attributes.py vocabulary exists; promotion paths are planned"],
+        store: "feature_versions and future attestation/usefulness evidence."
+      }
+    ];
+
+    const edges = [
+      ["file", "run_manifest"], ["openmetadata", "run_manifest"],
+      ["run_manifest", "adapters"], ["adapters", "validation"], ["validation", "pass_a"],
+      ["pass_a", "graph_build"], ["graph_build", "pass_bc"], ["pass_bc", "projection"],
+      ["graph_build", "catalog_graph"], ["projection", "catalog_graph"],
+      ["pass_a", "evidence"], ["pass_bc", "governed_relations"], ["projection", "governed_relations"],
+      ["evidence", "operational"], ["governed_relations", "operational"],
+      ["catalog_graph", "metadata_snapshot"], ["operational", "metadata_snapshot"],
+      ["governed_relations", "recipe_planner"], ["operational", "gauntlet"],
+      ["feature_engineer", "intent"], ["intent", "metadata_snapshot"],
+      ["metadata_snapshot", "llm_ideas"], ["llm_ideas", "gauntlet"],
+      ["metadata_snapshot", "recipe_planner"], ["recipe_planner", "planner_shadow", "shadow"],
+      ["gauntlet", "considered"], ["recipe_planner", "considered"],
+      ["considered", "draft"], ["draft", "confirm"], ["admin", "confirm"],
+      ["confirm", "registry"], ["live_gate", "recipe_planner", "control"],
+      ["planner_shadow", "live_gate", "shadow"], ["registry", "validation_ladder"],
+      ["registry", "intent_adapter", "planned"], ["intent_adapter", "formula_author", "planned"],
+      ["formula_author", "formula_tools"], ["formula_tools", "formula_author"],
+      ["formula_author", "formula_validation"], ["formula_validation", "formula_output"],
+      ["operational", "formula_output"], ["formula_output", "formula_critic"],
+      ["formula_critic", "formula_result"], ["formula_result", "formula_orchestrator", "planned"],
+      ["formula_orchestrator", "freeze", "planned"], ["freeze", "compile", "planned"],
+      ["compile", "execute", "planned"], ["customer_data", "execute"],
+      ["execute", "attestation"], ["attestation", "data_checked", "planned"],
+      ["data_checked", "validation_ladder", "planned"],
+      ["audit_runtime", "pass_a", "control"], ["audit_runtime", "llm_ideas", "control"],
+      ["audit_runtime", "formula_author", "control"], ["audit_runtime", "confirm", "control"],
+      ["catalog_graph", "postgres", "control"], ["evidence", "postgres", "control"],
+      ["registry", "postgres", "control"], ["planner_shadow", "postgres", "control"]
+    ];
+
+    const laneById = Object.fromEntries(lanes.map(lane => [lane.id, lane]));
+    const nodeById = Object.fromEntries(nodes.map(node => [node.id, node]));
+    const world = document.getElementById("world");
+    const svg = document.getElementById("edge-layer");
+    const viewport = document.getElementById("viewport");
+    const zoomControl = document.getElementById("zoom-control");
+    const zoomOutput = document.getElementById("zoom-output");
+    let activeFilter = "all";
+    let selectedId = null;
+
+    function renderLanes() {
+      for (const lane of lanes) {
+        const el = document.createElement("section");
+        el.className = "lane";
+        el.dataset.label = lane.label;
+        el.dataset.summary = lane.summary;
+        el.style.left = `${lane.x}px`;
+        el.style.setProperty("--lane", lane.color);
+        world.appendChild(el);
+      }
+    }
+
+    function renderNodes() {
+      for (const node of nodes) {
+        const el = document.createElement("button");
+        el.type = "button";
+        el.className = "node";
+        el.id = `node-${node.id}`;
+        el.dataset.node = node.id;
+        el.dataset.status = node.status;
+        el.style.left = `${laneById[node.lane].x + 20}px`;
+        el.style.top = `${node.y}px`;
+        el.innerHTML = `
+          <span class="status">${node.status === "implemented" ? "live" : node.status}</span>
+          <span class="node-title">${node.title}</span>
+          <span class="node-meta">${node.meta}</span>
+        `;
+        el.addEventListener("click", () => selectNode(node.id));
+        world.appendChild(el);
+      }
+    }
+
+    function connectorPath(from, to) {
+      const a = document.getElementById(`node-${from}`).getBoundingClientRect();
+      const b = document.getElementById(`node-${to}`).getBoundingClientRect();
+      const worldRect = world.getBoundingClientRect();
+      const zoom = Number(zoomControl.value) / 100;
+      const ax = (a.right - worldRect.left) / zoom;
+      const ay = (a.top + a.height / 2 - worldRect.top) / zoom;
+      const bx = (b.left - worldRect.left) / zoom;
+      const by = (b.top + b.height / 2 - worldRect.top) / zoom;
+
+      if (bx >= ax + 24) {
+        const bend = Math.max(42, (bx - ax) * 0.46);
+        return `M ${ax} ${ay} C ${ax + bend} ${ay}, ${bx - bend} ${by}, ${bx} ${by}`;
+      }
+
+      const startX = (a.left + a.width / 2 - worldRect.left) / zoom;
+      const startY = (a.bottom - worldRect.top) / zoom;
+      const endX = (b.left + b.width / 2 - worldRect.left) / zoom;
+      const endY = (b.top - worldRect.top) / zoom;
+      const midY = startY + Math.max(30, Math.abs(endY - startY) * 0.42);
+      return `M ${startX} ${startY} C ${startX} ${midY}, ${endX} ${midY}, ${endX} ${endY}`;
+    }
+
+    function drawEdges() {
+      svg.querySelectorAll(".edge").forEach(el => el.remove());
+      for (const [from, to, kind = "flow"] of edges) {
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", connectorPath(from, to));
+        path.dataset.from = from;
+        path.dataset.to = to;
+        path.classList.add("edge");
+        if (kind === "shadow") path.classList.add("shadow-edge");
+        if (kind === "planned") path.classList.add("planned-edge");
+        if (kind === "control") path.classList.add("control-edge");
+        svg.appendChild(path);
+      }
+      applyFilter();
+      highlightSelection();
+    }
+
+    function selectNode(id) {
+      selectedId = id;
+      const node = nodeById[id];
+      document.getElementById("inspector-kicker").textContent =
+        `${laneById[node.lane].label} / ${node.status}`;
+      document.getElementById("inspector-title").textContent = node.title;
+      document.getElementById("inspector-summary").textContent = node.summary;
+      document.getElementById("inspector-authority").textContent = node.authority;
+      document.getElementById("inspector-store").textContent = node.store;
+      const list = document.getElementById("inspector-code");
+      list.replaceChildren(...node.code.map(path => {
+        const li = document.createElement("li");
+        const code = document.createElement("code");
+        code.textContent = path;
+        li.appendChild(code);
+        return li;
+      }));
+      highlightSelection();
+    }
+
+    function nodeVisible(node) {
+      return activeFilter === "all" || node.groups.includes(activeFilter) || node.lane === activeFilter;
+    }
+
+    function applyFilter() {
+      for (const node of nodes) {
+        const el = document.getElementById(`node-${node.id}`);
+        el.classList.toggle("dimmed", !nodeVisible(node));
+      }
+      svg.querySelectorAll(".edge").forEach(edge => {
+        const visible = nodeVisible(nodeById[edge.dataset.from]) && nodeVisible(nodeById[edge.dataset.to]);
+        edge.style.opacity = visible ? "" : "0.05";
+      });
+      updateCounts();
+    }
+
+    function highlightSelection() {
+      document.querySelectorAll(".node").forEach(el => {
+        el.classList.toggle("selected", el.dataset.node === selectedId);
+      });
+      svg.querySelectorAll(".edge").forEach(edge => {
+        const active = selectedId && (edge.dataset.from === selectedId || edge.dataset.to === selectedId);
+        edge.classList.toggle("active-edge", Boolean(active));
+      });
+    }
+
+    function updateCounts() {
+      const visible = nodes.filter(nodeVisible);
+      const statuses = ["implemented", "shadow", "inflight", "planned", "external"];
+      const labels = {
+        implemented: "implemented", shadow: "shadow", inflight: "in flight",
+        planned: "planned", external: "external"
+      };
+      const counts = document.getElementById("status-counts");
+      counts.replaceChildren(...statuses.map(status => {
+        const item = document.createElement("div");
+        item.className = "count";
+        item.innerHTML = `<strong>${visible.filter(n => n.status === status).length}</strong><span>${labels[status]}</span>`;
+        return item;
+      }));
+    }
+
+    function setZoom(value) {
+      document.documentElement.style.setProperty("--zoom", String(value / 100));
+      zoomOutput.textContent = `${value}%`;
+      requestAnimationFrame(drawEdges);
+    }
+
+    document.querySelectorAll(".filter").forEach(button => {
+      button.addEventListener("click", () => {
+        activeFilter = button.dataset.filter;
+        document.querySelectorAll(".filter").forEach(item => {
+          item.classList.toggle("active", item === button);
+        });
+        applyFilter();
+      });
+    });
+
+    document.getElementById("flow-toggle").addEventListener("click", event => {
+      const flowing = world.classList.toggle("flowing");
+      event.currentTarget.textContent = flowing ? "Pause flow" : "Play flow";
+      event.currentTarget.setAttribute("aria-pressed", String(flowing));
+    });
+
+    zoomControl.addEventListener("input", event => setZoom(Number(event.target.value)));
+    window.addEventListener("resize", () => requestAnimationFrame(drawEdges));
+
+    renderLanes();
+    renderNodes();
+    setZoom(Number(zoomControl.value));
+    selectNode("catalog_graph");
+    requestAnimationFrame(() => {
+      viewport.scrollLeft = 420;
+      drawEdges();
+    });
+  </script>
+</body>
+</html>
