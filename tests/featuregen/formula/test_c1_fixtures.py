@@ -8,6 +8,7 @@ That is what proves Task 6's output-authority tests exercise C1 itself, not a mo
 """
 from __future__ import annotations
 
+from featuregen.overlay.upload.column_authority import read_column_facts
 from featuregen.overlay.upload.operational_facts import read_operational_value
 
 from tests.featuregen.formula.c1_fixtures import (
@@ -16,6 +17,7 @@ from tests.featuregen.formula.c1_fixtures import (
     seed_fork,
     seed_hash_mismatch,
     seed_no_value,
+    seed_not_operational,
     seed_projection_unavailable,
     seed_resolved,
     seed_retired,
@@ -93,3 +95,15 @@ def test_seed_retired_reads_retired(db):
     assert ov.status == "retired" == col.expected_status
     assert ov.producer is None and ov.strength is None   # no manufactured authority
     assert ov.value == "non_additive"                 # echoes display, but NOT load-bearing
+
+
+# ── not_operational: a live load-bearing decision on a field C1 governs only as a HINT ────────────
+def test_seed_not_operational_reads_not_operational(db):
+    col = seed_not_operational(db)
+    ov = _read(db, col)
+    facts = read_column_facts(db, col.logical_ref, col.field_name)
+    assert ov.status == "not_operational" == col.expected_status
+    assert ov.status != "resolved"                    # never a fabricated governed authority
+    assert ov.decision_event_id is not None           # the decision is carried for traceability
+    assert facts.authority == "hint"                  # C1 agrees with read_column_facts (hint)
+    assert ov.value == facts.value                    # value axis still mirrors the flat read

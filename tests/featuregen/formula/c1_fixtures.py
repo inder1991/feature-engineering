@@ -185,6 +185,20 @@ def seed_projection_unavailable(db, *, source: str = "c1fx_proj_unavailable",
         col.logical_ref, "additivity", "projection_unavailable", source, table, column)
 
 
+# ── not_operational: a live load-bearing decision on a HINT field (unit) ──────────────────────────
+def seed_not_operational(db, *, source: str = "c1fx_not_operational", table: str = "accounts",
+                         column: str = "balance") -> SeededColumn:
+    """``status="not_operational"``: source-ATTESTED ``unit`` evidence resolved by the real
+    resolver — the decision is live and load-bearing, but ``read_column_facts`` governs ``unit``
+    only as a HINT (not a decision-projection field), so C1 refuses governed authority while
+    carrying the decision + evidence-derived producer/strength for traceability."""
+    ref = _build_column(db, source, table, column)
+    _record_evidence(db, ref, "unit", "dollars",
+                     EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=source, logical_refs=[ref])
+    return SeededColumn(ref, "unit", "not_operational", source, table, column)
+
+
 # ── retired: a real resolved decision retired by a superseding STALED event ───────────────────────
 def seed_retired(db, *, source: str = "c1fx_retired", table: str = "accounts",
                  column: str = "balance") -> SeededColumn:
