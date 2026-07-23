@@ -297,8 +297,51 @@ def _resolve_unary(
     return InvalidOutput("unsupported_aggregation")  # pragma: no cover - AggregateFunction is closed
 
 
-def _resolve_difference(body: DiffBody, per_expr_facts):
-    raise NotImplementedError  # implemented in the DIFFERENCE cycle
+class _Incompatible:
+    """Sentinel: two operand dimensions (unit or currency) that are NOT the same and cannot combine."""
+
+
+_INCOMPATIBLE = _Incompatible()
+
+
+def _same_dimension(
+    left: OperationalValue | None, right: OperationalValue | None
+) -> str | None | _Incompatible:
+    """The common unit/currency of two operands, or :data:`_INCOMPATIBLE` if they differ.
+
+    Both HINTS. Equal (incl. both absent → ``None``) → the shared dimension; any difference → the
+    sentinel. Dimension HINTS never trigger NEEDS_AUTHORITY; the difference is a structural output
+    fact the caller turns into INVALID (DIFFERENCE) or an external requirement (RATIO)."""
+    a, b = _hint_value(left), _hint_value(right)
+    if a == b:
+        return a
+    return _INCOMPATIBLE
+
+
+def _resolve_difference(
+    body: DiffBody, per_expr_facts
+) -> FormulaOutputPolicyV1 | NeedsAuthority | ExternalRequirement | InvalidOutput:
+    """§C DIFFERENCE — numeric both operands + EXACTLY compatible unit/currency; the output carries
+    that unit/currency, and INCOMPATIBLE units/currency → INVALID_FORMULA."""
+    minu = _expr_facts(per_expr_facts, "body.minuend")
+    subt = _expr_facts(per_expr_facts, "body.subtrahend")
+    needs = _needs_authority(
+        [minu.additivity, minu.output_type, subt.additivity, subt.output_type])
+    if needs is not None:
+        return needs
+
+    unit = _same_dimension(minu.unit, subt.unit)
+    if isinstance(unit, _Incompatible):
+        return InvalidOutput("incompatible_unit")
+    currency = _same_dimension(minu.currency, subt.currency)
+    if isinstance(currency, _Incompatible):
+        return InvalidOutput("incompatible_currency")
+
+    output_type, external_type_required = _numeric_output_type(minu.output_type)
+    additivity = formula_additivity(body, per_expr_facts=per_expr_facts, partition_proof=_NO_PROOF)
+    return FormulaOutputPolicyV1(
+        output_type=output_type, unit=unit, currency=currency, output_additivity=additivity,
+        external_type_required=external_type_required)
 
 
 def _resolve_ratio(body: RatioBody, per_expr_facts):

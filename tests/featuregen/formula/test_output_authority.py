@@ -217,3 +217,38 @@ def test_sum_needs_authority_when_required_additivity_fails_closed(db, seeder):
 
     assert isinstance(result, NeedsAuthority)
     assert result.reason                                   # a machine reason is carried
+
+
+# ── §C — DIFFERENCE demands EXACTLY compatible unit/currency ───────────────────────────────────────
+def test_difference_incompatible_units_is_invalid_output(db):
+    """DIFFERENCE of two operands with INCOMPATIBLE units (§C: subtracting dollars from euros is not a
+    meaningful value) → INVALID_FORMULA, not merely unsupported."""
+    minu_unit = _seed_unit_hint(db, "t6_diff_min", "dollars")
+    subt_unit = _seed_unit_hint(db, "t6_diff_sub", "euros")
+    facts = {
+        "body.minuend": ExprFacts(unit=minu_unit),
+        "body.subtrahend": ExprFacts(unit=subt_unit),
+    }
+    result = resolve_formula_output_policy(
+        _proposal(DiffBody(minuend=sum_expression(), subtrahend=sum_expression())),
+        per_expr_facts=facts, grain_facts={}, now=_NOW)
+
+    assert isinstance(result, InvalidOutput)
+
+
+def test_difference_compatible_units_resolves_to_that_unit(db):
+    """DIFFERENCE of two SAME-unit operands → resolves, carrying THAT unit (§C)."""
+    minu_unit = _seed_unit_hint(db, "t6_diff2_min", "dollars")
+    subt_unit = _seed_unit_hint(db, "t6_diff2_sub", "dollars")
+    type_col = seed_resolved(db, source="t6_diff2_type")
+    facts = {
+        "body.minuend": ExprFacts(unit=minu_unit, output_type=_read(db, type_col, "logical_representation")),
+        "body.subtrahend": ExprFacts(unit=subt_unit),
+    }
+    result = resolve_formula_output_policy(
+        _proposal(DiffBody(minuend=sum_expression(), subtrahend=sum_expression())),
+        per_expr_facts=facts, grain_facts={}, now=_NOW)
+
+    assert isinstance(result, FormulaOutputPolicyV1)
+    assert result.unit == "dollars"
+    assert result.output_additivity is AdditivityClass.NON_ADDITIVE
