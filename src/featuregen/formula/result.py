@@ -196,6 +196,21 @@ def derive_disposition(
                 f"{disposition} with a resolved output carries the TypedFormulaV1 "
                 "only — candidate_proposal must be None"
             )
+    else:
+        # NEEDS_REVIEW with UNRESOLVED output authority (§F honesty core): NO
+        # authoritative formula exists — carrying one would launder a guess into
+        # authority. The validated proposal is the ONLY reviewable artifact.
+        if candidate_formula is not None:
+            raise IncoherentResultError(
+                f"output authority is unresolved (output_status={axes.output_status!r})"
+                " — no authoritative TypedFormulaV1 exists, so a candidate_formula "
+                "here would launder a guess into authority"
+            )
+        if candidate_proposal is None:
+            raise IncoherentResultError(
+                "unresolved-output NEEDS_REVIEW requires the validated "
+                "candidate_proposal — there is nothing to review without it"
+            )
 
     return AuthoringResult(
         structural_status=axes.structural_status,

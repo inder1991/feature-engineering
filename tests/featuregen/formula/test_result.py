@@ -10,9 +10,11 @@ import pytest
 from tests.featuregen.formula import factories as f
 
 from featuregen.formula.canonical import formula_content_hash
+from featuregen.formula.output_authority import ExternalRequirement
 from featuregen.formula.result import (
     DISPOSITION_POLICY_VERSION,
     AuthoringAxes,
+    AuthorityFailure,
     IncoherentResultError,
     derive_disposition,
 )
@@ -131,6 +133,62 @@ def test_resolved_with_a_candidate_proposal_raises_incoherent():
 def test_reviewable_needs_review_without_a_formula_raises_incoherent():
     with pytest.raises(IncoherentResultError, match="candidate_formula"):
         derive_disposition(_axes(critic_status="blocking"), authoring_run_id=RUN_ID)
+
+
+# ---- unresolved output authority (the honesty core: NO authoritative formula exists) ----
+
+
+def test_needs_authority_output_reviews_the_proposal_with_no_formula_and_no_policy():
+    proposal = _proposal()
+    failures = (
+        AuthorityFailure(reason="hash_mismatch", operand="body.numerator", field="additivity"),
+    )
+    result = derive_disposition(
+        _axes(output_status="needs_authority"),
+        authoring_run_id=RUN_ID,
+        candidate_proposal=proposal,
+        authority_failures=failures,
+    )
+    assert result.authoring_disposition == "NEEDS_REVIEW"
+    assert result.candidate_proposal is proposal
+    assert result.authority_failures == failures
+    # No authoritative formula exists — and no fabricated FormulaOutputPolicyV1 can
+    # hide anywhere: the formula slot is empty and the proposal type has no output slot.
+    assert result.candidate_formula is None
+    assert result.candidate_formula_hash is None
+    assert not hasattr(result.candidate_proposal, "output")
+
+
+def test_external_requirement_output_reviews_the_proposal_with_the_typed_requirements():
+    proposal = _proposal()
+    requirements = (ExternalRequirement("UNIT_PROVISIONING_REQUIRED"),)
+    result = derive_disposition(
+        _axes(output_status="external_requirement"),
+        authoring_run_id=RUN_ID,
+        candidate_proposal=proposal,
+        output_requirements=requirements,
+    )
+    assert result.authoring_disposition == "NEEDS_REVIEW"
+    assert result.candidate_proposal is proposal
+    assert result.output_requirements == requirements
+    assert result.candidate_formula is None
+    assert result.candidate_formula_hash is None
+
+
+def test_unresolved_output_with_a_candidate_formula_raises_incoherent():
+    for output_status in ("needs_authority", "external_requirement"):
+        with pytest.raises(IncoherentResultError, match="[Uu]nresolved"):
+            derive_disposition(
+                _axes(output_status=output_status),
+                authoring_run_id=RUN_ID,
+                candidate_formula=f.base_formula(),
+                candidate_proposal=_proposal(),
+            )
+
+
+def test_unresolved_output_without_a_candidate_proposal_raises_incoherent():
+    with pytest.raises(IncoherentResultError, match="candidate_proposal"):
+        derive_disposition(_axes(output_status="needs_authority"), authoring_run_id=RUN_ID)
 
 
 def test_unsupported_result_echoes_the_axes_it_was_folded_from():
