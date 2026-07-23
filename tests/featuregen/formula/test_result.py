@@ -6,6 +6,8 @@ artifact shape — the authority-laundering failure mode — cannot pass.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from tests.featuregen.formula import factories as f
 
@@ -200,3 +202,119 @@ def test_unsupported_result_echoes_the_axes_it_was_folded_from():
     assert result.capability_status == "ok"
     assert result.critic_status == "advisory"
     assert result.technical_status == "ok"
+
+
+# ---- the §F precedence ladder (strict order, first match wins) ----
+
+_ALL_WORST = dict(
+    structural_status="invalid_formula",
+    capability_status="unsupported_capability",
+    output_status="invalid_output",
+    expectation_status="mismatch",
+    critic_status="blocking",
+    technical_status="technical_failure",
+)
+
+
+def test_precedence_ladder_technical_then_rejected_then_unsupported_then_review():
+    # 1. technical_failure beats EVERYTHING.
+    worst = derive_disposition(_axes(**_ALL_WORST), authoring_run_id=RUN_ID)
+    assert worst.authoring_disposition == "TECHNICAL_FAILURE"
+    assert worst.candidate_formula is None
+    assert worst.candidate_formula_hash is None
+
+    # 2. clear technical → REJECTED (invalid beats unsupported).
+    rejected = derive_disposition(
+        _axes(**{**_ALL_WORST, "technical_status": "ok"}), authoring_run_id=RUN_ID
+    )
+    assert rejected.authoring_disposition == "REJECTED"
+    assert rejected.candidate_formula is None
+    assert rejected.candidate_formula_hash is None
+
+    # 3. clear both REJECTED triggers → UNSUPPORTED (beats every review trigger).
+    unsupported = derive_disposition(
+        _axes(
+            **{
+                **_ALL_WORST,
+                "technical_status": "ok",
+                "structural_status": "unsupported_operation",
+                "output_status": "needs_authority",
+            }
+        ),
+        authoring_run_id=RUN_ID,
+    )
+    assert unsupported.authoring_disposition == "UNSUPPORTED"
+
+    # 4. clear structural/capability → NEEDS_REVIEW (unresolved-output shape).
+    review = derive_disposition(
+        _axes(
+            structural_status="ok",
+            capability_status="ok",
+            output_status="needs_authority",
+            expectation_status="mismatch",
+            critic_status="blocking",
+            technical_status="ok",
+        ),
+        authoring_run_id=RUN_ID,
+        candidate_proposal=_proposal(),
+    )
+    assert review.authoring_disposition == "NEEDS_REVIEW"
+    assert review.candidate_formula is None
+
+    # 5. clear the review triggers → RESOLVED.
+    resolved = derive_disposition(
+        _axes(), authoring_run_id=RUN_ID, candidate_formula=f.base_formula()
+    )
+    assert resolved.authoring_disposition == "RESOLVED"
+
+
+def test_invalid_output_folds_to_rejected_not_needs_review():
+    result = derive_disposition(_axes(output_status="invalid_output"), authoring_run_id=RUN_ID)
+    assert result.authoring_disposition == "REJECTED"
+    assert result.candidate_formula is None
+
+
+def test_expectation_not_provided_never_blocks_resolution():
+    result = derive_disposition(
+        _axes(expectation_status="not_provided"),
+        authoring_run_id=RUN_ID,
+        candidate_formula=f.base_formula(),
+    )
+    assert result.authoring_disposition == "RESOLVED"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(structural_status="invalid_formula"),  # REJECTED
+        dict(technical_status="technical_failure"),  # TECHNICAL_FAILURE
+        dict(capability_status="unsupported_capability"),  # UNSUPPORTED
+    ],
+)
+def test_terminal_dispositions_with_a_candidate_formula_raise_incoherent(overrides):
+    with pytest.raises(IncoherentResultError, match="candidate_formula"):
+        derive_disposition(
+            _axes(**overrides), authoring_run_id=RUN_ID, candidate_formula=f.base_formula()
+        )
+
+
+# ---- fail-closed axis vocabulary + immutability ----
+
+
+def test_unknown_axis_value_fails_closed_instead_of_falling_through_to_resolved():
+    with pytest.raises(IncoherentResultError, match="output_status"):
+        derive_disposition(
+            _axes(output_status="banana"),
+            authoring_run_id=RUN_ID,
+            candidate_formula=f.base_formula(),
+        )
+
+
+def test_result_is_frozen_and_slotted():
+    result = derive_disposition(
+        _axes(), authoring_run_id=RUN_ID, candidate_formula=f.base_formula()
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.authoring_disposition = "REJECTED"  # type: ignore[misc]
+    # Slotted: no __dict__ to smuggle a fabricated output policy onto.
+    assert not hasattr(result, "__dict__")
