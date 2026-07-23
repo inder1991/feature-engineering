@@ -76,3 +76,16 @@ def seed_resolved(db, *, source: str = "c1fx_resolved", table: str = "accounts",
                      EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
     resolve_and_project(db, source=source, logical_refs=[ref])
     return SeededColumn(ref, "additivity", "resolved", source, table, column)
+
+
+# ── no_value: a live decision on a RECOMMENDATION-ceiling field (business_term) ───────────────────
+def seed_no_value(db, *, source: str = "c1fx_no_value", table: str = "accounts",
+                  column: str = "balance") -> SeededColumn:
+    """``status="no_value"``: source-ATTESTED ``business_term`` evidence resolved by the real
+    resolver — the field's influence ceiling is RECOMMENDATION, so the live decision is never
+    operational (``conflict_status="influence_not_operational"``)."""
+    ref = _build_column(db, source, table, column)
+    _record_evidence(db, ref, "business_term", "Account Balance",
+                     EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=source, logical_refs=[ref])
+    return SeededColumn(ref, "business_term", "no_value", source, table, column)

@@ -11,6 +11,7 @@ from __future__ import annotations
 from featuregen.overlay.upload.operational_facts import read_operational_value
 
 from tests.featuregen.formula.c1_fixtures import (
+    seed_no_value,
     seed_resolved,
 )
 
@@ -27,3 +28,12 @@ def test_seed_resolved_reads_resolved(db):
     assert ov.value == "non_additive"                 # the projected display value, verified
     assert ov.producer is not None and ov.strength is not None   # real selected evidence
     assert ov.decision_event_id is not None           # a real decision, not a flat insert
+
+
+# ── no_value: a live decision on a RECOMMENDATION-ceiling field — never operational ───────────────
+def test_seed_no_value_reads_no_value(db):
+    col = seed_no_value(db)
+    ov = _read(db, col)
+    assert ov.status == "no_value" == col.expected_status
+    assert ov.conflict_status == "influence_not_operational"
+    assert ov.decision_event_id is not None           # the decision exists; it is just not operational
