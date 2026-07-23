@@ -25,13 +25,27 @@ last, or restore the other fixtures' readability with :func:`clear_projection_un
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
+from featuregen.overlay.field_evidence import (
+    canonical_hash,
+    field_input_hash,
+    record_field_evidence,
+)
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.field_resolution import resolve_and_project
+from featuregen.overlay.upload.field_resolution import (
+    FIELD_POLICY_VERSION,
+    RESOLVER_VERSION,
+    resolve_and_project,
+)
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
+
+# Pinned instants for the decision-log fixtures that need explicit ordering (fork/retired).
+_T1 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+_T2 = datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -104,3 +118,29 @@ def seed_conflict(db, *, source: str = "c1fx_conflict", table: str = "accounts",
                      EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
     resolve_and_project(db, source=source, logical_refs=[ref])
     return SeededColumn(ref, "additivity", "conflict", source, table, column)
+
+
+def _record_resolved_decision(db, logical_ref: str, *, load_bearing: str, now: datetime) -> str:
+    """One real RESOLVED decision event via the append-only decision command (mirrors the shipped
+    fail-closed suite's ``_record_decision``)."""
+    return record_field_decision(
+        db, logical_ref=logical_ref, field_name="additivity",
+        event_type=FieldDecisionEventType.RESOLVED, selected_evidence_ids=[],
+        evidence_set_hash=canonical_hash([]),
+        display_value_hash=canonical_hash(load_bearing),
+        load_bearing_value_hash=canonical_hash(load_bearing),
+        conflict_status="resolved", reason_codes=[],
+        field_policy_version=FIELD_POLICY_VERSION, resolver_version=RESOLVER_VERSION,
+        actor_ref=None, supersedes_event_id=None, now=now)
+
+
+# ── fork (GATE 1): a temporal-tie ambiguous head in the decision log ──────────────────────────────
+def seed_fork(db, *, source: str = "c1fx_fork", table: str = "accounts",
+              column: str = "balance") -> SeededColumn:
+    """``status="fork"``: two non-retired RESOLVED ``additivity`` decisions recorded at the SAME
+    pinned instant that DISAGREE on their load-bearing value — the head is ambiguous (a violated
+    write invariant), so GATE 1 fails closed with ``forked_decision_head``."""
+    ref = _build_column(db, source, table, column)
+    _record_resolved_decision(db, ref, load_bearing="non_additive", now=_T1)
+    _record_resolved_decision(db, ref, load_bearing="additive", now=_T1)
+    return SeededColumn(ref, "additivity", "fork", source, table, column)

@@ -12,6 +12,7 @@ from featuregen.overlay.upload.operational_facts import read_operational_value
 
 from tests.featuregen.formula.c1_fixtures import (
     seed_conflict,
+    seed_fork,
     seed_no_value,
     seed_resolved,
 )
@@ -46,3 +47,12 @@ def test_seed_conflict_reads_conflict(db):
     ov = _read(db, col)
     assert ov.status == "conflict" == col.expected_status
     assert ov.conflict_status == "conflict"           # the resolver's genuine conflict reason
+
+
+# ── fork (GATE 1): no single unambiguous latest non-retired decision head ─────────────────────────
+def test_seed_fork_reads_fork(db):
+    col = seed_fork(db)
+    ov = _read(db, col)
+    assert ov.status == "fork" == col.expected_status
+    assert ov.conflict_status == "forked_decision_head"
+    assert ov.value is None and ov.producer is None   # fail-closed: no operational value served
