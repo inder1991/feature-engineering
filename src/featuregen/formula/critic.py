@@ -196,15 +196,106 @@ def _finding_plain(finding: CriticFinding) -> dict:
             "operand": finding.operand, "detail": finding.detail}
 
 
+# ---- the independent context (never the author's trail) ----------------------------------------
+
+# The governable column fields re-fetched for the critic context (the same field set the Task-9
+# get_column_metadata tool projects — but read HERE, through the C1 authority adapter, never
+# copied from the author's tool trail).
+_COLUMN_FACT_FIELDS: tuple[str, ...] = (
+    "additivity", "logical_representation", "is_grain", "is_as_of",
+    "unit", "currency", "entity", "declared_type",
+)
+
+
 def proposal_column_refs(proposal: TypedFormulaProposalV1) -> tuple[str, ...]:
-    """Every column logical_ref the proposal stands on, sorted + deduplicated."""
-    raise NotImplementedError
+    """Every column logical_ref the proposal stands on — grain keys plus, per body expression,
+    the operand, the window's event-time ref, and every filter-predicate left — sorted and
+    deduplicated so the context (and any hash over it) is deterministic."""
+    refs: set[str] = set(proposal.grain.keys)
+    for expr in _body_expressions(proposal.body):
+        if expr.operand is not None:
+            refs.add(expr.operand)
+        refs.add(expr.window.event_time_ref)
+        if expr.filter is not None:
+            _collect_filter_lefts(expr.filter, refs)
+    return tuple(sorted(refs))
+
+
+def _body_expressions(body):
+    if isinstance(body, UnaryBody):
+        return (body.expr,)
+    if isinstance(body, RatioBody):
+        return (body.numerator, body.denominator)
+    if isinstance(body, DiffBody):
+        return (body.minuend, body.subtrahend)
+    raise SchemaError(f"body must be UnaryBody | RatioBody | DiffBody, got {type(body).__name__}")
+
+
+def _collect_filter_lefts(node: FilterNode, refs: set[str]) -> None:
+    if isinstance(node, FilterPredicate):
+        refs.add(node.left)
+    elif isinstance(node, FilterBool):
+        for child in node.children:
+            _collect_filter_lefts(child, refs)
+
+
+def _column_context(conn, ref: str, roles: tuple[str, ...]) -> dict:
+    """One column's governed facts, RE-FETCHED under the caller's read scope — the same
+    metadata-only projection the authoring tools expose (value/authority/provenance per field,
+    never ``definition`` free text, never data values). A malformed, table-level, unknown, or
+    sensitivity-hidden ref reads as ``found: False`` — hidden is indistinguishable from
+    nonexistent, and the critic simply sees an ungrounded ref."""
+    try:
+        source, schema, table, column = parse_ref(ref)
+    except ValueError:
+        return {"logical_ref": ref, "found": False}
+    if column is None:
+        return {"logical_ref": ref, "found": False}
+    normalized = normalize_ref(source, schema, table, column)
+    object_ref = f"public.{table}.{column}"
+    row = conn.execute(
+        "SELECT data_type, sensitivity FROM graph_node "
+        "WHERE catalog_source = %s AND lower(object_ref) = %s AND kind = 'column'",
+        (source.strip().lower(), object_ref.lower())).fetchone()
+    if row is None or (row[1] is not None and row[1] not in allowed_sensitivities(roles)):
+        return {"logical_ref": normalized, "found": False}
+    facts = {}
+    for field_name in _COLUMN_FACT_FIELDS:
+        col = read_column_facts(conn, normalized, field_name)
+        facts[field_name] = {
+            "value": col.value, "authority": col.authority, "provenance": col.provenance}
+    return {"logical_ref": normalized, "found": True, "table": table, "column": column,
+            "data_type": row[0], "facts": facts}
+
+
+def _proposal_plain(proposal: TypedFormulaProposalV1) -> dict:
+    """The proposal as plain JSON types (the authored ARTIFACT under review — enums to their
+    string values, tuples to lists). Never the author's reasoning: only the proposal itself."""
+    if not isinstance(proposal, TypedFormulaProposalV1):
+        raise SchemaError(
+            f"critique covers TypedFormulaProposalV1 only, got {type(proposal).__name__}")
+    # StrEnums are str subclasses and every literal value is already a canonical string, so a
+    # JSON round-trip yields exactly the plain document the wire/audit layers expect.
+    return json.loads(json.dumps(dataclasses.asdict(proposal)))
 
 
 def build_critic_metadata(conn, intent: AuthoringIntent, proposal: TypedFormulaProposalV1, *,
                           roles: tuple[str, ...]) -> dict:
-    """The critic's INDEPENDENTLY-assembled, read-scoped, metadata-only context."""
-    raise NotImplementedError
+    """The critic's INDEPENDENTLY-assembled ``catalog_metadata``: the intent, the proposal, and
+    the proposal's columns' governed facts RE-FETCHED here under ``roles``. EXACTLY these three
+    keys — there is no slot for the author's reasoning or tool trace, so independence is
+    structural, not a convention."""
+    return {
+        "authoring_intent": {
+            "name": intent.name,
+            "hypothesis": intent.hypothesis,
+            "target_entity": intent.target_entity,
+            "target_grain_keys": list(intent.target_grain_keys),
+        },
+        "proposal": _proposal_plain(proposal),
+        "operand_columns": [_column_context(conn, ref, roles)
+                            for ref in proposal_column_refs(proposal)],
+    }
 
 
 def critique(
