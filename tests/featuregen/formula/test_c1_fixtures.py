@@ -18,6 +18,7 @@ from tests.featuregen.formula.c1_fixtures import (
     seed_no_value,
     seed_projection_unavailable,
     seed_resolved,
+    seed_retired,
 )
 
 
@@ -83,3 +84,12 @@ def test_seed_projection_unavailable_reads_projection_unavailable(db):
     # LIVE projection health, and the fixture's seeding really was the clean governed path.
     clear_projection_unavailable(db)
     assert _read(db, col).status == "resolved"
+
+
+# ── retired: the latest decision is a retiring STALED — never served as operational ───────────────
+def test_seed_retired_reads_retired(db):
+    col = seed_retired(db)
+    ov = _read(db, col)
+    assert ov.status == "retired" == col.expected_status
+    assert ov.producer is None and ov.strength is None   # no manufactured authority
+    assert ov.value == "non_additive"                 # echoes display, but NOT load-bearing

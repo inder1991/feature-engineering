@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
+from featuregen.overlay.field_decision import (
+    FieldDecisionEventType,
+    read_field_decisions,
+    record_field_decision,
+)
 from featuregen.overlay.field_evidence import (
     canonical_hash,
     field_input_hash,
@@ -179,6 +183,29 @@ def seed_projection_unavailable(db, *, source: str = "c1fx_proj_unavailable",
         ["overlay", "overlay_fact", "c1-fixture-poison", "poison", 1])
     return SeededColumn(
         col.logical_ref, "additivity", "projection_unavailable", source, table, column)
+
+
+# ── retired: a real resolved decision retired by a superseding STALED event ───────────────────────
+def seed_retired(db, *, source: str = "c1fx_retired", table: str = "accounts",
+                 column: str = "balance") -> SeededColumn:
+    """``status="retired"``: the full lifecycle — a CLEAN resolved ``additivity`` decision (same
+    seeding as :func:`seed_resolved`, pinned at an earlier instant), then a retiring ``STALED``
+    event that SUPERSEDES that head (exactly how the write path retires a decision). The latest
+    decision is retired, so no operational value is served; the flat display value still echoes."""
+    ref = _build_column(db, source, table, column)
+    _record_evidence(db, ref, "additivity", "non_additive",
+                     EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=source, logical_refs=[ref], now=_T1)
+    head = read_field_decisions(db, ref, "additivity")[-1]
+    record_field_decision(
+        db, logical_ref=ref, field_name="additivity",
+        event_type=FieldDecisionEventType.STALED, selected_evidence_ids=[],
+        evidence_set_hash=canonical_hash([]), display_value_hash=None,
+        load_bearing_value_hash=None, conflict_status="staled",
+        reason_codes=["evidence_staled"],
+        field_policy_version=FIELD_POLICY_VERSION, resolver_version=RESOLVER_VERSION,
+        actor_ref=None, supersedes_event_id=head.decision_event_id, now=_T2)
+    return SeededColumn(ref, "additivity", "retired", source, table, column)
 
 
 def clear_projection_unavailable(db) -> None:
