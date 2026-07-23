@@ -196,3 +196,24 @@ def test_sum_resolves_without_demanding_hint_only_unit(db):
     assert result.unit == "dollars"                            # HINT carried — NOT advisory "euros"
     assert result.currency is None                             # no currency fact — NOT advisory "EUR"
     assert result.output_additivity is AdditivityClass.NON_ADDITIVE
+
+
+# ── §C — a REQUIRED field failing closed in C1 (fork/hash_mismatch/projection_unavailable) ─────────
+@pytest.mark.parametrize(
+    "seeder", [seed_hash_mismatch, seed_fork, seed_projection_unavailable])
+def test_sum_needs_authority_when_required_additivity_fails_closed(db, seeder):
+    """SUM's ``additivity`` is a REQUIRED field (§C). When C1 fails it closed — a forked head, a
+    tampered value hash, or a degraded projection — the resolver fails closed to NEEDS_AUTHORITY
+    rather than fabricating a policy. (``seed_projection_unavailable`` degrades globally; it is the
+    only seed here and is read immediately.)"""
+    col = seeder(db, source="t6_hardfail")
+    add_ov = _read(db, col, "additivity")
+    assert add_ov.status in {"hash_mismatch", "fork", "projection_unavailable"}
+
+    facts = {"body.expr": ExprFacts(additivity=add_ov)}
+    result = resolve_formula_output_policy(
+        _proposal(UnaryBody(expr=sum_expression())),
+        per_expr_facts=facts, grain_facts={}, now=_NOW)
+
+    assert isinstance(result, NeedsAuthority)
+    assert result.reason                                   # a machine reason is carried

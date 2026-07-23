@@ -217,6 +217,18 @@ def _numeric_output_type(ov: OperationalValue | None) -> tuple[str, bool]:
     return _UNKNOWN_TYPE, True
 
 
+def _needs_authority(required: list[OperationalValue | None]) -> NeedsAuthority | None:
+    """§C fail-closed: if ANY REQUIRED field's C1 read is fork / hash_mismatch /
+    projection_unavailable, no policy can be trusted → :class:`NeedsAuthority` carrying the machine
+    reason. ``None`` entries (a field the operation does not require, or was not read) are skipped;
+    HINT statuses (``not_operational``) are never in :data:`_HARD_FAIL_STATUSES`, so a hint never
+    forces authority."""
+    for ov in required:
+        if ov is not None and ov.status in _HARD_FAIL_STATUSES:
+            return NeedsAuthority(ov.conflict_status or ov.status)
+    return None
+
+
 def _hint_value(ov: OperationalValue | None) -> str | None:
     """The carried HINT value (unit/currency). HINTS never force NEEDS_AUTHORITY (§C); a fail-closed
     read simply carries ``None``."""
@@ -259,13 +271,23 @@ def _resolve_unary(
     additivity = formula_additivity(body, per_expr_facts=per_expr_facts, partition_proof=_NO_PROOF)
 
     if agg in _COUNT_FUNCTIONS:
-        # §C — COUNT_* are DIMENSIONLESS. COUNT_ROWS also needs the grain to be readable.
+        # §C — COUNT_* are DIMENSIONLESS. COUNT_ROWS also needs the grain to be readable; the operand
+        # existence/type read is required for COUNT_NON_NULL/COUNT_DISTINCT.
+        required = [facts.output_type]
+        if agg is AggregateFunction.COUNT_ROWS:
+            required = list((grain_facts or {}).values())
+        needs = _needs_authority(required)
+        if needs is not None:
+            return needs
         return FormulaOutputPolicyV1(
             output_type=_COUNT_OUTPUT_TYPE, unit=None, currency=None,
             output_additivity=additivity, external_type_required=False)
 
     if agg is AggregateFunction.SUM:
         # §C — SUM: numeric type + additivity; unit/currency are HINTS (carried, never blocking).
+        needs = _needs_authority([facts.additivity, facts.output_type])
+        if needs is not None:
+            return needs
         output_type, external_type_required = _numeric_output_type(facts.output_type)
         return FormulaOutputPolicyV1(
             output_type=output_type, unit=_hint_value(facts.unit),
