@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from featuregen.config import get_settings
 from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
-from featuregen.formula.authoring import run_authoring
+from featuregen.formula.replay_authoring import run_authoring
 from featuregen.formula.control import (
     LeaseFence,
     LeaseFenceLost,

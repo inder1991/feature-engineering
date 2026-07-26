@@ -509,7 +509,8 @@ def test_a_rejected_fallback_replay_preserves_the_callers_uncommitted_work(
 
 def test_a_fallback_replay_on_an_already_aborted_caller_leaves_it_recoverable(
         db, monkeypatch, _dsn) -> None:
-    """Fix-wave-3 IMPORTANT. The savepoint branch may be taken only for ``INTRANS``. On an ALREADY
+    """Fix-wave-3 IMPORTANT. The savepoint branch may never be taken for ``INERROR`` (it serves
+    ``INTRANS``/``ACTIVE``). On an ALREADY
     ABORTED caller transaction (``INERROR``) psycopg's ``Transaction.__enter__`` increments
     ``_num_transactions`` BEFORE issuing ``SAVEPOINT``; that ``SAVEPOINT`` then fails with
     ``InFailedSqlTransaction``, ``__enter__`` raises, ``__exit__`` never runs, and the counter LEAKS

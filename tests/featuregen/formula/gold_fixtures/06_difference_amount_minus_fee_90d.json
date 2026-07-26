@@ -1,0 +1,77 @@
+{
+  "case_id": "difference_amount_minus_fee_90d",
+  "operation": "difference",
+  "adversarial": false,
+  "delivery": "provider",
+  "note": "DIFFERENCE requires EXACTLY compatible dimensions (§C). Both operands carry no unit/currency hint, so the dimensions agree trivially and the output inherits them (null). The output type comes from the MINUEND's governed logical_representation. Ordered slots are semantic: minuend and subtrahend are never sorted, so swapping them is a DIFFERENT formula with a different hash.",
+  "intent": {
+    "name": "net_txn_amount_90d",
+    "hypothesis": "Transaction value net of fees over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "difference",
+      "minuend": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": {"kind": "predicate", "op": "equal",
+                   "left": "authored::public.txns.status_cd",
+                   "right_literal": {"type": "string", "value": "posted"}},
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      },
+      "subtrahend": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.fee_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [],
+  "expected_disposition": "RESOLVED",
+  "expected_axes": {
+    "structural_status": "ok",
+    "capability_status": "ok",
+    "output_status": "resolved",
+    "expectation_status": "not_provided",
+    "critic_status": "clean",
+    "technical_status": "ok"
+  },
+  "expected_output_policy": {
+    "output_type": "numeric",
+    "unit": null,
+    "currency": null,
+    "output_additivity": "non_additive",
+    "external_type_required": false
+  },
+  "expected_operands": [
+    "authored::public.txns.txn_amt",
+    "authored::public.txns.fee_amt",
+    "authored::public.txns.status_cd",
+    "authored::public.txns.cif_id"
+  ],
+  "expects_blocking_critic": false,
+  "canonical_json": "{\"body\":{\"final_operation\":\"difference\",\"minuend\":{\"aggregation\":\"sum\",\"filter\":{\"kind\":\"predicate\",\"left\":\"authored::public.txns.status_cd\",\"op\":\"equal\",\"right_literal\":{\"type\":\"string\",\"value\":\"posted\"},\"right_param\":null,\"right_set\":null},\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"subtrahend\":{\"aggregation\":\"sum\",\"filter\":null,\"operand\":\"authored::public.txns.fee_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}}},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"formula_schema_version\":1,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"output\":{\"currency\":null,\"external_type_required\":false,\"output_additivity\":\"non_additive\",\"output_type\":\"numeric\",\"unit\":null},\"output_policy_version\":1,\"parameters\":[]}",
+  "expected_formula_hash": "4da62c58f40a2d35def39799581ba1431d3256b1df45dd15daf7cf0f6091441e"
+}
