@@ -9,7 +9,7 @@ from featuregen.formula.authoring import run_authoring
 from featuregen.formula.control import LeaseFenceLost
 from featuregen.formula.critic import CriticReview
 from featuregen.formula.frozen_configuration import freeze_current_configuration
-from featuregen.formula.trace import run_status
+from featuregen.formula.replay_trace import run_status
 from featuregen.formula.turns import AuthoringIntent, AuthorTurnRecord, TurnKind
 
 

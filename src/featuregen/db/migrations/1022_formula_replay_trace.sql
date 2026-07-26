@@ -1,4 +1,4 @@
--- Child-1 prerequisite: immutable formula authoring manifests and ordered trace events.
+-- Delivery replay protocol: immutable formula authoring manifests and ordered trace events.
 CREATE TABLE IF NOT EXISTS formula_authoring_run (
     authoring_run_id text PRIMARY KEY,
     intent_hash      text NOT NULL,

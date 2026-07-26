@@ -56,7 +56,7 @@ from featuregen.formula.schema import (
     TypedFormulaV1,
     UnaryBody,
 )
-from featuregen.formula.trace import (
+from featuregen.formula.replay_trace import (
     append_event,
     load_verified_checkpoint,
     open_authoring_run,

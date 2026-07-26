@@ -8,7 +8,7 @@ from typing import Any
 from psycopg.rows import dict_row
 
 from featuregen.formula.control import RecoveryRequiresReconciliation
-from featuregen.formula.trace import load_verified_checkpoint
+from featuregen.formula.replay_trace import load_verified_checkpoint
 from featuregen.overlay.upload.dispatch_audit import formula_dispatches_reconciled
 from featuregen.overlay.upload.recipe_formula_expectations import (
     RECIPE_FORMULA_EXPECTATIONS,

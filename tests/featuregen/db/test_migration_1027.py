@@ -4,57 +4,98 @@ import psycopg
 import pytest
 
 
-def _intent_and_run(conn, suffix: str) -> tuple[str, str]:
-    intent_id = f"r6_intent_{suffix}"
-    run_id = f"r6_run_{suffix}"
+def _intent(conn, intent_id: str) -> None:
     conn.execute(
         "INSERT INTO contract_intent "
         "(intent_id, hypothesis, redacted_hypothesis, intake_mode, actor) "
         "VALUES (%s, 'h', 'h', 'hypothesis', '\"tester\"'::jsonb)",
         (intent_id,),
     )
+
+
+def _run(conn, run_id: str, intent_id: str) -> None:
     conn.execute(
         "INSERT INTO feature_generation_run (generation_run_id, intent_id, actor) "
         "VALUES (%s, %s, '{}'::jsonb)",
         (run_id, intent_id),
     )
-    return intent_id, run_id
 
 
-def test_feedback_supersession_run_fk_is_installed(conn) -> None:
-    row = conn.execute(
-        "SELECT condeferrable, condeferred FROM pg_constraint "
-        "WHERE conname = 'confirmed_generation_scope_superseded_run_fk'"
-    ).fetchone()
-    assert row == (True, True)
+def test_r5_authority_foreign_keys_are_installed(conn) -> None:
+    expected = {
+        "confirmed_generation_scope_intent_fk",
+        "confirmed_generation_scope_run_fk",
+        "contract_considered_revision_run_fk",
+        "contract_considered_revision_snapshot_fk",
+        "recipe_formula_shadow_manifest_intent_fk",
+        "recipe_formula_shadow_manifest_revision_fk",
+        "recipe_formula_shadow_observation_intent_fk",
+        "recipe_formula_shadow_observation_revision_fk",
+        "recipe_formula_shadow_observation_snapshot_fk",
+        "recipe_formula_shadow_observation_authoring_run_fk",
+        "recipe_formula_shadow_work_item_intent_fk",
+        "recipe_formula_shadow_work_item_revision_fk",
+        "recipe_formula_shadow_work_item_snapshot_fk",
+    }
+    rows = conn.execute(
+        "SELECT conname FROM pg_constraint WHERE conname = ANY(%s)",
+        (list(expected),),
+    ).fetchall()
+    assert {row[0] for row in rows} == expected
 
 
-def test_feedback_supersession_requires_scope_and_run_to_match(conn) -> None:
-    intent_id, prior_run = _intent_and_run(conn, "prior")
-    current_run = "r6_run_current"
-    wrong_run = "r6_run_wrong"
+def test_r5_audit_refuses_cross_intent_considered_revision(conn) -> None:
+    _intent(conn, "r5_intent_a")
+    _intent(conn, "r5_intent_b")
+    _run(conn, "r5_run_a", "r5_intent_a")
+
+    with pytest.raises(psycopg.errors.RaiseException, match="considered revisions"):
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO contract_considered_revision "
+                "(considered_revision_id, intent_id, generation_run_id, considered_json, "
+                "considered_content_hash, canonicalization_version) "
+                "VALUES ('r5_bad_revision', 'r5_intent_b', 'r5_run_a', '{}'::jsonb, 'h', 'v1')"
+            )
+            conn.execute("SELECT featuregen_assert_generation_lineage_integrity()")
+
+
+def test_r5_deferred_trigger_refuses_cross_intent_recognition(conn) -> None:
+    _intent(conn, "r5_scope_intent_a")
+    _intent(conn, "r5_scope_intent_b")
+    _run(conn, "r5_scope_run", "r5_scope_intent_a")
     conn.execute(
-        "INSERT INTO feature_generation_run (generation_run_id, intent_id, actor) "
-        "VALUES (%s, %s, '{}'::jsonb), (%s, %s, '{}'::jsonb)",
-        (current_run, intent_id, wrong_run, intent_id),
-    )
-    conn.execute(
-        "INSERT INTO confirmed_generation_scope "
-        "(scope_id, intent_id, generation_run_id, expansion, scope_mode, "
-        "confirmation_source, confirmed_by) "
-        "VALUES ('r6_prior_scope', %s, %s, 'exact', 'scoped', 'user_confirmed', 'tester')",
-        (intent_id, prior_run),
+        "INSERT INTO intent_recognition_attempt "
+        "(recognition_id, intent_id, input_hash, status, taxonomy_version, "
+        "applicability_mapping_version, recognizer_model_id, prompt_version, "
+        "recipe_registry_version, created_by) "
+        "VALUES ('r5_cross_recognition', 'r5_scope_intent_b', 'h', 'unscoped', "
+        "'t', 'a', 'm', 'p', 'r', '{}'::jsonb)"
     )
 
-    with pytest.raises(psycopg.errors.RaiseException, match="feedback supersession lineage"):
+    with pytest.raises(psycopg.errors.RaiseException, match="inconsistent generation lineage"):
         with conn.transaction():
             conn.execute(
                 "INSERT INTO confirmed_generation_scope "
-                "(scope_id, intent_id, generation_run_id, supersedes_scope_id, "
-                "supersedes_generation_run_id, expansion, scope_mode, "
-                "confirmation_source, confirmed_by) "
-                "VALUES ('r6_bad_feedback_scope', %s, %s, 'r6_prior_scope', %s, "
-                "'exact', 'scoped', 'user_feedback', 'tester')",
-                (intent_id, current_run, wrong_run),
+                "(scope_id, intent_id, generation_run_id, recognition_id, expansion, "
+                "scope_mode, confirmation_source, confirmed_by) "
+                "VALUES ('r5_bad_scope', 'r5_scope_intent_a', 'r5_scope_run', "
+                "'r5_cross_recognition', 'exact', 'scoped', 'user_confirmed', 'tester')"
+            )
+            conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
+
+def test_r5_deferred_fk_refuses_orphan_snapshot(conn) -> None:
+    _intent(conn, "r5_snapshot_intent")
+    _run(conn, "r5_snapshot_run", "r5_snapshot_intent")
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO contract_considered_revision "
+                "(considered_revision_id, intent_id, generation_run_id, metadata_snapshot_id, "
+                "considered_json, considered_content_hash, canonicalization_version) "
+                "VALUES ('r5_orphan_snapshot_revision', 'r5_snapshot_intent', "
+                "'r5_snapshot_run', 'missing_snapshot', '{}'::jsonb, 'h', 'v1')"
             )
             conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
