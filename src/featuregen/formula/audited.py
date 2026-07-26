@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
-from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
+from featuregen.overlay.upload.enrich_llm import _generation_settings, drive_audited_structured_call
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,13 +40,19 @@ class AuditedCallResult:
     usage: dict
 
 
+def current_formula_generation_settings() -> dict:
+    """The exact settings the shared audited driver would apply to a formula call."""
+    return _generation_settings()
+
+
 def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task: str,
                          prompt_id: str, schema_id: str, instruction: str,
                          catalog_metadata: dict,
                          actor: IdentityEnvelope | None = None,
                          prompt_version: int = 1, schema_version: int = 1,
                          dispatch_audit: DispatchAuditContext | None = None,
-                         cacheable_metadata_keys: tuple[str, ...] = ()) -> AuditedCallResult:
+                         cacheable_metadata_keys: tuple[str, ...] = (),
+                         generation_settings: dict | None = None) -> AuditedCallResult:
     """Run one governed authoring call and return its full disposition (see ``AuditedCallResult``).
 
     Delegates to ``drive_audited_structured_call`` — never re-implementing the egress/schema/repair
@@ -60,6 +66,7 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
         catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
         prompt_version=prompt_version, schema_version=schema_version,
         dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys,
-        run_id=authoring_run_id, record_egress_block=True)
+        run_id=authoring_run_id, record_egress_block=True,
+        generation_settings=generation_settings)
     return AuditedCallResult(output=res.output, llm_call_ref=res.llm_call_ref,
                              provider_calls=res.provider_calls, usage=res.usage)

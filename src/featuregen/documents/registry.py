@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -7,6 +8,10 @@ import jsonschema
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn, SchemaValidationError, Upcaster
+
+
+def _canonical_schema(value: Mapping[str, Any]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 class DocumentSchemaRegistry:
@@ -42,6 +47,46 @@ class DocumentSchemaRegistry:
             """,
             (type_name, schema_version, Jsonb(dict(json_schema)), owner, status),
         )
+
+    def register_immutable_schema(
+        self,
+        type_name: str,
+        schema_version: int,
+        json_schema: Mapping[str, Any],
+        owner: str,
+        *,
+        status: str = "active",
+    ) -> None:
+        """Register a content-immutable provider contract.
+
+        The general document registry intentionally supports lifecycle updates. Provider output
+        schemas have a stricter identity rule: one ``(type_name, schema_version)`` must always
+        identify the same canonical schema bytes, owner, and status. Identical registration is an
+        idempotent no-op; drift fails closed and requires a new version.
+        """
+        candidate = dict(json_schema)
+        row = self._conn.execute(
+            "SELECT json_schema, owner, status FROM document_type_registry "
+            "WHERE type_name=%s AND schema_version=%s",
+            (type_name, schema_version),
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO document_type_registry "
+                "(type_name, schema_version, json_schema, owner, status) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (type_name, schema_version, Jsonb(candidate), owner, status),
+            )
+            return
+        if (
+            _canonical_schema(row[0]) != _canonical_schema(candidate)
+            or row[1] != owner
+            or row[2] != status
+        ):
+            raise SchemaValidationError(
+                f"immutable schema drift for {type_name}@v{schema_version}; "
+                "register a new version"
+            )
 
     def register_upcaster(
         self, type_name: str, from_version: int, to_version: int, upcaster: Upcaster

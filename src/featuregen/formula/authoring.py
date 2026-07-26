@@ -4,12 +4,20 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from featuregen.contracts.envelopes import IdentityEnvelope
-from featuregen.formula.author import author_formula
+from featuregen.formula.audited import current_formula_generation_settings
+from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID, author_formula
 from featuregen.formula.capability import (
     CAPABILITY_POLICY_VERSION,
     classify_formula_capability,
 )
-from featuregen.formula.critic import CRITIC_POLICY_VERSION, critique
+from featuregen.formula.critic import (
+    CRITIC_POLICY_VERSION,
+    critique,
+)
+from featuregen.formula.frozen_configuration import (
+    FrozenAuthorCriticConfigurationV1,
+    verify_frozen_configuration,
+)
 from featuregen.formula.output_authority import (
     ExprFacts,
     ExternalRequirement,
@@ -156,6 +164,7 @@ def run_authoring(
     roles=(),
     actor: IdentityEnvelope | None,
     max_turns: int = 8,
+    frozen_configuration: FrozenAuthorCriticConfigurationV1 | None = None,
 ):
     """Author, parse, govern output semantics, independently critique, and fold one result."""
     versions = {
@@ -164,26 +173,35 @@ def run_authoring(
         "critic": CRITIC_POLICY_VERSION,
         "disposition": DISPOSITION_POLICY_VERSION,
     }
+    if frozen_configuration is not None:
+        versions["frozen_configuration_policy"] = (
+            frozen_configuration.configuration_policy_version)
+        versions["frozen_configuration_hash"] = frozen_configuration.configuration_hash
     run_id = open_authoring_run(
         conn,
         intent_hash=canonical_hash(_intent_material(intent)),
         versions=versions,
         actor=_actor_json(actor),
     )
-    try:
-        raw, turns = author_formula(
-            conn,
-            intent,
-            author_client,
-            roles=tuple(roles),
-            max_turns=max_turns,
-            actor=actor,
-            authoring_run_id=run_id,
-        )
-    except Exception as exc:
-        return _technical_failure(conn, run_id, 0, f"author:{type(exc).__name__}")
+    if frozen_configuration is not None:
+        try:
+            current_settings = current_formula_generation_settings()
+            verify_frozen_configuration(
+                frozen_configuration,
+                generation_settings=current_settings,
+                author_instruction=AUTHOR_INSTRUCTION,
+                author_prompt_id=AUTHOR_PROMPT_ID,
+            )
+        except Exception as exc:
+            return _technical_failure(
+                conn, run_id, 0, f"configuration:{type(exc).__name__}")
     seq = 0
-    for turn in turns:
+
+    def persist_author_turn(turn) -> None:
+        nonlocal seq
+        output_hash = canonical_hash(turn.output) if turn.output is not None else None
+        tool_result_hash = (
+            canonical_hash(turn.tool_result) if turn.tool_result is not None else None)
         append_event(
             conn,
             run_id,
@@ -197,9 +215,29 @@ def run_authoring(
                 "tool_name": turn.tool_name,
                 "provider_calls": turn.provider_calls,
                 "usage": turn.usage,
+                "output": turn.output,
+                "output_hash": output_hash,
+                "tool_result": turn.tool_result,
+                "tool_result_hash": tool_result_hash,
             },
         )
         seq += 1
+
+    try:
+        raw, turns = author_formula(
+            conn,
+            intent,
+            author_client,
+            roles=tuple(roles),
+            max_turns=max_turns,
+            actor=actor,
+            authoring_run_id=run_id,
+            on_turn=persist_author_turn,
+            provider_contract=(
+                frozen_configuration.author if frozen_configuration is not None else None),
+        )
+    except Exception as exc:
+        return _technical_failure(conn, run_id, seq, f"author:{type(exc).__name__}")
     if raw is None:
         result = derive_disposition(
             AuthoringAxes("ok", "ok", "resolved", "not_provided", "clean", "technical_failure"),
@@ -254,6 +292,8 @@ def run_authoring(
             roles=tuple(roles),
             actor=actor,
             authoring_run_id=run_id,
+            provider_contract=(
+                frozen_configuration.critic if frozen_configuration is not None else None),
         )
     except Exception as exc:
         return _technical_failure(conn, run_id, seq, f"critic:{type(exc).__name__}")

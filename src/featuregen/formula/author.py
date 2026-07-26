@@ -19,6 +19,9 @@ returned trail with its ``llm_call_ref``.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.formula.audited import audited_formula_call
@@ -34,6 +37,9 @@ from featuregen.formula.turns import (
     TurnKind,
 )
 from featuregen.intake.llm import LLMClient
+
+if TYPE_CHECKING:
+    from featuregen.formula.frozen_configuration import FrozenProviderContractV1
 
 __all__ = [
     "AUTHOR_INSTRUCTION",
@@ -94,7 +100,7 @@ def tool_trail_entry(turn_no: int, tool_name: str, result: dict) -> dict:
 def _register_turn_schema(conn) -> None:
     """Idempotently register the AuthorTurnV1 output schema so the audited seam can resolve and
     validate it (its self-registration fallback covers only the enrichment schemas)."""
-    DocumentSchemaRegistry(conn).register_schema(
+    DocumentSchemaRegistry(conn).register_immutable_schema(
         AUTHOR_TURN_SCHEMA_ID, AUTHOR_TURN_SCHEMA_VERSION, AUTHOR_TURN_V1_SCHEMA, _SCHEMA_OWNER)
 
 
@@ -113,6 +119,8 @@ def author_formula(
     max_turns: int,
     actor: IdentityEnvelope | None,
     authoring_run_id: str,
+    on_turn: Callable[[AuthorTurnRecord], None] | None = None,
+    provider_contract: FrozenProviderContractV1 | None = None,
 ) -> tuple[dict | None, list[AuthorTurnRecord]]:
     """Author one TypedFormula proposal via a bounded sequential-turn loop.
 
@@ -121,19 +129,48 @@ def author_formula(
     docstring). Every turn in ``turns`` is exactly one audited call carrying its ``llm_call_ref``;
     tools run read-only over ``conn`` under ``roles``."""
     _register_turn_schema(conn)
+    instruction = (
+        provider_contract.instruction_utf8.decode("utf-8")
+        if provider_contract is not None
+        else AUTHOR_INSTRUCTION
+    )
+    prompt_id = provider_contract.prompt_id if provider_contract is not None else AUTHOR_PROMPT_ID
+    prompt_version = provider_contract.prompt_version if provider_contract is not None else 1
+    schema_id = (
+        provider_contract.output_schema_id
+        if provider_contract is not None
+        else AUTHOR_TURN_SCHEMA_ID
+    )
+    schema_version = (
+        provider_contract.output_schema_version
+        if provider_contract is not None
+        else AUTHOR_TURN_SCHEMA_VERSION
+    )
+    generation_settings = (
+        provider_contract.generation_settings()
+        if provider_contract is not None
+        else None
+    )
     role_tuple = tuple(roles)
     turns: list[AuthorTurnRecord] = []
     trail: list[dict] = []
     tokens_spent = 0
+
+    def record(turn: AuthorTurnRecord) -> None:
+        turns.append(turn)
+        if on_turn is not None:
+            on_turn(turn)
+
     for index in range(max_turns):
         if tokens_spent > AUTHOR_TOKEN_BUDGET:
             return None, turns          # budget exceeded — technical, never a fabricated proposal
         result = audited_formula_call(
             conn, client, authoring_run_id=authoring_run_id, task=AUTHOR_TASK,
-            prompt_id=AUTHOR_PROMPT_ID, schema_id=AUTHOR_TURN_SCHEMA_ID,
-            instruction=AUTHOR_INSTRUCTION,
+            prompt_id=prompt_id, schema_id=schema_id,
+            instruction=instruction,
             catalog_metadata=build_turn_metadata(intent, trail),
-            actor=actor, schema_version=AUTHOR_TURN_SCHEMA_VERSION)
+            actor=actor, prompt_version=prompt_version, schema_version=schema_version,
+            generation_settings=generation_settings)
         usage = dict(result.usage or {})
         tokens_spent += _tokens_of(usage)
         output = result.output
@@ -141,7 +178,7 @@ def author_formula(
         if output is None:
             # egress-blocked or provider-failed — audited (the ref records the block/failure),
             # but there is nothing to act on: the run is technical.
-            turns.append(AuthorTurnRecord(
+            record(AuthorTurnRecord(
                 index=index, kind=TurnKind.FAILED, llm_call_ref=result.llm_call_ref,
                 tool_name=None, tool_result=None, output=None,
                 provider_calls=result.provider_calls, usage=usage))
@@ -150,7 +187,7 @@ def author_formula(
         turn_type = output.get("turn_type")
         final_proposal = output.get("final_proposal")
         if turn_type == TURN_TYPE_FINAL_PROPOSAL and isinstance(final_proposal, dict):
-            turns.append(AuthorTurnRecord(
+            record(AuthorTurnRecord(
                 index=index, kind=TurnKind.FINAL_PROPOSAL, llm_call_ref=result.llm_call_ref,
                 tool_name=None, tool_result=None, output=output,
                 provider_calls=result.provider_calls, usage=usage))
@@ -164,7 +201,7 @@ def author_formula(
             tool_result = run_tool(
                 conn, tool_name, arguments if isinstance(arguments, dict) else {},
                 roles=role_tuple)
-            turns.append(AuthorTurnRecord(
+            record(AuthorTurnRecord(
                 index=index, kind=TurnKind.TOOL_CALL, llm_call_ref=result.llm_call_ref,
                 tool_name=tool_name, tool_result=tool_result, output=output,
                 provider_calls=result.provider_calls, usage=usage))
@@ -174,7 +211,7 @@ def author_formula(
 
         # a discriminator without its slot (or an unknown shape the schema let through):
         # fail closed — record the turn and surface the run as technical.
-        turns.append(AuthorTurnRecord(
+        record(AuthorTurnRecord(
             index=index, kind=TurnKind.FAILED, llm_call_ref=result.llm_call_ref,
             tool_name=None, tool_result=None, output=output,
             provider_calls=result.provider_calls, usage=usage))

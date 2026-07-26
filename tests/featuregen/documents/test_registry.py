@@ -32,6 +32,41 @@ def test_validate_unregistered_type_raises(db):
         reg.validate("FEATURE_PLAN", 99, {"x": 1})
 
 
+def test_immutable_schema_registration_is_idempotent_only_for_identical_content(db):
+    reg = DocumentSchemaRegistry(db)
+    reg.register_immutable_schema("FORMULA_TURN", 1, _SCHEMA, owner="formula")
+    reg.register_immutable_schema(
+        "FORMULA_TURN",
+        1,
+        {
+            "properties": {"x": {"type": "integer"}},
+            "additionalProperties": False,
+            "required": ["x"],
+            "type": "object",
+        },
+        owner="formula",
+    )
+    assert reg.schema_for("FORMULA_TURN", 1) == _SCHEMA
+
+
+@pytest.mark.parametrize(
+    ("schema", "owner", "status"),
+    [
+        ({"type": "array"}, "formula", "active"),
+        (_SCHEMA, "different-owner", "active"),
+        (_SCHEMA, "formula", "deprecated"),
+    ],
+)
+def test_immutable_schema_registration_rejects_same_version_drift(
+    db, schema, owner, status
+):
+    reg = DocumentSchemaRegistry(db)
+    reg.register_immutable_schema("FORMULA_TURN", 1, _SCHEMA, owner="formula")
+    with pytest.raises(SchemaValidationError, match="immutable schema drift"):
+        reg.register_immutable_schema(
+            "FORMULA_TURN", 1, schema, owner=owner, status=status)
+
+
 def test_upcast_chains_stepwise(db):
     reg = DocumentSchemaRegistry(db)
     reg.register_upcaster("DQ_REPORT", 1, 2, lambda b: {**b, "v2": True})

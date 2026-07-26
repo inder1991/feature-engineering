@@ -27,14 +27,14 @@ from featuregen.formula.author import (
     build_turn_metadata,
     tool_trail_entry,
 )
+from featuregen.formula.tools import TOOLS, run_tool
 from featuregen.formula.turns import (
     AUTHOR_TURN_V1_SCHEMA,
+    TOOL_NAMES,
     AuthoringIntent,
     AuthorTurnRecord,
-    TOOL_NAMES,
     TurnKind,
 )
-from featuregen.formula.tools import TOOLS, run_tool
 from featuregen.intake.llm import FakeLLM, FakeResponse, compute_input_hash
 from featuregen.intake.redaction import RedactionResult, build_llm_inputs
 from featuregen.intake.schema_projection import (
@@ -185,6 +185,33 @@ def test_three_turn_flow_returns_final_proposal_and_turn_trail(db):
     assert turns[1].tool_name == "get_column_metadata"
     assert turns[1].tool_result == r2
     assert turns[2].output == _final_turn(raw)
+
+
+def test_completed_turn_callback_runs_before_the_next_provider_call(db):
+    _seed_catalog(db)
+    client = FakeLLM()
+    _script_three_turn_run(db, client)
+    persisted: list[int] = []
+
+    class CheckingClient:
+        def call(self, request):
+            expected_completed = len(persisted)
+            assert sum(client._calls.values()) == expected_completed
+            return client.call(request)
+
+    proposal, turns = author_formula(
+        db,
+        _INTENT,
+        CheckingClient(),
+        roles=(),
+        max_turns=5,
+        actor=_ACTOR,
+        authoring_run_id=RUN,
+        on_turn=lambda turn: persisted.append(turn.index),
+    )
+    assert proposal == _raw_proposal()
+    assert persisted == [0, 1, 2]
+    assert len(turns) == 3
 
 
 def test_each_turn_is_one_audited_call_with_llm_call_ref(db):
