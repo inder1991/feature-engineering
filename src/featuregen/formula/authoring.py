@@ -586,7 +586,7 @@ def _typed_formula(proposal: TypedFormulaProposalV1,
 
 def _axes(*, structural_status: StructuralStatus = "ok",
           capability_status: str = "ok",
-          output_status: OutputStatus = "resolved",
+          output_status: OutputStatus = "needs_authority",
           expectation_status: ExpectationStatus = "not_provided",
           critic_status: CriticStatus = "clean",
           technical_status: str = "ok") -> AuthoringAxes:
@@ -596,7 +596,15 @@ def _axes(*, structural_status: StructuralStatus = "ok",
     higher-precedence axis already decides the fold (technical, or a structural verdict), and the
     stages that would have set the remaining axes never ran — so ``"ok"``/``"clean"`` here means
     "nothing was observed", and the §F precedence guarantees it is never what the disposition turns
-    on. Every full run passes all six explicitly."""
+    on. Every full run passes all six explicitly.
+
+    ``output_status`` is the ONE axis whose "nothing was observed" value cannot be the clean one:
+    ``"resolved"`` is a POSITIVE claim — the C1 authority stage resolved this run's output — and an
+    early exit is taken before that stage ever runs. Writing it onto the returned result and into
+    the write-once §H terminal payload would be a dishonest durable record of exactly the thing §J's
+    ``false_resolve_rate`` exists to prevent. ``"needs_authority"`` is the honest reading (no
+    authority was established) and sits BELOW technical/invalid/unsupported in the §F precedence, so
+    it changes no disposition on any early-exit path."""
     return AuthoringAxes(
         structural_status=structural_status,
         capability_status=capability_status,        # type: ignore[arg-type]

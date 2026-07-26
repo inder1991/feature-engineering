@@ -539,6 +539,38 @@ def test_an_author_that_never_finalizes_is_a_technical_failure(db) -> None:
     assert CRITIC_TASK not in tasks                  # the critic is never asked about nothing
 
 
+def test_an_early_exit_run_never_claims_a_resolved_output(db) -> None:
+    """A run that exits BEFORE the C1 authority stage must not claim ``output_status="resolved"``.
+
+    "Resolved output" is a POSITIVE claim — the C1 stage resolved this run's output — and on an
+    early exit that stage never ran. The claim is checked in BOTH places it is durable: the returned
+    ``AuthoringResult`` and the WRITE-ONCE §H terminal payload (migration 1020 makes the row
+    physically immutable, so a dishonest payload there can never be corrected). Asserted over BOTH
+    of the orchestrator's early-exit sites: the technical ``(None, turns)`` author outcome, and a
+    proposal that never parses."""
+    seed_authoring_catalog(db)
+    invalid = _raw()
+    del invalid["decimal"]
+    technical = FakeLLM(script={AUTHOR_TASK: FakeResponse(output={"turn_type": "final_proposal"})})
+
+    def assert_no_resolved_claim(result, expected_disposition: str) -> None:
+        assert result.authoring_disposition == expected_disposition
+        assert result.output_status != "resolved", expected_disposition
+        terminal = _events(db, result.authoring_run_id)[-1]
+        assert terminal[1] in ("COMPLETED", "FAILED")
+        assert terminal[3]["authoring_disposition"] == expected_disposition
+        assert terminal[3]["output_status"] != "resolved", expected_disposition
+        assert terminal[3]["candidate_formula_hash"] is None
+
+    # site 1 — ``author_formula`` returned ``(None, turns)``: nothing was ever parsed
+    assert_no_resolved_claim(_run(db, author=technical), "TECHNICAL_FAILURE")
+    # site 2 — the proposal never parsed (the stub is the same one the parse-boundary tests use:
+    # a proposal missing a required object cannot arrive through the wire schema either)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(authoring, "author_formula", lambda *a, **k: (invalid, []))
+        assert_no_resolved_claim(_run(db), "REJECTED")
+
+
 def test_an_exhausted_author_run_is_technical_and_fully_traced(db) -> None:
     """The other ``(None, turns)`` shape: every turn taken is still recorded with its audit ref."""
     seed_authoring_catalog(db)
