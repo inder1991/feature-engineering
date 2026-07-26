@@ -507,6 +507,40 @@ def test_a_rejected_fallback_replay_preserves_the_callers_uncommitted_work(
                       "AND seq = 2", (run_id,)).fetchone()[0] == "FAILED"
 
 
+def test_a_fallback_replay_on_an_already_aborted_caller_leaves_it_recoverable(
+        db, monkeypatch, _dsn) -> None:
+    """Fix-wave-3 IMPORTANT. The savepoint branch may be taken only for ``INTRANS``. On an ALREADY
+    ABORTED caller transaction (``INERROR``) psycopg's ``Transaction.__enter__`` increments
+    ``_num_transactions`` BEFORE issuing ``SAVEPOINT``; that ``SAVEPOINT`` then fails with
+    ``InFailedSqlTransaction``, ``__enter__`` raises, ``__exit__`` never runs, and the counter LEAKS
+    at 1 permanently — after which ``conn.rollback()`` / ``conn.commit()`` raise ``ProgrammingError:
+    Explicit rollback() forbidden within a Transaction context`` and the connection is unrecoverable
+    in-process. Pre-wave-2 the same probe recovered, so this was a strict regression, and it
+    falsified ``_replay_on_caller``'s contract ("leave the caller's transaction exactly as usable as
+    it found it").
+
+    Reachable in exactly the shape Task 12 produces: an orchestrator recording its terminal
+    ``FAILED`` *because* its own SQL failed, while the durable connection blips. ``api.deps``'
+    ``get_feature_gen_conn`` then does ``except Exception: conn.rollback(); raise`` — that
+    ``rollback()`` would itself raise and MASK the request's real error.
+
+    Replaying BARE on ``INERROR`` is the correct behaviour: nothing can be written on an aborted
+    transaction, so the append raises honestly and psycopg's counter is never touched."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_inerror_replay")   # commits durably: the caller stays IDLE
+    with pytest.raises(psycopg.errors.UndefinedTable):    # the caller's OWN statement fails
+        db.execute("SELECT 1 FROM a_table_that_does_not_exist")
+    assert db.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+    depth_before = db._num_transactions
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    with pytest.raises(psycopg.errors.InFailedSqlTransaction):   # the honest outcome
+        append_event(db, run_id, TraceEventKind.FAILED, seq=0,
+                     idempotency_key=f"{run_id}:0", payload={"disposition": "TECHNICAL_FAILURE"})
+    assert db._num_transactions == depth_before   # pre-fix: 1 — a permanently leaked savepoint
+    db.rollback()                                 # pre-fix: ProgrammingError (forbidden in a txn)
+    assert db.execute("SELECT 1").fetchone()[0] == 1      # and the connection is REUSABLE again
+
+
 def test_a_lost_ack_event_replay_converges_instead_of_raising(db, monkeypatch, _dsn) -> None:
     """Fix-wave-2 IMPORTANT 1, coupled half: COMMIT AMBIGUITY. The fresh connection's INSERT commits
     server-side but the ack never arrives, so the fallback replays a statement the database HAS

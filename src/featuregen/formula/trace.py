@@ -324,26 +324,45 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
     through this very degraded path. Precedent for the shape: ``overlay.upload.enrich`` (program-audit
     finding I-2). A savepoint takes no advisory lock, so the I-3 self-deadlock does not apply.
 
-    Two shapes, because ``conn.transaction()`` is not a savepoint when there is no transaction:
+    THREE shapes, keyed on the EXACT transaction status — ``conn.transaction()`` is not a savepoint
+    when there is no transaction, and it is not usable at all once one has aborted:
 
-    * IN a transaction (the request shape) → SAVEPOINT. The rejection is contained and the caller's
-      uncommitted work — including trace rows that degraded here earlier, the only copy there is —
-      survives untouched. A blanket ``rollback()`` would keep the connection usable by destroying
-      exactly the evidence this module exists to preserve.
-    * IDLE → replay bare. ``conn.transaction()`` would BEGIN *and COMMIT* here, committing a degraded
-      row whose whole point is to share the request's fate (and breaking the caller's control of its
-      own transaction boundary). Nothing of the caller's is in flight, so if the replay is rejected
-      the implicit single-statement transaction is discarded — that loses nothing and keeps the
-      connection usable."""
-    if conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
+    * ``INTRANS`` (the healthy request shape) → SAVEPOINT. The rejection is contained and the
+      caller's uncommitted work — including trace rows that degraded here earlier, the only copy
+      there is — survives untouched. A blanket ``rollback()`` would keep the connection usable by
+      destroying exactly the evidence this module exists to preserve.
+    * ``IDLE`` → replay bare. ``conn.transaction()`` would BEGIN *and COMMIT* here, committing a
+      degraded row whose whole point is to share the request's fate (and breaking the caller's
+      control of its own transaction boundary). Nothing of the caller's is in flight, so if the
+      replay is rejected the implicit single-statement transaction is discarded — that loses nothing
+      and keeps the connection usable.
+    * ``INERROR`` (the caller's transaction ALREADY aborted, on its own earlier statement) → replay
+      bare, and let ``InFailedSqlTransaction`` propagate. Nothing can be written on an aborted
+      transaction and this module must not pretend otherwise. Taking the savepoint branch here
+      BRICKED the connection: psycopg's ``Transaction.__enter__`` increments
+      ``conn._num_transactions`` BEFORE issuing ``SAVEPOINT``, that ``SAVEPOINT`` fails,
+      ``__enter__`` raises, ``__exit__`` never runs, and the counter LEAKS at 1 permanently — after
+      which ``conn.rollback()``/``conn.commit()`` raise ``ProgrammingError("Explicit rollback()
+      forbidden within a Transaction context")`` and the connection is unrecoverable in-process.
+      That is reachable in exactly the shape Task 12 produces (an orchestrator recording its
+      terminal ``FAILED`` *because* its own SQL failed, while the durable connection blips), and
+      ``api.deps.get_feature_gen_conn``'s ``except Exception: conn.rollback(); raise`` would then
+      have MASKED the request's real error with that ``ProgrammingError``. No ``rollback()`` here
+      either: that would discard the caller's uncommitted trace evidence, which is the one thing
+      this function may never do."""
+    status = conn.info.transaction_status
+    if status == psycopg.pq.TransactionStatus.INTRANS:
+        with conn.transaction():   # savepoint: contain a rejected replay without poisoning the txn
+            conn.execute(sql, params)
+        return
+    if status == psycopg.pq.TransactionStatus.IDLE:
         try:
             conn.execute(sql, params)
         except Exception:
             conn.rollback()   # discards ONLY the rejected statement's implicit tx — nothing else
             raise
         return
-    with conn.transaction():   # savepoint: contain a rejected replay without poisoning the txn
-        conn.execute(sql, params)
+    conn.execute(sql, params)   # INERROR (or worse): bare, so psycopg's savepoint stack can't leak
 
 
 def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple | None:
