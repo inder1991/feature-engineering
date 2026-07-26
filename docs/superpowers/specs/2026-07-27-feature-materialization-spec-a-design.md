@@ -56,11 +56,19 @@ FeatureGroupPlanV1                                       → group_plan_hash
 ComputationPlanV1
   ↓ A6  render
 Generated Kedro project                                  → generated_project_hash
-  ↓ A7  `kedro run` in the data plane (Spark on YARN)
+  ↓ A7  submit to the cluster; validate the pipeline (§N)
+        L0 builds · L1 schema/access · L2 tiny-sample (ON DEMAND)
+ValidationReportV1                                       → classified findings
+  ↓      findings route: renderer defect → regenerate
+  ↓                      governed-fact mismatch → re-attest, then regenerate
+  ↓                      environment/data → operator
+  ↓ A8  `kedro run` (L3) in the data plane (Spark on YARN)
 intermediate → primary → feature_staging → assemble → validate → publish
-  ↓ A8  manifest returns to the control plane
-RunManifestV1                                            → execution_hash
+  ↓ A9  manifest returns to the control plane
+RunManifestV1                                            → sandbox_execution_hash
 ```
+
+A7 is a loop, not a step: the platform submits, reads the classified report, fixes either the renderer or the governed fact, and regenerates. A8 only happens once L0 and L1 pass.
 
 **A1 `FormulaPlannerIntentV1`** states requirements in *logical* terms and preserves `logical_ref` strings byte-exactly. It must never substitute a similar column. It carries: the required column refs (by role — measure, filter, event-time, grain key), the target grain (`entity`, ordered `keys`), the window policy, and the operation shape. It resolves nothing physical.
 
@@ -328,7 +336,9 @@ Three tiers, mirroring Child-1's gold gate — and, as there, the cheap tier pro
 
 1. **Golden-file render tests** (default CI, no Spark). IR + group plan → generated project bytes, compared to committed goldens. Catches renderer drift. Also asserts `generated_project_hash` stability and the identity headers.
 2. **Spark-local execution tests** (marked, opt-in; the `eval`-marker pattern). Actually run the generated pipeline in Spark local mode on tiny hand-authored fixtures and assert: computed values match hand-computed expectations; **the §G look-ahead row is excluded**; exactly one row per `(keys…, business_dt)`; entities with no source rows still appear; every §I gate fires on a deliberately broken group.
-3. **Cluster acceptance** (manual). `kedro run` on the real Hadoop/Hive environment; the atomic-publication test from §K; the run manifest ingested and readable.
+3. **Validation-loop tests** (default CI where possible, no cluster for L0). Assert that each level detects what it is for and — critically — that findings are **classified correctly**, since the classification is what routes the fix. The discriminating cases: a deliberately-broken renderer output yields `RENDERER_DEFECT`; a Hive column whose real type contradicts the governed fact yields `GOVERNED_FACT_MISMATCH` and **not** `ENVIRONMENT_OR_DATA`; a missing partition yields `ENVIRONMENT_OR_DATA` and **not** a renderer defect; an unattributable finding yields `UNCLASSIFIED` and fails closed. Also assert the egress rule: no finding carries a data value, only counts, types and locations. And assert the regeneration rules — a `GOVERNED_FACT_MISMATCH` blocks regeneration, and validation results never carry across a changed `generated_project_hash`.
+
+4. **Cluster acceptance** (manual). Submit via the local submitter; L0 and L1 pass; L2 on demand over a sample; `kedro run` (L3) on the real Hadoop/Hive environment; the atomic-publication test from §K; the run manifest ingested and readable.
 
 Fixtures are **hand-authored**, not generated from the code that renders them — the Child-1 lesson that a fixture derived from the implementation asserts only that the code agrees with itself.
 
@@ -344,12 +354,69 @@ Fixtures are **hand-authored**, not generated from the code that renders them �
 | Any §I gate fails | group rejected, manifest `status = rejected`, reason recorded |
 | Publication mechanism cannot guarantee atomic visibility | publication refused; reported, not downgraded |
 | `generated_project_hash` mismatch | publication refused (tamper evidence) |
+| L0 fails | nothing submitted; findings classified (almost always `RENDERER_DEFECT`) |
+| L1 fails | no L2/L3 attempted; a type or existence contradiction is `GOVERNED_FACT_MISMATCH` and blocks regeneration until re-attested; a missing partition or permission denial is `ENVIRONMENT_OR_DATA` |
+| L2 fails | no L3 run; findings classified; nothing published |
+| A finding cannot be attributed | `UNCLASSIFIED` — fails closed, never downgraded to environmental |
+| Submission itself fails (cluster unreachable) | `status = error` on the report, no findings invented, loop not advanced |
+
+---
+
+## §N Validation loop and local submission
+
+The platform does not emit code and hope. A generated project is **submitted, validated, and reported on**, and the classified report drives regeneration. This is what lets the platform fix a feature rather than hand you a broken pipeline.
+
+### Levels — fail fast, cheapest first
+
+| Level | What it proves | Cost | When |
+|---|---|---|---|
+| **L0** project builds | imports resolve, the Kedro DAG builds, catalog entries parse, `generated_project_hash` matches its render record | seconds, **no cluster** | every generation |
+| **L1** schema + access | every column in the IR physical read set exists in Hive with the declared type, is readable, and the `business_dt` partition exists | seconds, **metastore metadata only — no data read** | every submission |
+| **L2** tiny-sample execution | Spark analysis errors, join-cardinality blowups, and the §I gates over a sampled slice | minutes, small Spark job | **on demand** |
+| **L3** full partition run | the real materialization (§A8) | full | operator |
+
+L0 and L1 are standard. **L2 is explicitly on demand** — requested when L1 passes but the output isn't trusted yet. L3 is a run, not a validation.
+
+The layering is the point: a wrong column name must surface in seconds from L1, never after an hour of L3 Spark.
+
+### `ValidationReportV1`
+
+Small, machine-readable, no feature data. Carries `report_id`, `generated_project_hash`, `group_plan_hash`, `level ∈ {L0, L1, L2}`, `environment_id`, `started_at`, `finished_at`, `status ∈ {passed, failed, error}`, and `findings: tuple[ValidationFinding, ...]`.
+
+Each `ValidationFinding` carries a `code` from a **closed vocabulary**, a `severity`, its `classification` (below), a `location` (physical `(schema, table, column)` and/or the generated node), `expected` / `observed` **as type and schema facts only**, and a `count` where one is meaningful.
+
+**Egress rule (normative).** Findings carry **counts, types and locations — never data values.** `"3 duplicate grain keys in sandbox_feature.cif_daily"` is permitted; the offending `cif_id` values are not. Where a value would aid debugging it stays in the data plane's own logs and the finding points at its location. A validation report crosses the data-plane boundary, so it is governed by the same metadata-only discipline as Child-1's tool egress.
+
+### Classification — what makes the loop actionable
+
+"It failed" is useless. Every finding is classified into exactly one bucket, because each routes to a different fix:
+
+| Classification | Meaning | Fix route |
+|---|---|---|
+| `RENDERER_DEFECT` | we generated wrong or invalid PySpark/Kedro | fix the renderer and **regenerate**. The generated project is never hand-edited — `generated_project_hash` makes an edit detectable |
+| `GOVERNED_FACT_MISMATCH` | reality contradicts a governed fact — the catalog says `transactions.amount` is decimal, Hive says `string` | the **code is right and the catalog is wrong**: raise an external requirement against that fact and re-attest it before regenerating |
+| `ENVIRONMENT_OR_DATA` | partition absent, permission denied, source not yet loaded | nothing to fix in code; the operator acts |
+| `UNCLASSIFIED` | cannot be attributed | **fails closed** — must never be silently treated as environmental, which would let a real renderer defect masquerade as someone else's problem |
+
+That second bucket is the one that earns the loop: it distinguishes "our generator is broken" from "your catalog is lying", which are the same symptom and opposite fixes.
+
+### Regeneration rules (normative)
+
+- `GOVERNED_FACT_MISMATCH` **blocks** regeneration until the fact is re-attested — regenerating against a fact known to be wrong reproduces the same failure and wastes a cluster round-trip.
+- `RENDERER_DEFECT` permits regeneration once the renderer changes. The new project necessarily has a different `generated_project_hash`, so a stale project cannot be re-validated by accident.
+- A regenerated project starts at L0 again. Validation results are never inherited across `generated_project_hash` values.
+
+### Submission
+
+`PipelineSubmitter` is the seam; `LocalClusterSubmitter` is the only implementation in this slice — a deliberately thin adapter that submits the generated project to the local Hadoop/Spark cluster (`spark-submit`, or Livy where available) and collects the report. It is cheap precisely because there is no cross-organisation security boundary on localhost.
+
+**Deferred to Child-6:** authenticated submission into a real bank environment — request-endpoint authentication, idempotency-key derivation, the run acceptance/status/cancellation protocol, result attestation, and reconciliation after partial failure. Only the transport changes; the loop's value does not depend on it.
 
 ---
 
 ## First-slice bounds
 
-One entity (CIF) · one cadence (daily) · one materialization group · the three worked-example features (`cross_border_value_ratio_90d`, `total_debit_amount_30d`, `distinct_merchant_count_90d`) · one `business_dt` partition per run · one Hadoop/Hive environment · only the formula operations those features need · **no UI · no cross-cadence assembly · no statistical profiling**.
+One entity (CIF) · one cadence (daily) · one materialization group · the three worked-example features (`cross_border_value_ratio_90d`, `total_debit_amount_30d`, `distinct_merchant_count_90d`) · one `business_dt` partition per run · one Hadoop/Hive environment · only the formula operations those features need · L0+L1 validation standard with **L2 on demand** · a local submitter only · **no UI · no cross-cadence assembly · no statistical profiling**.
 
 ---
 
@@ -359,7 +426,9 @@ Mandatory section per the functional-first directive. All recorded in `docs/DEFE
 
 **Deferred from the parent architecture:** Iceberg atomic revisions, time-travel and restatement · the run state machine (`REQUESTED→ACCEPTED→RUNNING→COMMITTED/FAILED/CANCELLED/STALE_INPUT`) · outbox and reconciliation · external attestation round-trip and authenticated callbacks (Child-6) · execution-signature batching optimization (Child-7) · quarantine by bounded bisection · profiling privacy hardening (Spec B) · the full Child-2 lifecycle (frozen artifact → feature version → deployment binding, status axes → `materialization_eligibility`, template-reuse policy, parameter split) · the full `TemporalPolicyV1` (SCD effective/system time, reversal policy, late-arrival horizon, restatement policy).
 
-**Newly identified here:** a **governed source-delivery SLA** distinct from catalog freshness — the prerequisite for deriving `availability_class` (§C.1) · the `dependencies_ready` cadence trigger, which needs it · **automated job submission** from the control plane (Spec A generates; the operator runs `kedro run`) · multi-partition and backfill runs (one `business_dt` per run here) · multi-environment promotion.
+**Newly identified here:** a **governed source-delivery SLA** distinct from catalog freshness — the prerequisite for deriving `availability_class` (§C.1) · the `dependencies_ready` cadence trigger, which needs it · **authenticated submission into a real bank environment** (§N — Spec A ships a local submitter; the authenticated request endpoint, idempotency keys, run state machine, result attestation and reconciliation are Child-6) · multi-partition and backfill runs (one `business_dt` per run here) · multi-environment promotion.
+
+**Reclassified as functional and now IN Spec A:** the submit → validate → classify → regenerate loop (§N). It was originally deferred as "automated job submission", but the *loop* is what lets the platform fix a feature instead of handing over a broken pipeline — and distinguishing "our renderer is wrong" from "the catalog is lying" is governance, not operations. Only the authenticated cross-organisation transport stays deferred.
 
 **Explicitly NOT deferred**, despite resembling NFRs: PIT correctness (§G) — a look-ahead feature is wrong; atomic group publication (§K) — a partially-published table is a correctness failure; the §I validation gates; and the derived sensitivity/access/retention classification (§C) — governance is the product.
 
