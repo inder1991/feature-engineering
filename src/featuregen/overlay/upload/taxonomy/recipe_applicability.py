@@ -34,10 +34,16 @@ and the Task-4 override table in ``docs/superpowers/plans/2026-07-09-phase0-taxo
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from featuregen.overlay.upload import templates
 from featuregen.overlay.upload.taxonomy.legacy_crosswalk import crosswalk
 from featuregen.overlay.upload.taxonomy.use_cases import ancestors, selectable_leaves
+
+
+class ApplicabilitySource(StrEnum):
+    AUTHORED = "authored"
+    LEGACY_DERIVED = "legacy_derived"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,7 @@ class ApplicabilitySpec:
     typology: tuple[str, ...] = ()
     journey_stage: tuple[str, ...] = ()
     business_outcome: tuple[str, ...] = ()
+    source: ApplicabilitySource = ApplicabilitySource.LEGACY_DERIVED
 
 
 # ── Step 1: explicit primary overrides (win over derivation — spec D3/D7, by recipe id) ─────────────
@@ -64,7 +71,7 @@ class ApplicabilitySpec:
 # tag exists (D3). The other derived use-case leaves fall through to `secondary`.
 _FRAUD_TXN_MONITORING: tuple[str, ...] = (
     "card_testing_velocity", "device_sharing_velocity", "new_device_flag", "geo_velocity_impossible",
-    "first_time_payee_high_value", "merchant_risk_anomaly", "txn_velocity_spike", "amount_zscore_spike",
+    "first_time_payee_high_value", "txn_velocity_spike", "amount_zscore_spike",
     "cross_channel_rail_anomaly", "cross_border_burst", "amount_just_under_limit",
 )
 _AML_TXN_MONITORING: tuple[str, ...] = (
@@ -74,8 +81,8 @@ _AML_TXN_MONITORING: tuple[str, ...] = (
 )
 # concentration_risk is cross-cutting — all six recipes land on the promoted concentration leaf (D7).
 _CONCENTRATION: tuple[str, ...] = (
-    "rate_sensitive_concentration", "book_desk_concentration", "sukuk_concentration",
-    "syndication_concentration", "group_exposure_aggregation", "guarantor_reliance",
+    "book_desk_concentration", "sukuk_concentration",
+    "syndication_concentration", "guarantor_reliance",
 )
 
 _PRIMARY_OVERRIDE: dict[str, str] = {
@@ -259,7 +266,7 @@ def recipe_applicability(template: templates.Template) -> ApplicabilitySpec:
             dim_values[dimension].append(target)
         # modelling_context / measure / metadata -> ignored (not applicability fields)
 
-    # ── primary: override > IN-FAMILY derived leaf > orphan home > family fallback ──
+    # ── primary: authored > override > IN-FAMILY derived leaf > orphan home > family fallback ──
     # Family-aware (adversarial-review fix): a foreign-family generic-tag leaf (e.g. a markets recipe's
     # `limit_management` tag hitting the CREDIT limit leaf) must NEVER become the primary — the recipe's
     # objective belongs to its own domain. So derivation only accepts a leaf inside the family's subtree;
@@ -271,12 +278,35 @@ def recipe_applicability(template: templates.Template) -> ApplicabilitySpec:
         return family_root is not None and (leaf == family_root or family_root in ancestors(leaf))
 
     in_family_leaves = [leaf for leaf in leaf_targets if _in_family(leaf)]
-    if template.id in _PRIMARY_OVERRIDE:
+    if template.primary_objective is not None:
+        if template.primary_objective not in leaves:
+            raise ValueError(
+                f"recipe {template.id!r} authored primary is not a selectable leaf: "
+                f"{template.primary_objective!r}")
+        if len(template.supporting_objectives) != len(set(template.supporting_objectives)):
+            raise ValueError(f"recipe {template.id!r} has duplicate supporting objectives")
+        if template.primary_objective in template.supporting_objectives:
+            raise ValueError(f"recipe {template.id!r} repeats its primary as a supporting objective")
+        unknown_supporting = [s for s in template.supporting_objectives if s not in leaves]
+        if unknown_supporting:
+            raise ValueError(
+                f"recipe {template.id!r} has non-selectable supporting objectives: "
+                f"{unknown_supporting!r}")
+        primary = template.primary_objective
+        authored_secondary = template.supporting_objectives
+        source = ApplicabilitySource.AUTHORED
+    elif template.id in _PRIMARY_OVERRIDE:
         primary = _PRIMARY_OVERRIDE[template.id]
+        authored_secondary = None
+        source = ApplicabilitySource.LEGACY_DERIVED
     elif in_family_leaves:
         primary = in_family_leaves[0]
+        authored_secondary = None
+        source = ApplicabilitySource.LEGACY_DERIVED
     elif template.id in _ORPHAN_PRIMARY:
         primary = _ORPHAN_PRIMARY[template.id]
+        authored_secondary = None
+        source = ApplicabilitySource.LEGACY_DERIVED
     else:
         fallback = _FAMILY_FALLBACK_LEAF.get(family) if family is not None else None
         if fallback is not None:
@@ -287,11 +317,18 @@ def recipe_applicability(template: templates.Template) -> ApplicabilitySpec:
             raise ValueError(
                 f"recipe {template.id!r} (family {family!r}) has no selectable-leaf primary: "
                 "no override, no in-family leaf, no orphan home, and no family fallback")
+        authored_secondary = None
+        source = ApplicabilitySource.LEGACY_DERIVED
 
     # secondary: the other distinct selectable-leaf objectives (excluding primary), in tag order,
     # then any explicitly-added secondaries — deduped, and never containing the primary.
-    secondary = tuple(
-        s for s in _dedup([*leaf_targets, *_SECONDARY_ADD.get(template.id, ())]) if s != primary)
+    secondary = (
+        authored_secondary
+        if authored_secondary is not None
+        else tuple(
+            s for s in _dedup([*leaf_targets, *_SECONDARY_ADD.get(template.id, ())])
+            if s != primary)
+    )
 
     return ApplicabilitySpec(
         primary=primary,
@@ -303,4 +340,5 @@ def recipe_applicability(template: templates.Template) -> ApplicabilitySpec:
             [*dim_values["journey_stage"], *_JOURNEY_STAGE_ADD.get(template.id, ())]),
         business_outcome=_dedup(
             [*dim_values["business_outcome"], *_BUSINESS_OUTCOME_ADD.get(template.id, ())]),
+        source=source,
     )

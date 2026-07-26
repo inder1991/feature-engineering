@@ -121,7 +121,7 @@ _ALL_CORP_IDS = {t.id for t in CORPORATE_TRADE_TEMPLATES}
 # ══ authored the two families (the final breadth pass — completes the 15-family library) ═════════════
 def test_growth_trade_families_authored():
     assert len(CROSS_SELL_TEMPLATES) == 10
-    assert len(CORPORATE_TRADE_TEMPLATES) == 11
+    assert len(CORPORATE_TRADE_TEMPLATES) == 12
     assert set(XS) == {
         "channel_adoption_depth", "product_gap_whitespace", "next_best_product_propensity",
         "relationship_deepening_breadth", "campaign_response_recency", "clv_revenue_trajectory",
@@ -130,7 +130,8 @@ def test_growth_trade_families_authored():
     assert set(CORP) == {
         "facility_utilisation_headroom", "lc_guarantee_rollover", "invoice_finance_dynamics",
         "supply_chain_finance_dynamics", "covenant_headroom_breach", "syndication_concentration",
-        "group_exposure_aggregation", "guarantor_reliance", "trade_cycle_working_capital",
+        "group_exposure_aggregation", "obligor_facility_count", "guarantor_reliance",
+        "trade_cycle_working_capital",
         "pooling_structure_utilisation", "cross_product_stress_count"}
     # every need references a real concept (also enforced at import by _validate_registry)
     for t in CROSS_SELL_TEMPLATES + CORPORATE_TRADE_TEMPLATES:
@@ -151,7 +152,10 @@ def test_every_growth_trade_recipe_anchors_on_a_non_structural_distinctive_conce
             if n.optional:
                 continue
             c = CONCEPT_REGISTRY[n.concept]
-            structural = c.entity_link is not None or c.pit_role == "as_of"
+            structural = c.pit_role == "as_of"
+            # Delivery A tightened entity matching: an entity-linked need now requires the exact
+            # concept or matching VERIFIED entity authority, so obligor/facility identity is a safe
+            # domain anchor and can no longer bind a generic customer grain.
             if not structural and n.concept not in churn_concepts:
                 distinctive = True
         assert distinctive, f"{t.id} has no non-structural distinctive required need (would cross-surface)"
@@ -237,8 +241,8 @@ def test_corporate_covenant_recipe_is_the_only_near_label_and_is_flagged(db):
 def test_recipe_skips_when_its_distinctive_concept_is_absent(db):
     # a corporate catalog with ONLY 'limit' (+ drawn/as_of/facility grain) grounds the limit-anchored
     # recipes but nothing that needs covenant / syndication_share / contingent / ownership / collateral.
-    # (pooling_structure_utilisation is limit-anchored too — its pooling_structure_id ENTITY need binds
-    # the facility grain structurally, exactly as the routing design intends.)
+        # pooling_structure_utilisation does not bind: a facility grain may no longer substitute for
+        # its different pooling_structure entity need without matching VERIFIED entity authority.
     catalog = [
         (CanonicalRow("mini_corp", "f", "facility_id", "integer", is_grain=True, entity="Facility"),
          "facility_id"),
@@ -252,8 +256,10 @@ def test_recipe_skips_when_its_distinctive_concept_is_absent(db):
     _build(db, "mini_corp", catalog)
     grounded = {gf.template_id for gf in ground_all(db, CORPORATE_TRADE_TEMPLATES,
                                                     catalog_source="mini_corp")}
-    assert grounded == {"facility_utilisation_headroom", "pooling_structure_utilisation",
-                        "cross_product_stress_count"}    # exactly the three limit-anchored recipes
+    assert grounded == {
+        "facility_utilisation_headroom",
+        "cross_product_stress_count",
+    }
     assert "covenant_headroom_breach" not in grounded    # needs the covenant anchor (absent)
     assert "syndication_concentration" not in grounded   # needs the syndication_share anchor (absent)
 

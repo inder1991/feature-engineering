@@ -732,7 +732,7 @@ describe('governed contract flow client', () => {
     expect(url).toBe('/contract/draft')
     expect(JSON.parse(init.body)).toEqual({
       intent_id: 'int_1', chosen_source: 'anchor', chosen_option_id: 'balance_trend_90d',
-      why: 'best fit' })
+      why: 'best fit', expected_generation_run_id: null })
   })
 
   it('contractConfirm merges the draft with the intent_id', async () => {

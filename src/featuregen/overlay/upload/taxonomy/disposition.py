@@ -54,6 +54,7 @@ class StageStatus(StrEnum):
 
     COMPLETED = "completed"
     FAILED = "failed"
+    INCOMPLETE = "incomplete"
     NOT_EVALUATED = "not_evaluated"
 
 
@@ -64,6 +65,7 @@ class FinalDisposition(StrEnum):
 
     OUT_OF_SCOPE = "out_of_scope"
     UNBUILDABLE = "unbuildable"
+    GROUNDING_INCOMPLETE = "grounding_incomplete"
     SAFETY_REJECTED = "safety_rejected"
     ELIGIBLE = "eligible"
 
@@ -102,6 +104,7 @@ def evaluate_dispositions(
     *,
     evaluation_version: str,
     now: object,
+    incomplete: dict[str, tuple[str, ...]] | None = None,
 ) -> list[RecipeEvaluation]:
     """Fold the shared applicability decision + grounding/safety outcomes into one
     :class:`RecipeEvaluation` per recipe in ``result.by_recipe``.
@@ -122,6 +125,7 @@ def evaluate_dispositions(
         * else -> grounding ``COMPLETED`` (ran, nothing bound), safety ``NOT_EVALUATED`` -> ``UNBUILDABLE``.
     """
     evaluations: list[RecipeEvaluation] = []
+    incomplete = incomplete or {}
     for recipe_id, decision in result.by_recipe.items():
         applicability = StageEvaluation(
             status=StageStatus.COMPLETED,
@@ -149,7 +153,21 @@ def evaluate_dispositions(
 
         # In scope: the relevance tier IS the applicability relationship (primary/supporting).
         relevance_tier = decision
-        if recipe_id in rejected:
+        if recipe_id in incomplete:
+            grounding = StageEvaluation(
+                StageStatus.INCOMPLETE,
+                incomplete[recipe_id],
+                evaluation_version,
+                now,
+            )
+            safety = StageEvaluation(
+                StageStatus.NOT_EVALUATED,
+                ("prior_stage_incomplete",),
+                evaluation_version,
+                now,
+            )
+            final = FinalDisposition.GROUNDING_INCOMPLETE
+        elif recipe_id in rejected:
             # It bound a candidate (grounding completed) but the safety gauntlet refused it.
             grounding = StageEvaluation(
                 StageStatus.COMPLETED, _NO_REASON, evaluation_version, now)

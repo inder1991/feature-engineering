@@ -123,3 +123,26 @@ def test_informational_coverage(caplog):
             "phase0 coverage: populated=%d / leaf_count=%d, unpopulated(non-intentional)=%d",
             populated, report["leaf_count"], len(unpopulated))
     assert populated >= 1
+
+
+def test_release_objectives_have_explicit_primary_recipe_coverage():
+    report = coverage_report()
+    by_leaf = report["by_leaf"]
+    expected = {
+        "credit.monitoring.obligor": "obligor_facility_count",
+        "fraud.merchant_fraud": "merchant_mcc_diversity",
+        "treasury_alm.deposit_runoff_forecasting":
+            "contractual_deposit_maturity_profile",
+        "treasury_alm.net_interest_margin": "lagged_net_interest_flow",
+    }
+    for leaf, recipe_id in expected.items():
+        assert recipe_id in by_leaf[leaf]
+        assert recipe_id in report["authored_primary_by_leaf"][leaf]
+        assert report["coverage_quality_tier_by_leaf"][leaf] == "MINIMUM_ANCHOR"
+
+
+def test_every_active_leaf_has_effective_discovery_coverage():
+    report = coverage_report()
+    assert report["active_zero_effective"] == []
+    assert report["primary_by_leaf"] == report["by_leaf"]
+    assert report["supporting_by_leaf"] == report["secondary_by_leaf"]

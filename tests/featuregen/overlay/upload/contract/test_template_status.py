@@ -10,7 +10,12 @@ from datetime import UTC, datetime
 
 import featuregen.overlay.upload.contract.gate1 as gate1
 from featuregen.overlay.upload.contract.gate1 import _template_candidates
-from featuregen.overlay.upload.templates import GroundedFeature, Template
+from featuregen.overlay.upload.templates import (
+    GroundedFeature,
+    GroundingOutcome,
+    GroundingStatus,
+    Template,
+)
 
 NOW = datetime(2026, 7, 18, tzinfo=UTC)
 
@@ -41,8 +46,23 @@ def _ftr_numeric_graph(db):
 
 def test_template_candidate_carries_needs_external_validation_status(db, monkeypatch):
     _ftr_numeric_graph(db)
-    monkeypatch.setattr(gate1, "ground_all", lambda *a, **k: [_GF])
-    ideas, rejections, grounded_ids, rejected_ids, binding = _template_candidates(
+    monkeypatch.setattr(
+        gate1,
+        "ground_all_outcomes",
+        lambda *a, **k: [
+            GroundingOutcome("sum_balance", GroundingStatus.GROUNDED, _GF)
+        ],
+    )
+    (
+        ideas,
+        rejections,
+        grounded_ids,
+        rejected_ids,
+        binding,
+        incomplete,
+        contexts,
+        candidate_keys,
+    ) = _template_candidates(
         db, catalog_source="ftr", roles=(), target_ref=None, now=NOW, templates=(_TMPL,))
     assert ideas, "the grounded numeric template should survive as a needs-check candidate"
     idea = ideas[0]
@@ -51,3 +71,6 @@ def test_template_candidate_carries_needs_external_validation_status(db, monkeyp
     assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
     assert any(r.code == "TYPE_IS_NUMERIC" for r in idea.requirements)
     assert "sum_balance" in grounded_ids
+    assert incomplete == {}
+    assert len(contexts) == 1
+    assert candidate_keys == {"sum_balance": tuple(contexts)}

@@ -44,7 +44,7 @@ def test_exact_churn_scopes_churn_recipes_and_no_credit_or_fraud() -> None:
 def test_unscoped_fails_open_to_all_recipes() -> None:
     primary, supporting = in_scope_recipes(ConfirmedScope(primary=None, unscoped=True))
     assert primary == ALL_IDS
-    assert len(primary) == 153
+    assert len(primary) == 157
     assert supporting == set()
 
 
@@ -140,7 +140,7 @@ def test_applicability_result_classifies_every_recipe_exactly_once() -> None:
     assert isinstance(result, ApplicabilityResult)
     # EVERY recipe appears exactly once (dict keys are unique, so equality of key-set == exactly-once).
     assert set(result.by_recipe) == ALL_IDS
-    assert len(result.by_recipe) == 153
+    assert len(result.by_recipe) == 157
     # The confirmed churn objective's recipes are primary...
     assert result.by_recipe["balance_trend"] == "primary"
     assert result.by_recipe["dormancy_days"] == "primary"
@@ -167,7 +167,7 @@ def test_applicability_result_unscoped_is_all_primary() -> None:
     assert all(rel == "primary" for rel in result.by_recipe.values())
     assert "out_of_scope" not in result.by_recipe.values()
     assert result.eligible_ids == frozenset(ALL_IDS)
-    assert len(result.eligible_ids) == 153
+    assert len(result.eligible_ids) == 157
 
 
 def test_applicability_result_secondary_match_is_supporting() -> None:

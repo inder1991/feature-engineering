@@ -20,6 +20,8 @@ from featuregen.overlay.upload.planner.contract_gold import GOLD_SET_VERSION
 from featuregen.overlay.upload.planner.contracts import (
     ADDITIVITY_RULE_VERSION,
     AGGREGATION_RULE_VERSION,
+    APPLICABILITY_MAPPING_VERSION,
+    CONCEPT_REGISTRY_VERSION,
     PHYSICAL_PLAN_VERSION,
     PLAN_CONTRACT_VERSION,
     PLANNER_VERSION,
@@ -62,6 +64,8 @@ def current_version_vector() -> dict[str, str]:
         "additivity_rule": ADDITIVITY_RULE_VERSION, "temporal_rule": TEMPORAL_RULE_VERSION,
         "safety_evaluator": SAFETY_EVALUATOR_VERSION, "reason_code_registry": REASON_CODE_REGISTRY_VERSION,
         "recipe_registry": RECIPE_REGISTRY_VERSION, "gate_evaluator": EVALUATOR_VERSION,
+        "applicability_mapping": APPLICABILITY_MAPPING_VERSION,
+        "concept_registry": CONCEPT_REGISTRY_VERSION,
         "gold_set": GOLD_SET_VERSION,
     }
 

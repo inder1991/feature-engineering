@@ -1702,7 +1702,8 @@ describe('govern', () => {
     // The row shows the minted contract; the two-gate flow ran with the intent from generate.
     expect(await screen.findByText(/governed/i)).toBeInTheDocument()
     expect(screen.getByText('contract_1')).toBeInTheDocument()
-    expect(contractDraft).toHaveBeenCalledWith('int_1', 'alternative', 'avg_balance')
+    expect(contractDraft).toHaveBeenCalledWith(
+      'int_1', 'alternative', 'avg_balance', '', undefined)
     expect(contractConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ feature_name: 'avg_balance' }), 'int_1')
     expect(contractDraft).toHaveBeenCalledTimes(1)
@@ -1748,7 +1749,8 @@ describe('govern', () => {
     expect(await screen.findByText(/governed/i)).toBeInTheDocument()
     expect(screen.getByText('contract_2')).toBeInTheDocument()
     // The two-gate flow ran with the FRESH intent from the feedback round, for the fresh candidate.
-    expect(contractDraft).toHaveBeenCalledWith('int_1', 'alternative', 'inactivity_days')
+    expect(contractDraft).toHaveBeenCalledWith(
+      'int_1', 'alternative', 'inactivity_days', '', undefined)
     expect(contractConfirm).toHaveBeenCalledWith(AVG_DRAFT, 'int_1')
     expect(contractDraft).toHaveBeenCalledTimes(1)
     expect(contractConfirm).toHaveBeenCalledTimes(1)

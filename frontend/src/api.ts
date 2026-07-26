@@ -1035,7 +1035,12 @@ export interface DispositionStage {
 // eligible recipe (primary/supporting), null for a recipe that never reached grounding.
 export interface RecipeDisposition {
   recipe_id: string
-  final_disposition: 'eligible' | 'unbuildable' | 'safety_rejected' | 'out_of_scope'
+  final_disposition:
+    | 'eligible'
+    | 'unbuildable'
+    | 'grounding_incomplete'
+    | 'safety_rejected'
+    | 'out_of_scope'
   relevance_tier: 'primary' | 'supporting' | null
   applicability: DispositionStage
   grounding: DispositionStage
@@ -1107,12 +1112,14 @@ export function contractDraft(
   chosenSource: 'anchor' | 'alternative',
   chosenOptionId: string,
   why = '',
+  expectedGenerationRunId?: string,
 ): Promise<DraftResp> {
   return post('/contract/draft', {
     intent_id: intentId,
     chosen_source: chosenSource,
     chosen_option_id: chosenOptionId,
     why,
+    expected_generation_run_id: expectedGenerationRunId ?? null,
   })
 }
 

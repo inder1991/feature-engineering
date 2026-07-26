@@ -57,6 +57,10 @@ def test_monetary_additivity_behaviour():
     ce = concept("contingent_exposure")
     assert ce.additivity == "semi_additive"
     assert ce.is_a == "monetary_stock"
+    for name in ("interest_income", "interest_expense"):
+        flow = concept(name)
+        assert flow.additivity == "additive"
+        assert flow.is_a == "monetary_flow"
 
 
 def test_identifier_entity_links():

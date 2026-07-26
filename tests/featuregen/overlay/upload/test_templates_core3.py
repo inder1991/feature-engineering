@@ -100,9 +100,19 @@ TREASURY_SOURCE = "treasury"
 _TREASURY_CATALOG = [
     (CanonicalRow(TREASURY_SOURCE, "deposits", "customer_id", "integer", is_grain=True, entity="Customer"),
      "customer_id"),
+    (CanonicalRow(TREASURY_SOURCE, "deposits", "portfolio_id", "integer", entity="Portfolio"),
+     "portfolio_id"),
+    (CanonicalRow(TREASURY_SOURCE, "deposits", "account_id", "integer", entity="Account"),
+     "account_id"),
     (CanonicalRow(TREASURY_SOURCE, "deposits", "as_of_dt", "timestamp", as_of=True), "as_of_date"),
+    (CanonicalRow(TREASURY_SOURCE, "deposits", "event_ts", "timestamp"), "event_timestamp"),
+    (CanonicalRow(TREASURY_SOURCE, "deposits", "segment", "text"), "segment"),
     (CanonicalRow(TREASURY_SOURCE, "deposits", "balance", "numeric", additivity="semi_additive",
                   currency="USD"), "monetary_stock"),
+    (CanonicalRow(TREASURY_SOURCE, "deposits", "interest_income", "numeric",
+                  additivity="additive", currency="USD"), "interest_income"),
+    (CanonicalRow(TREASURY_SOURCE, "deposits", "interest_expense", "numeric",
+                  additivity="additive", currency="USD"), "interest_expense"),
     # ALM-distinctive treasury anchors (every recipe requires one)
     (CanonicalRow(TREASURY_SOURCE, "deposits", "benchmark_rate", "numeric"), "benchmark_rate"),
     (CanonicalRow(TREASURY_SOURCE, "deposits", "ftp_rate", "numeric"), "ftp_rate"),
@@ -153,10 +163,10 @@ _PAY_DANGEROUS = {"public.txns.fraud_flag", "public.customers.age_band"}
 _ALL_PAY_IDS = {t.id for t in PAYMENTS_TEMPLATES}
 
 
-# ══ authored the three families (10 each, across the journey) ═══════════════════════════════════════
+# ══ authored the three families across their governed journeys ══════════════════════════════════════
 def test_core3_families_authored():
     assert len(COLLECTIONS_TEMPLATES) == 10
-    assert len(DEPOSITS_TEMPLATES) == 10
+    assert len(DEPOSITS_TEMPLATES) == 12
     assert len(PAYMENTS_TEMPLATES) == 10
     assert set(COLL) == {
         "promise_to_pay_adherence", "payment_plan_adherence", "cure_reage_dynamics",
@@ -166,7 +176,8 @@ def test_core3_families_authored():
     assert set(DEP) == {
         "nmd_stickiness", "hqla_eligibility_contribution", "nsfr_asf_contribution", "deposit_beta",
         "lcr_outflow_weight", "repricing_gap_exposure", "hot_money_share",
-        "rate_sensitive_concentration", "maturity_ladder_runoff", "early_withdrawal_break"}
+        "rate_sensitive_concentration", "maturity_ladder_runoff", "early_withdrawal_break",
+        "contractual_deposit_maturity_profile", "lagged_net_interest_flow"}
     assert set(PAY) == {
         "rail_volume_value", "rail_scheme_diversity", "purpose_code_diversity", "interchange_revenue",
         "merchant_discount_economics", "authorisation_decline_rate", "chargeback_dispute_rate",

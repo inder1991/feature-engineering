@@ -39,14 +39,14 @@ from featuregen.overlay.upload.contract.author import (
     draft_contract,
 )
 from featuregen.overlay.upload.contract.gate1 import (
+    Gate1Error,
     _intent_scoped_applicability_enabled,
     build_considered_set,
-    chosen_feature,
-    considered_snapshot_lineage,
     gate1_choice,
     intent_target_ref,
     persist_intent,
-    record_gate1_choice,
+    recorded_gate1_draft_choice,
+    select_and_record_gate1_choice,
 )
 from featuregen.overlay.upload.contract.govern import (
     Contract,
@@ -207,6 +207,7 @@ class DraftReqIn(BaseModel):
     chosen_source: str            # "anchor" | "alternative"
     chosen_option_id: str         # the chosen feature's name (from the considered set)
     why: str = ""
+    expected_generation_run_id: str | None = None
 
 
 class RecognitionIn(BaseModel):
@@ -528,7 +529,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
-        evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now)
+        evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now,
+        incomplete=cs.incomplete_template_ids)
     # 8. Applicability OWNS the in-scope recipe count (never recognition).
     response = {**_considered_set_response(intent, cs),
                 "generation_run_id": generation_run_id, "scope_id": scope_id,
@@ -699,12 +701,30 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
     (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
     is read SERVER-side (BLOCKER 2). Then draft + the critique→refine loop (MCV each pass)."""
-    feature = chosen_feature(conn, body.intent_id, body.chosen_source, body.chosen_option_id)
-    if feature is None:
+    owned = conn.execute(
+        "SELECT 1 FROM contract_intent WHERE intent_id = %s AND actor = %s::jsonb",
+        (body.intent_id, _actor_json(identity.subject)),
+    ).fetchone()
+    if owned is None:
+        raise HTTPException(status_code=404, detail="unknown intent")
+    try:
+        choice = select_and_record_gate1_choice(
+            conn,
+            body.intent_id,
+            chosen_source=body.chosen_source,
+            chosen_option_id=body.chosen_option_id,
+            actor=identity.subject,
+            why=body.why,
+            expected_generation_run_id=body.expected_generation_run_id,
+        )
+    except Gate1Error as e:
+        if str(e) == "REGENERATE_FROM_CURRENT_CONSIDERED_SET":
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        raise HTTPException(status_code=409, detail="considered revision verification failed") from e
+    if choice is None:
         raise HTTPException(status_code=422,
                             detail="chosen option is not in the recorded considered set for this intent")
-    record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
-                        chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
+    feature = choice.feature
     target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
     # 3C.2a authoring fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked
     # for freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
@@ -727,7 +747,7 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     # snapshot the considered set was authored against). Reloaded from the server considered-set row —
     # the request model carries no client snapshot id, so there is nothing client-supplied to trust.
     # Null on a READ COMMITTED / pre-C0 considered set. This is ADDITIVE — the validator is unchanged.
-    snapshot = considered_snapshot_lineage(conn, body.intent_id)
+    snapshot = choice.snapshot_lineage
     # H1b — expose the exact role bindings (role / column-ref / source / authority / warnings) + the
     # overall binding_hash the human is confirming. The confirm requires this hash and 409s if the
     # server's authoritative bindings drift before finalize (see /contract/confirm). Computed over the
@@ -763,14 +783,24 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     Then confirm_contract re-runs the deterministic MCV and registers a versioned, drift-linked contract."""
     if not body.intent_id:
         raise HTTPException(status_code=422, detail="intent_id is required to govern a contract")
+    owned = conn.execute(
+        "SELECT 1 FROM contract_intent WHERE intent_id = %s AND actor = %s::jsonb",
+        (body.intent_id, _actor_json(identity.subject)),
+    ).fetchone()
+    if owned is None:
+        raise HTTPException(status_code=422, detail="unknown intent")
     choice = gate1_choice(conn, body.intent_id)
     if choice is None:
         raise HTTPException(status_code=422,
                             detail="no Gate #1 choice recorded for this intent — draft it first")
-    chosen = chosen_feature(conn, body.intent_id, choice["chosen_source"], choice["chosen_option_id"])
-    if chosen is None:
+    try:
+        recorded_choice = recorded_gate1_draft_choice(conn, body.intent_id)
+    except Gate1Error as e:
+        raise HTTPException(status_code=409, detail="considered revision verification failed") from e
+    if recorded_choice is None:
         raise HTTPException(status_code=422,
                             detail="the chosen feature is not in the recorded considered set")
+    chosen = recorded_choice.feature
     draft = body.to_draft()
     if (draft.feature_name != chosen.name
             or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
@@ -856,7 +886,7 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # request model (DraftIn) carries no client snapshot id, so no client value is ever trusted. ADDITIVE:
     # the confirm-time MCV re-run + Slice-3 tamper-fix (grain_table/derives_from/join_path above) are
     # UNCHANGED — re-sourcing the validator onto the snapshot is a later delivery (C2–C4/H).
-    lineage = considered_snapshot_lineage(conn, body.intent_id)
+    lineage = recorded_choice.snapshot_lineage
     if lineage is not None:
         logger.info("governing contract for intent %s against snapshot %s (run %s, content_hash %s)",
                     body.intent_id, lineage["snapshot_id"], lineage["generation_run_id"],

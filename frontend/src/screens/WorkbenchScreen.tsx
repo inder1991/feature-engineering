@@ -138,6 +138,7 @@ function signalWarningText(code: string): string {
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
 const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
   { key: 'eligible', heading: 'Recommended' },
+  { key: 'grounding_incomplete', heading: 'Grounding incomplete' },
   { key: 'unbuildable', heading: 'Relevant but missing data' },
   { key: 'safety_rejected', heading: 'Rejected by safety' },
   { key: 'out_of_scope', heading: 'Outside confirmed scope' },
@@ -151,7 +152,7 @@ function dispositionReason(d: RecipeDisposition): string {
   }
   const stage = d.final_disposition === 'out_of_scope'
     ? d.applicability
-    : d.final_disposition === 'unbuildable'
+    : d.final_disposition === 'unbuildable' || d.final_disposition === 'grounding_incomplete'
       ? d.grounding
       : d.safety
   const codes = stage?.reason_codes ?? []
@@ -594,6 +595,7 @@ export function WorkbenchScreen() {
   // The server-side intent that will later govern these candidates into a signed contract. Set
   // on a successful generate; dropped by clearSets on any invalidation (scope edit or error).
   const [intentId, setIntentId] = useState<string | null>(null)
+  const [generationRunId, setGenerationRunId] = useState<string | null>(null)
   const [source, setSource] = useState('')
   const [entity, setEntity] = useState('')
   const [target, setTarget] = useState('')
@@ -799,6 +801,7 @@ export function WorkbenchScreen() {
     setRejectionsOpen(false)
     // Drop any stale governance intent: the candidates it governed no longer exist.
     setIntentId(null)
+    setGenerationRunId(null)
   }
 
   // Resets both feedback channels: round counters, recorded strips, typed instructions, and
@@ -882,6 +885,7 @@ export function WorkbenchScreen() {
     cs: ConsideredSetResp, seq: number, roundHyp: string, roundObj: string,
   ) {
     setIntentId(cs.intent_id)
+    setGenerationRunId(cs.generation_run_id ?? null)
     // Dedupe by name across sets: the same feature in several lenses is one candidate that
     // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
     const byName = new Map<string, GeneratedCandidate>()
@@ -1146,6 +1150,7 @@ export function WorkbenchScreen() {
         sets: cs.alternatives, recommendation: cs.recommendation, rejections: cs.rejections,
       }
       setIntentId(cs.intent_id)
+      setGenerationRunId(cs.generation_run_id ?? null)
       // Pins read the selection AS THE RESPONSE LANDS (the mirrors), not as it stood at submit.
       const prev = generatedRef.current ?? []
       const pinned = prev.filter(c =>
@@ -1476,7 +1481,13 @@ export function WorkbenchScreen() {
     try {
       for (const candidate of batch) {
         try {
-          const d = await contractDraft(iid, 'alternative', candidate.idea.name)
+          const d = await contractDraft(
+            iid,
+            'alternative',
+            candidate.idea.name,
+            '',
+            generationRunId ?? undefined,
+          )
           const c = await contractConfirm(d.draft, iid)
           setGoverned(prev => ({ ...prev,
             [candidate.key]: { contractId: c.contract_id, version: c.version } }))
