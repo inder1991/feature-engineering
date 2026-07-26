@@ -475,6 +475,38 @@ def _reconcile_llm_field_evidence(conn, *, field_name: str, retire_refs: set[str
         stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
 
 
+def _write_definition_evidence(conn, *, rows: list[CanonicalRow], definitions: dict[str, str],
+                               glossary: GlossaryUpload,
+                               bindings: dict[str, ObjectBinding] | None,
+                               source_snapshot_id: str) -> int:
+    """Promote the LLM's drafted definitions (E1a Task 2) out of the display-only
+    ``graph_node.definition`` into governed ``llm/proposed`` ``field_evidence``, so asset-detail can
+    honestly show the AI as their author. Returns the CONTAINED per-item failure count, which the
+    caller MUST propagate into its stage report (``partial``/``items_failed``) — losing metadata
+    while reporting success is the bug that count exists to prevent.
+
+    GLOSSARY columns only: the evidence keys on the record's SCHEMA-preserving ``logical_ref``,
+    while attachability is checked at the row's PUBLIC-flattened ref — the two identities
+    ``_write_llm_field_evidence`` never collapses. A blank/whitespace draft is not a proposal."""
+    by_hash = {content_hash(r): r for r in rows}
+    rec_by_tc = _records_by_tc(glossary)
+
+    def ref_of(h: str) -> tuple[str, str, object] | None:
+        row = by_hash.get(h)
+        if row is None:
+            return None
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        if rec is None:
+            return None   # not a glossary column term — no schema-preserving identity to key on
+        return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
+                {"table": row.table, "column": row.column, "type": row.type})
+
+    return _write_llm_field_evidence(
+        conn, field_name="definition", items=definitions, ref_of=ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        producer_configuration_hash=None, bindings=bindings)
+
+
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
                     glossary: GlossaryUpload | None = None,
                     bindings: dict[str, ObjectBinding] | None = None,

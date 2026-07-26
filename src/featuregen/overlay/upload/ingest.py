@@ -37,6 +37,7 @@ from featuregen.overlay.upload.contract.invalidation import (
     invalidate_contracts_for,
 )
 from featuregen.overlay.upload.enrich import (
+    _write_definition_evidence,
     classify_domains,
     content_hash,
     draft_definitions,
@@ -1874,6 +1875,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
         def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
+        def_evidence_failures = 0
         try:
             with conn.transaction():
                 # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
@@ -1881,6 +1883,14 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
                                                 glossary=glossary,
                                                 ingestion_run_id=ingestion_run_id, stats=def_stats)
+                # E1a: the drafted definition is not display-only — promote it to governed
+                # `llm/proposed` evidence so asset-detail shows the AI as its author. Gated exactly
+                # like the concept evidence side-effect (glossary + snapshot); the technical path is
+                # untouched. Its CONTAINED failures ride into the stage report below.
+                if glossary is not None and snapshot_id is not None:
+                    def_evidence_failures = _write_definition_evidence(
+                        conn, rows=vr.good, definitions=definitions, glossary=glossary,
+                        bindings=bindings, source_snapshot_id=snapshot_id)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
@@ -1889,6 +1899,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # must not be counted as unresolved items degrading the stage to "partial".
             len({content_hash(r) for r in vr.good if not r.definition}
                 - suppressed_definition_hashes(vr.good, glossary)),
+            internal_failures=def_evidence_failures,
             not_attempted=def_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
