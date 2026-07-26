@@ -19,7 +19,14 @@ from featuregen.formula.frozen_configuration import (
     freeze_current_configuration,
     frozen_configuration_json,
 )
-from featuregen.formula.recipe_egress import build_recipe_authoring_egress
+from featuregen.formula.recipe_egress import (
+    RecipeEgressViolation,
+    build_recipe_authoring_egress,
+)
+from featuregen.overlay.upload.contract.scope_records import (
+    GenerationInputUnavailable,
+    generation_input_for_run,
+)
 from featuregen.overlay.upload.recipe_formula_authority import (
     FormulaAuthorityRejection,
     build_formula_authority_envelope,
@@ -160,9 +167,15 @@ def verify_work_item_payload(row: Mapping[str, Any]) -> str | None:
     provider_input = row.get("provider_input_json")
     configuration = row.get("frozen_configuration_json")
     identity = row.get("request_identity_json")
-    if not all(isinstance(value, dict) for value in (
-        expectation, binding, provider_input, configuration, identity
-    )):
+    if not isinstance(expectation, dict):
+        return "WORK_ITEM_SHAPE_INVALID"
+    if not isinstance(binding, dict):
+        return "WORK_ITEM_SHAPE_INVALID"
+    if not isinstance(provider_input, dict):
+        return "WORK_ITEM_SHAPE_INVALID"
+    if not isinstance(configuration, dict):
+        return "WORK_ITEM_SHAPE_INVALID"
+    if not isinstance(identity, dict):
         return "WORK_ITEM_SHAPE_INVALID"
     if content_hash(expectation) != row.get("recipe_expectation_hash"):
         return "RECIPE_EXPECTATION_HASH_MISMATCH"
@@ -280,7 +293,7 @@ def declare_expected_run(
 ) -> str:
     """Persist the independent source from which a wholly missing manifest is detected."""
     manifest_id = f"rfm_{generation_run_id}"
-    material = {
+    material: dict[str, Any] = {
         "generation_run_id": generation_run_id,
         "intent_id": intent_id,
         "confirmed_scope_id": confirmed_scope_id,
@@ -410,7 +423,7 @@ def write_manifest(
     entries_json = [asdict(entry) for entry in entries]
     expected_count = sum(1 for entry in entries if entry.capture_required)
     capture_axis = "CAPTURED" if ranking_enabled else "SKIPPED_RANKING_DISABLED"
-    material = {
+    material: dict[str, Any] = {
         "manifest_id": manifest_id,
         "generation_run_id": generation_run_id,
         "intent_id": intent_id,
@@ -746,7 +759,7 @@ def reconcile_run(conn, generation_run_id: str) -> ShadowReconciliation:
     expected_count = manifest[0]
     status = "COMPLETE" if actual == expected_count else "INCOMPLETE"
     reason = None if status == "COMPLETE" else "OBSERVATION_COUNT_MISMATCH"
-    material = {
+    reconciliation_material: dict[str, Any] = {
         "run": generation_run_id,
         "status": status,
         "expected": expected_count,
@@ -759,7 +772,7 @@ def reconcile_run(conn, generation_run_id: str) -> ShadowReconciliation:
         expected_count,
         actual,
         reason,
-        content_hash(material),
+        content_hash(reconciliation_material),
     )
 
 
@@ -805,8 +818,6 @@ def _capture_selected_entry(
     grounding_context_by_candidate_key: Mapping[str, Any],
     metadata_snapshot_id: str | None,
     metadata_snapshot_content_hash: str | None,
-    hypothesis: str,
-    prediction_goal: str,
     identity: IdentityEnvelope,
     request_read_scope_hash: str | None,
 ) -> None:
@@ -849,10 +860,18 @@ def _capture_selected_entry(
         )
         return
     try:
+        sealed_input = generation_input_for_run(
+            conn, common["generation_run_id"])
+        if (
+            sealed_input is None
+            or sealed_input.intent_id != common["intent_id"]
+        ):
+            raise RecipeEgressViolation(
+                "formula authoring requires a verified sealed generation input")
         expectation = bind_formula_expectation(context, blueprint)
         egress = build_recipe_authoring_egress(
-            hypothesis=hypothesis,
-            prediction_goal=prediction_goal,
+            hypothesis=sealed_input.redacted_hypothesis,
+            prediction_goal=sealed_input.redacted_prediction_goal,
             expectation=expectation,
         )
         configuration = freeze_current_configuration(
@@ -866,6 +885,16 @@ def _capture_selected_entry(
             **common,
             capture_axis="CAPTURE_INPUT_INCOMPLETE",
             technical_axis=exc.code,
+        )
+        return
+    except (RecipeEgressViolation, GenerationInputUnavailable):
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURED",
+            delivery_axis="EGRESS_REJECTED",
+            authoring_axis="NOT_RUN",
+            technical_axis="OK",
         )
         return
     except ValueError:
@@ -939,10 +968,8 @@ def capture_ranked_shadow(
     ranking_enabled: bool,
     candidate_keys_by_recipe_id: Mapping[str, Sequence[str]],
     grounding_context_by_candidate_key: Mapping[str, Any],
-    hypothesis: str,
-    prediction_goal: str,
     identity: IdentityEnvelope,
-    request_read_scope_hash: str,
+    request_read_scope_hash: str | None,
 ) -> ShadowReconciliation:
     """Capture the complete ranked population without making a provider call.
 
@@ -991,7 +1018,7 @@ def capture_ranked_shadow(
             "recipe_candidate_key": entry.recipe_candidate_key,
         })
         observation_id = f"rfo_{idempotency_key[:24]}"
-        common = {
+        common: dict[str, Any] = {
             "observation_id": observation_id,
             "idempotency_key": idempotency_key,
             "capture_entry_id": entry.capture_entry_id,
@@ -1014,8 +1041,6 @@ def capture_ranked_shadow(
                     grounding_context_by_candidate_key=grounding_context_by_candidate_key,
                     metadata_snapshot_id=metadata_snapshot_id,
                     metadata_snapshot_content_hash=metadata_snapshot_content_hash,
-                    hypothesis=hypothesis,
-                    prediction_goal=prediction_goal,
                     identity=identity,
                     request_read_scope_hash=request_read_scope_hash,
                 )

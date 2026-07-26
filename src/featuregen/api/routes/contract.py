@@ -707,7 +707,9 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                     "WHERE r.considered_revision_id=%s",
                     (cs.considered_revision_id,),
                 ).fetchone()
-                if revision is None or not isinstance(revision[2], str):
+                if revision is None or (
+                    ranking_enabled and not isinstance(revision[2], str)
+                ):
                     raise ValueError("recipe formula shadow requires snapshot read-scope lineage")
                 capture_ranked_shadow(
                     conn,
@@ -724,8 +726,6 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                     candidate_keys_by_recipe_id=cs.recipe_candidate_keys_by_recipe_id,
                     grounding_context_by_candidate_key=(
                         cs.recipe_grounding_context_by_candidate_key),
-                    hypothesis=intent.redacted_hypothesis,
-                    prediction_goal=run_prediction_goal,
                     identity=identity,
                     request_read_scope_hash=revision[2],
                 )

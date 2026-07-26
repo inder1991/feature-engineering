@@ -3,16 +3,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
+from featuregen.intake.redaction import REDACTION_VERSION
 from featuregen.overlay.upload.recipe_formula_contracts import (
     BoundRecipeFormulaExpectationV1,
 )
+from featuregen.overlay.upload.sample_parser import parse_sample_profile
+from featuregen.overlay.upload.sanitize import SANITIZER_VERSION, sanitize_definition
 
-RECIPE_EGRESS_POLICY_VERSION = 1
+RECIPE_EGRESS_POLICY_VERSION = 2
+FORMULA_PROSE_POLICY_VERSION = (
+    f"recipe-formula-prose-v1+{SANITIZER_VERSION}+{REDACTION_VERSION}"
+)
 MAX_PROSE = 4_000
 MAX_REF = 512
 MAX_ROLE = 128
@@ -41,6 +48,22 @@ _FORBIDDEN_KEYS = frozenset({
     "values",
 })
 
+_CONTEXTUAL_PERSON_PATTERNS = (
+    re.compile(
+        r"\b(?i:customer|client|account\s+holder|cardholder)\s+"
+        r"(?i:named|called|name\s+is)\s+"
+        r"(?P<person>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){1,3})\b"
+    ),
+    re.compile(
+        r"\b(?i:Mr|Mrs|Ms|Dr)\.?\s+"
+        r"(?P<person>[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){1,3})\b"
+    ),
+)
+_CONTEXTUAL_ACCOUNT_PATTERN = re.compile(
+    r"\b(?i:account|acct|a/c)(?:\s+(?i:number|no))?\s*[:#-]?\s*"
+    r"(?P<identifier>\d[\d -]{7,20}\d)\b"
+)
+
 
 class RecipeEgressViolation(ValueError):
     """A recipe provider payload contains an unknown, forbidden, or unbounded field."""
@@ -53,6 +76,8 @@ class RecipeAuthoringEgressV1:
     target_entity: str
     formula_expectation: dict[str, Any]
     egress_policy_version: int
+    redaction_policy_version: str
+    input_redaction: dict[str, Any]
     content_hash: str
 
     def provider_payload(self) -> dict[str, Any]:
@@ -62,6 +87,8 @@ class RecipeAuthoringEgressV1:
             "target_entity": self.target_entity,
             "formula_expectation": self.formula_expectation,
             "egress_policy_version": self.egress_policy_version,
+            "redaction_policy_version": self.redaction_policy_version,
+            "input_redaction": self.input_redaction,
         }
 
 
@@ -99,6 +126,102 @@ def _bounded_text(value: Any, *, path: str, limit: int, allow_empty: bool = Fals
     if not isinstance(value, str) or (not allow_empty and not value.strip()) or len(value) > limit:
         raise RecipeEgressViolation(f"{path} is not a bounded string")
     return value
+
+
+def _contextual_name_spans(text: str) -> list[dict[str, int | str]]:
+    spans: list[dict[str, int | str]] = []
+    for pattern in _CONTEXTUAL_PERSON_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span("person")
+            spans.append({"type": "PERSON_NAME", "start": start, "end": end})
+    return sorted(spans, key=lambda span: (int(span["start"]), int(span["end"])))
+
+
+def _contextual_account_spans(text: str) -> list[dict[str, int | str]]:
+    return [
+        {"type": "ACCOUNT", "start": match.start("identifier"), "end": match.end("identifier")}
+        for match in _CONTEXTUAL_ACCOUNT_PATTERN.finditer(text)
+    ]
+
+
+def _replace_spans(text: str, spans: list[dict[str, int | str]]) -> str:
+    redacted = text
+    for span in reversed(spans):
+        start, end = int(span["start"]), int(span["end"])
+        redacted = redacted[:start] + f"[REDACTED:{span['type']}]" + redacted[end:]
+    return redacted
+
+
+def _sample_value_spans(text: str) -> list[dict[str, int | str]]:
+    spans: list[dict[str, int | str]] = []
+    cursor = 0
+    for value in parse_sample_profile(text).sample_values:
+        start = text.find(value, cursor)
+        if start < 0:
+            start = text.find(value)
+        if start >= 0:
+            end = start + len(value)
+            spans.append({"type": "SAMPLE_VALUE", "start": start, "end": end})
+            cursor = end
+    return spans
+
+
+def _sanitize_formula_prose(value: Any, *, field: str) -> tuple[str, list[dict[str, Any]]]:
+    text = _bounded_text(value, path=field, limit=MAX_PROSE)
+    contextual_spans = sorted(
+        [*_contextual_name_spans(text), *_contextual_account_spans(text)],
+        key=lambda span: (int(span["start"]), int(span["end"])),
+    )
+    sample_spans = _sample_value_spans(text)
+    sanitized = sanitize_definition(_replace_spans(text, contextual_spans))
+    if sanitized.reason or not sanitized.clean.strip():
+        raise RecipeEgressViolation(f"{field} prose redaction failed closed")
+    if sanitized.redaction_version != REDACTION_VERSION:
+        raise RecipeEgressViolation(f"{field} used an unsupported redaction policy")
+    pii_spans = [
+        {"type": str(span["type"]), "start": int(span["start"]), "end": int(span["end"])}
+        for span in sanitized.redacted_spans
+    ]
+    raw_spans: list[Mapping[str, Any]] = [
+        *contextual_spans,
+        *sample_spans,
+        *pii_spans,
+    ]
+    audit: list[dict[str, Any]] = [
+        {"type": str(span["type"]), "start": int(span["start"]), "end": int(span["end"])}
+        for span in raw_spans
+    ]
+    audit.sort(
+        key=lambda span: (int(span["start"]), int(span["end"]), str(span["type"]))
+    )
+    return sanitized.clean, audit
+
+
+def _validate_redaction_audit(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise RecipeEgressViolation("input_redaction must be an object")
+    _exact_keys(value, {"hypothesis", "prediction_goal"}, "input_redaction")
+    for field in ("hypothesis", "prediction_goal"):
+        field_audit = value[field]
+        if not isinstance(field_audit, Mapping):
+            raise RecipeEgressViolation(f"input_redaction.{field} must be an object")
+        _exact_keys(field_audit, {"redacted_spans"}, f"input_redaction.{field}")
+        spans = field_audit["redacted_spans"]
+        if not isinstance(spans, list) or len(spans) > 128:
+            raise RecipeEgressViolation(f"input_redaction.{field}.redacted_spans is invalid")
+        for span in spans:
+            if not isinstance(span, Mapping):
+                raise RecipeEgressViolation("redaction span must be an object")
+            _exact_keys(span, {"type", "start", "end"}, "redaction span")
+            _bounded_text(span["type"], path="redaction span type", limit=MAX_ROLE)
+            if (
+                not isinstance(span["start"], int)
+                or isinstance(span["start"], bool)
+                or not isinstance(span["end"], int)
+                or isinstance(span["end"], bool)
+                or not 0 <= span["start"] < span["end"] <= MAX_PROSE
+            ):
+                raise RecipeEgressViolation("redaction span positions are invalid")
 
 
 def _validate_ref(value: Any, path: str) -> str:
@@ -205,19 +328,26 @@ def validate_recipe_provider_payload(payload: Mapping[str, Any]) -> None:
             "target_entity",
             "formula_expectation",
             "egress_policy_version",
+            "redaction_policy_version",
+            "input_redaction",
         },
         "recipe_egress",
     )
     forbidden = _FORBIDDEN_KEYS & set(_walk_keys(payload))
     if forbidden:
         raise RecipeEgressViolation(f"forbidden recipe egress keys: {sorted(forbidden)}")
-    _bounded_text(payload["hypothesis"], path="hypothesis", limit=MAX_PROSE)
-    _bounded_text(
-        payload["prediction_goal"], path="prediction_goal", limit=MAX_PROSE)
+    for field in ("hypothesis", "prediction_goal"):
+        text = _bounded_text(payload[field], path=field, limit=MAX_PROSE)
+        rescanned, residual_audit = _sanitize_formula_prose(text, field=field)
+        if rescanned != text or residual_audit:
+            raise RecipeEgressViolation(f"{field} contains residual unsafe prose")
     _bounded_text(payload["target_entity"], path="target_entity", limit=MAX_ROLE)
     _validate_formula_expectation(payload["formula_expectation"])
     if payload["egress_policy_version"] != RECIPE_EGRESS_POLICY_VERSION:
         raise RecipeEgressViolation("unsupported recipe egress policy version")
+    if payload["redaction_policy_version"] != FORMULA_PROSE_POLICY_VERSION:
+        raise RecipeEgressViolation("unsupported formula prose redaction policy version")
+    _validate_redaction_audit(payload["input_redaction"])
 
 
 def build_recipe_authoring_egress(
@@ -226,6 +356,12 @@ def build_recipe_authoring_egress(
     prediction_goal: str,
     expectation: BoundRecipeFormulaExpectationV1,
 ) -> RecipeAuthoringEgressV1:
+    safe_hypothesis, hypothesis_audit = _sanitize_formula_prose(
+        hypothesis, field="hypothesis"
+    )
+    safe_goal, goal_audit = _sanitize_formula_prose(
+        prediction_goal, field="prediction_goal"
+    )
     raw = _plain(asdict(expectation))
     formula_expectation = {
         key: raw[key]
@@ -238,22 +374,31 @@ def build_recipe_authoring_egress(
             "policy_version",
         )
     }
+    input_redaction: dict[str, Any] = {
+        "hypothesis": {"redacted_spans": hypothesis_audit},
+        "prediction_goal": {"redacted_spans": goal_audit},
+    }
     payload = {
-        "hypothesis": hypothesis,
-        "prediction_goal": prediction_goal,
+        "hypothesis": safe_hypothesis,
+        "prediction_goal": safe_goal,
         "target_entity": expectation.grain_entity,
         "formula_expectation": formula_expectation,
         "egress_policy_version": RECIPE_EGRESS_POLICY_VERSION,
+        "redaction_policy_version": FORMULA_PROSE_POLICY_VERSION,
+        "input_redaction": input_redaction,
     }
     validate_recipe_provider_payload(payload)
     encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
     return RecipeAuthoringEgressV1(
-        hypothesis=hypothesis,
-        prediction_goal=prediction_goal,
+        hypothesis=safe_hypothesis,
+        prediction_goal=safe_goal,
         target_entity=expectation.grain_entity,
         formula_expectation=formula_expectation,
         egress_policy_version=RECIPE_EGRESS_POLICY_VERSION,
+        redaction_policy_version=FORMULA_PROSE_POLICY_VERSION,
+        input_redaction=input_redaction,
         content_hash=hashlib.sha256(encoded).hexdigest(),
     )
 

@@ -29,6 +29,7 @@ from featuregen.overlay.upload.taxonomy.disposition import (
     StageStatus,
 )
 from featuregen.overlay.upload.taxonomy.recognition import APPLICABILITY_MAPPING_VERSION
+from featuregen.overlay.upload.taxonomy.recognizer import RECOGNIZER_TASK
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 RANK_FLAG = "FEATUREGEN_INTENT_RANKING"
@@ -335,14 +336,36 @@ def test_formula_shadow_positive_route_creates_immutable_work_item(
     monkeypatch.setenv(SCOPE_FLAG, "1")
     monkeypatch.setenv(RANK_FLAG, "1")
     monkeypatch.setenv(FORMULA_SHADOW_FLAG, "1")
+    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")
     _merchant_catalog(conn)
+    hypothesis = "merchant category breadth may indicate merchant fraud"
+    objective = "identify merchant fraud"
+    recognition = make_client(FakeLLM(script={
+        RECOGNIZER_TASK: FakeResponse(output={
+            "status": "classified",
+            "candidates": [{
+                "use_case_id": "fraud.merchant_fraud",
+                "relationship": "primary",
+                "confidence": "high",
+                "evidence_spans": ["merchant fraud"],
+                "rationale": "the hypothesis concerns merchant fraud",
+            }],
+            "ambiguity_note": None,
+        }),
+    })).post(
+        "/contract/recognitions",
+        json={"hypothesis": hypothesis, "objective": objective},
+        headers=AUTH,
+    ).json()
     response = make_client(_fake()).post(
         "/contract/considered-set",
         json={
-            "hypothesis": "merchant category breadth may indicate merchant fraud",
-            "objective": "identify merchant fraud",
+            "hypothesis": hypothesis,
+            "objective": objective,
             "catalog_source": "merchant_bank",
             "target_ref": "public.tx.fraud_flag",
+            "intent_id": recognition["intent_id"],
+            "recognition_id": recognition["recognition_id"],
             "confirmed_scope": {
                 "primary": "fraud.merchant_fraud",
                 "confirmation_source": "user_confirmed",

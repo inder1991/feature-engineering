@@ -1,13 +1,36 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import psycopg
 import pytest
 
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.formula.recipe_egress import (
+    RecipeEgressViolation,
+    build_recipe_authoring_egress,
+)
+from featuregen.formula.schema import (
+    AggregateFunction,
+    EmptyWindowResult,
+    FinalOperation,
+    Inclusivity,
+    NullInput,
+    OverflowBehavior,
+    RoundingMode,
+    WindowBasis,
+    WindowUnit,
+)
 from featuregen.overlay.upload import recipe_formula_shadow as shadow_module
+from featuregen.overlay.upload.recipe_formula_contracts import (
+    BoundExpressionExpectationV1,
+    BoundRecipeFormulaExpectationV1,
+    DecimalPolicyExpectationV1,
+    WindowExpectationV1,
+)
 from featuregen.overlay.upload.recipe_formula_shadow import (
+    RankedCaptureEntryV1,
     ShadowIntegrityError,
     build_capture_entries,
     capture_ranked_shadow,
@@ -88,6 +111,78 @@ def _declare(db, suffix: str = "1"):
         ranking_flag=True,
     )
     return intent_id, run_id, revision_id, considered_hash, manifest_id
+
+
+def _capture_entry_and_common(db, suffix: str):
+    intent_id, run_id, _revision_id, considered_hash, _manifest_id = _declare(db, suffix)
+    revision_id = f"revision-shadow-{suffix}"
+    entry = RankedCaptureEntryV1(
+        capture_entry_id=f"entry-{suffix}",
+        recipe_id="merchant_mcc_diversity",
+        canonical_rank=1,
+        selected_for_initial_view=True,
+        rank_reasons=("primary",),
+        initial_view_reasons=("selected",),
+        recipe_candidate_key="candidate-1",
+        candidate_resolution="EXACT",
+        capture_required=True,
+        capture_reason="selected_initial_view",
+    )
+    common = {
+        "observation_id": f"observation-{suffix}",
+        "idempotency_key": f"idempotency-{suffix}",
+        "capture_entry_id": entry.capture_entry_id,
+        "generation_run_id": run_id,
+        "intent_id": intent_id,
+        "considered_revision_id": revision_id,
+        "considered_content_hash": considered_hash,
+        "metadata_snapshot_id": "snapshot-test",
+        "metadata_snapshot_content_hash": "snapshot-hash-test",
+        "recipe_id": entry.recipe_id,
+        "recipe_candidate_key": entry.recipe_candidate_key,
+    }
+    return entry, common
+
+
+def _bound_expectation() -> BoundRecipeFormulaExpectationV1:
+    window = WindowExpectationV1(
+        event_time_role="event_ts",
+        basis=WindowBasis.TRAILING,
+        length_parameter="window",
+        unit=WindowUnit.DAY,
+        start_inclusive=Inclusivity.INCLUSIVE,
+        end_inclusive=Inclusivity.EXCLUSIVE,
+        timezone="Asia/Dubai",
+        empty_window=EmptyWindowResult.NULL,
+        null_input=NullInput.IGNORE,
+    )
+    return BoundRecipeFormulaExpectationV1(
+        recipe_candidate_key="candidate-1",
+        recipe_id="merchant_mcc_diversity",
+        semantic_parameter_binding_hash="semantic-hash",
+        final_operation=FinalOperation.IDENTITY,
+        expressions=(
+            BoundExpressionExpectationV1(
+                expression_path="body.expr",
+                aggregation=AggregateFunction.COUNT_DISTINCT,
+                operand_ref="bank::public.txn.mcc",
+                source_relation_ref="bank::public.txn",
+                event_time_ref="bank::public.txn.event_ts",
+                window_length=90,
+                window=window,
+            ),
+        ),
+        grain_entity="merchant",
+        grain_key_refs=("bank::public.txn.merchant_id",),
+        decimal=DecimalPolicyExpectationV1(
+            precision=38,
+            scale=6,
+            rounding=RoundingMode.HALF_EVEN,
+            overflow=OverflowBehavior.ERROR,
+        ),
+        blueprint_content_hash="blueprint-hash",
+        policy_version=1,
+    )
 
 
 def test_expected_run_detects_wholly_missing_manifest(db):
@@ -287,6 +382,188 @@ def test_work_item_and_outbox_are_atomic_and_content_checked(db):
             "DELETE FROM recipe_formula_shadow_work_item WHERE work_item_id='work-1'")
 
 
+def test_formula_capture_rejects_missing_sealed_generation_input_before_work_insert(db):
+    entry, common = _capture_entry_and_common(db, "egress-missing")
+    shadow_module._capture_selected_entry(
+        db,
+        index=0,
+        entry=entry,
+        common=common,
+        grounding_context_by_candidate_key={"candidate-1": object()},
+        metadata_snapshot_id="snapshot-test",
+        metadata_snapshot_content_hash="snapshot-hash-test",
+        identity=IdentityEnvelope(
+            subject="user:test",
+            actor_kind="human",
+            authenticated=True,
+            auth_method="password",
+            role_claims=("analyst",),
+        ),
+        request_read_scope_hash="scope-hash",
+    )
+    assert db.execute(
+        "SELECT delivery_axis,authoring_axis,technical_axis "
+        "FROM recipe_formula_shadow_observation WHERE observation_id=%s",
+        (common["observation_id"],),
+    ).fetchone() == ("EGRESS_REJECTED", "NOT_RUN", "OK")
+    assert db.execute(
+        "SELECT count(*) FROM recipe_formula_shadow_work_item "
+        "WHERE generation_run_id=%s",
+        (common["generation_run_id"],),
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT count(*) FROM outbox WHERE message_id LIKE 'formula-shadow:%'",
+    ).fetchone()[0] == 0
+
+
+def test_formula_redactor_failure_persists_no_raw_prose_or_work(
+    db, monkeypatch, caplog
+):
+    entry, common = _capture_entry_and_common(db, "egress-failure")
+    raw_hypothesis = "customer named Never Persist This"
+    raw_goal = "card 4111 1111 1111 1111 must never persist"
+    monkeypatch.setattr(
+        shadow_module,
+        "generation_input_for_run",
+        lambda _conn, _run: SimpleNamespace(
+            intent_id=common["intent_id"],
+            redacted_hypothesis=raw_hypothesis,
+            redacted_prediction_goal=raw_goal,
+        ),
+    )
+    monkeypatch.setattr(
+        shadow_module, "bind_formula_expectation", lambda _context, _blueprint: object())
+    monkeypatch.setattr(
+        shadow_module,
+        "build_recipe_authoring_egress",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RecipeEgressViolation("hypothesis prose redaction failed closed")),
+    )
+    shadow_module._capture_selected_entry(
+        db,
+        index=0,
+        entry=entry,
+        common=common,
+        grounding_context_by_candidate_key={"candidate-1": object()},
+        metadata_snapshot_id="snapshot-test",
+        metadata_snapshot_content_hash="snapshot-hash-test",
+        identity=IdentityEnvelope(
+            subject="user:test",
+            actor_kind="human",
+            authenticated=True,
+            auth_method="password",
+            role_claims=("analyst",),
+        ),
+        request_read_scope_hash="scope-hash",
+    )
+    durable = "\n".join(
+        str(row[0])
+        for table in (
+            "recipe_formula_shadow_expected_run",
+            "recipe_formula_shadow_observation",
+            "recipe_formula_shadow_work_item",
+            "llm_call",
+        )
+        for row in db.execute(f"SELECT row_to_json(t)::text FROM {table} t").fetchall()
+    )
+    assert raw_hypothesis not in durable
+    assert raw_goal not in durable
+    assert raw_hypothesis not in caplog.text
+    assert raw_goal not in caplog.text
+    assert db.execute(
+        "SELECT delivery_axis FROM recipe_formula_shadow_observation "
+        "WHERE observation_id=%s",
+        (common["observation_id"],),
+    ).fetchone()[0] == "EGRESS_REJECTED"
+    assert db.execute(
+        "SELECT count(*) FROM recipe_formula_shadow_work_item "
+        "WHERE generation_run_id=%s",
+        (common["generation_run_id"],),
+    ).fetchone()[0] == 0
+
+
+def test_successful_formula_capture_persists_only_safe_prose_and_span_audit(db):
+    intent_id, run_id, revision_id, considered_hash, _manifest_id = _declare(
+        db, "egress-safe")
+    raw_hypothesis = (
+        "Customer named Alice Johnson emailed alice@example.com. "
+        "Representative values such as PRIVATE01; PRIVATE02"
+    )
+    raw_goal = "Predict fraud for card 4111 1111 1111 1111"
+    egress = build_recipe_authoring_egress(
+        hypothesis=raw_hypothesis,
+        prediction_goal=raw_goal,
+        expectation=_bound_expectation(),
+    )
+    provider_input = egress.provider_payload()
+    expectation_json = asdict(_bound_expectation())
+    values = {
+        "work_item_id": "work-egress-safe",
+        "idempotency_key": "work-egress-safe-key",
+        "capture_entry_id": "entry-egress-safe",
+        "generation_run_id": run_id,
+        "intent_id": intent_id,
+        "considered_revision_id": revision_id,
+        "considered_content_hash": considered_hash,
+        "metadata_snapshot_id": None,
+        "metadata_snapshot_content_hash": None,
+        "recipe_id": "merchant_mcc_diversity",
+        "recipe_candidate_key": "candidate-1",
+        "recipe_expectation": expectation_json,
+        "recipe_expectation_hash": content_hash(expectation_json),
+        "binding_envelope": {"bindings": []},
+        "binding_envelope_hash": content_hash({"bindings": []}),
+        "provider_input": provider_input,
+        "provider_input_hash": egress.content_hash,
+        "frozen_configuration": {"configuration_hash": "config-hash"},
+        "frozen_configuration_hash": "config-hash",
+        "request_identity": {"subject": "user:test"},
+        "request_read_scope_hash": "scope-hash",
+    }
+    write_work_item(db, **values)
+    write_observation(
+        db,
+        observation_id="observation-egress-safe",
+        idempotency_key="observation-egress-safe-key",
+        capture_entry_id="observation-entry-egress-safe",
+        generation_run_id=run_id,
+        intent_id=intent_id,
+        considered_revision_id=revision_id,
+        considered_content_hash=considered_hash,
+        recipe_id="merchant_mcc_diversity",
+        recipe_candidate_key="candidate-1",
+        provider_input=provider_input,
+        provider_input_hash=egress.content_hash,
+        capture_axis="CAPTURED",
+        delivery_axis="NOT_DISPATCHED",
+    )
+    durable = "\n".join(
+        row[0]
+        for table in (
+            "recipe_formula_shadow_expected_run",
+            "recipe_formula_shadow_observation",
+            "recipe_formula_shadow_work_item",
+            "outbox",
+            "llm_call",
+        )
+        for row in db.execute(f"SELECT row_to_json(t)::text FROM {table} t").fetchall()
+    )
+    for raw in (
+        raw_hypothesis,
+        raw_goal,
+        "Alice Johnson",
+        "alice@example.com",
+        "PRIVATE01",
+        "PRIVATE02",
+        "4111 1111 1111 1111",
+    ):
+        assert raw not in durable
+    assert "[REDACTED:PERSON_NAME]" in durable
+    assert "[REDACTED:EMAIL]" in durable
+    assert "[REDACTED:PAN]" in durable
+    assert '"type": "SAMPLE_VALUE"' in durable
+
+
 def test_one_capture_failure_does_not_erase_other_ranked_entries(
     db, monkeypatch
 ) -> None:
@@ -333,8 +610,6 @@ def test_one_capture_failure_does_not_erase_other_ranked_entries(
             "obligor_facility_count": ("candidate-obligor",),
         },
         grounding_context_by_candidate_key={},
-        hypothesis="h",
-        prediction_goal="g",
         identity=IdentityEnvelope(
             subject="user:test",
             actor_kind="human",
