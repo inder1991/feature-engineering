@@ -21,9 +21,11 @@ request transaction's fate a rolled-back request would leave audited provider ca
 manifest and NO trace — evidence that content egressed, with nothing saying which run made it. So
 the manifest and every event are written on a FRESH connection opened from ``get_settings().dsn``
 (the FULL configured DSN — NOT ``conn.info.dsn``, which psycopg3 strips the password from: that was
-a real bug fixed on this codebase), each committing independently, performing ONE bare INSERT under a
-bounded ``lock_timeout`` (it can self-block on an index entry the request itself holds —
-``_SET_LOCK_TIMEOUT``), and NEVER taking an advisory lock (a second lock-taking connection
+a real bug fixed on this codebase), each committing independently, performing ONE bare INSERT with
+BOTH of its waits bounded — the CONNECT by a default ``connect_timeout`` (``_CONNECT_TIMEOUT_SECONDS``:
+a blackholed host would otherwise hang the request in ``connect()``) and the INSERT's lock by
+``lock_timeout`` (it can self-block on an index entry the request itself holds —
+``_SET_LOCK_TIMEOUT``) — and NEVER taking an advisory lock (a second lock-taking connection
 self-deadlocked in program-audit I-3). When no DSN is configured (the tests / no-DB harness) the
 write goes on the caller's connection — the designed harness path, not a degradation; a
 CONNECTION-DEPENDENT failure with a
@@ -51,6 +53,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 
 from featuregen.aggregates.ids import mint_id
@@ -135,6 +138,15 @@ _REPLAY_EVENT = _INSERT_EVENT + " ON CONFLICT (idempotency_key) DO NOTHING"
 #: ``OperationalError``, hence CONNECTION-DEPENDENT, hence the fallback replay, which is exactly
 #: right: the caller's connection is the one place the blocking row is visible at all.
 _SET_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '3s'"
+
+#: ``_SET_LOCK_TIMEOUT`` bounds the LOCK, not the CONNECT — and ``get_settings().dsn`` is the raw
+#: configured DSN, so a BLACKHOLED database host (a dropped route, a firewall that discards rather
+#: than refuses) left ``psycopg.connect`` waiting on libpq's default: forever, inside a request, on
+#: the very path whose whole point is that losing the trace must never cost the caller. A DEFAULT,
+#: not an override: an operator DSN that names its own ``connect_timeout`` still wins (the merge
+#: order in ``_bounded_connect_dsn``), which is also why the tests' own ``connect_timeout=1`` blip
+#: DSNs keep failing in one second rather than five.
+_CONNECT_TIMEOUT_SECONDS = 5
 
 
 def open_authoring_run(conn: DbConn, *, intent_hash: str, versions: Mapping[str, Any],
@@ -262,6 +274,16 @@ _DETERMINISTIC_REJECTIONS: tuple[type[Exception], ...] = (
 )
 
 
+def _bounded_connect_dsn(dsn: str) -> str:
+    """``dsn`` with a DEFAULT ``connect_timeout`` merged in, so no durable connect can hang forever.
+
+    The DSN's own value WINS (it is spread second), so this only supplies the bound libpq otherwise
+    leaves unset — an operator who has tuned ``connect_timeout`` keeps it, and the password the DSN
+    carries survives the round-trip in both keyword and URI form."""
+    return make_conninfo(
+        "", **{"connect_timeout": _CONNECT_TIMEOUT_SECONDS, **conninfo_to_dict(dsn)})
+
+
 def _durable_write(conn: DbConn, sql: str, params: tuple, *, replay_sql: str, what: str) -> None:
     """Perform ONE bare INSERT on a FRESH connection from ``get_settings().dsn``, committed
     independently of the caller's transaction (module docstring for why), under a bounded
@@ -297,8 +319,11 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, replay_sql: str, wh
         conn.execute(sql, params)   # the designed tests / no-DB path, NOT a degradation
         return
     try:
-        with psycopg.connect(dsn) as trace_conn:  # own tx, committed on clean `with` exit
-            trace_conn.execute(_SET_LOCK_TIMEOUT)  # bounded self-block, never an unbounded wait
+        # BOTH waits are bounded: the CONNECT by `_CONNECT_TIMEOUT_SECONDS`, the INSERT's lock by
+        # `_SET_LOCK_TIMEOUT`. Either expiry is an `OperationalError`, i.e. connection-dependent,
+        # i.e. the fallback replay — never a hung request.
+        with psycopg.connect(_bounded_connect_dsn(dsn)) as trace_conn:  # committed on clean exit
+            trace_conn.execute(_SET_LOCK_TIMEOUT)
             trace_conn.execute(sql, params)
         return
     except _DETERMINISTIC_REJECTIONS:
@@ -403,7 +428,7 @@ def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple 
     dsn = get_settings().dsn
     if dsn:
         try:
-            with psycopg.connect(dsn) as trace_conn:
+            with psycopg.connect(_bounded_connect_dsn(dsn)) as trace_conn:   # bounded connect too
                 row = trace_conn.execute(sql, params).fetchone()
             if row is not None:
                 return row

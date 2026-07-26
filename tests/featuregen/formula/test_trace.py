@@ -784,6 +784,44 @@ def test_a_self_blocking_durable_insert_times_out_instead_of_hanging(db, monkeyp
     assert run_status(db, run_id) == "completed"         # its own terminal event stands
 
 
+def test_every_durable_connect_is_bounded_and_never_overrides_a_configured_timeout(
+        db, monkeypatch, _dsn) -> None:
+    """Fix-wave-3 cleanup 2. ``lock_timeout`` bounds the LOCK, not the CONNECT: ``get_settings().dsn``
+    is the raw configured DSN and ``psycopg.connect(dsn)`` carried none, so a BLACKHOLED database
+    host (a dropped route / a firewall that discards rather than refuses) hung the request inside
+    ``connect()`` — on the one path whose whole point is that losing the trace must never cost the
+    caller. Both the WRITE and the READ connects now carry a bounded default.
+
+    A DEFAULT, not an override: a DSN that names its own ``connect_timeout`` keeps it (which is why
+    the blip DSNs throughout this file still fail in 1s), and the password survives the merge — the
+    ``conn.info.dsn`` password-stripping bug this module already guards against must not come back
+    in through the timeout merge."""
+    seen: list[str] = []
+    real_connect = psycopg.connect
+
+    def spy(conninfo="", **kwargs):
+        seen.append(conninfo)
+        return real_connect(conninfo, **kwargs)
+
+    monkeypatch.setattr(trace.psycopg, "connect", spy)
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)               # no connect_timeout of its own
+    run_id = _open(db, intent_hash="ih_bounded_connect")
+    assert run_status(db, run_id) == "incomplete"            # exercises the READ connect too
+    assert len(seen) == 2, seen
+    assert all("connect_timeout=5" in c for c in seen), seen
+
+    seen.clear()
+    monkeypatch.setenv("FEATUREGEN_DSN", f"{_dsn} connect_timeout=1")
+    _open(db, intent_hash="ih_operator_timeout_wins")
+    assert "connect_timeout=1" in seen[0], seen               # the operator's value WINS
+    assert "connect_timeout=5" not in seen[0], seen
+
+    # And the merge is lossless — including the password, in URI form.
+    merged = trace._bounded_connect_dsn("postgresql://u:secret@h:5432/db")
+    assert "password=secret" in merged
+    assert "connect_timeout=5" in merged
+
+
 def test_durable_writes_use_the_full_dsn_and_no_advisory_lock(db) -> None:
     """Two structural guards on the durable pattern, asserted over the AST (so prose in docstrings
     can't satisfy or break them): the DSN read is ``get_settings().dsn`` — never the password-less
