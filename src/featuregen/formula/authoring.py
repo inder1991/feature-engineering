@@ -271,7 +271,13 @@ def run_authoring(conn, intent: AuthoringIntent, author_client: LLMClient,
     ``author_client`` and ``critic_client`` are DELIBERATELY separate: LLM-2 reviews the proposal
     from an independently-assembled context (``critic.build_critic_metadata``) with no slot for the
     author's reasoning or tool trail, so it is a second opinion rather than an echo. ``roles`` gates
-    every catalog read (the author's tools, the critic's re-fetch, and the C1 authority reads);
+    the MODEL-VISIBLE catalog reads — the author's tools (Task 9) and the critic's re-fetch (which
+    gates on ``allowed_sensitivities(roles)`` itself). It does NOT reach this module's own C1
+    AUTHORITY reads: ``read_operational_value`` (Task 5) and the ``read_column_facts`` beneath it take
+    no ``roles`` parameter at all, so :func:`_read_c1_facts` is UN-SCOPED and the output policy is
+    resolved over facts a read-scoped caller might not itself be allowed to see. A real gap,
+    deliberately not closed here — adding the seam is a cross-task change to Tasks 5/6. What it does
+    NOT do is widen model egress: nothing :func:`_read_c1_facts` reads is ever sent to a provider.
     ``actor`` is stamped on the manifest and threaded through both audited seams.
 
     EVERY stage runs once a proposal parses, even when an earlier axis already decides the fold (an
