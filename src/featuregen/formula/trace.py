@@ -24,8 +24,9 @@ the manifest and every event are written on a FRESH connection opened from ``get
 a real bug fixed on this codebase), each committing independently, performing ONE bare INSERT under a
 bounded ``lock_timeout`` (it can self-block on an index entry the request itself holds —
 ``_SET_LOCK_TIMEOUT``), and NEVER taking an advisory lock (a second lock-taking connection
-self-deadlocked in program-audit I-3). When no DSN is configured (the tests / no-DB harness) the write goes on the caller's
-connection — the designed harness path, not a degradation; any CONNECTION-DEPENDENT failure with a
+self-deadlocked in program-audit I-3). When no DSN is configured (the tests / no-DB harness) the
+write goes on the caller's connection — the designed harness path, not a degradation; a
+CONNECTION-DEPENDENT failure with a
 DSN configured (a connect/commit blip, or a ``ForeignKeyViolation`` against a referent that only
 exists on the caller's uncommitted transaction because an upstream durable write itself degraded)
 logs and degrades the same way (transactional evidence beats none, and an evidence-free crash then
@@ -315,8 +316,9 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
     The fallback deliberately replays statements the database has ALREADY REJECTED once — the FK
     class is the whole point of it (``_durable_write``) — or ALREADY ACCEPTED, when a commit ack was
     lost (``_REPLAY_RUN``, which is why ``sql`` here is the idempotent variant). Either way it MUST
-    leave the caller's transaction
-    exactly as usable as it found it. A bare ``conn.execute`` did not: an FK the caller's connection
+    leave the caller's transaction exactly as usable as it found it.
+
+    A bare ``conn.execute`` did not: an FK the caller's connection
     also refuses aborted the request transaction, so the orchestrator lost every uncommitted thing it
     had done and could not execute another statement — not even its own terminal ``FAILED`` event
     through this very degraded path. Precedent for the shape: ``overlay.upload.enrich`` (program-audit
@@ -337,7 +339,7 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
         try:
             conn.execute(sql, params)
         except Exception:
-            conn.rollback()   # discard ONLY the rejected statement's implicit tx; nothing else is in it
+            conn.rollback()   # discards ONLY the rejected statement's implicit tx — nothing else
             raise
         return
     with conn.transaction():   # savepoint: contain a rejected replay without poisoning the txn
