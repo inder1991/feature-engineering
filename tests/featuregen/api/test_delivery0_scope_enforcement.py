@@ -1,3 +1,5 @@
+import psycopg
+import pytest
 from tests.featuregen.api._helpers import AUTH
 from tests.featuregen.api.test_1b_rollout import (
     CHURN,
@@ -218,22 +220,20 @@ def test_release_mode_draft_reads_target_from_exact_generation_run(
         headers=AUTH,
     ).json()
     client = make_client(_generation_and_draft_llm())
-    generated = client.post(
-        "/contract/considered-set",
-        json={
-            "hypothesis": HYPOTHESIS,
-            "objective": "predict churn",
-            "catalog_source": "bank",
-            "target_ref": TARGET,
-            "intent_id": recognition["intent_id"],
-            "recognition_id": recognition["recognition_id"],
-            "confirmed_scope": {
-                "primary": CHURN,
-                "confirmation_source": "user_confirmed",
-            },
+    generation_payload = {
+        "hypothesis": HYPOTHESIS,
+        "objective": "predict churn",
+        "catalog_source": "bank",
+        "target_ref": TARGET,
+        "intent_id": recognition["intent_id"],
+        "recognition_id": recognition["recognition_id"],
+        "confirmed_scope": {
+            "primary": CHURN,
+            "confirmation_source": "user_confirmed",
         },
-        headers=AUTH,
-    )
+    }
+    generated = client.post(
+        "/contract/considered-set", json=generation_payload, headers=AUTH)
     assert generated.status_code == 200, generated.text
     body = generated.json()
     chosen = next(
@@ -241,8 +241,34 @@ def test_release_mode_draft_reads_target_from_exact_generation_run(
         for feature_set in body["alternatives"]
         for feature in feature_set["features"]
     )
+    newer = client.post(
+        "/contract/considered-set", json=generation_payload, headers=AUTH)
+    assert newer.status_code == 200, newer.text
+    assert newer.json()["generation_run_id"] != body["generation_run_id"]
+    assert next(
+        feature
+        for feature_set in newer.json()["alternatives"]
+        for feature in feature_set["features"]
+    )["option_id"] != chosen["option_id"]
+    newer_chosen = next(
+        feature
+        for feature_set in newer.json()["alternatives"]
+        for feature in feature_set["features"]
+    )
+    wrong_run = client.post(
+        "/contract/draft",
+        json={
+            "intent_id": recognition["intent_id"],
+            "chosen_source": "alternative",
+            "chosen_option_id": newer_chosen["option_id"],
+            "expected_generation_run_id": body["generation_run_id"],
+        },
+        headers=AUTH,
+    )
+    assert wrong_run.status_code == 409
 
-    # A mutable legacy intent target cannot alter this run's leakage authority.
+    # Run B is now the mutable latest pointer. Drafting run A still resolves its exact option and target;
+    # changing the mutable legacy intent target cannot alter run A's leakage authority either.
     conn.execute(
         "UPDATE contract_intent SET target_ref = 'public.labels.forged' WHERE intent_id = %s",
         (recognition["intent_id"],),
@@ -252,7 +278,7 @@ def test_release_mode_draft_reads_target_from_exact_generation_run(
         json={
             "intent_id": recognition["intent_id"],
             "chosen_source": "alternative",
-            "chosen_option_id": chosen["name"],
+            "chosen_option_id": chosen["option_id"],
             "expected_generation_run_id": body["generation_run_id"],
         },
         headers=AUTH,
@@ -260,6 +286,43 @@ def test_release_mode_draft_reads_target_from_exact_generation_run(
     assert drafted.status_code == 200, drafted.text
     assert drafted.json()["draft"]["target_ref"] == TARGET
     assert drafted.json()["snapshot"]["generation_run_id"] == body["generation_run_id"]
+    choice_id = drafted.json()["choice_id"]
+    assert choice_id
+    stored_choice = conn.execute(
+        "SELECT generation_run_id, option_id FROM contract_gate1_choice_revision "
+        "WHERE choice_id = %s",
+        (choice_id,),
+    ).fetchone()
+    assert stored_choice == (body["generation_run_id"], chosen["option_id"])
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), conn.transaction():
+        conn.execute(
+            "UPDATE contract_gate1_choice_revision SET why = 'changed' WHERE choice_id = %s",
+            (choice_id,),
+        )
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), conn.transaction():
+        conn.execute(
+            "DELETE FROM contract_gate1_choice_revision WHERE choice_id = %s",
+            (choice_id,),
+        )
+
+    contract_body = {
+        **drafted.json()["draft"],
+        "intent_id": recognition["intent_id"],
+        "choice_id": choice_id,
+    }
+    wrong_actor = client.post(
+        "/contract/confirm",
+        json=contract_body,
+        headers={"X-User": "another-user", "X-Roles": "platform_admin"},
+    )
+    assert wrong_actor.status_code == 422
+    confirmed = client.post("/contract/confirm", json=contract_body, headers=AUTH)
+    assert confirmed.status_code == 200, confirmed.text
+    bound_snapshot = conn.execute(
+        "SELECT metadata_snapshot_id FROM contract WHERE contract_id = %s",
+        (confirmed.json()["contract_id"],),
+    ).fetchone()[0]
+    assert bound_snapshot == drafted.json()["snapshot"]["snapshot_id"]
 
 
 def test_release_mode_rejects_legacy_unsealed_recognition(

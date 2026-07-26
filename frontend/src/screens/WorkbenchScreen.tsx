@@ -21,13 +21,9 @@
 // - A response with one non-empty set renders the flat list exactly as before, no cards row.
 // - Sets that came back empty are dropped from the compare row (nothing to take or compare);
 //   their gauntlet rejections still show in the rejections panel.
-// - Candidate identity within a round is the feature name: the same name in several sets is the
-//   same feature on purpose (strong signals earn their place in several theses), so it renders
-//   with an "In N sets" chip, selects globally, and registers once. Keys stay per-fetch
-//   (g{seq}:{name}) so a later round reusing a name never resurrects registered state.
-//   Accepted tradeoff: the backend does not GUARANTEE cross-lens name identity (two lenses could
-//   in principle propose different definitions under one name); the first set's definition wins
-//   the merge, and the row renders that one definition.
+// - A considered candidate is identified by the backend's opaque option_id, not its display name.
+//   Same-name recipe, governed, and free-form variants remain separate rows and retain their own
+//   provenance and draft identity. Legacy responses without option_id fall back to the per-fetch name.
 // - Set theses are client-side copy keyed by the router's fixed lens vocabulary (the wire
 //   carries no set description); an unknown lens simply renders without a thesis line.
 //
@@ -381,10 +377,8 @@ function slugFrom(text: string): string {
     .slice(0, 63)
 }
 
-// Candidate identity within a round is the feature name (the same name in several sets is the
-// same feature); keys carry the fetch sequence (g{seq}:{name}) because LLM-chosen names are not
-// unique across rounds, so keying registered state by name alone would show phantom "Registered"
-// on a fresh, never-registered candidate that reuses an old name.
+// Candidate identity within a governed round is the server's opaque option_id. The fetch sequence
+// isolates legacy responses and keeps a later revision from resurrecting state from an older round.
 interface GeneratedCandidate {
   kind: 'generated'
   key: string
@@ -395,6 +389,17 @@ interface GeneratedCandidate {
   // Pinned through a whole-round feedback regeneration (it was selected or registered when the
   // round replaced everything else). Kept rows show in every set view and leave the sets model.
   kept?: boolean
+}
+
+function generationSourceLabel(idea: FeatureIdea): string {
+  if (idea.path_authority === 'governed_cross_catalog') {
+    return idea.recipe_id ? `Governed recipe · ${idea.recipe_id}` : 'Governed planner'
+  }
+  if (idea.generation_source === 'recipe') {
+    return idea.recipe_id ? `Recipe · ${idea.recipe_id}` : 'Recipe'
+  }
+  if (idea.generation_source === 'user_defined') return 'User-defined'
+  return 'Free-form'
 }
 
 // One recorded whole-round feedback submission: who asked, what they asked, what it did.
@@ -877,34 +882,28 @@ export function WorkbenchScreen() {
     invalidateGenerated()
   }
 
-  // Apply a considered-set response as the current round: dedupe candidates by name across sets,
-  // open the detail list on the advisory pick, and reset the feedback cycle against THIS round's
-  // hypothesis/objective. Shared by the one-shot generate (flag off) and the confirmed/broadened
-  // scoped generate (flag on). Callers run the out-of-order guard BEFORE calling.
+  // Apply a considered-set response as the current round. Every opaque option remains selectable even
+  // when several variants share a display name. Shared by legacy and confirmed-scope generation.
   function applyConsideredRound(
     cs: ConsideredSetResp, seq: number, roundHyp: string, roundObj: string,
   ) {
     setIntentId(cs.intent_id)
     setGenerationRunId(cs.generation_run_id ?? null)
-    // Dedupe by name across sets: the same feature in several lenses is one candidate that
-    // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
-    const byName = new Map<string, GeneratedCandidate>()
+    const candidates: GeneratedCandidate[] = []
     const lenses: string[] = []
-    for (const set of cs.alternatives) {
+    for (const [setIndex, set] of cs.alternatives.entries()) {
       if (set.features.length === 0) continue
       lenses.push(set.lens)
-      for (const idea of set.features) {
-        const existing = byName.get(idea.name)
-        if (existing) {
-          if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
-        } else {
-          byName.set(idea.name, {
-            kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
-          })
-        }
+      for (const [featureIndex, idea] of set.features.entries()) {
+        candidates.push({
+          kind: 'generated',
+          key: `g${seq}:${idea.option_id ?? `${setIndex}:${featureIndex}:${idea.name}`}`,
+          idea,
+          lenses: [set.lens],
+        })
       }
     }
-    setGenerated([...byName.values()])
+    setGenerated(candidates)
     setSetLenses(lenses)
     setRecommendation(cs.recommendation)
     // The detail list opens on the advisory pick when there is one among the surviving sets.
@@ -1158,32 +1157,24 @@ export function WorkbenchScreen() {
       const keptSelected = pinned
         .filter(c => registeredRef.current[c.key] === undefined).length
       const replaced = prev.length - pinned.length
-      const pinnedNames = new Set(pinned.map(c => c.idea.name))
       const pinnedKeys = new Set(pinned.map(c => c.key))
-      const byName = new Map<string, GeneratedCandidate>()
+      const fresh: GeneratedCandidate[] = []
       const lenses: string[] = []
-      for (const set of round.sets) {
-        // The pin wins a name collision: one row per name, and the human's kept candidate is
-        // never silently swapped for a regenerated variant. Filter FIRST: a set whose every
-        // candidate collided (or that arrived empty) must not render an empty card, and must
-        // never become the active or recommended-active view.
-        const freshIdeas = set.features.filter(idea => !pinnedNames.has(idea.name))
-        if (freshIdeas.length === 0) continue
+      for (const [setIndex, set] of round.sets.entries()) {
+        if (set.features.length === 0) continue
         lenses.push(set.lens)
-        for (const idea of freshIdeas) {
-          const existing = byName.get(idea.name)
-          if (existing) {
-            if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
-          } else {
-            byName.set(idea.name, {
-              kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
-            })
-          }
+        for (const [featureIndex, idea] of set.features.entries()) {
+          fresh.push({
+            kind: 'generated',
+            key: `g${seq}:${idea.option_id ?? `${setIndex}:${featureIndex}:${idea.name}`}`,
+            idea,
+            lenses: [set.lens],
+          })
         }
       }
       setGenerated([
         ...pinned.map((c): GeneratedCandidate => ({ ...c, kept: true, lenses: [] })),
-        ...byName.values(),
+        ...fresh,
       ])
       // The intent was refreshed above (setIntentId(cs.intent_id)) so the FRESH candidates are
       // governable; the kept pins came from a prior generation and are excluded by governableCount.
@@ -1465,7 +1456,7 @@ export function WorkbenchScreen() {
   // Govern the selected GENERATED candidates into signed contracts, mirroring confirmRegistration:
   // sequential, one candidate at a time, per-candidate try/catch so a failure marks that candidate
   // and the batch continues. Only fresh (non-kept) generated candidates are in the current intent's
-  // considered-set snapshot; chosenSource is always 'alternative' and chosenOptionId is the name.
+  // considered-set snapshot; chosenSource is legacy-only and chosenOptionId is the opaque option id.
   async function confirmGovern() {
     if (governInFlight.current) return
     const iid = intentId
@@ -1484,11 +1475,11 @@ export function WorkbenchScreen() {
           const d = await contractDraft(
             iid,
             'alternative',
-            candidate.idea.name,
+            candidate.idea.option_id ?? candidate.idea.name,
             '',
             generationRunId ?? undefined,
           )
-          const c = await contractConfirm(d.draft, iid)
+          const c = await contractConfirm(d.draft, iid, d.choice_id)
           setGoverned(prev => ({ ...prev,
             [candidate.key]: { contractId: c.contract_id, version: c.version } }))
           deselect(candidate.key)
@@ -2152,6 +2143,14 @@ export function WorkbenchScreen() {
               const error = errors[c.key]
               const rawName = c.kind === 'generated' ? c.idea.name : c.name
               const displayName = rawName.trim() || 'unnamed draft'
+              const sameNameVariants = c.kind === 'generated'
+                ? (generated ?? []).filter(other => other.idea.name === c.idea.name).length
+                : 0
+              const variantContext = c.kind === 'generated' && sameNameVariants > 1
+                ? c.kept
+                  ? 'earlier round'
+                  : `${c.lenses[0] ?? 'unscoped'}; ${generationSourceLabel(c.idea)}`
+                : null
               const canSelect = c.kind === 'generated' || c.name.trim() !== ''
               const description = c.kind === 'generated' ? c.idea.description : c.description
               const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
@@ -2174,7 +2173,7 @@ export function WorkbenchScreen() {
                   ) : (
                     <input
                       type="checkbox"
-                      aria-label={`Select ${displayName}`}
+                      aria-label={`Select ${displayName}${variantContext ? ` (${variantContext})` : ''}`}
                       checked={c.key in selected}
                       disabled={batchBusy || !canSelect}
                       onChange={() => toggleSelect(
@@ -2195,15 +2194,16 @@ export function WorkbenchScreen() {
                       <span className="badge proposal">
                         {c.kind === 'generated' ? 'Proposal' : 'Draft'}
                       </span>
+                      {c.kind === 'generated' && (
+                        <span className="badge">{generationSourceLabel(c.idea)}</span>
+                      )}
+                      {c.kind === 'generated' && c.idea.candidate_status && (
+                        <span className="badge">{c.idea.candidate_status}</span>
+                      )}
                       {/* Honest stamp: soft (not solid) so it never outshouts the selection or
                           registered states. Drafts skip the gauntlet, so they carry no stamp. */}
                       {c.kind === 'generated' && c.idea.verification && (
                         <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
-                      )}
-                      {/* Overlap is on purpose: strong signals earn their place in several
-                          theses. Soft chip; the row is one candidate either way. */}
-                      {c.kind === 'generated' && c.lenses.length > 1 && (
-                        <span className="badge">In {c.lenses.length} sets</span>
                       )}
                       {/* Pinned through a whole-round regeneration. Registered rows skip the
                           chip: Registered is already their mark. */}

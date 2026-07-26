@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -128,10 +128,18 @@ def _contract_input_items(conn, draft: ContractDraft):
     # # H1b: ungoverned support-column requirement/rejection is wired there; this task records the
     # roles the reconciled draft already carries and drops NONE silently.
     for step in draft.join_path:
-        ref = step.get("ref") or step.get("to")
-        if not ref:
+        join_ref = step.get("ref") or step.get("to")
+        if not join_ref:
             continue
-        yield (step.get("catalog_source") or grain_source or "", ref, ref, ref, "join", None, None)
+        yield (
+            step.get("catalog_source") or grain_source or "",
+            join_ref,
+            join_ref,
+            join_ref,
+            "join",
+            None,
+            None,
+        )
 
 
 def _insert_contract_input_columns(conn, contract_id: str, draft: ContractDraft) -> None:
@@ -226,17 +234,17 @@ def _contract_dependency_items(conn, draft: ContractDraft):
         # bridge revocation / join-key drift. Previously the raw ``bfk_*`` / realization id was recorded as a
         # graph_node ⟶ MISSING ⟶ poison ⟶ every governed contract permanently downgraded (the vacuous C-1).
         if step.get("kind") == "governed_segment":
-            ref = step.get("ref")
-            if not ref:
+            segment_ref = step.get("ref")
+            if not segment_ref:
                 continue                       # a ``direct_catalog`` source prefix — no bridge/realization
             segment_kind = step.get("segment_kind")
             if segment_kind == str(SegmentKind.governed_bridge):
-                marker = bridge_fact_marker(ref)
+                marker = bridge_fact_marker(segment_ref)
             elif segment_kind in (str(SegmentKind.intra_catalog_realization),
                                   str(SegmentKind.semantic_rollup)):
-                marker = realization_marker(ref)
+                marker = realization_marker(segment_ref)
             else:
-                marker = ref                   # an unknown ref-carrying kind — record raw (fail-closed:
+                marker = segment_ref           # an unknown ref-carrying kind — record raw (fail-closed:
                 #                                unresolvable ⟶ poison ⟶ not promotable, never silently uncovered)
             yield (step_catalog, marker, marker, None, None, None)
             continue
@@ -440,14 +448,47 @@ def _cancel_undelivered_external_submissions(conn, prior_contract_id: str | None
     return
 
 
-def _confirm_snapshot_binding(conn, intent_id: str | None) -> tuple[str | None, str | None]:
-    """MF-3 — the SERVER C0 metadata-snapshot lineage recorded on the considered set for this intent,
-    read AT CONFIRM. Returns ``(snapshot_id, content_hash)`` to bind IMMUTABLY onto the write-once-in-
-    practice contract row: ``contract_considered.snapshot_id`` is a MUTABLE upsert pointer (a later
-    broaden repoints it S1->S2), so recording the value AT CONFIRM on the contract row is what makes
-    "what catalog state was this contract authored against" reconstructable and un-repointable. Returns
-    ``(None, None)`` when the intent has no considered-set row, or it recorded no snapshot (a pre-C0 /
-    READ COMMITTED considered set) — additive, the columns stay NULL."""
+def _confirm_snapshot_binding(
+    conn,
+    intent_id: str | None,
+    snapshot_lineage: Mapping[str, str | None] | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve the immutable snapshot binding for this confirm.
+
+    Scoped callers pass lineage reloaded from the append-only exact choice. It is verified against both
+    the immutable snapshot and the intent-bound generation run. Legacy callers fall back to the mutable
+    latest considered pointer for compatibility.
+    """
+    if snapshot_lineage is not None:
+        if intent_id is None:
+            raise ContractValidationError("exact snapshot lineage requires an intent")
+        generation_run_id = snapshot_lineage.get("generation_run_id")
+        snapshot_id = snapshot_lineage.get("snapshot_id")
+        content_hash = snapshot_lineage.get("content_hash")
+        if not isinstance(generation_run_id, str) or not generation_run_id:
+            raise ContractValidationError("exact snapshot lineage is incomplete")
+        if snapshot_id is None and content_hash is None:
+            run = conn.execute(
+                "SELECT 1 FROM feature_generation_run "
+                "WHERE generation_run_id = %s AND intent_id = %s",
+                (generation_run_id, intent_id),
+            ).fetchone()
+            if run is None:
+                raise ContractValidationError("exact generation lineage verification failed")
+            return None, None
+        if not all(isinstance(v, str) and v for v in (snapshot_id, content_hash)):
+            raise ContractValidationError("exact snapshot lineage is incomplete")
+        row = conn.execute(
+            "SELECT 1 "
+            "FROM catalog_metadata_snapshot s "
+            "JOIN feature_generation_run r USING (generation_run_id) "
+            "WHERE s.snapshot_id = %s AND s.generation_run_id = %s AND s.content_hash = %s "
+            "AND r.intent_id = %s",
+            (snapshot_id, generation_run_id, content_hash, intent_id),
+        ).fetchone()
+        if row is None:
+            raise ContractValidationError("exact snapshot lineage verification failed")
+        return snapshot_id, content_hash
     if intent_id is None:
         return None, None
     row = conn.execute(
@@ -470,6 +511,7 @@ class Contract:
 def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] = (),
                      target_ref: str | None = None,
                      now: datetime | None = None, intent_id: str | None = None,
+                     snapshot_lineage: Mapping[str, str | None] | None = None,
                      confirmed_binding_hash: str | None = None,
                      plan_envelope: PlanEnvelopeV1 | None = None,
                      templates=None) -> Contract:
@@ -570,7 +612,8 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     # read AT CONFIRM from the server row. Persisted onto the never-repointed contract row so a later
     # broaden (which repoints the mutable contract_considered.snapshot_id) cannot change what catalog state
     # this governed contract was authored against. NULL on a pre-C0 / READ COMMITTED set (additive).
-    metadata_snapshot_id, metadata_content_hash = _confirm_snapshot_binding(conn, intent_id)
+    metadata_snapshot_id, metadata_content_hash = _confirm_snapshot_binding(
+        conn, intent_id, snapshot_lineage)
     # H1b — FOLD the confirmed role-binding hash into the 1011 ``metadata_input_fingerprint`` (the
     # feature-contract metadata fingerprint now includes the confirmed role-binding hash; no migration —
     # reuses the existing column). ``metadata_content_hash`` (the MF-3 immutable snapshot binding) stays

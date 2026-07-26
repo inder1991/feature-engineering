@@ -245,6 +245,15 @@ export interface JoinStep {
 }
 
 export interface FeatureIdea {
+  // Opaque, revision-scoped identity on /contract/considered-set responses. It distinguishes variants
+  // that share a display name and is the only scoped drafting token; other feature APIs may omit it.
+  option_id?: string
+  generation_source?: 'recipe' | 'llm_freeform' | 'user_defined' | string
+  recipe_id?: string
+  candidate_status?: string
+  planner_applicability?: string
+  origin?: string
+  path_authority?: string
   name: string
   description: string
   derives_from: string[]
@@ -946,6 +955,12 @@ export interface DraftResp {
   draft: ContractDraft
   unresolved: unknown[]
   intent_id: string
+  choice_id: string | null
+  snapshot?: {
+    generation_run_id: string
+    snapshot_id: string | null
+    content_hash: string | null
+  } | null
 }
 
 export interface Contract {
@@ -1106,7 +1121,7 @@ export function contractConsideredSet(
 }
 
 // Record the human's Gate #1 choice (server reconstructs the feature from the persisted set) and author
-// the draft. chosen_option_id is the chosen feature's name from the considered set.
+// the draft. In confirmation-required mode chosen_option_id is the opaque option_id, never display name.
 export function contractDraft(
   intentId: string,
   chosenSource: 'anchor' | 'alternative',
@@ -1125,8 +1140,16 @@ export function contractDraft(
 
 // Gate #2 — the governing write. The draft (from contractDraft) is sent back with its intent_id; the
 // server re-runs the MCV and mints a versioned, DESIGN-CHECKED contract.
-export function contractConfirm(draft: ContractDraft, intentId: string): Promise<Contract> {
-  return post('/contract/confirm', { ...draft, intent_id: intentId })
+export function contractConfirm(
+  draft: ContractDraft,
+  intentId: string,
+  choiceId?: string | null,
+): Promise<Contract> {
+  return post('/contract/confirm', {
+    ...draft,
+    intent_id: intentId,
+    choice_id: choiceId ?? null,
+  })
 }
 
 export function listContracts(limit = 50): Promise<ContractSummary[]> {

@@ -43,10 +43,12 @@ from featuregen.overlay.upload.contract.author import (
 from featuregen.overlay.upload.contract.gate1 import (
     Gate1Error,
     _intent_scoped_applicability_enabled,
+    _public_considered_snapshot,
     build_considered_set,
     gate1_choice,
     intent_target_ref,
     persist_intent,
+    recorded_gate1_choice_revision,
     recorded_gate1_draft_choice,
     select_and_record_gate1_choice,
 )
@@ -167,6 +169,7 @@ class DraftIn(BaseModel):
     derives_pairs: list[tuple[str, str]] = []
     join_path: list[dict] = []
     intent_id: str | None = None   # server re-reads target_ref + links the contract via this
+    choice_id: str | None = None
     # H1b Gate-1 role-binding confirmation: the binding_hash the client SAW at /contract/draft. At
     # confirm the server recomputes the CURRENT binding_hash from its authoritative reconciled bindings
     # and 409s if it differs (bindings drifted since draft — re-review). LEGACY DEGRADATION: absent
@@ -222,8 +225,8 @@ class ConsideredSetIn(BaseModel):
 
 class DraftReqIn(BaseModel):
     intent_id: str
-    chosen_source: str            # "anchor" | "alternative"
-    chosen_option_id: str         # the chosen feature's name (from the considered set)
+    chosen_source: str = "alternative"  # legacy-only in confirmation-required mode
+    chosen_option_id: str         # opaque option id in confirmation-required mode
     why: str = ""
     expected_generation_run_id: str | None = None
 
@@ -245,13 +248,22 @@ def scope_mode() -> dict:
     }
 
 
-def _considered_set_response(intent, cs) -> dict:
-    """Today's considered-set response body — the anchor + alternatives + recommendation + rejections.
-    The scoped (Phase-1B) path returns this SAME shape plus the disposition lens; the no-scope path
-    returns it verbatim (byte-unchanged vs pre-1B)."""
-    return {"intent_id": intent.intent_id, "anchor": cs.anchor,
-            "alternatives": cs.alternatives, "recommendation": cs.recommendation,
-            "rejections": cs.rejections}
+def _considered_set_response(conn, intent, cs) -> dict:
+    """Return the controlled public considered-set projection.
+
+    Private ranking signals remain sealed in the revision and are not promoted into the API contract.
+    """
+    public = _public_considered_snapshot(conn, cs)
+    return {
+        "intent_id": intent.intent_id,
+        "anchor": public["anchor"],
+        "alternatives": [
+            {"lens": feature_set["lens"], "features": feature_set["features"]}
+            for feature_set in public["alternatives"]
+        ],
+        "recommendation": public["recommendation"],
+        "rejections": cs.rejections,
+    }
 
 
 def _require_generation_llm(client: LLMClient | None) -> LLMClient:
@@ -635,7 +647,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now,
         incomplete=cs.incomplete_template_ids)
     # 8. Applicability OWNS the in-scope recipe count (never recognition).
-    response = {**_considered_set_response(intent, cs),
+    response = {**_considered_set_response(conn, intent, cs),
                 "generation_run_id": generation_run_id, "scope_id": scope_id,
                 "dispositions": [_disposition_json(d) for d in dispositions],
                 "in_scope_count": len(applicability.eligible_ids)}
@@ -809,7 +821,7 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
         raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
             status_code=409,
             detail="a concurrent request updated this intent; re-fetch and retry") from e
-    return _considered_set_response(intent, cs)
+    return _considered_set_response(conn, intent, cs)
 
 
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
@@ -930,8 +942,15 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     # SERVER-authoritative reconciled draft `d`, so it equals the confirm-time recompute unless the
     # underlying catalog state actually drifts. READ-ONLY (no global authority write).
     bindings = confirmed_role_bindings(conn, d)
-    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id, "snapshot": snapshot,
-            "bindings": binding_exposure(bindings), "binding_hash": binding_hash(bindings)}
+    return {
+        "draft": d,
+        "unresolved": unresolved,
+        "intent_id": body.intent_id,
+        "choice_id": choice.choice_id,
+        "snapshot": snapshot,
+        "bindings": binding_exposure(bindings),
+        "binding_hash": binding_hash(bindings),
+    }
 
 
 @router.get("/contracts", dependencies=[Depends(require_feature_read)])
@@ -965,14 +984,31 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     ).fetchone()
     if owned is None:
         raise HTTPException(status_code=422, detail="unknown intent")
-    choice = gate1_choice(conn, body.intent_id)
-    if choice is None:
-        raise HTTPException(status_code=422,
-                            detail="no Gate #1 choice recorded for this intent — draft it first")
-    try:
-        recorded_choice = recorded_gate1_draft_choice(conn, body.intent_id)
-    except Gate1Error as e:
-        raise HTTPException(status_code=409, detail="considered revision verification failed") from e
+    if confirmation_required():
+        if body.choice_id is None:
+            raise HTTPException(
+                status_code=422, detail="choice_id is required to govern a scoped contract")
+        try:
+            recorded_choice = recorded_gate1_choice_revision(
+                conn,
+                choice_id=body.choice_id,
+                intent_id=body.intent_id,
+                actor=identity.subject,
+            )
+        except Gate1Error as e:
+            raise HTTPException(
+                status_code=409, detail="considered revision verification failed") from e
+    else:
+        choice = gate1_choice(conn, body.intent_id)
+        if choice is None:
+            raise HTTPException(
+                status_code=422,
+                detail="no Gate #1 choice recorded for this intent — draft it first")
+        try:
+            recorded_choice = recorded_gate1_draft_choice(conn, body.intent_id)
+        except Gate1Error as e:
+            raise HTTPException(
+                status_code=409, detail="considered revision verification failed") from e
     if recorded_choice is None:
         raise HTTPException(status_code=422,
                             detail="the chosen feature is not in the recorded considered set")
@@ -1084,6 +1120,7 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
                                 roles=identity.role_claims,   # the CONFIRMER's authority reaches the
                                 #                               re-run's join-authority disposition
                                 now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id,
+                                snapshot_lineage=lineage if confirmation_required() else None,
                                 confirmed_binding_hash=current_binding_hash,
                                 # H3c — the governed plan (from the SERVER-reconstructed chosen feature,
                                 # never the client body): confirm_contract REBUILDS it against the current

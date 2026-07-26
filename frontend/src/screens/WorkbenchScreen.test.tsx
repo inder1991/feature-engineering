@@ -108,9 +108,14 @@ function singleSetRound(
 
 const TEMPORAL_ONLY = idea('days_since_last_txn')
 const RATIO_ONLY = idea('balance_to_limit_ratio')
-// The overlapping feature: present in both sets on purpose (strong signals earn their place in
-// several theses); it must render as ONE candidate with an In 2 sets chip.
+// Same display name in two sets deliberately represents two independently selectable options.
 const SHARED = idea('txn_count_shared')
+const SHARED_RECIPE: api.FeatureIdea = {
+  ...SHARED,
+  generation_source: 'recipe',
+  recipe_id: 'txn_count_recipe',
+  candidate_status: 'grounded',
+}
 
 const CAVEAT =
   'advisory only: a fit/coverage judgment over the metadata, not a performance prediction; '
@@ -120,7 +125,7 @@ function multiSetRound(rejections: api.Rejection[] = []): api.FeatureSetsResult 
   return {
     sets: [
       { lens: 'temporal', features: [TEMPORAL_ONLY, SHARED] },
-      { lens: 'ratio', features: [RATIO_ONLY, SHARED] },
+      { lens: 'ratio', features: [RATIO_ONLY, SHARED_RECIPE] },
     ],
     recommendation: {
       recommended_lens: 'temporal',
@@ -161,7 +166,15 @@ const HYPOTHESIS = 'balance draining precedes churn'
 // response through this helper too (the round-shape helpers stay reusable for either path).
 function considered(round: api.FeatureSetsResult): api.ConsideredSetResp {
   return {
-    intent_id: 'int_1', anchor: null, alternatives: round.sets,
+    intent_id: 'int_1',
+    anchor: null,
+    alternatives: round.sets.map((set, setIndex) => ({
+      ...set,
+      features: set.features.map((feature, featureIndex) => ({
+        ...feature,
+        option_id: feature.option_id ?? `opt_${setIndex}_${featureIndex}_${feature.name}`,
+      })),
+    })),
     recommendation: round.recommendation, rejections: round.rejections,
   }
 }
@@ -403,7 +416,9 @@ describe('multiple sets', () => {
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     expect(screen.getByText('from the Temporal set')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' })).toBeChecked()
-    expect(screen.getByRole('checkbox', { name: 'Select txn_count_shared' })).toBeChecked()
+    expect(screen.getByRole('checkbox', {
+      name: 'Select txn_count_shared (temporal; Free-form)',
+    })).toBeChecked()
     // The card meta reflects the tray.
     expect(screen.getByText(/2 in your tray/)).toBeInTheDocument()
   })
@@ -430,31 +445,37 @@ describe('multiple sets', () => {
     expect(screen.getByText('2 selected')).toBeInTheDocument()
   })
 
-  it('renders an overlapping feature as one candidate with the In N sets chip', async () => {
+  it('keeps same-name options in separate lenses as distinct selectable variants', async () => {
     await renderAndGenerateSets(multiSetRound())
     await screen.findByText('txn_count_shared')
-    // One chip in the temporal view; the set-only features carry none.
-    expect(screen.getAllByText('In 2 sets')).toHaveLength(1)
-    await selectCandidate('txn_count_shared')
+    const temporal = screen.getByRole('checkbox', {
+      name: 'Select txn_count_shared (temporal; Free-form)',
+    })
+    await userEvent.click(temporal)
     await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
-    // Same candidate in the other view: still selected, still one selection.
-    expect(screen.getByRole('checkbox', { name: 'Select txn_count_shared' })).toBeChecked()
+    // The ratio option has the same display name but a different opaque identity.
+    expect(screen.getByRole('checkbox', {
+      name: 'Select txn_count_shared (ratio; Recipe · txn_count_recipe)',
+    })).not.toBeChecked()
+    expect(screen.getByText('grounded')).toBeInTheDocument()
     expect(screen.getByText('1 selected')).toBeInTheDocument()
   })
 
-  it('registers an overlapping feature once and flips its row in every set view', async () => {
+  it('registers only the selected same-name variant', async () => {
     registerFeature.mockResolvedValue('feat_20')
     featureFreshness.mockResolvedValue(FRESH)
     await renderAndGenerateSets(multiSetRound())
-    await selectCandidate('txn_count_shared')
+    await userEvent.click(screen.getByRole('checkbox', {
+      name: 'Select txn_count_shared (temporal; Free-form)',
+    }))
     await registerSelection(1)
     expect(await screen.findByText('feat_20')).toBeInTheDocument()
     expect(registerFeature).toHaveBeenCalledTimes(1)
     await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
-    expect(screen.getByText('feat_20')).toBeInTheDocument()
-    expect(
-      screen.queryByRole('checkbox', { name: 'Select txn_count_shared' }),
-    ).not.toBeInTheDocument()
+    expect(screen.queryByText('feat_20')).not.toBeInTheDocument()
+    expect(screen.getByRole('checkbox', {
+      name: 'Select txn_count_shared (ratio; Recipe · txn_count_recipe)',
+    })).toBeInTheDocument()
   })
 
   it('registers a cross-set mix as one batch, whichever view is showing', async () => {
@@ -1169,13 +1190,15 @@ describe('whole-round feedback', () => {
     contractConsideredSet.mockResolvedValueOnce(considered(multiSetRound()))
     await submitSetFeedback('sharper recency signals')
     expect(await screen.findByText('Kept')).toBeInTheDocument()
-    // Previous round held 3 candidates; the pin stayed, 2 were replaced.
-    expect(screen.getByText(/kept 1 selected, replaced 2/)).toBeInTheDocument()
+    // Previous round held four exact options; the pin stayed and three were replaced.
+    expect(screen.getByText(/kept 1 selected, replaced 3/)).toBeInTheDocument()
     // The kept row shows in the temporal view and after switching to the ratio view.
-    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.getAllByText('days_since_last_txn')).toHaveLength(2)
     await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
     expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' })).toBeChecked()
+    expect(screen.getByRole('checkbox', {
+      name: 'Select days_since_last_txn (earlier round)',
+    })).toBeChecked()
   })
 
   it('disables the channel after three rounds with the exhausted note', async () => {
@@ -1298,7 +1321,7 @@ describe('whole-round feedback', () => {
     expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
   })
 
-  it('drops a set whose every candidate collided with pins instead of rendering an empty card', async () => {
+  it('preserves a regenerated same-name option instead of collapsing it into a pin', async () => {
     const threeSets = (): api.FeatureSetsResult => ({
       sets: [
         { lens: 'temporal', features: [TEMPORAL_ONLY] },
@@ -1318,15 +1341,19 @@ describe('whole-round feedback', () => {
     contractConsideredSet.mockResolvedValueOnce(considered(threeSets()))
     await submitSetFeedback('sharper signals')
     await screen.findByText('Kept')
-    // The temporal set's only candidate collided with the pin: no empty card renders...
-    expect(screen.queryByText('Temporal set')).not.toBeInTheDocument()
+    // The pin and regenerated candidate are separate exact choices, so the temporal set remains.
+    expect(screen.getByText('Temporal set')).toBeInTheDocument()
     expect(screen.getByText('Ratio set')).toBeInTheDocument()
     expect(screen.getByText('Unary set')).toBeInTheDocument()
-    // ...and the recommended-but-emptied lens never becomes the active view.
-    expect(screen.getByRole('button', { name: /ratio set/i }))
+    expect(screen.getByRole('button', { name: /temporal set/i }))
       .toHaveAttribute('aria-pressed', 'true')
-    // The kept pick stays visible in the surviving views.
-    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.getAllByText('days_since_last_txn')).toHaveLength(2)
+    expect(screen.getByRole('checkbox', {
+      name: 'Select days_since_last_txn (earlier round)',
+    })).toBeChecked()
+    expect(screen.getByRole('checkbox', {
+      name: 'Select days_since_last_txn (temporal; Free-form)',
+    })).not.toBeChecked()
   })
 
   it('a kept row never claims the currently-viewed lens in the tray note', async () => {
@@ -1340,8 +1367,11 @@ describe('whole-round feedback', () => {
     expect(screen.getByText('kept from an earlier round')).toBeInTheDocument()
     expect(screen.queryByText('from the Temporal set')).not.toBeInTheDocument()
     // Reselecting the kept row while a set view shows must not stamp the viewed lens.
-    await userEvent.click(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' }))
-    await userEvent.click(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' }))
+    const kept = screen.getByRole('checkbox', {
+      name: 'Select days_since_last_txn (earlier round)',
+    })
+    await userEvent.click(kept)
+    await userEvent.click(kept)
     expect(screen.getByText('kept from an earlier round')).toBeInTheDocument()
     expect(screen.queryByText(/from the (Temporal|Ratio) set/)).not.toBeInTheDocument()
   })
@@ -1685,7 +1715,9 @@ describe('govern', () => {
   }
 
   it('governs a selected generated candidate through draft + confirm into a signed contract', async () => {
-    contractDraft.mockResolvedValue({ draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1' })
+    contractDraft.mockResolvedValue({
+      draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1', choice_id: 'g1c_1',
+    })
     contractConfirm.mockResolvedValue({
       contract_id: 'contract_1', feature_id: 'feat_1', feature_name: 'avg_balance', version: 1,
     })
@@ -1703,9 +1735,9 @@ describe('govern', () => {
     expect(await screen.findByText(/governed/i)).toBeInTheDocument()
     expect(screen.getByText('contract_1')).toBeInTheDocument()
     expect(contractDraft).toHaveBeenCalledWith(
-      'int_1', 'alternative', 'avg_balance', '', undefined)
+      'int_1', 'alternative', 'opt_0_0_avg_balance', '', undefined)
     expect(contractConfirm).toHaveBeenCalledWith(
-      expect.objectContaining({ feature_name: 'avg_balance' }), 'int_1')
+      expect.objectContaining({ feature_name: 'avg_balance' }), 'int_1', 'g1c_1')
     expect(contractDraft).toHaveBeenCalledTimes(1)
     expect(contractConfirm).toHaveBeenCalledTimes(1)
     // Govern is a parallel path: it never registers, and the governed row is done (no checkbox).
@@ -1714,7 +1746,9 @@ describe('govern', () => {
   })
 
   it('a whole-round feedback refreshes the intent; kept candidates are not governable, fresh ones are', async () => {
-    contractDraft.mockResolvedValue({ draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1' })
+    contractDraft.mockResolvedValue({
+      draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1', choice_id: 'g1c_1',
+    })
     contractConfirm.mockResolvedValue({
       contract_id: 'contract_2', feature_id: 'feat_2', feature_name: 'inactivity_days', version: 1,
     })
@@ -1750,14 +1784,16 @@ describe('govern', () => {
     expect(screen.getByText('contract_2')).toBeInTheDocument()
     // The two-gate flow ran with the FRESH intent from the feedback round, for the fresh candidate.
     expect(contractDraft).toHaveBeenCalledWith(
-      'int_1', 'alternative', 'inactivity_days', '', undefined)
-    expect(contractConfirm).toHaveBeenCalledWith(AVG_DRAFT, 'int_1')
+      'int_1', 'alternative', 'opt_0_0_inactivity_days', '', undefined)
+    expect(contractConfirm).toHaveBeenCalledWith(AVG_DRAFT, 'int_1', 'g1c_1')
     expect(contractDraft).toHaveBeenCalledTimes(1)
     expect(contractConfirm).toHaveBeenCalledTimes(1)
   })
 
   it('marks the candidate with the failure and does not govern it when confirm rejects', async () => {
-    contractDraft.mockResolvedValue({ draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1' })
+    contractDraft.mockResolvedValue({
+      draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1', choice_id: 'g1c_1',
+    })
     contractConfirm.mockRejectedValue(
       new api.ApiError(422, 'the safety gauntlet rejected the contract'))
     await renderAndGenerate([IDEA])
