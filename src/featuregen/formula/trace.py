@@ -29,7 +29,10 @@ DSN configured (a connect/commit blip, or a ``ForeignKeyViolation`` against a re
 exists on the caller's uncommitted transaction because an upstream durable write itself degraded)
 logs and degrades the same way (transactional evidence beats none, and an evidence-free crash then
 reads as *incomplete*, which is the honest outcome). Only CONNECTION-INDEPENDENT rejections
-propagate — see ``_DETERMINISTIC_REJECTIONS``.
+propagate — see ``_DETERMINISTIC_REJECTIONS``. ``run_status`` READS through the same fresh-connection
+path (``_durable_read``), because a read on the caller's connection cannot see those independent
+commits when the caller is pinned to ``REPEATABLE READ`` — which ``api.deps.get_feature_gen_conn``,
+the natural host for authoring, does.
 
 ``payload`` is CANONICAL REDACTED METADATA ONLY — tool result identities/verdicts/hashes,
 dispositions, reason codes — NEVER raw catalog data values, matching the metadata-only discipline of
@@ -97,6 +100,10 @@ _INSERT_EVENT = (
     "llm_call_ref, idempotency_key, payload, payload_hash) "
     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
 )
+_SELECT_TERMINAL = (
+    "SELECT kind FROM authoring_trace_event "
+    "WHERE authoring_run_id = %s AND kind IN (%s, %s) LIMIT 1"
+)
 
 
 def open_authoring_run(conn: DbConn, *, intent_hash: str, versions: Mapping[str, Any],
@@ -161,11 +168,28 @@ def run_status(conn: DbConn, run_id: str) -> RunStatus:
     committed), else ``"completed"``/``"failed"`` from the single terminal event.
 
     There is no status column to drift, and nothing is inferred from ``llm_call`` rows — a run with
-    dozens of durable, committed provider calls and no terminal event is still ``"incomplete"``."""
-    row = conn.execute(
-        "SELECT kind FROM authoring_trace_event "
-        "WHERE authoring_run_id = %s AND kind IN (%s, %s) LIMIT 1",
-        (run_id, TraceEventKind.COMPLETED.value, TraceEventKind.FAILED.value)).fetchone()
+    dozens of durable, committed provider calls and no terminal event is still ``"incomplete"``.
+
+    SYMMETRIC WITH THE WRITES, and deliberately so: the events are committed on the durable fresh
+    connection, so the read goes through the SAME path (``_durable_read``) whenever a DSN is
+    configured. Reading on the CALLER's connection instead was an isolation trap —
+    ``api.deps.get_feature_gen_conn`` pins the feature-generation connection (the natural host for
+    authoring: ``api.routes.contract._FeatureGenConn``) to ``REPEATABLE READ``, whose snapshot
+    predates the terminal event this very request just committed elsewhere. It fails SAFE
+    (``"incomplete"``), but an orchestrator reading its OWN terminal event would mislabel the run or
+    re-author it.
+
+    Isolation assumption (mirrors ``overlay.upload.ingestion_run.terminalize_run``): the fresh
+    connection reads at the Postgres default ``READ COMMITTED``, which is what lets it see events
+    committed a moment earlier by the durable writes. If that default is ever raised process-wide
+    (a ``PGOPTIONS``/``ALTER DATABASE SET default_transaction_isolation``), this path needs a
+    re-check — a fresh REPEATABLE READ snapshot taken at the SELECT is still after those commits, so
+    it stays correct, but SERIALIZABLE would newly admit 40001 here. DSN-less (the tests / no-DB
+    harness) it reads the caller's connection, where the writes also landed."""
+    row = _durable_read(
+        conn, _SELECT_TERMINAL,
+        (run_id, TraceEventKind.COMPLETED.value, TraceEventKind.FAILED.value),
+        what=f"run_status {run_id}")
     if row is None:
         return "incomplete"
     return "completed" if row[0] == TraceEventKind.COMPLETED.value else "failed"
@@ -231,3 +255,25 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
                 "durable authoring-trace write failed (%s); falling back to the request connection",
                 what)
     conn.execute(sql, params)
+
+
+def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple | None:
+    """The READ mirror of ``_durable_write``: one row, on a FRESH connection from
+    ``get_settings().dsn`` so it SEES what the durable writes committed (``run_status`` for the
+    isolation trap this closes). Read-only and single-statement, so there is nothing to commit and
+    nothing to poison; a fresh connection cannot deadlock (no advisory lock, no write).
+
+    Any failure degrades to the caller's connection — where a DEGRADED write's rows are the only
+    copy anyway — so a connect blip can never turn a read into a request-failing exception. Nothing
+    here is deterministic-rejection territory: a SELECT of committed rows either works or the
+    connection is unusable."""
+    dsn = get_settings().dsn
+    if dsn:
+        try:
+            with psycopg.connect(dsn) as trace_conn:
+                return trace_conn.execute(sql, params).fetchone()
+        except Exception:  # noqa: BLE001 — a trace-read failure must never fail the caller
+            logger.exception(
+                "durable authoring-trace read failed (%s); falling back to the request connection",
+                what)
+    return conn.execute(sql, params).fetchone()

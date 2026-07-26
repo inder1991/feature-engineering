@@ -444,6 +444,46 @@ def test_deterministic_rejections_still_raise_on_the_durable_path(db, monkeypatc
                              "WHERE authoring_run_id = %s", (run_id,)).fetchone()[0] == 2
 
 
+def test_run_status_sees_a_durable_terminal_under_repeatable_read(db, monkeypatch, _dsn) -> None:
+    """Review IMPORTANT 2 — the read must be SYMMETRIC with the writes. ``api.deps.py:135`` pins the
+    feature-generation connection (``api.routes.contract._FeatureGenConn``, the natural host for
+    authoring) to ``REPEATABLE READ``. Reading on the caller's connection there returned
+    ``"incomplete"`` for a run this very request had just COMPLETED: the RR snapshot predates the
+    durable commits. It failed safe, but an orchestrator reading its own terminal event would
+    mislabel the run or re-author it.
+
+    Discriminating: the caller's own snapshot is asserted BLIND to the committed rows, so a
+    caller-connection read could only have said ``"incomplete"``."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    db.rollback()                                    # no tx in flight before changing isolation
+    db.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    # The request's FIRST table read is what PINS the RR snapshot — exactly what the feature-gen
+    # request does (the C0 metadata snapshot) before authoring starts.
+    assert db.execute("SELECT count(*) FROM authoring_run").fetchone()[0] >= 0
+    assert db.execute("SHOW transaction_isolation").fetchone()[0] == "repeatable read"
+    run_id = _open(db, intent_hash="ih_rr")           # all three commit on fresh connections,
+    _started(db, run_id, seq=0)                       # i.e. AFTER the caller's snapshot was taken
+    append_event(db, run_id, TraceEventKind.COMPLETED, seq=1,
+                 idempotency_key=f"{run_id}:1", payload={"disposition": "RESOLVED"})
+    assert db.execute("SELECT count(*) FROM authoring_trace_event WHERE authoring_run_id = %s",
+                      (run_id,)).fetchone()[0] == 0   # the RR snapshot really is blind
+    assert run_status(db, run_id) == "completed"
+
+
+def test_run_status_falls_back_to_the_request_connection_when_the_dsn_is_unreachable(
+        db, monkeypatch, caplog) -> None:
+    """The read degrades exactly like the write: an unreachable DSN must never turn a status read
+    into a request-failing exception, and the events it needs are on the caller's connection anyway
+    (the write degraded there too)."""
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    with caplog.at_level(logging.ERROR, logger="featuregen.formula.trace"):
+        run_id = _open(db)
+        append_event(db, run_id, TraceEventKind.FAILED, seq=0,
+                     idempotency_key=f"{run_id}:0", payload={})
+        assert run_status(db, run_id) == "failed"
+    assert caplog.text.count("durable authoring-trace read failed") == 1
+
+
 def test_durable_writes_use_the_full_dsn_and_no_advisory_lock(db) -> None:
     """Two structural guards on the durable pattern, asserted over the AST (so prose in docstrings
     can't satisfy or break them): the DSN read is ``get_settings().dsn`` — never the password-less
