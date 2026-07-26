@@ -210,6 +210,40 @@ def test_critic_metadata_is_read_scoped_hidden_reads_as_not_found(db):
     assert amt["found"] and amt["facts"]["additivity"]["value"] == "additive"
 
 
+def test_critic_uses_server_owned_frozen_metadata_loader(db):
+    loaded: list[str] = []
+
+    def frozen_loader(logical_ref: str) -> dict:
+        loaded.append(logical_ref)
+        return {"logical_ref": logical_ref, "found": True, "snapshot": "frozen"}
+
+    client = FakeLLM()
+    _script(client, {"findings": []})
+    review = critique(
+        db,
+        _INTENT,
+        _proposal(),
+        client,
+        actor=_ACTOR,
+        authoring_run_id=RUN,
+        metadata_loader=frozen_loader,
+    )
+
+    assert loaded == [REF_CIF, REF_AMT, REF_DT]
+    findings, digest, technical = review
+    assert findings == []
+    assert digest == review.findings_hash
+    assert technical is False
+    row = db.execute(
+        "SELECT redacted_input FROM llm_call WHERE run_id = %s",
+        (RUN,),
+    ).fetchone()
+    assert row[0]["catalog_metadata"]["operand_columns"] == [
+        {"logical_ref": ref, "found": True, "snapshot": "frozen"}
+        for ref in (REF_CIF, REF_AMT, REF_DT)
+    ]
+
+
 # ---- critique: the one audited critic call -----------------------------------------------------
 
 
@@ -313,7 +347,8 @@ def test_author_reasoning_and_tool_trace_never_reach_the_critic(db):
 
 def test_critique_signature_has_no_slot_for_an_author_trace():
     assert set(inspect.signature(critique).parameters) == {
-        "conn", "intent", "proposal", "client", "roles", "actor", "authoring_run_id"}
+        "conn", "intent", "proposal", "client", "roles", "actor", "authoring_run_id",
+        "provider_contract", "metadata_loader", "progress_callback"}
 
 
 def test_findings_hash_is_order_independent_end_to_end(db):
