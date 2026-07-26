@@ -356,10 +356,92 @@ def test_durable_write_degrades_to_the_request_connection(db, monkeypatch, caplo
         _started(db, run_id, seq=0)
         append_event(db, run_id, TraceEventKind.COMPLETED, seq=1,
                      idempotency_key=f"{run_id}:1", payload={})
-    assert caplog.text.count("durable authoring-trace connection failed") == 3
+    assert caplog.text.count("durable authoring-trace write failed") == 3
     assert run_status(db, run_id) == "completed"
     assert db.execute("SELECT count(*) FROM authoring_run WHERE authoring_run_id = %s",
                       (run_id,)).fetchone()[0] == 1
+
+
+# ── the degrade is RECOVERABLE: connection-DEPENDENT failures fall back, deterministic ones raise ──
+def test_fk_violation_on_an_uncommitted_manifest_recovers_on_the_request_connection(
+        db, monkeypatch, _dsn) -> None:
+    """Review IMPORTANT 1(a) — WITHIN this module. A transient connect blip degrades the MANIFEST
+    onto the caller's UNCOMMITTED transaction. When the blip clears, the next append opens a healthy
+    fresh connection whose FK CANNOT SEE that manifest. Before the fix that raised
+    ``ForeignKeyViolation`` and was NOT retried on the caller's connection — where it would have
+    succeeded — so every subsequent append for the run failed identically and the whole run's trace
+    was lost. Now it degrades to the caller's connection and the trace survives."""
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    run_id = _open(db, intent_hash="ih_blip")          # manifest lands on db's uncommitted tx
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)         # blip clears: fresh connections are healthy
+    with psycopg.connect(_dsn) as probe:               # the manifest really is invisible elsewhere
+        assert probe.execute("SELECT count(*) FROM authoring_run WHERE authoring_run_id = %s",
+                             (run_id,)).fetchone()[0] == 0
+    _started(db, run_id, seq=0)                        # would raise ForeignKeyViolation pre-fix
+    append_event(db, run_id, TraceEventKind.COMPLETED, seq=1,
+                 idempotency_key=f"{run_id}:1", payload={"disposition": "RESOLVED"})
+    assert db.execute("SELECT count(*) FROM authoring_trace_event WHERE authoring_run_id = %s",
+                      (run_id,)).fetchone()[0] == 2
+
+
+def test_fk_violation_on_a_degraded_llm_call_recovers_on_the_request_connection(
+        db, monkeypatch, _dsn) -> None:
+    """Review IMPORTANT 1(b) — ACROSS SEAMS. ``enrich_llm._record_llm_call_durable`` has its own
+    degrade path that this codebase treats as a real production event (it COUNTS them:
+    ``consume_audit_degradations``). When THAT degrades, the ``llm_call`` row sits on the caller's
+    uncommitted transaction while the trace connection is healthy, so ``llm_call_ref``'s FK is
+    unsatisfiable there. Modelled exactly: record the call on the request connection (as the degraded
+    seam does), then append with a healthy DSN armed."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_degraded_call")   # manifest commits durably (seam healthy)
+    monkeypatch.delenv("FEATUREGEN_DSN")
+    ref = _llm_call_ref(db, run_id)                      # the DEGRADED audit write: caller's tx
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    with psycopg.connect(_dsn) as probe:
+        assert probe.execute("SELECT count(*) FROM llm_call WHERE llm_call_ref = %s",
+                             (ref,)).fetchone()[0] == 0
+    append_event(db, run_id, TraceEventKind.LLM_CALL_RECORDED, seq=0,
+                 idempotency_key=f"{run_id}:0", llm_call_ref=ref, payload={"turn": 0})
+    assert db.execute("SELECT llm_call_ref FROM authoring_trace_event WHERE authoring_run_id = %s",
+                      (run_id,)).fetchone()[0] == ref
+
+
+def test_a_genuinely_absent_referent_still_raises_on_the_durable_path(db, monkeypatch, _dsn) -> None:
+    """The fallback is a RECOVERY, not a swallow: a referent that exists on NO connection still
+    surfaces ``ForeignKeyViolation`` (from the replay on the caller's connection)."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        append_event(db, run_id, TraceEventKind.LLM_CALL_RECORDED, seq=0,
+                     idempotency_key=f"{run_id}:0", llm_call_ref="llmc_ghost", payload={})
+
+
+def test_deterministic_rejections_still_raise_on_the_durable_path(db, monkeypatch, _dsn) -> None:
+    """The refinement's other half: a CONNECTION-INDEPENDENT rejection must PROPAGATE, never be
+    pointlessly replayed onto the caller's transaction (and never silently swallowed). All three
+    classes, on the real durable path with a healthy DSN: UniqueViolation (duplicate idempotency
+    key), the post-terminal guard, and the write-once trigger."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_deterministic")
+    _started(db, run_id, seq=0)
+    with pytest.raises(psycopg.errors.UniqueViolation):        # same idempotency key, new seq
+        append_event(db, run_id, TraceEventKind.TOOL_CALLED, seq=1,
+                     idempotency_key=f"{run_id}:0", payload={})
+    append_event(db, run_id, TraceEventKind.FAILED, seq=2,
+                 idempotency_key=f"{run_id}:2", payload={})
+    with pytest.raises(psycopg.errors.RaiseException, match="terminal"):   # post-terminal guard
+        append_event(db, run_id, TraceEventKind.CRITIC_RECORDED, seq=3,
+                     idempotency_key=f"{run_id}:3", payload={})
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), \
+            psycopg.connect(_dsn) as fresh:
+        fresh.execute("UPDATE authoring_trace_event SET kind = 'COMPLETED' "
+                      "WHERE authoring_run_id = %s", (run_id,))
+    # Nothing was replayed onto the caller's transaction: it is still usable, and the run holds
+    # exactly the two appends that were accepted.
+    assert db.execute("SELECT 1").fetchone()[0] == 1
+    with psycopg.connect(_dsn) as fresh:
+        assert fresh.execute("SELECT count(*) FROM authoring_trace_event "
+                             "WHERE authoring_run_id = %s", (run_id,)).fetchone()[0] == 2
 
 
 def test_durable_writes_use_the_full_dsn_and_no_advisory_lock(db) -> None:

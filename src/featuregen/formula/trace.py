@@ -24,9 +24,12 @@ the manifest and every event are written on a FRESH connection opened from ``get
 a real bug fixed on this codebase), each committing independently, performing ONE bare INSERT, and
 NEVER taking an advisory lock (a second lock-taking connection self-deadlocked in program-audit
 I-3). When no DSN is configured (the tests / no-DB harness) the write goes on the caller's
-connection — the designed harness path, not a degradation; a genuine connect failure with a DSN
-configured logs and degrades the same way (transactional evidence beats none, and an evidence-free
-crash then reads as *incomplete*, which is the honest outcome).
+connection — the designed harness path, not a degradation; any CONNECTION-DEPENDENT failure with a
+DSN configured (a connect/commit blip, or a ``ForeignKeyViolation`` against a referent that only
+exists on the caller's uncommitted transaction because an upstream durable write itself degraded)
+logs and degrades the same way (transactional evidence beats none, and an evidence-free crash then
+reads as *incomplete*, which is the honest outcome). Only CONNECTION-INDEPENDENT rejections
+propagate — see ``_DETERMINISTIC_REJECTIONS``.
 
 ``payload`` is CANONICAL REDACTED METADATA ONLY — tool result identities/verdicts/hashes,
 dispositions, reason codes — NEVER raw catalog data values, matching the metadata-only discipline of
@@ -121,16 +124,26 @@ def append_event(conn: DbConn, run_id: str, kind: TraceEventKind | str, *, seq: 
     ``kind`` must be in the closed §H vocabulary (``ValueError`` otherwise, before anything touches
     the DB). ``seq`` is the caller's position in the run (unique per run). ``idempotency_key`` is the
     globally unique retry/replay key. ``llm_call_ref`` links the immutable provider-call record this
-    event evidences (None for events that made no call); it must be a DURABLY COMMITTED ``llm_call``
-    row — which the audited seam guarantees, since ``_record_llm_call_durable`` commits it on its own
-    connection — because this event's own INSERT rides a different connection and the FK is checked
-    there. ``payload`` is canonical redacted metadata only (module docstring) and is hashed into
-    ``payload_hash``.
+    event evidences (None for events that made no call). ``payload`` is canonical redacted metadata
+    only (module docstring) and is hashed into ``payload_hash``.
 
-    Raises the underlying ``psycopg`` error when the DB rejects the append: a duplicate seq or
-    idempotency key (``UniqueViolation``), an unknown run or ``llm_call_ref``
-    (``ForeignKeyViolation``), or an append AFTER a terminal event (``RaiseException``). Those are
-    real integrity failures, never retried anywhere else."""
+    FAILURE TAXONOMY. A CONNECTION-INDEPENDENT rejection RAISES the underlying ``psycopg`` error: a
+    duplicate seq or idempotency key (``UniqueViolation``), an append AFTER a terminal event or a
+    write-once violation (``RaiseException``), a kind/payload the DB CHECKs reject
+    (``CheckViolation``). Those are real integrity failures and are never retried anywhere.
+
+    A CONNECTION-DEPENDENT failure does NOT raise: it degrades to the caller's connection
+    (``_durable_write``). ``ForeignKeyViolation`` is the load-bearing case, because the FK is checked
+    on the TRACE connection: ``run_id`` and ``llm_call_ref`` are only visible there once DURABLY
+    COMMITTED. The audited seam normally guarantees that for ``llm_call``
+    (``_record_llm_call_durable`` commits it on its own connection) — but ONLY when that seam did not
+    itself degrade. When it did (a counted, real production event: ``consume_audit_degradations``)
+    the ``llm_call`` row sits on the caller's UNCOMMITTED transaction; likewise the manifest when
+    ``open_authoring_run`` degraded. Falling back is what recovers those appends, on the one
+    connection where the referent IS visible — the alternative was losing every subsequent event of
+    that run. A transient ``OperationalError`` (a connect blip, a connection lost mid-INSERT, a
+    commit failure) degrades for the same reason. A referent that exists NOWHERE still raises
+    ``ForeignKeyViolation``, just from the caller's connection."""
     event_kind = TraceEventKind(kind)
     body = _json_object(payload, "payload")
     event_id = mint_id("atev")
@@ -166,27 +179,55 @@ def _json_object(value: Mapping[str, Any], name: str) -> dict[str, Any]:
     return dict(value)
 
 
+#: Rejections that are CONNECTION-INDEPENDENT: Postgres would refuse the IDENTICAL statement on ANY
+#: connection, so replaying it on the caller's would only reproduce the failure while poisoning the
+#: caller's transaction. These PROPAGATE. Everything else is treated as CONNECTION-DEPENDENT and
+#: falls back — deliberately the DEFAULT, so an unanticipated failure mode loses a transaction, not
+#: the trace (the blanket-except contract of ``_record_llm_call_durable``, minus this refinement).
+_DETERMINISTIC_REJECTIONS: tuple[type[Exception], ...] = (
+    # A duplicate seq / idempotency key: an index entry is visible to the uniqueness check even from
+    # an uncommitted concurrent transaction, so this verdict does not depend on WHICH connection asks.
+    psycopg.errors.UniqueViolation,
+    # The write-once triggers and the post-terminal guard (RAISE EXCEPTION → RaiseException, a
+    # ProgrammingError subclass). ProgrammingError also covers a malformed statement, which is
+    # malformed everywhere. NOTE: NOT SerializationFailure/DeadlockDetected — those are
+    # OperationalError subclasses, i.e. transient, i.e. they DO fall back.
+    psycopg.errors.RaiseException,
+    psycopg.ProgrammingError,
+    # A kind outside the closed vocabulary, a non-object payload/versions, seq < 0, a NULL column.
+    psycopg.errors.CheckViolation,
+    psycopg.errors.NotNullViolation,
+    psycopg.DataError,
+)
+
+
 def _durable_write(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
     """Perform ONE bare INSERT on a FRESH connection from ``get_settings().dsn``, committed
     independently of the caller's transaction (module docstring for why). No advisory lock is ever
     taken, so this can never self-deadlock against a lock the request holds.
 
     * no DSN configured → write on the caller's connection (the designed tests / no-DB path);
-    * connect failure with a DSN configured → log and degrade to the caller's connection
-      (transactional evidence beats none);
-    * the INSERT itself rejected (unique / FK / write-once / terminal-guard) → the error PROPAGATES.
-      It is NOT retried on the caller's connection: replaying a known-bad statement there would
-      poison the caller's transaction while producing the same failure."""
+    * a CONNECTION-DEPENDENT failure with a DSN configured → log and degrade to the caller's
+      connection (transactional evidence beats none). That covers the connect/commit failure AND —
+      critically — ``ForeignKeyViolation``, whose verdict depends on WHICH connection asks: a
+      manifest or ``llm_call`` row that degraded onto the caller's UNCOMMITTED transaction is
+      invisible from a fresh connection, so its dependent appends would otherwise be lost forever
+      (every subsequent event of that run failing identically) despite succeeding on the caller's
+      connection. Both degrade paths are real, counted production events upstream
+      (``enrich_llm.consume_audit_degradations``), not hypotheticals;
+    * a CONNECTION-INDEPENDENT rejection (``_DETERMINISTIC_REJECTIONS``) → PROPAGATES. Replaying a
+      known-bad statement on the caller's connection would poison that transaction while producing
+      the identical failure."""
     dsn = get_settings().dsn
     if dsn:
         try:
-            trace_conn = psycopg.connect(dsn)
-        except Exception:  # noqa: BLE001 — a trace-connection failure must not lose the trace
-            logger.exception(
-                "durable authoring-trace connection failed (%s); falling back to the request "
-                "connection", what)
-        else:
-            with trace_conn:   # own tx, committed on clean `with` exit; closed either way
+            with psycopg.connect(dsn) as trace_conn:  # own tx, committed on clean `with` exit
                 trace_conn.execute(sql, params)
             return
+        except _DETERMINISTIC_REJECTIONS:
+            raise
+        except Exception:  # noqa: BLE001 — a connection-dependent failure must not lose the trace
+            logger.exception(
+                "durable authoring-trace write failed (%s); falling back to the request connection",
+                what)
     conn.execute(sql, params)
