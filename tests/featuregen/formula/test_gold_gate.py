@@ -95,9 +95,10 @@ def _run_case(db, doc: dict) -> GoldOutcome:
         CRITIC_TASK: FakeResponse(output={"findings": list(doc.get("critic_findings") or [])})})
     with pytest.MonkeyPatch.context() as mp:
         if doc.get("delivery") == "direct":
-            # The author's wire schema pins the operation enums, so this proposal can never arrive
-            # THROUGH a provider call (see the fixture's own note). The raw dict is handed to the
-            # orchestrator directly — the seam actually under test for this case.
+            # For a proposal the author's wire schema still cannot carry (the body-shape
+            # ``final_operation`` consts stay pinned; only ``aggregation`` is open) — it can never
+            # arrive THROUGH a provider call, so the raw dict goes to the orchestrator directly,
+            # which is then the seam actually under test (see such a fixture's own note).
             mp.setattr(authoring, "author_formula",
                        lambda *a, _raw=doc["proposal"], **k: (_raw, []))
             author = FakeLLM()

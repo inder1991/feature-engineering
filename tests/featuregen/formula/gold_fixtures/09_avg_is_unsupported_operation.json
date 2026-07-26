@@ -2,8 +2,8 @@
   "case_id": "avg_is_unsupported_operation",
   "operation": "avg",
   "adversarial": true,
-  "delivery": "direct",
-  "note": "§J classification: avg -> UNSUPPORTED_OPERATION (NOT invalid). `delivery: direct` because the author's wire schema pins the aggregation enum, so such a proposal can never arrive THROUGH a provider call — the audited seam rejects it as a malformed turn (a technical outcome) long before parse. The harness therefore hands the raw proposal to the orchestrator directly, which is exactly the seam under test: how run_authoring maps an author outcome onto the §F axes. `unsupported != invalid` is the whole point: an average is a perfectly sensible request the v1 grammar simply does not carry, and reporting it as malformed would be a lie about the requester.",
+  "delivery": "provider",
+  "note": "§J classification: avg -> UNSUPPORTED_OPERATION (NOT invalid). `delivery: provider` because this is a LIVE production path: the author's WIRE schema opens `aggregation` to any string (the strict proposal_v1 schema parse_proposal_v1 runs still pins the enum), so a model asked for an average really can emit one, and the orchestrator's raw-dict read classifies it before parse. Delivered `direct`, this case proved only the axis mapping, never that such a proposal can arrive at all — and with the enum pinned on the wire it could not: the turn failed response-schema validation, the repair loop exhausted, and the run ended TECHNICAL_FAILURE. `unsupported != invalid` is the whole point: an average is a perfectly sensible request the v1 grammar simply does not carry, and reporting it as malformed — or as a broken loop — would be a lie about the requester.",
   "intent": {
     "name": "avg_txn_amt_90d",
     "hypothesis": "Average transaction amount over a trailing 90-day window predicts churn.",

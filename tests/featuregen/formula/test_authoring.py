@@ -659,20 +659,20 @@ def test_an_over_deep_filter_is_rejected(db) -> None:
 REF_STATUS_REF = "authored::public.txns.status_cd"
 
 
-def test_an_out_of_vocabulary_aggregation_is_unsupported_not_invalid(db, monkeypatch) -> None:
+def test_an_out_of_vocabulary_aggregation_is_unsupported_not_invalid(db) -> None:
     """``unsupported != invalid``: ``avg`` is OUT of the §B vocabulary, so a proposal naming it is
-    UNSUPPORTED, never REJECTED.
+    UNSUPPORTED, never REJECTED — and never a TECHNICAL_FAILURE.
 
-    The author's wire schema pins the aggregation enum, so such a proposal cannot arrive THROUGH a
-    provider call — the seam rejects it as a malformed turn (a technical outcome) long before parse.
-    The author is therefore stubbed to hand the orchestrator that raw dict directly, which is
-    precisely the seam this plumbing suite exists to test: how ``run_authoring`` maps an author
-    outcome onto the §F axes."""
+    Delivered THROUGH a real provider turn (no stub), because that is the whole point: the wire
+    schema opens ``aggregation`` to any string, so the model asked for an average CAN emit one and
+    the run reaches ``_names_an_unsupported_operation``, which reads the raw dict before parse. With
+    the enum pinned on the wire the turn instead failed RESPONSE-schema validation, the repair loop
+    exhausted and the run ended TECHNICAL_FAILURE — telling the requester "the loop broke" instead of
+    "the v1 grammar does not carry averages", and inflating §J's ``technical_failure_rate_clean``."""
     seed_authoring_catalog(db)
-    raw = _raw({"final_operation": "identity", "expr": _expr("avg")})
-    monkeypatch.setattr(authoring, "author_formula", lambda *a, **k: (raw, []))
-    result = _run(db)
+    result = _run(db, _raw({"final_operation": "identity", "expr": _expr("avg")}))
 
+    assert result.technical_status == "ok"            # the loop worked; the grammar does not cover it
     assert result.structural_status == "unsupported_operation"
     assert result.authoring_disposition == "UNSUPPORTED"
     assert result.candidate_formula is None
