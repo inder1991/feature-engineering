@@ -1,0 +1,9 @@
+{
+  "baseline_commit": "3668b935",
+  "baseline_file": "grounding_baseline_3668b93_v1.json",
+  "baseline_file_sha256": "b1d4abd6f8ccdf6123c9519b9e9cbd3830b38b65e5649e3fe9d402b321188d5e",
+  "canonicalization_version": "canonical-row-v1",
+  "fixture_content_hash": "2da277ff44c0158e8ca17a1048bd6f57c9166b3f632d6b9025c4927d630ef6fb",
+  "registry_recipe_count": 153,
+  "schema_version": "grounding-regression-manifest-v1"
+}
