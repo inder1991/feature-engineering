@@ -313,7 +313,7 @@ def _missing_operands(outcome: GoldOutcome) -> frozenset[str]:
     # proposal_column_refs walks grain keys + every body expression's operand, window event-time ref
     # and filter lefts. It reads only ``.grain``/``.body``, which TypedFormulaV1 and
     # TypedFormulaProposalV1 both carry, so it serves either artifact.
-    present = {_norm_ref(ref) for ref in proposal_column_refs(artifact)}
+    present = {_norm_ref(ref) for ref in proposal_column_refs(artifact)}  # type: ignore[arg-type]
     return frozenset(expected - present)
 
 

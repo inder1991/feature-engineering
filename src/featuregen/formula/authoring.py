@@ -104,7 +104,10 @@ from featuregen.formula.schema import (
 from featuregen.formula.trace import TraceEventKind, append_event, open_authoring_run
 from featuregen.formula.turns import AuthoringIntent, AuthorTurnRecord, TurnKind
 from featuregen.intake.llm import LLMClient
-from featuregen.overlay.upload.operational_facts import read_operational_value
+from featuregen.overlay.upload.operational_facts import (
+    OperationalValue,
+    read_operational_value,
+)
 
 __all__ = [
     "AUTHORING_MAX_TURNS",
@@ -444,7 +447,7 @@ def _expressions(proposal: TypedFormulaProposalV1):
 
 
 def _read_c1_facts(conn, proposal: TypedFormulaProposalV1
-                   ) -> tuple[dict[str, ExprFacts], dict[str, object]]:
+                   ) -> tuple[dict[str, ExprFacts], dict[str, OperationalValue]]:
     """Build Task 6's two governed-fact bundles from REAL C1 reads.
 
     ``per_expr_facts`` is keyed by the §A INTERNAL BODY PATH of each expression (``body.expr`` /
@@ -470,7 +473,7 @@ def _read_c1_facts(conn, proposal: TypedFormulaProposalV1
 
 
 def _attribute_authority_failures(per_expr_facts: Mapping[str, ExprFacts],
-                                  grain_facts: Mapping[str, object],
+                                  grain_facts: Mapping[str, OperationalValue],
                                   reason: str | None) -> tuple[AuthorityFailure, ...]:
     """WHICH operand/field failed closed, for a NEEDS_AUTHORITY output.
 
