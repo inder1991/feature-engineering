@@ -37,12 +37,13 @@ from featuregen.overlay.upload.contract.invalidation import (
     invalidate_contracts_for,
 )
 from featuregen.overlay.upload.enrich import (
+    _definition_targets,
     _write_definition_evidence,
+    _write_domain_evidence,
     classify_domains,
     content_hash,
     draft_definitions,
     enrich_concepts,
-    suppressed_definition_hashes,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
 from featuregen.overlay.upload.field_resolution import (
@@ -1827,6 +1828,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         record_stage(stage_recorder, "glossary_classification", "not_applicable")
 
     concepts = definitions = domains = None
+    # E1a T3: {(table, column): domain} for the columns whose domain OVERRIDES their table's default
+    # (the classifier's out-param). Stays empty with no client / no overrides -> every column inherits.
+    domain_overrides: dict[tuple[str, str], str] = {}
     if client is None:
         # No LLM provider configured: the three enrichment stages honestly never ran (#22).
         for _stage in ("enrich_concept", "enrich_definition", "enrich_domain"):
@@ -1906,23 +1910,44 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         state, reason, detail = _enrichment_outcome(
             definitions,
             # Honest expected count (R5-3): suppressed blanks are deliberately NOT drafted, so they
-            # must not be counted as unresolved items degrading the stage to "partial".
-            len({content_hash(r) for r in vr.good if not r.definition}
-                - suppressed_definition_hashes(vr.good, glossary)),
+            # must not be counted as unresolved items degrading the stage to "partial". The SAME
+            # target set the drafter selects with and the reconciler keeps — one definition, no drift.
+            len(_definition_targets(vr.good, glossary)),
             internal_failures=def_evidence_failures,
             not_attempted=def_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
         domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
+        domain_evidence_failures = 0
         try:
             with conn.transaction():
                 domains = classify_domains(conn, vr.good, client, actor,
-                                           ingestion_run_id=ingestion_run_id, stats=domain_stats)
+                                           ingestion_run_id=ingestion_run_id, stats=domain_stats,
+                                           column_domains=domain_overrides)
+                # E1a T3: the classified domain is not display-only either — promote it to governed
+                # `llm/proposed` evidence at BOTH levels (the table's default on the TABLE node; a
+                # column's only where it OVERRIDES that default — inheritance is never fabricated as
+                # evidence) and RECONCILE the tables/overrides that dropped out of this run. Gated
+                # exactly like the definition evidence (glossary + snapshot). Its CONTAINED failures
+                # ride into the stage report below.
+                if glossary is not None and snapshot_id is not None:
+                    try:
+                        domain_evidence_failures = _write_domain_evidence(
+                            conn, source=catalog_source, rows=vr.good, domains=domains,
+                            column_domains=domain_overrides, glossary=glossary, bindings=bindings,
+                            source_snapshot_id=snapshot_id)
+                    except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
+                        # per-item try) rolls this savepoint back, so leaving the count at 0 would
+                        # report `succeeded` for a run that wrote nothing. Count it, then re-raise
+                        # to the advisory handler below, which logs it.
+                        domain_evidence_failures = 1
+                        raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
             domains, len({r.table for r in vr.good}),
+            internal_failures=domain_evidence_failures,
             not_attempted=domain_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
@@ -1931,6 +1956,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # schema-carrying records; None/empty for technical and generic-glossary uploads, whose
     # nodes keep schema_name/declared_type NULL — byte-for-byte unchanged.
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains,
+                column_domains=domain_overrides,
                 schemas=schema_by_ref(glossary), declared_types=declared_type_by_ref(glossary))
     record_stage(stage_recorder, "graph_persistence", "succeeded", started_at=stage_started)
     if governed_joins_enabled() or pass_c_enabled():

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
+from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair, _norm
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import humanize
 from featuregen.overlay.upload.enrich import content_hash
@@ -216,11 +216,15 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
                 concepts: dict[str, str] | None = None,
                 definitions: dict[str, str] | None = None,
                 domains: dict[str, str] | None = None,
+                column_domains: dict[tuple[str, str], str] | None = None,
                 schemas: dict[str, str] | None = None,
                 declared_types: dict[str, str] | None = None) -> None:
     concepts = concepts or {}
     definitions = definitions or {}   # {content_hash: drafted_definition} (blank columns only)
-    domains = domains or {}           # {table_name: domain}
+    domains = domains or {}           # {table_name: domain} — the table DEFAULT its columns inherit
+    # E1a T3: {(table, column): domain} for the columns that OVERRIDE their table's default only.
+    # Empty (every caller but ingest's enrichment path) -> every column inherits, as before.
+    column_domains = column_domains or {}
     # Additive schema preservation (round-4 #5): both keyed by the node's object_ref, built by the
     # caller via schema_by_ref/declared_type_by_ref. Default None -> every node writes NULL, so
     # technical/generic uploads are byte-for-byte unchanged.
@@ -243,7 +247,10 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
     for r in rows:
         c_ref = _column_ref(r.table, r.column)
         concept = concepts.get(content_hash(r))
-        domain = domains.get(r.table)
+        # The column's EFFECTIVE domain (E1a T3): its own domain when the classifier gave it one
+        # that differs, else the table's default — INHERITED, and inheritance is never evidence.
+        domain = (column_domains.get((_norm(r.table), _norm(r.column)))
+                  or domains.get(r.table))
         # Declared definition wins; a drafted one fills a blank (R3 — never overwrite a human's).
         definition = r.definition or definitions.get(content_hash(r)) or None
         conn.execute(

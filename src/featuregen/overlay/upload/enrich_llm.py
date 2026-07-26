@@ -460,12 +460,27 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                      "definition": {"type": "string", "maxLength": 500}},
                       "required": ["ref", "definition"]}}},
         "required": ["results"]},
+    # E1a T3 — the domain result is TWO-LEVEL: `domain` is the TABLE's default (the context all of
+    # its columns inherit) and `column_domains` lists ONLY the columns whose domain DIFFERS from it.
+    # An ARRAY of closed {column, domain} objects, never a free-key map: a map with dynamic keys
+    # cannot be expressed with `additionalProperties: false`, and an open object fails the provider's
+    # structured-output contract. Additive + OPTIONAL (absent from `required`) so a result carrying
+    # only the table domain — the flat single/fallback seam's shape, and the normal answer when no
+    # column differs — stays valid.
     ("overlay_domain_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 256},
-                                     "domain": {"type": "string", "maxLength": 64}},
+                                     "domain": {"type": "string", "maxLength": 64},
+                                     "column_domains": {"type": "array",
+                                         "items": {"type": "object", "additionalProperties": False,
+                                                   "properties": {
+                                                       "column": {"type": "string",
+                                                                  "maxLength": 128},
+                                                       "domain": {"type": "string",
+                                                                  "maxLength": 64}},
+                                                   "required": ["column", "domain"]}}},
                       "required": ["ref", "domain"]}}},
         "required": ["results"]},
     # Table-synthesis (Pass B) output schemas. `_batch` is an array of per-item {ref, synthesis}

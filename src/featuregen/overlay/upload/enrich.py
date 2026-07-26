@@ -83,7 +83,10 @@ def _vocab_fingerprint() -> str:
 # than leaving them orphaned under a same-version key.
 _CONCEPT_CACHE_VERSION = f"concept:v2:{_vocab_fingerprint()}"
 _DEFINITION_CACHE_VERSION = "definition:v1"
-_DOMAIN_CACHE_VERSION = "domain:v1"
+# v2 (E1a T3): a domain result is no longer a bare table-domain string but the TWO-LEVEL envelope
+# (`_accept_domain_result`) — the table default plus the column overrides. The bump versions the v1
+# bare-string rows out rather than leaving them to decode as a domain with no overrides.
+_DOMAIN_CACHE_VERSION = "domain:v2"
 
 
 def content_hash(row: CanonicalRow) -> str:
@@ -260,6 +263,66 @@ def _accept_domain(max_len: int):
             return None, "invalid_value"
         return value, "valid"
     return _accept
+
+
+def _extract_domain_result(entry: dict) -> str:
+    """Serialize ONE batch result's TWO-LEVEL domain payload — the table default plus the column
+    OVERRIDES — into the single canonical string the batch harness carries per item (the same
+    ``extract`` seam Pass B uses for its structured ``synthesis`` object)."""
+    return json.dumps({"domain": str(entry.get("domain") or "").strip(),
+                       "column_domains": entry.get("column_domains") or []}, sort_keys=True)
+
+
+def _accept_domain_result(max_len: int):
+    """Acceptor for the TWO-LEVEL domain result (E1a T3): the table's DEFAULT domain plus the
+    columns whose domain DIFFERS from it, canonicalized into ONE envelope — the single string the
+    batch harness caches and returns per item.
+
+    Both seams land on the same shape: BATCH carries the overrides (its per-item schema has them),
+    while the SINGLE seam (and the batch's single-item fallback) returns a BARE table-domain string
+    from the flat schema, accepted here as the same envelope with NO overrides. An invalid table
+    domain rejects the whole item (as before — it is the context everything inherits); an invalid or
+    blank override is dropped on its own, never taking the item's table domain with it. An override
+    EQUAL to the table default is dropped too: it is not an override, and writing evidence for it
+    would fabricate a column-level assertion for what is really inheritance."""
+    accept_label = _accept_domain(max_len)
+
+    def _accept(raw: str) -> tuple[str | None, str]:
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = raw            # a bare label from the flat single/fallback schema
+        if not isinstance(payload, dict):
+            payload = {"domain": raw}
+        table_domain, reason = accept_label(str(payload.get("domain") or "").strip())
+        if table_domain is None:
+            return None, reason
+        proposed = payload.get("column_domains") or []
+        if isinstance(proposed, dict):   # already-canonical envelope {column: domain}
+            proposed = [{"column": c, "domain": d} for c, d in proposed.items()]
+        overrides: dict[str, str] = {}
+        for item in proposed:
+            if not isinstance(item, dict):
+                continue
+            column = _norm(str(item.get("column") or ""))
+            value, _r = accept_label(str(item.get("domain") or "").strip())
+            if column and value is not None and value != table_domain:
+                overrides[column] = value
+        return json.dumps({"domain": table_domain, "column_domains": overrides},
+                          sort_keys=True), "valid"
+    return _accept
+
+
+def _parse_domain_result(raw: str) -> tuple[str, dict[str, str]]:
+    """Decode one canonical domain envelope into ``(table_domain, {column: override})``."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return raw, {}
+    if not isinstance(payload, dict):
+        return raw, {}
+    overrides = payload.get("column_domains")
+    return str(payload.get("domain") or ""), overrides if isinstance(overrides, dict) else {}
 
 
 def _norm(value: str) -> str:
@@ -535,13 +598,132 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
         producer_configuration_hash=None, bindings=bindings)
 
     # The set difference is computed here (never handed a ref written this run — that would silently
-    # stale the fresh evidence): KEEP = written this run ∪ still an expected target.
-    expected = ({content_hash(r) for r in rows if not r.definition}
-                - suppressed_definition_hashes(rows, glossary))
-    keep = {ref[0] for h in set(definitions) | expected if (ref := ref_of(h)) is not None}
+    # stale the fresh evidence): KEEP = written this run ∪ still an expected target. The expected set
+    # comes from the SAME `_definition_targets` the drafter selects with — a reconciler that narrowed
+    # relative to the drafter would silently RETIRE a live target on a transient miss.
+    keep = {ref[0] for h in set(definitions) | _definition_targets(rows, glossary)
+            if (ref := ref_of(h)) is not None}
     _reconcile_llm_field_evidence(
         conn, field_name="definition",
         retire_refs=_active_llm_field_refs(conn, source=source, field_name="definition") - keep)
+    return failures
+
+
+def _table_refs(glossary: GlossaryUpload) -> dict[str, str]:
+    """Normalized table name -> the SCHEMA-PRESERVING ref of its TABLE node — the identity
+    table-grained evidence stores under. Built from the glossary's own records (a table term names
+    its table; a column term attests its table's schema too), so an FTR table under a real schema is
+    never written to a ``public`` twin. First declaration wins, mirroring ``graph.schema_by_ref``."""
+    out: dict[str, str] = {}
+    for rec in glossary.records:
+        try:
+            source, schema, table, _column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        out.setdefault(table, normalize_ref(source, schema, table))
+    return out
+
+
+def _declared_domain_tables(glossary: GlossaryUpload) -> set[str]:
+    """Normalized names of the tables whose glossary TABLE term DECLARES a data domain of its own."""
+    out: set[str] = set()
+    for rec in glossary.records:
+        if not rec.is_table or not rec.domain:
+            continue
+        try:
+            _source, _schema, table, _column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        out.add(table)
+    return out
+
+
+def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                           domains: dict[str, str],
+                           column_domains: dict[tuple[str, str], str],
+                           glossary: GlossaryUpload,
+                           bindings: dict[str, ObjectBinding] | None,
+                           source_snapshot_id: str) -> int:
+    """Promote the LLM's TWO-LEVEL domain classification (E1a T3) into governed ``llm/proposed``
+    ``domain`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
+    MUST propagate into its stage report (``partial``/``items_failed``).
+
+    TWO LEVELS, HONESTLY SEPARATED:
+    * the TABLE's domain — the default context — is evidence on the TABLE node, at its
+      schema-preserving ref. A table has no per-column attachability question, so no binding gate
+      applies (``bindings=None``).
+    * a COLUMN's domain is evidence on the COLUMN node ONLY where it OVERRIDES that default (keyed
+      on the glossary record's schema-preserving ref, attachability checked at the row's
+      public-flattened one — the two identities the writer never collapses). A column that INHERITS
+      gets NO evidence: inheritance is a read-time relationship, and fabricating a column-level row
+      for it would assert an authorship the classifier never claimed.
+
+    THE AI FILLS A BLANK, IT NEVER CONTESTS A CURATED VALUE (R3's rule for definitions, applied to
+    domain): a table or column whose glossary sidecar DECLARES a ``data_domain`` is NOT an AI target
+    at either level. That is not politeness — the source's own proposal and a competing LLM one
+    resolve to a display CONFLICT, which BLANKS the curated domain the catalog was showing.
+
+    RECONCILIATION by disposition, over BOTH levels (the target universe, not just the successes).
+    Every ref in this source still carrying active LLM ``domain`` evidence is retired EXCEPT: every
+    table in this upload that is still a target (classified this run, or MISSED — a transient miss
+    KEEPS, the safe default), the overrides written this run, and the still-target columns of a table
+    whose classification missed (its overrides are unknown this run, not withdrawn). So a table that
+    dropped out of the source, one that GAINED a curated domain, and a column the classifier no
+    longer singles out are all RETIRED.
+
+    Scoped safely (T3 review): ``domain`` LLM evidence has exactly ONE writer — this one. Pass B
+    (``table_synth``) also writes ``llm/proposed`` evidence at TABLE refs, but for ``table_role`` /
+    ``primary_entity`` / ``event_or_snapshot``; the ``field_name='domain'`` filter excludes it. The
+    glossary sidecar's own ``data_domain`` is SOURCE-produced and human corrections are HUMAN — both
+    invisible to this producer-scoped retirement."""
+    table_refs = _table_refs(glossary)
+    rec_by_tc = _records_by_tc(glossary)
+    declared_tables = _declared_domain_tables(glossary)
+    columns_by_table: dict[str, list[str]] = {}
+    for r in rows:
+        columns_by_table.setdefault(_norm(r.table), []).append(_norm(r.column))
+
+    def table_ref_of(table: str) -> tuple[str, str, object] | None:
+        """The table's evidence identity, or None when it is not an AI domain target."""
+        ref = table_refs.get(_norm(table))
+        if ref is None or _norm(table) in declared_tables:
+            return None   # no glossary record names it, or its term declares the domain itself
+        # The classification's own input: the table and the columns the request carried.
+        return (ref, ref, {"table": _norm(table),
+                           "columns": sorted(columns_by_table.get(_norm(table), []))})
+
+    def column_ref_of(key: str) -> tuple[str, str, object] | None:
+        """The column's evidence identity, or None when it is not an AI domain target."""
+        table, _sep, column = key.partition(".")
+        rec = rec_by_tc.get((table, column))
+        if rec is None or rec.domain:
+            return None   # not a glossary column term, or its sidecar declares the domain itself
+        return (rec.logical_ref, normalize_ref(source, None, table, column),
+                {"table": table, "column": column, "table_domain": domains.get(table, "")})
+
+    overrides = {f"{table}.{column}": value
+                 for (table, column), value in column_domains.items()}
+    failures = _write_llm_field_evidence(
+        conn, field_name="domain", items=dict(domains), ref_of=table_ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        bindings=None)
+    failures += _write_llm_field_evidence(
+        conn, field_name="domain", items=overrides, ref_of=column_ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        bindings=bindings)
+
+    # KEEP = every still-target table in this upload (written OR transient-missed) ∪ the overrides
+    # written this run ∪ every still-target column of a table whose classification MISSED (its
+    # overrides are unknown, not withdrawn). Computed through the SAME `ref_of`s the writes used, so
+    # a ref written this run is never handed to retirement and a non-target is never kept alive.
+    missed = {t for t in columns_by_table if t not in {_norm(d) for d in domains}}
+    keep = {ref[0] for t in columns_by_table if (ref := table_ref_of(t)) is not None}
+    keep |= {ref[0] for k in overrides if (ref := column_ref_of(k)) is not None}
+    keep |= {ref[0] for (table, column) in rec_by_tc
+             if table in missed and (ref := column_ref_of(f"{table}.{column}")) is not None}
+    _reconcile_llm_field_evidence(
+        conn, field_name="domain",
+        retire_refs=_active_llm_field_refs(conn, source=source, field_name="domain") - keep)
     return failures
 
 
@@ -677,6 +859,20 @@ def suppressed_definition_hashes(rows: list[CanonicalRow],
     return out
 
 
+def _definition_targets(rows: list[CanonicalRow],
+                        glossary: GlossaryUpload | None) -> set[str]:
+    """The content hashes this run EXPECTS an AI definition for: a column with NO declared definition
+    (R3 — a drafted one only ever fills a blank), MINUS the sanitizer-SUPPRESSED blanks (R5-3 —
+    suppressed is not missing).
+
+    ONE definition of the target set, shared by all three readers of it (T2b review finding): the
+    drafter's own selection, ingest's honest expected count for the stage report, and the evidence
+    reconciler's keep-set. Drift between them is asymmetric and dangerous — a reconciler narrower
+    than the drafter would silently RETIRE a live target on a transient miss."""
+    return ({content_hash(r) for r in rows if not r.definition}
+            - suppressed_definition_hashes(rows, glossary))
+
+
 def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                       *, concepts: dict[str, str] | None = None,
                       glossary: GlossaryUpload | None = None,
@@ -696,9 +892,8 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
     ``ingestion_run_id`` (C5-T5): with it, every dispatch is attributed to the run + the exact
     column subjects drafted (stage ``enrich_definition``); ``None`` is byte-for-byte today."""
     concepts = concepts or {}
-    blank = {content_hash(r): r for r in rows if not r.definition}
-    for h in suppressed_definition_hashes(rows, glossary):
-        blank.pop(h, None)   # R5-3: suppressed ≠ missing — never silently LLM-drafted
+    targets = _definition_targets(rows, glossary)   # blank, minus the suppressed (R3 + R5-3)
+    blank = {h: r for r in rows if (h := content_hash(r)) in targets}
     key_of = {h: _def_cache_key(h, concepts.get(h, "")) for h in blank}
     cached = _cache_get(conn, "enrichment_definition", list(key_of.values()), _DEFINITION_CACHE_VERSION)
     result = {h: cached[key_of[h]] for h in blank if key_of[h] in cached}
@@ -751,8 +946,19 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
 
 def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                      actor=None, *, ingestion_run_id: str | None = None,
-                     stats: dict | None = None) -> dict[str, str]:
-    """Classify each table's business domain (per-table), returning {table_name: domain}.
+                     stats: dict | None = None,
+                     column_domains: dict[tuple[str, str], str] | None = None) -> dict[str, str]:
+    """Classify each table's business domain (per-table), returning {table_name: domain} — the table
+    DEFAULT, the context every one of its columns inherits.
+
+    E1a T3 — TWO LEVELS: the classifier is asked for the table's domain PLUS only those columns
+    whose domain DIFFERS from it. ``column_domains`` (optional out-param; the RETURN shape is
+    deliberately unchanged, so every existing consumer is untouched) receives those OVERRIDES ONLY,
+    keyed by normalized ``(table, column)``. A column absent from it INHERITS its table's domain —
+    the classifier never restates the default per column, and nothing downstream may invent
+    column-level evidence for an inherited value. Overrides ride the BATCH per-item schema; the flat
+    single/fallback schema carries only the table domain, so that path yields a table default with
+    no overrides (inheritance for every column — never a fabricated one).
 
     ``stats`` (optional out-param — return shape unchanged): in batch mode, receives
     ``not_attempted``, the count of tables the budget/deadline cutoff skipped WITHOUT dispatch, so
@@ -768,18 +974,23 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
 
     hash_of_table = {t: _table_content_hash(source, t, cols) for t, cols in by_table.items()}
     cached = _cache_get(conn, "enrichment_domain", list(hash_of_table.values()), _DOMAIN_CACHE_VERSION)
+    # {table: canonical two-level envelope} — one shape from BOTH modes and from the cache.
+    envelopes = {t: cached[hash_of_table[t]] for t in by_table if hash_of_table[t] in cached}
+    accept_domain = _accept_domain_result(64)
 
     if enrich_config.mode("domain") == "batch":
         misses = [BatchItem(t, {"table": t, "columns": sorted(cols)})
                   for t, cols in by_table.items() if hash_of_table[t] not in cached]
-        out = {t: cached[hash_of_table[t]] for t in by_table if hash_of_table[t] in cached}
         batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
         resolved = run_batched(
             conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v1",
             schema_id="overlay_domain_batch", shared_metadata={}, items=misses, out_key="domain",
-            instruction="For each item classify the table's business domain. Return exactly one "
+            instruction="For each item give the TABLE's business domain in `domain` — the default "
+                        "context for all of its columns — and in `column_domains` list ONLY the "
+                        "columns whose own domain DIFFERS from that table domain (omit every column "
+                        "that shares it; an empty list is the normal answer). Return exactly one "
                         "result per input ref; treat each table independently.",
-            accept=_accept_domain(64), actor=actor,
+            accept=accept_domain, extract=_extract_domain_result, actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
             report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_domain",
@@ -788,28 +999,35 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                                if ingestion_run_id is not None else None))
         if stats is not None:
             stats["not_attempted"] = batch_report.get("not_attempted", 0)
-        for table, dom in resolved.items():
-            _cache_put(conn, "enrichment_domain", hash_of_table[table], dom, _DOMAIN_CACHE_VERSION)
-            out[table] = dom
-        return out
+        for table, envelope in resolved.items():
+            _cache_put(conn, "enrichment_domain", hash_of_table[table], envelope,
+                       _DOMAIN_CACHE_VERSION)
+            envelopes[table] = envelope
+    else:
+        for table, cols in by_table.items():
+            if table in envelopes:
+                continue
+            raw = _call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
+                        {"table": table, "columns": sorted(cols)}, "domain",
+                        "Classify this table's business domain.", actor,
+                        _single_ctx(ingestion_run_id, "enrich_domain",
+                                    _table_subject(source, table, cols)))
+            if raw is None:
+                continue   # provider failure / empty -> don't cache (M3)
+            envelope, _reason = accept_domain(raw)
+            if envelope is None:
+                continue   # over-long / multiline / list-stringified / task-echo -> don't cache (M3/M9)
+            _cache_put(conn, "enrichment_domain", hash_of_table[table], envelope,
+                       _DOMAIN_CACHE_VERSION)
+            envelopes[table] = envelope
 
     result: dict[str, str] = {}
-    accept_domain = _accept_domain(64)   # same plausibility gate the batch path applies
-    for table, cols in by_table.items():
-        h = hash_of_table[table]
-        if h in cached:
-            result[table] = cached[h]
+    for table, envelope in envelopes.items():
+        table_domain, overrides = _parse_domain_result(envelope)
+        if not table_domain:
             continue
-        raw = _call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
-                    {"table": table, "columns": sorted(cols)}, "domain",
-                    "Classify this table's business domain.", actor,
-                    _single_ctx(ingestion_run_id, "enrich_domain",
-                                _table_subject(source, table, cols)))
-        if raw is None:
-            continue   # provider failure / empty -> don't cache (M3)
-        domain, _reason = accept_domain(raw)
-        if domain is None:
-            continue   # over-long / multiline / list-stringified / task-echo -> don't cache (M3/M9)
-        _cache_put(conn, "enrichment_domain", h, domain, _DOMAIN_CACHE_VERSION)
-        result[table] = domain
+        result[table] = table_domain
+        if column_domains is not None:
+            for column, value in overrides.items():
+                column_domains[(_norm(table), _norm(column))] = value
     return result

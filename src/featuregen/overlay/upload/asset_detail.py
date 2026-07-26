@@ -183,6 +183,15 @@ def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) ->
         entry["evidence_provenance"] = (
             _evidence_provenance_label(ev[0], ev[1]) if ev else None
         )
+        # [E1a T3] domain is TWO-LEVEL: a table's domain is the DEFAULT context its columns inherit,
+        # and a column asserts its own only as an explicit OVERRIDE. So the column's own active
+        # evidence IS the discriminator — with it the value is `direct` (authored at this column);
+        # without it the value on the flat column came from the table, and we say so rather than
+        # fabricating column-level evidence for what is really inheritance.
+        if label == "domain":
+            entry["origin"] = "direct" if ev else "inherited"
+            if ev is None:
+                entry["inherited_from"] = anchor["table_name"]
         # [F12] composition-audit — ``entity`` is governed by the E3 SECOND gate
         # (``entity_status='VERIFIED'``, the same gate ``verified_entity_of`` and this payload's OWN
         # relationships.semantic subsection apply), which C1 cannot model (entity has no fact/decision

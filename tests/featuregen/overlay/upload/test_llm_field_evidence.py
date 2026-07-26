@@ -22,7 +22,15 @@ evidence write fails, so lost metadata is never laundered into a success.
 Task 2b closes the reconciliation gap: the stage reconciles the whole TARGET UNIVERSE by DISPOSITION,
 not just the successes — a column whose definition becomes sanitizer-SUPPRESSED, or that stops being
 an AI target at all, has its prior AI definition RETIRED; a transient miss KEEPS it; and a ref
-written this run is never in the retire set.
+written this run is never in the retire set. Retirement is also SOURCE-scoped: ingesting one source
+can never reach into another's AI evidence.
+
+Task 3 makes ``domain`` TWO-LEVEL: the table's domain is the DEFAULT context its columns inherit and
+is evidence on the TABLE node; a column carries its own ``domain`` evidence ONLY where it OVERRIDES
+that default. Inheritance is never fabricated as evidence — asset-detail says ``origin="inherited"``
+with ``inherited_from``, or ``origin="direct"`` when the column really does assert its own. The AI
+fills a BLANK domain and never contests a sidecar-curated one (two competing proposals resolve to a
+display CONFLICT that would blank the curated value).
 """
 from __future__ import annotations
 
@@ -415,3 +423,230 @@ def test_definition_evidence_escape_records_partial(db, monkeypatch):
     assert report.state == "partial" and report.reason_code == "items_failed"
     assert report.detail["internal_failures"] == 1
     assert _ai_defs(db, _NAME_REF) == []
+
+
+# ── Cross-SOURCE isolation (review finding T2b-M3) ────────────────────────────────────────────────
+# Retirement is source-wide and destructive; ingesting source A must never reach into source B.
+
+
+def test_reconciliation_never_retires_another_sources_ai(overlay_conn):
+    """Ingesting source A must NOT retire source B's AI evidence: the target universe is scoped to
+    ONE catalog source (a ref of another source is not this upload's to retire)."""
+    upload = _blank_def_upload()
+    (row,) = upload.rows
+    build_graph(overlay_conn, _AI_SOURCE, [row])
+    other = normalize_ref("ftr_other", "dpl_eib_compliance", "comp_fin_tran", "cust_name")
+    _write_llm_field_evidence(overlay_conn, field_name="definition",
+                              items={"h": "another source's AI def"},
+                              ref_of=lambda k: (other, other, {"k": k}), source_snapshot_id="snap")
+
+    # Source A drops its own target entirely (nothing drafted, nothing expected) -> full retirement
+    # of ITS universe. Source B's row must be untouched.
+    n = _write_definition_evidence(overlay_conn, source=_AI_SOURCE, rows=[], definitions={},
+                                   glossary=upload, concepts=None, bindings=None,
+                                   source_snapshot_id="snap2")
+    assert n == 0
+    assert [e.proposed_value for e in _ai_defs(overlay_conn, other)] == ["another source's AI def"]
+
+
+# ── E1a Task 3: TWO-LEVEL domain — a table DEFAULT + explicit column OVERRIDES ────────────────────
+# The table's domain is the context every column inherits; a column only carries its OWN domain
+# evidence when the classifier gave it a DIFFERENT one. Inheritance is never fabricated as evidence.
+
+# Two columns of ONE table, both with the sidecar's `data_domain` cell EMPTY, so neither column
+# carries a SOURCE domain assertion of its own — the AI's two-level classification is the only
+# domain in play (an inherited column has NO column-level evidence at all).
+_DOMAIN_CSV = _HDR + _row(domain="") + _row(
+    source_row="19", fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.FRAUD_SCORE", term_name="Fraud Score",
+    definition='"Model score for the transaction fraud risk."', domain="", term_type="Measure",
+    synonyms="", b1="", b2="", b3="", b4="", fibo="", data_type="DECIMAL")
+_TABLE_REF = normalize_ref(_AI_SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN")
+_SCORE_REF = normalize_ref(_AI_SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN", "FRAUD_SCORE")
+_SCORE_OBJECT_REF = "public.comp_fin_tran.fraud_score"
+
+
+def _ai_domains(conn, ref: str) -> list:
+    """The ACTIVE ``llm`` domain proposals at ``ref`` (producer-scoped)."""
+    return [e for e in read_active_field_evidence(conn, ref, "domain") if e.producer == "llm"]
+
+
+def _domain_upload():
+    return to_glossary_upload(read_ftr_glossary(_DOMAIN_CSV, source=_AI_SOURCE))
+
+
+def _domain_client(table_domain: str = "retail_banking",
+                   overrides: tuple[dict, ...] = ({"column": "fraud_score",
+                                                   "domain": "fraud_risk"},)) -> FakeLLM:
+    """A FakeLLM whose domain task returns the TWO-LEVEL result: the table's default domain plus
+    ONLY the columns whose domain differs from it."""
+    return FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"results": []}),
+        "overlay.enrich.definition": FakeResponse(output={"results": []}),
+        "overlay.enrich.domain": FakeResponse(output={"results": [
+            {"ref": "comp_fin_tran", "domain": table_domain,
+             "column_domains": list(overrides)}]}),
+    })
+
+
+def _ingest_domains(db) -> None:
+    _seal()
+    upload = _domain_upload()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=_NOW,
+                        client=_domain_client(), glossary=upload)
+    assert res.status == "ingested"
+
+
+def _domain_field(db, object_ref: str) -> dict:
+    return build_asset_detail(
+        db, source=_AI_SOURCE, object_ref=object_ref, roles=list(_ADMIN.role_claims),
+        identity=_ADMIN, include=["effective_metadata"])["effective_metadata"]["fields"]["domain"]
+
+
+def test_table_domain_is_table_level_evidence_columns_inherit(db):
+    """The TABLE default: ``llm/proposed`` ``domain`` evidence lands on the TABLE node (at its
+    SCHEMA-preserving ref, never a ``public`` twin), and a column that does NOT override it renders
+    ``origin="inherited"`` with NO column-level domain evidence fabricated for it."""
+    _ingest_domains(db)
+
+    ev = _ai_domains(db, _TABLE_REF)
+    assert len(ev) == 1
+    assert ev[0].strength == "proposed" and ev[0].proposed_value == "retail_banking"
+
+    assert _ai_domains(db, _NAME_REF) == []          # inheritance is NOT evidence
+    field = _domain_field(db, _NAME_OBJECT_REF)
+    assert field["origin"] == "inherited" and field["inherited_from"] == "comp_fin_tran"
+    assert field["value"] == "retail_banking"        # the effective domain is the table's default
+
+
+def test_column_domain_override_is_direct_column_evidence(db):
+    """An OVERRIDE: the column whose domain DIFFERS from its table gets its own ``llm/proposed``
+    ``domain`` evidence, renders ``origin="direct"``, and its effective domain is the override —
+    not the table default."""
+    _ingest_domains(db)
+
+    ev = _ai_domains(db, _SCORE_REF)
+    assert len(ev) == 1
+    assert ev[0].strength == "proposed" and ev[0].proposed_value == "fraud_risk"
+
+    field = _domain_field(db, _SCORE_OBJECT_REF)
+    assert field["origin"] == "direct" and "inherited_from" not in field
+    assert field["value"] == "fraud_risk"
+    assert field["evidence_provenance"] == "AI proposed"
+
+
+def test_dropped_domain_override_is_retired(overlay_conn):
+    """A column that STOPS being an override (its table classified fine, and the model no longer
+    gives that column a different domain) must stop asserting yesterday's AI override."""
+    upload = _domain_upload()
+    build_graph(overlay_conn, _AI_SOURCE, upload.rows)
+    _write_llm_field_evidence(overlay_conn, field_name="domain", items={"h": "fraud_risk"},
+                              ref_of=lambda k: (_SCORE_REF, _SCORE_REF, {"k": k}),
+                              source_snapshot_id="snap")
+
+    n = enrich_mod._write_domain_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=upload.rows,
+        domains={"comp_fin_tran": "retail_banking"}, column_domains={}, glossary=upload,
+        bindings=None, source_snapshot_id="snap2")
+
+    assert n == 0
+    assert _ai_domains(overlay_conn, _SCORE_REF) == []                     # no longer an override
+    assert [e.proposed_value for e in _ai_domains(overlay_conn, _TABLE_REF)] == ["retail_banking"]
+
+
+def test_transient_domain_miss_keeps_prior_ai(overlay_conn):
+    """THE SAFETY PROPERTY: the table is still a target but the classifier returned nothing — a
+    provider blip. BOTH the table domain and its column overrides survive."""
+    upload = _domain_upload()
+    build_graph(overlay_conn, _AI_SOURCE, upload.rows)
+    for ref, value in ((_TABLE_REF, "retail_banking"), (_SCORE_REF, "fraud_risk")):
+        _write_llm_field_evidence(overlay_conn, field_name="domain", items={"h": value},
+                                  ref_of=lambda k, r=ref: (r, r, {"k": k}),
+                                  source_snapshot_id="snap")
+
+    n = enrich_mod._write_domain_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=upload.rows, domains={}, column_domains={},
+        glossary=upload, bindings=None, source_snapshot_id="snap2")
+
+    assert n == 0
+    assert [e.proposed_value for e in _ai_domains(overlay_conn, _TABLE_REF)] == ["retail_banking"]
+    assert [e.proposed_value for e in _ai_domains(overlay_conn, _SCORE_REF)] == ["fraud_risk"]
+
+
+def test_domain_evidence_write_failure_records_partial(db, monkeypatch):
+    """FAILURE PROPAGATION at the domain stage too: a contained evidence-write failure must surface
+    as ``partial``/``items_failed``, never a laundered ``succeeded``."""
+    _seal()
+    upload = _domain_upload()
+
+    def _boom(*a, **k):
+        raise RuntimeError("field_evidence store unavailable")
+
+    monkeypatch.setattr(enrich_mod, "record_field_evidence", _boom)
+    rec = StageRecorder()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=_NOW,
+                        client=_domain_client(), glossary=upload, stage_recorder=rec)
+    assert res.status == "ingested"               # the contained failure never aborts the upload
+
+    report = next(r for r in rec.reports if r.stage == "enrich_domain")
+    assert report.state == "partial" and report.reason_code == "items_failed"
+    assert _ai_domains(db, _TABLE_REF) == []
+
+
+def test_domain_evidence_escape_records_partial(db, monkeypatch):
+    """A throw ESCAPING ``_write_domain_evidence`` (outside the writer's per-item try) must still
+    count: the savepoint rolls the writes back, so ``succeeded`` would launder lost metadata."""
+    _seal()
+    upload = _domain_upload()
+
+    def _boom(*a, **k):
+        raise RuntimeError("field_evidence store unavailable")
+
+    monkeypatch.setattr(enrich_mod, "_reconcile_llm_field_evidence", _boom)
+    rec = StageRecorder()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=_NOW,
+                        client=_domain_client(), glossary=upload, stage_recorder=rec)
+    assert res.status == "ingested"
+
+    report = next(r for r in rec.reports if r.stage == "enrich_domain")
+    assert report.state == "partial" and report.reason_code == "items_failed"
+    assert report.detail["internal_failures"] == 1
+    assert _ai_domains(db, _TABLE_REF) == []
+
+
+def test_source_declared_domain_is_never_contested(overlay_conn):
+    """The AI fills a BLANK domain, it never contests a CURATED one: a column whose sidecar declares
+    its own ``data_domain`` is not an AI target at all — and a prior AI proposal for it is retired.
+    (Two competing proposals resolve to a display CONFLICT, which would BLANK the curated value.)"""
+    declared = to_glossary_upload(read_ftr_glossary(_HDR + _row(), source=_AI_SOURCE))
+    assert declared.records[0].domain                     # the sidecar curated it ("Party")
+    build_graph(overlay_conn, _AI_SOURCE, declared.rows)
+    _write_llm_field_evidence(overlay_conn, field_name="domain", items={"h": "stale ai domain"},
+                              ref_of=lambda k: (_NAME_REF, _NAME_REF, {"k": k}),
+                              source_snapshot_id="snap")
+
+    n = enrich_mod._write_domain_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=declared.rows,
+        domains={"comp_fin_tran": "retail_banking"},
+        column_domains={("comp_fin_tran", "cust_name"): "fraud_risk"}, glossary=declared,
+        bindings=None, source_snapshot_id="snap2")
+
+    assert n == 0
+    assert _ai_domains(overlay_conn, _NAME_REF) == []      # not a target -> not written, and retired
+
+
+def test_table_no_longer_in_the_upload_is_retired(overlay_conn):
+    """A table that DROPPED OUT of the source entirely is no longer a target — its AI domain is
+    retired rather than left asserting itself for a table nobody uploaded."""
+    upload = _domain_upload()
+    build_graph(overlay_conn, _AI_SOURCE, upload.rows)
+    gone = normalize_ref(_AI_SOURCE, "dpl_eib_compliance", "old_table")
+    _write_llm_field_evidence(overlay_conn, field_name="domain", items={"h": "legacy"},
+                              ref_of=lambda k: (gone, gone, {"k": k}), source_snapshot_id="snap")
+
+    n = enrich_mod._write_domain_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=upload.rows,
+        domains={"comp_fin_tran": "retail_banking"}, column_domains={}, glossary=upload,
+        bindings=None, source_snapshot_id="snap2")
+
+    assert n == 0
+    assert _ai_domains(overlay_conn, gone) == []
