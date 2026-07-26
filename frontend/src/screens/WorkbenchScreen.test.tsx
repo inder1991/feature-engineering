@@ -40,9 +40,10 @@ beforeEach(() => {
   featureRecipe.mockReset()
   registerFeature.mockReset()
   featureFreshness.mockReset()
-  // Phase 1B flags default OFF unless a test stubs them; clear any prior test's stub so the
-  // flag-off assertions (today's one-shot behaviour) run without leakage.
+  // Most pre-Delivery-0 tests pin the emergency compatibility UI. Delivery-0 tests explicitly
+  // unstub this value to exercise the release-safe confirmation default.
   vi.unstubAllEnvs()
+  vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '0')
 })
 
 // derives_pairs deliberately names a catalog ('cards') that differs from the source the tests
@@ -1828,7 +1829,7 @@ describe('Gate #1 scope confirmation', () => {
   }
 
   it('flag OFF: generate calls considered-set once and never recognitions (today’s flow)', async () => {
-    // No env stub → intent_confirmation_ui defaults off.
+    // The emergency compatibility flag is pinned to 0 by beforeEach.
     await renderAndGenerate([IDEA])
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(contractConsideredSet).toHaveBeenCalledTimes(1)
@@ -1839,6 +1840,15 @@ describe('Gate #1 scope confirmation', () => {
     // No confirm step and no lens render when the flags are off.
     expect(screen.queryByRole('button', { name: /confirm scope and generate/i })).toBeNull()
     expect(screen.queryByText(/how your scope dispositioned/i)).toBeNull()
+  })
+
+  it('release default: generate recognises first and never takes the one-shot path', async () => {
+    vi.unstubAllEnvs()
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    await generateFlagOn()
+    expect(contractRecognitions).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn')
+    expect(contractConsideredSet).not.toHaveBeenCalled()
+    expect(await screen.findByText('Customer churn')).toBeInTheDocument()
   })
 
   it('flag ON: generate recognises first, renders the proposed scope, and confirm sends the scope', async () => {

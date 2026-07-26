@@ -1043,8 +1043,8 @@ export interface RecipeDisposition {
 }
 
 // Run the recognizer over the objective and persist an append-only attempt (no generation run yet).
-// Fail-open: the endpoint never returns 5xx; a recognizer failure comes back as status
-// 'technical_failure' with unscoped semantics, so the caller can still generate over everything.
+// A recognizer failure comes back as status 'technical_failure'. The client may then offer the
+// explicit human broaden action; it must never silently generate over the complete registry.
 export function contractRecognitions(
   hypothesis: string,
   objective: string,
@@ -1056,8 +1056,8 @@ export function contractRecognitions(
 // gauntlet-validated considered set (anchor + generated alternatives + an advisory recommendation).
 // Phase 1B: when `confirmedScope` is supplied (the human confirmed/broadened the recognised scope),
 // the server ALSO mints a generation run, persists the scope, grounds only the in-scope recipe
-// subset, and attaches per-recipe `dispositions` + an `in_scope_count`. When it is absent, this is
-// byte-identical to today's one-shot generate.
+// subset, and attaches per-recipe `dispositions` + an `in_scope_count`. In release mode the backend
+// rejects an absent scope; omission exists only for the explicitly configured emergency legacy mode.
 export function contractConsideredSet(
   hypothesis: string,
   objective: string,
@@ -1079,8 +1079,7 @@ export function contractConsideredSet(
     // HUMAN guidance for a whole-round feedback re-run; mints a FRESH governing intent over the
     // guided set. null on the initial generate (no feedback yet).
     feedback: opts.feedback ?? null,
-    // Phase 1B scoped-grounding fields. All null on the flag-off one-shot path → the server takes
-    // today's ground-everything route (recognition/applicability never engage).
+    // Scoped-grounding fields. Null is only valid against an explicitly configured legacy backend.
     intent_id: opts.intentId ?? null,
     recognition_id: opts.recognitionId ?? null,
     confirmed_scope: opts.confirmedScope

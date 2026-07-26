@@ -67,15 +67,15 @@ import {
 import { getSession } from '../session'
 
 // ---- Phase 1B feature flags -------------------------------------------------------------------
-// Two independent UI flags, read via Vite's env idiom and default OFF: with both off the screen
-// behaves EXACTLY as today (one-shot generate, no recognition call, no disposition lens). Read at
-// call time (not cached at module scope) so tests can flip them with vi.stubEnv.
+// Scope confirmation is the release-safe default. Setting the flag to "0" is an emergency UI
+// compatibility switch only; the backend still rejects a one-shot request unless its own explicit
+// legacy mode is active. Read at call time so tests can exercise both deployment modes.
 // - intent_confirmation_ui: on Generate, first recognise the objective and let the human
 //   confirm/override/broaden the scope BEFORE the considered set is generated.
 // - intent_disposition_lens: when a scoped response carries dispositions, group recipes by their
 //   final disposition (only meaningful with the confirmation UI on).
 function confirmationUiEnabled(): boolean {
-  return import.meta.env.VITE_INTENT_CONFIRMATION_UI === '1'
+  return import.meta.env.VITE_INTENT_CONFIRMATION_UI !== '0'
 }
 function dispositionLensEnabled(): boolean {
   return import.meta.env.VITE_INTENT_DISPOSITION_LENS === '1'

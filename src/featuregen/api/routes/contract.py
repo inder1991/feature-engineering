@@ -22,6 +22,7 @@ from featuregen.api.deps import (
     get_feature_gen_conn,
     get_identity,
     get_llm,
+    get_llm_optional,
     require_feature_generate,
     require_feature_read,
 )
@@ -72,6 +73,7 @@ from featuregen.overlay.upload.contract.live_activation import (
     require_live_ready,
 )
 from featuregen.overlay.upload.contract.review import author_contract
+from featuregen.overlay.upload.contract.scope_mode import confirmation_required, scope_mode_status
 from featuregen.overlay.upload.contract.scope_records import (
     dimension_provenance,
     record_confirmed_scope,
@@ -115,6 +117,7 @@ from featuregen.overlay.upload.taxonomy.recognition import (
 from featuregen.overlay.upload.taxonomy.recognizer import recognize
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +133,7 @@ _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _FeatureGenConn = Annotated[psycopg.Connection, Depends(get_feature_gen_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 _LLM = Annotated[LLMClient, Depends(get_llm)]
+_OptionalLLM = Annotated[LLMClient | None, Depends(get_llm_optional)]
 
 
 # ---- I/O models. The security-critical state (target_ref, the chosen feature) lives SERVER-side,
@@ -211,6 +215,17 @@ class RecognitionIn(BaseModel):
 
 
 # ---- routes -------------------------------------------------------------------------------------
+@router.get("/contract/scope-mode", dependencies=[Depends(require_feature_read)])
+def scope_mode() -> dict:
+    """Expose the server authority mode so clients and operators can detect rollout mismatches."""
+    status = scope_mode_status()
+    return {
+        "mode": status.mode.value,
+        "confirmation_required": status.confirmation_required,
+        "configuration_valid": status.configuration_valid,
+    }
+
+
 def _considered_set_response(intent, cs) -> dict:
     """Today's considered-set response body — the anchor + alternatives + recommendation + rejections.
     The scoped (Phase-1B) path returns this SAME shape plus the disposition lens; the no-scope path
@@ -218,6 +233,16 @@ def _considered_set_response(intent, cs) -> dict:
     return {"intent_id": intent.intent_id, "anchor": cs.anchor,
             "alternatives": cs.alternatives, "recommendation": cs.recommendation,
             "rejections": cs.rejections}
+
+
+def _require_generation_llm(client: LLMClient | None) -> LLMClient:
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="no LLM provider is configured on this deployment "
+            "(set FEATUREGEN_LLM_PROVIDER=anthropic to enable feature-assist)",
+        )
+    return client
 
 
 def _disposition_json(ev: RecipeEvaluation) -> dict:
@@ -338,7 +363,7 @@ def _ranking_json(r: RankedRecipe) -> dict:
 
 
 def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
-                           client: _LLM) -> dict:
+                           client: LLMClient | None) -> dict:
     """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
     run, PERSISTS the confirmed scope in the API layer BEFORE the builder (the canonical run→scope
     linkage; scope persistence is never the builder's job), computes the ONE ``ApplicabilityResult``,
@@ -362,10 +387,27 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     #    422 on a leftover id). Otherwise every confirmed id must be a selectable taxonomy leaf and the
     #    id set must be collision-free.
     if cscope.unscoped:
+        if confirmation_required():
+            if cscope.confirmation_source not in {"broaden", "user_broadened"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail="unscoped generation requires an explicit broaden confirmation",
+                )
+            if body.recognition_id is None and body.supersedes_scope_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="unscoped broaden must reference a recognition or prior confirmed scope",
+                )
         scope = ConfirmedScope(
             primary=None, secondary=(), unscoped=True,
             modelling_contexts=clean_contexts, target_entity=clean_entity)
     else:
+        if (confirmation_required()
+                and cscope.confirmation_source != "user_confirmed"):
+            raise HTTPException(
+                status_code=422,
+                detail="scoped generation requires user_confirmed confirmation source",
+            )
         # A ``primary`` that also appears in ``secondary`` (or a duplicated ``secondary``) would collide
         # on the ``confirmed_scope_use_case`` PK downstream → UniqueViolation → 500; reject it as a 422.
         if cscope.primary is not None and cscope.primary in cscope.secondary:
@@ -374,6 +416,11 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if len(cscope.secondary) != len(set(cscope.secondary)):
             raise HTTPException(status_code=422, detail="secondary use-cases must be unique")
         confirmed_ids = ([cscope.primary] if cscope.primary else []) + list(cscope.secondary)
+        if confirmation_required() and not confirmed_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="confirmed scope requires at least one selectable use-case",
+            )
         leaves = selectable_leaves()
         for uid in confirmed_ids:
             if use_case(uid) is None or uid not in leaves:
@@ -405,6 +452,30 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if owned is None:
             raise HTTPException(status_code=404, detail="unknown intent")
         intent = replace(intent, intent_id=body.intent_id)
+    if confirmation_required():
+        if body.recognition_id is None and body.supersedes_scope_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="confirmed scope must reference its recognition or prior confirmed scope",
+            )
+        if body.recognition_id is not None:
+            recognition_owned = conn.execute(
+                "SELECT 1 FROM intent_recognition_attempt a "
+                "JOIN contract_intent i ON i.intent_id = a.intent_id "
+                "WHERE a.recognition_id = %s AND a.intent_id = %s AND i.actor = %s::jsonb",
+                (body.recognition_id, intent.intent_id, _actor_json(intent.actor)),
+            ).fetchone()
+            if recognition_owned is None:
+                raise HTTPException(status_code=404, detail="unknown recognition")
+        if body.supersedes_scope_id is not None:
+            prior_owned = conn.execute(
+                "SELECT 1 FROM confirmed_generation_scope "
+                "WHERE scope_id = %s AND intent_id = %s AND confirmed_by = %s",
+                (body.supersedes_scope_id, intent.intent_id, identity.subject),
+            ).fetchone()
+            if prior_owned is None:
+                raise HTTPException(status_code=404, detail="unknown prior confirmed scope")
+    client = _require_generation_llm(client)
     # 3C.2a — the LIVE governed cross-catalog readiness interlock. On an entity-scoped run (no single
     # catalog) with the live flag ON, the deployment MUST be activation-approved BEFORE any LLM/planner
     # dispatch — fail-closed 503, NEVER a legacy fallback, and BEFORE any run/scope is minted or
@@ -507,17 +578,35 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
 
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
 def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
-                   client: _LLM) -> dict:
+                   client: _OptionalLLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
     the intent. Every option shown has passed the gauntlet.
 
-    Phase-1B: when ``confirmed_scope`` is present the request mints a generation run, persists the
+    When ``confirmed_scope`` is present the request mints a generation run, persists the
     confirmed scope BEFORE the builder, scopes grounding through a single ``ApplicabilityResult`` and
-    attaches a per-recipe disposition lens (see :func:`_scoped_considered_set`). Absent → today's exact
-    path (no run, no scope row, no dispositions)."""
+    attaches a per-recipe disposition lens (see :func:`_scoped_considered_set`). Release mode rejects
+    an absent scope. Only the explicit legacy_unscoped emergency mode retains the old one-shot path."""
     if body.confirmed_scope is not None:
         return _scoped_considered_set(body, conn, identity, client)
+    if confirmation_required():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SCOPE_CONFIRMATION_REQUIRED",
+                "message": (
+                    "recognize and confirm a use-case scope before generating candidates; "
+                    "use an explicit broaden action to inspect all buildable recipes"
+                ),
+            },
+        )
+    counters.incr("contract.legacy_unscoped_requests")
+    logger.warning(
+        "legacy unscoped considered-set request accepted: actor=%s catalog=%s",
+        identity.subject,
+        body.catalog_source,
+    )
+    client = _require_generation_llm(client)
     try:
         intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
                                actor=identity.subject)

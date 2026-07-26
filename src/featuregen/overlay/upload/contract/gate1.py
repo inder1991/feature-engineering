@@ -25,6 +25,7 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_to_json,
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
+from featuregen.overlay.upload.contract.scope_mode import confirmation_required
 from featuregen.overlay.upload.feature_assist import (
     ExternalRequirementPreview,
     FeatureIdea,
@@ -198,30 +199,31 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     return ideas, rejections, frozenset(grounded_ids), rejected_ids, binding_by_id
 
 
-# ── Phase-1B Task 4: scoped grounding (flag-gated, default off) ─────────────────────────────────────
-# When FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1, a supplied ApplicabilityResult narrows the template
-# universe grounding evaluates to the eligible recipe subset. The flag defaults OFF → grounding sees the
-# whole ALL_TEMPLATES registry, byte-identical to today. The narrowing NEVER widens (the eligible set is
-# ⊆ ALL_TEMPLATES) and NEVER relaxes safety (grounding still refuses leakage/protected columns by
-# construction). Recognition/applicability is computed once in the API layer (Tasks 6/7); the builder is
-# a pure consumer here. See docs/superpowers/plans/2026-07-10-phase1b-scoped-grounding.md Task 4.
+# ── Delivery 0: server-enforced scoped grounding ────────────────────────────────────────────────────
+# Normal release mode always narrows to the supplied applicability. The old applicability flag is read
+# only in the explicit legacy_unscoped emergency mode. The narrowing never widens and never relaxes
+# grounding safety.
 def _intent_scoped_applicability_enabled() -> bool:
-    """Scoped grounding is OFF by default — ``build_considered_set`` grounds ``ALL_TEMPLATES`` unchanged
-    unless a deployment opts in with ``FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1``."""
+    """Release mode always enforces scoped applicability.
+
+    The historical flag remains only for the explicitly selected ``legacy_unscoped`` emergency mode;
+    it can no longer disable a confirmed scope during normal operation.
+    """
+    if confirmation_required():
+        return True
     return os.environ.get("FEATUREGEN_INTENT_SCOPED_APPLICABILITY", "0") == "1"
 
 
 def _templates_to_ground(intent: Intent,
                          applicability: ApplicabilityResult | None) -> Sequence[Template]:
-    """The template subset grounding evaluates for this run. Grounds only the applicability's
-    ``eligible_ids`` when ALL of: the scoped-applicability flag is on; an ``applicability`` is supplied;
-    the intent is NOT definition-mode (definition bypasses recognition/applicability, never grounding);
-    and the applicability GENUINELY NARROWS — its eligible set is strictly smaller than the full registry
-    (an unscoped/all-eligible result is not a narrowing and fails open to full grounding). Otherwise
-    returns ``ALL_TEMPLATES`` — today's behaviour, byte-identical."""
+    """Return the governed recipe universe for this run.
+
+    Release mode applies a confirmed narrowing in both intake modes. Legacy mode preserves the
+    historical definition bypass and old flag semantics for emergency rollback.
+    """
     if (_intent_scoped_applicability_enabled()
             and applicability is not None
-            and intent.intake_mode != "definition"
+            and (confirmation_required() or intent.intake_mode != "definition")
             and len(applicability.eligible_ids) < len(ALL_TEMPLATES)):
         return tuple(t for t in ALL_TEMPLATES if t.id in applicability.eligible_ids)
     return ALL_TEMPLATES

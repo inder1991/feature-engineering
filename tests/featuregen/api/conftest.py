@@ -15,7 +15,7 @@ def _auth_stub(monkeypatch):
 
 
 @pytest.fixture
-def make_client(conn):
+def make_client(conn, monkeypatch):
     """Build a TestClient whose requests run on the suite's rolled-back connection.
 
     The get_conn override yields the shared test conn WITHOUT commit/close — the root `conn`
@@ -23,6 +23,9 @@ def make_client(conn):
     feature-gen conn (REPEATABLE READ in prod, Delivery C0) is overridden to the SAME shared conn so the
     contract feature-gen routes stay on the rolled-back test transaction; its production isolation is
     covered directly in test_feature_gen_isolation.py."""
+    # Historical API tests exercise the compatibility request shape. Delivery 0 tests explicitly
+    # override this to confirmation_required; production defaults to confirmation_required.
+    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "legacy_unscoped")
     with ExitStack() as stack:
 
         def _make(llm_client=None):
