@@ -72,10 +72,23 @@ from featuregen.overlay.upload.templates import (
     GroundedFeature,
     GroundingStatus,
     Template,
-    ground_all_outcomes,
+)
+from featuregen.overlay.upload.templates import (
+    ground_all_outcomes as _ground_all_default,
 )
 
 logger = logging.getLogger(__name__)
+
+# Preserve both historical test/integration seams while callers migrate to the explicit name.
+ground_all_outcomes = _ground_all_default
+ground_all = _ground_all_default
+
+
+def _ground_template_outcomes(*args, **kwargs):
+    if ground_all_outcomes is not _ground_all_default:
+        return ground_all_outcomes(*args, **kwargs)
+    return ground_all(*args, **kwargs)
+
 
 # 3C.2a — the fail-closed cross-catalog invariant. On a live entity-scoped run EVERY customer-visible
 # cross-catalog feature must have a governed physical plan, so an LLM alternative whose derives span
@@ -183,7 +196,7 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     (Task 5) consumes them as its ``grounded_ids`` / ``rejected`` inputs. Additionally returns the
     per-SURVIVING-template ``binding_quality`` value (Task A3 Part A) — a read-only presentation signal
     the ranker consumes; grounding behaviour is unchanged by computing it."""
-    outcomes = ground_all_outcomes(
+    outcomes = _ground_template_outcomes(
         conn, templates, catalog_source=catalog_source, roles=roles)
     grounded = [
         outcome.feature for outcome in outcomes if outcome.feature is not None]

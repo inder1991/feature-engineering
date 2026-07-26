@@ -86,6 +86,38 @@ def test_provider_calls_and_usage_populated(db):
     assert res.usage.get("output_tokens") == 7
 
 
+def test_formula_call_always_threads_the_physical_dispatch_audit(monkeypatch):
+    captured = {}
+
+    def _drive(*args, **kwargs):
+        captured.update(kwargs)
+        return type("Outcome", (), {
+            "output": {"answer": "ok"},
+            "llm_call_ref": "llm-1",
+            "provider_calls": 1,
+            "usage": {},
+        })()
+
+    monkeypatch.setattr(
+        "featuregen.formula.audited.drive_audited_structured_call", _drive)
+    result = audited_formula_call(
+        object(),
+        object(),
+        authoring_run_id="run-audit-context",
+        task="formula.critic",
+        prompt_id="critic-v1",
+        schema_id="critic",
+        instruction="Review.",
+        catalog_metadata={},
+    )
+    assert result.llm_call_ref == "llm-1"
+    audit = captured["dispatch_audit"]
+    assert audit.ingestion_run_id is None
+    assert audit.stage == "formula:formula.critic"
+    assert audit.subjects == ()
+    assert captured["logical_call_ref"].startswith("lc_formula_")
+
+
 def test_result_is_a_frozen_slotted_dataclass():
     assert dataclasses.is_dataclass(AuditedCallResult)
     res = AuditedCallResult(output=None, llm_call_ref=None, provider_calls=0, usage={})

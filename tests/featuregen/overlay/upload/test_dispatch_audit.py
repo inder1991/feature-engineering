@@ -13,7 +13,13 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from featuregen.overlay.upload.dispatch_audit import AuditUnavailable, record_dispatch
+from featuregen.intake.llm import LLMRequest, compute_input_hash
+from featuregen.overlay.upload.dispatch_audit import (
+    AuditIntegrityError,
+    AuditUnavailable,
+    compute_physical_request_hash,
+    record_dispatch,
+)
 
 
 @pytest.fixture
@@ -106,6 +112,40 @@ def test_replay_of_same_logical_call_and_attempt_returns_existing_ref(durable_ds
             (first,)).fetchone()[0]
     assert headers == 1     # one physical dispatch record per attempt — never duplicated
     assert subjects == 2    # the replay appended no duplicate subject rows
+
+
+def test_replay_with_changed_physical_request_fails_integrity(durable_dsn) -> None:
+    durable_dsn.append("log_c5t2_changed")
+    _record(
+        logical_call_ref="log_c5t2_changed",
+        physical_request_hash="physical-a",
+    )
+    with pytest.raises(AuditIntegrityError):
+        _record(
+            logical_call_ref="log_c5t2_changed",
+            physical_request_hash="physical-b",
+        )
+
+
+def test_physical_request_hash_distinguishes_repair_payloads() -> None:
+    common = {
+        "task": "formula.author",
+        "prompt_id": "formula-author-v1",
+        "prompt_version": 1,
+        "output_schema_id": "typed-formula-v1",
+        "output_schema_version": 1,
+        "generation_settings": {"provider": "anthropic", "model": "test"},
+    }
+    first = LLMRequest(
+        **common,
+        inputs={"catalog_metadata": {}, "_repair_errors": ["first error"]},
+    )
+    second = LLMRequest(
+        **common,
+        inputs={"catalog_metadata": {}, "_repair_errors": ["second error"]},
+    )
+    assert compute_input_hash(first.inputs) == compute_input_hash(second.inputs)
+    assert compute_physical_request_hash(first) != compute_physical_request_hash(second)
 
 
 def test_a_new_attempt_is_a_new_dispatch_record(durable_dsn) -> None:

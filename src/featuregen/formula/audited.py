@@ -17,6 +17,8 @@ is evidenced with a real ``llm_call_ref``.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -59,14 +61,41 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
     boundary and never touching ``record_llm_call`` — threading ``authoring_run_id`` as the audit
     run bucket and requesting ``record_egress_block=True`` so a blocked payload is still audited
     (the block yields ``output=None`` but a real ``llm_call_ref``). ``prompt_version`` /
-    ``schema_version`` / ``dispatch_audit`` / ``cacheable_metadata_keys`` pass straight through with
-    the same defaults the overlay seam uses."""
+    ``schema_version`` / ``cacheable_metadata_keys`` pass straight through. Formula calls always
+    carry a dispatch-audit context so every physical provider attempt reaches ``AuditingClient``;
+    callers may supply a richer context, otherwise this function creates the formula-stage context.
+    The dedicated shadow worker separately requires a configured durable audit store, closing the
+    shared wrapper's intentional DSN-less development bypass."""
+    effective_dispatch_audit = dispatch_audit or DispatchAuditContext(
+        ingestion_run_id=None,
+        stage=f"formula:{task}",
+        subjects=(),
+    )
+    logical_material = {
+        "authoring_run_id": authoring_run_id,
+        "task": task,
+        "prompt_id": prompt_id,
+        "prompt_version": prompt_version,
+        "schema_id": schema_id,
+        "schema_version": schema_version,
+        "instruction": instruction,
+        "catalog_metadata": catalog_metadata,
+        "generation_settings": generation_settings,
+    }
+    logical_call_ref = "lc_formula_" + hashlib.sha256(json.dumps(
+        logical_material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()).hexdigest()[:32]
     res = drive_audited_structured_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
         catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
         prompt_version=prompt_version, schema_version=schema_version,
-        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys,
+        dispatch_audit=effective_dispatch_audit,
+        cacheable_metadata_keys=cacheable_metadata_keys,
         run_id=authoring_run_id, record_egress_block=True,
-        generation_settings=generation_settings)
+        generation_settings=generation_settings,
+        logical_call_ref=logical_call_ref)
     return AuditedCallResult(output=res.output, llm_call_ref=res.llm_call_ref,
                              provider_calls=res.provider_calls, usage=res.usage)

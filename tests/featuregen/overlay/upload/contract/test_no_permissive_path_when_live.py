@@ -43,6 +43,9 @@ def client(db, monkeypatch):
     """A TestClient on the suite's rolled-back connection (mirrors tests/featuregen/api/conftest.py's
     make_client — that fixture is directory-scoped, so this file builds its own)."""
     monkeypatch.setenv("FEATUREGEN_AUTH_STUB", "1")
+    # This 3C.2a suite predates Delivery 0 and tests planner activation, not recognition lineage.
+    # Production defaults to confirmation_required; the dedicated Delivery 0 suite covers it.
+    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "legacy_unscoped")
     app = create_app(llm_client=_flow_llm())
 
     def _test_conn():
@@ -113,7 +116,8 @@ def test_full_flag_on_cross_catalog_flow_never_invokes_permissive_path(
     #    reconstructed server-side from the recorded considered set, never recomputed permissively.
     dr = client.post("/contract/draft", json={
         "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": "governed cross-catalog"}, headers=AUTH)
+        "chosen_option_id": "t_roll", "why": "governed cross-catalog",
+        "expected_generation_run_id": body["generation_run_id"]}, headers=AUTH)
     assert dr.status_code == 200, dr.text
     draft = dr.json()["draft"]
     assert [s["segment"] for s in draft["join_path"]] == list(envelope["ordered_path"])
@@ -139,7 +143,8 @@ def test_drifted_governed_plan_fails_closed_409_without_permissive_fallback(
     _inject_fixture_template(monkeypatch)
     res = client.post("/contract/considered-set", json=_governed_scoped_body(), headers=AUTH)
     assert res.status_code == 200, res.text
-    intent_id = res.json()["intent_id"]
+    considered = res.json()
+    intent_id = considered["intent_id"]
 
     # drift ops (mirror test_draft_rebinding): the FK column's concept flips account_id → customer_id
     rows = [
@@ -151,7 +156,8 @@ def test_drifted_governed_plan_fails_closed_409_without_permissive_fallback(
 
     dr = client.post("/contract/draft", json={
         "intent_id": intent_id, "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": ""}, headers=AUTH)
+        "chosen_option_id": "t_roll", "why": "",
+        "expected_generation_run_id": considered["generation_run_id"]}, headers=AUTH)
     assert dr.status_code == 409, dr.text
     assert "regenerate" in dr.json()["detail"]
     assert permissive_calls == []     # fail-closed, never a permissive substitute path

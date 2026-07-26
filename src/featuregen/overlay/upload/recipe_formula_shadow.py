@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -26,7 +27,6 @@ from featuregen.overlay.upload.recipe_formula_authority import (
 from featuregen.overlay.upload.recipe_formula_contracts import (
     RecipeFormulaPreflightError,
     bind_formula_expectation,
-    expectation_content_hash,
 )
 from featuregen.overlay.upload.recipe_formula_expectations import (
     RECIPE_FORMULA_EXPECTATIONS,
@@ -41,6 +41,7 @@ RECIPE_FORMULA_SHADOW_HANDLER = "recipe_formula_shadow.author.v1"
 INVOCATION_PREDICATE_VERSION = "recipe-formula-invocation-v1"
 CAPTURE_POLICY_VERSION = "recipe-formula-capture-v1"
 MAX_RECIPE_FORMULA_CAPTURES_PER_RUN = 12
+logger = logging.getLogger(__name__)
 
 
 class ShadowIntegrityError(RuntimeError):
@@ -101,6 +102,170 @@ def capture_entry_id(
 def _checked_existing(existing, expected: tuple, label: str) -> None:
     if existing != expected:
         raise ShadowIntegrityError(f"{label} conflicts with its stored identity")
+
+
+def _work_item_material(
+    *,
+    work_item_id: str,
+    idempotency_key: str,
+    capture_entry_id: str,
+    generation_run_id: str,
+    intent_id: str,
+    considered_revision_id: str,
+    considered_content_hash: str,
+    metadata_snapshot_id: str | None,
+    metadata_snapshot_content_hash: str | None,
+    recipe_id: str,
+    recipe_candidate_key: str,
+    recipe_expectation: dict,
+    recipe_expectation_hash: str,
+    binding_envelope: dict,
+    binding_envelope_hash: str,
+    provider_input: dict,
+    provider_input_hash: str,
+    frozen_configuration: dict,
+    frozen_configuration_hash: str,
+    request_identity: dict,
+    request_read_scope_hash: str | None,
+) -> dict[str, Any]:
+    return {
+        "work_item_id": work_item_id,
+        "idempotency_key": idempotency_key,
+        "capture_entry_id": capture_entry_id,
+        "generation_run_id": generation_run_id,
+        "intent_id": intent_id,
+        "considered_revision_id": considered_revision_id,
+        "considered_content_hash": considered_content_hash,
+        "metadata_snapshot_id": metadata_snapshot_id,
+        "metadata_snapshot_content_hash": metadata_snapshot_content_hash,
+        "recipe_id": recipe_id,
+        "recipe_candidate_key": recipe_candidate_key,
+        "recipe_expectation": recipe_expectation,
+        "recipe_expectation_hash": recipe_expectation_hash,
+        "binding_envelope": binding_envelope,
+        "binding_envelope_hash": binding_envelope_hash,
+        "provider_input": provider_input,
+        "provider_input_hash": provider_input_hash,
+        "frozen_configuration": frozen_configuration,
+        "frozen_configuration_hash": frozen_configuration_hash,
+        "request_identity": request_identity,
+        "request_read_scope_hash": request_read_scope_hash,
+    }
+
+
+def verify_work_item_payload(row: Mapping[str, Any]) -> str | None:
+    """Return a stable integrity failure code, or ``None`` for an exact frozen payload."""
+    expectation = row.get("recipe_expectation_json")
+    binding = row.get("binding_envelope_json")
+    provider_input = row.get("provider_input_json")
+    configuration = row.get("frozen_configuration_json")
+    identity = row.get("request_identity_json")
+    if not all(isinstance(value, dict) for value in (
+        expectation, binding, provider_input, configuration, identity
+    )):
+        return "WORK_ITEM_SHAPE_INVALID"
+    if content_hash(expectation) != row.get("recipe_expectation_hash"):
+        return "RECIPE_EXPECTATION_HASH_MISMATCH"
+    if content_hash(binding) != row.get("binding_envelope_hash"):
+        return "BINDING_ENVELOPE_HASH_MISMATCH"
+    if content_hash(provider_input) != row.get("provider_input_hash"):
+        return "PROVIDER_INPUT_HASH_MISMATCH"
+    if configuration.get("configuration_hash") != row.get("frozen_configuration_hash"):
+        return "FROZEN_CONFIGURATION_HASH_MISMATCH"
+    material = _work_item_material(
+        work_item_id=row["work_item_id"],
+        idempotency_key=row["idempotency_key"],
+        capture_entry_id=row["capture_entry_id"],
+        generation_run_id=row["generation_run_id"],
+        intent_id=row["intent_id"],
+        considered_revision_id=row["considered_revision_id"],
+        considered_content_hash=row["considered_content_hash"],
+        metadata_snapshot_id=row.get("metadata_snapshot_id"),
+        metadata_snapshot_content_hash=row.get("metadata_snapshot_content_hash"),
+        recipe_id=row["recipe_id"],
+        recipe_candidate_key=row["recipe_candidate_key"],
+        recipe_expectation=expectation,
+        recipe_expectation_hash=row["recipe_expectation_hash"],
+        binding_envelope=binding,
+        binding_envelope_hash=row["binding_envelope_hash"],
+        provider_input=provider_input,
+        provider_input_hash=row["provider_input_hash"],
+        frozen_configuration=configuration,
+        frozen_configuration_hash=row["frozen_configuration_hash"],
+        request_identity=identity,
+        request_read_scope_hash=row.get("request_read_scope_hash"),
+    )
+    if content_hash(material) != row.get("payload_hash"):
+        return "WORK_ITEM_PAYLOAD_HASH_MISMATCH"
+    return None
+
+
+def _observation_material(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "observation_id": row.get("observation_id"),
+        "idempotency_key": row.get("idempotency_key"),
+        "capture_entry_id": row.get("capture_entry_id"),
+        "generation_run_id": row.get("generation_run_id"),
+        "intent_id": row.get("intent_id"),
+        "considered_revision_id": row.get("considered_revision_id"),
+        "considered_content_hash": row.get("considered_content_hash"),
+        "metadata_snapshot_id": row.get("metadata_snapshot_id"),
+        "metadata_snapshot_content_hash": row.get(
+            "metadata_snapshot_content_hash"
+        ),
+        "recipe_id": row.get("recipe_id"),
+        "recipe_candidate_key": row.get("recipe_candidate_key"),
+        "recipe_expectation": row.get("recipe_expectation_json"),
+        "recipe_expectation_hash": row.get("recipe_expectation_hash"),
+        "binding_envelope": row.get("binding_envelope_json"),
+        "binding_envelope_hash": row.get("binding_envelope_hash"),
+        "provider_input": row.get("provider_input_json"),
+        "provider_input_hash": row.get("provider_input_hash"),
+        "frozen_configuration": row.get("frozen_configuration_json"),
+        "frozen_configuration_hash": row.get("frozen_configuration_hash"),
+        "request_identity": row.get("request_identity_json"),
+        "request_read_scope_hash": row.get("request_read_scope_hash"),
+        "capture_axis": row.get("capture_axis"),
+        "authority_axis": row.get("authority_axis"),
+        "authorization_axis": row.get("authorization_axis"),
+        "drift_axis": row.get("drift_axis"),
+        "configuration_axis": row.get("configuration_axis"),
+        "delivery_axis": row.get("delivery_axis"),
+        "authoring_axis": row.get("authoring_axis"),
+        "technical_axis": row.get("technical_axis"),
+        "authoring_run_id": row.get("authoring_run_id"),
+        "authoring_result": row.get("authoring_result_json"),
+    }
+
+
+def verify_observation_payload(row: Mapping[str, Any]) -> str | None:
+    """Return a stable integrity failure code for an observation, if any."""
+    nested_payloads = (
+        ("recipe_expectation_json", "recipe_expectation_hash",
+         "OBSERVATION_RECIPE_EXPECTATION_HASH_MISMATCH"),
+        ("binding_envelope_json", "binding_envelope_hash",
+         "OBSERVATION_BINDING_ENVELOPE_HASH_MISMATCH"),
+        ("provider_input_json", "provider_input_hash",
+         "OBSERVATION_PROVIDER_INPUT_HASH_MISMATCH"),
+    )
+    for payload_key, hash_key, reason in nested_payloads:
+        payload = row.get(payload_key)
+        expected_hash = row.get(hash_key)
+        if payload is None and expected_hash is None:
+            continue
+        if not isinstance(payload, dict) or content_hash(payload) != expected_hash:
+            return reason
+    configuration = row.get("frozen_configuration_json")
+    configuration_hash = row.get("frozen_configuration_hash")
+    if configuration is not None or configuration_hash is not None:
+        if (
+            not isinstance(configuration, dict)
+            or configuration.get("configuration_hash") != configuration_hash
+        ):
+            return "OBSERVATION_FROZEN_CONFIGURATION_HASH_MISMATCH"
+    if content_hash(_observation_material(row)) != row.get("payload_hash"):
+        return "OBSERVATION_PAYLOAD_HASH_MISMATCH"
+    return None
 
 
 def declare_expected_run(
@@ -344,7 +509,7 @@ def write_observation(
     authoring_run_id: str | None = None,
     authoring_result: dict | None = None,
 ) -> None:
-    payload = {
+    payload = _observation_material({
         "observation_id": observation_id,
         "idempotency_key": idempotency_key,
         "capture_entry_id": capture_entry_id,
@@ -356,10 +521,15 @@ def write_observation(
         "metadata_snapshot_content_hash": metadata_snapshot_content_hash,
         "recipe_id": recipe_id,
         "recipe_candidate_key": recipe_candidate_key,
+        "recipe_expectation_json": recipe_expectation,
         "recipe_expectation_hash": recipe_expectation_hash,
+        "binding_envelope_json": binding_envelope,
         "binding_envelope_hash": binding_envelope_hash,
+        "provider_input_json": provider_input,
         "provider_input_hash": provider_input_hash,
+        "frozen_configuration_json": frozen_configuration,
         "frozen_configuration_hash": frozen_configuration_hash,
+        "request_identity_json": request_identity,
         "request_read_scope_hash": request_read_scope_hash,
         "capture_axis": capture_axis,
         "authority_axis": authority_axis,
@@ -370,8 +540,8 @@ def write_observation(
         "authoring_axis": authoring_axis,
         "technical_axis": technical_axis,
         "authoring_run_id": authoring_run_id,
-        "authoring_result": authoring_result,
-    }
+        "authoring_result_json": authoring_result,
+    })
     digest = content_hash(payload)
     inserted = conn.execute(
         "INSERT INTO recipe_formula_shadow_observation "
@@ -458,24 +628,29 @@ def write_work_item(
     request_read_scope_hash: str | None,
 ) -> None:
     """Persist immutable worker input and its minimal outbox pointer atomically."""
-    material = {
-        "work_item_id": work_item_id,
-        "idempotency_key": idempotency_key,
-        "capture_entry_id": capture_entry_id,
-        "generation_run_id": generation_run_id,
-        "intent_id": intent_id,
-        "considered_revision_id": considered_revision_id,
-        "considered_content_hash": considered_content_hash,
-        "metadata_snapshot_id": metadata_snapshot_id,
-        "metadata_snapshot_content_hash": metadata_snapshot_content_hash,
-        "recipe_id": recipe_id,
-        "recipe_candidate_key": recipe_candidate_key,
-        "recipe_expectation_hash": recipe_expectation_hash,
-        "binding_envelope_hash": binding_envelope_hash,
-        "provider_input_hash": provider_input_hash,
-        "frozen_configuration_hash": frozen_configuration_hash,
-        "request_read_scope_hash": request_read_scope_hash,
-    }
+    material = _work_item_material(
+        work_item_id=work_item_id,
+        idempotency_key=idempotency_key,
+        capture_entry_id=capture_entry_id,
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        considered_revision_id=considered_revision_id,
+        considered_content_hash=considered_content_hash,
+        metadata_snapshot_id=metadata_snapshot_id,
+        metadata_snapshot_content_hash=metadata_snapshot_content_hash,
+        recipe_id=recipe_id,
+        recipe_candidate_key=recipe_candidate_key,
+        recipe_expectation=recipe_expectation,
+        recipe_expectation_hash=recipe_expectation_hash,
+        binding_envelope=binding_envelope,
+        binding_envelope_hash=binding_envelope_hash,
+        provider_input=provider_input,
+        provider_input_hash=provider_input_hash,
+        frozen_configuration=frozen_configuration,
+        frozen_configuration_hash=frozen_configuration_hash,
+        request_identity=request_identity,
+        request_read_scope_hash=request_read_scope_hash,
+    )
     digest = content_hash(material)
     inserted = conn.execute(
         "INSERT INTO recipe_formula_shadow_work_item "
@@ -621,6 +796,134 @@ def finalize_manifest(conn, generation_run_id: str) -> ShadowReconciliation:
     return result
 
 
+def _capture_selected_entry(
+    conn,
+    *,
+    index: int,
+    entry: RankedCaptureEntryV1,
+    common: dict[str, Any],
+    grounding_context_by_candidate_key: Mapping[str, Any],
+    metadata_snapshot_id: str | None,
+    metadata_snapshot_content_hash: str | None,
+    hypothesis: str,
+    prediction_goal: str,
+    identity: IdentityEnvelope,
+    request_read_scope_hash: str | None,
+) -> None:
+    if index >= MAX_RECIPE_FORMULA_CAPTURES_PER_RUN:
+        write_observation(
+            conn,
+            **common,
+            capture_axis="BUDGET_TRUNCATED",
+            technical_axis="CAPTURE_INCOMPLETE",
+        )
+        return
+    if entry.candidate_resolution != "EXACT" or entry.recipe_candidate_key is None:
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURE_INPUT_INCOMPLETE",
+            technical_axis=f"CANDIDATE_{entry.candidate_resolution}",
+        )
+        return
+    context = grounding_context_by_candidate_key.get(entry.recipe_candidate_key)
+    blueprint = RECIPE_FORMULA_EXPECTATIONS.get(entry.recipe_id)
+    if context is None or blueprint is None:
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURE_INPUT_INCOMPLETE",
+            technical_axis="PRIVATE_CONTEXT_MISSING",
+        )
+        return
+    if (
+        metadata_snapshot_id is None
+        or metadata_snapshot_content_hash is None
+        or request_read_scope_hash is None
+    ):
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURE_INPUT_INCOMPLETE",
+            technical_axis="METADATA_SNAPSHOT_LINEAGE_MISSING",
+        )
+        return
+    try:
+        expectation = bind_formula_expectation(context, blueprint)
+        egress = build_recipe_authoring_egress(
+            hypothesis=hypothesis,
+            prediction_goal=prediction_goal,
+            expectation=expectation,
+        )
+        configuration = freeze_current_configuration(
+            generation_settings=current_formula_generation_settings(),
+            author_instruction=AUTHOR_INSTRUCTION,
+            author_prompt_id=AUTHOR_PROMPT_ID,
+        )
+    except RecipeFormulaPreflightError as exc:
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURE_INPUT_INCOMPLETE",
+            technical_axis=exc.code,
+        )
+        return
+    except ValueError:
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURE_INPUT_INCOMPLETE",
+            technical_axis="FORMULA_PREFLIGHT_INVALID",
+        )
+        return
+    authority = build_formula_authority_envelope(
+        conn,
+        context=context,
+        expectation=expectation,
+    )
+    expectation_json = asdict(expectation)
+    bound_expectation_hash = content_hash(expectation_json)
+    if isinstance(authority, FormulaAuthorityRejection):
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURED",
+            recipe_expectation=expectation_json,
+            recipe_expectation_hash=bound_expectation_hash,
+            authority_axis=authority.reason,
+            delivery_axis="NOT_ENQUEUED",
+            technical_axis="OK",
+        )
+        return
+    provider_input = egress.provider_payload()
+    configuration_json = frozen_configuration_json(configuration)
+    idempotency_key = common["idempotency_key"]
+    write_work_item(
+        conn,
+        work_item_id=f"rfw_{idempotency_key[:24]}",
+        idempotency_key=idempotency_key,
+        capture_entry_id=entry.capture_entry_id,
+        generation_run_id=common["generation_run_id"],
+        intent_id=common["intent_id"],
+        considered_revision_id=common["considered_revision_id"],
+        considered_content_hash=common["considered_content_hash"],
+        metadata_snapshot_id=metadata_snapshot_id,
+        metadata_snapshot_content_hash=metadata_snapshot_content_hash,
+        recipe_id=entry.recipe_id,
+        recipe_candidate_key=entry.recipe_candidate_key,
+        recipe_expectation=expectation_json,
+        recipe_expectation_hash=bound_expectation_hash,
+        binding_envelope=authority.to_json(),
+        binding_envelope_hash=authority.content_hash,
+        provider_input=provider_input,
+        provider_input_hash=egress.content_hash,
+        frozen_configuration=configuration_json,
+        frozen_configuration_hash=configuration.configuration_hash,
+        request_identity=identity_to_jsonb(identity),
+        request_read_scope_hash=request_read_scope_hash,
+    )
+
+
 def capture_ranked_shadow(
     conn,
     *,
@@ -701,108 +1004,41 @@ def capture_ranked_shadow(
             "recipe_id": entry.recipe_id,
             "recipe_candidate_key": entry.recipe_candidate_key,
         }
-        if index >= MAX_RECIPE_FORMULA_CAPTURES_PER_RUN:
-            write_observation(
-                conn,
-                **common,
-                capture_axis="BUDGET_TRUNCATED",
-                technical_axis="CAPTURE_INCOMPLETE",
-            )
-            continue
-        if entry.candidate_resolution != "EXACT" or entry.recipe_candidate_key is None:
-            write_observation(
-                conn,
-                **common,
-                capture_axis="CAPTURE_INPUT_INCOMPLETE",
-                technical_axis=f"CANDIDATE_{entry.candidate_resolution}",
-            )
-            continue
-        context = grounding_context_by_candidate_key.get(entry.recipe_candidate_key)
-        blueprint = RECIPE_FORMULA_EXPECTATIONS.get(entry.recipe_id)
-        if context is None or blueprint is None:
-            write_observation(
-                conn,
-                **common,
-                capture_axis="CAPTURE_INPUT_INCOMPLETE",
-                technical_axis="PRIVATE_CONTEXT_MISSING",
-            )
-            continue
-        if (
-            metadata_snapshot_id is None
-            or metadata_snapshot_content_hash is None
-            or request_read_scope_hash is None
-        ):
-            write_observation(
-                conn,
-                **common,
-                capture_axis="CAPTURE_INPUT_INCOMPLETE",
-                technical_axis="METADATA_SNAPSHOT_LINEAGE_MISSING",
-            )
-            continue
         try:
-            expectation = bind_formula_expectation(context, blueprint)
-            egress = build_recipe_authoring_egress(
-                hypothesis=hypothesis,
-                prediction_goal=prediction_goal,
-                expectation=expectation,
+            with conn.transaction():
+                _capture_selected_entry(
+                    conn,
+                    index=index,
+                    entry=entry,
+                    common=common,
+                    grounding_context_by_candidate_key=grounding_context_by_candidate_key,
+                    metadata_snapshot_id=metadata_snapshot_id,
+                    metadata_snapshot_content_hash=metadata_snapshot_content_hash,
+                    hypothesis=hypothesis,
+                    prediction_goal=prediction_goal,
+                    identity=identity,
+                    request_read_scope_hash=request_read_scope_hash,
+                )
+        except Exception:
+            logger.exception(
+                "recipe formula capture failed for %s; recording terminal failure",
+                entry.capture_entry_id,
             )
-            configuration = freeze_current_configuration(
-                generation_settings=current_formula_generation_settings(),
-                author_instruction=AUTHOR_INSTRUCTION,
-                author_prompt_id=AUTHOR_PROMPT_ID,
-            )
-        except (RecipeFormulaPreflightError, ValueError) as exc:
-            write_observation(
-                conn,
-                **common,
-                capture_axis="CAPTURE_INPUT_INCOMPLETE",
-                technical_axis=type(exc).__name__,
-            )
-            continue
-        authority = build_formula_authority_envelope(
-            conn,
-            context=context,
-            expectation=expectation,
-        )
-        if isinstance(authority, FormulaAuthorityRejection):
-            write_observation(
-                conn,
-                **common,
-                capture_axis="CAPTURED",
-                recipe_expectation=asdict(expectation),
-                recipe_expectation_hash=expectation_content_hash(blueprint),
-                authority_axis=authority.reason,
-                delivery_axis="NOT_ENQUEUED",
-                technical_axis="OK",
-            )
-            continue
-        expectation_json = asdict(expectation)
-        provider_input = egress.provider_payload()
-        configuration_json = frozen_configuration_json(configuration)
-        work_item_id = f"rfw_{idempotency_key[:24]}"
-        write_work_item(
-            conn,
-            work_item_id=work_item_id,
-            idempotency_key=idempotency_key,
-            capture_entry_id=entry.capture_entry_id,
-            generation_run_id=generation_run_id,
-            intent_id=intent_id,
-            considered_revision_id=considered_revision_id,
-            considered_content_hash=considered_content_hash,
-            metadata_snapshot_id=metadata_snapshot_id,
-            metadata_snapshot_content_hash=metadata_snapshot_content_hash,
-            recipe_id=entry.recipe_id,
-            recipe_candidate_key=entry.recipe_candidate_key,
-            recipe_expectation=expectation_json,
-            recipe_expectation_hash=expectation_content_hash(blueprint),
-            binding_envelope=authority.to_json(),
-            binding_envelope_hash=authority.content_hash,
-            provider_input=provider_input,
-            provider_input_hash=egress.content_hash,
-            frozen_configuration=configuration_json,
-            frozen_configuration_hash=configuration.configuration_hash,
-            request_identity=identity_to_jsonb(identity),
-            request_read_scope_hash=request_read_scope_hash,
-        )
+            try:
+                with conn.transaction():
+                    write_observation(
+                        conn,
+                        **common,
+                        capture_axis="CAPTURE_INPUT_INCOMPLETE",
+                        delivery_axis="NOT_ENQUEUED",
+                        technical_axis="CAPTURE_PERSIST_FAILED",
+                    )
+            except Exception:
+                # The declared manifest still expects this entry. Reconciliation therefore remains
+                # INCOMPLETE; the log is diagnostic, never the source of readiness truth.
+                logger.exception(
+                    "recipe formula terminal capture failure could not be persisted for %s",
+                    entry.capture_entry_id,
+                )
     result = reconcile_run(conn, generation_run_id)
     return finalize_manifest(conn, generation_run_id) if result.status == "COMPLETE" else result

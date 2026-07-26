@@ -42,6 +42,7 @@ from featuregen.overlay.upload.recipe_formula_authority import (
 )
 from featuregen.overlay.upload.recipe_formula_shadow import (
     finalize_manifest,
+    verify_work_item_payload,
     write_observation,
 )
 from featuregen.runtime.queue import (
@@ -171,6 +172,17 @@ def process_recipe_formula_shadow_once(
             fail_recipe_formula_shadow(
                 conn, claim, error="work item missing", permanent=True)
             return FormulaShadowWorkerOutcome("dead", str(work_item_id))
+        integrity_failure = verify_work_item_payload(row)
+        if integrity_failure is not None:
+            return _terminalize(conn, claim, row, axes={
+                "authorization_axis": "NOT_EVALUATED",
+                "authority_axis": "NOT_EVALUATED",
+                "drift_axis": "NOT_EVALUATED",
+                "configuration_axis": "NOT_EVALUATED",
+                "delivery_axis": "NOT_DISPATCHED",
+                "authoring_axis": "NOT_RUN",
+                "technical_axis": integrity_failure,
+            })
         existing = conn.execute(
             "SELECT observation_id FROM recipe_formula_shadow_observation "
             "WHERE capture_entry_id=%s",

@@ -5,12 +5,18 @@ from types import SimpleNamespace
 import psycopg
 import pytest
 
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.overlay.upload import recipe_formula_shadow as shadow_module
 from featuregen.overlay.upload.recipe_formula_shadow import (
     ShadowIntegrityError,
     build_capture_entries,
+    capture_ranked_shadow,
+    content_hash,
     declare_expected_run,
     finalize_manifest,
     reconcile_run,
+    verify_observation_payload,
+    verify_work_item_payload,
     write_manifest,
     write_observation,
     write_work_item,
@@ -196,6 +202,18 @@ def test_shadow_population_rows_are_write_once(db):
         db.execute(
             "UPDATE recipe_formula_shadow_observation SET technical_axis='tampered' "
             "WHERE observation_id='observation-worm'")
+    cursor = db.execute(
+        "SELECT * FROM recipe_formula_shadow_observation "
+        "WHERE observation_id='observation-worm'"
+    )
+    columns = [description.name for description in cursor.description]
+    stored = dict(zip(columns, cursor.fetchone(), strict=True))
+    assert verify_observation_payload(stored) is None
+    stored["technical_axis"] = "tampered"
+    assert (
+        verify_observation_payload(stored)
+        == "OBSERVATION_PAYLOAD_HASH_MISMATCH"
+    )
 
 
 def test_unscoped_run_is_not_a_missing_manifest(db):
@@ -219,11 +237,12 @@ def test_work_item_and_outbox_are_atomic_and_content_checked(db):
         "recipe_id": "merchant_mcc_diversity",
         "recipe_candidate_key": "candidate-1",
         "recipe_expectation": {"recipe": "merchant_mcc_diversity"},
-        "recipe_expectation_hash": "expectation-hash",
+        "recipe_expectation_hash": content_hash(
+            {"recipe": "merchant_mcc_diversity"}),
         "binding_envelope": {"bindings": []},
-        "binding_envelope_hash": "binding-hash",
+        "binding_envelope_hash": content_hash({"bindings": []}),
         "provider_input": {"hypothesis": "h"},
-        "provider_input_hash": "input-hash",
+        "provider_input_hash": content_hash({"hypothesis": "h"}),
         "frozen_configuration": {"configuration_hash": "config-hash"},
         "frozen_configuration_hash": "config-hash",
         "request_identity": {"subject": "user:test"},
@@ -243,8 +262,94 @@ def test_work_item_and_outbox_are_atomic_and_content_checked(db):
         "recipe_formula_shadow.requested.v1",
         {"work_item_id": "work-1"},
     )
+    stored = db.execute(
+        "SELECT * FROM recipe_formula_shadow_work_item "
+        "WHERE work_item_id='work-1'",
+    ).fetchone()
+    columns = [
+        description.name
+        for description in db.execute(
+            "SELECT * FROM recipe_formula_shadow_work_item LIMIT 0").description
+    ]
+    assert verify_work_item_payload(dict(zip(columns, stored, strict=True))) is None
     with pytest.raises(ShadowIntegrityError):
         write_work_item(db, **{**values, "provider_input_hash": "changed"})
+    with pytest.raises(ShadowIntegrityError):
+        write_work_item(
+            db,
+            **{
+                **values,
+                "request_identity": {"subject": "different-user"},
+            },
+        )
     with pytest.raises(psycopg.errors.RaiseException), db.transaction():
         db.execute(
             "DELETE FROM recipe_formula_shadow_work_item WHERE work_item_id='work-1'")
+
+
+def test_one_capture_failure_does_not_erase_other_ranked_entries(
+    db, monkeypatch
+) -> None:
+    intent_id, run_id, scope_id, revision_id, considered_hash = _seed_lineage(
+        db, "isolated")
+    ranked = tuple(
+        SimpleNamespace(
+            recipe_id=recipe_id,
+            canonical_rank=index,
+            selected_for_initial_view=True,
+            rank_reasons=("primary",),
+            initial_view_reasons=("selected",),
+        )
+        for index, recipe_id in enumerate(
+            ("merchant_mcc_diversity", "obligor_facility_count"), start=1)
+    )
+
+    def _capture(conn, *, index, common, **kwargs):
+        del kwargs
+        if index == 0:
+            raise RuntimeError("candidate write failed")
+        write_observation(
+            conn,
+            **common,
+            capture_axis="CAPTURE_INPUT_INCOMPLETE",
+            technical_axis="SECOND_ENTRY_RECORDED",
+        )
+
+    monkeypatch.setattr(shadow_module, "_capture_selected_entry", _capture)
+    result = capture_ranked_shadow(
+        db,
+        generation_run_id=run_id,
+        intent_id=intent_id,
+        confirmed_scope_id=scope_id,
+        considered_revision_id=revision_id,
+        considered_content_hash=considered_hash,
+        metadata_snapshot_id="snapshot-isolated",
+        metadata_snapshot_content_hash="snapshot-hash-isolated",
+        ranked=ranked,
+        ranking_version="rank-v1",
+        ranking_enabled=True,
+        candidate_keys_by_recipe_id={
+            "merchant_mcc_diversity": ("candidate-merchant",),
+            "obligor_facility_count": ("candidate-obligor",),
+        },
+        grounding_context_by_candidate_key={},
+        hypothesis="h",
+        prediction_goal="g",
+        identity=IdentityEnvelope(
+            subject="user:test",
+            actor_kind="human",
+            authenticated=True,
+            auth_method="password",
+            role_claims=("analyst",),
+        ),
+        request_read_scope_hash="scope-hash",
+    )
+    assert result.status == "COMPLETE"
+    assert db.execute(
+        "SELECT technical_axis FROM recipe_formula_shadow_observation "
+        "WHERE generation_run_id=%s ORDER BY recipe_id",
+        (run_id,),
+    ).fetchall() == [
+        ("CAPTURE_PERSIST_FAILED",),
+        ("SECOND_ENTRY_RECORDED",),
+    ]

@@ -734,7 +734,8 @@ def drive_audited_structured_call(
         cacheable_metadata_keys: tuple[str, ...] = (),
         run_id: str = ENRICHMENT_RUN_ID,
         record_egress_block: bool = False,
-        generation_settings: dict | None = None) -> AuditedStructuredResult:
+        generation_settings: dict | None = None,
+        logical_call_ref: str | None = None) -> AuditedStructuredResult:
     """The outcome-returning core of ``audited_structured_call`` (same governance, richer return —
     mirrors ``drive_structured_call`` naming). Two ADDITIVE knobs beyond that seam's parameters,
     both defaulting to the historical behavior so ``audited_structured_call`` stays byte-identical:
@@ -823,7 +824,10 @@ def drive_audited_structured_call(
     dispatch_client: LLMClient = client
     auditing_client: AuditingClient | None = None
     if dispatch_audit is not None:
-        auditing_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
+        auditing_client = AuditingClient(
+            client,
+            dispatch_audit,
+            logical_call_ref=logical_call_ref or mint_id("lc"),
                                          redaction_version=redaction_version)
         dispatch_client = auditing_client
     outcome = drive_structured_call(

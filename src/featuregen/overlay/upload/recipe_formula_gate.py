@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from psycopg.rows import dict_row
+
+from featuregen.overlay.upload.recipe_formula_shadow import (
+    verify_observation_payload,
+)
+
 AUTHORABLE_RECIPE_IDS = frozenset({
     "merchant_mcc_diversity",
     "obligor_facility_count",
@@ -160,20 +166,29 @@ def build_population_report(
     run_ids = [row[0] for row in expected]
     observations = []
     if run_ids:
-        observations = conn.execute(
-            "SELECT recipe_id,authorization_axis,delivery_axis,authoring_axis,"
-            "technical_axis,authoring_result_json "
-            "FROM recipe_formula_shadow_observation "
-            "WHERE generation_run_id = ANY(%s)",
-            (run_ids,),
-        ).fetchall()
+        with conn.cursor(row_factory=dict_row) as cursor:
+            observations = cursor.execute(
+                "SELECT * FROM recipe_formula_shadow_observation "
+                "WHERE generation_run_id = ANY(%s)",
+                (run_ids,),
+            ).fetchall()
     malformed = 0
     dispatched = 0
     resolved = 0
     technical = 0
     unreconciled = 0
     positives = {recipe_id: 0 for recipe_id in AUTHORABLE_RECIPE_IDS}
-    for recipe_id, authorization, delivery, authoring, technical_axis, result in observations:
+    for observation in observations:
+        if verify_observation_payload(observation) is not None:
+            malformed += 1
+            technical += 1
+            continue
+        recipe_id = observation["recipe_id"]
+        authorization = observation["authorization_axis"]
+        delivery = observation["delivery_axis"]
+        authoring = observation["authoring_axis"]
+        technical_axis = observation["technical_axis"]
+        result = observation["authoring_result_json"]
         if (
             authorization not in _TERMINAL_AUTHORIZATIONS
             or delivery not in _TERMINAL_DELIVERY

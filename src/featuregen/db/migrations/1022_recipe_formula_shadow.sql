@@ -2,6 +2,7 @@
 ALTER TABLE outbox ADD COLUMN IF NOT EXISTS payload_hash text NULL;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS payload_hash text NULL;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS lease_fence bigint NOT NULL DEFAULT 0;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS physical_request_hash text NULL;
 
 CREATE TABLE IF NOT EXISTS recipe_formula_shadow_expected_run (
     generation_run_id            text PRIMARY KEY
@@ -75,13 +76,29 @@ CREATE TABLE IF NOT EXISTS recipe_formula_shadow_observation (
     frozen_configuration_hash    text NULL,
     request_identity_json        jsonb NULL,
     request_read_scope_hash      text NULL,
-    capture_axis                 text NOT NULL,
-    authorization_axis           text NOT NULL DEFAULT 'NOT_EVALUATED',
+    capture_axis                 text NOT NULL CHECK (capture_axis IN
+                                      ('CAPTURED','CAPTURE_INPUT_INCOMPLETE','BUDGET_TRUNCATED')),
+    authorization_axis           text NOT NULL DEFAULT 'NOT_EVALUATED' CHECK (
+                                      authorization_axis IN
+                                      ('NOT_EVALUATED','AUTHORIZED_CURRENT',
+                                       'AUTHORIZATION_REVOKED','AUTHORIZATION_UNVERIFIABLE',
+                                       'AUTHORIZATION_SCOPE_CHANGED')),
     authority_axis               text NOT NULL DEFAULT 'NOT_EVALUATED',
-    drift_axis                   text NOT NULL DEFAULT 'NOT_EVALUATED',
-    configuration_axis           text NOT NULL DEFAULT 'NOT_EVALUATED',
-    delivery_axis                text NOT NULL DEFAULT 'NOT_ENQUEUED',
-    authoring_axis               text NOT NULL DEFAULT 'NOT_RUN',
+    drift_axis                   text NOT NULL DEFAULT 'NOT_EVALUATED' CHECK (
+                                      drift_axis IN
+                                      ('NOT_EVALUATED','CURRENT','DRIFT_DRIFTED',
+                                       'DRIFT_UNVERIFIABLE','AUTHORITY_DRIFTED')),
+    configuration_axis           text NOT NULL DEFAULT 'NOT_EVALUATED' CHECK (
+                                      configuration_axis IN
+                                      ('NOT_EVALUATED','CURRENT','DRIFTED','UNVERIFIABLE')),
+    delivery_axis                text NOT NULL DEFAULT 'NOT_ENQUEUED' CHECK (
+                                      delivery_axis IN
+                                      ('NOT_ENQUEUED','NOT_DISPATCHED','EGRESS_REJECTED',
+                                       'DISPATCHED_AUDITED','PRIOR_DISPATCH_UNRECONCILED')),
+    authoring_axis               text NOT NULL DEFAULT 'NOT_RUN' CHECK (
+                                      authoring_axis IN
+                                      ('NOT_RUN','RESOLVED','NEEDS_REVIEW','UNSUPPORTED',
+                                       'REJECTED','TECHNICAL_FAILURE')),
     technical_axis               text NOT NULL DEFAULT 'OK',
     authoring_run_id             text NULL,
     authoring_result_json        jsonb NULL,

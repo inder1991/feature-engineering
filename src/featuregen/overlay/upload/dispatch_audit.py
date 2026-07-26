@@ -22,6 +22,8 @@ never raw upload text.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -46,12 +48,35 @@ class AuditUnavailable(Exception):
     """The pre-dispatch audit could not be durably committed — the caller must NOT dispatch."""
 
 
+class AuditIntegrityError(AuditUnavailable):
+    """An idempotency key was reused for materially different provider egress."""
+
+
+def compute_physical_request_hash(request: LLMRequest) -> str:
+    """Hash every provider-facing request field, including transient repair input."""
+    material = {
+        "task": request.task,
+        "prompt_id": request.prompt_id,
+        "prompt_version": request.prompt_version,
+        "inputs": dict(request.inputs),
+        "output_schema_id": request.output_schema_id,
+        "output_schema_version": request.output_schema_version,
+        "output_schema": request.output_schema,
+        "generation_settings": request.generation_settings,
+        "cacheable_metadata_keys": list(request.cacheable_metadata_keys),
+    }
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id: str | None,
                     stage: str, task: str, redacted_input: dict, input_hash: str,
                     subjects: list[dict], redaction_version: str | None = None,
                     provider: str | None = None, model: str | None = None,
                     prompt_version: int | None = None,
-                    schema_version: int | None = None) -> str:
+                    schema_version: int | None = None,
+                    physical_request_hash: str | None = None) -> str:
     """Mint a dispatch_ref; on an OWN connection (``get_settings().dsn``) INSERT one immutable
     ``llm_dispatch`` header + one ``llm_dispatch_subject`` row per subject, and COMMIT
     independently (survives an upload rollback). Returns the dispatch_ref.
@@ -78,23 +103,40 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
             row = audit_conn.execute(
                 "INSERT INTO llm_dispatch (dispatch_ref, logical_call_ref, attempt_no, "
                 "ingestion_run_id, stage, task, input_hash, redacted_input, redaction_version, "
-                "provider, model, prompt_version, schema_version) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "provider, model, prompt_version, schema_version, physical_request_hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
                 (dispatch_ref, logical_call_ref, attempt_no, ingestion_run_id, stage, task,
                  input_hash, Jsonb(redacted_input), redaction_version, provider, model,
-                 prompt_version, schema_version)).fetchone()
+                 prompt_version, schema_version, physical_request_hash)).fetchone()
             if row is None:
-                # Idempotent replay: this (logical_call_ref, attempt_no) is already audited.
-                # The header is write-once, so the prior record is authoritative — return it.
                 existing = audit_conn.execute(
-                    "SELECT dispatch_ref FROM llm_dispatch "
+                    "SELECT dispatch_ref,ingestion_run_id,stage,task,input_hash,redacted_input,"
+                    "redaction_version,provider,model,prompt_version,schema_version,"
+                    "physical_request_hash FROM llm_dispatch "
                     "WHERE logical_call_ref = %s AND attempt_no = %s",
                     (logical_call_ref, attempt_no)).fetchone()
                 if existing is None:   # unreachable outside a torn DB — still fail closed
                     raise AuditUnavailable(
                         f"pre-dispatch audit conflict for {logical_call_ref!r} attempt "
                         f"{attempt_no} but the prior record could not be read back")
+                expected = (
+                    ingestion_run_id,
+                    stage,
+                    task,
+                    input_hash,
+                    redacted_input,
+                    redaction_version,
+                    provider,
+                    model,
+                    prompt_version,
+                    schema_version,
+                    physical_request_hash,
+                )
+                if existing[1:] != expected:
+                    raise AuditIntegrityError(
+                        f"pre-dispatch identity {logical_call_ref!r} attempt {attempt_no} "
+                        "was reused for materially different egress")
                 return existing[0]
             for subject in subjects:
                 audit_conn.execute(
@@ -269,7 +311,8 @@ class AuditingClient:
                 redaction_version=self._redaction_version,
                 provider=gen.get("provider"), model=gen.get("model"),
                 prompt_version=request.prompt_version,
-                schema_version=request.output_schema_version)
+                schema_version=request.output_schema_version,
+                physical_request_hash=compute_physical_request_hash(request))
         except AuditUnavailable:
             logger.warning(
                 "pre-dispatch audit unavailable for %s attempt %s — provider NOT called "

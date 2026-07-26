@@ -9,6 +9,7 @@ from featuregen.identity.current_principal import (
 )
 from featuregen.overlay.upload.recipe_formula_shadow import (
     build_capture_entries,
+    content_hash,
     declare_expected_run,
     write_manifest,
     write_work_item,
@@ -117,16 +118,21 @@ def _seed_work(db, suffix: str = "1"):
         recipe_id="merchant_mcc_diversity",
         recipe_candidate_key="candidate-1",
         recipe_expectation=expectation,
-        recipe_expectation_hash=f"expectation-hash-{suffix}",
+        recipe_expectation_hash=content_hash(expectation),
         binding_envelope={"bindings": []},
-        binding_envelope_hash=f"binding-hash-{suffix}",
+        binding_envelope_hash=content_hash({"bindings": []}),
         provider_input={
             "hypothesis": "merchant diversity",
             "prediction_goal": "identify merchant fraud",
             "target_entity": "customer",
             "formula_expectation": expectation,
         },
-        provider_input_hash=f"provider-hash-{suffix}",
+        provider_input_hash=content_hash({
+            "hypothesis": "merchant diversity",
+            "prediction_goal": "identify merchant fraud",
+            "target_entity": "customer",
+            "formula_expectation": expectation,
+        }),
         frozen_configuration={"configuration_hash": f"config-hash-{suffix}"},
         frozen_configuration_hash=f"config-hash-{suffix}",
         request_identity={
