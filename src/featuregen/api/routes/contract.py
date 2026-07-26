@@ -30,6 +30,7 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
+from featuregen.intake.redaction import REDACTION_VERSION
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import (
     ContractDraft,
@@ -76,8 +77,16 @@ from featuregen.overlay.upload.contract.live_activation import (
 from featuregen.overlay.upload.contract.review import author_contract
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required, scope_mode_status
 from featuregen.overlay.upload.contract.scope_records import (
+    GenerationInputUnavailable,
+    RecognitionInput,
+    RecognitionInputUnavailable,
     dimension_provenance,
+    generation_input_for_run,
+    load_recognition_input,
+    recognition_id_for_scope,
+    recognition_input_material,
     record_confirmed_scope,
+    record_generation_input,
     record_recognition_attempt,
 )
 from featuregen.overlay.upload.feature_metadata_snapshot import (
@@ -372,6 +381,29 @@ def _ranking_json(r: RankedRecipe) -> dict:
             "initial_view_reasons": [c.value for c in r.initial_view_reasons]}
 
 
+def _target_for_generation(
+    conn,
+    *,
+    intent_id: str,
+    snapshot_lineage: dict | None,
+) -> str | None:
+    """Resolve leakage authority from the exact chosen run, with legacy fallback only in legacy mode."""
+    generation_run_id = (
+        snapshot_lineage.get("generation_run_id") if snapshot_lineage is not None else None)
+    if generation_run_id is not None:
+        try:
+            sealed = generation_input_for_run(conn, generation_run_id)
+        except GenerationInputUnavailable as e:
+            raise HTTPException(status_code=409, detail="GENERATION_INPUT_INVALID") from e
+        if sealed is not None:
+            if sealed.intent_id != intent_id:
+                raise HTTPException(status_code=409, detail="GENERATION_INPUT_LINEAGE_CHANGED")
+            return sealed.target_ref
+    if confirmation_required():
+        raise HTTPException(status_code=409, detail="GENERATION_INPUT_UNAVAILABLE")
+    return intent_target_ref(conn, intent_id)
+
+
 def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
                            client: LLMClient | None) -> dict:
     """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
@@ -449,6 +481,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     try:
         intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
                                actor=identity.subject)
+        submitted_goal = redact_free_text(body.objective, label="prediction goal")
+        submitted_feedback = redact_free_text(body.feedback or "", label="feedback")
     except IntentValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     if body.intent_id:
@@ -462,29 +496,55 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if owned is None:
             raise HTTPException(status_code=404, detail="unknown intent")
         intent = replace(intent, intent_id=body.intent_id)
+    effective_recognition_id = body.recognition_id
+    sealed_recognition: RecognitionInput | None = None
     if confirmation_required():
         if body.recognition_id is None and body.supersedes_scope_id is None:
             raise HTTPException(
                 status_code=422,
                 detail="confirmed scope must reference its recognition or prior confirmed scope",
             )
-        if body.recognition_id is not None:
-            recognition_owned = conn.execute(
-                "SELECT 1 FROM intent_recognition_attempt a "
-                "JOIN contract_intent i ON i.intent_id = a.intent_id "
-                "WHERE a.recognition_id = %s AND a.intent_id = %s AND i.actor = %s::jsonb",
-                (body.recognition_id, intent.intent_id, _actor_json(intent.actor)),
-            ).fetchone()
-            if recognition_owned is None:
-                raise HTTPException(status_code=404, detail="unknown recognition")
         if body.supersedes_scope_id is not None:
             prior_owned = conn.execute(
-                "SELECT 1 FROM confirmed_generation_scope "
+                "SELECT recognition_id FROM confirmed_generation_scope "
                 "WHERE scope_id = %s AND intent_id = %s AND confirmed_by = %s",
                 (body.supersedes_scope_id, intent.intent_id, identity.subject),
             ).fetchone()
             if prior_owned is None:
                 raise HTTPException(status_code=404, detail="unknown prior confirmed scope")
+            prior_recognition_id = recognition_id_for_scope(
+                conn, scope_id=body.supersedes_scope_id, intent_id=intent.intent_id)
+            if effective_recognition_id is None:
+                effective_recognition_id = prior_recognition_id
+            elif (prior_recognition_id is not None
+                  and prior_recognition_id != effective_recognition_id):
+                raise HTTPException(
+                    status_code=409, detail="RECOGNITION_LINEAGE_CHANGED")
+        if effective_recognition_id is None:
+            raise HTTPException(
+                status_code=409, detail="RECOGNITION_INPUT_UNAVAILABLE")
+        recognition_owned = conn.execute(
+            "SELECT 1 FROM intent_recognition_attempt a "
+            "JOIN contract_intent i ON i.intent_id = a.intent_id "
+            "WHERE a.recognition_id = %s AND a.intent_id = %s AND i.actor = %s::jsonb",
+            (effective_recognition_id, intent.intent_id, _actor_json(intent.actor)),
+        ).fetchone()
+        if recognition_owned is None:
+            raise HTTPException(status_code=404, detail="unknown recognition")
+        try:
+            sealed_recognition = load_recognition_input(
+                conn,
+                recognition_id=effective_recognition_id,
+                intent_id=intent.intent_id,
+            )
+        except RecognitionInputUnavailable as e:
+            raise HTTPException(
+                status_code=409, detail="RECOGNITION_INPUT_UNAVAILABLE") from e
+        if (
+            intent.redacted_hypothesis != sealed_recognition.redacted_hypothesis
+            or submitted_goal != sealed_recognition.redacted_prediction_goal
+        ):
+            raise HTTPException(status_code=409, detail="RECOGNITION_INPUT_CHANGED")
     client = _require_generation_llm(client)
     # 3C.2a — the LIVE governed cross-catalog readiness interlock. On an entity-scoped run (no single
     # catalog) with the live flag ON, the deployment MUST be activation-approved BEFORE any LLM/planner
@@ -500,7 +560,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     generation_run_id = mint_id("grun")
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
     # before any generation). The intent is durably recorded first so the lineage reads intent→run→scope.
-    persist_intent(conn, intent, body.target_ref)
+    persist_intent(conn, intent, body.target_ref if not confirmation_required() else None)
     ensure_generation_run(
         conn,
         generation_run_id,
@@ -515,13 +575,36 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # Reconstruct each confirmed dimension's provenance from the IMMUTABLE recognition attempt (never the
     # client): a value the recognizer proposed is ``accepted_llm_proposal``, one the human introduced is
     # ``user_added``, and a corrected entity is a ``user_replacement`` recording what it superseded.
-    dim_sources, dim_replaces = dimension_provenance(conn, body.recognition_id, scope)
+    dim_sources, dim_replaces = dimension_provenance(conn, effective_recognition_id, scope)
     scope_id = record_confirmed_scope(
         conn, intent_id=intent.intent_id, generation_run_id=generation_run_id,
-        recognition_id=body.recognition_id, scope=scope,
+        recognition_id=effective_recognition_id, scope=scope,
         use_case_origins=cscope.use_case_origins, confirmation_source=cscope.confirmation_source,
         confirmed_by=identity.subject, supersedes_scope_id=body.supersedes_scope_id,
         dimension_sources=dim_sources, replaces=dim_replaces)
+    sealed_generation = (
+        record_generation_input(
+            conn,
+            generation_run_id=generation_run_id,
+            intent_id=intent.intent_id,
+            recognition=sealed_recognition,
+            confirmed_scope_id=scope_id,
+            redacted_definition=intent.redacted_definition,
+            redacted_feedback=submitted_feedback,
+            target_ref=body.target_ref,
+            actor=identity,
+        )
+        if sealed_recognition is not None
+        else None
+    )
+    run_target_ref = (
+        sealed_generation.target_ref if sealed_generation is not None else body.target_ref)
+    run_prediction_goal = (
+        sealed_generation.redacted_prediction_goal
+        if sealed_generation is not None else submitted_goal)
+    run_feedback = (
+        sealed_generation.redacted_feedback
+        if sealed_generation is not None else submitted_feedback)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
     now = datetime.now(UTC)
@@ -536,8 +619,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     try:
         cs = build_considered_set(
             conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-            feedback=body.feedback, now=now, applicability=applicability,
+            roles=identity.role_claims, target_ref=run_target_ref, objective=run_prediction_goal,
+            feedback=run_feedback, now=now, applicability=applicability,
             is_live=is_live, target_entity=scope.target_entity,
             generation_run_id=generation_run_id)
     except CatalogProjectionUnavailable as e:
@@ -612,6 +695,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                     "WHERE r.considered_revision_id=%s",
                     (cs.considered_revision_id,),
                 ).fetchone()
+                if revision is None or not isinstance(revision[2], str):
+                    raise ValueError("recipe formula shadow requires snapshot read-scope lineage")
                 capture_ranked_shadow(
                     conn,
                     generation_run_id=generation_run_id,
@@ -628,9 +713,9 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                     grounding_context_by_candidate_key=(
                         cs.recipe_grounding_context_by_candidate_key),
                     hypothesis=intent.redacted_hypothesis,
-                    prediction_goal=body.objective or "",
+                    prediction_goal=run_prediction_goal,
                     identity=identity,
-                    request_read_scope_hash=revision[2] if revision else None,
+                    request_read_scope_hash=revision[2],
                 )
         except Exception:
             logger.exception(
@@ -739,7 +824,7 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
     recognition never blocks generation and never 5xxs."""
     try:
         intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
-        redacted_goal = redact_free_text(body.objective) if body.objective else None
+        redacted_goal = redact_free_text(body.objective, label="prediction goal")
     except IntentValidationError as e:   # a free-text field that cannot be safely redacted -> denial
         raise HTTPException(status_code=422, detail=str(e)) from e
     # Idempotent intent, PER ACTOR: submit_intent mints a fresh id each call, so reuse the EARLIEST intent
@@ -757,12 +842,18 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
         intent = replace(intent, intent_id=prior[0])
     persist_intent(conn, intent)
 
-    input_hash = compute_input_hash({"hypothesis": intent.redacted_hypothesis, "goal": redacted_goal})
+    input_json = recognition_input_material(
+        redacted_hypothesis=intent.redacted_hypothesis,
+        redacted_prediction_goal=redacted_goal,
+        redaction_policy_version=REDACTION_VERSION,
+    )
+    input_hash = compute_input_hash(input_json)
     result = recognize(conn, client, redacted_hypothesis=intent.redacted_hypothesis,
                        redacted_goal=redacted_goal, actor=identity)
     recognition_id = record_recognition_attempt(
         conn, intent_id=intent.intent_id, input_hash=input_hash, result=result,
-        actor=identity.subject)
+        actor=identity.subject, input_json=input_json,
+        redaction_policy_version=REDACTION_VERSION)
     # Fail-open asymmetry: unscoped / technical_failure -> full grounding downstream (recognition never
     # narrows on doubt). The recipe count is NOT here — applicability computes it after generate.
     unscoped = result.status in (RecognitionStatus.UNSCOPED, RecognitionStatus.TECHNICAL_FAILURE)
@@ -809,7 +900,8 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
         raise HTTPException(status_code=422,
                             detail="chosen option is not in the recorded considered set for this intent")
     feature = choice.feature
-    target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
+    target = _target_for_generation(
+        conn, intent_id=body.intent_id, snapshot_lineage=choice.snapshot_lineage)
     # 3C.2a authoring fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked
     # for freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
     # a drifted plan → 409 (regenerate, never a substitute path). I-1 draft/confirm parity: a cross-catalog
@@ -963,7 +1055,8 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
             status_code=422,
             detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: cross-catalog feature requires a governed "
                    "plan envelope")
-    target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
+    target = _target_for_generation(
+        conn, intent_id=body.intent_id, snapshot_lineage=recorded_choice.snapshot_lineage)
     # Delivery C0 Task 5: reload the SERVER snapshot lineage the considered set was authored against and
     # bind the governing write to it in the audit trail (a regulator can prove EXACTLY what catalog state
     # this contract was authored against). Reloaded from the server considered-set row — the confirm

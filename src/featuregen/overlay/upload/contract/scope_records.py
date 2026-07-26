@@ -21,12 +21,14 @@ Computation-free and behaviour-neutral: scope persistence lives here / in the AP
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
+from featuregen.intake.llm import compute_input_hash
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
 from featuregen.overlay.upload.taxonomy.recognition import RecognitionResult, UseCaseCandidate
 
@@ -54,6 +56,53 @@ def _candidate_json(candidate: UseCaseCandidate) -> dict[str, Any]:
     }
 
 
+class RecognitionInputUnavailable(ValueError):
+    """The recognition predates sealed inputs or its immutable content does not verify."""
+
+
+class GenerationInputUnavailable(ValueError):
+    """A generation run has no sealed input or its immutable content does not verify."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecognitionInput:
+    recognition_id: str
+    intent_id: str
+    redacted_hypothesis: str
+    redacted_prediction_goal: str
+    input_content_hash: str
+    redaction_policy_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationInput:
+    generation_run_id: str
+    intent_id: str
+    recognition_id: str
+    confirmed_scope_id: str
+    redacted_hypothesis: str
+    redacted_definition: str
+    redacted_prediction_goal: str
+    redacted_feedback: str
+    target_ref: str | None
+    recognition_input_content_hash: str
+    generation_input_content_hash: str
+
+
+def recognition_input_material(
+    *,
+    redacted_hypothesis: str,
+    redacted_prediction_goal: str,
+    redaction_policy_version: str,
+) -> dict[str, str]:
+    """The complete redacted and policy-versioned input recognized by Gate #1."""
+    return {
+        "redacted_hypothesis": redacted_hypothesis,
+        "redacted_prediction_goal": redacted_prediction_goal,
+        "redaction_policy_version": redaction_policy_version,
+    }
+
+
 def record_recognition_attempt(
     conn,
     *,
@@ -61,6 +110,8 @@ def record_recognition_attempt(
     input_hash: str,
     result: RecognitionResult,
     actor: Any,
+    input_json: dict[str, str] | None = None,
+    redaction_policy_version: str | None = None,
 ) -> str:
     """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet,
     the candidate PROPOSALS, and the optional intent DIMENSIONS (``modelling_contexts`` / ``target_entity``)
@@ -69,25 +120,239 @@ def record_recognition_attempt(
     input always resolves to the same attempt (never a second row)."""
     recognition_id = mint_id("rcg")
     candidates = [_candidate_json(c) for c in result.candidates]
+    if input_json is not None:
+        computed_hash = compute_input_hash(input_json)
+        if computed_hash != input_hash:
+            raise ValueError("recognition input hash does not match input_json")
+        if not redaction_policy_version:
+            raise ValueError("redaction_policy_version is required with input_json")
+        if input_json.get("redaction_policy_version") != redaction_policy_version:
+            raise ValueError("recognition input redaction policy does not match its stamp")
     conn.execute(
         "INSERT INTO intent_recognition_attempt "
         "(recognition_id, intent_id, input_hash, status, candidates, ambiguity_note, "
         "taxonomy_version, applicability_mapping_version, recognizer_model_id, prompt_version, "
-        "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by, "
+        "input_json, input_content_hash, redaction_policy_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (intent_id, input_hash) DO NOTHING",
         (recognition_id, intent_id, input_hash, result.status.value, Jsonb(candidates),
          result.ambiguity_note, result.taxonomy_version, result.applicability_mapping_version,
          result.recognizer_model_id, result.prompt_version, result.recipe_registry_version,
          Jsonb(list(result.modelling_contexts)), result.target_entity, Jsonb(list(result.warnings)),
-         Jsonb(_actor_dict(actor))))
+         Jsonb(_actor_dict(actor)), Jsonb(input_json) if input_json is not None else None,
+         input_hash if input_json is not None else None, redaction_policy_version))
     # Read back the governing id for this (intent, input) — the one just inserted, or the pre-existing
     # one when the INSERT hit ON CONFLICT DO NOTHING. Either way a repeat returns the SAME id.
     row = conn.execute(
-        "SELECT recognition_id FROM intent_recognition_attempt "
+        "SELECT recognition_id, input_json, input_content_hash, redaction_policy_version "
+        "FROM intent_recognition_attempt "
         "WHERE intent_id = %s AND input_hash = %s",
         (intent_id, input_hash)).fetchone()
+    if input_json is not None and (
+        row[1] != input_json
+        or row[2] != input_hash
+        or row[3] != redaction_policy_version
+    ):
+        raise ValueError("existing recognition attempt has different sealed input")
     return row[0]
+
+
+def load_recognition_input(
+    conn,
+    *,
+    recognition_id: str,
+    intent_id: str,
+) -> RecognitionInput:
+    """Load and verify the exact redacted input used for one recognition attempt."""
+    row = conn.execute(
+        "SELECT input_json, input_content_hash, redaction_policy_version "
+        "FROM intent_recognition_attempt WHERE recognition_id = %s AND intent_id = %s",
+        (recognition_id, intent_id),
+    ).fetchone()
+    if row is None:
+        raise RecognitionInputUnavailable("unknown recognition")
+    material, content_hash, policy_version = row
+    if material is None or content_hash is None or policy_version is None:
+        raise RecognitionInputUnavailable("recognition input is not sealed")
+    expected_keys = {
+        "redacted_hypothesis",
+        "redacted_prediction_goal",
+        "redaction_policy_version",
+    }
+    if not isinstance(material, dict) or set(material) != expected_keys:
+        raise RecognitionInputUnavailable("recognition input has an unsupported shape")
+    if not all(isinstance(material[key], str) for key in expected_keys):
+        raise RecognitionInputUnavailable("recognition input fields must be strings")
+    if compute_input_hash(material) != content_hash:
+        raise RecognitionInputUnavailable("recognition input content hash mismatch")
+    if material["redaction_policy_version"] != policy_version:
+        raise RecognitionInputUnavailable("recognition input redaction policy mismatch")
+    return RecognitionInput(
+        recognition_id=recognition_id,
+        intent_id=intent_id,
+        redacted_hypothesis=material["redacted_hypothesis"],
+        redacted_prediction_goal=material["redacted_prediction_goal"],
+        input_content_hash=content_hash,
+        redaction_policy_version=policy_version,
+    )
+
+
+def recognition_id_for_scope(
+    conn,
+    *,
+    scope_id: str,
+    intent_id: str,
+) -> str | None:
+    """Resolve broaden lineage to the original recognition without trusting the request."""
+    row = conn.execute(
+        "SELECT recognition_id FROM confirmed_generation_scope "
+        "WHERE scope_id = %s AND intent_id = %s",
+        (scope_id, intent_id),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def _generation_input_material(
+    *,
+    generation_run_id: str,
+    intent_id: str,
+    recognition_id: str,
+    confirmed_scope_id: str,
+    redacted_hypothesis: str,
+    redacted_definition: str,
+    redacted_prediction_goal: str,
+    redacted_feedback: str,
+    target_ref: str | None,
+    recognition_input_content_hash: str,
+) -> dict[str, Any]:
+    return {
+        "version": "contract-generation-input@1",
+        "generation_run_id": generation_run_id,
+        "intent_id": intent_id,
+        "recognition_id": recognition_id,
+        "confirmed_scope_id": confirmed_scope_id,
+        "redacted_hypothesis": redacted_hypothesis,
+        "redacted_definition": redacted_definition,
+        "redacted_prediction_goal": redacted_prediction_goal,
+        "redacted_feedback": redacted_feedback,
+        "target_ref": target_ref,
+        "recognition_input_content_hash": recognition_input_content_hash,
+    }
+
+
+def record_generation_input(
+    conn,
+    *,
+    generation_run_id: str,
+    intent_id: str,
+    recognition: RecognitionInput,
+    confirmed_scope_id: str,
+    redacted_definition: str,
+    redacted_feedback: str,
+    target_ref: str | None,
+    actor: Any,
+) -> GenerationInput:
+    """Seal the exact text and leakage target consumed by one confirmed-scope generation run."""
+    material = _generation_input_material(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition.recognition_id,
+        confirmed_scope_id=confirmed_scope_id,
+        redacted_hypothesis=recognition.redacted_hypothesis,
+        redacted_definition=redacted_definition,
+        redacted_prediction_goal=recognition.redacted_prediction_goal,
+        redacted_feedback=redacted_feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition.input_content_hash,
+    )
+    content_hash = compute_input_hash(material)
+    conn.execute(
+        "INSERT INTO contract_generation_input "
+        "(generation_run_id, intent_id, recognition_id, confirmed_scope_id, "
+        "redacted_hypothesis, redacted_definition, redacted_prediction_goal, redacted_feedback, "
+        "target_ref, recognition_input_content_hash, generation_input_content_hash, created_by) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            generation_run_id,
+            intent_id,
+            recognition.recognition_id,
+            confirmed_scope_id,
+            recognition.redacted_hypothesis,
+            redacted_definition,
+            recognition.redacted_prediction_goal,
+            redacted_feedback,
+            target_ref,
+            recognition.input_content_hash,
+            content_hash,
+            Jsonb(_actor_dict(actor)),
+        ),
+    )
+    return GenerationInput(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition.recognition_id,
+        confirmed_scope_id=confirmed_scope_id,
+        redacted_hypothesis=recognition.redacted_hypothesis,
+        redacted_definition=redacted_definition,
+        redacted_prediction_goal=recognition.redacted_prediction_goal,
+        redacted_feedback=redacted_feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition.input_content_hash,
+        generation_input_content_hash=content_hash,
+    )
+
+
+def generation_input_for_run(conn, generation_run_id: str) -> GenerationInput | None:
+    """Load and hash-verify a run's sealed input; return ``None`` only for explicit legacy runs."""
+    row = conn.execute(
+        "SELECT intent_id, recognition_id, confirmed_scope_id, redacted_hypothesis, "
+        "redacted_definition, redacted_prediction_goal, redacted_feedback, target_ref, "
+        "recognition_input_content_hash, generation_input_content_hash "
+        "FROM contract_generation_input WHERE generation_run_id = %s",
+        (generation_run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    (
+        intent_id,
+        recognition_id,
+        scope_id,
+        hypothesis,
+        definition,
+        goal,
+        feedback,
+        target_ref,
+        recognition_hash,
+        content_hash,
+    ) = row
+    material = _generation_input_material(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition_id,
+        confirmed_scope_id=scope_id,
+        redacted_hypothesis=hypothesis,
+        redacted_definition=definition,
+        redacted_prediction_goal=goal,
+        redacted_feedback=feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition_hash,
+    )
+    if compute_input_hash(material) != content_hash:
+        raise GenerationInputUnavailable("generation input content hash mismatch")
+    return GenerationInput(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition_id,
+        confirmed_scope_id=scope_id,
+        redacted_hypothesis=hypothesis,
+        redacted_definition=definition,
+        redacted_prediction_goal=goal,
+        redacted_feedback=feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition_hash,
+        generation_input_content_hash=content_hash,
+    )
 
 
 def record_confirmed_scope(
