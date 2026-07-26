@@ -465,6 +465,47 @@ def test_a_genuinely_absent_referent_still_raises_on_the_durable_path(db, monkey
                      idempotency_key=f"{run_id}:0", llm_call_ref="llmc_ghost", payload={})
 
 
+def test_a_rejected_fallback_replay_leaves_an_idle_caller_connection_usable(
+        db, monkeypatch, _dsn) -> None:
+    """Fix-wave-2 IMPORTANT 1. The fallback deliberately replays statements the database has ALREADY
+    rejected once (the FK class), so the replay itself must not poison the caller's connection. It
+    used to: the bare ``conn.execute`` left the implicit transaction ABORTED, so the caller could not
+    execute another statement — including its own terminal ``FAILED`` event through this very
+    degraded path. Pre-wave that same call raised from the TRACE connection and left the caller
+    usable, so the recovery had made the caller strictly worse off."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db)                                  # commits durably: the caller stays IDLE
+    assert db.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        append_event(db, run_id, TraceEventKind.LLM_CALL_RECORDED, seq=0,
+                     idempotency_key=f"{run_id}:0", llm_call_ref="llmc_ghost", payload={})
+    assert db.execute("SELECT 1").fetchone()[0] == 1     # the caller's connection is still USABLE
+
+
+def test_a_rejected_fallback_replay_preserves_the_callers_uncommitted_work(
+        db, monkeypatch, _dsn) -> None:
+    """Fix-wave-2 IMPORTANT 1, the shape that matters in a request: the caller is mid-transaction
+    with a DEGRADED manifest and event of its own. A rejected replay must be contained by a SAVEPOINT
+    — usable connection AND that uncommitted work intact. A blanket ``conn.rollback()`` would keep
+    the connection usable while silently destroying the trace evidence it is there to protect, and a
+    bare replay poisons the transaction outright."""
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    run_id = _open(db, intent_hash="ih_savepoint")       # manifest degrades onto the caller's tx
+    _started(db, run_id, seq=0)                          # ...and so does the first event
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)           # the blip clears
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        append_event(db, run_id, TraceEventKind.LLM_CALL_RECORDED, seq=1,
+                     idempotency_key=f"{run_id}:1", llm_call_ref="llmc_ghost", payload={})
+    assert db.execute("SELECT 1").fetchone()[0] == 1     # usable
+    assert db.execute("SELECT count(*) FROM authoring_trace_event WHERE authoring_run_id = %s",
+                      (run_id,)).fetchone()[0] == 1     # the degraded evidence SURVIVED the replay
+    # And the caller can still write its own terminal event through the degraded path (Task 12).
+    append_event(db, run_id, TraceEventKind.FAILED, seq=2,
+                 idempotency_key=f"{run_id}:2", payload={"disposition": "TECHNICAL_FAILURE"})
+    assert db.execute("SELECT kind FROM authoring_trace_event WHERE authoring_run_id = %s "
+                      "AND seq = 2", (run_id,)).fetchone()[0] == "FAILED"
+
+
 def test_deterministic_rejections_still_raise_on_the_durable_path(db, monkeypatch, _dsn) -> None:
     """The refinement's other half: a CONNECTION-INDEPENDENT rejection must PROPAGATE, never be
     pointlessly replayed onto the caller's transaction (and never silently swallowed). All three

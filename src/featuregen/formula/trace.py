@@ -241,20 +241,59 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
       (``enrich_llm.consume_audit_degradations``), not hypotheticals;
     * a CONNECTION-INDEPENDENT rejection (``_DETERMINISTIC_REJECTIONS``) → PROPAGATES. Replaying a
       known-bad statement on the caller's connection would poison that transaction while producing
-      the identical failure."""
+      the identical failure.
+
+    The degrade path replays through ``_replay_on_caller``, never bare: it is replaying a statement
+    the database may already have REJECTED once, and that rejection must not cost the caller its
+    transaction."""
     dsn = get_settings().dsn
-    if dsn:
+    if not dsn:
+        conn.execute(sql, params)   # the designed tests / no-DB path, NOT a degradation
+        return
+    try:
+        with psycopg.connect(dsn) as trace_conn:  # own tx, committed on clean `with` exit
+            trace_conn.execute(sql, params)
+        return
+    except _DETERMINISTIC_REJECTIONS:
+        raise
+    except Exception:  # noqa: BLE001 — a connection-dependent failure must not lose the trace
+        logger.exception(
+            "durable authoring-trace write failed (%s); falling back to the request connection",
+            what)
+    _replay_on_caller(conn, sql, params)
+
+
+def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
+    """Replay a degraded durable write on the CALLER's connection WITHOUT poisoning it.
+
+    The fallback deliberately replays statements the database has ALREADY REJECTED once — the FK
+    class is the whole point of it (``_durable_write``) — so it MUST leave the caller's transaction
+    exactly as usable as it found it. A bare ``conn.execute`` did not: an FK the caller's connection
+    also refuses aborted the request transaction, so the orchestrator lost every uncommitted thing it
+    had done and could not execute another statement — not even its own terminal ``FAILED`` event
+    through this very degraded path. Precedent for the shape: ``overlay.upload.enrich`` (program-audit
+    finding I-2). A savepoint takes no advisory lock, so the I-3 self-deadlock does not apply.
+
+    Two shapes, because ``conn.transaction()`` is not a savepoint when there is no transaction:
+
+    * IN a transaction (the request shape) → SAVEPOINT. The rejection is contained and the caller's
+      uncommitted work — including trace rows that degraded here earlier, the only copy there is —
+      survives untouched. A blanket ``rollback()`` would keep the connection usable by destroying
+      exactly the evidence this module exists to preserve.
+    * IDLE → replay bare. ``conn.transaction()`` would BEGIN *and COMMIT* here, committing a degraded
+      row whose whole point is to share the request's fate (and breaking the caller's control of its
+      own transaction boundary). Nothing of the caller's is in flight, so if the replay is rejected
+      the implicit single-statement transaction is discarded — that loses nothing and keeps the
+      connection usable."""
+    if conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
         try:
-            with psycopg.connect(dsn) as trace_conn:  # own tx, committed on clean `with` exit
-                trace_conn.execute(sql, params)
-            return
-        except _DETERMINISTIC_REJECTIONS:
+            conn.execute(sql, params)
+        except Exception:
+            conn.rollback()   # discard ONLY the rejected statement's implicit tx; nothing else is in it
             raise
-        except Exception:  # noqa: BLE001 — a connection-dependent failure must not lose the trace
-            logger.exception(
-                "durable authoring-trace write failed (%s); falling back to the request connection",
-                what)
-    conn.execute(sql, params)
+        return
+    with conn.transaction():   # savepoint: contain a rejected replay without poisoning the txn
+        conn.execute(sql, params)
 
 
 def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple | None:
