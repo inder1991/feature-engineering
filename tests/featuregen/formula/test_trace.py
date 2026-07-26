@@ -563,6 +563,65 @@ def test_a_lost_ack_event_replay_converges_instead_of_raising(db, monkeypatch, _
                              "WHERE authoring_run_id = %s", (run_id,)).fetchone()[0] == 1
 
 
+def test_a_replay_that_writes_nothing_is_logged_not_silently_vanished(
+        db, monkeypatch, _dsn, caplog) -> None:
+    """Fix-wave-3 cleanup 1. ``ON CONFLICT DO NOTHING`` makes convergence and SWALLOW look identical
+    from the caller: a genuinely DIFFERENT event reusing an existing ``idempotency_key`` is dropped,
+    ``append_event`` returns a freshly minted ``atev_…`` id for a row that exists NOWHERE, and there
+    was no exception and no log line. Behaviour is deliberately unchanged (still non-raising, still
+    failing toward ``"incomplete"``); ``rowcount == 0`` now makes it OBSERVABLE.
+
+    Discriminating on the SWALLOW, not the convergence: seq/kind/payload all differ from the durable
+    row, so nothing about this event is recorded anywhere."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_swallowed_replay")
+    shared = f"{run_id}:reused-key"
+    _started(db, run_id, seq=0, key=shared)              # the durable row that owns the key
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    with caplog.at_level(logging.WARNING, logger="featuregen.formula.trace"):
+        event_id = append_event(db, run_id, TraceEventKind.CRITIC_RECORDED, seq=7,
+                                idempotency_key=shared, payload={"verdict": "REJECT"})
+    assert "wrote NOTHING" in caplog.text
+    assert "CRITIC_RECORDED seq=7" in caplog.text        # names the event that vanished
+    assert db.execute("SELECT count(*) FROM authoring_trace_event "
+                      "WHERE authoring_trace_event_id = %s", (event_id,)).fetchone()[0] == 0
+    assert run_status(db, run_id) == "incomplete"        # still absence-derived, never false-terminal
+
+
+def test_a_converged_replay_is_logged_too_so_the_two_are_distinguishable(
+        db, monkeypatch, _dsn, caplog) -> None:
+    """The other reading of ``rowcount == 0``: the DESIGNED convergence of a lost commit ack also
+    writes nothing, so it is logged with the same marker — an operator sees every replay that landed
+    on an existing row and can resolve which it was from the named event. Paired with the swallow
+    test above so the log line is proved to cover BOTH, and with
+    ``test_a_lost_ack_event_replay_converges_instead_of_raising`` which proves the convergence
+    itself is unchanged."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_converged_logged")
+    monkeypatch.setattr(trace, "mint_id", lambda prefix: f"atev_convlog_{run_id}")
+    _started(db, run_id, seq=0)                          # commits server-side; the ack is then LOST
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    with caplog.at_level(logging.WARNING, logger="featuregen.formula.trace"):
+        _started(db, run_id, seq=0)                      # the identical statement is replayed
+    assert "wrote NOTHING" in caplog.text
+    assert "STARTED seq=0" in caplog.text
+
+
+def test_a_replay_that_really_inserts_is_not_logged_as_writing_nothing(
+        db, monkeypatch, _dsn, caplog) -> None:
+    """The negative half, so the marker DISCRIMINATES rather than firing on every degrade: a replay
+    that genuinely recovers the event (the FK-on-a-degraded-manifest shape) inserts a row and must
+    NOT be reported as having written nothing."""
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    run_id = _open(db, intent_hash="ih_real_replay_insert")   # manifest degrades onto the caller
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)                # the blip clears: the FK now degrades
+    with caplog.at_level(logging.WARNING, logger="featuregen.formula.trace"):
+        _started(db, run_id, seq=0)
+    assert "wrote NOTHING" not in caplog.text
+    assert db.execute("SELECT count(*) FROM authoring_trace_event WHERE authoring_run_id = %s",
+                      (run_id,)).fetchone()[0] == 1
+
+
 def test_a_lost_ack_manifest_replay_converges_instead_of_raising(db, monkeypatch, _dsn) -> None:
     """The same commit ambiguity on the MANIFEST, whose replay key is its ``authoring_run_id`` PK: a
     manifest that committed server-side before the ack was lost must not raise a duplicate-key error

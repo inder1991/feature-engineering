@@ -307,10 +307,10 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, replay_sql: str, wh
         logger.exception(
             "durable authoring-trace write failed (%s); falling back to the request connection",
             what)
-    _replay_on_caller(conn, replay_sql, params)
+    _replay_on_caller(conn, replay_sql, params, what=what)
 
 
-def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
+def _replay_on_caller(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
     """Replay a degraded durable write on the CALLER's connection WITHOUT poisoning it.
 
     The fallback deliberately replays statements the database has ALREADY REJECTED once — the FK
@@ -349,20 +349,34 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
       ``api.deps.get_feature_gen_conn``'s ``except Exception: conn.rollback(); raise`` would then
       have MASKED the request's real error with that ``ProgrammingError``. No ``rollback()`` here
       either: that would discard the caller's uncommitted trace evidence, which is the one thing
-      this function may never do."""
+      this function may never do.
+
+    OBSERVABLE, whichever way the ``ON CONFLICT DO NOTHING`` lands. ``rowcount == 0`` means the
+    arbiter matched an existing row and this replay wrote nothing — the DESIGNED convergence on a
+    lost commit ack, but also, indistinguishably from here, a genuinely DIFFERENT event whose
+    ``idempotency_key`` was reused and which is therefore silently dropped while ``append_event``
+    still returns a freshly minted id for a row that exists nowhere. The accepted behaviour is
+    unchanged (non-raising, failing toward ``"incomplete"``); it is merely no longer INVISIBLE."""
     status = conn.info.transaction_status
     if status == psycopg.pq.TransactionStatus.INTRANS:
         with conn.transaction():   # savepoint: contain a rejected replay without poisoning the txn
-            conn.execute(sql, params)
-        return
-    if status == psycopg.pq.TransactionStatus.IDLE:
+            cur = conn.execute(sql, params)
+    elif status == psycopg.pq.TransactionStatus.IDLE:
         try:
-            conn.execute(sql, params)
+            cur = conn.execute(sql, params)
         except Exception:
             conn.rollback()   # discards ONLY the rejected statement's implicit tx — nothing else
             raise
-        return
-    conn.execute(sql, params)   # INERROR (or worse): bare, so psycopg's savepoint stack can't leak
+    else:
+        # INERROR (or worse): bare, so psycopg's savepoint stack can't leak.
+        cur = conn.execute(sql, params)
+    if cur.rowcount == 0:
+        logger.warning(
+            "degraded authoring-trace replay of %s wrote NOTHING: the ON CONFLICT arbiter matched a "
+            "row that already exists. Either this CONVERGED on the durable row of a lost commit ack "
+            "(the designed outcome), or a DIFFERENT event reused this replay key and THIS one was "
+            "dropped. The id returned to the caller then names no row anywhere; run_status stays "
+            "absence-derived and can only read the run as 'incomplete'", what)
 
 
 def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple | None:
