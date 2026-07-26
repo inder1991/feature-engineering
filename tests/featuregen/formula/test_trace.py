@@ -14,6 +14,7 @@ import ast
 import hashlib
 import logging
 import re
+import threading
 from pathlib import Path
 
 import psycopg
@@ -163,16 +164,64 @@ def test_second_terminal_event_is_rejected(db) -> None:
                      idempotency_key=f"{run_id}:1", payload={})
 
 
-def test_one_terminal_event_partial_unique_index_exists(db) -> None:
+def test_one_terminal_event_partial_unique_index_is_exactly_as_shipped(db) -> None:
     """The trigger raises first for a SEQUENTIAL second terminal; the partial UNIQUE index is what
-    holds under CONCURRENCY (two sessions both passing the EXISTS check). Assert it physically
-    exists, since no single-session test can distinguish the two enforcers."""
+    holds under CONCURRENCY (see the two-session test below).
+
+    The PREDICATE is pinned, not just the index's existence and uniqueness (review MINOR 1): the
+    reviewer mutated it to ``WHERE kind IN ('COMPLETED','FAILED') AND seq > 1000000`` — which gives
+    ZERO concurrency protection — and the whole suite still passed. Exact-match the full indexdef so
+    any narrowing of the predicate, any added column, or a switch to a non-unique index fails HERE."""
     defs = [r[0] for r in db.execute(
         "SELECT indexdef FROM pg_indexes WHERE tablename = 'authoring_trace_event'").fetchall()]
     terminal = [d for d in defs if "COMPLETED" in d and "FAILED" in d]
     assert terminal, defs
-    assert terminal[0].startswith("CREATE UNIQUE INDEX")
-    assert "(authoring_run_id)" in terminal[0].replace("USING btree ", "")
+    assert " ".join(terminal[0].split()) == (
+        "CREATE UNIQUE INDEX authoring_trace_event_one_terminal_idx "
+        "ON public.authoring_trace_event USING btree (authoring_run_id) "
+        "WHERE (kind = ANY (ARRAY['COMPLETED'::text, 'FAILED'::text]))")
+
+
+def test_one_terminal_per_run_holds_under_concurrency(db, monkeypatch, _dsn) -> None:
+    """The ONLY test that proves the partial UNIQUE index's actual concurrency guarantee (review
+    MINOR 1). The sequential case is caught by the BEFORE INSERT trigger, so it cannot distinguish
+    the two enforcers — and the trigger's ``EXISTS`` probe is exactly what two concurrent sessions
+    both pass, because neither sees the other's UNCOMMITTED terminal.
+
+    Session A inserts COMPLETED and holds it uncommitted; session B inserts FAILED for the same run,
+    passes the trigger, and BLOCKS on A's index entry; A commits; B raises ``UniqueViolation``.
+    Raw INSERTs on purpose: routing them through ``append_event`` would commit each on its own fresh
+    connection, which is precisely the interleaving this test must NOT have."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_concurrent")   # the manifest must be COMMITTED for the FK
+    insert = ("INSERT INTO authoring_trace_event (authoring_trace_event_id, authoring_run_id, seq, "
+              "kind, idempotency_key, payload, payload_hash) VALUES (%s, %s, %s, %s, %s, '{}', 'h')")
+    b_error: list[BaseException] = []
+
+    with psycopg.connect(_dsn) as a, psycopg.connect(_dsn) as b:
+        a.execute(insert, (f"atev_a_{run_id}", run_id, 0, "COMPLETED", f"{run_id}:a"))
+
+        def insert_in_b() -> None:
+            try:
+                b.execute(insert, (f"atev_b_{run_id}", run_id, 1, "FAILED", f"{run_id}:b"))
+            except BaseException as exc:              # noqa: BLE001 — recorded, asserted below
+                b_error.append(exc)
+
+        thread = threading.Thread(target=insert_in_b, daemon=True)
+        thread.start()
+        thread.join(1.0)
+        assert thread.is_alive(), "session B did not BLOCK — the partial unique index is not holding"
+        assert not b_error, b_error
+        a.commit()                                    # A wins the index entry
+        thread.join(10.0)
+        assert not thread.is_alive(), "session B never unblocked after A committed"
+        assert isinstance(b_error[0], psycopg.errors.UniqueViolation), b_error
+        b.rollback()
+
+    with psycopg.connect(_dsn) as fresh:              # exactly ONE terminal survived
+        assert fresh.execute(
+            "SELECT count(*) FROM authoring_trace_event WHERE authoring_run_id = %s "
+            "AND kind IN ('COMPLETED', 'FAILED')", (run_id,)).fetchone()[0] == 1
 
 
 # ── uniqueness ───────────────────────────────────────────────────────────────────────────────────
