@@ -60,7 +60,7 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula._jcs import dumps as _jcs_dumps
@@ -108,6 +108,13 @@ from featuregen.overlay.upload.operational_facts import (
     OperationalValue,
     read_operational_value,
 )
+
+if TYPE_CHECKING:
+    # Deliberately TYPE_CHECKING-only: `AuthoringResult` must not exist as a runtime name in this
+    # module, because a name that exists is a name that can be CONSTRUCTED — bypassing every
+    # coherence raise-guard `derive_disposition` owns. `test_authoring.py` asserts both halves over
+    # the AST: no runtime import, and no construction call anywhere.
+    from featuregen.formula.result import AuthoringResult
 
 __all__ = [
     "AUTHORING_MAX_TURNS",
@@ -258,7 +265,7 @@ def authoring_intent_hash(intent: AuthoringIntent) -> str:
 
 def run_authoring(conn, intent: AuthoringIntent, author_client: LLMClient,
                   critic_client: LLMClient, *, roles: tuple[str, ...] | list[str] | tuple[()],
-                  actor: IdentityEnvelope) -> object:
+                  actor: IdentityEnvelope) -> AuthoringResult:
     """Author ONE TypedFormula for ``intent`` and return the folded §F result.
 
     ``author_client`` and ``critic_client`` are DELIBERATELY separate: LLM-2 reviews the proposal
@@ -266,6 +273,12 @@ def run_authoring(conn, intent: AuthoringIntent, author_client: LLMClient,
     author's reasoning or tool trail, so it is a second opinion rather than an echo. ``roles`` gates
     every catalog read (the author's tools, the critic's re-fetch, and the C1 authority reads);
     ``actor`` is stamped on the manifest and threaded through both audited seams.
+
+    EVERY stage runs once a proposal parses, even when an earlier axis already decides the fold (an
+    out-of-capability proposal is still resolved and still criticized). That is deliberate: §F says
+    each axis is an explicit upstream verdict, never an assumed all-clear, and short-circuiting would
+    record ``"ok"``/``"clean"`` for stages that never ran. The cost is one critic call on a proposal
+    that cannot be built; the §F precedence guarantees it can never change the disposition.
 
     Single-threaded on ``conn`` by contract (module docstring). Raises whatever the chain raises —
     a run whose own SQL failed stays honestly INCOMPLETE rather than claiming a terminal state."""
@@ -349,7 +362,7 @@ def _finish(trace: _Trace, axes: AuthoringAxes, *, formula: TypedFormulaV1 | Non
             output_requirements: tuple[ExternalRequirement, ...] = (),
             authority_failures: tuple[AuthorityFailure, ...] = (),
             capability_reason: str | None = None,
-            critic_findings_hash: str | None = None):
+            critic_findings_hash: str | None = None) -> AuthoringResult:
     """Fold the axes through Task 8 (the ONLY constructor of an ``AuthoringResult``), append the
     single terminal event, and return the result.
 

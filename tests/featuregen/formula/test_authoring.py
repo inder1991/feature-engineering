@@ -438,9 +438,32 @@ def test_authoring_result_is_never_constructed_directly(db) -> None:
     called = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
     assert "AuthoringResult" not in called
     assert "derive_disposition" in called
-    assert "AuthoringResult" not in {  # nor imported, so it cannot be constructed at all
-        alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-        for alias in node.names}
+    # ...and the name does not exist AT RUNTIME, so it cannot be constructed even by accident. The
+    # module may name it for typing (the public return annotation), but only under TYPE_CHECKING.
+    assert "AuthoringResult" not in _runtime_imports(tree)
+    assert "AuthoringResult" in _type_checking_imports(tree)   # the annotation is real, not `object`
+    assert not hasattr(authoring, "AuthoringResult")
+
+
+def _type_checking_imports(tree: ast.Module) -> set[str]:
+    """Names imported INSIDE an ``if TYPE_CHECKING:`` block — present for annotations, absent from
+    the module at runtime."""
+    guarded: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and "TYPE_CHECKING" in ast.unparse(node.test):
+            for child in ast.walk(node):
+                if isinstance(child, ast.ImportFrom):
+                    guarded.update(alias.asname or alias.name for alias in child.names)
+    return guarded
+
+
+def _runtime_imports(tree: ast.Module) -> set[str]:
+    """Names the module really binds at import time (every ``from … import …`` minus the
+    TYPE_CHECKING-guarded ones)."""
+    every = {alias.asname or alias.name
+             for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+             for alias in node.names}
+    return every - _type_checking_imports(tree)
 
 
 def _all_axes():
