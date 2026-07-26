@@ -38,6 +38,26 @@ _VERSIONS = {
 }
 
 
+@pytest.fixture(autouse=True, scope="module")
+def no_dsn():
+    """DSN-HERMETIC by default (precedent: tests/featuregen/overlay/upload/test_ingestion_run.py).
+
+    Almost every test here assumes the request-connection fallback path, whose writes the ``db``
+    fixture rolls back. With an ambient ``FEATUREGEN_DSN`` (a developer shell sourced from
+    ``.env.demo`` / ``run-demo.sh``) they would instead COMMIT on the durable fresh connection — and
+    ``authoring_trace_event`` rows physically CANNOT be cleaned up afterwards (that is the write-once
+    guarantee), so a second run of the suite would fail on a stale idempotency key and stay red until
+    the database was dropped. Module-scoped so it is stripped once for the whole file; the handful of
+    tests that deliberately exercise the durable path re-arm it with the function-scoped
+    ``monkeypatch`` (which restores "unset" at their teardown).
+
+    Idempotency keys are additionally derived from the minted ``run_id`` everywhere, never a global
+    constant, so even the deliberately-durable tests leave uniquely-keyed, inert rows behind."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("FEATUREGEN_DSN", raising=False)
+        yield
+
+
 def _open(db, *, intent_hash: str = "ih_1") -> str:
     return open_authoring_run(db, intent_hash=intent_hash, versions=_VERSIONS, actor=make_actor())
 
@@ -166,24 +186,25 @@ def test_duplicate_seq_for_one_run_is_rejected(db) -> None:
 
 def test_same_seq_in_two_runs_is_allowed(db) -> None:
     run_a, run_b = _open(db), _open(db)
-    _started(db, run_a, seq=0, key="a:0")
-    _started(db, run_b, seq=0, key="b:0")
+    _started(db, run_a, seq=0)   # keys default to f"{run_id}:{seq}" — run-scoped, never a constant
+    _started(db, run_b, seq=0)
     assert run_status(db, run_a) == "incomplete"
     assert run_status(db, run_b) == "incomplete"
 
 
 def test_duplicate_idempotency_key_is_rejected(db) -> None:
     run_a, run_b = _open(db), _open(db)
-    _started(db, run_a, seq=0, key="shared-key")
+    shared = f"{run_a}:shared"   # shared between the two runs, unique to this test invocation
+    _started(db, run_a, seq=0, key=shared)
     with pytest.raises(psycopg.errors.UniqueViolation):
-        _started(db, run_b, seq=0, key="shared-key")
+        _started(db, run_b, seq=0, key=shared)
 
 
 # ── closed kind vocabulary ───────────────────────────────────────────────────────────────────────
 def test_unknown_kind_rejected_before_the_db(db) -> None:
     run_id = _open(db)
     with pytest.raises(ValueError):
-        append_event(db, run_id, "NOT_A_KIND", seq=0, idempotency_key="k", payload={})
+        append_event(db, run_id, "NOT_A_KIND", seq=0, idempotency_key=f"{run_id}:0", payload={})
 
 
 def test_kind_check_is_closed_at_the_db_level(db) -> None:
@@ -193,7 +214,8 @@ def test_kind_check_is_closed_at_the_db_level(db) -> None:
         db.execute(
             "INSERT INTO authoring_trace_event (authoring_trace_event_id, authoring_run_id, seq, "
             "kind, idempotency_key, payload, payload_hash) "
-            "VALUES ('atev_x', %s, 0, 'SMUGGLED', 'k', '{}'::jsonb, 'h')", (run_id,))
+            "VALUES (%s, %s, 0, 'SMUGGLED', %s, '{}'::jsonb, 'h')",
+            (f"atev_{run_id}", run_id, f"{run_id}:smuggled"))
 
 
 def test_kind_check_covers_exactly_the_seven_h_kinds(db) -> None:
