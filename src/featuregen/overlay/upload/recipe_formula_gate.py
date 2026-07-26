@@ -7,6 +7,7 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from featuregen.overlay.upload.dispatch_audit import formula_dispatches_reconciled
 from featuregen.overlay.upload.recipe_formula_shadow import (
     verify_observation_payload,
 )
@@ -197,6 +198,14 @@ def build_population_report(
             malformed += 1
         if delivery == "DISPATCHED_AUDITED":
             dispatched += 1
+            authoring_run_id = observation.get("authoring_run_id")
+            if (
+                not isinstance(authoring_run_id, str)
+                or not formula_dispatches_reconciled(conn, authoring_run_id)
+            ):
+                unreconciled += 1
+                technical += 1
+                continue
         if delivery == "PRIOR_DISPATCH_UNRECONCILED":
             unreconciled += 1
         result_json = _result_json(result)

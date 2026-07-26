@@ -34,6 +34,7 @@ from featuregen.identity.current_principal import (
 )
 from featuregen.intake.llm import current_llm_client
 from featuregen.overlay.field_evidence import canonical_hash
+from featuregen.overlay.upload.dispatch_audit import formula_dispatches_reconciled
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     compare_snapshot_to_current,
 )
@@ -145,6 +146,31 @@ def _terminalize(conn, claim, row: dict, *, axes: dict, result: dict | None = No
         finalize_manifest(conn, row["generation_run_id"])
     return FormulaShadowWorkerOutcome(
         "completed", row["work_item_id"], observation_id)
+
+
+def _terminal_authoring_event(conn, authoring_run_id: str) -> tuple[str, dict] | None:
+    row = conn.execute(
+        "SELECT kind,payload FROM formula_authoring_trace_event "
+        "WHERE authoring_run_id=%s AND kind IN ('completed','failed')",
+        (authoring_run_id,),
+    ).fetchone()
+    if row is None or not isinstance(row[1], dict):
+        return None
+    return row[0], row[1]
+
+
+def _trace_event_count(conn, authoring_run_id: str) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM formula_authoring_trace_event WHERE authoring_run_id=%s",
+        (authoring_run_id,),
+    ).fetchone()[0]
+
+
+def _dispatch_count(conn, authoring_run_id: str) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM llm_dispatch WHERE authoring_run_id=%s",
+        (authoring_run_id,),
+    ).fetchone()[0]
 
 
 def process_recipe_formula_shadow_once(
@@ -332,15 +358,35 @@ def process_recipe_formula_shadow_once(
             "SELECT 1 FROM formula_authoring_run WHERE authoring_run_id=%s",
             (deterministic_run_id,),
         ).fetchone() is not None:
-            return _terminalize(conn, claim, row, axes={
-                "authorization_axis": "AUTHORIZED_CURRENT",
-                "authority_axis": "VERIFIED_AT_CAPTURE",
-                "drift_axis": "CURRENT",
-                "configuration_axis": "CURRENT",
-                "delivery_axis": "PRIOR_DISPATCH_UNRECONCILED",
-                "authoring_axis": "TECHNICAL_FAILURE",
-                "technical_axis": "RECOVERY_REQUIRES_RECONCILIATION",
-            }, authoring_run_id=deterministic_run_id)
+            terminal = _terminal_authoring_event(conn, deterministic_run_id)
+            if terminal is not None and formula_dispatches_reconciled(
+                conn, deterministic_run_id
+            ):
+                _kind, terminal_result = terminal
+                return _terminalize(conn, claim, row, axes={
+                    "authorization_axis": "AUTHORIZED_CURRENT",
+                    "authority_axis": "VERIFIED_AT_CAPTURE",
+                    "drift_axis": "CURRENT",
+                    "configuration_axis": "CURRENT",
+                    "delivery_axis": "DISPATCHED_AUDITED",
+                    "authoring_axis": terminal_result["authoring_disposition"],
+                    "technical_axis": str(
+                        terminal_result["technical_status"]).upper(),
+                }, result=terminal_result, authoring_run_id=deterministic_run_id)
+            if (
+                terminal is not None
+                or _trace_event_count(conn, deterministic_run_id) > 0
+                or _dispatch_count(conn, deterministic_run_id) > 0
+            ):
+                return _terminalize(conn, claim, row, axes={
+                    "authorization_axis": "AUTHORIZED_CURRENT",
+                    "authority_axis": "VERIFIED_AT_CAPTURE",
+                    "drift_axis": "CURRENT",
+                    "configuration_axis": "CURRENT",
+                    "delivery_axis": "PRIOR_DISPATCH_UNRECONCILED",
+                    "authoring_axis": "TECHNICAL_FAILURE",
+                    "technical_axis": "RECOVERY_REQUIRES_RECONCILIATION",
+                }, authoring_run_id=deterministic_run_id)
         client = author_client or current_llm_client()
         critic = critic_client or client
         intent = AuthoringIntent(
@@ -372,6 +418,21 @@ def process_recipe_formula_shadow_once(
             progress_callback=renew_lease,
         )
         result_json = _plain(result)
+        if not formula_dispatches_reconciled(conn, deterministic_run_id):
+            dispatch_count = _dispatch_count(conn, deterministic_run_id)
+            return _terminalize(conn, claim, row, axes={
+                "authorization_axis": "AUTHORIZED_CURRENT",
+                "authority_axis": "VERIFIED_AT_CAPTURE",
+                "drift_axis": "CURRENT",
+                "configuration_axis": "CURRENT",
+                "delivery_axis": (
+                    "PRIOR_DISPATCH_UNRECONCILED"
+                    if dispatch_count else "NOT_DISPATCHED"),
+                "authoring_axis": "TECHNICAL_FAILURE",
+                "technical_axis": (
+                    "DISPATCH_RECONCILIATION_FAILED"
+                    if dispatch_count else result.technical_status.upper()),
+            }, result=result_json, authoring_run_id=result.authoring_run_id)
         return _terminalize(conn, claim, row, axes={
             "authorization_axis": "AUTHORIZED_CURRENT",
             "authority_axis": "VERIFIED_AT_CAPTURE",

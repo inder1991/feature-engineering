@@ -184,7 +184,16 @@ def author_formula(
             instruction=instruction,
             catalog_metadata=build_turn_metadata(intent, trail),
             actor=actor, prompt_version=prompt_version, schema_version=schema_version,
-            generation_settings=generation_settings)
+            generation_settings=generation_settings,
+            turn_index=index,
+            provider_contract_hash=(
+                provider_contract.contract_hash if provider_contract is not None else None),
+            prompt_content_hash=(
+                provider_contract.prompt_content_hash
+                if provider_contract is not None else None),
+            schema_content_hash=(
+                provider_contract.schema_content_hash
+                if provider_contract is not None else None))
         usage = dict(result.usage or {})
         tokens_spent += _tokens_of(usage)
         output = result.output

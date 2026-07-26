@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import Any
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
@@ -47,6 +48,38 @@ def current_formula_generation_settings() -> dict:
     return _generation_settings()
 
 
+def _dispatch_subjects(value: Any) -> tuple[dict, ...]:
+    refs: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+        elif isinstance(item, str) and "::" in item:
+            source, object_ref = item.split("::", 1)
+            if (
+                source
+                and "." in object_ref
+                and not any(character.isspace() for character in item)
+            ):
+                refs.add(item)
+
+    visit(value)
+    subjects = []
+    for logical_ref in sorted(refs):
+        catalog_source, object_ref = logical_ref.split("::", 1)
+        subjects.append({
+            "catalog_source": catalog_source,
+            "object_ref": object_ref,
+            "logical_ref": logical_ref,
+            "field_names": [object_ref.rsplit(".", 1)[-1]],
+        })
+    return tuple(subjects)
+
+
 def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task: str,
                          prompt_id: str, schema_id: str, instruction: str,
                          catalog_metadata: dict,
@@ -54,7 +87,11 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
                          prompt_version: int = 1, schema_version: int = 1,
                          dispatch_audit: DispatchAuditContext | None = None,
                          cacheable_metadata_keys: tuple[str, ...] = (),
-                         generation_settings: dict | None = None) -> AuditedCallResult:
+                         generation_settings: dict | None = None,
+                         turn_index: int = 0,
+                         provider_contract_hash: str | None = None,
+                         prompt_content_hash: str | None = None,
+                         schema_content_hash: str | None = None) -> AuditedCallResult:
     """Run one governed authoring call and return its full disposition (see ``AuditedCallResult``).
 
     Delegates to ``drive_audited_structured_call`` — never re-implementing the egress/schema/repair
@@ -69,7 +106,13 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
     effective_dispatch_audit = dispatch_audit or DispatchAuditContext(
         ingestion_run_id=None,
         stage=f"formula:{task}",
-        subjects=(),
+        subjects=_dispatch_subjects(catalog_metadata),
+        authoring_run_id=authoring_run_id,
+        call_role=task,
+        turn_index=turn_index,
+        provider_contract_hash=provider_contract_hash,
+        prompt_content_hash=prompt_content_hash,
+        schema_content_hash=schema_content_hash,
     )
     logical_material = {
         "authoring_run_id": authoring_run_id,
@@ -81,6 +124,10 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
         "instruction": instruction,
         "catalog_metadata": catalog_metadata,
         "generation_settings": generation_settings,
+        "turn_index": turn_index,
+        "provider_contract_hash": provider_contract_hash,
+        "prompt_content_hash": prompt_content_hash,
+        "schema_content_hash": schema_content_hash,
     }
     logical_call_ref = "lc_formula_" + hashlib.sha256(json.dumps(
         logical_material,

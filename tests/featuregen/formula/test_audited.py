@@ -108,13 +108,30 @@ def test_formula_call_always_threads_the_physical_dispatch_audit(monkeypatch):
         prompt_id="critic-v1",
         schema_id="critic",
         instruction="Review.",
-        catalog_metadata={},
+        catalog_metadata={
+            "operand_ref": "ftr::public.transactions.amount",
+        },
+        turn_index=3,
+        provider_contract_hash="contract-hash",
+        prompt_content_hash="prompt-hash",
+        schema_content_hash="schema-hash",
     )
     assert result.llm_call_ref == "llm-1"
     audit = captured["dispatch_audit"]
     assert audit.ingestion_run_id is None
     assert audit.stage == "formula:formula.critic"
-    assert audit.subjects == ()
+    assert audit.authoring_run_id == "run-audit-context"
+    assert audit.call_role == "formula.critic"
+    assert audit.turn_index == 3
+    assert audit.provider_contract_hash == "contract-hash"
+    assert audit.prompt_content_hash == "prompt-hash"
+    assert audit.schema_content_hash == "schema-hash"
+    assert audit.subjects == ({
+        "catalog_source": "ftr",
+        "object_ref": "public.transactions.amount",
+        "logical_ref": "ftr::public.transactions.amount",
+        "field_names": ["amount"],
+    },)
     assert captured["logical_call_ref"].startswith("lc_formula_")
 
 

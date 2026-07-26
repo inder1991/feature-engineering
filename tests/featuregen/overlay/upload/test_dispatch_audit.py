@@ -18,6 +18,7 @@ from featuregen.overlay.upload.dispatch_audit import (
     AuditIntegrityError,
     AuditUnavailable,
     compute_physical_request_hash,
+    formula_dispatches_reconciled,
     record_dispatch,
 )
 
@@ -127,6 +128,33 @@ def test_replay_with_changed_physical_request_fails_integrity(durable_dsn) -> No
         )
 
 
+def test_replay_with_changed_formula_turn_identity_fails_integrity(
+    durable_dsn,
+) -> None:
+    durable_dsn.append("log_c5t2_formula_identity")
+    _record(
+        logical_call_ref="log_c5t2_formula_identity",
+        physical_request_hash="physical-a",
+        call_role="formula.author",
+        turn_index=0,
+        canonical_turn_input_hash="logical-a",
+        provider_contract_hash="contract-a",
+        prompt_content_hash="prompt-a",
+        schema_content_hash="schema-a",
+    )
+    with pytest.raises(AuditIntegrityError):
+        _record(
+            logical_call_ref="log_c5t2_formula_identity",
+            physical_request_hash="physical-a",
+            call_role="formula.author",
+            turn_index=1,
+            canonical_turn_input_hash="logical-a",
+            provider_contract_hash="contract-a",
+            prompt_content_hash="prompt-a",
+            schema_content_hash="schema-a",
+        )
+
+
 def test_physical_request_hash_distinguishes_repair_payloads() -> None:
     common = {
         "task": "formula.author",
@@ -146,6 +174,30 @@ def test_physical_request_hash_distinguishes_repair_payloads() -> None:
     )
     assert compute_input_hash(first.inputs) == compute_input_hash(second.inputs)
     assert compute_physical_request_hash(first) != compute_physical_request_hash(second)
+
+
+def test_formula_dispatch_reconciliation_requires_every_audit_dimension() -> None:
+    class _Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class _Conn:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, *args):
+            return _Result(self.rows)
+
+    complete = ("physical", "logical", "contract", "prompt", "schema", True, True)
+    assert formula_dispatches_reconciled(_Conn([complete]), "run")
+    assert not formula_dispatches_reconciled(_Conn([]), "run")
+    for index in range(len(complete)):
+        broken = list(complete)
+        broken[index] = None if index < 5 else False
+        assert not formula_dispatches_reconciled(_Conn([tuple(broken)]), "run")
 
 
 def test_a_new_attempt_is_a_new_dispatch_record(durable_dsn) -> None:

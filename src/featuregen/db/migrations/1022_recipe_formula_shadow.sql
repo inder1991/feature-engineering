@@ -3,6 +3,14 @@ ALTER TABLE outbox ADD COLUMN IF NOT EXISTS payload_hash text NULL;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS payload_hash text NULL;
 ALTER TABLE queue ADD COLUMN IF NOT EXISTS lease_fence bigint NOT NULL DEFAULT 0;
 ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS physical_request_hash text NULL;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS authoring_run_id text NULL
+    REFERENCES formula_authoring_run(authoring_run_id);
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS call_role text NULL;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS turn_index integer NULL;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS canonical_turn_input_hash text NULL;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS provider_contract_hash text NULL;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS prompt_content_hash text NULL;
+ALTER TABLE llm_dispatch ADD COLUMN IF NOT EXISTS schema_content_hash text NULL;
 
 CREATE TABLE IF NOT EXISTS recipe_formula_shadow_expected_run (
     generation_run_id            text PRIMARY KEY

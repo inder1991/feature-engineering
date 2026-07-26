@@ -70,13 +70,26 @@ def compute_physical_request_hash(request: LLMRequest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _content_hash(value) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id: str | None,
                     stage: str, task: str, redacted_input: dict, input_hash: str,
                     subjects: list[dict], redaction_version: str | None = None,
                     provider: str | None = None, model: str | None = None,
                     prompt_version: int | None = None,
                     schema_version: int | None = None,
-                    physical_request_hash: str | None = None) -> str:
+                    physical_request_hash: str | None = None,
+                    authoring_run_id: str | None = None,
+                    call_role: str | None = None,
+                    turn_index: int | None = None,
+                    canonical_turn_input_hash: str | None = None,
+                    provider_contract_hash: str | None = None,
+                    prompt_content_hash: str | None = None,
+                    schema_content_hash: str | None = None) -> str:
     """Mint a dispatch_ref; on an OWN connection (``get_settings().dsn``) INSERT one immutable
     ``llm_dispatch`` header + one ``llm_dispatch_subject`` row per subject, and COMMIT
     independently (survives an upload rollback). Returns the dispatch_ref.
@@ -103,17 +116,23 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
             row = audit_conn.execute(
                 "INSERT INTO llm_dispatch (dispatch_ref, logical_call_ref, attempt_no, "
                 "ingestion_run_id, stage, task, input_hash, redacted_input, redaction_version, "
-                "provider, model, prompt_version, schema_version, physical_request_hash) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "provider, model, prompt_version, schema_version, physical_request_hash, "
+                "authoring_run_id, call_role, turn_index, canonical_turn_input_hash, "
+                "provider_contract_hash, prompt_content_hash, schema_content_hash) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
                 (dispatch_ref, logical_call_ref, attempt_no, ingestion_run_id, stage, task,
                  input_hash, Jsonb(redacted_input), redaction_version, provider, model,
-                 prompt_version, schema_version, physical_request_hash)).fetchone()
+                 prompt_version, schema_version, physical_request_hash, authoring_run_id,
+                 call_role, turn_index, canonical_turn_input_hash, provider_contract_hash,
+                 prompt_content_hash, schema_content_hash)).fetchone()
             if row is None:
                 existing = audit_conn.execute(
                     "SELECT dispatch_ref,ingestion_run_id,stage,task,input_hash,redacted_input,"
                     "redaction_version,provider,model,prompt_version,schema_version,"
-                    "physical_request_hash FROM llm_dispatch "
+                    "physical_request_hash,authoring_run_id,call_role,turn_index,"
+                    "canonical_turn_input_hash,provider_contract_hash,prompt_content_hash,"
+                    "schema_content_hash FROM llm_dispatch "
                     "WHERE logical_call_ref = %s AND attempt_no = %s",
                     (logical_call_ref, attempt_no)).fetchone()
                 if existing is None:   # unreachable outside a torn DB — still fail closed
@@ -132,6 +151,13 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                     prompt_version,
                     schema_version,
                     physical_request_hash,
+                    authoring_run_id,
+                    call_role,
+                    turn_index,
+                    canonical_turn_input_hash,
+                    provider_contract_hash,
+                    prompt_content_hash,
+                    schema_content_hash,
                 )
                 if existing[1:] != expected:
                     raise AuditIntegrityError(
@@ -242,6 +268,24 @@ def dispatch_egress_status(conn, dispatch_ref: str) -> str:
     return "egress_outcome_unknown"
 
 
+def formula_dispatches_reconciled(conn, authoring_run_id: str) -> bool:
+    """Require complete immutable request identity, transport outcome, and logical-call link."""
+    rows = conn.execute(
+        "SELECT d.physical_request_hash,d.canonical_turn_input_hash,"
+        "d.provider_contract_hash,d.prompt_content_hash,d.schema_content_hash,"
+        "EXISTS (SELECT 1 FROM llm_dispatch_outcome o "
+        "        WHERE o.dispatch_ref=d.dispatch_ref),"
+        "EXISTS (SELECT 1 FROM llm_call_dispatch l "
+        "        WHERE l.dispatch_ref=d.dispatch_ref) "
+        "FROM llm_dispatch d WHERE d.authoring_run_id=%s",
+        (authoring_run_id,),
+    ).fetchall()
+    return bool(rows) and all(
+        all(value is not None for value in row[:5]) and row[5] and row[6]
+        for row in rows
+    )
+
+
 # ---- C5-T3: the auditing-client wrapper (the dispatch seam) --------------------------------------
 
 
@@ -256,6 +300,12 @@ class DispatchAuditContext:
     ingestion_run_id: str | None
     stage: str
     subjects: Sequence[dict] = ()
+    authoring_run_id: str | None = None
+    call_role: str | None = None
+    turn_index: int | None = None
+    provider_contract_hash: str | None = None
+    prompt_content_hash: str | None = None
+    schema_content_hash: str | None = None
 
 
 class AuditingClient:
@@ -301,6 +351,22 @@ class AuditingClient:
             return self._inner.call(request)
         self._attempt_no += 1
         gen = request.generation_settings or {}
+        prompt_content_hash = self._ctx.prompt_content_hash or _content_hash(
+            request.inputs.get("instruction"))
+        schema_content_hash = self._ctx.schema_content_hash or _content_hash(
+            request.output_schema)
+        provider_contract_hash = self._ctx.provider_contract_hash or _content_hash({
+            "call_role": self._ctx.call_role or request.task,
+            "provider": gen.get("provider"),
+            "model": gen.get("model"),
+            "generation_settings": gen,
+            "prompt_id": request.prompt_id,
+            "prompt_version": request.prompt_version,
+            "prompt_content_hash": prompt_content_hash,
+            "output_schema_id": request.output_schema_id,
+            "output_schema_version": request.output_schema_version,
+            "schema_content_hash": schema_content_hash,
+        })
         try:
             dispatch_ref = record_dispatch(
                 logical_call_ref=self._logical_call_ref, attempt_no=self._attempt_no,
@@ -312,7 +378,14 @@ class AuditingClient:
                 provider=gen.get("provider"), model=gen.get("model"),
                 prompt_version=request.prompt_version,
                 schema_version=request.output_schema_version,
-                physical_request_hash=compute_physical_request_hash(request))
+                physical_request_hash=compute_physical_request_hash(request),
+                authoring_run_id=self._ctx.authoring_run_id,
+                call_role=self._ctx.call_role,
+                turn_index=self._ctx.turn_index,
+                canonical_turn_input_hash=compute_input_hash(request.inputs),
+                provider_contract_hash=provider_contract_hash,
+                prompt_content_hash=prompt_content_hash,
+                schema_content_hash=schema_content_hash)
         except AuditUnavailable:
             logger.warning(
                 "pre-dispatch audit unavailable for %s attempt %s — provider NOT called "

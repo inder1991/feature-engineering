@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
+
+from psycopg.types.json import Jsonb
 
 from featuregen.identity.current_principal import (
     CurrentPrincipalResolution,
@@ -175,6 +178,43 @@ class _AuthoringResult:
     authoring_run_id: str
 
 
+def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str) -> None:
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker._current_read_scope_hash",
+        lambda *args: f"scope-hash-{suffix}",
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.compare_snapshot_to_current",
+        lambda *args: SimpleNamespace(
+            status="current", current_content_hash=f"snapshot-hash-{suffix}"),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_formula_authority_envelope",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.load_frozen_configuration_json",
+        lambda value: object(),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.validate_recipe_provider_payload",
+        lambda value: None,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.FrozenRecipeReadContext.load",
+        lambda *args: object(),
+    )
+
+
+def _authoring_run_id(work_item_id: str) -> str:
+    return "far_" + hashlib.sha256(work_item_id.encode()).hexdigest()[:24]
+
+
 def test_revoked_principal_terminalizes_without_dispatch(db, monkeypatch) -> None:
     work_item_id, run_id = _seed_work(db, "revoked")
     called = False
@@ -339,6 +379,10 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
 
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
+        lambda *args: True,
+    )
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-1",
@@ -424,4 +468,103 @@ def test_missing_durable_audit_store_terminalizes_without_dispatch(
         "NOT_DISPATCHED",
         "NOT_RUN",
         "AUDIT_STORE_UNAVAILABLE",
+    )
+
+
+def test_completed_durable_authoring_resumes_without_provider_call(
+    db, monkeypatch, _dsn
+) -> None:
+    work_item_id, run_id = _seed_work(db, "recover-complete")
+    _prepare_dispatch_ready(monkeypatch, "recover-complete", _dsn)
+    authoring_run_id = _authoring_run_id(work_item_id)
+    db.execute(
+        "INSERT INTO formula_authoring_run "
+        "(authoring_run_id,intent_hash,versions,actor) "
+        "VALUES (%s,'intent-hash','{}'::jsonb,NULL)",
+        (authoring_run_id,),
+    )
+    terminal = {
+        "authoring_disposition": "RESOLVED",
+        "candidate_formula_hash": "formula-hash",
+        "structural_status": "ok",
+        "capability_status": "ok",
+        "output_status": "resolved",
+        "expectation_status": "match",
+        "critic_status": "clean",
+        "technical_status": "ok",
+    }
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event "
+        "(authoring_run_id,seq,kind,idempotency_key,payload) "
+        "VALUES (%s,1,'completed',%s,%s)",
+        (authoring_run_id, f"{authoring_run_id}:terminal", Jsonb(terminal)),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
+        lambda *args: True,
+    )
+    called = False
+
+    def _run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-recovery",
+        author_client=object(),
+        critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed"
+    assert not called
+    assert db.execute(
+        "SELECT delivery_axis,authoring_axis,authoring_result_json "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone() == ("DISPATCHED_AUDITED", "RESOLVED", terminal)
+
+
+def test_incomplete_prior_dispatch_is_not_automatically_reissued(
+    db, monkeypatch, _dsn
+) -> None:
+    work_item_id, run_id = _seed_work(db, "recover-ambiguous")
+    _prepare_dispatch_ready(monkeypatch, "recover-ambiguous", _dsn)
+    authoring_run_id = _authoring_run_id(work_item_id)
+    db.execute(
+        "INSERT INTO formula_authoring_run "
+        "(authoring_run_id,intent_hash,versions,actor) "
+        "VALUES (%s,'intent-hash','{}'::jsonb,NULL)",
+        (authoring_run_id,),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker._dispatch_count",
+        lambda *args: 1,
+    )
+    called = False
+
+    def _run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-recovery",
+        author_client=object(),
+        critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed"
+    assert not called
+    assert db.execute(
+        "SELECT delivery_axis,technical_axis "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone() == (
+        "PRIOR_DISPATCH_UNRECONCILED",
+        "RECOVERY_REQUIRES_RECONCILIATION",
     )
