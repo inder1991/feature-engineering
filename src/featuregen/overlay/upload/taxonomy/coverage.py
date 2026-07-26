@@ -5,11 +5,10 @@ answer, per leaf, *which recipes name it as their primary objective* (and, separ
 It is the human-readable audit behind the Phase-0 exit criteria and is read-only — nothing here touches
 ``templates.py`` or grounding.
 
-Key framing (the corrected Phase-0 gate): the 153 recipes populate only a **subset** of the 88
-selectable leaves. A selectable leaf with no authored recipe is normal — many governed objectives simply
-have no recipe yet — so an *unpopulated non-intentional* leaf is **informational, not a failure**. The
-one hard rule the report enforces is that an :attr:`UseCase.intentionally_empty` leaf (a declared-future
-``*`` objective) must carry **zero** recipes as primary *and* zero as secondary.
+The report distinguishes reviewed primary coverage, supporting-only coverage and true zero coverage.
+Release gates decide which active leaves require a primary anchor; membership in a release list never
+changes the measured tier. An :attr:`UseCase.intentionally_empty` leaf (a declared-future ``*``
+objective) must carry **zero** recipes as primary *and* zero as secondary.
 
 ``coverage_report()`` returns:
 
@@ -75,18 +74,12 @@ def coverage_report() -> dict:
         leaf for leaf in leaves
         if not effective_by_leaf[leaf] and not USE_CASE_REGISTRY[leaf].intentionally_empty
     ]
-    release_anchors = {
-        "credit.monitoring.obligor",
-        "fraud.merchant_fraud",
-        "treasury_alm.deposit_runoff_forecasting",
-        "treasury_alm.net_interest_margin",
-    }
     coverage_quality_tier_by_leaf = {
         leaf: (
             "ZERO"
             if not effective_by_leaf[leaf]
             else "MINIMUM_ANCHOR"
-            if by_leaf[leaf] or leaf in release_anchors
+            if by_leaf[leaf]
             else "SUPPORTING_ONLY"
         )
         for leaf in leaves

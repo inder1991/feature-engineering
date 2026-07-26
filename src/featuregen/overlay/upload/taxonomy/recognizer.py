@@ -20,13 +20,17 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from featuregen.contracts import SchemaValidationError
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import DEFAULT_LLM_MODEL, LLMClient
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
-from featuregen.overlay.upload.enrich_llm import audited_structured_call
+from featuregen.overlay.upload.enrich_llm import (
+    ENRICHMENT_RUN_ID,
+    drive_audited_structured_call,
+)
 from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
     RecognitionResult,
@@ -49,6 +53,14 @@ logger = logging.getLogger(__name__)
 RECOGNIZER_TASK = "use_case_recognition"
 _OUTPUT_SCHEMA_ID = "use_case_recognition"
 _OUTPUT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class AuditedRecognition:
+    result: RecognitionResult
+    llm_call_ref: str | None
+    provider_calls: int
+    usage: dict[str, Any]
 
 
 def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> RecognitionResult:
@@ -101,7 +113,7 @@ def _recognition_instruction(
     return "\n".join(lines)
 
 
-def recognize(
+def recognize_with_audit(
     conn,
     client: LLMClient,
     *,
@@ -111,7 +123,8 @@ def recognize(
     model_id: str | None = None,
     actor: IdentityEnvelope | None = None,
     ingestion_run_id: str | None = None,
-) -> RecognitionResult:
+    audit_run_id: str | None = None,
+) -> AuditedRecognition:
     """Recognise the governed use-case scope of a *redacted* request. LLM-only and FAIL-OPEN: never
     raises to its caller. Routes through the platform's AUDITED seam (``audited_structured_call``) so a
     real provider gets the registered output-schema (never fails closed for lack of one), the egress
@@ -135,30 +148,93 @@ def recognize(
                                               stage="recognizer", subjects=())
 
     try:
-        output = audited_structured_call(
+        audited = drive_audited_structured_call(
             conn, client, task=RECOGNIZER_TASK, prompt_id=PROMPT_ID,
             schema_id=_OUTPUT_SCHEMA_ID, catalog_metadata={}, instruction=instruction, actor=actor,
-            dispatch_audit=dispatch_audit)
+            dispatch_audit=dispatch_audit,
+            run_id=audit_run_id or ENRICHMENT_RUN_ID,
+            record_egress_block=audit_run_id is not None,
+        )
     except Exception:
         logger.exception("recognition dispatch raised; failing open to technical_failure")
-        return unscoped_result(
-            "recognition dispatch error", model_id=model, prompt_version=PROMPT_VERSION, technical=True)
+        return AuditedRecognition(
+            unscoped_result(
+                "recognition dispatch error",
+                model_id=model,
+                prompt_version=PROMPT_VERSION,
+                technical=True,
+            ),
+            None,
+            0,
+            {},
+        )
 
+    output = audited.output
     if not output:                              # egress block / provider failure / empty body
-        return unscoped_result(
-            "recognition failed or egress-blocked", model_id=model, prompt_version=PROMPT_VERSION,
-            technical=True)
+        return AuditedRecognition(
+            unscoped_result(
+                "recognition failed or egress-blocked",
+                model_id=model,
+                prompt_version=PROMPT_VERSION,
+                technical=True,
+            ),
+            audited.llm_call_ref,
+            audited.provider_calls,
+            audited.usage,
+        )
 
     try:
         validate_recognition_output(output)     # closed-taxonomy semantics (id in registry, primary leaf)
     except SchemaValidationError as exc:
-        return unscoped_result(
-            f"recognition output invalid: {exc}", model_id=model, prompt_version=PROMPT_VERSION,
-            technical=True)
+        return AuditedRecognition(
+            unscoped_result(
+                f"recognition output invalid: {exc}",
+                model_id=model,
+                prompt_version=PROMPT_VERSION,
+                technical=True,
+            ),
+            audited.llm_call_ref,
+            audited.provider_calls,
+            audited.usage,
+        )
 
     try:
-        return _result_from_output(output, model_id=model)
+        result = _result_from_output(output, model_id=model)
     except Exception:
         logger.exception("recognition output mapping raised; failing open to technical_failure")
-        return unscoped_result(
-            "recognition mapping error", model_id=model, prompt_version=PROMPT_VERSION, technical=True)
+        result = unscoped_result(
+            "recognition mapping error",
+            model_id=model,
+            prompt_version=PROMPT_VERSION,
+            technical=True,
+        )
+    return AuditedRecognition(
+        result,
+        audited.llm_call_ref,
+        audited.provider_calls,
+        audited.usage,
+    )
+
+
+def recognize(
+    conn,
+    client: LLMClient,
+    *,
+    redacted_hypothesis: str,
+    redacted_goal: str | None = None,
+    redacted_feedback: str | None = None,
+    model_id: str | None = None,
+    actor: IdentityEnvelope | None = None,
+    ingestion_run_id: str | None = None,
+) -> RecognitionResult:
+    """Compatibility projection over :func:`recognize_with_audit`."""
+    return recognize_with_audit(
+        conn,
+        client,
+        redacted_hypothesis=redacted_hypothesis,
+        redacted_goal=redacted_goal,
+        redacted_feedback=redacted_feedback,
+        model_id=model_id,
+        actor=actor,
+        ingestion_run_id=ingestion_run_id,
+    ).result

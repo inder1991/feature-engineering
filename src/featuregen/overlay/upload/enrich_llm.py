@@ -352,6 +352,11 @@ def _generation_settings() -> dict:
     return {"provider": "fake", "model": "test"}
 
 
+def current_enrichment_generation_settings() -> dict:
+    """Return the exact provider controls used by the audited structured-call seam."""
+    return dict(_generation_settings())
+
+
 def _audit_egress_block(conn, *, task: str, actor, reason: str) -> None:
     """A blocked egress is a security event (content was about to reach the LLM) — record it on the
     tamper-evident chain, not just the log (the redaction contract requires hard failures be audited).

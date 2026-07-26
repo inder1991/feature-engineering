@@ -10,7 +10,11 @@ from __future__ import annotations
 from collections import Counter
 
 from featuregen.overlay.upload.taxonomy import gold_recognition
-from featuregen.overlay.upload.taxonomy.gold_recognition import GOLD
+from featuregen.overlay.upload.taxonomy.gold_recognition import (
+    GOLD,
+    TARGET_GOLD,
+    validate_target_gold,
+)
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
@@ -104,3 +108,21 @@ def test_expected_recipes_are_reachable_from_the_ideal_scope():
 def test_module_marks_the_set_as_authored_pending_expert_review():
     doc = (gold_recognition.__doc__ or "").upper()
     assert "AUTHORED" in doc and "PENDING EXPERT REVIEW" in doc
+
+
+def test_release_target_denominator_is_exactly_25_distinct_cases_per_anchor():
+    validate_target_gold()
+    assert len(TARGET_GOLD) == 100
+    assert set(TARGET_GOLD).isdisjoint(GOLD)
+    counts = Counter(case.expected_primary for case in TARGET_GOLD)
+    assert counts == {
+        "credit.monitoring.obligor": 25,
+        "fraud.merchant_fraud": 25,
+        "treasury_alm.deposit_runoff_forecasting": 25,
+        "treasury_alm.net_interest_margin": 25,
+    }
+    assert len({case.hypothesis for case in TARGET_GOLD}) == 100
+    for case in TARGET_GOLD:
+        assert case.expected_primary in _LEAVES
+        assert len(case.expected_relevant_recipes) >= 2
+        assert set(case.expected_relevant_recipes) <= _RECIPE_IDS
