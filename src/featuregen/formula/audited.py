@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.formula.control import LeaseFence
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import _generation_settings, drive_audited_structured_call
@@ -91,7 +92,8 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
                          turn_index: int = 0,
                          provider_contract_hash: str | None = None,
                          prompt_content_hash: str | None = None,
-                         schema_content_hash: str | None = None) -> AuditedCallResult:
+                         schema_content_hash: str | None = None,
+                         lease_fence: LeaseFence | None = None) -> AuditedCallResult:
     """Run one governed authoring call and return its full disposition (see ``AuditedCallResult``).
 
     Delegates to ``drive_audited_structured_call`` — never re-implementing the egress/schema/repair
@@ -113,6 +115,7 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
         provider_contract_hash=provider_contract_hash,
         prompt_content_hash=prompt_content_hash,
         schema_content_hash=schema_content_hash,
+        lease_fence=lease_fence,
     )
     logical_material = {
         "authoring_run_id": authoring_run_id,

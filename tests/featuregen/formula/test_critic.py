@@ -348,7 +348,7 @@ def test_author_reasoning_and_tool_trace_never_reach_the_critic(db):
 def test_critique_signature_has_no_slot_for_an_author_trace():
     assert set(inspect.signature(critique).parameters) == {
         "conn", "intent", "proposal", "client", "roles", "actor", "authoring_run_id",
-        "provider_contract", "metadata_loader", "progress_callback"}
+        "provider_contract", "metadata_loader", "progress_callback", "lease_fence"}
 
 
 def test_findings_hash_is_order_independent_end_to_end(db):

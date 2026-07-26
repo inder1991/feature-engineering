@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from psycopg.types.json import Jsonb
 
+from featuregen.formula.control import RecoveryRequiresReconciliation
 from featuregen.identity.current_principal import (
     CurrentPrincipalResolution,
     PrincipalResolutionStatus,
@@ -207,7 +208,14 @@ def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str) -> None:
     )
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.FrozenRecipeReadContext.load",
-        lambda *args: object(),
+        lambda *args: SimpleNamespace(
+            formula_facts=lambda proposal: ({}, {}),
+            get_column_metadata=lambda ref: {"found": True, "logical_ref": ref},
+        ),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.renew_recipe_formula_shadow",
+        lambda *args, **kwargs: True,
     )
 
 
@@ -383,6 +391,10 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
         "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
         lambda *args: True,
     )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.renew_recipe_formula_shadow",
+        lambda *args, **kwargs: True,
+    )
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-1",
@@ -471,7 +483,7 @@ def test_missing_durable_audit_store_terminalizes_without_dispatch(
     )
 
 
-def test_completed_durable_authoring_resumes_without_provider_call(
+def test_completed_durable_authoring_is_delegated_to_verified_replay(
     db, monkeypatch, _dsn
 ) -> None:
     work_item_id, run_id = _seed_work(db, "recover-complete")
@@ -503,11 +515,12 @@ def test_completed_durable_authoring_resumes_without_provider_call(
         "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
         lambda *args: True,
     )
-    called = False
+    orchestration_calls = 0
 
     def _run(*args, **kwargs):
-        nonlocal called
-        called = True
+        nonlocal orchestration_calls
+        orchestration_calls += 1
+        return _AuthoringResult("RESOLVED", "ok", authoring_run_id)
 
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
@@ -518,13 +531,15 @@ def test_completed_durable_authoring_resumes_without_provider_call(
         critic_client=object(),
         identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
     )
-    assert outcome.status == "completed"
-    assert not called
+    assert outcome.status == "completed", db.execute(
+        "SELECT last_error FROM queue WHERE message_id='formula-test-recover-complete'"
+    ).fetchone()
+    assert orchestration_calls == 1
     assert db.execute(
-        "SELECT delivery_axis,authoring_axis,authoring_result_json "
+        "SELECT delivery_axis,authoring_axis "
         "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
         (run_id,),
-    ).fetchone() == ("DISPATCHED_AUDITED", "RESOLVED", terminal)
+    ).fetchone() == ("DISPATCHED_AUDITED", "RESOLVED")
 
 
 def test_incomplete_prior_dispatch_is_not_automatically_reissued(
@@ -539,15 +554,12 @@ def test_incomplete_prior_dispatch_is_not_automatically_reissued(
         "VALUES (%s,'intent-hash','{}'::jsonb,NULL)",
         (authoring_run_id,),
     )
-    monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker._dispatch_count",
-        lambda *args: 1,
-    )
     called = False
 
     def _run(*args, **kwargs):
         nonlocal called
         called = True
+        raise RecoveryRequiresReconciliation("ambiguous pre-dispatch record")
 
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
@@ -558,8 +570,10 @@ def test_incomplete_prior_dispatch_is_not_automatically_reissued(
         critic_client=object(),
         identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
     )
-    assert outcome.status == "completed"
-    assert not called
+    assert outcome.status == "completed", db.execute(
+        "SELECT last_error FROM queue WHERE message_id='formula-test-recover-ambiguous'"
+    ).fetchone()
+    assert called
     assert db.execute(
         "SELECT delivery_axis,technical_axis "
         "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",

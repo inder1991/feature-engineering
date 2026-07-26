@@ -253,6 +253,7 @@ def renew_recipe_formula_shadow(
     row = conn.execute(
         "UPDATE queue SET lease_expires_at=now() + make_interval(secs => %s) "
         "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
         "RETURNING id",
         (lease_seconds, claim.id, claim.lease_owner, claim.lease_fence),
     ).fetchone()
@@ -265,6 +266,7 @@ def complete_recipe_formula_shadow(
     row = conn.execute(
         "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL "
         "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
         "RETURNING id",
         (claim.id, claim.lease_owner, claim.lease_fence),
     ).fetchone()
@@ -283,7 +285,8 @@ def fail_recipe_formula_shadow(
         "UPDATE queue SET status=%s, last_error=%s, lease_owner=NULL, lease_expires_at=NULL, "
         "available_at=CASE WHEN %s='ready' THEN now() + make_interval(secs => %s) "
         "ELSE available_at END "
-        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s RETURNING id",
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() RETURNING id",
         (
             status,
             error,

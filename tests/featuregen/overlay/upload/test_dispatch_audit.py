@@ -13,6 +13,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
+from featuregen.formula.control import LeaseFence, LeaseFenceLost
 from featuregen.intake.llm import LLMRequest, compute_input_hash
 from featuregen.overlay.upload.dispatch_audit import (
     AuditIntegrityError,
@@ -47,6 +48,7 @@ def durable_dsn(monkeypatch, _dsn):
                   "ENABLE TRIGGER llm_dispatch_subject_no_mutation")
         c.execute("ALTER TABLE llm_dispatch_outcome "
                   "ENABLE TRIGGER llm_dispatch_outcome_no_mutation")
+        c.execute("DELETE FROM queue WHERE message_id='dispatch-fence-test'")
 
 
 _SUBJECTS = [
@@ -206,6 +208,50 @@ def test_a_new_attempt_is_a_new_dispatch_record(durable_dsn) -> None:
     first = _record(logical_call_ref="log_c5t2_retry", attempt_no=1)
     second = _record(logical_call_ref="log_c5t2_retry", attempt_no=2)
     assert second != first
+
+
+def test_formula_dispatch_insert_is_conditioned_on_the_live_queue_fence(
+    durable_dsn, _dsn
+) -> None:
+    logical_ref = "log_c5t2_fenced"
+    durable_dsn.append(logical_ref)
+    with psycopg.connect(_dsn, autocommit=True) as setup:
+        queue_id = setup.execute(
+            "INSERT INTO queue "
+            "(message_id,partition_key,handler,payload,status,lease_owner,"
+            "lease_expires_at,lease_fence) "
+            "VALUES ('dispatch-fence-test','dispatch-fence-test',"
+            "'recipe_formula_shadow.author.v1','{}'::jsonb,'leased','worker-a',"
+            "now() + interval '5 minutes',11) RETURNING id"
+        ).fetchone()[0]
+    fence = LeaseFence(queue_id, "worker-a", 11)
+    dispatch_ref = _record(
+        logical_call_ref=logical_ref,
+        lease_fence=fence,
+    )
+    with psycopg.connect(_dsn, autocommit=True) as check:
+        assert check.execute(
+            "SELECT queue_id,lease_owner,lease_fence FROM llm_dispatch "
+            "WHERE dispatch_ref=%s",
+            (dispatch_ref,),
+        ).fetchone() == (queue_id, "worker-a", 11)
+        check.execute(
+            "UPDATE queue SET lease_expires_at=now() - interval '1 second' "
+            "WHERE id=%s",
+            (queue_id,),
+        )
+    with pytest.raises(LeaseFenceLost):
+        _record(logical_call_ref=logical_ref, lease_fence=fence)
+    with pytest.raises(LeaseFenceLost):
+        _record(
+            logical_call_ref="log_c5t2_fenced_expired",
+            lease_fence=fence,
+        )
+    with psycopg.connect(_dsn) as check:
+        assert check.execute(
+            "SELECT count(*) FROM llm_dispatch "
+            "WHERE logical_call_ref='log_c5t2_fenced_expired'"
+        ).fetchone()[0] == 0
 
 
 # ── fail-closed durability (AuditUnavailable — the caller must NOT dispatch) ──────────────────────

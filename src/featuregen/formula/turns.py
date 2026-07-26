@@ -153,3 +153,4 @@ class AuthorTurnRecord:
     #                               with no output)
     provider_calls: int
     usage: dict
+    tool_context_hash: str = ""

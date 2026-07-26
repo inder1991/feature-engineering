@@ -41,6 +41,7 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.formula._jcs import dumps as _jcs_dumps
 from featuregen.formula.audited import audited_formula_call
+from featuregen.formula.control import LeaseFence
 from featuregen.formula.schema import (
     DiffBody,
     FilterBool,
@@ -392,6 +393,7 @@ def critique(
     provider_contract: FrozenProviderContractV1 | None = None,
     metadata_loader: Callable[[str], dict] | None = None,
     progress_callback: Callable[[], None] | None = None,
+    lease_fence: LeaseFence | None = None,
 ) -> CriticReview:
     """Run the independent critic ONCE over ``proposal`` against ``intent``.
 
@@ -443,7 +445,10 @@ def critique(
             provider_contract.prompt_content_hash if provider_contract is not None else None),
         schema_content_hash=(
             provider_contract.schema_content_hash if provider_contract is not None else None),
+        lease_fence=lease_fence,
     )
+    if progress_callback is not None:
+        progress_callback()
     findings, is_technical_failure, notes = _parse_findings(result.output)
     for note in notes:
         logger.warning("critic (run %s, call %s): %s",

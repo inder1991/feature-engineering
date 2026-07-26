@@ -32,6 +32,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
+from featuregen.formula.control import LeaseFence, LeaseFenceLost
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import (
     PROVIDER_TRANSIENT,
@@ -89,7 +90,8 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                     canonical_turn_input_hash: str | None = None,
                     provider_contract_hash: str | None = None,
                     prompt_content_hash: str | None = None,
-                    schema_content_hash: str | None = None) -> str:
+                    schema_content_hash: str | None = None,
+                    lease_fence: LeaseFence | None = None) -> str:
     """Mint a dispatch_ref; on an OWN connection (``get_settings().dsn``) INSERT one immutable
     ``llm_dispatch`` header + one ``llm_dispatch_subject`` row per subject, and COMMIT
     independently (survives an upload rollback). Returns the dispatch_ref.
@@ -113,26 +115,55 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
     dispatch_ref = mint_id("disp")
     try:
         with psycopg.connect(dsn) as audit_conn:   # own tx, committed on `with` exit
-            row = audit_conn.execute(
-                "INSERT INTO llm_dispatch (dispatch_ref, logical_call_ref, attempt_no, "
-                "ingestion_run_id, stage, task, input_hash, redacted_input, redaction_version, "
-                "provider, model, prompt_version, schema_version, physical_request_hash, "
-                "authoring_run_id, call_role, turn_index, canonical_turn_input_hash, "
-                "provider_contract_hash, prompt_content_hash, schema_content_hash) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
-                (dispatch_ref, logical_call_ref, attempt_no, ingestion_run_id, stage, task,
-                 input_hash, Jsonb(redacted_input), redaction_version, provider, model,
-                 prompt_version, schema_version, physical_request_hash, authoring_run_id,
-                 call_role, turn_index, canonical_turn_input_hash, provider_contract_hash,
-                 prompt_content_hash, schema_content_hash)).fetchone()
+            queue_id = lease_fence.queue_id if lease_fence is not None else None
+            lease_owner = lease_fence.lease_owner if lease_fence is not None else None
+            fence_epoch = lease_fence.lease_fence if lease_fence is not None else None
+            values = (
+                dispatch_ref, logical_call_ref, attempt_no, ingestion_run_id, stage, task,
+                input_hash, Jsonb(redacted_input), redaction_version, provider, model,
+                prompt_version, schema_version, physical_request_hash, authoring_run_id,
+                call_role, turn_index, canonical_turn_input_hash, provider_contract_hash,
+                prompt_content_hash, schema_content_hash, queue_id, lease_owner, fence_epoch,
+            )
+            columns = (
+                "(dispatch_ref,logical_call_ref,attempt_no,ingestion_run_id,stage,task,input_hash,"
+                "redacted_input,redaction_version,provider,model,prompt_version,schema_version,"
+                "physical_request_hash,authoring_run_id,call_role,turn_index,"
+                "canonical_turn_input_hash,provider_contract_hash,prompt_content_hash,"
+                "schema_content_hash,queue_id,lease_owner,lease_fence) "
+            )
+            if lease_fence is None:
+                row = audit_conn.execute(
+                    "INSERT INTO llm_dispatch " + columns
+                    + "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
+                    values,
+                ).fetchone()
+            else:
+                row = audit_conn.execute(
+                    "INSERT INTO llm_dispatch " + columns
+                    + "SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s,%s,%s,%s,%s WHERE EXISTS (SELECT 1 FROM queue "
+                    "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+                    "AND lease_expires_at > now()) "
+                    "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
+                    (*values, queue_id, lease_owner, fence_epoch),
+                ).fetchone()
             if row is None:
+                if lease_fence is not None and audit_conn.execute(
+                    "SELECT 1 FROM queue WHERE id=%s AND status='leased' "
+                    "AND lease_owner=%s AND lease_fence=%s AND lease_expires_at > now()",
+                    (queue_id, lease_owner, fence_epoch),
+                ).fetchone() is None:
+                    raise LeaseFenceLost(
+                        "formula pre-dispatch lease fence is no longer live")
                 existing = audit_conn.execute(
                     "SELECT dispatch_ref,ingestion_run_id,stage,task,input_hash,redacted_input,"
                     "redaction_version,provider,model,prompt_version,schema_version,"
                     "physical_request_hash,authoring_run_id,call_role,turn_index,"
                     "canonical_turn_input_hash,provider_contract_hash,prompt_content_hash,"
-                    "schema_content_hash FROM llm_dispatch "
+                    "schema_content_hash,queue_id,lease_owner,lease_fence FROM llm_dispatch "
                     "WHERE logical_call_ref = %s AND attempt_no = %s",
                     (logical_call_ref, attempt_no)).fetchone()
                 if existing is None:   # unreachable outside a torn DB — still fail closed
@@ -158,6 +189,9 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                     provider_contract_hash,
                     prompt_content_hash,
                     schema_content_hash,
+                    queue_id,
+                    lease_owner,
+                    fence_epoch,
                 )
                 if existing[1:] != expected:
                     raise AuditIntegrityError(
@@ -171,7 +205,7 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                     (dispatch_ref, subject.get("catalog_source"), subject.get("object_ref"),
                      subject.get("logical_ref"), Jsonb(subject.get("field_names") or [])))
         return dispatch_ref
-    except AuditUnavailable:
+    except (AuditUnavailable, LeaseFenceLost):
         raise
     except Exception as exc:  # noqa: BLE001 — ANY durability failure means: do not dispatch
         logger.exception("pre-dispatch audit write failed for logical_call_ref=%s attempt=%s",
@@ -306,6 +340,7 @@ class DispatchAuditContext:
     provider_contract_hash: str | None = None
     prompt_content_hash: str | None = None
     schema_content_hash: str | None = None
+    lease_fence: LeaseFence | None = None
 
 
 class AuditingClient:
@@ -385,7 +420,8 @@ class AuditingClient:
                 canonical_turn_input_hash=compute_input_hash(request.inputs),
                 provider_contract_hash=provider_contract_hash,
                 prompt_content_hash=prompt_content_hash,
-                schema_content_hash=schema_content_hash)
+                schema_content_hash=schema_content_hash,
+                lease_fence=self._ctx.lease_fence)
         except AuditUnavailable:
             logger.warning(
                 "pre-dispatch audit unavailable for %s attempt %s — provider NOT called "

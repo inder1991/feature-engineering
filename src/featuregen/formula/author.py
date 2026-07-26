@@ -19,12 +19,13 @@ returned trail with its ``llm_call_ref``.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.formula.audited import audited_formula_call
+from featuregen.formula.control import LeaseFence
 from featuregen.formula.tools import TOOLS, run_tool
 from featuregen.formula.turns import (
     AUTHOR_TURN_SCHEMA_ID,
@@ -37,6 +38,7 @@ from featuregen.formula.turns import (
     TurnKind,
 )
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.field_evidence import canonical_hash
 
 if TYPE_CHECKING:
     from featuregen.formula.frozen_configuration import FrozenProviderContractV1
@@ -129,6 +131,8 @@ def author_formula(
     provider_contract: FrozenProviderContractV1 | None = None,
     tool_runner: Callable[..., dict] = run_tool,
     progress_callback: Callable[[], None] | None = None,
+    lease_fence: LeaseFence | None = None,
+    resume_turns: Sequence[dict] = (),
 ) -> tuple[dict | None, list[AuthorTurnRecord]]:
     """Author one TypedFormula proposal via a bounded sequential-turn loop.
 
@@ -168,21 +172,55 @@ def author_formula(
     trail: list[dict] = []
     tokens_spent = 0
 
+    for payload in resume_turns:
+        try:
+            turn = AuthorTurnRecord(
+                index=int(payload["index"]),
+                kind=TurnKind(str(payload["kind"])),
+                llm_call_ref=payload.get("llm_call_ref"),
+                tool_name=payload.get("tool_name"),
+                tool_result=payload.get("tool_result"),
+                output=payload.get("output"),
+                provider_calls=int(payload.get("provider_calls", 0)),
+                usage=dict(payload.get("usage") or {}),
+                tool_context_hash=str(payload["tool_context_hash"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid resumed author turn") from exc
+        if turn.index != len(turns):
+            raise ValueError("resumed author turns are not contiguous")
+        turns.append(turn)
+        tokens_spent += _tokens_of(turn.usage)
+        if turn.kind is TurnKind.TOOL_CALL:
+            if turn.tool_name is None or turn.tool_result is None:
+                raise ValueError("resumed tool turn is incomplete")
+            trail.append(
+                tool_trail_entry(turn.index + 1, turn.tool_name, turn.tool_result))
+        elif turn.kind is TurnKind.FINAL_PROPOSAL:
+            final = (turn.output or {}).get("final_proposal")
+            if not isinstance(final, dict):
+                raise ValueError("resumed final proposal is incomplete")
+            return dict(final), turns
+        elif turn.kind is TurnKind.FAILED:
+            return None, turns
+
     def record(turn: AuthorTurnRecord) -> None:
         turns.append(turn)
         if on_turn is not None:
             on_turn(turn)
 
-    for index in range(max_turns):
+    for index in range(len(turns), max_turns):
         if tokens_spent > AUTHOR_TOKEN_BUDGET:
             return None, turns          # budget exceeded — technical, never a fabricated proposal
         if progress_callback is not None:
             progress_callback()
+        turn_metadata = build_turn_metadata(intent, trail)
+        tool_context_hash = canonical_hash(trail)
         result = audited_formula_call(
             conn, client, authoring_run_id=authoring_run_id, task=AUTHOR_TASK,
             prompt_id=prompt_id, schema_id=schema_id,
             instruction=instruction,
-            catalog_metadata=build_turn_metadata(intent, trail),
+            catalog_metadata=turn_metadata,
             actor=actor, prompt_version=prompt_version, schema_version=schema_version,
             generation_settings=generation_settings,
             turn_index=index,
@@ -193,7 +231,10 @@ def author_formula(
                 if provider_contract is not None else None),
             schema_content_hash=(
                 provider_contract.schema_content_hash
-                if provider_contract is not None else None))
+                if provider_contract is not None else None),
+            lease_fence=lease_fence)
+        if progress_callback is not None:
+            progress_callback()
         usage = dict(result.usage or {})
         tokens_spent += _tokens_of(usage)
         output = result.output
@@ -204,7 +245,8 @@ def author_formula(
             record(AuthorTurnRecord(
                 index=index, kind=TurnKind.FAILED, llm_call_ref=result.llm_call_ref,
                 tool_name=None, tool_result=None, output=None,
-                provider_calls=result.provider_calls, usage=usage))
+                provider_calls=result.provider_calls, usage=usage,
+                tool_context_hash=tool_context_hash))
             return None, turns
 
         turn_type = output.get("turn_type")
@@ -213,7 +255,8 @@ def author_formula(
             record(AuthorTurnRecord(
                 index=index, kind=TurnKind.FINAL_PROPOSAL, llm_call_ref=result.llm_call_ref,
                 tool_name=None, tool_result=None, output=output,
-                provider_calls=result.provider_calls, usage=usage))
+                provider_calls=result.provider_calls, usage=usage,
+                tool_context_hash=tool_context_hash))
             return dict(final_proposal), turns    # the RAW dict — Task 2 parses it later
 
         tool_call = output.get("tool_call")
@@ -227,7 +270,8 @@ def author_formula(
             record(AuthorTurnRecord(
                 index=index, kind=TurnKind.TOOL_CALL, llm_call_ref=result.llm_call_ref,
                 tool_name=tool_name, tool_result=tool_result, output=output,
-                provider_calls=result.provider_calls, usage=usage))
+                provider_calls=result.provider_calls, usage=usage,
+                tool_context_hash=tool_context_hash))
             # the canonical result becomes DATA in the next turn's catalog_metadata
             trail.append(tool_trail_entry(index + 1, tool_name, tool_result))
             continue
@@ -237,6 +281,7 @@ def author_formula(
         record(AuthorTurnRecord(
             index=index, kind=TurnKind.FAILED, llm_call_ref=result.llm_call_ref,
             tool_name=None, tool_result=None, output=output,
-            provider_calls=result.provider_calls, usage=usage))
+            provider_calls=result.provider_calls, usage=usage,
+            tool_context_hash=tool_context_hash))
         return None, turns
     return None, turns                  # max_turns exhausted without a final proposal — technical

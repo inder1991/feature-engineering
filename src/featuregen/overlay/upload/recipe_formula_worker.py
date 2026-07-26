@@ -7,12 +7,18 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+import psycopg
 from psycopg.rows import dict_row
 
 from featuregen.config import get_settings
 from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
 from featuregen.formula.authoring import run_authoring
+from featuregen.formula.control import (
+    LeaseFence,
+    LeaseFenceLost,
+    RecoveryRequiresReconciliation,
+)
 from featuregen.formula.frozen_configuration import (
     ConfigurationDrifted,
     load_frozen_configuration_json,
@@ -61,12 +67,8 @@ class FormulaShadowWorkerOutcome:
     observation_id: str | None = None
 
 
-class LeaseFenceLost(RuntimeError):
-    """The worker no longer owns the fenced lease and must stop before dispatch."""
-
-
 def _plain(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _plain(asdict(value))
     if isinstance(value, Enum):
         return value.value
@@ -108,7 +110,7 @@ def _terminalize(conn, claim, row: dict, *, axes: dict, result: dict | None = No
     with conn.transaction():
         current = conn.execute(
             "SELECT 1 FROM queue WHERE id=%s AND status='leased' AND lease_owner=%s "
-            "AND lease_fence=%s FOR UPDATE",
+            "AND lease_fence=%s AND lease_expires_at > now() FOR UPDATE",
             (claim.id, claim.lease_owner, claim.lease_fence),
         ).fetchone()
         if current is None:
@@ -146,24 +148,6 @@ def _terminalize(conn, claim, row: dict, *, axes: dict, result: dict | None = No
         finalize_manifest(conn, row["generation_run_id"])
     return FormulaShadowWorkerOutcome(
         "completed", row["work_item_id"], observation_id)
-
-
-def _terminal_authoring_event(conn, authoring_run_id: str) -> tuple[str, dict] | None:
-    row = conn.execute(
-        "SELECT kind,payload FROM formula_authoring_trace_event "
-        "WHERE authoring_run_id=%s AND kind IN ('completed','failed')",
-        (authoring_run_id,),
-    ).fetchone()
-    if row is None or not isinstance(row[1], dict):
-        return None
-    return row[0], row[1]
-
-
-def _trace_event_count(conn, authoring_run_id: str) -> int:
-    return conn.execute(
-        "SELECT count(*) FROM formula_authoring_trace_event WHERE authoring_run_id=%s",
-        (authoring_run_id,),
-    ).fetchone()[0]
 
 
 def _dispatch_count(conn, authoring_run_id: str) -> int:
@@ -354,39 +338,6 @@ def process_recipe_formula_shadow_once(
             })
         deterministic_run_id = "far_" + hashlib.sha256(
             row["work_item_id"].encode()).hexdigest()[:24]
-        if conn.execute(
-            "SELECT 1 FROM formula_authoring_run WHERE authoring_run_id=%s",
-            (deterministic_run_id,),
-        ).fetchone() is not None:
-            terminal = _terminal_authoring_event(conn, deterministic_run_id)
-            if terminal is not None and formula_dispatches_reconciled(
-                conn, deterministic_run_id
-            ):
-                _kind, terminal_result = terminal
-                return _terminalize(conn, claim, row, axes={
-                    "authorization_axis": "AUTHORIZED_CURRENT",
-                    "authority_axis": "VERIFIED_AT_CAPTURE",
-                    "drift_axis": "CURRENT",
-                    "configuration_axis": "CURRENT",
-                    "delivery_axis": "DISPATCHED_AUDITED",
-                    "authoring_axis": terminal_result["authoring_disposition"],
-                    "technical_axis": str(
-                        terminal_result["technical_status"]).upper(),
-                }, result=terminal_result, authoring_run_id=deterministic_run_id)
-            if (
-                terminal is not None
-                or _trace_event_count(conn, deterministic_run_id) > 0
-                or _dispatch_count(conn, deterministic_run_id) > 0
-            ):
-                return _terminalize(conn, claim, row, axes={
-                    "authorization_axis": "AUTHORIZED_CURRENT",
-                    "authority_axis": "VERIFIED_AT_CAPTURE",
-                    "drift_axis": "CURRENT",
-                    "configuration_axis": "CURRENT",
-                    "delivery_axis": "PRIOR_DISPATCH_UNRECONCILED",
-                    "authoring_axis": "TECHNICAL_FAILURE",
-                    "technical_axis": "RECOVERY_REQUIRES_RECONCILIATION",
-                }, authoring_run_id=deterministic_run_id)
         client = author_client or current_llm_client()
         critic = critic_client or client
         intent = AuthoringIntent(
@@ -398,7 +349,17 @@ def process_recipe_formula_shadow_once(
         )
 
         def renew_lease() -> None:
-            if not renew_recipe_formula_shadow(conn, claim, lease_seconds=900):
+            dsn = get_settings().dsn
+            if not dsn:
+                raise LeaseFenceLost("formula queue lease cannot be renewed durably")
+            try:
+                with psycopg.connect(dsn) as lease_conn:
+                    renewed = renew_recipe_formula_shadow(
+                        lease_conn, claim, lease_seconds=900)
+            except Exception as exc:
+                raise LeaseFenceLost(
+                    "formula queue lease renewal is unavailable") from exc
+            if not renewed:
                 raise LeaseFenceLost("formula queue lease fence changed")
 
         result = run_authoring(
@@ -416,6 +377,11 @@ def process_recipe_formula_shadow_once(
             facts_reader=frozen_reads.formula_facts,
             critic_metadata_loader=frozen_reads.get_column_metadata,
             progress_callback=renew_lease,
+            lease_fence=LeaseFence(
+                queue_id=claim.id,
+                lease_owner=claim.lease_owner,
+                lease_fence=claim.lease_fence,
+            ),
         )
         result_json = _plain(result)
         if not formula_dispatches_reconciled(conn, deterministic_run_id):
@@ -444,6 +410,18 @@ def process_recipe_formula_shadow_once(
         }, result=result_json, authoring_run_id=result.authoring_run_id)
     except LeaseFenceLost:
         return FormulaShadowWorkerOutcome("stale_lease", str(work_item_id))
+    except RecoveryRequiresReconciliation:
+        return _terminalize(conn, claim, row, axes={
+            "authorization_axis": "AUTHORIZED_CURRENT",
+            "authority_axis": "VERIFIED_AT_CAPTURE",
+            "drift_axis": "CURRENT",
+            "configuration_axis": "CURRENT",
+            "delivery_axis": "PRIOR_DISPATCH_UNRECONCILED",
+            "authoring_axis": "TECHNICAL_FAILURE",
+            "technical_axis": "RECOVERY_REQUIRES_RECONCILIATION",
+        }, authoring_run_id=(
+            "far_" + hashlib.sha256(str(work_item_id).encode()).hexdigest()[:24]
+        ))
     except Exception as exc:
         fail_recipe_formula_shadow(
             conn,
