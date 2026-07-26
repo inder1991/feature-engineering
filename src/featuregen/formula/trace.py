@@ -105,6 +105,25 @@ _SELECT_TERMINAL = (
     "WHERE authoring_run_id = %s AND kind IN (%s, %s) LIMIT 1"
 )
 
+#: FALLBACK-ONLY variants of the two INSERTs (``_replay_on_caller``). COMMIT AMBIGUITY: when the
+#: fresh connection's INSERT commits server-side but the ack is lost, the fallback replays a
+#: statement the database HAS durably recorded — so unguarded it handed the caller a duplicate-key
+#: error for an event that IS recorded. The replay therefore uses the row's own replay key as an
+#: ON CONFLICT arbiter (``idempotency_key``, "the globally unique retry/replay key", for an event;
+#: the minted ``authoring_run_id`` PK for a manifest — the only key ``open_authoring_run`` can
+#: repeat) and CONVERGES on the durable row instead of raising.
+#:
+#: The PRIMARY statements above deliberately carry NO such clause: a genuine uniqueness breach on
+#: the normal durable path is a CONNECTION-INDEPENDENT rejection and must still PROPAGATE
+#: (``_DETERMINISTIC_REJECTIONS``). The narrowing this accepts is the mirror image: a duplicate key
+#: reached ONLY via a degraded replay is treated as convergence rather than a breach, which is the
+#: right call precisely because the replay's provenance is "the database already accepted this".
+#: RESIDUAL, and honest: a lost-ack replay of a TERMINAL event can still surface the write-once
+#: RAISE from migration 1020's terminal guard, which fires BEFORE any conflict check — a run the
+#: caller can see as closed reads as closed, so ``run_status`` stays correct either way.
+_REPLAY_RUN = _INSERT_RUN + " ON CONFLICT (authoring_run_id) DO NOTHING"
+_REPLAY_EVENT = _INSERT_EVENT + " ON CONFLICT (idempotency_key) DO NOTHING"
+
 
 def open_authoring_run(conn: DbConn, *, intent_hash: str, versions: Mapping[str, Any],
                        actor: IdentityEnvelope) -> str:
@@ -119,7 +138,7 @@ def open_authoring_run(conn: DbConn, *, intent_hash: str, versions: Mapping[str,
         conn, _INSERT_RUN,
         (run_id, intent_hash, Jsonb(_json_object(versions, "versions")),
          Jsonb(identity_to_jsonb(actor))),
-        what=f"authoring_run {run_id}")
+        replay_sql=_REPLAY_RUN, what=f"authoring_run {run_id}")
     return run_id
 
 
@@ -158,7 +177,7 @@ def append_event(conn: DbConn, run_id: str, kind: TraceEventKind | str, *, seq: 
         conn, _INSERT_EVENT,
         (event_id, run_id, seq, event_kind.value, llm_call_ref, idempotency_key, Jsonb(body),
          hashlib.sha256(_jcs_dumps(body)).hexdigest()),
-        what=f"{event_kind.value} seq={seq} on {run_id}")
+        replay_sql=_REPLAY_EVENT, what=f"{event_kind.value} seq={seq} on {run_id}")
     return event_id
 
 
@@ -225,7 +244,7 @@ _DETERMINISTIC_REJECTIONS: tuple[type[Exception], ...] = (
 )
 
 
-def _durable_write(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
+def _durable_write(conn: DbConn, sql: str, params: tuple, *, replay_sql: str, what: str) -> None:
     """Perform ONE bare INSERT on a FRESH connection from ``get_settings().dsn``, committed
     independently of the caller's transaction (module docstring for why). No advisory lock is ever
     taken, so this can never self-deadlock against a lock the request holds.
@@ -243,9 +262,10 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
       known-bad statement on the caller's connection would poison that transaction while producing
       the identical failure.
 
-    The degrade path replays through ``_replay_on_caller``, never bare: it is replaying a statement
-    the database may already have REJECTED once, and that rejection must not cost the caller its
-    transaction."""
+    The degrade path replays ``replay_sql`` (the idempotent variant — commit ambiguity, see
+    ``_REPLAY_RUN``) through ``_replay_on_caller``, never bare: it is replaying a statement the
+    database may already have REJECTED — or already ACCEPTED — once, and neither may cost the caller
+    its transaction."""
     dsn = get_settings().dsn
     if not dsn:
         conn.execute(sql, params)   # the designed tests / no-DB path, NOT a degradation
@@ -260,14 +280,16 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
         logger.exception(
             "durable authoring-trace write failed (%s); falling back to the request connection",
             what)
-    _replay_on_caller(conn, sql, params)
+    _replay_on_caller(conn, replay_sql, params)
 
 
 def _replay_on_caller(conn: DbConn, sql: str, params: tuple) -> None:
     """Replay a degraded durable write on the CALLER's connection WITHOUT poisoning it.
 
     The fallback deliberately replays statements the database has ALREADY REJECTED once — the FK
-    class is the whole point of it (``_durable_write``) — so it MUST leave the caller's transaction
+    class is the whole point of it (``_durable_write``) — or ALREADY ACCEPTED, when a commit ack was
+    lost (``_REPLAY_RUN``, which is why ``sql`` here is the idempotent variant). Either way it MUST
+    leave the caller's transaction
     exactly as usable as it found it. A bare ``conn.execute`` did not: an FK the caller's connection
     also refuses aborted the request transaction, so the orchestrator lost every uncommitted thing it
     had done and could not execute another statement — not even its own terminal ``FAILED`` event

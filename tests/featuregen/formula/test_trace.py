@@ -21,6 +21,7 @@ import psycopg
 import pytest
 from tests.featuregen._helpers import make_actor
 
+from featuregen.aggregates.ids import mint_id
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.formula import trace
 from featuregen.formula._jcs import dumps as jcs_dumps
@@ -504,6 +505,46 @@ def test_a_rejected_fallback_replay_preserves_the_callers_uncommitted_work(
                  idempotency_key=f"{run_id}:2", payload={"disposition": "TECHNICAL_FAILURE"})
     assert db.execute("SELECT kind FROM authoring_trace_event WHERE authoring_run_id = %s "
                       "AND seq = 2", (run_id,)).fetchone()[0] == "FAILED"
+
+
+def test_a_lost_ack_event_replay_converges_instead_of_raising(db, monkeypatch, _dsn) -> None:
+    """Fix-wave-2 IMPORTANT 1, coupled half: COMMIT AMBIGUITY. The fresh connection's INSERT commits
+    server-side but the ack never arrives, so the fallback replays a statement the database HAS
+    durably recorded. Unguarded that hit the ``idempotency_key`` UNIQUE and handed the caller a
+    ``UniqueViolation`` (plus, pre-savepoint, an aborted transaction) for an event that IS recorded.
+    ``idempotency_key`` is the documented "globally unique retry/replay key" — the REPLAY now actually
+    uses it and converges.
+
+    ``mint_id`` is pinned so the replayed statement is BYTE-IDENTICAL to the committed one (the true
+    lost-ack shape): the ``idempotency_key`` arbiter must win over the PK and (run, seq) indexes."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_lost_ack_event")
+    monkeypatch.setattr(trace, "mint_id", lambda prefix: f"atev_lostack_{run_id}")
+    _started(db, run_id, seq=0)                        # commits server-side; the ack is then LOST
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    _started(db, run_id, seq=0)                        # the identical statement is replayed
+    assert db.execute("SELECT 1").fetchone()[0] == 1
+    with psycopg.connect(_dsn) as fresh:               # converged on the ONE durable row
+        assert fresh.execute("SELECT count(*) FROM authoring_trace_event "
+                             "WHERE authoring_run_id = %s", (run_id,)).fetchone()[0] == 1
+
+
+def test_a_lost_ack_manifest_replay_converges_instead_of_raising(db, monkeypatch, _dsn) -> None:
+    """The same commit ambiguity on the MANIFEST, whose replay key is its ``authoring_run_id`` PK: a
+    manifest that committed server-side before the ack was lost must not raise a duplicate-key error
+    at the caller either. ``mint_id`` is pinned so ``open_authoring_run`` replays the id that is
+    already durable — the only way that call can repeat a PK."""
+    durable_id = mint_id("arun")
+    monkeypatch.setattr(trace, "mint_id", lambda prefix: durable_id)
+    with psycopg.connect(_dsn) as pre:                 # the INSERT that committed server-side
+        pre.execute("INSERT INTO authoring_run (authoring_run_id, intent_hash, versions, actor) "
+                    "VALUES (%s, 'ih_lost_ack_manifest', '{}'::jsonb, '{}'::jsonb)", (durable_id,))
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    assert _open(db, intent_hash="ih_lost_ack_manifest") == durable_id   # must not raise
+    assert db.execute("SELECT 1").fetchone()[0] == 1
+    with psycopg.connect(_dsn) as fresh:
+        assert fresh.execute("SELECT count(*) FROM authoring_run WHERE authoring_run_id = %s",
+                             (durable_id,)).fetchone()[0] == 1
 
 
 def test_deterministic_rejections_still_raise_on_the_durable_path(db, monkeypatch, _dsn) -> None:
