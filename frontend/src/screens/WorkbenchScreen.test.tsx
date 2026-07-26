@@ -1925,6 +1925,56 @@ describe('Gate #1 scope confirmation', () => {
       }))
   })
 
+  it('flag ON: whole-round feedback re-runs recognition before a new scoped generation', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions
+      .mockResolvedValueOnce(RECOGNITION)
+      .mockResolvedValueOnce({
+        ...RECOGNITION,
+        recognition_id: 'rec_feedback',
+        candidates: [RECOGNITION.candidates[0]],
+      })
+    contractConsideredSet
+      .mockResolvedValueOnce(scopedConsidered())
+      .mockResolvedValueOnce({
+        ...scopedConsidered(),
+        generation_run_id: 'run_2',
+        scope_id: 'scope_2',
+      })
+    await generateFlagOn()
+    await userEvent.click(
+      await screen.findByRole('button', { name: /confirm scope and generate/i }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+
+    await userEvent.type(
+      screen.getByLabelText('Feedback on the whole round'), 'more behavioral signals')
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 1 of 3',
+    }))
+
+    expect(contractRecognitions).toHaveBeenLastCalledWith(HYPOTHESIS, 'predict churn', {
+      feedback: 'more behavioral signals',
+      supersedesScopeId: 'scope_1',
+    })
+    expect(contractConsideredSet).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole(
+      'button', { name: /confirm scope and generate/i })).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenLastCalledWith(
+      HYPOTHESIS,
+      'predict churn',
+      expect.objectContaining({
+        intentId: 'int_1',
+        recognitionId: 'rec_feedback',
+        feedback: 'more behavioral signals',
+        supersedesScopeId: 'scope_1',
+      }),
+    )
+    expect(await screen.findByText(/Set feedback round 1 of 3 · recorded/))
+      .toBeInTheDocument()
+  })
+
   it('flag ON: shows the proposed dimensions and confirm sends them', async () => {
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue(RECOGNITION)

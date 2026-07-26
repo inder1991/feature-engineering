@@ -200,6 +200,98 @@ def test_release_mode_accepts_owned_recognition_then_confirmed_scope(
     ).fetchone()[0] is None
 
 
+def test_release_mode_feedback_requires_re_recognition_and_scope_confirmation(
+        make_client, conn, monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")
+    _bank_multi(conn)
+    recognizer_client = make_client(_recognizer())
+    initial_recognition = recognizer_client.post(
+        "/contract/recognitions",
+        json={"hypothesis": HYPOTHESIS, "objective": "predict churn"},
+        headers=AUTH,
+    ).json()
+    initial = make_client(_fake()).post(
+        "/contract/considered-set",
+        json={
+            "hypothesis": HYPOTHESIS,
+            "objective": "predict churn",
+            "catalog_source": "bank",
+            "intent_id": initial_recognition["intent_id"],
+            "recognition_id": initial_recognition["recognition_id"],
+            "confirmed_scope": {"primary": CHURN},
+        },
+        headers=AUTH,
+    )
+    assert initial.status_code == 200, initial.text
+    prior_scope_id = initial.json()["scope_id"]
+
+    bypass = make_client(_fake()).post(
+        "/contract/considered-set",
+        json={
+            "hypothesis": HYPOTHESIS,
+            "objective": "predict churn",
+            "feedback": "focus on behavior",
+            "catalog_source": "bank",
+            "intent_id": initial_recognition["intent_id"],
+            "recognition_id": initial_recognition["recognition_id"],
+            "supersedes_scope_id": prior_scope_id,
+            "confirmed_scope": {"primary": CHURN},
+        },
+        headers=AUTH,
+    )
+    assert bypass.status_code == 409
+    assert bypass.json()["detail"] == "RECOGNITION_INPUT_CHANGED"
+
+    revised_recognition = recognizer_client.post(
+        "/contract/recognitions",
+        json={
+            "hypothesis": HYPOTHESIS,
+            "objective": "predict churn",
+            "feedback": "focus on behavior",
+            "supersedes_scope_id": prior_scope_id,
+        },
+        headers=AUTH,
+    )
+    assert revised_recognition.status_code == 200, revised_recognition.text
+    revised = revised_recognition.json()
+    assert revised["recognition_id"] != initial_recognition["recognition_id"]
+
+    sealed = conn.execute(
+        "SELECT input_json FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (revised["recognition_id"],),
+    ).fetchone()[0]
+    assert sealed["redacted_feedback"] == "focus on behavior"
+    assert sealed["supersedes_scope_id"] == prior_scope_id
+
+    regenerated = make_client(_fake()).post(
+        "/contract/considered-set",
+        json={
+            "hypothesis": HYPOTHESIS,
+            "objective": "predict churn",
+            "feedback": "focus on behavior",
+            "catalog_source": "bank",
+            "intent_id": revised["intent_id"],
+            "recognition_id": revised["recognition_id"],
+            "supersedes_scope_id": prior_scope_id,
+            "confirmed_scope": {"primary": CHURN},
+        },
+        headers=AUTH,
+    )
+    assert regenerated.status_code == 200, regenerated.text
+    assert regenerated.json()["generation_run_id"] != initial.json()["generation_run_id"]
+    parent = conn.execute(
+        "SELECT supersedes_scope_id, supersedes_generation_run_id, confirmation_source "
+        "FROM confirmed_generation_scope "
+        "WHERE scope_id = %s",
+        (regenerated.json()["scope_id"],),
+    ).fetchone()
+    assert parent == (
+        prior_scope_id,
+        initial.json()["generation_run_id"],
+        "user_feedback",
+    )
+
+
 def test_release_mode_rejects_changed_recognition_text_before_minting_run(
         make_client, conn, monkeypatch):
     monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")

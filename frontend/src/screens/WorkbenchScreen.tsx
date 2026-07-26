@@ -28,11 +28,10 @@
 //   carries no set description); an unknown lens simply renders without a thesis line.
 //
 // Feedback channels (Phase 3 decisions, documented for the record):
-// - Whole-round feedback re-calls /contract/considered-set with the ROUND's original hypothesis
-//   and objective (both snapshotted at generate time; a later edit never silently rewrites what
-//   feedback runs against) plus the current scope, which cannot have drifted (scope edits
-//   invalidate the round), and the human's instruction as `feedback`. It mints a FRESH governing
-//   intent over the guided set, so post-feedback candidates stay governable.
+// - In confirmation-required mode, whole-round feedback first creates a new sealed recognition over
+//   the ROUND's original hypothesis/objective plus the bounded human instruction. The user confirms
+//   that revised scope before /contract/considered-set mints the superseding run. Emergency legacy
+//   mode retains the direct one-shot call.
 // - Pin semantics are client-side: candidates that are selected or registered stay (selected
 //   pins get a Kept chip; registered rows are already their own mark), everything else is
 //   replaced by the new response. A new candidate reusing a pinned name is dropped: the pin
@@ -412,6 +411,11 @@ interface SetFeedbackRecord {
   replaced: number
 }
 
+interface RecognitionTransition {
+  feedback: string
+  supersedesScopeId: string
+}
+
 // Per-candidate refine channel state, keyed by candidate key.
 interface RefineState {
   open: boolean
@@ -642,6 +646,8 @@ export function WorkbenchScreen() {
   // edits before confirming: the chosen primary use-case, the kept secondaries, and whether to
   // include descendant sub-use-cases (exact ↔ include_descendants).
   const [recognition, setRecognition] = useState<RecognitionResp | null>(null)
+  const [recognitionTransition, setRecognitionTransition] =
+    useState<RecognitionTransition | null>(null)
   const [scopePrimary, setScopePrimary] = useState<string | null>(null)
   const [scopeSecondary, setScopeSecondary] = useState<string[]>([])
   const [scopeExpansion, setScopeExpansion] = useState<'exact' | 'include_descendants'>('exact')
@@ -828,6 +834,7 @@ export function WorkbenchScreen() {
     // A scope edit also drops the Gate #1 confirm step and any scoped disposition lens: the
     // recognised scope was for the previous scope context. (Both no-ops when the flags are off.)
     setRecognition(null)
+    setRecognitionTransition(null)
     setDispositions(null)
     // The deterministic ranking was for the previous scope too; drop it (no-op when the flag is off).
     setRanking(null)
@@ -886,6 +893,7 @@ export function WorkbenchScreen() {
   // when several variants share a display name. Shared by legacy and confirmed-scope generation.
   function applyConsideredRound(
     cs: ConsideredSetResp, seq: number, roundHyp: string, roundObj: string,
+    resetFeedback = true,
   ) {
     setIntentId(cs.intent_id)
     setGenerationRunId(cs.generation_run_id ?? null)
@@ -934,7 +942,39 @@ export function WorkbenchScreen() {
     // whole-round feedback reruns these even if the inputs are edited later.
     setRoundHypothesis(roundHyp)
     setRoundObjective(roundObj)
-    clearFeedback()
+    if (resetFeedback) clearFeedback()
+  }
+
+  function finishFeedbackTransition(
+    transition: RecognitionTransition,
+    prior: GeneratedCandidate[],
+  ) {
+    const pinned = prior.filter(candidate =>
+      candidate.key in selectedRef.current
+      || registeredRef.current[candidate.key] !== undefined)
+    const pinnedKeys = new Set(pinned.map(candidate => candidate.key))
+    const keptSelected = pinned
+      .filter(candidate => registeredRef.current[candidate.key] === undefined).length
+    setGenerated(fresh => [
+      ...pinned.map((candidate): GeneratedCandidate => ({
+        ...candidate, kept: true, lenses: [],
+      })),
+      ...(fresh ?? []),
+    ])
+    setSelected(previous => Object.fromEntries(
+      Object.entries(previous).map(([key, origin]) =>
+        pinnedKeys.has(key) ? [key, null] : [key, origin])))
+    setSetFbRounds(round => round + 1)
+    setSetFbRecords(records => [...records, {
+      round: records.length + 1,
+      user: getSession().user,
+      instruction: transition.feedback,
+      kept: keptSelected,
+      replaced: prior.length - pinned.length,
+    }])
+    setSetFbInstruction('')
+    setRefines(previous => Object.fromEntries(
+      Object.entries(previous).filter(([key]) => pinnedKeys.has(key))))
   }
 
   // Phase 1B (intent_confirmation_ui): recognise the objective and enter the confirm step. NO
@@ -958,6 +998,7 @@ export function WorkbenchScreen() {
       setRoundHypothesis(hypothesis.trim())
       setRoundObjective(objective)
       setRecognition(rec)
+      setRecognitionTransition(null)
       setScopePrimary(rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
       setScopeSecondary(
         rec.candidates.filter(c => c.relationship === 'secondary').map(c => c.use_case_id))
@@ -980,6 +1021,8 @@ export function WorkbenchScreen() {
   async function confirmScope() {
     const rec = recognition
     if (!rec || feedbackLocked) return
+    const transition = recognitionTransition
+    const prior = generatedRef.current ?? []
     const seq = ++generateSeq.current
     setNotice('')
     setGenerating(true)
@@ -990,6 +1033,7 @@ export function WorkbenchScreen() {
         targetRef: target.trim() || undefined,
         intentId: rec.intent_id,
         recognitionId: rec.recognition_id,
+        feedback: transition?.feedback,
         confirmedScope: {
           primary: scopePrimary,
           secondary: scopeSecondary,
@@ -999,10 +1043,16 @@ export function WorkbenchScreen() {
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
         },
+        supersedesScopeId: transition?.supersedesScopeId,
       })
       if (seq !== generateSeq.current) return
-      applyConsideredRound(cs, seq, roundHypothesis, roundObjective)
+      applyConsideredRound(
+        cs, seq, roundHypothesis, roundObjective, transition === null)
+      if (transition) {
+        finishFeedbackTransition(transition, prior)
+      }
       setRecognition(null)
+      setRecognitionTransition(null)
     } catch (err) {
       if (seq !== generateSeq.current) return
       fail(err)
@@ -1016,6 +1066,8 @@ export function WorkbenchScreen() {
   async function broadenScope() {
     if (feedbackLocked) return
     const rec = recognition
+    const transition = recognitionTransition
+    const prior = generatedRef.current ?? []
     const seq = ++generateSeq.current
     setNotice('')
     setGenerating(true)
@@ -1029,6 +1081,7 @@ export function WorkbenchScreen() {
         // the run/scope lineage. `intentId` holds the confirmed round's intent (set by applyConsideredRound).
         intentId: intentId ?? rec?.intent_id,
         recognitionId: rec?.recognition_id,
+        feedback: transition?.feedback,
         confirmedScope: {
           primary: null,
           secondary: [],
@@ -1038,11 +1091,16 @@ export function WorkbenchScreen() {
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
         },
-        supersedesScopeId: lastScopeId ?? undefined,
+        supersedesScopeId: transition?.supersedesScopeId
+          ?? lastScopeId
+          ?? undefined,
       })
       if (seq !== generateSeq.current) return
-      applyConsideredRound(cs, seq, roundHypothesis, roundObjective)
+      applyConsideredRound(
+        cs, seq, roundHypothesis, roundObjective, transition === null)
+      if (transition) finishFeedbackTransition(transition, prior)
       setRecognition(null)
+      setRecognitionTransition(null)
     } catch (err) {
       if (seq !== generateSeq.current) return
       fail(err)
@@ -1111,20 +1169,43 @@ export function WorkbenchScreen() {
     }
   }
 
-  // Whole-round feedback: rerun the round's hypothesis + objective under the human's guidance
-  // through considered-set (minting a fresh governing intent). Selected and registered candidates
-  // are pinned client-side; everything else is replaced by the response.
+  // Whole-round feedback: release mode re-runs recognition and requires another human scope
+  // confirmation before generation. Emergency legacy mode retains the direct considered-set call.
   async function sendSetFeedback(e: FormEvent) {
     e.preventDefault()
     if (setFbInFlight.current) return
     const instruction = setFbInstruction.trim()
     if (!instruction || setFbRounds >= FEEDBACK_ROUNDS) return
-    if (feedbackLocked || generating) return
+    if (feedbackLocked || generating || recognition !== null) return
     const seq = ++generateSeq.current
     setFbInFlight.current = true
     setNotice('')
     setSetFbBusy(true)
     try {
+      if (confirmationUi) {
+        if (!lastScopeId) {
+          throw new Error("Feedback requires a prior confirmed scope")
+        }
+        const rec = await contractRecognitions(roundHypothesis, roundObjective, {
+          feedback: instruction,
+          supersedesScopeId: lastScopeId,
+        })
+        if (seq !== generateSeq.current) return
+        setRecognition(rec)
+        setRecognitionTransition({
+          feedback: instruction,
+          supersedesScopeId: lastScopeId,
+        })
+        setScopePrimary(
+          rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
+        setScopeSecondary(
+          rec.candidates.filter(c => c.relationship === 'secondary')
+            .map(c => c.use_case_id))
+        setScopeExpansion('exact')
+        setScopeContexts(rec.modelling_contexts)
+        setScopeEntity(rec.target_entity)
+        return
+      }
       // Feedback routes through the governed considered-set endpoint so the round mints a FRESH
       // intent over the guided set: post-feedback candidates become governable (the stale-intent
       // guard is lifted). The ROUND's snapshotted hypothesis + objective run, never a since-edited
@@ -2516,13 +2597,15 @@ export function WorkbenchScreen() {
                     id="wb-setfb"
                     value={setFbInstruction}
                     onChange={e => setSetFbInstruction(e.target.value)}
-                    disabled={setFbBusy || setFbExhausted || feedbackLocked}
+                    disabled={setFbBusy || setFbExhausted || feedbackLocked
+                      || recognition !== null}
                     placeholder="e.g. more behavioral signals, fewer balance aggregates"
                   />
                   <button
                     type="submit"
                     className="btn btn--primary"
                     disabled={setFbBusy || setFbExhausted || feedbackLocked || generating
+                      || recognition !== null
                       || !setFbInstruction.trim()}
                   >
                     {setFbBusy

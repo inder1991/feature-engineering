@@ -83,14 +83,21 @@ def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> Recognit
     )
 
 
-def _recognition_instruction(redacted_hypothesis: str, redacted_goal: str | None) -> str:
+def _recognition_instruction(
+    redacted_hypothesis: str,
+    redacted_goal: str | None,
+    redacted_feedback: str | None = None,
+) -> str:
     """The model-facing text: the closed-taxonomy prompt + the redacted request. This is passed as the
     audited seam's ``instruction`` (the reserved ``redacted_intent`` the adapter renders to the model);
-    it carries ONLY the already-redacted hypothesis/goal — never catalog columns."""
+    it carries ONLY the already-redacted hypothesis/goal and optional human revision feedback —
+    never catalog columns."""
     lines = [build_recognition_prompt(), "", "=== REQUEST TO CLASSIFY ===",
              f"HYPOTHESIS: {redacted_hypothesis}"]
     if redacted_goal:
         lines.append(f"PREDICTION GOAL: {redacted_goal}")
+    if redacted_feedback:
+        lines.append(f"HUMAN FEEDBACK FOR THIS REVISION: {redacted_feedback}")
     return "\n".join(lines)
 
 
@@ -100,6 +107,7 @@ def recognize(
     *,
     redacted_hypothesis: str,
     redacted_goal: str | None = None,
+    redacted_feedback: str | None = None,
     model_id: str | None = None,
     actor: IdentityEnvelope | None = None,
     ingestion_run_id: str | None = None,
@@ -110,15 +118,17 @@ def recognize(
     guard scans the text, and the call is recorded in ``llm_call``. Any failure (egress block, provider
     failure/refusal, invalid body, dispatch/mapping error) folds to a candidate-free
     ``TECHNICAL_FAILURE``; a well-formed ``unscoped`` body folds to ``UNSCOPED``. The input carries only
-    the redacted hypothesis + prediction goal (``catalog_metadata`` is empty — recognition never sees
-    columns). ``model_id`` defaults to the env-configured model (matching the wired client).
+    the redacted hypothesis + prediction goal and optional redacted human revision feedback
+    (``catalog_metadata`` is empty — recognition never sees columns). ``model_id`` defaults to the
+    env-configured model (matching the wired client).
 
     ``ingestion_run_id`` (C5-T5): when a caller runs recognition in service of an ingestion run, the
     dispatch is pre-audited + attributed to that run (stage ``recognizer``; subjects empty — the
     call is about the redacted request, never a catalog object). Today's callers pass nothing —
     ``None`` dispatches unattributed, byte-for-byte as before."""
     model = model_id or os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)
-    instruction = _recognition_instruction(redacted_hypothesis, redacted_goal)
+    instruction = _recognition_instruction(
+        redacted_hypothesis, redacted_goal, redacted_feedback)
     dispatch_audit = None
     if ingestion_run_id is not None:
         dispatch_audit = DispatchAuditContext(ingestion_run_id=ingestion_run_id,

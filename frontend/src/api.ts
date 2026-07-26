@@ -1060,13 +1060,19 @@ export interface RecipeDisposition {
 }
 
 // Run the recognizer over the objective and persist an append-only attempt (no generation run yet).
-// A recognizer failure comes back as status 'technical_failure'. The client may then offer the
-// explicit human broaden action; it must never silently generate over the complete registry.
+// Feedback recognition binds the bounded instruction to the prior confirmed scope. A recognizer
+// failure comes back as status 'technical_failure'; generation still requires a human action.
 export function contractRecognitions(
   hypothesis: string,
   objective: string,
+  opts: { feedback?: string; supersedesScopeId?: string } = {},
 ): Promise<RecognitionResp> {
-  return post('/contract/recognitions', { hypothesis, objective })
+  return post('/contract/recognitions', {
+    hypothesis,
+    objective,
+    feedback: opts.feedback ?? null,
+    supersedes_scope_id: opts.supersedesScopeId ?? null,
+  })
 }
 
 // Gate #1 intake: mandatory hypothesis + objective; the server persists the intent and returns the

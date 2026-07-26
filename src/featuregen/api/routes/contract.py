@@ -235,6 +235,8 @@ class DraftReqIn(BaseModel):
 class RecognitionIn(BaseModel):
     hypothesis: str = Field(min_length=1)
     objective: str = ""           # optional prediction goal; redacted before it can reach the LLM
+    feedback: str | None = Field(default=None, max_length=2000)
+    supersedes_scope_id: str | None = None
 
 
 # ---- routes -------------------------------------------------------------------------------------
@@ -519,7 +521,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             if effective_recognition_id is None:
                 effective_recognition_id = prior_recognition_id
             elif (prior_recognition_id is not None
-                  and prior_recognition_id != effective_recognition_id):
+                  and prior_recognition_id != effective_recognition_id
+                  and not submitted_feedback):
                 raise HTTPException(
                     status_code=409, detail="RECOGNITION_LINEAGE_CHANGED")
         if effective_recognition_id is None:
@@ -545,8 +548,14 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if (
             intent.redacted_hypothesis != sealed_recognition.redacted_hypothesis
             or submitted_goal != sealed_recognition.redacted_prediction_goal
+            or submitted_feedback != sealed_recognition.redacted_feedback
         ):
             raise HTTPException(status_code=409, detail="RECOGNITION_INPUT_CHANGED")
+        if (
+            sealed_recognition.redacted_feedback
+            and body.supersedes_scope_id != sealed_recognition.supersedes_scope_id
+        ):
+            raise HTTPException(status_code=409, detail="RECOGNITION_LINEAGE_CHANGED")
     client = _require_generation_llm(client)
     # 3C.2a — the LIVE governed cross-catalog readiness interlock. On an entity-scoped run (no single
     # catalog) with the live flag ON, the deployment MUST be activation-approved BEFORE any LLM/planner
@@ -582,7 +591,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         conn, effective_recognition_id, scope)
     confirmation_source = (
         "user_broadened" if scope.unscoped
-        else "user_feedback" if body.feedback
+        else "user_feedback" if sealed_recognition and sealed_recognition.redacted_feedback
         else "user_confirmed"
     )
     scope_id = record_confirmed_scope(
@@ -837,8 +846,14 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
     try:
         intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
         redacted_goal = redact_free_text(body.objective, label="prediction goal")
+        redacted_feedback = redact_free_text(body.feedback or "", label="feedback")
     except IntentValidationError as e:   # a free-text field that cannot be safely redacted -> denial
         raise HTTPException(status_code=422, detail=str(e)) from e
+    if bool(redacted_feedback) != bool(body.supersedes_scope_id):
+        raise HTTPException(
+            status_code=422,
+            detail="feedback recognition requires exactly one prior confirmed scope",
+        )
     # Idempotent intent, PER ACTOR: submit_intent mints a fresh id each call, so reuse the EARLIEST intent
     # already recorded for this exact (actor, hypothesis, mode) — re-recognising the same objective is free
     # and never forks the immutable intent. The actor filter is essential: WITHOUT it, user B typing user
@@ -853,15 +868,26 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
     if prior is not None:
         intent = replace(intent, intent_id=prior[0])
     persist_intent(conn, intent)
+    if body.supersedes_scope_id is not None:
+        prior_scope = conn.execute(
+            "SELECT 1 FROM confirmed_generation_scope "
+            "WHERE scope_id = %s AND intent_id = %s AND confirmed_by = %s",
+            (body.supersedes_scope_id, intent.intent_id, identity.subject),
+        ).fetchone()
+        if prior_scope is None:
+            raise HTTPException(status_code=404, detail="unknown prior confirmed scope")
 
     input_json = recognition_input_material(
         redacted_hypothesis=intent.redacted_hypothesis,
         redacted_prediction_goal=redacted_goal,
         redaction_policy_version=REDACTION_VERSION,
+        redacted_feedback=redacted_feedback,
+        supersedes_scope_id=body.supersedes_scope_id,
     )
     input_hash = compute_input_hash(input_json)
     result = recognize(conn, client, redacted_hypothesis=intent.redacted_hypothesis,
-                       redacted_goal=redacted_goal, actor=identity)
+                       redacted_goal=redacted_goal, redacted_feedback=redacted_feedback,
+                       actor=identity)
     recognition_id = record_recognition_attempt(
         conn, intent_id=intent.intent_id, input_hash=input_hash, result=result,
         actor=identity.subject, input_json=input_json,

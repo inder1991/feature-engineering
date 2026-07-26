@@ -72,6 +72,8 @@ class RecognitionInput:
     redacted_prediction_goal: str
     input_content_hash: str
     redaction_policy_version: str
+    redacted_feedback: str = ""
+    supersedes_scope_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,13 +96,25 @@ def recognition_input_material(
     redacted_hypothesis: str,
     redacted_prediction_goal: str,
     redaction_policy_version: str,
-) -> dict[str, str]:
+    redacted_feedback: str = "",
+    supersedes_scope_id: str | None = None,
+) -> dict[str, Any]:
     """The complete redacted and policy-versioned input recognized by Gate #1."""
-    return {
+    material: dict[str, Any] = {
         "redacted_hypothesis": redacted_hypothesis,
         "redacted_prediction_goal": redacted_prediction_goal,
         "redaction_policy_version": redaction_policy_version,
     }
+    if redacted_feedback:
+        if not supersedes_scope_id:
+            raise ValueError("feedback recognition requires a superseded scope")
+        material.update({
+            "redacted_feedback": redacted_feedback,
+            "supersedes_scope_id": supersedes_scope_id,
+        })
+    elif supersedes_scope_id is not None:
+        raise ValueError("superseded scope is only valid for feedback recognition")
+    return material
 
 
 def record_recognition_attempt(
@@ -110,7 +124,7 @@ def record_recognition_attempt(
     input_hash: str,
     result: RecognitionResult,
     actor: Any,
-    input_json: dict[str, str] | None = None,
+    input_json: dict[str, Any] | None = None,
     redaction_policy_version: str | None = None,
 ) -> str:
     """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet,
@@ -175,15 +189,26 @@ def load_recognition_input(
     material, content_hash, policy_version = row
     if material is None or content_hash is None or policy_version is None:
         raise RecognitionInputUnavailable("recognition input is not sealed")
-    expected_keys = {
+    base_keys = {
         "redacted_hypothesis",
         "redacted_prediction_goal",
         "redaction_policy_version",
     }
-    if not isinstance(material, dict) or set(material) != expected_keys:
+    feedback_keys = base_keys | {"redacted_feedback", "supersedes_scope_id"}
+    if not isinstance(material, dict) or frozenset(material) not in {
+        frozenset(base_keys), frozenset(feedback_keys),
+    }:
         raise RecognitionInputUnavailable("recognition input has an unsupported shape")
-    if not all(isinstance(material[key], str) for key in expected_keys):
+    if not all(isinstance(material[key], str) for key in base_keys):
         raise RecognitionInputUnavailable("recognition input fields must be strings")
+    redacted_feedback = material.get("redacted_feedback", "")
+    supersedes_scope_id = material.get("supersedes_scope_id")
+    if (
+        not isinstance(redacted_feedback, str)
+        or (supersedes_scope_id is not None and not isinstance(supersedes_scope_id, str))
+        or bool(redacted_feedback) != bool(supersedes_scope_id)
+    ):
+        raise RecognitionInputUnavailable("recognition feedback lineage is malformed")
     if compute_input_hash(material) != content_hash:
         raise RecognitionInputUnavailable("recognition input content hash mismatch")
     if material["redaction_policy_version"] != policy_version:
@@ -195,6 +220,8 @@ def load_recognition_input(
         redacted_prediction_goal=material["redacted_prediction_goal"],
         input_content_hash=content_hash,
         redaction_policy_version=policy_version,
+        redacted_feedback=redacted_feedback,
+        supersedes_scope_id=supersedes_scope_id,
     )
 
 
@@ -389,12 +416,20 @@ def record_confirmed_scope(
     scoping, so a broaden (an ``unscoped`` "show all buildable recipes") does NOT forget the confirmed
     context — ``scope_for_run`` rebuilds them either way."""
     scope_id = mint_id("scp")
+    supersedes_generation_run_id: str | None = None
+    if supersedes_scope_id is not None:
+        row = conn.execute(
+            "SELECT generation_run_id FROM confirmed_generation_scope WHERE scope_id = %s",
+            (supersedes_scope_id,),
+        ).fetchone()
+        supersedes_generation_run_id = row[0] if row is not None else None
     conn.execute(
         "INSERT INTO confirmed_generation_scope "
-        "(scope_id, intent_id, generation_run_id, recognition_id, supersedes_scope_id, expansion, "
-        "scope_mode, confirmation_source, confirmed_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "(scope_id, intent_id, generation_run_id, recognition_id, supersedes_scope_id, "
+        "supersedes_generation_run_id, expansion, scope_mode, confirmation_source, confirmed_by) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (scope_id, intent_id, generation_run_id, recognition_id, supersedes_scope_id,
+         supersedes_generation_run_id,
          scope.expansion.value, "unscoped" if scope.unscoped else "scoped",
          confirmation_source, confirmed_by))
 
