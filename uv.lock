@@ -336,6 +336,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
     { name = "python-ulid" },
+    { name = "tzdata" },
     { name = "uvicorn" },
 ]
 
@@ -374,6 +375,7 @@ requires-dist = [
     { name = "python-ulid", specifier = ">=2.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "types-jsonschema", marker = "extra == 'dev'", specifier = ">=4.21" },
+    { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 provides-extras = ["llm", "dev"]

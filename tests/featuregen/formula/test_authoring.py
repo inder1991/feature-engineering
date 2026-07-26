@@ -234,14 +234,21 @@ def test_author_and_critic_are_separate_clients_and_separate_contexts(db) -> Non
     result = _run(db, author=author, critic=critic)
 
     rows = db.execute(
-        "SELECT task, redacted_input FROM llm_call WHERE run_id = %s ORDER BY created_at",
+        "SELECT task, redacted_input FROM llm_call WHERE run_id = %s",
         (result.authoring_run_id,)).fetchall()
-    tasks = [r[0] for r in rows]
-    assert tasks == [AUTHOR_TASK, CRITIC_TASK]          # author first, then the independent critic
-    critic_meta = rows[1][1]["catalog_metadata"]
+    # Keyed by TASK, never ordered by ``created_at``: both rows are written inside one request
+    # transaction and Postgres' ``now()`` is transaction-scoped, so their timestamps are IDENTICAL
+    # and the row order is whatever the scan happens to produce. The ORDERING claim is proved from
+    # the trace below, where seq is the orchestrator's own monotone contract.
+    by_task = {row[0]: row[1] for row in rows}
+    assert len(rows) == 2 and set(by_task) == {AUTHOR_TASK, CRITIC_TASK}
+    critic_meta = by_task[CRITIC_TASK]["catalog_metadata"]
     assert set(critic_meta) == {"authoring_intent", "proposal", "operand_columns"}
     assert "tool_trail" not in json.dumps(critic_meta)
     assert CANARY not in json.dumps(rows)               # no catalog free text egressed anywhere
+    # the author's call is evidenced BEFORE the critic's — the critic reviews an authored proposal
+    kinds = [event[1] for event in _events(db, result.authoring_run_id)]
+    assert kinds.index("LLM_CALL_RECORDED") < kinds.index("CRITIC_RECORDED")
 
 
 # ── carry-forward #1: the per_expr_facts bundle shape ────────────────────────────────────────────
