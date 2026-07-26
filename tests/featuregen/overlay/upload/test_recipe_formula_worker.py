@@ -209,6 +209,10 @@ def test_configuration_drift_is_terminal_not_retryable(db, monkeypatch) -> None:
             status="current", current_content_hash="snapshot-hash-config"),
     )
     monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_formula_authority_envelope",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.load_frozen_configuration_json",
         lambda value: object(),
     )
@@ -238,10 +242,55 @@ def test_configuration_drift_is_terminal_not_retryable(db, monkeypatch) -> None:
     assert row == ("DRIFTED", "NOT_DISPATCHED")
 
 
+def test_authority_drift_terminalizes_before_provider_dispatch(db, monkeypatch) -> None:
+    _work_item_id, run_id = _seed_work(db, "authority")
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker._current_read_scope_hash",
+        lambda *args: "scope-hash-authority",
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.compare_snapshot_to_current",
+        lambda *args: SimpleNamespace(
+            status="current", current_content_hash="snapshot-hash-authority"),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_formula_authority_envelope",
+        lambda *args: "EVENT_TIME_AUTHORITY_DRIFT",
+    )
+    called = False
+
+    def _run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-1",
+        author_client=object(),
+        critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed"
+    assert not called
+    row = db.execute(
+        "SELECT authority_axis,drift_axis,delivery_axis "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone()
+    assert row == (
+        "EVENT_TIME_AUTHORITY_DRIFT",
+        "AUTHORITY_DRIFTED",
+        "NOT_DISPATCHED",
+    )
+
+
 def test_success_uses_frozen_readers_and_completes_fenced_work(
-    db, monkeypatch
+    db, monkeypatch, _dsn
 ) -> None:
     work_item_id, run_id = _seed_work(db, "success")
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker._current_read_scope_hash",
         lambda *args: "scope-hash-success",
@@ -250,6 +299,10 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
         "featuregen.overlay.upload.recipe_formula_worker.compare_snapshot_to_current",
         lambda *args: SimpleNamespace(
             status="current", current_content_hash="snapshot-hash-success"),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_formula_authority_envelope",
+        lambda *args: None,
     )
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.load_frozen_configuration_json",
@@ -276,7 +329,7 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
     def _run(*args, **kwargs):
         received.update(kwargs)
         kwargs["progress_callback"]()
-        return _AuthoringResult("ACCEPTED", "ok", "authoring-success")
+        return _AuthoringResult("RESOLVED", "ok", "authoring-success")
 
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
@@ -300,5 +353,69 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
         "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
         (run_id,),
     ).fetchone()
-    assert row == ("DISPATCHED_AUDITED", "ACCEPTED", "OK")
+    assert row == ("DISPATCHED_AUDITED", "RESOLVED", "OK")
     assert work_item_id == outcome.work_item_id
+
+
+def test_missing_durable_audit_store_terminalizes_without_dispatch(
+    db, monkeypatch
+) -> None:
+    _work_item_id, run_id = _seed_work(db, "no-audit-store")
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker._current_read_scope_hash",
+        lambda *args: "scope-hash-no-audit-store",
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.compare_snapshot_to_current",
+        lambda *args: SimpleNamespace(
+            status="current",
+            current_content_hash="snapshot-hash-no-audit-store",
+        ),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_formula_authority_envelope",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.load_frozen_configuration_json",
+        lambda value: object(),
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.validate_recipe_provider_payload",
+        lambda value: None,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.FrozenRecipeReadContext.load",
+        lambda *args: object(),
+    )
+    called = False
+
+    def _run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-1",
+        author_client=object(),
+        critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed"
+    assert not called
+    assert db.execute(
+        "SELECT delivery_axis,authoring_axis,technical_axis "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone() == (
+        "NOT_DISPATCHED",
+        "NOT_RUN",
+        "AUDIT_STORE_UNAVAILABLE",
+    )

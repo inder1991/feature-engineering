@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from featuregen.overlay.field_evidence import canonical_hash
-from featuregen.overlay.upload.operational_facts import read_operational_value
+from featuregen.overlay.upload.operational_facts import (
+    read_operational_value,
+    read_verified_decision_value,
+)
 from featuregen.overlay.upload.planner.b_concept_authority import (
     ConceptRejection,
     PlannerConceptBinding,
@@ -27,6 +30,7 @@ class FormulaAuthorityEnvelopeV1:
     recipe_candidate_key: str
     bindings: tuple[dict[str, Any], ...]
     grain_facts: tuple[dict[str, Any], ...]
+    event_time_facts: tuple[dict[str, Any], ...]
     policy_version: int = AUTHORITY_ENVELOPE_VERSION
 
     def to_json(self) -> dict[str, Any]:
@@ -34,6 +38,7 @@ class FormulaAuthorityEnvelopeV1:
             "recipe_candidate_key": self.recipe_candidate_key,
             "bindings": list(self.bindings),
             "grain_facts": list(self.grain_facts),
+            "event_time_facts": list(self.event_time_facts),
             "policy_version": self.policy_version,
         }
 
@@ -122,8 +127,105 @@ def build_formula_authority_envelope(
             "resolver_version": grain.resolver_version,
         })
 
+    event_time_facts: list[dict[str, Any]] = []
+    event_refs = {
+        expression.event_time_ref
+        for expression in expectation.expressions
+        if expression.event_time_ref is not None
+    }
+    for logical_ref in sorted(event_refs):
+        temporal = read_verified_decision_value(
+            conn, logical_ref, "temporal_role")
+        if temporal.status != "resolved" or temporal.value != "event":
+            return FormulaAuthorityRejection(
+                f"EVENT_TIME_AUTHORITY_{temporal.status.upper()}",
+                logical_ref=logical_ref,
+                role=by_ref[logical_ref].role if logical_ref in by_ref else None,
+            )
+        event_time_facts.append({
+            "logical_ref": logical_ref,
+            "temporal_role": temporal.value,
+            "decision_event_id": temporal.decision_event_id,
+            "selected_evidence_ids": list(temporal.selected_evidence_ids),
+            "policy_version": temporal.policy_version,
+            "resolver_version": temporal.resolver_version,
+        })
+
     return FormulaAuthorityEnvelopeV1(
         recipe_candidate_key=context.recipe_candidate_key,
         bindings=tuple(bindings),
         grain_facts=tuple(grain_facts),
+        event_time_facts=tuple(event_time_facts),
     )
+
+
+def verify_formula_authority_envelope(
+    conn,
+    envelope: dict[str, Any],
+) -> str | None:
+    """Re-resolve a frozen authority envelope; return a drift reason or ``None``.
+
+    Worker-time verification never adopts current authority. Any changed value, evidence set,
+    governing decision/fact, or accepted authority tier makes the frozen work stale.
+    """
+    if envelope.get("policy_version") != AUTHORITY_ENVELOPE_VERSION:
+        return "AUTHORITY_POLICY_VERSION_DRIFT"
+    bindings = envelope.get("bindings")
+    grain_facts = envelope.get("grain_facts")
+    event_time_facts = envelope.get("event_time_facts")
+    if not all(isinstance(value, list) for value in (
+        bindings, grain_facts, event_time_facts
+    )):
+        return "AUTHORITY_ENVELOPE_INVALID"
+    for frozen in bindings:
+        if not isinstance(frozen, dict) or not isinstance(
+            frozen.get("logical_ref"), str
+        ):
+            return "AUTHORITY_ENVELOPE_INVALID"
+        current = resolve_planner_concept_binding(conn, frozen["logical_ref"])
+        if not isinstance(current, PlannerConceptBinding):
+            return "CONCEPT_AUTHORITY_NO_LONGER_RESOLVED"
+        current_material = {
+            "authoritative_concept": current.authoritative_concept,
+            "authority": current.authority.value,
+            "evidence_ids": list(current.evidence_ids),
+            "evidence_set_hash": current.evidence_set_hash,
+            "value_hash": current.value_hash,
+        }
+        if any(frozen.get(key) != value for key, value in current_material.items()):
+            return "CONCEPT_AUTHORITY_DRIFT"
+        if frozen.get("expected_concept") != current.authoritative_concept:
+            return "CONCEPT_BINDING_MISMATCH"
+    for frozen in grain_facts:
+        if not isinstance(frozen, dict) or not isinstance(
+            frozen.get("logical_ref"), str
+        ):
+            return "AUTHORITY_ENVELOPE_INVALID"
+        current = read_operational_value(conn, frozen["logical_ref"], "is_grain")
+        if (
+            current.status != "resolved"
+            or current.value not in (True, "true")
+            or current.fact_key != frozen.get("fact_key")
+            or current.fact_event_id != frozen.get("fact_event_id")
+            or current.policy_version != frozen.get("policy_version")
+            or current.resolver_version != frozen.get("resolver_version")
+        ):
+            return "GRAIN_AUTHORITY_DRIFT"
+    for frozen in event_time_facts:
+        if not isinstance(frozen, dict) or not isinstance(
+            frozen.get("logical_ref"), str
+        ):
+            return "AUTHORITY_ENVELOPE_INVALID"
+        current = read_verified_decision_value(
+            conn, frozen["logical_ref"], "temporal_role")
+        if (
+            current.status != "resolved"
+            or current.value != frozen.get("temporal_role")
+            or current.decision_event_id != frozen.get("decision_event_id")
+            or list(current.selected_evidence_ids)
+            != frozen.get("selected_evidence_ids")
+            or current.policy_version != frozen.get("policy_version")
+            or current.resolver_version != frozen.get("resolver_version")
+        ):
+            return "EVENT_TIME_AUTHORITY_DRIFT"
+    return None

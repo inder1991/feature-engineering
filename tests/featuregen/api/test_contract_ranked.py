@@ -15,9 +15,13 @@ from tests.featuregen.api._helpers import AUTH
 
 from featuregen.api.routes.contract import rankable_recipe_ids
 from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.taxonomy.disposition import (
     FinalDisposition,
     RecipeEvaluation,
@@ -92,6 +96,77 @@ def _post_churn_scoped(client) -> dict:
         "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed"}}, headers=AUTH)
     assert res.status_code == 200, res.text
     return res.json()
+
+
+def _merchant_catalog(conn) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    catalog = [
+        (CanonicalRow(
+            "merchant_bank", "tx", "merchant_id", "string",
+            is_grain=True, entity="Merchant"), "merchant_id"),
+        (CanonicalRow(
+            "merchant_bank", "tx", "mcc", "string"), "mcc"),
+        (CanonicalRow(
+            "merchant_bank", "tx", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow(
+            "merchant_bank", "tx", "ingested_at", "timestamp",
+            as_of=True, as_of_basis="ingested_at"), "as_of_date"),
+        (CanonicalRow(
+            "merchant_bank", "tx", "fraud_flag", "boolean"), "outcome_label"),
+    ]
+    build_graph(
+        conn,
+        "merchant_bank",
+        [row for row, _concept in catalog],
+        concepts={content_hash(row): concept for row, concept in catalog},
+    )
+    for row, concept in catalog[:3]:
+        ref = normalize_ref("merchant_bank", None, row.table, row.column)
+        record_field_evidence(
+            conn,
+            logical_ref=ref,
+            field_name="concept",
+            proposed_value=concept,
+            producer=EvidenceProducer.HUMAN,
+            strength=AssertionStrength.CONFIRMED,
+            producer_ref="human:test",
+            source_snapshot_id="snapshot:test",
+            input_hash=field_input_hash(
+                logical_ref=ref, field_name="concept", material=concept),
+        )
+    event_ref = normalize_ref("merchant_bank", None, "tx", "event_ts")
+    record_field_evidence(
+        conn,
+        logical_ref=event_ref,
+        field_name="temporal_role",
+        proposed_value="event",
+        producer=EvidenceProducer.HUMAN,
+        strength=AssertionStrength.CONFIRMED,
+        producer_ref="human:test",
+        source_snapshot_id="snapshot:test",
+        input_hash=field_input_hash(
+            logical_ref=event_ref, field_name="temporal_role", material="event"),
+    )
+    resolve_and_project(
+        conn,
+        source="merchant_bank",
+        logical_refs=[event_ref],
+        fields=["temporal_role"],
+    )
+    conn.execute(
+        "UPDATE graph_node SET grain_fact_event_id='grain-merchant-test' "
+        "WHERE catalog_source='merchant_bank' "
+        "AND object_ref='public.tx.merchant_id'",
+    )
+    conn.execute(
+        "INSERT INTO overlay_drift_watermark "
+        "(catalog_source,last_completed_at,last_run_id,head_seq) "
+        "VALUES ('merchant_bank',%s,'r',0) "
+        "ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at=%s",
+        (now, now),
+    )
 
 
 def _stage(status: StageStatus) -> StageEvaluation:
@@ -249,6 +324,69 @@ def test_formula_shadow_expected_declaration_failure_is_loud_503(
     )
     assert response.status_code == 503
     assert response.json()["detail"] == "SHADOW_EXPECTATION_STORE_UNAVAILABLE"
+
+
+def test_formula_shadow_positive_route_creates_immutable_work_item(
+    make_client, conn, monkeypatch
+):
+    import psycopg
+
+    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    monkeypatch.setenv(SCOPE_FLAG, "1")
+    monkeypatch.setenv(RANK_FLAG, "1")
+    monkeypatch.setenv(FORMULA_SHADOW_FLAG, "1")
+    _merchant_catalog(conn)
+    response = make_client(_fake()).post(
+        "/contract/considered-set",
+        json={
+            "hypothesis": "merchant category breadth may indicate merchant fraud",
+            "objective": "identify merchant fraud",
+            "catalog_source": "merchant_bank",
+            "target_ref": "public.tx.fraud_flag",
+            "confirmed_scope": {
+                "primary": "fraud.merchant_fraud",
+                "confirmation_source": "user_confirmed",
+            },
+        },
+        headers=AUTH,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    selected = {
+        item["recipe_id"]
+        for item in body["ranking"]
+        if item["selected_for_initial_view"]
+    }
+    merchant_disposition = next(
+        item for item in body["dispositions"]
+        if item["recipe_id"] == "merchant_mcc_diversity"
+    )
+    import json
+
+    assert "merchant_mcc_diversity" in selected, json.dumps({
+        "disposition": merchant_disposition,
+        "ranking": body["ranking"],
+    }, indent=2)
+    work = conn.execute(
+        "SELECT recipe_id,metadata_snapshot_id,binding_envelope_json,"
+        "provider_input_json FROM recipe_formula_shadow_work_item "
+        "WHERE generation_run_id=%s",
+        (body["generation_run_id"],),
+    ).fetchall()
+    observations = conn.execute(
+        "SELECT recipe_id,capture_axis,authority_axis,technical_axis "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (body["generation_run_id"],),
+    ).fetchall()
+    assert len(work) == 1, observations
+    assert work[0][0] == "merchant_mcc_diversity"
+    assert work[0][1]
+    assert work[0][2]["event_time_facts"][0]["temporal_role"] == "event"
+    assert work[0][3]["prediction_goal"] == "identify merchant fraud"
+    assert conn.execute(
+        "SELECT count(*) FROM outbox "
+        "WHERE topic='recipe_formula_shadow.requested.v1'"
+    ).fetchone()[0] == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════

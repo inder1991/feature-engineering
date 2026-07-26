@@ -9,6 +9,7 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from featuregen.config import get_settings
 from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
 from featuregen.formula.authoring import run_authoring
@@ -35,6 +36,9 @@ from featuregen.intake.llm import current_llm_client
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     compare_snapshot_to_current,
+)
+from featuregen.overlay.upload.recipe_formula_authority import (
+    verify_formula_authority_envelope,
 )
 from featuregen.overlay.upload.recipe_formula_shadow import (
     finalize_manifest,
@@ -229,6 +233,18 @@ def process_recipe_formula_shadow_once(
                 "authoring_axis": "NOT_RUN",
                 "technical_axis": "OK",
             })
+        authority_drift = verify_formula_authority_envelope(
+            conn, row["binding_envelope_json"])
+        if authority_drift is not None:
+            return _terminalize(conn, claim, row, axes={
+                "authorization_axis": "AUTHORIZED_CURRENT",
+                "authority_axis": authority_drift,
+                "drift_axis": "AUTHORITY_DRIFTED",
+                "configuration_axis": "NOT_EVALUATED",
+                "delivery_axis": "NOT_DISPATCHED",
+                "authoring_axis": "NOT_RUN",
+                "technical_axis": "OK",
+            })
         try:
             configuration = load_frozen_configuration_json(
                 row["frozen_configuration_json"])
@@ -284,6 +300,19 @@ def process_recipe_formula_shadow_once(
                 "delivery_axis": "NOT_DISPATCHED",
                 "authoring_axis": "NOT_RUN",
                 "technical_axis": "OK",
+            })
+        if not get_settings().dsn:
+            # Formula shadow is an enablement harness, not a best-effort development path.
+            # Deterministic preflight above may still classify bad frozen input, but no provider
+            # call is allowed without an independently committed pre-dispatch record.
+            return _terminalize(conn, claim, row, axes={
+                "authorization_axis": "AUTHORIZED_CURRENT",
+                "authority_axis": "VERIFIED_AT_CAPTURE",
+                "drift_axis": "CURRENT",
+                "configuration_axis": "CURRENT",
+                "delivery_axis": "NOT_DISPATCHED",
+                "authoring_axis": "NOT_RUN",
+                "technical_axis": "AUDIT_STORE_UNAVAILABLE",
             })
         deterministic_run_id = "far_" + hashlib.sha256(
             row["work_item_id"].encode()).hexdigest()[:24]

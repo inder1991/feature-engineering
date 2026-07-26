@@ -73,7 +73,6 @@ class FrozenRecipeReadContext:
             metadata.setdefault(logical_ref, {})[field] = {
                 "value": value,
                 "authority": str(authority.get("authority") or "hint"),
-                "provenance": authority.get("provenance"),
             }
         missing = sorted(allowed_refs - frozenset(items))
         if missing:
@@ -102,7 +101,6 @@ class FrozenRecipeReadContext:
             "column": column,
             "data_type": data_type,
             "facts": dict(metadata),
-            "snapshot_id": self.snapshot_id,
         }
 
     def formula_facts(self, proposal: TypedFormulaProposalV1):

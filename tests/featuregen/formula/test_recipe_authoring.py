@@ -120,6 +120,8 @@ def test_frozen_recipe_context_serves_tools_and_output_facts_without_live_reads(
         object(), "get_column_metadata", {"logical_ref": AMT}, roles=("analyst",))
     assert metadata["found"] is True
     assert metadata["facts"]["unit"]["value"] == "AED"
+    assert "snapshot_id" not in metadata
+    assert all("provenance" not in fact for fact in metadata["facts"].values())
     assert conn.queries == 1
 
     per_expr, grain = context.formula_facts(
