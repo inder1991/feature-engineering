@@ -123,9 +123,13 @@ _SELECT_TERMINAL = (
 #: (``_DETERMINISTIC_REJECTIONS``). The narrowing this accepts is the mirror image: a duplicate key
 #: reached ONLY via a degraded replay is treated as convergence rather than a breach, which is the
 #: right call precisely because the replay's provenance is "the database already accepted this".
-#: RESIDUAL, and honest: a lost-ack replay of a TERMINAL event can still surface the write-once
-#: RAISE from migration 1020's terminal guard, which fires BEFORE any conflict check — a run the
-#: caller can see as closed reads as closed, so ``run_status`` stays correct either way.
+#: RESIDUAL, and DELIBERATELY DEFERRED — not impossible: a lost-ack replay of a TERMINAL event can
+#: still surface the write-once RAISE from migration 1020's terminal guard, because that trigger
+#: fires BEFORE any conflict check, so ``ON CONFLICT`` cannot absorb it. It IS fixable in this
+#: module without touching the frozen migration (catch ``RaiseException`` on a terminal replay and
+#: confirm convergence by re-reading the ``idempotency_key``); it is deferred because the outcome is
+#: already honest — a run the caller can see as closed reads as closed, so ``run_status`` stays
+#: correct either way — and the extra read is not worth its own failure mode for that.
 _REPLAY_RUN = _INSERT_RUN + " ON CONFLICT (authoring_run_id) DO NOTHING"
 _REPLAY_EVENT = _INSERT_EVENT + " ON CONFLICT (idempotency_key) DO NOTHING"
 
