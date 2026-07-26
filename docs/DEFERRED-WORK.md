@@ -28,6 +28,21 @@ Deferred wholesale from the parent architecture (`docs/superpowers/specs/2026-07
 | 🟡 Full `TemporalPolicyV1`: SCD effective/system time, reversal policy, late-arrival horizon, restatement policy, availability-basis external requirement | Child-4 | **Window/cutoff PIT correctness is CORE and ships with code-gen** (a look-ahead feature is *wrong*). The SCD/reversal/late-arrival refinements are not. | Bitemporal sources, or a late-arrival/reversal correctness question on real data. |
 | 🟡 Delivery I — external-validation protocol (Ed25519 + RFC 8785) | pre-existing | Partner-gated fast-follow, not first release. Produce-side already staged. | A partner willing to validate. |
 
+### A.1 Newly identified while designing Spec A (2026-07-27)
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **Governed source-delivery SLA** — a fact stating when a source's business data is ready (T+1 / T+3), distinct from catalog-scan freshness | The prerequisite for **deriving** `availability_class` instead of declaring it. Verified absent: `AVAILABILITY_TIME` (`overlay/facts.py`) is `{column, basis, lag_hours?}` — it names which column carries knowledge time, not when a source arrives; `drift_freshness_sla` (`overlay/config.py`) measures catalog-scan freshness. Deriving availability from either would be dishonest. Deferring does **not** break correctness: look-ahead is prevented by the availability-column comparison, so a late row is simply absent from an earlier run. | Before promising consumers an availability SLA, or before enabling the `dependencies_ready` trigger. **Recoverability is built in:** every contract persists its full physical read set, so derivation can retroactively validate each declared `availability_class` and flag the ones that lied. |
+| 🟡 `dependencies_ready` cadence trigger | Needs the delivery SLA above. Spec A supports `scheduled` and `manual` only. | Same as above. |
+| 🟡 Automated job submission from the control plane | Spec A **generates** the project; the operator runs `kedro run`. Submission/orchestration belongs to the deferred run state machine and dispatch machinery. | Unattended or scheduled runs. |
+| 🟡 Content-addressed input snapshots | Spec A's `input_snapshot_ids` = the `(schema, table, partition)` list read + the IR's `catalog_state_stamp`. That identifies *which* inputs and *which governed facts*, but is **not** a content snapshot — two runs over the same partitions after an in-place source rewrite share the same execution identity. True content versioning needs the deferred Iceberg layer. | Reproducibility/replay guarantees, or any restatement work. Also one of the reasons Spec A publishes to sandbox. |
+| 🟡 Multi-partition and backfill runs | Spec A does one `business_dt` per run. | First backfill request. |
+| 🟡 Multi-environment promotion | One Hadoop/Hive environment in Spec A. | A second environment. |
+| ⚪ **Spec B** — statistical profiling/EDA + UI | Split out deliberately so Spec A ships runnable feature tables first. Spec A reports via the run manifest only (row counts, validation results), not statistics. | After Spec A publishes on the cluster. Profile history is append-only from the start so drift detection can be added later without backfill. |
+| ⚪ **Spec C** — `model_input` assembly | Needs published groups to assemble. | When a model needs features from more than one group. Carries the daily/monthly **as-of** alignment rule (a daily row takes the latest month-end value not later than its `business_dt` — a naive equi-join would leak future month-end data into early-month rows). |
+
+**Not deferred, despite resembling NFRs** — recorded here so nobody "optimizes" them away: PIT correctness (a look-ahead feature is *wrong*, not unhardened) · atomic group publication (a partially-published table is a correctness failure) · the blocking validation gates (duplicate keys, missing/extra/mistyped columns, incomplete computation, project-integrity) · derived sensitivity/access/retention classification (governance is the product).
+
 ---
 
 ## B. Child-1 (TypedFormula authoring) — open findings
