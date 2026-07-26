@@ -1,6 +1,7 @@
 """End-to-end offline TypedFormula authoring orchestration."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -66,6 +67,7 @@ def _intent_material(intent) -> dict:
         "hypothesis": intent.hypothesis,
         "target_entity": intent.target_entity,
         "target_grain_keys": list(intent.target_grain_keys),
+        "recipe_authoring_context": getattr(intent, "recipe_authoring_context", None),
     }
 
 
@@ -165,6 +167,12 @@ def run_authoring(
     actor: IdentityEnvelope | None,
     max_turns: int = 8,
     frozen_configuration: FrozenAuthorCriticConfigurationV1 | None = None,
+    proposal_validator: Callable[[TypedFormulaProposalV1], tuple[str, ...]] | None = None,
+    tool_runner: Callable[..., dict] | None = None,
+    authoring_run_id: str | None = None,
+    facts_reader: Callable[[TypedFormulaProposalV1], tuple[dict, dict]] | None = None,
+    critic_metadata_loader: Callable[[str], dict] | None = None,
+    progress_callback: Callable[[], None] | None = None,
 ):
     """Author, parse, govern output semantics, independently critique, and fold one result."""
     versions = {
@@ -182,6 +190,7 @@ def run_authoring(
         intent_hash=canonical_hash(_intent_material(intent)),
         versions=versions,
         actor=_actor_json(actor),
+        authoring_run_id=authoring_run_id,
     )
     if frozen_configuration is not None:
         try:
@@ -235,6 +244,8 @@ def run_authoring(
             on_turn=persist_author_turn,
             provider_contract=(
                 frozen_configuration.author if frozen_configuration is not None else None),
+            progress_callback=progress_callback,
+            **({} if tool_runner is None else {"tool_runner": tool_runner}),
         )
     except Exception as exc:
         return _technical_failure(conn, run_id, seq, f"author:{type(exc).__name__}")
@@ -260,6 +271,28 @@ def run_authoring(
             conn, run_id, "failed", seq=seq, idempotency_key=f"{run_id}:terminal",
             payload={**_terminal_payload(result), "reason": str(exc)})
         return result
+
+    if proposal_validator is not None:
+        violations = proposal_validator(proposal)
+        if violations:
+            result = derive_disposition(
+                AuthoringAxes(
+                    "invalid_formula", "ok", "resolved", "not_provided", "clean", "ok"),
+                authoring_run_id=run_id,
+            )
+            append_event(
+                conn,
+                run_id,
+                "failed",
+                seq=seq,
+                idempotency_key=f"{run_id}:terminal",
+                payload={
+                    **_terminal_payload(result),
+                    "reason": "recipe_expectation_not_preserved",
+                    "violations": list(violations),
+                },
+            )
+            return result
 
     append_event(
         conn,
@@ -294,6 +327,8 @@ def run_authoring(
             authoring_run_id=run_id,
             provider_contract=(
                 frozen_configuration.critic if frozen_configuration is not None else None),
+            metadata_loader=critic_metadata_loader,
+            progress_callback=progress_callback,
         )
     except Exception as exc:
         return _technical_failure(conn, run_id, seq, f"critic:{type(exc).__name__}")
@@ -331,7 +366,13 @@ def run_authoring(
         return result
 
     try:
-        per_expr, grain_facts = _facts(conn, proposal)
+        if progress_callback is not None:
+            progress_callback()
+        per_expr, grain_facts = (
+            facts_reader(proposal)
+            if facts_reader is not None
+            else _facts(conn, proposal)
+        )
         output = resolve_formula_output_policy(
             proposal,
             per_expr_facts=per_expr,

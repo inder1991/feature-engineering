@@ -29,6 +29,7 @@ from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 RANK_FLAG = "FEATUREGEN_INTENT_RANKING"
 SCOPE_FLAG = "FEATUREGEN_INTENT_SCOPED_APPLICABILITY"
+FORMULA_SHADOW_FLAG = "FEATUREGEN_RECIPE_FORMULA_SHADOW"
 CHURN = "customer.relationship_attrition.churn"
 HYPOTHESIS = "customers churn when their balance drops"
 TARGET = "public.accounts.churned"
@@ -191,6 +192,63 @@ def test_recommendation_is_present_and_distinct_from_ranking(make_client, conn, 
     # The recommendation carries no ranking fields and the ranking carries no lens/reasoning — separate.
     assert "canonical_rank" not in body["recommendation"]
     assert all("recommended_lens" not in r for r in body["ranking"])
+
+
+def test_formula_shadow_ranking_disabled_records_complete_zero_manifest(
+    make_client, conn, monkeypatch
+):
+    monkeypatch.setenv(SCOPE_FLAG, "1")
+    monkeypatch.delenv(RANK_FLAG, raising=False)
+    monkeypatch.setenv(FORMULA_SHADOW_FLAG, "1")
+    _bank_multi(conn)
+
+    body = _post_churn_scoped(make_client(_fake()))
+
+    assert "ranking" not in body
+    expected = conn.execute(
+        "SELECT ranking_flag, expected_manifest_id "
+        "FROM recipe_formula_shadow_expected_run "
+        "WHERE generation_run_id=%s",
+        (body["generation_run_id"],),
+    ).fetchone()
+    assert expected and expected[0] is False
+    manifest = conn.execute(
+        "SELECT status, expected_observation_count, actual_observation_count, capture_axis "
+        "FROM recipe_formula_shadow_run_manifest WHERE manifest_id=%s",
+        (expected[1],),
+    ).fetchone()
+    assert manifest == ("COMPLETE", 0, 0, "SKIPPED_RANKING_DISABLED")
+
+
+def test_formula_shadow_expected_declaration_failure_is_loud_503(
+    make_client, conn, monkeypatch
+):
+    import featuregen.api.routes.contract as route
+
+    monkeypatch.setenv(SCOPE_FLAG, "1")
+    monkeypatch.setenv(FORMULA_SHADOW_FLAG, "1")
+    _bank_multi(conn)
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(route, "declare_expected_run", _fail)
+    response = make_client(_fake()).post(
+        "/contract/considered-set",
+        json={
+            "hypothesis": HYPOTHESIS,
+            "objective": "predict churn",
+            "catalog_source": "bank",
+            "target_ref": TARGET,
+            "confirmed_scope": {
+                "primary": CHURN,
+                "confirmation_source": "user_confirmed",
+            },
+        },
+        headers=AUTH,
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "SHADOW_EXPECTATION_STORE_UNAVAILABLE"
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════

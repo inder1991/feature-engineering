@@ -3,13 +3,18 @@ from __future__ import annotations
 import pytest
 
 from featuregen.runtime.queue import (
+    QueueIdempotencyConflict,
     claim_one,
+    claim_recipe_formula_shadow,
     complete,
+    complete_recipe_formula_shadow,
     enqueue,
+    enqueue_checked,
     fail_permanent,
     fail_retryable,
     queue_depth,
     reclaim_stuck_queue,
+    renew_recipe_formula_shadow,
 )
 
 
@@ -35,6 +40,58 @@ def test_enqueue_idempotent_on_message_id(db) -> None:
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM queue WHERE message_id = 'e1'")
         assert cur.fetchone()[0] == 1
+
+
+def test_checked_enqueue_requires_identical_delivery_identity(db) -> None:
+    first = enqueue_checked(
+        db,
+        message_id="formula-checked",
+        partition_key="formula:obs-1",
+        handler="recipe_formula_shadow.author.v1",
+        payload={"observation_id": "obs-1"},
+    )
+    assert enqueue_checked(
+        db,
+        message_id="formula-checked",
+        partition_key="formula:obs-1",
+        handler="recipe_formula_shadow.author.v1",
+        payload={"observation_id": "obs-1"},
+    ) == first
+    with pytest.raises(QueueIdempotencyConflict):
+        enqueue_checked(
+            db,
+            message_id="formula-checked",
+            partition_key="formula:obs-1",
+            handler="recipe_formula_shadow.author.v1",
+            payload={"observation_id": "different"},
+        )
+
+
+def test_formula_queue_is_excluded_from_general_claim_and_fenced(db) -> None:
+    enqueue_checked(
+        db,
+        message_id="formula-fenced",
+        partition_key="formula:obs-2",
+        handler="recipe_formula_shadow.author.v1",
+        payload={"observation_id": "obs-2"},
+    )
+    assert claim_one(db, owner="general") is None
+    first = claim_recipe_formula_shadow(db, owner="formula-a")
+    assert first is not None
+    assert first.lease_fence == 1
+    assert renew_recipe_formula_shadow(db, first)
+    db.execute(
+        "UPDATE queue SET lease_expires_at=now() - interval '1 second' WHERE id=%s",
+        (first.id,),
+    )
+    assert reclaim_stuck_queue(db) == 1
+    second = claim_recipe_formula_shadow(db, owner="formula-b")
+    assert second is not None
+    assert second.id == first.id
+    assert second.lease_fence == 2
+    assert not renew_recipe_formula_shadow(db, first)
+    assert not complete_recipe_formula_shadow(db, first)
+    assert complete_recipe_formula_shadow(db, second)
 
 
 def test_claim_leases_ready_row_and_bumps_attempts(db) -> None:

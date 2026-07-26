@@ -27,6 +27,7 @@ from featuregen.api.deps import (
     require_feature_read,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
@@ -79,10 +80,18 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_confirmed_scope,
     record_recognition_attempt,
 )
-from featuregen.overlay.upload.feature_metadata_snapshot import CatalogProjectionUnavailable
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CatalogProjectionUnavailable,
+    ensure_generation_run,
+)
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
 from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.planner.shadow import run_shadow_planner
+from featuregen.overlay.upload.recipe_formula_shadow import (
+    capture_ranked_shadow,
+    declare_expected_run,
+    recipe_formula_shadow_enabled,
+)
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     ScopeExpansion,
@@ -492,6 +501,17 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
     # before any generation). The intent is durably recorded first so the lineage reads intent→run→scope.
     persist_intent(conn, intent, body.target_ref)
+    ensure_generation_run(
+        conn,
+        generation_run_id,
+        identity_to_jsonb(identity),
+        {
+            "scoped_applicability": _intent_scoped_applicability_enabled(),
+            "ranking": _intent_ranking_enabled(),
+            "recipe_formula_shadow": recipe_formula_shadow_enabled(),
+        },
+        intent_id=intent.intent_id,
+    )
     # Reconstruct each confirmed dimension's provenance from the IMMUTABLE recognition attempt (never the
     # client): a value the recognizer proposed is ``accepted_llm_proposal``, one the human introduced is
     # ``user_added``, and a corrected entity is a ``user_replacement`` recording what it superseded.
@@ -541,16 +561,80 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
     # input). Flag off => neither key is present (Task-7/1B byte-identical). The ranking is deliberately
     # SEPARATE from the LLM ``recommendation`` and the human's Gate-#1 choice — three distinct layers.
-    if _intent_ranking_enabled():
+    ranking_enabled = _intent_ranking_enabled()
+    ranked: tuple[RankedRecipe, ...] = ()
+    ranking_version: str | None = None
+    if ranking_enabled:
         rankable_ids = rankable_recipe_ids(dispositions)
         signals = _rank_signals(rankable_ids, dispositions, cs, scope)
         ranking_version = APPLICABILITY_MAPPING_VERSION   # pinned BEFORE the ranker is called
-        ranked = rank_eligible(rankable_ids, signals, ranking_version=ranking_version)
+        ranked = tuple(rank_eligible(
+            rankable_ids, signals, ranking_version=ranking_version))
         response["ranking"] = [_ranking_json(r) for r in ranked]
         response["ranking_version"] = ranking_version
         # Task B3: the SOFT dimension warnings (grain mismatch / context conflict) surfaced per recipe.
         # This NEVER changes dispositions — a warned recipe stays exactly as eligible as it was.
         response["signal_warnings"] = _signal_warnings(signals)
+    # Delivery B formula shadow: enroll only this confirmed-scope, immutable-revision path. The
+    # expected-run declaration is the narrow flag-on durability interlock: without it a wholly
+    # missing manifest could never be detected, so failure is an explicit 503. Everything after
+    # declaration is isolated in a savepoint and remains behavior-neutral; reconciliation will
+    # report a missing/incomplete manifest if capture fails.
+    if recipe_formula_shadow_enabled():
+        if cs.considered_revision_id is None or cs.considered_content_hash is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SHADOW_EXPECTATION_STORE_UNAVAILABLE",
+            )
+        try:
+            declare_expected_run(
+                conn,
+                generation_run_id=generation_run_id,
+                intent_id=intent.intent_id,
+                confirmed_scope_id=scope_id,
+                considered_revision_id=cs.considered_revision_id,
+                considered_content_hash=cs.considered_content_hash,
+                ranking_flag=ranking_enabled,
+            )
+        except Exception as exc:
+            logger.exception("recipe formula shadow expected-run declaration failed")
+            raise HTTPException(
+                status_code=503,
+                detail="SHADOW_EXPECTATION_STORE_UNAVAILABLE",
+            ) from exc
+        try:
+            with conn.transaction():
+                revision = conn.execute(
+                    "SELECT r.metadata_snapshot_id, r.metadata_snapshot_content_hash, "
+                    "s.read_scope_hash FROM contract_considered_revision r "
+                    "LEFT JOIN catalog_metadata_snapshot s "
+                    "ON s.snapshot_id = r.metadata_snapshot_id "
+                    "WHERE r.considered_revision_id=%s",
+                    (cs.considered_revision_id,),
+                ).fetchone()
+                capture_ranked_shadow(
+                    conn,
+                    generation_run_id=generation_run_id,
+                    intent_id=intent.intent_id,
+                    confirmed_scope_id=scope_id,
+                    considered_revision_id=cs.considered_revision_id,
+                    considered_content_hash=cs.considered_content_hash,
+                    metadata_snapshot_id=revision[0] if revision else None,
+                    metadata_snapshot_content_hash=revision[1] if revision else None,
+                    ranked=ranked,
+                    ranking_version=ranking_version,
+                    ranking_enabled=ranking_enabled,
+                    candidate_keys_by_recipe_id=cs.recipe_candidate_keys_by_recipe_id,
+                    grounding_context_by_candidate_key=(
+                        cs.recipe_grounding_context_by_candidate_key),
+                    hypothesis=intent.redacted_hypothesis,
+                    prediction_goal=body.objective or "",
+                    identity=identity,
+                    request_read_scope_hash=revision[2] if revision else None,
+                )
+        except Exception:
+            logger.exception(
+                "recipe formula shadow capture failed after expected-run declaration")
     # 3B.3a shadow: on an entity-scoped run (no single catalog to ground on) compute + LOG single-catalog
     # binding plans for the eligible recipes. Log-only — the response is UNCHANGED.
     if body.catalog_source is None and scope.target_entity is not None:

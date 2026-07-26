@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from featuregen.formula._jcs import dumps as jcs_dumps
+from featuregen.formula.author import AUTHOR_PROMPT_VERSION
 from featuregen.formula.capability import CAPABILITY_POLICY_VERSION, classify_formula_capability
 from featuregen.formula.critic import (
     CRITIC_INSTRUCTION,
@@ -96,6 +98,100 @@ class FrozenAuthorCriticConfigurationV1:
     version_vector_json: str
     configuration_policy_version: int
     configuration_hash: str
+
+
+def provider_contract_json(contract: FrozenProviderContractV1) -> dict:
+    return {
+        "role": contract.role,
+        "provider": contract.provider,
+        "model": contract.model,
+        "generation_settings": contract.generation_settings(),
+        "prompt_id": contract.prompt_id,
+        "prompt_version": contract.prompt_version,
+        "instruction_utf8": contract.instruction_utf8.decode("utf-8"),
+        "prompt_content_hash": contract.prompt_content_hash,
+        "output_schema_id": contract.output_schema_id,
+        "output_schema_version": contract.output_schema_version,
+        "output_schema": contract.output_schema(),
+        "schema_content_hash": contract.schema_content_hash,
+        "contract_hash": contract.contract_hash,
+    }
+
+
+def frozen_configuration_json(
+    configuration: FrozenAuthorCriticConfigurationV1,
+) -> dict:
+    return {
+        "author": provider_contract_json(configuration.author),
+        "critic": provider_contract_json(configuration.critic),
+        "tool_registry_hash": configuration.tool_registry_hash,
+        "operation_grammar_hash": configuration.operation_grammar_hash,
+        "critic_policy_hash": configuration.critic_policy_hash,
+        "disposition_policy_hash": configuration.disposition_policy_hash,
+        "version_vector": json.loads(configuration.version_vector_json),
+        "configuration_policy_version": configuration.configuration_policy_version,
+        "configuration_hash": configuration.configuration_hash,
+    }
+
+
+def load_frozen_configuration_json(
+    value: Mapping[str, Any],
+) -> FrozenAuthorCriticConfigurationV1:
+    """Reconstruct and integrity-check an immutable configuration work-item payload."""
+
+    def _provider(role: str) -> FrozenProviderContractV1:
+        raw = value.get(role)
+        if not isinstance(raw, Mapping):
+            raise ConfigurationDrifted(f"stored {role} provider contract is missing")
+        rebuilt = freeze_provider_contract(
+            role=role,
+            generation_settings=raw["generation_settings"],
+            prompt_id=str(raw["prompt_id"]),
+            prompt_version=int(raw["prompt_version"]),
+            instruction=str(raw["instruction_utf8"]),
+            output_schema_id=str(raw["output_schema_id"]),
+            output_schema_version=int(raw["output_schema_version"]),
+            output_schema=raw["output_schema"],
+        )
+        for field_name in (
+            "prompt_content_hash",
+            "schema_content_hash",
+            "contract_hash",
+        ):
+            if getattr(rebuilt, field_name) != raw.get(field_name):
+                raise ConfigurationDrifted(
+                    f"stored {role} {field_name} does not verify")
+        return rebuilt
+
+    author = _provider("author")
+    critic = _provider("critic")
+    version_vector = value.get("version_vector")
+    if not isinstance(version_vector, Mapping):
+        raise ConfigurationDrifted("stored version vector is missing")
+    envelope = {
+        "author_contract_hash": author.contract_hash,
+        "critic_contract_hash": critic.contract_hash,
+        "tool_registry_hash": value.get("tool_registry_hash"),
+        "operation_grammar_hash": value.get("operation_grammar_hash"),
+        "critic_policy_hash": value.get("critic_policy_hash"),
+        "disposition_policy_hash": value.get("disposition_policy_hash"),
+        "version_vector": dict(version_vector),
+        "configuration_policy_version": value.get("configuration_policy_version"),
+    }
+    calculated = _hash_bytes(_canonical_bytes(envelope))
+    if calculated != value.get("configuration_hash"):
+        raise ConfigurationDrifted("stored configuration envelope hash does not verify")
+    return FrozenAuthorCriticConfigurationV1(
+        author=author,
+        critic=critic,
+        tool_registry_hash=str(value["tool_registry_hash"]),
+        operation_grammar_hash=str(value["operation_grammar_hash"]),
+        critic_policy_hash=str(value["critic_policy_hash"]),
+        disposition_policy_hash=str(value["disposition_policy_hash"]),
+        version_vector_json=_canonical_bytes(dict(version_vector)).decode("utf-8"),
+        configuration_policy_version=int(value["configuration_policy_version"]),
+        configuration_hash=calculated,
+    )
 
 
 def freeze_provider_contract(
@@ -203,7 +299,7 @@ def freeze_current_configuration(
     generation_settings: Mapping[str, Any],
     author_instruction: str,
     author_prompt_id: str,
-    author_prompt_version: int = 1,
+    author_prompt_version: int = AUTHOR_PROMPT_VERSION,
 ) -> FrozenAuthorCriticConfigurationV1:
     """Freeze every byte/policy that can change authoring output under stable labels."""
     author = freeze_provider_contract(
@@ -276,7 +372,7 @@ def verify_frozen_configuration(
     generation_settings: Mapping[str, Any],
     author_instruction: str,
     author_prompt_id: str,
-    author_prompt_version: int = 1,
+    author_prompt_version: int = AUTHOR_PROMPT_VERSION,
 ) -> None:
     current = freeze_current_configuration(
         generation_settings=generation_settings,

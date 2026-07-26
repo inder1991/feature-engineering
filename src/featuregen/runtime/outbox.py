@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -11,13 +13,29 @@ from psycopg.types.json import Json
 from featuregen.contracts import EventEnvelope
 from featuregen.runtime.backoff import compute_backoff
 from featuregen.runtime.observability import counters
-from featuregen.runtime.queue import BackpressureError, enqueue, queue_depth
+from featuregen.runtime.queue import (
+    FORMULA_SHADOW_QUEUE_HANDLERS,
+    BackpressureError,
+    enqueue,
+    enqueue_checked,
+    queue_depth,
+)
 
 
 class UnroutedOutboxTopic(Exception):
     """Raised by the queue publisher when a topic declared ROUTE-REQUIRED has no configured route.
     It is a LOUD delivery failure (relay backs off -> DLQ), distinct from a topic that is
     intentionally drain-only (no route, not required -> silent no-op). SP-0.5 round-2."""
+
+
+class OutboxIdempotencyConflict(RuntimeError):
+    """One message id was reused for materially different delivery content."""
+
+
+def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +106,46 @@ def insert_outbox_message(conn: psycopg.Connection, msg: OutboxMessage) -> int:
             return int(row[0])
         cur.execute("SELECT id FROM outbox WHERE message_id = %s", (msg.message_id,))
         return int(cur.fetchone()[0])
+
+
+def insert_outbox_message_checked(conn: psycopg.Connection, msg: OutboxMessage) -> int:
+    """Insert or prove an exact idempotent replay; never accept same-id/different-content."""
+    payload_hash = canonical_payload_hash(msg.payload)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO outbox "
+            "(message_id, partition_key, topic, payload, payload_hash, caused_by_event) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (message_id) DO NOTHING RETURNING id",
+            (
+                msg.message_id,
+                msg.partition_key,
+                msg.topic,
+                Json(msg.payload),
+                payload_hash,
+                msg.caused_by_event,
+            ),
+        )
+        inserted = cur.fetchone()
+        if inserted is not None:
+            return int(inserted[0])
+        cur.execute(
+            "SELECT id, partition_key, topic, payload_hash, payload "
+            "FROM outbox WHERE message_id = %s",
+            (msg.message_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise OutboxIdempotencyConflict("outbox id disappeared during checked insert")
+    stored_hash = row[3] or canonical_payload_hash(row[4])
+    if (
+        row[1] != msg.partition_key
+        or row[2] != msg.topic
+        or stored_hash != payload_hash
+    ):
+        raise OutboxIdempotencyConflict(
+            f"outbox message {msg.message_id!r} conflicts with its stored identity")
+    return int(row[0])
 
 
 def relay_publish_batch(
@@ -223,7 +281,9 @@ def make_queue_publisher(
             raise BackpressureError(
                 f"partition {msg.partition_key!r} at capacity ({max_partition_depth})"
             )
-        enqueue(
+        enqueue_fn = (
+            enqueue_checked if handler in FORMULA_SHADOW_QUEUE_HANDLERS else enqueue)
+        enqueue_fn(
             conn,
             message_id=msg.message_id,
             partition_key=msg.partition_key,
