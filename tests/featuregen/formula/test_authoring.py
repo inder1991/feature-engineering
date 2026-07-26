@@ -773,7 +773,13 @@ def test_every_payload_hash_recomputes_from_the_stored_jsonb(db) -> None:
 def test_trace_payloads_are_metadata_only(db) -> None:
     """The §H discipline ``formula.tools`` already enforces on egress, applied to what is STORED:
     canonical redacted tool results + hashes, dispositions, reason codes — never raw catalog data
-    values or catalog free text."""
+    values, never catalog free text, and never the MODEL's own words.
+
+    Probed on all three surfaces a payload can leak through, because the write-once row (migration
+    1020) can never be corrected once written: the catalog canary, the critic's model-authored
+    ``detail``, and — the symmetric seam — a TOOL RESULT that echoes the model's words back
+    (jsonschema messages QUOTE the offending instance value, and a bad-argument error quotes the
+    ``logical_ref`` the model wrote)."""
     seed_authoring_catalog(db)
     author = _author_client(_raw())
     result = _run(db, author=author)
@@ -786,6 +792,32 @@ def test_trace_payloads_are_metadata_only(db) -> None:
     dumped2 = json.dumps([e[3] for e in _events(db, result2.authoring_run_id)])
     assert "a distinctive detail string" not in dumped2
     assert "WEAK_PROXY" in dumped2
+
+    # ...and neither does a TOOL RESULT that quotes the model back. Both echo paths are probed: a
+    # validate_draft_formula ``detail`` (a str(SchemaError) naming the value the model wrote) and an
+    # ``error`` naming a bad argument. The author repeats the one call until max_turns, so every run
+    # ends TECHNICAL — irrelevant here: what is under test is the TOOL_RESULT_RECORDED payload.
+    from featuregen.formula.tools import run_tool
+
+    model_text = "MODEL-WROTE-4111111111111111"
+    echoes = [
+        ("validate_draft_formula",
+         {"proposal": _raw({"final_operation": "identity", "expr": _expr(model_text)})}),
+        ("get_column_metadata", {"logical_ref": model_text}),
+    ]
+    for tool_name, arguments in echoes:
+        echoing = FakeLLM(script={AUTHOR_TASK: FakeResponse(output={
+            "turn_type": "tool_call",
+            "tool_call": {"tool_name": tool_name, "arguments": arguments}})})
+        # the tool really does echo the model's words — the leak this asserts against is live
+        assert model_text in json.dumps(run_tool(db, tool_name, arguments, roles=()))
+        echoed = _run(db, author=echoing)
+        recorded = [e[3] for e in _events(db, echoed.authoring_run_id)
+                    if e[1] == "TOOL_RESULT_RECORDED"]
+        assert recorded, tool_name
+        assert model_text not in json.dumps(recorded), tool_name
+        # the hash still covers the FULL result, so what the model saw stays tamper-evident
+        assert all(r["result_hash"] for r in recorded), tool_name
 
 
 def test_a_multi_turn_run_records_the_tool_call_and_its_canonical_result(db) -> None:

@@ -640,14 +640,28 @@ class _Trace:
                      payload=_metadata_payload(payload))
 
 
+#: The tool-result fields that echo the MODEL's own words (see :func:`_trace_turns`): a jsonschema
+#: message quoting the instance value the model wrote, or a bad-argument error quoting it. Omitted
+#: from the write-once trace exactly as the critic's model-authored ``detail`` is.
+_MODEL_FREE_TEXT_KEYS: frozenset[str] = frozenset({"detail", "error"})
+
+
 def _trace_turns(trace: _Trace, turns: list[AuthorTurnRecord]) -> None:
     """One LLM_CALL_RECORDED per author turn (linked to its immutable audit row), plus
-    TOOL_CALLED + TOOL_RESULT_RECORDED for a tool turn — the canonical, already-redacted tool result
-    verbatim, with the sha256 of its RFC 8785 bytes so the stored copy is tamper-evident.
+    TOOL_CALLED + TOOL_RESULT_RECORDED for a tool turn — the canonical tool result MINUS its
+    model-echoing free text, with the sha256 of the FULL result's RFC 8785 bytes.
 
-    Tool results are metadata-only by construction (``formula.tools`` returns column/grain/operation
-    METADATA and never data values or catalog free text), which is exactly what makes them storable
-    here under the same discipline that governs their egress."""
+    Tool results are metadata-only as to the CATALOG by construction (``formula.tools`` returns
+    column/grain/operation METADATA and never data values or ``graph_node.definition``), which is
+    what makes them storable here at all. Two fields nevertheless echo the MODEL's own words back:
+    ``validate_draft_formula``'s ``detail`` is a ``str(SchemaError)``, and jsonschema messages quote
+    the offending instance value; ``_error``'s ``error`` quotes a bad argument (a ``logical_ref`` the
+    model wrote). Both are dropped — the SAME omission the CRITIC_RECORDED payload makes for the
+    model-authored finding ``detail``, and for the same reason: the §H payload is metadata only, and
+    migration 1020 makes the row physically immutable, so nothing written here can ever be
+    remediated. ``result_hash`` covers the FULL canonical result (again mirroring the critic, whose
+    ``critic_findings_hash`` covers the ``detail`` its payload omits), so the bytes the model actually
+    saw stay tamper-evident without being stored."""
     for turn in turns:
         trace.append(TraceEventKind.LLM_CALL_RECORDED, {
             "turn": turn.index,
@@ -664,7 +678,7 @@ def _trace_turns(trace: _Trace, turns: list[AuthorTurnRecord]) -> None:
         trace.append(TraceEventKind.TOOL_RESULT_RECORDED, {
             "turn": turn.index,
             "tool_name": turn.tool_name,
-            "result": result,
+            "result": {k: v for k, v in result.items() if k not in _MODEL_FREE_TEXT_KEYS},
             "result_hash": hashlib.sha256(_jcs_dumps(result)).hexdigest(),
         })
 
