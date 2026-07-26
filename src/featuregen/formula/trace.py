@@ -427,8 +427,18 @@ def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple 
     connection is unusable. The caller-connection read is guarded too, because the caller's
     transaction may ALREADY be aborted (an earlier failed statement of its own) — a read contracted to
     "never fail the caller" may not raise ``InFailedSqlTransaction``; absence of evidence is the safe
-    answer. Cost of the union, accepted: on a terminal-less run the extra read touches the caller's
-    connection, which under ``REPEATABLE READ`` may PIN its snapshot slightly earlier than before."""
+    answer.
+
+    COST OF THE UNION, accepted, and BOTH halves of it are side effects on the caller's connection —
+    reached on EVERY terminal-less run, which is every run until it closes:
+
+    * under ``REPEATABLE READ`` the extra read may PIN the caller's snapshot slightly earlier than
+      before;
+    * on a non-autocommit connection sitting ``IDLE``, psycopg issues an implicit ``BEGIN`` for it —
+      so ``run_status``, a PURE READ, leaves the caller ``INTRANS`` where it found it idle. Harmless
+      for the request-scoped connections this module is hosted on (``api.deps.get_feature_gen_conn``
+      commits or rolls back at the end of the request either way), but it is a real state change and
+      a caller that reasons about its own transaction boundary must know about it."""
     dsn = get_settings().dsn
     if dsn:
         try:
