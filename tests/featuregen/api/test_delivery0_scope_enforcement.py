@@ -78,19 +78,43 @@ def test_release_mode_rejects_scoped_request_without_recognition_lineage(make_cl
     assert "reference its recognition" in response.json()["detail"]
 
 
-def test_release_mode_rejects_untrusted_confirmation_source(make_client, monkeypatch):
+def test_release_mode_ignores_client_claimed_provenance(
+        make_client, conn, monkeypatch):
     monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")
-    response = make_client().post(
+    _bank_multi(conn)
+    recognition = make_client(_recognizer()).post(
+        "/contract/recognitions",
+        json={"hypothesis": HYPOTHESIS, "objective": "predict churn"},
+        headers=AUTH,
+    ).json()
+    response = make_client(_fake()).post(
         "/contract/considered-set",
-        json=_body(confirmed_scope={
-            "primary": CHURN,
-            "confirmation_source": "automatic",
-        }),
+        json={
+            "hypothesis": HYPOTHESIS,
+            "objective": "predict churn",
+            "catalog_source": "bank",
+            "intent_id": recognition["intent_id"],
+            "recognition_id": recognition["recognition_id"],
+            "confirmed_scope": {
+                "primary": CHURN,
+                "confirmation_source": "automatic",
+                "use_case_origins": {CHURN: "user_added"},
+            },
+        },
         headers=AUTH,
     )
 
-    assert response.status_code == 422
-    assert "user_confirmed" in response.json()["detail"]
+    assert response.status_code == 200, response.text
+    scope_id = response.json()["scope_id"]
+    assert conn.execute(
+        "SELECT confirmation_source FROM confirmed_generation_scope WHERE scope_id = %s",
+        (scope_id,),
+    ).fetchone()[0] == "user_confirmed"
+    assert conn.execute(
+        "SELECT origin FROM confirmed_scope_use_case "
+        "WHERE scope_id = %s AND use_case_id = %s",
+        (scope_id, CHURN),
+    ).fetchone()[0] == "accepted_llm_proposal"
 
 
 def test_release_mode_rejects_unlinked_or_implicit_unscoped_request(make_client, monkeypatch):
@@ -109,7 +133,7 @@ def test_release_mode_rejects_unlinked_or_implicit_unscoped_request(make_client,
     )
 
     assert implicit.status_code == 422
-    assert "explicit broaden" in implicit.json()["detail"]
+    assert "reference a recognition or prior confirmed scope" in implicit.json()["detail"]
     assert unlinked.status_code == 422
     assert "reference a recognition or prior confirmed scope" in unlinked.json()["detail"]
 

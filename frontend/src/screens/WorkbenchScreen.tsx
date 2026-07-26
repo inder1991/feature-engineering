@@ -984,11 +984,6 @@ export function WorkbenchScreen() {
     setNotice('')
     setGenerating(true)
     try {
-      const ids = [scopePrimary, ...scopeSecondary].filter((id): id is string => id !== null)
-      // Every confirmed use-case is llm_proposed here: the controls re-role the recognizer's
-      // proposals (confirm/remove/change-primary), there is no free-text add, so the
-      // proposed-vs-accepted delta the backend stores is purely re-roling.
-      const useCaseOrigins = Object.fromEntries(ids.map(id => [id, 'llm_proposed']))
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
         entity: entity.trim() || undefined,
@@ -1000,8 +995,6 @@ export function WorkbenchScreen() {
           secondary: scopeSecondary,
           expansion: scopeExpansion,
           unscoped: false,
-          useCaseOrigins,
-          confirmationSource: 'user_confirmed',
           // SOFT dimensions the human confirmed/overrode: ranking nudges only, never a scope filter.
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
@@ -1041,8 +1034,6 @@ export function WorkbenchScreen() {
           secondary: [],
           expansion: 'exact',
           unscoped: true,
-          useCaseOrigins: {},
-          confirmationSource: 'broaden',
           // Dimensions are SOFT ranking nudges that still apply to the broadened (unscoped) set.
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
@@ -1060,8 +1051,8 @@ export function WorkbenchScreen() {
     }
   }
 
-  // Change the primary to another candidate: promote the chosen use-case, demote the old primary
-  // into the secondaries (both stay llm_proposed — the recognizer proposed them, we re-role).
+  // Change the primary to another candidate: promote the chosen use-case and demote the old primary.
+  // The server records both relationship changes as user overrides of the recognition proposal.
   function makePrimary(useCaseId: string) {
     setScopeSecondary(prev => {
       const withoutChosen = prev.filter(id => id !== useCaseId)

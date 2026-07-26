@@ -1019,15 +1019,12 @@ export interface RecognitionResp {
 // The human's confirmed Gate #1 scope, in the shape the UI holds it (camelCase). `primary` /
 // `secondary` are use-case ids; `expansion` maps the "include all sub-use-cases?" toggle
 // (exact ↔ include_descendants); `unscoped` true is a BROADEN (ground all buildable recipes);
-// `useCaseOrigins` records each confirmed use-case's provenance (llm_proposed / user_added) so the
-// proposed-vs-accepted delta stays queryable; `confirmationSource` names how it was confirmed.
+// Provenance is derived by the server from the immutable recognition and authenticated action.
 export interface ConfirmedScopeInput {
   primary: string | null
   secondary: string[]
   expansion: 'exact' | 'include_descendants'
   unscoped: boolean
-  useCaseOrigins: Record<string, string>
-  confirmationSource: string
   // Phase-2B SOFT dimensions the human confirmed/overrode: governed modelling context ids and the
   // proposed prediction grain. They flow into the scoped considered-set as ranking nudges (never a
   // scope-narrowing filter). `targetEntity` is null when the human proposed/kept no grain.
@@ -1108,8 +1105,6 @@ export function contractConsideredSet(
           secondary: opts.confirmedScope.secondary,
           expansion: opts.confirmedScope.expansion,
           unscoped: opts.confirmedScope.unscoped,
-          use_case_origins: opts.confirmedScope.useCaseOrigins,
-          confirmation_source: opts.confirmedScope.confirmationSource,
           modelling_contexts: opts.confirmedScope.modellingContexts,
           target_entity: opts.confirmedScope.targetEntity,
         }

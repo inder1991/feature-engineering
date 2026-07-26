@@ -1907,7 +1907,6 @@ describe('Gate #1 scope confirmation', () => {
         intentId: 'int_1', recognitionId: 'rec_1',
         confirmedScope: expect.objectContaining({
           primary: 'churn', secondary: ['engagement'], expansion: 'exact', unscoped: false,
-          useCaseOrigins: { churn: 'llm_proposed', engagement: 'llm_proposed' },
         }),
       }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()

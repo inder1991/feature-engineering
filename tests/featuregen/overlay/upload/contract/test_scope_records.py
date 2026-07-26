@@ -21,6 +21,7 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_generation_input,
     record_recognition_attempt,
     scope_for_run,
+    use_case_provenance,
 )
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
 from featuregen.overlay.upload.taxonomy.recognition import (
@@ -257,13 +258,54 @@ def test_confirmed_scope_writes_children_and_round_trips(db) -> None:
         "SELECT use_case_id, relationship, origin, display_order FROM confirmed_scope_use_case "
         "WHERE scope_id = %s ORDER BY display_order", (scope_id,)).fetchall()
     assert children == [
-        (PRIMARY, "primary", "llm_proposed", 0),     # primary defaults to llm_proposed, order 0
+        (PRIMARY, "primary", "accepted_llm_proposal", 0),
         (SECONDARY, "secondary", "user_added", 1),   # secondary origin overridden, order 1
     ]
 
     # scope_for_run reconstructs the EXACT ConfirmedScope by run id only (canonical linkage).
     reconstructed = scope_for_run(db, "run_1")
     assert reconstructed == scope
+
+
+def test_use_case_provenance_derives_role_overrides_and_replacement(db) -> None:
+    rid = record_recognition_attempt(
+        db, intent_id="intent_role_override", input_hash="hash_role_override",
+        result=_result(), actor="ds1")
+    promoted = ConfirmedScope(primary=SECONDARY, secondary=(PRIMARY,))
+
+    origins, relationships, replacements = use_case_provenance(db, rid, promoted)
+
+    assert origins == {
+        SECONDARY: "user_overridden",
+        PRIMARY: "user_overridden",
+    }
+    assert relationships == {
+        SECONDARY: "secondary",
+        PRIMARY: "primary",
+    }
+    assert replacements == {SECONDARY: PRIMARY}
+
+    scope_id = record_confirmed_scope(
+        db,
+        intent_id="intent_role_override",
+        generation_run_id="run_role_override",
+        recognition_id=rid,
+        scope=promoted,
+        use_case_origins=origins,
+        use_case_proposed_relationships=relationships,
+        use_case_replacements=replacements,
+        confirmation_source="user_confirmed",
+        confirmed_by="ds1",
+    )
+    rows = db.execute(
+        "SELECT use_case_id, relationship, origin, proposed_relationship, replaces_use_case_id "
+        "FROM confirmed_scope_use_case WHERE scope_id = %s ORDER BY display_order",
+        (scope_id,),
+    ).fetchall()
+    assert rows == [
+        (SECONDARY, "primary", "user_overridden", "secondary", PRIMARY),
+        (PRIMARY, "secondary", "user_overridden", "primary", None),
+    ]
 
 
 def test_unscoped_scope_has_no_children_and_round_trips(db) -> None:

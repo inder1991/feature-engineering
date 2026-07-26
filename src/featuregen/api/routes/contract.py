@@ -90,6 +90,7 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_confirmed_scope,
     record_generation_input,
     record_recognition_attempt,
+    use_case_provenance,
 )
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CatalogProjectionUnavailable,
@@ -190,14 +191,14 @@ class DraftIn(BaseModel):
 class ConfirmedScopeIn(BaseModel):
     """The human-confirmed Gate #1 scope (Phase-1B). ``unscoped=true`` fails open to full grounding and
     needs no ids; otherwise ``primary`` (if set) and every ``secondary`` must be a selectable taxonomy
-    leaf. ``use_case_origins`` maps a use-case id to its provenance (``llm_proposed``/``user_added``/
-    ``user_overridden``) for the proposed-vs-accepted audit delta."""
+    leaf. The two deprecated provenance fields are accepted only for wire compatibility and ignored;
+    the server derives governance provenance from the authenticated action and recognition record."""
     primary: str | None = None
     secondary: list[str] = []
     expansion: str = ScopeExpansion.EXACT.value
     unscoped: bool = False
-    use_case_origins: dict[str, str] = {}
-    confirmation_source: str = "user_confirmed"
+    use_case_origins: dict[str, str] | None = Field(default=None, deprecated=True)
+    confirmation_source: str | None = Field(default=None, deprecated=True)
     # ── Phase-2B (Task B3): the two human-confirmed intent DIMENSIONS. Both SOFT — they never narrow
     # applicability (``by_recipe``/``out_of_scope`` are untouched); they only feed the ranker and surface
     # per-recipe grain/context warnings. ``target_entity`` is a grain nudge (never a reject); an unknown
@@ -442,11 +443,6 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     #    id set must be collision-free.
     if cscope.unscoped:
         if confirmation_required():
-            if cscope.confirmation_source not in {"broaden", "user_broadened"}:
-                raise HTTPException(
-                    status_code=422,
-                    detail="unscoped generation requires an explicit broaden confirmation",
-                )
             if body.recognition_id is None and body.supersedes_scope_id is None:
                 raise HTTPException(
                     status_code=422,
@@ -456,12 +452,6 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             primary=None, secondary=(), unscoped=True,
             modelling_contexts=clean_contexts, target_entity=clean_entity)
     else:
-        if (confirmation_required()
-                and cscope.confirmation_source != "user_confirmed"):
-            raise HTTPException(
-                status_code=422,
-                detail="scoped generation requires user_confirmed confirmation source",
-            )
         # A ``primary`` that also appears in ``secondary`` (or a duplicated ``secondary``) would collide
         # on the ``confirmed_scope_use_case`` PK downstream → UniqueViolation → 500; reject it as a 422.
         if cscope.primary is not None and cscope.primary in cscope.secondary:
@@ -588,10 +578,20 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # client): a value the recognizer proposed is ``accepted_llm_proposal``, one the human introduced is
     # ``user_added``, and a corrected entity is a ``user_replacement`` recording what it superseded.
     dim_sources, dim_replaces = dimension_provenance(conn, effective_recognition_id, scope)
+    use_case_origins, proposed_relationships, use_case_replacements = use_case_provenance(
+        conn, effective_recognition_id, scope)
+    confirmation_source = (
+        "user_broadened" if scope.unscoped
+        else "user_feedback" if body.feedback
+        else "user_confirmed"
+    )
     scope_id = record_confirmed_scope(
         conn, intent_id=intent.intent_id, generation_run_id=generation_run_id,
         recognition_id=effective_recognition_id, scope=scope,
-        use_case_origins=cscope.use_case_origins, confirmation_source=cscope.confirmation_source,
+        use_case_origins=use_case_origins,
+        use_case_proposed_relationships=proposed_relationships,
+        use_case_replacements=use_case_replacements,
+        confirmation_source=confirmation_source,
         confirmed_by=identity.subject, supersedes_scope_id=body.supersedes_scope_id,
         dimension_sources=dim_sources, replaces=dim_replaces)
     sealed_generation = (

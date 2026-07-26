@@ -5,11 +5,11 @@ Three append-only writers/readers over the ``0974_intent_scope_records`` tables:
 * :func:`record_recognition_attempt` — persists the recognizer's PROPOSAL for an intent, BEFORE any
   generation run exists. Idempotent on ``(intent_id, input_hash)``: the same intent + redacted input
   resolves to the SAME ``recognition_id`` (never a second row), so re-recognising is free.
+* :func:`use_case_provenance` — derives accepted/added/overridden provenance from the immutable
+  recognition attempt and the confirmed scope. The client never supplies governance provenance.
 * :func:`record_confirmed_scope` — writes the human-confirmed governing scope for exactly one
   generation run (parent) plus one normalized child per accepted use-case, each stamped with its
-  ``origin`` (``llm_proposed``/``user_added``/``user_overridden``). The proposals (on the attempt) and
-  the choices (child rows) are both retained, joined by ``recognition_id`` — so the proposed-vs-accepted
-  delta stays queryable.
+  server-derived provenance. The proposals and choices remain independently queryable.
 * :func:`scope_for_run` — the CANONICAL lookup: the governing scope for a run, by run id only (the
   ``UNIQUE(generation_run_id)`` linkage). Never latest-by-time; ``supersedes_scope_id`` is lineage only.
 * :func:`confirmation_delta` — the proposed-vs-confirmed DIMENSION delta for a run: the attempt's
@@ -363,6 +363,8 @@ def record_confirmed_scope(
     recognition_id: str | None,
     scope: ConfirmedScope,
     use_case_origins: dict[str, str],
+    use_case_proposed_relationships: dict[str, str] | None = None,
+    use_case_replacements: dict[str, str] | None = None,
     confirmation_source: str,
     confirmed_by: str,
     supersedes_scope_id: str | None = None,
@@ -371,8 +373,8 @@ def record_confirmed_scope(
 ) -> str:
     """Write the human-confirmed governing scope for ``generation_run_id`` (parent) plus one normalized
     child per accepted use-case. The primary (``relationship='primary'``, ``display_order=0``) then each
-    secondary (``relationship='secondary'``, ``display_order=1..N``); each child's ``origin`` comes from
-    ``use_case_origins`` (default ``'llm_proposed'``). An ``unscoped`` scope has no primary/secondary, so
+    secondary (``relationship='secondary'``, ``display_order=1..N``); each child's provenance is
+    server-derived by :func:`use_case_provenance`. An ``unscoped`` scope has no primary/secondary, so
     it writes zero child rows. Raises on a duplicate ``generation_run_id`` (the UNIQUE canonical linkage).
     Returns the minted ``scope_id``.
 
@@ -407,13 +409,22 @@ def record_confirmed_scope(
         for order, use_case_id in enumerate(scope.secondary, start=1):
             children.append((use_case_id, "secondary", order))
 
+    derived_origins, derived_relationships, derived_replacements = use_case_provenance(
+        conn, recognition_id, scope)
+    origins = {**derived_origins, **use_case_origins}
+    proposed_relationships = {
+        **derived_relationships, **(use_case_proposed_relationships or {})}
+    replacements = {**derived_replacements, **(use_case_replacements or {})}
     for use_case_id, relationship, display_order in children:
         conn.execute(
             "INSERT INTO confirmed_scope_use_case "
-            "(scope_id, use_case_id, relationship, origin, display_order) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "(scope_id, use_case_id, relationship, origin, proposed_relationship, "
+            "replaces_use_case_id, display_order) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (scope_id, use_case_id, relationship,
-             use_case_origins.get(use_case_id, "llm_proposed"), display_order))
+             origins.get(use_case_id, "user_added"),
+             proposed_relationships.get(use_case_id), replacements.get(use_case_id),
+             display_order))
 
     # Confirmed intent DIMENSIONS (Phase-2B), each a normalized child with rich provenance. UNLIKE the
     # use-case children, these persist for BOTH scoped and unscoped scopes: the confirmed dimensions are
@@ -439,6 +450,64 @@ def record_confirmed_scope(
             "VALUES (%s, %s, %s, %s, %s, %s)",
             (scope_id, dimension, value, source, replaces_value, display_order))
     return scope_id
+
+
+def use_case_provenance(
+    conn, recognition_id: str | None, scope: ConfirmedScope,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Derive use-case provenance from the immutable recognition proposal.
+
+    Returns ``(origins, proposed_relationships, replacements)`` keyed by confirmed use-case id.
+    A candidate retained in its proposed role is accepted, a new secondary is user-added, and any
+    role change is an override. A newly selected primary also records the recognizer's displaced
+    primary when one existed. Unscoped confirmation has no use-case children and therefore no child
+    provenance; its action provenance is carried by the parent ``confirmation_source``.
+    """
+    if scope.unscoped:
+        return {}, {}, {}
+
+    candidates: list[dict[str, Any]] = []
+    if recognition_id is not None:
+        row = conn.execute(
+            "SELECT candidates FROM intent_recognition_attempt WHERE recognition_id = %s",
+            (recognition_id,),
+        ).fetchone()
+        if row is not None and isinstance(row[0], list):
+            candidates = [c for c in row[0] if isinstance(c, dict)]
+
+    proposed: dict[str, str] = {
+        str(candidate["use_case_id"]): str(candidate["relationship"])
+        for candidate in candidates
+        if isinstance(candidate.get("use_case_id"), str)
+        and candidate.get("relationship") in {"primary", "secondary"}
+    }
+    proposed_primary = next(
+        (uid for uid, relationship in proposed.items() if relationship == "primary"), None)
+
+    confirmed: list[tuple[str, str]] = []
+    if scope.primary is not None:
+        confirmed.append((scope.primary, "primary"))
+    confirmed.extend((uid, "secondary") for uid in scope.secondary)
+
+    origins: dict[str, str] = {}
+    proposed_relationships: dict[str, str] = {}
+    replacements: dict[str, str] = {}
+    for use_case_id, relationship in confirmed:
+        prior_relationship = proposed.get(use_case_id)
+        if prior_relationship == relationship:
+            origins[use_case_id] = "accepted_llm_proposal"
+        elif prior_relationship is not None:
+            origins[use_case_id] = "user_overridden"
+            proposed_relationships[use_case_id] = prior_relationship
+            if (relationship == "primary" and proposed_primary is not None
+                    and proposed_primary != use_case_id):
+                replacements[use_case_id] = proposed_primary
+        elif relationship == "primary" and proposed_primary is not None:
+            origins[use_case_id] = "user_overridden"
+            replacements[use_case_id] = proposed_primary
+        else:
+            origins[use_case_id] = "user_added"
+    return origins, proposed_relationships, replacements
 
 
 def dimension_provenance(
