@@ -10,6 +10,9 @@ must then NOT dispatch (wired in C5-T3).
 """
 from __future__ import annotations
 
+import hashlib
+import json
+
 import psycopg
 import pytest
 
@@ -186,20 +189,86 @@ def test_formula_dispatch_reconciliation_requires_every_audit_dimension() -> Non
         def fetchall(self):
             return self.rows
 
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    def digest(value) -> str:
+        return hashlib.sha256(json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+
+    schema = {"type": "object", "additionalProperties": False}
+    inputs = {"instruction": "author safely", "catalog_metadata": {}}
+    settings = {"provider": "anthropic", "model": "test"}
+    request = LLMRequest(
+        task="formula.author",
+        prompt_id="formula-author-v1",
+        prompt_version=1,
+        inputs=inputs,
+        output_schema_id="typed-formula-v1",
+        output_schema_version=1,
+        generation_settings=settings,
+        output_schema=schema,
+    )
+    input_hash = compute_input_hash(inputs)
+    prompt_hash = digest(inputs["instruction"])
+    schema_hash = digest(schema)
+    contract_hash = digest({
+        "call_role": "formula.author",
+        "provider": "anthropic",
+        "model": "test",
+        "generation_settings": settings,
+        "prompt_id": "formula-author-v1",
+        "prompt_version": 1,
+        "prompt_content_hash": prompt_hash,
+        "output_schema_id": "typed-formula-v1",
+        "output_schema_version": 1,
+        "schema_content_hash": schema_hash,
+    })
+    dispatch = (
+        "dispatch-1", "formula.author", input_hash, inputs, "anthropic", "test", 1, 1,
+        compute_physical_request_hash(request), "formula.author", input_hash,
+        contract_hash, prompt_hash, schema_hash,
+    )
+    link = (
+        "call-1", "formula.author", "anthropic", "test", "formula-author-v1", 1,
+        "typed-formula-v1", 1, settings, input_hash,
+    )
+
     class _Conn:
-        def __init__(self, rows):
-            self.rows = rows
+        def __init__(self, *, dispatches=(dispatch,), links=(link,),
+                     outcomes=(("response_received",),), trace=((1,),)):
+            self.dispatches = dispatches
+            self.links = links
+            self.outcomes = outcomes
+            self.trace = trace
 
-        def execute(self, *args):
-            return _Result(self.rows)
+        def execute(self, sql, *args):
+            if "FROM llm_dispatch WHERE authoring_run_id" in sql:
+                return _Result(self.dispatches)
+            if "FROM llm_call_dispatch" in sql:
+                return _Result(self.links)
+            if "FROM document_type_registry" in sql:
+                return _Result(((schema,),))
+            if "FROM llm_dispatch_outcome" in sql:
+                return _Result(self.outcomes)
+            if "FROM formula_authoring_trace_event" in sql:
+                return _Result(self.trace)
+            raise AssertionError(sql)
 
-    complete = ("physical", "logical", "contract", "prompt", "schema", True, True)
-    assert formula_dispatches_reconciled(_Conn([complete]), "run")
-    assert not formula_dispatches_reconciled(_Conn([]), "run")
-    for index in range(len(complete)):
-        broken = list(complete)
-        broken[index] = None if index < 5 else False
-        assert not formula_dispatches_reconciled(_Conn([tuple(broken)]), "run")
+    assert formula_dispatches_reconciled(_Conn(), "run")
+    assert not formula_dispatches_reconciled(_Conn(dispatches=()), "run")
+    broken_dispatch = list(dispatch)
+    broken_dispatch[8] = "0" * 64
+    assert not formula_dispatches_reconciled(
+        _Conn(dispatches=(tuple(broken_dispatch),)), "run")
+    assert not formula_dispatches_reconciled(_Conn(links=()), "run")
+    assert not formula_dispatches_reconciled(_Conn(outcomes=()), "run")
+    assert not formula_dispatches_reconciled(_Conn(trace=((0,),)), "run")
+
+
+def test_formula_dispatch_reconciliation_query_runs_against_postgres(db) -> None:
+    assert not formula_dispatches_reconciled(db, "missing-authoring-run")
 
 
 def test_a_new_attempt_is_a_new_dispatch_record(durable_dsn) -> None:

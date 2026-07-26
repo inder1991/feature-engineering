@@ -10,6 +10,10 @@ from featuregen.formula.control import LeaseFence
 from featuregen.formula.critic import CRITIC_TASK
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.upload.dispatch_audit import (
+    formula_dispatch_reconciliation_failure,
+    formula_dispatches_reconciled,
+)
 
 
 def test_fenced_author_critic_trace_is_replayable_without_provider_reissue(
@@ -72,6 +76,9 @@ def test_fenced_author_critic_trace_is_replayable_without_provider_reissue(
                 ("OUTPUT_POLICY_RESOLVED",),
                 ("TERMINAL",),
             ]
+        assert formula_dispatches_reconciled(db, run_id), (
+            formula_dispatch_reconciliation_failure(db, run_id)
+        )
 
         replay_client = FakeLLM(script={})
         replayed = run_authoring(

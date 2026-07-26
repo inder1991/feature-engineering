@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.recipe_egress import (
@@ -38,6 +39,8 @@ from featuregen.overlay.upload.recipe_formula_shadow import (
     declare_expected_run,
     finalize_manifest,
     reconcile_run,
+    verify_expected_run_payload,
+    verify_manifest_payload,
     verify_observation_payload,
     verify_work_item_payload,
     write_manifest,
@@ -238,6 +241,30 @@ def test_manifest_and_observations_reconcile_exact_expected_population(db):
     complete = finalize_manifest(db, run_id)
     assert complete.status == "COMPLETE"
     assert complete.actual_observations == 1
+
+    with db.cursor(row_factory=dict_row) as cursor:
+        declaration = cursor.execute(
+            "SELECT * FROM recipe_formula_shadow_expected_run WHERE generation_run_id=%s",
+            (run_id,),
+        ).fetchone()
+        manifest = cursor.execute(
+            "SELECT * FROM recipe_formula_shadow_run_manifest WHERE generation_run_id=%s",
+            (run_id,),
+        ).fetchone()
+    assert verify_expected_run_payload(declaration) is None
+    assert verify_manifest_payload(manifest) is None
+
+    bad_declaration = dict(declaration)
+    bad_declaration["ranking_flag"] = False
+    assert verify_expected_run_payload(bad_declaration) == (
+        "EXPECTED_RUN_DECLARATION_HASH_MISMATCH")
+    bad_ranking = dict(manifest)
+    bad_ranking["ranking_hash"] = "forged"
+    assert verify_manifest_payload(bad_ranking) == "MANIFEST_RANKING_HASH_MISMATCH"
+    bad_reconciliation = dict(manifest)
+    bad_reconciliation["reconciliation_hash"] = "forged"
+    assert verify_manifest_payload(bad_reconciliation) == (
+        "MANIFEST_RECONCILIATION_HASH_MISMATCH")
     row = db.execute(
         "SELECT status, actual_observation_count FROM recipe_formula_shadow_run_manifest "
         "WHERE generation_run_id=%s",

@@ -281,6 +281,88 @@ def verify_observation_payload(row: Mapping[str, Any]) -> str | None:
     return None
 
 
+def verify_expected_run_payload(row: Mapping[str, Any]) -> str | None:
+    """Verify the independently declared shadow population identity."""
+    material = {
+        "generation_run_id": row.get("generation_run_id"),
+        "intent_id": row.get("intent_id"),
+        "confirmed_scope_id": row.get("confirmed_scope_id"),
+        "considered_revision_id": row.get("considered_revision_id"),
+        "considered_content_hash": row.get("considered_content_hash"),
+        "shadow_flag": row.get("shadow_flag"),
+        "ranking_flag": row.get("ranking_flag"),
+        "invocation_predicate_version": row.get("invocation_predicate_version"),
+        "capture_policy_version": row.get("capture_policy_version"),
+        "expected_manifest_id": row.get("expected_manifest_id"),
+    }
+    if content_hash(material) != row.get("declaration_hash"):
+        return "EXPECTED_RUN_DECLARATION_HASH_MISMATCH"
+    return None
+
+
+def verify_manifest_payload(row: Mapping[str, Any]) -> str | None:
+    """Verify ranking, capture identities, counts, manifest hash and terminal reconciliation."""
+    ranking = row.get("ranking_json")
+    entries = row.get("capture_entries")
+    if not isinstance(ranking, list) or not isinstance(entries, list):
+        return "MANIFEST_SHAPE_INVALID"
+    if content_hash(ranking) != row.get("ranking_hash"):
+        return "MANIFEST_RANKING_HASH_MISMATCH"
+    seen_entry_ids: set[str] = set()
+    required = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return "MANIFEST_CAPTURE_ENTRY_INVALID"
+        entry_id = entry.get("capture_entry_id")
+        recipe_id = entry.get("recipe_id")
+        rank = entry.get("canonical_rank")
+        ranking_version = row.get("ranking_version")
+        if (
+            not isinstance(entry_id, str)
+            or not isinstance(recipe_id, str)
+            or not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or not isinstance(ranking_version, str)
+            or entry_id != capture_entry_id(
+                str(row.get("generation_run_id")), ranking_version, rank, recipe_id)
+            or entry_id in seen_entry_ids
+        ):
+            return "MANIFEST_CAPTURE_ENTRY_IDENTITY_INVALID"
+        seen_entry_ids.add(entry_id)
+        if entry.get("capture_required") is True:
+            required += 1
+    if required != row.get("expected_observation_count"):
+        return "MANIFEST_EXPECTED_COUNT_MISMATCH"
+    material = {
+        "manifest_id": row.get("manifest_id"),
+        "generation_run_id": row.get("generation_run_id"),
+        "intent_id": row.get("intent_id"),
+        "considered_revision_id": row.get("considered_revision_id"),
+        "considered_content_hash": row.get("considered_content_hash"),
+        "ranking_version": row.get("ranking_version"),
+        "ranking_json": ranking,
+        "capture_entries": entries,
+        "expected_observation_count": row.get("expected_observation_count"),
+        "capture_axis": row.get("capture_axis"),
+        "capture_policy_version": row.get("capture_policy_version"),
+    }
+    if content_hash(material) != row.get("manifest_hash"):
+        return "MANIFEST_CONTENT_HASH_MISMATCH"
+    status = row.get("status")
+    if status not in {"COMPLETE", "INCOMPLETE"}:
+        return "MANIFEST_NOT_TERMINAL"
+    reconciliation = {
+        "run": row.get("generation_run_id"),
+        "status": status,
+        "expected": row.get("expected_observation_count"),
+        "actual": row.get("actual_observation_count"),
+        "reason": None if status == "COMPLETE" else "OBSERVATION_COUNT_MISMATCH",
+    }
+    if content_hash(reconciliation) != row.get("reconciliation_hash"):
+        return "MANIFEST_RECONCILIATION_HASH_MISMATCH"
+    return None
+
+
 def declare_expected_run(
     conn,
     *,

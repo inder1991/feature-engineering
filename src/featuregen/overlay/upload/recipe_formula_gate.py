@@ -7,15 +7,24 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from featuregen.formula.control import RecoveryRequiresReconciliation
+from featuregen.formula.trace import load_verified_checkpoint
 from featuregen.overlay.upload.dispatch_audit import formula_dispatches_reconciled
+from featuregen.overlay.upload.recipe_formula_expectations import (
+    RECIPE_FORMULA_EXPECTATIONS,
+    validate_expectation_registry,
+)
 from featuregen.overlay.upload.recipe_formula_shadow import (
+    verify_expected_run_payload,
+    verify_manifest_payload,
     verify_observation_payload,
 )
 
-AUTHORABLE_RECIPE_IDS = frozenset({
-    "merchant_mcc_diversity",
-    "obligor_facility_count",
-})
+
+def authorable_recipe_ids() -> frozenset[str]:
+    """The validated expectation registry is the single authorability authority."""
+    validate_expectation_registry()
+    return frozenset(RECIPE_FORMULA_EXPECTATIONS)
 
 _TERMINAL_AUTHORIZATIONS = frozenset({
     "NOT_EVALUATED",
@@ -121,7 +130,11 @@ def build_provider_evidence(
     return ProviderGateEvidence(
         distinct_clean_cases=len(clean),
         exact_matches=sum(1 for outcome in clean if outcome.exact_match),
-        technical_failures=sum(1 for outcome in outcomes if outcome.technical_failure),
+        technical_failures=sum(
+            1 for outcome in outcomes
+            if outcome.technical_failure
+            and (outcome.case_kind == "clean" or not outcome.blocking_detected)
+        ),
         false_resolves=sum(1 for outcome in outcomes if outcome.false_resolve),
         accepted_results=len(accepted),
         preservation_successes=sum(
@@ -146,6 +159,7 @@ def build_population_report(
     *,
     since: datetime | None = None,
     until: datetime | None = None,
+    generation_run_ids: tuple[str, ...] | None = None,
 ) -> FormulaShadowPopulationReport:
     predicates = []
     parameters: list[Any] = []
@@ -155,30 +169,77 @@ def build_population_report(
     if until is not None:
         predicates.append("e.declared_at < %s")
         parameters.append(until)
+    if generation_run_ids is not None:
+        predicates.append("e.generation_run_id = ANY(%s)")
+        parameters.append(list(generation_run_ids))
     where = " WHERE " + " AND ".join(predicates) if predicates else ""
-    expected = conn.execute(
-        "SELECT e.generation_run_id,m.status,m.expected_observation_count,"
-        "m.actual_observation_count "
-        "FROM recipe_formula_shadow_expected_run e "
-        "LEFT JOIN recipe_formula_shadow_run_manifest m "
-        "ON m.generation_run_id=e.generation_run_id" + where,
-        tuple(parameters),
-    ).fetchall()
-    run_ids = [row[0] for row in expected]
-    observations = []
+    with conn.cursor(row_factory=dict_row) as cursor:
+        expected = cursor.execute(
+            "SELECT e.* FROM recipe_formula_shadow_expected_run e" + where,
+            tuple(parameters),
+        ).fetchall()
+    run_ids = [row["generation_run_id"] for row in expected]
+    manifests_by_run: dict[str, dict] = {}
+    observations_by_run: dict[str, list[dict]] = {run_id: [] for run_id in run_ids}
     if run_ids:
         with conn.cursor(row_factory=dict_row) as cursor:
+            manifests = cursor.execute(
+                "SELECT * FROM recipe_formula_shadow_run_manifest "
+                "WHERE generation_run_id = ANY(%s)",
+                (run_ids,),
+            ).fetchall()
             observations = cursor.execute(
                 "SELECT * FROM recipe_formula_shadow_observation "
                 "WHERE generation_run_id = ANY(%s)",
                 (run_ids,),
             ).fetchall()
+        manifests_by_run = {row["generation_run_id"]: row for row in manifests}
+        for observation in observations:
+            observations_by_run[observation["generation_run_id"]].append(observation)
+    else:
+        observations = []
     malformed = 0
     dispatched = 0
     resolved = 0
     technical = 0
     unreconciled = 0
-    positives = {recipe_id: 0 for recipe_id in AUTHORABLE_RECIPE_IDS}
+    authorable = authorable_recipe_ids()
+    positives = {recipe_id: 0 for recipe_id in authorable}
+    complete_manifests = 0
+    expected_observations = 0
+    for declaration in expected:
+        run_id = declaration["generation_run_id"]
+        declaration_bad = verify_expected_run_payload(declaration)
+        manifest = manifests_by_run.get(run_id)
+        if declaration_bad is not None:
+            malformed += 1
+        if (
+            manifest is None
+            or manifest["manifest_id"] != declaration["expected_manifest_id"]
+            or manifest["intent_id"] != declaration["intent_id"]
+            or manifest["considered_revision_id"] != declaration["considered_revision_id"]
+            or manifest["considered_content_hash"] != declaration["considered_content_hash"]
+        ):
+            malformed += 1
+            continue
+        manifest_bad = verify_manifest_payload(manifest)
+        if manifest_bad is not None:
+            malformed += 1
+        if manifest["status"] == "COMPLETE":
+            complete_manifests += 1
+        expected_observations += int(manifest["expected_observation_count"] or 0)
+        required_ids = {
+            entry["capture_entry_id"]
+            for entry in manifest["capture_entries"]
+            if isinstance(entry, dict) and entry.get("capture_required") is True
+        }
+        actual_ids = {
+            observation["capture_entry_id"]
+            for observation in observations_by_run[run_id]
+        }
+        if required_ids != actual_ids or len(actual_ids) != len(observations_by_run[run_id]):
+            malformed += 1
+
     for observation in observations:
         if verify_observation_payload(observation) is not None:
             malformed += 1
@@ -216,8 +277,38 @@ def build_population_report(
         )
         if technical_failed:
             technical += 1
+        trace_exact = False
+        authoring_run_id = observation.get("authoring_run_id")
+        if isinstance(authoring_run_id, str):
+            run = conn.execute(
+                "SELECT intent_hash,versions FROM formula_authoring_run "
+                "WHERE authoring_run_id=%s",
+                (authoring_run_id,),
+            ).fetchone()
+            if run is not None:
+                try:
+                    checkpoint = load_verified_checkpoint(
+                        conn, authoring_run_id, intent_hash=run[0], versions=run[1])
+                    trace_exact = (
+                        checkpoint.terminal_result is not None
+                        and checkpoint.terminal_result.get("result") == result_json
+                    )
+                except RecoveryRequiresReconciliation:
+                    trace_exact = False
+        if delivery == "DISPATCHED_AUDITED" and authoring == "RESOLVED" and not trace_exact:
+            malformed += 1
+            technical += 1
+            continue
         exact_resolve = (
-            authoring == "RESOLVED"
+            observation["capture_axis"] == "CAPTURED"
+            and authorization == "AUTHORIZED_CURRENT"
+            and observation["authority_axis"] == "VERIFIED_AT_CAPTURE"
+            and observation["drift_axis"] == "CURRENT"
+            and observation["configuration_axis"] == "CURRENT"
+            and delivery == "DISPATCHED_AUDITED"
+            and authoring == "RESOLVED"
+            and technical_axis == "OK"
+            and trace_exact
             and result_json.get("structural_status") == "ok"
             and result_json.get("capability_status") == "ok"
             and result_json.get("output_status") == "resolved"
@@ -233,9 +324,9 @@ def build_population_report(
                 positives[recipe_id] += 1
     return FormulaShadowPopulationReport(
         expected_runs=len(expected),
-        manifests=sum(1 for row in expected if row[1] is not None),
-        complete_manifests=sum(1 for row in expected if row[1] == "COMPLETE"),
-        expected_observations=sum(int(row[2] or 0) for row in expected),
+        manifests=len(manifests_by_run),
+        complete_manifests=complete_manifests,
+        expected_observations=expected_observations,
         actual_observations=len(observations),
         dispatched=dispatched,
         resolved=resolved,
@@ -281,8 +372,8 @@ def evaluate_gate(
         reasons.append("population: technical failures are present")
 
     positive_counts = dict(report.positives_by_recipe)
-    non_vacuous = all(positive_counts.get(recipe_id, 0) > 0
-                       for recipe_id in AUTHORABLE_RECIPE_IDS)
+    authorable = authorable_recipe_ids()
+    non_vacuous = all(positive_counts.get(recipe_id, 0) > 0 for recipe_id in authorable)
     if not non_vacuous:
         reasons.append("positives: every authorable recipe requires an exact resolved case")
 
@@ -317,7 +408,7 @@ def evaluate_gate(
     shadow_passed = population and non_vacuous and deterministic and provider_quality
     live_authority = real_authority_population or {}
     activation_ready = all(
-        live_authority.get(recipe_id, 0) > 0 for recipe_id in AUTHORABLE_RECIPE_IDS)
+        live_authority.get(recipe_id, 0) > 0 for recipe_id in authorable)
     if shadow_passed and not activation_ready:
         activation_status = "SHADOW_READY_AUTHORITY_PROVISIONING_REQUIRED"
     elif shadow_passed:

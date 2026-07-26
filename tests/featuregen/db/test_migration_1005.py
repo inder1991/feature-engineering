@@ -35,7 +35,7 @@ _KEY_COLUMNS = {
 # how many FOREIGN KEY constraints each table must carry (nullable FKs still count)
 _FK_COUNTS = {
     # 1005 adds ingestion_run; 1022 adds the nullable formula-authoring association.
-    "llm_dispatch": 2,             # -> ingestion_run, formula_authoring_run
+    "llm_dispatch": 3,             # -> ingestion_run, formula_authoring_run, queue lease
     "llm_dispatch_subject": 1,     # -> llm_dispatch
     "llm_dispatch_outcome": 1,     # -> llm_dispatch
     "ingestion_run_llm_call": 2,   # -> ingestion_run, llm_call
