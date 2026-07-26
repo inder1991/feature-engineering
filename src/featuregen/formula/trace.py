@@ -21,9 +21,10 @@ request transaction's fate a rolled-back request would leave audited provider ca
 manifest and NO trace — evidence that content egressed, with nothing saying which run made it. So
 the manifest and every event are written on a FRESH connection opened from ``get_settings().dsn``
 (the FULL configured DSN — NOT ``conn.info.dsn``, which psycopg3 strips the password from: that was
-a real bug fixed on this codebase), each committing independently, performing ONE bare INSERT, and
-NEVER taking an advisory lock (a second lock-taking connection self-deadlocked in program-audit
-I-3). When no DSN is configured (the tests / no-DB harness) the write goes on the caller's
+a real bug fixed on this codebase), each committing independently, performing ONE bare INSERT under a
+bounded ``lock_timeout`` (it can self-block on an index entry the request itself holds —
+``_SET_LOCK_TIMEOUT``), and NEVER taking an advisory lock (a second lock-taking connection
+self-deadlocked in program-audit I-3). When no DSN is configured (the tests / no-DB harness) the write goes on the caller's
 connection — the designed harness path, not a degradation; any CONNECTION-DEPENDENT failure with a
 DSN configured (a connect/commit blip, or a ``ForeignKeyViolation`` against a referent that only
 exists on the caller's uncommitted transaction because an upstream durable write itself degraded)
@@ -123,6 +124,16 @@ _SELECT_TERMINAL = (
 #: caller can see as closed reads as closed, so ``run_status`` stays correct either way.
 _REPLAY_RUN = _INSERT_RUN + " ON CONFLICT (authoring_run_id) DO NOTHING"
 _REPLAY_EVENT = _INSERT_EVENT + " ON CONFLICT (idempotency_key) DO NOTHING"
+
+#: A BOUNDED wait on the durable connection's INSERT, because that INSERT can SELF-BLOCK against the
+#: request that issued it: an event which degraded onto the caller's UNCOMMITTED transaction owns
+#: 1020's (run, seq) and partial-terminal unique-index entries, and a later durable INSERT touching
+#: the same entry waits on a lock only the caller can release — i.e. never, inside the request. Local
+#: to the fresh connection's own transaction (``SET LOCAL``, discarded at its commit), so it can never
+#: leak onto the caller's session. On expiry Postgres raises ``LockNotAvailable`` — an
+#: ``OperationalError``, hence CONNECTION-DEPENDENT, hence the fallback replay, which is exactly
+#: right: the caller's connection is the one place the blocking row is visible at all.
+_SET_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '3s'"
 
 
 def open_authoring_run(conn: DbConn, *, intent_hash: str, versions: Mapping[str, Any],
@@ -252,8 +263,16 @@ _DETERMINISTIC_REJECTIONS: tuple[type[Exception], ...] = (
 
 def _durable_write(conn: DbConn, sql: str, params: tuple, *, replay_sql: str, what: str) -> None:
     """Perform ONE bare INSERT on a FRESH connection from ``get_settings().dsn``, committed
-    independently of the caller's transaction (module docstring for why). No advisory lock is ever
-    taken, so this can never self-deadlock against a lock the request holds.
+    independently of the caller's transaction (module docstring for why), under a bounded
+    ``lock_timeout``.
+
+    No advisory lock is ever taken (program-audit I-3: a fresh connection re-acquiring the request's
+    advisory lock hangs forever). That is NOT the same as "cannot self-block", which this docstring
+    used to claim: the fresh connection can still wait on ROW/INDEX contention owned by the CALLER's
+    own uncommitted transaction — a degraded event holds 1020's (run, seq) and partial-terminal unique
+    index entries, and a later durable INSERT for the same run blocked on them until the request
+    ended, i.e. never. ``_SET_LOCK_TIMEOUT`` bounds that into ``LockNotAvailable``, which degrades
+    like any other connection-dependent failure instead of hanging the request.
 
     * no DSN configured → write on the caller's connection (the designed tests / no-DB path);
     * a CONNECTION-DEPENDENT failure with a DSN configured → log and degrade to the caller's
@@ -278,6 +297,7 @@ def _durable_write(conn: DbConn, sql: str, params: tuple, *, replay_sql: str, wh
         return
     try:
         with psycopg.connect(dsn) as trace_conn:  # own tx, committed on clean `with` exit
+            trace_conn.execute(_SET_LOCK_TIMEOUT)  # bounded self-block, never an unbounded wait
             trace_conn.execute(sql, params)
         return
     except _DETERMINISTIC_REJECTIONS:

@@ -653,6 +653,44 @@ def test_run_status_falls_back_to_the_request_connection_when_the_dsn_is_unreach
     assert caplog.text.count("durable authoring-trace read failed") == 1
 
 
+def test_a_self_blocking_durable_insert_times_out_instead_of_hanging(db, monkeypatch, _dsn) -> None:
+    """Fix-wave-2 coupled MINOR. "No advisory lock is ever taken, so this can never self-deadlock"
+    was over-broad: the fresh connection can still BLOCK on an index entry the CALLER's own
+    uncommitted transaction owns. Here a blip degrades the terminal event onto the caller's tx, so it
+    owns 1020's partial-unique-index entry for the run; the blip clears and the next durable terminal
+    INSERT passes the trigger's EXISTS probe (the caller's terminal is uncommitted) and then waits on
+    a lock the request itself holds — forever, in a request, on a connection that carried no timeout.
+    A bounded ``lock_timeout`` degrades that to ``LockNotAvailable`` (an ``OperationalError``, i.e.
+    connection-dependent), which takes the fallback path — where the caller's OWN connection sees its
+    own terminal and the write-once guard raises honestly.
+
+    Threaded (precedent: the two-session concurrency test above) so a regression FAILS in seconds
+    instead of hanging until the suite-wide timeout."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_self_block")      # manifest COMMITS durably: the FK is fine
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    append_event(db, run_id, TraceEventKind.COMPLETED, seq=0,   # degrades onto the caller's tx and
+                 idempotency_key=f"{run_id}:0", payload={})     # takes the terminal index entry
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)                  # the blip clears
+    outcome: list[object] = []
+
+    def append_a_second_terminal() -> None:
+        try:
+            append_event(db, run_id, TraceEventKind.FAILED, seq=1,
+                         idempotency_key=f"{run_id}:1", payload={})
+            outcome.append("accepted")
+        except BaseException as exc:                    # noqa: BLE001 — recorded, asserted below
+            outcome.append(exc)
+
+    thread = threading.Thread(target=append_a_second_terminal, daemon=True)
+    thread.start()
+    thread.join(20.0)
+    assert not thread.is_alive(), "the durable INSERT HUNG on the caller's own index entry"
+    assert isinstance(outcome[0], psycopg.errors.RaiseException), outcome
+    assert db.execute("SELECT 1").fetchone()[0] == 1     # and the caller is still usable
+    assert run_status(db, run_id) == "completed"         # its own terminal event stands
+
+
 def test_durable_writes_use_the_full_dsn_and_no_advisory_lock(db) -> None:
     """Two structural guards on the durable pattern, asserted over the AST (so prose in docstrings
     can't satisfy or break them): the DSN read is ``get_settings().dsn`` — never the password-less
