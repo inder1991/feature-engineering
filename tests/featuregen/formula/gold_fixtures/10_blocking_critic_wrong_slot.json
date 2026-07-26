@@ -1,0 +1,77 @@
+{
+  "case_id": "blocking_critic_wrong_slot",
+  "operation": "ratio",
+  "adversarial": true,
+  "delivery": "provider",
+  "note": "§J blocking-critic recall. The intent asks for FEES AS A SHARE OF VALUE, and the proposal inverts the slots: it divides value by fees. The result is perfectly VALID, single-source, and fully resolvable — the only thing wrong with it is that it does not answer the question, which is precisely what an independent critic is for and what no structural gate can catch. Any blocking finding prevents auto-RESOLVED; the output DID resolve, so this is the REVIEWABLE shape and the authored formula IS carried [c7-r3].",
+  "intent": {
+    "name": "fee_share_of_value_90d",
+    "hypothesis": "Fees as a share of transaction value over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "ratio",
+      "zero_denominator": "null",
+      "numerator": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      },
+      "denominator": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.fee_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [
+    {"code": "WRONG_SLOT_DIRECTION", "operand": "authored::public.txns.fee_amt",
+     "detail": "the intent asks for fees as a share of value; the proposal divides value by fees"}
+  ],
+  "expected_disposition": "NEEDS_REVIEW",
+  "expected_axes": {
+    "structural_status": "ok",
+    "capability_status": "ok",
+    "output_status": "resolved",
+    "critic_status": "blocking",
+    "technical_status": "ok"
+  },
+  "expected_output_policy": {
+    "output_type": "decimal",
+    "unit": null,
+    "currency": null,
+    "output_additivity": "non_additive",
+    "external_type_required": false
+  },
+  "expected_operands": [
+    "authored::public.txns.txn_amt",
+    "authored::public.txns.fee_amt",
+    "authored::public.txns.cif_id"
+  ],
+  "expects_blocking_critic": true,
+  "canonical_json": null,
+  "expected_formula_hash": null
+}

@@ -1,0 +1,86 @@
+{
+  "case_id": "ratio_posted_amount_share_90d",
+  "operation": "ratio",
+  "adversarial": false,
+  "delivery": "provider",
+  "note": "RATIO whose operand dimensions CANCEL is dimensionless (§C): output_type decimal, unit/currency null. This fixture also pins the §E associative rule end to end — the proposal emits the numerator's AND children in the OPPOSITE order to the canonical one (merchant_id first, then status_cd), and the curated hash is the canonical order (children sorted by the sha256 of their own JCS bytes: a596cc3f... < aa9f2ee8...). An emission-order-sensitive hash would fail this case and only this case.",
+  "intent": {
+    "name": "posted_amount_share_90d",
+    "hypothesis": "The share of transaction value that is posted and merchant-attributed over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "ratio",
+      "zero_denominator": "null",
+      "numerator": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": {
+          "kind": "bool",
+          "op": "and",
+          "children": [
+            {"kind": "predicate", "op": "is_not_null",
+             "left": "authored::public.txns.merchant_id"},
+            {"kind": "predicate", "op": "equal",
+             "left": "authored::public.txns.status_cd",
+             "right_literal": {"type": "string", "value": "posted"}}
+          ]
+        },
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      },
+      "denominator": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [],
+  "expected_disposition": "RESOLVED",
+  "expected_axes": {
+    "structural_status": "ok",
+    "capability_status": "ok",
+    "output_status": "resolved",
+    "expectation_status": "not_provided",
+    "critic_status": "clean",
+    "technical_status": "ok"
+  },
+  "expected_output_policy": {
+    "output_type": "decimal",
+    "unit": null,
+    "currency": null,
+    "output_additivity": "non_additive",
+    "external_type_required": false
+  },
+  "expected_operands": [
+    "authored::public.txns.txn_amt",
+    "authored::public.txns.status_cd",
+    "authored::public.txns.merchant_id",
+    "authored::public.txns.cif_id"
+  ],
+  "expects_blocking_critic": false,
+  "canonical_json": "{\"body\":{\"denominator\":{\"aggregation\":\"sum\",\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"ratio\",\"numerator\":{\"aggregation\":\"sum\",\"filter\":{\"children\":[{\"kind\":\"predicate\",\"left\":\"authored::public.txns.status_cd\",\"op\":\"equal\",\"right_literal\":{\"type\":\"string\",\"value\":\"posted\"},\"right_param\":null,\"right_set\":null},{\"kind\":\"predicate\",\"left\":\"authored::public.txns.merchant_id\",\"op\":\"is_not_null\",\"right_literal\":null,\"right_param\":null,\"right_set\":null}],\"kind\":\"bool\",\"op\":\"and\"},\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"zero_denominator\":\"null\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"formula_schema_version\":1,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"output\":{\"currency\":null,\"external_type_required\":false,\"output_additivity\":\"non_additive\",\"output_type\":\"decimal\",\"unit\":null},\"output_policy_version\":1,\"parameters\":[]}",
+  "expected_formula_hash": "4ddc8c054d89dc50da2e30eba51de670c414a47ae28c88efeaf1a8d264af9fd5"
+}

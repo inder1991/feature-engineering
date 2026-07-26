@@ -1,0 +1,48 @@
+{
+  "case_id": "avg_is_unsupported_operation",
+  "operation": "avg",
+  "adversarial": true,
+  "delivery": "direct",
+  "note": "§J classification: avg -> UNSUPPORTED_OPERATION (NOT invalid). `delivery: direct` because the author's wire schema pins the aggregation enum, so such a proposal can never arrive THROUGH a provider call — the audited seam rejects it as a malformed turn (a technical outcome) long before parse. The harness therefore hands the raw proposal to the orchestrator directly, which is exactly the seam under test: how run_authoring maps an author outcome onto the §F axes. `unsupported != invalid` is the whole point: an average is a perfectly sensible request the v1 grammar simply does not carry, and reporting it as malformed would be a lie about the requester.",
+  "intent": {
+    "name": "avg_txn_amt_90d",
+    "hypothesis": "Average transaction amount over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "identity",
+      "expr": {
+        "aggregation": "avg",
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [],
+  "expected_disposition": "UNSUPPORTED",
+  "expected_axes": {
+    "structural_status": "unsupported_operation",
+    "capability_status": "ok"
+  },
+  "expected_output_policy": null,
+  "expected_operands": [],
+  "expects_blocking_critic": false,
+  "canonical_json": null,
+  "expected_formula_hash": null
+}
