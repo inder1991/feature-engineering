@@ -204,7 +204,13 @@ def run_status(conn: DbConn, run_id: str) -> RunStatus:
     (a ``PGOPTIONS``/``ALTER DATABASE SET default_transaction_isolation``), this path needs a
     re-check — a fresh REPEATABLE READ snapshot taken at the SELECT is still after those commits, so
     it stays correct, but SERIALIZABLE would newly admit 40001 here. DSN-less (the tests / no-DB
-    harness) it reads the caller's connection, where the writes also landed."""
+    harness) it reads the caller's connection, where the writes also landed.
+
+    BOTH COPIES, ABSENCE-DERIVED: a terminal event that DEGRADED onto the caller's transaction is
+    invisible to the fresh connection, so reading only there reintroduced the same mislabelling in
+    mirror image. ``_durable_read`` therefore derives over the UNION of the durable and caller
+    connections — still exclusively from event ABSENCE, so the union can only ever move a run from
+    ``"incomplete"`` toward the terminal event some connection really holds, never manufacture one."""
     row = _durable_read(
         conn, _SELECT_TERMINAL,
         (run_id, TraceEventKind.COMPLETED.value, TraceEventKind.FAILED.value),
@@ -324,17 +330,35 @@ def _durable_read(conn: DbConn, sql: str, params: tuple, *, what: str) -> tuple 
     isolation trap this closes). Read-only and single-statement, so there is nothing to commit and
     nothing to poison; a fresh connection cannot deadlock (no advisory lock, no write).
 
-    Any failure degrades to the caller's connection — where a DEGRADED write's rows are the only
-    copy anyway — so a connect blip can never turn a read into a request-failing exception. Nothing
-    here is deterministic-rejection territory: a SELECT of committed rows either works or the
-    connection is unusable."""
+    UNION OVER BOTH CONNECTIONS, and that is load-bearing: the fresh connection is blind to any row
+    a durable write DEGRADED onto the caller's uncommitted transaction, so reading only there reported
+    a run as terminal-less while the caller itself held its terminal event. So the caller's connection
+    is read too — whenever the durable read FAILS (where a degraded write's rows are the only copy
+    anyway, so a connect blip can never turn a read into a request-failing exception) AND whenever it
+    simply finds NOTHING. First row wins; both empty is the honest ABSENCE. The union is monotone in
+    evidence — it can only surface a terminal event that one of the two connections really holds, so
+    it can never manufacture a false ``"completed"``.
+
+    Nothing here is deterministic-rejection territory: a SELECT of committed rows either works or the
+    connection is unusable. The caller-connection read is guarded too, because the caller's
+    transaction may ALREADY be aborted (an earlier failed statement of its own) — a read contracted to
+    "never fail the caller" may not raise ``InFailedSqlTransaction``; absence of evidence is the safe
+    answer. Cost of the union, accepted: on a terminal-less run the extra read touches the caller's
+    connection, which under ``REPEATABLE READ`` may PIN its snapshot slightly earlier than before."""
     dsn = get_settings().dsn
     if dsn:
         try:
             with psycopg.connect(dsn) as trace_conn:
-                return trace_conn.execute(sql, params).fetchone()
+                row = trace_conn.execute(sql, params).fetchone()
+            if row is not None:
+                return row
         except Exception:  # noqa: BLE001 — a trace-read failure must never fail the caller
             logger.exception(
                 "durable authoring-trace read failed (%s); falling back to the request connection",
                 what)
-    return conn.execute(sql, params).fetchone()
+    try:
+        return conn.execute(sql, params).fetchone()
+    except Exception:  # noqa: BLE001 — ditto: an aborted caller tx must not surface from a read
+        logger.exception(
+            "request-connection authoring-trace read failed (%s); deriving from ABSENCE", what)
+        return None

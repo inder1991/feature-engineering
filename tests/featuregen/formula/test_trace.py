@@ -601,6 +601,44 @@ def test_run_status_sees_a_durable_terminal_under_repeatable_read(db, monkeypatc
     assert run_status(db, run_id) == "completed"
 
 
+def test_run_status_still_sees_a_terminal_written_through_the_DEGRADED_path(
+        db, monkeypatch, _dsn) -> None:
+    """Fix-wave-2 IMPORTANT 2 — the MIRROR IMAGE of the bug the previous wave closed. A blip degrades
+    the manifest and the terminal event onto the caller's UNCOMMITTED transaction; the blip then
+    clears, so ``run_status`` opens a HEALTHY fresh connection, sees nothing there, and used to report
+    ``"incomplete"`` for a run the caller itself had just completed — exactly the harm fix 2 cited (an
+    orchestrator reading its own terminal event mislabels the run or re-authors it).
+
+    The read is now derived over the UNION of both connections, still purely from event ABSENCE.
+    Discriminating: the terminal is asserted INVISIBLE from a fresh connection, so only the caller's
+    copy can answer."""
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=127.0.0.1 port=1 dbname=nope connect_timeout=1")
+    run_id = _open(db, intent_hash="ih_degraded_status")
+    append_event(db, run_id, TraceEventKind.COMPLETED, seq=0,
+                 idempotency_key=f"{run_id}:0", payload={"disposition": "RESOLVED"})
+    assert run_status(db, run_id) == "completed"      # while the blip persists (already honest)
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)       # the blip clears: fresh connections are healthy
+    with psycopg.connect(_dsn) as probe:             # the terminal really is invisible durably
+        assert probe.execute("SELECT count(*) FROM authoring_trace_event "
+                             "WHERE authoring_run_id = %s", (run_id,)).fetchone()[0] == 0
+    assert run_status(db, run_id) == "completed"     # pre-fix: "incomplete"
+
+
+def test_run_status_never_fails_the_caller_on_an_already_aborted_transaction(
+        db, monkeypatch, _dsn) -> None:
+    """Fix-wave-2 IMPORTANT 2, coupled half: the caller-connection read sat OUTSIDE the ``try``, so on
+    an already-ABORTED caller transaction the read that "must never fail the caller" raised
+    ``InFailedSqlTransaction`` — and the union now reaches that read on every terminal-less run. It
+    fails SAFE instead: absence of evidence is ``"incomplete"``."""
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    run_id = _open(db, intent_hash="ih_aborted_tx")
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        db.execute("SELECT 1 FROM a_table_that_does_not_exist")
+    assert db.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+    assert run_status(db, run_id) == "incomplete"
+    db.rollback()
+
+
 def test_run_status_falls_back_to_the_request_connection_when_the_dsn_is_unreachable(
         db, monkeypatch, caplog) -> None:
     """The read degrades exactly like the write: an unreachable DSN must never turn a status read
