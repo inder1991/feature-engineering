@@ -38,6 +38,11 @@ from featuregen.formula.output_authority import (
     resolve_formula_output_policy,
 )
 from featuregen.formula.parse import parse_proposal_v1
+from featuregen.formula.replay_trace import (
+    append_event,
+    load_verified_checkpoint,
+    open_authoring_run,
+)
 from featuregen.formula.result import (
     DISPOSITION_POLICY_VERSION,
     AuthoringAxes,
@@ -55,11 +60,6 @@ from featuregen.formula.schema import (
     TypedFormulaProposalV1,
     TypedFormulaV1,
     UnaryBody,
-)
-from featuregen.formula.replay_trace import (
-    append_event,
-    load_verified_checkpoint,
-    open_authoring_run,
 )
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.operational_facts import read_operational_value

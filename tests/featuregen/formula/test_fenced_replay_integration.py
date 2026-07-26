@@ -5,9 +5,9 @@ from tests.featuregen.formula.factories import default_output
 from tests.featuregen.formula.test_parse import raw_unary_proposal
 
 from featuregen.formula.author import AUTHOR_TASK
-from featuregen.formula.authoring import run_authoring
 from featuregen.formula.control import LeaseFence
 from featuregen.formula.critic import CRITIC_TASK
+from featuregen.formula.replay_authoring import run_authoring
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.dispatch_audit import (
@@ -32,7 +32,7 @@ def test_fenced_author_critic_trace_is_replayable_without_provider_reissue(
         ).fetchone()[0]
     monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
     monkeypatch.setattr(
-        "featuregen.formula.authoring.resolve_formula_output_policy",
+        "featuregen.formula.replay_authoring.resolve_formula_output_policy",
         lambda *args, **kwargs: default_output(),
     )
     client = FakeLLM(script={

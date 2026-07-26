@@ -5,10 +5,10 @@ from tests.featuregen.formula.factories import default_output
 from tests.featuregen.formula.test_parse import raw_unary_proposal
 
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
-from featuregen.formula.replay_authoring import run_authoring
 from featuregen.formula.control import LeaseFenceLost
 from featuregen.formula.critic import CriticReview
 from featuregen.formula.frozen_configuration import freeze_current_configuration
+from featuregen.formula.replay_authoring import run_authoring
 from featuregen.formula.replay_trace import run_status
 from featuregen.formula.turns import AuthoringIntent, AuthorTurnRecord, TurnKind
 

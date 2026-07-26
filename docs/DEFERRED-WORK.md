@@ -34,15 +34,22 @@ Deferred wholesale from the parent architecture (`docs/superpowers/specs/2026-07
 
 All 12 tasks shipped with per-task reviews; **0 Critical, 0 unresolved Important** except B-0 below. The whole-branch final review was **deliberately skipped** under the functional-first directive (each task already had a dedicated adversarial review; the marginal value was cross-task polish).
 
-### B-0 🔴 The one open Important — §C unit-cancellation is INERT in production
+### B-0 🔴 The one open Important — §C unit-cancellation is INERT for FTR
 `src/featuregen/formula/output_authority.py` (`_resolve_ratio` / `_resolve_difference`)
 
-The resolver reads `unit`/`currency` from the flat `graph_node.unit`/`currency` columns, but **no shipped ingest path populates them** — `unit`/`currency` are absent from `field_resolution._DISPLAY_COLUMN`, and `build_graph`/`CanonicalRow` carry no unit. Both operands therefore read `unit=None`, `_same_dimension(None, None)` treats that as compatible, and so:
+The generic technical CSV path does carry `unit`/`currency` through `_headers.py` →
+`CanonicalRow` → `graph_node`. The FTR adapter and the real FTR file do not provide either field,
+however, so FTR operands read `unit=None` and `currency=None`. `_same_dimension(None, None)` treats
+that as compatible, and so:
 - `DIFFERENCE` with incompatible units **never** emits `InvalidOutput`
 - `RATIO` with non-cancelling units **never** emits `ExternalRequirement("UNIT_PROVISIONING_REQUIRED")`
 
-The resolver logic is correct and unit-tested; the mechanism is simply not wired to real data. Tests pass only via a synthetic `UPDATE graph_node SET unit=…`. **Two brief-mandated authority behaviours silently never fire in production.**
-**Trigger:** before any real-data run where a ratio or difference of differently-united columns matters. **Fix shape:** populate `unit`/`currency` on the ingest path (add to `_DISPLAY_COLUMN` + carry through `CanonicalRow`), or make the resolver demand them as an external requirement when absent instead of assuming compatibility.
+The resolver logic is exercised when a source actually supplies dimensions, but the FTR cohort
+cannot trigger it. **Two brief-mandated authority behaviours silently never fire for FTR.**
+**Trigger:** before any real FTR ratio or difference where incompatible dimensions matter.
+**Fix shape:** provision reviewed FTR unit/currency metadata, or version the formula policy so an
+absent dimension produces an external requirement rather than changing existing formula identities
+in place.
 
 ### B-1 Authority / correctness (🟡)
 | # | Item | Location |
