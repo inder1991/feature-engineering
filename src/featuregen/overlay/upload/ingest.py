@@ -1884,13 +1884,23 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                                                 glossary=glossary,
                                                 ingestion_run_id=ingestion_run_id, stats=def_stats)
                 # E1a: the drafted definition is not display-only — promote it to governed
-                # `llm/proposed` evidence so asset-detail shows the AI as its author. Gated exactly
-                # like the concept evidence side-effect (glossary + snapshot); the technical path is
-                # untouched. Its CONTAINED failures ride into the stage report below.
+                # `llm/proposed` evidence so asset-detail shows the AI as its author, and RECONCILE
+                # the columns that dropped out of this run (a suppressed / no-longer-blank column
+                # must stop asserting its old AI definition). Gated exactly like the concept evidence
+                # side-effect (glossary + snapshot); the technical path is untouched. Its CONTAINED
+                # failures ride into the stage report below.
                 if glossary is not None and snapshot_id is not None:
-                    def_evidence_failures = _write_definition_evidence(
-                        conn, rows=vr.good, definitions=definitions, glossary=glossary,
-                        bindings=bindings, source_snapshot_id=snapshot_id)
+                    try:
+                        def_evidence_failures = _write_definition_evidence(
+                            conn, source=catalog_source, rows=vr.good, definitions=definitions,
+                            glossary=glossary, concepts=concepts, bindings=bindings,
+                            source_snapshot_id=snapshot_id)
+                    except Exception:  # noqa: BLE001 — T2-M2: an ESCAPE (a throw outside the writer's
+                        # per-item try) rolls this savepoint back, so leaving the count at 0 would
+                        # report `succeeded` for a run that wrote nothing. Count it, then re-raise to
+                        # the advisory handler below, which logs it.
+                        def_evidence_failures = 1
+                        raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(

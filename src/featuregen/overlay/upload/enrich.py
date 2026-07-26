@@ -475,8 +475,22 @@ def _reconcile_llm_field_evidence(conn, *, field_name: str, retire_refs: set[str
         stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
 
 
-def _write_definition_evidence(conn, *, rows: list[CanonicalRow], definitions: dict[str, str],
-                               glossary: GlossaryUpload,
+def _active_llm_field_refs(conn, *, source: str, field_name: str) -> set[str]:
+    """The refs in ONE catalog source that currently carry ACTIVE LLM evidence for a field — the
+    universe reconciliation reasons over (an upload is a whole-source replacement, so a ref absent
+    from it is genuinely gone). Scoped with ``split_part`` rather than ``LIKE``: a source name may
+    legitimately contain ``_``, a LIKE wildcard, which would reach into a NEIGHBOURING catalog."""
+    rows = conn.execute(
+        "SELECT DISTINCT logical_ref FROM field_evidence "
+        "WHERE field_name = %s AND producer = %s AND lifecycle = 'active' "
+        "AND split_part(logical_ref, '::', 1) = %s",
+        (field_name, EvidenceProducer.LLM.value, _norm(source))).fetchall()
+    return {r[0] for r in rows}
+
+
+def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                               definitions: dict[str, str], glossary: GlossaryUpload,
+                               concepts: dict[str, str] | None,
                                bindings: dict[str, ObjectBinding] | None,
                                source_snapshot_id: str) -> int:
     """Promote the LLM's drafted definitions (E1a Task 2) out of the display-only
@@ -487,9 +501,22 @@ def _write_definition_evidence(conn, *, rows: list[CanonicalRow], definitions: d
 
     GLOSSARY columns only: the evidence keys on the record's SCHEMA-preserving ``logical_ref``,
     while attachability is checked at the row's PUBLIC-flattened ref — the two identities
-    ``_write_llm_field_evidence`` never collapses. A blank/whitespace draft is not a proposal."""
+    ``_write_llm_field_evidence`` never collapses. A blank/whitespace draft is not a proposal.
+    ``concepts`` rides in the input material because the drafter's own cache key folds in the
+    assigned concept (``_def_cache_key``) — a concept change legitimately re-drafts, so the
+    evidence's ``input_hash`` must see the same input the draft was made from (T2-M1).
+
+    Task 2b — RECONCILE THE TARGET UNIVERSE, not just the successes: a column that DROPS OUT of a run
+    must stop asserting yesterday's AI value. Everything in this source that still carries active LLM
+    ``definition`` evidence is retired EXCEPT the refs this run wrote and the refs it still EXPECTED
+    to draft (blank + not sanitizer-suppressed). So a withheld (suppressed) column and one that is no
+    longer a target (source-provided definition, dropped from the upload, no longer a glossary term)
+    are RETIRED, while a miss on a still-expected target — a provider blip, and equally an egress
+    block or an accept-gate rejection, which the drafter cannot distinguish from one — is KEPT. That
+    conflation is deliberate: KEEP is the safe default; AI evidence is never retired on ambiguity."""
     by_hash = {content_hash(r): r for r in rows}
     rec_by_tc = _records_by_tc(glossary)
+    concepts = concepts or {}
 
     def ref_of(h: str) -> tuple[str, str, object] | None:
         row = by_hash.get(h)
@@ -499,12 +526,23 @@ def _write_definition_evidence(conn, *, rows: list[CanonicalRow], definitions: d
         if rec is None:
             return None   # not a glossary column term — no schema-preserving identity to key on
         return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
-                {"table": row.table, "column": row.column, "type": row.type})
+                {"table": row.table, "column": row.column, "type": row.type,
+                 "concept": concepts.get(h, "")})
 
-    return _write_llm_field_evidence(
+    failures = _write_llm_field_evidence(
         conn, field_name="definition", items=definitions, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
         producer_configuration_hash=None, bindings=bindings)
+
+    # The set difference is computed here (never handed a ref written this run — that would silently
+    # stale the fresh evidence): KEEP = written this run ∪ still an expected target.
+    expected = ({content_hash(r) for r in rows if not r.definition}
+                - suppressed_definition_hashes(rows, glossary))
+    keep = {ref[0] for h in set(definitions) | expected if (ref := ref_of(h)) is not None}
+    _reconcile_llm_field_evidence(
+        conn, field_name="definition",
+        retire_refs=_active_llm_field_refs(conn, source=source, field_name="definition") - keep)
+    return failures
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,

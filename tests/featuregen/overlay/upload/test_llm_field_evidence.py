@@ -18,6 +18,11 @@ Task 2 adds the end-to-end proof: a glossary upload whose column declares NO def
 drafted by the LLM, and that draft is now GOVERNED ``llm/proposed`` evidence that asset-detail
 renders as "AI proposed" — plus the honest stage report (``partial``/``items_failed``) when an
 evidence write fails, so lost metadata is never laundered into a success.
+
+Task 2b closes the reconciliation gap: the stage reconciles the whole TARGET UNIVERSE by DISPOSITION,
+not just the successes — a column whose definition becomes sanitizer-SUPPRESSED, or that stops being
+an AI target at all, has its prior AI definition RETIRED; a transient miss KEEPS it; and a ref
+written this run is never in the retire set.
 """
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ from featuregen.overlay.upload.asset_detail import build_asset_detail
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import (
     _reconcile_llm_field_evidence,
+    _write_definition_evidence,
     _write_llm_field_evidence,
     content_hash,
 )
@@ -208,6 +214,11 @@ _AI_SOURCE = "ftr_ai"
 # the graph node carries `schema_name` and asset-detail resolves the SCHEMA-preserving logical_ref
 # the evidence is keyed under.
 _BLANK_DEF_CSV = _HDR + _row(definition="")
+# The SAME column, re-uploaded with a definition the sanitizer blanks fail-closed (an unhandled
+# sample-value marker) -> `definition_suppressed`: blank, but DELIBERATELY withheld, not missing.
+_SUPPRESSED_DEF_CSV = _HDR + _row(definition="representative values")
+# The same column with a real uploader-declared definition -> no longer an AI target at all.
+_DECLARED_DEF_CSV = _HDR + _row()
 _NAME_OBJECT_REF = "public.comp_fin_tran.cust_name"
 _NAME_REF = normalize_ref(_AI_SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN", "CUST_NAME")
 _ADMIN = mint_test_identity(subject="user:admin", role_claims=("platform_admin",))
@@ -288,3 +299,119 @@ def test_definition_evidence_write_failure_records_partial(db, monkeypatch):
     assert report.state == "partial" and report.reason_code == "items_failed"
     assert report.detail["internal_failures"] == 1
     assert read_active_field_evidence(db, _NAME_REF, "definition") == []
+
+
+# ── E1a Task 2b: reconcile the TARGET UNIVERSE, not just the successes ────────────────────────────
+# A column that DROPS OUT of a run must not keep asserting yesterday's AI value. Retirement is by
+# DISPOSITION: deliberately withheld / no longer a target -> RETIRE; a transient miss -> KEEP.
+
+
+def _ai_defs(conn, ref: str) -> list:
+    """The ACTIVE ``llm`` definition proposals at ``ref`` (producer-scoped: a source/human row at the
+    same ref is another producer's and must never be touched by AI reconciliation)."""
+    return [e for e in read_active_field_evidence(conn, ref, "definition") if e.producer == "llm"]
+
+
+def _blank_def_upload():
+    return to_glossary_upload(read_ftr_glossary(_BLANK_DEF_CSV, source=_AI_SOURCE))
+
+
+def _ingest_drafted(db, now: datetime) -> None:
+    """Ingest the blank-definition glossary so the column carries an AI definition."""
+    upload = _blank_def_upload()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=now,
+                        client=_drafting_client(upload.rows[0], "Customer full legal name"),
+                        glossary=upload)
+    assert res.status == "ingested"
+    assert [e.proposed_value for e in _ai_defs(db, _NAME_REF)] == ["Customer full legal name"]
+
+
+def test_suppressed_definition_retires_prior_ai(db):
+    """THE KEY PROPERTY, end-to-end: a column whose definition becomes sanitizer-SUPPRESSED drops out
+    of the drafter's target set — the prior AI definition must be RETIRED, not left asserting itself
+    as "AI proposed" for a value the model no longer proposes."""
+    _seal()
+    _ingest_drafted(db, _NOW)
+
+    sup = to_glossary_upload(read_ftr_glossary(_SUPPRESSED_DEF_CSV, source=_AI_SOURCE))
+    (row,) = sup.rows
+    assert not row.definition                          # blank...
+    assert sup.records[0].definition_suppressed        # ...but WITHHELD, not missing
+    res = ingest_upload(db, _AI_SOURCE, sup.rows, actor=_actor(), now=_NOW + timedelta(hours=1),
+                        client=_drafting_client(row, "must not be drafted"), glossary=sup)
+    assert res.status == "ingested"
+    assert _ai_defs(db, _NAME_REF) == []
+
+
+def test_no_longer_a_target_retires_prior_ai(db):
+    """A column that now carries an UPLOADER-declared definition is no longer an AI target (R3 never
+    overwrites a human's) — its prior AI proposal is retired rather than left competing."""
+    _seal()
+    _ingest_drafted(db, _NOW)
+
+    declared = to_glossary_upload(read_ftr_glossary(_DECLARED_DEF_CSV, source=_AI_SOURCE))
+    (row,) = declared.rows
+    assert row.definition                              # source-provided -> not a blank to draft
+    res = ingest_upload(db, _AI_SOURCE, declared.rows, actor=_actor(),
+                        now=_NOW + timedelta(hours=1),
+                        client=_drafting_client(row, "must not be drafted"), glossary=declared)
+    assert res.status == "ingested"
+    assert _ai_defs(db, _NAME_REF) == []
+    # producer-scoped: the SOURCE's own definition proposal at the same ref is untouched.
+    assert [e.producer for e in read_active_field_evidence(db, _NAME_REF, "definition")] == ["source"]
+
+
+def test_transient_miss_keeps_prior_ai(overlay_conn):
+    """THE SAFETY PROPERTY: the column is still an expected target (blank, NOT suppressed) but the
+    drafter returned nothing — a provider blip. The prior AI definition SURVIVES with its value."""
+    upload = _blank_def_upload()
+    (row,) = upload.rows
+    build_graph(overlay_conn, _AI_SOURCE, [row])
+    _write_llm_field_evidence(overlay_conn, field_name="definition", items={"h": "prior AI def"},
+                              ref_of=lambda k: (_NAME_REF, _NAME_REF, {"k": k}),
+                              source_snapshot_id="snap")
+    n = _write_definition_evidence(overlay_conn, source=_AI_SOURCE, rows=[row], definitions={},
+                                   glossary=upload, concepts=None, bindings=None,
+                                   source_snapshot_id="snap2")
+    assert n == 0
+    assert [e.proposed_value for e in _ai_defs(overlay_conn, _NAME_REF)] == ["prior AI def"]
+
+
+def test_fresh_write_is_never_retired(overlay_conn):
+    """The set-difference guard: a ref written THIS run must be excluded from ``retire_refs`` — one
+    active row carrying the new value, never a freshly-staled one."""
+    upload = _blank_def_upload()
+    (row,) = upload.rows
+    build_graph(overlay_conn, _AI_SOURCE, [row])
+    _write_llm_field_evidence(overlay_conn, field_name="definition", items={"h": "prior AI def"},
+                              ref_of=lambda k: (_NAME_REF, _NAME_REF, {"k": k}),
+                              source_snapshot_id="snap")
+    n = _write_definition_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=[row],
+        definitions={content_hash(row): "Customer full legal name"}, glossary=upload,
+        concepts=None, bindings=None, source_snapshot_id="snap2")
+    assert n == 0
+    assert [e.proposed_value for e in _ai_defs(overlay_conn, _NAME_REF)] == ["Customer full legal name"]
+
+
+def test_definition_evidence_escape_records_partial(db, monkeypatch):
+    """T2-M2: a throw ESCAPING ``_write_definition_evidence`` (outside the writer's per-item try)
+    must still count as a failure — the savepoint rolls the writes back, so reporting ``succeeded``
+    would launder lost metadata into a success."""
+    _seal()
+    upload = _blank_def_upload()
+
+    def _boom(*a, **k):
+        raise RuntimeError("field_evidence store unavailable")
+
+    monkeypatch.setattr(enrich_mod, "_reconcile_llm_field_evidence", _boom)
+    rec = StageRecorder()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=_NOW,
+                        client=_drafting_client(upload.rows[0], "Customer full legal name"),
+                        glossary=upload, stage_recorder=rec)
+    assert res.status == "ingested"               # the contained failure never aborts the upload
+
+    report = next(r for r in rec.reports if r.stage == "enrich_definition")
+    assert report.state == "partial" and report.reason_code == "items_failed"
+    assert report.detail["internal_failures"] == 1
+    assert _ai_defs(db, _NAME_REF) == []
