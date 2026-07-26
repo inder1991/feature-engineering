@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
@@ -395,6 +396,83 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
             logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
                            exc_info=True)
     return failures
+
+
+# A `keep_input_hash` that can never equal a real per-field input hash (always a 64-char sha256 hex
+# digest — this contains non-hex chars), so `stale_source_evidence(..., keep_input_hash=_STALE_ALL)`
+# stales EVERY active row for the given producer+field. The SAME sentinel value `ingest._STALE_ALL`
+# uses; duplicated (not imported) because `ingest` imports THIS module — importing back would cycle.
+_STALE_ALL = "__field_absent_from_upload__"
+
+
+def stale_all_llm_field_evidence(conn, *, logical_ref: str, field_name: str) -> int:
+    """Retire ALL of the LLM's ACTIVE evidence for one ``(logical_ref, field_name)``; return the rows
+    staled. PRODUCER-SCOPED — human / taxonomy / source rows are never touched."""
+    return stale_source_evidence(conn, logical_ref=logical_ref, field_name=field_name,
+                                 producer=EvidenceProducer.LLM, keep_input_hash=_STALE_ALL)
+
+
+def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
+                              ref_of: Callable[[str], tuple[str, str, object] | None],
+                              source_snapshot_id: str,
+                              valid_fn: Callable[[str], bool] | None = None,
+                              producer_configuration_hash: str | None = None,
+                              bindings: dict[str, ObjectBinding] | None = None) -> int:
+    """Write one ``llm/proposed`` ``field_evidence`` row per item of ``items`` (E1a); return the
+    number of CONTAINED per-item failures so the caller's stage report can say ``partial``.
+
+    SUPERSEDE-AND-REWRITE, unconditionally: prior ACTIVE LLM evidence for the field is staled and a
+    fresh row written. No unchanged-detection and no result cache — that reuse is a DEFERRED
+    optimization (and is why this is a separate, simpler writer than ``_write_concept_evidence``,
+    which keeps its own).
+
+    TWO IDENTITIES, never collapsed: ``ref_of(key)`` returns ``(evidence_ref, binding_ref,
+    material)`` — attachability is checked against ``bindings[binding_ref]`` (the PUBLIC-flattened
+    ref a binding is keyed by), while the hash/stale/write all key on ``evidence_ref`` (the
+    schema-preserving storage identity). Collapsing them silently skips every non-``public``-schema
+    column: the binding lookup misses, the item is skipped, and the run reports zero failures.
+
+    FAIL-SOFT per item, wrapping the WHOLE body: a throw anywhere (``ref_of``, hashing, the write)
+    logs, counts one failure, and moves on — one bad item never aborts the batch. A SKIP (invalid
+    value, ``ref_of`` returning ``None``, an unattachable binding) is not a failure and is not
+    counted."""
+    failures = 0
+    for key, value in items.items():
+        try:
+            if valid_fn is not None and not valid_fn(value):
+                continue                       # skip — not a proposal, not a failure
+            resolved = ref_of(key)
+            if resolved is None:
+                continue
+            evidence_ref, binding_ref, material = resolved
+            if bindings is not None:
+                binding = bindings.get(binding_ref)          # PUBLIC-flattened attachability lookup
+                if binding is None or not may_attach(binding):
+                    continue                   # attachable columns only
+            input_hash = field_input_hash(logical_ref=evidence_ref, field_name=field_name,
+                                          material=material)
+            with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
+                stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
+                record_field_evidence(
+                    conn, logical_ref=evidence_ref, field_name=field_name, proposed_value=value,
+                    producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
+                    producer_ref=ENRICHMENT_RUN_ID, producer_item_ref=str(key),
+                    producer_configuration_hash=producer_configuration_hash,
+                    source_snapshot_id=source_snapshot_id, input_hash=input_hash)
+        except Exception:  # noqa: BLE001 — advisory: one item's failure never aborts the rest
+            failures += 1
+            logger.warning("advisory %s field_evidence write failed for item %s", field_name, key,
+                           exc_info=True)
+    return failures
+
+
+def _reconcile_llm_field_evidence(conn, *, field_name: str, retire_refs: set[str]) -> None:
+    """Retire prior ACTIVE LLM evidence for the columns this run must DROP — deliberately withheld
+    (sanitizer-suppressed / egress-blocked) or no longer a target. A suppressed field must not keep
+    asserting an old AI value. A TRANSIENT failure's ref is deliberately NOT in ``retire_refs``, so
+    good data survives a provider blip."""
+    for evidence_ref in retire_refs:
+        stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
