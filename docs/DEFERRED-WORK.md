@@ -147,6 +147,14 @@ in place.
 | 🟡 **A grain spanning two off-source tables is refused** | Spec §3's IR carries one `join_plan`, so such a grain would need two traversals with two independent fan-out verdicts. Refused as `GRAIN_PATH_NOT_GOVERNED` because the closed §14 vocabulary has no member naming the real condition. Left open rather than designed around. | A formula whose grain keys genuinely live on two different off-source tables. |
 | 🟡 **A joined dimension's own availability is ungated** | §8 rule 1 gates one availability column per expression, so a dimension reached by a join contributes no availability constraint of its own in this slice. | Bitemporal or late-arriving dimension data, where the dimension's own knowledge time matters. |
 
+### A.6 Compile-side gaps found in Task 7 (2026-07-27)
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🔴 **An absent `graph_node` row authorizes, and that compounds the case bug** | `ir.py:379`: "a ref with no `graph_node` row at all is treated as untagged, i.e. authorized". Compilation resolves the *table* but never verifies a **column** ref names a real catalog node, so `…transactions.no_such_column` compiles, enters the read set and passes Gate 2; L1's `COLUMN_ABSENT` is the first check that catches it. Alone this is only late detection. **Combined with A.3's case-handling inconsistency it is worse:** a ref that fails to match its node *because of casing* also reads as untagged and authorizes — bypassing the restriction on the real column. Untagged-means-visible is correct for a node that exists; it is not correct for one that could not be found. | Fix alongside A.3. Minimum: distinguish "node exists and is untagged" from "node not found", and refuse the second. |
+| 🟡 **No code for "formula grain entity ≠ population entity"** | Task 7 used `GRAIN_PATH_NOT_GOVERNED`, which does not name the real condition. §14 has no member for it. | When the message matters to a requester, or when the two conditions need different fixes. |
+| 🟡 **§1.3 and §2 disagree on where the spine lives** | §1.3 passes `irs` and `spine` separately; §2 puts the spine inside the IR. Disagreement between them is unspecified, so Task 7 raises `ValueError` — which is also the only place §4's "declared once per contract" is actually enforceable, since `compile_ir` validates per feature. | Resolve when the orchestrator (T15/T17) wires the real call. |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |
