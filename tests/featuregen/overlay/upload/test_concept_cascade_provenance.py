@@ -12,11 +12,27 @@ the canonical resolution SELECTED:
 And a human concept correction must regenerate the dependent taxonomy IN THE SAME TRANSACTION — the
 cascade otherwise only ran at glossary ingest, leaving the derived safety facts carrying the OLD
 concept until a re-upload that may never come.
+
+Two more properties the final review added:
+
+* a concept PENDING REVALIDATION derives nothing (the ``_CONCEPT`` policy's RECOMMENDATION ceiling
+  short-circuits ``resolve_field_authority`` before its disqualifier check, so the flag would
+  otherwise be inert and the cascade would keep re-deriving ``taxonomy/confirmed`` safety facts from
+  a confirmation the material change invalidated);
+* the INGEST cascade retires the DECISION of a derived field it no longer emits — the projection
+  skips an evidence-less field, so the prior load-bearing decision would stay the latest and keep a
+  retired value feature-eligible.
 """
 from __future__ import annotations
 
-from tests.featuregen._helpers import mint_test_identity
+from datetime import UTC, datetime, timedelta
 
+from tests.featuregen._helpers import mint_test_identity
+from tests.featuregen.overlay.upload.test_ftr_adapter import _HDR, _row
+
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_evidence import (
     field_input_hash,
@@ -26,8 +42,15 @@ from featuregen.overlay.field_evidence import (
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.field_correction import apply_field_correction, read_field_cas
 from featuregen.overlay.upload.field_resolution import is_feature_eligible, resolve_and_project
+from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
+from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.graph import build_graph
-from featuregen.overlay.upload.ingest import derive_and_write_concept_cascade
+from featuregen.overlay.upload.ingest import (
+    derive_and_write_concept_cascade,
+    ingest_upload,
+    resolve_concept_evidence,
+)
+from featuregen.overlay.upload.object_ref import normalize_ref
 
 ADMIN_A = mint_test_identity(subject="user:priya", role_claims=("platform-admin",))
 ADMIN_B = mint_test_identity(subject="user:sam", role_claims=("platform-admin",))
@@ -181,3 +204,105 @@ def test_derived_rows_carry_queryable_root_links_to_their_parent_concept(db):
     assert origins == {BALANCE: EvidenceProducer.LLM.value, FEE: EvidenceProducer.HUMAN.value}, (
         "two same-valued concepts of different origin produced indistinguishable derived rows — "
         f"the root link is missing or wrong: {origins}")
+
+
+# ── Final review F2: a concept PENDING REVALIDATION must derive nothing ───────────────────────────
+# `_CONCEPT` is a RECOMMENDATION-ceiling policy with no disqualifiers of its own, so
+# `resolve_field_authority` returns at the ceiling check BEFORE it would honour the flag. The cascade
+# is what gives `concept` its operational REACH (a `taxonomy/confirmed` derivation clears
+# `_BEHAVIOURAL`), so the flag has to be honoured HERE — else a confirmation the material change
+# invalidated keeps re-deriving operational safety facts on every subsequent ingest.
+
+
+def test_concept_pending_revalidation_derives_no_taxonomy(db):
+    """A human-confirmed concept whose column MATERIAL then changed is PENDING revalidation — the
+    cascade must derive nothing from it, and the derived behavioural facts must stop gating."""
+    _seed_graph(db)
+    _llm_concept(db, BALANCE, "monetary_stock")
+    _cascade(db, BALANCE)
+    resolve_and_project(db, source=SOURCE, logical_refs=[BALANCE])
+    _human_confirms_concept(db, BALANCE, "public.accounts.balance", "monetary_stock", "h1")
+    assert is_feature_eligible(db, BALANCE, "additivity") is True
+
+    flag_pending_revalidation(
+        db, logical_ref=BALANCE, field_name="concept",
+        reason="source re-upload changed the column's material (definition/type); the human "
+               "confirmation must be revalidated",
+        source_snapshot_id="snap-2", now=None)
+
+    assert resolve_concept_evidence(db, BALANCE) is None, (
+        "the concept resolution ignored an ACTIVE disqualifier — a confirmation pending "
+        "revalidation still selected a record to derive operational taxonomy from")
+    _cascade(db, BALANCE)                       # the next ingest's cascade
+    assert _derived(db, BALANCE, "additivity") == []
+    assert _derived(db, BALANCE, "temporal_role") == []
+
+
+# ── Final review F1: the INGEST cascade must retire the DECISION of a field it no longer emits ────
+# `resolve_and_project` iterates only fields with ACTIVE evidence, so a derived field the cascade
+# staled keeps its PRIOR load-bearing decision (and stays feature-eligible) unless the decision is
+# retired first — exactly what the parser/technical paths already do for their dropped fields.
+
+_NAME_OBJECT_REF = "public.comp_fin_tran.cust_name"
+_NAME_REF = normalize_ref(SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN", "CUST_NAME")
+
+
+def _seal() -> None:
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+        profiler_require_restricted_role=False))
+
+
+def _uploader() -> IdentityEnvelope:
+    return IdentityEnvelope(subject="upload", actor_kind="human", authenticated=True,
+                            auth_method="oidc", role_claims=("data_owner",))
+
+
+def _quiet_client() -> FakeLLM:
+    """An LLM that proposes nothing — the concept in play is the HUMAN's confirmation."""
+    return FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"results": []}),
+        "overlay.enrich.definition": FakeResponse(output={"results": []}),
+        "overlay.enrich.domain": FakeResponse(output={"results": []}),
+        "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
+    })
+
+
+def _ingest_ftr(db, definition: str, now: datetime) -> None:
+    upload = to_glossary_upload(
+        read_ftr_glossary(_HDR + _row(definition=definition), source=SOURCE))
+    res = ingest_upload(db, SOURCE, upload.rows, actor=_uploader(), now=now,
+                        client=_quiet_client(), glossary=upload)
+    assert res.status == "ingested"
+
+
+def test_ingest_retires_the_decision_of_a_derived_field_the_cascade_dropped(db):
+    """END TO END on the INGEST path: a human-confirmed concept makes `additivity` operational; a
+    re-upload changes the column's MATERIAL (flagging the confirmation pending revalidation), and the
+    NEXT ingest's cascade can no longer derive anything. Its evidence is staled — and its DECISION
+    must be retired with it, else `is_feature_eligible` keeps serving the withdrawn value."""
+    _seal()
+    # The correction path stamps its decisions with the REAL clock, so the later ingests must be
+    # stamped after it — the decision log is ordered by time, not by call order.
+    started = datetime.now(UTC)
+    _ingest_ftr(db, "Registered legal name of the counterparty.", started)
+    _llm_concept(db, _NAME_REF, "monetary_flow")
+    _cascade(db, _NAME_REF)
+    resolve_and_project(db, source=SOURCE, logical_refs=[_NAME_REF])
+    _human_confirms_concept(db, _NAME_REF, _NAME_OBJECT_REF, "monetary_stock", "h1")
+    assert is_feature_eligible(db, _NAME_REF, "additivity") is True
+
+    # A re-upload with a CHANGED definition = a material change -> the confirmation is flagged.
+    _ingest_ftr(db, "The counterparty's registered trading name.", started + timedelta(hours=1))
+    # ...and the NEXT ingest's cascade finds no concept it may derive from.
+    _ingest_ftr(db, "The counterparty's registered trading name.", started + timedelta(hours=2))
+
+    assert _derived(db, _NAME_REF, "additivity") == []
+    assert is_feature_eligible(db, _NAME_REF, "additivity") is False, (
+        "the cascade staled the derived additivity EVIDENCE but its prior load-bearing DECISION "
+        "stayed the latest — the ingest path never retired it")
+    assert db.execute(
+        "SELECT additivity FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (SOURCE, _NAME_OBJECT_REF)).fetchone()[0] is None

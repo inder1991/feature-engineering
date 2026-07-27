@@ -1216,14 +1216,26 @@ def resolve_concept_evidence(conn, logical_ref: str) -> FieldEvidenceView | None
     resolution that sets the flat ``graph_node.concept`` display — NOT by "latest active", which is
     not the resolver's choice when producers disagree or a row is stale/rejected. The winning RECORD
     is then recovered as the STRONGEST active view asserting that selected value (never a weaker
-    same-valued row, whose strength would under-state the derivation)."""
+    same-valued row, whose strength would under-state the derivation).
+
+    An ACTIVE DISQUALIFIER selects nothing (final review F2). ``_CONCEPT`` is a RECOMMENDATION-ceiling
+    policy with no disqualifiers of its own, so ``resolve_field_authority`` returns at the ceiling
+    check BEFORE it would honour a pending-revalidation flag — and the ``display_value`` read below
+    ignores the set entirely. The CASCADE is what gives ``concept`` operational REACH (a
+    ``taxonomy/confirmed`` derivation clears ``_BEHAVIOURAL``, whose own disqualifiers WOULD block the
+    direct path), so the flag has to be honoured here or a confirmation the column's material change
+    invalidated keeps deriving operational safety facts on every later ingest. Fail closed: derive
+    nothing while the root is under question (the derived rows are then staled below, and the ingest /
+    correction paths retire their decisions)."""
     policy = policy_for(_CONCEPT_FIELD)
     if policy is None:  # pragma: no cover — `concept` always has a registered policy
         return None
+    disqualifiers = active_disqualifiers_for(conn, logical_ref, _CONCEPT_FIELD)
+    if disqualifiers:
+        return None
     views = [to_view(e) for e in read_active_field_evidence(conn, logical_ref, _CONCEPT_FIELD)]
     selected = resolve_field_authority(
-        views, policy,
-        active_disqualifiers=active_disqualifiers_for(conn, logical_ref, _CONCEPT_FIELD),
+        views, policy, active_disqualifiers=disqualifiers,
     ).display_value
     if selected is None:
         return None
@@ -1430,6 +1442,15 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                     # only ever be asserted at a hard-coded PROPOSED strength.
                     derive_and_write_concept_cascade(
                         conn, logical_ref, producer_ref=snapshot_id, snapshot_id=snapshot_id)
+                    # The TAXONOMY mirror of the parser/technical retire above (final review F1): a
+                    # derived field the re-resolved concept no longer implies has its EVIDENCE staled
+                    # by the cascade, and this round's resolve_and_project then SKIPS the evidence-less
+                    # field — so its prior load-bearing DECISION would stay the latest and keep the
+                    # withdrawn value feature-eligible. Same call the correction path makes; guarded
+                    # inside the helper, so a human's direct behavioural decision is never touched.
+                    _retire_dropped_field_decisions(
+                        conn, source=source, logical_ref=logical_ref, fields=_TAXONOMY_FIELDS,
+                        now=now, changed_sink=changed_sink)
             except Exception:  # noqa: BLE001
                 contained_failures += 1
                 logger.warning("advisory glossary TAXONOMY evidence failed for %s", logical_ref,

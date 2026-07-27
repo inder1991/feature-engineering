@@ -28,6 +28,14 @@ def test_normalize_source_name_rejects_a_reserved_name_but_passes_a_real_one():
         normalize_source_name("__gate_gold__")
 
 
+def test_normalize_source_name_rejects_the_ref_separator():
+    """A ``::`` in a source name is the REF separator: ``retail::eu`` builds refs whose
+    ``split_part(logical_ref, '::', 1)`` reads as source ``retail``, so ingesting the SEPARATE source
+    ``retail`` would sweep ``retail::eu``'s evidence into its own reconciliation and retire it."""
+    with pytest.raises(ValueError, match="single path segment"):
+        normalize_source_name("Retail::EU")
+
+
 def test_validate_rows_rejects_a_reserved_catalog_source():
     # An ingest into a reserved source is refused fail-closed as a structural error — nothing is
     # accepted, so no direct ingest_upload caller can write the gate console's fixture namespace.

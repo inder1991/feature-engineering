@@ -52,16 +52,21 @@ def normalize_source_name(source: str) -> str:
     ``/catalog/assets/{source}/{object_ref:path}``, ``/uploads`` Form field). A '/' or a '%' in it
     would (percent-)decode across the route boundary — uvicorn percent-decodes ``%2F`` to ``/``
     BEFORE routing — and mis-split ``{source}/{object_ref:path}``, reading or writing a DIFFERENT
-    source. Reject both at the WRITE boundary rather than loosening any route. A ``__…__`` RESERVED
-    name (:func:`is_reserved_source_name`) is also rejected, so a user upload can never share a
-    catalog with the gate console's internal fixtures. Raises ``ValueError`` on an empty name, one
-    containing '/' or '%', or a reserved name."""
+    source. A ``::`` is rejected for the same reason one level down: it is the ref's SOURCE separator,
+    so ``retail::eu`` builds refs a ``split_part(logical_ref, '::', 1)`` scope reads as source
+    ``retail`` — ingesting the SEPARATE source ``retail`` would then pull ``retail::eu``'s rows into
+    its own reconciliation and silently RETIRE them. Reject all three at the WRITE boundary rather
+    than loosening any route or scope query. A ``__…__`` RESERVED name
+    (:func:`is_reserved_source_name`) is also rejected, so a user upload can never share a catalog
+    with the gate console's internal fixtures. Raises ``ValueError`` on an empty name, one containing
+    '/', '%' or '::', or a reserved name."""
     normalized = source.strip().lower()
     if not normalized:
         raise ValueError("source is required")
-    if "/" in normalized or "%" in normalized:
+    if "/" in normalized or "%" in normalized or _SOURCE_SEP in normalized:
         raise ValueError(
-            "source must be a single path segment: '/' and '%' are not allowed in a source name")
+            "source must be a single path segment: '/', '%' and '::' are not allowed in a source "
+            "name")
     if is_reserved_source_name(normalized):
         raise ValueError(
             "source name is reserved: names wrapped in double underscores (e.g. '__gate_gold__') "

@@ -351,6 +351,9 @@ def apply_field_correction(
             _retire_dropped_field_decisions(
                 conn, source=norm_source, logical_ref=logical_ref, fields=_TAXONOMY_FIELDS,
                 now=None)
+            # `sensitivity_floor` is in _TAXONOMY_FIELDS deliberately: it is an INPUT to the
+            # `sensitivity` decision (§7), so naming it here re-resolves `sensitivity` too — which is
+            # exactly right, a re-derived floor must be able to move the sensitivity it restricts.
             resolve_and_project(conn, source=norm_source, logical_refs=[logical_ref],
                                 fields=_TAXONOMY_FIELDS)
         graph_ref = _graph_key(norm_source, logical_ref)[1]

@@ -784,3 +784,47 @@ def test_no_llm_client_records_skipped_and_ingestion_continues(db):
     assert res.status == "ingested"
     assert next(r for r in rec.reports if r.stage == "enrich_synonyms").state == "skipped_no_client"
     assert _ai_terms(db, _AMT_REF) == []
+
+
+# ── T4 reconciliation: the synonym writer's own target universe (final review F4) ─────────────────
+# Every column in the upload is a synonym target, so retirement covers exactly the refs that are no
+# longer targets — while a transient miss on a still-present column KEEPS its prior terms. Both
+# directions were untested: a mutation of the KEEP set (`for h in by_hash` -> `for h in synonyms`)
+# passed the whole file, i.e. "a provider blip wipes every AI synonym in the source" was uncovered.
+
+
+def test_transient_synonym_miss_keeps_prior_ai(overlay_conn):
+    """THE SAFETY PROPERTY for synonyms: the column is still in the upload but the drafter returned
+    nothing — a provider blip. Its prior AI synonym evidence SURVIVES."""
+    upload = _syn_upload()
+    build_graph(overlay_conn, _AI_SOURCE, upload.rows)
+    _write_llm_field_evidence(overlay_conn, field_name="semantic_terms",
+                              items={"h": "available funds, cleared amount"},
+                              ref_of=lambda k: (_AMT_REF, _AMT_REF, {"k": k}),
+                              source_snapshot_id="snap")
+
+    n = enrich_mod._write_synonym_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=upload.rows, synonyms={}, glossary=upload,
+        bindings=None, source_snapshot_id="snap2")
+
+    assert n == 0
+    assert [e.proposed_value for e in _ai_terms(overlay_conn, _AMT_REF)] == [
+        "available funds, cleared amount"]
+
+
+def test_column_no_longer_a_synonym_target_is_retired(overlay_conn):
+    """The RETIRE direction: a column that dropped out of the source is no longer a target, so its
+    prior AI synonyms must stop riding the node's semantic terms."""
+    upload = _syn_upload()
+    build_graph(overlay_conn, _AI_SOURCE, upload.rows)
+    gone = normalize_ref(_AI_SOURCE, "dpl_eib_compliance", "comp_fin_tran", "old_column")
+    _write_llm_field_evidence(overlay_conn, field_name="semantic_terms",
+                              items={"h": "legacy alias"},
+                              ref_of=lambda k: (gone, gone, {"k": k}), source_snapshot_id="snap")
+
+    n = enrich_mod._write_synonym_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=upload.rows, synonyms={}, glossary=upload,
+        bindings=None, source_snapshot_id="snap2")
+
+    assert n == 0
+    assert _ai_terms(overlay_conn, gone) == []
