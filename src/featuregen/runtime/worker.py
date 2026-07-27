@@ -32,6 +32,13 @@ from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_wat
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import fire_due_overlay_expiries, fire_due_overlay_renewals
 from featuregen.overlay.upload.ingestion_run import reconcile_ingestion_runs
+from featuregen.overlay.upload.recipe_formula_shadow import (
+    RECIPE_FORMULA_SHADOW_HANDLER,
+    RECIPE_FORMULA_SHADOW_TOPIC,
+)
+from featuregen.overlay.upload.recipe_formula_worker import (
+    process_recipe_formula_shadow_once,
+)
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
 from featuregen.runtime.external_commands import (
@@ -56,7 +63,9 @@ from featuregen.runtime.timers import fire_timer, poll_due_timers
 # (activation, timer commands, repair/cost-breaker parks) enqueue their queue rows DIRECTLY, so no
 # event TYPE needs relay->queue fan-out. The relay stage still runs to keep the outbox drained; a
 # deployment adds real routes (or swaps in an external-bus publisher) by passing `publish=`.
-_DEFAULT_RELAY_ROUTE: dict[str, str] = {}
+_DEFAULT_RELAY_ROUTE: dict[str, str] = {
+    RECIPE_FORMULA_SHADOW_TOPIC: RECIPE_FORMULA_SHADOW_HANDLER,
+}
 
 
 def _relay_publisher_from_env(
@@ -84,8 +93,15 @@ def _relay_publisher_from_env(
                     f"FEATUREGEN_RELAY_ROUTES file {path!r} must be a JSON object of "
                     "{topic: handler} strings"
                 )
+    configured_formula_handler = routes.get(RECIPE_FORMULA_SHADOW_TOPIC)
+    if configured_formula_handler not in (None, RECIPE_FORMULA_SHADOW_HANDLER):
+        raise ValueError("the reserved recipe-formula shadow route cannot be overridden")
+    routes[RECIPE_FORMULA_SHADOW_TOPIC] = RECIPE_FORMULA_SHADOW_HANDLER
     required = os.environ.get("FEATUREGEN_RELAY_REQUIRED", "").strip()
-    route_required = frozenset(t.strip() for t in required.split(",") if t.strip())
+    route_required = frozenset({
+        *(t.strip() for t in required.split(",") if t.strip()),
+        RECIPE_FORMULA_SHADOW_TOPIC,
+    })
     return make_queue_publisher(routes, route_required=route_required)
 
 # Control-plane queue handlers are defined ONCE in runtime/queue.py as CONTROL_SIGNAL_HANDLERS: the
@@ -106,6 +122,7 @@ class WorkerTick:
     parked: int
     errors: int
     external_dispatched: int = 0
+    formula_processed: int = 0
 
 
 def _control_actor():
@@ -375,7 +392,10 @@ def run_worker_once(
     Each stage is individually guarded (`_stage`): a fault is counted + logged and the tick continues.
     Returns a `WorkerTick` of per-stage counts for tests + metrics."""
     if publish is None:
-        publish = make_queue_publisher(_DEFAULT_RELAY_ROUTE)
+        publish = make_queue_publisher(
+            _DEFAULT_RELAY_ROUTE,
+            route_required=frozenset({RECIPE_FORMULA_SHADOW_TOPIC}),
+        )
     if leaked_conn_cap is None:
         leaked_conn_cap = int(os.environ.get("FEATUREGEN_LEAKED_CONN_CAP", "50"))
     if external_stale_seconds is None:
@@ -412,6 +432,18 @@ def run_worker_once(
     relay_published = _stage("relay")(
         lambda: relay_publish_batch(conn, publish, owner=owner), 0
     )
+
+    def _drain_formula() -> int:
+        processed = 0
+        for _ in range(batch):
+            outcome = process_recipe_formula_shadow_once(
+                conn, owner=f"{owner}:formula", now=now)
+            if outcome.status == "idle":
+                break
+            processed += 1
+        return processed
+
+    formula_processed = _stage("recipe_formula_shadow")(_drain_formula, 0)
 
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
@@ -503,6 +535,7 @@ def run_worker_once(
         parked=parked,
         errors=errors,
         external_dispatched=external_dispatched,
+        formula_processed=formula_processed,
     )
 
 

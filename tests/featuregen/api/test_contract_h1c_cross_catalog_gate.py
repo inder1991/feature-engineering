@@ -24,6 +24,7 @@ from pathlib import Path
 from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
 from tests.featuregen.api.test_contract import _fake, _intent_id
 
+from featuregen.overlay.upload.contract.gate1 import DraftChoice
 from featuregen.overlay.upload.contract.govern import Contract
 from featuregen.overlay.upload.contract.live_activation import (
     CROSS_CATALOG_GROUNDING_NOT_ENABLED,
@@ -146,7 +147,10 @@ def _install_multi_chosen(monkeypatch, draft, *, envelope) -> None:
             origin="governed_planner" if envelope is not None else "llm",
             path_authority="governed_cross_catalog" if envelope is not None else "single_or_llm")
 
-    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _chosen)
+    monkeypatch.setattr(
+        "featuregen.api.routes.contract.recorded_gate1_draft_choice",
+        lambda *args, **kwargs: DraftChoice(_chosen(), None, None, None),
+    )
 
 
 # ═══════════════ 1. multi-catalog refused while 3C.2 disabled (flag off, no envelope) ═══════════════
@@ -382,7 +386,10 @@ def test_envelope_spanning_two_catalogs_trips_interlock_even_if_readset_single(
             derives_pairs=SINGLE_READSET, plan_envelope=_multi_env(),   # envelope spans TWO catalogs
             origin="governed_planner", path_authority="governed_cross_catalog")
 
-    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _chosen)
+    monkeypatch.setattr(
+        "featuregen.api.routes.contract.recorded_gate1_draft_choice",
+        lambda *args, **kwargs: DraftChoice(_chosen(), None, None, None),
+    )
     calls = _permissive_recorder(monkeypatch)
 
     cr = client.post("/contract/confirm", json=draft, headers=AUTH)

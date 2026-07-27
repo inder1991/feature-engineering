@@ -9,6 +9,7 @@ from generation: no ``generation_run_id`` is minted and no recipe/applicability 
 from tests.featuregen.api._helpers import AUTH
 
 from featuregen.intake.llm import PROVIDER_REFUSAL, FakeLLM, FakeResponse
+from featuregen.intake.redaction import REDACTION_VERSION
 from featuregen.overlay.upload.taxonomy.recognizer import RECOGNIZER_TASK
 
 # A real, selectable LEAF objective — a valid primary the closed-taxonomy validator accepts.
@@ -67,6 +68,18 @@ def test_recognitions_classified_returns_candidate_and_writes_attempt(make_clien
         "SELECT count(*) FROM intent_recognition_attempt WHERE intent_id = %s",
         (body["intent_id"],)).fetchone()[0]
     assert n == 1
+    sealed = conn.execute(
+        "SELECT input_json, input_content_hash, redaction_policy_version "
+        "FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (body["recognition_id"],),
+    ).fetchone()
+    assert sealed[0] == {
+        "redacted_hypothesis": "customers churn when their balance drops",
+        "redacted_prediction_goal": "predict churn",
+        "redaction_policy_version": REDACTION_VERSION,
+    }
+    assert sealed[1]
+    assert sealed[2] == REDACTION_VERSION
 
 
 def test_recognitions_unscoped(make_client):

@@ -456,3 +456,163 @@ GOLD: tuple[GoldCase, ...] = (
         category="synonym",
     ),
 )
+
+
+def _target_cases(
+    *,
+    prefix: str,
+    objective: str,
+    subjects: tuple[str, ...],
+    goals: tuple[str, ...],
+    adjacent: tuple[str, ...],
+    recipes: tuple[str, ...],
+) -> tuple[GoldCase, ...]:
+    """Build the pre-registered 5x5 target matrix.
+
+    Every hypothesis explicitly distinguishes the target from a nearby banking objective. This keeps
+    the release denominator adversarial: recognition must use the full meaning, not one leaf keyword.
+    """
+    cases = []
+    for subject_index, subject in enumerate(subjects, start=1):
+        for goal_index, goal in enumerate(goals, start=1):
+            adjacent_leaf = adjacent[(subject_index + goal_index - 2) % len(adjacent)]
+            cases.append(GoldCase(
+                id=f"{prefix}{subject_index}{goal_index}",
+                hypothesis=(
+                    f"{subject} The intended decision is {goal}; distinguish this from "
+                    f"{adjacent_leaf}."
+                ),
+                prediction_goal=goal,
+                expected_primary=objective,
+                permitted_secondary=(),
+                expected_relevant_recipes=recipes,
+                category="straightforward",
+            ))
+    return tuple(cases)
+
+
+# Release denominator for the four coverage anchors. These cases are intentionally separate from
+# GOLD: the original 27 remain the broad diagnostic population and cannot dilute this exact 100-case
+# provider gate.
+TARGET_GOLD: tuple[GoldCase, ...] = (
+    *_target_cases(
+        prefix="TOE",
+        objective="credit.monitoring.obligor",
+        subjects=(
+            "Monitor total exposure across all facilities belonging to each borrowing obligor.",
+            "Aggregate drawn and contingent lending positions at the legal borrower level.",
+            "Identify obligors whose active facility breadth and exposure are concentrating.",
+            "Build a borrower-level view of facilities, limits and credit mitigation.",
+            "Track connected lending exposure by obligor before a limit is breached.",
+        ),
+        goals=(
+            "rank obligors by consolidated exposure",
+            "detect rising borrower concentration",
+            "measure active facilities per obligor",
+            "monitor obligor limit headroom",
+            "assess borrower credit-mitigation coverage",
+        ),
+        adjacent=(
+            "facility limit management",
+            "portfolio sector concentration",
+            "credit underwriting",
+            "collections recovery",
+        ),
+        recipes=("obligor_facility_count", "group_exposure_aggregation"),
+    ),
+    *_target_cases(
+        prefix="TMF",
+        objective="fraud.merchant_fraud",
+        subjects=(
+            "Detect merchants whose category mix and transaction pattern suggest merchant collusion.",
+            "Score acquiring merchants for laundering, bust-out or fraudulent trading behaviour.",
+            "Find merchant outlets with abnormal MCC diversity and dispute patterns.",
+            "Monitor merchant-level fraud risk rather than individual cardholder misuse.",
+            "Identify risky sellers using merchant identity, category and payment behaviour.",
+        ),
+        goals=(
+            "predict merchant fraud risk",
+            "rank suspicious acquiring merchants",
+            "detect merchant collusion patterns",
+            "flag abnormal merchant category behaviour",
+            "prioritize merchant investigations",
+        ),
+        adjacent=(
+            "cardholder transaction fraud",
+            "account takeover",
+            "payment operations",
+            "AML transaction monitoring",
+        ),
+        recipes=("merchant_mcc_diversity", "merchant_risk_anomaly"),
+    ),
+    *_target_cases(
+        prefix="TDR",
+        objective="treasury_alm.deposit_runoff_forecasting",
+        subjects=(
+            "Forecast deposit balances leaving as contractual maturities roll through the ladder.",
+            "Estimate term-deposit run-off by maturity bucket under the planning horizon.",
+            "Project maturing deposit principal that will not remain in the funding base.",
+            "Model contractual and behavioural deposit outflows for treasury funding plans.",
+            "Predict the deposit book's run-off profile across future time buckets.",
+        ),
+        goals=(
+            "forecast deposit run-off by bucket",
+            "project maturing funding outflows",
+            "estimate retained versus exiting deposits",
+            "build the contractual maturity runoff curve",
+            "quantify future deposit balance decay",
+        ),
+        adjacent=(
+            "individual customer attrition",
+            "liquidity buffer adequacy",
+            "deposit pricing beta",
+            "net interest margin",
+        ),
+        recipes=(
+            "contractual_deposit_maturity_profile",
+            "maturity_ladder_runoff",
+        ),
+    ),
+    *_target_cases(
+        prefix="TNM",
+        objective="treasury_alm.net_interest_margin",
+        subjects=(
+            "Forecast interest income less interest expense across the banking book.",
+            "Estimate net interest margin from lagged asset yield and funding cost flows.",
+            "Project spread earnings after deposit repricing and funding-cost changes.",
+            "Model the bank's net interest flow over the planning horizon.",
+            "Explain future margin using interest revenue, expense and repricing gaps.",
+        ),
+        goals=(
+            "forecast net interest margin",
+            "project net interest income",
+            "estimate banking-book spread earnings",
+            "predict margin compression",
+            "attribute future net interest flow",
+        ),
+        adjacent=(
+            "IRRBB economic value sensitivity",
+            "deposit runoff forecasting",
+            "product profitability margin",
+            "liquidity risk",
+        ),
+        recipes=("lagged_net_interest_flow", "repricing_gap_exposure"),
+    ),
+)
+
+
+def validate_target_gold() -> None:
+    expected = {
+        "credit.monitoring.obligor",
+        "fraud.merchant_fraud",
+        "treasury_alm.deposit_runoff_forecasting",
+        "treasury_alm.net_interest_margin",
+    }
+    assert len(TARGET_GOLD) == 100
+    assert len({case.id for case in TARGET_GOLD}) == 100
+    assert len({case.hypothesis for case in TARGET_GOLD}) == 100
+    for objective in expected:
+        assert sum(case.expected_primary == objective for case in TARGET_GOLD) == 25
+
+
+validate_target_gold()

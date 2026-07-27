@@ -56,8 +56,10 @@ def _seed_gate1(conn, intent_id: str, idea: FeatureIdea) -> None:
     """The server state /contract/confirm reads: the intent row (FK target), the considered-set
     snapshot (``chosen_feature`` reconstructs the chosen from HERE) and the recorded Gate #1 choice."""
     conn.execute(
-        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
-        "VALUES (%s, 'h', 'hypothesis')", (intent_id,))
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, actor) "
+        "VALUES (%s, 'h', 'hypothesis', %s::jsonb)",
+        (intent_id, json.dumps("user:tester")),
+    )
     cs = ConsideredSet(intent_id, None, [FeatureSet("templates", [idea])], None)
     conn.execute(
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb)",

@@ -218,6 +218,13 @@ class SnapshotContext:
         return self._index.get((catalog_source, object_ref, field))
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotFreshness:
+    status: str
+    reason: str | None
+    current_content_hash: str | None
+
+
 # ── Delivery H3b — the C0-snapshot column adapter for the planner ───────────────────────────────────
 # The planner's candidate discovery reads catalog columns via ``templates._load_columns`` — a LIVE
 # ``graph_node`` read. On the feature-generation path (REPEATABLE READ, C0-T2) the read is instead
@@ -284,15 +291,30 @@ def _assert_repeatable_read(conn: DbConn) -> str:
     return level
 
 
-def _ensure_run(conn: DbConn, generation_run_id: str, actor: dict, flags: dict) -> None:
+def ensure_generation_run(
+    conn: DbConn,
+    generation_run_id: str,
+    actor: dict,
+    flags: dict,
+    *,
+    intent_id: str | None = None,
+) -> None:
     """Ensure the durable generation-run manifest exists (idempotent). ``actor`` is NOT NULL in the
     schema; a missing actor defaults to ``{}``. ON CONFLICT DO NOTHING keeps re-builds under one
     run harmless (the manifest may accrete context; it is NOT write-once)."""
-    conn.execute(
-        "INSERT INTO feature_generation_run (generation_run_id, actor, flags) "
-        "VALUES (%s, %s, %s) ON CONFLICT (generation_run_id) DO NOTHING",
-        (generation_run_id, Jsonb(actor), Jsonb(flags)),
-    )
+    row = conn.execute(
+        "INSERT INTO feature_generation_run (generation_run_id, intent_id, actor, flags) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (generation_run_id) DO UPDATE "
+        "SET intent_id=COALESCE(feature_generation_run.intent_id, EXCLUDED.intent_id) "
+        "WHERE feature_generation_run.intent_id IS NULL "
+        "OR EXCLUDED.intent_id IS NULL "
+        "OR feature_generation_run.intent_id=EXCLUDED.intent_id "
+        "RETURNING generation_run_id",
+        (generation_run_id, intent_id, Jsonb(actor), Jsonb(flags)),
+    ).fetchone()
+    if row is None:
+        raise ValueError("generation run is already bound to a different intent")
 
 
 def _physical_ref(conn: DbConn, catalog_source: str, logical_ref: str) -> str | None:
@@ -398,7 +420,7 @@ def build_metadata_snapshot(
     # no snapshot) and let CatalogProjectionUnavailable propagate to the C0-T5 route. The returned
     # watermarks pin the checkpoint the read model is current as-of into the snapshot header.
     projection_watermarks = check_projection_readiness(conn)
-    _ensure_run(conn, generation_run_id, actor or {}, flags or {})
+    ensure_generation_run(conn, generation_run_id, actor or {}, flags or {})
 
     requested = tuple(fields) if fields is not None else _DEFAULT_FIELDS
     selected = [f for f in requested if f in _KNOWN_FIELDS]
@@ -468,3 +490,58 @@ def build_metadata_snapshot(
         _items=tuple(items),
         _index=MappingProxyType(index),
     )
+
+
+def compare_snapshot_to_current(conn: DbConn, snapshot_id: str) -> SnapshotFreshness:
+    """Re-derive a sealed snapshot's items under current readers and classify catalog drift."""
+    header = conn.execute(
+        "SELECT read_scope_hash,isolation_level,policy_version,registry_version,config_version,"
+        "content_hash,item_count FROM catalog_metadata_snapshot WHERE snapshot_id=%s",
+        (snapshot_id,),
+    ).fetchone()
+    if header is None:
+        return SnapshotFreshness("unverifiable", "SNAPSHOT_MISSING", None)
+    (
+        read_scope_hash,
+        isolation_level,
+        policy_version,
+        registry_version,
+        config_version,
+        stored_content_hash,
+        item_count,
+    ) = header
+    if (
+        policy_version != FIELD_POLICY_VERSION
+        or registry_version != RESOLVER_VERSION
+        or config_version != SOURCE_CAPABILITY_PROFILE_VERSION
+    ):
+        return SnapshotFreshness("drifted", "SNAPSHOT_VERSION_DRIFT", None)
+    rows = conn.execute(
+        "SELECT catalog_source,graph_ref,field_or_fact_type,item_hash "
+        "FROM catalog_metadata_snapshot_item WHERE snapshot_id=%s "
+        "ORDER BY catalog_source,graph_ref,field_or_fact_type,item_hash",
+        (snapshot_id,),
+    ).fetchall()
+    if len(rows) != item_count:
+        return SnapshotFreshness("unverifiable", "SNAPSHOT_ITEM_COUNT_MISMATCH", None)
+    current_hashes: list[str] = []
+    for catalog_source, graph_ref, field, stored_item_hash in rows:
+        try:
+            current = _build_item(conn, catalog_source, graph_ref, field)
+        except Exception:
+            return SnapshotFreshness("unverifiable", "CURRENT_CATALOG_READ_FAILED", None)
+        current_hashes.append(current.item_hash)
+        if current.item_hash != stored_item_hash:
+            return SnapshotFreshness("drifted", "SNAPSHOT_ITEM_DRIFT", None)
+    current_content_hash = canonical_hash({
+        "item_hashes": sorted(current_hashes),
+        "read_scope_hash": read_scope_hash,
+        "policy_version": FIELD_POLICY_VERSION,
+        "registry_version": RESOLVER_VERSION,
+        "config_version": SOURCE_CAPABILITY_PROFILE_VERSION,
+        "isolation_level": isolation_level,
+    })
+    if current_content_hash != stored_content_hash:
+        return SnapshotFreshness(
+            "unverifiable", "SNAPSHOT_CONTENT_HASH_MISMATCH", current_content_hash)
+    return SnapshotFreshness("current", None, current_content_hash)

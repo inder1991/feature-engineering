@@ -37,6 +37,7 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "AUTHOR_TURN_SCHEMA_ID",
@@ -153,6 +154,7 @@ class AuthoringIntent:
     hypothesis: str
     target_entity: str
     target_grain_keys: tuple[str, ...] = ()
+    recipe_authoring_context: dict[str, Any] | None = None
 
 
 class TurnKind(StrEnum):
@@ -182,3 +184,4 @@ class AuthorTurnRecord:
     #                               with no output)
     provider_calls: int
     usage: dict
+    tool_context_hash: str = ""

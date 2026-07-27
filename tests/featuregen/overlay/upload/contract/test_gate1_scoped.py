@@ -13,6 +13,8 @@ everything (fail-open asymmetry). See
 """
 from datetime import UTC, datetime
 
+import pytest
+
 import featuregen.overlay.upload.contract.gate1 as gate1
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -32,6 +34,12 @@ ALL_IDS = frozenset(t.id for t in ALL_TEMPLATES)
 # A credit recipe and a fraud recipe — both out of scope for a churn narrowing.
 CREDIT_RECIPE = "credit_utilisation"
 FRAUD_RECIPE = "txn_velocity_spike"
+
+
+@pytest.fixture(autouse=True)
+def _legacy_scope_mode(monkeypatch):
+    """This module pins the historical rollout matrix; Delivery 0 strict-mode tests live separately."""
+    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "legacy_unscoped")
 
 
 def _bank_churn(db):

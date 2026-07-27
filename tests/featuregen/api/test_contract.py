@@ -1,5 +1,8 @@
+from dataclasses import replace
+
 from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
 
+import featuregen.api.routes.contract as contract_routes
 from featuregen.intake.llm import FakeLLM, FakeResponse
 
 
@@ -248,7 +251,16 @@ def test_confirm_route_rechecks_freshness_and_maps_stale_to_409(make_client, mon
             plan_envelope=_stale_envelope(), origin="governed_planner",
             path_authority="governed_cross_catalog")
 
-    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _governed_chosen)
+    original = contract_routes.recorded_gate1_draft_choice
+
+    def _governed_recorded(*args, **kwargs):
+        recorded = original(*args, **kwargs)
+        return replace(recorded, feature=_governed_chosen()) if recorded is not None else None
+
+    monkeypatch.setattr(
+        "featuregen.api.routes.contract.recorded_gate1_draft_choice",
+        _governed_recorded,
+    )
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.drifted)
     res = client.post("/contract/confirm", json=draft, headers=AUTH)

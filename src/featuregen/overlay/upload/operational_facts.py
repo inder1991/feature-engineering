@@ -81,7 +81,7 @@ from dataclasses import dataclass
 
 from featuregen.contracts import DbConn
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-from featuregen.overlay.field_authority import InfluenceTier
+from featuregen.overlay.field_authority import InfluenceTier, resolve_field_authority
 from featuregen.overlay.field_decision import (
     FieldDecisionEvent,
     FieldDecisionEventType,
@@ -91,6 +91,7 @@ from featuregen.overlay.field_evidence import (
     FieldEvidence,
     canonical_hash,
     read_active_field_evidence,
+    to_view,
 )
 from featuregen.overlay.identity import fact_key as _fact_key
 from featuregen.overlay.upload.column_authority import _DECISION_ID_COLUMN, read_column_facts
@@ -106,6 +107,7 @@ from featuregen.overlay.upload.field_resolution import (
     RESOLVER_VERSION,
     _evidence_set_hash,
 )
+from featuregen.overlay.upload.field_revalidation import active_disqualifiers_for
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.upload_catalog import table_ref
 
@@ -312,6 +314,111 @@ def _selected_authority(
         return None, None
     strongest = max(candidates, key=lambda e: _STRENGTH_ORDER.index(AssertionStrength(e.strength)))
     return EvidenceProducer(strongest.producer), AssertionStrength(strongest.strength)
+
+
+def read_verified_decision_value(
+    conn: DbConn,
+    logical_ref: str,
+    field_name: str,
+) -> OperationalValue:
+    """Verify a decision-only operational field without trusting a flat graph projection.
+
+    This is intentionally narrower than :func:`read_operational_value`: it is for a caller that
+    explicitly consumes the generic field-decision authority (for example the formula planner's
+    ``temporal_role`` check). The value is re-resolved from the exact active evidence named by the
+    latest decision and both evidence/value hashes must match before ``status='resolved'``.
+    """
+    policy = policy_for(field_name)
+    influence = policy.influence_max if policy is not None else InfluenceTier.DISPLAY
+    if policy is None or policy.operational_rule is None:
+        return _fail_closed(
+            field_name, influence, status="not_operational", reason="no_operational_policy")
+    try:
+        check_projection_readiness(conn)
+    except CatalogProjectionUnavailable as exc:
+        return _fail_closed(
+            field_name,
+            influence,
+            status="projection_unavailable",
+            reason=exc.detail,
+        )
+    decisions = read_field_decisions(conn, logical_ref, field_name)
+    if not decisions:
+        return _fail_closed(
+            field_name, influence, status="no_decision", reason="no_decision")
+    fork_reason = _forked_head_reason(decisions)
+    if fork_reason is not None:
+        return _fail_closed(field_name, influence, status="fork", reason=fork_reason)
+    latest = decisions[-1]
+    if latest.event_type in _RETIRED_EVENTS:
+        return _fail_closed(
+            field_name,
+            influence,
+            status="retired",
+            reason=latest.conflict_status,
+            decision_event_id=latest.decision_event_id,
+            selected_evidence_ids=latest.selected_evidence_ids,
+        )
+    selected = set(latest.selected_evidence_ids)
+    evidence = [
+        row
+        for row in read_active_field_evidence(conn, logical_ref, field_name)
+        if row.evidence_id in selected
+    ]
+    if (
+        {row.evidence_id for row in evidence} != selected
+        or _evidence_set_hash(evidence) != latest.evidence_set_hash
+    ):
+        return _fail_closed(
+            field_name,
+            influence,
+            status="hash_mismatch",
+            reason="evidence_set_hash_mismatch",
+            decision_event_id=latest.decision_event_id,
+            selected_evidence_ids=latest.selected_evidence_ids,
+        )
+    resolution = resolve_field_authority(
+        [to_view(row) for row in evidence],
+        policy,
+        active_disqualifiers=active_disqualifiers_for(
+            conn, logical_ref, field_name),
+    )
+    value = resolution.load_bearing_value
+    if (
+        value is None
+        or latest.load_bearing_value_hash is None
+        or canonical_hash(value) != latest.load_bearing_value_hash
+    ):
+        return _fail_closed(
+            field_name,
+            influence,
+            status=(
+                "conflict"
+                if resolution.unresolved_reason == "conflict"
+                else "hash_mismatch"
+                if value is not None
+                else "no_value"
+            ),
+            reason=resolution.unresolved_reason or "value_hash_mismatch",
+            decision_event_id=latest.decision_event_id,
+            selected_evidence_ids=latest.selected_evidence_ids,
+        )
+    producer, strength = _selected_authority(
+        conn, logical_ref, field_name, latest.selected_evidence_ids)
+    return OperationalValue(
+        value=value,
+        influence=influence,
+        producer=producer,
+        strength=strength,
+        status="resolved",
+        conflict_status=latest.conflict_status,
+        selected_evidence_ids=latest.selected_evidence_ids,
+        decision_event_id=latest.decision_event_id,
+        fact_key=None,
+        fact_event_id=None,
+        policy_version=FIELD_POLICY_VERSION,
+        resolver_version=RESOLVER_VERSION,
+    )
 
 
 def read_operational_value(conn: DbConn, logical_ref: str, field_name: str) -> OperationalValue:

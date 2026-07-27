@@ -13,6 +13,15 @@ from datetime import datetime
 from enum import StrEnum
 
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
+from featuregen.overlay.upload.taxonomy.versions import (
+    APPLICABILITY_MAPPING_VERSION as APPLICABILITY_MAPPING_VERSION,
+)
+from featuregen.overlay.upload.taxonomy.versions import (
+    CONCEPT_REGISTRY_VERSION as CONCEPT_REGISTRY_VERSION,
+)
+from featuregen.overlay.upload.taxonomy.versions import (
+    RECIPE_REGISTRY_VERSION as RECIPE_REGISTRY_VERSION,
+)
 
 PLANNER_VERSION = "3b3a.1.0.0"
 # The BindingPlanV1 SCHEMA version (contract shape). 3B.3c split it out of the physical-id
@@ -35,9 +44,6 @@ RANKING_VERSION = "1.0.0"
 # Version pins for inputs that have no formal version source yet (wired to real policy versions in 3C):
 READ_SCOPE_POLICY_VERSION = "1.0.0"
 ROLE_RESOLUTION_VERSION = "1.0.0"   # 3B.4: a real version (was the "unknown" placeholder); pins the frozen-input identity
-RECIPE_REGISTRY_VERSION = "1.0.0"
-APPLICABILITY_MAPPING_VERSION = "1.0.0"
-CONCEPT_REGISTRY_VERSION = "concepts@1"
 
 # Bounds (conservative; tunable). Truncation is always recorded, never a pretend-complete result.
 MAX_CANDIDATE_COLUMNS_PER_NEED_PER_CATALOG = 8

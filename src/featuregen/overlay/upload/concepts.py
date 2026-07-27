@@ -56,6 +56,14 @@ _ALL: tuple[Concept, ...] = (
     Concept("monetary_flow", "monetary", additivity="additive",
             description="Transaction amount, payment, fee, interest paid/earned, drawdown, repayment, "
                         "P&L, revenue. Fully additive across both entities and time."),
+    Concept("interest_income", "monetary", additivity="additive", is_a="monetary_flow",
+            description="Interest income recognized in a governed period. The concept identifies the "
+                        "economic role but does not assert whether the physical values are signed or "
+                        "positive magnitudes."),
+    Concept("interest_expense", "monetary", additivity="additive", is_a="monetary_flow",
+            description="Interest expense recognized in a governed period. The concept identifies the "
+                        "economic role but does not assert whether the physical values are signed or "
+                        "positive magnitudes."),
     Concept("monetary_rate", "monetary", additivity="non_additive",
             description="Interest rate, coupon, APR, yield, spread. Non-additive — never sum or "
                         "average naively across notionals."),

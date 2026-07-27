@@ -352,6 +352,11 @@ def _generation_settings() -> dict:
     return {"provider": "fake", "model": "test"}
 
 
+def current_enrichment_generation_settings() -> dict:
+    """Return the exact provider controls used by the audited structured-call seam."""
+    return dict(_generation_settings())
+
+
 def _audit_egress_block(conn, *, task: str, actor, reason: str) -> None:
     """A blocked egress is a security event (content was about to reach the LLM) — record it on the
     tamper-evident chain, not just the log (the redaction contract requires hard failures be audited).
@@ -668,7 +673,7 @@ class AuditedStructuredResult:
 
 def _record_blocked_call(conn, *, run_id: str, task: str, prompt_id: str, prompt_version: int,
                          schema_id: str, schema_version: int, actor: IdentityEnvelope,
-                         reason: str) -> str:
+                         reason: str, generation_settings: dict | None = None) -> str:
     """Record the immutable llm_call row for a call BLOCKED before dispatch (the
     ``record_egress_block=True`` path of ``drive_audited_structured_call``). CONTENT-FREE by
     construction: the blocked payload failed the egress contract, so nothing from it may be
@@ -682,7 +687,10 @@ def _record_blocked_call(conn, *, run_id: str, task: str, prompt_id: str, prompt
     inputs = build_llm_inputs(redaction, catalog_metadata={}, raw_input_classification="clean")
     req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
                      output_schema_id=schema_id, output_schema_version=schema_version,
-                     generation_settings=_generation_settings())
+                     generation_settings=(
+                         dict(generation_settings)
+                         if generation_settings is not None
+                         else _generation_settings()))
     return _record_llm_call_durable(
         conn, run_id=run_id, request=req, input_hash=compute_input_hash(inputs),
         redaction_version=_REDACTION_VERSION, input_redaction={},
@@ -730,7 +738,9 @@ def drive_audited_structured_call(
         dispatch_audit: DispatchAuditContext | None = None,
         cacheable_metadata_keys: tuple[str, ...] = (),
         run_id: str = ENRICHMENT_RUN_ID,
-        record_egress_block: bool = False) -> AuditedStructuredResult:
+        record_egress_block: bool = False,
+        generation_settings: dict | None = None,
+        logical_call_ref: str | None = None) -> AuditedStructuredResult:
     """The outcome-returning core of ``audited_structured_call`` (same governance, richer return —
     mirrors ``drive_structured_call`` naming). Two ADDITIVE knobs beyond that seam's parameters,
     both defaulting to the historical behavior so ``audited_structured_call`` stays byte-identical:
@@ -744,6 +754,11 @@ def drive_audited_structured_call(
       ``llm_call_ref`` for the block itself. False (default) keeps the enrichment behavior:
       security-event only, no llm_call row, ``llm_call_ref=None``."""
     actor = actor or _ENRICH_ACTOR
+    effective_generation_settings = (
+        dict(generation_settings)
+        if generation_settings is not None
+        else _generation_settings()
+    )
 
     def _blocked(reason: str) -> AuditedStructuredResult:
         ref = None
@@ -751,7 +766,8 @@ def drive_audited_structured_call(
             ref = _record_blocked_call(
                 conn, run_id=run_id, task=task, prompt_id=prompt_id,
                 prompt_version=prompt_version, schema_id=schema_id,
-                schema_version=schema_version, actor=actor, reason=reason)
+                schema_version=schema_version, actor=actor, reason=reason,
+                generation_settings=effective_generation_settings)
         return AuditedStructuredResult(output=None, llm_call_ref=ref, provider_calls=0, usage={})
 
     reg = DocumentSchemaRegistry(conn)
@@ -792,7 +808,7 @@ def drive_audited_structured_call(
     req = LLMRequest(
         task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
         output_schema_id=schema_id, output_schema_version=schema_version,
-        generation_settings=_generation_settings(),   # from env — NOT a hard-coded fake/test
+        generation_settings=effective_generation_settings,
         output_schema=schema,
         # perf (vocab-caching): the single-mode concept path (and the batch's per-item fallback) also
         # carry the static vocabulary; mark it as the cached shared prefix so it isn't re-billed per
@@ -813,7 +829,10 @@ def drive_audited_structured_call(
     dispatch_client: LLMClient = client
     auditing_client: AuditingClient | None = None
     if dispatch_audit is not None:
-        auditing_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
+        auditing_client = AuditingClient(
+            client,
+            dispatch_audit,
+            logical_call_ref=logical_call_ref or mint_id("lc"),
                                          redaction_version=redaction_version)
         dispatch_client = auditing_client
     outcome = drive_structured_call(

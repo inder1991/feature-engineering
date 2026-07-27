@@ -43,6 +43,7 @@ from featuregen.intake.llm import LLMClient
 from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
 from featuregen.overlay.facts import register_overlay_event_types
 from featuregen.overlay.upload.contract.live_activation import startup_artifact_check
+from featuregen.overlay.upload.contract.scope_mode import scope_mode_status
 from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
 
 logger = logging.getLogger(__name__)
@@ -155,9 +156,26 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
         # code is 'degraded', not a false 'ok' — so a readiness probe catches the broken-deploy /
         # unpackaged-migrations footgun instead of letting endpoints 500 later.
         pending = getattr(app.state, "schema_pending", [])
+        scope_status = scope_mode_status()
         if pending:
-            return {"status": "degraded", "schema": "behind", "pending_migrations": len(pending)}
-        return {"status": "ok"}
+            return {
+                "status": "degraded",
+                "schema": "behind",
+                "pending_migrations": len(pending),
+                "scope_execution_mode": scope_status.mode.value,
+                "scope_mode_configuration_valid": scope_status.configuration_valid,
+            }
+        if not scope_status.configuration_valid:
+            return {
+                "status": "degraded",
+                "scope_execution_mode": scope_status.mode.value,
+                "scope_mode_configuration_valid": False,
+            }
+        return {
+            "status": "ok",
+            "scope_execution_mode": scope_status.mode.value,
+            "scope_mode_configuration_valid": True,
+        }
 
     @app.get("/metrics")
     def metrics(

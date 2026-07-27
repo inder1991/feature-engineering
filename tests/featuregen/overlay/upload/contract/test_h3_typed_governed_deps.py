@@ -71,6 +71,9 @@ _DOWNGRADED = ("needs_external_validation", "UNVERIFIED")
 def client(db, monkeypatch):
     """A TestClient on the suite's rolled-back connection (mirrors test_no_permissive_path_when_live)."""
     monkeypatch.setenv("FEATUREGEN_AUTH_STUB", "1")
+    # This governed-dependency suite isolates H3 behavior; recognition lineage is covered by
+    # Delivery 0 API tests and remains required by default in production.
+    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "legacy_unscoped")
     app = create_app(llm_client=_flow_llm())
 
     def _test_conn():
@@ -124,7 +127,8 @@ def test_route_governed_confirm_is_promotable_and_bridge_revocation_downgrades(c
     body = res.json()
     dr = client.post("/contract/draft", json={
         "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": "governed cross-catalog"}, headers=AUTH)
+        "chosen_option_id": "t_roll", "why": "governed cross-catalog",
+        "expected_generation_run_id": body["generation_run_id"]}, headers=AUTH)
     assert dr.status_code == 200, dr.text
     draft = dr.json()["draft"]
     draft["intent_id"] = body["intent_id"]
@@ -167,7 +171,8 @@ def test_route_governed_confirm_join_key_retype_downgrades(client, db, monkeypat
     body = res.json()
     dr = client.post("/contract/draft", json={
         "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": ""}, headers=AUTH)
+        "chosen_option_id": "t_roll", "why": "",
+        "expected_generation_run_id": body["generation_run_id"]}, headers=AUTH)
     assert dr.status_code == 200, dr.text
     draft = dr.json()["draft"]
     draft["intent_id"] = body["intent_id"]

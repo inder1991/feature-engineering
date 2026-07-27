@@ -21,6 +21,7 @@ from featuregen.events.store import append_event
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import (
+    _verified_considered_revision,
     build_considered_set,
     considered_snapshot_lineage,
 )
@@ -112,6 +113,67 @@ def test_considered_set_persists_snapshot_lineage_on_repeatable_read(db):
     assert n_bal > 0
     # the considered set itself is unchanged by the snapshot (additive)
     assert cs.anchor is not None and cs.anchor.name == "avg_balance_90d"
+    revision = db.execute(
+        "SELECT considered_revision_id, considered_content_hash "
+        "FROM contract_considered WHERE intent_id = %s",
+        (intent.intent_id,),
+    ).fetchone()
+    assert revision == (cs.considered_revision_id, cs.considered_content_hash)
+    public, revision_lineage, revision_id, revision_hash = _verified_considered_revision(
+        db, intent.intent_id, "fgr_test_1")
+    assert public["anchor"]["name"] == "avg_balance_90d"
+    assert revision_lineage == {
+        "generation_run_id": "fgr_test_1",
+        "snapshot_id": row[1],
+        "content_hash": row[2],
+    }
+    assert (revision_id, revision_hash) == revision
+
+
+def test_considered_revision_is_write_once_and_old_run_survives_regeneration(db):
+    _rr(db)
+    _bank(db)
+    intent = submit_intent(
+        hypothesis="customers churn when their balance drops",
+        definition="90-day average balance per account",
+        actor="ds1",
+    )
+    first = build_considered_set(
+        db,
+        intent,
+        _client(),
+        catalog_source="bank",
+        target_ref="public.accounts.churned",
+        now=NOW,
+        generation_run_id="fgr_revision_1",
+    )
+    second = build_considered_set(
+        db,
+        intent,
+        _client(),
+        catalog_source="bank",
+        target_ref="public.accounts.churned",
+        now=NOW,
+        generation_run_id="fgr_revision_2",
+    )
+    assert first.considered_revision_id != second.considered_revision_id
+    assert db.execute(
+        "SELECT count(*) FROM contract_considered_revision WHERE intent_id = %s",
+        (intent.intent_id,),
+    ).fetchone()[0] == 2
+    old_public, _lineage, old_id, old_hash = _verified_considered_revision(
+        db, intent.intent_id, "fgr_revision_1")
+    assert old_public["anchor"]["name"] == "avg_balance_90d"
+    assert (old_id, old_hash) == (
+        first.considered_revision_id,
+        first.considered_content_hash,
+    )
+    with pytest.raises(psycopg.errors.RaiseException):
+        db.execute(
+            "UPDATE contract_considered_revision SET considered_content_hash = 'tampered' "
+            "WHERE considered_revision_id = %s",
+            (old_id,),
+        )
 
 
 def test_considered_set_mints_fgr_run_when_none_supplied(db):
@@ -125,9 +187,10 @@ def test_considered_set_mints_fgr_run_when_none_supplied(db):
     assert run_id and run_id.startswith("fgr_")   # a fresh fgr run was minted for the snapshot
 
 
-# ── 2. a READ COMMITTED caller takes NO snapshot — additive, the lineage columns stay NULL ─────────────
+# ── 2. a READ COMMITTED caller takes NO snapshot but retains an explicit run identity ─────────────────
 def test_read_committed_build_takes_no_snapshot(db):
-    # the db fixture is READ COMMITTED by default; the direct-call flow is byte-identical to pre-C0.
+    # The db fixture is READ COMMITTED by default. No catalog snapshot is fabricated, but a caller-
+    # supplied run id is retained so a scoped considered revision can still be selected exactly.
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
     build_considered_set(db, intent, _client(), catalog_source="bank",
@@ -136,7 +199,7 @@ def test_read_committed_build_takes_no_snapshot(db):
     row = db.execute(
         "SELECT generation_run_id, snapshot_id, snapshot_content_hash "
         "FROM contract_considered WHERE intent_id = %s", (intent.intent_id,)).fetchone()
-    assert row == (None, None, None)   # no snapshot under READ COMMITTED
+    assert row == ("fgr_ignored", None, None)
     assert db.execute("SELECT count(*) FROM catalog_metadata_snapshot").fetchone()[0] == 0
     assert considered_snapshot_lineage(db, intent.intent_id) is None
 

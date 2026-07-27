@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from featuregen.runtime.outbox import (
+    OutboxIdempotencyConflict,
+    OutboxMessage,
     insert_outbox_message,
+    insert_outbox_message_checked,
     outbox_messages_for_events,
     partition_key_for,
 )
@@ -36,6 +39,25 @@ def test_insert_is_idempotent_on_message_id(db, seed_run_event) -> None:
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM outbox WHERE message_id = %s", (m.message_id,))
         assert cur.fetchone()[0] == 1
+
+
+def test_checked_insert_requires_identical_delivery_identity(db) -> None:
+    message = OutboxMessage(
+        "checked-1", "formula:obs-1", "formula.requested.v1", {"x": 1})
+    first = insert_outbox_message_checked(db, message)
+    assert insert_outbox_message_checked(db, message) == first
+    with pytest.raises(OutboxIdempotencyConflict):
+        insert_outbox_message_checked(
+            db,
+            OutboxMessage(
+                "checked-1", "formula:obs-1", "different.topic", {"x": 1}),
+        )
+    with pytest.raises(OutboxIdempotencyConflict):
+        insert_outbox_message_checked(
+            db,
+            OutboxMessage(
+                "checked-1", "formula:obs-1", "formula.requested.v1", {"x": 2}),
+        )
 
 
 def test_partition_key_for_unknown_aggregate_raises() -> None:

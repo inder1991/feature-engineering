@@ -25,10 +25,9 @@ from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import draft_contract
 from featuregen.overlay.upload.contract.gate1 import (
     build_considered_set,
-    chosen_feature,
     considered_snapshot_lineage,
     intent_target_ref,
-    record_gate1_choice,
+    select_and_record_gate1_choice,
 )
 from featuregen.overlay.upload.contract.govern import confirm_contract
 from featuregen.overlay.upload.contract.intake import submit_intent
@@ -117,10 +116,12 @@ def test_snapshot_lineage_threads_from_considered_set_to_confirmed_contract(db):
     # 3. Gate #1 choice → draft: draft reloads the SERVER lineage (never a client id). Reconstruct the
     #    chosen feature from the server considered set exactly as the /contract/draft route does.
     actor = _actor()
-    record_gate1_choice(db, intent.intent_id, chosen_source="anchor",
-                        chosen_option_id="avg_balance_90d", actor=actor, why="best fit")
-    feature = chosen_feature(db, intent.intent_id, "anchor", "avg_balance_90d")
-    assert feature is not None
+    option_id = cs.option_ids_by_path["anchor"]
+    choice = select_and_record_gate1_choice(
+        db, intent.intent_id, chosen_source="anchor", chosen_option_id=option_id,
+        actor=actor, why="best fit", expected_generation_run_id=run_id)
+    assert choice is not None
+    feature = choice.feature
     target = intent_target_ref(db, intent.intent_id)   # SERVER truth
     assert target == _TARGET
 
@@ -137,7 +138,8 @@ def test_snapshot_lineage_threads_from_considered_set_to_confirmed_contract(db):
     lineage_at_confirm = considered_snapshot_lineage(db, intent.intent_id)
     assert lineage_at_confirm == lineage_at_draft
     contract = confirm_contract(db, draft, actor=actor.subject, roles=actor.role_claims, now=NOW,
-                                target_ref=target, intent_id=intent.intent_id)
+                                target_ref=target, intent_id=intent.intent_id,
+                                snapshot_lineage=choice.snapshot_lineage)
     assert contract.version == 1
     assert contract.feature_id.startswith("feat")
     assert contract.contract_id.startswith("contract")
@@ -189,22 +191,25 @@ def test_broaden_after_confirm_does_not_repoint_contract_snapshot_binding(db):
                            definition="90-day average balance per account", actor="ds1")
 
     # 1. Considered set S1 → Gate #1 choice → draft → confirm. The contract binds to S1's snapshot.
-    build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET, now=NOW,
-                         generation_run_id="fgr_s1")
+    cs = build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET, now=NOW,
+                              generation_run_id="fgr_s1")
     s1 = db.execute("SELECT snapshot_id FROM contract_considered WHERE intent_id = %s",
                     (intent.intent_id,)).fetchone()[0]
     assert s1
 
     actor = _actor()
-    record_gate1_choice(db, intent.intent_id, chosen_source="anchor",
-                        chosen_option_id="avg_balance_90d", actor=actor, why="best fit")
-    feature = chosen_feature(db, intent.intent_id, "anchor", "avg_balance_90d")
-    assert feature is not None
+    choice = select_and_record_gate1_choice(
+        db, intent.intent_id, chosen_source="anchor",
+        chosen_option_id=cs.option_ids_by_path["anchor"], actor=actor, why="best fit",
+        expected_generation_run_id="fgr_s1")
+    assert choice is not None
+    feature = choice.feature
     target = intent_target_ref(db, intent.intent_id)
     draft = draft_contract(db, feature, client, roles=actor.role_claims, target_ref=target, actor=actor)
     draft, _ = author_contract(db, draft, client, now=NOW, actor=actor)
     contract = confirm_contract(db, draft, actor=actor.subject, roles=actor.role_claims, now=NOW,
-                                target_ref=target, intent_id=intent.intent_id)
+                                target_ref=target, intent_id=intent.intent_id,
+                                snapshot_lineage=choice.snapshot_lineage)
 
     bound = db.execute(
         "SELECT metadata_snapshot_id, metadata_content_hash FROM contract WHERE contract_id = %s",

@@ -46,7 +46,13 @@ from featuregen.overlay.upload.taxonomy.entity_graph import (
 )
 from featuregen.overlay.upload.taxonomy.entity_relationships import EntityCompatibility
 from featuregen.overlay.upload.taxonomy.legacy_crosswalk import crosswalk
-from featuregen.overlay.upload.templates import GroundedFeature, Template
+from featuregen.overlay.upload.templates import (
+    BindingResolution,
+    GroundedFeature,
+    SourceEntityRoleResolution,
+    Template,
+    resolve_source_entity_need_role,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -82,6 +88,11 @@ def binding_quality(gf: GroundedFeature) -> BindingQuality:
     bind (``AMBIGUOUS``) beats an unmet optional (``ACCEPTABLE``) beats a concept substitution
     (``STRONG``); a clean bind with none of those markers is ``EXACT``.
     """
+    resolutions = {binding.resolution for binding in gf.binding_resolutions}
+    if BindingResolution.AMBIGUOUS in resolutions:
+        return BindingQuality.AMBIGUOUS
+    if BindingResolution.MISSING in resolutions:
+        return BindingQuality.ACCEPTABLE
     notes = " ".join(gf.notes).lower()
     if any(marker in notes for marker in _AMBIGUOUS_MARKERS):
         return BindingQuality.AMBIGUOUS
@@ -201,11 +212,12 @@ def _grain_entity(t: Template) -> str | None:
     (the FIRST need whose concept carries an ``entity_link`` — e.g. a ``customer_id`` need fixes the
     grain at ``customer``, a ``facility_id`` need at ``facility``). A recipe with no entity-linking need
     has no derivable grain → ``None``."""
-    for need in t.needs:
-        c = concept(need.concept)
-        if c is not None and c.entity_link is not None:
-            return c.entity_link
-    return None
+    resolved = resolve_source_entity_need_role(t)
+    if resolved.resolution == SourceEntityRoleResolution.AMBIGUOUS or resolved.role is None:
+        return None
+    need = next(need for need in t.needs if need.role == resolved.role)
+    c = concept(need.concept)
+    return c.entity_link if c is not None else None
 
 
 def entity_compatibility(t: Template, target_entity: str | None = None) -> EntityCompatibility:

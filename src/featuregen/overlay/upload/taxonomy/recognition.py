@@ -30,13 +30,15 @@ from featuregen.overlay.upload.taxonomy.use_cases import (
     selectable_leaves,
     use_case,
 )
+from featuregen.overlay.upload.taxonomy.versions import (
+    APPLICABILITY_MAPPING_VERSION,
+    RECIPE_REGISTRY_VERSION,
+)
 
 # The version quintet stamped on every recognition result (governance §3). taxonomy_version +
 # applicability_mapping_version (bumps when recipe_applicability changes) + recipe_registry_version are
 # the three the *result* carries; the recognizer adds recognizer_model_id + prompt_version.
 TAXONOMY_VERSION = "1.0.0"
-APPLICABILITY_MAPPING_VERSION = "1.0.0"
-RECIPE_REGISTRY_VERSION = "1.0.0"
 
 # The selectable LEAVES (terminal objectives). A primary MUST be one of these — the applicability layer
 # scopes on leaves, so a non-leaf selectable parent (e.g. "customer", "credit") would scope to zero recipes.

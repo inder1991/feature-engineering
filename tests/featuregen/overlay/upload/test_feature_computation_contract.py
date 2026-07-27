@@ -67,11 +67,13 @@ def test_feature_idea_carries_typed_operands_and_requirements():
 
 # ── H1a: carry-through metadata fields (additive, server-assigned, flag-off byte-preserving) ─────────
 
-# The EXACT key set the pre-H1a _idea_json produced for a plain llm_freeform idea — byte-identity is
-# asserted against this reference (no H1a key may appear unless a non-default field is set).
+# The exact base key set for a plain llm_freeform idea after considered-candidate v2. R2 added
+# description to the sealed identity so same-named candidates with different semantics cannot alias;
+# no H1a-only key may appear unless a non-default field is set.
 _PRE_H1A_IDEA_JSON_KEYS = {
-    "name", "derives_from", "aggregation", "grain_table", "verification", "critic_note", "rationale",
-    "validation_status", "requirements", "derives_pairs", "origin", "path_authority", "plan_envelope",
+    "name", "description", "derives_from", "aggregation", "grain_table", "verification",
+    "critic_note", "rationale", "validation_status", "requirements", "derives_pairs", "origin",
+    "path_authority", "plan_envelope",
 }
 
 
@@ -107,8 +109,8 @@ def test_role_binding_is_frozen_hashable_and_round_trips():
 
 
 def test_idea_json_byte_identical_for_plain_idea():
-    # A plain llm_freeform idea (all H1a fields default) serializes to EXACTLY the pre-H1a key set —
-    # no new key leaks, so a pre-H1a persisted snapshot is byte-identical (flag-off preservation).
+    # A plain llm_freeform idea (all H1a fields default) serializes to exactly the v2 base key set.
+    # No H1a-only key leaks; description is load-bearing candidate identity, not an H1a field.
     idea = FeatureIdea(name="avg_balance_90d", description="d",
                        derives_from=["public.accounts.balance"], aggregation="avg_90d",
                        grain_table="accounts",
