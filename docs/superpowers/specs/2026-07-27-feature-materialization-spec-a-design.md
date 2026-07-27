@@ -43,6 +43,7 @@ Before cluster acceptance, an inventory task captures from the metastore, for `b
 - physical location;
 - whether historical partitions are rewritten in place;
 - how a customer snapshot corresponding to a business date is selected;
+- **`late_arrival_days`** for any table declared `AVAILABILITY_PARTITION` (§3.4 — how far past the event window late arrivals may land);
 - **the logical→physical schema mapping** for each table (needed by §3.5 when `graph_node.schema_name` is NULL);
 - **how account-to-customer ownership is modelled** (see §H — a joint-account bridge makes the traversal `1:N` and would refuse the worked feature);
 - **the Hive, Spark and metastore versions** (§10's capability attestation is keyed on that exact triple);
@@ -227,13 +228,14 @@ A partition column named `load_dt` does **not** tell you how a 90-day *event-tim
 ```python
 class PartitionMappingKind(StrEnum):
     EVENT_TIME_PARTITION = "event_time_partition"      # (time_ref, partition_column, transform, timezone)
-    AVAILABILITY_PARTITION = "availability_partition"  # (time_ref, partition_column, transform, timezone)
+    AVAILABILITY_PARTITION = "availability_partition"  # (time_ref, partition_column, transform,
+                                                       #  timezone, late_arrival_days)
     STATIC_SNAPSHOT = "static_snapshot"                # (partition_values)
     FULL_SCAN = "full_scan"
     VERIFIED_UNPARTITIONED = "verified_unpartitioned"
 ```
 
-A table with no declared mapping refuses with `PARTITION_MAPPING_NOT_DECLARED`. **"A 90-day window resolves 90 partitions" is only true for an explicitly declared one-day `EVENT_TIME_PARTITION` mapping** — it is never a general rule, and an `AVAILABILITY_PARTITION` mapping must extend the partition set beyond the event window to catch late arrivals.
+A table with no declared mapping refuses with `PARTITION_MAPPING_NOT_DECLARED`. **"A 90-day window resolves 90 partitions" is only true for an explicitly declared one-day `EVENT_TIME_PARTITION` mapping** — it is never a general rule, and an `AVAILABILITY_PARTITION` mapping must extend the partition set beyond the event window to catch late arrivals — **`late_arrival_days` is by how much**, and it is required, because a mapping that must widen without saying by how much is unimplementable.
 
 **Plural** — a 90-day feature reads many partitions. `partition_columns is None` means **verified unpartitioned**, never "unknown"; unknown refuses with `PARTITION_IDENTITY_UNKNOWN`. `input_snapshot_ids` (a run-time value, inside `sandbox_execution_hash` only) is the exact ordered partition set read. L1 runs at **run preparation**, after snapshots resolve, and verifies every one exists.
 

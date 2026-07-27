@@ -132,6 +132,13 @@ in place.
 | 🔴 **Ref case-handling is inconsistent across readers** | `entity.effective_entity` queries `WHERE object_ref = %s` (exact) while `column_authority._scalar` queries `WHERE lower(object_ref) = %s` with a lowered parameter. `build_graph` stores refs in the upload's own casing, so a **mixed-case catalog reads as "no governed entity"** through the first path while the second resolves fine. This is a **class** of bug: any caller that rebuilds a ref rather than threading the stored one is exposed. `materialize/spine.py` threads the stored ref and is safe. | Before any mixed-case catalog is ingested, or when a governed entity inexplicably reads as absent. Fix = one case convention across every `graph_node` reader. |
 | 🟡 **`GRAIN.is_unique` is written but never read** | Every writer hardcodes `is_unique: True` (`ingest.py:287,2792`, `table_synth.py:150`); no projection path consumes it. An `is_unique=false` fact would be accepted, stored, and silently ignored — a latent fail-open. Spec A therefore derives uniqueness from the governed grain **set** rather than trusting the flag. | Before anything relies on `is_unique` as an authority, or when a non-unique grain must be expressible. |
 
+### A.4 Identity properties accepted while building Task 5 (2026-07-27)
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 `catalog_state_stamp` uses a **catalog-wide** `drift_head_seq` | An unrelated upload to the same catalog source moves **every** requirement's identity, so projects regenerate when nothing they read has changed. Conservative rather than wrong — it never claims staleness it doesn't have — but it will cause avoidable churn. Wall-clock (`last_completed_at`) is deliberately excluded so a re-projection of an unchanged catalog does not move identity. | When regeneration churn becomes a cost, or when a per-object stamp exists. |
+| 🟡 A catalog with **no watermark is recorded honestly, not refused** | There is no §14 member for "catalog state unknown", so Task 5 records the absence rather than inventing a code. Consequence: identity does not pin catalog state in that case. | If catalog-state pinning must be guaranteed, T1 needs a new code and this becomes a refusal. |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |
