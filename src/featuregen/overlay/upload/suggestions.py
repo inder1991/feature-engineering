@@ -20,11 +20,25 @@ Grounding is asked for this table AND the tables a CLEARING join makes reachable
 grounding alone could no longer produce a cross-table candidate AT ALL — not even one a governed join
 legitimately authorises: "average transaction amount per customer", where the amount lives on
 `transactions` and the customer key comes over a VERIFIED join to `customers`, became invisible on
-this screen. The reachable set comes from `join_path.clearing_reachable_tables`, which is the
-gauntlet's OWN machinery (same fetch, same read-scope check, same clearing rule), so the columns this
-screen may reach and the gauntlet's `JOIN_CONNECTIVITY` disposition cannot disagree. An UNVERIFIED
-join does NOT widen — a candidate reached over one would arrive carrying a `JOIN_CONNECTIVITY`
-requirement or be rejected `NO_JOIN_PATH`, which is precisely the noise per-table grounding removed.
+this screen. The neighbourhood comes from `join_path.clearing_neighbourhood`, which is the gauntlet's
+OWN machinery (same fetch, same read-scope check, same clearing rule), so the columns this screen may
+reach and the gauntlet's `JOIN_CONNECTIVITY` disposition cannot disagree. An UNVERIFIED join does NOT
+widen — a candidate reached over one would arrive carrying a `JOIN_CONNECTIVITY` requirement or be
+rejected `NO_JOIN_PATH`, which is precisely the noise per-table grounding removed.
+
+The widening is BOUNDED, and that is a correctness property, not a speed one. It first walked the
+join graph TRANSITIVELY, and on a real catalog almost every table reaches the customer/account hub
+over some chain of joins — so opening a hub table ground the registry against most of the catalog: an
+operation whose cost is a property of the CATALOG rather than of the request, i.e. with no
+predictable resource bound (measured on a hub fixture with 40 directly-joined tables: 12,710
+statements for one page view, against 6,284 capped — and the capped figure did not move when the
+fixture grew from 24 neighbours to 40, while the transitive one rose with every join). An ordinary
+two-table page is unchanged at 813 statements, against 812 before the cap. An automatic page load now
+widens ONE HOP, into at most `MAX_NEIGHBOUR_TABLES` directly-joined tables and within a total
+`MAX_COLUMNS_CONSIDERED` column budget, keeping the nearest neighbours in a deterministic order. What
+that leaves out is REPORTED (`neighbourhood` on the payload) rather than silently dropped, and a
+deliberate caller may still ask for more hops via `max_hops`. Choosing WHICH deeper join path to
+follow is a governed, explicit act and wants its own picker UI — deferred, not solved here.
 
 The catalog-wide question is a DIFFERENT question and still has its own caller: `build_considered_set`
 (the hypothesis-driven feature-generation flow) asks what the CATALOG can produce and passes no
@@ -32,15 +46,17 @@ The catalog-wide question is a DIFFERENT question and still has its own caller: 
 """
 from __future__ import annotations
 
+from featuregen.overlay.upload import join_path
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.gate1 import _template_candidates
 from featuregen.overlay.upload.feature_assist import FeatureIdea
-from featuregen.overlay.upload.join_path import clearing_reachable_tables, table_of_ref
+from featuregen.overlay.upload.join_path import clearing_neighbourhood, table_of_ref
 from featuregen.overlay.upload.recipe_grounding_context import RecipeGroundingContextV1
 
 
-def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=()) -> dict:
+def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(),
+                               max_hops: int | None = None) -> dict:
     """Every template candidate this catalog can ground on ``table``, grouped by entity.
 
     ``target_ref=None, now=None``: there is no hypothesis to leak into and no clock to fail freshness
@@ -51,21 +67,35 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     ``table_known`` is a FOURTH state, and the load-bearing one for honesty: a table this catalog does
     not hold produces exactly the same zero-suggestion payload as a table whose columns carry no
     concepts, so without it the screen diagnoses a NONEXISTENT table as "your columns don't carry
-    business concepts". Resolved from ``graph_node`` alone, before the engine runs."""
+    business concepts". Resolved from ``graph_node`` alone, before the engine runs.
+
+    ``max_hops`` is the EXPLICIT opt-in for a wider neighbourhood. ``None`` — what every automatic
+    page load passes — is the capped default (``join_path.MAX_HOPS_DEFAULT``: one hop). A deliberate
+    caller may ask for more; the table cap and the column budget still apply, so expansion changes
+    which tables are ELIGIBLE, never how many are admitted."""
     known = _resolve_table(conn, catalog_source, table)
     if known is None:
+        # Zeroes are the truth here, not a placeholder: a table this catalog does not hold has no
+        # neighbours to have truncated. Reported anyway so the payload's shape never varies.
         return {"catalog_source": catalog_source, "table": table, "table_known": False,
                 "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
-                "groups": [], "rejections": []}
+                "groups": [], "rejections": [],
+                "neighbourhood": {"tables_considered": 0, "tables_available": 0, "truncated": False,
+                                  "max_hops": (join_path.MAX_HOPS_DEFAULT if max_hops is None
+                                               else max_hops),
+                                  "limit_reason": None}}
     table = known                                   # the catalog's own bare name — the engine's key
-    # The join NEIGHBOURHOOD, decided by the gauntlet's own rule (one statement). Read-scoped: an edge
-    # with an endpoint this caller cannot see is DENIED there, so it never widens anything here.
-    reachable = clearing_reachable_tables(conn, catalog_source, table, roles=roles)
+    # The BOUNDED join NEIGHBOURHOOD, decided by the gauntlet's own rule. Read-scoped: an edge with an
+    # endpoint this caller cannot see is DENIED there, so it never widens anything here — and a table
+    # the cap drops was, by construction, one this caller could already see, so truncation changes
+    # HOW MUCH is grounded against and never WHAT may be.
+    neighbourhood = clearing_neighbourhood(conn, catalog_source, table, roles=roles,
+                                           max_hops=max_hops)
     ideas, rejections, _grounded, _rejected, binding_by_id, _incomplete, contexts, keys_by_recipe = (
         _template_candidates(conn, catalog_source=catalog_source, roles=roles,
                              target_ref=None, now=None,           # no intent, no clock, no LLM
                              table=table,                         # ...THIS table's columns...
-                             also_tables=sorted(reachable - {table})))   # ...+ what it can join to
+                             also_tables=neighbourhood.neighbours))   # ...+ what it can join to
     mine = [idea for idea in ideas if _binds(idea, table)]
     # Keyed on the entity REF alone: keying on (ref, label) lets one column open two groups, which
     # the screen then renders with the same React key.
@@ -93,6 +123,10 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
         # screen's and needs no re-attribution — see the module docstring. With no join the
         # neighbourhood is the table itself and the list is exactly the table's, as before.
         "rejections": rejections,
+        # WHAT WAS LEFT OUT. A page that grounds against a bounded slice of a table's join
+        # neighbourhood must say so, or its empty states become false claims ("nothing else is
+        # buildable here" when the truth is "we did not look"). These are the screen's numbers.
+        "neighbourhood": neighbourhood.as_metadata(),
     }
 
 

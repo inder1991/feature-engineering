@@ -185,18 +185,159 @@ def _classified_edges(conn, catalog_source: str, roles: Iterable[str]) -> _Class
     return _ClassifiedEdges(tuple(clearing), tuple(unverified), unverified_fact, tuple(denied))
 
 
-def _reachable(adj: dict[str, list[tuple[str, JoinStep]]], from_table: str) -> set[str]:
-    """Every table reachable from ``from_table`` over ``adj`` (``from_table`` itself included). The
-    closure form of :func:`_bfs` — same adjacency, same hops, no target."""
-    seen = {from_table}
+def _reachable(adj: dict[str, list[tuple[str, JoinStep]]], from_table: str,
+               max_hops: int | None = None) -> dict[str, int]:
+    """``table -> hop distance`` for every table reachable from ``from_table`` over ``adj`` within
+    ``max_hops`` hops (``from_table`` itself at distance 0). The closure form of :func:`_bfs` — same
+    adjacency, same hops, no target. ``max_hops=None`` is the UNBOUNDED closure; ``1`` is "the
+    directly joined tables and nothing further". BFS visits in non-decreasing distance, so the first
+    time a table is seen carries its shortest distance."""
+    seen = {from_table: 0}
     queue: deque[str] = deque([from_table])
     while queue:
         table = queue.popleft()
+        hop = seen[table] + 1
+        if max_hops is not None and hop > max_hops:
+            continue
         for neighbor, _step in adj.get(table, []):
             if neighbor not in seen:
-                seen.add(neighbor)
+                seen[neighbor] = hop
                 queue.append(neighbor)
     return seen
+
+
+# ── the automatic widening's RESOURCE BOUND ──────────────────────────────────────────────────────
+# `clearing_reachable_tables` answers a question with no bound: on a real catalog almost every table
+# reaches the customer/account hub over SOME chain of joins, so its closure from a hub table is most
+# of the catalog — and a screen that grounds the template registry against that closure has a cost
+# that is a property of the CATALOG, not of the request. These three constants are what turn an
+# automatic page load back into a bounded operation. They are deliberately plain module constants:
+# they are quoted to the user in the screen's own copy, and changing the bound is a one-line change.
+#
+#: How far an AUTOMATIC page load widens. ONE hop — the opened table and the tables joined DIRECTLY
+#: to it. A second hop is where the closure stops being a neighbourhood and starts being the catalog.
+MAX_HOPS_DEFAULT = 1
+#: How many of those direct neighbours may be widened into, at most.
+MAX_NEIGHBOUR_TABLES = 20
+#: How many read-scoped COLUMNS a page may ground against in total, the opened table included. The
+#: table cap alone is not a bound — one 400-column neighbour blows the page's cost on its own. 300 is
+#: ~2.4x the widest real table in the reference catalog (126 columns), so a widened page costs at
+#: most a small multiple of an ordinary one.
+MAX_COLUMNS_CONSIDERED = 300
+#: The most hops an EXPLICIT request may ask for. Expansion is a deliberate act, not a way to opt out
+#: of the bound: it changes which tables are ELIGIBLE, never how many are admitted.
+MAX_HOPS_CEILING = 3
+
+#: ``limit_reason`` values — which bound actually bit, or ``None`` when nothing was left out.
+LIMIT_TABLE_CAP = "table_cap"
+LIMIT_COLUMN_BUDGET = "column_budget"
+
+
+@dataclass(frozen=True, slots=True)
+class JoinNeighbourhood:
+    """The bounded join neighbourhood of one table, plus the HONEST account of what was left out.
+
+    ``tables`` is the anchor followed by the kept neighbours IN THE ORDER THEY WERE KEPT. The counts
+    are about NEIGHBOURS only — the anchor is never a neighbour of itself and is never truncated
+    away, so ``tables_considered``/``tables_available`` read exactly as the screen states them
+    ("showing 20 of 73 directly joined tables")."""
+
+    tables: tuple[str, ...]
+    tables_considered: int
+    tables_available: int
+    truncated: bool
+    max_hops: int
+    limit_reason: str | None
+
+    @property
+    def neighbours(self) -> tuple[str, ...]:
+        return self.tables[1:]
+
+    def as_metadata(self) -> dict:
+        """The payload's ``neighbourhood`` block. A screen that shows a SUBSET must say so, so these
+        five fields travel with every response — the two counts, whether anything was dropped, the
+        hop bound that was applied (stated even when nothing was truncated, because deeper joins
+        exist and were not loaded), and which bound bit."""
+        return {"tables_considered": self.tables_considered,
+                "tables_available": self.tables_available,
+                "truncated": self.truncated,
+                "max_hops": self.max_hops,
+                "limit_reason": self.limit_reason}
+
+
+def _visible_column_counts(conn, catalog_source: str, tables: Iterable[str],
+                           roles: Iterable[str]) -> dict[str, int]:
+    """``table -> number of columns THIS CALLER may see``, in ONE statement. The read-scope predicate
+    is character-for-character :func:`templates._load_columns`' own, because this is what prices the
+    budget: pricing a table by columns the caller cannot see would spend budget on nothing."""
+    rows = conn.execute(
+        "SELECT table_name, count(*) FROM graph_node "
+        "WHERE kind = 'column' AND catalog_source = %s "
+        "  AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "  AND table_name = ANY(%s) "
+        "GROUP BY table_name",
+        (catalog_source, allowed_sensitivities(roles), list(tables))).fetchall()
+    return {table: count for table, count in rows}
+
+
+def clearing_neighbourhood(conn, catalog_source: str, from_table: str, *,
+                           roles: Iterable[str] = (),
+                           max_hops: int | None = None,
+                           max_tables: int | None = None,
+                           max_columns: int | None = None) -> JoinNeighbourhood:
+    """The BOUNDED clearing-join neighbourhood of ``from_table`` — what an automatic page load may
+    widen its grounding set to.
+
+    Same edges, same clearing rule and same read scope as :func:`clearing_reachable_tables` (it is
+    the same :func:`_classified_edges` fetch); what is added is a bound. ``max_hops`` defaults to
+    :data:`MAX_HOPS_DEFAULT` (one hop — the directly joined tables), ``max_tables`` to
+    :data:`MAX_NEIGHBOUR_TABLES` and ``max_columns`` to :data:`MAX_COLUMNS_CONSIDERED`; ``None``
+    resolves to the constant at CALL time, and each may be passed explicitly for a deliberate,
+    wider request. Costs ONE statement, plus ONE aggregate to price the budget when there is at
+    least one candidate neighbour to price.
+
+    ORDER, before anything is dropped: **(hop distance, then table name)**. Distance is the only
+    relevance signal this system actually holds — a directly joined table is more likely to be part
+    of the same feature than one three joins away — and beyond it the tie is broken lexically rather
+    than by an invented score (this codebase does not have, and deliberately does not fake, a
+    relevance ranking). Both keys are properties of the graph, never of DB row order, so the same
+    request always keeps the same neighbours.
+
+    TRUNCATION only ever NARROWS. The anchor is admitted first and never dropped; neighbours are then
+    admitted in order while both bounds hold, and the walk STOPS at the first neighbour that would
+    breach one (rather than skipping it for a smaller one further down — "the nearest N" is a rule a
+    user can predict, "whatever happened to fit" is not). Nothing here can admit a column the caller
+    could not already see: the caller names TABLES, and a table contributes only the columns the
+    read-scoped load already cleared.
+    """
+    hops = MAX_HOPS_DEFAULT if max_hops is None else max_hops
+    table_cap = MAX_NEIGHBOUR_TABLES if max_tables is None else max_tables
+    column_budget = MAX_COLUMNS_CONSIDERED if max_columns is None else max_columns
+
+    edges = _classified_edges(conn, catalog_source, roles)
+    distance = _reachable(_adjacency(edges.clearing), from_table, hops)
+    ordered = sorted((t for t in distance if t != from_table),
+                     key=lambda t: (distance[t], t))
+    if not ordered:
+        return JoinNeighbourhood(tables=(from_table,), tables_considered=0, tables_available=0,
+                                 truncated=False, max_hops=hops, limit_reason=None)
+
+    counts = _visible_column_counts(conn, catalog_source, [from_table, *ordered], roles)
+    kept: list[str] = []
+    used = counts.get(from_table, 0)          # the opened table is never budgeted away
+    reason: str | None = None
+    for table in ordered:
+        if len(kept) >= table_cap:
+            reason = LIMIT_TABLE_CAP
+            break
+        if used + counts.get(table, 0) > column_budget:
+            reason = LIMIT_COLUMN_BUDGET
+            break
+        kept.append(table)
+        used += counts.get(table, 0)
+    return JoinNeighbourhood(tables=(from_table, *kept), tables_considered=len(kept),
+                             tables_available=len(ordered), truncated=len(kept) < len(ordered),
+                             max_hops=hops, limit_reason=reason)
 
 
 def clearing_reachable_tables(conn, catalog_source: str, from_table: str, *,
@@ -211,6 +352,13 @@ def clearing_reachable_tables(conn, catalog_source: str, from_table: str, *,
     or rejects ``NO_JOIN_PATH``, which is exactly the mis-attributed noise the per-table screen exists
     to remove. Surfacing "you could build X if you confirmed this join" is a separate product
     decision, not a side effect of this helper.
+
+    UNBOUNDED BY CONSTRUCTION — this is the full transitive closure, and its size is a property of
+    the CATALOG, not of the question asked. On a real catalog almost everything reaches the
+    customer/account hub, so from a hub table this is most of the catalog. It is correct, and it is
+    NOT what an automatic page load may use: :func:`clearing_neighbourhood` is the bounded form the
+    suggestions screen calls. Keep this one for a caller that genuinely wants the closure and can
+    afford it.
 
     Costs ONE statement — the same single ``graph_edge`` fetch the classifier makes."""
     edges = _classified_edges(conn, catalog_source, roles)

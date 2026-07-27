@@ -649,8 +649,8 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
     catalog-wide default answers "what can this CATALOG produce" and is what the feature-generation
     flow asks. Default ``None`` = catalog-wide, exactly as before.
 
-    ``also_tables`` widens that narrowing back out to a NAMED set of sibling tables — the tables a
-    CLEARING join makes reachable from ``table`` (``join_path.clearing_reachable_tables``). Without
+    ``also_tables`` widens that narrowing back out to a NAMED set of sibling tables — the BOUNDED
+    clearing-join neighbourhood of ``table`` (``join_path.clearing_neighbourhood``). Without
     it a per-table pass can no longer produce a cross-table candidate at all, not even one a governed
     join legitimately authorises ("average transaction amount per customer", where the amount is on
     one table and the customer key comes over a verified join). It is still a NARROWING of the same

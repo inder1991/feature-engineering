@@ -32,11 +32,12 @@ import time
 from typing import Annotated
 
 import psycopg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from psycopg import sql
 
 from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.overlay.upload.join_path import MAX_HOPS_CEILING, MAX_HOPS_DEFAULT
 from featuregen.overlay.upload.suggestions import suggest_features_for_table
 
 logger = logging.getLogger(__name__)
@@ -57,17 +58,30 @@ SUGGESTIONS_STATEMENT_TIMEOUT_MS = 30_000
 
 @router.get("/catalog/{catalog_source}/tables/{table}/suggestions",
             dependencies=[Depends(require_catalog_read)])
-def table_suggestions(catalog_source: str, table: str, conn: _Conn, identity: _Identity) -> dict:
+def table_suggestions(
+    catalog_source: str, table: str, conn: _Conn, identity: _Identity,
+    max_hops: Annotated[int, Query(ge=1, le=MAX_HOPS_CEILING)] = MAX_HOPS_DEFAULT,
+) -> dict:
     """This table's suggested features. A table with no suggestions returns the honest empty payload
     — that is a catalog-readiness fact, not a server error — and one this catalog does not hold is
-    reported distinctly as ``table_known: false``, never as "no concepts"."""
+    reported distinctly as ``table_known: false``, never as "no concepts".
+
+    ``max_hops`` is the EXPLICIT opt-in for a wider join neighbourhood. Its default is the capped
+    one an automatic page load gets (``MAX_HOPS_DEFAULT``); FastAPI's own bounds refuse anything
+    above ``MAX_HOPS_CEILING`` with a 422, so a request cannot ask the server for an unbounded walk.
+    Raising it changes which tables are ELIGIBLE to widen into, never how many are admitted — the
+    table cap and column budget still apply — so the page's cost stays bounded either way. Choosing
+    WHICH deeper join path to follow is a governed, explicit act that wants its own picker; that UI
+    is DEFERRED, and this parameter is the surface it will use."""
     # SET LOCAL is transaction-scoped (get_conn owns the txn), so the bound dies with the request.
     # SET takes no bound parameters, so the literal is composed — the profiler's own precedent.
     conn.execute(sql.SQL("SET LOCAL statement_timeout = {}")
                  .format(sql.Literal(SUGGESTIONS_STATEMENT_TIMEOUT_MS)))
     started = time.monotonic()
     out = suggest_features_for_table(conn, catalog_source=catalog_source, table=table,
-                                     roles=identity.role_claims)
-    logger.info("suggestions for %s.%s took %.3fs (known=%s, suggested=%s)", catalog_source, table,
-                time.monotonic() - started, out["table_known"], out["summary"]["suggested"])
+                                     roles=identity.role_claims, max_hops=max_hops)
+    logger.info("suggestions for %s.%s took %.3fs (known=%s, suggested=%s, hops=%s, "
+                "neighbours=%s/%s)", catalog_source, table, time.monotonic() - started,
+                out["table_known"], out["summary"]["suggested"], max_hops,
+                out["neighbourhood"]["tables_considered"], out["neighbourhood"]["tables_available"])
     return out

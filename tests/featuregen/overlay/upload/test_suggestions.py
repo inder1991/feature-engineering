@@ -21,6 +21,7 @@ from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.commands import confirm_fact, propose_fact
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
+from featuregen.overlay.upload import join_path
 from featuregen.overlay.upload import suggestions as suggestions_module
 from featuregen.overlay.upload import templates as templates_module
 from featuregen.overlay.upload.canonical import validate_rows
@@ -29,6 +30,7 @@ from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.join_path import clearing_reachable_tables
 from featuregen.overlay.upload.source_profile import FTR_GLOSSARY_PROFILE
 from featuregen.overlay.upload.suggestions import render_recipe, suggest_features_for_table
 from featuregen.overlay.upload.table_fact_governance import (
@@ -150,6 +152,11 @@ def _ingest(conn, source: str, columns: dict) -> None:
         "overlay.enrich.domain": FakeResponse(output={"results": [
             {"ref": t, "domain": "payments"} for t in columns]}),
         "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
+        # The measure-unit stage only DISPATCHES once a run is big enough to batch, so the small
+        # fixtures here never reached it. The hub fixture below does. It proposes NOTHING: an AI
+        # unit is `llm/proposed` evidence that can never clear UNIT_CONSISTENT anyway, so an empty
+        # result keeps every fixture in this module on exactly the units its file declares.
+        "overlay.enrich.unit": FakeResponse(output={"results": []}),
     })
     res = ingest_upload(conn, source, upload.rows, actor=_UPLOADER, now=NOW,
                         client=client, glossary=upload)
@@ -676,3 +683,295 @@ def test_writes_nothing(overlay_conn, ftr_catalog):
     suggest_features_for_table(overlay_conn, catalog_source=ftr_catalog.source,
                                table=ftr_catalog.table)
     assert fingerprint() == before
+
+
+# ── the ONE-HOP CAP: the widening's resource bound ───────────────────────────────────────────────
+# The widening above was correct on a small catalog and UNBOUNDED on a large one: it walked the
+# clearing-join graph TRANSITIVELY (a full BFS closure), and on a real catalog almost every table
+# reaches the customer/account hub — so opening a hub table ground the registry against most of the
+# catalog. That is not a slow page, it is a page with NO PREDICTABLE RESOURCE BOUND. The cap is
+# therefore a DEFECT fix, not an optimisation: one hop, a table cap and a column budget inside that
+# hop, a deterministic order before truncating, and honest metadata saying what was left out.
+_HUB_SOURCE = "p4_suggestions_hub_ftr"
+_HUB_TABLE = "cust_hub"
+_FAR_TABLE = "far_custody"                     # TWO hops out — joined to a spoke, never to the hub
+_SPOKES = tuple(f"spoke_{n:02d}" for n in range(40))     # >> MAX_NEIGHBOUR_TABLES, on purpose
+_SPOKE_COLUMNS = 5
+
+_HUB_COLUMNS: dict[str, dict] = {
+    _HUB_TABLE: {
+        "CIF_ID": ("customer_id", "varchar", "Hub Customer Identifier"),
+        "ACCT_ID": ("account_id", "varchar", "Hub Account Identifier"),
+        "AS_OF_DT": ("as_of_date", "date", "Hub As Of Date"),
+        "TXN_TS": ("event_timestamp", "timestamp", "Hub Event Timestamp"),
+        "TXN_CNT": ("count", "integer", "Hub Transaction Count"),
+    },
+}
+for _i, _spoke in enumerate(_SPOKES):
+    _HUB_COLUMNS[_spoke] = {
+        f"S{_i:02d}_ACCT": ("account_id", "varchar", f"Spoke {_i} Account"),
+        f"S{_i:02d}_AMT": ("monetary_flow", "decimal", f"Spoke {_i} Amount"),
+        f"S{_i:02d}_DT": ("as_of_date", "date", f"Spoke {_i} As Of Date"),
+        f"S{_i:02d}_CNT": ("count", "integer", f"Spoke {_i} Count"),
+        f"S{_i:02d}_TS": ("event_timestamp", "timestamp", f"Spoke {_i} Timestamp"),
+    }
+_HUB_COLUMNS[_FAR_TABLE] = {
+    "FAR_ACCT": ("account_id", "varchar", "Far Account"),
+    "FAR_BAL": ("monetary_stock", "decimal", "Far Balance"),
+}
+
+
+def _clearing_edge(conn, source: str, from_ref: str, to_ref: str) -> None:
+    """A FILE-DECLARED operational `joins` edge — `join_path`'s clearing rule, no fact needed."""
+    conn.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority, "
+        "approved_join_fact_key, approved_join_status) "
+        "VALUES (%s, 'joins', %s, %s, 'N:1', 'operational', NULL, NULL)",
+        (source, from_ref, to_ref))
+
+
+@pytest.fixture
+def hub_catalog(overlay_conn):
+    """A HUB: 40 tables joined DIRECTLY to it, and one table two hops out behind the first spoke.
+
+    The hub's own grain/availability go through the REAL governance path. The spokes' ``is_grain`` /
+    ``is_as_of`` flags are set DIRECTLY — they are the projected OUTCOME of that same path, and this
+    fixture needs 40 of them purely to be COST-REPRESENTATIVE (an is_grain candidate column is what
+    makes grounding issue an ``effective_entity`` query per need, which is the cost this cap bounds).
+    Governing 40 tables through propose/confirm/project would make a cost fixture minutes long and
+    would assert nothing this suite does not already assert elsewhere."""
+    _seal()
+    _ingest(overlay_conn, _HUB_SOURCE, _HUB_COLUMNS)
+    _govern_table_facts(overlay_conn, _HUB_TABLE, "cif_id", "as_of_dt", source=_HUB_SOURCE)
+    for i, spoke in enumerate(_SPOKES):
+        overlay_conn.execute(
+            "UPDATE graph_node SET is_grain = true WHERE catalog_source = %s AND object_ref = %s",
+            (_HUB_SOURCE, f"public.{spoke}.s{i:02d}_acct"))
+        overlay_conn.execute(
+            "UPDATE graph_node SET is_as_of = true WHERE catalog_source = %s AND object_ref = %s",
+            (_HUB_SOURCE, f"public.{spoke}.s{i:02d}_dt"))
+        _clearing_edge(overlay_conn, _HUB_SOURCE,
+                       f"public.{_HUB_TABLE}.acct_id", f"public.{spoke}.s{i:02d}_acct")
+    overlay_conn.execute(
+        "UPDATE graph_node SET is_grain = true WHERE catalog_source = %s AND object_ref = %s",
+        (_HUB_SOURCE, f"public.{_FAR_TABLE}.far_acct"))
+    _clearing_edge(overlay_conn, _HUB_SOURCE,
+                   f"public.{_SPOKES[0]}.s00_acct", f"public.{_FAR_TABLE}.far_acct")
+    return _Catalog(source=_HUB_SOURCE, table=_HUB_TABLE)
+
+
+def _statements(conn, monkeypatch) -> list[int]:
+    """Count EVERY statement this connection issues — the page's real resource cost."""
+    cls = type(conn)
+    real = cls.execute
+    counter = [0]
+
+    def _exec(self, *a, **kw):
+        counter[0] += 1
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(cls, "execute", _exec)
+    return counter
+
+
+def _grounding_set(monkeypatch) -> list[list]:
+    """Capture the COLUMNS actually handed to grounding — the literal grounding set, not a proxy."""
+    seen: list[list] = []
+    real = templates_module.ground_template_outcome
+
+    def _spy(conn, template, *, columns=None, **kw):
+        if columns is not None and not seen:
+            seen.append(list(columns))
+        return real(conn, template, columns=columns, **kw)
+
+    monkeypatch.setattr(templates_module, "ground_template_outcome", _spy)
+    return seen
+
+
+def _hub(conn, **kw) -> dict:
+    return suggest_features_for_table(conn, catalog_source=_HUB_SOURCE, table=_HUB_TABLE, **kw)
+
+
+#: The concrete ceilings these two pages must stay under.
+#:
+#: HUB, measured on this fixture: 6_284 statements capped, against 12_710 with the bounds lifted —
+#: and the capped figure did NOT move when the fixture grew from 24 direct neighbours to 40, which is
+#: the property being bought. The uncapped one rises with every join anyone ever adds.
+#: ORDINARY (the two-table `join_catalog`): 813 statements, against 812 before this cap existed —
+#: the ONE extra statement is the aggregate that prices the column budget.
+#: Both carry a little headroom so an unrelated one-off query does not fail them.
+_HUB_STATEMENT_CEILING = 7_000
+_ORDINARY_STATEMENT_CEILING = 850
+
+
+def test_a_hub_tables_page_has_a_bounded_statement_cost(overlay_conn, hub_catalog, monkeypatch):
+    """THE DEFECT. 40 tables join straight to this hub and a 41st sits behind one of them. Opening the
+    hub used to ground against ALL of them — the closure, whose size is a property of the CATALOG, not
+    of the request. Now the page grounds against the hub plus at most ``MAX_NEIGHBOUR_TABLES`` of its
+    DIRECT neighbours, so its cost has a ceiling that a new join cannot raise."""
+    counter = _statements(overlay_conn, monkeypatch)
+    counter[0] = 0
+    out = _hub(overlay_conn)
+    assert counter[0] <= _HUB_STATEMENT_CEILING, counter[0]
+    # non-vacuous: the unbounded closure really would have reached every table in this catalog
+    assert len(clearing_reachable_tables(overlay_conn, _HUB_SOURCE, _HUB_TABLE)) == len(_SPOKES) + 2
+    assert out["neighbourhood"]["tables_considered"] == join_path.MAX_NEIGHBOUR_TABLES
+
+
+def test_removing_the_cap_is_what_costs_the_statements(overlay_conn, hub_catalog, monkeypatch):
+    """The cap is load-bearing, not incidental: with the SAME fixture and the SAME request, lifting
+    the bounds costs materially more — and the gap grows with the catalog, which is the whole defect."""
+    counter = _statements(overlay_conn, monkeypatch)
+    counter[0] = 0
+    _hub(overlay_conn)
+    capped = counter[0]
+    monkeypatch.setattr(join_path, "MAX_NEIGHBOUR_TABLES", 10_000)
+    monkeypatch.setattr(join_path, "MAX_COLUMNS_CONSIDERED", 10_000_000)
+    counter[0] = 0
+    _hub(overlay_conn, max_hops=99)
+    assert counter[0] > capped * 1.9, (capped, counter[0])
+
+
+def test_a_two_hop_tables_columns_are_not_considered(overlay_conn, hub_catalog, monkeypatch):
+    """ONE HOP. ``far_custody`` is reachable — over a spoke — and lexically sorts FIRST among the
+    neighbours, so nothing but the hop bound keeps it out. Asserted on the literal column list handed
+    to grounding, because a card-level assertion could pass for the wrong reason."""
+    seen = _grounding_set(monkeypatch)
+    _hub(overlay_conn)
+    tables = {col.table for col in seen[0]}
+    assert _FAR_TABLE not in tables
+    assert _HUB_TABLE in tables
+    assert tables == {_HUB_TABLE, *_SPOKES[:join_path.MAX_NEIGHBOUR_TABLES]}
+
+
+def test_the_kept_neighbours_are_the_documented_order_and_are_stable(overlay_conn, hub_catalog,
+                                                                     monkeypatch):
+    """DETERMINISM. Truncation keeps neighbours by (hop distance, then table name) — never by DB row
+    order — so the same request always shows the same tables. Asserted BOTH ways: the kept set is
+    exactly the documented prefix, and two identical requests agree."""
+    seen = _grounding_set(monkeypatch)
+    first = _hub(overlay_conn)
+    kept = sorted({col.table for col in seen[0]} - {_HUB_TABLE})
+    assert kept == list(_SPOKES[:join_path.MAX_NEIGHBOUR_TABLES])
+    seen.clear()
+    second = _hub(overlay_conn)
+    assert sorted({col.table for col in seen[0]}) == sorted(kept + [_HUB_TABLE])
+    assert first == second
+
+
+def test_the_metadata_tells_the_truth_when_truncated(overlay_conn, hub_catalog):
+    """The screen may not silently show a subset. 24 neighbours are reachable in one hop, 20 were
+    used, and the reason is the table cap — every field is the reality, not a constant."""
+    meta = _hub(overlay_conn)["neighbourhood"]
+    assert meta == {"tables_considered": join_path.MAX_NEIGHBOUR_TABLES,
+                    "tables_available": len(_SPOKES),
+                    "truncated": True, "max_hops": 1, "limit_reason": "table_cap"}
+
+
+def test_the_column_budget_can_bite_before_the_table_cap(overlay_conn, hub_catalog, monkeypatch):
+    """A SINGLE wide neighbour can blow the budget on its own, so the tables cap alone is not a
+    resource bound. With the budget lowered, fewer tables are admitted and the metadata names the
+    budget — not the table cap — as the constraint that bit."""
+    monkeypatch.setattr(join_path, "MAX_COLUMNS_CONSIDERED",
+                        len(_HUB_COLUMNS[_HUB_TABLE]) + 11 * _SPOKE_COLUMNS)
+    meta = _hub(overlay_conn)["neighbourhood"]
+    assert meta["tables_considered"] == 11
+    assert meta["tables_available"] == len(_SPOKES)
+    assert meta["truncated"] is True and meta["limit_reason"] == "column_budget"
+
+
+def test_the_metadata_is_honest_when_nothing_was_truncated(overlay_conn, join_catalog):
+    """The untruncated case is a claim too: one reachable neighbour, one used, nothing left out."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    assert _screen(overlay_conn)["neighbourhood"] == {
+        "tables_considered": 1, "tables_available": 1,
+        "truncated": False, "max_hops": 1, "limit_reason": None}
+
+
+def test_an_ordinary_tables_page_costs_what_it_did(overlay_conn, join_catalog, monkeypatch):
+    """The other half of the contract: an ordinary table's small neighbourhood is NOT changed by the
+    cap. Its statement count moves only by the ONE aggregate that prices the neighbourhood."""
+    counter = _statements(overlay_conn, monkeypatch)
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    counter[0] = 0
+    widened = _screen(overlay_conn)
+    with_join = counter[0]
+    assert "balance_trend_90d" in _names(widened)          # still widens across the one join
+    assert with_join <= _ORDINARY_STATEMENT_CEILING, with_join
+    assert widened["neighbourhood"]["truncated"] is False
+
+
+def test_a_caller_who_cannot_see_a_neighbour_never_has_it_counted(overlay_conn, join_catalog):
+    """READ-SCOPING IS UNTOUCHABLE, and the metadata must not leak either: a caller who cannot see the
+    join's endpoint must not learn from ``tables_available`` that a neighbour is there at all."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND object_ref = %s", (_JOIN_SOURCE, _JOIN_TO))
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+
+    blind = _screen(overlay_conn, roles=())["neighbourhood"]
+    privileged = _screen(overlay_conn, roles=("restricted_reader",))["neighbourhood"]
+    assert blind["tables_available"] == 0 and blind["tables_considered"] == 0
+    assert blind["truncated"] is False
+    assert privileged["tables_available"] == 1 and privileged["tables_considered"] == 1
+
+
+def test_truncation_only_ever_narrows_what_a_caller_can_see(overlay_conn, hub_catalog, monkeypatch):
+    """The cap may only NARROW. Whatever survives truncation — at any budget, for any caller — is a
+    SUBSET of the columns that caller could already see, and tightening the budget can only ever
+    remove columns, never add or substitute one the caller may not read."""
+    visible = {c.object_ref for c in templates_module._load_columns(overlay_conn, _HUB_SOURCE, ())}
+    kept: list[set] = []
+    for budget in (10_000, 60, 20):
+        monkeypatch.setattr(join_path, "MAX_COLUMNS_CONSIDERED", budget)
+        seen = _grounding_set(monkeypatch)
+        _hub(overlay_conn)
+        columns = {col.object_ref for col in seen[0]}
+        assert columns <= visible                        # never more than the read scope allows
+        kept.append(columns)
+    assert kept[0] > kept[1] > kept[2]                   # tightening strictly removes, never swaps
+
+
+def test_an_explicit_max_hops_reaches_further_than_the_page_default(overlay_conn, hub_catalog,
+                                                                    monkeypatch):
+    """NOT a kill switch. A DELIBERATE request may ask for a wider neighbourhood — the opt-in changes
+    which tables are ELIGIBLE, never how many are admitted, so the budget still bounds the cost.
+    (The table cap is raised here only because 40 one-hop spokes would otherwise fill it before the
+    second hop is reached — which is the documented order doing its job.)"""
+    assert _hub(overlay_conn)["neighbourhood"]["tables_available"] == len(_SPOKES)
+    assert _hub(overlay_conn, max_hops=2)["neighbourhood"]["tables_available"] == len(_SPOKES) + 1
+
+    monkeypatch.setattr(join_path, "MAX_NEIGHBOUR_TABLES", len(_SPOKES) + 1)
+    seen = _grounding_set(monkeypatch)
+    _hub(overlay_conn, max_hops=2)
+    assert _FAR_TABLE in {col.table for col in seen[0]}
+    assert _hub(overlay_conn, max_hops=2)["neighbourhood"]["max_hops"] == 2
+
+
+def test_the_cap_writes_nothing_and_leaves_the_catalog_wide_path_alone(overlay_conn, hub_catalog):
+    """Two pins in one: the capped page is still strictly read-only, and the catalog-wide
+    feature-generation pass — which never widened — is argument-for-argument what it always was."""
+    tables = ("graph_node", "graph_edge", "field_decision_event", "contract_intent")
+
+    def fingerprint():
+        return tuple(overlay_conn.execute(
+            f"SELECT count(*), md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) "
+            f"FROM {t} t").fetchone() for t in tables)
+
+    before = fingerprint()
+    _hub(overlay_conn)
+    assert fingerprint() == before
+    default = _template_candidates(overlay_conn, catalog_source=_HUB_SOURCE, roles=(),
+                                   target_ref=None, now=None)
+    explicit = _template_candidates(overlay_conn, catalog_source=_HUB_SOURCE, roles=(),
+                                    target_ref=None, now=None, table=None)
+    assert [(i.name, i.grain_table, i.recipe_id) for i in default[0]] == [
+        (i.name, i.grain_table, i.recipe_id) for i in explicit[0]]
+    assert default[1:] == explicit[1:]
+
+
+def test_the_unbounded_closure_helper_still_answers_its_own_question(overlay_conn, hub_catalog):
+    """``clearing_reachable_tables`` keeps its contract for any deliberate caller: the FULL transitive
+    closure, in ONE statement. It is simply no longer what an automatic page load uses."""
+    reachable = clearing_reachable_tables(overlay_conn, _HUB_SOURCE, _HUB_TABLE)
+    assert reachable == {_HUB_TABLE, _FAR_TABLE, *_SPOKES}

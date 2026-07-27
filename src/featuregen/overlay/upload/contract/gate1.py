@@ -237,9 +237,9 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     The feature-generation flow (``build_considered_set``) asks the CATALOG-wide question and must keep
     asking it, so the default is ``None`` — unchanged, one candidate per template, whole catalog.
 
-    ``also_tables`` widens that narrowing to the sibling tables a CLEARING join makes reachable from
-    ``table`` (the suggestions screen resolves them via ``join_path.clearing_reachable_tables``), so a
-    cross-table candidate a governed join authorises can ground. It is INERT when ``table is None``:
+    ``also_tables`` widens that narrowing to the sibling tables a CLEARING join reaches from ``table``
+    (the suggestions screen resolves a BOUNDED set of them via ``join_path.clearing_neighbourhood``),
+    so a cross-table candidate a governed join authorises can ground. It is INERT when ``table is None``:
     the catalog-wide pass already considers every table and must stay byte-identical."""
     # The kwargs are passed ONLY when narrowing: `_ground_template_outcomes` is a long-standing
     # substitution seam (tests and the measurement harness replace it), so the catalog-wide call must

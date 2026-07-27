@@ -28,12 +28,27 @@ from featuregen.overlay.catalog import _clear_catalog_adapter
 from featuregen.overlay.commands import register_overlay_commands
 from featuregen.overlay.config import _clear_overlay_config
 from featuregen.overlay.facts import register_overlay_event_types
+from featuregen.overlay.upload.join_path import MAX_HOPS_CEILING, MAX_HOPS_DEFAULT
 
 PATH = f"/catalog/{SOURCE}/tables/{TABLE}/suggestions"
 
 
 def _h(roles: str = "feature_engineer", user: str = "u") -> dict:
     return {"X-User": user, "X-Roles": roles}
+
+
+def _capture(seen: dict):
+    """Stand in for the engine and record EVERY argument the route threads into it. A route that
+    silently dropped `roles` — or that quietly widened the join neighbourhood past the page default
+    — would still return a perfectly well-shaped 200, so both are asserted at this seam."""
+    def _engine(conn, *, catalog_source, table, roles, max_hops):
+        seen.update(catalog_source=catalog_source, table=table, roles=roles, max_hops=max_hops)
+        return {"catalog_source": catalog_source, "table": table, "table_known": False,
+                "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
+                "groups": [], "rejections": [],
+                "neighbourhood": {"tables_considered": 0, "tables_available": 0, "truncated": False,
+                                  "max_hops": max_hops, "limit_reason": None}}
+    return _engine
 
 
 @pytest.fixture(autouse=True)
@@ -73,14 +88,7 @@ def test_read_scope_roles_come_from_the_session(client, monkeypatch):
     never a request parameter. Captured at the seam, because a route that silently dropped `roles`
     would still return a perfectly well-shaped 200."""
     seen: dict = {}
-
-    def _capture(conn, *, catalog_source, table, roles):
-        seen.update(catalog_source=catalog_source, table=table, roles=roles)
-        return {"catalog_source": catalog_source, "table": table, "table_known": False,
-                "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
-                "groups": [], "rejections": []}
-
-    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture)
+    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture(seen))
     r = client.get("/catalog/src/tables/txns/suggestions",
                    headers=_h(roles="feature_engineer,pii_reader"))
     assert r.status_code == 200, r.text
@@ -119,6 +127,40 @@ def test_unknown_table_is_reported_as_unknown_not_as_an_empty_catalog(client, ft
     assert body["summary"] == {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0}
     assert body["groups"] == [] and body["rejections"] == []
     assert client.get(PATH, headers=_h()).json()["table_known"] is True
+
+
+def test_an_automatic_page_load_gets_the_capped_neighbourhood(client, monkeypatch):
+    """The DEFECT's contract at the HTTP edge: a plain page load — no query string — must ask for the
+    capped default, never the transitive walk. Pinned at the seam, because the widening is invisible
+    in the response shape."""
+    seen: dict = {}
+    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture(seen))
+    assert client.get("/catalog/src/tables/txns/suggestions", headers=_h()).status_code == 200
+    assert seen["max_hops"] == MAX_HOPS_DEFAULT == 1
+
+
+def test_a_deliberate_request_may_expand_but_not_without_a_bound(client, monkeypatch):
+    """Multi-hop is NOT disabled — an explicit caller can ask for a wider neighbourhood — but the ask
+    is bounded: past `MAX_HOPS_CEILING` the request is refused (422) rather than served, so no client
+    can talk the server back into an unbounded walk. The table cap and column budget apply either
+    way, so expansion changes which tables are eligible, never how many are admitted."""
+    seen: dict = {}
+    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture(seen))
+    assert client.get("/catalog/src/tables/txns/suggestions?max_hops=2",
+                      headers=_h()).status_code == 200
+    assert seen["max_hops"] == 2
+    assert client.get(f"/catalog/src/tables/txns/suggestions?max_hops={MAX_HOPS_CEILING + 1}",
+                      headers=_h()).status_code == 422
+    assert client.get("/catalog/src/tables/txns/suggestions?max_hops=0",
+                      headers=_h()).status_code == 422
+
+
+def test_the_neighbourhood_metadata_reaches_the_client(client, ftr_catalog):  # noqa: F811
+    """The screen may not silently show a subset, so what the widening left out travels on the
+    payload — over HTTP, from the real engine, not just in-process."""
+    body = client.get(PATH, headers=_h()).json()
+    assert body["neighbourhood"] == {"tables_considered": 0, "tables_available": 0,
+                                     "truncated": False, "max_hops": 1, "limit_reason": None}
 
 
 def test_the_read_runs_under_a_statement_timeout(client, conn):
