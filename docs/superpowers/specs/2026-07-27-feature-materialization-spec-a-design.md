@@ -1,4 +1,4 @@
-# Spec A — Executable Materialization Vertical Slice (design, rev 4)
+# Spec A — Executable Materialization Vertical Slice (design, rev 5)
 
 **Goal:** Turn a **governed, provenance-verified** feature authoring result into a **complete runnable Kedro/PySpark project** that computes the worked-example features on the Hadoop/Hive cluster and publishes them as one atomically-visible feature-group partition — proven by executing them and reading the published table.
 
@@ -148,7 +148,7 @@ class ExpressionExecutionIR:
     physical_read_set: tuple[PhysicalRef, ...]
     join_plan: JoinPlan
     pit: PitSpec                       # THIS expression's event time, availability basis, window
-    input_snapshots: tuple[PhysicalInputSnapshot, ...]
+    input_requirements: tuple[PhysicalInputRequirement, ...]   # STATIC; run-time snapshots are NOT here
     aggregation: AggregateFunction
     filter_tree: Mapping[str, Any] | None
 ```
@@ -191,8 +191,11 @@ class PhysicalInputRequirement:
     schema: str
     table: str
     partition_columns: tuple[tuple[str, str], ...] | None   # ordered (column, type); None = verified unpartitioned
-    partition_mapping: PartitionMapping | None              # HOW a business_dt maps to partitions
+    partition_mapping: PartitionMappingV1 | None            # DECLARED (§3.4); never inferred
+    layout_fingerprint: str          # SEMANTIC: partition columns+types, physical types, mapping
     catalog_state_stamp: tuple[tuple[str, str], ...]
+    # NOTE: `captured_at`, refresh time and any other OBSERVATION provenance are deliberately
+    # absent — re-capturing identical metadata must not change ir_hash.
 
 # RUN PREPARATION — business_dt + live metastore; NEVER in ir_hash
 @dataclass(frozen=True, slots=True)
@@ -206,13 +209,30 @@ class PhysicalInputSnapshot:
     resolved_at_business_dt: str
 ```
 
+**Snapshots resolve PER EXPRESSION.** A group holds a 30-day feature, two 90-day features, and a ratio whose two expressions may read different tables with different windows and different availability bases. A single `window` argument cannot describe those reads. Run preparation therefore takes one `RunInputRequest(feature_name, expr_path, physical_requirement, pit_spec)` per expression and returns snapshots keyed by `(feature_name, expr_path, requirement_id)`. Identical resolved reads may be de-duplicated **after** their semantics are compared, never before.
+
 ```
 generation:  formula → IR (PhysicalInputRequirement)      → ir_hash, CompilationIdentity
-run prep:    business_dt + ClusterInventoryV1 + metastore  → PhysicalInputSnapshot
+run prep:    business_dt + ClusterInventoryV1 + metastore  → PhysicalInputSnapshot (per expression)
                                                            → sandbox_execution_hash
                                                            → L1 partition validation
                                                            → execution
 ```
+
+### §3.4 `PartitionMappingV1` is declared, never inferred
+
+A partition column named `load_dt` does **not** tell you how a 90-day *event-time* window maps to *load* partitions — late-arriving transactions live in load partitions outside the event range, so an inferred mapping silently drops data. The mapping is therefore **declared** in the environment inventory (§0) with closed variants:
+
+```python
+class PartitionMappingKind(StrEnum):
+    EVENT_TIME_PARTITION = "event_time_partition"      # (time_ref, partition_column, transform, timezone)
+    AVAILABILITY_PARTITION = "availability_partition"  # (time_ref, partition_column, transform, timezone)
+    STATIC_SNAPSHOT = "static_snapshot"                # (partition_values)
+    FULL_SCAN = "full_scan"
+    VERIFIED_UNPARTITIONED = "verified_unpartitioned"
+```
+
+A table with no declared mapping refuses with `PARTITION_MAPPING_NOT_DECLARED`. **"A 90-day window resolves 90 partitions" is only true for an explicitly declared one-day `EVENT_TIME_PARTITION` mapping** — it is never a general rule, and an `AVAILABILITY_PARTITION` mapping must extend the partition set beyond the event window to catch late arrivals.
 
 **Plural** — a 90-day feature reads many partitions. `partition_columns is None` means **verified unpartitioned**, never "unknown"; unknown refuses with `PARTITION_IDENTITY_UNKNOWN`. `input_snapshot_ids` (a run-time value, inside `sandbox_execution_hash` only) is the exact ordered partition set read. L1 runs at **run preparation**, after snapshots resolve, and verifies every one exists.
 
@@ -273,7 +293,10 @@ class SnapshotPolicyKind(StrEnum):
     PARTITION_MAPPED = "partition_mapped"
     ACTIVE_POPULATION = "active_population"
 
-CurrentSnapshot()                       # the table IS the current population; no history
+CurrentSnapshot(observed_snapshot_ref)  # the table IS the current population; no history.
+                                        # REQUIRES an observed snapshot date/version — a present-day
+                                        # table cannot honestly answer an arbitrary HISTORICAL
+                                        # business_dt, so a mismatch refuses rather than pretending.
 LatestAvailableAsOf(effective_time_ref, availability_ref,
                     deterministic_tie_break_refs)   # SCD-style history
 PartitionMappedSnapshot(ordered_partition_mapping)  # business_dt → partition values
@@ -319,7 +342,7 @@ This slice publishes exactly one group: more than one distinct contract hash ret
 - **Unknown restriction labels fail closed to `prohibited`** (`safety_floor` behaviour) and are never returned verbatim.
 - **Missing classification has an explicit policy** stated in `CLASSIFICATION_POLICY_VERSION`, not an implicit default.
 - **A `prohibited` input refuses materialization** (`PROHIBITED_INPUT`). It does not produce a "prohibited feature group".
-- `retention_class` comes from an explicit platform retention **policy version** — no governed per-column retention exists.
+- `retention_class` comes from an explicit platform retention policy: **`RETENTION_POLICY_VERSION`** and **`DEFAULT_RETENTION_CLASS`** are declared constants (no governed per-column retention exists), and both enter the contract identity — otherwise the implementation must invent a retention model.
 
 ### §5.3 PIT semantics exclude the calculation window
 
@@ -436,16 +459,25 @@ Without the generation/run/date binding, a reused staging path could leave an ol
 
 The contract hash is the group key, but `sandbox_feature.cif_daily` is a human name. Nothing yet stops a *different* contract — changed cutoff semantics, spine declaration, sensitivity, retention or cadence — from overwriting the same physical table, silently replacing one materialization contract with a semantically different one under an unchanged name.
 
+An append-only row cannot hold a field that moves, so the binding is **two records**:
+
 ```python
 @dataclass(frozen=True, slots=True)
-class GroupBindingV1:
-    logical_group_name: str                # "cif_daily"
-    materialization_contract_hash: str     # bound ONCE
-    physical_target: str                   # "sandbox_feature.cif_daily"
-    current_group_plan_hash: str           # moves when features are added
+class GroupContractBinding:          # written ONCE per logical name
+    binding_id: str
+    logical_group_name: str          # "cif_daily"
+    materialization_contract_hash: str
+    physical_target: str             # "sandbox_feature.cif_daily"
+
+@dataclass(frozen=True, slots=True)
+class GroupPlanRevision:             # appended whenever the packing list changes
+    binding_id: str
+    group_plan_hash: str
+    generation_id: str
+    created_at: str
 ```
 
-Persisted in an immutable registry. Publication refuses with `GROUP_BINDING_CONFLICT` when the contract hash for a logical name differs from its binding. **Adding a feature changes `current_group_plan_hash` and keeps the binding**; changing the contract requires a new logical name or an explicit rebinding decision.
+Both tables are append-only (UPDATE/DELETE/TRUNCATE all blocked). **"Current plan" is derived** as the latest revision that published successfully — never stored as a mutable field. Publication refuses with `GROUP_BINDING_CONFLICT` when a logical name's contract hash differs from its binding; adding a feature appends a `GroupPlanRevision` and keeps the binding.
 
 ### §10.2 Published generation metadata lives in the data
 
@@ -454,6 +486,10 @@ The atomicity probe depends on a generation marker being visible in **the same a
 ```
 __generation_id · __generated_project_hash · __sandbox_execution_hash
 ```
+
+**They are added exactly once, after assembly — never in per-feature staging.** Per-feature staging carries only `(keys…, business_dt, <one feature column>)`; if every staging output carried the system columns, assembly would produce duplicate or conflicting copies. Order: stage per feature → assemble onto the spine → **add the three system columns once** → validate.
+
+Two of the three cannot be literals in the rendered source: `__generated_project_hash` would be self-referential (§7), so the assembled node **reads it from `GENERATED.lock` at runtime**; `__sandbox_execution_hash` is a run-time value and arrives via **prepared run parameters** (§11.1).
 
 They are part of `expected_schema(plan)` and therefore part of the §9 schema gate. A pointer/view switch then moves data and identity together by construction. Spec C omits them from model inputs.
 
@@ -508,10 +544,23 @@ PublisherSelection(environment_id, mechanism, capability_attestation_id, engine_
 
 ---
 
-## §11 Validation loop
+## §11 Run execution and the validation loop
+
+### §11.1 Prepared parameters are what execution reads
+
+Resolving and validating exact partitions is worthless if the generated project then reads whatever it likes. Run preparation produces `RunPreparation.parameters`, and **submission passes them to execution**:
+
+```python
+prep = prepare_run(result, business_dt=…, inventory=…, metastore=…)
+submit_and_run(project, run_parameters=prep.parameters)     # NOT business_dt alone
+```
+
+The generated project **must**: apply exactly the prepared partition predicates; **refuse to run** if a snapshot parameter is missing or unexpected (`RUN_PARAMETERS_MISSING`); write the same snapshot ids, `run_id` and `sandbox_execution_hash` into its manifests; and **never re-resolve partitions itself** during execution. An execution test proves Spark read precisely the prepared partitions and nothing else.
+
+### §11.2 Validation loop
 
 **L0** — materialize to a temp directory, install into an isolated environment, **import the project and build the Kedro pipeline object**, and verify `generated_project_hash` against `GENERATED.lock`. Parsing source text does not prove what L0 claims.
-**L1** — metastore metadata only, over **every feature IR, every expression, and the spine**: each read-set column exists with the declared type, is readable under the caller's roles, and **every resolved partition in `input_snapshots` exists**.
+**L1** — metastore metadata only, over **every feature IR, every expression, and the spine**: each read-set column exists with the declared type, is readable under the caller's roles, and **every resolved partition in the run's `PhysicalInputSnapshot`s exists** (L1 runs at run preparation, after snapshots resolve).
 **L2 (on demand)** — tiny-sample execution: Spark analysis errors, the §9 gates.
 **L3** — the real run.
 
@@ -588,13 +637,17 @@ class ValidationGateCode(StrEnum):              # BLOCKING gates in the generate
     MISSING_STAGING_MANIFEST · STALE_STAGING_MANIFEST · DUPLICATE_STAGING_MANIFEST
     IR_HASH_MISMATCH · INCOMPLETE_COMPUTATION · FORBIDDEN_NUMERIC
     OVERFLOW_VIOLATION · SPINE_INCOMPLETE · SPINE_DUPLICATE_KEY
-    PROJECT_INTEGRITY · GROUP_BINDING_CONFLICT · CAPABILITY_UNPROVEN
+    SPINE_NON_DETERMINISTIC · RUN_PARAMETERS_MISSING · PROJECT_INTEGRITY
 
 class ValidationFindingCode(StrEnum):           # L0/L1/L2 findings (§11), non-blocking by themselves
     PROJECT_DOES_NOT_BUILD · PROJECT_HASH_MISMATCH · PIPELINE_NOT_CONSTRUCTIBLE
     COLUMN_ABSENT · COLUMN_TYPE_MISMATCH · PARTITION_ABSENT · READ_DENIED
     UNKNOWN_FINDING                              # → FindingClass.UNCLASSIFIED, fails closed
 ```
+
+`SPINE_NON_DETERMINISTIC` is a **runtime** gate — an unresolved tie depends on actual rows, so it is discovered during execution, not compilation. `CAPABILITY_UNPROVEN` and `GROUP_BINDING_CONFLICT` are publication decisions and live in `PublicationRefusalCode`; a refusal must never fall back to comparing a raw string because its code is missing from the enum it is typed to.
+
+**Enum tests use `==`, never `>=`.** A superset assertion permits arbitrary extra codes and therefore does not test a closed vocabulary at all.
 
 **Normalize-then-refuse.** Classification normalizes an unknown `effective_restriction` to `prohibited` **internally** (per `safety_floor`) and then refuses with `PROHIBITED_INPUT`. Rev 3 asserted both that unknown *returns* `prohibited` and that `prohibited` *raises* — which cannot both hold through one public API. Internal normalization, single public refusal.
 
