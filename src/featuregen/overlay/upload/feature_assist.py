@@ -699,18 +699,8 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                                f"mixed units {sorted(units)}; aggregation would be silently wrong")
     if len(currencies) > 1:
         return None, Rejection(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
-    if len(pairs) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
-        for src, d in pairs:
-            if not meta[d]["unit"]:
-                requirements.append(build_requirement(
-                    code="UNIT_CONSISTENT", operand=(src, d),
-                    detail="unit unknown across a combining op", params=None))
-            if not meta[d]["currency"]:
-                # currency is UNKNOWN here (that is the mint condition), so no bound currency_ref is
-                # available — pass none; currency_ref is OPTIONAL in the registry (C2C3-T1 tweak).
-                requirements.append(build_requirement(
-                    code="CURRENCY_CONSISTENT", operand=(src, d),
-                    detail="currency unknown across a combining op", params={}))
+    # (the "unit unknown" NEEDS-CHECK is minted further down, after the temporal + grain
+    #  dispositions resolve which operands are the GROUP BY key and the window boundary)
 
     # ── disposition: temporal — a windowed feature needs a governed-VERIFIED as-of column; a table
     #    with NO as-of column at all is still a hard reject (future-leakage risk) ──
@@ -742,6 +732,43 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                 requirements.append(build_requirement(
                     code="GRAIN_IS_UNIQUE", operand=(gcat, gref),
                     detail="grain declared, not governed-verified", params=None))
+
+    # ── disposition: unit / currency NEEDS-CHECK — asked only where units can actually MIX.
+    #    Placed HERE (not beside the hard rejects above) because it is defined in terms of the
+    #    operands the two dispositions above just resolved.
+    #
+    #    `pairs` is every BOUND operand, the GROUP BY key and the window boundary included, so the
+    #    old `len(pairs) >= 2` gate read `AVG(txn_amt) BY cif_id OVER 30d [as_of_dt]` — three pairs,
+    #    ONE measure — as a "combining op" and asked for the unit of a customer id and a date.
+    #    Measured on the real FTR sample: 21 of 28 UNIT_CONSISTENT named cif_id / as_of_dt / txn_ts /
+    #    setl_stat, questions no one can ever answer, and nothing could reach DESIGN_CHECKED.
+    #
+    #    TWO STRUCTURAL corrections, never a concept- or role-based one (that would rest a safety
+    #    gate on an AI-PROPOSED concept, and one wrong concept would wave a real dollars-vs-fils
+    #    mismatch through):
+    #      1. `grain_operand` / `time_operand` are excluded. They are the feature's own key and its
+    #         point-in-time anchor — the very pair `_recipe_parts` already subtracts to render the
+    #         measures — never summed, averaged or divided into the result.
+    #      2. The gate counts MEASURES. With a single measure there is nothing to mix: the result
+    #         INHERITS that column's unit and cannot be corrupted, which is the only harm this check
+    #         prevents (its name is *consistency* — that needs two things).
+    #    The MIXED_UNITS / MIXED_CURRENCY hard rejects above are untouched and still read EVERY
+    #    derive, grain and as-of included: a positive contradiction still rejects outright. Only the
+    #    unanswerable "unit unknown" question is narrowed. ──
+    structural = {op for op in (grain_operand, time_operand) if op is not None}
+    measures = [p for p in pairs if p not in structural]
+    if len(measures) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
+        for src, d in measures:
+            if not meta[d]["unit"]:
+                requirements.append(build_requirement(
+                    code="UNIT_CONSISTENT", operand=(src, d),
+                    detail="unit unknown across a combining op", params=None))
+            if not meta[d]["currency"]:
+                # currency is UNKNOWN here (that is the mint condition), so no bound currency_ref is
+                # available — pass none; currency_ref is OPTIONAL in the registry (C2C3-T1 tweak).
+                requirements.append(build_requirement(
+                    code="CURRENCY_CONSISTENT", operand=(src, d),
+                    detail="currency unknown across a combining op", params={}))
 
     # ── disposition: cross-table join authority (spec §7). A measure in a different table than the
     #    grain needs a real path; UNVERIFIED -> JOIN_CONNECTIVITY, no-path / read-scope-denied -> reject ──

@@ -4,15 +4,23 @@ MEASURED on the real FTR path (see the per-test docstrings for the assertions th
 
     BEFORE   1 candidate  {NEEDS_EXTERNAL_VALIDATION: 1, DESIGN_CHECKED: 0}
              rejections   {NO_POINT_IN_TIME: 9, NON_NUMERIC: 3}
-    AFTER   10 candidates {NEEDS_EXTERNAL_VALIDATION: 10, DESIGN_CHECKED: 0}
+    AFTER   10 candidates {NEEDS_EXTERNAL_VALIDATION: 5, DESIGN_CHECKED: 5}
              rejections   {NON_NUMERIC: 3}
+             requirements {UNIT_CONSISTENT: 11, CURRENCY_CONSISTENT: 11}
 
 So the confirm does REAL work — it retires all nine ``NO_POINT_IN_TIME`` future-leakage rejections
-and no candidate afterwards carries ``GRAIN_IS_UNIQUE`` or ``TEMPORAL_IS_POPULATED`` — but the
-DESIGN_CHECKED lift is **ZERO**, because ``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT`` fire on every
-bound operand of a combining op (21 of the 28 name ``cif_id`` / ``as_of_dt`` / ``txn_ts`` /
-``setl_stat``, which can never carry a unit) and the FTR glossary format has no unit/currency column
-at all.
+and no candidate afterwards carries ``GRAIN_IS_UNIQUE`` or ``TEMPORAL_IS_POPULATED``.
+
+**Re-recorded after E4a Task 1.** The DESIGN_CHECKED lift used to be **ZERO** because
+``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT`` fired on every bound operand of a combining op —
+28 of each, 21 of them naming ``cif_id`` / ``as_of_dt`` / ``txn_ts`` / ``setl_stat``, and the FTR
+glossary format has no unit/currency column at all, so those questions could never be answered.
+``_validate_idea`` now asks only where units can actually MIX (two or more MEASURE operands, with
+the GROUP BY key and the point-in-time anchor excluded — a structural narrowing, never a
+concept- or role-based one). Result: **28/28 -> 11/11** unit/currency questions, ``cif_id`` and
+``as_of_dt`` gone from the operand list entirely, and **5 of the 10 candidates now reach
+DESIGN_CHECKED**. The MIXED_UNITS / MIXED_CURRENCY hard rejects are untouched and still read every
+derive, so a positive contradiction still rejects outright.
 
 This is the permanent regression guard for the whole E4 thesis, and it is deliberately end-to-end:
 the catalog is built through the REAL FTR path (``read_ftr_glossary`` -> ``to_glossary_upload`` ->
@@ -265,28 +273,35 @@ def test_the_confirm_clears_the_gating_checks_and_mints_no_new_requirement(overl
     assert not (after_codes - before_codes), f"the confirm minted new requirements: {after_codes}"
 
 
-def test_the_design_checked_lift_is_zero_because_unit_currency_fires_on_every_operand(
-        overlay_conn, ai_proposed_catalog):
-    """THE HONEST HEADLINE: confirming the AI's grain/as-of moves **zero** features to
-    DESIGN_CHECKED, and the blocker is NOT the E4a chain.
+def test_the_design_checked_lift_after_the_unit_narrowing(overlay_conn, ai_proposed_catalog):
+    """THE HONEST HEADLINE, re-recorded after E4a Task 1.
 
-    Every surviving candidate is stopped by ``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT``, which
-    ``_validate_idea`` mints for EVERY bound operand of a combining op — the grain key, the as-of
-    date and a status string included (measured: 21 of the 28 unit requirements name ``cif_id``,
-    ``as_of_dt``, ``txn_ts`` or ``setl_stat``; only 7 name an actual measure). A real FTR glossary
-    export carries no unit or currency column AT ALL, so those values are always NULL on this path.
+    It used to be zero: ``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT`` were minted for EVERY bound
+    operand of a combining op — the grain key, the as-of date and a status string included (28 of
+    each, 21 of them naming ``cif_id`` / ``as_of_dt`` / ``txn_ts`` / ``setl_stat``) — and a real FTR
+    glossary export carries no unit or currency column AT ALL, so no one could ever answer them.
 
-    Consequence for the programme: E4b as scoped (govern ``unit``/``currency``) would still lift
-    this number to zero, because no one can attest a "unit" for a customer id or a date. This test
-    pins that reality; when the operand selection or the unit gate changes, it MUST fail and be
-    re-measured rather than quietly passing."""
+    ``_validate_idea`` now asks only where units can MIX. **5 of the 10 candidates reach
+    DESIGN_CHECKED** and the questions drop **28/28 -> 11/11**. The survivors are genuine
+    multi-measure combinations (``txn_ts`` / ``acct_id`` / ``txn_amt`` / ``cust_hold`` /
+    ``setl_stat``) whose unit really is unknown — which is Task 2/3's job, not Task 1's.
+
+    This is a regression guard in BOTH directions: a change that re-widens the check (the numbers
+    climb, DESIGN_CHECKED falls) and a change that narrows it further (the grain/as-of exclusion
+    growing into a concept- or role-based one) must both fail here and be re-measured."""
     _confirm_ai_table_facts(overlay_conn,
                             mint_test_identity(subject="user:e4a-admin",
                                                role_claims=("platform-admin",)))
     counts = _status_counts(overlay_conn)
-    assert counts["DESIGN_CHECKED"] == 0
+    assert counts["DESIGN_CHECKED"] == 5, f"re-measure the E4a headline: {dict(counts)}"
+    assert counts["NEEDS_EXTERNAL_VALIDATION"] == 5, f"re-measure: {dict(counts)}"
+    # the only thing still holding a candidate back is an honestly-unknown MEASURE unit
     assert set(_requirement_codes(overlay_conn)) == {"UNIT_CONSISTENT", "CURRENCY_CONSISTENT"}
-    # the unit/currency checks name NON-MEASURE operands — the precise reason the lift is zero
-    non_measures = {op for op in _requirement_operands(overlay_conn)
-                    if op.rsplit("@", 1)[-1] in ("cif_id", "as_of_dt", "txn_ts", "setl_stat")}
-    assert non_measures, "unit/currency no longer fires on non-measure operands — re-measure E4a"
+    assert dict(_requirement_codes(overlay_conn)) == {"UNIT_CONSISTENT": 11,
+                                                      "CURRENCY_CONSISTENT": 11}
+    # ...and NOT ONE of them names the table's GROUP BY key or its point-in-time anchor. Those are
+    # the questions no human could answer; asking them was the whole reason the lift was zero.
+    structural = {op for op in _requirement_operands(overlay_conn)
+                  if op.rsplit("@", 1)[-1] in ("cif_id", "as_of_dt")}
+    assert not structural, (
+        f"the grain key / as-of anchor is being asked for a unit again: {sorted(structural)}")

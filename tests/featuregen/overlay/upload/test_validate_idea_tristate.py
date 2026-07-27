@@ -443,6 +443,103 @@ def test_single_measure_absent_unit_adds_no_requirement(db):
     assert all(r.code not in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT") for r in idea.requirements)
 
 
+# ── E4a Task 1: the unit/currency needs-check asks only where units can actually MIX ──────────────
+# `pairs` carries EVERY bound operand — the GROUP BY key and the window boundary included — so the
+# old `len(pairs) >= 2` gate read `AVG(txn_amt) BY cif_id OVER 30d [as_of_dt]` as a "combining op"
+# and asked for the unit of a customer id and a date. Measured on the real FTR sample: 21 of 28
+# UNIT_CONSISTENT named cif_id / as_of_dt / txn_ts / setl_stat, and nothing could ever reach
+# DESIGN_CHECKED. The narrowing below is STRUCTURAL (measure count; grain/time exclusion) — never
+# by concept or analytical role, which would rest a safety gate on an AI-proposed guess.
+_E4A = "e4a_unit_ftr"
+_CIF, _ASOF = "public.fin_tran.cif_id", "public.fin_tran.as_of_dt"
+_TXN, _BAL = "public.fin_tran.txn_amt", "public.fin_tran.bal_amt"
+
+
+def _e4a_catalog(db, *, txn_unit="", txn_ccy="", bal_unit="", bal_ccy="", asof_unit=""):
+    """A catalog shaped like the real FTR sample: a grain key, a point-in-time anchor and two
+    monetary measures. The grain / as-of columns are BOUND OPERANDS of every windowed template
+    candidate, which is exactly why they used to be asked for a unit."""
+    build_graph(db, _E4A, [
+        CanonicalRow(_E4A, "fin_tran", "cif_id", "varchar", is_grain=True),
+        CanonicalRow(_E4A, "fin_tran", "as_of_dt", "date", as_of=True, unit=asof_unit),
+        CanonicalRow(_E4A, "fin_tran", "txn_amt", "numeric", unit=txn_unit, currency=txn_ccy),
+        CanonicalRow(_E4A, "fin_tran", "bal_amt", "numeric", unit=bal_unit, currency=bal_ccy)])
+    _fresh(db, _E4A)
+
+
+def _e4a_idea(db, refs, aggregation):
+    known, src_of = _kv(refs, _E4A)
+    raw = {"name": "f", "derives_from": list(refs), "aggregation": aggregation,
+           "grain_table": "fin_tran"}
+    return _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+
+
+def _unit_asks(idea) -> set[tuple[str, str]]:
+    """(code, column ref) for every unit/currency needs-check the gauntlet minted."""
+    return {(r.code, r.operand[1]) for r in idea.requirements
+            if r.code in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT")}
+
+
+def test_single_measure_windowed_feature_asks_for_no_unit_at_all(db):
+    """(a) `AVG(txn_amt) BY cif_id OVER 30d [as_of_dt]` binds THREE operands but combines NOTHING:
+    the result inherits txn_amt's unit and cannot be corrupted. One measure -> no question."""
+    _e4a_catalog(db)
+    idea, rej = _e4a_idea(db, [_TXN, _CIF, _ASOF], "avg_30d")
+    assert rej is None
+    assert idea.grain_ref == (_E4A, _CIF) and idea.time_ref == (_E4A, _ASOF)
+    assert _unit_asks(idea) == set()
+
+
+def test_two_measures_still_demand_the_unit_of_the_undeclared_measure_ANTI_SILENT_CLEAR(db):
+    """(b) THE ANTI-SILENT-CLEAR GUARD — this test must FAIL if anyone ever widens the exclusion.
+
+    A genuine two-measure op (`txn_amt / bal_amt`) where a MEASURE's unit and currency are unknown
+    still mints UNIT_CONSISTENT and CURRENCY_CONSISTENT for that measure. The narrowing removed the
+    meaningless questions; it must never remove this one, which is the whole point of the check."""
+    _e4a_catalog(db, txn_unit="dollars", txn_ccy="AED")   # bal_amt declares NOTHING
+    idea, rej = _e4a_idea(db, [_TXN, _BAL, _CIF, _ASOF], "ratio_30d")
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert ("UNIT_CONSISTENT", _BAL) in _unit_asks(idea)
+    assert ("CURRENCY_CONSISTENT", _BAL) in _unit_asks(idea)
+
+
+def test_the_grain_key_and_the_time_anchor_are_never_asked_for_a_unit(db):
+    """(c) With TWO undeclared measures the check fires on both — and on ONLY those two. The
+    GROUP BY key and the window boundary are never summed, averaged or divided, so an unknown unit
+    on them cannot make the aggregation wrong."""
+    _e4a_catalog(db)
+    idea, rej = _e4a_idea(db, [_TXN, _BAL, _CIF, _ASOF], "ratio_30d")
+    assert rej is None
+    assert _unit_asks(idea) == {("UNIT_CONSISTENT", _TXN), ("UNIT_CONSISTENT", _BAL),
+                                ("CURRENCY_CONSISTENT", _TXN), ("CURRENCY_CONSISTENT", _BAL)}
+    assert idea.grain_ref == (_E4A, _CIF) and idea.time_ref == (_E4A, _ASOF)
+
+
+def test_mixed_units_across_two_measures_still_hard_rejects_with_grain_and_asof_bound(db):
+    """(d) The hard reject is untouched: a POSITIVE contradiction between two measures still
+    rejects outright, grain/as-of operands bound alongside."""
+    _e4a_catalog(db, txn_unit="dollars", bal_unit="fils")
+    idea, rej = _e4a_idea(db, [_TXN, _BAL, _CIF, _ASOF], "ratio_30d")
+    assert idea is None and rej.code == RejectCode.MIXED_UNITS
+
+
+def test_mixed_currency_across_two_measures_still_hard_rejects_with_grain_and_asof_bound(db):
+    _e4a_catalog(db, txn_ccy="AED", bal_ccy="USD")
+    idea, rej = _e4a_idea(db, [_TXN, _BAL, _CIF, _ASOF], "ratio_30d")
+    assert idea is None and rej.code == RejectCode.MIXED_CURRENCY
+
+
+def test_a_declared_unit_on_the_time_anchor_still_hard_rejects_a_contradiction(db):
+    """The exclusion narrows ONLY the unanswerable "unit unknown" QUESTION. A positive
+    contradiction is still read across EVERY bound operand — the grain key and the time anchor
+    included — so a feature that really does arithmetic against the as-of column (a date
+    difference) still hard-rejects on a declared unit mismatch."""
+    _e4a_catalog(db, asof_unit="days", txn_unit="dollars")
+    idea, rej = _e4a_idea(db, [_TXN, _CIF, _ASOF], "avg_30d")
+    assert idea is None and rej.code == RejectCode.MIXED_UNITS
+
+
 def _two_table(db, *, fact_key=None, status=None, acct_sensitivity=None):
     db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
                "data_type) VALUES ('bank', 'public.transactions.amount', 'column', 'transactions', "
