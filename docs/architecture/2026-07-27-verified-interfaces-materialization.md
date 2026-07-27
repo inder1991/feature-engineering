@@ -843,3 +843,74 @@ column.
 second check here.** `resolve_physical_type` calls it first and every return depends on the
 nullability it feeds, so the gate is structural rather than positional. (An earlier draft duplicated
 the check locally; mutation testing showed the duplicate was unobservable.)
+
+---
+
+## 25. What Task 9 established
+
+**The two axes are real, and both branches of §2 were verified against the shipped code rather than
+remembered.**
+
+| Question | Column | Read through | Verified |
+|---|---|---|---|
+| `sensitivity_class` | `graph_node.effective_restriction` | `safety_floor.apply_sensitivity_floor` | `safety_floor.py:78-90` — `_rank`/`_normalize` map any label outside `SENSITIVITY_ORDER` to `prohibited`, so an unrankable value can never sort below the floor and is never returned verbatim |
+| `access_requirements` | `graph_node.sensitivity` | `read_scope.SENSITIVITY_ROLES` | `read_scope.py:13` — `{pii: pii_reader, restricted: restricted_reader}` |
+
+**`restricted` is a legal value of BOTH columns**, and that overlap is what makes a conflation hard
+to see: a resolver reading the TAG column for the class returns a legal-looking `restricted` where
+the truth is `public`. `test_the_word_restricted_lives_in_BOTH_vocabularies_and_means_different_things`
+is the discriminator, and independence is proved by a 2×2 that moves each axis with the other held
+fixed rather than by one fixture where both happen to agree.
+
+**The unknown-label path is REACHABLE, checked rather than assumed.** Migration `0993` constrains
+`graph_node.sensitivity` to exactly `('pii','restricted')` (a test now demonstrates the
+`CheckViolation`), but it puts **no** constraint on `effective_restriction` — nothing in the schema
+stops an unrankable label reaching that column, so normalize-then-refuse is a live path.
+`field_resolution._resolve_sensitivity` writes it already normalized, so the guard defends against
+every OTHER writer, not against that one.
+
+**`CLASSIFICATION_POLICY_VERSION = 1` states the missing-classification policy: an unclassified
+element is `internal`.** A column with no `effective_restriction` (NULL, blank, or no `graph_node`
+row at all) is not proven `public` — nobody attested it — and is not `prohibited` either, because
+"nobody classified this" and "a governed decision forbids this" route an operator to two different
+people. `Classification.unclassified_refs` carries which elements fell to the policy so the
+assumption is visible; it is deliberately NOT identity-bearing, since a column later classified at
+the value the policy already assumed describes the same artifact.
+
+**A contract is derived per feature over `physical_read_set((ir,), ir.spine)`** — the §1.3 union,
+now exposed from `ir.py` rather than re-walked, so the classification cannot see a narrower read set
+than Gate 2 authorized. `authorize_compilation` and `physical_read_set` share one `_sorted_refs`
+derivation. The spine and any join endpoint can therefore decide a feature's class.
+
+**§5.5's hash, as built:** `entity`, `ordered_keys`, `pit_semantics`, `sensitivity_class`,
+`access_requirements`, `retention_class`, `retention_policy_version`, `availability_class`,
+`cadence`, `publication_policy`, `backfill_boundary`, `spine` (its `identity_payload()` only), and
+all three policy versions — asserted as a key-set EQUALITY, never a superset. The landing keys are
+the **spine's** `ordered_key_refs`, not the formula's grain keys: the published row is one per
+population key per `business_dt`, and a feature's grain columns may be another table's spelling of
+the same entity (`compile_ir` already refuses a different entity).
+
+**Three exclusions that are decisions, not omissions.** The **calculation window** (§5.3 — a 30d and
+a 90d feature share a group). The **resolved physical type** — only `PHYSICAL_TYPE_POLICY_VERSION`
+is in the contract; a contract carrying `DECIMAL(38,6)` would give a `BIGINT` count and a `DECIMAL`
+sum different contracts, and the "one group" of this slice could never contain both. The
+**availability LAG** — the basis (`posted_at` / `ingested_at` / `event_time_plus_lag`) IS part of the
+landing semantics because it changes what "known by the cutoff" means, but the lag's magnitude only
+changes which rows qualify, which is an expression-IR fact already hashed there.
+
+**Where §14 has no code, this task raised rather than borrowed one.** §14's closed vocabulary has no
+member for a malformed *declaration*, so an unknown cadence trigger/period, a non-IANA timezone, a
+cutoff that is not a wall-clock time (or that carries its own UTC offset), an override naming an
+unrankable class, and an override that LOOSENS the derived classification all raise `ValueError` at
+the declaration boundary — the line `authorize_compilation` already draws for a call assembled
+wrongly. The one governed verdict is `PROHIBITED_INPUT`, returned whether the top rank came from the
+catalog or from a declared override.
+
+**Cadence and the landing semantics deliberately carry the same cutoff twice** (as the schedule and
+as the key's meaning). Both are copied from one `CadenceDecl`, so they cannot disagree; each is
+pinned by its own key-set test, because mutation testing showed that dropping either one alone left
+the contract hash unchanged.
+
+**`AvailabilityClass` is invented here** (`same_day` / `next_day` / `best_effort`): §5.4 requires it
+declared and names no vocabulary, and deriving one needs the deferred source-delivery SLA. Recorded
+as a spec gap rather than presented as governed.

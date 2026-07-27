@@ -567,9 +567,9 @@ Spec §5.
 
 **Files:** Create `src/featuregen/materialize/{classify,contract}.py`; Test `test_classify.py`, `test_contract.py`
 
-**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`.
+**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`. **Plus**, because §5.1 is only enforceable if the group has ONE entry point and the read set has ONE derivation: `UNCLASSIFIED_RESTRICTION` (the stated missing-classification policy), `CadencePeriod` / `CadenceTrigger` / `PublicationPolicy` / `BackfillBoundary`, `LandingPitSemantics`, `ContractGroup`, `derive_group_contract(conn, authorization, …)` (takes Gate 2's TOKEN), and `ir.physical_read_set(irs, spine)` — §1.3's union exposed for ONE feature instead of being re-walked in the classification stage.
 
-- [ ] **Step 1: Failing classification tests**
+- [x] **Step 1: Failing classification tests**
 
 ```python
 def test_sensitivity_class_comes_from_effective_restriction(db, confidential_catalog, refs):
@@ -595,8 +595,40 @@ def test_a_join_key_or_the_spine_can_be_the_most_restrictive(db, restricted_join
     assert classify_read_set(db, refs).sensitivity_class == "restricted"
 ```
 
-- [ ] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes **all three** policy versions (classification, physical-type, retention) **and the spine's `identity_payload()` only — never its provenance** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
-- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
+- [x] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes **all three** policy versions (classification, physical-type, retention) **and the spine's `identity_payload()` only — never its provenance** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
+- [x] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
+
+**Established (interfaces reference §25), beyond the sketch above:** `restricted` is a legal value of **both** sensitivity columns, so independence is proved by a **2×2** (each axis moved with the other held fixed) rather than by one fixture where they agree · migration `0993` constrains the TAG column to exactly `SENSITIVITY_ROLES`' keys but leaves `effective_restriction` **unconstrained**, so normalize-then-refuse is a reachable path (demonstrated, not assumed) · the missing-classification policy is stated as `internal` — not `public` (a claim nobody attested) and not `prohibited` (which would collapse "unclassified" into "forbidden") · the landing keys are the **spine's**, not the formula's grain keys · the resolved physical TYPE is excluded from the contract, or a `BIGINT` count and a `DECIMAL` sum could never share a group · a malformed **declaration** (bad trigger/period/timezone/cutoff, a loosening override) raises `ValueError` because §14 has no member for it, while `PROHIBITED_INPUT` is the one governed verdict. Gaps recorded in `DEFERRED-WORK.md` A.10 — the load-bearing one is that **`AvailabilityClass`'s vocabulary is invented here**, since §5.4 requires it declared and names none, and it enters the contract hash.
+
+---
+
+### Task 9.1: Adopt `AvailabilityPromiseV1` (BEFORE Task 10 freezes group identity)
+
+Spec §5.6. Architect ruling, 2026-07-27. Replaces the invented `AvailabilityClass` enum, which entered the contract hash and so made an arbitrary member list load-bearing.
+
+**Files:** Modify `src/featuregen/materialize/contract.py`; Test `test_contract.py`
+
+**Produces:** `AvailabilityPromiseKind` (`CALENDAR_OFFSET` in v1); `AvailabilityPromiseV1(kind, calendar_days, plus_minutes)`; a normalizing constructor; `availability_class` renamed **`availability_promise`** throughout.
+
+- [ ] **Step 1: Failing tests** — the ruling fixes these seven:
+
+```python
+def test_t3_plus_2h_hashes_differently_from_t3(): ...
+def test_semantically_equivalent_inputs_have_ONE_canonical_form(): ...
+    # days=0, plus_minutes=1560 is REJECTED at construction; the normalizing
+    # constructor yields days=1, plus_minutes=120 — and that hashes identically to
+    # a directly-constructed (1, 120).
+def test_a_later_override_succeeds(): ...
+def test_an_earlier_override_is_a_CALLER_ERROR(): ...        # ValueError, not a governed code
+def test_negative_or_noncanonical_declarations_fail_construction(): ...
+def test_promise_identity_contains_no_live_arrival_observation(): ...
+def test_differing_cadence_timezone_or_cutoff_makes_promises_INCOMPARABLE(): ...
+    # not "greater" or "lesser" — incomparable, so the override is refused
+```
+
+Plus: **`kind` is present in the canonical payload in v1** — assert it, because the whole forward-compatibility property depends on it. Without it, adding a second kind later re-keys every existing contract.
+
+- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): AvailabilityPromiseV1 replaces the invented class enum`
 
 ---
 

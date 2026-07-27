@@ -204,9 +204,14 @@ def _tag(db, table, column, sensitivity):
         (sensitivity, _SRC, f"public.{table}.{column}"))
 
 
-@pytest.fixture
-def catalog(db):
-    """`transactions` (the fact table), the two-hop path to `customers`, and the spine's facts."""
+def seed_catalog(db):
+    """`transactions` (the fact table), the two-hop path to `customers`, and the spine's facts.
+
+    A module-level function rather than only a fixture body so a later task's tests can seed THE
+    SAME governed catalog (Task 9's contracts classify the read set this catalog defines). A second
+    copy of it would be a second chance to disagree about what the catalog is, and every assertion
+    about a read set is only as good as the read set being the real one.
+    """
     for column in ("txn_amt", "txn_dt", "posted_ts", "cif_id", "acct_id", "merchant_id",
                    "dr_cr_flag", "status_cd", "cross_border_flag"):
         _col(db, "transactions", column)
@@ -236,6 +241,11 @@ def catalog(db):
         "head_seq) VALUES (%s, now(), 'r', 7) ON CONFLICT (catalog_source) "
         "DO UPDATE SET last_completed_at = now()", (_SRC,))
     return db
+
+
+@pytest.fixture
+def catalog(db):
+    return seed_catalog(db)
 
 
 # ── the declared inventory (Task 0/5) ────────────────────────────────────────────────────────────
