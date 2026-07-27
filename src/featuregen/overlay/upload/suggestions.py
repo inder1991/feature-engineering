@@ -95,7 +95,51 @@ def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str]) -> dict:
                          for r in idea.requirements],
         "uses": list(dict.fromkeys(ref for _src, ref in idea.derives_pairs)),
         "binding_quality": binding_by_id.get(idea.recipe_id or "", ""),
+        "recipe": render_recipe(idea),
+        "recipe_parts": _recipe_parts(idea),
     }
+
+
+def render_recipe(idea: FeatureIdea) -> str:
+    """The one-line recipe this feature computes, e.g. ``trend_90d(bal_amt) BY cif_id OVER 90d
+    [as_of_dt]``.
+
+    ``operation_kind`` is printed AS BOUND. It is a DOMAIN label (``trend``, ``inflow_outflow``,
+    ``frequency_trend`` — ~152 of them), NOT a SQL verb: there is no label -> verb map here, because
+    inventing one would print ``AVG(...)`` for an operation the system calls ``trend``. Clauses that
+    do not apply are omitted, never emitted empty."""
+    parts = _recipe_parts(idea)
+    measures = ", ".join(parts["measures"])
+    line = f"{parts['operation']}({measures})" if parts["operation"] else measures
+    if parts["grain"]:
+        line += f" BY {parts['grain']}"
+    if parts["window"]:
+        line += f" OVER {parts['window']}"
+    if parts["time"]:
+        line += f" [{parts['time']}]"
+    return line
+
+
+def _recipe_parts(idea: FeatureIdea) -> dict:
+    """The rendered line's pieces, structured. ``measure_refs`` carries EVERY bound pair — the grain
+    and point-in-time columns included — so both are subtracted here: a card listing the grain column
+    as a measure would claim the feature aggregates its own key. Order is the engine's binding order
+    (deduped), so the same idea always renders the same line."""
+    dropped = {ref for ref in (idea.grain_ref, idea.time_ref) if ref is not None}
+    measures = [ref for ref in dict.fromkeys(idea.measure_refs) if ref not in dropped]
+    return {
+        "operation": idea.operation_kind,
+        "measures": [_column(ref) for _src, ref in measures],
+        "grain": _column(idea.grain_ref[1]) if idea.grain_ref else "",
+        "window": idea.window or "",
+        "time": _column(idea.time_ref[1]) if idea.time_ref else "",
+    }
+
+
+def _column(object_ref: str) -> str:
+    """The column name — the ref's last segment. A full ``schema.table.column`` ref is unreadable on
+    a card, and nothing is invented by taking the name the catalog already holds."""
+    return object_ref.rsplit(".", 1)[-1]
 
 
 def _entity_label(entity_ref: str) -> str:

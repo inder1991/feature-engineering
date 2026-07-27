@@ -23,10 +23,11 @@ from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
 from featuregen.overlay.upload.canonical import validate_rows
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.source_profile import FTR_GLOSSARY_PROFILE
-from featuregen.overlay.upload.suggestions import suggest_features_for_table
+from featuregen.overlay.upload.suggestions import render_recipe, suggest_features_for_table
 from featuregen.overlay.upload.table_fact_governance import (
     load_table_fact_confirmation_context,
     project_verified_table_fact,
@@ -191,6 +192,79 @@ def test_rejections_are_this_tables_only(overlay_conn, ftr_catalog):
         overlay_conn, catalog_source=ftr_catalog.source, table=OTHER_TABLE)
     assert out["rejections"]                        # this table really does reject something
     assert not ({r["name"] for r in out["rejections"]} & {r["name"] for r in other["rejections"]})
+
+
+def _idea(**kw) -> FeatureIdea:
+    """A bare FeatureIdea carrying only the typed computation operands the renderer reads."""
+    return FeatureIdea(name="f", description="", derives_from=[], aggregation=None,
+                       grain_table=TABLE, **kw)
+
+
+def test_recipe_renders_the_real_operation_label_not_an_invented_sql_verb():
+    """``operation_kind`` is a DOMAIN label (~152 values: trend / inflow_outflow / frequency_trend),
+    NOT a SQL verb. Printing ``AVG(...)`` for an operation the system calls ``trend`` would be a
+    confident-looking invention, so the line carries the label the engine actually bound."""
+    line = render_recipe(_idea(
+        operation_kind="trend_90d",
+        measure_refs=((SOURCE, f"public.{TABLE}.bal_amt"), (SOURCE, f"public.{TABLE}.cif_id"),
+                      (SOURCE, f"public.{TABLE}.as_of_dt")),
+        grain_ref=(SOURCE, f"public.{TABLE}.cif_id"),
+        time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="90d"))
+    assert line == "trend_90d(bal_amt) BY cif_id OVER 90d [as_of_dt]"
+
+
+def test_recipe_does_not_render_the_grain_or_time_column_as_a_measure():
+    """``measure_refs`` carries EVERY bound pair, grain and point-in-time included. A card that lists
+    the grain column as a measure claims the feature aggregates its own key."""
+    idea = _idea(operation_kind="inflow_outflow_30d",
+                 measure_refs=((SOURCE, f"public.{TABLE}.cif_id"),
+                               (SOURCE, f"public.{TABLE}.txn_amt"),
+                               (SOURCE, f"public.{TABLE}.as_of_dt")),
+                 grain_ref=(SOURCE, f"public.{TABLE}.cif_id"),
+                 time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="30d")
+    assert render_recipe(idea) == "inflow_outflow_30d(txn_amt) BY cif_id OVER 30d [as_of_dt]"
+
+
+def test_recipe_omits_the_clauses_that_do_not_apply():
+    """An idea with no window and no point-in-time column must render cleanly — no dangling ``OVER``,
+    no empty ``[]``, no trailing space."""
+    line = render_recipe(_idea(
+        operation_kind="product_breadth",
+        measure_refs=((SOURCE, f"public.{TABLE}.setl_stat"), (SOURCE, f"public.{TABLE}.cif_id")),
+        grain_ref=(SOURCE, f"public.{TABLE}.cif_id")))
+    assert line == "product_breadth(setl_stat) BY cif_id"
+    assert "OVER" not in line and "[" not in line
+    assert line == line.strip()
+
+
+def test_recipe_renders_multiple_measures_in_a_stable_order():
+    """Two real measures, rendered in the order the engine bound them — same idea, same line."""
+    idea = _idea(operation_kind="payment_ratio",
+                 measure_refs=((SOURCE, f"public.{TABLE}.txn_amt"),
+                               (SOURCE, f"public.{TABLE}.bal_amt"),
+                               (SOURCE, f"public.{TABLE}.cif_id")),
+                 grain_ref=(SOURCE, f"public.{TABLE}.cif_id"))
+    assert render_recipe(idea) == "payment_ratio(txn_amt, bal_amt) BY cif_id"
+    assert render_recipe(idea) == render_recipe(idea)
+
+
+def test_every_card_carries_a_recipe_and_its_parts(overlay_conn, ftr_catalog):
+    """The card's recipe line and the structured pieces behind it — on EVERY suggestion, from the
+    real grounded engine, not a hand-built idea."""
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    cards = [s for g in out["groups"] for s in g["suggestions"]]
+    assert cards
+    for s in cards:
+        assert s["recipe"] and s["recipe"] == s["recipe"].strip()
+        parts = s["recipe_parts"]
+        assert parts["operation"] and parts["measures"]
+        assert parts["grain"] not in parts["measures"]      # the grain is never a measure
+        assert parts["time"] not in parts["measures"]
+        if not parts["window"]:
+            assert "OVER" not in s["recipe"]
+        if not parts["time"]:
+            assert "[" not in s["recipe"]
 
 
 def test_writes_nothing(overlay_conn, ftr_catalog):
