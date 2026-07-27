@@ -42,6 +42,7 @@ from featuregen.overlay.upload.contract.author import (
 )
 from featuregen.overlay.upload.contract.gate1 import (
     Gate1Error,
+    UnknownConsideredOption,
     _intent_scoped_applicability_enabled,
     _public_considered_snapshot,
     build_considered_set,
@@ -930,9 +931,19 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
             why=body.why,
             expected_generation_run_id=body.expected_generation_run_id,
         )
+    except UnknownConsideredOption as e:
+        # A stale tab naming an option from a superseded revision is a CLIENT error, not evidence of
+        # a corrupted record — same 422 the unscoped path returns for the same mistake, so the two
+        # modes stay consistent and an integrity 409 keeps meaning integrity.
+        raise HTTPException(
+            status_code=422,
+            detail="chosen option is not in the recorded considered set for this intent") from e
     except Gate1Error as e:
         if str(e) == "REGENERATE_FROM_CURRENT_CONSIDERED_SET":
             raise HTTPException(status_code=409, detail=str(e)) from e
+        logger.warning(
+            "considered revision verification failed for intent %s (run %s): %s",
+            body.intent_id, body.expected_generation_run_id, e)
         raise HTTPException(status_code=409, detail="considered revision verification failed") from e
     if choice is None:
         raise HTTPException(status_code=422,

@@ -40,6 +40,10 @@ def _generation_and_draft_llm() -> FakeLLM:
             "definition": "Average balance over 90 days.",
         }),
         "overlay.contract.critique": FakeResponse(output={"findings": []}),
+        # The assist gauntlet's candidate critique. Absent, FakeLLM raises KeyError and the stage
+        # fails open — survivable for a test that only inspects the response, but it means the run
+        # never exercises a clean critique. Scripted empty so "no issues" is a real answer.
+        "overlay.feature.critique_candidates": FakeResponse(output={"issues": []}),
     })
 
 
@@ -388,7 +392,15 @@ def test_release_mode_draft_reads_target_from_exact_generation_run(
         },
         headers=AUTH,
     )
-    assert wrong_run.status_code == 409
+    # Run B's option under run A's token is REJECTED — the substitution never drafts. It is reported
+    # as 422 (the option is not in run A's set) rather than 409, because run A's stored revision
+    # verified perfectly: nothing about the RECORD is wrong, only the request's reference to it. This
+    # is the exact code+detail the unscoped path already returns for the same mistake, so the two
+    # modes agree, and a 409 keeps meaning "the stored record failed verification" — see
+    # test_corrupted_revision_is_409_not_422 for the other side of that split.
+    assert wrong_run.status_code == 422, wrong_run.text
+    assert wrong_run.json()["detail"] == (
+        "chosen option is not in the recorded considered set for this intent")
 
     # Run B is now the mutable latest pointer. Drafting run A still resolves its exact option and target;
     # changing the mutable legacy intent target cannot alter run A's leakage authority either.
