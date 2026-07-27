@@ -1,0 +1,24 @@
+"""Task 1 — ``materialize_hash`` is THE one hasher for the materialization package."""
+from __future__ import annotations
+
+import pytest
+
+from featuregen.materialize.canonical import materialize_hash
+
+
+def test_key_order_irrelevant():
+    assert materialize_hash({"a": 1, "b": 2}) == materialize_hash({"b": 2, "a": 1})
+
+
+def test_sha256_hex():
+    h = materialize_hash({"a": 1})
+    assert len(h) == 64 and all(c in "0123456789abcdef" for c in h)
+
+
+def test_values_distinguished():
+    assert materialize_hash({"a": 1}) != materialize_hash({"a": 2})
+
+
+def test_rejects_non_mapping():
+    with pytest.raises(TypeError):
+        materialize_hash([1])  # type: ignore[arg-type]
