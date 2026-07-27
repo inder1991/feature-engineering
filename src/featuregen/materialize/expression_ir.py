@@ -29,6 +29,21 @@ verdicts are PROPAGATED here, never softened or repaired. ``inputs.resolve_physi
 the one route from a schema-flattened logical ref to a table on the cluster (§3.5). Asking either
 question a second way here would be a second chance to answer it differently.
 
+**Operand type evidence: read here because only here is it per-EXPRESSION (§6, Task 8.1).**
+Child-1 collapses a whole formula to ONE logical word — a SUM's own operand, a DIFFERENCE's
+*minuend*, and for a RATIO the constant ``"decimal"``, which describes no operand at all — so a
+ratio's numerator and denominator, and a difference's subtrahend, are invisible to any stage holding
+only ``FormulaOutputPolicyV1``. §6 requires EVERY arithmetic operand to be an exact numeric before a
+``DECIMAL(p,s)`` may be published, and that question cannot be asked of a word that never described
+the operand being asked about. So each compiled expression carries its own
+:class:`OperandTypeEvidence`: the C1 ``logical_representation`` of ITS operand, read through the same
+shipped reader the availability authority uses.
+
+This module RECORDS; it does not judge. Nothing here refuses on a type — ``physical_types`` owns
+§6's rule, and splitting "what the catalog says" from "what may therefore be published" keeps one
+answer to each. The evidence is deliberately outside :meth:`ExpressionExecutionIR.identity_payload`
+(see that method).
+
 **Availability: authority from the projection, payload through its link.** The governed
 ``AVAILABILITY_TIME`` fact says which column carries knowledge time AND on what basis (``posted_at``
 / ``ingested_at`` / ``event_time_plus_lag`` + ``lag_hours``), and §8 rule 1 needs all of it to render
@@ -76,6 +91,8 @@ __all__ = [
     "ExpressionExecutionIR",
     "NonPhysicalReason",
     "NonPhysicalRef",
+    "OperandTypeEvidence",
+    "OperandTypeStatus",
     "PhysicalRef",
     "PitSpec",
     "RefRole",
@@ -94,6 +111,23 @@ BODY_PATHS: frozenset[str] = frozenset(
 #: `read_operational_value` renders the boolean fact flags as strings (`column_authority._render`).
 _RESOLVED = "resolved"
 _GOVERNED_TRUE = "true"
+
+#: The C1 field carrying a column's governed logical type. Named once: `authoring.py` pairs it with
+#: `output_type` and `replay_authoring._facts` reads exactly this field to build `ExprFacts`, so an
+#: operand type read under a different field name would not be the one Child-1 resolved over.
+_LOGICAL_TYPE_FIELD = "logical_representation"
+
+#: The C1 statuses in which the READ ITSELF failed closed — the decision head is ambiguous, its
+#: hashes do not recompute, or the projection the read depends on is degraded/lagged. Mirrored from
+#: `output_authority._HARD_FAIL_STATUSES` (which is private, and belongs to a module this one must
+#: not couple to) and kept LOCAL + auditable, exactly as that module keeps its own copy.
+#:
+#: The distinction this set draws is the whole point of :class:`OperandTypeStatus`: "the catalog
+#: holds no governed type decision for this column" is a governance GAP, while "the governed type
+#: could not be read" is a degraded or tampered AUTHORITY. Collapsing them would report a forked
+#: decision log as a missing attestation and send an operator to attest a column that already is.
+_UNAVAILABLE_TYPE_STATUSES: frozenset[str] = frozenset(
+    {"fork", "hash_mismatch", "projection_unavailable"})
 
 
 class RefRole(StrEnum):
@@ -127,6 +161,53 @@ class NonPhysicalReason(StrEnum):
     #: A ``ParameterRef.name`` — a declared run parameter, bound at execution, never a catalog
     #: column.
     RUN_PARAMETER = "run_parameter"
+
+
+class OperandTypeStatus(StrEnum):
+    """Why an expression's operand does or does not carry a governed logical type. Closed.
+
+    Four members because three of them route to three different people, and the fourth is not a
+    problem at all:
+
+    * :attr:`GOVERNED` — C1 served the type as ``resolved``: a hash-verified governed decision
+      projection. This is the ONLY status that carries a type, because it is the only one under
+      which a word about the operand is a governed fact rather than an echo of a file declaration;
+    * :attr:`UNGOVERNED` — the read succeeded and no governed decision backs it (``no_decision`` /
+      ``no_value`` / ``not_operational`` / ``retired`` / ``conflict``). A governance GAP: somebody
+      must attest the column's type;
+    * :attr:`UNAVAILABLE` — the read itself failed closed (``fork`` / ``hash_mismatch`` /
+      ``projection_unavailable``). Degraded or tampered AUTHORITY: the remedy is to repair the
+      decision log or the projection, not to attest anything;
+    * :attr:`NO_OPERAND` — Child-1's grammar gives this aggregate no operand at all
+      (``operand is None`` IFF ``COUNT_ROWS``, ``schema.py`` [c9]), so there is nothing to type and
+      nothing is wrong.
+    """
+
+    GOVERNED = "governed"
+    UNGOVERNED = "ungoverned"
+    UNAVAILABLE = "unavailable"
+    NO_OPERAND = "no_operand"
+
+
+@dataclass(frozen=True, slots=True)
+class OperandTypeEvidence:
+    """What the catalog says about ONE expression's operand type — a statement, not a verdict.
+
+    ``logical_type`` is populated for :attr:`OperandTypeStatus.GOVERNED` and for nothing else. That
+    asymmetry is deliberate: carrying an ungoverned word in the same slot as a governed one is how a
+    file-declared ``numeric`` gets consumed as though somebody had attested it, and §6's rule then
+    rests on a claim nobody made. A consumer that wants a type must therefore check the status.
+
+    ``read_status`` is C1's own status word, carried verbatim so an operator-facing refusal can say
+    WHICH read failed (``fork`` reads differently from ``projection_unavailable``) without this
+    module re-describing a vocabulary it does not own. ``None`` only for :attr:`NO_OPERAND`, where no
+    read was attempted.
+    """
+
+    operand_ref: str | None
+    status: OperandTypeStatus
+    logical_type: str | None
+    read_status: str | None
 
 
 class AvailabilityBasis(StrEnum):
@@ -237,6 +318,7 @@ class ExpressionExecutionIR:
     aggregation: AggregateFunction
     filter_tree: Mapping[str, Any] | None
     non_physical_refs: tuple[NonPhysicalRef, ...]
+    operand_type: OperandTypeEvidence
 
     def identity_payload(self) -> dict[str, Any]:
         """What this expression IS — no provenance, no run-time value.
@@ -245,6 +327,15 @@ class ExpressionExecutionIR:
         which way) and not its authority columns or ``roles_used``. Those record WHY the traversal
         was allowed and WHO asked; neither changes a single row of the result, and including them
         would split one computation into as many artifacts as there are approvers and readers.
+
+        ``operand_type`` is excluded for a sharper reason than that. It is evidence about whether
+        this expression may be PUBLISHED, not about what it computes: a SUM over a governed
+        ``numeric`` and the same SUM over a governed ``bigint`` read the same rows and add them the
+        same way, and giving them two identities would split one computation over a distinction the
+        published ``DECIMAL(p,s)`` does not record. The consequence of the evidence — the resolved
+        :class:`~featuregen.materialize.physical_types.PhysicalType` — enters ``group_plan_hash`` on
+        its own (§6). Including the evidence here would also make a projection blip change
+        ``ir_hash`` and fire §9's ``IR_HASH_MISMATCH`` gate against a computation nobody touched.
         """
         return {
             "expr_path": self.expr_path,
@@ -427,6 +518,44 @@ def _governed_availability(
         # An integral lag renders without its `.0` so a re-declaration as `36` and `36.0` is one lag.
         lag_hours=(_canonical_number(lag)
                    if basis is AvailabilityBasis.EVENT_TIME_PLUS_LAG else None))
+
+
+def _operand_type_evidence(conn: DbConn, expr: AggregateExpression) -> OperandTypeEvidence:
+    """The governed C1 logical type of THIS expression's operand, or a marker saying why there is
+    none (§6, Task 8.1).
+
+    One read of the shipped governed reader, classified into :class:`OperandTypeStatus`. Three
+    things it deliberately does NOT do:
+
+    * it does not fall back to ``graph_node.data_type``. That column is the flat projection C1 reads
+      THROUGH its hash gate, and reading it directly would serve exactly the value C1 refused —
+      turning a tampered projection into a governed-looking type;
+    * it does not consult ``formula.output.output_type``. That word is Child-1's, derived from ONE
+      operand per formula, and using it here would re-import the blind spot this function exists to
+      close;
+    * it does not refuse. A type nobody governed is a fact about the catalog; whether it may back a
+      published column is §6's question, and ``physical_types`` owns it.
+    """
+    if expr.operand is None:
+        # `operand is None` IFF `COUNT_ROWS` (schema.py [c9]) — nothing to type, nothing wrong.
+        return OperandTypeEvidence(
+            operand_ref=None, status=OperandTypeStatus.NO_OPERAND, logical_type=None,
+            read_status=None)
+
+    read = read_operational_value(conn, expr.operand, _LOGICAL_TYPE_FIELD)
+    if read.status in _UNAVAILABLE_TYPE_STATUSES:
+        return OperandTypeEvidence(
+            operand_ref=expr.operand, status=OperandTypeStatus.UNAVAILABLE, logical_type=None,
+            read_status=read.status)
+    if read.status == _RESOLVED and read.value is not None:
+        return OperandTypeEvidence(
+            operand_ref=expr.operand, status=OperandTypeStatus.GOVERNED,
+            logical_type=str(read.value), read_status=read.status)
+    # A `resolved` status with no value cannot describe a type, so it degrades here rather than
+    # being carried as a governed `None` a consumer would have to re-check.
+    return OperandTypeEvidence(
+        operand_ref=expr.operand, status=OperandTypeStatus.UNGOVERNED, logical_type=None,
+        read_status=read.status)
 
 
 def _canonical_number(value: object) -> str | None:
@@ -628,6 +757,10 @@ def compile_expression(
        whether everything the expression mentions was consumed, and nothing is consumed until the
        steps above have run.
 
+    The operand's governed type is then READ and CARRIED as :class:`OperandTypeEvidence`. It is not
+    a fifth check: §6's exact-numeric rule is ``physical_types``', and a compiler that refused a type
+    here would hold two opinions about one question.
+
     Raises:
         ValueError: ``expr_path`` is outside Child-1's body-path vocabulary, or ``grain_keys`` is
             empty. Both are calls assembled wrongly rather than governed verdicts, and §14's closed
@@ -702,6 +835,10 @@ def compile_expression(
     if unaccounted is not None:
         return unaccounted
 
+    # Read LAST, after every refusal: the evidence describes an expression that compiled, and a
+    # catalog read performed for a plan that was then refused is a read nothing needed.
+    operand_type = _operand_type_evidence(conn, expr)
+
     return ExpressionExecutionIR(
         expr_path=expr_path,
         physical_read_set=read_set.build(),
@@ -721,7 +858,8 @@ def compile_expression(
         aggregation=expr.aggregation,
         filter_tree=(None if expr.filter is None
                      else filter_plain(expr.filter, f"{expr_path}.filter")),
-        non_physical_refs=tuple(_classify_non_physical(expr, expr_path)))
+        non_physical_refs=tuple(_classify_non_physical(expr, expr_path)),
+        operand_type=operand_type)
 
 
 def _column_of(column_ref: str) -> str | None:

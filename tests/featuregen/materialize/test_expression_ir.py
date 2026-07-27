@@ -49,6 +49,7 @@ from featuregen.materialize.expression_ir import (
     AvailabilityBasis,
     ExpressionExecutionIR,
     NonPhysicalReason,
+    OperandTypeStatus,
     PitSpec,
     RefRole,
     compile_expression,
@@ -61,7 +62,10 @@ from featuregen.materialize.inventory import (
     PartitionTransform,
     TableLayout,
 )
+from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.identity import fact_key as _fact_key
+from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.upload_catalog import table_ref as _catalog_table_ref
 
 _SRC = "hdfc"
@@ -126,11 +130,15 @@ def _code_of(module) -> str:
 # value (`table_fact_projection` projects the fact's `column` and nothing else).
 
 
-def _col(db, table, column, *, schema="banking", sensitivity=None):
+def _col(db, table, column, *, schema="banking", sensitivity=None, data_type=None):
+    """One catalog column. `data_type` is the flat projection C1 reads the logical type THROUGH:
+    `field_resolution` writes only the `logical_type_decision_id` LINK for
+    `logical_representation` (it has no display column), so the value itself is `build_graph`'s —
+    and a governed read is exactly the agreement between the two."""
     db.execute(
         "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
-        "schema_name, sensitivity) VALUES (%s, %s, 'column', %s, %s, %s, %s)",
-        (_SRC, f"public.{table}.{column}", table, column, schema, sensitivity))
+        "schema_name, sensitivity, data_type) VALUES (%s, %s, 'column', %s, %s, %s, %s, %s)",
+        (_SRC, f"public.{table}.{column}", table, column, schema, sensitivity, data_type))
 
 
 def _edge(db, from_ref, to_ref, *, cardinality="N:1", fact_key="ajf", status="VERIFIED"):
@@ -179,13 +187,33 @@ def _govern_availability(db, table, column, *, basis="posted_at", lag_hours=None
     _fact_row(db, table, value, event_id=event_id)
 
 
+def _govern_logical_type(db, logical_ref, value):
+    """Seed a GOVERNED `logical_representation` decision through the REAL machinery (Task 8.1).
+
+    `record_field_evidence` + `resolve_and_project` is the only route to C1 `status="resolved"` — a
+    flat `graph_node.data_type` write would skip the decision lifecycle `read_operational_value`
+    derives its statuses from, and every assertion about "governed" would then be a fiction. Same
+    shape `fixtures.seed_materialize_catalog` uses.
+    """
+    record_field_evidence(
+        db, logical_ref=logical_ref, field_name="logical_representation", proposed_value=value,
+        producer=EvidenceProducer.SOURCE, strength=AssertionStrength.ATTESTED,
+        producer_ref="task81-fixture", source_snapshot_id="task81-snap",
+        input_hash=field_input_hash(
+            logical_ref=logical_ref, field_name="logical_representation", material=value))
+    resolve_and_project(db, source=_SRC, logical_refs=[logical_ref])
+
+
 @pytest.fixture
 def catalog(db):
     """`transactions` (grain key on the table itself), `card_txns`, and the two-hop dimension path."""
     for column in ("txn_amt", "txn_dt", "cif_id", "acct_id", "dr_cr_flag", "status_cd"):
-        _col(db, "transactions", column)
+        # `status_cd` DECLARES a type nobody attested — the "file's word for itself" case, kept
+        # distinct from `dr_cr_flag`, which declares nothing at all.
+        _col(db, "transactions", column,
+             data_type={"txn_amt": "numeric", "status_cd": "text"}.get(column))
     for column in ("card_amt", "card_dt", "cif_id"):
-        _col(db, "card_txns", column)
+        _col(db, "card_txns", column, data_type="numeric" if column == "card_amt" else None)
     _col(db, "accounts", "account_id")
     _col(db, "accounts", "cif_id")
     _col(db, "customers", "cif_id")
@@ -194,6 +222,11 @@ def catalog(db):
     _govern_availability(db, "transactions", "txn_dt")
     _govern_availability(db, "card_txns", "card_dt", basis="ingested_at",
                          event_id="ovf_evt_asof_cards")
+    # The two AMOUNT columns carry a governed logical type; `dr_cr_flag` deliberately does not, so a
+    # test can compile over an operand the catalog has never typed without inventing a second
+    # catalog for it.
+    _govern_logical_type(db, TXN_AMT, "numeric")
+    _govern_logical_type(db, CARDS_AMT, "numeric")
     _watermark(db)
     return db
 
@@ -740,12 +773,225 @@ def test_count_rows_has_no_operand_and_still_compiles(catalog):
     assert _refs(ir) == {TXN, TXN_DT, TXN_CIF}
 
 
+# ══ Task 8.1 — per-EXPRESSION governed operand type evidence (§6) ════════════════════════════════
+# The IR carries the C1 `logical_representation` of ITS OWN operand because Child-1's formula-level
+# word cannot: it describes a SUM's own operand, a DIFFERENCE's MINUEND, and for a RATIO nothing at
+# all. This module RECORDS the evidence; `physical_types` decides what may be published from it.
+
+
+def _evidence(catalog, **kwargs):
+    ir = _compile(catalog, **kwargs)
+    assert isinstance(ir, ExpressionExecutionIR), ir
+    return ir.operand_type
+
+
+def test_the_ir_carries_the_operands_GOVERNED_logical_type(catalog):
+    evidence = _evidence(catalog)
+    assert evidence.status is OperandTypeStatus.GOVERNED
+    assert evidence.logical_type == "numeric"
+    assert evidence.operand_ref == TXN_AMT
+
+
+def test_an_operand_the_catalog_has_never_typed_is_UNGOVERNED_and_carries_no_type(catalog):
+    """A governance GAP, not a broken read. The type slot stays EMPTY: carrying the flat
+    `graph_node.data_type` here would let a file's word for itself be consumed as an attestation."""
+    evidence = _evidence(catalog, expr=_expr(operand=TXN_DR_CR))
+    assert evidence.status is OperandTypeStatus.UNGOVERNED
+    assert evidence.logical_type is None
+    assert evidence.operand_ref == TXN_DR_CR
+
+
+def test_a_column_that_DECLARES_a_type_but_carries_no_decision_is_UNGOVERNED(catalog):
+    """The discriminator for "governed" itself. `status_cd` has a flat `data_type` — the file's own
+    word — and no field decision. A read that took the value and skipped the C1 status would call
+    that GOVERNED, which is exactly the laundering §6's evidence contract forbids."""
+    evidence = _evidence(catalog, expr=_expr(operand=TXN_STATUS))
+    assert evidence.status is OperandTypeStatus.UNGOVERNED
+    assert evidence.logical_type is None
+
+
+def test_a_resolved_read_carrying_NO_value_cannot_be_GOVERNED(catalog, monkeypatch):
+    """A fail-closed belt. `status="resolved"` with a null value is unreachable through the shipped
+    reader (the hash gate could not have passed), so the guard is only provable by forcing it — and
+    without the guard a `None` would be carried as the string `"None"` and tested for exactness."""
+    from featuregen.overlay.upload.field_policies import InfluenceTier
+    from featuregen.overlay.upload.operational_facts import OperationalValue
+
+    monkeypatch.setattr(
+        expression_ir, "read_operational_value",
+        lambda *args, **kwargs: OperationalValue(
+            value=None, influence=InfluenceTier.OPERATIONAL, producer=None, strength=None,
+            status="resolved", conflict_status=None, selected_evidence_ids=(),
+            decision_event_id=None, fact_key=None, fact_event_id=None, policy_version="p",
+            resolver_version="r"))
+    evidence = expression_ir._operand_type_evidence(catalog, _expr())
+    assert evidence.status is OperandTypeStatus.UNGOVERNED
+    assert evidence.logical_type is None
+
+
+def test_a_TAMPERED_governed_type_is_UNAVAILABLE_and_never_the_tampered_word(catalog):
+    """THE discriminating case for the whole task, and the reason the two failures must stay apart.
+
+    `txn_amt` has a governed `numeric` decision; the flat projection is then rewritten to
+    `double precision`. C1's hash gate catches it (`status="hash_mismatch"`), so the honest answer
+    is "the type could not be read". An implementation that read the flat column would report a
+    GOVERNED float — a tampered value laundered into a governed-looking verdict, and refused with
+    the wrong explanation.
+    """
+    catalog.execute(
+        "UPDATE graph_node SET data_type = 'double precision' "
+        "WHERE catalog_source = %s AND object_ref = %s", (_SRC, "public.transactions.txn_amt"))
+    evidence = _evidence(catalog)
+    assert evidence.status is OperandTypeStatus.UNAVAILABLE
+    assert evidence.read_status == "hash_mismatch"
+    assert evidence.logical_type is None
+
+
+def test_a_DEGRADED_projection_makes_the_type_UNAVAILABLE_not_merely_UNGOVERNED(catalog):
+    """The other C1 fail-closed route (GATE 3). A poisoned overlay read model makes every governed
+    read untrustworthy — an authority problem, never a missing attestation. The column's own
+    decision is still perfectly good, which is exactly why the two must not be reported alike."""
+    catalog.execute(
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_seq) VALUES ('overlay', 'catalog', %s, 'poisoned-by-test', 1)", (_SRC,))
+    # The availability read degrades first and refuses the whole expression, which is correct — so
+    # the evidence is read directly, against the SAME degraded catalog, to prove the classification.
+    evidence = expression_ir._operand_type_evidence(catalog, _expr())
+    assert evidence.status is OperandTypeStatus.UNAVAILABLE
+    assert evidence.read_status == "projection_unavailable"
+
+
+def test_a_count_rows_expression_carries_NO_OPERAND_rather_than_a_failed_read(catalog):
+    """`operand is None` IFF `COUNT_ROWS` (schema [c9]). Nothing to type, and nothing wrong — so it
+    must not be reported as an unreadable or ungoverned type."""
+    evidence = _evidence(catalog, expr=_expr(aggregation=AggregateFunction.COUNT_ROWS, operand=None))
+    assert evidence.status is OperandTypeStatus.NO_OPERAND
+    assert (evidence.operand_ref, evidence.logical_type, evidence.read_status) == (None, None, None)
+
+
+def test_a_count_over_a_TEXT_operand_still_records_the_read(catalog):
+    """Evidence is recorded for every operand there is; whether it is CONSULTED is §6's question,
+    asked in `physical_types`. A compiler that skipped the read for counts would make the two
+    modules disagree about what the IR contains."""
+    evidence = _evidence(
+        catalog, expr=_expr(aggregation=AggregateFunction.COUNT_DISTINCT, operand=TXN_DR_CR))
+    assert evidence.status is OperandTypeStatus.UNGOVERNED
+    assert evidence.operand_ref == TXN_DR_CR
+
+
+def test_the_evidence_is_read_PER_EXPRESSION_not_once_per_formula(catalog):
+    """The claim the task turns on: a ratio's two halves get two answers. One read per formula would
+    type the denominator with a statement about the numerator — exactly the collapse §6 names."""
+    numerator = _evidence(catalog, expr_path="body.numerator")
+    denominator = _evidence(catalog, expr_path="body.denominator", expr=_expr(operand=TXN_DR_CR))
+    assert numerator.status is OperandTypeStatus.GOVERNED
+    assert denominator.status is OperandTypeStatus.UNGOVERNED
+
+
+def test_the_operand_type_is_NOT_identity_bearing(catalog):
+    """Evidence about whether the expression may be PUBLISHED, not about what it computes.
+
+    Two reasons it is excluded from `identity_payload`: a governed `numeric` and a governed
+    `bigint` operand read the same rows and add them the same way, so hashing the difference would
+    split one computation into two artifacts; and a projection blip would change `ir_hash` and fire
+    §9's `IR_HASH_MISMATCH` against a computation nobody touched. The physical CONSEQUENCE enters
+    `group_plan_hash` separately (§6).
+    """
+    before = _compile(catalog)
+    catalog.execute(
+        "UPDATE graph_node SET data_type = 'double precision' "
+        "WHERE catalog_source = %s AND object_ref = %s", (_SRC, "public.transactions.txn_amt"))
+    after = _compile(catalog)
+    assert isinstance(before, ExpressionExecutionIR) and isinstance(after, ExpressionExecutionIR)
+    assert before.operand_type != after.operand_type
+    assert expression_ir_hash(before) == expression_ir_hash(after)
+    assert "operand_type" not in before.identity_payload()
+
+
+def _one_expression_formula(expr, *, output_type="numeric"):
+    """A minimal real `TypedFormulaV1` around ONE expression, so the seam below is closed with the
+    type adapter's actual public signature rather than a hand-built evidence dict."""
+    from featuregen.formula.schema import (
+        CANONICALIZATION_VERSION,
+        FORMULA_SCHEMA_VERSION,
+        OPERATION_GRAMMAR_VERSION,
+        OUTPUT_POLICY_VERSION,
+        AdditivityClass,
+        DecimalPolicy,
+        FormulaOutputPolicyV1,
+        Grain,
+        OverflowBehavior,
+        RoundingMode,
+        TypedFormulaV1,
+        UnaryBody,
+    )
+
+    return TypedFormulaV1(
+        formula_schema_version=FORMULA_SCHEMA_VERSION,
+        operation_grammar_version=OPERATION_GRAMMAR_VERSION,
+        output_policy_version=OUTPUT_POLICY_VERSION,
+        canonicalization_version=CANONICALIZATION_VERSION,
+        grain=Grain(entity="customer", keys=(TXN_CIF,)),
+        body=UnaryBody(expr=expr), parameters=(),
+        decimal=DecimalPolicy(precision=18, scale=2, rounding=RoundingMode.HALF_UP,
+                              overflow=OverflowBehavior.ERROR),
+        output=FormulaOutputPolicyV1(
+            output_type=output_type, unit=None, currency=None,
+            output_additivity=AdditivityClass.NON_ADDITIVE, external_type_required=False))
+
+
+def test_the_evidence_this_module_PRODUCES_is_what_the_type_adapter_CONSUMES(catalog):
+    """The seam, closed end to end against a REAL compilation over the REAL governed catalog.
+
+    Everything else in this file asserts what the IR carries; everything in `test_physical_types`
+    asserts what the adapter does with hand-built evidence. Without this, both halves could agree
+    with themselves and disagree with each other — the mapping is keyed by BODY PATH, and a
+    compiler emitting a path the adapter does not expect raises rather than typing anything.
+    """
+    from featuregen.materialize.physical_types import PhysicalType, resolve_physical_type
+
+    ir = _compile(catalog)
+    assert isinstance(ir, ExpressionExecutionIR)
+    formula = _one_expression_formula(_expr())
+    resolved = resolve_physical_type(formula, operand_types={ir.expr_path: ir.operand_type})
+    assert isinstance(resolved, PhysicalType), resolved
+    assert resolved.sql_type == "DECIMAL(18,2)"
+
+
+def test_a_TAMPERED_catalog_refuses_the_published_type_through_the_same_seam(catalog):
+    """The mirror, and the reason Task 8.1 blocks Task 10: the compilation still succeeds — the
+    plan is perfectly good — and the PUBLISHED TYPE is what refuses, before any group plan
+    authorizes generated execution."""
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+    from featuregen.materialize.physical_types import resolve_physical_type
+
+    catalog.execute(
+        "UPDATE graph_node SET data_type = 'double precision' "
+        "WHERE catalog_source = %s AND object_ref = %s", (_SRC, "public.transactions.txn_amt"))
+    ir = _compile(catalog)
+    assert isinstance(ir, ExpressionExecutionIR)      # the PLAN is fine
+    refused = resolve_physical_type(
+        _one_expression_formula(_expr()), operand_types={ir.expr_path: ir.operand_type})
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+
+
+def test_the_type_is_read_through_the_GOVERNED_reader_not_the_flat_column(catalog):
+    """A source assertion, because the failure it guards is invisible in a passing suite: reading
+    `graph_node.data_type` directly returns exactly the value C1's hash gate refused. The reader is
+    the shipped one, and the field is the one Child-1 resolved over."""
+    source = _code_of(expression_ir)
+    assert "read_operational_value" in source
+    assert "logical_representation" in source
+    assert "data_type" not in source
+
+
 # ══ shape ════════════════════════════════════════════════════════════════════════════════════════
 
 
 def test_every_public_type_is_a_frozen_slotted_dataclass():
     for cls in (ExpressionExecutionIR, PitSpec, expression_ir.PhysicalRef,
-                expression_ir.NonPhysicalRef):
+                expression_ir.NonPhysicalRef, expression_ir.OperandTypeEvidence):
         assert dataclasses.is_dataclass(cls)
         assert cls.__dataclass_params__.frozen
         assert hasattr(cls, "__slots__")

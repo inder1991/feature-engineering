@@ -7,13 +7,30 @@ and mapping it directly is the defect this module exists to prevent: a ``COUNT_D
 logically ``integer`` and physically ``BIGINT``; a ``SUM`` publishes ``DECIMAL(p,s)`` taken from the
 formula's OWN :class:`~featuregen.formula.schema.DecimalPolicy` whatever word Child-1 resolved.
 
-The word is still read — but as **evidence about the OPERAND**, never as a type to map. Child-1
-resolves a SUM's / DIFFERENCE's ``output_type`` to the operand's governed ``logical_representation``
-verbatim (``output_authority._numeric_output_type``), so it is the only visible statement about what
-is being summed. It is consulted for exactly one question: is the operand an EXACT numeric? An
-operand whose type is unreadable (Child-1's ``"unknown"``) or inexact refuses with
-``PHYSICAL_TYPE_UNSUPPORTED`` rather than publishing a fixed-point column nobody governed. §6's
-"never silently map ambiguous numerics" is honoured by refusing, and no fallback type exists here.
+**The word is not read at all.** ``FormulaOutputPolicyV1.output_type`` describes at most ONE operand
+per formula — a SUM's own, a DIFFERENCE's *minuend*, and for a RATIO the constant ``"decimal"``,
+which describes no operand at all (``output_authority``) — so a ratio's numerator and denominator and
+a difference's subtrahend are unrepresentable in it. §6 requires EVERY arithmetic operand to be an
+exact numeric, so the evidence is taken per EXPRESSION from
+:class:`~featuregen.materialize.expression_ir.OperandTypeEvidence`, which carries each operand's own
+governed C1 ``logical_representation`` (Task 8.1). Consulting the word as well would give one
+question two answers, and the weaker one would sometimes win.
+
+**Only an EXACT numeric may back a `DECIMAL` (§6).** The catalog's ``_NUMERIC_LOGICAL_TYPES`` is
+*arithmetic-capable*, not exact — it contains ``float``, ``double``, ``double precision``, ``real``
+and ``money`` — so "is it numeric?" is the wrong question: publishing ``DECIMAL(p,s)`` from a binary
+float asserts a reproducibility float arithmetic does not have. Three operand states refuse, each
+with its own explanation and all with ``PHYSICAL_TYPE_UNSUPPORTED`` (§14's only member for a typing
+verdict, and this module must not invent one):
+
+* a GOVERNED type outside :data:`_EXACT_NUMERIC_LOGICAL_TYPES` — known, and unsupported here;
+* UNGOVERNED — no governed decision backs the operand's type, so the fixed-point claim would rest on
+  a file declaration nobody attested;
+* UNAVAILABLE — the type authority itself is degraded (fork / hash-mismatch / unprojectable), which
+  is a different problem with a different remedy and is kept a distinct branch so the allowlist test
+  cannot swallow it and report "not an exact numeric" about a type nobody could read.
+
+§6's "never silently map ambiguous numerics" is honoured by refusing; no fallback type exists here.
 
 **Nullability is part of the type decision**, not a downstream detail: §9's gate compares the staged
 column's nullability against this answer, so a wrong answer there makes that gate unenforceable. It
@@ -46,16 +63,15 @@ validated nor carried — validating it would refuse a correct feature over an i
 carrying it would put a rounding mode on an integral column. The renderer must therefore take its
 rounding/overflow obligations from :class:`PhysicalType`, never from ``formula.decimal``.
 
-**A blind spot §6 does not resolve, recorded rather than papered over.** ``resolve_physical_type``
-sees one formula and one resolved logical word, and that word is derived from ONE operand: the SUM's
-own operand, or a DIFFERENCE's MINUEND (``output_authority._resolve_difference``). A RATIO's word is
-the constant ``"decimal"`` and describes no operand at all. So a ratio's numerator/denominator and a
-difference's subtrahend are INVISIBLE here: an inexact operand in one of those positions cannot be
-refused by this adapter. Catching it needs the per-expression C1 facts (``ExprFacts.output_type``),
-which this signature does not receive.
+**Evidence is REQUIRED, never defaulted.** ``operand_types`` is a keyword argument with no default
+and its key set must equal the formula's body paths exactly. A default of ``{}`` would let a caller
+skip §6's gate by omission — the fail-open shape this task exists to close — and a mapping that does
+not line up with the body is a call assembled wrongly, so it raises ``ValueError`` rather than
+borrowing a governed code for a programming error (the line Task 9 drew).
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,7 +79,6 @@ from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
     DecimalPolicy,
-    DiffBody,
     EmptyWindowResult,
     FormulaBody,
     NullInput,
@@ -76,6 +91,7 @@ from featuregen.formula.schema import (
     body_expressions,
 )
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+from featuregen.materialize.expression_ir import OperandTypeEvidence, OperandTypeStatus
 
 __all__ = [
     "PHYSICAL_TYPE_POLICY_VERSION",
@@ -86,33 +102,45 @@ __all__ = [
 #: The version of THIS mapping. It enters ``FeatureGroupPlanV1`` / ``group_plan_hash`` (§6) and the
 #: materialization contract hash (§5.5), so a change to any rule below is a change of identity: a
 #: column typed under a different policy is a different artifact even when the type string matches.
-PHYSICAL_TYPE_POLICY_VERSION = 1
+#:
+#: **2** (Task 8.1): the operand rule changed from "the formula's one logical word is exact" to
+#: "EVERY arithmetic operand carries a GOVERNED exact-numeric type". Formulas that resolved to a
+#: ``DECIMAL`` under version 1 can refuse under version 2 — a float denominator was invisible to the
+#: word, and an ungoverned operand type was accepted — so the two versions are not interchangeable
+#: and a contract keyed on the old one describes a column decided by a rule that no longer applies.
+PHYSICAL_TYPE_POLICY_VERSION = 2
 
 #: The maximum precision a Hive/Spark ``DECIMAL`` can hold. A policy above it is not representable.
 _MAX_DECIMAL_PRECISION = 38
 
-#: The base logical types a SUM / DIFFERENCE operand may have. An ALLOWLIST, deliberately: the
-#: complement (an unreadable type, a string, an inexact binary fraction) is open-ended, and a
-#: denylist would admit every future member of it. Base names only — a parameterised
-#: ``numeric(18,2)`` is normalised to ``numeric`` before the test.
+#: §6's ``EXACT_NUMERIC`` set — the base logical types an ARITHMETIC operand may have. An ALLOWLIST,
+#: deliberately: the complement (an unreadable type, a string, an inexact binary fraction, whatever a
+#: future catalog adds) is open-ended, and a denylist would admit every future member of it. Base
+#: names only — a parameterised ``numeric(18,2)`` is normalised to ``numeric`` before the test.
 #:
-#: Inexact binary floating-point types are absent on purpose. Their sum is order-dependent under
-#: parallel execution, so the fixed-point value published from one is not reproducible — and a
-#: money column that is not reproducible is worse than a refused one. ``money`` is likewise absent:
-#: its scale is a locale setting rather than a declared column property, so the ``(p,s)`` it would
-#: convert to is not knowable from governed metadata.
+#: §6 spells the set ``{numeric, decimal, integer, int, int4, int8, bigint, smallint}``. ``int2`` is
+#: the one addition: it is PostgreSQL's own alias for ``smallint`` (as ``int4``/``int8``, which §6
+#: DOES list, are for ``integer``/``bigint``), so excluding it would refuse a genuinely exact column
+#: over its spelling while accepting its two siblings.
+#:
+#: Inexact binary floating-point types are absent on purpose, and this is §6's whole point: they ARE
+#: in the catalog's ``_NUMERIC_LOGICAL_TYPES`` (``b_output_policy.py:65``,
+#: ``output_authority.py:59``), so a "is it numeric?" test passes a float and publishes fixed-point
+#: anyway. A float sum is order-dependent under parallel execution, so the value published from one
+#: is not reproducible — and a money column that is not reproducible is worse than a refused one.
+#: ``money`` is absent for a different reason: its scale is a locale setting rather than a declared
+#: column property, so the ``(p,s)`` it would convert to is not knowable from governed metadata.
 _EXACT_NUMERIC_LOGICAL_TYPES: frozenset[str] = frozenset(
     {"numeric", "decimal", "integer", "int", "int2", "int4", "int8", "bigint", "smallint"})
 
+#: The aggregates whose result is a COUNT. Their operand is not an arithmetic operand — you may
+#: ``COUNT_DISTINCT`` a text column, and the count is integral whatever the column holds — so §6's
+#: exact-numeric rule does not apply to it. ``COUNT_ROWS`` has no operand at all (schema [c9]).
 _COUNT_FUNCTIONS: frozenset[AggregateFunction] = frozenset({
     AggregateFunction.COUNT_ROWS,
     AggregateFunction.COUNT_NON_NULL,
     AggregateFunction.COUNT_DISTINCT,
 })
-
-#: Child-1's "the operand's type was absent or is not numeric" marker (``output_authority``). Kept
-#: as a named constant so the refusal reads as a governed verdict rather than a string comparison.
-_UNKNOWN_LOGICAL_TYPE = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,43 +216,81 @@ def _decimal_type(policy: DecimalPolicy) -> str | MaterializationRefused:
     return f"DECIMAL({policy.precision},{policy.scale})"
 
 
-def _operand_evidence(body: FormulaBody) -> AggregateExpression | None:
-    """The expression the formula's logical word actually describes, or ``None`` if it describes no
-    operand at all.
+def _require_evidence(
+    expressions: tuple[tuple[str, AggregateExpression], ...],
+    operand_types: Mapping[str, OperandTypeEvidence],
+) -> None:
+    """The supplied evidence must describe EXACTLY this formula's expressions.
 
-    Child-1 derives the word from ONE place per body shape (``output_authority``): a unary body's
-    own expression, a DIFFERENCE's MINUEND, and — for a RATIO — nowhere, because ``"decimal"`` is a
-    constant. Treating the word as evidence about any other expression would be reading a fact
-    about the numerator off a statement about the denominator.
+    Two directions, both fatal to the gate if unchecked. A MISSING body path would let a caller skip
+    §6's rule for one half of a ratio by omitting it. An EXTRA one, or an entry whose
+    ``operand_ref`` is not the operand of the expression at that path, means the evidence was
+    gathered for a different formula — and then the operand actually summed is typed by a statement
+    about a column it is not.
+
+    Raises:
+        ValueError: the mapping does not line up with the body. A call assembled wrongly is not a
+            governed verdict — §14 has no member for it, and Task 9 drew this line for exactly the
+            same reason (a malformed declaration must not borrow a governed code).
     """
-    if isinstance(body, UnaryBody):
-        return body.expr
-    if isinstance(body, DiffBody):
-        return body.minuend
-    return None
+    paths = {path for path, _expr in expressions}
+    supplied = set(operand_types)
+    if paths != supplied:
+        raise ValueError(
+            f"operand_types must describe exactly the formula's expressions: "
+            f"missing {sorted(paths - supplied)}, unexpected {sorted(supplied - paths)}. "
+            f"Evidence omitted for a body path would silently exempt that operand from §6's "
+            f"exact-numeric rule, which is the fail-open this argument exists to close")
+    mismatched = sorted(
+        path for path, expr in expressions
+        if operand_types[path].operand_ref != expr.operand)
+    if mismatched:
+        raise ValueError(
+            f"{len(mismatched)} evidence entr(y/ies) name a different operand than the expression "
+            f"at the same body path ({', '.join(mismatched)}): the evidence was gathered for "
+            f"another formula, so it types a column this one does not read")
 
 
-def _check_operand_type(body: FormulaBody, word: str) -> MaterializationRefused | None:
-    """Refuse a published DECIMAL whose visible operand is not an exact numeric.
+def _check_operand_types(
+    expressions: tuple[tuple[str, AggregateExpression], ...],
+    operand_types: Mapping[str, OperandTypeEvidence],
+) -> MaterializationRefused | None:
+    """§6 — refuse a published ``DECIMAL`` unless EVERY arithmetic operand is a governed exact
+    numeric.
 
-    A count's operands are integral by construction, so the word is not evidence about them (a
-    ``COUNT_ROWS`` has no operand for Child-1 to read a type from at all, and its word is
-    ``"unknown"`` for that reason rather than because anything is wrong). The check therefore
-    applies only where the evidence exists: an aggregate that is not a count.
+    Every expression, not the one the formula's word happened to describe: a ratio's numerator AND
+    denominator, a difference's minuend AND subtrahend. A count is skipped because its result is
+    integral whatever its operand holds, so the operand is not arithmetic — and its evidence is
+    still carried, just not consulted.
+
+    The three refusing states are separate branches on purpose. An UNGOVERNED or UNAVAILABLE operand
+    carries no type at all, so it is also absent from the exact-numeric allowlist: a single check
+    would refuse it — with the wrong explanation, blaming a type nobody could read. The branch order
+    is what keeps "we know the type and cannot use it" apart from "we could not read the type".
     """
-    evidence = _operand_evidence(body)
-    if evidence is None or evidence.aggregation in _COUNT_FUNCTIONS:
-        return None
-    if _base_logical_type(word) == _UNKNOWN_LOGICAL_TYPE:
-        return _refuse(
-            f"the operand of {evidence.aggregation.value} has no readable governed type "
-            f"(Child-1 resolved {_UNKNOWN_LOGICAL_TYPE!r}), so publishing a fixed-point column "
-            f"from it would be a numeric claim no governed fact supports")
-    if not _is_exact_numeric(word):
-        return _refuse(
-            f"the operand of {evidence.aggregation.value} has logical type {word!r}, which is not "
-            f"an exact numeric: the aggregate is not reproducible, so no fixed-point conversion of "
-            f"it is unambiguous")
+    for path, expr in expressions:
+        if expr.aggregation in _COUNT_FUNCTIONS:
+            continue
+        evidence = operand_types[path]
+        where = f"the {expr.aggregation.value} operand at {path}"
+        if evidence.status is OperandTypeStatus.UNAVAILABLE:
+            return _refuse(
+                f"{where} has no readable governed type: the C1 type-authority read failed closed "
+                f"({evidence.read_status}), so the operand's type is UNKNOWN rather than known and "
+                f"unsupported. Publishing a fixed-point column here would convert a value whose "
+                f"representation could not be established; the remedy is to repair the type "
+                f"authority, not to change the column")
+        if evidence.status is not OperandTypeStatus.GOVERNED or evidence.logical_type is None:
+            return _refuse(
+                f"{where} carries no GOVERNED logical type (C1 status {evidence.read_status!r}), "
+                f"so a published DECIMAL(p,s) would rest on a type declaration nobody attested. "
+                f"§6 admits an exact numeric as a governed fact, never as a file's word for itself")
+        if not _is_exact_numeric(evidence.logical_type):
+            return _refuse(
+                f"{where} has governed logical type {evidence.logical_type!r}, which is not an "
+                f"exact numeric: its aggregate is order-dependent under parallel execution, so no "
+                f"fixed-point conversion of it is reproducible. A numeric type is not sufficient — "
+                f"only an exact one may back a DECIMAL column")
     return None
 
 
@@ -251,7 +317,11 @@ def _published_operation(body: FormulaBody) -> AggregateFunction | None:
     return body.expr.aggregation if isinstance(body, UnaryBody) else None
 
 
-def resolve_physical_type(formula: TypedFormulaV1) -> PhysicalType | MaterializationRefused:
+def resolve_physical_type(
+    formula: TypedFormulaV1,
+    *,
+    operand_types: Mapping[str, OperandTypeEvidence],
+) -> PhysicalType | MaterializationRefused:
     """The published column type for ``formula`` (§6), or a typed refusal.
 
     The mapping, keyed on the OPERATION:
@@ -273,13 +343,22 @@ def resolve_physical_type(formula: TypedFormulaV1) -> PhysicalType | Materializa
     A refusal is RETURNED rather than raised: one refused feature is one governed verdict among the
     many a compilation collects, the shape ``ir.compile_ir`` already uses.
 
+    Args:
+        formula: the governed formula whose column is being typed.
+        operand_types: one :class:`~featuregen.materialize.expression_ir.OperandTypeEvidence` per
+            body path — exactly the mapping ``{e.expr_path: e.operand_type for e in ir.expressions}``
+            a compiled ``FormulaExecutionIRV1`` already holds. Required, because §6's rule is only a
+            gate if it cannot be skipped by omission.
+
     Returns:
         The resolved :class:`PhysicalType`, or a :class:`MaterializationRefused` carrying
-        ``PHYSICAL_TYPE_UNSUPPORTED`` — an operand this slice cannot convert unambiguously, a
-        decimal policy outside what a Hive/Spark ``DECIMAL`` can represent, or an overflow behaviour
-        it does not implement.
+        ``PHYSICAL_TYPE_UNSUPPORTED`` — an arithmetic operand that is not a governed exact numeric,
+        a decimal policy outside what a Hive/Spark ``DECIMAL`` can represent, or an overflow
+        behaviour this slice does not implement.
 
     Raises:
+        ValueError: ``operand_types`` does not describe exactly this formula's expressions. A call
+            assembled wrongly is not a governed verdict (§14 has no member for it).
         featuregen.formula.schema.SchemaError: ``formula.body`` is outside Child-1's closed union,
             raised by ``schema.body_expressions``. A forged object is not a governed verdict, and
             §14's vocabulary has no member for it.
@@ -289,6 +368,10 @@ def resolve_physical_type(formula: TypedFormulaV1) -> PhysicalType | Materializa
     # structural rather than positional: EVERY return below needs the nullability this feeds, so a
     # body Child-1 does not define cannot reach one of them.
     expressions = body_expressions(body)
+    # Checked BEFORE the count short-circuit: a count publishes BIGINT without consulting its
+    # operand's type, so validating the pairing only on the decimal path would let a mismatched
+    # mapping — evidence gathered for another formula — pass unnoticed for every count.
+    _require_evidence(expressions, operand_types)
     nullable = _is_nullable(body, expressions)
     operation = _published_operation(body)
 
@@ -297,7 +380,7 @@ def resolve_physical_type(formula: TypedFormulaV1) -> PhysicalType | Materializa
         # validated nor carried (module docstring). The count's own width is the engine's BIGINT.
         return PhysicalType(sql_type="BIGINT", nullable=nullable, rounding=None, overflow=None)
 
-    refusal = _check_operand_type(body, formula.output.output_type)
+    refusal = _check_operand_types(expressions, operand_types)
     if refusal is not None:
         return refusal
 
