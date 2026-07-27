@@ -16,6 +16,11 @@ This is a PURE performance change, so the tests here are about EQUIVALENCE and S
   it), so a hoisted list must stay pinned to the SAME ``(catalog_source, roles)`` for its own pass and
   must never survive into the next one. Two passes with different roles must still differ.
 * :func:`test_columns_are_loaded_exactly_once_per_pass` — the fix's whole point, pinned.
+
+Section 4 covers the P4 consumer of the same seam: ``ground_all_outcomes(table=...)``, which narrows
+the loaded list to one table. It rides on the identical hazard — the list is read-scoped — so the
+narrowing is proved to be a pure SUBSET of what the caller could already see, never a way to name a
+table into visibility.
 """
 from __future__ import annotations
 
@@ -29,6 +34,10 @@ from tests.featuregen.overlay.upload.test_gating_confirm_lift import (  # noqa: 
 from tests.featuregen.overlay.upload.test_templates import _CATALOG, _churn_catalog
 
 from featuregen.overlay.upload import templates as templates_module
+from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.suggestions import suggest_features_for_table
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     ground_all_outcomes,
@@ -36,6 +45,7 @@ from featuregen.overlay.upload.templates import (
 )
 
 CHURN_SOURCE = "churn"
+_RESTRICTED = {"public.cards.full_name", "public.cards.beneficiary_name"}
 
 
 def _per_template_load(conn, templates, *, catalog_source, roles=()):
@@ -159,3 +169,90 @@ def test_the_old_way_loaded_once_per_template(db, load_spy):
     load_spy.clear()
     _per_template_load(db, ALL_TEMPLATES, catalog_source=CHURN_SOURCE, roles=("pii_reader",))
     assert len(load_spy) == len(ALL_TEMPLATES)
+
+
+# ── 4. The P4 per-table narrowing — it can only NARROW ───────────────────────────────────────────
+# `ground_all_outcomes(table=...)` scopes the candidate columns to ONE table, because the pass yields
+# at most one candidate per template and catalog-wide the first table to bind a recipe uses it up.
+# The hazard is the same one as the hoist: the column list is READ-SCOPED, so the filter must be a
+# pure subset of what these roles could already see — never a way to name a table into visibility.
+_ONE_SOURCE = "onetable"
+_ONE = [
+    (CanonicalRow(_ONE_SOURCE, "cards", "customer_id", "integer", is_grain=True, entity="Customer"), "customer_id"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "balance", "numeric", additivity="semi_additive", currency="USD"), "monetary_stock"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "snapshot_date", "timestamp", as_of=True), "as_of_date"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "amount", "numeric", additivity="additive", currency="USD"), "monetary_flow"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "txn_ts", "timestamp"), "event_timestamp"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "full_name", "text", sensitivity="pii"), "pii"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "beneficiary_name", "text", sensitivity="pii"), "beneficiary_name"),
+    (CanonicalRow(_ONE_SOURCE, "cards", "beneficiary_bank", "text"), "beneficiary_bank"),
+    (CanonicalRow(_ONE_SOURCE, "other", "amount", "numeric", additivity="additive", currency="USD"), "monetary_flow"),
+]
+
+
+def _one_table_catalog(db):
+    """ONE table carrying a whole recipe's worth of concepts, INCLUDING two restricted columns — the
+    only shape that can show a per-table pass differing by read scope, because a recipe that reaches
+    across tables cannot ground per-table at all."""
+    build_graph(db, _ONE_SOURCE, [r for r, _c in _ONE],
+                concepts={content_hash(r): c for r, c in _ONE if c})
+
+
+def _refs(outcomes):
+    return {ref for o in outcomes if o.feature is not None for _src, ref in o.feature.derives_pairs}
+
+
+def test_the_table_filter_never_widens_a_callers_read_scope(db):
+    """P4 — ``table=`` narrows the candidate columns to one table. It is applied AFTER the read scope,
+    so it can only ever REMOVE candidates: two callers still see correspondingly different results and
+    the narrower caller never reaches a restricted column by naming a table."""
+    _one_table_catalog(db)
+    unscoped = ground_all_outcomes(
+        db, ALL_TEMPLATES, catalog_source=_ONE_SOURCE, roles=(), table="cards")
+    pii = ground_all_outcomes(
+        db, ALL_TEMPLATES, catalog_source=_ONE_SOURCE, roles=("pii_reader",), table="cards")
+
+    # the pii-gated recipe is the observable, per table exactly as catalog-wide
+    assert "external_own_transfer_trend_90d" in _names(pii)
+    assert "external_own_transfer_trend_90d" not in _names(unscoped)
+    assert _names(unscoped) < _names(pii)
+    assert not (_refs(unscoped) & _RESTRICTED)
+    assert _refs(pii) & _RESTRICTED                  # non-vacuous: the fixture really gates something
+
+    # the filter never reaches BEYOND the named table either
+    assert all(ref.startswith("public.cards.") for ref in _refs(unscoped) | _refs(pii))
+
+
+def test_every_column_a_filtered_pass_binds_is_one_the_caller_could_already_see(db):
+    """The general statement of the same guarantee, asserted against the caller's OWN read-scoped
+    column list rather than against one gated recipe: a table filter can only ever be a subset."""
+    _one_table_catalog(db)
+    for roles in ((), ("pii_reader",)):
+        visible = {c.object_ref
+                   for c in templates_module._load_columns(db, _ONE_SOURCE, roles)}
+        for table in ("cards", "other", "no_such_table"):
+            outcomes = ground_all_outcomes(
+                db, ALL_TEMPLATES, catalog_source=_ONE_SOURCE, roles=roles, table=table)
+            assert _refs(outcomes) <= visible, (roles, table)
+
+
+def test_two_callers_with_different_roles_get_correspondingly_different_suggestions(db):
+    """End to end on the read-only endpoint: ``roles`` comes from the authenticated session and is
+    handed to the same narrowed grounding pass, so a column the caller may not see is not a candidate
+    and cannot be suggested — the per-table pass changes nothing about that."""
+    _one_table_catalog(db)
+    unscoped = suggest_features_for_table(
+        db, catalog_source=_ONE_SOURCE, table="cards", roles=())
+    pii = suggest_features_for_table(
+        db, catalog_source=_ONE_SOURCE, table="cards", roles=("pii_reader",))
+
+    def _suggested(out):
+        return {s["name"] for g in out["groups"] for s in g["suggestions"]}
+
+    def _used(out):
+        return {ref for g in out["groups"] for s in g["suggestions"] for ref in s["uses"]}
+
+    assert "external_own_transfer_trend_90d" in _suggested(pii)
+    assert _suggested(unscoped) < _suggested(pii)
+    assert not (_used(unscoped) & _RESTRICTED)
+    assert _used(pii) & _RESTRICTED

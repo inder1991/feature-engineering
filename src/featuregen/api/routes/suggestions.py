@@ -45,11 +45,13 @@ router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 
-# One request grounds the WHOLE template registry against the catalog, so its cost scales with
-# catalog WIDTH, not with the table: a 2-table/12-column fixture already issues ~1.7k SELECTs. That
-# is the engine's shape and this read-only route does not get to change it — but a wide catalog must
-# fail FAST (a 500 the caller sees) rather than pin a connection for minutes. 30s is well above any
-# measured run here and well below any sane client timeout; change this one constant to move it.
+# One request grounds the WHOLE template registry (~157 recipes) against THIS TABLE's columns, so its
+# cost is O(recipes × table columns) — constant in the number of tables the catalog holds. It used to
+# ground catalog-wide and filter, which scaled with catalog WIDTH (a 3-table/19-column fixture issued
+# ~1.7k SELECTs for one page; the same page is ~0.4k per-table). It is still hundreds of statements on
+# a wide TABLE, and a slow one must fail FAST (a 500 the caller sees) rather than pin a connection for
+# minutes. 30s is well above any measured run here and well below any sane client timeout; change this
+# one constant to move it.
 SUGGESTIONS_STATEMENT_TIMEOUT_MS = 30_000
 
 

@@ -4,18 +4,29 @@ The engine already exists: `gate1._template_candidates` grounds the whole templa
 catalog and runs every candidate through the same gauntlet the LLM candidates clear — deterministically,
 with NO intent, NO hypothesis and NO LLM. It simply had one call site, inside `build_considered_set`.
 This module exposes it per table. It WRITES NOTHING.
+
+Grounding is asked for THIS TABLE (`table=` on `_template_candidates`), not catalog-wide-then-filtered.
+The engine yields at most one candidate per template, so a catalog-wide pass hands each recipe to
+whichever table binds it first (ties break on table name) and every other table shows nothing for it:
+on a four-table fixture two tables — including the widest — showed ZERO suggestions, and two recipes
+whose distinctive columns exist on only one table were lost entirely, having grounded their entity
+need on the alphabetically-first table and then been rejected NO_JOIN_PATH there. Per-table grounding
+is also CHEAPER (grounding cost scales with the columns considered, so a page view is O(recipes ×
+table columns) instead of O(recipes × catalog columns)) and it removed the second grounding pass the
+rejection list used to need: every rejection now comes from a candidate grounded on this table's
+columns alone, so the engine's list is already this table's and needs no re-attribution.
+
+The catalog-wide question is a DIFFERENT question and still has its own caller: `build_considered_set`
+(the hypothesis-driven feature-generation flow) asks what the CATALOG can produce and passes no
+`table`, so that path is untouched.
 """
 from __future__ import annotations
 
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.contract._serial import requirements_to_json
-from featuregen.overlay.upload.contract.gate1 import (
-    _ground_template_outcomes,
-    _template_candidates,
-)
+from featuregen.overlay.upload.contract.gate1 import _template_candidates
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.recipe_grounding_context import RecipeGroundingContextV1
-from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 
 def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=()) -> dict:
@@ -38,7 +49,12 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     table = known                                   # the catalog's own bare name — the engine's key
     ideas, rejections, _grounded, _rejected, binding_by_id, _incomplete, contexts, keys_by_recipe = (
         _template_candidates(conn, catalog_source=catalog_source, roles=roles,
-                             target_ref=None, now=None))          # no intent, no clock, no LLM
+                             target_ref=None, now=None,           # no intent, no clock, no LLM
+                             table=table))                        # ...and only THIS table's columns
+    # Grounding is now scoped to the table, so every idea is already this table's — but a template
+    # whose needs are ALL optional and all unmet grounds with no bindings at all and therefore no
+    # grain table, and such an idea is not a suggestion FOR this table. The filter is what makes the
+    # per-table guarantee a property of this function rather than of the engine's internals.
     mine = [idea for idea in ideas if idea.grain_table == table]
     # Keyed on the entity REF alone: keying on (ref, label) lets one column open two groups, which
     # the screen then renders with the same React key.
@@ -61,7 +77,9 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
         # page's lead.
         "groups": [{"entity_ref": ref, "entity_label": labels.get(ref, ""), "suggestions": items}
                    for ref, items in sorted(groups.items(), key=lambda kv: (kv[0] == "", kv[0]))],
-        "rejections": _rejections_here(conn, catalog_source, roles, table, rejections),
+        # Every rejection came from a candidate grounded on THIS table's columns alone, so the
+        # engine's list is already this table's — see the module docstring.
+        "rejections": rejections,
     }
 
 
@@ -97,24 +115,6 @@ def _entity_of(idea: FeatureIdea, contexts: dict[str, RecipeGroundingContextV1],
     # NAME. Labelling it with the column would put "cif_id features" beside "customer features" as
     # though the catalog had attested an entity called cif_id — it attested nothing.
     return (idea.grain_ref[1] if idea.grain_ref else ""), ""
-
-
-def _rejections_here(conn, catalog_source: str, roles, table: str,
-                     rejections: list[dict]) -> list[dict]:
-    """This table's rejections. The engine's list is CATALOG-wide and each entry carries only
-    ``{name, reason, code}`` — no grain — so ``name -> grain table(s)`` is rebuilt from the same
-    grounding the engine ran (through gate-1's own seam, so a substituted grounder stays consistent).
-    A name that grounds on more than one table is kept for each, never silently dropped — and a name
-    the second pass does not produce at all is kept HERE rather than dropped: the screen counts these
-    into "N features are blocked", so a silent drop under-reports a readiness gap."""
-    if not rejections:
-        return []
-    grain_of: dict[str, set[str | None]] = {}
-    for outcome in _ground_template_outcomes(conn, ALL_TEMPLATES, catalog_source=catalog_source,
-                                             roles=roles):
-        if outcome.feature is not None:
-            grain_of.setdefault(outcome.feature.name, set()).add(outcome.feature.grain_table)
-    return [r for r in rejections if r["name"] not in grain_of or table in grain_of[r["name"]]]
 
 
 def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: str) -> dict:

@@ -208,6 +208,7 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
+                         table: str | None = None,
                          ) -> tuple[list[FeatureIdea], list[dict],
                                     frozenset[str], dict[str, tuple[str, ...]], dict[str, str],
                                     dict[str, tuple[str, ...]],
@@ -226,9 +227,20 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     every ``gf.template_id`` lands in exactly one of the two id collections — the disposition stage
     (Task 5) consumes them as its ``grounded_ids`` / ``rejected`` inputs. Additionally returns the
     per-SURVIVING-template ``binding_quality`` value (Task A3 Part A) — a read-only presentation signal
-    the ranker consumes; grounding behaviour is unchanged by computing it."""
+    the ranker consumes; grounding behaviour is unchanged by computing it.
+
+    ``table`` narrows GROUNDING to one table's columns (never the gauntlet's candidate universe, which
+    stays catalog-wide so a cross-catalog/cross-table judgement is unchanged). It is OPT-IN and used by
+    the per-table suggestions screen ONLY: this pass yields at most one candidate per template, so
+    catalog-wide the first table to bind a recipe uses it up and every other table shows nothing for it.
+    The feature-generation flow (``build_considered_set``) asks the CATALOG-wide question and must keep
+    asking it, so the default is ``None`` — unchanged, one candidate per template, whole catalog."""
+    # The kwarg is passed ONLY when narrowing: `_ground_template_outcomes` is a long-standing
+    # substitution seam (tests and the measurement harness replace it), so the catalog-wide call must
+    # stay argument-for-argument what it has always been.
+    narrowing = {} if table is None else {"table": table}
     outcomes = _ground_template_outcomes(
-        conn, templates, catalog_source=catalog_source, roles=roles)
+        conn, templates, catalog_source=catalog_source, roles=roles, **narrowing)
     grounded = [
         outcome.feature for outcome in outcomes if outcome.feature is not None]
     incomplete_ids = {

@@ -22,7 +22,9 @@ from featuregen.overlay.commands import confirm_fact, propose_fact
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
 from featuregen.overlay.upload import suggestions as suggestions_module
+from featuregen.overlay.upload import templates as templates_module
 from featuregen.overlay.upload.canonical import validate_rows
+from featuregen.overlay.upload.contract.gate1 import _template_candidates
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
@@ -38,13 +40,18 @@ from featuregen.overlay.upload.upload_catalog import table_ref
 SOURCE = "p4_suggestions_ftr"
 TABLE = "comp_fin_tran"
 OTHER_TABLE = "mkt_risk_pos"
+# The SIBLING: transaction-shaped exactly like TABLE, so it competes for the same recipes. Named to
+# sort AFTER TABLE because `_ranked_matches` breaks ties on (score, table, column, object_ref) — so
+# catalog-wide grounding gives every shared recipe to `comp_fin_tran` and this table gets NOTHING.
+SIBLING_TABLE = "loan_repay"
 NOW = datetime(2026, 7, 27, tzinfo=UTC)
 _FQN_PREFIX = "DPL_EIB_COMPLIANCE."
 
 # table -> column -> (concept, declared type, business term). The concepts are what the enrichment
 # stage proposes; grounding is the router, so this is what decides which template families surface.
-# TWO tables and TWO source entities on purpose: a per-table filter and a per-entity grouping can
-# only be shown to work by a fixture that would expose them being wrong.
+# THREE tables and TWO source entities on purpose: a per-table filter and a per-entity grouping can
+# only be shown to work by a fixture that would expose them being wrong, and the starvation the
+# per-table pass exists to fix is only visible when two tables carry the SAME concept profile.
 _COLUMNS = {
     TABLE: {
         "CIF_ID": ("customer_id", "varchar", "Customer Identifier"),
@@ -61,6 +68,15 @@ _COLUMNS = {
         "BOOK_ID": ("book_id", "varchar", "Trading Book Identifier"),
         "VAR_AMT": ("var", "decimal", "Value At Risk"),
         "RISK_DT": ("as_of_date", "date", "Risk As Of Date"),
+    },
+    SIBLING_TABLE: {
+        "LOAN_CIF": ("customer_id", "varchar", "Borrower Customer Identifier"),
+        "LOAN_ACCT": ("account_id", "varchar", "Loan Account Identifier"),
+        "REPAY_AMT": ("monetary_flow", "decimal", "Repayment Amount"),
+        "PRIN_BAL": ("monetary_stock", "decimal", "Principal Balance"),
+        "DUE_DT": ("as_of_date", "date", "Repayment Due Date"),
+        "POST_TS": ("event_timestamp", "timestamp", "Repayment Posting Timestamp"),
+        "REPAY_CNT": ("count", "integer", "Repayment Count"),
     },
 }
 _CONCEPT_OF = {col: spec[0] for cols in _COLUMNS.values() for col, spec in cols.items()}
@@ -133,6 +149,7 @@ def ftr_catalog(overlay_conn):
     assert res.status == "ingested", res.status
     _govern_table_facts(overlay_conn, TABLE, "cif_id", "as_of_dt")
     _govern_table_facts(overlay_conn, OTHER_TABLE, "book_id", "risk_dt")
+    _govern_table_facts(overlay_conn, SIBLING_TABLE, "loan_cif", "due_dt")
     return _Catalog(source=SOURCE, table=TABLE)
 
 
@@ -238,14 +255,33 @@ def test_the_unlabelled_group_sorts_last(overlay_conn, ftr_catalog, monkeypatch)
     assert refs[-1] == ""
 
 
-def test_a_rejection_the_grain_pass_cannot_place_is_kept_not_dropped(monkeypatch):
-    """The grain rebuild is a SECOND grounding pass. A rejection whose name that pass does not
-    produce was silently dropped — and the screen counts these into "N features are blocked", so the
-    drop UNDER-reports a readiness gap. Keep it and let it be seen."""
-    monkeypatch.setattr(suggestions_module, "_ground_template_outcomes", lambda *a, **k: [])
-    kept = suggestions_module._rejections_here(
-        None, SOURCE, (), TABLE, [{"name": "ghost", "reason": "no basis", "code": "NO_POINT_IN_TIME"}])
-    assert [r["name"] for r in kept] == ["ghost"]
+def test_the_rejection_list_is_the_engines_own_per_table_list(overlay_conn, ftr_catalog):
+    """The rejections needed a SECOND catalog-wide grounding pass to rebuild ``name -> grain
+    table(s)``, because the engine's rejection entries carry only ``{name, reason, code}`` and the
+    engine's list was catalog-wide. Under per-table grounding every rejected candidate was grounded
+    on THIS table's columns alone, so the list is already this table's and the second pass — with its
+    re-attribution guesswork and its "kept because the second pass could not place it" fallback — is
+    gone. Pinned directly against the engine so a silent divergence cannot creep back."""
+    engine = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(), target_ref=None,
+                                  now=None, table=TABLE)[1]
+    assert engine, "the fixture rejects nothing on this table — the pin would be vacuous"
+    out = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=TABLE)
+    assert out["rejections"] == engine
+
+
+def test_one_page_view_reads_the_catalog_columns_once(overlay_conn, ftr_catalog, monkeypatch):
+    """The page used to ground TWICE — once for the candidates and once to re-attribute the
+    rejections — over the WHOLE catalog. It now grounds once, over one table."""
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    real = templates_module._load_columns
+
+    def _spy(conn, catalog_source, roles):
+        calls.append((catalog_source, tuple(roles)))
+        return real(conn, catalog_source, roles)
+
+    monkeypatch.setattr(templates_module, "_load_columns", _spy)
+    suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=TABLE)
+    assert calls == [(SOURCE, ())]
 
 
 def test_rejections_are_this_tables_only(overlay_conn, ftr_catalog):
@@ -257,6 +293,83 @@ def test_rejections_are_this_tables_only(overlay_conn, ftr_catalog):
         overlay_conn, catalog_source=ftr_catalog.source, table=OTHER_TABLE)
     assert out["rejections"]                        # this table really does reject something
     assert not ({r["name"] for r in out["rejections"]} & {r["name"] for r in other["rejections"]})
+
+
+# ── per-table grounding: the starvation fix ──────────────────────────────────────────────────────
+def _catalog_wide_ideas(conn) -> list[FeatureIdea]:
+    """The FEATURE-GENERATION engine's own pass — ``_template_candidates`` called exactly as
+    ``build_considered_set`` calls it, with no table narrowing."""
+    return _template_candidates(conn, catalog_source=SOURCE, roles=(), target_ref=None, now=None)[0]
+
+
+def _uses(out: dict) -> set[str]:
+    return {ref for g in out["groups"] for s in g["suggestions"] for ref in s["uses"]}
+
+
+def test_a_table_starved_by_catalog_wide_grounding_gets_its_own_suggestions(
+        overlay_conn, ftr_catalog):
+    """THE HEADLINE. ``ground_all_outcomes`` yields AT MOST ONE candidate per template catalog-wide,
+    and ties break on table name — so ``comp_fin_tran`` wins every shared recipe and its identically
+    shaped sibling ``loan_repay`` shows an EMPTY screen ("your columns carry no business concepts"),
+    which is a confident, false claim about a table that carries seven tagged columns.
+
+    Grounding the registry against ONLY this table's columns is what the screen was always asking
+    for. The recipes and the bound columns are asserted specifically: a non-empty count would also
+    be satisfied by leaking another table's cards in."""
+    # the starvation, pinned on the engine's own catalog-wide pass
+    assert not [i for i in _catalog_wide_ideas(overlay_conn) if i.grain_table == SIBLING_TABLE]
+
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=SOURCE, table=SIBLING_TABLE)
+    assert out["table_known"] is True
+    names = _names(out)
+    assert {"balance_trend_90d", "dormancy_days"} <= names, sorted(names)
+    cards = {s["name"]: s for g in out["groups"] for s in g["suggestions"]}
+    # the SIBLING's own balance / own event clock — not comp_fin_tran's
+    assert f"public.{SIBLING_TABLE}.prin_bal" in cards["balance_trend_90d"]["uses"]
+    assert f"public.{SIBLING_TABLE}.post_ts" in cards["dormancy_days"]["uses"]
+    assert cards["balance_trend_90d"]["recipe"] == "trend_90d(prin_bal) BY loan_cif OVER 90d [due_dt]"
+    assert out["summary"]["suggested"] == len(cards) >= 5
+
+
+def test_no_suggestion_binds_a_column_of_another_table(overlay_conn, ftr_catalog):
+    """No cross-table leakage: every operand of every card belongs to the table that was asked for.
+    There is no governed join in this catalog, so a cross-table operand would be a bug — and under
+    catalog-wide grounding it happened (a candidate grained on one table reaching for another's
+    measure, which the gauntlet then rejected NO_JOIN_PATH against the wrong table)."""
+    for table in (TABLE, OTHER_TABLE, SIBLING_TABLE):
+        out = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=table)
+        assert out["summary"]["suggested"] >= 1, table
+        assert all(ref.startswith(f"public.{table}.") for ref in _uses(out)), table
+        assert {s["grain_table"] for g in out["groups"] for s in g["suggestions"]} == {table}
+
+
+def test_no_table_shows_the_empty_screen_any_more(overlay_conn, ftr_catalog):
+    """The measurement's headline number: every governed table in this catalog now suggests
+    something, where catalog-wide grounding left the sibling with nothing at all."""
+    per_table = {t: suggest_features_for_table(
+        overlay_conn, catalog_source=SOURCE, table=t)["summary"]["suggested"]
+        for t in (TABLE, OTHER_TABLE, SIBLING_TABLE)}
+    assert all(per_table.values()), per_table
+    assert sum(per_table.values()) > len(_catalog_wide_ideas(overlay_conn))
+
+
+def test_the_feature_generation_path_is_still_catalog_wide(overlay_conn, ftr_catalog):
+    """The SCOPE guarantee. ``_template_candidates`` is also the engine behind the hypothesis-driven
+    feature-generation flow (Workbench -> considered set), which answers a different question — what
+    can this CATALOG produce — so the narrowing must be OPT-IN. Called the way that flow calls it,
+    the pass is exactly what it was: still one candidate per template, still starving the sibling."""
+    default = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(),
+                                   target_ref=None, now=None)
+    explicit = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(),
+                                    target_ref=None, now=None, table=None)
+    assert [(i.name, i.grain_table, i.recipe_id) for i in default[0]] == [
+        (i.name, i.grain_table, i.recipe_id) for i in explicit[0]]
+    assert default[1:] == explicit[1:]          # rejections + every id/context map the flow consumes
+    grains = {i.grain_table for i in default[0]}
+    assert TABLE in grains and SIBLING_TABLE not in grains
+    # one candidate per template — the catalog-wide invariant this change must not touch
+    assert len({i.recipe_id for i in default[0]}) == len(default[0])
 
 
 def _idea(**kw) -> FeatureIdea:

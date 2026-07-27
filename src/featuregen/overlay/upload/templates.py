@@ -635,12 +635,26 @@ def ground_template(conn, template: Template, *, catalog_source: str,
 
 def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: str,
                         roles: Iterable[str] = (),
-                        use_case: str | None = None) -> list[GroundingOutcome]:
+                        use_case: str | None = None,
+                        table: str | None = None) -> list[GroundingOutcome]:
+    """Ground ``templates`` against ``catalog_source``, one outcome per template.
+
+    ``table`` narrows the candidate columns to that one table. It is a pure NARROWING applied AFTER
+    the read scope (:func:`_load_columns` already dropped every column these ``roles`` may not see),
+    so it can only ever remove candidates — a table filter cannot widen what a caller can reach. It
+    exists because this pass yields AT MOST ONE candidate per template: catalog-wide, whichever table
+    binds a recipe first (ties break on table name) uses it up, and every other table in the catalog
+    shows nothing for that recipe. A per-table screen wants "what can THIS table produce"; the
+    catalog-wide default answers "what can this CATALOG produce" and is what the feature-generation
+    flow asks. Default ``None`` = catalog-wide, exactly as before.
+    """
     # The read-scoped column list is IDENTICAL for every template in this pass, so load it ONCE and
     # hand it down — grounding the whole registry re-read the entire catalog per template (157 full
     # scans a pass, 156 of them discarded), which is invisible at 126 columns and ruinous at 150k.
     # Scoped to THIS pass's (catalog_source, roles) and never held beyond it: no cache, no global.
     cols = _load_columns(conn, catalog_source, roles)
+    if table is not None:
+        cols = [col for col in cols if col.table == table]
     outcomes: list[GroundingOutcome] = []
     for template in templates:
         if use_case is not None and use_case not in template.use_cases:
