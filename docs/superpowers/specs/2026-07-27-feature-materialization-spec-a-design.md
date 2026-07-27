@@ -1,4 +1,4 @@
-# Spec A — Executable Materialization Vertical Slice (design, rev 5)
+# Spec A — Executable Materialization Vertical Slice (design, rev 6)
 
 **Goal:** Turn a **governed, provenance-verified** feature authoring result into a **complete runnable Kedro/PySpark project** that computes the worked-example features on the Hadoop/Hive cluster and publishes them as one atomically-visible feature-group partition — proven by executing them and reading the published table.
 
@@ -43,6 +43,7 @@ Before cluster acceptance, an inventory task captures from the metastore, for `b
 - physical location;
 - whether historical partitions are rewritten in place;
 - how a customer snapshot corresponding to a business date is selected;
+- **the logical→physical schema mapping** for each table (needed by §3.5 when `graph_node.schema_name` is NULL);
 - **how account-to-customer ownership is modelled** (see §H — a joint-account bridge makes the traversal `1:N` and would refuse the worked feature);
 - **the Hive, Spark and metastore versions** (§10's capability attestation is keyed on that exact triple);
 - **the full runtime compatibility set needed to RUN the generated project**: Python, Java, Spark/PySpark and Kedro versions. A project that compiles against the wrong PySpark cannot run, and that is discovered at `kedro run`, not at render.
@@ -165,7 +166,7 @@ Outcome mapping: `OPERATIONAL` → proceed · `UNVERIFIED` → `JOIN_PATH_NOT_VE
 
 **Unknown cardinality is refused.** `JoinStep.cardinality` is `str | None` and `graph_edge.cardinality` is nullable (both verified). Refusing only `1:N` would let `None` proceed — and an unknown edge may *be* `1:N`, inflating a SUM. Any step with `cardinality is None` refuses with `JOIN_CARDINALITY_UNKNOWN`. Unknown is never assumed safe.
 
-**Schema continuity is validated across every step, not just the endpoints.** The planner's BFS indexes nodes by **bare table name**, so an ambiguous *intermediate* hop can silently cross schemas — `banking.transactions → banking.accounts → archive.customers` is reachable whenever two schemas share a table name, even when both endpoints look unambiguous. The adapter validates full schema-qualified continuity across every returned step and refuses with `AMBIGUOUS_TABLE_NAME`. Reverse-edge provenance and cardinality are verified in the same pass.
+**Table-name ambiguity is checked after PHYSICAL resolution (§3.5), not on the refs.** The planner's BFS indexes nodes by bare table name, so a path can be stitched between two tables that share a name. But logical refs are schema-flattened (§3.5) — every `object_ref` is written under `public` — so the ambiguity can **never** appear as two different schemas *in the refs*, and a rule written against that would be unreachable rather than discriminating. The real condition is **two resolved physical schemas containing the same table name**; the adapter checks it against resolved physical identities across every returned step, not just the endpoints, and refuses with `AMBIGUOUS_TABLE_NAME`. Reverse-edge provenance and cardinality are verified in the same pass.
 
 ### §3.2 Fan-out is refused, not repaired
 
@@ -237,6 +238,21 @@ A table with no declared mapping refuses with `PARTITION_MAPPING_NOT_DECLARED`. 
 **Plural** — a 90-day feature reads many partitions. `partition_columns is None` means **verified unpartitioned**, never "unknown"; unknown refuses with `PARTITION_IDENTITY_UNKNOWN`. `input_snapshot_ids` (a run-time value, inside `sandbox_execution_hash` only) is the exact ordered partition set read. L1 runs at **run preparation**, after snapshots resolve, and verifies every one exists.
 
 For an unpartitioned mutable table the snapshot is **not content-addressed** — recorded honestly, and one more reason this slice is sandbox-only.
+
+---
+
+### §3.5 Physical schema resolution is an explicit step
+
+**A logical ref's schema segment is catalog-side, not the physical Hive schema.** `build_graph` flattens every `object_ref` to `public.<table>[.<column>]` (`graph.py:20`); the real declared schema survives only in `graph_node.schema_name`, which is **nullable**. So a governed ref may legitimately read `hdfc::public.transactions.amount` for a table that lives in `banking`.
+
+Every example in this spec written as `hdfc::banking.…` should be read as *"the ref for the transactions table"* — its literal schema segment depends on what the upload declared, and nothing may parse a physical schema out of it.
+
+**Normative:**
+
+1. Physical `(schema, table)` is resolved **from the governed catalog**, reusing the existing `column_authority.logical_ref_of` pattern (read `graph_node.schema_name`) — never by parsing the ref.
+2. When `schema_name` is `NULL`, resolution consults the environment's declared logical→physical schema mapping from the §0 inventory.
+3. If neither yields a physical schema, compilation refuses with **`PHYSICAL_SCHEMA_NOT_RESOLVED`**. It must **not** silently fall back to `public`, which would read a different table than the catalog governs — a wrong-table read that produces plausible numbers is exactly the failure this spec exists to prevent.
+4. The resolved physical identity, not the ref, is what feeds `PhysicalInputRequirement`, the join adapter's ambiguity check (§3.1), and the generated catalog entries.
 
 ---
 
@@ -627,7 +643,8 @@ class CompilationRefusalCode(StrEnum):          # raised/returned during compile
     AMBIGUOUS_TABLE_NAME · JOIN_PATH_NOT_VERIFIED · JOIN_PATH_DENIED_BY_READ_SCOPE
     GRAIN_PATH_NOT_GOVERNED · JOIN_FANOUT_UNSUPPORTED · JOIN_CARDINALITY_UNKNOWN
     SPINE_SOURCE_NOT_DECLARED · SPINE_DECLARATION_REJECTED_BY_FACTS
-    PARTITION_MAPPING_NOT_DECLARED · AVAILABILITY_TIME_NOT_GOVERNED
+    PARTITION_MAPPING_NOT_DECLARED · PHYSICAL_SCHEMA_NOT_RESOLVED
+    AVAILABILITY_TIME_NOT_GOVERNED
     PHYSICAL_TYPE_UNSUPPORTED · MULTIPLE_MATERIALIZATION_CONTRACTS
     PARTITION_IDENTITY_UNKNOWN · UNACCOUNTED_LOGICAL_REF
 

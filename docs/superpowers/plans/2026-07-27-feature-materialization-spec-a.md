@@ -67,7 +67,8 @@ def test_adapter_captures_partition_columns_in_order(fake_metastore):
 - [ ] **Step 6: Answer the two slice-shaping questions** in the Markdown record:
   1. **Account-to-customer ownership.** A single `accounts.cif_id` is `N:1` and fine; a joint-holder bridge is `1:N` and **refuses `total_debit_amount_30d`** (spec §3.2) — record the substitute feature if so.
   2. **How a customer snapshot maps to a business date** → becomes the `SnapshotPolicy` variant (T4).
-  3. **How each table's partitions map to a time window** → its `PartitionMappingV1`. A `load_dt` column does **not** imply an event-time mapping: late arrivals sit in load partitions outside the event range, so an `AVAILABILITY_PARTITION` mapping must widen the set. **Declare it; never infer it** — no mapping ⇒ `PARTITION_MAPPING_NOT_DECLARED`.
+  3. **The logical→physical schema mapping per table.** Refs are schema-flattened to `public`; §3.5 needs this whenever `graph_node.schema_name` is NULL, or resolution refuses with `PHYSICAL_SCHEMA_NOT_RESOLVED`.
+  4. **How each table's partitions map to a time window** → its `PartitionMappingV1`. A `load_dt` column does **not** imply an event-time mapping: late arrivals sit in load partitions outside the event range, so an `AVAILABILITY_PARTITION` mapping must widen the set. **Declare it; never infer it** — no mapping ⇒ `PARTITION_MAPPING_NOT_DECLARED`.
 - [ ] **Step 7: Commit** — `feat(materialize): typed cluster inventory + metastore adapter`
 
 ---
@@ -110,7 +111,8 @@ def test_compilation_codes_are_exactly_the_spec_set():
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",
         "GRAIN_PATH_NOT_GOVERNED", "JOIN_FANOUT_UNSUPPORTED", "JOIN_CARDINALITY_UNKNOWN",
         "SPINE_SOURCE_NOT_DECLARED", "SPINE_DECLARATION_REJECTED_BY_FACTS",
-        "PARTITION_MAPPING_NOT_DECLARED", "AVAILABILITY_TIME_NOT_GOVERNED",
+        "PARTITION_MAPPING_NOT_DECLARED", "PHYSICAL_SCHEMA_NOT_RESOLVED",
+        "AVAILABILITY_TIME_NOT_GOVERNED",
         "PHYSICAL_TYPE_UNSUPPORTED", "MULTIPLE_MATERIALIZATION_CONTRACTS",
         "PARTITION_IDENTITY_UNKNOWN", "UNACCOUNTED_LOGICAL_REF"}
 
@@ -386,7 +388,7 @@ Spec §3.3. Generation-time only. **No `business_dt` anywhere in this task.**
 
 **Files:** Create `src/featuregen/materialize/inputs.py`; Test `test_inputs.py`
 
-**Produces:** `PartitionMapping`; `PhysicalInputRequirement`; `derive_requirement(inventory, *, table_ref) -> PhysicalInputRequirement | MaterializationRefused`.
+**Produces:** `PartitionMapping`; `PhysicalInputRequirement`; `resolve_physical_identity(conn, inventory, *, logical_ref) -> PhysicalIdentity | MaterializationRefused` (reuses the `column_authority.logical_ref_of` pattern — reads `graph_node.schema_name`, then the inventory's declared logical→physical mapping when it is NULL, else `PHYSICAL_SCHEMA_NOT_RESOLVED`); `derive_requirement(conn, inventory, *, logical_ref) -> PhysicalInputRequirement | MaterializationRefused`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -395,6 +397,23 @@ def test_requirement_takes_no_business_dt():
     import inspect
     from featuregen.materialize.inputs import derive_requirement
     assert "business_dt" not in inspect.signature(derive_requirement).parameters
+
+
+def test_physical_schema_is_RESOLVED_never_parsed_from_the_ref(db, seeded_catalog, inventory):
+    """Refs are schema-flattened to `public`; the real schema lives in graph_node.schema_name."""
+    ident = resolve_physical_identity(db, inventory, logical_ref="hdfc::public.transactions.amount")
+    assert ident.schema == "banking"          # from schema_name, NOT from the ref segment
+
+
+def test_null_schema_name_falls_back_to_the_DECLARED_mapping(db, no_schema_name, inventory):
+    assert resolve_physical_identity(db, inventory,
+                                     logical_ref="hdfc::public.transactions.amount").schema == "banking"
+
+
+def test_unresolvable_schema_REFUSES_rather_than_defaulting_to_public(db, no_schema_name, bare_inventory):
+    """Silently defaulting to `public` would read a DIFFERENT table than the catalog governs."""
+    r = resolve_physical_identity(db, bare_inventory, logical_ref="hdfc::public.transactions.amount")
+    assert r.code is CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED
 
 
 def test_mapping_comes_from_the_DECLARATION_not_the_column_name(inv_load_dt_no_mapping):
