@@ -61,6 +61,9 @@ function payload(over: Partial<api.TableSuggestions> = {}): api.TableSuggestions
       },
     ],
     rejections: [],
+    neighbourhood: {
+      tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1, limit_reason: null,
+    },
     ...over,
   }
 }
@@ -234,6 +237,83 @@ describe('SuggestedFeaturesScreen', () => {
       expect(summary.querySelector('.tone-danger')).toBeNull()
       expect(within(summary).getByText('0')).toBeInTheDocument()
     })
+
+  // ── what the page did NOT look at ─────────────────────────────────────────────────────────────
+  // Suggestions are grounded on this table plus the tables joined DIRECTLY to it, capped. A page
+  // that shows a bounded slice of the join neighbourhood and says nothing turns every empty state
+  // into a false claim ("nothing else is buildable here" when the truth is "we did not look").
+  it('says how many joined tables it showed of how many exist when it truncated', async () => {
+    getTableSuggestions.mockResolvedValue(payload({
+      neighbourhood: {
+        tables_considered: 20, tables_available: 73, truncated: true, max_hops: 1,
+        limit_reason: 'table_cap',
+      },
+    }))
+    renderScreen()
+    const note = await screen.findByTestId('neighbourhood')
+    expect(note).toHaveTextContent(/Showing 20 of 73 directly joined tables/i)
+    expect(note).toHaveTextContent(/Deeper join paths were not automatically considered/i)
+    // and WHICH limit did it — never a bare number the reader cannot account for
+    expect(note).toHaveTextContent(/how many joined tables/i)
+  })
+
+  it('names the column budget when that is the limit that bit, not the table count', async () => {
+    getTableSuggestions.mockResolvedValue(payload({
+      neighbourhood: {
+        tables_considered: 3, tables_available: 41, truncated: true, max_hops: 1,
+        limit_reason: 'column_budget',
+      },
+    }))
+    renderScreen()
+    const note = await screen.findByTestId('neighbourhood')
+    expect(note).toHaveTextContent(/Showing 3 of 41 directly joined tables/i)
+    expect(note).toHaveTextContent(/how many columns/i)
+  })
+
+  it('states the hop limit even when nothing was truncated', async () => {
+    // The point of saying it always: deeper join paths EXIST and were deliberately not loaded, so a
+    // user who sees "all 4 joined tables" must not read that as "everything reachable was tried".
+    getTableSuggestions.mockResolvedValue(payload({
+      neighbourhood: {
+        tables_considered: 4, tables_available: 4, truncated: false, max_hops: 1,
+        limit_reason: null,
+      },
+    }))
+    renderScreen()
+    const note = await screen.findByTestId('neighbourhood')
+    expect(note).toHaveTextContent(/all 4 directly joined tables/i)
+    expect(note).toHaveTextContent(/Deeper join paths were not automatically considered/i)
+    expect(note).toHaveTextContent(/within 1 join of this one/i)
+    expect(note).not.toHaveTextContent(/Showing 4 of 4/i)
+  })
+
+  it('says so plainly when no confirmed join reaches another table', async () => {
+    getTableSuggestions.mockResolvedValue(payload())        // 0 available, 0 considered
+    renderScreen()
+    const note = await screen.findByTestId('neighbourhood')
+    expect(note).toHaveTextContent(/no confirmed join reaches another table/i)
+    expect(note).not.toHaveTextContent(/Showing 0 of 0/i)
+  })
+
+  it('takes the hop number from the payload rather than assuming one hop', async () => {
+    // An explicit wider request is a supported (deliberate) call, and the copy must not then lie
+    // about what was loaded.
+    getTableSuggestions.mockResolvedValue(payload({
+      neighbourhood: {
+        tables_considered: 9, tables_available: 9, truncated: false, max_hops: 2,
+        limit_reason: null,
+      },
+    }))
+    renderScreen()
+    expect(await screen.findByTestId('neighbourhood')).toHaveTextContent(/within 2 joins of this one/i)
+  })
+
+  it('says nothing about joins for a table this catalog does not hold', async () => {
+    getTableSuggestions.mockResolvedValue(payload({ table_known: false }))
+    renderScreen()
+    await screen.findByText(/no such table in this catalog/i)
+    expect(screen.queryByTestId('neighbourhood')).not.toBeInTheDocument()
+  })
 
   it('surfaces a load failure honestly', async () => {
     getTableSuggestions.mockRejectedValue(new api.ApiError(500, 'grounding blew up'))

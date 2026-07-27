@@ -1964,6 +1964,23 @@ export interface SuggestionRejection {
   code: string
 }
 
+// WHAT THE PAGE DID NOT LOOK AT. Suggestions are grounded on the opened table plus the tables joined
+// DIRECTLY to it, bounded by a table cap and a column budget — walking the join graph transitively
+// has no resource bound on a real catalog, where almost everything reaches the customer/account hub.
+// The bound is honest rather than hidden: these five fields say how much of the neighbourhood was
+// used, how much exists, whether anything was dropped and which limit dropped it. The counts are
+// about NEIGHBOURS — the opened table itself is never truncated away and is not counted here.
+export interface JoinNeighbourhood {
+  tables_considered: number
+  tables_available: number
+  truncated: boolean
+  // The hop bound that was applied (1 on any automatic page load). Stated even when nothing was
+  // truncated: deeper join paths exist and were deliberately not loaded.
+  max_hops: number
+  // Which bound bit: 'table_cap' | 'column_budget', or null when nothing was left out.
+  limit_reason: string | null
+}
+
 export interface TableSuggestions {
   catalog_source: string
   table: string
@@ -1973,8 +1990,12 @@ export interface TableSuggestions {
   summary: { suggested: number; clean_ready: number; needs_review: number; entities: number }
   groups: SuggestionGroup[]
   rejections: SuggestionRejection[]
+  neighbourhood: JoinNeighbourhood
 }
 
+// An automatic page load takes the server's capped default (one hop). The route also accepts an
+// explicit `?max_hops=` for a deliberate, wider request — no caller passes it yet: choosing WHICH
+// deeper join path to follow is a governed act that wants its own picker UI, which is DEFERRED.
 export function getTableSuggestions(source: string, table: string): Promise<TableSuggestions> {
   return request(
     `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}/suggestions`,

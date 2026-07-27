@@ -3491,7 +3491,10 @@ button.stat:hover {
 }
 
 .sug-scope,
-.sug-readonly {
+.sug-readonly,
+/* what the page did NOT look at — same quiet hint weight as the read-only note: it is a scope
+   statement about this view, not a warning about the catalog. */
+.sug-neighbourhood {
   margin: 0;
 }
 

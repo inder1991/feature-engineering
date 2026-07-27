@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   ApiError,
   type FeatureSuggestion,
+  type JoinNeighbourhood,
   type SuggestionGroup,
   type SuggestionRequirement,
   type TableSuggestions,
@@ -54,6 +55,48 @@ const STATUS_TONE: Record<string, string> = {
 // and the page is already scoped to one table, so the short name is unambiguous here.
 function columnOf(ref: string): string {
   return ref.split('.').pop() ?? ref
+}
+
+// WHICH bound dropped the tables that were dropped, in words. Named rather than numbered on purpose:
+// the numbers live in ONE place (join_path.MAX_NEIGHBOUR_TABLES / MAX_COLUMNS_CONSIDERED, quoted in
+// the payload's own terms), so a copy that printed "20" here would be free to drift from the cap the
+// server actually applied. An unknown reason from a newer backend degrades to no clause at all
+// rather than to a guess.
+const LIMIT_WORDS: Record<string, string> = {
+  table_cap: 'the automatic limit on how many joined tables one page loads',
+  column_budget: 'the automatic limit on how many columns one page grounds against',
+}
+
+// What the page did NOT look at. Suggestions are grounded on this table plus the tables joined
+// DIRECTLY to it, capped — walking the join graph transitively has no resource bound on a real
+// catalog, where almost everything reaches the customer/account hub. Saying nothing would turn
+// every empty state on this screen into a claim the page never actually checked ("nothing else is
+// buildable here" when the truth is "we did not look"). So the limit is stated ALWAYS, truncated or
+// not: deeper join paths exist, and they were deliberately not loaded.
+function NeighbourhoodNote({ n }: { n: JoinNeighbourhood }) {
+  const joins = n.max_hops === 1 ? '1 join' : `${n.max_hops} joins`
+  const because = n.limit_reason ? LIMIT_WORDS[n.limit_reason] : ''
+  return (
+    <p className="hint sug-neighbourhood" data-testid="neighbourhood">
+      {n.truncated ? (
+        <>
+          Showing <strong>{n.tables_considered} of {n.tables_available}</strong> directly joined
+          tables{because ? ` — ${because}` : ''}.{' '}
+        </>
+      ) : n.tables_available > 0 ? (
+        <>
+          Grounded on this table and all {n.tables_available} directly joined{' '}
+          {n.tables_available === 1 ? 'table' : 'tables'}.{' '}
+        </>
+      ) : (
+        <>
+          Grounded on this table alone — no confirmed join reaches another table from here.{' '}
+        </>
+      )}
+      Deeper join paths were not automatically considered: only tables within {joins} of this one are
+      loaded on a page view.
+    </p>
+  )
 }
 
 export function SuggestedFeaturesScreen({ source, table }: { source: string; table: string }) {
@@ -175,6 +218,8 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
         This view is read-only. These are proposals the catalog can already ground — accepting or
         dismissing one is not offered here, and nothing on this screen changes the catalog.
       </p>
+
+      <NeighbourhoodNote n={data.neighbourhood} />
 
       {/* Cause #1: nothing to suggest and nothing blocked — the columns carry no business concepts. */}
       {summary.suggested === 0 && rejections.length === 0 && (

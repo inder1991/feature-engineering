@@ -97,6 +97,10 @@ describe('app shell', () => {
       summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
       groups: [],
       rejections: [],
+      neighbourhood: {
+        tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1,
+        limit_reason: null,
+      },
     })
     window.location.hash = '#/suggested?source=core_banking&table=public.comp_fin_tran'
     render(<App />)
