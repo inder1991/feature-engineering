@@ -697,7 +697,19 @@ class ValidationFindingCode(StrEnum):           # L0/L1/L2 findings (§11), non-
 
 One entity (CIF) · one cadence (daily) · one materialization group · one `business_dt` per run · one Hadoop/Hive environment · no scan sharing · no fan-out · L0+L1 standard with L2 on demand · local submitter only · sandbox only · no UI · no cross-cadence assembly · no statistical profiling.
 
-The three worked features are the **target**; §0 may reveal that a joint-account model refuses one of them, in which case the slice substitutes a feature whose traversal is `N:1`.
+### Choosing the acceptance features (normative)
+
+The acceptance features are **not named in advance**. They are whichever authored features the platform's own authoring chain produces that cover the **three shapes** the acceptance test must exercise:
+
+| Shape | What it proves |
+|---|---|
+| Aggregate with a filter (e.g. `SUM … WHERE …`) | `DECIMAL(p,s)` from `DecimalPolicy`, explicit rounding, overflow **raising** rather than yielding Spark's default NULL |
+| `COUNT_DISTINCT` | `BIGINT`, and Child-1's non-additive resolution |
+| A ratio | the zero-denominator policy and column nullability |
+
+**Why not name them:** a formula produced by the authoring chain references catalog columns *by construction* (its §I tools read the real catalog) and can only enter materialization through §1.2's gate against an immutable terminal event. Hand-picked names carry no such guarantee — earlier revisions of this spec named two features that were invented as illustrations and then propagated as if they were requirements.
+
+The features are selected at acceptance time (§13 tier 3), from a real authoring run against the ingested catalog. If the data model cannot support one of the shapes, the acceptance test substitutes another feature of that shape and records the substitution.
 
 ---
 
