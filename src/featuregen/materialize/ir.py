@@ -82,6 +82,7 @@ __all__ = [
     "authorize_compilation",
     "compile_ir",
     "ir_hash",
+    "physical_read_set",
 ]
 
 
@@ -365,6 +366,29 @@ def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_R
     return union.elements()
 
 
+def _sorted_refs(elements: Sequence[_ReadElement]) -> tuple[str, ...]:
+    """The elements' logical refs, sorted and de-duplicated — ONE expression of "what was read"."""
+    return tuple(sorted({element.logical_ref for element in elements}))
+
+
+def physical_read_set(
+    irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec
+) -> tuple[str, ...]:
+    """§1.3's COMPLETE physical read set for ``irs`` over ``spine``, as sorted logical refs.
+
+    The same union Gate 2 authorizes, exposed because §5.2 classifies a read set PER FEATURE and so
+    needs it for a single IR — ``physical_read_set((ir,), ir.spine)`` — which the group-wide
+    authorization does not produce. Deriving it a second way in the classification stage would give
+    the group two answers to "what does this feature read", and the narrower answer would be the one
+    the sensitivity class was computed from.
+
+    Raises:
+        ValueError: an IR carries join steps with an empty read set (see
+            :func:`authorize_compilation`).
+    """
+    return _sorted_refs(_union_of(irs, spine))
+
+
 def _hidden(
     conn: DbConn, elements: Sequence[_ReadElement], roles: tuple[str, ...]
 ) -> tuple[_ReadElement, ...]:
@@ -453,6 +477,4 @@ def authorize_compilation(
             f"partial authorization and no per-feature bypass")
 
     return AuthorizedCompilation(
-        irs=group, spine=spine,
-        authorized_refs=tuple(sorted({element.logical_ref for element in elements})),
-        roles_used=roles_used)
+        irs=group, spine=spine, authorized_refs=_sorted_refs(elements), roles_used=roles_used)
