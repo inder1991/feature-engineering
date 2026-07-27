@@ -81,6 +81,7 @@ __all__ = [
     "RefRole",
     "compile_expression",
     "expression_ir_hash",
+    "join_key_ref",
     "logical_refs_in",
 ]
 
@@ -800,7 +801,7 @@ def _plan_to_grain(
     read_order: dict[str, None] = {}
     for step in plan.steps:
         for step_ref in (step.from_ref, step.to_ref):
-            key_ref = _key_ref(source_catalog, step_ref)
+            key_ref = join_key_ref(source_catalog, step_ref)
             key_table_ref = _table_ref_of(key_ref)
             identity = tables.resolve(key_table_ref)
             if isinstance(identity, MaterializationRefused):
@@ -834,13 +835,18 @@ def _is_source_relation(table_ref: str, identity: PhysicalIdentity) -> bool:
     return (_fold(source), _fold(table)) == (_fold(identity.catalog_source), _fold(identity.table))
 
 
-def _key_ref(catalog_source: str, step_ref: str) -> str:
+def join_key_ref(catalog_source: str, step_ref: str) -> str:
     """A join step's endpoint as a canonical logical COLUMN ref.
 
     The planner's steps carry the graph's own ``schema.table.column`` object refs and no catalog
     source (its BFS is single-catalog). The source is threaded in from the call that planned the
     path, and the schema segment is the step's OWN — not a hard-coded ``public``, which would be
     this module deciding what the graph stores.
+
+    Public since Task 7: Gate 2 (§1.3) authorizes every join step's endpoint as its own element
+    class, and an endpoint addressed by a second conversion there could name a different node than
+    the one this module put in the read set — so the same node would be authorized under one
+    address and read under another.
     """
     parts = step_ref.split(".")
     if len(parts) >= 3:

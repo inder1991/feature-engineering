@@ -350,7 +350,7 @@ def validate_semantics(p: TypedFormulaProposalV1) -> None:
     _check_decimal(p.decimal)
     for i, key in enumerate(p.grain.keys):
         _require_column_ref(key, f"grain.keys[{i}]")
-    for path, expr in _body_expressions(p.body):
+    for path, expr in body_expressions(p.body):
         _check_expression(path, expr, params)
 
 
@@ -522,10 +522,18 @@ def _require_contained_column(ref: LogicalRef, path: str, table_ref: LogicalRef)
         )
 
 
-def _body_expressions(
+def body_expressions(
     body: FormulaBody,
 ) -> tuple[tuple[str, AggregateExpression], ...]:
-    """The body's expressions keyed by canonical internal path. [c4]"""
+    """The body's expressions keyed by canonical internal path. [c4]
+
+    Public since Spec-A Task 7 (it was the private ``_body_expressions``), for the same reason
+    ``canonical.filter_plain`` and ``join_path.table_of_ref`` were made public before it: an adapter
+    must ask the question the owning module already answers. ``materialize.ir`` compiles ONE
+    ``ExpressionExecutionIR`` per body path, and a second enumeration there could disagree with this
+    one about how many expressions a body has, or what each is called — and the path names the
+    staging output every later stage reads.
+    """
     if isinstance(body, UnaryBody):
         return (("body.expr", body.expr),)
     if isinstance(body, RatioBody):
