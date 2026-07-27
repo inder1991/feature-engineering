@@ -174,6 +174,21 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
 _MAX_RATIONALE = 200
 
 
+def _operand_roles(gf: GroundedFeature) -> tuple[tuple[str, str], ...]:
+    """The (object_ref, role) pairs the TEMPLATE declared for this candidate's bound operands.
+
+    Read verbatim off ``binding_resolutions``, which grounding already built as
+    ``resolutions[need.role] = GroundedNeedResolution(role=need.role, selected_object_ref=col…)`` —
+    so the role is the recipe author's hand-written ``Need.role`` and nothing else. A resolution with
+    no ``selected_object_ref`` (missing / ambiguous / truncated need) labels no operand, so it is
+    SKIPPED rather than guessed at. Sorted + deduped for determinism.
+    """
+    return tuple(sorted({
+        (resolution.selected_object_ref, resolution.role)
+        for resolution in gf.binding_resolutions
+        if resolution.selected_object_ref is not None}))
+
+
 def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
     """A B2 GroundedFeature -> a Gate-1 FeatureIdea in the SAME shape the LLM proposes, so both sources
     run the identical gauntlet and snapshot identically. Carries the transient DESIGN-CHECKED
@@ -184,7 +199,10 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
         derives_from=[ref for _src, ref in gf.derives_pairs],
         aggregation=gf.aggregation, grain_table=gf.grain_table,
         derives_pairs=gf.derives_pairs, verification="DESIGN-CHECKED",
-        critic_note="", rationale=rationale)
+        critic_note="", rationale=rationale,
+        # `derives_pairs` is bare (catalog_source, object_ref) — the role the template DECLARED for
+        # each operand was dropped here. Carry it; nothing reads it yet.
+        operand_roles=_operand_roles(gf))
 
 
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
@@ -245,8 +263,13 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
             # recipe provenance: generation_source + recipe_id come from the grounded TEMPLATE id (the
             # server's own knowledge of the recipe path), never from the LLM/candidate raw. recipe_id
             # then survives the Gate-1 considered-set round-trip (persist → reload) via the (de)serializers.
+            # `operand_roles` rides along in the SAME server-stamp: the validator builds its own idea
+            # from `raw` (which is bare refs), so without this the template-declared roles would be
+            # dropped again one line after being carried. Additive — the validator's status +
+            # requirements are untouched.
             ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
-                                 planner_applicability="not_applicable_single_catalog"))
+                                 planner_applicability="not_applicable_single_catalog",
+                                 operand_roles=idea.operand_roles))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
             context = build_recipe_grounding_context(by_id[gf.template_id], gf)

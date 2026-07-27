@@ -529,6 +529,19 @@ class FeatureIdea:
     planner_applicability: str = "not_applicable_nonrecipe"
     physical_plan_id: str | None = None
     planner_declaration_id: str | None = None
+    # ── The TEMPLATE AUTHOR's own declaration of what each bound operand IS: (object_ref, role)
+    #    pairs carried straight off grounding's `binding_resolutions` (`Need.role` — "stock_col" /
+    #    "flow_col" / "asof" / "entity" / "event_ts", hand-written in the recipe library and versioned
+    #    in the repo). SORTED + deduped so the frozen dataclass is deterministic and hashable, matching
+    #    `Requirement.params`' precedent.
+    #
+    #    EMPTY for an LLM-proposed candidate: it has no template, so there is no declaration to carry.
+    #    An absent role is NOT a licence to guess — every consumer must fall back to today's behaviour
+    #    on it. A role is NEVER inferred from a concept (concepts are AI-PROPOSED, so one wrong concept
+    #    would rest a safety decision on a guess), a column name, or a data type.
+    #
+    #    Purely carried here — nothing reads it yet; no disposition, requirement or status depends on it.
+    operand_roles: tuple[tuple[str, str], ...] = ()
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
