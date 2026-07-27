@@ -414,6 +414,14 @@ Overrides are **monotonic** — stricter/later accepted, looser/earlier refused 
 - **`OverflowBehavior.ERROR` must fail the feature.** Spark's default decimal behaviour on overflow returns **NULL**, so genuine ERROR semantics require deliberate configuration plus explicit checks in generated code. All three first-slice features declare ERROR, so this is on the critical path — a silent NULL where the formula demanded an error is exactly the quiet wrongness this system exists to prevent.
 - **`SATURATE` is refused** in this slice unless its clamping behaviour is explicitly implemented and tested.
 - **Nullability is part of the decision**, derived from `EmptyWindowResult` and `ZeroDenominator`: a `ZERO` empty-window yields a non-null column; `ZeroDenominator.NULL` yields a nullable one. The §9 type gate cannot check honestly otherwise.
+- **Only an EXACT numeric operand type may produce a `DECIMAL`.** The catalog's existing `_NUMERIC_LOGICAL_TYPES` set is *arithmetic-capable*, not exact — it contains `float`, `double`, `double precision`, `real` and `money`. Publishing `DECIMAL(p,s)` from a binary-float operand asserts a reproducibility that float arithmetic does not have, so "numeric" is **not** a sufficient test.
+
+```
+EXACT_NUMERIC = {numeric, decimal, integer, int, int4, int8, bigint, smallint}
+REFUSED       = {float, double, double precision, real, money}   → PHYSICAL_TYPE_UNSUPPORTED
+```
+
+  Every **arithmetic operand** must be exact — a ratio's numerator *and* denominator, a difference's minuend *and* subtrahend. This requires per-expression governed operand types in the IR (§3), because a formula collapses to a single logical word and a ratio's word describes no operand at all.
 - Hive/Spark `DECIMAL` maxes at **precision 38**; a policy exceeding it, or any ambiguous conversion, returns `PHYSICAL_TYPE_UNSUPPORTED`. **Never silently map ambiguous numerics to `DOUBLE`.**
 - `DECIMAL(p,s)` and `BIGINT` support is validated during the environment capability check (§10).
 

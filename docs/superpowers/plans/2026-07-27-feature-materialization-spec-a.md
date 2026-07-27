@@ -530,6 +530,37 @@ Spec §6.
 
 ---
 
+### Task 8.1: Exact-numeric operand evidence (BLOCKS Task 10)
+
+Spec §6. Architect's ruling, 2026-07-27: a known-unsupported numeric representation must be refused **before the group plan authorizes generated execution** — not merely "before leaving sandbox".
+
+**Why this exists:** `_resolve_ratio` documents "numeric both operands" and never checks it, and the obvious fix is wrong — `_is_numeric_logical_type` accepts `float`, `double`, `double precision`, `real`, `money`, so a float ratio passes it and still publishes fixed-point. *Numeric* and *exact-numeric* are different questions.
+
+**Files:** Modify `src/featuregen/materialize/expression_ir.py`, `physical_types.py`; Test `test_expression_ir.py`, `test_physical_types.py`
+
+**Produces:** `ExpressionExecutionIR` gains **`operand_type` evidence** (the governed C1 type of that expression's operand, or an explicit "unavailable" marker); `resolve_physical_type` validates **every arithmetic operand**; `PHYSICAL_TYPE_POLICY_VERSION` **increments**.
+
+**Scope note:** the sibling Child-1 fix (make `_resolve_ratio` enforce its documented rule, and distinguish *unavailable type authority* from *a governed non-numeric type*) is routed to the feature-generation owner. **Do not edit that file from this stream** — it is actively being worked.
+
+- [ ] **Step 1: Failing tests** — the acceptance set is fixed by the ruling:
+
+```python
+def test_exact_decimal_ratio_survives(...): ...          # decimal/integer operands → DECIMAL(p,s)
+def test_string_operand_dies(...): ...                   # → PHYSICAL_TYPE_UNSUPPORTED
+def test_unknown_or_unreadable_type_dies_or_requires_authority(...): ...
+                                                         # state WHICH is chosen and why
+def test_float_numerator_dies(...): ...
+def test_float_denominator_dies(...): ...
+def test_float_difference_subtrahend_dies(...): ...
+def test_money_operand_dies(...): ...
+```
+
+Plus the mutation harness's **must-survive no-op** control.
+
+- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** — carry the governed operand type per expression; gate `DECIMAL` production on the exact-numeric allowlist; increment the policy version · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): exact-numeric operand evidence gates DECIMAL`
+
+---
+
 ### Task 9: Classification + per-feature contracts + grouping
 
 Spec §5.
