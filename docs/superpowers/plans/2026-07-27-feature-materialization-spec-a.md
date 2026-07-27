@@ -1,4 +1,4 @@
-# Spec A — Executable Materialization Vertical Slice: Implementation Plan (rev 4)
+# Spec A — Executable Materialization Vertical Slice: Implementation Plan (rev 5)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax.
 
@@ -34,9 +34,9 @@
 
 Spec §0. **Blocks T17 only**; T1–T16 proceed in parallel. The Markdown write-up is the human record; **compilation and run preparation consume the typed object**.
 
-**Files:** Create `src/featuregen/materialize/inventory.py`, `docs/architecture/2026-07-27-hdfc-cluster-inventory.md`; Test `test_inventory.py`
+**Files:** Create `src/featuregen/materialize/inventory.py`, `conf/environments/hdfc-local-inventory.yml` (the typed artefact the loader reads), `docs/architecture/2026-07-27-hdfc-cluster-inventory.md` (the human record); Test `test_inventory.py`
 
-**Produces:** `TableLayout` (frozen: `schema`, `table`, `partition_columns: tuple[tuple[str,str],...] | None`, `location`, `rewritten_in_place: bool`); `EngineVersions` (frozen: `hive`, `spark`, `metastore`, `python`, `java`, `pyspark`, `kedro`); `ClusterInventoryV1` (frozen: `environment_id`, `tables`, `engine_versions`, `captured_at`); `load_inventory(path) -> ClusterInventoryV1`; `MetastoreInventoryAdapter.capture(conn, tables) -> ClusterInventoryV1`.
+**Produces:** `PartitionMappingV1` (closed variants per spec §3.4); `TableLayout` (frozen: `schema`, `table`, `partition_columns: tuple[tuple[str,str],...] | None`, `partition_mapping: PartitionMappingV1 | None`, `location`, `rewritten_in_place: bool`, `layout_fingerprint: str`); `EngineVersions` (frozen: `hive`, `spark`, `metastore`, `python`, `java`, `pyspark`, `kedro`); `ClusterInventoryV1` (frozen: `environment_id`, `tables`, `engine_versions`, `captured_at`); `load_inventory(path) -> ClusterInventoryV1`; `MetastoreInventoryAdapter.capture(conn, tables) -> ClusterInventoryV1`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -67,17 +67,18 @@ def test_adapter_captures_partition_columns_in_order(fake_metastore):
 - [ ] **Step 6: Answer the two slice-shaping questions** in the Markdown record:
   1. **Account-to-customer ownership.** A single `accounts.cif_id` is `N:1` and fine; a joint-holder bridge is `1:N` and **refuses `total_debit_amount_30d`** (spec §3.2) — record the substitute feature if so.
   2. **How a customer snapshot maps to a business date** → becomes the `SnapshotPolicy` variant (T4).
+  3. **How each table's partitions map to a time window** → its `PartitionMappingV1`. A `load_dt` column does **not** imply an event-time mapping: late arrivals sit in load partitions outside the event range, so an `AVAILABILITY_PARTITION` mapping must widen the set. **Declare it; never infer it** — no mapping ⇒ `PARTITION_MAPPING_NOT_DECLARED`.
 - [ ] **Step 7: Commit** — `feat(materialize): typed cluster inventory + metastore adapter`
 
 ---
 
-### Task 1: `materialize_hash` + the three closed failure enums
+### Task 1: `materialize_hash` + the four closed failure enums
 
 Spec §14. Built first so every later task refuses with a listed code.
 
 **Files:** Create `src/featuregen/materialize/{__init__,canonical,codes}.py`; Test `test_canonical.py`, `test_codes.py`
 
-**Produces:** `materialize_hash(payload) -> str`; `CompilationRefusalCode`; `ValidationGateCode`; `ValidationFindingCode`; `MaterializationRefused(Exception)` with `.code: CompilationRefusalCode`.
+**Produces:** `materialize_hash(payload) -> str`; `CompilationRefusalCode`; `PublicationRefusalCode`; `ValidationGateCode`; `ValidationFindingCode`; `MaterializationRefused(Exception)` carrying `.code: CompilationRefusalCode | PublicationRefusalCode`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -90,43 +91,80 @@ def test_sha256_hex():
     h = materialize_hash({"a": 1})
     assert len(h) == 64 and all(c in "0123456789abcdef" for c in h)
 
+def test_values_distinguished():
+    assert materialize_hash({"a": 1}) != materialize_hash({"a": 2})
+
 def test_rejects_non_mapping():
     with pytest.raises(TypeError):
         materialize_hash([1])  # type: ignore[arg-type]
+```
 
-# test_codes.py
-def test_every_spec_14_code_exists():
-    """The spec's §14 list is the contract; drift here is a defect."""
-    assert {c.value for c in CompilationRefusalCode} >= {
+```python
+# test_codes.py — EXACT equality: `>=` would permit arbitrary extra codes and
+# therefore would not test a CLOSED vocabulary at all.
+def test_compilation_codes_are_exactly_the_spec_set():
+    assert {c.value for c in CompilationRefusalCode} == {
         "AUTHORING_RUN_INCOMPLETE", "TERMINAL_PAYLOAD_TAMPERED", "NOT_RESOLVED",
         "FORMULA_HASH_MISMATCH", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
         "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "AMBIGUOUS_TABLE_NAME",
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",
         "GRAIN_PATH_NOT_GOVERNED", "JOIN_FANOUT_UNSUPPORTED", "JOIN_CARDINALITY_UNKNOWN",
         "SPINE_SOURCE_NOT_DECLARED", "SPINE_DECLARATION_REJECTED_BY_FACTS",
-        "SPINE_NON_DETERMINISTIC", "AVAILABILITY_TIME_NOT_GOVERNED",
+        "PARTITION_MAPPING_NOT_DECLARED", "AVAILABILITY_TIME_NOT_GOVERNED",
         "PHYSICAL_TYPE_UNSUPPORTED", "MULTIPLE_MATERIALIZATION_CONTRACTS",
         "PARTITION_IDENTITY_UNKNOWN", "UNACCOUNTED_LOGICAL_REF"}
 
 
-def test_gate_codes_exist():
-    assert {c.value for c in ValidationGateCode} >= {
+def test_publication_codes_are_exactly_the_spec_set():
+    """CAPABILITY_UNPROVEN / GROUP_BINDING_CONFLICT are PUBLICATION decisions —
+    they are not compilation refusals and not runtime gates."""
+    assert {c.value for c in PublicationRefusalCode} == {
+        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED"}
+
+
+def test_gate_codes_are_exactly_the_spec_set():
+    assert {c.value for c in ValidationGateCode} == {
         "KEY_NOT_UNIQUE", "MISSING_FEATURE_COLUMN", "UNEXPECTED_COLUMN", "WRONG_COLUMN_TYPE",
         "WRONG_NULLABILITY", "SCHEMA_HASH_MISMATCH", "MISSING_STAGING_MANIFEST",
         "STALE_STAGING_MANIFEST", "DUPLICATE_STAGING_MANIFEST", "IR_HASH_MISMATCH",
         "INCOMPLETE_COMPUTATION", "FORBIDDEN_NUMERIC", "OVERFLOW_VIOLATION",
-        "SPINE_INCOMPLETE", "SPINE_DUPLICATE_KEY", "PROJECT_INTEGRITY",
-        "GROUP_BINDING_CONFLICT", "CAPABILITY_UNPROVEN"}
+        "SPINE_INCOMPLETE", "SPINE_DUPLICATE_KEY", "SPINE_NON_DETERMINISTIC",
+        "RUN_PARAMETERS_MISSING", "PROJECT_INTEGRITY"}
 
 
-def test_refusal_carries_a_typed_code():
+def test_finding_codes_are_exactly_the_spec_set():
+    assert {c.value for c in ValidationFindingCode} == {
+        "PROJECT_DOES_NOT_BUILD", "PROJECT_HASH_MISMATCH", "PIPELINE_NOT_CONSTRUCTIBLE",
+        "COLUMN_ABSENT", "COLUMN_TYPE_MISMATCH", "PARTITION_ABSENT", "READ_DENIED",
+        "UNKNOWN_FINDING"}
+
+
+def test_the_four_enums_do_not_overlap():
+    """A code must belong to exactly one vocabulary, or a refusal cannot be typed."""
+    sets = [{c.value for c in e} for e in
+            (CompilationRefusalCode, PublicationRefusalCode, ValidationGateCode,
+             ValidationFindingCode)]
+    for i, a in enumerate(sets):
+        for b in sets[i + 1:]:
+            assert not (a & b), f"code appears in two enums: {a & b}"
+
+
+def test_refusal_carries_a_typed_code_not_a_string():
     e = MaterializationRefused(CompilationRefusalCode.NOT_RESOLVED, "detail")
     assert e.code is CompilationRefusalCode.NOT_RESOLVED
+    assert not isinstance(e.code, str) or isinstance(e.code, CompilationRefusalCode)
+
+
+def test_spine_non_determinism_is_a_RUNTIME_gate_not_a_compilation_refusal():
+    """An unresolved tie depends on actual rows, so it is discovered during execution."""
+    assert "SPINE_NON_DETERMINISTIC" not in {c.value for c in CompilationRefusalCode}
+    assert "SPINE_NON_DETERMINISTIC" in {c.value for c in ValidationGateCode}
 ```
 
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): hasher + closed failure-code enums`
-
----
+- [ ] **Step 2: Run — FAIL** (`ModuleNotFoundError`)
+- [ ] **Step 3: Implement** `canonical.py` (JCS + sha256 over a mapping) and `codes.py` (the four `StrEnum`s + `MaterializationRefused`).
+- [ ] **Step 4: Run — PASS (11)**
+- [ ] **Step 5: Commit** — `feat(materialize): hasher + four closed failure-code enums`
 
 ### Task 2: Terminal-event reader + Gate 1
 
@@ -359,6 +397,22 @@ def test_requirement_takes_no_business_dt():
     assert "business_dt" not in inspect.signature(derive_requirement).parameters
 
 
+def test_mapping_comes_from_the_DECLARATION_not_the_column_name(inv_load_dt_no_mapping):
+    r = derive_requirement(inv_load_dt_no_mapping, table_ref="hdfc::banking.transactions")
+    assert r.code is CompilationRefusalCode.PARTITION_MAPPING_NOT_DECLARED
+
+
+def test_recapturing_identical_metadata_keeps_the_same_identity(inv_a, inv_b_same_layout_later):
+    """captured_at must NOT reach identity, or a rescan changes the generated project."""
+    assert derive_requirement(inv_a, table_ref="hdfc::banking.transactions") == \
+           derive_requirement(inv_b_same_layout_later, table_ref="hdfc::banking.transactions")
+
+
+def test_changing_layout_or_a_physical_type_changes_the_fingerprint(inv_a, inv_relayout):
+    assert derive_requirement(inv_a, table_ref="hdfc::banking.transactions").layout_fingerprint != \
+           derive_requirement(inv_relayout, table_ref="hdfc::banking.transactions").layout_fingerprint
+
+
 def test_requirement_records_partition_COLUMNS_not_values(partitioned_inventory):
     req = derive_requirement(partitioned_inventory, table_ref="hdfc::banking.transactions")
     assert req.partition_columns == (("load_dt", "string"),)
@@ -394,7 +448,7 @@ Spec §2.1, §3.
 
 **Produces:** `PhysicalRef`; `PitSpec`; `ExpressionExecutionIR`; `compile_expression(conn, *, expr_path, expr, grain_keys, roles, inventory) -> ExpressionExecutionIR | MaterializationRefused`; `expression_ir_hash(e)`.
 
-- [ ] **Step 1: Failing tests** — read set contains operand + filter `left` + event-time + every join endpoint (**there is no `right_ref`**) · a ratio's two expressions get **independent** `PitSpec`s · different windows hash differently · missing `AVAILABILITY_TIME` ⇒ `AVAILABILITY_TIME_NOT_GOVERNED` · a fan-out or unknown-cardinality join refuses the expression · `identity_payload()` excludes provenance **and excludes any partition value** · **reference completeness**: every `logical_ref` from the expression appears in the read set or is explicitly classified non-physical, else `UNACCOUNTED_LOGICAL_REF`.
+- [ ] **Step 1: Failing tests** — read set contains operand + filter `left` + event-time + every join endpoint (**there is no `right_ref`**) · a ratio's two expressions get **independent** `PitSpec`s · different windows hash differently · missing `AVAILABILITY_TIME` ⇒ `AVAILABILITY_TIME_NOT_GOVERNED` · a fan-out or unknown-cardinality join refuses the expression · the IR field is named **`input_requirements: tuple[PhysicalInputRequirement, ...]`** (asserted by name; `input_snapshots` must NOT exist on the IR) · `identity_payload()` excludes provenance **and any partition value** · **reference completeness**: every `logical_ref` from the expression appears in the read set or is explicitly classified non-physical, else `UNACCOUNTED_LOGICAL_REF`.
 - [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): per-expression IR + reference completeness`
 
 ---
@@ -463,7 +517,7 @@ Spec §5.
 
 **Files:** Create `src/featuregen/materialize/{classify,contract}.py`; Test `test_classify.py`, `test_contract.py`
 
-**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`.
+**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`.
 
 - [ ] **Step 1: Failing classification tests**
 
@@ -491,7 +545,7 @@ def test_a_join_key_or_the_spine_can_be_the_most_restrictive(db, restricted_join
     assert classify_read_set(db, refs).sensitivity_class == "restricted"
 ```
 
-- [ ] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes both policy versions **and the spine's `identity_payload()` only** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
+- [ ] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes **all three** policy versions (classification, physical-type, retention) **and the spine's `identity_payload()` only — never its provenance** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
 - [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
 
 ---
@@ -502,9 +556,9 @@ Spec §9, §10.1.
 
 **Files:** Create `src/featuregen/materialize/{group_plan,binding}.py`; Test `test_group_plan.py`, `test_binding.py`
 
-**Produces:** `PlannedFeature` (incl. resolved `PhysicalType`); `FeatureGroupPlanV1`; `StagingManifestV1`; `expected_schema(plan)`; `check_completeness(...)`; `GroupBindingV1`; `bind_group(conn, ...) -> GroupBindingV1 | MaterializationRefused`.
+**Produces:** `PlannedFeature` (incl. resolved `PhysicalType`); `FeatureGroupPlanV1`; `StagingManifestV1`; `expected_schema(plan)`; `check_completeness(...)`; `GroupContractBinding`; `GroupPlanRevision`; `bind_group(...)` and `current_plan_revision(revisions)` as **pure functions** — their tables are created in T14, so persistence tests live there and T10 stays pure.
 
-- [ ] **Step 1: Failing tests** — a matching schema with a wrong `ir_hash` still fails (`IR_HASH_MISMATCH`) · a manifest from a **different generation/run/business_dt** ⇒ `STALE_STAGING_MANIFEST` · duplicate manifest ⇒ `DUPLICATE_STAGING_MANIFEST` · missing/failed manifest · missing/extra/mistyped column · **nullability mismatch** ⇒ `WRONG_NULLABILITY` · `expected_schema` includes the three **system columns** (`__generation_id`, `__generated_project_hash`, `__sandbox_execution_hash`) · adding a feature changes `group_plan_hash` and **keeps** the binding · a **different contract hash for the same logical name** ⇒ `GROUP_BINDING_CONFLICT` · name collision is a plan error.
+- [ ] **Step 1: Failing tests** — a matching schema with a wrong `ir_hash` still fails (`IR_HASH_MISMATCH`) · a manifest from a **different generation/run/business_dt** ⇒ `STALE_STAGING_MANIFEST` · duplicate manifest ⇒ `DUPLICATE_STAGING_MANIFEST` · missing/failed manifest · missing/extra/mistyped column · **nullability mismatch** ⇒ `WRONG_NULLABILITY` · `expected_schema` includes the three **system columns** (`__generation_id`, `__generated_project_hash`, `__sandbox_execution_hash`) · adding a feature changes `group_plan_hash` and **keeps** the binding · a **different contract hash for the same logical name** ⇒ `PublicationRefusalCode.GROUP_BINDING_CONFLICT` · **the binding record has no mutable field**: adding a feature appends a `GroupPlanRevision`, and `current_plan_revision` DERIVES the current plan from the latest successfully-published revision · name collision is a plan error.
 - [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): group plan, staging manifests, contract-bound target`
 
 ---
@@ -539,7 +593,7 @@ Spec §4.2, §8.
 
 **Files:** Create `render/nodes_compute.py`; Test `test_render_compute.py`
 
-- [ ] **Step 1: Failing tests** — spine reads the **declared** source, never a fact table · **each `SnapshotPolicy` variant renders its own selection**, and `LATEST_AVAILABLE_AS_OF` renders the effective-time filter, the availability filter and the deterministic tie-break · availability gate uses the governed column · `event_time_plus_lag` renders its lag · **calendar windows are not converted to days** · projection selects only read-set columns, never `*` · calculate writes a `StagingManifestV1` carrying `ir_hash`, generation, run and business_dt · each feature writes its own staging output · **the three system columns are written** · rendered overflow behaviour **raises** rather than yielding NULL · rounding is explicit · every rendered node parses.
+- [ ] **Step 1: Failing tests** — spine reads the **declared** source, never a fact table · **each `SnapshotPolicy` variant renders its own selection**, and `LATEST_AVAILABLE_AS_OF` renders the effective-time filter, the availability filter and the deterministic tie-break · availability gate uses the governed column · `event_time_plus_lag` renders its lag · **calendar windows are not converted to days** · projection selects only read-set columns, never `*` · calculate writes a `StagingManifestV1` carrying `ir_hash`, generation, run and business_dt · **per-feature staging carries ONLY `(keys…, business_dt, one feature column)` — no system columns**, since duplicating them across staging outputs collides at assembly · rendered overflow behaviour **raises** rather than yielding NULL · rounding is explicit · every rendered node parses.
 - [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): render spine, PIT projection, per-feature calculation`
 
 ---
@@ -551,7 +605,7 @@ Spec §9, §12.
 **Files:** Create `render/nodes_gate.py`, `src/featuregen/materialize/control_plane.py`, `src/featuregen/db/migrations/1031_materialization_control_plane.sql`; Test `test_render_gate.py`, `test_control_plane.py`, `test_migration_1031.py`
 
 - [ ] **Step 1: Failing migration tests** — `materialization_generation`, `pipeline_validation_report`, `materialization_run_event`, `materialization_run_manifest`, `publication_capability_attestation`, `group_binding` **all** reject UPDATE, DELETE **and TRUNCATE** (statement-level `BEFORE TRUNCATE … FOR EACH STATEMENT`; a `FOR EACH ROW` trigger does not fire on TRUNCATE) · `(run_id, seq)` unique on events · closed `event_kind` CHECK · manifest FKs to `generation_id` · one terminal manifest per run.
-- [ ] **Step 2: Failing gate tests** — every `ValidationGateCode` rendered · assembly consumes staging manifests · a failed gate raises · the manifest writer never calls `collect()`/`take()`/`head()` · `run_status` folds from events.
+- [ ] **Step 2: Failing gate tests** — every `ValidationGateCode` rendered · assembly consumes staging manifests · **assembly adds each of the three system columns exactly once** (assert exactly one copy of each) · `__generated_project_hash` is **read from `GENERATED.lock` at runtime** and **no generated source file contains the project-hash literal** · `__sandbox_execution_hash` arrives via prepared run parameters · a failed gate raises · the manifest writer never calls `collect()`/`take()`/`head()` · `run_status` folds from events.
 - [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): rendered gates, hooks, append-only control plane`
 
 ---
@@ -562,14 +616,33 @@ Spec §3.3, §11. **This is where `business_dt` first appears.**
 
 **Files:** Create `src/featuregen/materialize/{runprep,validation,submit}.py`; Test `test_runprep.py`, `test_validation.py`, `test_submit.py`
 
-**Produces:** `PhysicalInputSnapshot`; `resolve_snapshots(inventory, metastore, *, requirements, business_dt, window) -> tuple[...] | MaterializationRefused`; `RunPreparation` (snapshots + `sandbox_execution_hash`); `ValidationLevel`; `FindingClass`; `ValidationReportV1`; `run_l0`; `run_l1`; `classify`; `may_regenerate`; `LocalClusterSubmitter`.
+**Produces:** `PhysicalInputSnapshot`; `RunInputRequest` (frozen: `feature_name`, `expr_path`, `physical_requirement`, `pit_spec`); `resolve_snapshots(inventory, metastore, *, requests: tuple[RunInputRequest, ...], business_dt) -> tuple[...] | MaterializationRefused` (keyed by `(feature_name, expr_path, requirement_id)`; identical reads de-duplicated only AFTER comparing semantics); `RunPreparation` (snapshots + `sandbox_execution_hash` + **`parameters`** for execution); `ValidationLevel`; `FindingClass`; `ValidationReportV1`; `run_l0`; `run_l1`; `classify`; `may_regenerate`; `LocalClusterSubmitter`.
 
 - [ ] **Step 1: Failing run-prep tests**
 
 ```python
-def test_a_90_day_window_resolves_MANY_partitions(daily_inventory, metastore):
-    snaps = resolve_snapshots(daily_inventory, metastore, requirements=(req,),
-                              business_dt="2026-07-27", window=_window(90))
+def test_each_expression_resolves_its_OWN_snapshots(daily_inventory, metastore, group_requests):
+    """A 30d feature, two 90d features and a ratio's two expressions cannot share one window."""
+    snaps = resolve_snapshots(daily_inventory, metastore, requests=group_requests,
+                              business_dt="2026-07-27")
+    assert {(s.feature_name, s.expr_path) for s in snaps} == {
+        ("total_debit_amount_30d", "body.expr"),
+        ("distinct_merchant_count_90d", "body.expr"),
+        ("cross_border_value_ratio_90d", "body.numerator"),
+        ("cross_border_value_ratio_90d", "body.denominator")}
+
+
+def test_availability_mapping_widens_beyond_the_event_window(availability_inventory, metastore):
+    """Late arrivals sit in load partitions OUTSIDE the event range."""
+    snaps = resolve_snapshots(availability_inventory, metastore, requests=(req_90d,),
+                              business_dt="2026-07-27")
+    assert len(snaps[0].partition_specs) > 90
+
+
+def test_a_DECLARED_one_day_event_mapping_resolves_90_partitions(event_inventory, metastore):
+    """Valid ONLY for a declared one-day EVENT_TIME_PARTITION mapping — not a general rule."""
+    snaps = resolve_snapshots(event_inventory, metastore, requests=(req_90d,),
+                              business_dt="2026-07-27")
     assert len(snaps[0].partition_specs) == 90
 
 
