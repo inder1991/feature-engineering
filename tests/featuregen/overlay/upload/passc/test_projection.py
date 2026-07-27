@@ -155,8 +155,11 @@ def test_verified_join_projects_one_operational_edge_that_traverses(
     assert edge["event_id"] == confirmed_id and edge["event_id"] is not None
     assert edge["updated_at"] is not None
 
+    # The traversed step now REPORTS the governing fact (Spec A T3): the projected edge and the
+    # planned path name the SAME `approved_join`, so a consumer can tell a governed hop from a
+    # file-declared one without a second read of `graph_edge`.
     assert find_join_path(passc_conn, "src", "transactions", "customers") \
-        == [JoinStep(_FROM, _TO, "N:1")]
+        == [JoinStep(_FROM, _TO, "N:1", key, "VERIFIED")]
 
 
 def test_confirmed_direction_reversing_declared_edge_leaves_one_row(
@@ -266,8 +269,9 @@ def test_same_pair_rival_facts_project_order_independently(
     assert edge["fact_key"] == fact_key(verified_ref, "approved_join")
     assert edge["status"] == "VERIFIED" and edge["cardinality"] == "N:1"
     assert edge["event_id"] is not None and edge["updated_at"] is not None
+    # …and the traversed step names the WINNING fact — the rejected rival must not appear.
     assert find_join_path(passc_conn, "src", "transactions", "customers") \
-        == [JoinStep(_FROM, _TO, "N:1")]
+        == [JoinStep(_FROM, _TO, "N:1", fact_key(verified_ref, "approved_join"), "VERIFIED")]
 
 
 # ── The async demotion hook (no re-ingest, no projector run) ─────────────────────────────────────

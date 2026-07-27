@@ -45,7 +45,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta
 
 from featuregen.overlay.catalog_changes import drift_watermark
-from featuregen.overlay.upload.join_path import _invert, _table_of
+from featuregen.overlay.upload.join_path import _invert, table_of_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 LAYERS = frozenset({"joins", "entity", "features"})
@@ -66,7 +66,7 @@ def _prune(d: dict) -> dict:
 def _stub_node(source: str, to_ref: str) -> dict:
     """A declared-but-not-uploaded join target: known only by its ref, resolved=false."""
     return {"id": f"{source}:{to_ref}", "kind": "column", "object_ref": to_ref,
-            "table": _table_of(to_ref), "column": to_ref.split(".")[-1],
+            "table": table_of_ref(to_ref), "column": to_ref.split(".")[-1],
             "grain": False, "as_of": False, "stale": False, "resolved": False}
 
 
@@ -310,7 +310,7 @@ class _Builder:
                                "resolved": bool(resolved), "authority": authority,
                                "approved_join_status": join_status})
                 if resolved:
-                    out.append((("table", source, _table_of(to_ref)), None, edge))
+                    out.append((("table", source, table_of_ref(to_ref)), None, edge))
                 else:
                     out.append((None, _stub_node(source, to_ref), edge))
             else:   # reverse: orient the step to the traversal and invert the fan (M7)
@@ -318,7 +318,7 @@ class _Builder:
                                "layer": "joins", "kind": "join", "cardinality": _invert(card),
                                "resolved": True,   # from_ref always exists in its own catalog
                                "authority": authority, "approved_join_status": join_status})
-                out.append((("table", source, _table_of(from_ref)), None, edge))
+                out.append((("table", source, table_of_ref(from_ref)), None, edge))
         return out
 
     def _expand_entity(self, unit: _Unit) -> list[tuple[_Unit | None, dict | None, dict]]:

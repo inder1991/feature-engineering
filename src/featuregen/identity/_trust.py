@@ -7,15 +7,26 @@ ordinary code cannot name (module-private, absent from every ``__all__``) and th
 identity (``is``), never by value. Naming it at all means reaching into a private module, which the
 grep-guard test flags.
 
-Two — and only two — kinds of code legitimately hold the capability:
-  (a) the verifiers in ``verify.py``, which mint an authenticated principal from a PROVEN token; and
+Two — and only two — KINDS of code legitimately hold the capability:
+  (a) code that PROVED a credential before minting:
+        - ``verify.py``            — proved a bearer token's signature/issuer/audience/expiry
+        - ``local_session.py``     — proved a username/password against the local IAM store
+        - ``current_principal.py`` — re-resolved the principal from local IAM at worker time. The
+          subject is not caller-supplied: it comes from an integrity-verified sealed work item, and
+          roles are re-read live so a revoked user fails closed.
   (b) ``mint_trusted_identity`` below, the sanctioned factory for the internal trust ROOTS that must
       reconstruct/produce an authenticated principal WITHOUT a token — the write-once event store
       (via ``events/serde.py``) and the durable timer runtime (via ``aggregates/activation.py``).
 
-``test_no_stray_authenticated_mints`` makes the boundary auditable: no other module in
-``src/featuregen/`` may reference the capability, call ``mint_trusted_identity``, or construct
-``authenticated=True`` directly.
+``tests/featuregen/identity/test_trust_boundary.py`` makes the boundary auditable: no module in
+``src/featuregen/`` outside its explicit allowlist may reference the capability, call
+``mint_trusted_identity``, or construct ``authenticated=True`` directly. Detection is AST-based, so
+a mention in prose (like this docstring) does not arm it. Extending the allowlist is a deliberate
+review decision.
+
+NB: this list is the one place that says WHO may mint. It drifted before — it named only (a)
+``verify.py`` while ``local_session.py`` already held the capability, and cited a guard test that
+did not exist — so the boundary was enforced by prose alone. Keep it in step with the allowlist.
 """
 
 from __future__ import annotations

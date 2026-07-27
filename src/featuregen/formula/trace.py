@@ -49,7 +49,9 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Literal
 
 import psycopg
@@ -66,9 +68,12 @@ from featuregen.formula._jcs import dumps as _jcs_dumps
 __all__ = [
     "TERMINAL_KINDS",
     "RunStatus",
+    "TerminalEvent",
     "TraceEventKind",
     "append_event",
     "open_authoring_run",
+    "read_run_intent_hash",
+    "read_terminal_event",
     "run_status",
 ]
 
@@ -109,6 +114,14 @@ _SELECT_TERMINAL = (
     "SELECT kind FROM authoring_trace_event "
     "WHERE authoring_run_id = %s AND kind IN (%s, %s) LIMIT 1"
 )
+#: The same row `_SELECT_TERMINAL` derives `run_status` from, WITH its tamper-evidence pair. At most
+#: one row can match (1020's partial UNIQUE index on the terminal kinds), so `LIMIT 1` is the whole
+#: result set, not an arbitrary pick.
+_SELECT_TERMINAL_EVENT = (
+    "SELECT kind, payload, payload_hash FROM authoring_trace_event "
+    "WHERE authoring_run_id = %s AND kind IN (%s, %s) LIMIT 1"
+)
+_SELECT_RUN_INTENT_HASH = "SELECT intent_hash FROM authoring_run WHERE authoring_run_id = %s"
 
 #: FALLBACK-ONLY variants of the two INSERTs (``_replay_on_caller``). COMMIT AMBIGUITY: when the
 #: fresh connection's INSERT commits server-side but the ack is lost, the fallback replays a
@@ -246,6 +259,75 @@ def run_status(conn: DbConn, run_id: str) -> RunStatus:
     if row is None:
         return "incomplete"
     return "completed" if row[0] == TraceEventKind.COMPLETED.value else "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalEvent:
+    """The single terminal event of a run, WITH the record that makes it tamper-evident.
+
+    ``payload`` is the read-back canonical redacted metadata (a JSON object of JSON-primitive
+    values) and ``payload_hash`` is the sha256 over its RFC 8785 (JCS) bytes that ``append_event``
+    computed at write time. This type deliberately does NOT verify one against the other: the row is
+    physically immutable (migration 1020), so a disagreement means the stored bytes were altered out
+    of band, and deciding what to do about that belongs to the caller that is trusting the record —
+    see ``featuregen.materialize.admission`` (spec §1.2 check 2), which refuses with
+    ``TERMINAL_PAYLOAD_TAMPERED``. A reader that silently dropped a mismatching event would report
+    the run as INCOMPLETE and hide the tampering instead of surfacing it.
+
+    ``payload`` is exposed as a read-only mapping so a caller cannot mutate the record it is about
+    to hash. ``featuregen.formula._jcs`` dispatches on ``isinstance(obj, dict)``, so a hasher takes
+    ``dict(payload)`` (which ``materialize.canonical.materialize_hash`` already does)."""
+
+    kind: TraceEventKind
+    payload: Mapping[str, Any]
+    payload_hash: str
+
+
+def read_terminal_event(conn: DbConn, run_id: str) -> TerminalEvent | None:
+    """The run's terminal (``COMPLETED``/``FAILED``) event, or ``None`` when it has none.
+
+    The READ counterpart of the single terminal ``append_event`` writes, and the evidence any
+    consumer of an authoring outcome must verify against: an ``AuthoringResult`` is a publicly
+    constructible frozen dataclass, so only this immutable, ``payload_hash``-protected row can say
+    what a run actually decided.
+
+    ⚠️ ``kind`` ALONE ANSWERS ALMOST NOTHING. ``authoring._TERMINAL_FOR_DISPOSITION`` maps only
+    ``TECHNICAL_FAILURE`` to ``FAILED``, so a ``REJECTED`` or ``UNSUPPORTED`` run also writes
+    ``COMPLETED``. "A COMPLETED event exists" therefore does NOT mean the run resolved — read
+    ``payload["authoring_disposition"]``.
+
+    Goes through ``_durable_read`` for exactly the reasons ``run_status`` does: the events are
+    committed on the durable fresh connection, and the union over both connections also surfaces one
+    that DEGRADED onto the caller's uncommitted transaction. A reader that missed a just-committed
+    terminal event would report a complete run as incomplete."""
+    row = _durable_read(
+        conn, _SELECT_TERMINAL_EVENT,
+        (run_id, TraceEventKind.COMPLETED.value, TraceEventKind.FAILED.value),
+        what=f"read_terminal_event {run_id}")
+    if row is None:
+        return None
+    kind, payload, payload_hash = row
+    return TerminalEvent(
+        kind=TraceEventKind(kind),
+        # 1020 CHECKs `jsonb_typeof(payload) = 'object'`, so psycopg's jsonb loader always hands
+        # back a dict here; the copy is what makes the frozen record's mapping non-aliasing.
+        payload=MappingProxyType(dict(payload)),
+        payload_hash=payload_hash,
+    )
+
+
+def read_run_intent_hash(conn: DbConn, run_id: str) -> str | None:
+    """The ``intent_hash`` stamped on the run's MANIFEST, or ``None`` when no manifest is visible.
+
+    The manifest is written FIRST, before any provider call, and is write-once — so this is the
+    immutable record of WHAT was asked, against which a caller re-hashing its own
+    ``AuthoringIntent`` (``authoring.authoring_intent_hash``) can prove it holds the intent this run
+    was actually opened for. Same ``_durable_read`` visibility semantics as
+    :func:`read_terminal_event`; ``None`` is the honest ABSENCE and callers must fail closed on it
+    rather than treating it as a match."""
+    row = _durable_read(
+        conn, _SELECT_RUN_INTENT_HASH, (run_id,), what=f"read_run_intent_hash {run_id}")
+    return None if row is None else str(row[0])
 
 
 def _json_object(value: Mapping[str, Any], name: str) -> dict[str, Any]:

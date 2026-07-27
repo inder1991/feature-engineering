@@ -191,7 +191,7 @@ def test_dual_admin_confirm_reaches_verified_under_sealed_config(
         " WHERE kind = 'joins' AND catalog_source = 'src'").fetchall()
     assert rows == [("operational", key, "VERIFIED")]
     assert find_join_path(conn, "src", "transactions", "customers") == \
-        [JoinStep("public.transactions.cif_id", "public.customers.cif_id", "N:1")]
+        [JoinStep("public.transactions.cif_id", "public.customers.cif_id", "N:1", key, "VERIFIED")]
 
 
 # ── (3) fact_type gate: a non-join fact_key 404s on BOTH mutation routes, no event written ──────

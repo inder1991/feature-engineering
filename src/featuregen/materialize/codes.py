@@ -67,6 +67,7 @@ class CompilationRefusalCode(StrEnum):
 
     # Time: partitions must be DECLARED, never inferred (§3.4).
     PARTITION_MAPPING_NOT_DECLARED = "PARTITION_MAPPING_NOT_DECLARED"
+    PHYSICAL_SCHEMA_NOT_RESOLVED = "PHYSICAL_SCHEMA_NOT_RESOLVED"
     AVAILABILITY_TIME_NOT_GOVERNED = "AVAILABILITY_TIME_NOT_GOVERNED"
 
     # Output contract and physical typing.

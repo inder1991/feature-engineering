@@ -10,6 +10,7 @@ projection-lagged catalog ABORTS the whole considered set atomically (no conside
 """
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime
 
 import psycopg
@@ -21,6 +22,9 @@ from featuregen.events.store import append_event
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import (
+    Gate1Error,
+    UnknownConsideredOption,
+    _chosen_option_from_revision,
     _verified_considered_revision,
     build_considered_set,
     considered_snapshot_lineage,
@@ -242,3 +246,46 @@ def test_projection_lagged_aborts_considered_set_and_writes_no_row(db):
                       (intent.intent_id,)).fetchone()[0] == 0
     assert db.execute("SELECT count(*) FROM catalog_metadata_snapshot WHERE generation_run_id = %s",
                       ("fgr_lag",)).fetchone()[0] == 0
+
+
+def test_unknown_option_is_a_distinct_error_from_a_corrupt_revision(db):
+    """A stale option id and a corrupted record must not raise the same thing.
+
+    Every failure out of the revision readers used to be a bare ``Gate1Error``, and the route
+    collapsed all of them into 409 "considered revision verification failed". That made an ordinary
+    stale-tab retry indistinguishable — in the logs and to the client — from evidence that a sealed,
+    write-once record no longer verifies. They are now separate types so the route can answer 422 for
+    the first and keep 409 meaning the second. Asserting on the TYPES (not the HTTP codes) pins the
+    distinction at its source; the route mapping is covered in test_delivery0_scope_enforcement.
+    """
+    _rr(db)
+    _bank(db)
+    intent = submit_intent(
+        hypothesis="customers churn when their balance drops", actor="ds1")
+    build_considered_set(
+        db, intent, _client(), catalog_source="bank",
+        target_ref="public.accounts.churned", now=NOW,
+        generation_run_id="fgr_classify_1")
+    considered = db.execute(
+        "SELECT considered_json FROM contract_considered_revision "
+        "WHERE generation_run_id = %s",
+        ("fgr_classify_1",),
+    ).fetchone()[0]
+    option_id = next(iter(considered["options_by_id"]))
+
+    # Non-vacuous: the real option resolves cleanly, so the failures below are caused by what each
+    # case changes and not by a revision that never worked.
+    feature, _source, identity_hash = _chosen_option_from_revision(considered, option_id)
+    assert feature is not None and identity_hash
+
+    # CLIENT error — the record is untouched and valid; the caller named something not in it.
+    with pytest.raises(UnknownConsideredOption):
+        _chosen_option_from_revision(considered, "opt_not_in_this_revision")
+
+    # RECORD error — a real option id, but its sealed identity no longer hashes. Must still raise,
+    # and must NOT be reported as the client-error subtype.
+    corrupt = copy.deepcopy(considered)
+    corrupt["options_by_id"][option_id]["canonical_candidate_identity_hash"] = "0" * 64
+    with pytest.raises(Gate1Error) as caught:
+        _chosen_option_from_revision(corrupt, option_id)
+    assert not isinstance(caught.value, UnknownConsideredOption)

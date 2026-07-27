@@ -67,7 +67,8 @@ def test_adapter_captures_partition_columns_in_order(fake_metastore):
 - [ ] **Step 6: Answer the two slice-shaping questions** in the Markdown record:
   1. **Account-to-customer ownership.** A single `accounts.cif_id` is `N:1` and fine; a joint-holder bridge is `1:N` and **refuses `total_debit_amount_30d`** (spec §3.2) — record the substitute feature if so.
   2. **How a customer snapshot maps to a business date** → becomes the `SnapshotPolicy` variant (T4).
-  3. **How each table's partitions map to a time window** → its `PartitionMappingV1`. A `load_dt` column does **not** imply an event-time mapping: late arrivals sit in load partitions outside the event range, so an `AVAILABILITY_PARTITION` mapping must widen the set. **Declare it; never infer it** — no mapping ⇒ `PARTITION_MAPPING_NOT_DECLARED`.
+  3. **The logical→physical schema mapping per table.** Refs are schema-flattened to `public`; §3.5 needs this whenever `graph_node.schema_name` is NULL, or resolution refuses with `PHYSICAL_SCHEMA_NOT_RESOLVED`.
+  4. **How each table's partitions map to a time window** → its `PartitionMappingV1`. A `load_dt` column does **not** imply an event-time mapping: late arrivals sit in load partitions outside the event range, so an `AVAILABILITY_PARTITION` mapping must widen the set. **Declare it; never infer it** — no mapping ⇒ `PARTITION_MAPPING_NOT_DECLARED`.
 - [ ] **Step 7: Commit** — `feat(materialize): typed cluster inventory + metastore adapter`
 
 ---
@@ -110,7 +111,8 @@ def test_compilation_codes_are_exactly_the_spec_set():
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",
         "GRAIN_PATH_NOT_GOVERNED", "JOIN_FANOUT_UNSUPPORTED", "JOIN_CARDINALITY_UNKNOWN",
         "SPINE_SOURCE_NOT_DECLARED", "SPINE_DECLARATION_REJECTED_BY_FACTS",
-        "PARTITION_MAPPING_NOT_DECLARED", "AVAILABILITY_TIME_NOT_GOVERNED",
+        "PARTITION_MAPPING_NOT_DECLARED", "PHYSICAL_SCHEMA_NOT_RESOLVED",
+        "AVAILABILITY_TIME_NOT_GOVERNED",
         "PHYSICAL_TYPE_UNSUPPORTED", "MULTIPLE_MATERIALIZATION_CONTRACTS",
         "PARTITION_IDENTITY_UNKNOWN", "UNACCOUNTED_LOGICAL_REF"}
 
@@ -245,7 +247,9 @@ Spec §3.1–3.2. **Two halves in order.** Touches shared code — run the overl
 
 **Files:** Modify `src/featuregen/overlay/upload/join_path.py`; Create `src/featuregen/materialize/joins.py`; Test `tests/featuregen/overlay/upload/test_join_path_authority.py`, `test_joins.py`
 
-**Produces:** `JoinStep` gains `approved_join_fact_key`, `approved_join_status`, `authority`; `JoinPlan` (frozen: `steps`, `outcome_kind`, `roles_used`, `fans_out`); `plan_join(conn, *, catalog_source, from_table_ref, to_table_ref, roles) -> JoinPlan | MaterializationRefused`.
+**Produces:** `JoinStep` gains `approved_join_fact_key`, `approved_join_status`, `authority`; `JoinPlan` (frozen: `steps`, `outcome_kind`, `roles_used`, `fans_out`); `plan_join(conn, *, catalog_source, from_identity: PhysicalIdentity, to_identity: PhysicalIdentity, roles) -> JoinPlan | MaterializationRefused`.
+
+**⚠️ Takes RESOLVED physical identities, not logical refs.** Spec §3.5: refs are schema-flattened to `public`, so a physical schema cannot be parsed out of one. Resolution is T5's job; T3 stays pure and receives `PhysicalIdentity(catalog_source, schema, table)`. Define that small frozen type here (T5 imports it) so the ordering works.
 
 - [ ] **Step 1: Failing planner-authority tests** — an OPERATIONAL path's steps carry `approved_join_fact_key`/`approved_join_status` (**verified**: `clearing.append((from_ref, to_ref, card))` drops them today, though the SQL selects them at `:105-106`); a file-declared edge reports `authority="operational"` with a `None` fact key; **reverse-edge provenance and inverted cardinality both survive**.
 - [ ] **Step 2–4:** Run/carry the two columns through the clearing tuple **inside the existing query** (no second read)/run. **Run the overlay/upload sweep** — this is shared code.
@@ -255,30 +259,27 @@ Spec §3.1–3.2. **Two halves in order.** Touches shared code — run the overl
 ```python
 def test_bare_table_names_are_passed_to_the_planner(db, verified_join_catalog):
     """VERIFIED: _table_of returns parts[1]; a schema-qualified destination never matches."""
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.accounts", roles=("feature_engineer",))
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=ACCOUNTS, roles=("feature_engineer",))
     assert isinstance(r, JoinPlan) and r.steps
 
 
 def test_unknown_cardinality_is_REFUSED(db, null_cardinality_catalog):
     """VERIFIED: JoinStep.cardinality is str|None and graph_edge.cardinality is NULLable.
     An unknown edge may BE 1:N — refusing only 1:N would be a fail-open."""
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.accounts", roles=("feature_engineer",))
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=ACCOUNTS, roles=("feature_engineer",))
     assert r.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
 
 
-def test_ambiguous_INTERMEDIATE_hop_is_refused(db, ambiguous_intermediate_catalog):
-    """BFS indexes by bare name: transactions → accounts → archive.customers can be
-    stitched across schemas even when both ENDPOINTS look unambiguous."""
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+def test_two_resolved_schemas_sharing_a_table_name_are_refused(db, ambiguous_intermediate_catalog):
+    """The BFS indexes by BARE table name. Refs cannot express the ambiguity (all flattened
+    to `public`, spec §3.5), so the check runs on RESOLVED physical identities: two distinct
+    physical schemas containing the same table name anywhere on the path."""
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=CUSTOMERS, roles=("feature_engineer",))
     assert r.code is CompilationRefusalCode.AMBIGUOUS_TABLE_NAME
 
 
-def test_schema_continuity_is_validated_on_every_step(db, mixed_schema_path_catalog):
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+def test_physical_continuity_is_validated_on_EVERY_step_not_just_endpoints(db, mixed_schema_path_catalog):
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=CUSTOMERS, roles=("feature_engineer",))
     if isinstance(r, JoinPlan):
         schemas = {s.from_ref.split(".")[0] for s in r.steps} | \
                   {s.to_ref.split(".")[0] for s in r.steps}
@@ -286,8 +287,7 @@ def test_schema_continuity_is_validated_on_every_step(db, mixed_schema_path_cata
 
 
 def test_fan_out_toward_the_grain_is_REFUSED(db, joint_account_catalog):
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=CUSTOMERS, roles=("feature_engineer",))
     assert r.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
 
 
@@ -386,7 +386,7 @@ Spec §3.3. Generation-time only. **No `business_dt` anywhere in this task.**
 
 **Files:** Create `src/featuregen/materialize/inputs.py`; Test `test_inputs.py`
 
-**Produces:** `PartitionMapping`; `PhysicalInputRequirement`; `derive_requirement(inventory, *, table_ref) -> PhysicalInputRequirement | MaterializationRefused`.
+**Produces:** `PartitionMapping`; `PhysicalInputRequirement`; `resolve_physical_identity(conn, inventory, *, logical_ref) -> PhysicalIdentity | MaterializationRefused` (reuses the `column_authority.logical_ref_of` pattern — reads `graph_node.schema_name`, then the inventory's declared logical→physical mapping when it is NULL, else `PHYSICAL_SCHEMA_NOT_RESOLVED`); `derive_requirement(conn, inventory, *, logical_ref) -> PhysicalInputRequirement | MaterializationRefused`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -395,6 +395,23 @@ def test_requirement_takes_no_business_dt():
     import inspect
     from featuregen.materialize.inputs import derive_requirement
     assert "business_dt" not in inspect.signature(derive_requirement).parameters
+
+
+def test_physical_schema_is_RESOLVED_never_parsed_from_the_ref(db, seeded_catalog, inventory):
+    """Refs are schema-flattened to `public`; the real schema lives in graph_node.schema_name."""
+    ident = resolve_physical_identity(db, inventory, logical_ref="hdfc::public.transactions.amount")
+    assert ident.schema == "banking"          # from schema_name, NOT from the ref segment
+
+
+def test_null_schema_name_falls_back_to_the_DECLARED_mapping(db, no_schema_name, inventory):
+    assert resolve_physical_identity(db, inventory,
+                                     logical_ref="hdfc::public.transactions.amount").schema == "banking"
+
+
+def test_unresolvable_schema_REFUSES_rather_than_defaulting_to_public(db, no_schema_name, bare_inventory):
+    """Silently defaulting to `public` would read a DIFFERENT table than the catalog governs."""
+    r = resolve_physical_identity(db, bare_inventory, logical_ref="hdfc::public.transactions.amount")
+    assert r.code is CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED
 
 
 def test_mapping_comes_from_the_DECLARATION_not_the_column_name(inv_load_dt_no_mapping):

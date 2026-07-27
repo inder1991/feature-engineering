@@ -100,6 +100,19 @@ class Gate1Error(Exception):
     """A malformed or out-of-set Gate #1 confirmation."""
 
 
+class UnknownConsideredOption(Gate1Error):
+    """The caller named an option id that this verified revision does not contain.
+
+    Deliberately a SEPARATE type from its parent. Every other ``Gate1Error`` out of the revision
+    readers means the STORED record failed verification — a hash mismatch, an inconsistent option
+    map, a broken lineage — i.e. corruption or tampering, which is an operator-grade event. This one
+    means only that the client sent an option id the server does not recognise, which is what a
+    stale browser tab does after a regenerate. Collapsing the two makes a routine client retry
+    indistinguishable from an integrity failure in the logs, so the route maps this to 422 and the
+    rest to 409.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ConsideredSet:
     intent_id: str
@@ -1009,7 +1022,8 @@ def _chosen_option_from_revision(
         raise Gate1Error("considered revision option identities are inconsistent")
     record = options.get(option_id)
     if not isinstance(record, dict):
-        raise Gate1Error("unknown considered option")
+        # The revision itself verified fine above; the caller simply named something not in it.
+        raise UnknownConsideredOption("unknown considered option")
     identity = record.get("canonical_candidate_identity")
     identity_hash = record.get("canonical_candidate_identity_hash")
     if not isinstance(identity, dict) or canonical_hash(identity) != identity_hash:

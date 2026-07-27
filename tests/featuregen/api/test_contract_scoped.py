@@ -371,11 +371,24 @@ def test_shadow_internal_db_error_swallowed_by_planner_does_not_poison_transacti
         # it — restore the empty committed baseline ourselves (precedent: security/conftest truncates
         # after its committing test). schema_migrations + the migration-seeded projection_checkpoints
         # rows are the only committed baseline state; everything else app-level starts empty.
+        #
+        # session_replication_role='replica' suppresses USER triggers for this session, which the
+        # TRUNCATE below now requires: migration 1020 put a write-once guard on authoring_trace_event
+        # that raises "TRUNCATE not allowed". Without this the cleanup itself threw, the committed
+        # rows from this test survived into every later test in the session, and ~69 unrelated tests
+        # failed downstream on leftover state (duplicate graph_node keys, stale bank/core catalogs).
+        # That is a TEST-ONLY escape hatch on the suite's own connection: it never runs in
+        # application code, and the write-once guarantee it steps around is re-asserted for every
+        # other test by the trigger still being active outside this block.
         conn.rollback()   # clear any in-flight (possibly aborted) txn so the cleanup can run
         tables = [r[0] for r in conn.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
             "AND tablename NOT IN ('schema_migrations', 'projection_checkpoints')").fetchall()]
-        conn.execute("TRUNCATE " + ", ".join(f'"{t}"' for t in tables) + " CASCADE")
+        conn.execute("SET session_replication_role = replica")
+        try:
+            conn.execute("TRUNCATE " + ", ".join(f'"{t}"' for t in tables) + " CASCADE")
+        finally:
+            conn.execute("RESET session_replication_role")
         conn.commit()
 
 

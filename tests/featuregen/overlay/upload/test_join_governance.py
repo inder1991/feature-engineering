@@ -476,14 +476,15 @@ def test_project_verified_join_creates_operational_edge(passc_conn, human_admin_
     waiting for a re-upload (`_confirm_join` drains the overlay READ-MODEL projection but never
     projects graph edges, so the edge here is created by `project_verified_join` alone)."""
     _seed_endpoint_nodes(passc_conn)
-    ref, _key = _seed_join_with_evidence(passc_conn)
+    ref, key = _seed_join_with_evidence(passc_conn)
     _confirm_join(passc_conn, ref, admin1=human_admin_1, admin2=human_admin_2)
     assert find_join_path(passc_conn, "src", "transactions", "customers") is None
 
     status = project_verified_join(passc_conn, ref.from_ref.catalog_source, ref, now=None)
     assert status == "projected"
+    # The step carries the fact that authorized it (Spec A T3) — same read that planned the path.
     assert find_join_path(passc_conn, "src", "transactions", "customers") \
-        == [JoinStep(_FROM, _TO, "N:1")]
+        == [JoinStep(_FROM, _TO, "N:1", key, "VERIFIED")]
 
 
 def test_project_verified_join_projects_within_the_confirming_request(
@@ -508,7 +509,7 @@ def test_project_verified_join_projects_within_the_confirming_request(
         " WHERE kind = 'joins' AND catalog_source = 'src'").fetchall()
     assert rows == [("operational", key, "VERIFIED")]
     assert find_join_path(passc_conn, "src", "transactions", "customers") \
-        == [JoinStep(_FROM, _TO, "N:1")]
+        == [JoinStep(_FROM, _TO, "N:1", key, "VERIFIED")]
 
 
 def test_project_verified_join_pending_when_drift_watermark_stale(
