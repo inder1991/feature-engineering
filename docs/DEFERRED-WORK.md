@@ -139,6 +139,14 @@ in place.
 | 🟡 `catalog_state_stamp` uses a **catalog-wide** `drift_head_seq` | An unrelated upload to the same catalog source moves **every** requirement's identity, so projects regenerate when nothing they read has changed. Conservative rather than wrong — it never claims staleness it doesn't have — but it will cause avoidable churn. Wall-clock (`last_completed_at`) is deliberately excluded so a re-projection of an unchanged catalog does not move identity. | When regeneration churn becomes a cost, or when a per-object stamp exists. |
 | 🟡 A catalog with **no watermark is recorded honestly, not refused** | There is no §14 member for "catalog state unknown", so Task 5 records the absence rather than inventing a code. Consequence: identity does not pin catalog state in that case. | If catalog-state pinning must be guaranteed, T1 needs a new code and this becomes a refusal. |
 
+### A.5 Availability + grain-path limits found in Task 6 (2026-07-27)
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🔴 **`AVAILABILITY_TIME.basis` and `lag_hours` are projected NOWHERE** | `table_fact_projection` flattens the fact to a boolean `is_as_of` flag plus a fact-event link; `graph_node` has no `basis` or `lag_hours` column. Spec §8 rule 1 (the availability gate, incl. `event_time_plus_lag`) therefore **cannot be rendered from `graph_node` at all**. Task 6 dereferences the fact payload *through the link the projection wrote* (VERIFIED status + matching `confirmed_event_id` + matching column + `validate_fact_value`), keeping authority with the shipped reader rather than re-deciding it. Two accepted consequences: a **catalog-authoritative** availability fact is unusable today (fail-closed), and expiry/drift are exactly as strong as the shipped projection — no stronger. This is the only place `materialize/` reads a table the rest of it does not. | Projecting `basis`/`lag_hours` (or an equivalent) would let the gate read from `graph_node` like everything else, and would make catalog-authoritative facts usable. Same "mechanism present but not fully wired" class as B-0. |
+| 🟡 **A grain spanning two off-source tables is refused** | Spec §3's IR carries one `join_plan`, so such a grain would need two traversals with two independent fan-out verdicts. Refused as `GRAIN_PATH_NOT_GOVERNED` because the closed §14 vocabulary has no member naming the real condition. Left open rather than designed around. | A formula whose grain keys genuinely live on two different off-source tables. |
+| 🟡 **A joined dimension's own availability is ungated** | §8 rule 1 gates one availability column per expression, so a dimension reached by a join contributes no availability constraint of its own in this slice. | Bitemporal or late-arriving dimension data, where the dimension's own knowledge time matters. |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |
