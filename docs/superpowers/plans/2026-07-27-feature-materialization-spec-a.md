@@ -542,7 +542,7 @@ Spec §6. Architect's ruling, 2026-07-27: a known-unsupported numeric representa
 
 **Scope note:** the sibling Child-1 fix (make `_resolve_ratio` enforce its documented rule, and distinguish *unavailable type authority* from *a governed non-numeric type*) is routed to the feature-generation owner. **Do not edit that file from this stream** — it is actively being worked.
 
-- [ ] **Step 1: Failing tests** — the acceptance set is fixed by the ruling:
+- [x] **Step 1: Failing tests** — the acceptance set is fixed by the ruling:
 
 ```python
 def test_exact_decimal_ratio_survives(...): ...          # decimal/integer operands → DECIMAL(p,s)
@@ -557,7 +557,17 @@ def test_money_operand_dies(...): ...
 
 Plus the mutation harness's **must-survive no-op** control.
 
-- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** — carry the governed operand type per expression; gate `DECIMAL` production on the exact-numeric allowlist; increment the policy version · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): exact-numeric operand evidence gates DECIMAL`
+- [x] **Step 2: Run — FAIL** · **Step 3: Implement** — carry the governed operand type per expression; gate `DECIMAL` production on the exact-numeric allowlist; increment the policy version · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): exact-numeric operand evidence gates DECIMAL`
+
+**Established, beyond the sketch above:**
+
+- **`OperandTypeStatus` has FOUR members, not two.** The plan's "the governed C1 type … or an explicit *unavailable* marker" splits in three once C1's status vocabulary is read: `GOVERNED` (`status="resolved"`), `UNGOVERNED` (the read SUCCEEDED and no governed decision backs it — `no_decision` / `no_value` / `not_operational` / `retired` / `conflict`), and `UNAVAILABLE` (the read FAILED CLOSED — `fork` / `hash_mismatch` / `projection_unavailable`), plus `NO_OPERAND` for `COUNT_ROWS`, whose operand is `None` by grammar [c9] and is not a failure of anything.
+- **WHICH code each takes, and why.** Both refusals carry **`PHYSICAL_TYPE_UNSUPPORTED`**, because §14 is a closed vocabulary holding exactly one member for a typing verdict: `NOT_RESOLVED` is admission's terminal-disposition code (§1.2 rule 3) and `AVAILABILITY_TIME_NOT_GOVERNED` is the availability fact's, so borrowing either would double-book a code and leave a handler unable to route. What is **not** collapsed is the *diagnosis*: three separate branches with three details, asserted mutually non-overlapping — `UNGOVERNED` ⇒ "nobody attested this column's type", `UNAVAILABLE` ⇒ names the C1 status and says the authority is degraded, the allowlist branch ⇒ "not an exact numeric". Both no-type states are ALSO absent from the allowlist, so a single check would refuse them anyway *with the wrong explanation*; that is the collapse the acceptance test prevents. **If a reviewer wants two codes, §14 needs a new member (`OUTPUT_TYPE_NOT_GOVERNED`) — a spec change, not an implementation choice, and Task 1's `test_codes.py` pins the vocabularies with `==`.**
+- **The evidence carries a type ONLY when governed**, so the "ungoverned but numeric" path that published fixed-point on a file declaration no longer exists. That closes **A.9's third row** (`external_type_required` consumed by nothing) as a side effect, and it is a real behaviour change: a SUM over an operand whose type nobody attested now refuses.
+- **`operand_type` is deliberately NOT identity-bearing.** It decides whether the expression may be PUBLISHED, not what it computes (a governed `numeric` and a governed `bigint` operand read the same rows and add them the same way), and hashing it would fire §9's `IR_HASH_MISMATCH` on a projection blip. The consequence — the resolved `PhysicalType` — enters `group_plan_hash` on its own.
+- **`operand_types` is required and must line up with the body**: key set equal to the body paths, and each entry's `operand_ref` equal to that expression's operand — checked BEFORE the count short-circuit, or mismatched evidence would pass unnoticed for every `BIGINT`. A mismatched call raises `ValueError`, the line Task 9 drew.
+- **The allowlist is §6's set plus `int2`** — PostgreSQL's alias for `smallint`, as `int4`/`int8` (which §6 *does* list) are for `integer`/`bigint`; refusing it would reject an exact column over its spelling. Pinned in both directions, including that every member of §6's REFUSED set is in the catalog's `_NUMERIC_LOGICAL_TYPES` and absent from the allowlist — so the recommended-but-wrong fix is a failing test rather than a memory.
+- **`compile_expression` records and never judges**: the C1 read happens after every refusal (a refused plan performs no extra catalog read) and no type condition refuses there. §6's rule has one owner.
 
 ---
 
@@ -567,7 +577,7 @@ Spec §5.
 
 **Files:** Create `src/featuregen/materialize/{classify,contract}.py`; Test `test_classify.py`, `test_contract.py`
 
-**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`. **Plus**, because §5.1 is only enforceable if the group has ONE entry point and the read set has ONE derivation: `UNCLASSIFIED_RESTRICTION` (the stated missing-classification policy), `CadencePeriod` / `CadenceTrigger` / `PublicationPolicy` / `BackfillBoundary`, `LandingPitSemantics`, `ContractGroup`, `derive_group_contract(conn, authorization, …)` (takes Gate 2's TOKEN), and `ir.physical_read_set(irs, spine)` — §1.3's union exposed for ONE feature instead of being re-walked in the classification stage.
+**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass` (**replaced by Task 9.1's `AvailabilityPromiseV1`**); `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`. **Plus**, because §5.1 is only enforceable if the group has ONE entry point and the read set has ONE derivation: `UNCLASSIFIED_RESTRICTION` (the stated missing-classification policy), `CadencePeriod` / `CadenceTrigger` / `PublicationPolicy` / `BackfillBoundary`, `LandingPitSemantics`, `ContractGroup`, `derive_group_contract(conn, authorization, …)` (takes Gate 2's TOKEN), and `ir.physical_read_set(irs, spine)` — §1.3's union exposed for ONE feature instead of being re-walked in the classification stage.
 
 - [x] **Step 1: Failing classification tests**
 
@@ -598,7 +608,7 @@ def test_a_join_key_or_the_spine_can_be_the_most_restrictive(db, restricted_join
 - [x] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes **all three** policy versions (classification, physical-type, retention) **and the spine's `identity_payload()` only — never its provenance** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
 - [x] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
 
-**Established (interfaces reference §25), beyond the sketch above:** `restricted` is a legal value of **both** sensitivity columns, so independence is proved by a **2×2** (each axis moved with the other held fixed) rather than by one fixture where they agree · migration `0993` constrains the TAG column to exactly `SENSITIVITY_ROLES`' keys but leaves `effective_restriction` **unconstrained**, so normalize-then-refuse is a reachable path (demonstrated, not assumed) · the missing-classification policy is stated as `internal` — not `public` (a claim nobody attested) and not `prohibited` (which would collapse "unclassified" into "forbidden") · the landing keys are the **spine's**, not the formula's grain keys · the resolved physical TYPE is excluded from the contract, or a `BIGINT` count and a `DECIMAL` sum could never share a group · a malformed **declaration** (bad trigger/period/timezone/cutoff, a loosening override) raises `ValueError` because §14 has no member for it, while `PROHIBITED_INPUT` is the one governed verdict. Gaps recorded in `DEFERRED-WORK.md` A.10 — the load-bearing one is that **`AvailabilityClass`'s vocabulary is invented here**, since §5.4 requires it declared and names none, and it enters the contract hash.
+**Established (interfaces reference §25), beyond the sketch above:** `restricted` is a legal value of **both** sensitivity columns, so independence is proved by a **2×2** (each axis moved with the other held fixed) rather than by one fixture where they agree · migration `0993` constrains the TAG column to exactly `SENSITIVITY_ROLES`' keys but leaves `effective_restriction` **unconstrained**, so normalize-then-refuse is a reachable path (demonstrated, not assumed) · the missing-classification policy is stated as `internal` — not `public` (a claim nobody attested) and not `prohibited` (which would collapse "unclassified" into "forbidden") · the landing keys are the **spine's**, not the formula's grain keys · the resolved physical TYPE is excluded from the contract, or a `BIGINT` count and a `DECIMAL` sum could never share a group · a malformed **declaration** (bad trigger/period/timezone/cutoff, a loosening override) raises `ValueError` because §14 has no member for it, while `PROHIBITED_INPUT` is the one governed verdict. Gaps recorded in `DEFERRED-WORK.md` A.10 — the load-bearing one was that **`AvailabilityClass`'s vocabulary was invented here**, since §5.4 requires it declared and names none, and it entered the contract hash; **Task 9.1 replaced it with `AvailabilityPromiseV1` and closed that item.**
 
 ---
 
@@ -610,7 +620,7 @@ Spec §5.6. Architect ruling, 2026-07-27. Replaces the invented `AvailabilityCla
 
 **Produces:** `AvailabilityPromiseKind` (`CALENDAR_OFFSET` in v1); `AvailabilityPromiseV1(kind, calendar_days, plus_minutes)`; a normalizing constructor; `availability_class` renamed **`availability_promise`** throughout.
 
-- [ ] **Step 1: Failing tests** — the ruling fixes these seven:
+- [x] **Step 1: Failing tests** — the ruling fixes these seven:
 
 ```python
 def test_t3_plus_2h_hashes_differently_from_t3(): ...
@@ -628,7 +638,9 @@ def test_differing_cadence_timezone_or_cutoff_makes_promises_INCOMPARABLE(): ...
 
 Plus: **`kind` is present in the canonical payload in v1** — assert it, because the whole forward-compatibility property depends on it. Without it, adding a second kind later re-keys every existing contract.
 
-- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): AvailabilityPromiseV1 replaces the invented class enum`
+- [x] **Step 2: Run — FAIL** · **Step 3: Implement** · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): AvailabilityPromiseV1 replaces the invented class enum`
+
+**Established (interfaces reference §27), beyond the sketch above:** the bound `0 <= plus_minutes < 1440` is what makes `(calendar_days, plus_minutes)` orderable as a plain tuple — once minutes may reach a whole day, `(1, 0)` and `(0, 1440)` are the same instant and the monotonic comparison starts lying · **INCOMPARABLE is a fourth VERDICT** on `PromiseComparison`, not the absence of `LATER`, and the comparison basis is `(kind, cadence.timezone, cadence.business_date_cutoff)` — so the SAME offset on a different clock is incomparable, not equal · both the incomparable and the earlier refusal are `ValueError` (the Task 9 boundary, now settled by ruling), with separate messages because an incomparable pair was never ordered and reporting it as "earlier" would assert a comparison nobody made · an override carries no cadence of its own — it is read against the ONE cadence the derivation was given, and the two-cadence form of the rule is the public `override_availability_promise` a later stage must use against an already-persisted contract · the kind's contribution to comparability is **unreachable behaviourally in v1** (one member), so `_comparison_basis` is pinned by value instead. **A.10's 🔴 is closed.**
 
 ---
 

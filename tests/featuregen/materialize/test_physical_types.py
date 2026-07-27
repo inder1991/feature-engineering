@@ -1,15 +1,27 @@
-"""Task 8 — the versioned physical type adapter (spec §6).
+"""Task 8 + 8.1 — the versioned physical type adapter (spec §6).
 
-The property under test throughout: **the OPERATION decides the physical type, not the logical
-word.** ``FormulaOutputPolicyV1.output_type`` is a logical type (``numeric`` / ``integer`` /
-``decimal``); mapping that word straight onto a Hive type is the defect this module exists to
-prevent. A ``COUNT_DISTINCT`` is logically ``integer`` and physically ``BIGINT``; a ``SUM`` is
-``DECIMAL(p,s)`` from the formula's OWN ``DecimalPolicy`` whatever word Child-1 resolved.
+Two properties under test throughout.
+
+**1. The OPERATION decides the physical type, not the logical word.**
+``FormulaOutputPolicyV1.output_type`` is a logical type (``numeric`` / ``integer`` / ``decimal``);
+mapping that word straight onto a Hive type is the defect this module exists to prevent. A
+``COUNT_DISTINCT`` is logically ``integer`` and physically ``BIGINT``; a ``SUM`` is ``DECIMAL(p,s)``
+from the formula's OWN ``DecimalPolicy`` whatever word Child-1 resolved.
+
+**2. Only a GOVERNED EXACT numeric operand may back a ``DECIMAL`` — and EVERY arithmetic operand is
+checked (Task 8.1).** "Numeric" and "exact-numeric" are different questions: the catalog's
+``_NUMERIC_LOGICAL_TYPES`` contains ``float``, ``double``, ``double precision``, ``real`` and
+``money``, so a float ratio passes a numericness test and still publishes fixed-point — asserting a
+reproducibility float arithmetic does not have. And the check cannot be asked of Child-1's formula
+word, which describes a SUM's own operand, a DIFFERENCE's MINUEND, and for a RATIO nothing at all;
+so the evidence is per-EXPRESSION ``OperandTypeEvidence``, carried by the IR.
 
 The formulas here are built by hand rather than taken from ``fixtures.py`` because the fixtures are
 the three worked features — they cover one nullability combination between them, and this module's
-whole surface is the combinations. The worked features are asserted too (as the end of the file),
-so the synthetic builders cannot drift away from a real Child-1 formula.
+whole surface is the combinations. The worked features are asserted too (at the end of the file),
+so the synthetic builders cannot drift away from a real Child-1 formula; and one end-to-end test
+compiles a real expression against the real governed catalog, so the hand-built evidence cannot
+drift away from what ``compile_expression`` actually produces.
 """
 from __future__ import annotations
 
@@ -44,10 +56,12 @@ from featuregen.formula.schema import (
     WindowPolicy,
     WindowUnit,
     ZeroDenominator,
+    body_expressions,
 )
 from featuregen.materialize import physical_types
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+from featuregen.materialize.expression_ir import OperandTypeEvidence, OperandTypeStatus
 from featuregen.materialize.physical_types import (
     PHYSICAL_TYPE_POLICY_VERSION,
     PhysicalType,
@@ -139,15 +153,57 @@ def _difference(*, minuend: AggregateFunction = AggregateFunction.SUM,
                     output_type=output_type, decimal=decimal)
 
 
-def _resolved(formula: TypedFormulaV1) -> PhysicalType:
+# ── operand type evidence (Task 8.1) ─────────────────────────────────────────────────────────────
+
+def _governed(logical_type: str, *, ref: str = REF_AMT) -> OperandTypeEvidence:
+    return OperandTypeEvidence(operand_ref=ref, status=OperandTypeStatus.GOVERNED,
+                               logical_type=logical_type, read_status="resolved")
+
+
+def _ungoverned(*, ref: str = REF_AMT, read_status: str = "no_decision") -> OperandTypeEvidence:
+    """A read that SUCCEEDED and found no governed decision. The type slot is empty by
+    construction — the evidence type has no way to carry an unattested word."""
+    return OperandTypeEvidence(operand_ref=ref, status=OperandTypeStatus.UNGOVERNED,
+                               logical_type=None, read_status=read_status)
+
+
+def _unavailable(*, ref: str = REF_AMT, read_status: str = "hash_mismatch") -> OperandTypeEvidence:
+    """A read that FAILED CLOSED — fork / hash_mismatch / projection_unavailable."""
+    return OperandTypeEvidence(operand_ref=ref, status=OperandTypeStatus.UNAVAILABLE,
+                               logical_type=None, read_status=read_status)
+
+
+def _evidence(formula: TypedFormulaV1, **overrides: OperandTypeEvidence) -> dict:
+    """One evidence entry per body path: GOVERNED ``numeric`` unless a test says otherwise.
+
+    Keyed by body path with the dots dropped so a test can write ``denominator=_governed("real")``.
+    The default is the ordinary case — a governed exact operand — so every test that is NOT about
+    operand types reads as it did before Task 8.1.
+    """
+    keyed = {f"body.{name}": value for name, value in overrides.items()}
+    built = {}
+    for path, expr in body_expressions(formula.body):
+        if path in keyed:
+            built[path] = keyed[path]
+        elif expr.operand is None:
+            built[path] = OperandTypeEvidence(
+                operand_ref=None, status=OperandTypeStatus.NO_OPERAND, logical_type=None,
+                read_status=None)
+        else:
+            built[path] = _governed("numeric", ref=expr.operand)
+    assert set(keyed) <= set(built), f"override names a path this body does not have: {keyed}"
+    return built
+
+
+def _resolved(formula: TypedFormulaV1, **overrides: OperandTypeEvidence) -> PhysicalType:
     """Resolve, asserting success — a refusal here is a test failure, not a value."""
-    result = resolve_physical_type(formula)
+    result = resolve_physical_type(formula, operand_types=_evidence(formula, **overrides))
     assert isinstance(result, PhysicalType), result
     return result
 
 
-def _refusal(formula: TypedFormulaV1) -> MaterializationRefused:
-    result = resolve_physical_type(formula)
+def _refusal(formula: TypedFormulaV1, **overrides: OperandTypeEvidence) -> MaterializationRefused:
+    result = resolve_physical_type(formula, operand_types=_evidence(formula, **overrides))
     assert isinstance(result, MaterializationRefused), result
     return result
 
@@ -155,8 +211,14 @@ def _refusal(formula: TypedFormulaV1) -> MaterializationRefused:
 # ── the policy version ───────────────────────────────────────────────────────────────────────────
 
 def test_the_policy_version_is_a_declared_constant():
-    """§6: it enters ``FeatureGroupPlanV1``/``group_plan_hash`` and the contract hash (§5.5)."""
-    assert PHYSICAL_TYPE_POLICY_VERSION == 1
+    """§6: it enters ``FeatureGroupPlanV1``/``group_plan_hash`` and the contract hash (§5.5).
+
+    **2**, not 1: Task 8.1 changed the operand rule from "the formula's one logical word is exact"
+    to "EVERY arithmetic operand carries a GOVERNED exact-numeric type". A float denominator that
+    resolved to ``DECIMAL`` under version 1 refuses under version 2, so a contract keyed on the old
+    version describes a column decided by a rule that no longer applies.
+    """
+    assert PHYSICAL_TYPE_POLICY_VERSION == 2
 
 
 # ── counts → BIGINT ──────────────────────────────────────────────────────────────────────────────
@@ -201,68 +263,270 @@ def test_difference_takes_precision_and_scale_from_the_formulas_decimal_policy()
     assert _resolved(_difference()).sql_type == "DECIMAL(18,2)"
 
 
-def test_a_difference_of_two_counts_is_decimal_though_no_operand_type_is_readable():
+def test_a_difference_of_two_counts_is_decimal_though_no_operand_type_exists():
     """§6 keys the table on the FINAL operation, and a count's operands are integral by
-    construction — so the logical word (``unknown``, because a COUNT_ROWS has no operand for
-    Child-1 to read a type from) is not evidence about anything here and cannot refuse it."""
+    construction — so two ``COUNT_ROWS`` halves, which have no operand at all, cannot refuse it."""
     assert _resolved(
         _difference(minuend=AggregateFunction.COUNT_ROWS,
                     subtrahend=AggregateFunction.COUNT_ROWS,
                     output_type="unknown")).sql_type == "DECIMAL(18,2)"
 
 
-# ── the logical word as OPERAND evidence (never as a physical type) ──────────────────────────────
-
-def test_a_sum_over_an_unreadable_operand_type_is_refused():
-    """``"unknown"`` is Child-1's ``_UNKNOWN_TYPE``: the operand's type was absent or NOT numeric.
-    Publishing DECIMAL over it would be a numeric claim nobody governed."""
-    assert _refusal(_sum(output_type="unknown")).code is (
-        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+# ══ Task 8.1 — EVERY arithmetic operand must be a GOVERNED EXACT numeric (§6) ════════════════════
+# The seven acceptance cases fixed by the architect's 2026-07-27 ruling, plus the boundaries that
+# make each of them a discriminator rather than a coincidence.
 
 
-def test_a_sum_over_an_inexact_operand_type_is_refused():
-    """A binary floating-point operand is not an exact numeric: its sum is order-dependent under
-    parallel execution, so the DECIMAL published from it is not reproducible."""
-    for inexact in ("double precision", "real", "float"):
-        assert _refusal(_sum(output_type=inexact)).code is (
+def test_exact_decimal_ratio_survives():
+    """The positive case, and it must not be carried by the DEFAULT evidence: both halves are given
+    EXPLICIT exact types that differ from each other and from the builder's default."""
+    resolved = _resolved(_ratio(), numerator=_governed("decimal"), denominator=_governed("integer"))
+    assert resolved.sql_type == "DECIMAL(18,2)"
+
+
+@pytest.mark.parametrize("exact", sorted(physical_types._EXACT_NUMERIC_LOGICAL_TYPES))
+def test_every_allowlisted_exact_type_publishes_a_decimal(exact):
+    assert _resolved(_sum(), expr=_governed(exact)).sql_type == "DECIMAL(18,2)"
+
+
+def test_string_operand_dies():
+    """A SUM over a text column is not arithmetic at all — and the governed type says so."""
+    for text_type in ("varchar", "text", "character varying", "date", "boolean"):
+        assert _refusal(_sum(), expr=_governed(text_type)).code is (
             CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
 
 
-def test_the_two_operand_refusals_are_distinguishable_by_an_operator():
-    """"Child-1 could read no type at all" and "the type is readable but inexact" are different
-    problems — one is a governance gap in the catalog, the other a data-model choice — and only the
-    detail carries that. Without this the ``unknown`` branch is unobservable: an unreadable type is
-    also absent from the exact-numeric allowlist, so the second check would refuse it anyway with
-    the wrong explanation.
+def test_money_operand_dies():
+    """``money`` is IN the catalog's numeric set and must still be refused: its scale is a locale
+    setting rather than a declared column property, so the ``(p,s)`` it would convert to is not
+    knowable from governed metadata."""
+    assert _refusal(_sum(), expr=_governed("money")).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+
+
+def test_float_numerator_dies():
+    """Invisible to Child-1's word — a RATIO's ``output_type`` is the CONSTANT ``"decimal"`` and
+    describes no operand — which is the whole reason the evidence is per-expression."""
+    assert _refusal(_ratio(), numerator=_governed("double precision")).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+
+
+def test_float_denominator_dies():
+    assert _refusal(_ratio(), denominator=_governed("float")).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+
+
+def test_float_difference_subtrahend_dies():
+    """Child-1 derives a DIFFERENCE's word from the MINUEND only (``_resolve_difference``), so the
+    subtrahend is the position an implementation reading the word cannot see."""
+    assert _refusal(_difference(), subtrahend=_governed("real")).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+
+
+def test_a_float_in_ANY_arithmetic_position_dies():
+    """The complete matrix, so no position is checked only by accident."""
+    assert _refusal(_sum(), expr=_governed("real"))
+    assert _refusal(_ratio(), numerator=_governed("real"))
+    assert _refusal(_ratio(), denominator=_governed("real"))
+    assert _refusal(_difference(), minuend=_governed("real"))
+    assert _refusal(_difference(), subtrahend=_governed("real"))
+
+
+@pytest.mark.parametrize("inexact", ["float", "double", "double precision", "real", "money"])
+def test_the_refused_set_is_exactly_the_types_the_catalog_calls_numeric(inexact):
+    """§6's ``REFUSED`` set, one by one. Every member is in ``_NUMERIC_LOGICAL_TYPES``
+    (``output_authority.py:59``), which is what makes "is it numeric?" the WRONG test: the obvious
+    fix passes all five and publishes fixed-point anyway."""
+    from featuregen.formula.output_authority import _NUMERIC_LOGICAL_TYPES
+
+    assert inexact in _NUMERIC_LOGICAL_TYPES
+    assert inexact not in physical_types._EXACT_NUMERIC_LOGICAL_TYPES
+    assert _refusal(_sum(), expr=_governed(inexact)).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+
+
+def test_the_allowlist_covers_every_type_SPEC_6_names_and_nothing_inexact():
+    """The allowlist pinned in both directions against §6's own two sets. ``int2`` is the single
+    addition — PostgreSQL's alias for ``smallint``, as ``int4``/``int8`` (which §6 DOES list) are
+    for ``integer``/``bigint`` — so refusing it would reject an exact column over its spelling."""
+    spec_exact = {"numeric", "decimal", "integer", "int", "int4", "int8", "bigint", "smallint"}
+    assert spec_exact <= physical_types._EXACT_NUMERIC_LOGICAL_TYPES
+    assert physical_types._EXACT_NUMERIC_LOGICAL_TYPES - spec_exact == {"int2"}
+
+
+def test_unknown_or_unreadable_type_dies_or_requires_authority():
+    """BOTH die, and they die as SEPARATE branches carrying different explanations.
+
+    WHICH code, and why. §14 is a closed vocabulary and offers exactly one member for a typing
+    verdict — ``PHYSICAL_TYPE_UNSUPPORTED`` — so both refusals carry it; inventing a second code
+    would be a spec change, and borrowing an unrelated member (``NOT_RESOLVED`` is admission's,
+    ``AVAILABILITY_TIME_NOT_GOVERNED`` is the availability fact's) would make a handler unable to
+    route. What must NOT be collapsed is the DIAGNOSIS, because the remedies differ:
+
+    * UNGOVERNED — nobody has attested this column's type. Remedy: attest it.
+    * UNAVAILABLE — the type authority read failed closed (fork / hash-mismatch / unprojectable).
+      Remedy: repair the decision log or the projection; attesting again would not help.
+
+    Both states also carry NO type, so both are absent from the exact-numeric allowlist. A single
+    check would therefore refuse them anyway — with the wrong explanation, blaming a type nobody
+    could read. That is the collapse this test exists to prevent.
     """
-    unreadable = _refusal(_sum(output_type="unknown")).detail
-    inexact = _refusal(_sum(output_type="real")).detail
-    assert "no readable governed type" in unreadable
-    assert "not an exact numeric" in inexact
-    assert "no readable governed type" not in inexact
+    ungoverned = _refusal(_sum(), expr=_ungoverned())
+    unavailable = _refusal(_sum(), expr=_unavailable())
+    inexact = _refusal(_sum(), expr=_governed("real"))
+
+    assert ungoverned.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert unavailable.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+
+    assert "no GOVERNED logical type" in ungoverned.detail
+    assert "failed closed" in unavailable.detail and "hash_mismatch" in unavailable.detail
+    assert "not an exact numeric" in inexact.detail
+
+    # No branch may be reachable through another's message.
+    assert "not an exact numeric" not in ungoverned.detail
+    assert "not an exact numeric" not in unavailable.detail
+    assert "failed closed" not in ungoverned.detail
+    assert len({ungoverned.detail, unavailable.detail, inexact.detail}) == 3
 
 
-def test_a_parameterised_or_upper_case_operand_type_is_normalised_not_refused():
-    """Child-1 carries ``logical_representation`` VERBATIM, so the word may arrive parameterised
-    (``numeric(18,2)``) or upper-cased — neither is an unknown type."""
-    assert _resolved(_sum(output_type="NUMERIC(18,2)")).sql_type == "DECIMAL(18,2)"
-    assert _resolved(_sum(output_type=" decimal ")).sql_type == "DECIMAL(18,2)"
+@pytest.mark.parametrize("read_status", ["fork", "hash_mismatch", "projection_unavailable"])
+def test_every_C1_fail_closed_status_names_itself_in_the_refusal(read_status):
+    """An operator told only "unavailable" cannot tell a forked decision log from a lagged
+    projection, and the two are fixed by different people."""
+    refusal = _refusal(_sum(), expr=_unavailable(read_status=read_status))
+    assert read_status in refusal.detail
+
+
+def test_an_UNGOVERNED_operand_is_refused_even_when_the_catalog_word_would_be_exact():
+    """Closes DEFERRED-WORK A.9's third row. The evidence type cannot carry an unattested word at
+    all, so there is no "ungoverned but numeric" path that publishes fixed-point: a DECIMAL(p,s)
+    column is a governed claim about the operand, and an unattested `data_type` is not one."""
+    assert _refusal(_sum(), expr=_ungoverned()).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+
+
+def test_evidence_claiming_GOVERNED_with_NO_type_is_REFUSED_not_a_crash():
+    """A boundary belt, and it is load-bearing precisely because `resolve_physical_type` takes the
+    mapping from a CALLER. `_operand_type_evidence` never builds this pair, but a hand-assembled or
+    degenerate evidence object can — and without the guard the exactness test would call
+    ``.lower()`` on ``None`` and raise, turning a governed refusal into a stack trace (§14: a
+    governed failure never surfaces as a bare ``AttributeError``).
+    """
+    degenerate = OperandTypeEvidence(operand_ref=REF_AMT, status=OperandTypeStatus.GOVERNED,
+                                     logical_type=None, read_status="resolved")
+    result = resolve_physical_type(_sum(), operand_types={"body.expr": degenerate})
+    assert isinstance(result, MaterializationRefused), result
+    assert result.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+
+
+def test_a_parameterised_or_upper_case_governed_type_is_normalised_not_refused():
+    """``logical_representation`` is carried VERBATIM, so the word may arrive parameterised
+    (``numeric(18,2)``), upper-cased or padded — none of those is a different type."""
+    assert _resolved(_sum(), expr=_governed("NUMERIC(18,2)")).sql_type == "DECIMAL(18,2)"
+    assert _resolved(_sum(), expr=_governed(" decimal ")).sql_type == "DECIMAL(18,2)"
+    assert _resolved(_sum(), expr=_governed("BIGINT")).sql_type == "DECIMAL(18,2)"
+
+
+# ── the count exemption, and its limit ───────────────────────────────────────────────────────────
+
+def test_a_counts_operand_type_is_carried_but_NOT_consulted():
+    """A ``COUNT_DISTINCT`` over a text column is a legal, correct feature: the count is integral
+    whatever the column holds, so its operand is not an arithmetic operand. Refusing it would
+    refuse a correct feature; the evidence is still carried, just not consulted."""
+    assert _resolved(_count(), expr=_governed("varchar")).sql_type == "BIGINT"
+    assert _resolved(_count(), expr=_unavailable()).sql_type == "BIGINT"
+    assert _resolved(_count(AggregateFunction.COUNT_NON_NULL),
+                     expr=_governed("real")).sql_type == "BIGINT"
+
+
+def test_a_difference_whose_minuend_is_a_count_checks_only_the_SUM_half():
+    """The count half is exempt; the arithmetic half is not, and it is checked at its own path."""
+    assert _resolved(
+        _difference(minuend=AggregateFunction.COUNT_NON_NULL, subtrahend=AggregateFunction.SUM),
+        minuend=_governed("varchar")).sql_type == "DECIMAL(18,2)"
+    assert _refusal(
+        _difference(minuend=AggregateFunction.COUNT_NON_NULL, subtrahend=AggregateFunction.SUM),
+        minuend=_governed("varchar"), subtrahend=_governed("double")).code is (
+        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
 
 
 def test_a_difference_whose_minuend_is_a_sum_over_an_unreadable_operand_is_refused():
     assert _refusal(
-        _difference(minuend=AggregateFunction.SUM, subtrahend=AggregateFunction.COUNT_ROWS,
-                    output_type="unknown")).code is (
+        _difference(minuend=AggregateFunction.SUM, subtrahend=AggregateFunction.COUNT_ROWS),
+        minuend=_unavailable()).code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+
+
+# ── the formula's logical WORD is no longer operand evidence ─────────────────────────────────────
+
+def test_the_formulas_logical_word_can_no_longer_ACCEPT_an_inexact_operand():
+    """The regression direction that matters. Under Task 8, a word of ``"numeric"`` was the only
+    statement about the operand — so a float operand behind a numeric word published fixed-point."""
+    assert _refusal(_sum(output_type="numeric"), expr=_governed("double precision")).code is (
         CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
 
 
-def test_a_difference_whose_minuend_is_a_count_is_not_refused_by_the_word():
-    """Child-1 derives a DIFFERENCE's word from the MINUEND only (``_resolve_difference``), so an
-    ``unknown`` word says nothing when the minuend is a count."""
-    assert _resolved(
-        _difference(minuend=AggregateFunction.COUNT_NON_NULL,
-                    subtrahend=AggregateFunction.SUM,
-                    output_type="unknown")).sql_type == "DECIMAL(18,2)"
+def test_the_formulas_logical_word_can_no_longer_REFUSE_a_governed_exact_operand():
+    """The mirror: Child-1's ``"unknown"`` is not evidence about an operand the catalog governs."""
+    assert _resolved(_sum(output_type="unknown"), expr=_governed("numeric")).sql_type == (
+        "DECIMAL(18,2)")
+
+
+def test_the_module_never_reads_the_formulas_output_policy_for_a_type():
+    """A source assertion: two answers to one question is the defect, and the weaker answer
+    (a word describing at most one operand per formula) must not be consultable at all."""
+    source = Path(physical_types.__file__).read_text(encoding="utf-8")
+    executable = "\n".join(
+        line for line in source.splitlines()
+        if not line.lstrip().startswith(("#", "*", '"""', "'''")))
+    assert "output.output_type" not in executable
+    assert "formula.output" not in executable
+
+
+# ── the evidence must line up with the body: a mismatched CALL is a ValueError ───────────────────
+
+def test_evidence_missing_for_a_body_path_is_a_ValueError_not_a_refusal():
+    """The fail-open this argument exists to close: an omitted half of a ratio would exempt that
+    operand from §6 entirely. A call assembled wrongly is not a governed verdict (§14 has no member
+    for it), so it raises rather than borrowing ``PHYSICAL_TYPE_UNSUPPORTED``."""
+    formula = _ratio()
+    evidence = _evidence(formula)
+    del evidence["body.denominator"]
+    with pytest.raises(ValueError, match="body.denominator"):
+        resolve_physical_type(formula, operand_types=evidence)
+
+
+def test_evidence_for_a_body_path_the_formula_does_not_have_is_a_ValueError():
+    formula = _sum()
+    evidence = _evidence(formula) | {"body.denominator": _governed("numeric")}
+    with pytest.raises(ValueError, match="body.denominator"):
+        resolve_physical_type(formula, operand_types=evidence)
+
+
+def test_evidence_naming_a_DIFFERENT_operand_than_the_expression_is_a_ValueError():
+    """Evidence gathered for another formula types a column this one does not read — and it would
+    do so silently, since the paths still line up."""
+    formula = _sum()
+    evidence = {"body.expr": _governed("numeric", ref=f"{TABLE_REF}.some_other_column")}
+    with pytest.raises(ValueError, match="different operand"):
+        resolve_physical_type(formula, operand_types=evidence)
+
+
+def test_the_pairing_is_checked_for_a_COUNT_too():
+    """A count returns BIGINT without consulting its operand's type, so validating the pairing only
+    on the decimal path would let mismatched evidence through for every count."""
+    formula = _count()
+    evidence = {"body.expr": _governed("numeric", ref=f"{TABLE_REF}.some_other_column")}
+    with pytest.raises(ValueError, match="different operand"):
+        resolve_physical_type(formula, operand_types=evidence)
+
+
+def test_operand_types_has_no_default():
+    """A default of ``{}`` would let a caller skip §6's gate by omission."""
+    import inspect
+
+    parameter = inspect.signature(resolve_physical_type).parameters["operand_types"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # ── nullability is part of the type decision ─────────────────────────────────────────────────────
@@ -385,16 +649,52 @@ def test_the_rounding_mode_is_carried_into_the_type_decision():
 
 # ── never DOUBLE ─────────────────────────────────────────────────────────────────────────────────
 
-def test_the_module_source_never_names_a_binary_float_type():
+def _executable_source(module) -> str:
+    """The module's executable text, lower-cased, with comments and docstrings stripped.
+
+    Borrowed from ``test_inputs.py`` / ``test_expression_ir.py``. Necessary since Task 8.1: §6's
+    REFUSED set is now documented by name in this module's prose, so a whole-file match would fail
+    for an EXPLANATION of what is forbidden — and would be satisfied by deleting that explanation,
+    which is the wrong incentive in both directions.
+    """
+    import inspect
+    import io
+    import tokenize
+
+    kept: list[str] = []
+    tokens = tokenize.generate_tokens(io.StringIO(inspect.getsource(module)).readline)
+    previous = tokenize.INDENT
+    for token in tokens:
+        if token.type == tokenize.COMMENT:
+            continue
+        if token.type == tokenize.STRING and previous in (
+                tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE, tokenize.NL):
+            continue
+        if token.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            kept.append(token.string)
+        previous = token.type
+    return " ".join(kept).lower()
+
+
+def test_the_module_never_names_a_binary_float_type_IN_EXECUTABLE_CODE():
     """§6: "Never silently map ambiguous numerics to ``DOUBLE``." Ambiguity refuses.
 
-    Asserted against the SOURCE because a mapping can only be proven absent by its absence — a
+    Asserted against the source because a mapping can only be proven absent by its absence — a
     table with no DOUBLE row today can grow one tomorrow. If this fails, remove the mapping, not
-    the test: money in a binary float is a defect that costs money.
+    the test: money in a binary float is a defect that costs money. The allowlist is an executable
+    literal, so a float sneaking INTO it is exactly what this catches.
     """
-    source = Path(physical_types.__file__).read_text(encoding="utf-8")
-    assert "DOUBLE" not in source
-    assert "double" not in source.lower()
+    source = _executable_source(physical_types)
+    for banned in ("double", "float", "real", "money"):
+        assert banned not in source, f"{banned!r} appears in executable code"
+
+
+def test_the_prose_still_NAMES_the_refused_types():
+    """The complement, so the test above cannot be satisfied by deleting the explanation: §6's
+    REFUSED set is the reason this module exists, and a reader must be able to find it."""
+    source = Path(physical_types.__file__).read_text(encoding="utf-8").lower()
+    for refused in ("double precision", "real", "money", "float"):
+        assert refused in source
 
 
 def test_the_only_sql_types_this_module_can_publish_are_bigint_and_decimal():
@@ -410,16 +710,30 @@ def test_the_only_sql_types_this_module_can_publish_are_bigint_and_decimal():
 # ── refusal discipline ───────────────────────────────────────────────────────────────────────────
 
 def test_every_refusal_is_a_typed_task1_code_and_names_no_data_value():
-    refusal = _refusal(_sum(output_type="unknown"))
+    refusal = _refusal(_sum(), expr=_governed("real"))
     assert isinstance(refusal, MaterializationRefused)
     assert refusal.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
     assert refusal.detail
 
 
+def test_every_operand_refusal_names_a_LOCATION_and_never_the_column():
+    """§14's detail discipline: counts, types, hashes and LOCATIONS — never data. A body path is a
+    location; the operand's logical ref is a catalog address, and naming it in every refusal would
+    put the read set into an operator-facing message this module does not need to."""
+    for evidence in (_governed("real"), _ungoverned(), _unavailable()):
+        detail = _refusal(_ratio(), denominator=evidence).detail
+        assert "body.denominator" in detail
+        assert REF_AMT not in detail
+
+
 def test_a_refusal_is_RETURNED_not_raised():
     """One refused feature is one governed verdict among many a compilation collects — the same
     shape ``compile_ir`` uses."""
-    assert isinstance(resolve_physical_type(_sum(output_type="unknown")), MaterializationRefused)
+    formula = _sum()
+    assert isinstance(
+        resolve_physical_type(formula,
+                              operand_types=_evidence(formula, expr=_governed("real"))),
+        MaterializationRefused)
 
 
 def test_a_body_outside_child1s_closed_union_is_a_schema_error_not_a_refusal():
@@ -437,7 +751,7 @@ def test_a_body_outside_child1s_closed_union_is_a_schema_error_not_a_refusal():
         grain=formula.grain, body=_NotABody(),  # type: ignore[arg-type]
         parameters=(), decimal=formula.decimal, output=formula.output)
     with pytest.raises(SchemaError):
-        resolve_physical_type(forged)
+        resolve_physical_type(forged, operand_types={})
 
 
 # ── identity ─────────────────────────────────────────────────────────────────────────────────────

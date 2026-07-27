@@ -57,7 +57,8 @@ from featuregen.materialize.codes import CompilationRefusalCode, Materialization
 from featuregen.materialize.contract import (
     DEFAULT_RETENTION_CLASS,
     RETENTION_POLICY_VERSION,
-    AvailabilityClass,
+    AvailabilityPromiseKind,
+    AvailabilityPromiseV1,
     BackfillBoundary,
     CadenceDecl,
     CadencePeriod,
@@ -65,11 +66,14 @@ from featuregen.materialize.contract import (
     ContractGroup,
     ContractOverrides,
     MaterializationContractV1,
+    PromiseComparison,
     PublicationPolicy,
+    compare_availability_promises,
     contract_hash,
     derive_contract,
     derive_group_contract,
     group_by_contract,
+    override_availability_promise,
 )
 from featuregen.materialize.ir import authorize_compilation, ir_hash, physical_read_set
 from featuregen.materialize.physical_types import PHYSICAL_TYPE_POLICY_VERSION
@@ -82,6 +86,15 @@ COUNT_90D = "distinct_merchant_count_90d"
 CADENCE = CadenceDecl(period=CadencePeriod.DAILY, timezone="Asia/Kolkata",
                       business_date_cutoff="00:00:00", trigger=CadenceTrigger.SCHEDULED)
 
+#: The two cadences that differ from `CADENCE` in exactly ONE element of the comparison basis —
+#: the clock, and the hour on it. Each is a DIFFERENT answer to "T+3 by when, exactly?".
+ELSEWHERE = dataclasses.replace(CADENCE, timezone="Europe/London")
+EVENING = dataclasses.replace(CADENCE, business_date_cutoff="18:00:00")
+
+NEXT_DAY = AvailabilityPromiseV1(calendar_days=1)
+T3 = AvailabilityPromiseV1(calendar_days=3)
+T3_PLUS_2H = AvailabilityPromiseV1(calendar_days=3, plus_minutes=120)
+
 
 @pytest.fixture
 def catalog(db):
@@ -90,11 +103,11 @@ def catalog(db):
 
 
 def _contract(db, name=SUM_30D, *, ir=None, cadence=CADENCE,
-              availability_class=AvailabilityClass.NEXT_DAY, overrides=None, **compile_kwargs):
+              availability_promise=NEXT_DAY, overrides=None, **compile_kwargs):
     """Derive ONE feature's contract, failing the test HERE if the compile itself refused."""
     compiled = ir if ir is not None else _ok(_compile(db, name, **compile_kwargs))
-    return derive_contract(db, compiled, cadence=cadence, availability_class=availability_class,
-                           overrides=overrides)
+    return derive_contract(db, compiled, cadence=cadence,
+                           availability_promise=availability_promise, overrides=overrides)
 
 
 def _derived(value) -> MaterializationContractV1:
@@ -146,7 +159,7 @@ def test_passing_two_features_together_cannot_promote_either(catalog):
     authorization = authorize_compilation(catalog, group, group[0].spine, roles=_ROLES)
 
     refused = derive_group_contract(catalog, authorization, cadence=CADENCE,
-                                    availability_class=AvailabilityClass.NEXT_DAY)
+                                    availability_promise=NEXT_DAY)
     assert isinstance(refused, MaterializationRefused)
     assert refused.code is CompilationRefusalCode.MULTIPLE_MATERIALIZATION_CONTRACTS
     # Neither feature was promoted: each still derives its OWN class.
@@ -185,14 +198,14 @@ def test_the_group_entry_point_requires_an_AUTHORIZATION_TOKEN(catalog):
     group = (_ok(_compile(catalog, SUM_30D)),)
     with pytest.raises(TypeError, match="AuthorizedCompilation"):
         derive_group_contract(catalog, group, cadence=CADENCE,
-                              availability_class=AvailabilityClass.NEXT_DAY)
+                              availability_promise=NEXT_DAY)
 
 
 def test_the_group_contract_is_derived_over_the_authorized_IRS(catalog):
     group = tuple(_ok(_compile(catalog, name)) for name in (SUM_30D, COUNT_90D))
     authorization = authorize_compilation(catalog, group, group[0].spine, roles=_ROLES)
     derived = derive_group_contract(catalog, authorization, cadence=CADENCE,
-                                    availability_class=AvailabilityClass.NEXT_DAY)
+                                    availability_promise=NEXT_DAY)
     assert isinstance(derived, ContractGroup)
     assert derived.feature_names == (COUNT_90D, SUM_30D)
 
@@ -202,7 +215,7 @@ def test_a_PROHIBITED_input_refuses_the_whole_group(catalog):
     group = tuple(_ok(_compile(catalog, name)) for name in (SUM_30D, COUNT_90D))
     authorization = authorize_compilation(catalog, group, group[0].spine, roles=_ROLES)
     refused = derive_group_contract(catalog, authorization, cadence=CADENCE,
-                                    availability_class=AvailabilityClass.NEXT_DAY)
+                                    availability_promise=NEXT_DAY)
     assert isinstance(refused, MaterializationRefused)
     assert refused.code is CompilationRefusalCode.PROHIBITED_INPUT
 
@@ -258,7 +271,7 @@ def test_the_identity_payload_is_EXACTLY_the_specified_field_set(catalog):
     run id or a wall-clock reading enters an identity nobody notices changing."""
     assert set(_derived(_contract(catalog)).identity_payload()) == {
         "entity", "ordered_keys", "pit_semantics", "sensitivity_class", "access_requirements",
-        "retention_class", "retention_policy_version", "availability_class", "cadence",
+        "retention_class", "retention_policy_version", "availability_promise", "cadence",
         "publication_policy", "backfill_boundary", "spine", "classification_policy_version",
         "physical_type_policy_version"}
 
@@ -495,10 +508,9 @@ def test_the_cadence_enters_identity(catalog):
         assert contract_hash(_derived(_contract(catalog, cadence=cadence))) != base
 
 
-def test_the_availability_class_is_DECLARED_and_enters_identity(catalog):
+def test_the_availability_promise_is_DECLARED_and_enters_identity(catalog):
     base = contract_hash(_derived(_contract(catalog)))
-    other = contract_hash(_derived(
-        _contract(catalog, availability_class=AvailabilityClass.BEST_EFFORT)))
+    other = contract_hash(_derived(_contract(catalog, availability_promise=T3)))
     assert base != other
 
 
@@ -553,6 +565,247 @@ def test_a_no_op_override_changes_nothing(catalog):
     assert contract_hash(same) == contract_hash(base)
 
 
+# ══ §5.6 — the availability PROMISE is a canonical VALUE, not a label ════════════════════════════
+#
+# Rev 5 required an `availability_class` to be DECLARED and named no vocabulary, so Task 9 invented
+# one — and it entered the contract hash, which made an arbitrary member list load-bearing: anyone
+# needing `T+0` or `T+5` would have had to re-key every group to get it. §5.6 replaces the label with
+# a structured offset that can express any of them without touching the schema.
+
+
+def test_the_promise_KIND_vocabulary_is_CLOSED_and_ships_ONE_member():
+    """`==`, never `>=`. One member today, and the point of §5.6 is that a second one costs nothing:
+    `BUSINESS_DAY_OFFSET` may be added, but only WITH the governed holiday-calendar identifier and
+    version §5.6 requires, because calendar and banking days must never be read as each other."""
+    assert {k.value for k in AvailabilityPromiseKind} == {"calendar_offset"}
+
+
+def test_the_KIND_is_in_the_canonical_payload_from_v1(catalog):
+    """The whole forward-compatibility property depends on the discriminator shipping NOW.
+
+    If `kind` were omitted while one member exists, the day `BUSINESS_DAY_OFFSET` arrives every
+    existing payload would GAIN a field and every group would re-key — which is exactly what §5.6
+    exists to avoid. So it is asserted in the promise's own payload AND in the contract's, because
+    the contract is what actually gets hashed.
+    """
+    assert AvailabilityPromiseV1().identity_payload() == {
+        "kind": "calendar_offset", "calendar_days": 0, "plus_minutes": 0}
+    carried = _derived(_contract(catalog)).identity_payload()["availability_promise"]
+    assert carried["kind"] == "calendar_offset"
+
+
+def test_t3_plus_2h_hashes_differently_from_t3(catalog):
+    """The minutes are identity, not decoration — with a control that the same promise is one hash."""
+    plain = contract_hash(_derived(_contract(catalog, availability_promise=T3)))
+    plus_2h = contract_hash(_derived(_contract(catalog, availability_promise=T3_PLUS_2H)))
+    assert plain != plus_2h
+    assert contract_hash(_derived(_contract(
+        catalog, availability_promise=AvailabilityPromiseV1(calendar_days=3)))) == plain
+
+
+def test_semantically_equivalent_inputs_have_ONE_canonical_form(catalog):
+    """`days=0, plus_minutes=1560` is NOT a value — it is an input that must be normalized FIRST.
+
+    Normalizing silently inside the main constructor would make two spellings of one promise both
+    "work", and no call site could then show which was meant. So the plain constructor REFUSES it,
+    a separate constructor turns it into `(1, 120)`, and that must hash identically to a directly
+    constructed `(1, 120)` — otherwise the group key still depends on the spelling.
+    """
+    from featuregen.materialize.canonical import materialize_hash
+
+    with pytest.raises(ValueError, match="plus_minutes"):
+        AvailabilityPromiseV1(calendar_days=0, plus_minutes=1560)
+
+    normalized = AvailabilityPromiseV1.normalized(calendar_days=0, plus_minutes=1560)
+    direct = AvailabilityPromiseV1(calendar_days=1, plus_minutes=120)
+    assert (normalized.calendar_days, normalized.plus_minutes) == (1, 120)
+    assert normalized == direct
+    assert materialize_hash(normalized.identity_payload()) == materialize_hash(
+        direct.identity_payload())
+    assert contract_hash(_derived(_contract(catalog, availability_promise=normalized))) == \
+        contract_hash(_derived(_contract(catalog, availability_promise=direct)))
+
+
+def test_normalizing_an_ALREADY_canonical_promise_is_the_identity_function():
+    """The control for the test above: normalization is a re-spelling, not a second semantics."""
+    assert AvailabilityPromiseV1.normalized(calendar_days=3, plus_minutes=120) == T3_PLUS_2H
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"calendar_days": -1},                      # no promise lands before the business date
+    {"plus_minutes": -1},
+    {"plus_minutes": 1440},                     # a whole day, spelled as minutes
+    {"plus_minutes": 1560},                     # §5.6's own example
+    {"calendar_days": 1, "plus_minutes": 2880},
+])
+def test_negative_or_noncanonical_declarations_fail_construction(kwargs):
+    """`calendar_days >= 0` and `0 <= plus_minutes < 1440`, enforced at construction (§5.6).
+
+    The bound is what makes `(calendar_days, plus_minutes)` orderable as a plain tuple: once minutes
+    can reach a day, `(1, 0)` and `(0, 1440)` are the same instant and the tuple comparison that
+    decides a monotonic override starts lying.
+    """
+    with pytest.raises(ValueError):
+        AvailabilityPromiseV1(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"calendar_days": "3"}, {"plus_minutes": 1.5},
+                                    {"calendar_days": True}, {"kind": "business_day_offset"}])
+def test_a_promise_declared_in_the_WRONG_TYPE_is_a_malformed_declaration(kwargs):
+    """The payload is hashed: `"3"` and `3` are different canonical JSON and so different groups, and
+    a `kind` outside the vocabulary would put an uninterpretable discriminator into identity."""
+    with pytest.raises(ValueError):
+        AvailabilityPromiseV1(**kwargs)
+
+
+def test_the_offset_is_in_MINUTES_so_T1_plus_30_needs_no_schema_change():
+    """§5.6 chose minutes over hours precisely so a half-hour promise is expressible in v1."""
+    assert AvailabilityPromiseV1(calendar_days=1, plus_minutes=30).identity_payload() == {
+        "kind": "calendar_offset", "calendar_days": 1, "plus_minutes": 30}
+
+
+def test_the_normalizing_constructor_still_refuses_a_promise_BEFORE_the_cutoff():
+    """Normalization re-spells a total; it does not invent a representable one. `-30` minutes from
+    `T+0` is a promise to publish before the business date exists, and v1 cannot express it.
+
+    The message is pinned on the TOTAL, because that is this guard's whole reason to exist: without
+    it the borrow still fails downstream, but it fails complaining about a negative `calendar_days`
+    the caller never wrote.
+    """
+    with pytest.raises(ValueError, match="totals -30 minutes"):
+        AvailabilityPromiseV1.normalized(calendar_days=0, plus_minutes=-30)
+
+
+@pytest.mark.parametrize("kwargs", [{"calendar_days": "3"}, {"plus_minutes": "30"},
+                                    {"calendar_days": 1.5}, {"kind": "business_day_offset"}])
+def test_the_normalizing_constructor_type_checks_BEFORE_it_multiplies(kwargs):
+    """`"3" * 1440` is a 1440-character string, not three days: the check has to come first, or a
+    declaration mistake surfaces as a `TypeError` from inside the arithmetic."""
+    with pytest.raises(ValueError):
+        AvailabilityPromiseV1.normalized(**kwargs)
+
+
+def test_a_negative_MINUTE_component_normalizes_by_BORROWING_a_day():
+    """`T+1 minus 30 minutes` is a legal total spelled non-canonically — one form, `(0, 1410)`."""
+    assert AvailabilityPromiseV1.normalized(calendar_days=1, plus_minutes=-30) == \
+        AvailabilityPromiseV1(calendar_days=0, plus_minutes=1410)
+
+
+def test_promise_identity_contains_no_live_arrival_observation(catalog):
+    """§5.5's exclusions, at the promise. A promise is what was DECLARED; when the data actually
+    landed is an observation, and a promise that carried one would change identity every run.
+
+    `==` on both the field set and the payload set, so an `observed_arrival_at` cannot be added
+    without failing here — and the moving catalog watermark is exercised as the live observation
+    nearest to hand.
+    """
+    assert {f.name for f in dataclasses.fields(AvailabilityPromiseV1)} == {
+        "kind", "calendar_days", "plus_minutes"}
+    assert set(AvailabilityPromiseV1().identity_payload()) == {
+        "kind", "calendar_days", "plus_minutes"}
+
+    before = contract_hash(_derived(_contract(catalog, availability_promise=T3_PLUS_2H)))
+    catalog.execute(
+        "UPDATE overlay_drift_watermark SET last_completed_at = now(), head_seq = head_seq + 7 "
+        "WHERE catalog_source = %s", (_SRC,))
+    assert contract_hash(_derived(_contract(catalog, availability_promise=T3_PLUS_2H))) == before
+
+
+# ── the monotonic override (§5.4): LATER accepted, EARLIER a caller error, unequal clocks refused ──
+
+
+def test_a_later_override_succeeds(catalog):
+    """Later by DAYS through the derivation path, and later by MINUTES through the comparison."""
+    derived = _derived(_contract(
+        catalog, availability_promise=T3,
+        overrides=ContractOverrides(availability_promise=AvailabilityPromiseV1(calendar_days=5))))
+    assert derived.availability_promise == AvailabilityPromiseV1(calendar_days=5)
+    assert contract_hash(derived) != contract_hash(
+        _derived(_contract(catalog, availability_promise=T3)))
+
+    assert override_availability_promise(T3, T3_PLUS_2H, current_cadence=CADENCE,
+                                         proposed_cadence=CADENCE) == T3_PLUS_2H
+
+
+def test_an_override_to_the_SAME_promise_changes_nothing(catalog):
+    same = _derived(_contract(catalog, availability_promise=T3,
+                              overrides=ContractOverrides(availability_promise=T3)))
+    assert contract_hash(same) == contract_hash(
+        _derived(_contract(catalog, availability_promise=T3)))
+
+
+def test_an_earlier_override_is_a_CALLER_ERROR(catalog):
+    """`ValueError`, NOT a governed refusal. §14's codes describe valid requests rejected by the
+    catalog or by data state; asking to promise EARLIER than what was derived is a bad request, and
+    borrowing a governed code for it would report a caller's mistake as a platform verdict."""
+    with pytest.raises(ValueError) as caught:
+        _contract(catalog, availability_promise=T3,
+                  overrides=ContractOverrides(availability_promise=NEXT_DAY))
+    assert "earlier" in str(caught.value)
+    assert not isinstance(caught.value, MaterializationRefused)
+    assert not any(code.value in str(caught.value) for code in CompilationRefusalCode)
+
+    with pytest.raises(ValueError, match="earlier"):        # earlier by MINUTES alone
+        override_availability_promise(T3_PLUS_2H, T3, current_cadence=CADENCE,
+                                      proposed_cadence=CADENCE)
+
+
+@pytest.mark.parametrize("other", [ELSEWHERE, EVENING])
+def test_differing_cadence_timezone_or_cutoff_makes_promises_INCOMPARABLE(other):
+    """"T+3 at 23:59 Asia/Dubai" and "T+3 at 18:00 UTC" are different clocks.
+
+    Incomparable is a VERDICT of its own, not the absence of "later": forcing an ordering would let a
+    monotonic override succeed on a comparison that means nothing. The control below runs the SAME
+    two promises under ONE cadence and gets `LATER`, so the refusal is attributable to the clock
+    rather than to the promises.
+    """
+    assert compare_availability_promises(T3, T3_PLUS_2H, left_cadence=CADENCE,
+                                         right_cadence=other) is PromiseComparison.INCOMPARABLE
+    assert compare_availability_promises(T3, T3_PLUS_2H, left_cadence=CADENCE,
+                                         right_cadence=CADENCE) is PromiseComparison.LATER
+
+    with pytest.raises(ValueError, match="incomparable"):
+        override_availability_promise(T3, T3_PLUS_2H, current_cadence=CADENCE,
+                                      proposed_cadence=other)
+
+
+@pytest.mark.parametrize("other", [ELSEWHERE, EVENING])
+def test_the_SAME_offset_on_a_DIFFERENT_clock_is_not_the_SAME_promise(other):
+    """The sharpest case: equal components do NOT make two promises equal, because the offset is
+    counted from a cutoff and the cutoff moved."""
+    assert compare_availability_promises(T3, T3, left_cadence=CADENCE,
+                                         right_cadence=other) is PromiseComparison.INCOMPARABLE
+    assert compare_availability_promises(T3, T3, left_cadence=CADENCE,
+                                         right_cadence=CADENCE) is PromiseComparison.SAME
+
+
+def test_the_comparison_verdicts_are_a_CLOSED_four_member_vocabulary():
+    assert {v.value for v in PromiseComparison} == {"earlier", "same", "later", "incomparable"}
+
+
+def test_the_comparison_BASIS_is_the_KIND_the_TIMEZONE_and_the_CUTOFF():
+    """The kind's contribution CANNOT be shown behaviourally in v1 — there is one member, so two
+    promises of different kinds cannot be constructed — so it is pinned structurally instead. It is
+    pinned at all because the day a second kind arrives is the day a calendar-day promise could
+    otherwise be declared "later" than a banking-day one, which is not a comparison anyone can make.
+    """
+    from featuregen.materialize.contract import _comparison_basis
+
+    assert _comparison_basis(T3, CADENCE) == ("calendar_offset", "Asia/Kolkata", "00:00:00")
+
+
+def test_an_override_that_is_not_a_PROMISE_is_a_malformed_declaration():
+    with pytest.raises(ValueError, match="availability_promise"):
+        ContractOverrides(availability_promise="next_day")
+
+
+def test_a_promise_declared_as_a_LABEL_is_refused_by_the_derivation(catalog):
+    """The pre-§5.6 spelling. `"next_day"` must not reach the contract hash as a bare string: it
+    would be the invented vocabulary again, this time untyped and uncomparable."""
+    with pytest.raises(ValueError, match="AvailabilityPromiseV1"):
+        _contract(catalog, availability_promise="next_day")
+
+
 # ══ shape ════════════════════════════════════════════════════════════════════════════════════════
 
 
@@ -583,4 +836,4 @@ def test_an_admitted_feature_alone_cannot_produce_a_contract(catalog):
     compilation, so there is no path from an admitted artifact straight to a contract."""
     with pytest.raises(AttributeError):
         derive_contract(catalog, _admitted(SUM_30D), cadence=CADENCE,
-                        availability_class=AvailabilityClass.NEXT_DAY)
+                        availability_promise=NEXT_DAY)
