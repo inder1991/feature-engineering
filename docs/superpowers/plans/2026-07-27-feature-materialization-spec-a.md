@@ -247,7 +247,9 @@ Spec §3.1–3.2. **Two halves in order.** Touches shared code — run the overl
 
 **Files:** Modify `src/featuregen/overlay/upload/join_path.py`; Create `src/featuregen/materialize/joins.py`; Test `tests/featuregen/overlay/upload/test_join_path_authority.py`, `test_joins.py`
 
-**Produces:** `JoinStep` gains `approved_join_fact_key`, `approved_join_status`, `authority`; `JoinPlan` (frozen: `steps`, `outcome_kind`, `roles_used`, `fans_out`); `plan_join(conn, *, catalog_source, from_table_ref, to_table_ref, roles) -> JoinPlan | MaterializationRefused`.
+**Produces:** `JoinStep` gains `approved_join_fact_key`, `approved_join_status`, `authority`; `JoinPlan` (frozen: `steps`, `outcome_kind`, `roles_used`, `fans_out`); `plan_join(conn, *, catalog_source, from_identity: PhysicalIdentity, to_identity: PhysicalIdentity, roles) -> JoinPlan | MaterializationRefused`.
+
+**⚠️ Takes RESOLVED physical identities, not logical refs.** Spec §3.5: refs are schema-flattened to `public`, so a physical schema cannot be parsed out of one. Resolution is T5's job; T3 stays pure and receives `PhysicalIdentity(catalog_source, schema, table)`. Define that small frozen type here (T5 imports it) so the ordering works.
 
 - [ ] **Step 1: Failing planner-authority tests** — an OPERATIONAL path's steps carry `approved_join_fact_key`/`approved_join_status` (**verified**: `clearing.append((from_ref, to_ref, card))` drops them today, though the SQL selects them at `:105-106`); a file-declared edge reports `authority="operational"` with a `None` fact key; **reverse-edge provenance and inverted cardinality both survive**.
 - [ ] **Step 2–4:** Run/carry the two columns through the clearing tuple **inside the existing query** (no second read)/run. **Run the overlay/upload sweep** — this is shared code.
@@ -257,30 +259,27 @@ Spec §3.1–3.2. **Two halves in order.** Touches shared code — run the overl
 ```python
 def test_bare_table_names_are_passed_to_the_planner(db, verified_join_catalog):
     """VERIFIED: _table_of returns parts[1]; a schema-qualified destination never matches."""
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.accounts", roles=("feature_engineer",))
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=ACCOUNTS, roles=("feature_engineer",))
     assert isinstance(r, JoinPlan) and r.steps
 
 
 def test_unknown_cardinality_is_REFUSED(db, null_cardinality_catalog):
     """VERIFIED: JoinStep.cardinality is str|None and graph_edge.cardinality is NULLable.
     An unknown edge may BE 1:N — refusing only 1:N would be a fail-open."""
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.accounts", roles=("feature_engineer",))
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=ACCOUNTS, roles=("feature_engineer",))
     assert r.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
 
 
-def test_ambiguous_INTERMEDIATE_hop_is_refused(db, ambiguous_intermediate_catalog):
-    """BFS indexes by bare name: transactions → accounts → archive.customers can be
-    stitched across schemas even when both ENDPOINTS look unambiguous."""
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+def test_two_resolved_schemas_sharing_a_table_name_are_refused(db, ambiguous_intermediate_catalog):
+    """The BFS indexes by BARE table name. Refs cannot express the ambiguity (all flattened
+    to `public`, spec §3.5), so the check runs on RESOLVED physical identities: two distinct
+    physical schemas containing the same table name anywhere on the path."""
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=CUSTOMERS, roles=("feature_engineer",))
     assert r.code is CompilationRefusalCode.AMBIGUOUS_TABLE_NAME
 
 
-def test_schema_continuity_is_validated_on_every_step(db, mixed_schema_path_catalog):
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+def test_physical_continuity_is_validated_on_EVERY_step_not_just_endpoints(db, mixed_schema_path_catalog):
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=CUSTOMERS, roles=("feature_engineer",))
     if isinstance(r, JoinPlan):
         schemas = {s.from_ref.split(".")[0] for s in r.steps} | \
                   {s.to_ref.split(".")[0] for s in r.steps}
@@ -288,8 +287,7 @@ def test_schema_continuity_is_validated_on_every_step(db, mixed_schema_path_cata
 
 
 def test_fan_out_toward_the_grain_is_REFUSED(db, joint_account_catalog):
-    r = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
-                  to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+    r = plan_join(db, catalog_source="hdfc", from_identity=TXN, to_identity=CUSTOMERS, roles=("feature_engineer",))
     assert r.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
 
 
