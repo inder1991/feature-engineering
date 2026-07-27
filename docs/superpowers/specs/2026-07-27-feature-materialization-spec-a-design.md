@@ -615,7 +615,7 @@ Fixtures are hand-authored and validated against the real Child-1 resolver — a
 
 ---
 
-## §14 Failure vocabulary — three closed enums
+## §14 Failure vocabulary — four closed enums
 
 Every refusal uses a value from one of these enums. **A governed refusal never surfaces as a bare `TypeError`/`ValueError`**, and no code may be used that is not listed here.
 
@@ -627,9 +627,14 @@ class CompilationRefusalCode(StrEnum):          # raised/returned during compile
     AMBIGUOUS_TABLE_NAME · JOIN_PATH_NOT_VERIFIED · JOIN_PATH_DENIED_BY_READ_SCOPE
     GRAIN_PATH_NOT_GOVERNED · JOIN_FANOUT_UNSUPPORTED · JOIN_CARDINALITY_UNKNOWN
     SPINE_SOURCE_NOT_DECLARED · SPINE_DECLARATION_REJECTED_BY_FACTS
-    SPINE_NON_DETERMINISTIC · AVAILABILITY_TIME_NOT_GOVERNED
+    PARTITION_MAPPING_NOT_DECLARED · AVAILABILITY_TIME_NOT_GOVERNED
     PHYSICAL_TYPE_UNSUPPORTED · MULTIPLE_MATERIALIZATION_CONTRACTS
     PARTITION_IDENTITY_UNKNOWN · UNACCOUNTED_LOGICAL_REF
+
+class PublicationRefusalCode(StrEnum):          # pre-execution publication decisions
+    CAPABILITY_UNPROVEN            # no passing probe attestation for THIS environment/versions
+    GROUP_BINDING_CONFLICT         # the logical name is bound to a different contract hash
+    PUBLISH_MECHANISM_UNSUPPORTED  # a probe RAN and proved no mechanism satisfies the invariant
 
 class ValidationGateCode(StrEnum):              # BLOCKING gates in the generated pipeline (§9)
     KEY_NOT_UNIQUE · MISSING_FEATURE_COLUMN · UNEXPECTED_COLUMN
@@ -644,6 +649,8 @@ class ValidationFindingCode(StrEnum):           # L0/L1/L2 findings (§11), non-
     COLUMN_ABSENT · COLUMN_TYPE_MISMATCH · PARTITION_ABSENT · READ_DENIED
     UNKNOWN_FINDING                              # → FindingClass.UNCLASSIFIED, fails closed
 ```
+
+**`CAPABILITY_UNPROVEN` vs `PUBLISH_MECHANISM_UNSUPPORTED`.** The first means no passing attestation exists for this environment and version triple — nobody has proved anything yet. The second means a probe **did** run and demonstrated that no available mechanism satisfies the atomic-visibility invariant. They route differently: the first is "go run the probe", the second is "this cluster cannot publish atomically, and the design must change rather than the claim". §10.3's probe is what distinguishes them, and **Task 16 must confirm this split against what the probe can actually observe.**
 
 `SPINE_NON_DETERMINISTIC` is a **runtime** gate — an unresolved tie depends on actual rows, so it is discovered during execution, not compilation. `CAPABILITY_UNPROVEN` and `GROUP_BINDING_CONFLICT` are publication decisions and live in `PublicationRefusalCode`; a refusal must never fall back to comparing a raw string because its code is missing from the enum it is typed to.
 
