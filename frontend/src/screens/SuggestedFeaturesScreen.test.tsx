@@ -242,13 +242,13 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('names the missing permission on a 403 instead of a blank page or a raw error', async () => {
-    // The route is gated on feature:read and the app's default session is data_owner, which does
+    // The route is gated on catalog:read; a session lacking it (e.g. access_admin) gets a 403 that
     // not hold it. That is a product decision this screen does not get to change — but it must not
     // present as a broken page.
-    getTableSuggestions.mockRejectedValue(new api.ApiError(403, 'requires permission feature:read'))
+    getTableSuggestions.mockRejectedValue(new api.ApiError(403, 'requires permission catalog:read'))
     renderScreen()
     expect(await screen.findByText(/don’t have access to feature suggestions/i)).toBeInTheDocument()
-    expect(screen.getByText('feature:read')).toBeInTheDocument()
+    expect(screen.getByText('catalog:read')).toBeInTheDocument()
     expect(screen.getByText(/data_owner/)).toBeInTheDocument()
     // not a red failure, and no control that would pretend the user can grant it here
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()

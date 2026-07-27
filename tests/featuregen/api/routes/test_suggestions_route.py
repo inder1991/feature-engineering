@@ -89,12 +89,15 @@ def test_read_scope_roles_come_from_the_session(client, monkeypatch):
 
 
 def test_requires_the_read_permission(client):
-    """Guarded by `feature:read` (`require_feature_read`) — the most conservative EXISTING read
-    guard, pinned here so the choice is reviewable: access_admin (iam:manage only) is denied, and so
-    is data_owner, who holds catalog:read+write but builds no features. catalog_viewer and
-    feature_engineer both hold feature:read and pass."""
+    """Guarded by `catalog:read` (`require_catalog_read`), pinned here so the choice is reviewable.
+
+    A role WITHOUT catalog:read is denied (access_admin holds iam:manage only). `data_owner` PASSES
+    by design: this surface exists so a curator can see what still needs curating on a table they
+    own — its empty states are their to-dos. Reaching it via `feature:read` would have required
+    granting data_owner the feature registry, the contract reads and the lineage features layer too,
+    and would have broken `test_data_owner_can_upload_but_not_read_features_or_generate`."""
     assert client.get(PATH, headers=_h(roles="access_admin")).status_code == 403
-    assert client.get(PATH, headers=_h(roles="data_owner")).status_code == 403
+    assert client.get(PATH, headers=_h(roles="data_owner")).status_code != 403
 
 
 def test_the_route_is_get_only(client):

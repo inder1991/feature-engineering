@@ -60,7 +60,7 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
   const [data, setData] = useState<TableSuggestions | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  // A 403 is not a failure to report as one: the route is gated on feature:read and this session's
+  // A 403 is not a failure to report as one: the route is gated on catalog:read and this session's
   // roles do not carry it. Named separately so the screen can say WHICH permission is missing
   // instead of leaking the server's detail string into a red alert.
   const [forbidden, setForbidden] = useState(false)
@@ -108,11 +108,10 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
           <div className="callout-body">
             <p role="status">
               <strong>You don’t have access to feature suggestions.</strong> This view needs the{' '}
-              <code>feature:read</code> permission and this session’s roles don’t carry it.
+              <code>catalog:read</code> permission and this session’s roles don’t carry it.
             </p>
             <p className="hint">
-              Roles that hold it: catalog_viewer and feature_engineer. data_owner publishes the
-              catalog but does not build features, so it is denied here.
+              Roles that hold it: catalog_viewer, data_owner, feature_engineer and platform_admin.
             </p>
           </div>
         </div>

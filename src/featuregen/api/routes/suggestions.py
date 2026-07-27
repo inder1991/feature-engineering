@@ -6,13 +6,24 @@ can ground on the table, grouped by entity, with the gauntlet's own statuses. NO
 intent, NO LLM — and no verb other than GET, because v1 WRITES NOTHING: there is deliberately no
 surface here from which a suggestion could be accepted, dismissed or governed.
 
-Gated by ``feature:read`` (``require_feature_read``). The payload is feature-generation output — the
-same class of content the assist proposal routes gate on ``feature:generate`` — not raw catalog
-metadata, so this takes the most conservative EXISTING read guard rather than the ``catalog:read``
-its sibling ``/catalog/...`` reads use: ``feature:read``'s roles are a strict subset (it drops
-``data_owner``, who publishes the catalog but does not build features). Read-scope is separate and
-mandatory: ``roles=identity.role_claims`` comes from the authenticated session (never the request),
-so a column the caller may not see is not a grounding candidate and cannot be suggested."""
+Gated by ``catalog:read`` (``require_catalog_read``), like its sibling ``/catalog/...`` reads.
+
+Why not ``feature:read``: this surface exists so a CURATOR can see what still needs curating on a
+table they own — its empty states are data-owner to-dos ("these columns carry no business concept",
+"this table has no confirmed as-of column"). ``data_owner`` holds ``catalog:read`` but deliberately
+NOT ``feature:read``, a boundary pinned by ``test_data_owner_can_upload_but_not_read_features_or_
+generate`` (``GET /features`` must 403 for them). Granting ``feature:read`` to reach this one page
+would also hand over the feature registry, the contract reads and the lineage features layer — far
+more than the problem needs. So the narrower change is here, on the route.
+
+The trade, stated honestly: derived feature content is now readable via a ``catalog:read`` route.
+That is defensible — these suggestions are DERIVED FROM the catalog and rendered on a catalog table
+page, and nothing here can accept, dismiss or govern anything — but it does mean the route no longer
+gates purely on content class. Revisit if a finer ``feature:suggest:read`` permission is ever added.
+
+Read-scope is separate and mandatory: ``roles=identity.role_claims`` comes from the authenticated
+session (never the request), so a column the caller may not see is not a grounding candidate and
+cannot be suggested."""
 
 from __future__ import annotations
 
@@ -24,7 +35,7 @@ import psycopg
 from fastapi import APIRouter, Depends
 from psycopg import sql
 
-from featuregen.api.deps import get_conn, get_identity, require_feature_read
+from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.suggestions import suggest_features_for_table
 
@@ -43,7 +54,7 @@ SUGGESTIONS_STATEMENT_TIMEOUT_MS = 30_000
 
 
 @router.get("/catalog/{catalog_source}/tables/{table}/suggestions",
-            dependencies=[Depends(require_feature_read)])
+            dependencies=[Depends(require_catalog_read)])
 def table_suggestions(catalog_source: str, table: str, conn: _Conn, identity: _Identity) -> dict:
     """This table's suggested features. A table with no suggestions returns the honest empty payload
     — that is a catalog-readiness fact, not a server error — and one this catalog does not hold is
