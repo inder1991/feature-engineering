@@ -548,7 +548,7 @@ Spec §4.2, §8.
 
 Spec §9, §12.
 
-**Files:** Create `render/nodes_gate.py`, `src/featuregen/materialize/control_plane.py`, `src/featuregen/db/migrations/1021_materialization_control_plane.sql`; Test `test_render_gate.py`, `test_control_plane.py`, `test_migration_1021.py`
+**Files:** Create `render/nodes_gate.py`, `src/featuregen/materialize/control_plane.py`, `src/featuregen/db/migrations/1031_materialization_control_plane.sql`; Test `test_render_gate.py`, `test_control_plane.py`, `test_migration_1031.py`
 
 - [ ] **Step 1: Failing migration tests** — `materialization_generation`, `pipeline_validation_report`, `materialization_run_event`, `materialization_run_manifest`, `publication_capability_attestation`, `group_binding` **all** reject UPDATE, DELETE **and TRUNCATE** (statement-level `BEFORE TRUNCATE … FOR EACH STATEMENT`; a `FOR EACH ROW` trigger does not fire on TRUNCATE) · `(run_id, seq)` unique on events · closed `event_kind` CHECK · manifest FKs to `generation_id` · one terminal manifest per run.
 - [ ] **Step 2: Failing gate tests** — every `ValidationGateCode` rendered · assembly consumes staging manifests · a failed gate raises · the manifest writer never calls `collect()`/`take()`/`head()` · `run_status` folds from events.

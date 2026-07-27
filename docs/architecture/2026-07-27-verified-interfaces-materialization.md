@@ -1,6 +1,8 @@
 # Verified Interfaces — feature materialization
 
-**Purpose.** Every API the materialization program depends on, with its **real** signature and behaviour, cited to `file:line` and verified by reading the code on `main` at `12bc26d0` (2026-07-27).
+**Purpose.** Every API the materialization program depends on, with its **real** signature and behaviour, cited to `file:line`.
+
+**Baseline.** Originally verified at `12bc26d0`; **re-verified at `9cc25e89`** (2026-07-27) after a parallel feature-generation bug-fix stream landed 27 commits. Re-verification method: diff the cited files, not re-read everything.
 
 **Why this exists.** Two successive Spec-A plan revisions were rejected in review. Every defect in both sat in an API that had been *described from memory rather than read*; the one part that survived review was the part verified first. This file inverts the order of operations: **nothing may appear in a spec or plan unless it is verified here first.** A plan reference that cannot be traced to an entry below is a defect, not a detail.
 
@@ -294,3 +296,30 @@ existing private `_durable_read` (`:432`) so it inherits the same cross-connecti
 semantics `run_status` relies on.
 
 `authoring_intent_hash(intent)` lives at `formula/authoring.py:253`.
+
+---
+
+## 15. Re-verification at `9cc25e89` — parallel feature-gen bug-fix stream
+
+A concurrent workstream fixing feature-generation bugs landed 27 commits. Diffing **only the files this reference cites** (cheaper and more precise than re-reading) gives:
+
+**Unchanged — every interface Spec A depends on holds:**
+`overlay/upload/join_path.py` · `overlay/facts.py` · `overlay/config.py` · `overlay/safety_floor.py` · `overlay/upload/read_scope.py` · `overlay/upload/column_authority.py` · `overlay/upload/bridge_projection.py` · `overlay/upload/object_ref.py` · `formula/schema.py` · `formula/result.py` · `formula/trace.py` · `formula/authoring.py` · `formula/output_authority.py` · `contracts/envelopes.py`.
+
+Spot-confirmed against the new HEAD: the terminal payload still carries the disposition, all six axes and `candidate_formula_hash`; `_TERMINAL_FOR_DISPOSITION` still maps only `TECHNICAL_FAILURE` → `FAILED`; `AuthoringResult` still carries `authoring_run_id`.
+
+**Changed — one field, additive:**
+
+```python
+AuthoringIntent(name, hypothesis, target_entity, target_grain_keys=(),
+                recipe_authoring_context: dict[str, Any] | None = None)   # NEW, optional
+AuthorTurnRecord(..., tool_context_hash: str = "")                        # NEW, optional
+```
+
+**⚠️ Consequence for Gate 1.** `authoring_intent_hash` covers the intent object. A real run may populate `recipe_authoring_context`, so an intent **reconstructed** by a caller without it hashes differently and fails `INTENT_HASH_MISMATCH`. That is the correct behaviour — the admitted intent must be *the intent that was authored*, not a look-alike — but callers must pass the real object, and the plan's fixtures must not assume the field is always absent.
+
+**⚠️ Migration numbering moved.** `1021`–`1030` are now taken (`1021_contract_considered_revision` … `1030_recognition_evaluation`). **Next free: `1031`.** The plan's control-plane migration is renumbered accordingly.
+
+**Not consumed by Spec A** (new modules from that stream, noted so they are not mistaken for dependencies): `formula/replay_authoring.py` · `replay_trace.py` · `recipe_authoring.py` · `recipe_egress.py` · `frozen_configuration.py` · `control.py`. Changed but not depended on: `audited.py`, `author.py`, `critic.py`.
+
+**Re-verify again immediately before implementation begins** — that stream is active.
