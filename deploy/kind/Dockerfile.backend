@@ -2,9 +2,18 @@
 # files (located via Path(__file__).parent/migrations) are found at runtime.
 FROM python:3.11-slim
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+# NB: deliberately NO PIP_NO_CACHE_DIR here — the pip installs below use a BuildKit cache mount
+# (see the note on the install step). The cache lives outside the image, so keeping it costs no
+# layer size, while disabling it would make every retry of a flaky download start from zero.
+#
+# PIP_DEFAULT_TIMEOUT/PIP_RETRIES are set as ENV rather than as flags on one command so that EVERY
+# pip invocation in this file inherits them. The upgrade step below used to carry no patience
+# settings at all, so a slow PyPI killed the build there with a bare `TimeoutError: The read
+# operation timed out` before the carefully-tuned install step was ever reached.
+ENV PYTHONUNBUFFERED=1 PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
 
-RUN pip install --upgrade pip setuptools wheel
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip setuptools wheel
 COPY pyproject.toml README.md ./
 COPY src ./src
 # The `llm` extra pulls the anthropic SDK — a PRODUCTION-only lazy import (CI uses FakeLLM), version-
@@ -14,7 +23,16 @@ COPY src ./src
 # fresh PEP 517 env (that isolated fetch is what fails on a slow PyPI with a confusing "No matching
 # distribution ... (from versions: none)"). --timeout/--retries make the anthropic + runtime-dep
 # downloads patient on slow-but-working networks.
-RUN pip install --timeout 120 --retries 5 --no-build-isolation -e ".[llm]"
+#
+# The cache mount is what makes those retries actually converge. `COPY src` invalidates this layer
+# on every source change, so each build re-resolves ~35 packages; measured index latency to PyPI
+# swings 1-20s per package, and a single timeout aborts the WHOLE install — reported misleadingly as
+# "from versions: none"/ResolutionImpossible rather than as a network error. Without a cache each
+# attempt redownloads everything, so a rebuild is a coin flip that gets worse as the tree grows.
+# With it, whatever a failed attempt did fetch is still there next time, so retries make progress
+# instead of restarting. The cache is BuildKit-managed and never enters the image.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --timeout 120 --retries 10 --no-build-isolation -e ".[llm]"
 
 EXPOSE 8000
 CMD ["uvicorn", "--factory", "featuregen.api.app:create_app_from_env", "--host", "0.0.0.0", "--port", "8000"]
