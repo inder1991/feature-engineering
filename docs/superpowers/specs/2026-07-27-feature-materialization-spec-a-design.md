@@ -43,6 +43,7 @@ Before cluster acceptance, an inventory task captures from the metastore, for `b
 - physical location;
 - whether historical partitions are rewritten in place;
 - how a customer snapshot corresponding to a business date is selected;
+- **`late_arrival_days`** for any table declared `AVAILABILITY_PARTITION` (§3.4 — how far past the event window late arrivals may land);
 - **the logical→physical schema mapping** for each table (needed by §3.5 when `graph_node.schema_name` is NULL);
 - **how account-to-customer ownership is modelled** (see §H — a joint-account bridge makes the traversal `1:N` and would refuse the worked feature);
 - **the Hive, Spark and metastore versions** (§10's capability attestation is keyed on that exact triple);
@@ -227,19 +228,33 @@ A partition column named `load_dt` does **not** tell you how a 90-day *event-tim
 ```python
 class PartitionMappingKind(StrEnum):
     EVENT_TIME_PARTITION = "event_time_partition"      # (time_ref, partition_column, transform, timezone)
-    AVAILABILITY_PARTITION = "availability_partition"  # (time_ref, partition_column, transform, timezone)
+    AVAILABILITY_PARTITION = "availability_partition"  # (time_ref, partition_column, transform,
+                                                       #  timezone, late_arrival_days)
     STATIC_SNAPSHOT = "static_snapshot"                # (partition_values)
     FULL_SCAN = "full_scan"
     VERIFIED_UNPARTITIONED = "verified_unpartitioned"
 ```
 
-A table with no declared mapping refuses with `PARTITION_MAPPING_NOT_DECLARED`. **"A 90-day window resolves 90 partitions" is only true for an explicitly declared one-day `EVENT_TIME_PARTITION` mapping** — it is never a general rule, and an `AVAILABILITY_PARTITION` mapping must extend the partition set beyond the event window to catch late arrivals.
+A table with no declared mapping refuses with `PARTITION_MAPPING_NOT_DECLARED`. **"A 90-day window resolves 90 partitions" is only true for an explicitly declared one-day `EVENT_TIME_PARTITION` mapping** — it is never a general rule, and an `AVAILABILITY_PARTITION` mapping must extend the partition set beyond the event window to catch late arrivals — **`late_arrival_days` is by how much**, and it is required, because a mapping that must widen without saying by how much is unimplementable.
 
 **Plural** — a 90-day feature reads many partitions. `partition_columns is None` means **verified unpartitioned**, never "unknown"; unknown refuses with `PARTITION_IDENTITY_UNKNOWN`. `input_snapshot_ids` (a run-time value, inside `sandbox_execution_hash` only) is the exact ordered partition set read. L1 runs at **run preparation**, after snapshots resolve, and verifies every one exists.
 
 For an unpartitioned mutable table the snapshot is **not content-addressed** — recorded honestly, and one more reason this slice is sandbox-only.
 
 ---
+
+### §3.4b Source engine is part of physical identity
+
+The catalog upload carries a **`source_type`** (e.g. `edp`, `ods`) and a **`source`** engine (e.g. `hive`, `oracle`) per row. The engine is part of physical identity, because Spec A generates PySpark that reads **Hive and HDFS only** — it cannot read an Oracle table, and the semantics differ beyond the mechanics (an ODS is typically current-state-only, so it cannot answer the point-in-time reconstruction §4.2's spine policies assume).
+
+**Normative:**
+
+- Physical identity carries `source_type` and `engine`.
+- **Spec A refuses any read set element whose engine is not `hive`** with `SOURCE_ENGINE_UNSUPPORTED`, naming the element and its engine. A formula spanning two engines is refused, not half-generated.
+- **A blank or absent engine refuses too** — it must never default to `hive`, for the same reason a blank schema must not default to `public`.
+- The environment inventory (§0) declares the engine mapping **per `(source_type, source)`**, not per table, so it stays a handful of lines regardless of column count.
+
+Oracle support is deliberately deferred: it needs a different reader, different auth, and its own answer to what availability means.
 
 ### §3.5 Physical schema resolution is an explicit step
 
@@ -399,6 +414,14 @@ Overrides are **monotonic** — stricter/later accepted, looser/earlier refused 
 - **`OverflowBehavior.ERROR` must fail the feature.** Spark's default decimal behaviour on overflow returns **NULL**, so genuine ERROR semantics require deliberate configuration plus explicit checks in generated code. All three first-slice features declare ERROR, so this is on the critical path — a silent NULL where the formula demanded an error is exactly the quiet wrongness this system exists to prevent.
 - **`SATURATE` is refused** in this slice unless its clamping behaviour is explicitly implemented and tested.
 - **Nullability is part of the decision**, derived from `EmptyWindowResult` and `ZeroDenominator`: a `ZERO` empty-window yields a non-null column; `ZeroDenominator.NULL` yields a nullable one. The §9 type gate cannot check honestly otherwise.
+- **Only an EXACT numeric operand type may produce a `DECIMAL`.** The catalog's existing `_NUMERIC_LOGICAL_TYPES` set is *arithmetic-capable*, not exact — it contains `float`, `double`, `double precision`, `real` and `money`. Publishing `DECIMAL(p,s)` from a binary-float operand asserts a reproducibility that float arithmetic does not have, so "numeric" is **not** a sufficient test.
+
+```
+EXACT_NUMERIC = {numeric, decimal, integer, int, int4, int8, bigint, smallint}
+REFUSED       = {float, double, double precision, real, money}   → PHYSICAL_TYPE_UNSUPPORTED
+```
+
+  Every **arithmetic operand** must be exact — a ratio's numerator *and* denominator, a difference's minuend *and* subtrahend. This requires per-expression governed operand types in the IR (§3), because a formula collapses to a single logical word and a ratio's word describes no operand at all.
 - Hive/Spark `DECIMAL` maxes at **precision 38**; a policy exceeding it, or any ambiguous conversion, returns `PHYSICAL_TYPE_UNSUPPORTED`. **Never silently map ambiguous numerics to `DOUBLE`.**
 - `DECIMAL(p,s)` and `BIGINT` support is validated during the environment capability check (§10).
 
@@ -644,6 +667,7 @@ class CompilationRefusalCode(StrEnum):          # raised/returned during compile
     GRAIN_PATH_NOT_GOVERNED · JOIN_FANOUT_UNSUPPORTED · JOIN_CARDINALITY_UNKNOWN
     SPINE_SOURCE_NOT_DECLARED · SPINE_DECLARATION_REJECTED_BY_FACTS
     PARTITION_MAPPING_NOT_DECLARED · PHYSICAL_SCHEMA_NOT_RESOLVED
+    SOURCE_ENGINE_UNSUPPORTED
     AVAILABILITY_TIME_NOT_GOVERNED
     PHYSICAL_TYPE_UNSUPPORTED · MULTIPLE_MATERIALIZATION_CONTRACTS
     PARTITION_IDENTITY_UNKNOWN · UNACCOUNTED_LOGICAL_REF
@@ -681,7 +705,19 @@ class ValidationFindingCode(StrEnum):           # L0/L1/L2 findings (§11), non-
 
 One entity (CIF) · one cadence (daily) · one materialization group · one `business_dt` per run · one Hadoop/Hive environment · no scan sharing · no fan-out · L0+L1 standard with L2 on demand · local submitter only · sandbox only · no UI · no cross-cadence assembly · no statistical profiling.
 
-The three worked features are the **target**; §0 may reveal that a joint-account model refuses one of them, in which case the slice substitutes a feature whose traversal is `N:1`.
+### Choosing the acceptance features (normative)
+
+The acceptance features are **not named in advance**. They are whichever authored features the platform's own authoring chain produces that cover the **three shapes** the acceptance test must exercise:
+
+| Shape | What it proves |
+|---|---|
+| Aggregate with a filter (e.g. `SUM … WHERE …`) | `DECIMAL(p,s)` from `DecimalPolicy`, explicit rounding, overflow **raising** rather than yielding Spark's default NULL |
+| `COUNT_DISTINCT` | `BIGINT`, and Child-1's non-additive resolution |
+| A ratio | the zero-denominator policy and column nullability |
+
+**Why not name them:** a formula produced by the authoring chain references catalog columns *by construction* (its §I tools read the real catalog) and can only enter materialization through §1.2's gate against an immutable terminal event. Hand-picked names carry no such guarantee — earlier revisions of this spec named two features that were invented as illustrations and then propagated as if they were requirements.
+
+The features are selected at acceptance time (§13 tier 3), from a real authoring run against the ingested catalog. If the data model cannot support one of the shapes, the acceptance test substitutes another feature of that shape and records the substitution.
 
 ---
 

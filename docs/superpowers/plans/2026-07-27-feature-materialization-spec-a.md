@@ -521,10 +521,43 @@ Spec §6.
 
 **Files:** Create `src/featuregen/materialize/physical_types.py`; Test `test_physical_types.py`
 
-**Produces:** `PHYSICAL_TYPE_POLICY_VERSION = 1`; `PhysicalType` (frozen: `sql_type`, `nullable`); `resolve_physical_type(formula) -> PhysicalType | MaterializationRefused`.
+**Produces:** `PHYSICAL_TYPE_POLICY_VERSION = 1`; `PhysicalType` (frozen: `sql_type`, `nullable`, **plus `rounding` / `overflow`** — §6 requires both to be explicit in generated code, and a renderer cannot honour what it never receives); `resolve_physical_type(formula) -> PhysicalType | MaterializationRefused`.
 
-- [ ] **Step 1: Failing tests** — counts → `BIGINT` · SUM/RATIO/DIFFERENCE → `DECIMAL(p,s)` from `DecimalPolicy` · **operation beats the logical word** (`COUNT_DISTINCT` is logically `integer`, physically `BIGINT`) · `ZeroDenominator.NULL` ⇒ nullable · `EmptyWindowResult.ZERO` ⇒ non-nullable · precision > 38 ⇒ `PHYSICAL_TYPE_UNSUPPORTED` · `SATURATE` ⇒ refused · **`DOUBLE` never appears in the module source**.
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): versioned physical type adapter`
+- [x] **Step 1: Failing tests** — counts → `BIGINT` · SUM/RATIO/DIFFERENCE → `DECIMAL(p,s)` from `DecimalPolicy` · **operation beats the logical word** (`COUNT_DISTINCT` is logically `integer`, physically `BIGINT`) · `ZeroDenominator.NULL` ⇒ nullable · `EmptyWindowResult.ZERO` ⇒ non-nullable · precision > 38 ⇒ `PHYSICAL_TYPE_UNSUPPORTED` · `SATURATE` ⇒ refused · **`DOUBLE` never appears in the module source**.
+- [x] **Step 2–5:** Run/implement/run/commit — `feat(materialize): versioned physical type adapter`
+
+**Established (interfaces reference §24), beyond the sketch above:** the logical word is read as **operand evidence** and an unreadable/inexact operand refuses · `NullInput.PROPAGATE` is a **third** nullability source §6 does not list · a count's `DecimalPolicy` governs nothing and is neither validated nor carried · the body-shape gate is `schema.body_expressions`, not a second local check. Six gaps recorded in `DEFERRED-WORK.md` A.8 — the load-bearing one is that a **ratio's operands and a difference's subtrahend are invisible** to the operand check from the formula alone.
+
+---
+
+### Task 8.1: Exact-numeric operand evidence (BLOCKS Task 10)
+
+Spec §6. Architect's ruling, 2026-07-27: a known-unsupported numeric representation must be refused **before the group plan authorizes generated execution** — not merely "before leaving sandbox".
+
+**Why this exists:** `_resolve_ratio` documents "numeric both operands" and never checks it, and the obvious fix is wrong — `_is_numeric_logical_type` accepts `float`, `double`, `double precision`, `real`, `money`, so a float ratio passes it and still publishes fixed-point. *Numeric* and *exact-numeric* are different questions.
+
+**Files:** Modify `src/featuregen/materialize/expression_ir.py`, `physical_types.py`; Test `test_expression_ir.py`, `test_physical_types.py`
+
+**Produces:** `ExpressionExecutionIR` gains **`operand_type` evidence** (the governed C1 type of that expression's operand, or an explicit "unavailable" marker); `resolve_physical_type` validates **every arithmetic operand**; `PHYSICAL_TYPE_POLICY_VERSION` **increments**.
+
+**Scope note:** the sibling Child-1 fix (make `_resolve_ratio` enforce its documented rule, and distinguish *unavailable type authority* from *a governed non-numeric type*) is routed to the feature-generation owner. **Do not edit that file from this stream** — it is actively being worked.
+
+- [ ] **Step 1: Failing tests** — the acceptance set is fixed by the ruling:
+
+```python
+def test_exact_decimal_ratio_survives(...): ...          # decimal/integer operands → DECIMAL(p,s)
+def test_string_operand_dies(...): ...                   # → PHYSICAL_TYPE_UNSUPPORTED
+def test_unknown_or_unreadable_type_dies_or_requires_authority(...): ...
+                                                         # state WHICH is chosen and why
+def test_float_numerator_dies(...): ...
+def test_float_denominator_dies(...): ...
+def test_float_difference_subtrahend_dies(...): ...
+def test_money_operand_dies(...): ...
+```
+
+Plus the mutation harness's **must-survive no-op** control.
+
+- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** — carry the governed operand type per expression; gate `DECIMAL` production on the exact-numeric allowlist; increment the policy version · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): exact-numeric operand evidence gates DECIMAL`
 
 ---
 

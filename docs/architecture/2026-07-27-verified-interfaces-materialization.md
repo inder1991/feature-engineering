@@ -559,3 +559,287 @@ Spec §4's examples write `hdfc::banking.customers`; per §3.5 and §17 that is 
 for the customers table", never a physical schema. The real ref an upload produces is
 `hdfc::public.customers`, and that is what `tests/featuregen/materialize/test_spine.py` declares.
 Physical resolution onto `banking` is Task 5's explicit governed step.
+
+---
+
+## 19. Catalog state — `overlay/catalog_changes.py` + the planner's stamp vocabulary
+
+Entered during **Task 5**. Spec §3.3 puts `catalog_state_stamp` INSIDE `PhysicalInputRequirement`'s
+identity, so what a stamp is made of decides whether a compiled artifact is stable.
+
+```python
+drift_watermark(conn, catalog_source) -> datetime | None    # catalog_changes.py:24
+drift_head_seq(conn, catalog_source)  -> int | None         # catalog_changes.py:34
+```
+
+Both read the single `overlay_drift_watermark` row for the source; **both return `None` when no
+drift scan has ever completed** — absence is a real state, not zero. `head_seq` is
+`COALESCE(max(global_seq), 0)` at scan completion (`_write_watermark`, `:44-56`), i.e. a **monotone
+global event counter**, while `last_completed_at` is the wall-clock time the scan ran.
+
+The vocabulary already exists and must not be re-minted (`planner/contracts.py:77-83`):
+
+```python
+class CatalogStateStampKind(StrEnum):   # :77
+    drift_watermark = "drift_watermark"
+
+class CatalogOmissionReason(StrEnum):   # :81
+    no_usable_state_stamp = "no_usable_state_stamp"     # what resolve_catalog_scope records
+    catalog_consideration_bound = "catalog_consideration_bound"
+```
+
+`CatalogStateStampV1` (`:323`) carries `catalog_source`, `head_seq`, `last_completed_at`,
+`stamp_kind`, plus 3B.4's `compiler_input_fingerprint` / `projection_checkpoint`.
+`scope.resolve_catalog_scope` (`scope.py:20-56`) OMITS a catalog with no watermark rather than
+stamping it zero — the shipped precedent for "no watermark is not head_seq 0".
+
+**Consequences for materialization.**
+
+1. A materialization stamp may include `head_seq` (identity-bearing: the catalog moved) but **not**
+   `last_completed_at` — re-running the projection over an unchanged catalog would otherwise change
+   every compiled identity, the same defect as putting an inventory's `captured_at` in.
+2. `CatalogStateStampV1` itself is therefore NOT the right shape to embed in
+   `PhysicalInputRequirement`: two of its fields are observation provenance. §3.3 types the field as
+   `tuple[tuple[str, str], ...]`, and `materialize/inputs.py` fills it with
+   `(("stamp_kind", …), ("head_seq", …))`, reusing the enum values above rather than new strings.
+3. `head_seq` is **catalog-wide**, not per table. An unrelated upload to the same catalog source
+   moves it and therefore moves every requirement's identity. That is the conservative direction
+   (recompile when the governed catalog moved) and is recorded here so it is a known cost rather
+   than a surprise.
+
+---
+
+## 20. ⚠️ Task-5 gaps in the Spec-A plan's own Task-0 sketch
+
+Two fields the plan's `TableLayout` / `PartitionMappingV1` sketch omits, both of which Task 5's
+OWN stated tests require. `materialize/inventory.py` defines them; Task 0 must load and capture them.
+
+1. **`TableLayout.columns: tuple[tuple[str, str], ...]`** — the data columns as (name, physical
+   type). The plan's T5 test `test_changing_layout_or_a_physical_type_changes_the_fingerprint` and
+   spec §3.3's "SEMANTIC: partition columns+types, **physical types**, mapping" both need them, and
+   they cannot come from the catalog: `graph_node.data_type` is the LOGICAL representation a
+   decision governed (interfaces §3), not the cluster's `decimal(18,2)`.
+2. **`AvailabilityPartition.late_arrival_days: int`** — §3.4's prose requires an availability
+   mapping to "extend the partition set beyond the event window", but its field parenthetical
+   `(time_ref, partition_column, transform, timezone)` gives run preparation nothing to extend it
+   BY. An inferred widening is exactly the inference §3.4 forbids, so the amount is declared and
+   identity-bearing.
+
+Also entered: `transform` is given a CLOSED `PartitionTransform` StrEnum (`date_iso`,
+`date_compact`). The spec names the field without a vocabulary; an open string would be an
+ungoverned format applied against a live metastore, whose wrong answer looks like an empty
+partition rather than an error.
+
+---
+
+## 21. ⚠️ `AVAILABILITY_TIME`'s `basis` / `lag_hours` are NOT projected anywhere
+
+Entered during **Task 6**. The same shape of gap §18.3 records for `GRAIN.is_unique`, and equally
+load-bearing: spec §8 rule 1 renders the point-in-time gate *per* `AVAILABILITY_TIME.basis`, plus
+`lag_hours` for `event_time_plus_lag`.
+
+`table_fact_projection.project_table_facts_for_ref` (`:82-89`) reads **only** `avail.value["column"]`
+and writes `is_as_of = true` + `availability_fact_event_id` on that one column. `graph_node` has no
+basis and no lag column (`0945_graph.sql:15`, `0986_graph_node_table_fields.sql:10`), and
+`read_operational_value(conn, ref, "is_as_of")` therefore returns only `"true"`/`"false"` plus the
+fact key and event id. **The basis a governed availability fact declares is unreachable from every
+projected read.**
+
+Task 6 resolves it by **dereferencing the link the projection wrote**, not by re-deciding authority:
+
+```python
+read_operational_value(conn, ref, "is_as_of")     # AUTHORITY (incl. GATE 3 projection health)
+overlay_fact_state WHERE fact_key = fact_key(table_ref(source, table), "availability_time")
+#   -> status must be 'VERIFIED'                  (the only servable overlay status)
+#   -> confirmed_event_id must EQUAL graph_node.availability_fact_event_id
+#   -> value["column"] must be the flagged column (catches a stale projection either way)
+#   -> validate_fact_value(AVAILABILITY_TIME, value)  (the overlay's own schema)
+```
+
+`resolve_fact` is deliberately NOT used: it requires a registered `CatalogAdapter`
+(`catalog.current_catalog_adapter` raises when none is registered) and re-decides authority via
+catalog precedence, expiry and drift — a second, possibly disagreeing opinion about a question the
+projection already answered, which is what `materialize/joins.py` refuses to do for join paths.
+
+Two consequences recorded rather than worked around:
+
+1. An **authoritative `CatalogAdapter`** value cannot reach this path at all. `_catalog_verified`
+   (`resolve.py`) sets `provenance={"catalog_source": …}` with no `confirmed_event_id`, so
+   `table_fact_projection` writes NULL to `availability_fact_event_id`, `read_column_facts` reports
+   `authority="hint"`, and compilation refuses `AVAILABILITY_TIME_NOT_GOVERNED`. Fail-closed, but it
+   means a catalog-authoritative availability fact is unusable for materialization today.
+2. **Expiry and drift-freshness are as strong as the shipped projection, no stronger.** An expired
+   fact's flat `is_as_of` flag stays true until the projection re-runs, and `read_operational_value`
+   grants "resolved" on flag + link alone. Task 6 inherits that posture unchanged rather than
+   inventing a second expiry clock at generation time.
+
+**Also entered: `formula.canonical.filter_plain(node, path)` is now PUBLIC** (it was the private
+`_filter_plain`, `canonical.py:234`), for the reason `join_path.table_of_ref` was made public in
+Task 3 — an adapter must ask the question the canonical form already answers.
+`materialize/expression_ir.py` carries a per-expression `filter_tree` into `expression_ir_hash`, and
+a second rendering there could disagree with `formula_content_hash` about what the filter is.
+
+## 22. What Task 6 established
+
+* **One `PitSpec` per EXPRESSION.** `compile_expression(conn, *, expr_path, expr, grain_keys, roles,
+  inventory)` compiles ONE `AggregateExpression`; `ExpressionExecutionIR` is complete on its own, so
+  a ratio's two halves may read two tables, two event-time columns, two windows and two availability
+  bases (interfaces §6). Body paths come from `formula/schema.py::_body_expressions`' own vocabulary
+  (`BODY_PATHS`), never re-minted.
+* **`PitSpec` excludes `empty_window` / `null_input`** — spec §8 rule 4 assigns those to the
+  formula's own policies, so a type named "PIT" must not carry them.
+* **Child-1's containment rule is VERIFIED, not assumed.** `schema._require_contained_column`
+  constrains the operand, the event-time ref and every filter `left` to the expression's own
+  `source_relation`; that is the only reason per-column physical resolution is unnecessary, so
+  `compile_expression` checks it and refuses `UNACCOUNTED_LOGICAL_REF` rather than recording an
+  off-relation column under the SOURCE table's physical identity.
+* **Reference completeness (§2.1)** is `logical_refs_in(node, path)` — an exhaustive dataclass /
+  sequence walk yielding `(location, ref)` for every string `parse_ref` accepts. Non-physical slots
+  are keyed by the dataclass they sit on: `TypedLiteral.value` (`COMPARISON_LITERAL` — a predicate
+  has no `right_ref`, so a ref on the right is data) and `ParameterRef.name` (`RUN_PARAMETER`).
+  Refusals name the LOCATION, never the string, because an unconsumed ref-shaped slot may hold data.
+* **Identity excludes join provenance and roles.** `identity_payload()` takes the join plan's
+  `(from_ref, to_ref, cardinality)` steps only; `approved_join_fact_key`, `approved_join_status`,
+  `authority` and `roles_used` record why the traversal was allowed and who asked, and neither
+  changes a row. Including them would split one computation into as many artifacts as there are
+  approvers and readers. `non_physical_refs` is likewise recorded but not identity — it explains a
+  decision about the formula rather than feeding the computation.
+* **`input_requirements` order is stated by the plan**, not by resolution order: the join TARGET
+  must be resolved before the path can be planned, so resolution order would put the destination
+  ahead of the hops reaching it — and the order enters the hash.
+* **Open (spec ambiguity, not resolved here):** §3's IR has ONE `join_plan`, so a grain whose keys
+  sit on two tables off the source relation would need two traversals with two independent fan-out
+  verdicts. Task 6 refuses that with `GRAIN_PATH_NOT_GOVERNED` (the closest governed reading: there
+  is no single governed path to *the* grain) rather than widening the field. §8 rule 1 likewise
+  specifies ONE availability gate per expression, so a joined dimension table's own availability is
+  not gated in this slice — recorded as a known bound, not designed around.
+
+---
+
+## 23. What Task 7 established
+
+**Two helpers made PUBLIC, for the reason `filter_plain` and `table_of_ref` were before them** — an
+adapter must ask the question the owning module already answers, or the two answers can drift:
+
+```python
+formula.schema.body_expressions(body) -> tuple[tuple[str, AggregateExpression], ...]  # was _body_expressions
+materialize.expression_ir.join_key_ref(catalog_source, step_ref) -> str               # was _key_ref
+```
+
+`materialize.ir.compile_ir` compiles ONE `ExpressionExecutionIR` per body path, and a second
+enumeration there could disagree about how many expressions a body has or what each is called — the
+path names the staging output every later stage reads. `join_key_ref` is shared because Gate 2
+authorizes each join endpoint as its own element class: an endpoint addressed by a second conversion
+would authorize one node and read another. (`capability.py` and `critic.py` keep their own private,
+differently-shaped `_body_expressions`; they return expressions without paths and are untouched.)
+
+**Gate 2's union is derived from FOUR structural sources, deliberately overlapping.** Task 6 already
+folds join endpoints and the availability column into `physical_read_set`, and Task 4 builds
+`SpineSpec.read_set` as keys + availability + policy columns — so in a healthy artifact several
+sources name the same node. §1.3 nevertheless names them as separate element classes, so each is
+derived from its own source (`physical_read_set`, `join_plan.steps`, `pit.availability_ref`, the
+spine's `source_table_ref`/`ordered_key_refs`/`read_set`/`availability_ref`). The overlap makes the
+obvious test non-discriminating, so the element-class tests hand Gate 2 a DOCTORED artifact with the
+element removed from the overlapping source — each with a control proving the doctored group is
+otherwise authorizable. Without that, five of these derivations survived mutation.
+
+**"No contract, plan or project is produced" is only testable with a positive control.** The plan's
+own sketch counted derived contracts after calling `authorize_compilation` alone, which cannot
+derive one under any implementation — a vacuous assertion. `test_ir.py` runs §2's chain end to end
+against a downstream double that REFUSES anything but an `AuthorizedCompilation`, asserts the
+untagged group really does reach it (2 contracts, 1 project), and only then asserts zero.
+
+**Gate 2 owns the read-scope axis ONLY.** `graph_node.sensitivity` vs `allowed_sensitivities(roles)`
+(§2/§13 above). `effective_restriction` is §5.2's axis and refuses with `PROHIBITED_INPUT` during
+classification — a `prohibited` restriction with no read-scope tag therefore passes Gate 2, which is
+asserted rather than assumed.
+
+⚠️ **Migration `0993_graph_check_constraints.sql:22-24` constrains `graph_node.sensitivity` to
+exactly `SENSITIVITY_ROLES`' keys** (`'pii' | 'restricted' | NULL`). The fail-closed branch for an
+unknown tag is therefore unreachable through the database, and is a guard rather than a tested path;
+the tested property is that each tag needs its OWN granting role.
+
+**Two bounds and one spec ambiguity, recorded rather than worked around:**
+
+1. **A ref with no `graph_node` row is treated as untagged, i.e. authorized.** It carries no tag to
+   hide behind, so nothing sensitive passes; what it is, is a read of a column the catalog does not
+   describe, which §11's L1 reports as `COLUMN_ABSENT` against the live metastore. Refusing it here
+   would report a missing column as an insufficient role. Note the wider gap: **nothing in
+   compilation verifies that a formula's column refs exist as catalog nodes** — Task 6 resolves the
+   TABLE, not the columns — so L1 is the first place a typo'd column is caught.
+2. **Group-assembly errors raise `ValueError`, not a §14 code**: an empty group, an IR compiled
+   against a different spine declaration than the one supplied, and an IR carrying join steps with an
+   empty read set. None is a governed verdict about an artifact (the line `plan_join` and
+   `admission.FeatureNamePlanError` already draw), and the closed vocabulary has no member for them.
+3. **§14 has no code for "the formula's grain entity is not the declared population's entity."**
+   `GRAIN_PATH_NOT_GOVERNED` is used as the closest governed reading — there is no governed path from
+   this feature's grain to that population — the same reading Task 6 took for a two-table grain.
+
+**`compile_ir` validates the spine declaration on every call**, so a group of N features performs N
+validations. §4's "declared once per materialization contract" is enforced where the group actually
+exists: `authorize_compilation` refuses (`ValueError`) to authorize IRs whose spine identity payload
+differs from the supplied spine's.
+
+**`ir_hash` payload.** Identity: feature name, `formula_content_hash`, final operation,
+`zero_denominator`, grain entity + ORDERED keys, every expression keyed by BODY PATH (sorted — never
+tuple position, the same defect Task 6 found one level down), the spine's semantic payload, the
+carried output policy. Excluded: `authoring_run_id`, the declaration's provenance, `roles_used`, and
+every run-time value. The formula-side fields are also inside `formula_content_hash`; they are
+repeated because the IR is read on its own, and an identity only interpretable by fetching the
+formula would push every reader back to the object the IR summarizes.
+
+---
+
+## 24. What Task 8 established
+
+**The operation decides the physical type; the logical word is read as OPERAND EVIDENCE only.**
+`resolve_physical_type(formula) -> PhysicalType | MaterializationRefused` keys §6's table on the
+body shape and, for a unary body, on `body.expr.aggregation` — never on
+`FormulaOutputPolicyV1.output_type`. The word is consulted for exactly one question: is the operand
+an EXACT numeric? Child-1 resolves it to the operand's governed `logical_representation` verbatim
+(`output_authority._numeric_output_type`), so it is the only visible statement about what is being
+summed, and an unreadable (`"unknown"`) or inexact operand refuses with `PHYSICAL_TYPE_UNSUPPORTED`
+rather than publishing a fixed-point column no governed fact supports.
+
+| body / aggregation | published `sql_type` | `rounding` / `overflow` |
+|---|---|---|
+| `COUNT_ROWS` · `COUNT_NON_NULL` · `COUNT_DISTINCT` | `BIGINT` | `None` / `None` |
+| `SUM` | `DECIMAL(p,s)` from `DecimalPolicy` | carried from the policy |
+| `RATIO` | `DECIMAL(p,s)` from `DecimalPolicy` | carried from the policy |
+| `DIFFERENCE` | `DECIMAL(p,s)` from `DecimalPolicy` | carried from the policy |
+
+**Nullability is part of the type**, from the formula's own policies (§8 rule 4) and never from the
+SQL type — a `BIGINT` count over a window declared `NULL` when empty is a nullable column. Three
+sources, ANY of which makes the column nullable: `EmptyWindowResult.NULL` or `NullInput.PROPAGATE`
+on **any** expression (each `AggregateExpression` owns its own window, so a ratio has two), and
+`ZeroDenominator.NULL` on a ratio. **`NullInput.PROPAGATE` is a third source §6 does not list**: a
+null operand VALUE makes the aggregate null on a NON-empty window, and declaring such a column
+non-null is the direction of that decision that produces a broken write rather than a refusal.
+
+**The word describes ONE operand, and §6 does not say which.** Child-1 derives it from the SUM's own
+operand, or from a DIFFERENCE's **minuend** (`_resolve_difference`); a RATIO's word is the constant
+`"decimal"` and describes no operand at all. A count has no operand type to read, so its word is
+`"unknown"` for a benign reason and is not treated as evidence. Consequence recorded in
+`DEFERRED-WORK.md` A.7: **a ratio's numerator/denominator and a difference's subtrahend are
+invisible to this check.**
+
+**The decimal policy is validated exactly where it governs.** Refusals: `SATURATE` (a deferred NFR
+— nothing in this slice clamps), precision outside `1..38`, scale outside `0..precision`. Note
+`schema._check_decimal` permits `precision=0`, so a zero-width decimal is a real input rather than a
+hypothetical. A count publishes `BIGINT`, so its `DecimalPolicy` reaches no rendered expression and
+is **neither validated nor carried** — pinned by a test, with the obligation that the renderer takes
+rounding/overflow from `PhysicalType`, never from `formula.decimal`.
+
+**`RoundingMode` and `OverflowBehavior` are carried on `PhysicalType`**, because §6 requires both to
+be explicit in generated code and a renderer cannot honour what it never receives — Spark's default
+on decimal overflow is a NULL, so `ERROR` is deliberate work, not a default.
+
+**`PHYSICAL_TYPE_POLICY_VERSION = 1`** is a declared constant. `PhysicalType.identity_payload()`
+carries `sql_type`, `nullable`, `rounding`, `overflow` and deliberately NOT the policy version — the
+version is a property of the whole plan, contributed once by the contract (§5.5), not once per
+column.
+
+**A body outside Child-1's union raises `SchemaError` from `schema.body_expressions`, not from a
+second check here.** `resolve_physical_type` calls it first and every return depends on the
+nullability it feeds, so the gate is structural rather than positional. (An earlier draft duplicated
+the check locally; mutation testing showed the duplicate was unobservable.)
