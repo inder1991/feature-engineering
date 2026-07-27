@@ -16,9 +16,32 @@ from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 @dataclass(frozen=True, slots=True)
 class JoinStep:
+    """One traversal hop, oriented to the direction of travel.
+
+    The last three fields are the hop's AUTHORITY — why this edge was allowed to be traversed:
+
+    * ``approved_join_fact_key`` — the governed ``approved_join`` fact backing the edge, or ``None``
+      for a FILE-DECLARED edge (declared by an upload, never confirmed by anyone). ``None`` is a
+      meaningful answer, not a missing one.
+    * ``approved_join_status`` — that fact's folded status (``VERIFIED`` on an operational path;
+      ``DRAFT``/``PARTIALLY_CONFIRMED``/… on an unverified one). ``None`` iff there is no fact.
+    * ``authority`` — ``graph_edge.authority``: ``operational`` (usable for feature construction) vs
+      ``display_only`` (an ungoverned edge, kept for lineage display only). ``classify_join_path``
+      only ever fetches operational edges, so that is the default a hand-built step takes.
+
+    They default so this is a purely ADDITIVE extension: every existing caller that reads
+    ``from_ref``/``to_ref``/``cardinality`` — and every test that constructs a step positionally —
+    keeps working. Consumers that must record WHICH governed fact authorized a hop (materialization)
+    read them from the same query that planned the path, never from a second, potentially-drifted
+    read of ``graph_edge``.
+    """
+
     from_ref: str
     to_ref: str
     cardinality: str | None
+    approved_join_fact_key: str | None = None
+    approved_join_status: str | None = None
+    authority: str = "operational"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,9 +66,24 @@ class JoinOutcome:
         return self.kind == JoinOutcome.OPERATIONAL
 
 
-def _table_of(object_ref: str) -> str:
+def table_of_ref(object_ref: str) -> str:
+    """The BARE table name the BFS indexes an object_ref under (``public.txn.amt`` -> ``txn``).
+
+    Public because an ADAPTER over this planner must ask the same question the BFS asked: which
+    table name did this node collapse to? A caller that re-derived it differently would check a
+    different graph than the one that was traversed.
+    """
     parts = object_ref.split(".")
     return parts[1] if len(parts) >= 2 else object_ref
+
+
+#: One fetched `graph_edge` row as it flows through classification into the BFS:
+#: ``(from_ref, to_ref, cardinality, approved_join_fact_key, approved_join_status, authority)``.
+#: The authority columns travel INSIDE this one tuple — and therefore inside the ONE query that
+#: planned the path — because a second read of `graph_edge` to recover them later would be a
+#: different snapshot of a table the join projection mutates, and could disagree about which fact
+#: authorized the hop that was actually traversed.
+_Edge = tuple[str, str, str | None, str | None, str | None, str]
 
 
 def _invert(cardinality: str | None) -> str | None:
@@ -74,15 +112,23 @@ def _bfs(adj: dict[str, list[tuple[str, JoinStep]]], from_table: str,
     return None
 
 
-def _adjacency(edges) -> dict[str, list[tuple[str, JoinStep]]]:
+def _adjacency(edges: Iterable[_Edge]) -> dict[str, list[tuple[str, JoinStep]]]:
     adj: dict[str, list[tuple[str, JoinStep]]] = {}
-    for from_ref, to_ref, card in edges:
-        ft, tt = _table_of(from_ref), _table_of(to_ref)
+    for from_ref, to_ref, card, fact_key, status, authority in edges:
+        ft, tt = table_of_ref(from_ref), table_of_ref(to_ref)
         # Each step is ORIENTED to the traversal direction: the reverse edge swaps refs and inverts
-        # cardinality, so a returned step reads "from `_table_of(from_ref)` join to `_table_of(to_ref)`,
-        # fanning `cardinality` in that direction" (M7 — a reverse N:1 hop is really 1:N).
-        fwd = JoinStep(from_ref=from_ref, to_ref=to_ref, cardinality=card)
-        rev = JoinStep(from_ref=to_ref, to_ref=from_ref, cardinality=_invert(card))
+        # cardinality, so a returned step reads "from `table_of_ref(from_ref)` join to
+        # `table_of_ref(to_ref)`, fanning `cardinality` in that direction" (M7 — a reverse N:1 hop
+        # is really 1:N). AUTHORITY is a property of the EDGE, not of the direction of travel, so
+        # the fact key / status / authority ride BOTH orientations unchanged while the cardinality
+        # flips. Losing either half on the reverse hop is the same defect: one lets an unapproved
+        # join look approved, the other lets a fan-out look safe.
+        fwd = JoinStep(from_ref=from_ref, to_ref=to_ref, cardinality=card,
+                       approved_join_fact_key=fact_key, approved_join_status=status,
+                       authority=authority)
+        rev = JoinStep(from_ref=to_ref, to_ref=from_ref, cardinality=_invert(card),
+                       approved_join_fact_key=fact_key, approved_join_status=status,
+                       authority=authority)
         adj.setdefault(ft, []).append((tt, fwd))
         adj.setdefault(tt, []).append((ft, rev))
     return adj
@@ -101,26 +147,27 @@ def classify_join_path(conn, catalog_source: str, from_table: str, to_table: str
     allowed = allowed_sensitivities(roles)
     rows = conn.execute(
         "SELECT e.from_ref, e.to_ref, e.cardinality, e.approved_join_fact_key, "
-        "       e.approved_join_status, fn.sensitivity, tn.sensitivity "
+        "       e.approved_join_status, e.authority, fn.sensitivity, tn.sensitivity "
         "FROM graph_edge e "
         "JOIN graph_node fn ON fn.object_ref = e.from_ref AND fn.catalog_source = e.catalog_source "
         "JOIN graph_node tn ON tn.object_ref = e.to_ref AND tn.catalog_source = e.catalog_source "
         "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.authority = 'operational'",
         (catalog_source,)).fetchall()
 
-    clearing: list[tuple[str, str, str | None]] = []
-    unverified: list[tuple[str, str, str | None]] = []
+    clearing: list[_Edge] = []
+    unverified: list[_Edge] = []
     unverified_fact: dict[tuple[str, str], str] = {}
-    denied: list[tuple[str, str, str | None]] = []
-    for from_ref, to_ref, card, fact_key, status, fs, ts in rows:
+    denied: list[_Edge] = []
+    for from_ref, to_ref, card, fact_key, status, authority, fs, ts in rows:
+        edge: _Edge = (from_ref, to_ref, card, fact_key, status, authority)
         visible = (fs is None or fs in allowed) and (ts is None or ts in allowed)
         if not visible:
-            denied.append((from_ref, to_ref, card))
+            denied.append(edge)
             continue
         if fact_key is None or status == "VERIFIED":
-            clearing.append((from_ref, to_ref, card))
+            clearing.append(edge)
         else:
-            unverified.append((from_ref, to_ref, card))
+            unverified.append(edge)
             unverified_fact[(from_ref, to_ref)] = fact_key
 
     path = _bfs(_adjacency(clearing), from_table, to_table)
@@ -136,7 +183,7 @@ def classify_join_path(conn, catalog_source: str, from_table: str, to_table: str
                            endpoints=endpoints, fact_keys=keys)
     path = _bfs(_adjacency(clearing + unverified + denied), from_table, to_table)
     if path is not None:
-        denied_pairs = {(f, t) for f, t, _ in denied} | {(t, f) for f, t, _ in denied}
+        denied_pairs = {(f, t) for f, t, *_ in denied} | {(t, f) for f, t, *_ in denied}
         endpoints = tuple((s.from_ref, s.to_ref) for s in path
                           if (s.from_ref, s.to_ref) in denied_pairs)
         return JoinOutcome(kind=JoinOutcome.DENIED, endpoints=endpoints)

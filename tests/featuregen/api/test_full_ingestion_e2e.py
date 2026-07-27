@@ -175,8 +175,9 @@ def test_full_chain_upload_discover_confirm_traverse_dashboard(
         "SELECT authority, approved_join_fact_key, approved_join_status FROM graph_edge"
         " WHERE kind = 'joins' AND catalog_source = 'catx'").fetchall()
     assert rows == [("operational", key, "VERIFIED")]
+    # The step names the fact that authorized it (Spec A T3) — the SAME key the edge carries.
     assert find_join_path(conn, "catx", "customer", "customers") == \
-        [JoinStep("public.customer.cust_id", "public.customers.cust_id", "N:1")]
+        [JoinStep("public.customer.cust_id", "public.customers.cust_id", "N:1", key, "VERIFIED")]
 
     # A verified join has left the open queue.
     r = client.get("/sources/catx/governance/joins", headers=ADMIN2)
@@ -230,7 +231,7 @@ def test_reupload_with_new_candidate_keeps_verified_join_operational(
     # request, so feature construction never went dark.
     assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
     assert find_join_path(conn, "catx", "customer", "customers") == \
-        [JoinStep("public.customer.cust_id", "public.customers.cust_id", "N:1")]
+        [JoinStep("public.customer.cust_id", "public.customers.cust_id", "N:1", key, "VERIFIED")]
     # And the new candidate is queued for governance like any other discovery.
     r = client.get("/sources/catx/governance/joins", headers=ADMIN1)
     (p2,) = r.json()["proposals"]

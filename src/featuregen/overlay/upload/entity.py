@@ -391,7 +391,7 @@ def dismiss_entity_suggestion(conn, catalog_source: str, object_ref: str) -> boo
 
 from collections import deque  # noqa: E402
 
-from featuregen.overlay.upload.join_path import _invert, _table_of  # noqa: E402
+from featuregen.overlay.upload.join_path import _invert, table_of_ref  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,7 +420,7 @@ def _cross_adjacency(conn, roles: Iterable[str]) -> dict:
             "SELECT catalog_source, from_ref, to_ref, cardinality FROM graph_edge "
             "WHERE kind = 'joins' AND authority = 'operational' "
             "AND (approved_join_fact_key IS NULL OR approved_join_status = 'VERIFIED')").fetchall():
-        a, b = (src, _table_of(fr)), (src, _table_of(to))
+        a, b = (src, table_of_ref(fr)), (src, table_of_ref(to))
         if a == b:
             continue
         link(a, b, CrossStep("join", src, a[1], src, b[1], card or ""))
