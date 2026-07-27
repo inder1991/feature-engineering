@@ -177,6 +177,12 @@ export function SearchScreen() {
     navigate('asset', { source: hit.catalog_source, object_ref: hit.object_ref })
   }
 
+  // The read-only suggested-features sheet's ONE entry point (P4). Same shape as Details, keyed on
+  // the hit's own TABLE: suggestions are per table, so a column hit opens the table it lives on.
+  function openSuggested(hit: SearchHit) {
+    navigate('suggested', { source: hit.catalog_source, table: hit.table })
+  }
+
   // Active-filter chips, in facet-group order, then flags.
   const chips: { id: string; label: string; pii: boolean; remove: () => void }[] = []
   for (const group of FACET_GROUPS) {
@@ -363,6 +369,7 @@ export function SearchScreen() {
                   hit={hit}
                   onGraph={jumpToGraph}
                   onDetails={openDetails}
+                  onSuggested={openSuggested}
                 />
               ))}
             </ul>
@@ -395,10 +402,12 @@ function HitRow({
   hit,
   onGraph,
   onDetails,
+  onSuggested,
 }: {
   hit: SearchHit
   onGraph: (hit: SearchHit) => void
   onDetails: (hit: SearchHit) => void
+  onSuggested: (hit: SearchHit) => void
 }) {
   const [impact, setImpact] = useState<string[] | null>(null)
   const [impactError, setImpactError] = useState('')
@@ -473,6 +482,14 @@ function HitRow({
         onClick={() => onDetails(hit)}
       >
         Details
+      </button>
+      <button
+        type="button"
+        className="btn btn--ghost"
+        aria-label={`Suggested features for ${hit.table}`}
+        onClick={() => onSuggested(hit)}
+      >
+        Suggested features
       </button>
       <button
         type="button"
