@@ -323,3 +323,29 @@ AuthorTurnRecord(..., tool_context_hash: str = "")                        # NEW,
 **Not consumed by Spec A** (new modules from that stream, noted so they are not mistaken for dependencies): `formula/replay_authoring.py` · `replay_trace.py` · `recipe_authoring.py` · `recipe_egress.py` · `frozen_configuration.py` · `control.py`. Changed but not depended on: `audited.py`, `author.py`, `critic.py`.
 
 **Re-verify again immediately before implementation begins** — that stream is active.
+
+---
+
+## 16. Canonicalization — `formula/_jcs.py` (entered during Task 1)
+
+Task 1 cited `featuregen.formula._jcs.dumps` as already verified here; it was **not present**. Read and entered per the standing rule.
+
+```python
+dumps(obj) -> bytes                                # _jcs.py:195  — canonical UTF-8, NOT str
+dump(obj, sink: IO[bytes]) -> None                 # _jcs.py:206
+class CanonicalizationError(ValueError)            # _jcs.py:62   — base of all canonicalization errors
+class IntegerDomainError(CanonicalizationError)    # _jcs.py:70   — |n| > 2**53 - 1
+class FloatDomainError(CanonicalizationError)      # _jcs.py:83   — NaN / ±inf
+```
+
+The module is **vendored VERBATIM** from `trailofbits/rfc8785.py` v0.1.4 (Apache-2.0) and proven against the RFC 8785 test vectors in `tests/featuregen/formula/test_jcs_vectors.py`. `pyproject.toml` per-file-ignores its lint findings deliberately — **it must not be edited**.
+
+**⚠️ `dumps` returns `bytes`.** Hash the bytes directly (`hashlib.sha256(dumps(x)).hexdigest()`); `.encode()` on the result is a `TypeError`.
+
+**⚠️ Type dispatch is `isinstance(obj, dict)`, not `Mapping`** (`:245`). A `Mapping` that is not a `dict` (`MappingProxyType`, a custom mapping) falls through to the final `else` and raises `CanonicalizationError("unsupported type: …")` (`:272`). A function accepting `Mapping` must convert with `dict(payload)` first — `materialize.canonical` does.
+
+**Accepted values** (`dump`, `:206-272`): `None` · `bool` · `int` within ±(2\*\*53 − 1) · `str` · finite `float` · `list`/`tuple` · `dict` with **string keys only** (a non-string key raises `CanonicalizationError("object keys must be strings")`, `:259`). `Enum` is not special-cased: a `(str, Enum)` member serializes through the `str` branch (the code deliberately avoids `str(...)` coercion, `:218-221`), but any other `Enum` hits the unsupported-type branch. Serialize `.value` explicitly.
+
+**Object key order** is the UTF-16BE encoding of the key (`:256`), so mapping insertion order never affects the bytes.
+
+**Precedent:** `formula/canonical.py:75-81` — `formula_content_hash` is `sha256(_jcs_dumps(plain)).hexdigest()`. Spec A's `materialize.canonical.materialize_hash` is the same construction over a plain mapping, and is the ONE hasher for `src/featuregen/materialize/`.
