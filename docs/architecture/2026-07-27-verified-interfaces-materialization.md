@@ -787,3 +787,59 @@ carried output policy. Excluded: `authoring_run_id`, the declaration's provenanc
 every run-time value. The formula-side fields are also inside `formula_content_hash`; they are
 repeated because the IR is read on its own, and an identity only interpretable by fetching the
 formula would push every reader back to the object the IR summarizes.
+
+---
+
+## 24. What Task 8 established
+
+**The operation decides the physical type; the logical word is read as OPERAND EVIDENCE only.**
+`resolve_physical_type(formula) -> PhysicalType | MaterializationRefused` keys §6's table on the
+body shape and, for a unary body, on `body.expr.aggregation` — never on
+`FormulaOutputPolicyV1.output_type`. The word is consulted for exactly one question: is the operand
+an EXACT numeric? Child-1 resolves it to the operand's governed `logical_representation` verbatim
+(`output_authority._numeric_output_type`), so it is the only visible statement about what is being
+summed, and an unreadable (`"unknown"`) or inexact operand refuses with `PHYSICAL_TYPE_UNSUPPORTED`
+rather than publishing a fixed-point column no governed fact supports.
+
+| body / aggregation | published `sql_type` | `rounding` / `overflow` |
+|---|---|---|
+| `COUNT_ROWS` · `COUNT_NON_NULL` · `COUNT_DISTINCT` | `BIGINT` | `None` / `None` |
+| `SUM` | `DECIMAL(p,s)` from `DecimalPolicy` | carried from the policy |
+| `RATIO` | `DECIMAL(p,s)` from `DecimalPolicy` | carried from the policy |
+| `DIFFERENCE` | `DECIMAL(p,s)` from `DecimalPolicy` | carried from the policy |
+
+**Nullability is part of the type**, from the formula's own policies (§8 rule 4) and never from the
+SQL type — a `BIGINT` count over a window declared `NULL` when empty is a nullable column. Three
+sources, ANY of which makes the column nullable: `EmptyWindowResult.NULL` or `NullInput.PROPAGATE`
+on **any** expression (each `AggregateExpression` owns its own window, so a ratio has two), and
+`ZeroDenominator.NULL` on a ratio. **`NullInput.PROPAGATE` is a third source §6 does not list**: a
+null operand VALUE makes the aggregate null on a NON-empty window, and declaring such a column
+non-null is the direction of that decision that produces a broken write rather than a refusal.
+
+**The word describes ONE operand, and §6 does not say which.** Child-1 derives it from the SUM's own
+operand, or from a DIFFERENCE's **minuend** (`_resolve_difference`); a RATIO's word is the constant
+`"decimal"` and describes no operand at all. A count has no operand type to read, so its word is
+`"unknown"` for a benign reason and is not treated as evidence. Consequence recorded in
+`DEFERRED-WORK.md` A.7: **a ratio's numerator/denominator and a difference's subtrahend are
+invisible to this check.**
+
+**The decimal policy is validated exactly where it governs.** Refusals: `SATURATE` (a deferred NFR
+— nothing in this slice clamps), precision outside `1..38`, scale outside `0..precision`. Note
+`schema._check_decimal` permits `precision=0`, so a zero-width decimal is a real input rather than a
+hypothetical. A count publishes `BIGINT`, so its `DecimalPolicy` reaches no rendered expression and
+is **neither validated nor carried** — pinned by a test, with the obligation that the renderer takes
+rounding/overflow from `PhysicalType`, never from `formula.decimal`.
+
+**`RoundingMode` and `OverflowBehavior` are carried on `PhysicalType`**, because §6 requires both to
+be explicit in generated code and a renderer cannot honour what it never receives — Spark's default
+on decimal overflow is a NULL, so `ERROR` is deliberate work, not a default.
+
+**`PHYSICAL_TYPE_POLICY_VERSION = 1`** is a declared constant. `PhysicalType.identity_payload()`
+carries `sql_type`, `nullable`, `rounding`, `overflow` and deliberately NOT the policy version — the
+version is a property of the whole plan, contributed once by the contract (§5.5), not once per
+column.
+
+**A body outside Child-1's union raises `SchemaError` from `schema.body_expressions`, not from a
+second check here.** `resolve_physical_type` calls it first and every return depends on the
+nullability it feeds, so the gate is structural rather than positional. (An earlier draft duplicated
+the check locally; mutation testing showed the duplicate was unobservable.)

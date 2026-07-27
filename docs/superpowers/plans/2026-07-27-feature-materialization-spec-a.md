@@ -521,10 +521,12 @@ Spec §6.
 
 **Files:** Create `src/featuregen/materialize/physical_types.py`; Test `test_physical_types.py`
 
-**Produces:** `PHYSICAL_TYPE_POLICY_VERSION = 1`; `PhysicalType` (frozen: `sql_type`, `nullable`); `resolve_physical_type(formula) -> PhysicalType | MaterializationRefused`.
+**Produces:** `PHYSICAL_TYPE_POLICY_VERSION = 1`; `PhysicalType` (frozen: `sql_type`, `nullable`, **plus `rounding` / `overflow`** — §6 requires both to be explicit in generated code, and a renderer cannot honour what it never receives); `resolve_physical_type(formula) -> PhysicalType | MaterializationRefused`.
 
-- [ ] **Step 1: Failing tests** — counts → `BIGINT` · SUM/RATIO/DIFFERENCE → `DECIMAL(p,s)` from `DecimalPolicy` · **operation beats the logical word** (`COUNT_DISTINCT` is logically `integer`, physically `BIGINT`) · `ZeroDenominator.NULL` ⇒ nullable · `EmptyWindowResult.ZERO` ⇒ non-nullable · precision > 38 ⇒ `PHYSICAL_TYPE_UNSUPPORTED` · `SATURATE` ⇒ refused · **`DOUBLE` never appears in the module source**.
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): versioned physical type adapter`
+- [x] **Step 1: Failing tests** — counts → `BIGINT` · SUM/RATIO/DIFFERENCE → `DECIMAL(p,s)` from `DecimalPolicy` · **operation beats the logical word** (`COUNT_DISTINCT` is logically `integer`, physically `BIGINT`) · `ZeroDenominator.NULL` ⇒ nullable · `EmptyWindowResult.ZERO` ⇒ non-nullable · precision > 38 ⇒ `PHYSICAL_TYPE_UNSUPPORTED` · `SATURATE` ⇒ refused · **`DOUBLE` never appears in the module source**.
+- [x] **Step 2–5:** Run/implement/run/commit — `feat(materialize): versioned physical type adapter`
+
+**Established (interfaces reference §24), beyond the sketch above:** the logical word is read as **operand evidence** and an unreadable/inexact operand refuses · `NullInput.PROPAGATE` is a **third** nullability source §6 does not list · a count's `DecimalPolicy` governs nothing and is neither validated nor carried · the body-shape gate is `schema.body_expressions`, not a second local check. Six gaps recorded in `DEFERRED-WORK.md` A.8 — the load-bearing one is that a **ratio's operands and a difference's subtrahend are invisible** to the operand check from the formula alone.
 
 ---
 
