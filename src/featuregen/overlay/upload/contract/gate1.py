@@ -256,8 +256,12 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         raw = {"name": idea.name, "description": idea.description,
                "derives_from": list(idea.derives_from), "aggregation": idea.aggregation,
                "grain_table": idea.grain_table, "rationale": idea.rationale}
+        # The TEMPLATE-DECLARED operand roles ride into the gauntlet alongside `raw` (which is bare
+        # refs): they narrow which operands the unit/currency needs-check may ask about. Passed as a
+        # kwarg rather than folded into `raw` so the LLM's raw shape — and therefore the LLM path —
+        # is untouched.
         validated, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
-                                        roles=roles)
+                                        roles=roles, operand_roles=idea.operand_roles)
         if rej is None:
             # [F9] keep the VALIDATOR's idea (carries status + requirements), then SERVER-STAMP the H1a
             # recipe provenance: generation_source + recipe_id come from the grounded TEMPLATE id (the
@@ -1013,6 +1017,48 @@ def _chosen_feature_from_snapshot(
     return _idea_from_json(first)
 
 
+# ── E4b: re-attaching the template-declared operand roles at reload ───────────────────────────────
+# The roles are DELIBERATELY off every wire shape (`_idea_json` is hashed into `option_id` and
+# `considered_content_hash`), so they cannot be read back off the candidate. They do not need to be:
+# the private revision ALREADY persists the exact per-role column bindings under
+# `recipe_grounding_context_by_candidate_key` (`GroundedNeedBinding.role` + `.graph_object_ref`, the
+# same grounding that produced `binding_resolutions`). Re-deriving from THAT is a pure read of
+# already-persisted, already-hash-sealed server state — no new field, no new bytes, no identity change.
+def _revision_recipe_candidate_key(considered: dict, *, option_id: str | None,
+                                   feature: FeatureIdea | None) -> str | None:
+    """The grounding-context key for a chosen option: its own recorded key when the caller resolved an
+    exact option id, else the recipe's key when that recipe contributed EXACTLY ONE candidate (the same
+    unambiguous rule ``_recipe_candidate_key`` applied when writing it). Ambiguity yields None — the
+    roles are then absent and the gauntlet falls back, never guesses."""
+    record = (considered.get("options_by_id") or {}).get(option_id) if option_id else None
+    if isinstance(record, dict) and record.get("recipe_candidate_key"):
+        return str(record["recipe_candidate_key"])
+    if feature is not None and feature.recipe_id:
+        keys = (considered.get("recipe_candidate_keys_by_recipe_id") or {}).get(feature.recipe_id)
+        if isinstance(keys, list) and len(keys) == 1:
+            return str(keys[0])
+    return None
+
+
+def _operand_roles_from_revision(considered: dict, feature: FeatureIdea | None, *,
+                                 option_id: str | None = None) -> FeatureIdea | None:
+    """``feature`` with its template-declared ``operand_roles`` restored from the revision's private
+    recipe grounding context (sorted + deduped, matching ``_operand_roles``). Unchanged when there is
+    no context for it — an LLM candidate, a legacy revision, or an ambiguous recipe key."""
+    if feature is None:
+        return None
+    key = _revision_recipe_candidate_key(considered, option_id=option_id, feature=feature)
+    context = (considered.get("recipe_grounding_context_by_candidate_key") or {}).get(key) if key \
+        else None
+    if not isinstance(context, dict):
+        return feature
+    pairs = tuple(sorted({
+        (str(b["graph_object_ref"]), str(b["role"]))
+        for b in context.get("need_bindings", ())
+        if isinstance(b, dict) and b.get("graph_object_ref") and b.get("role")}))
+    return replace(feature, operand_roles=pairs) if pairs else feature
+
+
 def _public_option_entries(public: dict) -> list[tuple[str, str, dict]]:
     entries: list[tuple[str, str, dict]] = []
     anchor = public.get("anchor")
@@ -1069,7 +1115,9 @@ def _chosen_option_from_revision(
         or record.get("lens") != lens
     ):
         raise Gate1Error("considered option projection does not match its private identity")
-    return _idea_from_json(feature_without_option), source, identity_hash
+    feature = _operand_roles_from_revision(
+        considered, _idea_from_json(feature_without_option), option_id=option_id)
+    return feature, source, identity_hash
 
 
 def chosen_feature(conn, intent_id: str, chosen_source: str,
@@ -1246,9 +1294,11 @@ def select_and_record_gate1_choice(
     lineage: dict | None
     revision_id: str | None
     revision_hash: str | None
+    revision: dict | None = None   # the verified PRIVATE payload, when one exists (E4b role source)
     if expected_generation_run_id is not None:
-        public, lineage, revision_id, revision_hash = _verified_considered_revision(
+        revision, lineage, revision_id, revision_hash = _verified_considered_revision_payload(
             conn, intent_id, expected_generation_run_id)
+        public = revision["public"]
     else:
         row = conn.execute(
             "SELECT considered, generation_run_id, snapshot_id, snapshot_content_hash, "
@@ -1277,6 +1327,8 @@ def select_and_record_gate1_choice(
         revision_id, revision_hash = None, None
 
     feature = _chosen_feature_from_snapshot(public, chosen_source, chosen_option_id)
+    if revision is not None:
+        feature = _operand_roles_from_revision(revision, feature)
     if feature is None:
         return None
     conn.execute(
@@ -1372,15 +1424,15 @@ def recorded_gate1_draft_choice(conn, intent_id: str) -> DraftChoice | None:
     ).fetchone()
     if row is None:
         raise Gate1Error("recorded considered revision is missing")
-    public, lineage, verified_id, verified_hash = _verified_considered_revision(
+    revision, lineage, verified_id, verified_hash = _verified_considered_revision_payload(
         conn, intent_id, row[0])
     if (
         verified_id != revision_id
         or verified_hash != choice["considered_content_hash"]
     ):
         raise Gate1Error("recorded choice revision hash mismatch")
-    feature = _chosen_feature_from_snapshot(
-        public, choice["chosen_source"], choice["chosen_option_id"])
+    feature = _operand_roles_from_revision(revision, _chosen_feature_from_snapshot(
+        revision["public"], choice["chosen_source"], choice["chosen_option_id"]))
     return (
         DraftChoice(feature, lineage, verified_id, verified_hash)
         if feature is not None

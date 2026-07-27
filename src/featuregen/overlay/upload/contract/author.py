@@ -58,6 +58,14 @@ class ContractDraft:
     # axis from the hyphenated `verification` stamp; underscore VALIDATION_STATES vocabulary.
     validation_status: str = "DESIGN_CHECKED"
     requirements: tuple[Requirement, ...] = ()
+    # E4b: the TEMPLATE-DECLARED `(object_ref, role)` operand roles carried from the chosen
+    # FeatureIdea, so the confirm-time MCV re-run (`review.validate_minimum` -> `_validate_idea`)
+    # reaches the SAME unit/currency verdict Gate #1 showed the human — a governed artifact must never
+    # contradict the review screen. SERVER-SIDE ONLY: `DraftIn` carries no such field, so a client can
+    # never declare a role and suppress a unit check; the confirm route overwrites it from the
+    # server-reconstructed chosen feature, exactly as it does grain_table / derives_from. Empty for an
+    # LLM candidate (and for any pre-E4b draft), which falls back to the E4a structural rule.
+    operand_roles: tuple[tuple[str, str], ...] = ()
 
 
 def _as_of_column(conn, grain_table: str | None, catalog_source: str | None) -> str | None:
@@ -195,4 +203,5 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
         as_of_column=_as_of_column(conn, feature.grain_table, grain_catalog),
         derives_from=list(feature.derives_from), target_ref=target_ref,
         derives_pairs=feature.derives_pairs, join_path=join_path,
-        validation_status=feature.validation_status, requirements=feature.requirements)
+        validation_status=feature.validation_status, requirements=feature.requirements,
+        operand_roles=feature.operand_roles)

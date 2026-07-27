@@ -2,25 +2,34 @@
 
 MEASURED on the real FTR path (see the per-test docstrings for the assertions that pin each number):
 
-    BEFORE   1 candidate  {NEEDS_EXTERNAL_VALIDATION: 1, DESIGN_CHECKED: 0}
+    BEFORE   1 candidate  {DESIGN_CHECKED: 1}
              rejections   {NO_POINT_IN_TIME: 9, NON_NUMERIC: 3}
-    AFTER   10 candidates {NEEDS_EXTERNAL_VALIDATION: 5, DESIGN_CHECKED: 5}
+    AFTER   10 candidates {DESIGN_CHECKED: 10, NEEDS_EXTERNAL_VALIDATION: 0}
              rejections   {NON_NUMERIC: 3}
-             requirements {UNIT_CONSISTENT: 11, CURRENCY_CONSISTENT: 11}
+             requirements {}
 
 So the confirm does REAL work — it retires all nine ``NO_POINT_IN_TIME`` future-leakage rejections
 and no candidate afterwards carries ``GRAIN_IS_UNIQUE`` or ``TEMPORAL_IS_POPULATED``.
 
-**Re-recorded after E4a Task 1.** The DESIGN_CHECKED lift used to be **ZERO** because
-``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT`` fired on every bound operand of a combining op —
-28 of each, 21 of them naming ``cif_id`` / ``as_of_dt`` / ``txn_ts`` / ``setl_stat``, and the FTR
-glossary format has no unit/currency column at all, so those questions could never be answered.
-``_validate_idea`` now asks only where units can actually MIX (two or more MEASURE operands, with
-the GROUP BY key and the point-in-time anchor excluded — a structural narrowing, never a
-concept- or role-based one). Result: **28/28 -> 11/11** unit/currency questions, ``cif_id`` and
-``as_of_dt`` gone from the operand list entirely, and **5 of the 10 candidates now reach
-DESIGN_CHECKED**. The MIXED_UNITS / MIXED_CURRENCY hard rejects are untouched and still read every
-derive, so a positive contradiction still rejects outright.
+**Re-recorded twice.** The DESIGN_CHECKED lift used to be **ZERO** because ``UNIT_CONSISTENT`` /
+``CURRENCY_CONSISTENT`` fired on every bound operand of a combining op — 28 of each, 21 of them
+naming ``cif_id`` / ``as_of_dt`` / ``txn_ts`` / ``setl_stat``, and the FTR glossary format has no
+unit/currency column at all, so those questions could never be answered.
+
+* **E4a** narrowed it STRUCTURALLY — two or more MEASURE operands, with the GROUP BY key and the
+  point-in-time anchor excluded: **28/28 -> 11/11** questions and **5 of 10** candidates clean.
+* **E4b** (this recording) narrows it by the role the TEMPLATE AUTHOR DECLARED for each bound
+  operand. What E4a left behind were columns like ``txn_ts`` / ``acct_id`` / ``setl_stat`` riding
+  along as a SECOND operand, so the measure count tripped on a column that can never carry a unit.
+  ``Need.role`` is hand-written in the recipe library and resolved to a typed ``JoinRole`` by
+  ``need_metadata`` — governed, versioned, human-authored — so a key or a timestamp is no longer
+  asked. A CONCEPT-based shortcut stays refused: concepts are AI-proposed, and one wrong concept
+  would wave a real dollars-vs-fils mismatch through. Result: **11/11 -> 0/0** questions and
+  **10 of 10** candidates reach DESIGN_CHECKED.
+
+A declared MEASURE missing a unit is STILL always asked (``test_validate_idea_tristate``'s
+``..._ANTI_SILENT_CLEAR`` guards), and the MIXED_UNITS / MIXED_CURRENCY hard rejects are untouched
+and still read every derive, so a positive contradiction still rejects outright.
 
 **E4a Task 2 rides in these numbers.** The fixture's LLM now also PROPOSES a unit + currency for
 every measure whose file declares none, stored as ``llm/proposed`` field evidence. Every number
@@ -240,8 +249,8 @@ def test_confirming_the_ai_grain_and_asof_lifts_features_past_the_gating_checks(
     NOT in this chain."""
     before, before_codes = _status_counts(overlay_conn), _requirement_codes(overlay_conn)
     before_rejects = _rejection_codes(overlay_conn)
-    assert before["NEEDS_EXTERNAL_VALIDATION"] > 0, (
-        f"nothing needed validation before the confirm — the requirements do not fire ({before})")
+    assert sum(before.values()) > 0, (
+        f"the fixture surfaced no candidate at all before the confirm ({before})")
     assert before_rejects["NO_POINT_IN_TIME"] > 0, (
         "the table already had a governed as-of before the confirm — the fixture is not measuring "
         "the confirm")
@@ -287,34 +296,64 @@ def test_the_confirm_clears_the_gating_checks_and_mints_no_new_requirement(overl
 
 
 def test_the_design_checked_lift_after_the_unit_narrowing(overlay_conn, ai_proposed_catalog):
-    """THE HONEST HEADLINE, re-recorded after E4a Task 1.
+    """THE HONEST HEADLINE, re-recorded after E4b (operand roles).
 
     It used to be zero: ``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT`` were minted for EVERY bound
     operand of a combining op — the grain key, the as-of date and a status string included (28 of
     each, 21 of them naming ``cif_id`` / ``as_of_dt`` / ``txn_ts`` / ``setl_stat``) — and a real FTR
     glossary export carries no unit or currency column AT ALL, so no one could ever answer them.
+    E4a's structural narrowing took that to 11/11 and 5 of 10.
 
-    ``_validate_idea`` now asks only where units can MIX. **5 of the 10 candidates reach
-    DESIGN_CHECKED** and the questions drop **28/28 -> 11/11**. The survivors are genuine
-    multi-measure combinations (``txn_ts`` / ``acct_id`` / ``txn_amt`` / ``cust_hold`` /
-    ``setl_stat``) whose unit really is unknown — which is Task 2/3's job, not Task 1's.
+    E4b asks only where a unit can EXIST: an operand whose TEMPLATE-DECLARED role is a key or a
+    timestamp is not a measure and is not asked. On this sample every survivor turns out to bind at
+    most ONE declared measure (pinned by the test below), so **10 of 10 candidates reach
+    DESIGN_CHECKED** and the questions drop **11/11 -> 0/0**.
 
     This is a regression guard in BOTH directions: a change that re-widens the check (the numbers
-    climb, DESIGN_CHECKED falls) and a change that narrows it further (the grain/as-of exclusion
-    growing into a concept- or role-based one) must both fail here and be re-measured."""
+    climb, DESIGN_CHECKED falls) and a change that narrows it further (the exclusion growing into a
+    concept-, name- or type-based one) must both fail here and be re-measured."""
     _confirm_ai_table_facts(overlay_conn,
                             mint_test_identity(subject="user:e4a-admin",
                                                role_claims=("platform-admin",)))
     counts = _status_counts(overlay_conn)
-    assert counts["DESIGN_CHECKED"] == 5, f"re-measure the E4a headline: {dict(counts)}"
-    assert counts["NEEDS_EXTERNAL_VALIDATION"] == 5, f"re-measure: {dict(counts)}"
-    # the only thing still holding a candidate back is an honestly-unknown MEASURE unit
-    assert set(_requirement_codes(overlay_conn)) == {"UNIT_CONSISTENT", "CURRENCY_CONSISTENT"}
-    assert dict(_requirement_codes(overlay_conn)) == {"UNIT_CONSISTENT": 11,
-                                                      "CURRENCY_CONSISTENT": 11}
-    # ...and NOT ONE of them names the table's GROUP BY key or its point-in-time anchor. Those are
-    # the questions no human could answer; asking them was the whole reason the lift was zero.
-    structural = {op for op in _requirement_operands(overlay_conn)
-                  if op.rsplit("@", 1)[-1] in ("cif_id", "as_of_dt")}
-    assert not structural, (
-        f"the grain key / as-of anchor is being asked for a unit again: {sorted(structural)}")
+    assert counts["DESIGN_CHECKED"] == 10, f"re-measure the E4 headline: {dict(counts)}"
+    assert counts["NEEDS_EXTERNAL_VALIDATION"] == 0, f"re-measure: {dict(counts)}"
+    assert dict(_requirement_codes(overlay_conn)) == {}, (
+        f"re-measure: a requirement still fires on this sample "
+        f"({dict(_requirement_operands(overlay_conn))})")
+    # ...and NOT ONE of them names the table's GROUP BY key, its point-in-time anchor, or any of the
+    # ride-along operands. Those are the questions no human could answer; asking them was the whole
+    # reason the lift was zero.
+    unanswerable = {op for op in _requirement_operands(overlay_conn)
+                    if op.rsplit("@", 1)[-1] in ("cif_id", "as_of_dt", "txn_ts", "acct_id")}
+    assert not unanswerable, (
+        f"a key / time / ride-along operand is being asked for a unit again: {sorted(unanswerable)}")
+
+
+def test_the_zero_is_because_no_candidate_combines_two_declared_measures(overlay_conn,
+                                                                        ai_proposed_catalog):
+    """WHY the headline above is zero — pinned separately so it can never become a silent clear.
+
+    A result of "no unit questions" is only honest if the reason is that nothing on this sample
+    COMBINES two measures. This asserts the reason directly off the grounded candidates: every
+    survivor carries template-declared roles (so the narrowing is the declaration, not an accidental
+    absence of one), and each binds AT MOST ONE operand the recipe corpus resolves to a
+    ``JoinRole.MEASURE``. If a future recipe binds two, this test stops holding and the headline
+    above must show its unit question — which is exactly the anti-silent-clear direction."""
+    from featuregen.overlay.upload.contract.gate1 import _template_candidates
+    from featuregen.overlay.upload.need_metadata import is_measure_need_role
+    _confirm_ai_table_facts(overlay_conn,
+                            mint_test_identity(subject="user:e4a-admin",
+                                               role_claims=("platform-admin",)))
+    ideas = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(),
+                                 target_ref=None, now=None)[0]
+    mine = [idea for idea in ideas if idea.grain_table == TABLE]
+    assert len(mine) == 10, f"re-measure: {len(mine)} candidates"
+    for idea in mine:
+        assert idea.operand_roles, (
+            f"{idea.name} carries NO declared roles — its clean status came from an ABSENT "
+            "declaration, not from the role rule")
+        measures = [ref for ref, role in idea.operand_roles if is_measure_need_role(role)]
+        assert len(measures) <= 1, (
+            f"{idea.name} combines {len(measures)} declared measures ({measures}) yet the headline "
+            "above records no unit question — the check has been silently cleared")

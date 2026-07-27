@@ -51,7 +51,14 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     dispositions fire (without it they silently no-op and GRAIN_IS_UNIQUE / JOIN_CONNECTIVITY are
     dropped from the persisted requirements — the whole-branch-review Critical). `roles` is the
     confirming actor's read-scope for the join-authority disposition; the default () preserves the
-    draft/refine loop's existing behavior."""
+    draft/refine loop's existing behavior.
+
+    E4b — the draft's `operand_roles` ride along for the SAME reason `grain_table` does: without them
+    a recipe feature shown as DESIGN_CHECKED at Gate #1 would be re-validated here against the E4a
+    structural rule alone and recorded NEEDS_EXTERNAL_VALIDATION with a unit question on a timestamp.
+    That does not block the confirm, but the governed artifact would contradict the review screen —
+    unacceptable in an audit trail. They are template-declared and server-carried; a draft that has
+    none falls back to the E4a rule, which is what every LLM candidate does at both stages."""
     raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation,
            "grain_table": draft.grain_table}
     known = _live_columns(conn, draft.derives_from)   # LIVE graph, not set(draft.derives_from) (B2)
@@ -59,7 +66,7 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     for cs, ref in draft.derives_pairs:
         src_of.setdefault(ref, set()).add(cs)
     idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
-                                  roles=roles)
+                                  roles=roles, operand_roles=draft.operand_roles)
     if idea is None:
         return MinimumCheck(ok=False, reasons=[reason.message],
                             validation_status="REJECTED", requirements=())

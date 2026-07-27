@@ -456,14 +456,17 @@ _TXN, _BAL = "public.fin_tran.txn_amt", "public.fin_tran.bal_amt"
 
 
 def _e4a_catalog(db, *, txn_unit="", txn_ccy="", bal_unit="", bal_ccy="", asof_unit=""):
-    """A catalog shaped like the real FTR sample: a grain key, a point-in-time anchor and two
-    monetary measures. The grain / as-of columns are BOUND OPERANDS of every windowed template
-    candidate, which is exactly why they used to be asked for a unit."""
+    """A catalog shaped like the real FTR sample: a grain key, a point-in-time anchor, two monetary
+    measures and two RIDE-ALONG operands (an account key and an event timestamp). The grain / as-of
+    columns are BOUND OPERANDS of every windowed template candidate, which is exactly why they used
+    to be asked for a unit; ``acct_id`` / ``txn_ts`` are the second-operand riders E4b addresses."""
     build_graph(db, _E4A, [
         CanonicalRow(_E4A, "fin_tran", "cif_id", "varchar", is_grain=True),
         CanonicalRow(_E4A, "fin_tran", "as_of_dt", "date", as_of=True, unit=asof_unit),
         CanonicalRow(_E4A, "fin_tran", "txn_amt", "numeric", unit=txn_unit, currency=txn_ccy),
-        CanonicalRow(_E4A, "fin_tran", "bal_amt", "numeric", unit=bal_unit, currency=bal_ccy)])
+        CanonicalRow(_E4A, "fin_tran", "bal_amt", "numeric", unit=bal_unit, currency=bal_ccy),
+        CanonicalRow(_E4A, "fin_tran", "acct_id", "varchar"),
+        CanonicalRow(_E4A, "fin_tran", "txn_ts", "timestamp")])
     _fresh(db, _E4A)
 
 
@@ -538,6 +541,178 @@ def test_a_declared_unit_on_the_time_anchor_still_hard_rejects_a_contradiction(d
     _e4a_catalog(db, asof_unit="days", txn_unit="dollars")
     idea, rej = _e4a_idea(db, [_TXN, _CIF, _ASOF], "avg_30d")
     assert idea is None and rej.code == RejectCode.MIXED_UNITS
+
+
+# ── E4b: ask for a unit only where a unit can EXIST (the TEMPLATE-DECLARED operand role) ──────────
+# E4a narrowed the check structurally; what remained were operands like `setl_stat` / `acct_id` /
+# `txn_ts` bound as a SECOND operand, so `len(measures) >= 2` tripped and the check fired on a column
+# that can never carry a unit. The fix reads the role the RECIPE AUTHOR declared for each bound
+# operand (`Need.role`, hand-written and versioned in the repo) and resolves it through the SAME
+# typed `JoinRole` machinery `need_metadata` already derives. A concept-based shortcut stays REFUSED:
+# concepts are AI-proposed, and one wrong concept would wave a real dollars-vs-fils mismatch through.
+_ACCT, _TS = "public.fin_tran.acct_id", "public.fin_tran.txn_ts"
+
+# The recipe corpus' own binding-slot names for these operands (see `templates.py` — `entity` /
+# `asof` / `event_ts` / `account` / `flow_col` / `stock_col` are all authored roles).
+_ROLE_OF = {_TXN: "flow_col", _BAL: "stock_col", _CIF: "entity", _ASOF: "asof",
+            _ACCT: "account", _TS: "event_ts"}
+
+
+def _declared(*refs) -> tuple[tuple[str, str], ...]:
+    """The `(object_ref, role)` pairs a grounded template carries for these operands."""
+    return tuple(sorted((ref, _ROLE_OF[ref]) for ref in refs))
+
+
+def _e4b_idea(db, refs, aggregation, operand_roles=()):
+    known, src_of = _kv(refs, _E4A)
+    raw = {"name": "f", "derives_from": list(refs), "aggregation": aggregation,
+           "grain_table": "fin_tran"}
+    return _validate_idea(db, raw, known, src_of, None, NOW, FRESH,
+                          operand_roles=operand_roles)
+
+
+def test_the_measure_predicate_is_derived_from_the_typed_join_role_machinery():
+    """The measure question is answered by `need_metadata`'s resolved `JoinRole` — the same typed
+    mapping the 3B planner reads — never by a hard-coded string list. Pinned two ways: it must AGREE
+    with the corpus' own derivation for every authored role, and it must FAIL TOWARD ASKING for a
+    role this build does not declare (an unknown declaration must never SKIP a unit check)."""
+    from featuregen.overlay.upload.binding_roles import JoinRole
+    from featuregen.overlay.upload.need_metadata import (
+        RESOLVED_NEED_METADATA,
+        is_measure_need_role,
+    )
+    seen = 0
+    for metas in RESOLVED_NEED_METADATA.values():
+        for meta in metas:
+            seen += 1
+            assert is_measure_need_role(meta.role) is (meta.join_role is JoinRole.MEASURE), (
+                f"{meta.role!r} disagrees with its resolved join_role {meta.join_role}")
+    assert seen > 100, "the recipe corpus did not resolve — the derivation proves nothing"
+    assert is_measure_need_role("no_such_authored_role") is True   # absent ⇒ ASK
+
+
+def test_a_declared_key_or_time_operand_is_no_longer_asked_for_a_unit(db):
+    """THE FIX. `acct_id` / `txn_ts` ride along as second operands of a windowed count. The template
+    declares them `account` / `event_ts` — a key and a timestamp, which can never carry a unit — so
+    only `txn_amt` counts as a measure, there is nothing to MIX, and no question is asked.
+
+    The same feature WITHOUT roles (an LLM candidate) still asks for all three: the delta is the
+    declaration, and nothing else."""
+    _e4a_catalog(db)
+    refs = [_TXN, _ACCT, _TS]
+    with_roles, rej = _e4b_idea(db, refs, "count_30d", _declared(*refs))
+    assert rej is None
+    assert _unit_asks(with_roles) == set()
+    without, rej2 = _e4b_idea(db, refs, "count_30d")
+    assert rej2 is None
+    assert _unit_asks(without) == {(code, ref) for ref in refs
+                                   for code in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT")}
+
+
+def test_two_declared_MEASURE_operands_still_demand_the_unit_ANTI_SILENT_CLEAR(db):
+    """THE ANTI-SILENT-CLEAR GUARD FOR ROLES — this test must FAIL if anyone widens the exclusion.
+
+    Two operands the template DECLARES as measures (`flow_col` + `stock_col`), one of which declares
+    no unit, still mint UNIT_CONSISTENT and CURRENCY_CONSISTENT for that measure — even with two
+    ride-along non-measure operands bound alongside. A declared measure missing a unit is ALWAYS
+    asked; the role only ever removes the unanswerable questions."""
+    _e4a_catalog(db, txn_unit="dollars", txn_ccy="AED")   # bal_amt declares NOTHING
+    refs = [_TXN, _BAL, _ACCT, _TS]
+    idea, rej = _e4b_idea(db, refs, "count_30d", _declared(*refs))
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert _unit_asks(idea) == {("UNIT_CONSISTENT", _BAL), ("CURRENCY_CONSISTENT", _BAL)}
+
+
+def test_an_llm_proposed_candidate_with_no_roles_is_byte_identical_to_today(db):
+    """LLM candidates carry NO template roles, and `_validate_idea` is shared. An empty declaration
+    means "nothing was declared", NEVER "there are no measures": the E4a structural rule runs
+    unchanged, and passing `operand_roles=()` explicitly is indistinguishable from not passing it."""
+    _e4a_catalog(db)
+    refs = [_TXN, _BAL, _ACCT, _TS]
+    known, src_of = _kv(refs, _E4A)
+    raw = {"name": "f", "derives_from": list(refs), "aggregation": "count_30d",
+           "grain_table": "fin_tran"}
+    today, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    explicit, rej2 = _validate_idea(db, raw, known, src_of, None, NOW, FRESH, operand_roles=())
+    assert rej is None and rej2 is None
+    assert today == explicit
+    assert today.operand_roles == ()
+    # ...and it is still asked about every operand, exactly as before this change
+    assert _unit_asks(today) == {(code, ref) for ref in refs
+                                 for code in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT")}
+
+
+def test_a_template_declaring_no_roles_falls_back_to_the_e4a_structural_rule(db):
+    """A recipe whose grounding resolved no operand role is in the SAME position as the LLM: the
+    fallback is E4a's structural rule (measure count, grain/time excluded), never a skip."""
+    _e4a_catalog(db)
+    refs = [_TXN, _BAL, _CIF, _ASOF]
+    fallback, rej = _e4b_idea(db, refs, "ratio_30d", ())
+    e4a, rej2 = _e4a_idea(db, refs, "ratio_30d")
+    assert rej is None and rej2 is None
+    assert fallback == e4a
+    assert _unit_asks(fallback) == {("UNIT_CONSISTENT", _TXN), ("UNIT_CONSISTENT", _BAL),
+                                    ("CURRENCY_CONSISTENT", _TXN), ("CURRENCY_CONSISTENT", _BAL)}
+
+
+def test_mixed_units_still_hard_reject_with_roles_declared(db):
+    """The role narrows only the "unit unknown" QUESTION. MIXED_UNITS still scans EVERY derive — the
+    declared key and the declared timestamp included — so a positive contradiction anywhere still
+    rejects outright."""
+    _e4a_catalog(db, txn_unit="dollars", bal_unit="fils")
+    refs = [_TXN, _BAL, _ACCT, _TS]
+    idea, rej = _e4b_idea(db, refs, "count_30d", _declared(*refs))
+    assert idea is None and rej.code == RejectCode.MIXED_UNITS
+
+
+def test_mixed_currency_still_hard_rejects_with_roles_declared(db):
+    _e4a_catalog(db, txn_ccy="AED", bal_ccy="USD")
+    refs = [_TXN, _BAL, _ACCT, _TS]
+    idea, rej = _e4b_idea(db, refs, "count_30d", _declared(*refs))
+    assert idea is None and rej.code == RejectCode.MIXED_CURRENCY
+
+
+def test_a_contradiction_on_a_declared_NON_measure_operand_still_hard_rejects(db):
+    """Sharper still: the contradiction is between a MEASURE and the declared as-of anchor — an
+    operand the role rule excludes from the QUESTION. It must still hard-reject, because a declared
+    unit mismatch is a fact, not a question."""
+    _e4a_catalog(db, asof_unit="days", txn_unit="dollars")
+    refs = [_TXN, _ASOF]
+    idea, rej = _e4b_idea(db, refs, "count_30d", _declared(*refs))
+    assert idea is None and rej.code == RejectCode.MIXED_UNITS
+
+
+def test_gate1_and_the_confirm_time_mcv_reach_the_SAME_verdict(db):
+    """STAGE AGREEMENT — the governed artifact must not contradict what the human was shown.
+
+    `contract/review.validate_minimum` re-runs the SAME gauntlet from a `ContractDraft` at
+    `confirm_contract`. Without the roles on the draft, a feature shown as DESIGN_CHECKED at Gate #1
+    would be recorded NEEDS_EXTERNAL_VALIDATION with a UNIT_CONSISTENT on `txn_ts` — it does not
+    block, but the audit trail would disagree with the review screen. The roles are threaded onto the
+    draft (server-side only, never from the client body), so both stages agree."""
+    from featuregen.overlay.upload.contract.author import ContractDraft
+    from featuregen.overlay.upload.contract.review import validate_minimum
+    _e4a_catalog(db)
+    refs = [_TXN, _ACCT, _TS]
+    roles = _declared(*refs)
+    gate1, rej = _e4b_idea(db, refs, "count_30d", roles)
+    assert rej is None
+    draft = ContractDraft(
+        feature_name="f", definition="d", grain_table="fin_tran", aggregation="count_30d",
+        as_of_column="as_of_dt", derives_from=list(refs),
+        derives_pairs=tuple((_E4A, ref) for ref in refs), operand_roles=roles)
+    mcv = validate_minimum(db, draft, now=NOW)
+    assert mcv.ok
+    assert mcv.validation_status == gate1.validation_status
+    assert {(r.code, r.operand) for r in mcv.requirements} == {
+        (r.code, r.operand) for r in gate1.requirements}
+    # ...and the agreement is REAL, not two identical fallbacks: a draft with NO roles diverges,
+    # which is exactly the defect this threading closes.
+    from dataclasses import replace as _replace
+    bare = validate_minimum(db, _replace(draft, operand_roles=()), now=NOW)
+    assert {(r.code, r.operand) for r in bare.requirements} != {
+        (r.code, r.operand) for r in gate1.requirements}
 
 
 def _two_table(db, *, fact_key=None, status=None, acct_sensitivity=None):

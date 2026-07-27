@@ -1071,9 +1071,16 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # honest confirm can never be derailed and a tampered as_of is simply ignored (like grain_table).
     _catalogs = {cs for cs, _ref in chosen.derives_pairs}
     _grain_catalog = next(iter(_catalogs)) if len(_catalogs) == 1 else None
+    # E4b: `operand_roles` joins the same server-authoritative overwrite. The confirm-time MCV re-runs
+    # the gauntlet from this draft, and the unit/currency needs-check is now role-aware, so without
+    # them the GOVERNED contract would record NEEDS_EXTERNAL_VALIDATION for a feature Gate #1 showed as
+    # DESIGN_CHECKED. They are taken ONLY from the server-reconstructed chosen candidate (restored from
+    # the revision's private grounding context) — `DraftIn` has no such field, so a client can never
+    # declare a role and suppress a unit check.
     draft = replace(draft, grain_table=chosen.grain_table,
                     derives_from=list(chosen.derives_from),
-                    as_of_column=_as_of_column(conn, chosen.grain_table, _grain_catalog))
+                    as_of_column=_as_of_column(conn, chosen.grain_table, _grain_catalog),
+                    operand_roles=chosen.operand_roles)
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
     # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The

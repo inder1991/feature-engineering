@@ -136,6 +136,36 @@ RESOLVED_NEED_METADATA: Mapping[str, tuple[ResolvedNeedMetadataV1, ...]] = Mappi
     {t.id: derive_need_metadata(t) for t in ALL_TEMPLATES})
 
 
+# ── the TYPED measure predicate ───────────────────────────────────────────────────────────────────
+# A recipe's ``Need.role`` is a hand-authored binding-slot NAME ("stock_col", "entity", "event_ts");
+# ``JoinRole`` is the GOVERNED vocabulary that says what the slot CONTRIBUTES. ``_derive_one`` already
+# resolves every need to one (the explicit ``Need.join_role`` first, then the concept registry, then the
+# template default), so "can this operand carry a unit?" is answered by the SAME typed machinery the
+# 3B planner reads — never a hard-coded string list, a concept guess or a column-name heuristic.
+_JOIN_ROLES_BY_NEED_ROLE: Mapping[str, frozenset[JoinRole]] = MappingProxyType({
+    role: frozenset(
+        meta.join_role
+        for metas in RESOLVED_NEED_METADATA.values() for meta in metas
+        if meta.role == role)
+    for role in {meta.role for metas in RESOLVED_NEED_METADATA.values() for meta in metas}})
+
+
+def is_measure_need_role(role: str) -> bool:
+    """Does the recipe corpus resolve this binding-slot ``role`` to a ``JoinRole.MEASURE`` — a value
+    that can carry a unit or a currency?
+
+    Read off :data:`RESOLVED_NEED_METADATA`, the corpus-wide resolution of the typed join role, so the
+    answer moves with the recipe library rather than with a duplicated list of role names.
+
+    **Fails toward ASKING.** A role this build does not declare, or one the corpus resolves to more
+    than one ``JoinRole``, returns ``True``: an unknown or ambiguous declaration must never SKIP a
+    unit check. Only an unambiguous non-measure declaration returns ``False``."""
+    resolved = _JOIN_ROLES_BY_NEED_ROLE.get(role)
+    if resolved is None or len(resolved) != 1:
+        return True
+    return next(iter(resolved)) is JoinRole.MEASURE
+
+
 def derivation_report() -> tuple[dict[str, object], ...]:
     """One row per (template, need): the resolved fields + where each came from — for inspection/audit."""
     return tuple(

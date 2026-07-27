@@ -41,6 +41,7 @@ from featuregen.overlay.upload.join_path import (
     classify_join_path,
     find_join_path,
 )
+from featuregen.overlay.upload.need_metadata import is_measure_need_role
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
@@ -649,12 +650,18 @@ def _ai_suggestion(conn, logical_ref: str, field_name: str) -> str | None:
 
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
                    target_ref: str | None, now: datetime | None, fresh_within: timedelta,
-                   *, roles: Iterable[str] = ()):
+                   *, roles: Iterable[str] = (),
+                   operand_roles: tuple[tuple[str, str], ...] = ()):
     """The deterministic TRI-STATE gauntlet (spec §2). Returns (FeatureIdea, None) for DESIGN_CHECKED
     or NEEDS_EXTERNAL_VALIDATION — the returned idea carries validation_status + typed requirements +
     resolved operands — or (None, Rejection) for REJECTED (deterministically invalid / unauthorized).
     `roles` gates cross-table join authority (a read-scope-DENIED hop rejects). `src_of` maps
-    object_ref -> the candidate catalog source(s), used to resolve each derive's catalog (B3)."""
+    object_ref -> the candidate catalog source(s), used to resolve each derive's catalog (B3).
+
+    `operand_roles` is the `(object_ref, role)` map the TEMPLATE declared for this candidate's bound
+    operands (empty for an LLM-proposed candidate, which declares none). It narrows ONE thing — which
+    operands the unit/currency needs-check may ask about — and an EMPTY map means "nothing declared",
+    never "no measures": the E4a structural rule then runs exactly as before."""
     derives = _ground_refs(raw.get("derives_from", []), known)
     if not derives:
         return None, Rejection(RejectCode.UNGROUNDED, "ungrounded")
@@ -811,7 +818,21 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     )
 
     structural = {op for op in (grain_operand, time_operand) if op is not None}
-    measures = [p for p in pairs if p not in structural]
+    # E4b — the THIRD narrowing, and the only one that is not structural: the role the TEMPLATE AUTHOR
+    # DECLARED for each bound operand. `setl_stat` / `acct_id` / `txn_ts` ride along as SECOND operands,
+    # so the measure count above still trips and the check fires on a column that can never carry a
+    # unit. `Need.role` is hand-written in the recipe library and versioned in this repo, and
+    # `need_metadata` already resolves it to a typed `JoinRole` — so `is_measure_need_role` asks the
+    # governed machinery, not a duplicated string list. This is emphatically NOT a concept-based rule:
+    # concepts are AI-PROPOSED, and one wrong concept would wave a real dollars-vs-fils mismatch
+    # through. FAIL TOWARD ASKING at every step — an operand is excluded ONLY when the template
+    # declared a role for it AND every role it declared resolves to a non-measure. An operand with no
+    # declaration (and therefore an idea with NO declarations at all — every LLM candidate) is a
+    # measure, so the E4a rule below is reached unchanged.
+    declared_measures = {ref for ref, role in operand_roles if is_measure_need_role(role)}
+    declared_non_measures = {ref for ref, _role in operand_roles} - declared_measures
+    measures = [p for p in pairs
+                if p not in structural and p[1] not in declared_non_measures]
     if len(measures) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
         for src, d in measures:
             if not meta[d]["unit"]:

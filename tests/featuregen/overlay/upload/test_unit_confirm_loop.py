@@ -3,7 +3,9 @@
 The loop the two earlier tasks left open:
 
 * T1 narrowed ``UNIT_CONSISTENT`` / ``CURRENCY_CONSISTENT`` to the operands where units can actually
-  mix (DESIGN_CHECKED 0 -> 5 of 10);
+  mix (DESIGN_CHECKED 0 -> 5 of 10; E4b's operand roles later took it to 10 of 10 by dropping the
+  ride-along key/timestamp operands, so the FTR measurements below are re-recorded against a
+  two-declared-MEASURE probe — the case the check actually exists for);
 * T2 made the LLM PROPOSE a unit as ``llm/proposed`` **evidence** — deliberately inert: it never
   reaches ``graph_node.unit``, the only column the gauntlet reads, so it cannot clear the check.
 
@@ -327,6 +329,26 @@ def _requirement_operands(conn) -> Counter:
                    for s in _cards(conn) for r in s["requirements"])
 
 
+def _two_measure_probe(conn) -> Counter:
+    """The gauntlet over a feature that genuinely COMBINES this table's two monetary measures.
+
+    Since E4b every RECIPE candidate this FTR sample grounds binds at most ONE declared measure, so
+    the suggestion path asks no unit question here at all — correctly, since a lone measure cannot
+    mix. That is a fact about the sample, not about the safety rule, so the claims below are asserted
+    where the rule genuinely applies: two operands the recipe corpus DECLARES as measures
+    (``flow_col`` / ``stock_col``). The role rule therefore cannot be the reason a question fires or
+    does not — the only variable left is the unit evidence itself."""
+    refs = [f"public.{TABLE}.txn_amt", f"public.{TABLE}.cust_hold"]
+    idea, rej = _validate_idea(
+        conn, {"name": "txn_over_hold", "derives_from": refs, "aggregation": "ratio_30d",
+               "grain_table": TABLE},
+        set(refs), {ref: {SOURCE} for ref in refs}, None, NOW, FRESH,
+        operand_roles=((refs[0], "flow_col"), (refs[1], "stock_col")))
+    assert rej is None, f"the two-measure probe was rejected outright: {rej and rej.code}"
+    return Counter(f"{r.code}@{r.operand[-1].rsplit('.', 1)[-1]}" for r in idea.requirements
+                   if r.code in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT"))
+
+
 def _confirm_ai_measure_annotation(conn, column: str, field: str) -> dict:
     """A human confirms the AI's proposal for ONE measure annotation through the REAL generic
     field-correction command — the same path the ``/catalog/assets/.../fields/{field}/decisions``
@@ -359,7 +381,7 @@ def test_an_ai_proposed_unit_alone_still_does_not_clear_the_check(overlay_conn, 
         (SOURCE, f"public.{TABLE}.txn_amt")).fetchone()
     assert node == (None, None), f"an llm/proposed value reached graph_node: {node}"
 
-    reqs = _requirement_operands(overlay_conn)
+    reqs = _two_measure_probe(overlay_conn)
     assert reqs["UNIT_CONSISTENT@txn_amt"] > 0, (
         "an llm/proposed unit CLEARED UNIT_CONSISTENT — an AI guess now certifies unit safety")
     assert reqs["CURRENCY_CONSISTENT@txn_amt"] > 0
@@ -372,20 +394,21 @@ def test_a_human_confirm_of_the_ai_unit_clears_the_requirement(overlay_conn, ai_
     the HUMAN/CONFIRMED value PROJECTS into ``graph_node.unit``/``.currency`` (the only columns the
     gauntlet reads), and every requirement on those operands CLEARS.
 
-    MEASURED on the real FTR sample (run with ``-s``): **8 of the 22 unit/currency questions are
-    answered** by four one-click confirms — every question on a genuine MEASURE (``txn_amt``,
-    ``cust_hold``) disappears. **DESIGN_CHECKED does NOT move (5 of 10)**, and the reason is
-    diagnostic, not a defect in this loop: each of the 5 remaining cards ALSO carries a question on
-    ``txn_ts`` / ``acct_id`` / ``setl_stat`` — an event timestamp, an identifier and a status flag
-    that RIDE ALONG as a second operand. T1 narrowed the check structurally (grain + time anchor
-    excluded, measure count gated) but a ride-along non-measure operand is still counted as a
-    measure, and the AI is correctly never asked for the unit of one. Closing that last gap needs
-    real operand ROLES on the Need->derives_from path — see the T3 report.
+    **Re-recorded after E4b (operand roles).** The ride-along ceiling this test used to measure is
+    GONE: an operand whose TEMPLATE-DECLARED role is a key or a timestamp is no longer counted as a
+    measure, so ``txn_ts`` / ``acct_id`` / ``setl_stat`` are never asked and every card on this
+    sample already sits at DESIGN_CHECKED — **22 -> 0 questions, DESIGN_CHECKED 5 -> 10 of 10**,
+    before this loop runs at all.
 
-    The numbers are PINNED (not bounded) so any movement in either direction is a visible edit."""
+    That leaves nothing for the confirm to clear ON THE CARDS, so the loop is measured where the
+    question genuinely exists: a two-DECLARED-MEASURE probe over the SAME catalog goes from
+    NEEDS_EXTERNAL_VALIDATION (unit + currency unknown on both measures) to DESIGN_CHECKED (no
+    requirement left) across the four one-click confirms. The card-level counts are still pinned
+    (not bounded) so any movement in either direction is a visible edit."""
     before = _status_counts(overlay_conn)
     before_reqs = _requirement_operands(overlay_conn)
-    assert before_reqs["UNIT_CONSISTENT@txn_amt"] > 0
+    before_probe = _two_measure_probe(overlay_conn)
+    assert before_probe["UNIT_CONSISTENT@txn_amt"] > 0
 
     confirms = 0
     for column in (c.lower() for c in _MEASURES):
@@ -411,28 +434,29 @@ def test_a_human_confirm_of_the_ai_unit_clears_the_requirement(overlay_conn, ai_
           f"\n  questions {sum(before_reqs.values())} -> {sum(after_reqs.values())}"
           f"\n  before: {dict(before_reqs)}\n  after:  {dict(after_reqs)}")
 
-    # the loop itself: every question on a confirmed MEASURE is gone
-    for column in ("txn_amt", "cust_hold"):
-        assert not after_reqs[f"UNIT_CONSISTENT@{column}"], (
-            f"the human confirm did not clear UNIT_CONSISTENT@{column} — the loop is still open")
-        assert not after_reqs[f"CURRENCY_CONSISTENT@{column}"], column
-    assert sum(before_reqs.values()) == 22 and sum(after_reqs.values()) == 14, (
-        f"re-measure the E4a T3 headline: {sum(before_reqs.values())} -> "
-        f"{sum(after_reqs.values())}")
+    # THE LOOP ITSELF, measured where the question genuinely exists: the two-declared-measure probe
+    # asked for four things before the confirms and asks for nothing after.
+    after_probe = _two_measure_probe(overlay_conn)
+    assert set(before_probe) == {"UNIT_CONSISTENT@txn_amt", "CURRENCY_CONSISTENT@txn_amt",
+                                 "UNIT_CONSISTENT@cust_hold", "CURRENCY_CONSISTENT@cust_hold"}, (
+        f"re-measure: the probe's open questions changed ({dict(before_probe)})")
+    assert dict(after_probe) == {}, (
+        f"the human confirm did not clear the probe's unit questions — the loop is still open: "
+        f"{dict(after_probe)}")
 
-    # ...and the honest ceiling: the survivors all name a RIDE-ALONG non-measure operand, which is
-    # why the tri-state count does not move on THIS sample (see the docstring).
-    assert dict(before) == {"NEEDS_EXTERNAL_VALIDATION": 5, "DESIGN_CHECKED": 5}
-    assert dict(after) == {"NEEDS_EXTERNAL_VALIDATION": 5, "DESIGN_CHECKED": 5}
-    assert {op.split("@")[1] for op in after_reqs} == {"txn_ts", "acct_id", "setl_stat"}, (
-        f"a MEASURE still carries an unanswered unit question: {dict(after_reqs)}")
+    # ...and the card-level ceiling E4b removed: nothing on this sample is asked at all any more, so
+    # the tri-state is already at its terminal state before AND after the confirm.
+    assert sum(before_reqs.values()) == 0 and sum(after_reqs.values()) == 0, (
+        f"re-measure the headline: {sum(before_reqs.values())} -> {sum(after_reqs.values())}")
+    assert dict(before) == {"DESIGN_CHECKED": 10}
+    assert dict(after) == {"DESIGN_CHECKED": 10}
 
 
 def test_confirming_the_ai_unit_takes_a_feature_all_the_way_to_design_checked(db):
     """(b) THE TERMINAL STATE, proven where the operands are all genuine MEASURES. Two measure
     columns, an AI unit + currency proposal on each, a human confirm on each — and the feature
-    lands on ``DESIGN_CHECKED`` with NO requirements left. This is the loop's payoff isolated from
-    the FTR sample's ride-along-operand ceiling measured above."""
+    lands on ``DESIGN_CHECKED`` with NO requirements left — the loop's payoff on a purpose-built
+    catalog, independent of whatever the FTR sample happens to ground."""
     refs = _mini_catalog(db, units={"txn_amt": "AED", "fee_amt": "AED"})
 
     def _idea():

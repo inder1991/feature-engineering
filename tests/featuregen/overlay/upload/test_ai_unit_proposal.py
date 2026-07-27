@@ -39,6 +39,7 @@ from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_evidence import read_active_field_evidence, record_field_evidence
 from featuregen.overlay.upload.canonical import validate_rows
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.feature_assist import _validate_idea
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.ingest import ingest_upload
@@ -249,6 +250,26 @@ def _requirements(conn) -> Counter:
                    for g in out["groups"] for s in g["suggestions"] for r in s["requirements"])
 
 
+def _two_measure_requirements(conn) -> Counter:
+    """The gauntlet run over a feature that genuinely COMBINES this table's two monetary measures.
+
+    Every RECIPE candidate this FTR sample grounds binds at most ONE declared measure, so since E4b
+    the suggestion path asks no unit question here at all — correctly, since a lone measure cannot
+    mix and the result simply inherits its unit. That is a statement about the sample, not about the
+    safety rule, so this asks the gauntlet directly with two operands the recipe corpus DECLARES as
+    measures (``flow_col`` / ``stock_col``) — the case ``UNIT_CONSISTENT`` exists for, and the only
+    case in which an AI guess could do harm."""
+    refs = [f"public.{TABLE}.txn_amt", f"public.{TABLE}.bal_amt"]
+    idea, rej = _validate_idea(
+        conn,
+        {"name": "txn_over_bal", "derives_from": refs, "aggregation": "ratio_30d",
+         "grain_table": TABLE},
+        set(refs), {ref: {SOURCE} for ref in refs}, None, NOW, timedelta(hours=24),
+        operand_roles=((refs[0], "flow_col"), (refs[1], "stock_col")))
+    assert rej is None, f"the two-measure probe was rejected outright: {rej and rej.code}"
+    return Counter(f"{r.code}@{r.operand[-1].rsplit('.', 1)[-1]}" for r in idea.requirements)
+
+
 def test_an_ai_proposed_unit_does_not_clear_the_unit_consistent_safety_check(overlay_conn,
                                                                             ai_unit_catalog):
     """THE LOAD-BEARING SAFETY TEST — an AI GUESS MUST NOT CLEAR A SAFETY CHECK.
@@ -259,9 +280,10 @@ def test_an_ai_proposed_unit_does_not_clear_the_unit_consistent_safety_check(ove
 
     If this test ever goes green because the requirement vanished, an unreviewed model guess is
     silently certifying that two measures are unit-compatible — the exact failure the E4a design
-    exists to make impossible."""
+    exists to make impossible. The operands are DECLARED measures, so E4b's role rule cannot be the
+    reason the check fires or does not: the only variable left is the AI's proposal."""
     _confirm_ai_table_facts(overlay_conn)
-    reqs = _requirements(overlay_conn)
+    reqs = _two_measure_requirements(overlay_conn)
 
     assert _ai(overlay_conn, _ref("txn_amt"), "unit"), "no AI proposal — nothing is being tested"
     assert reqs["UNIT_CONSISTENT@txn_amt"] > 0, (

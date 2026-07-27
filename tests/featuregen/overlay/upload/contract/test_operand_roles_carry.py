@@ -190,8 +190,10 @@ def test_operand_roles_are_deliberately_off_every_wire_shape():
       * Both consumers of the role run IN PROCESS at generation time (``_template_candidates`` ->
         ``_validate_idea``), where the grounded feature is in hand — no serializer sits between them.
 
-    Putting it on the wire is therefore a separate, deliberately-hashed change if a confirm-time
-    consumer ever needs it (see the task report).
+    The confirm-time consumer that arrived in Task 2 did NOT need this decision reopened: the
+    private considered revision already persists the same per-role column bindings under
+    ``recipe_grounding_context_by_candidate_key``, so the roles are re-derived from state that is
+    already there and already hash-sealed (see the round-trip tests below).
     """
     from featuregen.api.feature_serialize import (
         serialize_feature_idea_v1,
@@ -209,3 +211,60 @@ def test_operand_roles_are_deliberately_off_every_wire_shape():
         emitted = shape(with_roles)
         assert "operand_roles" not in emitted
         assert emitted == shape(without)
+
+
+# ── Task 2: the roles are RESTORED at reload, from state that is already persisted ────────────────
+# The confirm-time MCV (``review.validate_minimum``) re-runs the SAME gauntlet from a ContractDraft.
+# Once the unit check is role-aware, a draft with no roles would be re-validated against the E4a rule
+# alone and the GOVERNED contract would record NEEDS_EXTERNAL_VALIDATION for a feature Gate #1 showed
+# as DESIGN_CHECKED. Rather than put the roles on the (hashed) wire, they are re-derived at reload
+# from the private revision's recipe grounding context — already persisted, already hash-sealed.
+def test_the_persisted_grounding_context_carries_the_same_pairs_as_the_grounded_feature(db):
+    """THE EQUIVALENCE THE RESTORE RESTS ON. ``GroundedNeedBinding`` (persisted in the revision) and
+    ``GroundedNeedResolution`` (the Gate-1 source) are two projections of the SAME grounding, so the
+    ``(object_ref, role)`` pairs derived from the persisted JSON must equal ``_operand_roles(gf)``
+    exactly. If they ever diverge, Gate #1 and the confirm would silently judge different operands."""
+    from featuregen.overlay.upload.contract.gate1 import (
+        _operand_roles,
+        _operand_roles_from_revision,
+    )
+    from featuregen.overlay.upload.recipe_grounding_context import (
+        build_recipe_grounding_context,
+    )
+    _churn_catalog(db)
+    template = next(t for t in RETAIL_CHURN_TEMPLATES if t.id == "balance_trend")
+    gf = ground_template(db, template, catalog_source=CHURN_SOURCE)
+    assert gf is not None
+    context = build_recipe_grounding_context(template, gf)
+    considered = {
+        "options_by_id": {"opt_x": {"recipe_candidate_key": context.recipe_candidate_key}},
+        "recipe_grounding_context_by_candidate_key": {
+            context.recipe_candidate_key: context.to_json()},
+        "recipe_candidate_keys_by_recipe_id": {template.id: [context.recipe_candidate_key]},
+    }
+    idea = _idea_from_grounded(gf, template)
+    assert idea.operand_roles == _operand_roles(gf)
+    # restored by exact option id ...
+    restored = _operand_roles_from_revision(
+        considered, gate1.replace(idea, operand_roles=()), option_id="opt_x")
+    assert restored.operand_roles == idea.operand_roles
+    # ... and by recipe id, for the reader that has no option id (the legacy draft-choice path)
+    by_recipe = _operand_roles_from_revision(
+        considered, gate1.replace(idea, operand_roles=(), recipe_id=template.id))
+    assert by_recipe.operand_roles == idea.operand_roles
+
+
+def test_a_candidate_with_no_grounding_context_keeps_its_empty_roles():
+    """An LLM candidate, a pre-E4b revision, or a recipe that contributed two candidates (ambiguous
+    key) all resolve to NO context. The idea is returned untouched — empty roles, which the gauntlet
+    reads as "nothing declared" and answers with the E4a structural rule. Never a guess."""
+    from featuregen.overlay.upload.contract.gate1 import _operand_roles_from_revision
+    idea = gate1.replace(_idea_from_grounded(_GF, _TMPL), operand_roles=())
+    assert _operand_roles_from_revision({}, idea, option_id="opt_x").operand_roles == ()
+    ambiguous = {"recipe_candidate_keys_by_recipe_id": {"sum_balance": ["k1", "k2"]},
+                 "recipe_grounding_context_by_candidate_key": {
+                     "k1": {"need_bindings": [
+                         {"role": "stock_col", "graph_object_ref": "public.loans.balance"}]}}}
+    assert _operand_roles_from_revision(
+        ambiguous, gate1.replace(idea, recipe_id="sum_balance")).operand_roles == ()
+    assert _operand_roles_from_revision({}, None) is None
