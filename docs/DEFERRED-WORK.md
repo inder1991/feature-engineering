@@ -155,6 +155,13 @@ in place.
 | 🟡 **No code for "formula grain entity ≠ population entity"** | Task 7 used `GRAIN_PATH_NOT_GOVERNED`, which does not name the real condition. §14 has no member for it. | When the message matters to a requester, or when the two conditions need different fixes. |
 | 🟡 **§1.3 and §2 disagree on where the spine lives** | §1.3 passes `irs` and `spine` separately; §2 puts the spine inside the IR. Disagreement between them is unspecified, so Task 7 raises `ValueError` — which is also the only place §4's "declared once per contract" is actually enforceable, since `compile_ir` validates per feature. | Resolve when the orchestrator (T15/T17) wires the real call. |
 
+### A.7 Working assumptions recorded to unblock (2026-07-27)
+
+| Assumption | Why it is an assumption | Revisit when |
+|---|---|---|
+| 🟡 **Every catalog row is `source_type=edp`, `source=hive`** | Supplied to unblock compile-side work, not verified against a real file. The sample CSV is expected to carry both columns with those values throughout. Spec A builds the cross-engine refusal (`SOURCE_ENGINE_UNSUPPORTED`) regardless, and a **blank** engine refuses rather than defaulting to hive — so an Oracle row appearing later is refused loudly, not mis-read. | The real CSV lands. Check: is `source` per-column or per-table, and is it populated on every row? |
+| 🟡 **`conf/environments/hdfc-local-inventory.yml` is a stub** | Engine block filled from the assumption above; `tables`, `engine_versions` and every physical layout field are `null`/empty and must come from the metastore. Unknown layout **refuses** (`PARTITION_IDENTITY_UNKNOWN`, `PHYSICAL_SCHEMA_NOT_RESOLVED`); nothing defaults. | Task 0 runs against the live cluster. |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |

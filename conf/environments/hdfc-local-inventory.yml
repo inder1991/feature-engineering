@@ -1,0 +1,32 @@
+# Spec A §0 — target-cluster inventory (TYPED input; the Markdown record is for humans).
+#
+# STATUS: WORKING ASSUMPTIONS, NOT VERIFIED FACTS.
+# The engine block below was supplied to unblock compile-side work (2026-07-27):
+# "assume the sample CSV has source_type and source, and every row is edp / hive".
+# Everything under `tables:` is still UNKNOWN and must come from the metastore before
+# cluster acceptance (Task 17). An unknown layout REFUSES; it does not default.
+
+environment_id: hdfc-local
+
+# Engine mapping is keyed by (source_type, source) — a handful of lines regardless of
+# how many columns the catalog carries. Spec §3.4b.
+engines:
+  edp/hive:
+    kind: hive
+    default_schema: null        # UNKNOWN — see §3.5; null means resolution must find it
+                                # in graph_node.schema_name or refuse.
+  # ods/oracle:                 # not present in the sample; Spec A would refuse it
+  #   kind: oracle              # (SOURCE_ENGINE_UNSUPPORTED)
+
+engine_versions:                # UNKNOWN until Task 0 runs against the cluster
+  hive: null
+  spark: null
+  metastore: null
+  python: null
+  java: null
+  pyspark: null
+  kedro: null
+
+tables: {}                      # UNKNOWN: partition columns, partition mapping,
+                                # late_arrival_days, location, rewritten_in_place.
+                                # Populate from DESCRIBE FORMATTED / SHOW PARTITIONS.

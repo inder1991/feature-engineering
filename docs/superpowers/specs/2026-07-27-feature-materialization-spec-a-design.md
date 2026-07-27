@@ -243,6 +243,19 @@ For an unpartitioned mutable table the snapshot is **not content-addressed** —
 
 ---
 
+### §3.4b Source engine is part of physical identity
+
+The catalog upload carries a **`source_type`** (e.g. `edp`, `ods`) and a **`source`** engine (e.g. `hive`, `oracle`) per row. The engine is part of physical identity, because Spec A generates PySpark that reads **Hive and HDFS only** — it cannot read an Oracle table, and the semantics differ beyond the mechanics (an ODS is typically current-state-only, so it cannot answer the point-in-time reconstruction §4.2's spine policies assume).
+
+**Normative:**
+
+- Physical identity carries `source_type` and `engine`.
+- **Spec A refuses any read set element whose engine is not `hive`** with `SOURCE_ENGINE_UNSUPPORTED`, naming the element and its engine. A formula spanning two engines is refused, not half-generated.
+- **A blank or absent engine refuses too** — it must never default to `hive`, for the same reason a blank schema must not default to `public`.
+- The environment inventory (§0) declares the engine mapping **per `(source_type, source)`**, not per table, so it stays a handful of lines regardless of column count.
+
+Oracle support is deliberately deferred: it needs a different reader, different auth, and its own answer to what availability means.
+
 ### §3.5 Physical schema resolution is an explicit step
 
 **A logical ref's schema segment is catalog-side, not the physical Hive schema.** `build_graph` flattens every `object_ref` to `public.<table>[.<column>]` (`graph.py:20`); the real declared schema survives only in `graph_node.schema_name`, which is **nullable**. So a governed ref may legitimately read `hdfc::public.transactions.amount` for a table that lives in `banking`.
@@ -646,6 +659,7 @@ class CompilationRefusalCode(StrEnum):          # raised/returned during compile
     GRAIN_PATH_NOT_GOVERNED · JOIN_FANOUT_UNSUPPORTED · JOIN_CARDINALITY_UNKNOWN
     SPINE_SOURCE_NOT_DECLARED · SPINE_DECLARATION_REJECTED_BY_FACTS
     PARTITION_MAPPING_NOT_DECLARED · PHYSICAL_SCHEMA_NOT_RESOLVED
+    SOURCE_ENGINE_UNSUPPORTED
     AVAILABILITY_TIME_NOT_GOVERNED
     PHYSICAL_TYPE_UNSUPPORTED · MULTIPLE_MATERIALIZATION_CONTRACTS
     PARTITION_IDENTITY_UNKNOWN · UNACCOUNTED_LOGICAL_REF
