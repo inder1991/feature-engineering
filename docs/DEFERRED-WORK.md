@@ -38,6 +38,7 @@ Deferred wholesale from the parent architecture (`docs/superpowers/specs/2026-07
 | 🟡 Content-addressed input snapshots | Spec A's `input_snapshot_ids` = the `(schema, table, partition)` list read + the IR's `catalog_state_stamp`. That identifies *which* inputs and *which governed facts*, but is **not** a content snapshot — two runs over the same partitions after an in-place source rewrite share the same execution identity. True content versioning needs the deferred Iceberg layer. | Reproducibility/replay guarantees, or any restatement work. Also one of the reasons Spec A publishes to sandbox. |
 | 🟡 Multi-partition and backfill runs | Spec A does one `business_dt` per run. | First backfill request. |
 | 🟡 Multi-environment promotion | One Hadoop/Hive environment in Spec A. | A second environment. |
+| 🟡 **`CurrentSnapshot` vintage mismatch has no failure code** | Spec §4.2 says a `CurrentSnapshot` whose observed vintage does not match a run's `business_dt` "refuses rather than pretending", but no member of the four closed §14 enums expresses it. Task 4 deliberately did **not** invent one. The condition arises at **run preparation** (business_dt is a run parameter), which is neither a compilation nor a publication decision — so the enum it belongs to is itself the open question. | Task 15, where run preparation is built and the condition first becomes reachable. |
 | ⚪ **Spec B** — statistical profiling/EDA + UI | Split out deliberately so Spec A ships runnable feature tables first. Spec A reports via the run manifest only (row counts, validation results), not statistics. | After Spec A publishes on the cluster. Profile history is append-only from the start so drift detection can be added later without backfill. |
 | ⚪ **Spec C** — `model_input` assembly | Needs published groups to assemble. | When a model needs features from more than one group. Carries the daily/monthly **as-of** alignment rule (a daily row takes the latest month-end value not later than its `business_dt` — a naive equi-join would leak future month-end data into early-month rows). |
 
@@ -123,6 +124,13 @@ in place.
 | Item | Detail | Trigger |
 |---|---|---|
 | 🔴 `cardinality_from_token(None) → MANY_TO_ONE` | `overlay/upload/catalog_realizations.py:37-39` silently treats an absent/empty cardinality token as `N:1`. This is precisely the fail-open Spec A's join adapter **refuses** (`JOIN_CARDINALITY_UNKNOWN`), because an unknown edge may actually be `1:N` — which multiplies rows and inflates a SUM. Untouched by Spec A and harmless where it is used today. | **Before any materialization path can reach it.** If a future task routes join cardinality through this helper, the T3 refusal is bypassed and wrong numbers become possible again. Found by Task 3's implementer. |
+
+### A.3 Shipped-code defects found while building Spec A Task 4 (2026-07-27)
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🔴 **Ref case-handling is inconsistent across readers** | `entity.effective_entity` queries `WHERE object_ref = %s` (exact) while `column_authority._scalar` queries `WHERE lower(object_ref) = %s` with a lowered parameter. `build_graph` stores refs in the upload's own casing, so a **mixed-case catalog reads as "no governed entity"** through the first path while the second resolves fine. This is a **class** of bug: any caller that rebuilds a ref rather than threading the stored one is exposed. `materialize/spine.py` threads the stored ref and is safe. | Before any mixed-case catalog is ingested, or when a governed entity inexplicably reads as absent. Fix = one case convention across every `graph_node` reader. |
+| 🟡 **`GRAIN.is_unique` is written but never read** | Every writer hardcodes `is_unique: True` (`ingest.py:287,2792`, `table_synth.py:150`); no projection path consumes it. An `is_unique=false` fact would be accepted, stored, and silently ignored — a latent fail-open. Spec A therefore derives uniqueness from the governed grain **set** rather than trusting the flag. | Before anything relies on `is_unique` as an authority, or when a non-unique grain must be expressible. |
 
 ## C. Repo / infra health
 
