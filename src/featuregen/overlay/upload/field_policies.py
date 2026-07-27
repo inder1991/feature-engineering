@@ -179,6 +179,15 @@ _DATA_TYPE = FieldPolicy(
 
 # unit / currency — measure annotations: load-bearing only when source-ATTESTED or human-CONFIRMED
 # (_SOURCE_OR_HUMAN == AnyOf((_SOURCE_ATTESTED, _HUMAN_CONFIRMED)); never an LLM proposal alone, §8).
+#
+# human_editable (E4a T3): a reviewer may CONFIRM an existing unit/currency proposal — including the
+# LLM's `llm/proposed` draft — through the generic field-correction command. This is the whole point
+# of the E4a loop: the FTR export declares no unit, so without a human path the UNIT_CONSISTENT
+# requirement was PERMANENTLY unanswerable. It changes NO authority. The LLM is deliberately absent
+# from BOTH rules above and must STAY absent: `_column_meta` (feature_assist) clears the check from
+# `graph_node.unit` alone, so an LLM value that can never win RESOLUTION can never be PROJECTED and
+# therefore can never clear a safety check on its own — the silent clear is designed out, not
+# guarded. Adding `_LLM_PROPOSED` to either rule would open it; that is the line.
 _MEASURE_ANNOTATION = FieldPolicy(
     influence_max=InfluenceTier.OPERATIONAL,
     display_rule=_SOURCE_OR_HUMAN,
@@ -186,6 +195,7 @@ _MEASURE_ANNOTATION = FieldPolicy(
     disqualifiers=_OPERATIONAL_DISQUALIFIERS,
     resolution_mode=ResolutionMode.GENERIC_FIELD,
     conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
+    human_editable=True,
 )
 
 

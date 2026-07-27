@@ -92,7 +92,32 @@ _DISPLAY_COLUMN: dict[str, str] = {
     "table_role": "table_role",
     "primary_entity": "primary_entity",
     "event_or_snapshot": "event_or_snapshot",
+    # E4a T3: a HUMAN-confirmed (or source-attested) measure annotation must reach the flat column,
+    # because `feature_assist._column_meta` reads `unit`/`currency` from `graph_node` and from
+    # nowhere else — without this projection a confirmed unit could never clear UNIT_CONSISTENT.
+    # See _SOURCE_AUTHORED_DISPLAY_COLUMNS: these two columns are SHARED with `build_graph`.
+    "unit": "unit",
+    "currency": "currency",
 }
+
+# The projected columns ``graph.build_graph`` ALSO populates, straight from the uploaded file — so
+# for these the resolver is a CO-AUTHOR, not the sole author, and a ``None`` resolution means "I
+# have nothing to say", NOT "there is nothing here" (E4a T3 projection-wipe hazard).
+#
+# The concrete failure this closes: a glossary upload declares a unit in ``graph_node`` but writes NO
+# source ``unit`` evidence (``ingest._SOURCE_FIELDS`` carries no unit — only the TECHNICAL profile
+# does), and the LLM is excluded from ``_MEASURE_ANNOTATION``'s display rule. So a column whose ONLY
+# unit evidence is the AI's ``llm/proposed`` draft resolves ``display_value=None`` — and an unscoped
+# projection would write that ``None`` over the file's real declared unit, silently destroying
+# catalog truth on the very upload that added the AI's help. (Worse: it would also DEFEAT the
+# MIXED_UNITS hard reject, which reads the same column.)
+#
+# The scope: a ``None`` display may clear one of these columns ONLY where the resolver's own
+# ``*_decision_id`` link is already set — i.e. only where the resolver itself previously projected
+# the value. ``build_graph`` recreates ``graph_node`` with NULL link columns on every upload, so a
+# file-declared value always reads as un-authored and is left alone; a human confirmation projects
+# (setting the link), and a later reject/stale of that confirmation then correctly retracts it.
+_SOURCE_AUTHORED_DISPLAY_COLUMNS = frozenset({"unit", "currency"})
 
 # The display columns that feed graph.build_graph's weighted search_doc (definition-B, concept/
 # domain-C). A projection into one of these must rebuild the node's FTS doc via
@@ -111,6 +136,9 @@ _DECISION_LINK_COLUMN: dict[str, str] = {
     "table_role": "table_role_decision_id",
     "primary_entity": "primary_entity_decision_id",
     "event_or_snapshot": "event_or_snapshot_decision_id",
+    # E4a T3 (migration 1031). Doubles as the AUTHORSHIP marker for the wipe guard above.
+    "unit": "unit_decision_id",
+    "currency": "currency_decision_id",
 }
 
 
@@ -191,7 +219,14 @@ def _project_display(
     """Write the DISPLAY value into the flat ``graph_node`` column (when one exists) AND set the
     companion ``*_decision_id`` link. A field with only a link column (``logical_representation``) sets
     the link without touching a display column. Case-insensitive match on the public-flattened
-    object_ref :func:`_graph_key` derives (see its note on the schema bridge)."""
+    object_ref :func:`_graph_key` derives (see its note on the schema bridge).
+
+    PROJECTION-WIPE GUARD (E4a T3): for a ``_SOURCE_AUTHORED_DISPLAY_COLUMNS`` field, ``build_graph``
+    is a CO-AUTHOR of the same flat column, so a ``None`` display value must not overwrite what the
+    file declared. Such a ``None`` projection is scoped to rows the resolver itself previously wrote
+    (its ``*_decision_id`` link is non-NULL); everywhere else the UPDATE matches no row and the
+    file's value stands. A resolved (non-``None``) value projects unconditionally, exactly as before,
+    and every other field is untouched by the guard."""
     catalog_source, object_ref_lc = _graph_key(source, logical_ref)
     display_col = _DISPLAY_COLUMN.get(field_name)
     link_col = _DECISION_LINK_COLUMN.get(field_name)
@@ -205,10 +240,14 @@ def _project_display(
         params.append(decision_id)
     if not assignments:
         return
+    guard = ""
+    if (display_value is None and field_name in _SOURCE_AUTHORED_DISPLAY_COLUMNS
+            and link_col is not None):
+        guard = f" AND {link_col} IS NOT NULL"
     params.extend([catalog_source, object_ref_lc])
     conn.execute(
         f"UPDATE graph_node SET {', '.join(assignments)} "
-        "WHERE catalog_source = %s AND lower(object_ref) = %s",
+        f"WHERE catalog_source = %s AND lower(object_ref) = %s{guard}",
         params,
     )
     # A doc-bearing display column changed: re-derive the node's search_doc from its now-current
