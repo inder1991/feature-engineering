@@ -35,20 +35,33 @@ from featuregen.overlay.upload.upload_catalog import table_ref
 
 SOURCE = "p4_suggestions_ftr"
 TABLE = "comp_fin_tran"
+OTHER_TABLE = "mkt_risk_pos"
 NOW = datetime(2026, 7, 27, tzinfo=UTC)
-_FQN_PREFIX = "DPL_EIB_COMPLIANCE.COMP_FIN_TRAN."
+_FQN_PREFIX = "DPL_EIB_COMPLIANCE."
 
-# (column -> concept, declared type, business term). The concepts are what the enrichment stage
-# proposes; grounding is the router, so this is what decides which template families surface.
+# table -> column -> (concept, declared type, business term). The concepts are what the enrichment
+# stage proposes; grounding is the router, so this is what decides which template families surface.
+# TWO tables and TWO source entities on purpose: a per-table filter and a per-entity grouping can
+# only be shown to work by a fixture that would expose them being wrong.
 _COLUMNS = {
-    "CIF_ID": ("customer_id", "varchar", "Customer Identifier"),
-    "ACCT_ID": ("account_id", "varchar", "Account Identifier"),
-    "TXN_AMT": ("monetary_flow", "decimal", "Transaction Amount"),
-    "BAL_AMT": ("monetary_stock", "decimal", "Account Balance"),
-    "AS_OF_DT": ("as_of_date", "date", "As Of Date"),
-    "TXN_TS": ("event_timestamp", "timestamp", "Transaction Timestamp"),
-    "TXN_CNT": ("count", "integer", "Transaction Count"),
+    TABLE: {
+        "CIF_ID": ("customer_id", "varchar", "Customer Identifier"),
+        "ACCT_ID": ("account_id", "varchar", "Account Identifier"),
+        "TXN_AMT": ("monetary_flow", "decimal", "Transaction Amount"),
+        "BAL_AMT": ("monetary_stock", "decimal", "Account Balance"),
+        "AS_OF_DT": ("as_of_date", "date", "As Of Date"),
+        "TXN_TS": ("event_timestamp", "timestamp", "Transaction Timestamp"),
+        "TXN_CNT": ("count", "integer", "Transaction Count"),
+        "CUST_HOLD": ("custody_holding", "decimal", "Custody Holding"),
+        "SETL_STAT": ("settlement_status", "varchar", "Settlement Status"),
+    },
+    OTHER_TABLE: {
+        "BOOK_ID": ("book_id", "varchar", "Trading Book Identifier"),
+        "VAR_AMT": ("var", "decimal", "Value At Risk"),
+        "RISK_DT": ("as_of_date", "date", "Risk As Of Date"),
+    },
 }
+_CONCEPT_OF = {col: spec[0] for cols in _COLUMNS.values() for col, spec in cols.items()}
 
 _SERVICE = IdentityEnvelope(subject="featuregen-overlay-enrichment", actor_kind="service",
                             authenticated=True, auth_method="internal", role_claims=())
@@ -71,18 +84,19 @@ def _seal() -> None:
 
 def _ftr_csv() -> str:
     return _HDR + "".join(
-        _row(source_row=str(n), fqn=_FQN_PREFIX + col, term_name=term,
-             definition=f'"{term} of the compliance transaction."', data_type=declared)
-        for n, (col, (_concept, declared, term)) in enumerate(_COLUMNS.items(), start=1))
+        _row(source_row=str(n), fqn=f"{_FQN_PREFIX}{table.upper()}.{col}", term_name=term,
+             definition=f'"{term}, recorded on {table}."', data_type=declared)
+        for n, (table, col, (_concept, declared, term)) in enumerate(
+            ((t, c, spec) for t, cols in _COLUMNS.items() for c, spec in cols.items()), start=1))
 
 
-def _govern_table_facts(conn) -> None:
+def _govern_table_facts(conn, table: str, grain_column: str, as_of_column: str) -> None:
     """Grain + availability through the REAL governance path: the service enrichment actor proposes,
     a platform admin confirms, the confirm-time bridge projects onto ``graph_node``."""
     admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
-    ref = table_ref(SOURCE, TABLE)
-    for fact_type, value in (("grain", {"columns": ["cif_id"], "is_unique": True}),
-                             ("availability_time", {"column": "as_of_dt", "basis": "posted_at"})):
+    ref = table_ref(SOURCE, table)
+    for fact_type, value in (("grain", {"columns": [grain_column], "is_unique": True}),
+                             ("availability_time", {"column": as_of_column, "basis": "posted_at"})):
         res = propose_fact(conn, Command(
             "propose_fact", "overlay_fact", None,
             {"ref": ref, "fact_type": fact_type, "proposed_value": value},
@@ -103,19 +117,20 @@ def ftr_catalog(overlay_conn):
     _seal()
     upload = to_glossary_upload(read_ftr_glossary(_ftr_csv(), source=SOURCE))
     good = validate_rows(upload.rows, SOURCE, profile=FTR_GLOSSARY_PROFILE).good
-    concepts = {content_hash(r): _COLUMNS[r.column.upper()][0] for r in good}
+    concepts = {content_hash(r): _CONCEPT_OF[r.column.upper()] for r in good}
     client = FakeLLM(script={
         "overlay.enrich.concept": FakeResponse(output={"results": [
             {"ref": h, "concept": c} for h, c in concepts.items()]}),
         "overlay.enrich.definition": FakeResponse(output={"results": []}),
         "overlay.enrich.domain": FakeResponse(output={"results": [
-            {"ref": TABLE, "domain": "payments"}]}),
+            {"ref": t, "domain": "payments"} for t in _COLUMNS]}),
         "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
     })
     res = ingest_upload(overlay_conn, SOURCE, upload.rows, actor=_UPLOADER, now=NOW,
                         client=client, glossary=upload)
     assert res.status == "ingested", res.status
-    _govern_table_facts(overlay_conn)
+    _govern_table_facts(overlay_conn, TABLE, "cif_id", "as_of_dt")
+    _govern_table_facts(overlay_conn, OTHER_TABLE, "book_id", "risk_dt")
     return _Catalog(source=SOURCE, table=TABLE)
 
 
@@ -132,29 +147,61 @@ def test_suggests_features_for_a_table_without_any_hypothesis(overlay_conn, ftr_
     assert s["uses"]                 # the columns it binds
 
 
+def _names(out: dict) -> set[str]:
+    return {s["name"] for g in out["groups"] for s in g["suggestions"]}
+
+
 def test_only_this_tables_suggestions_are_returned(overlay_conn, ftr_catalog):
+    """The catalog holds TWO governed tables, so dropping the per-table filter is visible: without a
+    second table's features in the engine's catalog-wide result there is nothing to leak."""
     out = suggest_features_for_table(
         overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    other = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=OTHER_TABLE)
+    assert _names(other)                            # the fixture really does ground on both tables
+    assert not (_names(out) & _names(other))
     for g in out["groups"]:
         for s in g["suggestions"]:
             assert s["grain_table"] == ftr_catalog.table
 
 
 def test_grouped_by_entity(overlay_conn, ftr_catalog):
+    """Two DISTINCT source entities on the ONE table: the recipes anchored on ``customer_id`` bind
+    ``cif_id``, the custody / settlement recipes anchor on ``account_id`` and bind ``acct_id``. The
+    table's single ``is_grain`` column is ``cif_id``, so a grouping taken from the table grain files
+    the account-grained features under the customer heading — this is what that would look like."""
     out = suggest_features_for_table(
         overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
-    labels = [g["entity_ref"] for g in out["groups"]]
-    assert len(labels) == len(set(labels))          # one group per entity, no duplicates
-    assert out["summary"]["entities"] == len(labels)
+    by_label = {g["entity_label"]: g for g in out["groups"]}
+    assert set(by_label) == {"customer", "account"}
+    assert out["summary"]["entities"] == 2
+    assert by_label["account"]["entity_ref"] == f"public.{TABLE}.acct_id"
+    assert by_label["customer"]["entity_ref"] == f"public.{TABLE}.cif_id"
+    # custody_holding_dynamics is bound to acct_id (account), NOT to the table's cif_id grain
+    assert "custody_holding_dynamics_90d" in {s["name"] for s in by_label["account"]["suggestions"]}
+    assert "balance_trend_90d" in {s["name"] for s in by_label["customer"]["suggestions"]}
+
+
+def test_rejections_are_this_tables_only(overlay_conn, ftr_catalog):
+    """A rejection is a claim ABOUT this table's catalog readiness, but the engine's rejection list is
+    catalog-wide and carries no grain — an unfiltered pass-through shows one table's rejects on another."""
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    other = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=OTHER_TABLE)
+    assert out["rejections"]                        # this table really does reject something
+    assert not ({r["name"] for r in out["rejections"]} & {r["name"] for r in other["rejections"]})
 
 
 def test_writes_nothing(overlay_conn, ftr_catalog):
-    """v1 is strictly read-only — the load-bearing guarantee."""
-    def counts():
-        return tuple(overlay_conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
-                     for t in ("field_evidence", "field_decision_event", "graph_node",
-                               "contract_intent"))
-    before = counts()
+    """v1 is strictly read-only — the load-bearing guarantee. A row COUNT cannot see an IN-PLACE write
+    (``UPDATE graph_node SET is_grain = false`` keeps the cardinality), so fingerprint the row CONTENT."""
+    tables = ("field_evidence", "field_decision_event", "graph_node", "contract_intent")
+    def fingerprint():
+        return tuple(overlay_conn.execute(
+            f"SELECT count(*), md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) "
+            f"FROM {t} t").fetchone() for t in tables)
+    before = fingerprint()
     suggest_features_for_table(overlay_conn, catalog_source=ftr_catalog.source,
                                table=ftr_catalog.table)
-    assert counts() == before
+    assert fingerprint() == before
