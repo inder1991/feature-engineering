@@ -118,6 +118,12 @@ in place.
 
 ---
 
+### A.2 Latent fail-open found while building Spec A (2026-07-27)
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🔴 `cardinality_from_token(None) → MANY_TO_ONE` | `overlay/upload/catalog_realizations.py:37-39` silently treats an absent/empty cardinality token as `N:1`. This is precisely the fail-open Spec A's join adapter **refuses** (`JOIN_CARDINALITY_UNKNOWN`), because an unknown edge may actually be `1:N` — which multiplies rows and inflates a SUM. Untouched by Spec A and harmless where it is used today. | **Before any materialization path can reach it.** If a future task routes join cardinality through this helper, the T3 refusal is bypassed and wrong numbers become possible again. Found by Task 3's implementer. |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |
