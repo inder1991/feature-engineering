@@ -267,6 +267,24 @@ def test_every_card_carries_a_recipe_and_its_parts(overlay_conn, ftr_catalog):
             assert "[" not in s["recipe"]
 
 
+def test_the_recipe_by_clause_names_the_cards_own_entity(overlay_conn, ftr_catalog):
+    """The heading and the line must agree. The card's entity is the recipe's BOUND entity, but the
+    ``BY`` clause was taken from the TABLE grain — so an account-grained card read "per account" over
+    ``custody_holding_dynamics_90d(cust_hold, acct_id) BY cif_id ...``, naming a key it is not
+    computed per AND listing its own key as a measure. The account group is the proof: its entity
+    (``acct_id``) is NOT the table's single ``is_grain`` column (``cif_id``)."""
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    account = next(g for g in out["groups"] if g["entity_label"] == "account")
+    assert "custody_holding_dynamics_90d" in {s["name"] for s in account["suggestions"]}
+    for group in out["groups"]:
+        column = group["entity_ref"].rsplit(".", 1)[-1]
+        for s in group["suggestions"]:
+            assert s["recipe_parts"]["grain"] == column
+            assert f" BY {column}" in s["recipe"]
+            assert column not in s["recipe_parts"]["measures"]
+
+
 def test_writes_nothing(overlay_conn, ftr_catalog):
     """v1 is strictly read-only — the load-bearing guarantee. A row COUNT cannot see an IN-PLACE write
     (``UPDATE graph_node SET is_grain = false`` keeps the cardinality), so fingerprint the row CONTENT."""

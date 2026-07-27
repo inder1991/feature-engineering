@@ -30,8 +30,8 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     mine = [idea for idea in ideas if idea.grain_table == table]
     groups: dict[tuple[str, str], list[dict]] = {}
     for idea in mine:
-        groups.setdefault(_entity_of(idea, contexts, keys_by_recipe), []).append(
-            _suggestion(idea, binding_by_id))
+        entity = _entity_of(idea, contexts, keys_by_recipe)
+        groups.setdefault(entity, []).append(_suggestion(idea, binding_by_id, entity[0]))
     clean = sum(1 for idea in mine if idea.validation_status == "DESIGN_CHECKED")
     return {
         "catalog_source": catalog_source, "table": table,
@@ -81,7 +81,7 @@ def _rejections_here(conn, catalog_source: str, roles, table: str,
     return [r for r in rejections if table in grain_of.get(r["name"], ())]
 
 
-def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str]) -> dict:
+def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: str = "") -> dict:
     """One card. Every field is the engine's own: the status is the gauntlet's tri-state, the
     description is the template's SME intent, the requirements are the typed ones the gauntlet
     minted, and ``binding_quality`` is the signal the engine already returns per surviving template.
@@ -95,12 +95,12 @@ def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str]) -> dict:
                          for r in idea.requirements],
         "uses": list(dict.fromkeys(ref for _src, ref in idea.derives_pairs)),
         "binding_quality": binding_by_id.get(idea.recipe_id or "", ""),
-        "recipe": render_recipe(idea),
-        "recipe_parts": _recipe_parts(idea),
+        "recipe": render_recipe(idea, entity_ref),
+        "recipe_parts": _recipe_parts(idea, entity_ref),
     }
 
 
-def render_recipe(idea: FeatureIdea) -> str:
+def render_recipe(idea: FeatureIdea, entity_ref: str = "") -> str:
     """The one-line recipe this feature computes, e.g. ``trend_90d(bal_amt) BY cif_id OVER 90d
     [as_of_dt]``.
 
@@ -108,7 +108,7 @@ def render_recipe(idea: FeatureIdea) -> str:
     ``frequency_trend`` — ~152 of them), NOT a SQL verb: there is no label -> verb map here, because
     inventing one would print ``AVG(...)`` for an operation the system calls ``trend``. Clauses that
     do not apply are omitted, never emitted empty."""
-    parts = _recipe_parts(idea)
+    parts = _recipe_parts(idea, entity_ref)
     measures = ", ".join(parts["measures"])
     line = f"{parts['operation']}({measures})" if parts["operation"] else measures
     if parts["grain"]:
@@ -120,17 +120,26 @@ def render_recipe(idea: FeatureIdea) -> str:
     return line
 
 
-def _recipe_parts(idea: FeatureIdea) -> dict:
+def _recipe_parts(idea: FeatureIdea, entity_ref: str = "") -> dict:
     """The rendered line's pieces, structured. ``measure_refs`` carries EVERY bound pair — the grain
     and point-in-time columns included — so both are subtracted here: a card listing the grain column
     as a measure would claim the feature aggregates its own key. Order is the engine's binding order
-    (deduped), so the same idea always renders the same line."""
+    (deduped), so the same idea always renders the same line.
+
+    ``entity_ref`` is the recipe's OWN bound entity (:func:`_entity_of`) when one resolved. The ``BY``
+    clause must name the column the card's HEADING names: ``idea.grain_ref`` is the table's single
+    ``is_grain`` column, so an account-grained card otherwise read "per account" above a line saying
+    ``BY cif_id``. It is subtracted from the measures for the same reason the grain is — it is the
+    feature's key, not a quantity it aggregates. Empty (no unambiguous source entity) falls back to
+    ``grain_ref``, unchanged."""
     dropped = {ref for ref in (idea.grain_ref, idea.time_ref) if ref is not None}
-    measures = [ref for ref in dict.fromkeys(idea.measure_refs) if ref not in dropped]
+    measures = [ref for ref in dict.fromkeys(idea.measure_refs)
+                if ref not in dropped and ref[1] != entity_ref]
+    grain = entity_ref or (idea.grain_ref[1] if idea.grain_ref else "")
     return {
         "operation": idea.operation_kind,
         "measures": [_column(ref) for _src, ref in measures],
-        "grain": _column(idea.grain_ref[1]) if idea.grain_ref else "",
+        "grain": _column(grain) if grain else "",
         "window": idea.window or "",
         "time": _column(idea.time_ref[1]) if idea.time_ref else "",
     }
