@@ -567,9 +567,9 @@ Spec §5.
 
 **Files:** Create `src/featuregen/materialize/{classify,contract}.py`; Test `test_classify.py`, `test_contract.py`
 
-**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`.
+**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `RETENTION_POLICY_VERSION = 1`; `DEFAULT_RETENTION_CLASS`; `classify_read_set(conn, refs) -> Classification | MaterializationRefused`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `MaterializationContractV1`; `derive_contract(...)`; `group_by_contract(contracts)`; `contract_hash(c)`. **Plus**, because §5.1 is only enforceable if the group has ONE entry point and the read set has ONE derivation: `UNCLASSIFIED_RESTRICTION` (the stated missing-classification policy), `CadencePeriod` / `CadenceTrigger` / `PublicationPolicy` / `BackfillBoundary`, `LandingPitSemantics`, `ContractGroup`, `derive_group_contract(conn, authorization, …)` (takes Gate 2's TOKEN), and `ir.physical_read_set(irs, spine)` — §1.3's union exposed for ONE feature instead of being re-walked in the classification stage.
 
-- [ ] **Step 1: Failing classification tests**
+- [x] **Step 1: Failing classification tests**
 
 ```python
 def test_sensitivity_class_comes_from_effective_restriction(db, confidential_catalog, refs):
@@ -595,8 +595,10 @@ def test_a_join_key_or_the_spine_can_be_the_most_restrictive(db, restricted_join
     assert classify_read_set(db, refs).sensitivity_class == "restricted"
 ```
 
-- [ ] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes **all three** policy versions (classification, physical-type, retention) **and the spine's `identity_payload()` only — never its provenance** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
-- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
+- [x] **Step 2: Failing contract tests** — contracts derived **per feature** · mixed contracts ⇒ `MULTIPLE_MATERIALIZATION_CONTRACTS` listing both groups, **not** a union · 30d and 90d share a contract · hash excludes calculation window · hash excludes live observations · hash includes **all three** policy versions (classification, physical-type, retention) **and the spine's `identity_payload()` only — never its provenance** · override may tighten, not loosen · `dependencies_ready` trigger refused · invalid timezone refused.
+- [x] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
+
+**Established (interfaces reference §25), beyond the sketch above:** `restricted` is a legal value of **both** sensitivity columns, so independence is proved by a **2×2** (each axis moved with the other held fixed) rather than by one fixture where they agree · migration `0993` constrains the TAG column to exactly `SENSITIVITY_ROLES`' keys but leaves `effective_restriction` **unconstrained**, so normalize-then-refuse is a reachable path (demonstrated, not assumed) · the missing-classification policy is stated as `internal` — not `public` (a claim nobody attested) and not `prohibited` (which would collapse "unclassified" into "forbidden") · the landing keys are the **spine's**, not the formula's grain keys · the resolved physical TYPE is excluded from the contract, or a `BIGINT` count and a `DECIMAL` sum could never share a group · a malformed **declaration** (bad trigger/period/timezone/cutoff, a loosening override) raises `ValueError` because §14 has no member for it, while `PROHIBITED_INPUT` is the one governed verdict. Gaps recorded in `DEFERRED-WORK.md` A.10 — the load-bearing one is that **`AvailabilityClass`'s vocabulary is invented here**, since §5.4 requires it declared and names none, and it enters the contract hash.
 
 ---
 
