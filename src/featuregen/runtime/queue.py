@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,12 +30,24 @@ def _record_dead_letter(queue_id: int, *, error: str, reason: str) -> None:
 # exactly complementary: `claim_one` EXCLUDES these (below) and `drain_control_signals` claims
 # ONLY these, both under FOR UPDATE SKIP LOCKED so neither double-processes across workers.
 CONTROL_SIGNAL_HANDLERS = frozenset({"runtime.auto_park", "runtime.repair_exhausted"})
+FORMULA_SHADOW_QUEUE_HANDLERS = frozenset({"recipe_formula_shadow.author.v1"})
+_DEDICATED_HANDLERS = CONTROL_SIGNAL_HANDLERS | FORMULA_SHADOW_QUEUE_HANDLERS
 
 
 class BackpressureError(RuntimeError):
     """Admission control signal (§5.2): a partition is at capacity. Raised by the queue
     publisher; the relay treats it as durable waiting (leave the outbox row pending, no attempt
     bump, no DLQ), never as a delivery failure."""
+
+
+class QueueIdempotencyConflict(RuntimeError):
+    """One queue message id was reused for materially different work."""
+
+
+def _payload_hash(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +61,19 @@ class QueueClaim:
     payload: Mapping[str, Any]
     attempts: int
     max_attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaQueueClaim:
+    id: int
+    message_id: str
+    partition_key: str
+    handler: str
+    payload: Mapping[str, Any]
+    attempts: int
+    max_attempts: int
+    lease_owner: str
+    lease_fence: int
 
 
 def enqueue(
@@ -72,6 +99,55 @@ def enqueue(
             return int(row[0])
         cur.execute("SELECT id FROM queue WHERE message_id = %s", (message_id,))
         return int(cur.fetchone()[0])
+
+
+def enqueue_checked(
+    conn: psycopg.Connection,
+    *,
+    message_id: str,
+    partition_key: str,
+    handler: str,
+    payload: Mapping[str, Any],
+    available_at: datetime | None = None,
+    priority: int = 100,
+) -> int:
+    payload_hash = _payload_hash(payload)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO queue "
+            "(message_id, partition_key, handler, payload, payload_hash, available_at, priority) "
+            "VALUES (%s, %s, %s, %s, %s, COALESCE(%s, now()), %s) "
+            "ON CONFLICT (message_id) DO NOTHING RETURNING id",
+            (
+                message_id,
+                partition_key,
+                handler,
+                Json(payload),
+                payload_hash,
+                available_at,
+                priority,
+            ),
+        )
+        inserted = cur.fetchone()
+        if inserted is not None:
+            return int(inserted[0])
+        cur.execute(
+            "SELECT id, partition_key, handler, payload_hash, payload "
+            "FROM queue WHERE message_id = %s",
+            (message_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise QueueIdempotencyConflict("queue id disappeared during checked insert")
+    stored_hash = row[3] or _payload_hash(row[4])
+    if (
+        row[1] != partition_key
+        or row[2] != handler
+        or stored_hash != payload_hash
+    ):
+        raise QueueIdempotencyConflict(
+            f"queue message {message_id!r} conflicts with its stored identity")
+    return int(row[0])
 
 
 def claim_one(
@@ -105,7 +181,7 @@ def claim_one(
                     "UPDATE queue q SET status='leased', lease_owner=%s, "
                     "  lease_expires_at = now() + make_interval(secs => %s), attempts = q.attempts + 1 "
                     "FROM c WHERE q.id = c.id RETURNING q.*",
-                    (list(CONTROL_SIGNAL_HANDLERS), owner, lease_seconds),
+                    (list(_DEDICATED_HANDLERS), owner, lease_seconds),
                 )
                 row = cur.fetchone()
     except psycopg.errors.UniqueViolation:
@@ -121,6 +197,113 @@ def claim_one(
         attempts=row["attempts"],
         max_attempts=row["max_attempts"],
     )
+
+
+def claim_recipe_formula_shadow(
+    conn: psycopg.Connection,
+    *,
+    owner: str,
+    lease_seconds: int = 300,
+) -> FormulaQueueClaim | None:
+    """Lease only the dedicated formula route with a monotonically increasing fence."""
+    row = None
+    try:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH c AS ("
+                    " SELECT id FROM queue"
+                    " WHERE status='ready' AND available_at <= now()"
+                    "   AND handler = ANY(%s)"
+                    "   AND partition_key NOT IN "
+                    "       (SELECT partition_key FROM queue WHERE status='leased')"
+                    " ORDER BY priority, available_at, id"
+                    " FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") "
+                    "UPDATE queue q SET status='leased', lease_owner=%s, "
+                    " lease_expires_at=now() + make_interval(secs => %s), "
+                    " attempts=q.attempts + 1, lease_fence=q.lease_fence + 1 "
+                    "FROM c WHERE q.id=c.id RETURNING q.*",
+                    (list(FORMULA_SHADOW_QUEUE_HANDLERS), owner, lease_seconds),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UniqueViolation:
+        return None
+    if row is None:
+        return None
+    return FormulaQueueClaim(
+        id=row["id"],
+        message_id=row["message_id"],
+        partition_key=row["partition_key"],
+        handler=row["handler"],
+        payload=row["payload"],
+        attempts=row["attempts"],
+        max_attempts=row["max_attempts"],
+        lease_owner=row["lease_owner"],
+        lease_fence=row["lease_fence"],
+    )
+
+
+def renew_recipe_formula_shadow(
+    conn: psycopg.Connection,
+    claim: FormulaQueueClaim,
+    *,
+    lease_seconds: int = 300,
+) -> bool:
+    row = conn.execute(
+        "UPDATE queue SET lease_expires_at=now() + make_interval(secs => %s) "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (lease_seconds, claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def complete_recipe_formula_shadow(
+    conn: psycopg.Connection, claim: FormulaQueueClaim
+) -> bool:
+    row = conn.execute(
+        "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def fail_recipe_formula_shadow(
+    conn: psycopg.Connection,
+    claim: FormulaQueueClaim,
+    *,
+    error: str,
+    permanent: bool,
+) -> bool:
+    status = "dead" if permanent or claim.attempts >= claim.max_attempts else "ready"
+    row = conn.execute(
+        "UPDATE queue SET status=%s, last_error=%s, lease_owner=NULL, lease_expires_at=NULL, "
+        "available_at=CASE WHEN %s='ready' THEN now() + make_interval(secs => %s) "
+        "ELSE available_at END "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() RETURNING id",
+        (
+            status,
+            error,
+            status,
+            compute_backoff(claim.attempts),
+            claim.id,
+            claim.lease_owner,
+            claim.lease_fence,
+        ),
+    ).fetchone()
+    if row is not None and status == "dead":
+        _record_dead_letter(
+            claim.id,
+            error=error,
+            reason="formula_permanent" if permanent else "formula_retry_exhausted",
+        )
+    return row is not None
 
 
 def complete(conn: psycopg.Connection, queue_id: int) -> None:

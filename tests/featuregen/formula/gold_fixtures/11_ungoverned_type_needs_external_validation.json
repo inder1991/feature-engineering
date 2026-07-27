@@ -1,0 +1,55 @@
+{
+  "case_id": "ungoverned_type_needs_external_validation",
+  "operation": "sum",
+  "adversarial": true,
+  "delivery": "provider",
+  "note": "The carry-forward #2 case, curated: `ungoverned_amt` LOOKS numeric in the flat catalog but has no governed logical_representation decision, so §C resolves the SUM with external_type_required=True. That is NOT a resolved output. The run is NEEDS_REVIEW carrying the validated PROPOSAL and a typed EXTERNAL_TYPE_VALIDATION_REQUIRED — never a TypedFormulaV1, which would assert a type authority the catalog has not granted. This is the false-resolve trap: everything else about the formula is perfect.",
+  "intent": {
+    "name": "ungoverned_amount_sum_90d",
+    "hypothesis": "Total ungoverned-column amount over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "identity",
+      "expr": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.ungoverned_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [],
+  "expected_disposition": "NEEDS_REVIEW",
+  "expected_axes": {
+    "structural_status": "ok",
+    "capability_status": "ok",
+    "output_status": "external_requirement",
+    "critic_status": "clean",
+    "technical_status": "ok"
+  },
+  "expected_output_policy": null,
+  "expected_output_requirements": ["EXTERNAL_TYPE_VALIDATION_REQUIRED"],
+  "expected_operands": [
+    "authored::public.txns.ungoverned_amt",
+    "authored::public.txns.cif_id"
+  ],
+  "expects_blocking_critic": false,
+  "canonical_json": null,
+  "expected_formula_hash": null
+}

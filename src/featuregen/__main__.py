@@ -85,6 +85,12 @@ def _run_pointer_repair(dsn: str, feature_id: str | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "worker":
+        from featuregen.intake.llm import register_llm_client
+        from featuregen.intake.llm_claude import ClaudeConfig, build_claude_llm
+
+        llm_config = ClaudeConfig.from_env()
+        if llm_config.enabled:
+            register_llm_client(build_claude_llm(llm_config))
         run_forever(_require_dsn(args.dsn), interval=args.interval)
         return 0
     if args.command == "migrate":

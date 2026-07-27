@@ -10,12 +10,18 @@ from __future__ import annotations
 import psycopg
 import pytest
 
+from featuregen.intake.llm import compute_input_hash
 from featuregen.overlay.upload.contract.scope_records import (
     confirmation_delta,
     dimension_provenance,
+    generation_input_for_run,
+    load_recognition_input,
+    recognition_input_material,
     record_confirmed_scope,
+    record_generation_input,
     record_recognition_attempt,
     scope_for_run,
+    use_case_provenance,
 )
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
 from featuregen.overlay.upload.taxonomy.recognition import (
@@ -79,6 +85,128 @@ def test_recognition_attempt_is_idempotent_and_stamps_quintet(db) -> None:
     assert created_by == {"subject": "ds1"}
 
 
+def test_sealed_recognition_and_generation_input_round_trip_and_are_write_once(db) -> None:
+    intent_id = "intent_sealed_input"
+    run_id = "run_sealed_input"
+    db.execute(
+        "INSERT INTO contract_intent "
+        "(intent_id, hypothesis, redacted_hypothesis, intake_mode, actor) "
+        "VALUES (%s, %s, %s, 'hypothesis', %s::jsonb)",
+        (intent_id, "customers churn", "customers churn", '"ds1"'),
+    )
+    material = recognition_input_material(
+        redacted_hypothesis="customers churn",
+        redacted_prediction_goal="predict churn",
+        redaction_policy_version="default-redactor@1",
+    )
+    input_hash = compute_input_hash(material)
+    recognition_id = record_recognition_attempt(
+        db,
+        intent_id=intent_id,
+        input_hash=input_hash,
+        result=_result(),
+        actor="ds1",
+        input_json=material,
+        redaction_policy_version="default-redactor@1",
+    )
+    recognition = load_recognition_input(
+        db, recognition_id=recognition_id, intent_id=intent_id)
+    assert recognition.redacted_prediction_goal == "predict churn"
+    assert recognition.input_content_hash == input_hash
+
+    db.execute(
+        "INSERT INTO feature_generation_run (generation_run_id, intent_id, actor) "
+        "VALUES (%s, %s, '{}'::jsonb)",
+        (run_id, intent_id),
+    )
+    scope_id = record_confirmed_scope(
+        db,
+        intent_id=intent_id,
+        generation_run_id=run_id,
+        recognition_id=recognition_id,
+        scope=ConfirmedScope(primary=PRIMARY),
+        use_case_origins={},
+        confirmation_source="user_confirmed",
+        confirmed_by="ds1",
+    )
+    recorded = record_generation_input(
+        db,
+        generation_run_id=run_id,
+        intent_id=intent_id,
+        recognition=recognition,
+        confirmed_scope_id=scope_id,
+        redacted_definition="",
+        redacted_feedback="keep explainable",
+        target_ref="public.labels.churned",
+        actor="ds1",
+    )
+    loaded = generation_input_for_run(db, run_id)
+    assert loaded == recorded
+    assert loaded is not None and loaded.target_ref == "public.labels.churned"
+
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), db.transaction():
+        db.execute(
+            "UPDATE contract_generation_input SET target_ref = NULL "
+            "WHERE generation_run_id = %s",
+            (run_id,),
+        )
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), db.transaction():
+        db.execute(
+            "UPDATE intent_recognition_attempt SET input_json = '{}'::jsonb "
+            "WHERE recognition_id = %s",
+            (recognition_id,),
+        )
+
+
+def test_generation_input_database_rejects_cross_run_lineage(db) -> None:
+    intent_id = "intent_bad_generation_lineage"
+    run_id = "run_bad_generation_lineage"
+    db.execute(
+        "INSERT INTO contract_intent "
+        "(intent_id, hypothesis, redacted_hypothesis, intake_mode, actor) "
+        "VALUES (%s, 'h', 'h', 'hypothesis', %s::jsonb)",
+        (intent_id, '"ds1"'),
+    )
+    material = recognition_input_material(
+        redacted_hypothesis="h",
+        redacted_prediction_goal="g",
+        redaction_policy_version="default-redactor@1",
+    )
+    recognition_id = record_recognition_attempt(
+        db,
+        intent_id=intent_id,
+        input_hash=compute_input_hash(material),
+        result=_result(),
+        actor="ds1",
+        input_json=material,
+        redaction_policy_version="default-redactor@1",
+    )
+    db.execute(
+        "INSERT INTO feature_generation_run (generation_run_id, intent_id, actor) "
+        "VALUES (%s, %s, '{}'::jsonb)",
+        (run_id, intent_id),
+    )
+    scope_id = record_confirmed_scope(
+        db,
+        intent_id=intent_id,
+        generation_run_id=run_id,
+        recognition_id=recognition_id,
+        scope=ConfirmedScope(primary=PRIMARY),
+        use_case_origins={},
+        confirmation_source="user_confirmed",
+        confirmed_by="ds1",
+    )
+    with pytest.raises(psycopg.errors.RaiseException, match="lineage is inconsistent"), db.transaction():
+        db.execute(
+            "INSERT INTO contract_generation_input "
+            "(generation_run_id, intent_id, recognition_id, confirmed_scope_id, "
+            "redacted_hypothesis, redacted_definition, redacted_prediction_goal, "
+            "redacted_feedback, recognition_input_content_hash, generation_input_content_hash, "
+            "created_by) VALUES (%s, %s, %s, %s, 'h', '', 'g', '', 'wrong', 'hash', '{}'::jsonb)",
+            (run_id, intent_id, recognition_id, scope_id),
+        )
+
+
 def test_recognition_attempt_round_trips_dimensions(db) -> None:
     # The optional confirmed-intent dimensions (modelling_contexts / target_entity) + the per-dimension
     # warnings persist verbatim on the attempt alongside the version quintet.
@@ -130,13 +258,54 @@ def test_confirmed_scope_writes_children_and_round_trips(db) -> None:
         "SELECT use_case_id, relationship, origin, display_order FROM confirmed_scope_use_case "
         "WHERE scope_id = %s ORDER BY display_order", (scope_id,)).fetchall()
     assert children == [
-        (PRIMARY, "primary", "llm_proposed", 0),     # primary defaults to llm_proposed, order 0
+        (PRIMARY, "primary", "accepted_llm_proposal", 0),
         (SECONDARY, "secondary", "user_added", 1),   # secondary origin overridden, order 1
     ]
 
     # scope_for_run reconstructs the EXACT ConfirmedScope by run id only (canonical linkage).
     reconstructed = scope_for_run(db, "run_1")
     assert reconstructed == scope
+
+
+def test_use_case_provenance_derives_role_overrides_and_replacement(db) -> None:
+    rid = record_recognition_attempt(
+        db, intent_id="intent_role_override", input_hash="hash_role_override",
+        result=_result(), actor="ds1")
+    promoted = ConfirmedScope(primary=SECONDARY, secondary=(PRIMARY,))
+
+    origins, relationships, replacements = use_case_provenance(db, rid, promoted)
+
+    assert origins == {
+        SECONDARY: "user_overridden",
+        PRIMARY: "user_overridden",
+    }
+    assert relationships == {
+        SECONDARY: "secondary",
+        PRIMARY: "primary",
+    }
+    assert replacements == {SECONDARY: PRIMARY}
+
+    scope_id = record_confirmed_scope(
+        db,
+        intent_id="intent_role_override",
+        generation_run_id="run_role_override",
+        recognition_id=rid,
+        scope=promoted,
+        use_case_origins=origins,
+        use_case_proposed_relationships=relationships,
+        use_case_replacements=replacements,
+        confirmation_source="user_confirmed",
+        confirmed_by="ds1",
+    )
+    rows = db.execute(
+        "SELECT use_case_id, relationship, origin, proposed_relationship, replaces_use_case_id "
+        "FROM confirmed_scope_use_case WHERE scope_id = %s ORDER BY display_order",
+        (scope_id,),
+    ).fetchall()
+    assert rows == [
+        (SECONDARY, "primary", "user_overridden", "secondary", PRIMARY),
+        (PRIMARY, "secondary", "user_overridden", "primary", None),
+    ]
 
 
 def test_unscoped_scope_has_no_children_and_round_trips(db) -> None:

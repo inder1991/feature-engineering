@@ -22,6 +22,8 @@ never raw upload text.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -30,6 +32,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
+from featuregen.documents.registry import DocumentSchemaRegistry
+from featuregen.formula.control import LeaseFence, LeaseFenceLost
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import (
     PROVIDER_TRANSIENT,
@@ -46,12 +50,49 @@ class AuditUnavailable(Exception):
     """The pre-dispatch audit could not be durably committed — the caller must NOT dispatch."""
 
 
+class AuditIntegrityError(AuditUnavailable):
+    """An idempotency key was reused for materially different provider egress."""
+
+
+def compute_physical_request_hash(request: LLMRequest) -> str:
+    """Hash every provider-facing request field, including transient repair input."""
+    material = {
+        "task": request.task,
+        "prompt_id": request.prompt_id,
+        "prompt_version": request.prompt_version,
+        "inputs": dict(request.inputs),
+        "output_schema_id": request.output_schema_id,
+        "output_schema_version": request.output_schema_version,
+        "output_schema": request.output_schema,
+        "generation_settings": request.generation_settings,
+        "cacheable_metadata_keys": list(request.cacheable_metadata_keys),
+    }
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _content_hash(value) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id: str | None,
                     stage: str, task: str, redacted_input: dict, input_hash: str,
                     subjects: list[dict], redaction_version: str | None = None,
                     provider: str | None = None, model: str | None = None,
                     prompt_version: int | None = None,
-                    schema_version: int | None = None) -> str:
+                    schema_version: int | None = None,
+                    physical_request_hash: str | None = None,
+                    authoring_run_id: str | None = None,
+                    call_role: str | None = None,
+                    turn_index: int | None = None,
+                    canonical_turn_input_hash: str | None = None,
+                    provider_contract_hash: str | None = None,
+                    prompt_content_hash: str | None = None,
+                    schema_content_hash: str | None = None,
+                    lease_fence: LeaseFence | None = None) -> str:
     """Mint a dispatch_ref; on an OWN connection (``get_settings().dsn``) INSERT one immutable
     ``llm_dispatch`` header + one ``llm_dispatch_subject`` row per subject, and COMMIT
     independently (survives an upload rollback). Returns the dispatch_ref.
@@ -75,26 +116,88 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
     dispatch_ref = mint_id("disp")
     try:
         with psycopg.connect(dsn) as audit_conn:   # own tx, committed on `with` exit
-            row = audit_conn.execute(
-                "INSERT INTO llm_dispatch (dispatch_ref, logical_call_ref, attempt_no, "
-                "ingestion_run_id, stage, task, input_hash, redacted_input, redaction_version, "
-                "provider, model, prompt_version, schema_version) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
-                (dispatch_ref, logical_call_ref, attempt_no, ingestion_run_id, stage, task,
-                 input_hash, Jsonb(redacted_input), redaction_version, provider, model,
-                 prompt_version, schema_version)).fetchone()
+            queue_id = lease_fence.queue_id if lease_fence is not None else None
+            lease_owner = lease_fence.lease_owner if lease_fence is not None else None
+            fence_epoch = lease_fence.lease_fence if lease_fence is not None else None
+            values = (
+                dispatch_ref, logical_call_ref, attempt_no, ingestion_run_id, stage, task,
+                input_hash, Jsonb(redacted_input), redaction_version, provider, model,
+                prompt_version, schema_version, physical_request_hash, authoring_run_id,
+                call_role, turn_index, canonical_turn_input_hash, provider_contract_hash,
+                prompt_content_hash, schema_content_hash, queue_id, lease_owner, fence_epoch,
+            )
+            columns = (
+                "(dispatch_ref,logical_call_ref,attempt_no,ingestion_run_id,stage,task,input_hash,"
+                "redacted_input,redaction_version,provider,model,prompt_version,schema_version,"
+                "physical_request_hash,authoring_run_id,call_role,turn_index,"
+                "canonical_turn_input_hash,provider_contract_hash,prompt_content_hash,"
+                "schema_content_hash,queue_id,lease_owner,lease_fence) "
+            )
+            if lease_fence is None:
+                row = audit_conn.execute(
+                    "INSERT INTO llm_dispatch " + columns
+                    + "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
+                    values,
+                ).fetchone()
+            else:
+                row = audit_conn.execute(
+                    "INSERT INTO llm_dispatch " + columns
+                    + "SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s,%s,%s,%s,%s WHERE EXISTS (SELECT 1 FROM queue "
+                    "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+                    "AND lease_expires_at > now()) "
+                    "ON CONFLICT (logical_call_ref, attempt_no) DO NOTHING RETURNING dispatch_ref",
+                    (*values, queue_id, lease_owner, fence_epoch),
+                ).fetchone()
             if row is None:
-                # Idempotent replay: this (logical_call_ref, attempt_no) is already audited.
-                # The header is write-once, so the prior record is authoritative — return it.
+                if lease_fence is not None and audit_conn.execute(
+                    "SELECT 1 FROM queue WHERE id=%s AND status='leased' "
+                    "AND lease_owner=%s AND lease_fence=%s AND lease_expires_at > now()",
+                    (queue_id, lease_owner, fence_epoch),
+                ).fetchone() is None:
+                    raise LeaseFenceLost(
+                        "formula pre-dispatch lease fence is no longer live")
                 existing = audit_conn.execute(
-                    "SELECT dispatch_ref FROM llm_dispatch "
+                    "SELECT dispatch_ref,ingestion_run_id,stage,task,input_hash,redacted_input,"
+                    "redaction_version,provider,model,prompt_version,schema_version,"
+                    "physical_request_hash,authoring_run_id,call_role,turn_index,"
+                    "canonical_turn_input_hash,provider_contract_hash,prompt_content_hash,"
+                    "schema_content_hash,queue_id,lease_owner,lease_fence FROM llm_dispatch "
                     "WHERE logical_call_ref = %s AND attempt_no = %s",
                     (logical_call_ref, attempt_no)).fetchone()
                 if existing is None:   # unreachable outside a torn DB — still fail closed
                     raise AuditUnavailable(
                         f"pre-dispatch audit conflict for {logical_call_ref!r} attempt "
                         f"{attempt_no} but the prior record could not be read back")
+                expected = (
+                    ingestion_run_id,
+                    stage,
+                    task,
+                    input_hash,
+                    redacted_input,
+                    redaction_version,
+                    provider,
+                    model,
+                    prompt_version,
+                    schema_version,
+                    physical_request_hash,
+                    authoring_run_id,
+                    call_role,
+                    turn_index,
+                    canonical_turn_input_hash,
+                    provider_contract_hash,
+                    prompt_content_hash,
+                    schema_content_hash,
+                    queue_id,
+                    lease_owner,
+                    fence_epoch,
+                )
+                if existing[1:] != expected:
+                    raise AuditIntegrityError(
+                        f"pre-dispatch identity {logical_call_ref!r} attempt {attempt_no} "
+                        "was reused for materially different egress")
                 return existing[0]
             for subject in subjects:
                 audit_conn.execute(
@@ -103,7 +206,7 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                     (dispatch_ref, subject.get("catalog_source"), subject.get("object_ref"),
                      subject.get("logical_ref"), Jsonb(subject.get("field_names") or [])))
         return dispatch_ref
-    except AuditUnavailable:
+    except (AuditUnavailable, LeaseFenceLost):
         raise
     except Exception as exc:  # noqa: BLE001 — ANY durability failure means: do not dispatch
         logger.exception("pre-dispatch audit write failed for logical_call_ref=%s attempt=%s",
@@ -200,6 +303,142 @@ def dispatch_egress_status(conn, dispatch_ref: str) -> str:
     return "egress_outcome_unknown"
 
 
+def formula_dispatch_reconciliation_failure(
+    conn,
+    authoring_run_id: str,
+) -> str | None:
+    """Return the first strict formula-dispatch reconciliation failure, if any."""
+    dispatches = conn.execute(
+        "SELECT dispatch_ref,task,input_hash,redacted_input,provider,model,prompt_version,"
+        "schema_version,physical_request_hash,call_role,canonical_turn_input_hash,"
+        "provider_contract_hash,prompt_content_hash,schema_content_hash "
+        "FROM llm_dispatch WHERE authoring_run_id=%s ORDER BY dispatch_ref",
+        (authoring_run_id,),
+    ).fetchall()
+    if not dispatches:
+        return "NO_PHYSICAL_DISPATCH"
+    registry = DocumentSchemaRegistry(conn)
+    for dispatch in dispatches:
+        (
+            dispatch_ref,
+            task,
+            input_hash,
+            redacted_input,
+            provider,
+            model,
+            prompt_version,
+            schema_version,
+            physical_hash,
+            call_role,
+            canonical_hash,
+            provider_contract_hash,
+            prompt_content_hash,
+            schema_content_hash,
+        ) = dispatch
+        links = conn.execute(
+            "SELECT c.llm_call_ref,c.task,c.provider,c.model,c.prompt_id,c.prompt_version,"
+            "c.output_schema_id,c.output_schema_version,c.generation_settings,c.input_hash "
+            "FROM llm_call_dispatch l JOIN llm_call c USING (llm_call_ref) "
+            "WHERE l.dispatch_ref=%s",
+            (dispatch_ref,),
+        ).fetchall()
+        if len(links) != 1:
+            return "LOGICAL_CALL_LINK_CARDINALITY_INVALID"
+        (
+            llm_call_ref,
+            call_task,
+            call_provider,
+            call_model,
+            prompt_id,
+            call_prompt_version,
+            schema_id,
+            call_schema_version,
+            generation_settings,
+            call_input_hash,
+        ) = links[0]
+        schema = registry.schema_for(schema_id, call_schema_version)
+        if (
+            schema is None
+            or not isinstance(redacted_input, dict)
+            or not isinstance(generation_settings, dict)
+        ):
+            return "REQUEST_SHAPE_UNVERIFIABLE"
+        computed_prompt_hash = _content_hash(
+            redacted_input.get("instruction")
+        )
+        computed_schema_hash = _content_hash(schema)
+        computed_contract_hash = _content_hash({
+            "call_role": call_role or task,
+            "provider": generation_settings.get("provider"),
+            "model": generation_settings.get("model"),
+            "generation_settings": generation_settings,
+            "prompt_id": prompt_id,
+            "prompt_version": call_prompt_version,
+            "prompt_content_hash": computed_prompt_hash,
+            "output_schema_id": schema_id,
+            "output_schema_version": call_schema_version,
+            "schema_content_hash": computed_schema_hash,
+        })
+        physical_request = LLMRequest(
+            task=task,
+            prompt_id=prompt_id,
+            prompt_version=prompt_version,
+            inputs=redacted_input,
+            output_schema_id=schema_id,
+            output_schema_version=schema_version,
+            generation_settings=generation_settings,
+            output_schema=schema,
+        )
+        outcomes = conn.execute(
+            "SELECT outcome FROM llm_dispatch_outcome WHERE dispatch_ref=%s",
+            (dispatch_ref,),
+        ).fetchall()
+        trace_link = conn.execute(
+            "SELECT count(*) FROM formula_authoring_trace_event "
+            "WHERE authoring_run_id=%s AND llm_call_ref=%s",
+            (authoring_run_id, llm_call_ref),
+        ).fetchone()
+        if (
+            not isinstance(physical_hash, str)
+            or len(physical_hash) != 64
+            or any(char not in "0123456789abcdef" for char in physical_hash)
+        ):
+            return "PHYSICAL_REQUEST_HASH_INVALID"
+        checks = (
+            (compute_input_hash(redacted_input) == input_hash, "DISPATCH_INPUT_HASH_MISMATCH"),
+            (canonical_hash == input_hash, "CANONICAL_INPUT_HASH_MISMATCH"),
+            (call_input_hash == input_hash, "LOGICAL_CALL_INPUT_HASH_MISMATCH"),
+            (call_task == task, "TASK_MISMATCH"),
+            (call_provider == provider, "PROVIDER_MISMATCH"),
+            (call_model == model, "MODEL_MISMATCH"),
+            (call_prompt_version == prompt_version, "PROMPT_VERSION_MISMATCH"),
+            (call_schema_version == schema_version, "SCHEMA_VERSION_MISMATCH"),
+            (prompt_content_hash == computed_prompt_hash, "PROMPT_CONTENT_HASH_MISMATCH"),
+            (schema_content_hash == computed_schema_hash, "SCHEMA_CONTENT_HASH_MISMATCH"),
+            (provider_contract_hash == computed_contract_hash, "PROVIDER_CONTRACT_HASH_MISMATCH"),
+            (
+                physical_hash == compute_physical_request_hash(physical_request),
+                "PHYSICAL_REQUEST_HASH_MISMATCH",
+            ),
+            (len(outcomes) == 1, "DISPATCH_OUTCOME_CARDINALITY_INVALID"),
+            (
+                bool(outcomes)
+                and outcomes[0][0] in {"response_received", "transport_failed"},
+                "DISPATCH_OUTCOME_INVALID",
+            ),
+            (trace_link is not None and trace_link[0] == 1, "TRACE_LINK_INVALID"),
+        )
+        for passed, reason in checks:
+            if not passed:
+                return reason
+    return None
+
+
+def formula_dispatches_reconciled(conn, authoring_run_id: str) -> bool:
+    """Require one strict, internally consistent audit chain for every physical dispatch."""
+    return formula_dispatch_reconciliation_failure(conn, authoring_run_id) is None
+
+
 # ---- C5-T3: the auditing-client wrapper (the dispatch seam) --------------------------------------
 
 
@@ -214,6 +453,13 @@ class DispatchAuditContext:
     ingestion_run_id: str | None
     stage: str
     subjects: Sequence[dict] = ()
+    authoring_run_id: str | None = None
+    call_role: str | None = None
+    turn_index: int | None = None
+    provider_contract_hash: str | None = None
+    prompt_content_hash: str | None = None
+    schema_content_hash: str | None = None
+    lease_fence: LeaseFence | None = None
 
 
 class AuditingClient:
@@ -259,6 +505,22 @@ class AuditingClient:
             return self._inner.call(request)
         self._attempt_no += 1
         gen = request.generation_settings or {}
+        prompt_content_hash = self._ctx.prompt_content_hash or _content_hash(
+            request.inputs.get("instruction"))
+        schema_content_hash = self._ctx.schema_content_hash or _content_hash(
+            request.output_schema)
+        provider_contract_hash = self._ctx.provider_contract_hash or _content_hash({
+            "call_role": self._ctx.call_role or request.task,
+            "provider": gen.get("provider"),
+            "model": gen.get("model"),
+            "generation_settings": gen,
+            "prompt_id": request.prompt_id,
+            "prompt_version": request.prompt_version,
+            "prompt_content_hash": prompt_content_hash,
+            "output_schema_id": request.output_schema_id,
+            "output_schema_version": request.output_schema_version,
+            "schema_content_hash": schema_content_hash,
+        })
         try:
             dispatch_ref = record_dispatch(
                 logical_call_ref=self._logical_call_ref, attempt_no=self._attempt_no,
@@ -269,7 +531,16 @@ class AuditingClient:
                 redaction_version=self._redaction_version,
                 provider=gen.get("provider"), model=gen.get("model"),
                 prompt_version=request.prompt_version,
-                schema_version=request.output_schema_version)
+                schema_version=request.output_schema_version,
+                physical_request_hash=compute_physical_request_hash(request),
+                authoring_run_id=self._ctx.authoring_run_id,
+                call_role=self._ctx.call_role,
+                turn_index=self._ctx.turn_index,
+                canonical_turn_input_hash=compute_input_hash(request.inputs),
+                provider_contract_hash=provider_contract_hash,
+                prompt_content_hash=prompt_content_hash,
+                schema_content_hash=schema_content_hash,
+                lease_fence=self._ctx.lease_fence)
         except AuditUnavailable:
             logger.warning(
                 "pre-dispatch audit unavailable for %s attempt %s — provider NOT called "

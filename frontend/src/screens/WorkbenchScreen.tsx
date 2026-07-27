@@ -21,22 +21,17 @@
 // - A response with one non-empty set renders the flat list exactly as before, no cards row.
 // - Sets that came back empty are dropped from the compare row (nothing to take or compare);
 //   their gauntlet rejections still show in the rejections panel.
-// - Candidate identity within a round is the feature name: the same name in several sets is the
-//   same feature on purpose (strong signals earn their place in several theses), so it renders
-//   with an "In N sets" chip, selects globally, and registers once. Keys stay per-fetch
-//   (g{seq}:{name}) so a later round reusing a name never resurrects registered state.
-//   Accepted tradeoff: the backend does not GUARANTEE cross-lens name identity (two lenses could
-//   in principle propose different definitions under one name); the first set's definition wins
-//   the merge, and the row renders that one definition.
+// - A considered candidate is identified by the backend's opaque option_id, not its display name.
+//   Same-name recipe, governed, and free-form variants remain separate rows and retain their own
+//   provenance and draft identity. Legacy responses without option_id fall back to the per-fetch name.
 // - Set theses are client-side copy keyed by the router's fixed lens vocabulary (the wire
 //   carries no set description); an unknown lens simply renders without a thesis line.
 //
 // Feedback channels (Phase 3 decisions, documented for the record):
-// - Whole-round feedback re-calls /contract/considered-set with the ROUND's original hypothesis
-//   and objective (both snapshotted at generate time; a later edit never silently rewrites what
-//   feedback runs against) plus the current scope, which cannot have drifted (scope edits
-//   invalidate the round), and the human's instruction as `feedback`. It mints a FRESH governing
-//   intent over the guided set, so post-feedback candidates stay governable.
+// - In confirmation-required mode, whole-round feedback first creates a new sealed recognition over
+//   the ROUND's original hypothesis/objective plus the bounded human instruction. The user confirms
+//   that revised scope before /contract/considered-set mints the superseding run. Emergency legacy
+//   mode retains the direct one-shot call.
 // - Pin semantics are client-side: candidates that are selected or registered stay (selected
 //   pins get a Kept chip; registered rows are already their own mark), everything else is
 //   replaced by the new response. A new candidate reusing a pinned name is dropped: the pin
@@ -67,15 +62,15 @@ import {
 import { getSession } from '../session'
 
 // ---- Phase 1B feature flags -------------------------------------------------------------------
-// Two independent UI flags, read via Vite's env idiom and default OFF: with both off the screen
-// behaves EXACTLY as today (one-shot generate, no recognition call, no disposition lens). Read at
-// call time (not cached at module scope) so tests can flip them with vi.stubEnv.
+// Scope confirmation is the release-safe default. Setting the flag to "0" is an emergency UI
+// compatibility switch only; the backend still rejects a one-shot request unless its own explicit
+// legacy mode is active. Read at call time so tests can exercise both deployment modes.
 // - intent_confirmation_ui: on Generate, first recognise the objective and let the human
 //   confirm/override/broaden the scope BEFORE the considered set is generated.
 // - intent_disposition_lens: when a scoped response carries dispositions, group recipes by their
 //   final disposition (only meaningful with the confirmation UI on).
 function confirmationUiEnabled(): boolean {
-  return import.meta.env.VITE_INTENT_CONFIRMATION_UI === '1'
+  return import.meta.env.VITE_INTENT_CONFIRMATION_UI !== '0'
 }
 function dispositionLensEnabled(): boolean {
   return import.meta.env.VITE_INTENT_DISPOSITION_LENS === '1'
@@ -138,6 +133,7 @@ function signalWarningText(code: string): string {
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
 const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
   { key: 'eligible', heading: 'Recommended' },
+  { key: 'grounding_incomplete', heading: 'Grounding incomplete' },
   { key: 'unbuildable', heading: 'Relevant but missing data' },
   { key: 'safety_rejected', heading: 'Rejected by safety' },
   { key: 'out_of_scope', heading: 'Outside confirmed scope' },
@@ -151,7 +147,7 @@ function dispositionReason(d: RecipeDisposition): string {
   }
   const stage = d.final_disposition === 'out_of_scope'
     ? d.applicability
-    : d.final_disposition === 'unbuildable'
+    : d.final_disposition === 'unbuildable' || d.final_disposition === 'grounding_incomplete'
       ? d.grounding
       : d.safety
   const codes = stage?.reason_codes ?? []
@@ -380,10 +376,8 @@ function slugFrom(text: string): string {
     .slice(0, 63)
 }
 
-// Candidate identity within a round is the feature name (the same name in several sets is the
-// same feature); keys carry the fetch sequence (g{seq}:{name}) because LLM-chosen names are not
-// unique across rounds, so keying registered state by name alone would show phantom "Registered"
-// on a fresh, never-registered candidate that reuses an old name.
+// Candidate identity within a governed round is the server's opaque option_id. The fetch sequence
+// isolates legacy responses and keeps a later revision from resurrecting state from an older round.
 interface GeneratedCandidate {
   kind: 'generated'
   key: string
@@ -396,6 +390,17 @@ interface GeneratedCandidate {
   kept?: boolean
 }
 
+function generationSourceLabel(idea: FeatureIdea): string {
+  if (idea.path_authority === 'governed_cross_catalog') {
+    return idea.recipe_id ? `Governed recipe · ${idea.recipe_id}` : 'Governed planner'
+  }
+  if (idea.generation_source === 'recipe') {
+    return idea.recipe_id ? `Recipe · ${idea.recipe_id}` : 'Recipe'
+  }
+  if (idea.generation_source === 'user_defined') return 'User-defined'
+  return 'Free-form'
+}
+
 // One recorded whole-round feedback submission: who asked, what they asked, what it did.
 interface SetFeedbackRecord {
   round: number
@@ -404,6 +409,11 @@ interface SetFeedbackRecord {
   // Selected (unregistered) pins that were kept; registered rows persist as their own record.
   kept: number
   replaced: number
+}
+
+interface RecognitionTransition {
+  feedback: string
+  supersedesScopeId: string
 }
 
 // Per-candidate refine channel state, keyed by candidate key.
@@ -594,6 +604,7 @@ export function WorkbenchScreen() {
   // The server-side intent that will later govern these candidates into a signed contract. Set
   // on a successful generate; dropped by clearSets on any invalidation (scope edit or error).
   const [intentId, setIntentId] = useState<string | null>(null)
+  const [generationRunId, setGenerationRunId] = useState<string | null>(null)
   const [source, setSource] = useState('')
   const [entity, setEntity] = useState('')
   const [target, setTarget] = useState('')
@@ -635,6 +646,8 @@ export function WorkbenchScreen() {
   // edits before confirming: the chosen primary use-case, the kept secondaries, and whether to
   // include descendant sub-use-cases (exact ↔ include_descendants).
   const [recognition, setRecognition] = useState<RecognitionResp | null>(null)
+  const [recognitionTransition, setRecognitionTransition] =
+    useState<RecognitionTransition | null>(null)
   const [scopePrimary, setScopePrimary] = useState<string | null>(null)
   const [scopeSecondary, setScopeSecondary] = useState<string[]>([])
   const [scopeExpansion, setScopeExpansion] = useState<'exact' | 'include_descendants'>('exact')
@@ -799,6 +812,7 @@ export function WorkbenchScreen() {
     setRejectionsOpen(false)
     // Drop any stale governance intent: the candidates it governed no longer exist.
     setIntentId(null)
+    setGenerationRunId(null)
   }
 
   // Resets both feedback channels: round counters, recorded strips, typed instructions, and
@@ -820,6 +834,7 @@ export function WorkbenchScreen() {
     // A scope edit also drops the Gate #1 confirm step and any scoped disposition lens: the
     // recognised scope was for the previous scope context. (Both no-ops when the flags are off.)
     setRecognition(null)
+    setRecognitionTransition(null)
     setDispositions(null)
     // The deterministic ranking was for the previous scope too; drop it (no-op when the flag is off).
     setRanking(null)
@@ -874,33 +889,29 @@ export function WorkbenchScreen() {
     invalidateGenerated()
   }
 
-  // Apply a considered-set response as the current round: dedupe candidates by name across sets,
-  // open the detail list on the advisory pick, and reset the feedback cycle against THIS round's
-  // hypothesis/objective. Shared by the one-shot generate (flag off) and the confirmed/broadened
-  // scoped generate (flag on). Callers run the out-of-order guard BEFORE calling.
+  // Apply a considered-set response as the current round. Every opaque option remains selectable even
+  // when several variants share a display name. Shared by legacy and confirmed-scope generation.
   function applyConsideredRound(
     cs: ConsideredSetResp, seq: number, roundHyp: string, roundObj: string,
+    resetFeedback = true,
   ) {
     setIntentId(cs.intent_id)
-    // Dedupe by name across sets: the same feature in several lenses is one candidate that
-    // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
-    const byName = new Map<string, GeneratedCandidate>()
+    setGenerationRunId(cs.generation_run_id ?? null)
+    const candidates: GeneratedCandidate[] = []
     const lenses: string[] = []
-    for (const set of cs.alternatives) {
+    for (const [setIndex, set] of cs.alternatives.entries()) {
       if (set.features.length === 0) continue
       lenses.push(set.lens)
-      for (const idea of set.features) {
-        const existing = byName.get(idea.name)
-        if (existing) {
-          if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
-        } else {
-          byName.set(idea.name, {
-            kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
-          })
-        }
+      for (const [featureIndex, idea] of set.features.entries()) {
+        candidates.push({
+          kind: 'generated',
+          key: `g${seq}:${idea.option_id ?? `${setIndex}:${featureIndex}:${idea.name}`}`,
+          idea,
+          lenses: [set.lens],
+        })
       }
     }
-    setGenerated([...byName.values()])
+    setGenerated(candidates)
     setSetLenses(lenses)
     setRecommendation(cs.recommendation)
     // The detail list opens on the advisory pick when there is one among the surviving sets.
@@ -931,7 +942,39 @@ export function WorkbenchScreen() {
     // whole-round feedback reruns these even if the inputs are edited later.
     setRoundHypothesis(roundHyp)
     setRoundObjective(roundObj)
-    clearFeedback()
+    if (resetFeedback) clearFeedback()
+  }
+
+  function finishFeedbackTransition(
+    transition: RecognitionTransition,
+    prior: GeneratedCandidate[],
+  ) {
+    const pinned = prior.filter(candidate =>
+      candidate.key in selectedRef.current
+      || registeredRef.current[candidate.key] !== undefined)
+    const pinnedKeys = new Set(pinned.map(candidate => candidate.key))
+    const keptSelected = pinned
+      .filter(candidate => registeredRef.current[candidate.key] === undefined).length
+    setGenerated(fresh => [
+      ...pinned.map((candidate): GeneratedCandidate => ({
+        ...candidate, kept: true, lenses: [],
+      })),
+      ...(fresh ?? []),
+    ])
+    setSelected(previous => Object.fromEntries(
+      Object.entries(previous).map(([key, origin]) =>
+        pinnedKeys.has(key) ? [key, null] : [key, origin])))
+    setSetFbRounds(round => round + 1)
+    setSetFbRecords(records => [...records, {
+      round: records.length + 1,
+      user: getSession().user,
+      instruction: transition.feedback,
+      kept: keptSelected,
+      replaced: prior.length - pinned.length,
+    }])
+    setSetFbInstruction('')
+    setRefines(previous => Object.fromEntries(
+      Object.entries(previous).filter(([key]) => pinnedKeys.has(key))))
   }
 
   // Phase 1B (intent_confirmation_ui): recognise the objective and enter the confirm step. NO
@@ -955,6 +998,7 @@ export function WorkbenchScreen() {
       setRoundHypothesis(hypothesis.trim())
       setRoundObjective(objective)
       setRecognition(rec)
+      setRecognitionTransition(null)
       setScopePrimary(rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
       setScopeSecondary(
         rec.candidates.filter(c => c.relationship === 'secondary').map(c => c.use_case_id))
@@ -977,36 +1021,38 @@ export function WorkbenchScreen() {
   async function confirmScope() {
     const rec = recognition
     if (!rec || feedbackLocked) return
+    const transition = recognitionTransition
+    const prior = generatedRef.current ?? []
     const seq = ++generateSeq.current
     setNotice('')
     setGenerating(true)
     try {
-      const ids = [scopePrimary, ...scopeSecondary].filter((id): id is string => id !== null)
-      // Every confirmed use-case is llm_proposed here: the controls re-role the recognizer's
-      // proposals (confirm/remove/change-primary), there is no free-text add, so the
-      // proposed-vs-accepted delta the backend stores is purely re-roling.
-      const useCaseOrigins = Object.fromEntries(ids.map(id => [id, 'llm_proposed']))
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
         entity: entity.trim() || undefined,
         targetRef: target.trim() || undefined,
         intentId: rec.intent_id,
         recognitionId: rec.recognition_id,
+        feedback: transition?.feedback,
         confirmedScope: {
           primary: scopePrimary,
           secondary: scopeSecondary,
           expansion: scopeExpansion,
           unscoped: false,
-          useCaseOrigins,
-          confirmationSource: 'user_confirmed',
           // SOFT dimensions the human confirmed/overrode: ranking nudges only, never a scope filter.
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
         },
+        supersedesScopeId: transition?.supersedesScopeId,
       })
       if (seq !== generateSeq.current) return
-      applyConsideredRound(cs, seq, roundHypothesis, roundObjective)
+      applyConsideredRound(
+        cs, seq, roundHypothesis, roundObjective, transition === null)
+      if (transition) {
+        finishFeedbackTransition(transition, prior)
+      }
       setRecognition(null)
+      setRecognitionTransition(null)
     } catch (err) {
       if (seq !== generateSeq.current) return
       fail(err)
@@ -1020,6 +1066,8 @@ export function WorkbenchScreen() {
   async function broadenScope() {
     if (feedbackLocked) return
     const rec = recognition
+    const transition = recognitionTransition
+    const prior = generatedRef.current ?? []
     const seq = ++generateSeq.current
     setNotice('')
     setGenerating(true)
@@ -1033,22 +1081,26 @@ export function WorkbenchScreen() {
         // the run/scope lineage. `intentId` holds the confirmed round's intent (set by applyConsideredRound).
         intentId: intentId ?? rec?.intent_id,
         recognitionId: rec?.recognition_id,
+        feedback: transition?.feedback,
         confirmedScope: {
           primary: null,
           secondary: [],
           expansion: 'exact',
           unscoped: true,
-          useCaseOrigins: {},
-          confirmationSource: 'broaden',
           // Dimensions are SOFT ranking nudges that still apply to the broadened (unscoped) set.
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
         },
-        supersedesScopeId: lastScopeId ?? undefined,
+        supersedesScopeId: transition?.supersedesScopeId
+          ?? lastScopeId
+          ?? undefined,
       })
       if (seq !== generateSeq.current) return
-      applyConsideredRound(cs, seq, roundHypothesis, roundObjective)
+      applyConsideredRound(
+        cs, seq, roundHypothesis, roundObjective, transition === null)
+      if (transition) finishFeedbackTransition(transition, prior)
       setRecognition(null)
+      setRecognitionTransition(null)
     } catch (err) {
       if (seq !== generateSeq.current) return
       fail(err)
@@ -1057,8 +1109,8 @@ export function WorkbenchScreen() {
     }
   }
 
-  // Change the primary to another candidate: promote the chosen use-case, demote the old primary
-  // into the secondaries (both stay llm_proposed — the recognizer proposed them, we re-role).
+  // Change the primary to another candidate: promote the chosen use-case and demote the old primary.
+  // The server records both relationship changes as user overrides of the recognition proposal.
   function makePrimary(useCaseId: string) {
     setScopeSecondary(prev => {
       const withoutChosen = prev.filter(id => id !== useCaseId)
@@ -1117,20 +1169,43 @@ export function WorkbenchScreen() {
     }
   }
 
-  // Whole-round feedback: rerun the round's hypothesis + objective under the human's guidance
-  // through considered-set (minting a fresh governing intent). Selected and registered candidates
-  // are pinned client-side; everything else is replaced by the response.
+  // Whole-round feedback: release mode re-runs recognition and requires another human scope
+  // confirmation before generation. Emergency legacy mode retains the direct considered-set call.
   async function sendSetFeedback(e: FormEvent) {
     e.preventDefault()
     if (setFbInFlight.current) return
     const instruction = setFbInstruction.trim()
     if (!instruction || setFbRounds >= FEEDBACK_ROUNDS) return
-    if (feedbackLocked || generating) return
+    if (feedbackLocked || generating || recognition !== null) return
     const seq = ++generateSeq.current
     setFbInFlight.current = true
     setNotice('')
     setSetFbBusy(true)
     try {
+      if (confirmationUi) {
+        if (!lastScopeId) {
+          throw new Error("Feedback requires a prior confirmed scope")
+        }
+        const rec = await contractRecognitions(roundHypothesis, roundObjective, {
+          feedback: instruction,
+          supersedesScopeId: lastScopeId,
+        })
+        if (seq !== generateSeq.current) return
+        setRecognition(rec)
+        setRecognitionTransition({
+          feedback: instruction,
+          supersedesScopeId: lastScopeId,
+        })
+        setScopePrimary(
+          rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
+        setScopeSecondary(
+          rec.candidates.filter(c => c.relationship === 'secondary')
+            .map(c => c.use_case_id))
+        setScopeExpansion('exact')
+        setScopeContexts(rec.modelling_contexts)
+        setScopeEntity(rec.target_entity)
+        return
+      }
       // Feedback routes through the governed considered-set endpoint so the round mints a FRESH
       // intent over the guided set: post-feedback candidates become governable (the stale-intent
       // guard is lifted). The ROUND's snapshotted hypothesis + objective run, never a since-edited
@@ -1146,6 +1221,7 @@ export function WorkbenchScreen() {
         sets: cs.alternatives, recommendation: cs.recommendation, rejections: cs.rejections,
       }
       setIntentId(cs.intent_id)
+      setGenerationRunId(cs.generation_run_id ?? null)
       // Pins read the selection AS THE RESPONSE LANDS (the mirrors), not as it stood at submit.
       const prev = generatedRef.current ?? []
       const pinned = prev.filter(c =>
@@ -1153,32 +1229,24 @@ export function WorkbenchScreen() {
       const keptSelected = pinned
         .filter(c => registeredRef.current[c.key] === undefined).length
       const replaced = prev.length - pinned.length
-      const pinnedNames = new Set(pinned.map(c => c.idea.name))
       const pinnedKeys = new Set(pinned.map(c => c.key))
-      const byName = new Map<string, GeneratedCandidate>()
+      const fresh: GeneratedCandidate[] = []
       const lenses: string[] = []
-      for (const set of round.sets) {
-        // The pin wins a name collision: one row per name, and the human's kept candidate is
-        // never silently swapped for a regenerated variant. Filter FIRST: a set whose every
-        // candidate collided (or that arrived empty) must not render an empty card, and must
-        // never become the active or recommended-active view.
-        const freshIdeas = set.features.filter(idea => !pinnedNames.has(idea.name))
-        if (freshIdeas.length === 0) continue
+      for (const [setIndex, set] of round.sets.entries()) {
+        if (set.features.length === 0) continue
         lenses.push(set.lens)
-        for (const idea of freshIdeas) {
-          const existing = byName.get(idea.name)
-          if (existing) {
-            if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
-          } else {
-            byName.set(idea.name, {
-              kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
-            })
-          }
+        for (const [featureIndex, idea] of set.features.entries()) {
+          fresh.push({
+            kind: 'generated',
+            key: `g${seq}:${idea.option_id ?? `${setIndex}:${featureIndex}:${idea.name}`}`,
+            idea,
+            lenses: [set.lens],
+          })
         }
       }
       setGenerated([
         ...pinned.map((c): GeneratedCandidate => ({ ...c, kept: true, lenses: [] })),
-        ...byName.values(),
+        ...fresh,
       ])
       // The intent was refreshed above (setIntentId(cs.intent_id)) so the FRESH candidates are
       // governable; the kept pins came from a prior generation and are excluded by governableCount.
@@ -1460,7 +1528,7 @@ export function WorkbenchScreen() {
   // Govern the selected GENERATED candidates into signed contracts, mirroring confirmRegistration:
   // sequential, one candidate at a time, per-candidate try/catch so a failure marks that candidate
   // and the batch continues. Only fresh (non-kept) generated candidates are in the current intent's
-  // considered-set snapshot; chosenSource is always 'alternative' and chosenOptionId is the name.
+  // considered-set snapshot; chosenSource is legacy-only and chosenOptionId is the opaque option id.
   async function confirmGovern() {
     if (governInFlight.current) return
     const iid = intentId
@@ -1476,8 +1544,14 @@ export function WorkbenchScreen() {
     try {
       for (const candidate of batch) {
         try {
-          const d = await contractDraft(iid, 'alternative', candidate.idea.name)
-          const c = await contractConfirm(d.draft, iid)
+          const d = await contractDraft(
+            iid,
+            'alternative',
+            candidate.idea.option_id ?? candidate.idea.name,
+            '',
+            generationRunId ?? undefined,
+          )
+          const c = await contractConfirm(d.draft, iid, d.choice_id)
           setGoverned(prev => ({ ...prev,
             [candidate.key]: { contractId: c.contract_id, version: c.version } }))
           deselect(candidate.key)
@@ -2141,6 +2215,14 @@ export function WorkbenchScreen() {
               const error = errors[c.key]
               const rawName = c.kind === 'generated' ? c.idea.name : c.name
               const displayName = rawName.trim() || 'unnamed draft'
+              const sameNameVariants = c.kind === 'generated'
+                ? (generated ?? []).filter(other => other.idea.name === c.idea.name).length
+                : 0
+              const variantContext = c.kind === 'generated' && sameNameVariants > 1
+                ? c.kept
+                  ? 'earlier round'
+                  : `${c.lenses[0] ?? 'unscoped'}; ${generationSourceLabel(c.idea)}`
+                : null
               const canSelect = c.kind === 'generated' || c.name.trim() !== ''
               const description = c.kind === 'generated' ? c.idea.description : c.description
               const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
@@ -2163,7 +2245,7 @@ export function WorkbenchScreen() {
                   ) : (
                     <input
                       type="checkbox"
-                      aria-label={`Select ${displayName}`}
+                      aria-label={`Select ${displayName}${variantContext ? ` (${variantContext})` : ''}`}
                       checked={c.key in selected}
                       disabled={batchBusy || !canSelect}
                       onChange={() => toggleSelect(
@@ -2184,15 +2266,16 @@ export function WorkbenchScreen() {
                       <span className="badge proposal">
                         {c.kind === 'generated' ? 'Proposal' : 'Draft'}
                       </span>
+                      {c.kind === 'generated' && (
+                        <span className="badge">{generationSourceLabel(c.idea)}</span>
+                      )}
+                      {c.kind === 'generated' && c.idea.candidate_status && (
+                        <span className="badge">{c.idea.candidate_status}</span>
+                      )}
                       {/* Honest stamp: soft (not solid) so it never outshouts the selection or
                           registered states. Drafts skip the gauntlet, so they carry no stamp. */}
                       {c.kind === 'generated' && c.idea.verification && (
                         <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
-                      )}
-                      {/* Overlap is on purpose: strong signals earn their place in several
-                          theses. Soft chip; the row is one candidate either way. */}
-                      {c.kind === 'generated' && c.lenses.length > 1 && (
-                        <span className="badge">In {c.lenses.length} sets</span>
                       )}
                       {/* Pinned through a whole-round regeneration. Registered rows skip the
                           chip: Registered is already their mark. */}
@@ -2514,13 +2597,15 @@ export function WorkbenchScreen() {
                     id="wb-setfb"
                     value={setFbInstruction}
                     onChange={e => setSetFbInstruction(e.target.value)}
-                    disabled={setFbBusy || setFbExhausted || feedbackLocked}
+                    disabled={setFbBusy || setFbExhausted || feedbackLocked
+                      || recognition !== null}
                     placeholder="e.g. more behavioral signals, fewer balance aggregates"
                   />
                   <button
                     type="submit"
                     className="btn btn--primary"
                     disabled={setFbBusy || setFbExhausted || feedbackLocked || generating
+                      || recognition !== null
                       || !setFbInstruction.trim()}
                   >
                     {setFbBusy

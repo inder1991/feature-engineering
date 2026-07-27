@@ -25,6 +25,7 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_to_json,
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
+from featuregen.overlay.upload.contract.scope_mode import confirmation_required
 from featuregen.overlay.upload.feature_assist import (
     ExternalRequirementPreview,
     FeatureIdea,
@@ -41,6 +42,7 @@ from featuregen.overlay.upload.feature_assist import (
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     build_metadata_snapshot,
     capture_column_snapshot,
+    ensure_generation_run,
 )
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
@@ -57,22 +59,41 @@ from featuregen.overlay.upload.planner.plan_envelope import (
 )
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
+from featuregen.overlay.upload.recipe_grounding_context import (
+    RecipeGroundingContextV1,
+    build_recipe_grounding_context,
+)
 from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
 from featuregen.overlay.upload.taxonomy.ranking_signals import binding_quality
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     GroundedFeature,
+    GroundingStatus,
     Template,
-    ground_all,
+)
+from featuregen.overlay.upload.templates import (
+    ground_all_outcomes as _ground_all_default,
 )
 
 logger = logging.getLogger(__name__)
+
+# Preserve both historical test/integration seams while callers migrate to the explicit name.
+ground_all_outcomes = _ground_all_default
+ground_all = _ground_all_default
+
+
+def _ground_template_outcomes(*args, **kwargs):
+    if ground_all_outcomes is not _ground_all_default:
+        return ground_all_outcomes(*args, **kwargs)
+    return ground_all(*args, **kwargs)
+
 
 # 3C.2a — the fail-closed cross-catalog invariant. On a live entity-scoped run EVERY customer-visible
 # cross-catalog feature must have a governed physical plan, so an LLM alternative whose derives span
 # more than one catalog (which has NO such plan) can never be a recommendation — it is surfaced as a
 # rejection carrying this reason string instead.
 GOVERNED_CROSS_CATALOG_PLAN_REQUIRED = "governed_cross_catalog_plan_required"
+CONSIDERED_CANONICALIZATION_VERSION = "contract-considered-v2"
 
 
 class Gate1Error(Exception):
@@ -94,10 +115,20 @@ class ConsideredSet:
     #   grounded candidate SURVIVED the gauntlet (the `ideas`) — the disposition stage's `grounded_ids`.
     rejected_template_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)   # template id ->
     #   the gauntlet reject codes for candidates it REFUSED (safety/leakage/units) — feeds `rejected`.
+    incomplete_template_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)
     binding_quality_by_template: dict[str, str] = field(default_factory=dict)   # template id ->
     #   BindingQuality.value for each SURVIVING grounded candidate (Task A3 Part A) — the ranker's
     #   binding-quality signal. Additive + read-only: grounding behaviour is unchanged and nothing else
     #   reads it (the ranker consumes it in the API layer only when FEATUREGEN_INTENT_RANKING is on).
+    recipe_grounding_context_by_candidate_key: dict[
+        str, RecipeGroundingContextV1
+    ] = field(default_factory=dict)
+    recipe_candidate_keys_by_recipe_id: dict[
+        str, tuple[str, ...]
+    ] = field(default_factory=dict)
+    option_ids_by_path: dict[str, str] = field(default_factory=dict)
+    considered_revision_id: str | None = None
+    considered_content_hash: str | None = None
 
 
 def persist_intent(conn, intent: Intent, target_ref: str | None = None) -> None:
@@ -147,7 +178,10 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
                          ) -> tuple[list[FeatureIdea], list[dict],
-                                    frozenset[str], dict[str, tuple[str, ...]], dict[str, str]]:
+                                    frozenset[str], dict[str, tuple[str, ...]], dict[str, str],
+                                    dict[str, tuple[str, ...]],
+                                    dict[str, RecipeGroundingContextV1],
+                                    dict[str, tuple[str, ...]]]:
     """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
     ``templates`` defaults to the whole ``ALL_TEMPLATES`` registry (today's behaviour); Phase-1B scoped
@@ -162,9 +196,17 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     (Task 5) consumes them as its ``grounded_ids`` / ``rejected`` inputs. Additionally returns the
     per-SURVIVING-template ``binding_quality`` value (Task A3 Part A) — a read-only presentation signal
     the ranker consumes; grounding behaviour is unchanged by computing it."""
-    grounded = ground_all(conn, templates, catalog_source=catalog_source, roles=roles)
+    outcomes = _ground_template_outcomes(
+        conn, templates, catalog_source=catalog_source, roles=roles)
+    grounded = [
+        outcome.feature for outcome in outcomes if outcome.feature is not None]
+    incomplete_ids = {
+        outcome.template_id: outcome.reason_codes
+        for outcome in outcomes
+        if outcome.status is GroundingStatus.BUDGET_TRUNCATED
+    }
     if not grounded:
-        return [], [], frozenset(), {}, {}
+        return [], [], frozenset(), {}, {}, incomplete_ids, {}, {}
     by_id = {t.id: t for t in templates}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
@@ -176,6 +218,8 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     grounded_ids: set[str] = set()                       # templates whose candidate SURVIVED the gauntlet
     rejected_ids: dict[str, tuple[str, ...]] = {}        # templates the gauntlet REFUSED -> its code
     binding_by_id: dict[str, str] = {}                   # SURVIVING template -> BindingQuality.value
+    contexts: dict[str, RecipeGroundingContextV1] = {}
+    keys_by_recipe: dict[str, list[str]] = {}
     for gf in grounded:
         idea = _idea_from_grounded(gf, by_id[gf.template_id])
         raw = {"name": idea.name, "description": idea.description,
@@ -192,36 +236,49 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
                                  planner_applicability="not_applicable_single_catalog"))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
+            context = build_recipe_grounding_context(by_id[gf.template_id], gf)
+            contexts[context.recipe_candidate_key] = context
+            keys_by_recipe.setdefault(gf.template_id, []).append(context.recipe_candidate_key)
         else:
             rejections.append({"name": idea.name, "reason": rej.message, "code": rej.code})
             rejected_ids[gf.template_id] = (rej.code,)
-    return ideas, rejections, frozenset(grounded_ids), rejected_ids, binding_by_id
+    return (
+        ideas,
+        rejections,
+        frozenset(grounded_ids),
+        rejected_ids,
+        binding_by_id,
+        incomplete_ids,
+        contexts,
+        {recipe_id: tuple(keys) for recipe_id, keys in keys_by_recipe.items()},
+    )
 
 
-# ── Phase-1B Task 4: scoped grounding (flag-gated, default off) ─────────────────────────────────────
-# When FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1, a supplied ApplicabilityResult narrows the template
-# universe grounding evaluates to the eligible recipe subset. The flag defaults OFF → grounding sees the
-# whole ALL_TEMPLATES registry, byte-identical to today. The narrowing NEVER widens (the eligible set is
-# ⊆ ALL_TEMPLATES) and NEVER relaxes safety (grounding still refuses leakage/protected columns by
-# construction). Recognition/applicability is computed once in the API layer (Tasks 6/7); the builder is
-# a pure consumer here. See docs/superpowers/plans/2026-07-10-phase1b-scoped-grounding.md Task 4.
+# ── Delivery 0: server-enforced scoped grounding ────────────────────────────────────────────────────
+# Normal release mode always narrows to the supplied applicability. The old applicability flag is read
+# only in the explicit legacy_unscoped emergency mode. The narrowing never widens and never relaxes
+# grounding safety.
 def _intent_scoped_applicability_enabled() -> bool:
-    """Scoped grounding is OFF by default — ``build_considered_set`` grounds ``ALL_TEMPLATES`` unchanged
-    unless a deployment opts in with ``FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1``."""
+    """Release mode always enforces scoped applicability.
+
+    The historical flag remains only for the explicitly selected ``legacy_unscoped`` emergency mode;
+    it can no longer disable a confirmed scope during normal operation.
+    """
+    if confirmation_required():
+        return True
     return os.environ.get("FEATUREGEN_INTENT_SCOPED_APPLICABILITY", "0") == "1"
 
 
 def _templates_to_ground(intent: Intent,
                          applicability: ApplicabilityResult | None) -> Sequence[Template]:
-    """The template subset grounding evaluates for this run. Grounds only the applicability's
-    ``eligible_ids`` when ALL of: the scoped-applicability flag is on; an ``applicability`` is supplied;
-    the intent is NOT definition-mode (definition bypasses recognition/applicability, never grounding);
-    and the applicability GENUINELY NARROWS — its eligible set is strictly smaller than the full registry
-    (an unscoped/all-eligible result is not a narrowing and fails open to full grounding). Otherwise
-    returns ``ALL_TEMPLATES`` — today's behaviour, byte-identical."""
+    """Return the governed recipe universe for this run.
+
+    Release mode applies a confirmed narrowing in both intake modes. Legacy mode preserves the
+    historical definition bypass and old flag semantics for emergency rollback.
+    """
     if (_intent_scoped_applicability_enabled()
             and applicability is not None
-            and intent.intake_mode != "definition"
+            and (confirmation_required() or intent.intake_mode != "definition")
             and len(applicability.eligible_ids) < len(ALL_TEMPLATES)):
         return tuple(t for t in ALL_TEMPLATES if t.id in applicability.eligible_ids)
     return ALL_TEMPLATES
@@ -415,8 +472,22 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
     considered set (``CatalogProjectionUnavailable`` propagates to the route → 503) with NO row written —
     the snapshot and the considered set commit atomically in the one feature transaction."""
     if not _on_repeatable_read(conn):
-        return None, None, None
+        # Compatibility/unit-test callers may not use the production REPEATABLE READ connection.
+        # Preserve an explicitly supplied scoped run id so the immutable considered revision and
+        # exact-choice token still exist; only the catalog snapshot lineage is unavailable.
+        return generation_run_id, None, None
     run_id = generation_run_id or mint_id("fgr")
+    # Bind a directly-built run to its intent before the snapshot helper's compatibility ensure call.
+    # The production route already creates this binding; keeping it here makes the builder's immutable
+    # revision and exact-choice lineage self-consistent for every caller.
+    ensure_generation_run(
+        conn,
+        run_id,
+        _run_actor(intent),
+        {"intake_mode": intent.intake_mode, "catalog_source": catalog_source,
+         "is_live": bool(is_live)},
+        intent_id=intent.intent_id,
+    )
     refs = _candidate_refs(cs)
     read_scope_hash = canonical_hash({
         "refs": [list(r) for r in refs],   # already sorted, deduped
@@ -475,7 +546,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     rejections = list(report.rejections)
     grounded_template_ids: frozenset[str] = frozenset()   # per-template grounding outcome for Task 5's
     rejected_template_ids: dict[str, tuple[str, ...]] = {}   # disposition stage (empty on a no-catalog run)
+    incomplete_template_ids: dict[str, tuple[str, ...]] = {}
     binding_quality_by_template: dict[str, str] = {}   # per-template binding signal for the ranker (A3)
+    recipe_grounding_context_by_candidate_key: dict[str, RecipeGroundingContextV1] = {}
+    recipe_candidate_keys_by_recipe_id: dict[str, tuple[str, ...]] = {}
     # B4 two-source model: seed the considered set with grounded parametric templates alongside the LLM
     # alternatives — but only where a single catalog is in scope to ground them (an entity-only,
     # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
@@ -485,7 +559,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
         (template_ideas, template_rejections, grounded_template_ids, rejected_template_ids,
-         binding_quality_by_template) = (
+         binding_quality_by_template, incomplete_template_ids,
+         recipe_grounding_context_by_candidate_key, recipe_candidate_keys_by_recipe_id) = (
             _template_candidates(
                 conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
                 templates=_templates_to_ground(intent, applicability)))
@@ -536,7 +611,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                        applicability=applicability,
                        grounded_template_ids=grounded_template_ids,
                        rejected_template_ids=rejected_template_ids,
-                       binding_quality_by_template=binding_quality_by_template)
+                       incomplete_template_ids=incomplete_template_ids,
+                       binding_quality_by_template=binding_quality_by_template,
+                       recipe_grounding_context_by_candidate_key=(
+                           recipe_grounding_context_by_candidate_key
+                       ),
+                       recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id)
     logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
                 "anchor=%s, recommended_lens=%s",
                 intent.intent_id, catalog_source, tuple(roles),
@@ -548,14 +628,38 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     snap_run_id, snap_id, snap_hash = _persist_considered_snapshot(
         conn, cs, intent, generation_run_id=generation_run_id, roles=roles,
         catalog_source=catalog_source, is_live=is_live)
+    cs = _with_option_ids(cs, snap_run_id or f"legacy:{intent.intent_id}")
+    revision_id, considered_hash = _persist_considered_revision(
+        conn,
+        cs,
+        generation_run_id=snap_run_id,
+        metadata_snapshot_id=snap_id,
+        metadata_snapshot_content_hash=snap_hash,
+    )
+    cs = replace(
+        cs,
+        considered_revision_id=revision_id,
+        considered_content_hash=considered_hash,
+    )
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered "
-        "(intent_id, considered, generation_run_id, snapshot_id, snapshot_content_hash) "
-        "VALUES (%s, %s::jsonb, %s, %s, %s) "
+        "(intent_id, considered, generation_run_id, snapshot_id, snapshot_content_hash, "
+        "considered_revision_id, considered_content_hash) "
+        "VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered, "
         "generation_run_id = EXCLUDED.generation_run_id, snapshot_id = EXCLUDED.snapshot_id, "
-        "snapshot_content_hash = EXCLUDED.snapshot_content_hash",
-        (intent.intent_id, json.dumps(_snapshot(conn, cs)), snap_run_id, snap_id, snap_hash))
+        "snapshot_content_hash = EXCLUDED.snapshot_content_hash, "
+        "considered_revision_id = EXCLUDED.considered_revision_id, "
+        "considered_content_hash = EXCLUDED.considered_content_hash",
+        (
+            intent.intent_id,
+            json.dumps(_public_considered_snapshot(conn, cs)),
+            snap_run_id,
+            snap_id,
+            snap_hash,
+            revision_id,
+            considered_hash,
+        ))
     return cs
 
 
@@ -573,7 +677,8 @@ def _option_ids(cs: ConsideredSet) -> set[str]:
 def _idea_json(f: FeatureIdea | None) -> dict | None:
     if f is None:
         return None
-    d = {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+    d = {"name": f.name, "description": f.description,
+         "derives_from": f.derives_from, "aggregation": f.aggregation,
          "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
          "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
          "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
@@ -613,16 +718,180 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
     return d
 
 
-def _snapshot(conn, cs: ConsideredSet) -> dict:
+def _option_positions(cs: ConsideredSet):
+    if cs.anchor is not None:
+        yield "anchor", "anchor", "anchor", cs.anchor
+    for set_index, feature_set in enumerate(cs.alternatives):
+        for feature_index, feature in enumerate(feature_set.features):
+            yield (
+                f"alternative:{set_index}:{feature_index}",
+                "alternative",
+                feature_set.lens,
+                feature,
+            )
+
+
+def _candidate_identity(
+    *,
+    path: str,
+    source: str,
+    lens: str,
+    feature: FeatureIdea,
+) -> dict:
     return {
-        "anchor": _idea_json(cs.anchor),
-        "alternatives": [{"lens": s.lens, "features": [_idea_json(f) for f in s.features],
-                          "signals": set_signals(conn, s)}   # deterministic ranking signals (item 1b)
-                         for s in cs.alternatives],
+        "version": "considered-candidate-v2",
+        "path": path,
+        "source": source,
+        "lens": lens,
+        "feature": _idea_json(feature),
+    }
+
+
+def _with_option_ids(cs: ConsideredSet, generation_identity: str) -> ConsideredSet:
+    option_ids: dict[str, str] = {}
+    seen: set[str] = set()
+    for path, source, lens, feature in _option_positions(cs):
+        identity_hash = canonical_hash(
+            _candidate_identity(path=path, source=source, lens=lens, feature=feature))
+        option_id = "opt_" + canonical_hash({
+            "version": "considered-option-id-v2",
+            "generation_identity": generation_identity,
+            "candidate_identity_hash": identity_hash,
+        })[:32]
+        if option_id in seen:
+            raise Gate1Error("duplicate considered option identity")
+        seen.add(option_id)
+        option_ids[path] = option_id
+    return replace(cs, option_ids_by_path=option_ids)
+
+
+def _idea_with_option_id(feature: FeatureIdea | None, option_id: str | None) -> dict | None:
+    body = _idea_json(feature)
+    if body is not None and option_id is not None:
+        body["option_id"] = option_id
+    return body
+
+
+def _recipe_candidate_key(cs: ConsideredSet, feature: FeatureIdea) -> str | None:
+    if feature.generation_source != "recipe" or feature.recipe_id is None:
+        return None
+    keys = cs.recipe_candidate_keys_by_recipe_id.get(feature.recipe_id, ())
+    return keys[0] if len(keys) == 1 else None
+
+
+def _public_considered_snapshot(conn, cs: ConsideredSet) -> dict:
+    return {
+        "anchor": _idea_with_option_id(cs.anchor, cs.option_ids_by_path.get("anchor")),
+        "alternatives": [
+            {
+                "lens": feature_set.lens,
+                "features": [
+                    _idea_with_option_id(
+                        feature,
+                        cs.option_ids_by_path.get(
+                            f"alternative:{set_index}:{feature_index}"),
+                    )
+                    for feature_index, feature in enumerate(feature_set.features)
+                ],
+                "signals": set_signals(conn, feature_set),
+            }
+            for set_index, feature_set in enumerate(cs.alternatives)
+        ],
         "recommendation": None if cs.recommendation is None else {
             "recommended_lens": cs.recommendation.recommended_lens,
             "reasoning": cs.recommendation.reasoning, "caveat": cs.recommendation.caveat},
     }
+
+
+def _private_considered_revision_snapshot(conn, cs: ConsideredSet) -> dict:
+    """Canonical public projection plus server-only recipe replay context."""
+    options_by_id: dict[str, dict] = {}
+    for path, source, lens, feature in _option_positions(cs):
+        option_id = cs.option_ids_by_path.get(path)
+        if option_id is None or option_id in options_by_id:
+            raise Gate1Error("considered option map is incomplete or duplicated")
+        identity = _candidate_identity(
+            path=path, source=source, lens=lens, feature=feature)
+        options_by_id[option_id] = {
+            "source": source,
+            "lens": lens,
+            "canonical_candidate_identity": identity,
+            "canonical_candidate_identity_hash": canonical_hash(identity),
+            "recipe_candidate_key": _recipe_candidate_key(cs, feature),
+        }
+    return {
+        "version": CONSIDERED_CANONICALIZATION_VERSION,
+        "public": {
+            **_public_considered_snapshot(conn, cs),
+            "rejections": cs.rejections,
+        },
+        "options_by_id": {
+            option_id: options_by_id[option_id] for option_id in sorted(options_by_id)
+        },
+        "recipe_grounding_context_by_candidate_key": {
+            key: context.to_json()
+            for key, context in sorted(cs.recipe_grounding_context_by_candidate_key.items())
+        },
+        "recipe_candidate_keys_by_recipe_id": {
+            recipe_id: list(keys)
+            for recipe_id, keys in sorted(cs.recipe_candidate_keys_by_recipe_id.items())
+        },
+    }
+
+
+def _snapshot(conn, cs: ConsideredSet) -> dict:
+    """Compatibility alias for the public-only considered snapshot."""
+    return _public_considered_snapshot(conn, cs)
+
+
+def _persist_considered_revision(
+    conn,
+    cs: ConsideredSet,
+    *,
+    generation_run_id: str | None,
+    metadata_snapshot_id: str | None,
+    metadata_snapshot_content_hash: str | None,
+) -> tuple[str | None, str | None]:
+    """Persist one immutable, hash-sealed revision for a generation run."""
+    if generation_run_id is None:
+        return None, None
+    considered = _private_considered_revision_snapshot(conn, cs)
+    envelope = {
+        "version": CONSIDERED_CANONICALIZATION_VERSION,
+        "intent_id": cs.intent_id,
+        "generation_run_id": generation_run_id,
+        "metadata_snapshot_id": metadata_snapshot_id,
+        "metadata_snapshot_content_hash": metadata_snapshot_content_hash,
+        "considered": considered,
+    }
+    digest = canonical_hash(envelope)
+    revision_id = mint_id("crv")
+    conn.execute(
+        "INSERT INTO contract_considered_revision "
+        "(considered_revision_id, intent_id, generation_run_id, metadata_snapshot_id, "
+        "metadata_snapshot_content_hash, considered_json, considered_content_hash, "
+        "canonicalization_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s) "
+        "ON CONFLICT (intent_id, generation_run_id) DO NOTHING",
+        (
+            revision_id,
+            cs.intent_id,
+            generation_run_id,
+            metadata_snapshot_id,
+            metadata_snapshot_content_hash,
+            json.dumps(considered),
+            digest,
+            CONSIDERED_CANONICALIZATION_VERSION,
+        ),
+    )
+    row = conn.execute(
+        "SELECT considered_revision_id, considered_content_hash "
+        "FROM contract_considered_revision WHERE intent_id = %s AND generation_run_id = %s",
+        (cs.intent_id, generation_run_id),
+    ).fetchone()
+    if row is None or row[1] != digest:
+        raise Gate1Error("considered revision conflicts with an existing generation run")
+    return row[0], row[1]
 
 
 def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen_option_id: str,
@@ -640,19 +909,24 @@ def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen
         raise Gate1Error("chosen_source 'alternative' but the chosen option is not an alternative")
     conn.execute(
         "INSERT INTO contract_gate1_choice "
-        "(intent_id, chosen_source, chosen_option_id, why, actor, considered) "
-        "VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb) "
+        "(intent_id, chosen_source, chosen_option_id, why, actor, considered, "
+        "considered_revision_id, considered_content_hash) "
+        "VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) "
         "ON CONFLICT (intent_id) DO UPDATE SET chosen_source = EXCLUDED.chosen_source, "
         "chosen_option_id = EXCLUDED.chosen_option_id, why = EXCLUDED.why, actor = EXCLUDED.actor, "
-        "considered = EXCLUDED.considered",
+        "considered = EXCLUDED.considered, "
+        "considered_revision_id = EXCLUDED.considered_revision_id, "
+        "considered_content_hash = EXCLUDED.considered_content_hash",
         (considered.intent_id, chosen_source, chosen_option_id, why,
-         _actor_json(actor), json.dumps(_snapshot(conn, considered))))
+         _actor_json(actor), json.dumps(_public_considered_snapshot(conn, considered)),
+         considered.considered_revision_id, considered.considered_content_hash))
     return chosen_option_id
 
 
 def _idea_from_json(d: dict) -> FeatureIdea:
     return FeatureIdea(
-        name=d["name"], description="", derives_from=list(d.get("derives_from", [])),
+        name=d["name"], description=d.get("description", ""),
+        derives_from=list(d.get("derives_from", [])),
         aggregation=d.get("aggregation"), grain_table=d.get("grain_table"),
         derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])),
         verification=d.get("verification", "DESIGN-CHECKED"),      # was dropped pre-3A-ii
@@ -680,16 +954,11 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         planner_declaration_id=d.get("planner_declaration_id"))
 
 
-def chosen_feature(conn, intent_id: str, chosen_source: str,
-                   chosen_option_id: str) -> FeatureIdea | None:
-    """Reconstruct the human's chosen feature from the SERVER-persisted considered set (BLOCKER 1) — the
-    draft is authored from HERE, never from a client-supplied feature. Returns None if the choice isn't
-    in the recorded set (so a fabricated / not-offered feature can't be drafted)."""
-    row = conn.execute("SELECT considered FROM contract_considered WHERE intent_id = %s",
-                       (intent_id,)).fetchone()
-    if row is None:
-        return None
-    snap = row[0]
+def _chosen_feature_from_snapshot(
+    snap: dict,
+    chosen_source: str,
+    chosen_option_id: str,
+) -> FeatureIdea | None:
     if chosen_source == "anchor":
         a = snap.get("anchor")
         return _idea_from_json(a) if a and a.get("name") == chosen_option_id else None
@@ -706,6 +975,295 @@ def chosen_feature(conn, intent_id: str, chosen_source: str,
            for m in matches[1:]):
         return None   # ambiguous same-name options — cannot safely reconstruct
     return _idea_from_json(first)
+
+
+def _public_option_entries(public: dict) -> list[tuple[str, str, dict]]:
+    entries: list[tuple[str, str, dict]] = []
+    anchor = public.get("anchor")
+    if anchor is not None:
+        entries.append(("anchor", "anchor", anchor))
+    for feature_set in public.get("alternatives", []):
+        lens = feature_set.get("lens")
+        for feature in feature_set.get("features", []):
+            entries.append(("alternative", lens, feature))
+    return entries
+
+
+def _chosen_option_from_revision(
+    considered: dict,
+    option_id: str,
+) -> tuple[FeatureIdea, str, str]:
+    """Resolve one opaque option from a verified v2 revision and cross-check its public projection."""
+    if considered.get("version") != CONSIDERED_CANONICALIZATION_VERSION:
+        raise Gate1Error("considered revision does not support exact option identity")
+    options = considered.get("options_by_id")
+    if not isinstance(options, dict):
+        raise Gate1Error("considered revision option map is missing")
+    public_entries = _public_option_entries(considered.get("public", {}))
+    public_ids = [entry[2].get("option_id") for entry in public_entries]
+    if (
+        any(not isinstance(public_id, str) for public_id in public_ids)
+        or len(public_ids) != len(set(public_ids))
+        or set(public_ids) != set(options)
+    ):
+        raise Gate1Error("considered revision option identities are inconsistent")
+    record = options.get(option_id)
+    if not isinstance(record, dict):
+        raise Gate1Error("unknown considered option")
+    identity = record.get("canonical_candidate_identity")
+    identity_hash = record.get("canonical_candidate_identity_hash")
+    if not isinstance(identity, dict) or canonical_hash(identity) != identity_hash:
+        raise Gate1Error("considered option identity hash mismatch")
+    matches = [
+        (source, lens, feature)
+        for source, lens, feature in public_entries
+        if feature.get("option_id") == option_id
+    ]
+    if len(matches) != 1:
+        raise Gate1Error("considered option is not unique in the public projection")
+    source, lens, public_feature = matches[0]
+    feature_without_option = {
+        key: value for key, value in public_feature.items() if key != "option_id"}
+    if (
+        identity.get("source") != source
+        or identity.get("lens") != lens
+        or identity.get("feature") != feature_without_option
+        or record.get("source") != source
+        or record.get("lens") != lens
+    ):
+        raise Gate1Error("considered option projection does not match its private identity")
+    return _idea_from_json(feature_without_option), source, identity_hash
+
+
+def chosen_feature(conn, intent_id: str, chosen_source: str,
+                   chosen_option_id: str) -> FeatureIdea | None:
+    """Legacy compatibility reader over the mutable latest considered-set pointer."""
+    row = conn.execute("SELECT considered FROM contract_considered WHERE intent_id = %s",
+                       (intent_id,)).fetchone()
+    return (
+        _chosen_feature_from_snapshot(row[0], chosen_source, chosen_option_id)
+        if row is not None
+        else None
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DraftChoice:
+    feature: FeatureIdea
+    snapshot_lineage: dict | None
+    considered_revision_id: str | None
+    considered_content_hash: str | None
+    choice_id: str | None = None
+    generation_run_id: str | None = None
+    option_id: str | None = None
+    canonical_candidate_identity_hash: str | None = None
+
+
+def _verified_considered_revision_payload(
+    conn,
+    intent_id: str,
+    generation_run_id: str,
+) -> tuple[dict, dict, str, str]:
+    row = conn.execute(
+        "SELECT considered_revision_id, intent_id, generation_run_id, metadata_snapshot_id, "
+        "metadata_snapshot_content_hash, considered_json, considered_content_hash, "
+        "canonicalization_version "
+        "FROM contract_considered_revision "
+        "WHERE intent_id = %s AND generation_run_id = %s FOR SHARE",
+        (intent_id, generation_run_id),
+    ).fetchone()
+    if row is None:
+        raise Gate1Error("REGENERATE_FROM_CURRENT_CONSIDERED_SET")
+    revision_id, stored_intent, stored_run, snapshot_id, snapshot_hash, considered, digest, version = row
+    if (
+        stored_intent != intent_id
+        or stored_run != generation_run_id
+        or considered.get("version") != version
+    ):
+        raise Gate1Error("considered revision lineage is inconsistent")
+    envelope = {
+        "version": version,
+        "intent_id": stored_intent,
+        "generation_run_id": stored_run,
+        "metadata_snapshot_id": snapshot_id,
+        "metadata_snapshot_content_hash": snapshot_hash,
+        "considered": considered,
+    }
+    if canonical_hash(envelope) != digest:
+        raise Gate1Error("considered revision content hash mismatch")
+    # The immutable considered revision always has generation lineage. Snapshot fields are nullable
+    # only for compatibility callers that do not run under the production REPEATABLE READ boundary.
+    lineage = {
+        "generation_run_id": stored_run,
+        "snapshot_id": snapshot_id,
+        "content_hash": snapshot_hash,
+    }
+    return considered, lineage, revision_id, digest
+
+
+def _verified_considered_revision(
+    conn,
+    intent_id: str,
+    generation_run_id: str,
+) -> tuple[dict, dict, str, str]:
+    """Compatibility reader returning the verified public projection."""
+    considered, lineage, revision_id, digest = _verified_considered_revision_payload(
+        conn, intent_id, generation_run_id)
+    return considered["public"], lineage, revision_id, digest
+
+
+def _record_exact_choice(
+    conn,
+    *,
+    intent_id: str,
+    generation_run_id: str,
+    considered_revision_id: str,
+    considered_content_hash: str,
+    option_id: str,
+    canonical_candidate_identity_hash: str,
+    actor,
+    why: str,
+) -> str:
+    choice_id = mint_id("g1c")
+    actor_body = _actor_json(actor)
+    if actor_body is None:
+        raise Gate1Error("an actor is required for an exact Gate #1 choice")
+    actor_value = json.loads(actor_body)
+    conn.execute(
+        "INSERT INTO contract_gate1_choice_revision "
+        "(choice_id, intent_id, generation_run_id, considered_revision_id, "
+        "considered_content_hash, option_id, canonical_candidate_identity_hash, actor, why) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s) "
+        "ON CONFLICT (generation_run_id, considered_revision_id, option_id) DO NOTHING",
+        (
+            choice_id,
+            intent_id,
+            generation_run_id,
+            considered_revision_id,
+            considered_content_hash,
+            option_id,
+            canonical_candidate_identity_hash,
+            actor_body,
+            why,
+        ),
+    )
+    row = conn.execute(
+        "SELECT choice_id, intent_id, considered_content_hash, "
+        "canonical_candidate_identity_hash, actor, why "
+        "FROM contract_gate1_choice_revision "
+        "WHERE generation_run_id = %s AND considered_revision_id = %s AND option_id = %s",
+        (generation_run_id, considered_revision_id, option_id),
+    ).fetchone()
+    if row is None or (
+        row[1] != intent_id
+        or row[2] != considered_content_hash
+        or row[3] != canonical_candidate_identity_hash
+        or row[4] != actor_value
+        or row[5] != why
+    ):
+        raise Gate1Error("exact Gate #1 choice conflicts with an existing selection")
+    return row[0]
+
+
+def select_and_record_gate1_choice(
+    conn,
+    intent_id: str,
+    *,
+    chosen_source: str,
+    chosen_option_id: str,
+    actor,
+    why: str = "",
+    expected_generation_run_id: str | None = None,
+) -> DraftChoice | None:
+    """Atomically select and record a choice from the exact immutable revision the user saw."""
+    if confirmation_required():
+        if expected_generation_run_id is None:
+            raise Gate1Error("REGENERATE_FROM_CURRENT_CONSIDERED_SET")
+        considered, exact_lineage, exact_revision_id, exact_revision_hash = (
+            _verified_considered_revision_payload(
+                conn, intent_id, expected_generation_run_id))
+        exact_feature, _source, candidate_identity_hash = _chosen_option_from_revision(
+            considered, chosen_option_id)
+        choice_id = _record_exact_choice(
+            conn,
+            intent_id=intent_id,
+            generation_run_id=expected_generation_run_id,
+            considered_revision_id=exact_revision_id,
+            considered_content_hash=exact_revision_hash,
+            option_id=chosen_option_id,
+            canonical_candidate_identity_hash=candidate_identity_hash,
+            actor=actor,
+            why=why,
+        )
+        return DraftChoice(
+            exact_feature,
+            exact_lineage,
+            exact_revision_id,
+            exact_revision_hash,
+            choice_id=choice_id,
+            generation_run_id=expected_generation_run_id,
+            option_id=chosen_option_id,
+            canonical_candidate_identity_hash=candidate_identity_hash,
+        )
+    public: dict
+    lineage: dict | None
+    revision_id: str | None
+    revision_hash: str | None
+    if expected_generation_run_id is not None:
+        public, lineage, revision_id, revision_hash = _verified_considered_revision(
+            conn, intent_id, expected_generation_run_id)
+    else:
+        row = conn.execute(
+            "SELECT considered, generation_run_id, snapshot_id, snapshot_content_hash, "
+            "considered_revision_id, considered_content_hash "
+            "FROM contract_considered WHERE intent_id = %s FOR SHARE",
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        # Scope confirmation is a one-way authority transition for an intent. An emergency
+        # legacy-unscoped regeneration may replace the mutable latest pointer, but it must not
+        # downgrade an intent that previously entered confirmed-scope execution back to an
+        # unpinned draft. The exact generation token remains mandatory thereafter.
+        scope_governed_intent = conn.execute(
+            "SELECT 1 FROM confirmed_generation_scope WHERE intent_id = %s LIMIT 1",
+            (intent_id,),
+        ).fetchone() is not None
+        if scope_governed_intent:
+            raise Gate1Error("REGENERATE_FROM_CURRENT_CONSIDERED_SET")
+        public = row[0]
+        lineage = (
+            {"generation_run_id": row[1], "snapshot_id": row[2], "content_hash": row[3]}
+            if row[2] is not None
+            else None
+        )
+        revision_id, revision_hash = None, None
+
+    feature = _chosen_feature_from_snapshot(public, chosen_source, chosen_option_id)
+    if feature is None:
+        return None
+    conn.execute(
+        "INSERT INTO contract_gate1_choice "
+        "(intent_id, chosen_source, chosen_option_id, why, actor, considered, "
+        "considered_revision_id, considered_content_hash) "
+        "VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) "
+        "ON CONFLICT (intent_id) DO UPDATE SET chosen_source = EXCLUDED.chosen_source, "
+        "chosen_option_id = EXCLUDED.chosen_option_id, why = EXCLUDED.why, "
+        "actor = EXCLUDED.actor, considered = EXCLUDED.considered, "
+        "considered_revision_id = EXCLUDED.considered_revision_id, "
+        "considered_content_hash = EXCLUDED.considered_content_hash",
+        (
+            intent_id,
+            chosen_source,
+            chosen_option_id,
+            why,
+            _actor_json(actor),
+            json.dumps(public),
+            revision_id,
+            revision_hash,
+        ),
+    )
+    return DraftChoice(feature, lineage, revision_id, revision_hash)
 
 
 def considered_snapshot_lineage(conn, intent_id: str) -> dict | None:
@@ -725,21 +1283,107 @@ def considered_snapshot_lineage(conn, intent_id: str) -> dict | None:
 def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_option_id: str,
                         actor, why: str = "") -> None:
     """Record the human's Gate #1 choice (audit) against the persisted considered set."""
-    row = conn.execute("SELECT considered FROM contract_considered WHERE intent_id = %s",
-                       (intent_id,)).fetchone()
-    conn.execute(
-        "INSERT INTO contract_gate1_choice (intent_id, chosen_source, chosen_option_id, why, actor, "
-        "considered) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb) "
-        "ON CONFLICT (intent_id) DO UPDATE SET chosen_source = EXCLUDED.chosen_source, "
-        "chosen_option_id = EXCLUDED.chosen_option_id, why = EXCLUDED.why, actor = EXCLUDED.actor",
-        (intent_id, chosen_source, chosen_option_id, why, _actor_json(actor),
-         json.dumps(row[0] if row else {})))
+    result = select_and_record_gate1_choice(
+        conn,
+        intent_id,
+        chosen_source=chosen_source,
+        chosen_option_id=chosen_option_id,
+        actor=actor,
+        why=why,
+    )
+    if result is None:
+        raise Gate1Error("chosen option is not in the recorded considered set")
 
 
 def gate1_choice(conn, intent_id: str) -> dict | None:
     """The human's RECORDED Gate #1 choice for an intent, or None if none was recorded. Used by
     /contract/confirm to prove a governed feature was actually chosen from the considered set."""
     row = conn.execute(
-        "SELECT chosen_source, chosen_option_id FROM contract_gate1_choice WHERE intent_id = %s",
+        "SELECT chosen_source, chosen_option_id, considered_revision_id, considered_content_hash "
+        "FROM contract_gate1_choice WHERE intent_id = %s",
         (intent_id,)).fetchone()
-    return {"chosen_source": row[0], "chosen_option_id": row[1]} if row else None
+    return (
+        {
+            "chosen_source": row[0],
+            "chosen_option_id": row[1],
+            "considered_revision_id": row[2],
+            "considered_content_hash": row[3],
+        }
+        if row
+        else None
+    )
+
+
+def recorded_gate1_draft_choice(conn, intent_id: str) -> DraftChoice | None:
+    """Reload the chosen feature and lineage from the immutable revision recorded at draft time."""
+    choice = gate1_choice(conn, intent_id)
+    if choice is None:
+        return None
+    revision_id = choice["considered_revision_id"]
+    if revision_id is None:
+        feature = chosen_feature(
+            conn, intent_id, choice["chosen_source"], choice["chosen_option_id"])
+        return (
+            DraftChoice(feature, considered_snapshot_lineage(conn, intent_id), None, None)
+            if feature is not None
+            else None
+        )
+    row = conn.execute(
+        "SELECT generation_run_id FROM contract_considered_revision "
+        "WHERE considered_revision_id = %s AND intent_id = %s",
+        (revision_id, intent_id),
+    ).fetchone()
+    if row is None:
+        raise Gate1Error("recorded considered revision is missing")
+    public, lineage, verified_id, verified_hash = _verified_considered_revision(
+        conn, intent_id, row[0])
+    if (
+        verified_id != revision_id
+        or verified_hash != choice["considered_content_hash"]
+    ):
+        raise Gate1Error("recorded choice revision hash mismatch")
+    feature = _chosen_feature_from_snapshot(
+        public, choice["chosen_source"], choice["chosen_option_id"])
+    return (
+        DraftChoice(feature, lineage, verified_id, verified_hash)
+        if feature is not None
+        else None
+    )
+
+
+def recorded_gate1_choice_revision(
+    conn,
+    *,
+    choice_id: str,
+    intent_id: str,
+    actor,
+) -> DraftChoice | None:
+    """Reload one append-only scoped choice by its exact id, actor, run and verified revision."""
+    row = conn.execute(
+        "SELECT generation_run_id, considered_revision_id, considered_content_hash, option_id, "
+        "canonical_candidate_identity_hash "
+        "FROM contract_gate1_choice_revision "
+        "WHERE choice_id = %s AND intent_id = %s AND actor = %s::jsonb",
+        (choice_id, intent_id, _actor_json(actor)),
+    ).fetchone()
+    if row is None:
+        return None
+    generation_run_id, revision_id, revision_hash, option_id, candidate_hash = row
+    considered, lineage, verified_id, verified_hash = _verified_considered_revision_payload(
+        conn, intent_id, generation_run_id)
+    if verified_id != revision_id or verified_hash != revision_hash:
+        raise Gate1Error("recorded choice revision hash mismatch")
+    feature, _source, verified_candidate_hash = _chosen_option_from_revision(
+        considered, option_id)
+    if verified_candidate_hash != candidate_hash:
+        raise Gate1Error("recorded choice candidate identity hash mismatch")
+    return DraftChoice(
+        feature,
+        lineage,
+        verified_id,
+        verified_hash,
+        choice_id=choice_id,
+        generation_run_id=generation_run_id,
+        option_id=option_id,
+        canonical_candidate_identity_hash=candidate_hash,
+    )

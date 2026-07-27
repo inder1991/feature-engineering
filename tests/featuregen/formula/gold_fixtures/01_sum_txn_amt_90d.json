@@ -1,0 +1,58 @@
+{
+  "case_id": "sum_txn_amt_90d",
+  "operation": "sum",
+  "adversarial": false,
+  "delivery": "provider",
+  "note": "SUM over a GOVERNED numeric type: §C grants the operand's own logical_representation as the output type and clears external validation. Additivity degrades to non_additive because no PartitionProof/path proof exists at resolve time (§D) — the resolver never claims additivity it cannot prove.",
+  "intent": {
+    "name": "txn_amt_sum_90d",
+    "hypothesis": "Total transaction amount over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "identity",
+      "expr": {
+        "aggregation": "sum",
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [],
+  "expected_disposition": "RESOLVED",
+  "expected_axes": {
+    "structural_status": "ok",
+    "capability_status": "ok",
+    "output_status": "resolved",
+    "expectation_status": "not_provided",
+    "critic_status": "clean",
+    "technical_status": "ok"
+  },
+  "expected_output_policy": {
+    "output_type": "numeric",
+    "unit": null,
+    "currency": null,
+    "output_additivity": "non_additive",
+    "external_type_required": false
+  },
+  "expected_operands": ["authored::public.txns.txn_amt", "authored::public.txns.cif_id"],
+  "expects_blocking_critic": false,
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"sum\",\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"formula_schema_version\":1,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"output\":{\"currency\":null,\"external_type_required\":false,\"output_additivity\":\"non_additive\",\"output_type\":\"numeric\",\"unit\":null},\"output_policy_version\":1,\"parameters\":[]}",
+  "expected_formula_hash": "c9fdf481fea83671892f1b34f0b1780165c1d19a414e4462ffd7bad899c6bec9"
+}

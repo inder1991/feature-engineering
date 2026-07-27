@@ -10,10 +10,16 @@ byte-identical to pre-1B.
 """
 from datetime import datetime
 
+import pytest
+
 from tests.featuregen.api._helpers import AUTH
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.contract.gate1 import (
+    Gate1Error,
+    select_and_record_gate1_choice,
+)
 from featuregen.overlay.upload.contract.scope_records import scope_for_run
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -145,6 +151,31 @@ def test_scoped_call_narrows_grounding_and_returns_dispositions(make_client, con
     assert (CHURN, "primary") in children
     # scope_for_run rebuilds the governing scope BY RUN ID (the canonical linkage).
     assert scope_for_run(conn, run) == ConfirmedScope(primary=CHURN)
+
+    chosen = next(
+        feature
+        for feature_set in scoped["alternatives"]
+        for feature in feature_set["features"]
+    )
+    with pytest.raises(Gate1Error, match="REGENERATE_FROM_CURRENT_CONSIDERED_SET"):
+        select_and_record_gate1_choice(
+            conn,
+            scoped["intent_id"],
+            chosen_source="alternative",
+            chosen_option_id=chosen["name"],
+            actor="user:tester",
+        )
+    pinned = select_and_record_gate1_choice(
+        conn,
+        scoped["intent_id"],
+        chosen_source="alternative",
+        chosen_option_id=chosen["name"],
+        actor="user:tester",
+        expected_generation_run_id=run,
+    )
+    assert pinned is not None
+    assert pinned.considered_revision_id
+    assert pinned.snapshot_lineage["generation_run_id"] == run
 
 
 # ── broaden: a NEW unscoped run supersedes the first; both scopes retained + retrievable ──────────────

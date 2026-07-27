@@ -191,6 +191,7 @@ def verify_bridge(conn, *, entity_id: str, left: tuple[str, str, str], right: tu
         {"ref": bref, "fact_type": "entity_bridge", "use_case": None, "target_event_id": target},
         human_actor, f"b-spike-confirm-bridge-{target}"))
     assert res.accepted, f"bridge confirm denied for {entity_id}: {res.denied_reason}"
+    _drain(conn)
     status = project_verified_bridge(conn, bref, now=now)
     return key, status
 

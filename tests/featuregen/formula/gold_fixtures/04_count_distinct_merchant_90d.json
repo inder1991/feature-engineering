@@ -1,0 +1,58 @@
+{
+  "case_id": "count_distinct_merchant_90d",
+  "operation": "count_distinct",
+  "adversarial": false,
+  "delivery": "provider",
+  "note": "THE §D bug fix, pinned into a curated identity: b_output_policy wrongly marks count_distinct ADDITIVE. distinct(A u B) != distinct(A) + distinct(B) without proven disjointness, and no such proof exists at resolve time — so this formula's identity carries output_additivity=non_additive. A regression back to 'additive' changes the content hash and this fixture fails.",
+  "intent": {
+    "name": "distinct_merchant_count_90d",
+    "hypothesis": "The breadth of distinct merchants transacted with over a trailing 90-day window predicts churn.",
+    "target_entity": "customer",
+    "target_grain_keys": ["authored::public.txns.cif_id"]
+  },
+  "proposal": {
+    "formula_schema_version": 1,
+    "operation_grammar_version": 1,
+    "canonicalization_version": 1,
+    "grain": {"entity": "customer", "keys": ["authored::public.txns.cif_id"]},
+    "body": {
+      "final_operation": "identity",
+      "expr": {
+        "aggregation": "count_distinct",
+        "operand": "authored::public.txns.merchant_id",
+        "source_relation": {"table_ref": "authored::public.txns"},
+        "filter": null,
+        "window": {
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "basis": "trailing", "length": 90, "unit": "day",
+          "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+          "timezone": "Asia/Dubai", "empty_window": "null", "null_input": "ignore"
+        }
+      }
+    },
+    "parameters": [],
+    "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "expected_output": null
+  },
+  "critic_findings": [],
+  "expected_disposition": "RESOLVED",
+  "expected_axes": {
+    "structural_status": "ok",
+    "capability_status": "ok",
+    "output_status": "resolved",
+    "expectation_status": "not_provided",
+    "critic_status": "clean",
+    "technical_status": "ok"
+  },
+  "expected_output_policy": {
+    "output_type": "integer",
+    "unit": null,
+    "currency": null,
+    "output_additivity": "non_additive",
+    "external_type_required": false
+  },
+  "expected_operands": ["authored::public.txns.merchant_id", "authored::public.txns.cif_id"],
+  "expects_blocking_critic": false,
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"count_distinct\",\"filter\":null,\"operand\":\"authored::public.txns.merchant_id\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"formula_schema_version\":1,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"output\":{\"currency\":null,\"external_type_required\":false,\"output_additivity\":\"non_additive\",\"output_type\":\"integer\",\"unit\":null},\"output_policy_version\":1,\"parameters\":[]}",
+  "expected_formula_hash": "f09abe419986f926ed2ba8b668959f4cfe92d77ae08d4ee931323d46a5903c84"
+}

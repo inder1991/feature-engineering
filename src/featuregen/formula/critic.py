@@ -32,15 +32,16 @@ import dataclasses
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.formula._jcs import dumps as _jcs_dumps
 from featuregen.formula.audited import audited_formula_call
+from featuregen.formula.control import LeaseFence
 from featuregen.formula.schema import (
     DiffBody,
     FilterBool,
@@ -57,9 +58,13 @@ from featuregen.overlay.upload.column_authority import read_column_facts
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
+if TYPE_CHECKING:
+    from featuregen.formula.frozen_configuration import FrozenProviderContractV1
+
 __all__ = [
     "CRITIC_FINDING_CODES",
     "CRITIC_FINDINGS_V1_SCHEMA",
+    "CRITIC_SCHEMA",
     "CRITIC_INSTRUCTION",
     "CRITIC_POLICY_VERSION",
     "CRITIC_PROMPT_ID",
@@ -68,6 +73,7 @@ __all__ = [
     "CRITIC_TASK",
     "CriticFinding",
     "CriticFindingCode",
+    "CriticReview",
     "Severity",
     "build_critic_metadata",
     "critic_findings_hash",
@@ -130,6 +136,23 @@ class CriticFinding:
     detail: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CriticReview:
+    """Audited critic result with backward-compatible three-value unpacking."""
+
+    findings: Sequence[CriticFinding]
+    findings_hash: str
+    technical_failure: bool
+    llm_call_ref: str | None
+    provider_calls: int
+    usage: dict
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.findings
+        yield self.findings_hash
+        yield self.technical_failure
+
+
 # The critic's structured-findings wire contract. ``code`` is DELIBERATELY a plain string (not an
 # enum) on the wire: an unknown code must reach the parser to be dropped-with-a-note (§G), not be
 # schema-rejected into a repair loop and a technical failure. ``severity`` is tolerated on the wire
@@ -158,6 +181,8 @@ CRITIC_FINDINGS_V1_SCHEMA: dict = {
     },
     "required": ["findings"],
 }
+# Frozen configuration uses this compatibility name while preserving main's immutable schema ID.
+CRITIC_SCHEMA = CRITIC_FINDINGS_V1_SCHEMA
 
 # The FIXED critic protocol instruction — the ONLY instruction text the critic model receives.
 # Everything case-specific rides catalog_metadata (data, never instructions); the closed code list
@@ -279,8 +304,14 @@ def _proposal_plain(proposal: TypedFormulaProposalV1) -> dict:
     return json.loads(json.dumps(dataclasses.asdict(proposal)))
 
 
-def build_critic_metadata(conn, intent: AuthoringIntent, proposal: TypedFormulaProposalV1, *,
-                          roles: tuple[str, ...]) -> dict:
+def build_critic_metadata(
+    conn,
+    intent: AuthoringIntent,
+    proposal: TypedFormulaProposalV1,
+    *,
+    roles: tuple[str, ...],
+    column_loader: Callable[[str], dict] | None = None,
+) -> dict:
     """The critic's INDEPENDENTLY-assembled ``catalog_metadata``: the intent, the proposal, and
     the proposal's columns' governed facts RE-FETCHED here under ``roles``. EXACTLY these three
     keys — there is no slot for the author's reasoning or tool trace, so independence is
@@ -293,8 +324,10 @@ def build_critic_metadata(conn, intent: AuthoringIntent, proposal: TypedFormulaP
             "target_grain_keys": list(intent.target_grain_keys),
         },
         "proposal": _proposal_plain(proposal),
-        "operand_columns": [_column_context(conn, ref, roles)
-                            for ref in proposal_column_refs(proposal)],
+        "operand_columns": [
+            column_loader(ref) if column_loader is not None else _column_context(conn, ref, roles)
+            for ref in proposal_column_refs(proposal)
+        ],
     }
 
 
@@ -304,7 +337,7 @@ def build_critic_metadata(conn, intent: AuthoringIntent, proposal: TypedFormulaP
 def _register_critic_schema(conn) -> None:
     """Idempotently register the findings output schema so the audited seam can resolve and
     validate it (its self-registration fallback covers only the enrichment schemas)."""
-    DocumentSchemaRegistry(conn).register_schema(
+    DocumentSchemaRegistry(conn).register_immutable_schema(
         CRITIC_SCHEMA_ID, CRITIC_SCHEMA_VERSION, CRITIC_FINDINGS_V1_SCHEMA, _SCHEMA_OWNER)
 
 
@@ -357,24 +390,74 @@ def critique(
     roles: tuple[str, ...] | list[str] | tuple[()] = (),
     actor: IdentityEnvelope | None = None,
     authoring_run_id: str,
-) -> tuple[list[CriticFinding], str, bool]:
+    provider_contract: FrozenProviderContractV1 | None = None,
+    metadata_loader: Callable[[str], dict] | None = None,
+    progress_callback: Callable[[], None] | None = None,
+    lease_fence: LeaseFence | None = None,
+) -> CriticReview:
     """Run the independent critic ONCE over ``proposal`` against ``intent``.
 
-    Returns ``(findings, critic_findings_hash, is_technical_failure)``. The single provider call
+    The result still unpacks as ``(findings, hash, is_technical_failure)`` for the original API. The
+    single provider call
     goes through the Task-3 audited seam under ``authoring_run_id`` with the independently-built
     context (see ``build_critic_metadata`` — never the author's reasoning or tool trace). A
     malformed/unparseable response or a ``None`` output is ``([], hash-over-[], True)`` — a
     technical failure, NEVER a clean critic. The proposal is never mutated; the hash is computed
     on every path so Task 12 always has a value."""
     _register_critic_schema(conn)
+    metadata = build_critic_metadata(
+        conn,
+        intent,
+        proposal,
+        roles=tuple(roles),
+        column_loader=metadata_loader,
+    )
+    if progress_callback is not None:
+        progress_callback()
     result = audited_formula_call(
         conn, client, authoring_run_id=authoring_run_id, task=CRITIC_TASK,
-        prompt_id=CRITIC_PROMPT_ID, schema_id=CRITIC_SCHEMA_ID,
-        instruction=CRITIC_INSTRUCTION,
-        catalog_metadata=build_critic_metadata(conn, intent, proposal, roles=tuple(roles)),
-        actor=actor, schema_version=CRITIC_SCHEMA_VERSION)
+        prompt_id=(
+            provider_contract.prompt_id if provider_contract is not None else CRITIC_PROMPT_ID),
+        schema_id=(
+            provider_contract.output_schema_id
+            if provider_contract is not None
+            else CRITIC_SCHEMA_ID),
+        instruction=(
+            provider_contract.instruction_utf8.decode("utf-8")
+            if provider_contract is not None
+            else CRITIC_INSTRUCTION),
+        catalog_metadata=metadata,
+        actor=actor,
+        prompt_version=(
+            provider_contract.prompt_version if provider_contract is not None else 1),
+        schema_version=(
+            provider_contract.output_schema_version
+            if provider_contract is not None
+            else CRITIC_SCHEMA_VERSION),
+        generation_settings=(
+            provider_contract.generation_settings()
+            if provider_contract is not None
+            else None),
+        turn_index=0,
+        provider_contract_hash=(
+            provider_contract.contract_hash if provider_contract is not None else None),
+        prompt_content_hash=(
+            provider_contract.prompt_content_hash if provider_contract is not None else None),
+        schema_content_hash=(
+            provider_contract.schema_content_hash if provider_contract is not None else None),
+        lease_fence=lease_fence,
+    )
+    if progress_callback is not None:
+        progress_callback()
     findings, is_technical_failure, notes = _parse_findings(result.output)
     for note in notes:
         logger.warning("critic (run %s, call %s): %s",
                        authoring_run_id, result.llm_call_ref, note)
-    return findings, critic_findings_hash(findings), is_technical_failure
+    return CriticReview(
+        findings=findings,
+        findings_hash=critic_findings_hash(findings),
+        technical_failure=is_technical_failure,
+        llm_call_ref=result.llm_call_ref,
+        provider_calls=result.provider_calls,
+        usage=result.usage,
+    )

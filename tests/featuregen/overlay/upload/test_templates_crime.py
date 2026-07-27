@@ -107,11 +107,12 @@ AML = _by_id(AML_TEMPLATES)
 
 # ── the families were authored (kill-chain + laundering cycle) ─────────────────────────────────────
 def test_crime_families_authored():
-    assert len(FRAUD_TEMPLATES) == 11
+    assert len(FRAUD_TEMPLATES) == 12
     assert len(AML_TEMPLATES) == 11
     assert set(FRAUD) == {
         "card_testing_velocity", "device_sharing_velocity", "new_device_flag", "geo_velocity_impossible",
-        "first_time_payee_high_value", "merchant_risk_anomaly", "txn_velocity_spike", "amount_zscore_spike",
+        "first_time_payee_high_value", "merchant_risk_anomaly", "merchant_mcc_diversity",
+        "txn_velocity_spike", "amount_zscore_spike",
         "cross_channel_rail_anomaly", "cross_border_burst", "amount_just_under_limit"}
     assert set(AML) == _AML_GROUNDS | _AML_SKIPS
     # every crime need references a real concept (also enforced at import by _validate_registry)

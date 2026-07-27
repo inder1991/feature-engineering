@@ -13,7 +13,11 @@ def _req(auth: str | None = None) -> SimpleNamespace:
 def test_health(client):
     res = client.get("/health")
     assert res.status_code == 200
-    assert res.json() == {"status": "ok"}
+    assert res.json() == {
+        "status": "ok",
+        "scope_execution_mode": "legacy_unscoped",
+        "scope_mode_configuration_valid": True,
+    }
 
 
 def test_identity_requires_user_header():

@@ -30,22 +30,50 @@ the honest limit is that grounding asserts intent, not enforcement.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
+from itertools import product
 
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
+from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept
+from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 # Concept-level sensitivities that a feature input may NEVER carry (a hard eligibility block, Part D.4).
 # Distinct from the column-STORED sensitivity (pii/restricted) that read_scope filters on: these are
 # behavioural classes declared by the column's *concept* in CONCEPT_REGISTRY.
 _BLOCKED_SENSITIVITIES = frozenset({"protected_attribute", "special_category"})
+MAX_GROUNDING_CANDIDATES_PER_NEED = 16
+MAX_GROUNDING_ASSIGNMENTS = 4096
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 # The template model
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
+class FormulaAuthoringClass(StrEnum):
+    UNASSESSED = "unassessed"
+    FORMULA_V1_AUTHORABLE = "formula_v1_authorable"
+    REQUIRES_TEMPORAL_POLICY = "requires_temporal_policy"
+    REQUIRES_SIGN_AUTHORITY = "requires_sign_authority"
+
+
+class SourceEntityRoleResolution(StrEnum):
+    EXPLICIT = "explicit"
+    INFERRED_UNAMBIGUOUS = "inferred_unambiguous"
+    NOT_APPLICABLE = "not_applicable"
+    AMBIGUOUS = "ambiguous_source_entity_role"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSourceEntityRole:
+    role: str | None
+    resolution: SourceEntityRoleResolution
+
+
 @dataclass(frozen=True, slots=True)
 class Need:
     """One binding slot of a template — a required (or optional) concept the grounding engine must find a
@@ -57,6 +85,7 @@ class Need:
     allowed_source_grains: tuple[str, ...] = ()   # acceptable source grains; () = unconstrained
     join_role: JoinRole | None = None             # explicit override; None -> derived (NEVER tuple position)
     temporal_role: TemporalRole | None = None     # explicit override; None -> derived from concept.pit_role
+    distinct_binding_group: str | None = None     # members must bind different physical columns
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +117,50 @@ class Template:
     # ── 3B.1 explicit source anchor (optional; needed only when >1 distinct entity-linked need) ──
     source_entity: str | None = None            # the recipe's source grain entity (derived when unambiguous)
     source_entity_need_role: str | None = None   # which need carries the source key
+    # Explicit applicability wins over legacy tag inference when present.
+    primary_objective: str | None = None
+    supporting_objectives: tuple[str, ...] = ()
+    # Eligibility for a formula-authoring gate, not proof that authoring or compilation succeeded.
+    formula_authoring_class: FormulaAuthoringClass = FormulaAuthoringClass.UNASSESSED
+
+
+class BindingResolution(StrEnum):
+    UNIQUE = "unique"
+    AMBIGUOUS = "ambiguous"
+    MISSING = "missing"
+    BUDGET_TRUNCATED = "budget_truncated"
+
+
+class GroundingStatus(StrEnum):
+    GROUNDED = "grounded"
+    UNBUILDABLE = "unbuildable"
+    BUDGET_TRUNCATED = "budget_truncated"
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedNeedResolution:
+    role: str
+    resolution: BindingResolution
+    selected_object_ref: str | None = None
+    tied_candidate_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedNeedBinding:
+    """Server-side recipe-role binding retained for replay and later authority checks."""
+
+    role: str
+    catalog_source: str
+    logical_ref: str
+    graph_object_ref: str
+    expected_concept: str
+    optional: bool
+    join_role: str | None
+    temporal_role: str | None
+    distinct_binding_group: str | None
+    binding_resolution: BindingResolution
+    tied_candidate_logical_refs: tuple[str, ...]
+    tied_candidate_set_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +182,51 @@ class GroundedFeature:
     near_label: bool = False
     eligibility: str = ""
     notes: tuple[str, ...] = ()                   # substitutions + declared derivations + unmet-optionals
+    binding_resolutions: tuple[GroundedNeedResolution, ...] = ()
+    role_bindings: tuple[GroundedNeedBinding, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingOutcome:
+    template_id: str
+    status: GroundingStatus
+    feature: GroundedFeature | None
+    reason_codes: tuple[str, ...] = ()
+
+
+def _candidate_set_hash(refs: Iterable[str]) -> str:
+    material = json.dumps(
+        {"version": "grounding-candidates-v1", "logical_refs": sorted(set(refs))},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def resolve_source_entity_need_role(template: Template) -> ResolvedSourceEntityRole:
+    """Resolve the source-grain role without depending on need order."""
+    if template.source_entity_need_role is not None:
+        need = next(
+            (candidate for candidate in template.needs
+             if candidate.role == template.source_entity_need_role),
+            None,
+        )
+        if need is not None and _is_entity_concept(need.concept):
+            return ResolvedSourceEntityRole(
+                template.source_entity_need_role,
+                SourceEntityRoleResolution.EXPLICIT,
+            )
+        return ResolvedSourceEntityRole(None, SourceEntityRoleResolution.AMBIGUOUS)
+    entity_roles = tuple(
+        need.role for need in template.needs if _is_entity_concept(need.concept))
+    if len(entity_roles) == 1:
+        return ResolvedSourceEntityRole(
+            entity_roles[0],
+            SourceEntityRoleResolution.INFERRED_UNAMBIGUOUS,
+        )
+    if not entity_roles:
+        return ResolvedSourceEntityRole(None, SourceEntityRoleResolution.NOT_APPLICABLE)
+    return ResolvedSourceEntityRole(None, SourceEntityRoleResolution.AMBIGUOUS)
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -164,7 +282,44 @@ def _safe_to_bind(col: _Col) -> bool:
     return True
 
 
-def _match(cols: Sequence[_Col], need: Need, *, prefer_table: str | None = None) -> _Col | None:
+def _candidate_score(conn, col: _Col, need: Need, *, prefer_table: str | None) -> int | None:
+    if not _safe_to_bind(col):
+        return None
+    expected = concept(need.concept)
+    want_as_of = bool(expected and expected.pit_role == "as_of")
+    want_entity = bool(expected and expected.entity_link)
+    score = 0
+    if col.concept == need.concept:
+        score -= 4
+    if want_as_of and col.is_as_of:
+        score -= 2
+    if want_entity and col.concept != need.concept and col.is_grain:
+        entity = effective_entity(conn, col.catalog_source, col.object_ref)
+        if entity.authority == GOVERNED_ENTITY and entity.entity == expected.entity_link:
+            score -= 2
+    if score < 0 and prefer_table is not None and col.table == prefer_table:
+        score -= 1
+    return score if score < 0 else None
+
+
+def _ranked_matches(conn, cols: Sequence[_Col], need: Need, *,
+                    prefer_table: str | None = None) -> tuple[list[tuple[int, _Col]], bool]:
+    ranked = [
+        (score, col)
+        for col in cols
+        if (score := _candidate_score(
+            conn, col, need, prefer_table=prefer_table)) is not None
+    ]
+    ranked.sort(key=lambda item: (
+        item[0], item[1].table, item[1].column, item[1].object_ref))
+    return (
+        ranked[:MAX_GROUNDING_CANDIDATES_PER_NEED],
+        len(ranked) > MAX_GROUNDING_CANDIDATES_PER_NEED,
+    )
+
+
+def _match(conn, cols: Sequence[_Col], need: Need, *,
+           prefer_table: str | None = None) -> _Col | None:
     """Pick the best SAFE column for a need, or None. A column scores by how well it fits:
     exact concept match is strongest; for an as-of need an ``is_as_of`` column also qualifies; for an
     identifier/entity need an ``is_grain`` (then entity-tagged) column also qualifies. A column with no
@@ -179,28 +334,9 @@ def _match(cols: Sequence[_Col], need: Need, *, prefer_table: str | None = None)
     spurious cross-table candidate the join gauntlet then rejects (NO_JOIN_PATH) even though a clean
     single-table binding existed. The bonus never overrides a stronger concept/structural fit and never
     turns a non-fitting column (score 0) into a match — so it only disambiguates genuine ties."""
-    c = concept(need.concept)                    # exists (validated at import), but guard anyway
-    want_as_of = bool(c and c.pit_role == "as_of")
-    want_entity = bool(c and c.entity_link)
-    best: _Col | None = None
-    best_score = 0
-    for col in cols:                             # already ordered by (table, column) from SQL
-        if not _safe_to_bind(col):
-            continue
-        score = 0
-        if col.concept == need.concept:
-            score -= 4                           # exact concept match — the intended binding
-        if want_as_of and col.is_as_of:
-            score -= 2                           # a declared as-of column fits an as-of need
-        if want_entity and col.is_grain:
-            score -= 2                           # the grain column fits the entity need
-        if want_entity and col.entity:
-            score -= 1                           # an entity-tagged column is a weaker entity fit
-        if score < 0 and prefer_table is not None and col.table == prefer_table:
-            score -= 1                           # same-grain-table affinity — a tie-break among fits
-        if score < 0 and score < best_score:
-            best, best_score = col, score
-    return best
+    ranked, _truncated = _ranked_matches(
+        conn, cols, need, prefer_table=prefer_table)
+    return ranked[0][1] if ranked else None
 
 
 def _bind_params(template: Template, overrides: dict | None) -> dict:
@@ -244,8 +380,9 @@ def _is_as_of_concept(concept_name: str | None) -> bool:
     return bool(c and c.pit_role == "as_of")
 
 
-def ground_template(conn, template: Template, *, catalog_source: str,
-                    roles: Iterable[str] = (), params: dict | None = None) -> GroundedFeature | None:
+def ground_template_outcome(conn, template: Template, *, catalog_source: str,
+                            roles: Iterable[str] = (),
+                            params: dict | None = None) -> GroundingOutcome:
     """Bind ``template`` to ``catalog_source``'s concept-tagged columns, or return None if a REQUIRED
     need can't ground (the caller then degrades / skips — see the template's ``degrade``).
 
@@ -267,30 +404,144 @@ def ground_template(conn, template: Template, *, catalog_source: str,
     # binding existed. The grain table is what `entity_col.table` resolves to below — computed here up
     # front purely to steer the tie-break; the actual grain remains derived from the final bindings.
     prefer_table: str | None = None
-    for need in template.needs:
-        if _is_entity_concept(need.concept):
-            ecol = _match(cols, need)
-            if ecol is not None:
-                prefer_table = ecol.table
-            break
+    source_role = resolve_source_entity_need_role(template)
+    if source_role.resolution == SourceEntityRoleResolution.AMBIGUOUS:
+        return GroundingOutcome(
+            template.id,
+            GroundingStatus.UNBUILDABLE,
+            None,
+            ("ambiguous_source_entity_role",),
+        )
+    if source_role.role is not None:
+        source_need = next(need for need in template.needs if need.role == source_role.role)
+        ecol = _match(conn, cols, source_need)
+        if ecol is not None:
+            prefer_table = ecol.table
 
     bindings: dict[str, _Col] = {}
+    resolutions: dict[str, GroundedNeedResolution] = {}
+    groups: dict[str, list[Need]] = {}
+    for need in template.needs:
+        if need.distinct_binding_group is not None:
+            groups.setdefault(need.distinct_binding_group, []).append(need)
+    for members in groups.values():
+        candidates: list[list[tuple[int, _Col]]] = []
+        for need in members:
+            ranked, truncated = _ranked_matches(
+                conn, cols, need, prefer_table=prefer_table)
+            if truncated:
+                return GroundingOutcome(
+                    template.id,
+                    GroundingStatus.BUDGET_TRUNCATED,
+                    None,
+                    ("grounding_candidate_budget_truncated", need.role),
+                )
+            if not ranked:
+                return GroundingOutcome(
+                    template.id,
+                    GroundingStatus.UNBUILDABLE,
+                    None,
+                    ("required_need_missing", need.role),
+                )
+            candidates.append(ranked)
+        assignment_count = 1
+        for ranked in candidates:
+            assignment_count *= len(ranked)
+            if assignment_count > MAX_GROUNDING_ASSIGNMENTS:
+                return GroundingOutcome(
+                    template.id,
+                    GroundingStatus.BUDGET_TRUNCATED,
+                    None,
+                    ("grounding_assignment_budget_truncated",),
+                )
+        valid = [
+            assignment
+            for assignment in product(*candidates)
+            if len({
+                (candidate.catalog_source, candidate.object_ref)
+                for _score, candidate in assignment
+            }) == len(assignment)
+        ]
+        if not valid:
+            return GroundingOutcome(
+                template.id,
+                GroundingStatus.UNBUILDABLE,
+                None,
+                ("distinct_binding_unresolvable",),
+            )
+        best_score = min(sum(score for score, _candidate in assignment) for assignment in valid)
+        best = [
+            assignment for assignment in valid
+            if sum(score for score, _candidate in assignment) == best_score
+        ]
+        if len(best) != 1:
+            return GroundingOutcome(
+                template.id,
+                GroundingStatus.UNBUILDABLE,
+                None,
+                ("distinct_binding_ambiguous",),
+            )
+        for need, (_score, col) in zip(members, best[0], strict=True):
+            bindings[need.role] = col
+            resolutions[need.role] = GroundedNeedResolution(
+                role=need.role,
+                resolution=BindingResolution.UNIQUE,
+                selected_object_ref=col.object_ref,
+            )
+
     notes = list(template.notes) + list(template.derived)
     for need in template.needs:
-        col = _match(cols, need, prefer_table=prefer_table)
+        col = bindings.get(need.role)
+        if col is None:
+            ranked, truncated = _ranked_matches(
+                conn, cols, need, prefer_table=prefer_table)
+            if truncated:
+                return GroundingOutcome(
+                    template.id,
+                    GroundingStatus.BUDGET_TRUNCATED,
+                    None,
+                    ("grounding_candidate_budget_truncated", need.role),
+                )
+            col = ranked[0][1] if ranked else None
         if col is None:
             if need.optional:
                 notes.append(
                     f"optional need '{need.role}' ({need.concept}) unmet -> "
                     f"{template.degrade or 'declared downstream derivation (§D.8)'}")
+                resolutions[need.role] = GroundedNeedResolution(
+                    role=need.role,
+                    resolution=BindingResolution.MISSING,
+                )
                 continue
-            return None                           # ungroundable required need -> caller degrades/skips
+            return GroundingOutcome(
+                template.id,
+                GroundingStatus.UNBUILDABLE,
+                None,
+                ("required_need_missing", need.role),
+            )
         bindings[need.role] = col
+        if need.role not in resolutions:
+            top_score = ranked[0][0]
+            tied = tuple(
+                candidate.object_ref
+                for score, candidate in ranked
+                if score == top_score
+            )
+            resolutions[need.role] = GroundedNeedResolution(
+                role=need.role,
+                resolution=(
+                    BindingResolution.UNIQUE
+                    if len(tied) == 1
+                    else BindingResolution.AMBIGUOUS
+                ),
+                selected_object_ref=col.object_ref,
+                tied_candidate_refs=tied if len(tied) > 1 else (),
+            )
 
     # Provenance: the (catalog_source, object_ref) of each bound column, deduped, in needs order.
     derives: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    entity_col: _Col | None = None
+    entity_col: _Col | None = bindings.get(source_role.role) if source_role.role else None
     as_of_col: _Col | None = None
     for need in template.needs:
         col = bindings.get(need.role)
@@ -300,8 +551,6 @@ def ground_template(conn, template: Template, *, catalog_source: str,
         if pair not in seen:
             seen.add(pair)
             derives.append(pair)
-        if entity_col is None and _is_entity_concept(need.concept):
-            entity_col = col
         if as_of_col is None and (_is_as_of_concept(need.concept) or col.is_as_of):
             as_of_col = col
 
@@ -312,7 +561,35 @@ def ground_template(conn, template: Template, *, catalog_source: str,
     else:
         grain_table = None
 
-    return GroundedFeature(
+    role_bindings: list[GroundedNeedBinding] = []
+    for need in template.needs:
+        col = bindings.get(need.role)
+        if col is None:
+            continue
+        resolution = resolutions[need.role]
+        tied_graph_refs = resolution.tied_candidate_refs or (col.object_ref,)
+        tied_logical_refs = tuple(sorted({
+            logical_ref_of(conn, col.catalog_source, object_ref)
+            for object_ref in tied_graph_refs
+        }))
+        role_bindings.append(GroundedNeedBinding(
+            role=need.role,
+            catalog_source=col.catalog_source,
+            logical_ref=logical_ref_of(conn, col.catalog_source, col.object_ref),
+            graph_object_ref=col.object_ref,
+            expected_concept=need.concept,
+            optional=need.optional,
+            join_role=need.join_role.value if need.join_role is not None else None,
+            temporal_role=(
+                need.temporal_role.value if need.temporal_role is not None else None
+            ),
+            distinct_binding_group=need.distinct_binding_group,
+            binding_resolution=resolution.resolution,
+            tied_candidate_logical_refs=tied_logical_refs,
+            tied_candidate_set_hash=_candidate_set_hash(tied_logical_refs),
+        ))
+
+    feature = GroundedFeature(
         template_id=template.id,
         name=_feature_name(template, bound),
         aggregation=_aggregation_label(template, bound),
@@ -326,21 +603,57 @@ def ground_template(conn, template: Template, *, catalog_source: str,
         near_label=template.near_label,
         eligibility=template.eligibility,
         notes=tuple(notes),
+        binding_resolutions=tuple(
+            resolutions[need.role] for need in template.needs
+            if need.role in resolutions),
+        role_bindings=tuple(role_bindings),
     )
+    return GroundingOutcome(template.id, GroundingStatus.GROUNDED, feature)
+
+
+def ground_template(conn, template: Template, *, catalog_source: str,
+                    roles: Iterable[str] = (), params: dict | None = None) -> GroundedFeature | None:
+    """Compatibility projection returning only a successfully grounded feature."""
+    return ground_template_outcome(
+        conn,
+        template,
+        catalog_source=catalog_source,
+        roles=roles,
+        params=params,
+    ).feature
+
+
+def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: str,
+                        roles: Iterable[str] = (),
+                        use_case: str | None = None) -> list[GroundingOutcome]:
+    outcomes: list[GroundingOutcome] = []
+    for template in templates:
+        if use_case is not None and use_case not in template.use_cases:
+            continue
+        outcomes.append(ground_template_outcome(
+            conn,
+            template,
+            catalog_source=catalog_source,
+            roles=roles,
+        ))
+    return outcomes
 
 
 def ground_all(conn, templates: Iterable[Template], *, catalog_source: str,
                roles: Iterable[str] = (), use_case: str | None = None) -> list[GroundedFeature]:
     """Ground every template that can ground (default params), skipping the ungroundable. When
     ``use_case`` is given, only templates whose ``use_cases`` include it are considered."""
-    out: list[GroundedFeature] = []
-    for template in templates:
-        if use_case is not None and use_case not in template.use_cases:
-            continue
-        grounded = ground_template(conn, template, catalog_source=catalog_source, roles=roles)
-        if grounded is not None:
-            out.append(grounded)
-    return out
+    return [
+        outcome.feature
+        for outcome in ground_all_outcomes(
+            conn,
+            templates,
+            catalog_source=catalog_source,
+            roles=roles,
+            use_case=use_case,
+        )
+        if outcome.feature is not None
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -546,7 +859,7 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
                Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
         params={"window": (90, 180), "baseline": ("prior_equal_window",),
                 "measure": ("amount", "count"), "match_method": ("token", "exact", "fuzzy"),
-                "match_threshold": (0.9, 0.8, 0.95)},
+                "match_threshold": ("0.9", "0.8", "0.95")},
         aggregation="own_transfer_trend", additivity="n/a", explain="M",
         use_cases=("retail_churn", "deposit_attrition", "primacy_loss", "wealth_outflow"),
         pit=_PIT_TRAILING,
@@ -1055,6 +1368,41 @@ FRAUD_TEMPLATES: tuple[Template, ...] = (
         notes=("anchor: 'mcc' (crime-distinctive, non-structural) routes this off a churn catalog.",
                "OUTPUT additivity is measure-dependent: high_risk_mcc_share is a non-additive ratio; "
                "novel_merchant_flag is n/a — the default carries the ratio case."),
+        primary_objective="fraud.merchant_fraud",
+        supporting_objectives=(
+            "fraud.transaction_fraud_detection",
+            "fraud.card_fraud",
+        ),
+    ),
+    Template(
+        id="merchant_mcc_diversity", family="merchant_behaviour",
+        source_entity_need_role="merchant",
+        intent="Distinct merchant-category breadth observed for a merchant over a governed trailing "
+               "window; an abrupt or unusually broad mix is a merchant-behaviour review signal.",
+        needs=(
+            Need("merchant", "merchant_id"),
+            Need("mcc", "mcc"),
+            Need("event_ts", "event_timestamp"),
+        ),
+        params={"window": (90, 30, 180)},
+        aggregation="count_distinct_mcc",
+        additivity="non_additive",
+        explain="H",
+        use_cases=("fraud", "merchant_analytics"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="missing merchant, MCC or event-time authority -> SKIP.",
+        stage="merchant-monitoring",
+        eligibility=_FRAUD_BEHAVIOUR,
+        notes=(
+            "Predictor only: merchant category diversity is not itself evidence of fraud.",
+            "COUNT_DISTINCT(mcc) per merchant over the trailing window.",
+        ),
+        primary_objective="fraud.merchant_fraud",
+        supporting_objectives=(
+            "fraud.transaction_fraud_detection",
+            "fraud.card_fraud",
+        ),
+        formula_authoring_class=FormulaAuthoringClass.FORMULA_V1_AUTHORABLE,
     ),
     # ── CASH-OUT (§B3 Stage 4) — built from behaviour, NOT the fraud outcome ─────────────────────────
     # F.7 — txn_velocity_spike (the cash-out ramp)
@@ -1719,6 +2067,8 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                "behavioural life) routes this off a churn catalog.",
                _DEPOSIT_NOT_A_REHASH,
                "a decay rate / tenor proxy — non-additive."),
+        primary_objective="treasury_alm.deposit_stability",
+        supporting_objectives=("treasury_alm.deposit_runoff_forecasting",),
     ),
     # T.2 — hqla_eligibility_contribution (HQLA / LCR buffer contribution)
     Template(
@@ -1782,6 +2132,12 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                "off a churn catalog.",
                _DEPOSIT_NOT_A_REHASH,
                "a beta (a ratio) — non-additive; compute per depositor/segment, never sum."),
+        primary_objective="treasury_alm.deposit_stability",
+        supporting_objectives=(
+            "treasury_alm.liquidity",
+            "treasury_alm.deposit_runoff_forecasting",
+            "treasury_alm.net_interest_margin",
+        ),
     ),
     # T.5 — lcr_outflow_weight (modelled 30-day net-cash-outflow rate)
     Template(
@@ -1821,6 +2177,8 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                "catalog.",
                _DEPOSIT_NOT_A_REHASH,
                "a signed gap that nets within a snapshot — non-additive; never summed across dates."),
+        primary_objective="treasury_alm.liquidity",
+        supporting_objectives=("treasury_alm.net_interest_margin",),
     ),
     # ── SURGE / HOT MONEY — non-core funding share + concentration ───────────────────────────────────
     # T.7 — hot_money_share (non-core wholesale funding share)
@@ -1843,6 +2201,11 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                _DEPOSIT_NOT_A_REHASH,
                "OUTPUT additivity is measure-dependent: value_share is a non-additive ratio; surge_flag "
                "is n/a — the default carries the ratio case."),
+        primary_objective="treasury_alm.deposit_stability",
+        supporting_objectives=(
+            "treasury_alm.liquidity",
+            "treasury_alm.deposit_runoff_forecasting",
+        ),
     ),
     # T.8 — rate_sensitive_concentration (funding concentration WEIGHTED by deposit beta)
     Template(
@@ -1865,6 +2228,12 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                "so the beta weighting is load-bearing for routing, not just economics.",
                _DEPOSIT_NOT_A_REHASH,
                "a concentration index (HHI / top-share) — non-additive."),
+        primary_objective="portfolio_risk.concentration",
+        supporting_objectives=(
+            "treasury_alm.deposit_stability",
+            "treasury_alm.liquidity",
+            "treasury_alm.deposit_runoff_forecasting",
+        ),
     ),
     # ── RUNOFF-PRONE — maturity laddering + early-break behaviour ────────────────────────────────────
     # T.9 — maturity_ladder_runoff (term deposits maturing in a horizon bucket)
@@ -1887,6 +2256,11 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                _DEPOSIT_NOT_A_REHASH,
                "OUTPUT additivity is measure-dependent: runoff_amount is a semi-additive stock (latest "
                "over time); runoff_share is a non-additive ratio — the default carries the ratio case."),
+        primary_objective="treasury_alm.deposit_stability",
+        supporting_objectives=(
+            "treasury_alm.liquidity",
+            "treasury_alm.deposit_runoff_forecasting",
+        ),
     ),
     # T.10 — early_withdrawal_break (term deposits broken before their contractual term)
     Template(
@@ -1911,6 +2285,85 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
                _DEPOSIT_NOT_A_REHASH,
                "OUTPUT additivity is measure-dependent: break_rate is a non-additive ratio; break_count "
                "is additive — the default carries the ratio case."),
+        primary_objective="treasury_alm.deposit_stability",
+        supporting_objectives=(
+            "treasury_alm.liquidity",
+            "treasury_alm.deposit_runoff_forecasting",
+        ),
+    ),
+    Template(
+        id="contractual_deposit_maturity_profile", family="runoff_forecasting",
+        source_entity_need_role="portfolio",
+        intent="Contractual deposit balances and account counts maturing after the governed business "
+               "date within a selected future horizon, grouped by portfolio and segment.",
+        needs=(
+            Need("portfolio", "portfolio_id"),
+            Need("account", "account_id"),
+            Need("maturity", "maturity_date"),
+            Need("asof", "as_of_date"),
+            Need("segment", "segment"),
+        ),
+        params={
+            "horizon_days": (30, 90, 180, 365),
+            "measure": ("maturing_account_count",),
+        },
+        aggregation="contractual_maturity_profile",
+        additivity="additive",
+        explain="H",
+        use_cases=("deposit_stability", "alm", "liquidity_risk"),
+        pit=("Snapshot active deposits at business as_of; select contractual maturity in "
+             "(as_of, as_of + horizon]. Knowledge-time and scenario semantics require the external "
+             "temporal policy."),
+        degrade="missing portfolio, account, maturity, snapshot date or segment -> SKIP.",
+        stage="runoff-forecast-input",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=(
+            "Contractual maturity exposure is a runoff-model input, not a forecasted runoff target.",
+            "Future-horizon inclusion remains blocked until TemporalPolicyV1 is compiled.",
+        ),
+        primary_objective="treasury_alm.deposit_runoff_forecasting",
+        supporting_objectives=(
+            "treasury_alm.deposit_stability",
+            "treasury_alm.liquidity",
+        ),
+        formula_authoring_class=FormulaAuthoringClass.REQUIRES_TEMPORAL_POLICY,
+    ),
+    Template(
+        id="lagged_net_interest_flow", family="net_interest_margin",
+        source_entity_need_role="portfolio",
+        intent="Lagged net interest flow: governed-period interest income less interest expense, "
+               "aggregated at portfolio grain strictly before the prediction cutoff.",
+        needs=(
+            Need("portfolio", "portfolio_id"),
+            Need(
+                "income",
+                "interest_income",
+                distinct_binding_group="interest_legs",
+            ),
+            Need(
+                "expense",
+                "interest_expense",
+                distinct_binding_group="interest_legs",
+            ),
+            Need("event_ts", "event_timestamp"),
+        ),
+        params={"window": (90, 30, 180, 365)},
+        aggregation="lagged_net_interest_flow",
+        additivity="additive",
+        explain="H",
+        use_cases=("alm", "ftp"),
+        pit=("Trailing period (as_of - {window}, as_of], using interest events knowable strictly "
+             "before the prediction cutoff."),
+        degrade="missing portfolio, income, expense, event time or sign authority -> SKIP.",
+        stage="nim-input",
+        eligibility="single currency and accounting period; physical expense sign must be governed.",
+        notes=(
+            "SUM(interest_income) - SUM(positive_interest_expense).",
+            "The concepts identify economic roles but do not certify physical sign convention.",
+        ),
+        primary_objective="treasury_alm.net_interest_margin",
+        supporting_objectives=("treasury_alm.liquidity",),
+        formula_authoring_class=FormulaAuthoringClass.REQUIRES_SIGN_AUTHORITY,
     ),
 )
 
@@ -2064,6 +2517,8 @@ PAYMENTS_TEMPLATES: tuple[Template, ...] = (
                "concept sub: no dedicated chargeback concept — the dispute/chargeback event is a "
                "declared downstream derivation scoped by the card scheme.",
                "a chargeback RATE — non-additive; compute per entity, never sum."),
+        primary_objective="payments.operations",
+        supporting_objectives=("fraud.merchant_fraud",),
     ),
     # Y.8 — return_payment_rate (direct-debit returns / standing-order failures)
     Template(
@@ -3976,6 +4431,43 @@ CORPORATE_TRADE_TEMPLATES: tuple[Template, ...] = (
                "OUTPUT additivity is measure-dependent: a group_exposure amount is a semi-additive stock "
                "(sum across the group, latest over time); a share / HHI is non-additive — the default "
                "carries the semi-additive group stock."),
+        primary_objective="portfolio_risk.concentration",
+        supporting_objectives=(
+            "credit.monitoring.obligor",
+            "credit.monitoring.limit_management",
+            "corporate_trade.trade_finance",
+        ),
+    ),
+    Template(
+        id="obligor_facility_count", family="obligor_monitoring",
+        source_entity_need_role="obligor",
+        intent="Distinct active facilities associated with an obligor over a governed trailing "
+               "observation window; rising facility breadth is an exposure-monitoring signal.",
+        needs=(
+            Need("obligor", "obligor_id"),
+            Need("facility", "facility_id"),
+            Need("event_ts", "event_timestamp"),
+        ),
+        params={"window": (365, 180, 90)},
+        aggregation="count_distinct_facility",
+        additivity="non_additive",
+        explain="H",
+        use_cases=("trade_finance", "limit_management"),
+        pit=_CORP_PIT_STATE,
+        degrade="missing obligor, facility or event-time authority -> SKIP.",
+        stage="obligor-monitoring",
+        eligibility="Identifiers only; facility activity must be knowable by the as-of cutoff.",
+        notes=(
+            "COUNT_DISTINCT(facility_id) per obligor over the trailing window.",
+            "Predictor only: facility breadth is not itself a default or limit-breach label.",
+        ),
+        primary_objective="credit.monitoring.obligor",
+        supporting_objectives=(
+            "credit.monitoring.limit_management",
+            "portfolio_risk.concentration",
+            "corporate_trade.trade_finance",
+        ),
+        formula_authoring_class=FormulaAuthoringClass.FORMULA_V1_AUTHORABLE,
     ),
     # ── CREDIT MITIGATION — guarantor reliance ───────────────────────────────────────────────────────
     # L.18 — guarantor_reliance
@@ -4104,13 +4596,58 @@ def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[
         if t.id in seen_ids:
             raise ValueError(f"duplicate template id {t.id!r} (checking {label})")
         seen_ids.add(t.id)
+        need_roles = [need.role for need in t.needs]
+        if len(need_roles) != len(set(need_roles)):
+            raise ValueError(f"template {t.id!r} has duplicate need roles")
+        distinct_groups: dict[str, list[str]] = {}
         for need in t.needs:
             if need.concept not in CONCEPT_REGISTRY:
                 raise ValueError(
                     f"template {t.id!r} need {need.role!r} references unknown concept {need.concept!r}")
+            if need.distinct_binding_group is not None:
+                if not need.distinct_binding_group.strip():
+                    raise ValueError(
+                        f"template {t.id!r} need {need.role!r} has an empty distinct-binding group")
+                distinct_groups.setdefault(need.distinct_binding_group, []).append(need.role)
+        for group, roles in distinct_groups.items():
+            if len(roles) < 2:
+                raise ValueError(
+                    f"template {t.id!r} distinct-binding group {group!r} has only one member")
+        if t.source_entity_need_role is not None:
+            source_need = next(
+                (need for need in t.needs if need.role == t.source_entity_need_role),
+                None,
+            )
+            if source_need is None or not _is_entity_concept(source_need.concept):
+                raise ValueError(
+                    f"template {t.id!r} source_entity_need_role must name an entity-linked need")
+        if t.primary_objective is None and t.supporting_objectives:
+            raise ValueError(
+                f"template {t.id!r} has supporting objectives without an authored primary")
+        if t.primary_objective is not None:
+            from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
+
+            leaves = frozenset(selectable_leaves())
+            if t.primary_objective not in leaves:
+                raise ValueError(
+                    f"template {t.id!r} primary objective is not a selectable leaf")
+            if len(t.supporting_objectives) != len(set(t.supporting_objectives)):
+                raise ValueError(f"template {t.id!r} has duplicate supporting objectives")
+            if t.primary_objective in t.supporting_objectives:
+                raise ValueError(
+                    f"template {t.id!r} repeats primary as a supporting objective")
+            if any(objective not in leaves for objective in t.supporting_objectives):
+                raise ValueError(
+                    f"template {t.id!r} has a non-selectable supporting objective")
         for key, allowed in t.params.items():
             if not isinstance(allowed, tuple) or not allowed:
                 raise ValueError(f"template {t.id!r} param {key!r} must be a non-empty tuple")
+            for value in allowed:
+                if value is not None and not isinstance(value, (bool, int, str)):
+                    raise ValueError(
+                        f"template {t.id!r} param {key!r} contains unsupported "
+                        f"{type(value).__name__}; use null, bool, integer or canonical string"
+                    )
 
 
 def _validate_registry() -> None:

@@ -9,6 +9,7 @@ wealth secondaries, and the concentration / counterparty overrides land on their
 from __future__ import annotations
 
 from featuregen.overlay.upload.taxonomy.recipe_applicability import (
+    ApplicabilitySource,
     ApplicabilitySpec,
     recipe_applicability,
 )
@@ -139,7 +140,9 @@ def test_no_unexpected_cross_domain_primary():
 
     violations: list[tuple[str, str | None, str]] = []
     for t in ALL_TEMPLATES:
-        if t.id in _PRIMARY_OVERRIDE or t.id in _ORPHAN_PRIMARY:
+        if (t.primary_objective is not None
+                or t.id in _PRIMARY_OVERRIDE
+                or t.id in _ORPHAN_PRIMARY):
             continue                                              # intentional, audited cross-domain homes
         primary = recipe_applicability(t).primary
         family_root = _FAMILY_ROOT.get(_ID_TO_FAMILY.get(t.id, ""))
@@ -148,3 +151,50 @@ def test_no_unexpected_cross_domain_primary():
         if not in_family:
             violations.append((t.id, family_root, primary))
     assert not violations, f"cross-domain primaries outside the override/orphan tables: {violations}"
+
+
+def test_four_objective_anchors_are_explicit_authored_primaries():
+    expected = {
+        "obligor_facility_count": "credit.monitoring.obligor",
+        "merchant_mcc_diversity": "fraud.merchant_fraud",
+        "contractual_deposit_maturity_profile":
+            "treasury_alm.deposit_runoff_forecasting",
+        "lagged_net_interest_flow": "treasury_alm.net_interest_margin",
+    }
+    for recipe_id, primary in expected.items():
+        spec = _spec(recipe_id)
+        assert spec.primary == primary
+        assert spec.source is ApplicabilitySource.AUTHORED
+
+
+def test_reviewed_existing_recipe_mappings_are_preserved_and_extended():
+    group = _spec("group_exposure_aggregation")
+    assert group.primary == "portfolio_risk.concentration"
+    assert group.secondary == (
+        "credit.monitoring.obligor",
+        "credit.monitoring.limit_management",
+        "corporate_trade.trade_finance",
+    )
+
+    merchant = _spec("merchant_risk_anomaly")
+    assert merchant.primary == "fraud.merchant_fraud"
+    assert merchant.secondary == (
+        "fraud.transaction_fraud_detection",
+        "fraud.card_fraud",
+    )
+
+    assert _spec("chargeback_dispute_rate").secondary == ("fraud.merchant_fraud",)
+    for recipe_id in (
+        "nmd_stickiness",
+        "maturity_ladder_runoff",
+        "early_withdrawal_break",
+        "deposit_beta",
+        "hot_money_share",
+        "rate_sensitive_concentration",
+    ):
+        assert (
+            "treasury_alm.deposit_runoff_forecasting"
+            in _spec(recipe_id).secondary
+        )
+    for recipe_id in ("deposit_beta", "repricing_gap_exposure"):
+        assert "treasury_alm.net_interest_margin" in _spec(recipe_id).secondary

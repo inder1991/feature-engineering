@@ -5,11 +5,11 @@ Three append-only writers/readers over the ``0974_intent_scope_records`` tables:
 * :func:`record_recognition_attempt` — persists the recognizer's PROPOSAL for an intent, BEFORE any
   generation run exists. Idempotent on ``(intent_id, input_hash)``: the same intent + redacted input
   resolves to the SAME ``recognition_id`` (never a second row), so re-recognising is free.
+* :func:`use_case_provenance` — derives accepted/added/overridden provenance from the immutable
+  recognition attempt and the confirmed scope. The client never supplies governance provenance.
 * :func:`record_confirmed_scope` — writes the human-confirmed governing scope for exactly one
   generation run (parent) plus one normalized child per accepted use-case, each stamped with its
-  ``origin`` (``llm_proposed``/``user_added``/``user_overridden``). The proposals (on the attempt) and
-  the choices (child rows) are both retained, joined by ``recognition_id`` — so the proposed-vs-accepted
-  delta stays queryable.
+  server-derived provenance. The proposals and choices remain independently queryable.
 * :func:`scope_for_run` — the CANONICAL lookup: the governing scope for a run, by run id only (the
   ``UNIQUE(generation_run_id)`` linkage). Never latest-by-time; ``supersedes_scope_id`` is lineage only.
 * :func:`confirmation_delta` — the proposed-vs-confirmed DIMENSION delta for a run: the attempt's
@@ -21,12 +21,14 @@ Computation-free and behaviour-neutral: scope persistence lives here / in the AP
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
+from featuregen.intake.llm import compute_input_hash
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
 from featuregen.overlay.upload.taxonomy.recognition import RecognitionResult, UseCaseCandidate
 
@@ -54,6 +56,67 @@ def _candidate_json(candidate: UseCaseCandidate) -> dict[str, Any]:
     }
 
 
+class RecognitionInputUnavailable(ValueError):
+    """The recognition predates sealed inputs or its immutable content does not verify."""
+
+
+class GenerationInputUnavailable(ValueError):
+    """A generation run has no sealed input or its immutable content does not verify."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecognitionInput:
+    recognition_id: str
+    intent_id: str
+    redacted_hypothesis: str
+    redacted_prediction_goal: str
+    input_content_hash: str
+    redaction_policy_version: str
+    redacted_feedback: str = ""
+    supersedes_scope_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationInput:
+    generation_run_id: str
+    intent_id: str
+    recognition_id: str
+    confirmed_scope_id: str
+    redacted_hypothesis: str
+    redacted_definition: str
+    redacted_prediction_goal: str
+    redacted_feedback: str
+    target_ref: str | None
+    recognition_input_content_hash: str
+    generation_input_content_hash: str
+
+
+def recognition_input_material(
+    *,
+    redacted_hypothesis: str,
+    redacted_prediction_goal: str,
+    redaction_policy_version: str,
+    redacted_feedback: str = "",
+    supersedes_scope_id: str | None = None,
+) -> dict[str, Any]:
+    """The complete redacted and policy-versioned input recognized by Gate #1."""
+    material: dict[str, Any] = {
+        "redacted_hypothesis": redacted_hypothesis,
+        "redacted_prediction_goal": redacted_prediction_goal,
+        "redaction_policy_version": redaction_policy_version,
+    }
+    if redacted_feedback:
+        if not supersedes_scope_id:
+            raise ValueError("feedback recognition requires a superseded scope")
+        material.update({
+            "redacted_feedback": redacted_feedback,
+            "supersedes_scope_id": supersedes_scope_id,
+        })
+    elif supersedes_scope_id is not None:
+        raise ValueError("superseded scope is only valid for feedback recognition")
+    return material
+
+
 def record_recognition_attempt(
     conn,
     *,
@@ -61,6 +124,8 @@ def record_recognition_attempt(
     input_hash: str,
     result: RecognitionResult,
     actor: Any,
+    input_json: dict[str, Any] | None = None,
+    redaction_policy_version: str | None = None,
 ) -> str:
     """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet,
     the candidate PROPOSALS, and the optional intent DIMENSIONS (``modelling_contexts`` / ``target_entity``)
@@ -69,25 +134,252 @@ def record_recognition_attempt(
     input always resolves to the same attempt (never a second row)."""
     recognition_id = mint_id("rcg")
     candidates = [_candidate_json(c) for c in result.candidates]
+    if input_json is not None:
+        computed_hash = compute_input_hash(input_json)
+        if computed_hash != input_hash:
+            raise ValueError("recognition input hash does not match input_json")
+        if not redaction_policy_version:
+            raise ValueError("redaction_policy_version is required with input_json")
+        if input_json.get("redaction_policy_version") != redaction_policy_version:
+            raise ValueError("recognition input redaction policy does not match its stamp")
     conn.execute(
         "INSERT INTO intent_recognition_attempt "
         "(recognition_id, intent_id, input_hash, status, candidates, ambiguity_note, "
         "taxonomy_version, applicability_mapping_version, recognizer_model_id, prompt_version, "
-        "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by, "
+        "input_json, input_content_hash, redaction_policy_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (intent_id, input_hash) DO NOTHING",
         (recognition_id, intent_id, input_hash, result.status.value, Jsonb(candidates),
          result.ambiguity_note, result.taxonomy_version, result.applicability_mapping_version,
          result.recognizer_model_id, result.prompt_version, result.recipe_registry_version,
          Jsonb(list(result.modelling_contexts)), result.target_entity, Jsonb(list(result.warnings)),
-         Jsonb(_actor_dict(actor))))
+         Jsonb(_actor_dict(actor)), Jsonb(input_json) if input_json is not None else None,
+         input_hash if input_json is not None else None, redaction_policy_version))
     # Read back the governing id for this (intent, input) — the one just inserted, or the pre-existing
     # one when the INSERT hit ON CONFLICT DO NOTHING. Either way a repeat returns the SAME id.
     row = conn.execute(
-        "SELECT recognition_id FROM intent_recognition_attempt "
+        "SELECT recognition_id, input_json, input_content_hash, redaction_policy_version "
+        "FROM intent_recognition_attempt "
         "WHERE intent_id = %s AND input_hash = %s",
         (intent_id, input_hash)).fetchone()
+    if input_json is not None and (
+        row[1] != input_json
+        or row[2] != input_hash
+        or row[3] != redaction_policy_version
+    ):
+        raise ValueError("existing recognition attempt has different sealed input")
     return row[0]
+
+
+def load_recognition_input(
+    conn,
+    *,
+    recognition_id: str,
+    intent_id: str,
+) -> RecognitionInput:
+    """Load and verify the exact redacted input used for one recognition attempt."""
+    row = conn.execute(
+        "SELECT input_json, input_content_hash, redaction_policy_version "
+        "FROM intent_recognition_attempt WHERE recognition_id = %s AND intent_id = %s",
+        (recognition_id, intent_id),
+    ).fetchone()
+    if row is None:
+        raise RecognitionInputUnavailable("unknown recognition")
+    material, content_hash, policy_version = row
+    if material is None or content_hash is None or policy_version is None:
+        raise RecognitionInputUnavailable("recognition input is not sealed")
+    base_keys = {
+        "redacted_hypothesis",
+        "redacted_prediction_goal",
+        "redaction_policy_version",
+    }
+    feedback_keys = base_keys | {"redacted_feedback", "supersedes_scope_id"}
+    if not isinstance(material, dict) or frozenset(material) not in {
+        frozenset(base_keys), frozenset(feedback_keys),
+    }:
+        raise RecognitionInputUnavailable("recognition input has an unsupported shape")
+    if not all(isinstance(material[key], str) for key in base_keys):
+        raise RecognitionInputUnavailable("recognition input fields must be strings")
+    redacted_feedback = material.get("redacted_feedback", "")
+    supersedes_scope_id = material.get("supersedes_scope_id")
+    if (
+        not isinstance(redacted_feedback, str)
+        or (supersedes_scope_id is not None and not isinstance(supersedes_scope_id, str))
+        or bool(redacted_feedback) != bool(supersedes_scope_id)
+    ):
+        raise RecognitionInputUnavailable("recognition feedback lineage is malformed")
+    if compute_input_hash(material) != content_hash:
+        raise RecognitionInputUnavailable("recognition input content hash mismatch")
+    if material["redaction_policy_version"] != policy_version:
+        raise RecognitionInputUnavailable("recognition input redaction policy mismatch")
+    return RecognitionInput(
+        recognition_id=recognition_id,
+        intent_id=intent_id,
+        redacted_hypothesis=material["redacted_hypothesis"],
+        redacted_prediction_goal=material["redacted_prediction_goal"],
+        input_content_hash=content_hash,
+        redaction_policy_version=policy_version,
+        redacted_feedback=redacted_feedback,
+        supersedes_scope_id=supersedes_scope_id,
+    )
+
+
+def recognition_id_for_scope(
+    conn,
+    *,
+    scope_id: str,
+    intent_id: str,
+) -> str | None:
+    """Resolve broaden lineage to the original recognition without trusting the request."""
+    row = conn.execute(
+        "SELECT recognition_id FROM confirmed_generation_scope "
+        "WHERE scope_id = %s AND intent_id = %s",
+        (scope_id, intent_id),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def _generation_input_material(
+    *,
+    generation_run_id: str,
+    intent_id: str,
+    recognition_id: str,
+    confirmed_scope_id: str,
+    redacted_hypothesis: str,
+    redacted_definition: str,
+    redacted_prediction_goal: str,
+    redacted_feedback: str,
+    target_ref: str | None,
+    recognition_input_content_hash: str,
+) -> dict[str, Any]:
+    return {
+        "version": "contract-generation-input@1",
+        "generation_run_id": generation_run_id,
+        "intent_id": intent_id,
+        "recognition_id": recognition_id,
+        "confirmed_scope_id": confirmed_scope_id,
+        "redacted_hypothesis": redacted_hypothesis,
+        "redacted_definition": redacted_definition,
+        "redacted_prediction_goal": redacted_prediction_goal,
+        "redacted_feedback": redacted_feedback,
+        "target_ref": target_ref,
+        "recognition_input_content_hash": recognition_input_content_hash,
+    }
+
+
+def record_generation_input(
+    conn,
+    *,
+    generation_run_id: str,
+    intent_id: str,
+    recognition: RecognitionInput,
+    confirmed_scope_id: str,
+    redacted_definition: str,
+    redacted_feedback: str,
+    target_ref: str | None,
+    actor: Any,
+) -> GenerationInput:
+    """Seal the exact text and leakage target consumed by one confirmed-scope generation run."""
+    material = _generation_input_material(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition.recognition_id,
+        confirmed_scope_id=confirmed_scope_id,
+        redacted_hypothesis=recognition.redacted_hypothesis,
+        redacted_definition=redacted_definition,
+        redacted_prediction_goal=recognition.redacted_prediction_goal,
+        redacted_feedback=redacted_feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition.input_content_hash,
+    )
+    content_hash = compute_input_hash(material)
+    conn.execute(
+        "INSERT INTO contract_generation_input "
+        "(generation_run_id, intent_id, recognition_id, confirmed_scope_id, "
+        "redacted_hypothesis, redacted_definition, redacted_prediction_goal, redacted_feedback, "
+        "target_ref, recognition_input_content_hash, generation_input_content_hash, created_by) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            generation_run_id,
+            intent_id,
+            recognition.recognition_id,
+            confirmed_scope_id,
+            recognition.redacted_hypothesis,
+            redacted_definition,
+            recognition.redacted_prediction_goal,
+            redacted_feedback,
+            target_ref,
+            recognition.input_content_hash,
+            content_hash,
+            Jsonb(_actor_dict(actor)),
+        ),
+    )
+    return GenerationInput(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition.recognition_id,
+        confirmed_scope_id=confirmed_scope_id,
+        redacted_hypothesis=recognition.redacted_hypothesis,
+        redacted_definition=redacted_definition,
+        redacted_prediction_goal=recognition.redacted_prediction_goal,
+        redacted_feedback=redacted_feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition.input_content_hash,
+        generation_input_content_hash=content_hash,
+    )
+
+
+def generation_input_for_run(conn, generation_run_id: str) -> GenerationInput | None:
+    """Load and hash-verify a run's sealed input; return ``None`` only for explicit legacy runs."""
+    row = conn.execute(
+        "SELECT intent_id, recognition_id, confirmed_scope_id, redacted_hypothesis, "
+        "redacted_definition, redacted_prediction_goal, redacted_feedback, target_ref, "
+        "recognition_input_content_hash, generation_input_content_hash "
+        "FROM contract_generation_input WHERE generation_run_id = %s",
+        (generation_run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    (
+        intent_id,
+        recognition_id,
+        scope_id,
+        hypothesis,
+        definition,
+        goal,
+        feedback,
+        target_ref,
+        recognition_hash,
+        content_hash,
+    ) = row
+    material = _generation_input_material(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition_id,
+        confirmed_scope_id=scope_id,
+        redacted_hypothesis=hypothesis,
+        redacted_definition=definition,
+        redacted_prediction_goal=goal,
+        redacted_feedback=feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition_hash,
+    )
+    if compute_input_hash(material) != content_hash:
+        raise GenerationInputUnavailable("generation input content hash mismatch")
+    return GenerationInput(
+        generation_run_id=generation_run_id,
+        intent_id=intent_id,
+        recognition_id=recognition_id,
+        confirmed_scope_id=scope_id,
+        redacted_hypothesis=hypothesis,
+        redacted_definition=definition,
+        redacted_prediction_goal=goal,
+        redacted_feedback=feedback,
+        target_ref=target_ref,
+        recognition_input_content_hash=recognition_hash,
+        generation_input_content_hash=content_hash,
+    )
 
 
 def record_confirmed_scope(
@@ -98,6 +390,8 @@ def record_confirmed_scope(
     recognition_id: str | None,
     scope: ConfirmedScope,
     use_case_origins: dict[str, str],
+    use_case_proposed_relationships: dict[str, str] | None = None,
+    use_case_replacements: dict[str, str] | None = None,
     confirmation_source: str,
     confirmed_by: str,
     supersedes_scope_id: str | None = None,
@@ -106,8 +400,8 @@ def record_confirmed_scope(
 ) -> str:
     """Write the human-confirmed governing scope for ``generation_run_id`` (parent) plus one normalized
     child per accepted use-case. The primary (``relationship='primary'``, ``display_order=0``) then each
-    secondary (``relationship='secondary'``, ``display_order=1..N``); each child's ``origin`` comes from
-    ``use_case_origins`` (default ``'llm_proposed'``). An ``unscoped`` scope has no primary/secondary, so
+    secondary (``relationship='secondary'``, ``display_order=1..N``); each child's provenance is
+    server-derived by :func:`use_case_provenance`. An ``unscoped`` scope has no primary/secondary, so
     it writes zero child rows. Raises on a duplicate ``generation_run_id`` (the UNIQUE canonical linkage).
     Returns the minted ``scope_id``.
 
@@ -122,12 +416,20 @@ def record_confirmed_scope(
     scoping, so a broaden (an ``unscoped`` "show all buildable recipes") does NOT forget the confirmed
     context — ``scope_for_run`` rebuilds them either way."""
     scope_id = mint_id("scp")
+    supersedes_generation_run_id: str | None = None
+    if supersedes_scope_id is not None:
+        row = conn.execute(
+            "SELECT generation_run_id FROM confirmed_generation_scope WHERE scope_id = %s",
+            (supersedes_scope_id,),
+        ).fetchone()
+        supersedes_generation_run_id = row[0] if row is not None else None
     conn.execute(
         "INSERT INTO confirmed_generation_scope "
-        "(scope_id, intent_id, generation_run_id, recognition_id, supersedes_scope_id, expansion, "
-        "scope_mode, confirmation_source, confirmed_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "(scope_id, intent_id, generation_run_id, recognition_id, supersedes_scope_id, "
+        "supersedes_generation_run_id, expansion, scope_mode, confirmation_source, confirmed_by) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (scope_id, intent_id, generation_run_id, recognition_id, supersedes_scope_id,
+         supersedes_generation_run_id,
          scope.expansion.value, "unscoped" if scope.unscoped else "scoped",
          confirmation_source, confirmed_by))
 
@@ -142,13 +444,22 @@ def record_confirmed_scope(
         for order, use_case_id in enumerate(scope.secondary, start=1):
             children.append((use_case_id, "secondary", order))
 
+    derived_origins, derived_relationships, derived_replacements = use_case_provenance(
+        conn, recognition_id, scope)
+    origins = {**derived_origins, **use_case_origins}
+    proposed_relationships = {
+        **derived_relationships, **(use_case_proposed_relationships or {})}
+    replacements = {**derived_replacements, **(use_case_replacements or {})}
     for use_case_id, relationship, display_order in children:
         conn.execute(
             "INSERT INTO confirmed_scope_use_case "
-            "(scope_id, use_case_id, relationship, origin, display_order) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "(scope_id, use_case_id, relationship, origin, proposed_relationship, "
+            "replaces_use_case_id, display_order) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (scope_id, use_case_id, relationship,
-             use_case_origins.get(use_case_id, "llm_proposed"), display_order))
+             origins.get(use_case_id, "user_added"),
+             proposed_relationships.get(use_case_id), replacements.get(use_case_id),
+             display_order))
 
     # Confirmed intent DIMENSIONS (Phase-2B), each a normalized child with rich provenance. UNLIKE the
     # use-case children, these persist for BOTH scoped and unscoped scopes: the confirmed dimensions are
@@ -174,6 +485,64 @@ def record_confirmed_scope(
             "VALUES (%s, %s, %s, %s, %s, %s)",
             (scope_id, dimension, value, source, replaces_value, display_order))
     return scope_id
+
+
+def use_case_provenance(
+    conn, recognition_id: str | None, scope: ConfirmedScope,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Derive use-case provenance from the immutable recognition proposal.
+
+    Returns ``(origins, proposed_relationships, replacements)`` keyed by confirmed use-case id.
+    A candidate retained in its proposed role is accepted, a new secondary is user-added, and any
+    role change is an override. A newly selected primary also records the recognizer's displaced
+    primary when one existed. Unscoped confirmation has no use-case children and therefore no child
+    provenance; its action provenance is carried by the parent ``confirmation_source``.
+    """
+    if scope.unscoped:
+        return {}, {}, {}
+
+    candidates: list[dict[str, Any]] = []
+    if recognition_id is not None:
+        row = conn.execute(
+            "SELECT candidates FROM intent_recognition_attempt WHERE recognition_id = %s",
+            (recognition_id,),
+        ).fetchone()
+        if row is not None and isinstance(row[0], list):
+            candidates = [c for c in row[0] if isinstance(c, dict)]
+
+    proposed: dict[str, str] = {
+        str(candidate["use_case_id"]): str(candidate["relationship"])
+        for candidate in candidates
+        if isinstance(candidate.get("use_case_id"), str)
+        and candidate.get("relationship") in {"primary", "secondary"}
+    }
+    proposed_primary = next(
+        (uid for uid, relationship in proposed.items() if relationship == "primary"), None)
+
+    confirmed: list[tuple[str, str]] = []
+    if scope.primary is not None:
+        confirmed.append((scope.primary, "primary"))
+    confirmed.extend((uid, "secondary") for uid in scope.secondary)
+
+    origins: dict[str, str] = {}
+    proposed_relationships: dict[str, str] = {}
+    replacements: dict[str, str] = {}
+    for use_case_id, relationship in confirmed:
+        prior_relationship = proposed.get(use_case_id)
+        if prior_relationship == relationship:
+            origins[use_case_id] = "accepted_llm_proposal"
+        elif prior_relationship is not None:
+            origins[use_case_id] = "user_overridden"
+            proposed_relationships[use_case_id] = prior_relationship
+            if (relationship == "primary" and proposed_primary is not None
+                    and proposed_primary != use_case_id):
+                replacements[use_case_id] = proposed_primary
+        elif relationship == "primary" and proposed_primary is not None:
+            origins[use_case_id] = "user_overridden"
+            replacements[use_case_id] = proposed_primary
+        else:
+            origins[use_case_id] = "user_added"
+    return origins, proposed_relationships, replacements
 
 
 def dimension_provenance(

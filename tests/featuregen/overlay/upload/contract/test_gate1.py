@@ -1,4 +1,5 @@
 """Phase 2 — Gate #1 bridge: considered-set from the loop + recorded human choice."""
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -7,6 +8,9 @@ from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import (
     Gate1Error,
+    _chosen_option_from_revision,
+    _private_considered_revision_snapshot,
+    _with_option_ids,
     build_considered_set,
     chosen_feature,
     confirm_gate1,
@@ -166,6 +170,116 @@ def test_confirm_gate1_validates_the_alternative_source(db):
         confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="anchor_feat", actor="ds1")
     assert confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="alt_feat",
                          actor="ds1") == "alt_feat"
+
+
+def test_exact_option_ids_preserve_same_name_recipe_and_llm_variants(db):
+    from featuregen.overlay.upload.contract.gate1 import ConsideredSet
+    from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet
+
+    llm = FeatureIdea(
+        "shared_name",
+        "",
+        ["public.accounts.balance"],
+        "avg_90d",
+        "accounts",
+        generation_source="llm_freeform",
+    )
+    recipe = FeatureIdea(
+        "shared_name",
+        "",
+        ["public.accounts.balance"],
+        "avg_90d",
+        "accounts",
+        generation_source="recipe",
+        recipe_id="balance_trend",
+    )
+    cs = _with_option_ids(
+        ConsideredSet(
+            "intent-collision",
+            None,
+            [
+                FeatureSet("llm", [llm]),
+                FeatureSet("templates", [recipe]),
+            ],
+            None,
+        ),
+        "run-collision",
+    )
+    revision = _private_considered_revision_snapshot(db, cs)
+    options = [
+        feature
+        for feature_set in revision["public"]["alternatives"]
+        for feature in feature_set["features"]
+    ]
+    assert [feature["name"] for feature in options] == ["shared_name", "shared_name"]
+    assert options[0]["option_id"] != options[1]["option_id"]
+
+    first, first_source, first_hash = _chosen_option_from_revision(
+        revision, options[0]["option_id"])
+    second, second_source, second_hash = _chosen_option_from_revision(
+        revision, options[1]["option_id"])
+    assert (first.generation_source, first_source) == ("llm_freeform", "alternative")
+    assert (second.generation_source, second.recipe_id, second_source) == (
+        "recipe", "balance_trend", "alternative")
+    assert first_hash != second_hash
+    with pytest.raises(Gate1Error, match="unknown considered option"):
+        _chosen_option_from_revision(revision, "opt_forged")
+
+
+def test_exact_option_ids_cover_recipe_grain_reordering_and_shadow_identity(db):
+    from featuregen.overlay.upload.contract.gate1 import ConsideredSet
+    from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet
+
+    common = {
+        "name": "shared_name",
+        "description": "same display description",
+        "derives_from": ["public.accounts.balance"],
+        "aggregation": "avg_90d",
+        "generation_source": "recipe",
+    }
+    recipe_a = FeatureIdea(**common, grain_table="accounts", recipe_id="recipe_a")
+    recipe_b = FeatureIdea(**common, grain_table="accounts", recipe_id="recipe_b")
+    different_grain = FeatureIdea(**common, grain_table="customers", recipe_id="recipe_c")
+    cs = _with_option_ids(
+        ConsideredSet(
+            "intent-collisions",
+            None,
+            [
+                FeatureSet("temporal", [recipe_a]),
+                FeatureSet("monetary", [recipe_b, different_grain]),
+            ],
+            None,
+            recipe_candidate_keys_by_recipe_id={
+                "recipe_a": ("rck_a",),
+                "recipe_b": ("rck_b",),
+                "recipe_c": ("rck_c",),
+            },
+        ),
+        "run-collisions",
+    )
+    revision = _private_considered_revision_snapshot(db, cs)
+    public = [
+        feature
+        for feature_set in revision["public"]["alternatives"]
+        for feature in feature_set["features"]
+    ]
+    assert len({feature["option_id"] for feature in public}) == 3
+    assert {feature["recipe_id"] for feature in public} == {
+        "recipe_a", "recipe_b", "recipe_c"}
+    assert {
+        record["recipe_candidate_key"]
+        for record in revision["options_by_id"].values()
+    } == {"rck_a", "rck_b", "rck_c"}
+
+    # Transport/UI order is not identity: carrying the opaque IDs with their options still resolves the
+    # exact recipe after the response sets are reordered.
+    reordered = deepcopy(revision)
+    reordered["public"]["alternatives"].reverse()
+    selected_id = next(
+        feature["option_id"] for feature in public if feature["recipe_id"] == "recipe_b")
+    selected, source, _identity_hash = _chosen_option_from_revision(reordered, selected_id)
+    assert (selected.recipe_id, selected.grain_table, source) == (
+        "recipe_b", "accounts", "alternative")
 
 
 def test_intent_is_persisted_at_gate1(db):

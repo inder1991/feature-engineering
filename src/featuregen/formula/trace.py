@@ -282,8 +282,16 @@ def _bounded_connect_dsn(dsn: str) -> str:
     """``dsn`` with a DEFAULT ``connect_timeout`` merged in, so no durable connect can hang forever.
 
     The DSN's own value WINS (it is spread second), so this only supplies the bound libpq otherwise
-    leaves unset — an operator who has tuned ``connect_timeout`` keeps it, and the password the DSN
-    carries survives the round-trip in both keyword and URI form."""
+    leaves unset — an operator who has tuned ``connect_timeout`` **in the DSN** keeps it, and the
+    password the DSN carries survives the round-trip in both keyword and URI form.
+
+    SCOPE, precisely: ``conninfo_to_dict`` parses the DSN STRING ONLY — it does not expand libpq's
+    environment defaults. So an operator who tuned the timeout through ``PGCONNECT_TIMEOUT`` rather
+    than the DSN does NOT keep it: this default is materialized into the conninfo, and an explicit
+    conninfo parameter outranks the environment in libpq. That is the deliberate trade — an
+    unbounded connect on this path hangs a request, and 5s is a far better failure than forever —
+    but it IS an override of that env var, not merely a fallback, and an operator who needs a
+    different bound here must set it in ``FEATUREGEN_DSN``."""
     return make_conninfo(
         "", **{"connect_timeout": _CONNECT_TIMEOUT_SECONDS, **conninfo_to_dict(dsn)})
 
@@ -353,21 +361,34 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple, *, what: str) -> No
     through this very degraded path. Precedent for the shape: ``overlay.upload.enrich`` (program-audit
     finding I-2). A savepoint takes no advisory lock, so the I-3 self-deadlock does not apply.
 
-    THREE shapes, keyed on the EXACT transaction status — ``conn.transaction()`` is not a savepoint
-    when there is no transaction, and it is not usable at all once one has aborted:
+    THREE shapes over the FIVE libpq transaction statuses — ``conn.transaction()`` is not a savepoint
+    when there is no transaction, and it is not usable at all once one has aborted. The enumeration
+    below is CLOSED (``IDLE``, ``ACTIVE``, ``INTRANS``, ``INERROR``, ``UNKNOWN``): every status has a
+    named home, so none can fall into a branch by accident.
 
-    * ``INTRANS`` (the healthy request shape) → SAVEPOINT. The rejection is contained and the
-      caller's uncommitted work — including trace rows that degraded here earlier, the only copy
-      there is — survives untouched. A blanket ``rollback()`` would keep the connection usable by
-      destroying exactly the evidence this module exists to preserve.
+    * ``INTRANS`` (the healthy request shape) and ``ACTIVE`` → SAVEPOINT. The rejection is contained
+      and the caller's uncommitted work — including trace rows that degraded here earlier, the only
+      copy there is — survives untouched. A blanket ``rollback()`` would keep the connection usable
+      by destroying exactly the evidence this module exists to preserve.
+
+      ``ACTIVE`` means a statement is in flight on this connection, which this module never produces
+      itself (it is single-threaded on the caller's connection by contract — see the module
+      docstring) but which a caller sharing a connection across threads could. It is routed to the
+      SAVEPOINT branch because that is the only branch that resolves the status SAFELY: psycopg's
+      ``Transaction.__enter__`` takes ``conn.lock`` and re-reads ``transaction_status`` underneath it,
+      so it sees the TRUE post-statement state (``INTRANS`` → ``SAVEPOINT``; ``IDLE`` → ``BEGIN``)
+      rather than the racing snapshot read above. The bare-execute branch has no such re-read: it
+      would blindly replay against whatever state the other statement left behind.
     * ``IDLE`` → replay bare. ``conn.transaction()`` would BEGIN *and COMMIT* here, committing a
       degraded row whose whole point is to share the request's fate (and breaking the caller's
       control of its own transaction boundary). Nothing of the caller's is in flight, so if the
       replay is rejected the implicit single-statement transaction is discarded — that loses nothing
       and keeps the connection usable.
-    * ``INERROR`` (the caller's transaction ALREADY aborted, on its own earlier statement) → replay
-      bare, and let ``InFailedSqlTransaction`` propagate. Nothing can be written on an aborted
-      transaction and this module must not pretend otherwise. Taking the savepoint branch here
+    * ``INERROR`` (the caller's transaction ALREADY aborted, on its own earlier statement) and
+      ``UNKNOWN`` (the connection is bad — libpq cannot report a status at all) → replay
+      bare, and let ``InFailedSqlTransaction`` (or the connection's own error) propagate. Nothing can
+      be written on an aborted or broken transaction and this module must not pretend otherwise.
+      Taking the savepoint branch here
       BRICKED the connection: psycopg's ``Transaction.__enter__`` increments
       ``conn._num_transactions`` BEFORE issuing ``SAVEPOINT``, that ``SAVEPOINT`` fails,
       ``__enter__`` raises, ``__exit__`` never runs, and the counter LEAKS at 1 permanently — after
@@ -387,7 +408,7 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple, *, what: str) -> No
     still returns a freshly minted id for a row that exists nowhere. The accepted behaviour is
     unchanged (non-raising, failing toward ``"incomplete"``); it is merely no longer INVISIBLE."""
     status = conn.info.transaction_status
-    if status == psycopg.pq.TransactionStatus.INTRANS:
+    if status in (psycopg.pq.TransactionStatus.INTRANS, psycopg.pq.TransactionStatus.ACTIVE):
         with conn.transaction():   # savepoint: contain a rejected replay without poisoning the txn
             cur = conn.execute(sql, params)
     elif status == psycopg.pq.TransactionStatus.IDLE:
@@ -397,7 +418,7 @@ def _replay_on_caller(conn: DbConn, sql: str, params: tuple, *, what: str) -> No
             conn.rollback()   # discards ONLY the rejected statement's implicit tx — nothing else
             raise
     else:
-        # INERROR (or worse): bare, so psycopg's savepoint stack can't leak.
+        # INERROR / UNKNOWN: bare, so psycopg's savepoint stack can't leak.
         cur = conn.execute(sql, params)
     if cur.rowcount == 0:
         logger.warning(

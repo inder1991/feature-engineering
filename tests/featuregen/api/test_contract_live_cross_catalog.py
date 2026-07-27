@@ -70,6 +70,7 @@ from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import (
     GOVERNED_CROSS_CATALOG_PLAN_REQUIRED,
     ConsideredSet,
+    DraftChoice,
 )
 from featuregen.overlay.upload.contract.live_activation import (
     CROSS_CATALOG_GROUNDING_NOT_ENABLED,
@@ -310,7 +311,8 @@ def test_s9_item4_cross_catalog_llm_candidate_cannot_reach_drafting(make_client,
                and r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in out["rejections"])
     dr = client.post("/contract/draft", json={
         "intent_id": out["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "cross_llm", "why": ""}, headers=AUTH)
+        "chosen_option_id": "cross_llm", "why": "",
+        "expected_generation_run_id": out["generation_run_id"]}, headers=AUTH)
     assert dr.status_code == 422, dr.text   # never offered → never draftable
 
 
@@ -449,7 +451,10 @@ def test_confirm_persists_server_envelope_join_path_not_client_forged(make_clien
             derives_pairs=tuple(tuple(p) for p in draft["derives_pairs"]),
             plan_envelope=env, origin="governed_planner", path_authority="governed_cross_catalog")
 
-    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _governed_chosen)
+    monkeypatch.setattr(
+        "featuregen.api.routes.contract.recorded_gate1_draft_choice",
+        lambda *args, **kwargs: DraftChoice(_governed_chosen(), None, None, None),
+    )
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.current)
     # This test's SUBJECT is the route's join_path server-derivation (routes/contract.py, BEFORE

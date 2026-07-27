@@ -245,6 +245,15 @@ export interface JoinStep {
 }
 
 export interface FeatureIdea {
+  // Opaque, revision-scoped identity on /contract/considered-set responses. It distinguishes variants
+  // that share a display name and is the only scoped drafting token; other feature APIs may omit it.
+  option_id?: string
+  generation_source?: 'recipe' | 'llm_freeform' | 'user_defined' | string
+  recipe_id?: string
+  candidate_status?: string
+  planner_applicability?: string
+  origin?: string
+  path_authority?: string
   name: string
   description: string
   derives_from: string[]
@@ -946,6 +955,12 @@ export interface DraftResp {
   draft: ContractDraft
   unresolved: unknown[]
   intent_id: string
+  choice_id: string | null
+  snapshot?: {
+    generation_run_id: string
+    snapshot_id: string | null
+    content_hash: string | null
+  } | null
 }
 
 export interface Contract {
@@ -1004,15 +1019,12 @@ export interface RecognitionResp {
 // The human's confirmed Gate #1 scope, in the shape the UI holds it (camelCase). `primary` /
 // `secondary` are use-case ids; `expansion` maps the "include all sub-use-cases?" toggle
 // (exact ↔ include_descendants); `unscoped` true is a BROADEN (ground all buildable recipes);
-// `useCaseOrigins` records each confirmed use-case's provenance (llm_proposed / user_added) so the
-// proposed-vs-accepted delta stays queryable; `confirmationSource` names how it was confirmed.
+// Provenance is derived by the server from the immutable recognition and authenticated action.
 export interface ConfirmedScopeInput {
   primary: string | null
   secondary: string[]
   expansion: 'exact' | 'include_descendants'
   unscoped: boolean
-  useCaseOrigins: Record<string, string>
-  confirmationSource: string
   // Phase-2B SOFT dimensions the human confirmed/overrode: governed modelling context ids and the
   // proposed prediction grain. They flow into the scoped considered-set as ranking nudges (never a
   // scope-narrowing filter). `targetEntity` is null when the human proposed/kept no grain.
@@ -1035,7 +1047,12 @@ export interface DispositionStage {
 // eligible recipe (primary/supporting), null for a recipe that never reached grounding.
 export interface RecipeDisposition {
   recipe_id: string
-  final_disposition: 'eligible' | 'unbuildable' | 'safety_rejected' | 'out_of_scope'
+  final_disposition:
+    | 'eligible'
+    | 'unbuildable'
+    | 'grounding_incomplete'
+    | 'safety_rejected'
+    | 'out_of_scope'
   relevance_tier: 'primary' | 'supporting' | null
   applicability: DispositionStage
   grounding: DispositionStage
@@ -1043,21 +1060,27 @@ export interface RecipeDisposition {
 }
 
 // Run the recognizer over the objective and persist an append-only attempt (no generation run yet).
-// Fail-open: the endpoint never returns 5xx; a recognizer failure comes back as status
-// 'technical_failure' with unscoped semantics, so the caller can still generate over everything.
+// Feedback recognition binds the bounded instruction to the prior confirmed scope. A recognizer
+// failure comes back as status 'technical_failure'; generation still requires a human action.
 export function contractRecognitions(
   hypothesis: string,
   objective: string,
+  opts: { feedback?: string; supersedesScopeId?: string } = {},
 ): Promise<RecognitionResp> {
-  return post('/contract/recognitions', { hypothesis, objective })
+  return post('/contract/recognitions', {
+    hypothesis,
+    objective,
+    feedback: opts.feedback ?? null,
+    supersedes_scope_id: opts.supersedesScopeId ?? null,
+  })
 }
 
 // Gate #1 intake: mandatory hypothesis + objective; the server persists the intent and returns the
 // gauntlet-validated considered set (anchor + generated alternatives + an advisory recommendation).
 // Phase 1B: when `confirmedScope` is supplied (the human confirmed/broadened the recognised scope),
 // the server ALSO mints a generation run, persists the scope, grounds only the in-scope recipe
-// subset, and attaches per-recipe `dispositions` + an `in_scope_count`. When it is absent, this is
-// byte-identical to today's one-shot generate.
+// subset, and attaches per-recipe `dispositions` + an `in_scope_count`. In release mode the backend
+// rejects an absent scope; omission exists only for the explicitly configured emergency legacy mode.
 export function contractConsideredSet(
   hypothesis: string,
   objective: string,
@@ -1079,8 +1102,7 @@ export function contractConsideredSet(
     // HUMAN guidance for a whole-round feedback re-run; mints a FRESH governing intent over the
     // guided set. null on the initial generate (no feedback yet).
     feedback: opts.feedback ?? null,
-    // Phase 1B scoped-grounding fields. All null on the flag-off one-shot path → the server takes
-    // today's ground-everything route (recognition/applicability never engage).
+    // Scoped-grounding fields. Null is only valid against an explicitly configured legacy backend.
     intent_id: opts.intentId ?? null,
     recognition_id: opts.recognitionId ?? null,
     confirmed_scope: opts.confirmedScope
@@ -1089,8 +1111,6 @@ export function contractConsideredSet(
           secondary: opts.confirmedScope.secondary,
           expansion: opts.confirmedScope.expansion,
           unscoped: opts.confirmedScope.unscoped,
-          use_case_origins: opts.confirmedScope.useCaseOrigins,
-          confirmation_source: opts.confirmedScope.confirmationSource,
           modelling_contexts: opts.confirmedScope.modellingContexts,
           target_entity: opts.confirmedScope.targetEntity,
         }
@@ -1102,25 +1122,35 @@ export function contractConsideredSet(
 }
 
 // Record the human's Gate #1 choice (server reconstructs the feature from the persisted set) and author
-// the draft. chosen_option_id is the chosen feature's name from the considered set.
+// the draft. In confirmation-required mode chosen_option_id is the opaque option_id, never display name.
 export function contractDraft(
   intentId: string,
   chosenSource: 'anchor' | 'alternative',
   chosenOptionId: string,
   why = '',
+  expectedGenerationRunId?: string,
 ): Promise<DraftResp> {
   return post('/contract/draft', {
     intent_id: intentId,
     chosen_source: chosenSource,
     chosen_option_id: chosenOptionId,
     why,
+    expected_generation_run_id: expectedGenerationRunId ?? null,
   })
 }
 
 // Gate #2 — the governing write. The draft (from contractDraft) is sent back with its intent_id; the
 // server re-runs the MCV and mints a versioned, DESIGN-CHECKED contract.
-export function contractConfirm(draft: ContractDraft, intentId: string): Promise<Contract> {
-  return post('/contract/confirm', { ...draft, intent_id: intentId })
+export function contractConfirm(
+  draft: ContractDraft,
+  intentId: string,
+  choiceId?: string | null,
+): Promise<Contract> {
+  return post('/contract/confirm', {
+    ...draft,
+    intent_id: intentId,
+    choice_id: choiceId ?? null,
+  })
 }
 
 export function listContracts(limit = 50): Promise<ContractSummary[]> {

@@ -732,7 +732,7 @@ describe('governed contract flow client', () => {
     expect(url).toBe('/contract/draft')
     expect(JSON.parse(init.body)).toEqual({
       intent_id: 'int_1', chosen_source: 'anchor', chosen_option_id: 'balance_trend_90d',
-      why: 'best fit' })
+      why: 'best fit', expected_generation_run_id: null })
   })
 
   it('contractConfirm merges the draft with the intent_id', async () => {
@@ -742,12 +742,13 @@ describe('governed contract flow client', () => {
       grain_table: 'accounts', aggregation: 'trend', as_of_column: 'snapshot_date',
       derives_from: ['balance_gbp'], target_ref: 'churned',
       derives_pairs: [['retail_core', 'balance_gbp']], join_path: [] }
-    const c = await contractConfirm(draft, 'int_1')
+    const c = await contractConfirm(draft, 'int_1', 'g1c_1')
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe('/contract/confirm')
     expect(init.method).toBe('POST')
     expect(JSON.parse(init.body)).toMatchObject({ feature_name: 'balance_trend_90d',
-      intent_id: 'int_1', derives_pairs: [['retail_core', 'balance_gbp']] })
+      intent_id: 'int_1', choice_id: 'g1c_1',
+      derives_pairs: [['retail_core', 'balance_gbp']] })
     expect(c.contract_id).toBe('c1')
   })
 

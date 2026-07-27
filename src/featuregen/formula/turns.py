@@ -7,10 +7,26 @@ because the provider's structured-output format requires a top-level object; the
 enforces (fail-closed) that the discriminator's slot is actually present — a shape the schema alone
 cannot force without requiring BOTH slots.
 
-``FinalProposalV1`` is byte-for-byte the Task-2 proposal contract: its slot is the REAL
+``FinalProposalV1`` is the Task-2 proposal contract: its slot is the REAL
 ``proposal_v1.schema.json`` (hoisted into this schema's ``$defs`` so its ``#/$defs/...`` refs
 resolve), so the model is held to the exact shape ``parse_proposal_v1`` consumes — but the author
 NEVER parses it; the raw dict passes through to the later parse/validate stages (Tasks 2/6/7/10).
+
+ONE DELIBERATE RELAXATION, wire-side only (§B/§F ``unsupported != invalid``). The WIRE projection
+opens ``aggregateExpression.aggregation`` to any string. With the enum pinned on the wire, a model
+asked for an average emitted ``"avg"``, the RESPONSE-schema validation rejected the turn, the repair
+loop exhausted, and the run ended ``TurnKind.FAILED`` → TECHNICAL_FAILURE: the requester was told
+"the loop broke" instead of "the v1 grammar does not carry averages", it inflated §J's
+``technical_failure_rate_clean`` (gated at 0, and meaning "the loop itself is broken"), and §J's
+``avg -> UNSUPPORTED_OPERATION`` had no live production path at all. Relaxed, an out-of-vocabulary
+aggregation REACHES the orchestrator, whose ``_names_an_unsupported_operation`` reads the RAW dict
+before parse for exactly this purpose and classifies it ``unsupported_operation`` → UNSUPPORTED.
+
+The relaxation is NOT an authority change: ``parse_proposal_v1`` + ``validate_semantics`` remain the
+only gate a proposal is ever accepted through, and the STRICT ``proposal_v1.schema.json`` they run is
+untouched (this module holds its own parsed copy, so the wire projection cannot leak into it). The
+supported vocabulary is unchanged and still discoverable — §I's ``list_supported_operations`` reports
+every ``AggregateFunction`` with its §B compatibility.
 
 Everything here is provider-compatible AFTER ``project_for_anthropic`` (length/size bounds are
 wire-stripped; the canonical bounds still govern response validation).
@@ -21,6 +37,7 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "AUTHOR_TURN_SCHEMA_ID",
@@ -58,9 +75,24 @@ TURN_TYPE_FINAL_PROPOSAL = "final_proposal"
 # to the turn schema's root so the internal "#/$defs/..." refs keep resolving when embedded.
 _proposal = json.loads(
     Path(__file__).with_name("proposal_v1.schema.json").read_text(encoding="utf-8"))
-_PROPOSAL_DEFS: dict = _proposal["$defs"]
 _PROPOSAL_NODE: dict = {
     k: v for k, v in _proposal.items() if k not in ("$schema", "$id", "title", "$defs")}
+
+# The wire-side ``aggregation`` relaxation (module docstring): any string, so an out-of-vocabulary
+# aggregation is a shape the provider CAN return and the orchestrator can classify as UNSUPPORTED,
+# rather than a response-schema violation that ends the run as a technical failure. Applied to a COPY
+# — the strict ``proposal_v1.schema.json`` ``parse_proposal_v1`` loads is never touched, and it stays
+# the only gate a proposal is accepted through.
+_PROPOSAL_DEFS: dict = {
+    **_proposal["$defs"],
+    "aggregateExpression": {
+        **_proposal["$defs"]["aggregateExpression"],
+        "properties": {
+            **_proposal["$defs"]["aggregateExpression"]["properties"],
+            "aggregation": {"type": "string"},
+        },
+    },
+}
 
 # FinalProposalV1 — the raw proposal dict, exactly the shape parse_proposal_v1 consumes. A $ref
 # into the shared $defs (resolvable within AUTHOR_TURN_V1_SCHEMA, where it is always embedded).
@@ -122,6 +154,7 @@ class AuthoringIntent:
     hypothesis: str
     target_entity: str
     target_grain_keys: tuple[str, ...] = ()
+    recipe_authoring_context: dict[str, Any] | None = None
 
 
 class TurnKind(StrEnum):
@@ -151,3 +184,4 @@ class AuthorTurnRecord:
     #                               with no output)
     provider_calls: int
     usage: dict
+    tool_context_hash: str = ""

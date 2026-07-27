@@ -184,8 +184,12 @@ def test_single_catalog_recipe_records_not_applicable_single_catalog(db):
 
     from featuregen.overlay.upload.contract.gate1 import _template_candidates
     _catalog(db, "core")   # customer_id grain + a monetary_stock balance — grounds t_bal
-    ideas, _rej, grounded_ids, _rejected, _bq = _template_candidates(
-        db, catalog_source="core", roles=(), target_ref=None, now=_NOW, templates=(_tmpl(),))
+    ideas, _rej, grounded_ids, _rejected, _bq, _incomplete, _contexts, _keys = (
+        _template_candidates(
+            db, catalog_source="core", roles=(), target_ref=None, now=_NOW,
+            templates=(_tmpl(),)
+        )
+    )
     assert ideas and grounded_ids == frozenset({"t_bal"})   # the single-catalog recipe survives grounding
     for f in ideas:
         assert f.generation_source == "recipe"

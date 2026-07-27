@@ -22,12 +22,15 @@ from featuregen.api.deps import (
     get_feature_gen_conn,
     get_identity,
     get_llm,
+    get_llm_optional,
     require_feature_generate,
     require_feature_read,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
+from featuregen.intake.redaction import REDACTION_VERSION
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import (
     ContractDraft,
@@ -38,14 +41,16 @@ from featuregen.overlay.upload.contract.author import (
     draft_contract,
 )
 from featuregen.overlay.upload.contract.gate1 import (
+    Gate1Error,
     _intent_scoped_applicability_enabled,
+    _public_considered_snapshot,
     build_considered_set,
-    chosen_feature,
-    considered_snapshot_lineage,
     gate1_choice,
     intent_target_ref,
     persist_intent,
-    record_gate1_choice,
+    recorded_gate1_choice_revision,
+    recorded_gate1_draft_choice,
+    select_and_record_gate1_choice,
 )
 from featuregen.overlay.upload.contract.govern import (
     Contract,
@@ -72,15 +77,33 @@ from featuregen.overlay.upload.contract.live_activation import (
     require_live_ready,
 )
 from featuregen.overlay.upload.contract.review import author_contract
+from featuregen.overlay.upload.contract.scope_mode import confirmation_required, scope_mode_status
 from featuregen.overlay.upload.contract.scope_records import (
+    GenerationInputUnavailable,
+    RecognitionInput,
+    RecognitionInputUnavailable,
     dimension_provenance,
+    generation_input_for_run,
+    load_recognition_input,
+    recognition_id_for_scope,
+    recognition_input_material,
     record_confirmed_scope,
+    record_generation_input,
     record_recognition_attempt,
+    use_case_provenance,
 )
-from featuregen.overlay.upload.feature_metadata_snapshot import CatalogProjectionUnavailable
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CatalogProjectionUnavailable,
+    ensure_generation_run,
+)
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
 from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.planner.shadow import run_shadow_planner
+from featuregen.overlay.upload.recipe_formula_shadow import (
+    capture_ranked_shadow,
+    declare_expected_run,
+    recipe_formula_shadow_enabled,
+)
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     ScopeExpansion,
@@ -115,6 +138,7 @@ from featuregen.overlay.upload.taxonomy.recognition import (
 from featuregen.overlay.upload.taxonomy.recognizer import recognize
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +154,7 @@ _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _FeatureGenConn = Annotated[psycopg.Connection, Depends(get_feature_gen_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 _LLM = Annotated[LLMClient, Depends(get_llm)]
+_OptionalLLM = Annotated[LLMClient | None, Depends(get_llm_optional)]
 
 
 # ---- I/O models. The security-critical state (target_ref, the chosen feature) lives SERVER-side,
@@ -145,6 +170,7 @@ class DraftIn(BaseModel):
     derives_pairs: list[tuple[str, str]] = []
     join_path: list[dict] = []
     intent_id: str | None = None   # server re-reads target_ref + links the contract via this
+    choice_id: str | None = None
     # H1b Gate-1 role-binding confirmation: the binding_hash the client SAW at /contract/draft. At
     # confirm the server recomputes the CURRENT binding_hash from its authoritative reconciled bindings
     # and 409s if it differs (bindings drifted since draft — re-review). LEGACY DEGRADATION: absent
@@ -165,14 +191,14 @@ class DraftIn(BaseModel):
 class ConfirmedScopeIn(BaseModel):
     """The human-confirmed Gate #1 scope (Phase-1B). ``unscoped=true`` fails open to full grounding and
     needs no ids; otherwise ``primary`` (if set) and every ``secondary`` must be a selectable taxonomy
-    leaf. ``use_case_origins`` maps a use-case id to its provenance (``llm_proposed``/``user_added``/
-    ``user_overridden``) for the proposed-vs-accepted audit delta."""
+    leaf. The two deprecated provenance fields are accepted only for wire compatibility and ignored;
+    the server derives governance provenance from the authenticated action and recognition record."""
     primary: str | None = None
     secondary: list[str] = []
     expansion: str = ScopeExpansion.EXACT.value
     unscoped: bool = False
-    use_case_origins: dict[str, str] = {}
-    confirmation_source: str = "user_confirmed"
+    use_case_origins: dict[str, str] | None = Field(default=None, deprecated=True)
+    confirmation_source: str | None = Field(default=None, deprecated=True)
     # ── Phase-2B (Task B3): the two human-confirmed intent DIMENSIONS. Both SOFT — they never narrow
     # applicability (``by_recipe``/``out_of_scope`` are untouched); they only feed the ranker and surface
     # per-recipe grain/context warnings. ``target_entity`` is a grain nudge (never a reject); an unknown
@@ -200,24 +226,57 @@ class ConsideredSetIn(BaseModel):
 
 class DraftReqIn(BaseModel):
     intent_id: str
-    chosen_source: str            # "anchor" | "alternative"
-    chosen_option_id: str         # the chosen feature's name (from the considered set)
+    chosen_source: str = "alternative"  # legacy-only in confirmation-required mode
+    chosen_option_id: str         # opaque option id in confirmation-required mode
     why: str = ""
+    expected_generation_run_id: str | None = None
 
 
 class RecognitionIn(BaseModel):
     hypothesis: str = Field(min_length=1)
     objective: str = ""           # optional prediction goal; redacted before it can reach the LLM
+    feedback: str | None = Field(default=None, max_length=2000)
+    supersedes_scope_id: str | None = None
 
 
 # ---- routes -------------------------------------------------------------------------------------
-def _considered_set_response(intent, cs) -> dict:
-    """Today's considered-set response body — the anchor + alternatives + recommendation + rejections.
-    The scoped (Phase-1B) path returns this SAME shape plus the disposition lens; the no-scope path
-    returns it verbatim (byte-unchanged vs pre-1B)."""
-    return {"intent_id": intent.intent_id, "anchor": cs.anchor,
-            "alternatives": cs.alternatives, "recommendation": cs.recommendation,
-            "rejections": cs.rejections}
+@router.get("/contract/scope-mode", dependencies=[Depends(require_feature_read)])
+def scope_mode() -> dict:
+    """Expose the server authority mode so clients and operators can detect rollout mismatches."""
+    status = scope_mode_status()
+    return {
+        "mode": status.mode.value,
+        "confirmation_required": status.confirmation_required,
+        "configuration_valid": status.configuration_valid,
+    }
+
+
+def _considered_set_response(conn, intent, cs) -> dict:
+    """Return the controlled public considered-set projection.
+
+    Private ranking signals remain sealed in the revision and are not promoted into the API contract.
+    """
+    public = _public_considered_snapshot(conn, cs)
+    return {
+        "intent_id": intent.intent_id,
+        "anchor": public["anchor"],
+        "alternatives": [
+            {"lens": feature_set["lens"], "features": feature_set["features"]}
+            for feature_set in public["alternatives"]
+        ],
+        "recommendation": public["recommendation"],
+        "rejections": cs.rejections,
+    }
+
+
+def _require_generation_llm(client: LLMClient | None) -> LLMClient:
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="no LLM provider is configured on this deployment "
+            "(set FEATUREGEN_LLM_PROVIDER=anthropic to enable feature-assist)",
+        )
+    return client
 
 
 def _disposition_json(ev: RecipeEvaluation) -> dict:
@@ -337,8 +396,31 @@ def _ranking_json(r: RankedRecipe) -> dict:
             "initial_view_reasons": [c.value for c in r.initial_view_reasons]}
 
 
+def _target_for_generation(
+    conn,
+    *,
+    intent_id: str,
+    snapshot_lineage: dict | None,
+) -> str | None:
+    """Resolve leakage authority from the exact chosen run, with legacy fallback only in legacy mode."""
+    generation_run_id = (
+        snapshot_lineage.get("generation_run_id") if snapshot_lineage is not None else None)
+    if generation_run_id is not None:
+        try:
+            sealed = generation_input_for_run(conn, generation_run_id)
+        except GenerationInputUnavailable as e:
+            raise HTTPException(status_code=409, detail="GENERATION_INPUT_INVALID") from e
+        if sealed is not None:
+            if sealed.intent_id != intent_id:
+                raise HTTPException(status_code=409, detail="GENERATION_INPUT_LINEAGE_CHANGED")
+            return sealed.target_ref
+    if confirmation_required():
+        raise HTTPException(status_code=409, detail="GENERATION_INPUT_UNAVAILABLE")
+    return intent_target_ref(conn, intent_id)
+
+
 def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
-                           client: _LLM) -> dict:
+                           client: LLMClient | None) -> dict:
     """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
     run, PERSISTS the confirmed scope in the API layer BEFORE the builder (the canonical run→scope
     linkage; scope persistence is never the builder's job), computes the ONE ``ApplicabilityResult``,
@@ -362,6 +444,12 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     #    422 on a leftover id). Otherwise every confirmed id must be a selectable taxonomy leaf and the
     #    id set must be collision-free.
     if cscope.unscoped:
+        if confirmation_required():
+            if body.recognition_id is None and body.supersedes_scope_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="unscoped broaden must reference a recognition or prior confirmed scope",
+                )
         scope = ConfirmedScope(
             primary=None, secondary=(), unscoped=True,
             modelling_contexts=clean_contexts, target_entity=clean_entity)
@@ -374,6 +462,11 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if len(cscope.secondary) != len(set(cscope.secondary)):
             raise HTTPException(status_code=422, detail="secondary use-cases must be unique")
         confirmed_ids = ([cscope.primary] if cscope.primary else []) + list(cscope.secondary)
+        if confirmation_required() and not confirmed_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="confirmed scope requires at least one selectable use-case",
+            )
         leaves = selectable_leaves()
         for uid in confirmed_ids:
             if use_case(uid) is None or uid not in leaves:
@@ -392,6 +485,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     try:
         intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
                                actor=identity.subject)
+        submitted_goal = redact_free_text(body.objective, label="prediction goal")
+        submitted_feedback = redact_free_text(body.feedback or "", label="feedback")
     except IntentValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     if body.intent_id:
@@ -405,6 +500,63 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if owned is None:
             raise HTTPException(status_code=404, detail="unknown intent")
         intent = replace(intent, intent_id=body.intent_id)
+    effective_recognition_id = body.recognition_id
+    sealed_recognition: RecognitionInput | None = None
+    if confirmation_required():
+        if body.recognition_id is None and body.supersedes_scope_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="confirmed scope must reference its recognition or prior confirmed scope",
+            )
+        if body.supersedes_scope_id is not None:
+            prior_owned = conn.execute(
+                "SELECT recognition_id FROM confirmed_generation_scope "
+                "WHERE scope_id = %s AND intent_id = %s AND confirmed_by = %s",
+                (body.supersedes_scope_id, intent.intent_id, identity.subject),
+            ).fetchone()
+            if prior_owned is None:
+                raise HTTPException(status_code=404, detail="unknown prior confirmed scope")
+            prior_recognition_id = recognition_id_for_scope(
+                conn, scope_id=body.supersedes_scope_id, intent_id=intent.intent_id)
+            if effective_recognition_id is None:
+                effective_recognition_id = prior_recognition_id
+            elif (prior_recognition_id is not None
+                  and prior_recognition_id != effective_recognition_id
+                  and not submitted_feedback):
+                raise HTTPException(
+                    status_code=409, detail="RECOGNITION_LINEAGE_CHANGED")
+        if effective_recognition_id is None:
+            raise HTTPException(
+                status_code=409, detail="RECOGNITION_INPUT_UNAVAILABLE")
+        recognition_owned = conn.execute(
+            "SELECT 1 FROM intent_recognition_attempt a "
+            "JOIN contract_intent i ON i.intent_id = a.intent_id "
+            "WHERE a.recognition_id = %s AND a.intent_id = %s AND i.actor = %s::jsonb",
+            (effective_recognition_id, intent.intent_id, _actor_json(intent.actor)),
+        ).fetchone()
+        if recognition_owned is None:
+            raise HTTPException(status_code=404, detail="unknown recognition")
+        try:
+            sealed_recognition = load_recognition_input(
+                conn,
+                recognition_id=effective_recognition_id,
+                intent_id=intent.intent_id,
+            )
+        except RecognitionInputUnavailable as e:
+            raise HTTPException(
+                status_code=409, detail="RECOGNITION_INPUT_UNAVAILABLE") from e
+        if (
+            intent.redacted_hypothesis != sealed_recognition.redacted_hypothesis
+            or submitted_goal != sealed_recognition.redacted_prediction_goal
+            or submitted_feedback != sealed_recognition.redacted_feedback
+        ):
+            raise HTTPException(status_code=409, detail="RECOGNITION_INPUT_CHANGED")
+        if (
+            sealed_recognition.redacted_feedback
+            and body.supersedes_scope_id != sealed_recognition.supersedes_scope_id
+        ):
+            raise HTTPException(status_code=409, detail="RECOGNITION_LINEAGE_CHANGED")
+    client = _require_generation_llm(client)
     # 3C.2a — the LIVE governed cross-catalog readiness interlock. On an entity-scoped run (no single
     # catalog) with the live flag ON, the deployment MUST be activation-approved BEFORE any LLM/planner
     # dispatch — fail-closed 503, NEVER a legacy fallback, and BEFORE any run/scope is minted or
@@ -419,17 +571,61 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     generation_run_id = mint_id("grun")
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
     # before any generation). The intent is durably recorded first so the lineage reads intent→run→scope.
-    persist_intent(conn, intent, body.target_ref)
+    persist_intent(conn, intent, body.target_ref if not confirmation_required() else None)
+    ensure_generation_run(
+        conn,
+        generation_run_id,
+        identity_to_jsonb(identity),
+        {
+            "scoped_applicability": _intent_scoped_applicability_enabled(),
+            "ranking": _intent_ranking_enabled(),
+            "recipe_formula_shadow": recipe_formula_shadow_enabled(),
+        },
+        intent_id=intent.intent_id,
+    )
     # Reconstruct each confirmed dimension's provenance from the IMMUTABLE recognition attempt (never the
     # client): a value the recognizer proposed is ``accepted_llm_proposal``, one the human introduced is
     # ``user_added``, and a corrected entity is a ``user_replacement`` recording what it superseded.
-    dim_sources, dim_replaces = dimension_provenance(conn, body.recognition_id, scope)
+    dim_sources, dim_replaces = dimension_provenance(conn, effective_recognition_id, scope)
+    use_case_origins, proposed_relationships, use_case_replacements = use_case_provenance(
+        conn, effective_recognition_id, scope)
+    confirmation_source = (
+        "user_broadened" if scope.unscoped
+        else "user_feedback" if sealed_recognition and sealed_recognition.redacted_feedback
+        else "user_confirmed"
+    )
     scope_id = record_confirmed_scope(
         conn, intent_id=intent.intent_id, generation_run_id=generation_run_id,
-        recognition_id=body.recognition_id, scope=scope,
-        use_case_origins=cscope.use_case_origins, confirmation_source=cscope.confirmation_source,
+        recognition_id=effective_recognition_id, scope=scope,
+        use_case_origins=use_case_origins,
+        use_case_proposed_relationships=proposed_relationships,
+        use_case_replacements=use_case_replacements,
+        confirmation_source=confirmation_source,
         confirmed_by=identity.subject, supersedes_scope_id=body.supersedes_scope_id,
         dimension_sources=dim_sources, replaces=dim_replaces)
+    sealed_generation = (
+        record_generation_input(
+            conn,
+            generation_run_id=generation_run_id,
+            intent_id=intent.intent_id,
+            recognition=sealed_recognition,
+            confirmed_scope_id=scope_id,
+            redacted_definition=intent.redacted_definition,
+            redacted_feedback=submitted_feedback,
+            target_ref=body.target_ref,
+            actor=identity,
+        )
+        if sealed_recognition is not None
+        else None
+    )
+    run_target_ref = (
+        sealed_generation.target_ref if sealed_generation is not None else body.target_ref)
+    run_prediction_goal = (
+        sealed_generation.redacted_prediction_goal
+        if sealed_generation is not None else submitted_goal)
+    run_feedback = (
+        sealed_generation.redacted_feedback
+        if sealed_generation is not None else submitted_feedback)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
     now = datetime.now(UTC)
@@ -444,8 +640,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     try:
         cs = build_considered_set(
             conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-            feedback=body.feedback, now=now, applicability=applicability,
+            roles=identity.role_claims, target_ref=run_target_ref, objective=run_prediction_goal,
+            feedback=run_feedback, now=now, applicability=applicability,
             is_live=is_live, target_entity=scope.target_entity,
             generation_run_id=generation_run_id)
     except CatalogProjectionUnavailable as e:
@@ -457,9 +653,10 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
-        evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now)
+        evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now,
+        incomplete=cs.incomplete_template_ids)
     # 8. Applicability OWNS the in-scope recipe count (never recognition).
-    response = {**_considered_set_response(intent, cs),
+    response = {**_considered_set_response(conn, intent, cs),
                 "generation_run_id": generation_run_id, "scope_id": scope_id,
                 "dispositions": [_disposition_json(d) for d in dispositions],
                 "in_scope_count": len(applicability.eligible_ids)}
@@ -468,16 +665,82 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
     # input). Flag off => neither key is present (Task-7/1B byte-identical). The ranking is deliberately
     # SEPARATE from the LLM ``recommendation`` and the human's Gate-#1 choice — three distinct layers.
-    if _intent_ranking_enabled():
+    ranking_enabled = _intent_ranking_enabled()
+    ranked: tuple[RankedRecipe, ...] = ()
+    ranking_version: str | None = None
+    if ranking_enabled:
         rankable_ids = rankable_recipe_ids(dispositions)
         signals = _rank_signals(rankable_ids, dispositions, cs, scope)
         ranking_version = APPLICABILITY_MAPPING_VERSION   # pinned BEFORE the ranker is called
-        ranked = rank_eligible(rankable_ids, signals, ranking_version=ranking_version)
+        ranked = tuple(rank_eligible(
+            rankable_ids, signals, ranking_version=ranking_version))
         response["ranking"] = [_ranking_json(r) for r in ranked]
         response["ranking_version"] = ranking_version
         # Task B3: the SOFT dimension warnings (grain mismatch / context conflict) surfaced per recipe.
         # This NEVER changes dispositions — a warned recipe stays exactly as eligible as it was.
         response["signal_warnings"] = _signal_warnings(signals)
+    # Delivery B formula shadow: enroll only this confirmed-scope, immutable-revision path. The
+    # expected-run declaration is the narrow flag-on durability interlock: without it a wholly
+    # missing manifest could never be detected, so failure is an explicit 503. Everything after
+    # declaration is isolated in a savepoint and remains behavior-neutral; reconciliation will
+    # report a missing/incomplete manifest if capture fails.
+    if recipe_formula_shadow_enabled():
+        if cs.considered_revision_id is None or cs.considered_content_hash is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SHADOW_EXPECTATION_STORE_UNAVAILABLE",
+            )
+        try:
+            declare_expected_run(
+                conn,
+                generation_run_id=generation_run_id,
+                intent_id=intent.intent_id,
+                confirmed_scope_id=scope_id,
+                considered_revision_id=cs.considered_revision_id,
+                considered_content_hash=cs.considered_content_hash,
+                ranking_flag=ranking_enabled,
+            )
+        except Exception as exc:
+            logger.exception("recipe formula shadow expected-run declaration failed")
+            raise HTTPException(
+                status_code=503,
+                detail="SHADOW_EXPECTATION_STORE_UNAVAILABLE",
+            ) from exc
+        try:
+            with conn.transaction():
+                revision = conn.execute(
+                    "SELECT r.metadata_snapshot_id, r.metadata_snapshot_content_hash, "
+                    "s.read_scope_hash FROM contract_considered_revision r "
+                    "LEFT JOIN catalog_metadata_snapshot s "
+                    "ON s.snapshot_id = r.metadata_snapshot_id "
+                    "WHERE r.considered_revision_id=%s",
+                    (cs.considered_revision_id,),
+                ).fetchone()
+                if revision is None or (
+                    ranking_enabled and not isinstance(revision[2], str)
+                ):
+                    raise ValueError("recipe formula shadow requires snapshot read-scope lineage")
+                capture_ranked_shadow(
+                    conn,
+                    generation_run_id=generation_run_id,
+                    intent_id=intent.intent_id,
+                    confirmed_scope_id=scope_id,
+                    considered_revision_id=cs.considered_revision_id,
+                    considered_content_hash=cs.considered_content_hash,
+                    metadata_snapshot_id=revision[0] if revision else None,
+                    metadata_snapshot_content_hash=revision[1] if revision else None,
+                    ranked=ranked,
+                    ranking_version=ranking_version,
+                    ranking_enabled=ranking_enabled,
+                    candidate_keys_by_recipe_id=cs.recipe_candidate_keys_by_recipe_id,
+                    grounding_context_by_candidate_key=(
+                        cs.recipe_grounding_context_by_candidate_key),
+                    identity=identity,
+                    request_read_scope_hash=revision[2],
+                )
+        except Exception:
+            logger.exception(
+                "recipe formula shadow capture failed after expected-run declaration")
     # 3B.3a shadow: on an entity-scoped run (no single catalog to ground on) compute + LOG single-catalog
     # binding plans for the eligible recipes. Log-only — the response is UNCHANGED.
     if body.catalog_source is None and scope.target_entity is not None:
@@ -507,17 +770,35 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
 
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
 def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
-                   client: _LLM) -> dict:
+                   client: _OptionalLLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
     the intent. Every option shown has passed the gauntlet.
 
-    Phase-1B: when ``confirmed_scope`` is present the request mints a generation run, persists the
+    When ``confirmed_scope`` is present the request mints a generation run, persists the
     confirmed scope BEFORE the builder, scopes grounding through a single ``ApplicabilityResult`` and
-    attaches a per-recipe disposition lens (see :func:`_scoped_considered_set`). Absent → today's exact
-    path (no run, no scope row, no dispositions)."""
+    attaches a per-recipe disposition lens (see :func:`_scoped_considered_set`). Release mode rejects
+    an absent scope. Only the explicit legacy_unscoped emergency mode retains the old one-shot path."""
     if body.confirmed_scope is not None:
         return _scoped_considered_set(body, conn, identity, client)
+    if confirmation_required():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SCOPE_CONFIRMATION_REQUIRED",
+                "message": (
+                    "recognize and confirm a use-case scope before generating candidates; "
+                    "use an explicit broaden action to inspect all buildable recipes"
+                ),
+            },
+        )
+    counters.incr("contract.legacy_unscoped_requests")
+    logger.warning(
+        "legacy unscoped considered-set request accepted: actor=%s catalog=%s",
+        identity.subject,
+        body.catalog_source,
+    )
+    client = _require_generation_llm(client)
     try:
         intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
                                actor=identity.subject)
@@ -549,7 +830,7 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
         raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
             status_code=409,
             detail="a concurrent request updated this intent; re-fetch and retry") from e
-    return _considered_set_response(intent, cs)
+    return _considered_set_response(conn, intent, cs)
 
 
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
@@ -564,9 +845,15 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
     recognition never blocks generation and never 5xxs."""
     try:
         intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
-        redacted_goal = redact_free_text(body.objective) if body.objective else None
+        redacted_goal = redact_free_text(body.objective, label="prediction goal")
+        redacted_feedback = redact_free_text(body.feedback or "", label="feedback")
     except IntentValidationError as e:   # a free-text field that cannot be safely redacted -> denial
         raise HTTPException(status_code=422, detail=str(e)) from e
+    if bool(redacted_feedback) != bool(body.supersedes_scope_id):
+        raise HTTPException(
+            status_code=422,
+            detail="feedback recognition requires exactly one prior confirmed scope",
+        )
     # Idempotent intent, PER ACTOR: submit_intent mints a fresh id each call, so reuse the EARLIEST intent
     # already recorded for this exact (actor, hypothesis, mode) — re-recognising the same objective is free
     # and never forks the immutable intent. The actor filter is essential: WITHOUT it, user B typing user
@@ -581,13 +868,30 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
     if prior is not None:
         intent = replace(intent, intent_id=prior[0])
     persist_intent(conn, intent)
+    if body.supersedes_scope_id is not None:
+        prior_scope = conn.execute(
+            "SELECT 1 FROM confirmed_generation_scope "
+            "WHERE scope_id = %s AND intent_id = %s AND confirmed_by = %s",
+            (body.supersedes_scope_id, intent.intent_id, identity.subject),
+        ).fetchone()
+        if prior_scope is None:
+            raise HTTPException(status_code=404, detail="unknown prior confirmed scope")
 
-    input_hash = compute_input_hash({"hypothesis": intent.redacted_hypothesis, "goal": redacted_goal})
+    input_json = recognition_input_material(
+        redacted_hypothesis=intent.redacted_hypothesis,
+        redacted_prediction_goal=redacted_goal,
+        redaction_policy_version=REDACTION_VERSION,
+        redacted_feedback=redacted_feedback,
+        supersedes_scope_id=body.supersedes_scope_id,
+    )
+    input_hash = compute_input_hash(input_json)
     result = recognize(conn, client, redacted_hypothesis=intent.redacted_hypothesis,
-                       redacted_goal=redacted_goal, actor=identity)
+                       redacted_goal=redacted_goal, redacted_feedback=redacted_feedback,
+                       actor=identity)
     recognition_id = record_recognition_attempt(
         conn, intent_id=intent.intent_id, input_hash=input_hash, result=result,
-        actor=identity.subject)
+        actor=identity.subject, input_json=input_json,
+        redaction_policy_version=REDACTION_VERSION)
     # Fail-open asymmetry: unscoped / technical_failure -> full grounding downstream (recognition never
     # narrows on doubt). The recipe count is NOT here — applicability computes it after generate.
     unscoped = result.status in (RecognitionStatus.UNSCOPED, RecognitionStatus.TECHNICAL_FAILURE)
@@ -610,13 +914,32 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
     (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
     is read SERVER-side (BLOCKER 2). Then draft + the critique→refine loop (MCV each pass)."""
-    feature = chosen_feature(conn, body.intent_id, body.chosen_source, body.chosen_option_id)
-    if feature is None:
+    owned = conn.execute(
+        "SELECT 1 FROM contract_intent WHERE intent_id = %s AND actor = %s::jsonb",
+        (body.intent_id, _actor_json(identity.subject)),
+    ).fetchone()
+    if owned is None:
+        raise HTTPException(status_code=404, detail="unknown intent")
+    try:
+        choice = select_and_record_gate1_choice(
+            conn,
+            body.intent_id,
+            chosen_source=body.chosen_source,
+            chosen_option_id=body.chosen_option_id,
+            actor=identity.subject,
+            why=body.why,
+            expected_generation_run_id=body.expected_generation_run_id,
+        )
+    except Gate1Error as e:
+        if str(e) == "REGENERATE_FROM_CURRENT_CONSIDERED_SET":
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        raise HTTPException(status_code=409, detail="considered revision verification failed") from e
+    if choice is None:
         raise HTTPException(status_code=422,
                             detail="chosen option is not in the recorded considered set for this intent")
-    record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
-                        chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
-    target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
+    feature = choice.feature
+    target = _target_for_generation(
+        conn, intent_id=body.intent_id, snapshot_lineage=choice.snapshot_lineage)
     # 3C.2a authoring fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked
     # for freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
     # a drifted plan → 409 (regenerate, never a substitute path). I-1 draft/confirm parity: a cross-catalog
@@ -638,15 +961,22 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     # snapshot the considered set was authored against). Reloaded from the server considered-set row —
     # the request model carries no client snapshot id, so there is nothing client-supplied to trust.
     # Null on a READ COMMITTED / pre-C0 considered set. This is ADDITIVE — the validator is unchanged.
-    snapshot = considered_snapshot_lineage(conn, body.intent_id)
+    snapshot = choice.snapshot_lineage
     # H1b — expose the exact role bindings (role / column-ref / source / authority / warnings) + the
     # overall binding_hash the human is confirming. The confirm requires this hash and 409s if the
     # server's authoritative bindings drift before finalize (see /contract/confirm). Computed over the
     # SERVER-authoritative reconciled draft `d`, so it equals the confirm-time recompute unless the
     # underlying catalog state actually drifts. READ-ONLY (no global authority write).
     bindings = confirmed_role_bindings(conn, d)
-    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id, "snapshot": snapshot,
-            "bindings": binding_exposure(bindings), "binding_hash": binding_hash(bindings)}
+    return {
+        "draft": d,
+        "unresolved": unresolved,
+        "intent_id": body.intent_id,
+        "choice_id": choice.choice_id,
+        "snapshot": snapshot,
+        "bindings": binding_exposure(bindings),
+        "binding_hash": binding_hash(bindings),
+    }
 
 
 @router.get("/contracts", dependencies=[Depends(require_feature_read)])
@@ -674,14 +1004,41 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     Then confirm_contract re-runs the deterministic MCV and registers a versioned, drift-linked contract."""
     if not body.intent_id:
         raise HTTPException(status_code=422, detail="intent_id is required to govern a contract")
-    choice = gate1_choice(conn, body.intent_id)
-    if choice is None:
-        raise HTTPException(status_code=422,
-                            detail="no Gate #1 choice recorded for this intent — draft it first")
-    chosen = chosen_feature(conn, body.intent_id, choice["chosen_source"], choice["chosen_option_id"])
-    if chosen is None:
+    owned = conn.execute(
+        "SELECT 1 FROM contract_intent WHERE intent_id = %s AND actor = %s::jsonb",
+        (body.intent_id, _actor_json(identity.subject)),
+    ).fetchone()
+    if owned is None:
+        raise HTTPException(status_code=422, detail="unknown intent")
+    if confirmation_required():
+        if body.choice_id is None:
+            raise HTTPException(
+                status_code=422, detail="choice_id is required to govern a scoped contract")
+        try:
+            recorded_choice = recorded_gate1_choice_revision(
+                conn,
+                choice_id=body.choice_id,
+                intent_id=body.intent_id,
+                actor=identity.subject,
+            )
+        except Gate1Error as e:
+            raise HTTPException(
+                status_code=409, detail="considered revision verification failed") from e
+    else:
+        choice = gate1_choice(conn, body.intent_id)
+        if choice is None:
+            raise HTTPException(
+                status_code=422,
+                detail="no Gate #1 choice recorded for this intent — draft it first")
+        try:
+            recorded_choice = recorded_gate1_draft_choice(conn, body.intent_id)
+        except Gate1Error as e:
+            raise HTTPException(
+                status_code=409, detail="considered revision verification failed") from e
+    if recorded_choice is None:
         raise HTTPException(status_code=422,
                             detail="the chosen feature is not in the recorded considered set")
+    chosen = recorded_choice.feature
     draft = body.to_draft()
     if (draft.feature_name != chosen.name
             or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
@@ -760,14 +1117,15 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
             status_code=422,
             detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: cross-catalog feature requires a governed "
                    "plan envelope")
-    target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
+    target = _target_for_generation(
+        conn, intent_id=body.intent_id, snapshot_lineage=recorded_choice.snapshot_lineage)
     # Delivery C0 Task 5: reload the SERVER snapshot lineage the considered set was authored against and
     # bind the governing write to it in the audit trail (a regulator can prove EXACTLY what catalog state
     # this contract was authored against). Reloaded from the server considered-set row — the confirm
     # request model (DraftIn) carries no client snapshot id, so no client value is ever trusted. ADDITIVE:
     # the confirm-time MCV re-run + Slice-3 tamper-fix (grain_table/derives_from/join_path above) are
     # UNCHANGED — re-sourcing the validator onto the snapshot is a later delivery (C2–C4/H).
-    lineage = considered_snapshot_lineage(conn, body.intent_id)
+    lineage = recorded_choice.snapshot_lineage
     if lineage is not None:
         logger.info("governing contract for intent %s against snapshot %s (run %s, content_hash %s)",
                     body.intent_id, lineage["snapshot_id"], lineage["generation_run_id"],
@@ -788,6 +1146,7 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
                                 roles=identity.role_claims,   # the CONFIRMER's authority reaches the
                                 #                               re-run's join-authority disposition
                                 now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id,
+                                snapshot_lineage=lineage if confirmation_required() else None,
                                 confirmed_binding_hash=current_binding_hash,
                                 # H3c — the governed plan (from the SERVER-reconstructed chosen feature,
                                 # never the client body): confirm_contract REBUILDS it against the current
