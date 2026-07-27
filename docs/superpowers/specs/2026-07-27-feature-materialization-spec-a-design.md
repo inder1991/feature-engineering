@@ -453,7 +453,7 @@ EXACT_NUMERIC = {numeric, decimal, integer, int, int4, int8, bigint, smallint}
 REFUSED       = {float, double, double precision, real, money}   → PHYSICAL_TYPE_UNSUPPORTED
 ```
 
-  Every **arithmetic operand** must be exact — a ratio's numerator *and* denominator, a difference's minuend *and* subtrahend. This requires per-expression governed operand types in the IR (§3), because a formula collapses to a single logical word and a ratio's word describes no operand at all.
+  A **governed** non-exact type refuses with `PHYSICAL_TYPE_UNSUPPORTED`; a type that could not be *established* at all refuses with `OUTPUT_TYPE_NOT_GOVERNED` (§14). Every **arithmetic operand** must be exact — a ratio's numerator *and* denominator, a difference's minuend *and* subtrahend. This requires per-expression governed operand types in the IR (§3), because a formula collapses to a single logical word and a ratio's word describes no operand at all.
 - Hive/Spark `DECIMAL` maxes at **precision 38**; a policy exceeding it, or any ambiguous conversion, returns `PHYSICAL_TYPE_UNSUPPORTED`. **Never silently map ambiguous numerics to `DOUBLE`.**
 - `DECIMAL(p,s)` and `BIGINT` support is validated during the environment capability check (§10).
 
@@ -701,7 +701,8 @@ class CompilationRefusalCode(StrEnum):          # raised/returned during compile
     PARTITION_MAPPING_NOT_DECLARED · PHYSICAL_SCHEMA_NOT_RESOLVED
     SOURCE_ENGINE_UNSUPPORTED
     AVAILABILITY_TIME_NOT_GOVERNED
-    PHYSICAL_TYPE_UNSUPPORTED · MULTIPLE_MATERIALIZATION_CONTRACTS
+    OUTPUT_TYPE_NOT_GOVERNED · PHYSICAL_TYPE_UNSUPPORTED
+    MULTIPLE_MATERIALIZATION_CONTRACTS
     PARTITION_IDENTITY_UNKNOWN · UNACCOUNTED_LOGICAL_REF
 
 class PublicationRefusalCode(StrEnum):          # pre-execution publication decisions
@@ -728,6 +729,16 @@ class ValidationFindingCode(StrEnum):           # L0/L1/L2 findings (§11), non-
 `SPINE_NON_DETERMINISTIC` is a **runtime** gate — an unresolved tie depends on actual rows, so it is discovered during execution, not compilation. `CAPABILITY_UNPROVEN` and `GROUP_BINDING_CONFLICT` are publication decisions and live in `PublicationRefusalCode`; a refusal must never fall back to comparing a raw string because its code is missing from the enum it is typed to.
 
 **Enum tests use `==`, never `>=`.** A superset assertion permits arbitrary extra codes and therefore does not test a closed vocabulary at all.
+
+**Two typing verdicts, because the code drives remediation** (ruling 2026-07-28):
+
+| Code | Means | Who fixes it |
+|---|---|---|
+| `OUTPUT_TYPE_NOT_GOVERNED` | the compiler could not **establish** a governed type — metadata missing (`UNGOVERNED`) or the type-authority read failed closed (`UNAVAILABLE`). The detail preserves which. | metadata / type-authority path: attest the column, or repair the decision log or projection |
+| `PHYSICAL_TYPE_UNSUPPORTED` | the type **is** governed and known, and materialization cannot safely represent it — a float operand under §6's exact-decimal rule, an out-of-range precision, an unimplemented overflow behaviour | formula or physical-type-policy path: change the column, or the policy |
+| `ValueError` | the caller supplied malformed or inconsistent evidence | a programming error, never a governed refusal |
+
+Collapsing the first two into one code would eventually route automation to the wrong remedy. This amendment reclassifies already-refused inputs only: it changes no successful contract identity or type mapping, so **`PHYSICAL_TYPE_POLICY_VERSION` does not move**.
 
 **Normalize-then-refuse.** Classification normalizes an unknown `effective_restriction` to `prohibited` **internally** (per `safety_floor`) and then refuses with `PROHIBITED_INPUT`. Rev 3 asserted both that unknown *returns* `prohibited` and that `prohibited` *raises* — which cannot both hold through one public API. Internal normalization, single public refusal.
 

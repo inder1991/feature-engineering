@@ -179,6 +179,17 @@ def _refuse(detail: str) -> MaterializationRefused:
     return MaterializationRefused(CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED, detail)
 
 
+def _refuse_ungoverned(detail: str) -> MaterializationRefused:
+    """The compiler could not ESTABLISH a governed type (§14, architect ruling 2026-07-28).
+
+    Distinct from :func:`_refuse` because the two route to different people: a missing or
+    unreadable type authority is a metadata/attestation problem, while a governed-but-unsupported
+    type is a formula or physical-type-policy problem. One code for both would eventually drive
+    automation to the wrong remediation path. The detail preserves WHICH cause applied.
+    """
+    return MaterializationRefused(CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED, detail)
+
+
 def _base_logical_type(word: str) -> str:
     """The comparable base of a Child-1 logical type word.
 
@@ -263,6 +274,12 @@ def _check_operand_types(
     integral whatever its operand holds, so the operand is not arithmetic — and its evidence is
     still carried, just not consulted.
 
+    Two CODES, three branches (§14, architect ruling 2026-07-28): UNGOVERNED and UNAVAILABLE both
+    mean the compiler could not ESTABLISH a governed type, so both carry
+    ``OUTPUT_TYPE_NOT_GOVERNED`` with the cause preserved in the detail; a governed type that
+    materialization cannot safely represent carries ``PHYSICAL_TYPE_UNSUPPORTED``. They route to
+    different people — attest/repair the metadata, versus change the formula or the type policy.
+
     The three refusing states are separate branches on purpose. An UNGOVERNED or UNAVAILABLE operand
     carries no type at all, so it is also absent from the exact-numeric allowlist: a single check
     would refuse it — with the wrong explanation, blaming a type nobody could read. The branch order
@@ -274,14 +291,14 @@ def _check_operand_types(
         evidence = operand_types[path]
         where = f"the {expr.aggregation.value} operand at {path}"
         if evidence.status is OperandTypeStatus.UNAVAILABLE:
-            return _refuse(
+            return _refuse_ungoverned(
                 f"{where} has no readable governed type: the C1 type-authority read failed closed "
                 f"({evidence.read_status}), so the operand's type is UNKNOWN rather than known and "
                 f"unsupported. Publishing a fixed-point column here would convert a value whose "
                 f"representation could not be established; the remedy is to repair the type "
                 f"authority, not to change the column")
         if evidence.status is not OperandTypeStatus.GOVERNED or evidence.logical_type is None:
-            return _refuse(
+            return _refuse_ungoverned(
                 f"{where} carries no GOVERNED logical type (C1 status {evidence.read_status!r}), "
                 f"so a published DECIMAL(p,s) would rest on a type declaration nobody attested. "
                 f"§6 admits an exact numeric as a governed fact, never as a file's word for itself")
