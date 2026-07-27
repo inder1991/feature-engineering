@@ -382,7 +382,8 @@ def _is_as_of_concept(concept_name: str | None) -> bool:
 
 def ground_template_outcome(conn, template: Template, *, catalog_source: str,
                             roles: Iterable[str] = (),
-                            params: dict | None = None) -> GroundingOutcome:
+                            params: dict | None = None,
+                            columns: Sequence[_Col] | None = None) -> GroundingOutcome:
     """Bind ``template`` to ``catalog_source``'s concept-tagged columns, or return None if a REQUIRED
     need can't ground (the caller then degrades / skips — see the template's ``degrade``).
 
@@ -393,9 +394,16 @@ def ground_template_outcome(conn, template: Template, *, catalog_source: str,
 
     Note the honest limits: PIT, single-currency, and "the stock has time history" are DECLARED here
     (there is no data plane to verify fact rows) — a downstream executor must honour them.
+
+    ``columns`` is a PERFORMANCE seam only: a caller grounding many templates in ONE pass
+    (:func:`ground_all_outcomes`) loads the read-scoped column list once and hands it down, instead of
+    re-reading the whole catalog per template. It MUST be the ``_load_columns`` result for this very
+    ``(catalog_source, roles)`` — the list is read-scoped, so a list built for a different catalog or a
+    different read scope would widen or narrow what this caller may see. Default ``None`` = load here,
+    exactly as before.
     """
     bound = _bind_params(template, params)
-    cols = _load_columns(conn, catalog_source, roles)
+    cols = columns if columns is not None else _load_columns(conn, catalog_source, roles)
 
     # Resolve the grain table FIRST (from the entity need) so every other need prefers a column in the
     # grain table when one fits equally well. Without this, a generic need binds the alphabetically-
@@ -612,7 +620,8 @@ def ground_template_outcome(conn, template: Template, *, catalog_source: str,
 
 
 def ground_template(conn, template: Template, *, catalog_source: str,
-                    roles: Iterable[str] = (), params: dict | None = None) -> GroundedFeature | None:
+                    roles: Iterable[str] = (), params: dict | None = None,
+                    columns: Sequence[_Col] | None = None) -> GroundedFeature | None:
     """Compatibility projection returning only a successfully grounded feature."""
     return ground_template_outcome(
         conn,
@@ -620,12 +629,18 @@ def ground_template(conn, template: Template, *, catalog_source: str,
         catalog_source=catalog_source,
         roles=roles,
         params=params,
+        columns=columns,
     ).feature
 
 
 def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: str,
                         roles: Iterable[str] = (),
                         use_case: str | None = None) -> list[GroundingOutcome]:
+    # The read-scoped column list is IDENTICAL for every template in this pass, so load it ONCE and
+    # hand it down — grounding the whole registry re-read the entire catalog per template (157 full
+    # scans a pass, 156 of them discarded), which is invisible at 126 columns and ruinous at 150k.
+    # Scoped to THIS pass's (catalog_source, roles) and never held beyond it: no cache, no global.
+    cols = _load_columns(conn, catalog_source, roles)
     outcomes: list[GroundingOutcome] = []
     for template in templates:
         if use_case is not None and use_case not in template.use_cases:
@@ -635,6 +650,7 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
             template,
             catalog_source=catalog_source,
             roles=roles,
+            columns=cols,
         ))
     return outcomes
 
