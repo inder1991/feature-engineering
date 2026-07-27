@@ -68,7 +68,12 @@ from featuregen.overlay.upload.field_resolution import (
     resolve_and_project,
     stale_and_clear_field,
 )
-from featuregen.overlay.upload.ingest import ingest_source_lock_key
+from featuregen.overlay.upload.ingest import (
+    _TAXONOMY_FIELDS,
+    _retire_dropped_field_decisions,
+    derive_and_write_concept_cascade,
+    ingest_source_lock_key,
+)
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.security.audit import record_denial
@@ -329,6 +334,25 @@ def apply_field_correction(
     #    ``object_ref`` is the PUBLIC-FLATTENED graph ref the dependency rows store (the SAME key
     #    ``_graph_key`` derives for the display projection and the ingest wire uses).
     if action in _PROJECTING_ACTIONS:
+        # 8a. [E1a Task 6] TRANSITIVE PROVENANCE — a projecting `concept` correction changed the
+        #     RESOLVED concept, and the behavioural TAXONOMY fields (additivity / temporal_role /
+        #     sensitivity_floor / leakage_anchor — two of them SAFETY checks) are DERIVED from it.
+        #     The cascade otherwise runs ONLY during glossary ingest, and the helpers above re-resolve
+        #     ONLY the corrected field, so the derived facts would keep asserting the SUPERSEDED
+        #     concept's value at its strength until a re-upload that may never come. Re-derive HERE,
+        #     in the SAME tx: rewrite the derived evidence from the newly-resolved record, retire the
+        #     DECISION of any derived field the new concept no longer implies (evidence-less fields
+        #     are skipped by the projection, so their prior load-bearing decision would stay latest),
+        #     then re-resolve exactly the derived fields.
+        if field == "concept":
+            correction_ref = f"human-correction:{idempotency_key}"
+            derive_and_write_concept_cascade(
+                conn, logical_ref, producer_ref=correction_ref, snapshot_id=correction_ref)
+            _retire_dropped_field_decisions(
+                conn, source=norm_source, logical_ref=logical_ref, fields=_TAXONOMY_FIELDS,
+                now=None)
+            resolve_and_project(conn, source=norm_source, logical_refs=[logical_ref],
+                                fields=_TAXONOMY_FIELDS)
         graph_ref = _graph_key(norm_source, logical_ref)[1]
         invalidate_contracts_for(conn, changed=[ChangedRef(
             catalog_source=norm_source, reason=REASON_METADATA_CORRECTED, object_ref=graph_ref)])

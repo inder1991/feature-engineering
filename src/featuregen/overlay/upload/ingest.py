@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -13,11 +14,17 @@ from featuregen.overlay import facts
 from featuregen.overlay.catalog_changes import detect_catalog_changes
 from featuregen.overlay.conflict_review import conflict_fingerprint, open_or_reopen_conflict
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_authority import (
+    _STRENGTH_RANK,
+    FieldEvidenceView,
+    resolve_field_authority,
+)
 from featuregen.overlay.field_evidence import (
     field_input_hash,
     read_active_field_evidence,
     record_field_evidence,
     stale_source_evidence,
+    to_view,
 )
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
 from featuregen.overlay.object_identity import ObjectBinding, may_attach
@@ -48,14 +55,19 @@ from featuregen.overlay.upload.enrich import (
     enrich_concepts,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
+from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_resolution import (
     FIELD_POLICY_VERSION,
+    RESOLVER_VERSION,
     _graph_key,
     is_feature_eligible,
     resolve_and_project,
     stale_and_clear_field,
 )
-from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
+from featuregen.overlay.upload.field_revalidation import (
+    active_disqualifiers_for,
+    flag_pending_revalidation,
+)
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload, join_path
 from featuregen.overlay.upload.graph import (
     _column_ref,
@@ -768,6 +780,8 @@ _PARSER_FIELDS: tuple[str, ...] = ("logical_representation", "semantic_type")
 # concept emits no additivity — its prior ACTIVE row must be reconciled present->absent (Important-3).
 _TAXONOMY_FIELDS: tuple[str, ...] = (
     "additivity", "temporal_role", "sensitivity_floor", "leakage_anchor")
+# The field the whole `_TAXONOMY_FIELDS` cascade is DERIVED from (see `derive_and_write_concept_cascade`).
+_CONCEPT_FIELD = "concept"
 
 # A `keep_input_hash` that can never equal a real per-field input hash (always a 64-char sha256 hex
 # digest — this contains non-hex chars), so `stale_source_evidence(..., keep_input_hash=_STALE_ALL)`
@@ -957,7 +971,9 @@ def _open_glossary_conflicts(
 
 def _write_producer_field(conn, *, logical_ref: str, field_name: str, value: object,
                           producer: EvidenceProducer, strength: AssertionStrength,
-                          producer_ref: str, snapshot_id: str, material: object) -> int:
+                          producer_ref: str, snapshot_id: str, material: object,
+                          producer_item_ref: str | None = None,
+                          evidence_spans: Sequence[str] = ()) -> int:
     """Write ONE per-field proposal with PRODUCER-SCOPED staleness + snapshot reuse (spec §5.1, review
     must-fix #7). Returns the number of the producer's prior ACTIVE rows this staled (a differing input
     superseded). NEVER touches other producers' rows — in particular a source/parser/taxonomy write can
@@ -966,7 +982,11 @@ def _write_producer_field(conn, *, logical_ref: str, field_name: str, value: obj
     * stale the producer's own ACTIVE rows for the field whose ``input_hash`` differs from this upload's
       (a CHANGED input supersedes -> STALE);
     * an UNCHANGED input (an ACTIVE row with the same ``input_hash`` already exists) is REUSED — not
-      re-written — even though ``source_snapshot_id`` advanced."""
+      re-written — even though ``source_snapshot_id`` advanced.
+
+    ``producer_item_ref`` / ``evidence_spans`` (Task 6) persist the ROOT LINK of a DERIVED row — the
+    evidence_id this value was derived FROM — so the chain is queryable. The defaults keep every
+    existing (non-derived) caller's write byte-for-byte unchanged."""
     input_hash = field_input_hash(logical_ref=logical_ref, field_name=field_name, material=material)
     staled = stale_source_evidence(
         conn, logical_ref=logical_ref, field_name=field_name,
@@ -981,6 +1001,7 @@ def _write_producer_field(conn, *, logical_ref: str, field_name: str, value: obj
             conn, logical_ref=logical_ref, field_name=field_name, proposed_value=value,
             producer=producer, strength=strength, producer_ref=producer_ref,
             source_snapshot_id=snapshot_id, input_hash=input_hash,
+            producer_item_ref=producer_item_ref, evidence_spans=evidence_spans,
         )
     return staled
 
@@ -1182,28 +1203,74 @@ def _write_glossary_parser_evidence(
         logger.info("glossary record carried no sample-profile facets for %s", logical_ref)
 
 
-def _write_glossary_taxonomy_evidence(
-    conn, *, logical_ref: str, row: CanonicalRow, concepts: dict[str, str], snapshot_id: str
-) -> None:
-    """Write TAXONOMY-derived behavioural evidence for a column whose concept was classified this run
-    (§3.2 strength propagation: derived at PROPOSED from the llm/proposed concept). An unknown /
-    unclassified concept derives nothing.
+def resolve_concept_evidence(conn, logical_ref: str) -> FieldEvidenceView | None:
+    """The concept evidence record the CANONICAL resolution SELECTED — its value, producer, strength
+    and evidence_id as ONE MATCHED tuple — or ``None`` when nothing is selected (no active concept
+    evidence, or an irreconcilable top-strength conflict).
+
+    Task 6 anti-laundering: a derivation must take its value AND its strength from the SAME record.
+    Reading the value from the LLM run's ``concepts`` dict while reading the strength from a
+    separately looked-up row lets an LLM value inherit a human's ``confirmed`` — a
+    ``taxonomy/confirmed`` SAFETY fact asserting a value no human ever confirmed. So the pick is made
+    HERE, by the same :func:`overlay.field_authority.resolve_field_authority` (PREFER_CONFIRMED)
+    resolution that sets the flat ``graph_node.concept`` display — NOT by "latest active", which is
+    not the resolver's choice when producers disagree or a row is stale/rejected. The winning RECORD
+    is then recovered as the STRONGEST active view asserting that selected value (never a weaker
+    same-valued row, whose strength would under-state the derivation)."""
+    policy = policy_for(_CONCEPT_FIELD)
+    if policy is None:  # pragma: no cover — `concept` always has a registered policy
+        return None
+    views = [to_view(e) for e in read_active_field_evidence(conn, logical_ref, _CONCEPT_FIELD)]
+    selected = resolve_field_authority(
+        views, policy,
+        active_disqualifiers=active_disqualifiers_for(conn, logical_ref, _CONCEPT_FIELD),
+    ).display_value
+    if selected is None:
+        return None
+    return max((v for v in views if v.value == selected),
+               key=lambda v: _STRENGTH_RANK[v.strength], default=None)
+
+
+def derive_and_write_concept_cascade(conn, logical_ref: str, *, producer_ref: str,
+                                     snapshot_id: str) -> None:
+    """Derive a column's behavioural TAXONOMY evidence from its RESOLVED concept, at THAT record's
+    strength, with a root link back to it (Task 6 — transitive provenance).
+
+    §3.2 strength propagation IS the safety property: an ``llm/proposed`` concept derives
+    ``taxonomy/proposed`` triples, which ``_BEHAVIOURAL``'s operational rule does NOT admit — an AI
+    guess can never clear a behavioural/safety gate. Only a human-``confirmed`` (or source-attested)
+    concept derives triples strong enough to gate, and the value they assert is that human's. Value
+    and strength both come from the ONE record :func:`resolve_concept_evidence` selected.
+
+    ROOT LINKS: each derived row stores the parent concept's ``evidence_id`` in BOTH
+    ``producer_item_ref`` and ``evidence_spans``, and its input hash covers the parent's
+    value + producer + strength + evidence_id + ``RESOLVER_VERSION``. Anchoring on the EVIDENCE id
+    (not a decision) is deliberate: an LLM-only concept's decision is non-load-bearing, so there may
+    be no decision to point at. The chain is then queryable ("which concept produced this safety
+    fact, asserted by whom, how strongly"), two same-valued concepts of different ORIGIN are
+    distinguishable, and a re-resolved concept RE-DERIVES instead of being reused as an unchanged
+    input.
 
     Present->absent reconciliation (Important-3): after writing the derived triples, stale the
-    TAXONOMY producer's prior ACTIVE rows for every derivable field this run did NOT emit — a re-upload
-    reclassifying an additive concept to a non-additive one emits no ``additivity``, so the prior
-    ``additivity='additive'`` row must be STALED, else ``resolve_and_project`` re-projects the wrong
-    aggregation semantics. Mirrors the SOURCE/PARSER reconciliation; PRODUCER-SCOPED (taxonomy only)."""
-    concept = concepts.get(content_hash(row))
+    TAXONOMY producer's prior ACTIVE rows for every derivable field this derivation did NOT emit — a
+    reclassification from an additive concept to a non-additive one emits no ``additivity``, so the
+    prior ``additivity='additive'`` row must be STALED, else ``resolve_and_project`` re-projects the
+    wrong aggregation semantics. A concept that resolves to nothing stales them all. Mirrors the
+    SOURCE/PARSER reconciliation; PRODUCER-SCOPED (taxonomy only — never human/source rows)."""
+    winner = resolve_concept_evidence(conn, logical_ref)
     present: set[str] = set()
-    if concept:
-        for field_name, value, strength in derive_concept_evidence(
-                concept, AssertionStrength.PROPOSED):
+    if winner is not None:
+        material = {"root_value": winner.value, "root_producer": winner.producer.value,
+                    "root_strength": winner.strength.value,
+                    "root_evidence_id": winner.evidence_id,
+                    "resolver_version": RESOLVER_VERSION}
+        for field_name, value, strength in derive_concept_evidence(winner.value, winner.strength):
             present.add(field_name)
             _write_producer_field(
                 conn, logical_ref=logical_ref, field_name=field_name, value=value,
                 producer=EvidenceProducer.TAXONOMY, strength=strength,
-                producer_ref=snapshot_id, snapshot_id=snapshot_id, material=concept,
+                producer_ref=producer_ref, snapshot_id=snapshot_id, material=material,
+                producer_item_ref=winner.evidence_id, evidence_spans=[winner.evidence_id],
             )
     _stale_absent_fields(
         conn, logical_ref=logical_ref, producer=EvidenceProducer.TAXONOMY,
@@ -1357,9 +1424,12 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         if concepts is not None:
             try:
                 with conn.transaction():
-                    _write_glossary_taxonomy_evidence(
-                        conn, logical_ref=logical_ref, row=row, concepts=concepts,
-                        snapshot_id=snapshot_id)
+                    # Task 6: derive from the RESOLVED concept evidence (written just above by
+                    # `enrich_concepts`, or by a prior human correction) — never from this run's
+                    # in-memory `concepts` dict, which would ignore a human's correction and could
+                    # only ever be asserted at a hard-coded PROPOSED strength.
+                    derive_and_write_concept_cascade(
+                        conn, logical_ref, producer_ref=snapshot_id, snapshot_id=snapshot_id)
             except Exception:  # noqa: BLE001
                 contained_failures += 1
                 logger.warning("advisory glossary TAXONOMY evidence failed for %s", logical_ref,
