@@ -54,6 +54,10 @@ from featuregen.overlay.upload.enrich import (
     _write_llm_field_evidence,
     content_hash,
 )
+from featuregen.overlay.upload.feature_assist import (
+    _candidate_columns,
+    select_relevant_context,
+)
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.ingest import ingest_upload
@@ -650,3 +654,133 @@ def test_table_no_longer_in_the_upload_is_retired(overlay_conn):
 
     assert n == 0
     assert _ai_domains(overlay_conn, gone) == []
+
+
+# ── E1a Task 4: LLM synonyms as FIRST-CLASS `llm/proposed` semantic evidence ──────────────────────
+# The AI's synonyms are not search-only decoration and need no human confirmation: they are durable
+# `field_evidence(field_name="semantic_terms", producer=llm, strength=proposed)` MERGED (union, never
+# overwrite) onto `graph_node.semantic_terms` AFTER `build_graph` — which DELETE+RECREATES the
+# source's nodes, so an enrich-time projection would be silently wiped. An AI synonym may be the ONLY
+# semantic signal that selects a column; it flows through the EXISTING menu/relevance path with no
+# new gate. Store the provenance WITH the synonym; let downstream decide how much authority to give it.
+
+_AMT_REF = normalize_ref(_AI_SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN", "TXN_AMT")
+_AMT_OBJECT_REF = "public.comp_fin_tran.txn_amt"
+# Two glossary columns, both with CURATED synonyms of their own ("Client Name|Account Holder", "Amt")
+# — so the merge has something real to preserve, and the AI's terms are distinguishable from them.
+_SYN_CSV = _HDR + _row() + _row(
+    source_row="19", fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.TXN_AMT", term_name="Transaction Amount",
+    definition='"The monetary amount of the transaction."', domain="Payments", term_type="Measure",
+    l1="Settlement", related="Amount Alias", l2="Clearing", l3="", synonyms="Amt", b1="Payment",
+    b2="Transaction", b3="Amount", b4="", fibo="fibo-fbc:MonetaryAmount", data_type="DECIMAL")
+
+
+def _syn_upload():
+    return to_glossary_upload(read_ftr_glossary(_SYN_CSV, source=_AI_SOURCE))
+
+
+def _synonym_client(upload, terms: dict[str, str]) -> FakeLLM:
+    """A FakeLLM whose SYNONYM task drafts ``terms[column]`` for each named column. ``validate_rows``
+    normalizes row identity before enrichment, so the batch ref is the normalized row's hash."""
+    results = []
+    for row in upload.rows:
+        drafted = terms.get(row.column.lower())
+        if drafted:
+            h = content_hash(replace(row, table=row.table.lower(), column=row.column.lower()))
+            results.append({"ref": h, "synonyms": drafted})
+    return FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"results": []}),
+        "overlay.enrich.definition": FakeResponse(output={"results": []}),
+        "overlay.enrich.domain": FakeResponse(output={"results": []}),
+        "overlay.enrich.synonyms": FakeResponse(output={"results": results}),
+    })
+
+
+def _ingest_synonyms(db, terms: dict[str, str], now: datetime = _NOW) -> None:
+    _seal()
+    upload = _syn_upload()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=now,
+                        client=_synonym_client(upload, terms), glossary=upload)
+    assert res.status == "ingested"
+
+
+def _ai_terms(conn, ref: str) -> list:
+    """The ACTIVE ``llm`` ``semantic_terms`` proposals at ``ref`` (producer-scoped)."""
+    return [e for e in read_active_field_evidence(conn, ref, "semantic_terms")
+            if e.producer == "llm"]
+
+
+def _node_terms(conn, object_ref: str) -> str:
+    row = conn.execute(
+        "SELECT semantic_terms FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (_AI_SOURCE, object_ref)).fetchone()
+    return row[0] or ""
+
+
+def test_ai_synonyms_are_llm_proposed_semantic_evidence(db):
+    """The AI's synonyms land as durable ``llm/proposed`` ``semantic_terms`` evidence at the
+    SCHEMA-preserving ref (never the ``public`` twin the binding is keyed by) — the provenance is
+    stored WITH the synonym, so downstream can decide how much authority to give it."""
+    _ingest_synonyms(db, {"txn_amt": "available funds, cleared amount"})
+
+    ev = _ai_terms(db, _AMT_REF)
+    assert len(ev) == 1
+    assert ev[0].producer == "llm" and ev[0].strength == "proposed"
+    assert ev[0].proposed_value == "available funds, cleared amount"
+    assert _ai_terms(db, normalize_ref(_AI_SOURCE, None, "COMP_FIN_TRAN", "TXN_AMT")) == []
+
+
+def test_ai_synonyms_merge_with_glossary_terms_and_survive_build_graph(db):
+    """MERGE, NEVER OVERWRITE — and the ORDERING proof: enrichment runs BEFORE ``build_graph``, which
+    DELETE+RECREATES the source's ``graph_node`` rows, so the union must be projected AFTER it. After
+    a FULL ingest the node carries BOTH the curated glossary terms and the AI's."""
+    _ingest_synonyms(db, {"txn_amt": "available funds, cleared amount"})
+
+    terms = _node_terms(db, _AMT_OBJECT_REF)
+    assert "Transaction Amount" in terms and "Amt" in terms      # the glossary's own, untouched
+    assert "available funds" in terms and "cleared amount" in terms   # the AI's, merged in
+    # The other column is unaffected: no AI synonym, curated terms intact.
+    assert "Client Name" in _node_terms(db, _NAME_OBJECT_REF)
+
+
+def test_ai_synonym_alone_reaches_the_candidate_menu(db):
+    """FEATURE-GEN REACH, no new gate: a column whose ONLY signal for the objective's words is an AI
+    synonym is selected — and ranked first — by the EXISTING relevance path, and the synonym rides
+    the menu column itself."""
+    _ingest_synonyms(db, {"txn_amt": "available funds"})
+    assert "available" not in _node_terms(db, _NAME_OBJECT_REF).lower()   # the AI is the only source
+
+    cols = _candidate_columns(db, _AI_SOURCE, roles=list(_ADMIN.role_claims))
+    selected, _context, _dropped = select_relevant_context(
+        db, cols, objective="available funds", entity=None)
+
+    assert selected[0]["object_ref"] == _AMT_OBJECT_REF
+    assert "available funds" in selected[0]["semantic_terms"]
+
+
+def test_reenrichment_stales_only_the_prior_ai_synonym(db):
+    """Producer-scoped staleness: a CHANGED synonym supersedes the prior LLM row (exactly one active
+    proposal, the new value) and drops out of the projection — while the glossary's curated terms are
+    never touched."""
+    _ingest_synonyms(db, {"txn_amt": "available funds"})
+    _ingest_synonyms(db, {"txn_amt": "cleared balance"}, now=_NOW + timedelta(hours=1))
+
+    assert [e.proposed_value for e in _ai_terms(db, _AMT_REF)] == ["cleared balance"]
+    terms = _node_terms(db, _AMT_OBJECT_REF)
+    assert "cleared balance" in terms
+    assert "available funds" not in terms
+    assert "Transaction Amount" in terms and "Amt" in terms      # the curated terms survive
+
+
+def test_no_llm_client_records_skipped_and_ingestion_continues(db):
+    """No provider configured: the synonym stage honestly records ``skipped_no_client`` and the
+    upload completes normally (the stage is never invented as a failure)."""
+    _seal()
+    upload = _syn_upload()
+    rec = StageRecorder()
+    res = ingest_upload(db, _AI_SOURCE, upload.rows, actor=_actor(), now=_NOW, glossary=upload,
+                        stage_recorder=rec)
+
+    assert res.status == "ingested"
+    assert next(r for r in rec.reports if r.stage == "enrich_synonyms").state == "skipped_no_client"
+    assert _ai_terms(db, _AMT_REF) == []

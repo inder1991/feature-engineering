@@ -429,6 +429,10 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                 "required": ["definition"]},
     ("overlay_domain", 1): {"type": "object", "additionalProperties": False,
                             "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
+    # E1a T4 — one comma-separated line of business synonyms/aliases for a column.
+    ("overlay_synonyms", 1): {"type": "object", "additionalProperties": False,
+                              "properties": {"synonyms": {"type": "string"}},
+                              "required": ["synonyms"]},
     ("overlay_entity", 1): {"type": "object", "additionalProperties": False,
                             "properties": {"entity": {"type": "string"}}, "required": ["entity"]},
     ("overlay_contract", 1): {"type": "object", "additionalProperties": False,
@@ -459,6 +463,14 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                       "properties": {"ref": {"type": "string", "maxLength": 128},
                                      "definition": {"type": "string", "maxLength": 500}},
                       "required": ["ref", "definition"]}}},
+        "required": ["results"]},
+    ("overlay_synonyms_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array",
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 128},
+                                     "synonyms": {"type": "string", "maxLength": 200}},
+                      "required": ["ref", "synonyms"]}}},
         "required": ["results"]},
     # E1a T3 — the domain result is TWO-LEVEL: `domain` is the TABLE's default (the context all of
     # its columns inherit) and `column_domains` lists ONLY the columns whose domain DIFFERS from it.

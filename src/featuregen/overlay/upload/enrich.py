@@ -43,6 +43,10 @@ _TASK = "overlay.enrich.concept"
 _MAX_META_LEN = 200
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
+_SYN_TASK = "overlay.enrich.synonyms"
+
+# Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
+_MAX_SYNONYMS_LEN = 200
 
 # Larger bound for a SANITIZED business definition specifically. The 200-char default cut every real
 # definition mid-sentence; sanitized definitions are the intended metadata payload, so allow a bigger
@@ -727,6 +731,62 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     return failures
 
 
+def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                            synonyms: dict[str, str], glossary: GlossaryUpload,
+                            bindings: dict[str, ObjectBinding] | None,
+                            source_snapshot_id: str) -> int:
+    """Store the LLM's drafted synonyms (E1a T4) as FIRST-CLASS ``llm/proposed`` ``semantic_terms``
+    ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller MUST propagate
+    into its stage report (``partial``/``items_failed``).
+
+    NOT search-only and NOT human-confirmed: an AI synonym may be the ONLY semantic signal that
+    selects a column — it needs no corroboration and passes no new gate. What makes that safe is that
+    the PROVENANCE travels WITH the term (producer ``llm``, strength ``proposed`` on the evidence
+    row), so each downstream consumer applies its own policy. The MERGE onto
+    ``graph_node.semantic_terms`` happens in ``ingest._project_semantic_terms``, AFTER ``build_graph``
+    (which delete+recreates the nodes an enrich-time write would land on).
+
+    GLOSSARY columns only, and the two identities are never collapsed: attachability is checked at
+    the row's PUBLIC-flattened ref, the evidence is stored at the record's SCHEMA-preserving one.
+
+    RECONCILIATION by disposition: EVERY column in this upload is a synonym target (synonyms are
+    additive — unlike a definition or a domain there is no curated value for the AI to contest, so
+    nothing is ever deliberately withheld). Retirement therefore covers exactly the refs that are no
+    longer targets — a column dropped from the source, or no longer a glossary term — while a
+    transient miss on a still-present column KEEPS its prior terms (the safe default).
+
+    Scoped safely: ``semantic_terms`` LLM evidence has exactly ONE writer — this one. The glossary's
+    own term/synonym/taxonomy text is a graph SEARCH PROJECTION, not ``field_evidence``, and Pass B
+    (``table_synth``) writes its ``llm/proposed`` rows for other field names at TABLE refs, so the
+    ``field_name='semantic_terms'`` + producer filter cannot reach another writer's rows."""
+    by_hash = {content_hash(r): r for r in rows}
+    rec_by_tc = _records_by_tc(glossary)
+
+    def ref_of(h: str) -> tuple[str, str, object] | None:
+        row = by_hash.get(h)
+        if row is None:
+            return None
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        if rec is None:
+            return None   # not a glossary column term — no schema-preserving identity to key on
+        return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
+                {"table": row.table, "column": row.column, "type": row.type})
+
+    failures = _write_llm_field_evidence(
+        conn, field_name="semantic_terms", items=synonyms, ref_of=ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        bindings=bindings)
+
+    # KEEP = every glossary column still in this upload (written this run OR transient-missed);
+    # computed through the SAME `ref_of` the write used, so a fresh row is never handed to retirement.
+    keep = {ref[0] for h in by_hash if (ref := ref_of(h)) is not None}
+    _reconcile_llm_field_evidence(
+        conn, field_name="semantic_terms",
+        retire_refs=_active_llm_field_refs(conn, source=source,
+                                           field_name="semantic_terms") - keep)
+    return failures
+
+
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
                     glossary: GlossaryUpload | None = None,
                     bindings: dict[str, ObjectBinding] | None = None,
@@ -1030,4 +1090,64 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
         if column_domains is not None:
             for column, value in overrides.items():
                 column_domains[(_norm(table), _norm(column))] = value
+    return result
+
+
+_SYN_INSTRUCTION = ("List the business SYNONYMS and common aliases for EACH column — the other names "
+                    "a business user would search for it by. Return ONE comma-separated line per "
+                    "item, terms only, no explanation. Treat each item independently: use only that "
+                    "item's table/column/type/concept; return exactly one result per input ref.")
+
+
+def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
+                   *, concepts: dict[str, str] | None = None,
+                   ingestion_run_id: str | None = None,
+                   stats: dict | None = None) -> dict[str, str]:
+    """Draft business synonyms for EVERY column; returns {content_hash: "term, term, term"} (E1a T4).
+
+    Every column is a target — synonyms are ADDITIVE (they merge with the glossary's own terms), so
+    unlike a definition there is no "only fill a blank" rule to apply. NO CACHE: E1a defers reuse, and
+    the evidence writer supersedes-and-rewrites unconditionally.
+
+    ``stats`` (optional out-param): in batch mode receives ``not_attempted``, the count the
+    budget/deadline cutoff skipped WITHOUT dispatch, so the caller labels a truncated run
+    ``truncated`` rather than ``items_failed``. ``ingestion_run_id`` (C5-T5) attributes every
+    dispatch to the run + the column subjects drafted (stage ``enrich_synonyms``)."""
+    concepts = concepts or {}
+    by_hash = {content_hash(r): r for r in rows}
+    accept = _accept_bounded(_MAX_SYNONYMS_LEN)
+
+    if enrich_config.mode("synonyms") == "batch":
+        # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
+        refs = sorted(by_hash, key=lambda h: (by_hash[h].table, h))
+        items = [BatchItem(h, {"table": by_hash[h].table, "column": by_hash[h].column,
+                               "type": by_hash[h].type,
+                               **({"concept": concepts[h]} if concepts.get(h) else {})})
+                 for h in refs]
+        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        resolved = run_batched(
+            conn, client, short="synonyms", task=_SYN_TASK,
+            prompt_id="overlay_synonyms_batch_v1", schema_id="overlay_synonyms_batch",
+            shared_metadata={}, items=items, out_key="synonyms",
+            instruction=_SYN_INSTRUCTION, accept=accept, actor=actor,
+            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            report=batch_report,
+            ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_synonyms",
+            dispatch_subjects=({h: _column_subject(by_hash[h]) for h in refs}
+                               if ingestion_run_id is not None else None))
+        if stats is not None:
+            stats["not_attempted"] = batch_report.get("not_attempted", 0)
+        return dict(resolved)
+
+    result: dict[str, str] = {}
+    for h, row in by_hash.items():                    # single mode — the per-item path
+        raw = _call(conn, client, _SYN_TASK, "overlay_synonyms_v1", "overlay_synonyms",
+                    {"table": row.table, "column": row.column, "type": row.type}, "synonyms",
+                    _SYN_INSTRUCTION, actor,
+                    _single_ctx(ingestion_run_id, "enrich_synonyms", _column_subject(row)))
+        if raw is None:
+            continue   # provider failure / empty
+        drafted, _reason = accept(raw)
+        if drafted is not None:
+            result[h] = drafted
     return result

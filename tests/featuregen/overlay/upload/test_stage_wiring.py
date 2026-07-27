@@ -61,7 +61,8 @@ def test_successful_upload_records_all_stages_in_order(db):
     assert res.status == "ingested"
     assert [r.stage for r in rec.reports] == [
         "validation", "brake", "fact_assertion", "drift", "glossary_classification",
-        "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
+        "enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms",
+        "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
@@ -72,6 +73,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "glossary_classification": "not_applicable",           # a technical, not glossary, upload
         "enrich_concept": "skipped_no_client",                 # no LLM provider configured
         "enrich_definition": "skipped_no_client", "enrich_domain": "skipped_no_client",
+        "enrich_synonyms": "skipped_no_client",
         "graph_persistence": "succeeded",
         "governed_joins": "disabled", "pass_c": "disabled", "pass_b": "disabled",  # flags off
         "glossary_evidence": "not_applicable",
@@ -117,7 +119,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 21
+    assert len(rec.reports) == 22
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
@@ -256,7 +258,8 @@ def test_durable_llm_audit_degradation_flags_the_enrich_stage(db, monkeypatch):
 # Every stage ingest_upload owns, in execution order — what a COMPLETE run account contains.
 _ALL_INGEST_STAGES = [
     "validation", "brake", "fact_assertion", "drift", "glossary_classification",
-    "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
+    "enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms",
+    "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",

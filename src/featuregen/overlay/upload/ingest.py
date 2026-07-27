@@ -40,9 +40,11 @@ from featuregen.overlay.upload.enrich import (
     _definition_targets,
     _write_definition_evidence,
     _write_domain_evidence,
+    _write_synonym_evidence,
     classify_domains,
     content_hash,
     draft_definitions,
+    draft_synonyms,
     enrich_concepts,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
@@ -1241,10 +1243,24 @@ def _project_semantic_terms(conn, *, source: str, object_ref: str, rec: Glossary
     (idempotent there), but this also covers any generic path that reaches here unredacted. An
     empty/blanked result leaves the node's freshly-inserted NULL. ``rebuild_search_doc`` is called
     EXPLICITLY because ``resolve_and_project``'s ``_project_display`` rebuild is conditional on a
-    doc-bearing display column changing — this ref might otherwise keep a doc without the terms."""
-    text = join_path(
-        [rec.term_name, *rec.synonyms, rec.bian_path, rec.fibo_path, rec.process_path,
-         *rec.related_terms], sep=" ")
+    doc-bearing display column changing — this ref might otherwise keep a doc without the terms.
+
+    E1a T4 — the AI's synonyms are MERGED here, never overwriting: they are durable ``llm/proposed``
+    ``semantic_terms`` ``field_evidence`` written during ENRICHMENT, which runs BEFORE ``build_graph``
+    DELETE+RECREATES the source's nodes — an enrich-time UPDATE would be silently wiped, so this
+    post-build projection is where the union lands. The glossary/source terms come first and are kept
+    verbatim; each active proposal's comma-separated terms are appended only when not already present
+    (case-insensitive). Re-enrichment retires just the prior LLM rows (producer-scoped staleness), so
+    a changed synonym drops out of this union on its own."""
+    parts = [rec.term_name, *rec.synonyms, rec.bian_path, rec.fibo_path, rec.process_path,
+             *rec.related_terms]
+    seen = {p.strip().lower() for p in parts if p.strip()}
+    for ev in read_active_field_evidence(conn, rec.logical_ref, "semantic_terms"):
+        for term in (ev.proposed_value or "").split(","):
+            if term.strip() and term.strip().lower() not in seen:
+                seen.add(term.strip().lower())
+                parts.append(term.strip())
+    text = join_path(parts, sep=" ")
     clean, _redaction_version = redact_text(text)
     if not clean:
         return
@@ -1832,8 +1848,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # (the classifier's out-param). Stays empty with no client / no overrides -> every column inherits.
     domain_overrides: dict[tuple[str, str], str] = {}
     if client is None:
-        # No LLM provider configured: the three enrichment stages honestly never ran (#22).
-        for _stage in ("enrich_concept", "enrich_definition", "enrich_domain"):
+        # No LLM provider configured: the enrichment stages honestly never ran (#22) — recorded as
+        # skipped, never as a failure, and ingestion continues normally.
+        for _stage in ("enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
@@ -1950,6 +1967,39 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             internal_failures=domain_evidence_failures,
             not_attempted=domain_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
+        stage_started = datetime.now(UTC)
+        synonyms = None
+        syn_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
+        syn_evidence_failures = 0
+        try:
+            with conn.transaction():
+                # E1a T4: the AI's synonyms are FIRST-CLASS `llm/proposed` `semantic_terms` evidence —
+                # not search-only decoration and not human-confirmed. They are MERGED onto
+                # `graph_node.semantic_terms` by `_project_semantic_terms` AFTER `build_graph` below
+                # (which delete+recreates the nodes a write here would land on). Gated exactly like
+                # the definition/domain evidence (glossary + snapshot); its CONTAINED failures ride
+                # into the stage report.
+                synonyms = draft_synonyms(conn, vr.good, client, actor, concepts=concepts,
+                                          ingestion_run_id=ingestion_run_id, stats=syn_stats)
+                if glossary is not None and snapshot_id is not None:
+                    try:
+                        syn_evidence_failures = _write_synonym_evidence(
+                            conn, source=catalog_source, rows=vr.good, synonyms=synonyms,
+                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id)
+                    except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
+                        # per-item try) rolls this savepoint back, so leaving the count at 0 would
+                        # report `succeeded` for a run that wrote nothing. Count it, then re-raise
+                        # to the advisory handler below, which logs it.
+                        syn_evidence_failures = 1
+                        raise
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory synonym enrichment failed for %r", catalog_source, exc_info=True)
+        state, reason, detail = _enrichment_outcome(
+            synonyms, len({content_hash(r) for r in vr.good}),
+            internal_failures=syn_evidence_failures,
+            not_attempted=syn_stats.get("not_attempted", 0))
+        record_stage(stage_recorder, "enrich_synonyms", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
     stage_started = datetime.now(UTC)
     # Additive schema preservation (round-4 #5): object_ref-keyed maps from the glossary's

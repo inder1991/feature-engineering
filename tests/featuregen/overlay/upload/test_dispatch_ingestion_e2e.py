@@ -67,6 +67,8 @@ def _client(rows: list[CanonicalRow], *, pass_b: bool = False) -> FakeLLM:
             {"ref": h, "definition": "A governed banking column."} for h in hashes]}),
         "overlay.enrich.domain": FakeResponse(output={"results": [
             {"ref": "accounts", "domain": "deposits"}]}),
+        "overlay.enrich.synonyms": FakeResponse(output={"results": [
+            {"ref": h, "synonyms": "account column, ledger column"} for h in hashes]}),
     }
     if pass_b:
         script["table_synth"] = FakeResponse(output={"results": [
