@@ -792,14 +792,19 @@ formula would push every reader back to the object the IR summarizes.
 
 ## 24. What Task 8 established
 
+> ⚠️ **The two paragraphs marked below are SUPERSEDED by Task 8.1 — see §26.** The formula's logical
+> word is no longer read at all, the signature is now
+> `resolve_physical_type(formula, *, operand_types=…)`, and the "invisible to this check"
+> consequence is closed. Everything else in this section stands unchanged.
+
 **The operation decides the physical type; the logical word is read as OPERAND EVIDENCE only.**
-`resolve_physical_type(formula) -> PhysicalType | MaterializationRefused` keys §6's table on the
-body shape and, for a unary body, on `body.expr.aggregation` — never on
-`FormulaOutputPolicyV1.output_type`. The word is consulted for exactly one question: is the operand
-an EXACT numeric? Child-1 resolves it to the operand's governed `logical_representation` verbatim
-(`output_authority._numeric_output_type`), so it is the only visible statement about what is being
-summed, and an unreadable (`"unknown"`) or inexact operand refuses with `PHYSICAL_TYPE_UNSUPPORTED`
-rather than publishing a fixed-point column no governed fact supports.
+*(SUPERSEDED in part — §26: the word is now read for nothing.)* `resolve_physical_type` keys §6's
+table on the body shape and, for a unary body, on `body.expr.aggregation` — never on
+`FormulaOutputPolicyV1.output_type`. Under Task 8 the word was consulted for exactly one question —
+is the operand an EXACT numeric? — because Child-1 resolves it to the operand's governed
+`logical_representation` verbatim (`output_authority._numeric_output_type`), making it the only
+visible statement about what is being summed. Task 8.1 replaced that single statement with
+per-EXPRESSION evidence.
 
 | body / aggregation | published `sql_type` | `rounding` / `overflow` |
 |---|---|---|
@@ -816,12 +821,12 @@ on **any** expression (each `AggregateExpression` owns its own window, so a rati
 null operand VALUE makes the aggregate null on a NON-empty window, and declaring such a column
 non-null is the direction of that decision that produces a broken write rather than a refusal.
 
-**The word describes ONE operand, and §6 does not say which.** Child-1 derives it from the SUM's own
-operand, or from a DIFFERENCE's **minuend** (`_resolve_difference`); a RATIO's word is the constant
-`"decimal"` and describes no operand at all. A count has no operand type to read, so its word is
-`"unknown"` for a benign reason and is not treated as evidence. Consequence recorded in
-`DEFERRED-WORK.md` A.7: **a ratio's numerator/denominator and a difference's subtrahend are
-invisible to this check.**
+**The word describes ONE operand, and §6 does not say which.** *(The finding stands; its consequence
+is CLOSED — §26.)* Child-1 derives it from the SUM's own operand, or from a DIFFERENCE's **minuend**
+(`_resolve_difference`); a RATIO's word is the constant `"decimal"` and describes no operand at all.
+A count has no operand type to read, so its word is `"unknown"` for a benign reason. That is exactly
+why Task 8.1 stopped reading it: ~~a ratio's numerator/denominator and a difference's subtrahend are
+invisible to this check~~ — they are now each checked against their own governed type.
 
 **The decimal policy is validated exactly where it governs.** Refusals: `SATURATE` (a deferred NFR
 — nothing in this slice clamps), precision outside `1..38`, scale outside `0..precision`. Note
@@ -834,7 +839,8 @@ rounding/overflow from `PhysicalType`, never from `formula.decimal`.
 be explicit in generated code and a renderer cannot honour what it never receives — Spark's default
 on decimal overflow is a NULL, so `ERROR` is deliberate work, not a default.
 
-**`PHYSICAL_TYPE_POLICY_VERSION = 1`** is a declared constant. `PhysicalType.identity_payload()`
+**`PHYSICAL_TYPE_POLICY_VERSION`** is a declared constant (`1` under Task 8; **`2` since Task 8.1**,
+which changed the operand rule — §26). `PhysicalType.identity_payload()`
 carries `sql_type`, `nullable`, `rounding`, `overflow` and deliberately NOT the policy version — the
 version is a property of the whole plan, contributed once by the contract (§5.5), not once per
 column.
@@ -914,3 +920,72 @@ the contract hash unchanged.
 **`AvailabilityClass` is invented here** (`same_day` / `next_day` / `best_effort`): §5.4 requires it
 declared and names no vocabulary, and deriving one needs the deferred source-delivery SLA. Recorded
 as a spec gap rather than presented as governed.
+
+---
+
+## 26. What Task 8.1 established
+
+**"Numeric" and "exact-numeric" are different questions, and the obvious fix is wrong.** Verified
+against the source rather than remembered: `_NUMERIC_LOGICAL_TYPES` (`b_output_policy.py:65`,
+`output_authority.py:59`) contains `float`, `double`, `double precision`, `real` **and** `money`. So
+`_is_numeric_logical_type` passes a float ratio, which then publishes `DECIMAL(38,6)` — a fixed-point
+column asserting a reproducibility float arithmetic does not have. Only an **exact** numeric may back
+a decimal column, and a test pins each member of §6's REFUSED set as simultaneously *in* the
+catalog's numeric set and *out* of the allowlist, so the wrong fix is a failing test.
+
+```
+_EXACT_NUMERIC_LOGICAL_TYPES = {numeric, decimal, integer, int, int2, int4, int8, bigint, smallint}
+REFUSED (all in _NUMERIC_LOGICAL_TYPES)  = {float, double, double precision, real, money}
+```
+
+`int2` is the single addition to §6's spelled set — PostgreSQL's alias for `smallint`, as
+`int4`/`int8` (which §6 does list) are for `integer`/`bigint`. Recorded in `DEFERRED-WORK.md` A.9.
+
+**The evidence is per EXPRESSION, carried by the IR.** `ExpressionExecutionIR.operand_type` is an
+`OperandTypeEvidence(operand_ref, status, logical_type, read_status)` read in `compile_expression`
+through the shipped governed reader — `read_operational_value(operand, "logical_representation")` —
+never off the flat `graph_node.data_type` that reader's hash gate exists to verify. **That module
+records and never judges:** the read happens after every refusal (a refused plan performs no extra
+catalog read) and no type condition refuses there.
+
+| `OperandTypeStatus` | C1 read | `logical_type` | §6 verdict for an ARITHMETIC operand |
+|---|---|---|---|
+| `GOVERNED` | `resolved` | the governed word | exact ⇒ publish · otherwise ⇒ refuse |
+| `UNGOVERNED` | `no_decision` / `no_value` / `not_operational` / `retired` / `conflict` | `None` | refuse — "nobody attested this type" |
+| `UNAVAILABLE` | `fork` / `hash_mismatch` / `projection_unavailable` | `None` | refuse — "the type could not be READ" |
+| `NO_OPERAND` | not attempted | `None` | n/a — `operand is None` IFF `COUNT_ROWS` [c9] |
+
+**Only a governed read carries a type.** There is no slot for an unattested word, so the
+"ungoverned but numeric" path that published fixed-point on a file declaration no longer exists.
+This closes `DEFERRED-WORK.md` A.9's `external_type_required` row and is a real behaviour change.
+
+**`resolve_physical_type(formula, *, operand_types: Mapping[str, OperandTypeEvidence])`** validates
+**every** arithmetic operand — a ratio's numerator AND denominator, a difference's minuend AND
+subtrahend — keyed by body path. Counts are exempt (a count is integral whatever its operand holds,
+so the operand is not arithmetic); their evidence is carried and simply not consulted. The mapping
+is **required, with no default**, and its key set must equal the body's paths with each entry's
+`operand_ref` equal to that expression's operand — checked BEFORE the count short-circuit, or
+mismatched evidence would pass unnoticed for every `BIGINT`. A mismatched call raises `ValueError`
+(the line Task 9 drew for a malformed call); §14 has no member for it.
+
+**One code, three diagnoses — and the separation is the point.** All three refusals carry
+`PHYSICAL_TYPE_UNSUPPORTED`, because §14 is closed and holds exactly one member for a typing verdict
+(`NOT_RESOLVED` is admission's terminal-disposition code; `AVAILABILITY_TIME_NOT_GOVERNED` is the
+availability fact's — borrowing either would double-book a code and leave a handler unable to
+route). The three branches are separate in code, in `OperandTypeStatus`, and in the refusal detail,
+with a test asserting the messages do not overlap. **`UNGOVERNED` and `UNAVAILABLE` carry no type,
+so they are also absent from the allowlist: a single check would refuse them anyway, blaming a type
+nobody could read.** The remaining gap — a caller switching on `.code` alone cannot distinguish them
+— is recorded in `DEFERRED-WORK.md` A.9 as a §14 decision for a human.
+
+**`operand_type` is deliberately NOT in `identity_payload()`.** It decides whether the expression may
+be PUBLISHED, not what it computes: a governed `numeric` and a governed `bigint` operand read the
+same rows and add them the same way, so hashing the difference would split one computation into two
+artifacts, and a projection blip would change `ir_hash` and fire §9's `IR_HASH_MISMATCH` against a
+computation nobody touched. The consequence — the resolved `PhysicalType` — enters `group_plan_hash`
+on its own (§6).
+
+**`PHYSICAL_TYPE_POLICY_VERSION = 2`.** The operand rule changed, so formulas that resolved to a
+`DECIMAL` under version 1 can refuse under version 2 (a float denominator was invisible to the word;
+an ungoverned operand type was accepted). A contract keyed on the old version describes a column
+decided by a rule that no longer applies.

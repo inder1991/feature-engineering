@@ -542,7 +542,7 @@ Spec §6. Architect's ruling, 2026-07-27: a known-unsupported numeric representa
 
 **Scope note:** the sibling Child-1 fix (make `_resolve_ratio` enforce its documented rule, and distinguish *unavailable type authority* from *a governed non-numeric type*) is routed to the feature-generation owner. **Do not edit that file from this stream** — it is actively being worked.
 
-- [ ] **Step 1: Failing tests** — the acceptance set is fixed by the ruling:
+- [x] **Step 1: Failing tests** — the acceptance set is fixed by the ruling:
 
 ```python
 def test_exact_decimal_ratio_survives(...): ...          # decimal/integer operands → DECIMAL(p,s)
@@ -557,7 +557,17 @@ def test_money_operand_dies(...): ...
 
 Plus the mutation harness's **must-survive no-op** control.
 
-- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** — carry the governed operand type per expression; gate `DECIMAL` production on the exact-numeric allowlist; increment the policy version · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): exact-numeric operand evidence gates DECIMAL`
+- [x] **Step 2: Run — FAIL** · **Step 3: Implement** — carry the governed operand type per expression; gate `DECIMAL` production on the exact-numeric allowlist; increment the policy version · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): exact-numeric operand evidence gates DECIMAL`
+
+**Established, beyond the sketch above:**
+
+- **`OperandTypeStatus` has FOUR members, not two.** The plan's "the governed C1 type … or an explicit *unavailable* marker" splits in three once C1's status vocabulary is read: `GOVERNED` (`status="resolved"`), `UNGOVERNED` (the read SUCCEEDED and no governed decision backs it — `no_decision` / `no_value` / `not_operational` / `retired` / `conflict`), and `UNAVAILABLE` (the read FAILED CLOSED — `fork` / `hash_mismatch` / `projection_unavailable`), plus `NO_OPERAND` for `COUNT_ROWS`, whose operand is `None` by grammar [c9] and is not a failure of anything.
+- **WHICH code each takes, and why.** Both refusals carry **`PHYSICAL_TYPE_UNSUPPORTED`**, because §14 is a closed vocabulary holding exactly one member for a typing verdict: `NOT_RESOLVED` is admission's terminal-disposition code (§1.2 rule 3) and `AVAILABILITY_TIME_NOT_GOVERNED` is the availability fact's, so borrowing either would double-book a code and leave a handler unable to route. What is **not** collapsed is the *diagnosis*: three separate branches with three details, asserted mutually non-overlapping — `UNGOVERNED` ⇒ "nobody attested this column's type", `UNAVAILABLE` ⇒ names the C1 status and says the authority is degraded, the allowlist branch ⇒ "not an exact numeric". Both no-type states are ALSO absent from the allowlist, so a single check would refuse them anyway *with the wrong explanation*; that is the collapse the acceptance test prevents. **If a reviewer wants two codes, §14 needs a new member (`OUTPUT_TYPE_NOT_GOVERNED`) — a spec change, not an implementation choice, and Task 1's `test_codes.py` pins the vocabularies with `==`.**
+- **The evidence carries a type ONLY when governed**, so the "ungoverned but numeric" path that published fixed-point on a file declaration no longer exists. That closes **A.9's third row** (`external_type_required` consumed by nothing) as a side effect, and it is a real behaviour change: a SUM over an operand whose type nobody attested now refuses.
+- **`operand_type` is deliberately NOT identity-bearing.** It decides whether the expression may be PUBLISHED, not what it computes (a governed `numeric` and a governed `bigint` operand read the same rows and add them the same way), and hashing it would fire §9's `IR_HASH_MISMATCH` on a projection blip. The consequence — the resolved `PhysicalType` — enters `group_plan_hash` on its own.
+- **`operand_types` is required and must line up with the body**: key set equal to the body paths, and each entry's `operand_ref` equal to that expression's operand — checked BEFORE the count short-circuit, or mismatched evidence would pass unnoticed for every `BIGINT`. A mismatched call raises `ValueError`, the line Task 9 drew.
+- **The allowlist is §6's set plus `int2`** — PostgreSQL's alias for `smallint`, as `int4`/`int8` (which §6 *does* list) are for `integer`/`bigint`; refusing it would reject an exact column over its spelling. Pinned in both directions, including that every member of §6's REFUSED set is in the catalog's `_NUMERIC_LOGICAL_TYPES` and absent from the allowlist — so the recommended-but-wrong fix is a failing test rather than a memory.
+- **`compile_expression` records and never judges**: the C1 read happens after every refusal (a refused plan performs no extra catalog read) and no type condition refuses there. §6's rule has one owner.
 
 ---
 
