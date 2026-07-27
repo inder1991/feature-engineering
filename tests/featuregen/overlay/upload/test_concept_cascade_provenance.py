@@ -85,10 +85,10 @@ def _derived(db, logical_ref: str, field_name: str):
     return [e for e in rows if e.producer == EvidenceProducer.TAXONOMY.value]
 
 
-def _correct(db, logical_ref, object_ref, field, action, actor, idem, **kw):
-    cas = read_field_cas(db, source=SOURCE, object_ref=object_ref, field=field)
+def _correct(db, logical_ref, object_ref, field, action, actor, idem, *, source=SOURCE, **kw):
+    cas = read_field_cas(db, source=source, object_ref=object_ref, field=field)
     res = apply_field_correction(
-        db, source=SOURCE, object_ref=object_ref, field=field, action=action, actor=actor,
+        db, source=source, object_ref=object_ref, field=field, action=action, actor=actor,
         idempotency_key=idem, expected_latest_decision_id=cas["latest_decision_id"],
         expected_evidence_set_hash=cas["evidence_set_hash"],
         expected_policy_version=cas["policy_version"], **kw)
@@ -96,12 +96,13 @@ def _correct(db, logical_ref, object_ref, field, action, actor, idem, **kw):
     return res
 
 
-def _human_confirms_concept(db, logical_ref, object_ref, value: str, tag: str) -> None:
+def _human_confirms_concept(db, logical_ref, object_ref, value: str, tag: str,
+                            *, source=SOURCE) -> None:
     """The REAL four-eyes correction path (propose by A, confirm by B)."""
     _correct(db, logical_ref, object_ref, "concept", "propose_override", ADMIN_A, f"{tag}-p",
-             replacement_value=value)
+             source=source, replacement_value=value)
     _correct(db, logical_ref, object_ref, "concept", "confirm_override", ADMIN_B, f"{tag}-c",
-             replacement_value=value)
+             source=source, replacement_value=value)
 
 
 def test_ai_proposed_concept_derives_taxonomy_proposed_and_does_not_gate(db):
@@ -244,7 +245,11 @@ def test_concept_pending_revalidation_derives_no_taxonomy(db):
 # retired first — exactly what the parser/technical paths already do for their dropped fields.
 
 _NAME_OBJECT_REF = "public.comp_fin_tran.cust_name"
-_NAME_REF = normalize_ref(SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN", "CUST_NAME")
+# Its OWN source: this test ingests an FTR GLOSSARY upload, and the MF-6 source-kind guard holds an
+# FTR upload onto a source another test already created as schema-less technical. `SOURCE` ("bank")
+# is generic enough to collide in a full-suite run, so the FTR path gets a distinct name.
+_FTR_SOURCE = "bank_ftr_cascade"
+_NAME_REF = normalize_ref(_FTR_SOURCE, "DPL_EIB_COMPLIANCE", "COMP_FIN_TRAN", "CUST_NAME")
 
 
 def _seal() -> None:
@@ -272,8 +277,8 @@ def _quiet_client() -> FakeLLM:
 
 def _ingest_ftr(db, definition: str, now: datetime) -> None:
     upload = to_glossary_upload(
-        read_ftr_glossary(_HDR + _row(definition=definition), source=SOURCE))
-    res = ingest_upload(db, SOURCE, upload.rows, actor=_uploader(), now=now,
+        read_ftr_glossary(_HDR + _row(definition=definition), source=_FTR_SOURCE))
+    res = ingest_upload(db, _FTR_SOURCE, upload.rows, actor=_uploader(), now=now,
                         client=_quiet_client(), glossary=upload)
     assert res.status == "ingested"
 
@@ -290,8 +295,9 @@ def test_ingest_retires_the_decision_of_a_derived_field_the_cascade_dropped(db):
     _ingest_ftr(db, "Registered legal name of the counterparty.", started)
     _llm_concept(db, _NAME_REF, "monetary_flow")
     _cascade(db, _NAME_REF)
-    resolve_and_project(db, source=SOURCE, logical_refs=[_NAME_REF])
-    _human_confirms_concept(db, _NAME_REF, _NAME_OBJECT_REF, "monetary_stock", "h1")
+    resolve_and_project(db, source=_FTR_SOURCE, logical_refs=[_NAME_REF])
+    _human_confirms_concept(db, _NAME_REF, _NAME_OBJECT_REF, "monetary_stock", "h1",
+                            source=_FTR_SOURCE)
     assert is_feature_eligible(db, _NAME_REF, "additivity") is True
 
     # A re-upload with a CHANGED definition = a material change -> the confirmation is flagged.
@@ -305,4 +311,4 @@ def test_ingest_retires_the_decision_of_a_derived_field_the_cascade_dropped(db):
         "stayed the latest — the ingest path never retired it")
     assert db.execute(
         "SELECT additivity FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
-        (SOURCE, _NAME_OBJECT_REF)).fetchone()[0] is None
+        (_FTR_SOURCE, _NAME_OBJECT_REF)).fetchone()[0] is None
