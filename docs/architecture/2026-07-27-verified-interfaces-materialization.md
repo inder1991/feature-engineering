@@ -1040,3 +1040,80 @@ against the ONE cadence the derivation was given, so a promise cannot be re-base
 re-declaring the cadence; the two-cadence form of the rule lives in the public
 `override_availability_promise`, which a later stage comparing a new declaration against an
 already-persisted contract must use.
+
+---
+
+## 28. What Task 10 established
+
+`materialize/group_plan.py` + `materialize/binding.py` — spec §9, §10.1, §10.2. Both modules are
+**pure functions over values**: the `group_binding` tables land with the rest of the control plane
+(T14), so nothing here opens a connection.
+
+```python
+SYSTEM_COLUMNS = ("__generation_id", "__generated_project_hash", "__sandbox_execution_hash")
+SYSTEM_COLUMN_SQL_TYPE = "STRING"
+
+ColumnRole(StrEnum)        # ENTITY_KEY · BUSINESS_DT · FEATURE · SYSTEM
+StagingStatus(StrEnum)     # completed · failed
+PlannedColumn(name, role, sql_type: str | None, nullable)
+PlannedFeature(column_name, ir_hash, physical_type: PhysicalType)
+FeatureGroupPlanV1(logical_group_name, materialization_contract_hash, entity_key_columns,
+                   business_dt_column, features, physical_type_policy_version)
+StagingManifestV1(...)     # §9's field list, `status` typed as StagingStatus
+GateFailure(code: ValidationGateCode, detail)
+
+build_group_plan(group: ContractGroup, features, *, logical_group_name) -> FeatureGroupPlanV1
+group_plan_hash(plan) · expected_schema(plan) · expected_schema_hash(plan)
+check_completeness(plan, manifests, *, generation_id, run_id, business_dt) -> tuple[GateFailure,...]
+
+SANDBOX_NAMESPACE = "sandbox_feature";  physical_target_for(logical_group_name)
+GroupContractBinding(binding_id, logical_group_name, materialization_contract_hash, physical_target)
+GroupPlanRevision(binding_id, group_plan_hash, generation_id, created_at)
+bind_group(plan, *, binding_id, existing=None) -> GroupContractBinding | MaterializationRefused
+plan_revision(plan, binding, *, generation_id, created_at) -> GroupPlanRevision
+current_plan_revision(revisions, *, published_generation_ids) -> GroupPlanRevision | None
+```
+
+**Completeness is proven by MANIFEST, not by schema.** `check_completeness` returns EVERY failure,
+not the first, and asks its questions in this order: duplicates over the whole staging area →
+**staleness over every manifest present, planned or not** → per planned feature (present,
+`completed`, `ir_hash`-matching) → strangers bound to this run. Staleness precedes the `ir_hash`
+because a manifest bound to another generation/run/date is not evidence about this run at all, and
+grading its computation would report a verdict nobody asked for. `generated_project_hash` and
+`sandbox_execution_hash` are deliberately NOT compared here — they have their own §9 gates, and
+checking them twice under a staging code would report one failure under two names.
+
+**The landing KEY and `business_dt` carry `sql_type=None`.** §6 decides the type of a FEATURE
+column; nothing governed states `cif_id`'s physical type at compile time (the inventory carries
+**partition**-column types only). Declaring one would be an invention the §9 gate then enforced
+against a real table. Their nullability *is* decided (`False`): the published shape is one row per
+`(keys…, business_dt)`, and a NULL landing key is not a landing key. **T14's gate must therefore
+check type only where `sql_type is not None`.**
+
+**A feature can never collide with a system column, structurally.** `admission.hive_identifier`
+requires a leading letter; every system column begins `__`. The collision check still lists them, so
+the guarantee survives a change to the normalizer.
+
+**`admission.hive_identifier` is now PUBLIC** (was `_hive_identifier`). One normalizer, not two: a
+second regex in the plan would be a second chance to disagree about which column a feature occupies,
+and the disagreement would surface as a schema gate failing on a name nobody chose. It is
+idempotent, so re-applying it to an admitted `feature_name` is a validation.
+
+**The binding has no field that moves, and "current plan" is DERIVED.** Adding a feature changes
+`group_plan_hash`, appends a `GroupPlanRevision` and returns the SAME binding object; only a
+different contract hash (or a physical target that disagrees with the derived one) is
+`PublicationRefusalCode.GROUP_BINDING_CONFLICT`, **returned** rather than raised. Publication success
+cannot live on an append-only revision row — it is known only afterwards, from §12's folded run
+events — so `current_plan_revision` takes the published generation ids as EVIDENCE. It refuses an
+ambiguous tie (two published revisions at one instant, or two plan hashes under one generation)
+rather than picking, and orders by INSTANT: `2026-07-27T23:00:00+05:30` sorts after
+`…T19:00:00+00:00` as text and is 90 minutes before it in fact, so `created_at` must be
+offset-aware ISO 8601.
+
+**A binding for a different logical name is a `ValueError`, not a refusal** — the binding is fetched
+BY that name, so the wrong one is a lookup bug rather than a verdict about the plan. The same line
+separates `plan_revision`'s cross-group check from `bind_group`'s conflict.
+
+**A.11's two-cadence override rule does not reach here.** The binding compares contract HASHES,
+never promises: a different promise is a different contract hash and therefore a conflict, not an
+override. Its first real consumer is T14's control plane or an API accepting a re-declaration.

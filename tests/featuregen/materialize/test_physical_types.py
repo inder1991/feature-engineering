@@ -357,11 +357,16 @@ def test_the_allowlist_covers_every_type_SPEC_6_names_and_nothing_inexact():
 def test_unknown_or_unreadable_type_dies_or_requires_authority():
     """BOTH die, and they die as SEPARATE branches carrying different explanations.
 
-    WHICH code, and why. §14 is a closed vocabulary and offers exactly one member for a typing
-    verdict — ``PHYSICAL_TYPE_UNSUPPORTED`` — so both refusals carry it; inventing a second code
-    would be a spec change, and borrowing an unrelated member (``NOT_RESOLVED`` is admission's,
-    ``AVAILABILITY_TIME_NOT_GOVERNED`` is the availability fact's) would make a handler unable to
-    route. What must NOT be collapsed is the DIAGNOSIS, because the remedies differ:
+    WHICH code, and why. §14 now carries TWO typing verdicts (architect ruling 2026-07-28), because
+    the code is what drives remediation routing:
+
+    * ``OUTPUT_TYPE_NOT_GOVERNED`` — the compiler could not ESTABLISH a governed type. Both causes
+      below take it, with the cause preserved in the detail.
+    * ``PHYSICAL_TYPE_UNSUPPORTED`` — the type IS governed and known, and materialization cannot
+      safely represent it (a float operand under an exact-decimal rule, an out-of-range precision).
+
+    An earlier revision routed all three through one code; that would eventually send automation
+    down the wrong remediation path. The DIAGNOSIS was already separate, and still is:
 
     * UNGOVERNED — nobody has attested this column's type. Remedy: attest it.
     * UNAVAILABLE — the type authority read failed closed (fork / hash-mismatch / unprojectable).
@@ -375,8 +380,10 @@ def test_unknown_or_unreadable_type_dies_or_requires_authority():
     unavailable = _refusal(_sum(), expr=_unavailable())
     inexact = _refusal(_sum(), expr=_governed("real"))
 
-    assert ungoverned.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
-    assert unavailable.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert ungoverned.code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
+    assert unavailable.code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
+    # …and a GOVERNED-but-unusable type keeps the other code, so the two remedies stay routable.
+    assert inexact.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
 
     assert "no GOVERNED logical type" in ungoverned.detail
     assert "failed closed" in unavailable.detail and "hash_mismatch" in unavailable.detail
@@ -402,7 +409,7 @@ def test_an_UNGOVERNED_operand_is_refused_even_when_the_catalog_word_would_be_ex
     all, so there is no "ungoverned but numeric" path that publishes fixed-point: a DECIMAL(p,s)
     column is a governed claim about the operand, and an unattested `data_type` is not one."""
     assert _refusal(_sum(), expr=_ungoverned()).code is (
-        CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
+        CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED)
 
 
 def test_evidence_claiming_GOVERNED_with_NO_type_is_REFUSED_not_a_crash():
@@ -416,7 +423,7 @@ def test_evidence_claiming_GOVERNED_with_NO_type_is_REFUSED_not_a_crash():
                                      logical_type=None, read_status="resolved")
     result = resolve_physical_type(_sum(), operand_types={"body.expr": degenerate})
     assert isinstance(result, MaterializationRefused), result
-    assert result.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert result.code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
 
 
 def test_a_parameterised_or_upper_case_governed_type_is_normalised_not_refused():
@@ -453,7 +460,7 @@ def test_a_difference_whose_minuend_is_a_count_checks_only_the_SUM_half():
 def test_a_difference_whose_minuend_is_a_sum_over_an_unreadable_operand_is_refused():
     assert _refusal(
         _difference(minuend=AggregateFunction.SUM, subtrahend=AggregateFunction.COUNT_ROWS),
-        minuend=_unavailable()).code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+        minuend=_unavailable()).code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
 
 
 # ── the formula's logical WORD is no longer operand evidence ─────────────────────────────────────

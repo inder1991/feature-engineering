@@ -973,7 +973,7 @@ def test_a_TAMPERED_catalog_refuses_the_published_type_through_the_same_seam(cat
     refused = resolve_physical_type(
         _one_expression_formula(_expr()), operand_types={ir.expr_path: ir.operand_type})
     assert isinstance(refused, MaterializationRefused)
-    assert refused.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert refused.code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
 
 
 def test_the_type_is_read_through_the_GOVERNED_reader_not_the_flat_column(catalog):

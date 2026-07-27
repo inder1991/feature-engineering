@@ -71,6 +71,7 @@ __all__ = [
     "FeatureNamePlanError",
     "ResolvedFeatureInput",
     "admit_artifacts",
+    "hive_identifier",
 ]
 
 #: The ONE disposition that may be materialized. NEEDS_REVIEW is not a near-miss: it means a human
@@ -89,7 +90,7 @@ _AXIS_FIELDS: tuple[str, ...] = (
 )
 
 #: A Hive identifier: lower-case ASCII, leading letter, ``_`` and digits thereafter, <= 128 chars
-#: (Hive's column-name bound). Anything outside is folded to ``_`` by :func:`_hive_identifier`.
+#: (Hive's column-name bound). Anything outside is folded to ``_`` by :func:`hive_identifier`.
 _HIVE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _NON_HIVE_CHARS = re.compile(r"[^a-z0-9_]")
 
@@ -169,7 +170,7 @@ def _admit_one(conn: DbConn, item: ResolvedFeatureInput) -> AdmittedFeature:
     _verify_intent_hash(conn, item.intent, run_id)                       # 6
 
     return AdmittedFeature(
-        feature_name=_hive_identifier(item.intent.name),
+        feature_name=hive_identifier(item.intent.name),
         formula=formula,
         formula_content_hash=content_hash,
         intent=item.intent,
@@ -326,14 +327,19 @@ def _verify_intent_hash(conn: DbConn, intent: AuthoringIntent, run_id: str) -> N
 
 # ── the feature name (spec §1.2, final paragraph) ────────────────────────────────────────────────
 
-def _hive_identifier(name: str) -> str:
+def hive_identifier(name: str) -> str:
     """``intent.name`` folded to a Hive identifier — the physical column the feature will occupy.
 
     Deterministic and conservative: NFKC-normalize, strip, lower-case, and map every character Hive
     does not accept in an unquoted identifier to ``_``. Nothing is collapsed or truncated, because
     both would map two distinct names onto one column — the very thing the collision check exists to
     prevent. A name that cannot be expressed at all (empty, not starting with a letter, longer than
-    Hive's 128-character bound) is a plan error, not a name to invent a mangling for."""
+    Hive's 128-character bound) is a plan error, not a name to invent a mangling for.
+
+    PUBLIC because the group plan (§9/§10.2) names the same columns and must reach the SAME answer:
+    a second normalizer would be a second chance to disagree about which column a feature occupies,
+    and the disagreement would surface as a schema gate failing on a name nobody chose. It is
+    idempotent, so re-applying it to an already-admitted ``feature_name`` is a validation."""
     folded = _NON_HIVE_CHARS.sub("_", unicodedata.normalize("NFKC", name).strip().lower())
     if not _HIVE_IDENTIFIER.fullmatch(folded):
         raise FeatureNamePlanError(
