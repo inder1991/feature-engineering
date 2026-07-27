@@ -559,3 +559,73 @@ Spec §4's examples write `hdfc::banking.customers`; per §3.5 and §17 that is 
 for the customers table", never a physical schema. The real ref an upload produces is
 `hdfc::public.customers`, and that is what `tests/featuregen/materialize/test_spine.py` declares.
 Physical resolution onto `banking` is Task 5's explicit governed step.
+
+---
+
+## 19. Catalog state — `overlay/catalog_changes.py` + the planner's stamp vocabulary
+
+Entered during **Task 5**. Spec §3.3 puts `catalog_state_stamp` INSIDE `PhysicalInputRequirement`'s
+identity, so what a stamp is made of decides whether a compiled artifact is stable.
+
+```python
+drift_watermark(conn, catalog_source) -> datetime | None    # catalog_changes.py:24
+drift_head_seq(conn, catalog_source)  -> int | None         # catalog_changes.py:34
+```
+
+Both read the single `overlay_drift_watermark` row for the source; **both return `None` when no
+drift scan has ever completed** — absence is a real state, not zero. `head_seq` is
+`COALESCE(max(global_seq), 0)` at scan completion (`_write_watermark`, `:44-56`), i.e. a **monotone
+global event counter**, while `last_completed_at` is the wall-clock time the scan ran.
+
+The vocabulary already exists and must not be re-minted (`planner/contracts.py:77-83`):
+
+```python
+class CatalogStateStampKind(StrEnum):   # :77
+    drift_watermark = "drift_watermark"
+
+class CatalogOmissionReason(StrEnum):   # :81
+    no_usable_state_stamp = "no_usable_state_stamp"     # what resolve_catalog_scope records
+    catalog_consideration_bound = "catalog_consideration_bound"
+```
+
+`CatalogStateStampV1` (`:323`) carries `catalog_source`, `head_seq`, `last_completed_at`,
+`stamp_kind`, plus 3B.4's `compiler_input_fingerprint` / `projection_checkpoint`.
+`scope.resolve_catalog_scope` (`scope.py:20-56`) OMITS a catalog with no watermark rather than
+stamping it zero — the shipped precedent for "no watermark is not head_seq 0".
+
+**Consequences for materialization.**
+
+1. A materialization stamp may include `head_seq` (identity-bearing: the catalog moved) but **not**
+   `last_completed_at` — re-running the projection over an unchanged catalog would otherwise change
+   every compiled identity, the same defect as putting an inventory's `captured_at` in.
+2. `CatalogStateStampV1` itself is therefore NOT the right shape to embed in
+   `PhysicalInputRequirement`: two of its fields are observation provenance. §3.3 types the field as
+   `tuple[tuple[str, str], ...]`, and `materialize/inputs.py` fills it with
+   `(("stamp_kind", …), ("head_seq", …))`, reusing the enum values above rather than new strings.
+3. `head_seq` is **catalog-wide**, not per table. An unrelated upload to the same catalog source
+   moves it and therefore moves every requirement's identity. That is the conservative direction
+   (recompile when the governed catalog moved) and is recorded here so it is a known cost rather
+   than a surprise.
+
+---
+
+## 20. ⚠️ Task-5 gaps in the Spec-A plan's own Task-0 sketch
+
+Two fields the plan's `TableLayout` / `PartitionMappingV1` sketch omits, both of which Task 5's
+OWN stated tests require. `materialize/inventory.py` defines them; Task 0 must load and capture them.
+
+1. **`TableLayout.columns: tuple[tuple[str, str], ...]`** — the data columns as (name, physical
+   type). The plan's T5 test `test_changing_layout_or_a_physical_type_changes_the_fingerprint` and
+   spec §3.3's "SEMANTIC: partition columns+types, **physical types**, mapping" both need them, and
+   they cannot come from the catalog: `graph_node.data_type` is the LOGICAL representation a
+   decision governed (interfaces §3), not the cluster's `decimal(18,2)`.
+2. **`AvailabilityPartition.late_arrival_days: int`** — §3.4's prose requires an availability
+   mapping to "extend the partition set beyond the event window", but its field parenthetical
+   `(time_ref, partition_column, transform, timezone)` gives run preparation nothing to extend it
+   BY. An inferred widening is exactly the inference §3.4 forbids, so the amount is declared and
+   identity-bearing.
+
+Also entered: `transform` is given a CLOSED `PartitionTransform` StrEnum (`date_iso`,
+`date_compact`). The spec names the field without a vocabulary; an open string would be an
+ungoverned format applied against a live metastore, whose wrong answer looks like an empty
+partition rather than an error.
