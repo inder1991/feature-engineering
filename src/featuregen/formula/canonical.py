@@ -64,7 +64,7 @@ from featuregen.formula.schema import (
 )
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
-__all__ = ["canonical_json", "formula_content_hash"]
+__all__ = ["canonical_json", "filter_plain", "formula_content_hash"]
 
 
 def canonical_json(f: TypedFormulaV1) -> str:
@@ -210,7 +210,7 @@ def _expression_plain(expr: AggregateExpression, path: str) -> dict:
                 expr.source_relation.table_ref, f"{path}.source_relation.table_ref"
             )
         },
-        "filter": None if expr.filter is None else _filter_plain(expr.filter, f"{path}.filter"),
+        "filter": None if expr.filter is None else filter_plain(expr.filter, f"{path}.filter"),
         "window": _window_plain(expr.window, f"{path}.window"),
     }
 
@@ -231,14 +231,22 @@ def _window_plain(window: WindowPolicy, path: str) -> dict:
     }
 
 
-def _filter_plain(node: FilterNode, path: str) -> dict:
+def filter_plain(node: FilterNode, path: str) -> dict:
+    """The §E canonical plain form of one filter subtree.
+
+    Public since Spec-A Task 6 (it was the private ``_filter_plain``), for the same reason
+    ``join_path.table_of_ref`` was made public in Task 3: an ADAPTER must ask the question the
+    canonical form already answers. ``materialize.expression_ir`` carries a per-expression filter
+    into its own identity, and a second rendering there could disagree with ``formula_content_hash``
+    about what the filter IS — two hashes naming one filter. There is one canonicalizer.
+    """
     if isinstance(node, FilterPredicate):
         return _predicate_plain(node, path)
     if isinstance(node, FilterBool):
         if node.op is FilterBoolOp.NOT:
             # NOT is never flattened, collapsed, or sorted.
             children = [
-                _filter_plain(child, f"{path}.children[{i}]")
+                filter_plain(child, f"{path}.children[{i}]")
                 for i, child in enumerate(node.children)
             ]
         else:
@@ -246,7 +254,7 @@ def _filter_plain(node: FilterNode, path: str) -> dict:
             # sort the flattened children by their own canonical JCS hash.
             flattened = _flatten_same_op(node.op, node.children)
             children = sorted(
-                (_filter_plain(child, f"{path}.children[*]") for child in flattened),
+                (filter_plain(child, f"{path}.children[*]") for child in flattened),
                 key=_child_hash,
             )
         return {"kind": node.kind.value, "op": node.op.value, "children": children}
