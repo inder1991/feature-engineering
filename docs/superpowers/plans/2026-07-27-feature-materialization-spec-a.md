@@ -320,7 +320,7 @@ Spec §4, §4.2.
 
 **Produces:** `PopulationSemantics`; `SnapshotPolicyKind` + the four variants; `SpineSourceDeclarationV1` with `identity_payload()` / `provenance_payload()`; `SpineSpec`; `validate_spine_declaration(conn, decl, *, roles) -> SpineSpec | MaterializationRefused`.
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```python
 def test_facts_validate_but_never_choose(db, two_candidate_customer_tables, decl_for_customers):
@@ -376,7 +376,7 @@ def test_declared_by_is_never_minted_in_this_module():
     assert "authenticated=True" not in inspect.getsource(spine)
 ```
 
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): spine declaration + closed SnapshotPolicy`
+- [x] **Step 2–5:** Run/implement/run/commit — `feat(materialize): spine declaration + closed SnapshotPolicy`
 
 ---
 

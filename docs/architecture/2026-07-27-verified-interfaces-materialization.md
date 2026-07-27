@@ -464,3 +464,98 @@ logical_ref_of(conn, catalog_source, object_ref) -> str
    `public`) but "two resolved physical schemas contain the same table name". The upload path cannot
    currently produce the former, so a test written against it would be unreachable rather than
    discriminating.
+
+---
+
+## 18. Governed ENTITY + governed GRAIN — what a spine declaration can be validated against
+
+Entered during **Task 4**. Spec §4 says `ENTITY_ASSIGNMENT`, `GRAIN` and `AVAILABILITY_TIME` may
+*reject* a spine declaration; these are the reads that make that possible, and the one place the
+reads cannot see what §4 assumes.
+
+### 18.1 Governed entity — `overlay/upload/entity.py`
+
+```python
+GOVERNED_ENTITY      = "governed"                 # :39  a VERIFIED entity_assignment
+LEGACY_FILE_DECLARED = "legacy_file_declared"     # :40  a legacy 'applied' suggestion
+FILE_DECLARED        = "file_declared"            # :41  the raw file-declared entity
+
+@dataclass(frozen=True, slots=True)
+class EntityRead:                                  # :216
+    entity: str | None
+    authority: str | None      # one of the three above, or None
+
+effective_entity(conn, catalog_source: str, object_ref: str) -> EntityRead   # :224
+```
+
+`object_ref` is the **public-flattened** graph_node key (`public.<table>.<column>`), not a
+`logical_ref`. Governed **iff** `graph_node.entity IS NOT NULL AND entity_status = 'VERIFIED'`
+(migration `1015_semantic_binding_projection.sql:58-64` adds `declared_entity`, `entity_fact_key`,
+`entity_fact_event_id`, `entity_status` with `CHECK (entity_status IS NULL OR = 'VERIFIED')`).
+
+**⚠️ `build_graph` writes `graph_node.entity` straight from the upload**, so a CSV column tagged
+`entity=customer` reads back as `FILE_DECLARED` — a display tag, not an attestation. Only
+`semantic_bindings.projection._apply_verified_entity` (`:144-186`) sets `entity_status='VERIFIED'`.
+A spine validator that accepted a non-`GOVERNED_ENTITY` read would let an upload's own spreadsheet
+column validate the definition of the customer population.
+
+**⚠️ CASE-MATCHING ASYMMETRY between the two governed readers.** `effective_entity` matches
+`object_ref = %s` **exactly** (`:230-233`), while `column_authority._scalar` (`:91-97`) matches
+`lower(object_ref) = %s`. `graph.build_graph` writes `object_ref`, `table_name` and `column_name`
+with the **upload's own casing** (`_table_ref`/`_column_ref`, `:148-153` — no `_norm`), whereas a
+canonical `logical_ref` is case-folded by `object_ref._norm`. So for a catalog uploaded as
+`Customers.CIF_ID`:
+
+* `read_column_facts` / `read_operational_value` find the node (they fold);
+* `effective_entity` does **not**, and returns `EntityRead(None, None)` — indistinguishable from
+  "no governed entity".
+
+A caller must therefore address `effective_entity` with the ref the catalog **stored**, not one it
+rebuilt. `materialize/spine.py` reads `object_ref` back from `graph_node` in the same statement that
+checks existence and read scope, and threads that value in; pinned by
+`test_spine.py::test_a_MIXED_CASE_catalog_is_the_same_catalog`.
+
+### 18.2 Governed grain / availability — `overlay/upload/operational_facts.py`
+
+```python
+read_operational_value(conn, logical_ref: str, field_name: str) -> OperationalValue   # :424
+_FACT_FIELD_TYPE = {"is_grain": "grain", "is_as_of": "availability_time"}             # :118-121
+```
+
+For those two SPECIALIZED_FACT fields authority is **not** the decision log: governed iff the flat
+flag is true **and** the `*_fact_event_id` link is non-null (`column_authority._FACT_EVENT_COLUMN`),
+surfacing as `status == "resolved"`. The value is a **string**: `column_authority._render` renders
+BOOLEAN columns as `"true"`/`"false"`, so the governed test is
+`status == "resolved" and value == "true"`.
+
+**GATE 3 runs first and fails closed.** `check_projection_readiness`
+(`feature_metadata_snapshot.py:130-166`) raises when the `overlay` projection has no checkpoint, is
+degraded, or sits below the event head; `read_operational_value` converts that to
+`status="projection_unavailable"` with `value=None`. Every governed read in a database whose overlay
+projection is not healthy therefore degrades — which is why the materialize fixtures seed the drift
+watermark.
+
+### 18.3 ⚠️ The GRAIN fact's `is_unique` is NOT projected anywhere
+
+`facts.py` gives `GRAIN` the value schema `{"columns": [...], "is_unique": bool}` (§4 above), but
+`table_fact_projection.project_table_facts_for_ref` (`:69-84`) reads **only** `grain.value["columns"]`
+and sets `is_grain = true` on them. `is_unique` is never read, never stored, and no read reachable
+from `graph_node` can distinguish a `is_unique=true` grain from a `is_unique=false` one.
+
+Two consequences, both load-bearing for §4:
+
+1. **Spine uniqueness must be derived from the SET of governed grain columns**, compared against the
+   declared keys and what the `SnapshotPolicy` collapses — not from `is_unique`. That is what
+   `materialize/spine.py` does.
+2. A governed `GRAIN` fact asserting `is_unique=false` projects **identically** to a unique one. That
+   is a fail-open in the projection, recorded here rather than worked around: recovering the raw fact
+   would mean `resolve_fact(conn, adapter, …)`, which needs a registered `CatalogAdapter`
+   (`catalog.current_catalog_adapter` raises `RuntimeError` when none is registered) and would be a
+   second, unguarded opinion about authority — exactly what `materialize/joins.py` refuses to do.
+
+### 18.4 Ref form in the Task 4 tests
+
+Spec §4's examples write `hdfc::banking.customers`; per §3.5 and §17 that is shorthand for "the ref
+for the customers table", never a physical schema. The real ref an upload produces is
+`hdfc::public.customers`, and that is what `tests/featuregen/materialize/test_spine.py` declares.
+Physical resolution onto `banking` is Task 5's explicit governed step.
