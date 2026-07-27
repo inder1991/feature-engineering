@@ -629,3 +629,87 @@ Also entered: `transform` is given a CLOSED `PartitionTransform` StrEnum (`date_
 `date_compact`). The spec names the field without a vocabulary; an open string would be an
 ungoverned format applied against a live metastore, whose wrong answer looks like an empty
 partition rather than an error.
+
+---
+
+## 21. ⚠️ `AVAILABILITY_TIME`'s `basis` / `lag_hours` are NOT projected anywhere
+
+Entered during **Task 6**. The same shape of gap §18.3 records for `GRAIN.is_unique`, and equally
+load-bearing: spec §8 rule 1 renders the point-in-time gate *per* `AVAILABILITY_TIME.basis`, plus
+`lag_hours` for `event_time_plus_lag`.
+
+`table_fact_projection.project_table_facts_for_ref` (`:82-89`) reads **only** `avail.value["column"]`
+and writes `is_as_of = true` + `availability_fact_event_id` on that one column. `graph_node` has no
+basis and no lag column (`0945_graph.sql:15`, `0986_graph_node_table_fields.sql:10`), and
+`read_operational_value(conn, ref, "is_as_of")` therefore returns only `"true"`/`"false"` plus the
+fact key and event id. **The basis a governed availability fact declares is unreachable from every
+projected read.**
+
+Task 6 resolves it by **dereferencing the link the projection wrote**, not by re-deciding authority:
+
+```python
+read_operational_value(conn, ref, "is_as_of")     # AUTHORITY (incl. GATE 3 projection health)
+overlay_fact_state WHERE fact_key = fact_key(table_ref(source, table), "availability_time")
+#   -> status must be 'VERIFIED'                  (the only servable overlay status)
+#   -> confirmed_event_id must EQUAL graph_node.availability_fact_event_id
+#   -> value["column"] must be the flagged column (catches a stale projection either way)
+#   -> validate_fact_value(AVAILABILITY_TIME, value)  (the overlay's own schema)
+```
+
+`resolve_fact` is deliberately NOT used: it requires a registered `CatalogAdapter`
+(`catalog.current_catalog_adapter` raises when none is registered) and re-decides authority via
+catalog precedence, expiry and drift — a second, possibly disagreeing opinion about a question the
+projection already answered, which is what `materialize/joins.py` refuses to do for join paths.
+
+Two consequences recorded rather than worked around:
+
+1. An **authoritative `CatalogAdapter`** value cannot reach this path at all. `_catalog_verified`
+   (`resolve.py`) sets `provenance={"catalog_source": …}` with no `confirmed_event_id`, so
+   `table_fact_projection` writes NULL to `availability_fact_event_id`, `read_column_facts` reports
+   `authority="hint"`, and compilation refuses `AVAILABILITY_TIME_NOT_GOVERNED`. Fail-closed, but it
+   means a catalog-authoritative availability fact is unusable for materialization today.
+2. **Expiry and drift-freshness are as strong as the shipped projection, no stronger.** An expired
+   fact's flat `is_as_of` flag stays true until the projection re-runs, and `read_operational_value`
+   grants "resolved" on flag + link alone. Task 6 inherits that posture unchanged rather than
+   inventing a second expiry clock at generation time.
+
+**Also entered: `formula.canonical.filter_plain(node, path)` is now PUBLIC** (it was the private
+`_filter_plain`, `canonical.py:234`), for the reason `join_path.table_of_ref` was made public in
+Task 3 — an adapter must ask the question the canonical form already answers.
+`materialize/expression_ir.py` carries a per-expression `filter_tree` into `expression_ir_hash`, and
+a second rendering there could disagree with `formula_content_hash` about what the filter is.
+
+## 22. What Task 6 established
+
+* **One `PitSpec` per EXPRESSION.** `compile_expression(conn, *, expr_path, expr, grain_keys, roles,
+  inventory)` compiles ONE `AggregateExpression`; `ExpressionExecutionIR` is complete on its own, so
+  a ratio's two halves may read two tables, two event-time columns, two windows and two availability
+  bases (interfaces §6). Body paths come from `formula/schema.py::_body_expressions`' own vocabulary
+  (`BODY_PATHS`), never re-minted.
+* **`PitSpec` excludes `empty_window` / `null_input`** — spec §8 rule 4 assigns those to the
+  formula's own policies, so a type named "PIT" must not carry them.
+* **Child-1's containment rule is VERIFIED, not assumed.** `schema._require_contained_column`
+  constrains the operand, the event-time ref and every filter `left` to the expression's own
+  `source_relation`; that is the only reason per-column physical resolution is unnecessary, so
+  `compile_expression` checks it and refuses `UNACCOUNTED_LOGICAL_REF` rather than recording an
+  off-relation column under the SOURCE table's physical identity.
+* **Reference completeness (§2.1)** is `logical_refs_in(node, path)` — an exhaustive dataclass /
+  sequence walk yielding `(location, ref)` for every string `parse_ref` accepts. Non-physical slots
+  are keyed by the dataclass they sit on: `TypedLiteral.value` (`COMPARISON_LITERAL` — a predicate
+  has no `right_ref`, so a ref on the right is data) and `ParameterRef.name` (`RUN_PARAMETER`).
+  Refusals name the LOCATION, never the string, because an unconsumed ref-shaped slot may hold data.
+* **Identity excludes join provenance and roles.** `identity_payload()` takes the join plan's
+  `(from_ref, to_ref, cardinality)` steps only; `approved_join_fact_key`, `approved_join_status`,
+  `authority` and `roles_used` record why the traversal was allowed and who asked, and neither
+  changes a row. Including them would split one computation into as many artifacts as there are
+  approvers and readers. `non_physical_refs` is likewise recorded but not identity — it explains a
+  decision about the formula rather than feeding the computation.
+* **`input_requirements` order is stated by the plan**, not by resolution order: the join TARGET
+  must be resolved before the path can be planned, so resolution order would put the destination
+  ahead of the hops reaching it — and the order enters the hash.
+* **Open (spec ambiguity, not resolved here):** §3's IR has ONE `join_plan`, so a grain whose keys
+  sit on two tables off the source relation would need two traversals with two independent fan-out
+  verdicts. Task 6 refuses that with `GRAIN_PATH_NOT_GOVERNED` (the closest governed reading: there
+  is no single governed path to *the* grain) rather than widening the field. §8 rule 1 likewise
+  specifies ONE availability gate per expression, so a joined dimension table's own availability is
+  not gated in this slice — recorded as a known bound, not designed around.
