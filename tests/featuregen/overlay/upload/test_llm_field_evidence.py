@@ -34,6 +34,7 @@ display CONFLICT that would blank the curated value).
 """
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -44,7 +45,12 @@ import featuregen.overlay.upload.enrich as enrich_mod
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
-from featuregen.overlay.field_evidence import read_active_field_evidence
+from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_evidence import (
+    field_input_hash,
+    read_active_field_evidence,
+    record_field_evidence,
+)
 from featuregen.overlay.object_identity import ObjectBinding, ObjectIdentityStatus
 from featuregen.overlay.upload.asset_detail import build_asset_detail
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -357,9 +363,20 @@ def test_suppressed_definition_retires_prior_ai(db):
 
 def test_no_longer_a_target_retires_prior_ai(db):
     """A column that now carries an UPLOADER-declared definition is no longer an AI target (R3 never
-    overwrites a human's) — its prior AI proposal is retired rather than left competing."""
+    overwrites a human's) — its prior AI proposal is retired rather than left competing.
+
+    The producer-scoping half is pinned on a HUMAN row deliberately: a SOURCE row proves nothing
+    here, because ``_write_glossary_source_evidence`` re-writes it AFTER reconciliation — a
+    retirement that reached every producer would look identical. Nothing re-writes the human's."""
     _seal()
     _ingest_drafted(db, _NOW)
+    human_id = record_field_evidence(
+        db, logical_ref=_NAME_REF, field_name="definition",
+        proposed_value="Full legal name as registered with the bank",
+        producer=EvidenceProducer.HUMAN, strength=AssertionStrength.CONFIRMED,
+        producer_ref="steward:priya", source_snapshot_id="snap-human",
+        input_hash=field_input_hash(logical_ref=_NAME_REF, field_name="definition",
+                                    material="steward"))
 
     declared = to_glossary_upload(read_ftr_glossary(_DECLARED_DEF_CSV, source=_AI_SOURCE))
     (row,) = declared.rows
@@ -369,8 +386,11 @@ def test_no_longer_a_target_retires_prior_ai(db):
                         client=_drafting_client(row, "must not be drafted"), glossary=declared)
     assert res.status == "ingested"
     assert _ai_defs(db, _NAME_REF) == []
-    # producer-scoped: the SOURCE's own definition proposal at the same ref is untouched.
-    assert [e.producer for e in read_active_field_evidence(db, _NAME_REF, "definition")] == ["source"]
+    # producer-scoped: the HUMAN's row survives the AI retirement with its identity intact, and the
+    # SOURCE's own proposal is there too.
+    active = read_active_field_evidence(db, _NAME_REF, "definition")
+    assert human_id in [e.evidence_id for e in active]
+    assert {e.producer for e in active} == {"human", "source"}
 
 
 def test_transient_miss_keeps_prior_ai(overlay_conn):
@@ -574,6 +594,53 @@ def test_transient_domain_miss_keeps_prior_ai(overlay_conn):
     assert n == 0
     assert [e.proposed_value for e in _ai_domains(overlay_conn, _TABLE_REF)] == ["retail_banking"]
     assert [e.proposed_value for e in _ai_domains(overlay_conn, _SCORE_REF)] == ["fraud_risk"]
+
+
+def _classified(raw: str) -> tuple[dict, dict]:
+    """The accept -> parse step ``classify_domains`` runs between the provider and the writer, for
+    the single table of the domain fixture. An UNRESOLVED item classifies nothing this run."""
+    envelope, _reason = enrich_mod._accept_domain_result(64)(raw)
+    if envelope is None:
+        return {}, {}
+    table_domain, overrides = enrich_mod._parse_domain_result(envelope)
+    return ({"comp_fin_tran": table_domain},
+            {("comp_fin_tran", c): v for c, v in overrides.items()})
+
+
+def test_accept_gate_rejected_override_keeps_prior_ai_domain(overlay_conn):
+    """An override the accept gate REJECTS is not a withdrawal — the gate cannot tell a bad label
+    from a provider blip, and dropping it on its own reads downstream as "the model no longer
+    overrides this column" and RETIRES its prior AI domain. KEEP is the safe default: the whole item
+    is a transient miss, so BOTH levels keep what they had."""
+    upload = _domain_upload()
+    build_graph(overlay_conn, _AI_SOURCE, upload.rows)
+    for ref, value in ((_TABLE_REF, "retail_banking"), (_SCORE_REF, "fraud_risk")):
+        _write_llm_field_evidence(overlay_conn, field_name="domain", items={"h": value},
+                                  ref_of=lambda k, r=ref: (r, r, {"k": k}),
+                                  source_snapshot_id="snap")
+
+    domains, column_domains = _classified(json.dumps(
+        {"domain": "retail_banking",
+         "column_domains": [{"column": "fraud_score", "domain": "x" * 200}]}))   # over-long label
+
+    n = enrich_mod._write_domain_evidence(
+        overlay_conn, source=_AI_SOURCE, rows=upload.rows, domains=domains,
+        column_domains=column_domains, glossary=upload, bindings=None,
+        source_snapshot_id="snap2")
+
+    assert n == 0
+    assert [e.proposed_value for e in _ai_domains(overlay_conn, _SCORE_REF)] == ["fraud_risk"]
+    assert [e.proposed_value for e in _ai_domains(overlay_conn, _TABLE_REF)] == ["retail_banking"]
+
+
+def test_a_valid_override_still_classifies_the_item(overlay_conn):
+    """The other side of the gate: a VALID two-level answer resolves as before — table default plus
+    the column override (the rejection above must not have made the acceptor over-strict)."""
+    domains, column_domains = _classified(json.dumps(
+        {"domain": "retail_banking",
+         "column_domains": [{"column": "fraud_score", "domain": "fraud_risk"}]}))
+    assert domains == {"comp_fin_tran": "retail_banking"}
+    assert column_domains == {("comp_fin_tran", "fraud_score"): "fraud_risk"}
 
 
 def test_domain_evidence_write_failure_records_partial(db, monkeypatch):

@@ -285,10 +285,13 @@ def _accept_domain_result(max_len: int):
     Both seams land on the same shape: BATCH carries the overrides (its per-item schema has them),
     while the SINGLE seam (and the batch's single-item fallback) returns a BARE table-domain string
     from the flat schema, accepted here as the same envelope with NO overrides. An invalid table
-    domain rejects the whole item (as before — it is the context everything inherits); an invalid or
-    blank override is dropped on its own, never taking the item's table domain with it. An override
-    EQUAL to the table default is dropped too: it is not an override, and writing evidence for it
-    would fabricate a column-level assertion for what is really inheritance."""
+    domain rejects the whole item (it is the context everything inherits) — and so does an override
+    the gate cannot accept: a rejected label is indistinguishable from a provider blip, and dropping
+    it on its own reads downstream as "the model WITHDREW this override" and retires the column's
+    prior AI domain (KEEP is the safe default this branch commits to everywhere else, so the item
+    resolves as a transient MISS instead). An override EQUAL to the table default is dropped —
+    that IS a withdrawal: it is not an override, and writing evidence for it would fabricate a
+    column-level assertion for what is really inheritance."""
     accept_label = _accept_domain(max_len)
 
     def _accept(raw: str) -> tuple[str | None, str]:
@@ -309,8 +312,12 @@ def _accept_domain_result(max_len: int):
             if not isinstance(item, dict):
                 continue
             column = _norm(str(item.get("column") or ""))
-            value, _r = accept_label(str(item.get("domain") or "").strip())
-            if column and value is not None and value != table_domain:
+            if not column:
+                continue                 # an unnamed override identifies nothing — skip it
+            value, reason = accept_label(str(item.get("domain") or "").strip())
+            if value is None:
+                return None, reason      # unusable label -> the ITEM is a transient miss (KEEP)
+            if value != table_domain:
                 overrides[column] = value
         return json.dumps({"domain": table_domain, "column_domains": overrides},
                           sort_keys=True), "valid"
@@ -721,7 +728,12 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     # overrides are unknown, not withdrawn). Computed through the SAME `ref_of`s the writes used, so
     # a ref written this run is never handed to retirement and a non-target is never kept alive.
     missed = {t for t in columns_by_table if t not in {_norm(d) for d in domains}}
-    keep = {ref[0] for t in columns_by_table if (ref := table_ref_of(t)) is not None}
+    # The classified tables join the keep set explicitly: `table_ref_of` consults the glossary's
+    # `table_refs`, not `columns_by_table`, so a `domains` key with no rows would be WRITTEN above
+    # and then immediately retired here (unreachable from ingest, which always passes `vr.good` —
+    # but `_write_domain_evidence` is module-level and callers pass the two independently).
+    keep = {ref[0] for t in set(columns_by_table) | {_norm(d) for d in domains}
+            if (ref := table_ref_of(t)) is not None}
     keep |= {ref[0] for k in overrides if (ref := column_ref_of(k)) is not None}
     keep |= {ref[0] for (table, column) in rec_by_tc
              if table in missed and (ref := column_ref_of(f"{table}.{column}")) is not None}
