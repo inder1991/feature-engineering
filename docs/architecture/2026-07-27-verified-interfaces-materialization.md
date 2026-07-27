@@ -14,22 +14,24 @@
 
 ```python
 classify_join_path(conn, catalog_source: str, from_table: str, to_table: str,
-                   *, roles: Iterable[str] = ()) -> JoinOutcome        # :91
+                   *, roles: Iterable[str] = ()) -> JoinOutcome        # :137
 ```
 
-**⚠️ Table arguments are BARE table names, not schema-qualified.** `_table_of(object_ref)` (`:46-48`) splits on `.` and returns `parts[1]`, so `"public.transactions.account_id"` → `"transactions"`. The BFS destination is compared against that. Passing `"banking.accounts"` never matches. Existing callers pass bare names: `feature_assist.py:752` passes `d.split(".")[-2]`; `contract/author.py:112` passes `grain_table`.
+**⚠️ Table arguments are BARE table names, not schema-qualified.** `table_of_ref(object_ref)` (`:69-77`, public since Task 3 — was the private `_table_of`) splits on `.` and returns `parts[1]`, so `"public.transactions.account_id"` → `"transactions"`. The BFS destination is compared against that. Passing `"banking.accounts"` never matches. Existing callers pass bare names: `feature_assist.py:752` passes `d.split(".")[-2]`; `contract/author.py:112` passes `grain_table`. Its other importers are `entity.py` and `lineage.py`.
 
-**Consequence for us:** an adapter must parse schema-qualified logical refs, pass bare table names in, keep schema/source identity separately, and **refuse ambiguity** when the same table name exists in two schemas of one catalog source.
+**Consequence for us:** an adapter must pass bare table names in, keep schema/source identity separately, and **refuse ambiguity** — see §17.4 for what that check can actually discriminate (resolved physical schemas, never the refs).
 
-**Outcomes** (`JoinOutcome.kind`): `OPERATIONAL` · `UNVERIFIED` · `DENIED` · `NO_PATH`. Layered BFS: shortest clearing path → OPERATIONAL; else clearing+unverified → UNVERIFIED; else a path through a denied hop → DENIED; else NO_PATH. `from_table == to_table` returns OPERATIONAL with no steps (`:98-99`).
+**Outcomes** (`JoinOutcome.kind`): `OPERATIONAL` · `UNVERIFIED` · `DENIED` · `NO_PATH`. Layered BFS: shortest clearing path → OPERATIONAL; else clearing+unverified → UNVERIFIED; else a path through a denied hop → DENIED; else NO_PATH. `from_table == to_table` returns OPERATIONAL with no steps (`:145-146`). `DENIED` carries `endpoints` but **no steps**.
 
-**Edge classification** (`:113-124`): an edge is *clearing* when `fact_key is None` (file-declared) **or** `status == 'VERIFIED'`; *unverified* when fact-linked but not VERIFIED; *denied* when either endpoint's `graph_node.sensitivity` is outside `allowed_sensitivities(roles)`.
+**Edge classification** (`:161-171`): an edge is *clearing* when `fact_key is None` (file-declared) **or** `status == 'VERIFIED'`; *unverified* when fact-linked but not VERIFIED; *denied* when either endpoint's `graph_node.sensitivity` is outside `allowed_sensitivities(roles)`.
 
-**⚠️ Authority provenance is LOST on operational paths.** `clearing.append((from_ref, to_ref, card))` (`:121`) drops `approved_join_fact_key` and `approved_join_status`; only `unverified_fact` retains a key. The SQL *does* select both columns (`:105-106`), so the fix is to carry them through the clearing tuple — **inside this query**, not by a second, potentially-drifted read.
+**Authority provenance is CARRIED (Task 3, was lost).** `JoinStep` (`:17-44`) now has six fields — `from_ref`, `to_ref`, `cardinality`, and (defaulted, so the extension is additive) `approved_join_fact_key`, `approved_join_status`, `authority`. The fetched row travels as `_Edge` (`:86`) = `(from_ref, to_ref, cardinality, fact_key, status, authority)` through classification into the BFS, so the provenance comes from **the same query that planned the path** — a second read of `graph_edge` would be a different snapshot of a table the join projection mutates. A file-declared edge reports `authority='operational'` with `approved_join_fact_key=None`: that `None` is a meaningful answer (nobody approved this edge), not a missing one. The query still filters `authority = 'operational'`, so `display_only` edges never appear.
 
-**`JoinStep` orientation** (`:80-88`): steps are oriented to traversal direction, and the reverse edge **inverts cardinality** — "a reverse N:1 hop is really 1:N". Cardinality is therefore load-bearing and must not be discarded.
+**`JoinStep` orientation** (`:117-134`): steps are oriented to traversal direction, and the reverse edge **inverts cardinality** — "a reverse N:1 hop is really 1:N". Authority is a property of the EDGE, so fact key / status / authority ride **both** orientations unchanged while cardinality flips. Cardinality is load-bearing and must not be discarded; `str | None` over a nullable column, so `None` means UNATTESTED, never "safe".
 
-**Façade:** `find_join_path(conn, catalog_source, from_table, to_table, *, roles)` (`:146`) is a backward-compatible wrapper returning steps or None; it collapses the four outcomes and is **not** suitable for us — we need the discriminated kind.
+**Façade:** `find_join_path(conn, catalog_source, from_table, to_table, *, roles)` (`:193`) is a backward-compatible wrapper returning steps or None; it collapses the four outcomes and is **not** suitable for us — we need the discriminated kind.
+
+**Adapter:** `materialize/joins.py` `plan_join(...) -> JoinPlan | MaterializationRefused` is the only materialization entry point to this planner; it owns no traversal.
 
 ---
 
