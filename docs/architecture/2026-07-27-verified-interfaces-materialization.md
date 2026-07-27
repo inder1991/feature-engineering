@@ -164,6 +164,24 @@ PartitionProof(disjoint_row_partitions=False, disjoint_distinct_values=False,
 
 **Consequence for us:** a fixture claiming `ADDITIVE` for a plain SUM is not a genuine Child-1 output. Fixtures must be produced by, or validated against, the real resolver.
 
+**Output TYPES, entered during Task 2** (the reference previously recorded only the additivity half, which is not enough to hand-author a `FormulaOutputPolicyV1`):
+
+| body | `output_type` | `unit`/`currency` | `external_type_required` |
+|---|---|---|---|
+| SUM / DIFFERENCE | the operand's C1 `logical_representation` verbatim (`_numeric_output_type`, `:206-217`); `"unknown"` if absent or non-numeric | C1 hints, carried | `False` **only** when that C1 read is `status="resolved"` |
+| COUNT_* | `"integer"` (`_COUNT_OUTPUT_TYPE`, `:65`) — dimensionless | `None` | `False` |
+| RATIO | `"decimal"` (`_RATIO_OUTPUT_TYPE`, `:66`) | `None` (they cancel) | `False` |
+
+A RATIO whose operand units/currencies do NOT cancel is an `ExternalRequirement`
+(`UNIT_PROVISIONING_REQUIRED` / `CURRENCY_PROVISIONING_REQUIRED`), never a policy; a DIFFERENCE with
+incompatible units/currency is `InvalidOutput`. `resolve_formula_output_policy` always passes
+`_NO_PROOF` (`:194`), so no partition proof exists at resolve time — which is why the additivity
+table above collapses to `NON_ADDITIVE` for every first-slice feature.
+
+**Verified end to end in `tests/featuregen/materialize/test_fixtures.py`**: the three worked features
+are hand-authored AND re-derived by driving the real orchestrator, so a wrong fixture is a failing
+test rather than a silent forgery.
+
 ---
 
 ## 8. Child-1 authoring trace — `formula/trace.py` + migration `1020`
@@ -181,6 +199,29 @@ Row columns (`:104-106`): `authoring_trace_event_id, authoring_run_id, seq, kind
 
 **`payload_hash` is a sha256 over the canonical payload** — so a terminal event is tamper-evident, and the payload is canonical redacted metadata (JSON-primitive values only).
 
+**ADDED IN TASK 2** — the public event reader §14 said was missing now exists:
+
+```python
+@dataclass(frozen=True, slots=True)
+class TerminalEvent:
+    kind: TraceEventKind; payload: Mapping[str, Any]; payload_hash: str   # payload is read-only
+
+read_terminal_event(conn, run_id) -> TerminalEvent | None    # the run's one terminal event
+read_run_intent_hash(conn, run_id) -> str | None             # authoring_run.intent_hash
+```
+
+Both go through the private `_durable_read`, so they inherit `run_status`'s cross-connection
+visibility (durable fresh connection UNION the caller's, absence-derived). `read_terminal_event`
+deliberately does **not** validate `payload_hash` against `payload` — a reader that dropped a
+mismatching event would report the run as incomplete and HIDE the tampering; verifying is the
+caller's decision (`materialize.admission`, §1.2 check 2, refuses with `TERMINAL_PAYLOAD_TAMPERED`).
+
+⚠️ **`authoring_run.intent_hash` — NOT the terminal payload — is where the intent hash lives.** The
+terminal payload (§14 below) carries the disposition, the six axes and the two hashes; it carries no
+`intent_hash`. Only the STARTED event's payload and the write-once manifest do, and the manifest is
+the one written first, before any provider call. Spec §1.2 check 6 therefore needs a SECOND read,
+which is why `read_run_intent_hash` exists alongside the event reader.
+
 **Consequence for us:** `AuthoringResult` is a publicly constructible frozen dataclass, so an in-memory consistency check proves nothing about provenance. Admission must verify the supplied result against the **immutable terminal event** for its run: terminal exists, its disposition is `RESOLVED`, its recorded candidate hash matches, the supplied status axes match, and `payload_hash` validates.
 
 ---
@@ -194,6 +235,19 @@ _SOURCE_SEP = "::"                                                       # :23
 ```
 
 Canonical form is `source::schema.table[.column]`.
+
+**⚠️ Entered at Task 2 — every ref an UPLOAD produces is under schema `public`.** `graph.build_graph`
+builds object refs with `_table_ref`/`_column_ref` (`graph.py:148-155`), which do not take a schema:
+the real (pre-flatten) schema is preserved only in the separate `graph_node.schema_name` column, via
+the `schemas` dict. So a governed logical ref is `hdfc::public.transactions.txn_amt`, never
+`hdfc::banking.transactions.txn_amt`, and `object_ref._DEFAULT_SCHEMA = "public"` is not a fallback
+in practice — it is the value.
+
+**Consequence for §1/§3.1.** The `AMBIGUOUS_TABLE_NAME` case (one catalog source, one table name, two
+schemas) cannot arise from the upload path as it stands, and the schema segment of a logical ref
+carries no cluster meaning. Mapping a logical ref onto the cluster's real `banking` schema is
+therefore a physical-resolution decision Task 3/5 must make explicitly — it may **not** be read off
+the ref.
 
 ---
 
@@ -290,12 +344,29 @@ So Gate 1 can verify disposition, all six axes and the candidate hash against an
 disposition, INCLUDING `REJECTED` and `UNSUPPORTED`, writes a `COMPLETED` event. Gate 1 must therefore
 check the **payload's `authoring_disposition`**, never merely that a `COMPLETED` event exists.
 
-**⚠️ `trace.py` exposes NO public event reader** — only `open_authoring_run` (`:156`), `append_event`
-(`:173`) and `run_status` (`:212`). A `read_terminal_event(conn, run_id)` must be ADDED, using the
-existing private `_durable_read` (`:432`) so it inherits the same cross-connection visibility
-semantics `run_status` relies on.
+**⚠️ `trace.py` exposed NO public event reader** — only `open_authoring_run` (`:156`), `append_event`
+(`:173`) and `run_status` (`:212`). ~~A `read_terminal_event(conn, run_id)` must be ADDED~~ —
+**DONE in Task 2**: `read_terminal_event` + `read_run_intent_hash`, both over the existing private
+`_durable_read`. See §8.
 
 `authoring_intent_hash(intent)` lives at `formula/authoring.py:253`.
+
+**⚠️ CORRECTION (Task 2) — `authoring_intent_hash` does NOT cover the whole intent object.** It
+hashes exactly four fields (`authoring.py:256-261`):
+
+```python
+{"name": …, "hypothesis": …, "target_entity": …, "target_grain_keys": [ … ]}
+```
+
+`AuthoringIntent.recipe_authoring_context` is **outside the digest**. §15 below asserted the
+opposite; that claim is refuted here and struck through in place. The consequences invert:
+
+- an intent reconstructed WITHOUT a populated `recipe_authoring_context` hashes IDENTICALLY and
+  passes check 6 — it does **not** fail `INTENT_HASH_MISMATCH`;
+- so Gate 1 **cannot** distinguish two intents that differ only in that field. That is a real (small)
+  limit on what "the admitted intent is the intent that was authored" proves, and widening the digest
+  would be a change to `authoring`'s identity contract, not to the gate. Pinned by
+  `test_admission.py::test_check_6_cannot_see_recipe_authoring_context` so it cannot change silently.
 
 ---
 
@@ -316,7 +387,12 @@ AuthoringIntent(name, hypothesis, target_entity, target_grain_keys=(),
 AuthorTurnRecord(..., tool_context_hash: str = "")                        # NEW, optional
 ```
 
-**⚠️ Consequence for Gate 1.** `authoring_intent_hash` covers the intent object. A real run may populate `recipe_authoring_context`, so an intent **reconstructed** by a caller without it hashes differently and fails `INTENT_HASH_MISMATCH`. That is the correct behaviour — the admitted intent must be *the intent that was authored*, not a look-alike — but callers must pass the real object, and the plan's fixtures must not assume the field is always absent.
+**⚠️ ~~Consequence for Gate 1.~~ REFUTED at Task 2 — see the correction at the end of §14.**
+~~`authoring_intent_hash` covers the intent object. A real run may populate
+`recipe_authoring_context`, so an intent **reconstructed** by a caller without it hashes differently
+and fails `INTENT_HASH_MISMATCH`.~~ The digest enumerates four fields and `recipe_authoring_context`
+is not among them, so such an intent hashes the SAME and admits. Callers should still pass the real
+object; the point is that Gate 1 does not enforce it.
 
 **⚠️ Migration numbering moved.** `1021`–`1030` are now taken (`1021_contract_considered_revision` … `1030_recognition_evaluation`). **Next free: `1031`.** The plan's control-plane migration is renumbered accordingly.
 
