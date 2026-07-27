@@ -1,112 +1,69 @@
-# Spec A — Executable Materialization Vertical Slice: Implementation Plan (rev 2)
+# Spec A — Executable Materialization Vertical Slice: Implementation Plan (rev 3)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** A published `sandbox_feature.cif_daily` partition on the real Hadoop/Hive cluster, computed by generated Kedro/PySpark from three governed formulas, with the numbers proven by execution.
+**Goal:** A published `sandbox_feature.<group>` partition on the real Hadoop/Hive cluster, computed by generated Kedro/PySpark from governed formulas, with the numbers proven by execution.
 
-**Definition of done is a live table, not a green suite.** Task 15 is the deliverable; everything before it is scaffolding for it.
+**Done means a live table, not a green suite.** Task 16 is the deliverable.
 
-**Architecture:** `src/featuregen/materialize/` compiles a governed `ResolvedFeatureInput` through per-expression IR → contract → group plan → a **complete runnable Kedro project**, which is then submitted, validated, executed and published. Render-only: the generated project is the sole execution path.
+**Spec:** `docs/superpowers/specs/2026-07-27-feature-materialization-spec-a-design.md` **rev 3**.
+**Verified interfaces:** `docs/architecture/2026-07-27-verified-interfaces-materialization.md`.
 
-**Spec:** `docs/superpowers/specs/2026-07-27-feature-materialization-spec-a-design.md` **rev 2** (386 lines, §0–§N). Read the cited section before implementing a task.
-
-> **Rev 2 of this plan.** Rev 1 was rejected by a code-grounded review for twelve defects, four of which would have produced silently wrong feature values. Do not consult rev 1.
+> **THE RULE THAT MATTERS.** Revisions 1 and 2 of this plan were rejected with 12 and 16 findings; **every defect sat in an API described from memory rather than read**. Before writing code against any interface, confirm it in the verified-interfaces reference. If it is not there, **read the source, add an entry, then implement**. An implementation built on an unverified assumption is a defect even if its tests pass.
 
 ## Global Constraints
 
 - **Frozen slotted dataclasses + `StrEnum`** — NOT pydantic.
-- **One hasher:** `materialize_hash()` (Task 1), wrapping `featuregen.formula._jcs.dumps` + sha256. Identity fields only — no provenance, no timestamps, no live observations.
-- **Reuse governed machinery.** Joins → `classify_join_path`. Sensitivity gating → `allowed_sensitivities`. C1 reads → `read_operational_value`. Never re-implement these.
-- **Cardinality is correctness.** A `1:N` step toward the grain multiplies rows and inflates a SUM. Collapse fan-out before joining.
-- **No scan sharing in this slice.** Each feature computes independently.
-- **Sandbox only.** `derive_namespace()` returns `sandbox_feature` unconditionally; there is no parameter that changes it.
-- **Render-only.** No `pyspark` import anywhere in `src/featuregen/materialize/`; PySpark appears only inside rendered text.
+- **One hasher:** `materialize_hash()` (Task 1). Identity fields only — no provenance, no timestamps, no live observations.
+- **Reuse governed machinery.** Joins → `classify_join_path`. Sensitivity → `graph_node` + `safety_floor.SENSITIVITY_ORDER` + `read_scope`. C1 → `read_operational_value`. Actor → `IdentityEnvelope`.
+- **Never mint identity.** Thread `IdentityEnvelope` from the request; never construct one with `authenticated=True`.
+- **Render-only.** No `pyspark` import in `src/featuregen/materialize/`.
+- **Fail closed** with a typed code from spec §14. Unknown ⇒ refusal, never a default.
 - **Manifests/findings carry counts, types, hashes, locations — never data values.**
-- **Fail closed** on anything ungoverned, unverified, denied or unresolvable.
-- **`INSERT OVERWRITE` is forbidden.**
+- **Sandbox only.** `derive_namespace()` takes no parameters.
+- **`INSERT OVERWRITE` is forbidden.** **No fan-out repair.** **No scan sharing.**
 - Commit trailer: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 
-**Test command:**
-```bash
-PYTHONPATH=src .venv/bin/python -m pytest tests/featuregen/materialize -p no:cacheprovider -q
-```
-
-## Verified Child-1 interfaces (use these EXACT names)
-
-Confirmed against `main` on 2026-07-27. Do not guess; these are correct.
-
-```python
-TypedLiteral(type: LiteralType, value: str)
-FilterPredicate(op: FilterPredicateOp, left: LogicalRef,
-                right_literal: TypedLiteral | None = None,
-                right_param: ParameterRef | None = None,
-                right_set: tuple[TypedLiteral, ...] | None = None)   # `kind` is init=False
-FilterBool(op: FilterBoolOp, children: tuple[FilterNode, ...])       # `children`, NOT `operands`
-SourceRelation(table_ref: LogicalRef)                                # TABLE ref, no column
-Grain(entity: str, keys: tuple[LogicalRef, ...])                     # key ORDER IS SEMANTIC
-WindowPolicy(event_time_ref, basis: WindowBasis, length: int, unit: WindowUnit,
-             start_inclusive: Inclusivity, end_inclusive: Inclusivity,
-             timezone: str, empty_window: EmptyWindowResult, null_input: NullInput)
-AggregateExpression(aggregation: AggregateFunction, operand: LogicalRef | None,
-                    source_relation: SourceRelation, filter: FilterNode | None,
-                    window: WindowPolicy)                            # operand None IFF COUNT_ROWS
-AuthoringIntent(name: str, hypothesis: str, target_entity: str,
-                target_grain_keys: tuple[str, ...] = ())             # `name` is the feature name
-```
-
-**There is no `right_ref` on `FilterPredicate`.** A filter's only column reference is `left`.
-
-Governed machinery:
-```python
-classify_join_path(conn, catalog_source: str, from_table: str, to_table: str,
-                   *, roles: Iterable[str] = ()) -> JoinOutcome
-  # JoinOutcome.kind ∈ {OPERATIONAL, UNVERIFIED, DENIED, NO_PATH}
-  # .steps: tuple[JoinStep(from_ref, to_ref, cardinality), ...]  — oriented to traversal
-read_operational_value(conn, logical_ref: str, field_name: str) -> OperationalValue
-read_column_facts(conn, logical_ref: str, field_name: str) -> OperationalColumnFacts
-  # -> {value, authority, provenance} ONLY. No sensitivity/access/retention.
-allowed_sensitivities(roles) -> set[str]     # featuregen.overlay.upload.read_scope
-parse_ref(logical_ref) -> (source, schema, table, column | None)
-```
+**Test command:** `PYTHONPATH=src .venv/bin/python -m pytest tests/featuregen/materialize -p no:cacheprovider -q`
 
 ---
 
-## File Structure
+### Task 0: Target-cluster inventory (BLOCKING, discovery — no code)
 
+Spec §0. Produces facts, not software. **Cluster acceptance (Task 16) is blocked until this is complete**; Tasks 1–15 are parameterized on its output and may proceed in parallel.
+
+**Files:** Create `docs/architecture/2026-07-27-hdfc-cluster-inventory.md`
+
+- [ ] **Step 1: Capture table layout** — for `banking.transactions`, `banking.accounts`, `banking.customers`:
+
+```sql
+DESCRIBE FORMATTED banking.transactions;
+SHOW PARTITIONS banking.transactions;
+-- repeat for accounts, customers
 ```
-src/featuregen/materialize/
-  canonical.py       T1   materialize_hash()
-  admission.py       T2   ResolvedFeatureInput + admission checks + role authorization
-  joins.py           T3   JoinPlan over classify_join_path
-  spine.py           T4   SpineSpec resolution
-  expression_ir.py   T5   ExpressionExecutionIR + PitSpec (per expression)
-  ir.py              T6   FormulaExecutionIRV1 + ir_hash
-  classify.py        T7   versioned sensitivity/access/retention adapter
-  contract.py        T7   MaterializationContractV1
-  group_plan.py      T8   FeatureGroupPlanV1 + StagingManifestV1 + completeness
-  identity.py        T9   CompilationIdentity / RenderedArtifactIdentity, sandbox namespace
-  render/
-    project.py       T10  render_project() -> complete runnable directory
-    nodes_compute.py T11  spine, PIT projection, calculate_*, fan-out collapse
-    nodes_gate.py    T12  assemble (manifest-consuming), §H gates, hooks
-    publish.py       T14  publish node
-  publish.py         T14  capability attestation + GroupPublisher
-  validation.py      T13  ValidationReportV1 + classification + L0/L1/L2
-  submit.py          T13  PipelineSubmitter + LocalClusterSubmitter
-  control_plane.py   T12  ingest of generation/reports/run events
-  pipeline.py        T15  generate_group() end-to-end entry point
-src/featuregen/db/migrations/1021_materialization_control_plane.sql   T12
-tests/featuregen/materialize/…
-tests/featuregen/materialize/fixtures.py     T2  hand-authored formulas (verified fields)
-tests/featuregen/materialize/spark_fixtures/ T13 tiny hand-authored data
+
+Record per table: partitioned yes/no · ordered partition columns + types · example partition values covering the acceptance date · physical location · whether historical partitions are rewritten in place.
+
+- [ ] **Step 2: Capture engine versions** (§K's attestation is keyed on this exact triple)
+
+```sql
+SELECT version();            -- Hive
+-- Spark: spark.version ; metastore: hive.metastore schema version
 ```
+
+- [ ] **Step 3: Answer the two slice-shaping questions**
+  1. **How is account-to-customer ownership modelled?** A single `accounts.cif_id` column is `N:1` toward the grain and fine. A joint-holder bridge table is `1:N` and **refuses `total_debit_amount_30d`** under spec §3.2 — in which case pick a first feature whose traversal is `N:1` and record the substitution here.
+  2. **How is a customer snapshot selected for a business date?** This becomes `SpineSourceDeclarationV1.snapshot_policy`.
+
+- [ ] **Step 4: Record `None`-vs-unknown explicitly.** For each table write either "verified unpartitioned" or the partition columns. **Never leave it unstated** — spec §3.3 treats `None` as *verified unpartitioned*, and an unknown recorded as `None` would silently license reading the wrong data.
+
+- [ ] **Step 5: Commit** — `docs: HDFC target-cluster inventory (Spec A Task 0)`
 
 ---
 
-### Task 1: `materialize_hash`
+### Task 1: `materialize_hash` + package skeleton
 
-**Files:** Create `src/featuregen/materialize/__init__.py`, `canonical.py`; Test `tests/featuregen/materialize/test_canonical.py`
-
+**Files:** Create `src/featuregen/materialize/{__init__,canonical}.py`; Test `tests/featuregen/materialize/test_canonical.py`
 **Produces:** `materialize_hash(payload: Mapping[str, Any]) -> str`
 
 - [ ] **Step 1: Failing test**
@@ -134,7 +91,7 @@ def test_rejects_non_mapping():
         materialize_hash([1])  # type: ignore[arg-type]
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (`ModuleNotFoundError`)
+- [ ] **Step 2: Run — FAIL** (`ModuleNotFoundError`)
 - [ ] **Step 3: Implement**
 
 ```python
@@ -157,118 +114,100 @@ def materialize_hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(_jcs_dumps(dict(payload))).hexdigest()
 ```
 
-- [ ] **Step 4: Run — expect PASS (4)**
-- [ ] **Step 5: Commit** — `feat(materialize): JCS+sha256 hasher`
+- [ ] **Step 4: Run — PASS (4)** · **Step 5: Commit** — `feat(materialize): JCS+sha256 hasher`
 
 ---
 
-### Task 2: `ResolvedFeatureInput` — the only public input
+### Task 2: Terminal-event reader + Gate 1 admission
 
-Spec §0. A bare formula must not be materializable.
+Spec §1.2. **`trace.py` has no public event reader — this task adds one.**
 
-**Files:** Create `src/featuregen/materialize/admission.py`, `tests/featuregen/materialize/fixtures.py`; Test `tests/featuregen/materialize/test_admission.py`
+**Files:** Modify `src/featuregen/formula/trace.py`; Create `src/featuregen/materialize/admission.py`, `tests/featuregen/materialize/fixtures.py`; Test `tests/featuregen/formula/test_trace_reader.py`, `tests/featuregen/materialize/test_admission.py`
 
-**Consumes:** `featuregen.formula.result.AuthoringResult`; `featuregen.formula.turns.AuthoringIntent`; `featuregen.formula.canonical.formula_content_hash`; `featuregen.formula.authoring` (for `authoring_intent_hash`); `allowed_sensitivities`.
+**Consumes (verified):** `AuthoringResult` (`result.py:97`, carries `authoring_run_id`) · terminal payload fields (`authoring.py:393-408`) · `authoring_intent_hash` (`authoring.py:253`) · `_durable_read` (`trace.py:432`) · `formula_content_hash`.
 
-**Produces:** `ResolvedFeatureInput` (frozen: `intent`, `result`); `AdmissionRefused(Exception)` with `.code`; `admit(conn, inputs: Sequence[ResolvedFeatureInput], *, roles: Iterable[str]) -> tuple[AdmittedFeature, ...]` where `AdmittedFeature` is frozen `(feature_name: str, formula: TypedFormulaV1, formula_content_hash: str, intent: AuthoringIntent)`.
+**Produces:** `TerminalEvent` (frozen: `kind`, `payload: Mapping`, `payload_hash: str`); `read_terminal_event(conn, run_id) -> TerminalEvent | None`; `ResolvedFeatureInput` (frozen: `intent`, `result`); `AdmissionRefused(Exception)` with `.code`; `AdmittedFeature` (frozen: `feature_name`, `formula`, `formula_content_hash`, `intent`, `authoring_run_id`); `admit_artifacts(conn, inputs) -> tuple[AdmittedFeature, ...]`.
 
-- [ ] **Step 1: Write the hand-authored fixtures (VERIFIED field names)**
+- [ ] **Step 1: Failing reader test**
+
+```python
+# tests/featuregen/formula/test_trace_reader.py
+from featuregen.formula.trace import TraceEventKind, append_event, read_terminal_event
+
+
+def test_no_terminal_event_reads_none(db, open_run):
+    append_event(db, open_run, TraceEventKind.STARTED, seq=0, idempotency_key="k0", payload={})
+    assert read_terminal_event(db, open_run) is None
+
+
+def test_terminal_event_returns_payload_and_hash(db, open_run):
+    append_event(db, open_run, TraceEventKind.COMPLETED, seq=1, idempotency_key="k1",
+                 payload={"authoring_disposition": "RESOLVED"})
+    ev = read_terminal_event(db, open_run)
+    assert ev.kind == "COMPLETED"
+    assert ev.payload["authoring_disposition"] == "RESOLVED"
+    assert len(ev.payload_hash) == 64
+```
+
+- [ ] **Step 2: Run — FAIL** · **Step 3: Implement `read_terminal_event`** in `trace.py` using `_durable_read`, selecting `kind, payload, payload_hash` where `kind IN (COMPLETED, FAILED)`.
+- [ ] **Step 4: Run — PASS (3)**
+
+- [ ] **Step 5: Write the fixtures — verified field names**
 
 ```python
 # tests/featuregen/materialize/fixtures.py
-"""Hand-authored fixtures. Field names verified against src/featuregen/formula/schema.py."""
+"""Hand-authored fixtures. Field names verified in the interfaces reference §6.
+
+NOTE the output policies: Child-1 resolves a plain SUM to NON_ADDITIVE without
+partition_proof.path_additive, and COUNT_DISTINCT to NON_ADDITIVE with logical type
+`integer`. A fixture claiming otherwise is a FORGERY and Gate 1 will reject it.
+"""
 from __future__ import annotations
 
 from featuregen.formula.schema import (
     AdditivityClass, AggregateExpression, AggregateFunction, DecimalPolicy, EmptyWindowResult,
     FilterPredicate, FilterPredicateOp, FormulaOutputPolicyV1, Grain, Inclusivity, LiteralType,
-    NullInput, OverflowBehavior, RatioBody, RoundingMode, SourceRelation, TypedFormulaV1,
-    TypedLiteral, UnaryBody, WindowBasis, WindowPolicy, WindowUnit,
+    NullInput, OverflowBehavior, RoundingMode, SourceRelation, TypedFormulaV1, TypedLiteral,
+    UnaryBody, WindowBasis, WindowPolicy, WindowUnit,
 )
 from featuregen.formula.turns import AuthoringIntent
 
 SRC = "hdfc"
 TXN = f"{SRC}::banking.transactions"
-AMOUNT = f"{TXN}.amount"
-TXN_DATE = f"{TXN}.transaction_date"
-POSTED_AT = f"{TXN}.posted_at"
-TXN_TYPE = f"{TXN}.transaction_type"
-MERCHANT = f"{TXN}.merchant_id"
-IS_CROSS_BORDER = f"{TXN}.is_cross_border"
-ACCOUNT_ID = f"{TXN}.account_id"
+AMOUNT, TXN_DATE, POSTED_AT = f"{TXN}.amount", f"{TXN}.transaction_date", f"{TXN}.posted_at"
+TXN_TYPE, MERCHANT = f"{TXN}.transaction_type", f"{TXN}.merchant_id"
 CIF_ID = f"{SRC}::banking.accounts.cif_id"
 CUSTOMERS = f"{SRC}::banking.customers"
 
 
-def _window(length: int, unit: WindowUnit = WindowUnit.DAY) -> WindowPolicy:
+def _window(length: int) -> WindowPolicy:
     return WindowPolicy(
-        event_time_ref=TXN_DATE, basis=WindowBasis.TRAILING, length=length, unit=unit,
+        event_time_ref=TXN_DATE, basis=WindowBasis.TRAILING, length=length, unit=WindowUnit.DAY,
         start_inclusive=Inclusivity.INCLUSIVE, end_inclusive=Inclusivity.INCLUSIVE,
         timezone="Asia/Dubai", empty_window=EmptyWindowResult.ZERO, null_input=NullInput.IGNORE)
 
 
 def _eq(left: str, value: str) -> FilterPredicate:
-    # NOTE: `kind` is init=False; there is NO right_ref field.
+    # `kind` is init=False; there is NO right_ref field.
     return FilterPredicate(op=FilterPredicateOp.EQUAL, left=left,
                            right_literal=TypedLiteral(type=LiteralType.STRING, value=value))
-
-
-def _decimal() -> DecimalPolicy:
-    return DecimalPolicy(precision=18, scale=2, rounding=RoundingMode.HALF_UP,
-                         overflow=OverflowBehavior.ERROR)
-
-
-def _grain() -> Grain:
-    return Grain(entity="customer", keys=(CIF_ID,))
 
 
 def total_debit_amount_30d() -> TypedFormulaV1:
     return TypedFormulaV1(
         formula_schema_version=1, operation_grammar_version=1, output_policy_version=1,
-        canonicalization_version=1, grain=_grain(),
+        canonicalization_version=1, grain=Grain(entity="customer", keys=(CIF_ID,)),
         body=UnaryBody(expr=AggregateExpression(
             aggregation=AggregateFunction.SUM, operand=AMOUNT,
             source_relation=SourceRelation(table_ref=TXN),
             filter=_eq(TXN_TYPE, "debit"), window=_window(30))),
-        parameters=(), decimal=_decimal(),
-        output=FormulaOutputPolicyV1(output_type="numeric", unit=None, currency=None,
-                                     output_additivity=AdditivityClass.ADDITIVE,
-                                     external_type_required=False))
-
-
-def distinct_merchant_count_90d() -> TypedFormulaV1:
-    return TypedFormulaV1(
-        formula_schema_version=1, operation_grammar_version=1, output_policy_version=1,
-        canonicalization_version=1, grain=_grain(),
-        body=UnaryBody(expr=AggregateExpression(
-            aggregation=AggregateFunction.COUNT_DISTINCT, operand=MERCHANT,
-            source_relation=SourceRelation(table_ref=TXN), filter=None, window=_window(90))),
-        parameters=(), decimal=_decimal(),
-        output=FormulaOutputPolicyV1(output_type="numeric", unit=None, currency=None,
-                                     output_additivity=AdditivityClass.NON_ADDITIVE,
-                                     external_type_required=False))
-
-
-def cross_border_value_ratio_90d() -> TypedFormulaV1:
-    """RATIO — exercises numerator/denominator, zero-denominator policy and rounding."""
-    from featuregen.formula.schema import ZeroDenominator
-    return TypedFormulaV1(
-        formula_schema_version=1, operation_grammar_version=1, output_policy_version=1,
-        canonicalization_version=1, grain=_grain(),
-        body=RatioBody(
-            numerator=AggregateExpression(
-                aggregation=AggregateFunction.SUM, operand=AMOUNT,
-                source_relation=SourceRelation(table_ref=TXN),
-                filter=_eq(IS_CROSS_BORDER, "true"), window=_window(90)),
-            denominator=AggregateExpression(
-                aggregation=AggregateFunction.SUM, operand=AMOUNT,
-                source_relation=SourceRelation(table_ref=TXN), filter=None,
-                window=_window(90)),
-            zero_denominator=ZeroDenominator.NULL),
-        parameters=(), decimal=_decimal(),
-        output=FormulaOutputPolicyV1(output_type="decimal", unit=None, currency=None,
-                                     output_additivity=AdditivityClass.NON_ADDITIVE,
-                                     external_type_required=False))
+        parameters=(),
+        decimal=DecimalPolicy(precision=18, scale=2, rounding=RoundingMode.HALF_UP,
+                              overflow=OverflowBehavior.ERROR),
+        output=FormulaOutputPolicyV1(
+            output_type="numeric", unit=None, currency=None,
+            output_additivity=AdditivityClass.NON_ADDITIVE,   # verified: no path_additive proof
+            external_type_required=False))
 
 
 def intent_for(name: str) -> AuthoringIntent:
@@ -276,418 +215,438 @@ def intent_for(name: str) -> AuthoringIntent:
                            target_entity="customer", target_grain_keys=(CIF_ID,))
 ```
 
-> Run `PYTHONPATH=src .venv/bin/python -c "from tests.featuregen.materialize.fixtures import *; total_debit_amount_30d(); distinct_merchant_count_90d(); cross_border_value_ratio_90d()"` **first**. If any field name is wrong, fix the fixture (not the schema) before continuing.
+**Before continuing**, run:
+`PYTHONPATH=src .venv/bin/python -c "from tests.featuregen.materialize.fixtures import *; total_debit_amount_30d()"`
+If any field name is wrong, fix the fixture **and** correct the interfaces reference.
 
-- [ ] **Step 2: Failing admission tests**
+- [ ] **Step 6: Failing Gate-1 tests**
 
 ```python
+# tests/featuregen/materialize/test_admission.py
 import pytest
-from featuregen.formula.canonical import formula_content_hash
-from featuregen.materialize.admission import AdmissionRefused, ResolvedFeatureInput, admit
+from featuregen.materialize.admission import AdmissionRefused, ResolvedFeatureInput, admit_artifacts
 from tests.featuregen.materialize.fixtures import intent_for, total_debit_amount_30d
 
 
-def test_non_resolved_disposition_is_refused(db, needs_review_result):
+def test_no_terminal_event_is_refused(db, run_without_terminal, result_for):
     with pytest.raises(AdmissionRefused) as e:
-        admit(db, [ResolvedFeatureInput(intent_for("f"), needs_review_result)], roles=("admin",))
+        admit_artifacts(db, [ResolvedFeatureInput(intent_for("f"), result_for(run_without_terminal))])
+    assert e.value.code == "AUTHORING_RUN_INCOMPLETE"
+
+
+def test_terminal_disposition_not_resolved_is_refused(db, rejected_run, result_for):
+    """A REJECTED run still writes a COMPLETED event — only the PAYLOAD says otherwise."""
+    with pytest.raises(AdmissionRefused) as e:
+        admit_artifacts(db, [ResolvedFeatureInput(intent_for("f"), result_for(rejected_run))])
     assert e.value.code == "NOT_RESOLVED"
 
 
-def test_missing_candidate_formula_is_refused(db, resolved_result_without_formula):
+def test_forged_result_with_a_legitimate_run_is_refused(db, resolved_run, forged_result):
+    """The attack: claim RESOLVED, attach any formula, cite a real run id."""
     with pytest.raises(AdmissionRefused) as e:
-        admit(db, [ResolvedFeatureInput(intent_for("f"), resolved_result_without_formula)],
-              roles=("admin",))
-    assert e.value.code == "NO_CANDIDATE_FORMULA"
-
-
-def test_formula_hash_disagreement_is_refused(db, tampered_result):
-    with pytest.raises(AdmissionRefused) as e:
-        admit(db, [ResolvedFeatureInput(intent_for("f"), tampered_result)], roles=("admin",))
+        admit_artifacts(db, [ResolvedFeatureInput(intent_for("f"), forged_result(resolved_run))])
     assert e.value.code == "FORMULA_HASH_MISMATCH"
 
 
-def test_intent_hash_mismatch_is_refused(db, resolved_result, foreign_intent):
+def test_axes_disagreeing_with_the_terminal_event_are_refused(db, resolved_run, tweaked_axes_result):
     with pytest.raises(AdmissionRefused) as e:
-        admit(db, [ResolvedFeatureInput(foreign_intent, resolved_result)], roles=("admin",))
+        admit_artifacts(db, [ResolvedFeatureInput(intent_for("f"),
+                                                  tweaked_axes_result(resolved_run))])
+    assert e.value.code == "AXES_MISMATCH"
+
+
+def test_tampered_terminal_payload_is_refused(db, tampered_terminal, result_for):
+    with pytest.raises(AdmissionRefused) as e:
+        admit_artifacts(db, [ResolvedFeatureInput(intent_for("f"), result_for(tampered_terminal))])
+    assert e.value.code == "TERMINAL_PAYLOAD_TAMPERED"
+
+
+def test_intent_hash_mismatch_is_refused(db, resolved_run, result_for):
+    with pytest.raises(AdmissionRefused) as e:
+        admit_artifacts(db, [ResolvedFeatureInput(intent_for("a_different_feature"),
+                                                  result_for(resolved_run))])
     assert e.value.code == "INTENT_HASH_MISMATCH"
 
 
-def test_insufficient_roles_refuse_the_whole_compilation(db, resolved_result, restricted_catalog):
-    with pytest.raises(AdmissionRefused) as e:
-        admit(db, [ResolvedFeatureInput(intent_for("total_debit_amount_30d"), resolved_result)],
-              roles=("catalog_viewer",))
-    assert e.value.code == "READ_SCOPE_INSUFFICIENT"
-
-
-def test_admitted_feature_takes_its_name_from_the_INTENT(db, resolved_result, seeded_catalog):
-    out = admit(db, [ResolvedFeatureInput(intent_for("total_debit_amount_30d"), resolved_result)],
-                roles=("feature_engineer",))
+def test_admitted_feature_name_comes_from_the_intent(db, resolved_run, result_for):
+    out = admit_artifacts(db, [ResolvedFeatureInput(intent_for("total_debit_amount_30d"),
+                                                    result_for(resolved_run))])
     assert out[0].feature_name == "total_debit_amount_30d"
-    assert out[0].formula_content_hash == formula_content_hash(total_debit_amount_30d())
 
 
-def test_there_is_no_api_accepting_a_bare_formula():
+def test_no_function_accepts_a_bare_formula():
     import inspect
     import featuregen.materialize.admission as m
     for name, fn in inspect.getmembers(m, inspect.isfunction):
-        if name.startswith("_"):
-            continue
-        params = inspect.signature(fn).parameters
-        assert "formula" not in params and "formulas" not in params, (
-            f"{name} exposes a raw-formula entry point, bypassing the governed gate")
+        if not name.startswith("_"):
+            params = inspect.signature(fn).parameters
+            assert "formula" not in params and "formulas" not in params, (
+                f"{name} exposes a raw-formula entry point, bypassing the governed gate")
 ```
 
-- [ ] **Step 3: Run — expect FAIL**
-- [ ] **Step 4: Implement `admission.py`** — the five checks in spec §0 order, each raising `AdmissionRefused` with its code. Role authorization collects **every** ref the formula names (operands, filter `left` refs, event-time refs, grain keys, source tables) and compares each element's `graph_node.sensitivity` against `allowed_sensitivities(roles)`; the spine source is added in Task 4 and this check is extended there.
-- [ ] **Step 5: Run — expect PASS (7)**
-- [ ] **Step 6: Commit** — `feat(materialize): governed ResolvedFeatureInput admission gate`
+- [ ] **Step 7: Run — FAIL** · **Step 8: Implement the six checks in spec §1.2 order** · **Step 9: Run — PASS (8)**
+- [ ] **Step 10: Commit** — `feat(materialize): Gate 1 admission against the immutable terminal event`
 
 ---
 
-### Task 3: `JoinPlan` over the existing planner
+### Task 3: `JoinPlan` — extend the planner, then adapt it
 
-Spec §A3. **Do not hand-roll join resolution.**
+Spec §3.1–3.2. **Two parts: the planner must first be taught to keep authority.**
 
-**Files:** Create `src/featuregen/materialize/joins.py`; Test `tests/featuregen/materialize/test_joins.py`
+**Files:** Modify `src/featuregen/overlay/upload/join_path.py`; Create `src/featuregen/materialize/joins.py`; Test `tests/featuregen/overlay/upload/test_join_path_authority.py`, `tests/featuregen/materialize/test_joins.py`
 
-**Produces:** `JoinPlanStep` (frozen: `from_ref`, `to_ref`, `cardinality`); `JoinPlan` (frozen: `steps`, `outcome_kind`, `roles_used`, `fans_out: bool`); `JoinRefused` (frozen: `code`, `detail`); `plan_join(conn, *, catalog_source, from_table, to_table, roles) -> JoinPlan | JoinRefused`.
+**Produces:** `JoinStep` gains `approved_join_fact_key`, `approved_join_status`, `authority`; `JoinPlanStep`; `JoinPlan` (frozen: `steps`, `outcome_kind`, `roles_used`, `fans_out`); `JoinRefused` (frozen: `code`, `detail`); `plan_join(conn, *, catalog_source, from_table_ref, to_table_ref, roles) -> JoinPlan | JoinRefused`.
 
-- [ ] **Step 1: Failing tests**
+- [ ] **Step 1: Failing planner-authority test**
 
 ```python
-import pytest
-from featuregen.materialize.joins import JoinPlan, JoinRefused, plan_join
+# tests/featuregen/overlay/upload/test_join_path_authority.py
+def test_operational_steps_retain_their_approving_fact(db, verified_join_catalog):
+    """Verified: clearing.append((from_ref, to_ref, card)) currently DROPS the fact key."""
+    outcome = classify_join_path(db, "hdfc", "transactions", "accounts", roles=("feature_engineer",))
+    assert outcome.kind == JoinOutcome.OPERATIONAL
+    assert outcome.steps[0].approved_join_fact_key is not None
+    assert outcome.steps[0].approved_join_status == "VERIFIED"
 
 
-def test_operational_path_retains_every_step_and_cardinality(db, verified_join_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.transactions",
-                       to_table="banking.accounts", roles=("feature_engineer",))
-    assert isinstance(result, JoinPlan)
-    assert result.steps and all(s.cardinality for s in result.steps)
+def test_file_declared_edges_report_their_authority(db, declared_join_catalog):
+    outcome = classify_join_path(db, "hdfc", "transactions", "accounts", roles=("feature_engineer",))
+    assert outcome.steps[0].approved_join_fact_key is None
+    assert outcome.steps[0].authority == "operational"
+```
+
+- [ ] **Step 2: Run — FAIL** · **Step 3: Carry `approved_join_fact_key`/`approved_join_status` through the clearing tuple, inside the existing query** (they are already SELECTed at `:105-106`). Do **not** add a second read. · **Step 4: Run — PASS**
+
+- [ ] **Step 5: Failing adapter tests**
+
+```python
+# tests/featuregen/materialize/test_joins.py
+def test_schema_qualified_refs_are_reduced_to_bare_table_names(db, verified_join_catalog):
+    """VERIFIED: _table_of returns parts[1]; a schema-qualified destination never matches."""
+    result = plan_join(db, catalog_source="hdfc",
+                       from_table_ref="hdfc::banking.transactions",
+                       to_table_ref="hdfc::banking.accounts", roles=("feature_engineer",))
+    assert isinstance(result, JoinPlan) and result.steps
 
 
-def test_fan_out_is_flagged_when_a_step_is_one_to_many(db, one_to_many_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.accounts",
-                       to_table="banking.transactions", roles=("feature_engineer",))
-    assert isinstance(result, JoinPlan)
-    assert result.fans_out is True     # renderer MUST collapse before joining
+def test_duplicate_table_name_across_schemas_is_refused(db, ambiguous_catalog):
+    result = plan_join(db, catalog_source="hdfc",
+                       from_table_ref="hdfc::banking.transactions",
+                       to_table_ref="hdfc::archive.transactions", roles=("feature_engineer",))
+    assert isinstance(result, JoinRefused) and result.code == "AMBIGUOUS_TABLE_NAME"
 
 
-def test_unverified_path_is_refused(db, unverified_join_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.transactions",
-                       to_table="banking.accounts", roles=("feature_engineer",))
-    assert isinstance(result, JoinRefused) and result.code == "JOIN_PATH_NOT_VERIFIED"
+def test_authority_survives_into_the_plan(db, verified_join_catalog):
+    result = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
+                       to_table_ref="hdfc::banking.accounts", roles=("feature_engineer",))
+    assert result.steps[0].approved_join_fact_key is not None
 
 
-def test_denied_by_read_scope_is_refused_distinctly(db, restricted_join_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.transactions",
-                       to_table="banking.accounts", roles=("catalog_viewer",))
-    assert isinstance(result, JoinRefused)
-    assert result.code == "JOIN_PATH_DENIED_BY_READ_SCOPE"
+def test_fan_out_toward_the_grain_is_REFUSED(db, joint_account_catalog):
+    """A 1:N step is refused, never repaired — allocation is a business decision."""
+    result = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
+                       to_table_ref="hdfc::banking.customers", roles=("feature_engineer",))
+    assert isinstance(result, JoinRefused) and result.code == "JOIN_FANOUT_UNSUPPORTED"
 
 
-def test_no_path_is_refused(db, empty_join_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.transactions",
-                       to_table="banking.unrelated", roles=("feature_engineer",))
-    assert isinstance(result, JoinRefused) and result.code == "GRAIN_PATH_NOT_GOVERNED"
+def test_no_deduplication_helper_exists_anywhere_in_the_module():
+    import inspect
+    from featuregen.materialize import joins
+    src = inspect.getsource(joins)
+    for banned in ("dropDuplicates", "drop_duplicates", "distinct("):
+        assert banned not in src, "fan-out must be refused, not repaired"
+
+
+def test_unverified_denied_and_no_path_map_to_distinct_codes(db, unverified_cat, restricted_cat,
+                                                             empty_cat):
+    assert plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
+                     to_table_ref="hdfc::banking.accounts",
+                     roles=("feature_engineer",)).code == "JOIN_PATH_NOT_VERIFIED"
+    # …restricted_cat -> JOIN_PATH_DENIED_BY_READ_SCOPE ; empty_cat -> GRAIN_PATH_NOT_GOVERNED
 
 
 def test_same_table_needs_no_steps(db, verified_join_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.transactions",
-                       to_table="banking.transactions", roles=("feature_engineer",))
+    result = plan_join(db, catalog_source="hdfc", from_table_ref="hdfc::banking.transactions",
+                       to_table_ref="hdfc::banking.transactions", roles=("feature_engineer",))
     assert isinstance(result, JoinPlan) and result.steps == ()
-
-
-def test_roles_are_recorded_in_the_plan(db, verified_join_catalog):
-    result = plan_join(db, catalog_source="hdfc", from_table="banking.transactions",
-                       to_table="banking.accounts", roles=("feature_engineer",))
-    assert result.roles_used == ("feature_engineer",)
 ```
 
-- [ ] **Step 2: Run — expect FAIL**
-- [ ] **Step 3: Implement `joins.py`** — a thin adapter that calls `classify_join_path` and maps `JoinOutcome.kind` per spec §A3's table. `fans_out` is `True` when any step's cardinality expands toward the destination. **No BFS, no bridge scanning, no prefix matching in this module.**
-- [ ] **Step 4: Run — expect PASS (7)**
-- [ ] **Step 5: Commit** — `feat(materialize): JoinPlan adapter over classify_join_path`
+- [ ] **Step 6: Run — FAIL** · **Step 7: Implement the adapter.** Parse with `parse_ref`, pass **bare** table names, keep schema/source separately, refuse ambiguity, map the four outcomes, and refuse any step whose cardinality fans out toward the destination. **No BFS, no bridge scan, no prefix matching in this module.** · **Step 8: Run — PASS (7)**
+- [ ] **Step 9: Commit** — `feat(materialize): JoinPlan adapter; planner retains join authority`
 
 ---
 
-### Task 4: `SpineSpec` — the governed entity population
+### Task 4: `SpineSourceDeclarationV1`
 
-Spec §A4. Without this, "every customer appears" is a lie.
+Spec §4. Facts validate; they never choose.
 
 **Files:** Create `src/featuregen/materialize/spine.py`; Test `tests/featuregen/materialize/test_spine.py`
-
-**Produces:** `SpineSpec` (frozen, per spec §A4); `SpineRefused` (frozen: `code="SPINE_SOURCE_NOT_GOVERNED"`, `detail`); `resolve_spine(conn, *, entity, grain_keys, roles, business_dt_column="business_dt") -> SpineSpec | SpineRefused`.
+**Produces:** `PopulationSemantics` (closed StrEnum); `SnapshotPolicy`; `SpineSourceDeclarationV1`; `SpineRefused`; `validate_spine_declaration(conn, decl, *, roles) -> SpineSpec | SpineRefused`.
 
 - [ ] **Step 1: Failing tests**
 
 ```python
-import pytest
-from featuregen.materialize.spine import SpineRefused, SpineSpec, resolve_spine
-
-
-def test_governed_entity_source_resolves(db, customers_entity_source):
-    out = resolve_spine(db, entity="customer", grain_keys=("hdfc::banking.accounts.cif_id",),
-                        roles=("feature_engineer",))
-    assert isinstance(out, SpineSpec)
+def test_facts_validate_but_never_choose(db, two_candidate_customer_tables, declaration_for_customers):
+    """kyc_customers ALSO has a unique cif_id; only the DECLARATION picks the master."""
+    out = validate_spine_declaration(db, declaration_for_customers, roles=("feature_engineer",))
     assert out.source_table_ref == "hdfc::banking.customers"
 
 
-def test_absent_entity_source_fails_closed(db, no_entity_source):
-    out = resolve_spine(db, entity="customer", grain_keys=("hdfc::banking.accounts.cif_id",),
-                        roles=("feature_engineer",))
-    assert isinstance(out, SpineRefused) and out.code == "SPINE_SOURCE_NOT_GOVERNED"
+def test_no_declaration_is_refused(db):
+    with pytest.raises(TypeError):
+        validate_spine_declaration(db, None, roles=())  # there is no inference path
 
 
-def test_spine_never_falls_back_to_a_fact_table(db, only_transactions):
-    # A spine built from transactions cannot contain a customer with no transactions.
-    out = resolve_spine(db, entity="customer", grain_keys=("hdfc::banking.accounts.cif_id",),
-                        roles=("feature_engineer",))
+def test_facts_may_REJECT_a_declaration(db, declaration_naming_a_non_unique_table):
+    out = validate_spine_declaration(db, declaration_naming_a_non_unique_table,
+                                     roles=("feature_engineer",))
+    assert isinstance(out, SpineRefused) and out.code == "SPINE_DECLARATION_REJECTED_BY_FACTS"
+
+
+def test_declaration_denied_by_read_scope_is_refused(db, restricted_customers, declaration):
+    out = validate_spine_declaration(db, declaration, roles=("catalog_viewer",))
     assert isinstance(out, SpineRefused)
 
 
-def test_spine_keys_needing_a_hop_carry_a_join_plan(db, customers_via_accounts):
-    out = resolve_spine(db, entity="customer", grain_keys=("hdfc::banking.accounts.cif_id",),
-                        roles=("feature_engineer",))
-    assert isinstance(out, SpineSpec) and out.join_plan is not None
+def test_population_semantics_is_a_closed_enum():
+    from featuregen.materialize.spine import PopulationSemantics
+    assert {p.value for p in PopulationSemantics} == {
+        "current_complete_population", "current_active_only", "historical_as_of"}
 
 
-def test_spine_source_hidden_by_read_scope_is_refused(db, restricted_customers):
-    out = resolve_spine(db, entity="customer", grain_keys=("hdfc::banking.accounts.cif_id",),
-                        roles=("catalog_viewer",))
-    assert isinstance(out, SpineRefused)
+def test_no_free_text_sql_predicate_is_accepted(db):
+    import inspect
+    from featuregen.materialize import spine
+    fields = {f.name for f in dataclasses.fields(spine.SpineSourceDeclarationV1)}
+    assert not any("sql" in f or "predicate" in f or "where" in f for f in fields)
 
 
-def test_snapshot_identity_is_recorded(db, customers_entity_source):
-    out = resolve_spine(db, entity="customer", grain_keys=("hdfc::banking.accounts.cif_id",),
-                        roles=("feature_engineer",))
-    assert out.snapshot_identity
+def test_declared_by_is_never_minted_inside_the_module():
+    import inspect
+    from featuregen.materialize import spine
+    assert "authenticated=True" not in inspect.getsource(spine)
 ```
 
-- [ ] **Step 2: Run — expect FAIL**
-- [ ] **Step 3: Implement `spine.py`** — resolve the entity's governed source via the `ENTITY_ASSIGNMENT`/`GRAIN` facts for the entity; require the source's grain fact to be `is_unique` over the entity keys; use `plan_join` (Task 3) when spine keys differ from grain keys; refuse otherwise. Extend Task 2's role check to include the spine source.
-- [ ] **Step 4: Run — expect PASS (6)**
-- [ ] **Step 5: Commit** — `feat(materialize): governed SpineSpec resolution, fail closed`
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): SpineSourceDeclarationV1, facts validate never choose`
 
 ---
 
-### Task 5: `ExpressionExecutionIR` — PIT per expression
+### Task 5: Physical input snapshots
 
-Spec §A2. Each `AggregateExpression` gets its own read set, join plan and `PitSpec`.
+Spec §3.3. Parameterized on Task 0; **assumes no partition column.**
 
-**Files:** Create `src/featuregen/materialize/expression_ir.py`; Test `tests/featuregen/materialize/test_expression_ir.py`
-
-**Produces:** `PhysicalRef` (frozen: `logical_ref`, `schema`, `table`, `column | None`, `role`); `PitSpec` (frozen: `event_time_column`, `availability_column`, `availability_basis`, `lag_hours: float | None`, `window_basis`, `window_length`, `window_unit`, `start_inclusive`, `end_inclusive`, `timezone`); `ExpressionExecutionIR` (frozen, per spec §A2); `ExpressionRefused` (frozen: `code`, `detail`); `compile_expression(conn, *, expr_path, expr, grain_keys, roles) -> ExpressionExecutionIR | ExpressionRefused`; `expression_ir_hash(e) -> str`.
+**Files:** Create `src/featuregen/materialize/snapshots.py`; Test `test_snapshots.py`
+**Produces:** `PartitionSpec`; `PhysicalInputSnapshot`; `resolve_snapshots(inventory, *, table_ref, window, business_dt) -> tuple[PhysicalInputSnapshot, ...] | SnapshotRefused`.
 
 - [ ] **Step 1: Failing tests**
 
 ```python
-import pytest
-from featuregen.materialize.expression_ir import (
-    ExpressionExecutionIR, ExpressionRefused, compile_expression, expression_ir_hash,
-)
-from tests.featuregen.materialize.fixtures import (
-    AMOUNT, TXN_DATE, TXN_TYPE, cross_border_value_ratio_90d, total_debit_amount_30d,
-)
+def test_a_90_day_window_resolves_MANY_partitions(daily_partitioned_inventory):
+    snaps = resolve_snapshots(daily_partitioned_inventory, table_ref="hdfc::banking.transactions",
+                              window=_window(90), business_dt="2026-07-27")
+    assert len(snaps[0].partition_specs) == 90       # plural is the whole point
 
 
-def test_read_set_includes_operand_filter_and_event_time(db, seeded_catalog):
-    e = compile_expression(db, expr_path="body.expr",
-                           expr=total_debit_amount_30d().body.expr,
-                           grain_keys=("hdfc::banking.accounts.cif_id",),
-                           roles=("feature_engineer",))
-    refs = {r.logical_ref for r in e.physical_read_set}
-    assert {AMOUNT, TXN_TYPE, TXN_DATE} <= refs
+def test_verified_unpartitioned_yields_None_not_empty(unpartitioned_inventory):
+    snaps = resolve_snapshots(unpartitioned_inventory, table_ref="hdfc::banking.customers",
+                              window=None, business_dt="2026-07-27")
+    assert snaps[0].partition_specs is None
 
 
-def test_each_ratio_expression_gets_its_OWN_pit(db, seeded_catalog):
-    f = cross_border_value_ratio_90d()
-    num = compile_expression(db, expr_path="body.numerator", expr=f.body.numerator,
-                             grain_keys=("hdfc::banking.accounts.cif_id",),
-                             roles=("feature_engineer",))
-    den = compile_expression(db, expr_path="body.denominator", expr=f.body.denominator,
-                             grain_keys=("hdfc::banking.accounts.cif_id",),
-                             roles=("feature_engineer",))
-    assert num.expr_path != den.expr_path
-    assert num.pit is not den.pit          # independent specs, not a shared object
+def test_unknown_layout_is_REFUSED_not_treated_as_unpartitioned(empty_inventory):
+    out = resolve_snapshots(empty_inventory, table_ref="hdfc::banking.transactions",
+                            window=_window(30), business_dt="2026-07-27")
+    assert isinstance(out, SnapshotRefused) and out.code == "PARTITION_IDENTITY_UNKNOWN"
 
 
-def test_expressions_with_different_windows_hash_differently(db, seeded_catalog):
-    a = compile_expression(db, expr_path="body.expr", expr=total_debit_amount_30d().body.expr,
-                           grain_keys=("hdfc::banking.accounts.cif_id",),
-                           roles=("feature_engineer",))
-    f = cross_border_value_ratio_90d()
-    b = compile_expression(db, expr_path="body.expr", expr=f.body.denominator,
-                           grain_keys=("hdfc::banking.accounts.cif_id",),
-                           roles=("feature_engineer",))
-    assert expression_ir_hash(a) != expression_ir_hash(b)
-
-
-def test_missing_availability_fact_fails_closed(db, catalog_without_availability):
-    out = compile_expression(db, expr_path="body.expr", expr=total_debit_amount_30d().body.expr,
-                             grain_keys=("hdfc::banking.accounts.cif_id",),
-                             roles=("feature_engineer",))
-    assert isinstance(out, ExpressionRefused)
-    assert out.code == "AVAILABILITY_TIME_NOT_GOVERNED"
-
-
-def test_ungoverned_join_to_the_grain_fails_closed(db, catalog_without_join):
-    out = compile_expression(db, expr_path="body.expr", expr=total_debit_amount_30d().body.expr,
-                             grain_keys=("hdfc::banking.accounts.cif_id",),
-                             roles=("feature_engineer",))
-    assert isinstance(out, ExpressionRefused)
-    assert out.code in {"GRAIN_PATH_NOT_GOVERNED", "JOIN_PATH_NOT_VERIFIED"}
-
-
-def test_join_keys_and_hops_enter_the_read_set(db, seeded_catalog):
-    e = compile_expression(db, expr_path="body.expr", expr=total_debit_amount_30d().body.expr,
-                           grain_keys=("hdfc::banking.accounts.cif_id",),
-                           roles=("feature_engineer",))
-    # account_id is not an operand or a filter — it is only a join key, and §C classifies over it.
-    assert any(r.column == "account_id" for r in e.physical_read_set)
-
-
-def test_fan_out_flag_is_carried_from_the_join_plan(db, one_to_many_catalog):
-    e = compile_expression(db, expr_path="body.expr", expr=total_debit_amount_30d().body.expr,
-                           grain_keys=("hdfc::banking.accounts.cif_id",),
-                           roles=("feature_engineer",))
-    assert isinstance(e, ExpressionExecutionIR)
-    assert e.join_plan.fans_out is True
-
-
-def test_hash_excludes_provenance(db, seeded_catalog):
-    e = compile_expression(db, expr_path="body.expr", expr=total_debit_amount_30d().body.expr,
-                           grain_keys=("hdfc::banking.accounts.cif_id",),
-                           roles=("feature_engineer",))
-    for banned in ("compiled_at", "roles_used", "run_id"):
-        assert banned not in e.identity_payload()
+def test_business_dt_is_never_assumed_to_be_the_partition_column(hourly_partitioned_inventory):
+    snaps = resolve_snapshots(hourly_partitioned_inventory, table_ref="hdfc::banking.transactions",
+                              window=_window(1), business_dt="2026-07-27")
+    cols = {c for s in snaps[0].partition_specs for c, _ in s.columns}
+    assert "business_dt" not in cols        # the inventory said the column is `load_hour`
 ```
 
-- [ ] **Step 2: Run — expect FAIL**
-- [ ] **Step 3: Implement `expression_ir.py`** — read `AVAILABILITY_TIME` for the expression's source table (fail closed if absent); build `PitSpec` from that fact plus the expression's own `WindowPolicy`; call `plan_join` (Task 3) from the expression's table to each grain key's table; expand the read set with every join step's `from_ref`/`to_ref` column. Filter refs come from `left` **only** — `FilterPredicate` has no `right_ref`.
-- [ ] **Step 4: Run — expect PASS (8)**
-- [ ] **Step 5: Commit** — `feat(materialize): per-expression IR with its own PIT and join plan`
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): plural partition snapshots, unknown refuses`
 
 ---
 
-### Task 6: `FormulaExecutionIRV1`
+### Task 6: `ExpressionExecutionIR`
 
-Spec §A3. Assembles expressions + grain + spine + carried output policy.
+Spec §3. One PIT per expression.
 
-**Files:** Create `src/featuregen/materialize/ir.py`; Test `tests/featuregen/materialize/test_ir.py`
+**Files:** Create `src/featuregen/materialize/expression_ir.py`; Test `test_expression_ir.py`
+**Produces:** `PhysicalRef`; `PitSpec`; `ExpressionExecutionIR`; `ExpressionRefused`; `compile_expression(conn, *, expr_path, expr, grain_keys, roles, inventory) -> … `; `expression_ir_hash(e)`.
 
-**Produces:** `FormulaExecutionIRV1` (frozen); `IrRefused` (frozen: `code`, `detail`); `compile_ir(conn, admitted: AdmittedFeature, *, roles) -> FormulaExecutionIRV1 | IrRefused`; `ir_hash(ir) -> str`.
+- [ ] **Step 1: Failing tests** — read set includes operand + filter `left` + event time + join endpoints (there is **no `right_ref`**) · a ratio's two expressions get independent `PitSpec`s · different windows hash differently · missing `AVAILABILITY_TIME` → `AVAILABILITY_TIME_NOT_GOVERNED` · a fan-out join refuses the expression · `identity_payload()` excludes provenance.
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): per-expression IR with its own PIT`
+
+---
+
+### Task 7: `FormulaExecutionIRV1` + Gate 2 authorization
+
+Spec §1.3, §2.
+
+**Files:** Create `src/featuregen/materialize/ir.py`; Test `test_ir.py`
+**Produces:** `FormulaExecutionIRV1`; `IrRefused`; `compile_ir(conn, admitted, *, roles, spine_decl, inventory)`; `ir_hash(ir)`; `authorize_read_set(conn, ir, *, roles) -> None | AuthorizationRefused`.
 
 - [ ] **Step 1: Failing tests**
 
 ```python
-def test_ratio_produces_two_expression_irs(db, seeded_catalog, admitted_ratio):
-    ir = compile_ir(db, admitted_ratio, roles=("feature_engineer",))
-    assert {e.expr_path for e in ir.expressions} == {"body.numerator", "body.denominator"}
+def test_gate_2_covers_join_endpoints_not_just_operands(db, restricted_join_key, ir):
+    """account_id is only a join key — Gate 2 must still see it."""
+    out = authorize_read_set(db, ir, roles=("feature_engineer",))
+    assert out.code == "READ_SCOPE_INSUFFICIENT"
 
 
-def test_output_policy_is_carried_not_rederived(db, seeded_catalog, admitted_sum):
-    ir = compile_ir(db, admitted_sum, roles=("feature_engineer",))
-    assert ir.output_policy == admitted_sum.formula.output
+def test_gate_2_covers_the_spine_source(db, restricted_customers, ir):
+    assert authorize_read_set(db, ir, roles=("feature_engineer",)).code == "READ_SCOPE_INSUFFICIENT"
 
 
-def test_spine_is_part_of_the_ir(db, seeded_catalog, admitted_sum):
-    ir = compile_ir(db, admitted_sum, roles=("feature_engineer",))
-    assert ir.spine.source_table_ref == "hdfc::banking.customers"
+def test_gate_2_covers_availability_columns(db, restricted_posted_at, ir):
+    assert authorize_read_set(db, ir, roles=("feature_engineer",)).code == "READ_SCOPE_INSUFFICIENT"
 
 
-def test_any_expression_refusal_refuses_the_whole_ir(db, catalog_without_availability, admitted_ratio):
-    out = compile_ir(db, admitted_ratio, roles=("feature_engineer",))
-    assert isinstance(out, IrRefused)
+def test_one_denied_element_refuses_the_WHOLE_compilation(db, one_restricted_column, two_feature_irs):
+    for ir in two_feature_irs:
+        assert authorize_read_set(db, ir, roles=("feature_engineer",)) is not None
 
 
-def test_spine_refusal_refuses_the_ir(db, no_entity_source, admitted_sum):
-    out = compile_ir(db, admitted_sum, roles=("feature_engineer",))
-    assert isinstance(out, IrRefused) and out.code == "SPINE_SOURCE_NOT_GOVERNED"
+def test_ratio_produces_two_expression_irs(db, seeded, admitted_ratio):
+    assert {e.expr_path for e in compile_ir(...).expressions} == {"body.numerator", "body.denominator"}
 
 
-def test_ir_hash_is_stable(db, seeded_catalog, admitted_sum):
-    ir = compile_ir(db, admitted_sum, roles=("feature_engineer",))
-    assert ir_hash(ir) == ir_hash(compile_ir(db, admitted_sum, roles=("feature_engineer",)))
+def test_output_policy_is_carried_never_rederived(db, seeded, admitted):
+    assert compile_ir(...).output_policy == admitted.formula.output
 ```
 
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): FormulaExecutionIRV1 over per-expression IRs`
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): FormulaExecutionIRV1 + Gate 2 over the complete read set`
 
 ---
 
-### Task 7: Classification adapter and `MaterializationContractV1`
+### Task 8: Physical type adapter
 
-Spec §C. **`read_column_facts` cannot supply sensitivity** — this task builds the versioned adapter.
+Spec §6.
 
-**Files:** Create `src/featuregen/materialize/classify.py`, `contract.py`; Test `tests/featuregen/materialize/test_classify.py`, `test_contract.py`
+**Files:** Create `src/featuregen/materialize/physical_types.py`; Test `test_physical_types.py`
+**Produces:** `PHYSICAL_TYPE_POLICY_VERSION = 1`; `PhysicalType` (frozen: `sql_type`, `nullable`); `PhysicalTypeUnsupported`; `resolve_physical_type(formula) -> PhysicalType | PhysicalTypeUnsupported`.
 
-**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `SensitivityClass` (StrEnum ordered `PUBLIC < INTERNAL < CONFIDENTIAL < RESTRICTED < PROHIBITED`); `classify_read_set(conn, refs) -> Classification` (frozen: `sensitivity_class`, `access_requirements: tuple[str, ...]`, `retention_class`, `policy_version`); `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `OverrideRefused`; `MaterializationContractV1`; `derive_contract(conn, irs, *, cadence, availability_class, overrides=None) -> MaterializationContractV1`; `contract_hash(c) -> str`.
+- [ ] **Step 1: Failing tests**
+
+```python
+def test_counts_are_bigint(count_distinct_formula):
+    assert resolve_physical_type(count_distinct_formula).sql_type == "BIGINT"
+
+
+def test_sum_uses_decimal_from_the_decimal_policy(sum_formula):
+    assert resolve_physical_type(sum_formula).sql_type == "DECIMAL(18,2)"
+
+
+def test_operation_beats_the_logical_word(count_distinct_formula):
+    """Logical output_type is `integer`; the OPERATION decides BIGINT."""
+    assert resolve_physical_type(count_distinct_formula).sql_type == "BIGINT"
+
+
+def test_zero_denominator_null_makes_the_column_nullable(ratio_null_formula):
+    assert resolve_physical_type(ratio_null_formula).nullable is True
+
+
+def test_empty_window_zero_makes_the_column_non_nullable(sum_zero_formula):
+    assert resolve_physical_type(sum_zero_formula).nullable is False
+
+
+def test_precision_above_38_is_unsupported(huge_precision_formula):
+    out = resolve_physical_type(huge_precision_formula)
+    assert isinstance(out, PhysicalTypeUnsupported) and out.code == "PHYSICAL_TYPE_UNSUPPORTED"
+
+
+def test_saturate_is_refused_in_this_slice(saturate_formula):
+    assert isinstance(resolve_physical_type(saturate_formula), PhysicalTypeUnsupported)
+
+
+def test_double_is_never_produced():
+    import inspect
+    from featuregen.materialize import physical_types
+    assert "DOUBLE" not in inspect.getsource(physical_types).upper()
+```
+
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): versioned physical type adapter`
+
+---
+
+### Task 9: Classification + contract per feature + grouping
+
+Spec §5.
+
+**Files:** Create `src/featuregen/materialize/{classify,contract}.py`; Test `test_classify.py`, `test_contract.py`
+**Produces:** `CLASSIFICATION_POLICY_VERSION = 1`; `classify_read_set(conn, refs) -> Classification`; `CadenceDecl`; `AvailabilityClass`; `ContractOverrides`; `OverrideRefused`; `MaterializationContractV1`; `derive_contract(conn, ir, *, cadence, availability_class, spine_decl, overrides=None)`; `group_by_contract(contracts) -> …`; `contract_hash(c)`.
 
 - [ ] **Step 1: Failing classification tests**
 
 ```python
-def test_most_restrictive_element_wins(db, mixed_sensitivity_catalog, ir_refs):
-    c = classify_read_set(db, ir_refs)
-    assert c.sensitivity_class is SensitivityClass.RESTRICTED
+def test_sensitivity_class_comes_from_effective_restriction(db, confidential_catalog, refs):
+    assert classify_read_set(db, refs).sensitivity_class == "confidential"
 
 
-def test_a_join_key_can_be_the_most_restrictive_element(db, restricted_join_key_catalog, ir_refs):
-    # account_id is neither operand nor filter — classification must still see it.
-    assert classify_read_set(db, ir_refs).sensitivity_class is SensitivityClass.RESTRICTED
+def test_access_requirements_come_from_the_read_scope_TAGS(db, pii_tagged_catalog, refs):
+    assert "pii_reader" in classify_read_set(db, refs).access_requirements
 
 
-def test_the_spine_source_is_classified_too(db, restricted_customers_catalog, ir_refs_with_spine):
-    assert classify_read_set(db, ir_refs_with_spine).sensitivity_class is SensitivityClass.RESTRICTED
+def test_the_two_axes_are_independent(db, pii_but_internal_catalog, refs):
+    """A pii-tagged column may still be effective_restriction=internal."""
+    c = classify_read_set(db, refs)
+    assert c.sensitivity_class == "internal" and "pii_reader" in c.access_requirements
 
 
-def test_policy_version_is_recorded(db, mixed_sensitivity_catalog, ir_refs):
-    assert classify_read_set(db, ir_refs).policy_version == 1
+def test_unknown_restriction_fails_closed_to_prohibited(db, garbage_restriction_catalog, refs):
+    assert classify_read_set(db, refs).sensitivity_class == "prohibited"
 
 
-def test_read_scope_tags_map_into_the_effective_vocabulary(db, pii_tagged_catalog, ir_refs):
-    # `pii` is a read-scope tag, not a contract class — it must MAP, not appear verbatim.
-    c = classify_read_set(db, ir_refs)
-    assert c.sensitivity_class in tuple(SensitivityClass)
+def test_prohibited_input_refuses_materialization(db, prohibited_catalog, refs):
+    with pytest.raises(ClassificationRefused) as e:
+        classify_read_set(db, refs)
+    assert e.value.code == "PROHIBITED_INPUT"
+
+
+def test_a_join_key_can_be_the_most_restrictive_element(db, restricted_join_key, refs):
+    assert classify_read_set(db, refs).sensitivity_class == "restricted"
 ```
 
 - [ ] **Step 2: Failing contract tests**
 
 ```python
+def test_a_contract_is_derived_PER_FEATURE(db, public_ir, restricted_ir, daily):
+    a = derive_contract(db, public_ir, cadence=daily, ...)
+    b = derive_contract(db, restricted_ir, cadence=daily, ...)
+    assert contract_hash(a) != contract_hash(b)
+
+
+def test_mixed_contracts_are_REFUSED_not_unioned(db, public_ir, restricted_ir, daily):
+    """A caller must not force a public feature into a restricted group by passing them together."""
+    out = group_by_contract([derive_contract(db, public_ir, ...),
+                             derive_contract(db, restricted_ir, ...)])
+    assert out.code == "MULTIPLE_MATERIALIZATION_CONTRACTS" and len(out.groups) == 2
+
+
 def test_30d_and_90d_share_a_contract(db, ir_30d, ir_90d, daily):
-    a = derive_contract(db, [ir_30d], cadence=daily, availability_class=AvailabilityClass.T_PLUS_1)
-    b = derive_contract(db, [ir_90d], cadence=daily, availability_class=AvailabilityClass.T_PLUS_1)
-    assert contract_hash(a) == contract_hash(b)   # window length is NOT contract identity
+    assert contract_hash(derive_contract(db, ir_30d, ...)) == \
+           contract_hash(derive_contract(db, ir_90d, ...))
 
 
-def test_contract_hash_excludes_calculation_window(db, ir_30d, daily):
-    payload = derive_contract(db, [ir_30d], cadence=daily,
-                              availability_class=AvailabilityClass.T_PLUS_1).identity_payload()
-    assert "window_length" not in str(payload) and "window_unit" not in str(payload)
+def test_contract_hash_excludes_the_calculation_window(db, ir_30d, daily):
+    payload = str(derive_contract(db, ir_30d, ...).identity_payload())
+    assert "window_length" not in payload and "window_unit" not in payload
 
 
 def test_hash_excludes_live_observations(db, ir_30d, daily):
-    payload = derive_contract(db, [ir_30d], cadence=daily,
-                              availability_class=AvailabilityClass.T_PLUS_1).identity_payload()
+    payload = derive_contract(db, ir_30d, ...).identity_payload()
     for banned in ("current_watermark", "actual_arrival_at", "job_status", "run_id"):
         assert banned not in payload
 
 
 def test_override_may_only_tighten(db, ir_30d, daily):
-    c = derive_contract(db, [ir_30d], cadence=daily, availability_class=AvailabilityClass.T_PLUS_3,
-                        overrides=ContractOverrides(availability_class=AvailabilityClass.T_PLUS_4))
-    assert c.availability_class is AvailabilityClass.T_PLUS_4
-
-
-def test_override_may_not_loosen(db, ir_30d, daily):
     with pytest.raises(OverrideRefused):
-        derive_contract(db, [ir_30d], cadence=daily, availability_class=AvailabilityClass.T_PLUS_3,
-                        overrides=ContractOverrides(availability_class=AvailabilityClass.T_PLUS_1))
-
-
-def test_invalid_timezone_refused():
-    with pytest.raises(ValueError, match="timezone"):
-        CadenceDecl(period="daily", timezone="Mars/Olympus", business_date_cutoff="23:59",
-                    trigger="scheduled")
+        derive_contract(db, ir_30d, availability_class=T_PLUS_3,
+                        overrides=ContractOverrides(availability_class=T_PLUS_1), ...)
 
 
 def test_dependencies_ready_trigger_refused():
@@ -696,551 +655,111 @@ def test_dependencies_ready_trigger_refused():
                     trigger="dependencies_ready")
 
 
-def test_classification_policy_version_is_hashed(db, ir_30d, daily):
-    assert "classification_policy_version" in derive_contract(
-        db, [ir_30d], cadence=daily,
-        availability_class=AvailabilityClass.T_PLUS_1).identity_payload()
+def test_both_policy_versions_are_hashed(db, ir_30d, daily):
+    p = derive_contract(db, ir_30d, ...).identity_payload()
+    assert "classification_policy_version" in p and "physical_type_policy_version" in p
 ```
 
-- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): versioned classification adapter + MaterializationContractV1`
+- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): classification + per-feature contracts + grouping`
 
 ---
 
-### Task 8: `FeatureGroupPlanV1`, `StagingManifestV1`, completeness by manifest
+### Task 10: Group plan, staging manifest, completeness
 
-Spec §D.
+Spec §9.
 
-**Files:** Create `src/featuregen/materialize/group_plan.py`; Test `tests/featuregen/materialize/test_group_plan.py`
+**Files:** Create `src/featuregen/materialize/group_plan.py`; Test `test_group_plan.py`
+**Produces:** `PlannedFeature` (incl. resolved `PhysicalType`); `FeatureGroupPlanV1`; `StagingManifestV1` (all binding fields per spec §9); `build_group_plan`; `group_plan_hash`; `expected_schema`; `check_completeness(plan, manifests, observed_schema, *, generation_id, run_id, business_dt)`.
 
-**Produces:** `PlannedFeature`; `FeatureGroupPlanV1`; `StagingManifestV1`; `GroupPlanError`; `build_group_plan(contract, entries)`; `group_plan_hash(plan)`; `expected_schema(plan)`; `check_completeness(plan, manifests, observed_schema) -> tuple[CompletenessFinding, ...]`.
-
-- [ ] **Step 1: Failing tests**
-
-```python
-def test_missing_manifest_fails_even_when_schema_matches(three_feature_plan, full_schema):
-    manifests = [m for m in _all_manifests() if m.intent_feature_name != "distinct_merchant_count_90d"]
-    findings = check_completeness(three_feature_plan, manifests, full_schema)
-    assert any(f.code == "MISSING_STAGING_MANIFEST" for f in findings)
-
-
-def test_ir_hash_mismatch_fails_even_when_schema_matches(three_feature_plan, full_schema):
-    manifests = _all_manifests()
-    manifests[0] = replace(manifests[0], ir_hash="deadbeef")
-    findings = check_completeness(three_feature_plan, manifests, full_schema)
-    assert any(f.code == "IR_HASH_MISMATCH" for f in findings)
-    # THE POINT: schema equality cannot prove which IR computed a column.
-
-
-def test_failed_status_fails(three_feature_plan, full_schema):
-    manifests = _all_manifests()
-    manifests[1] = replace(manifests[1], status="failed")
-    assert any(f.code == "INCOMPLETE_COMPUTATION"
-               for f in check_completeness(three_feature_plan, manifests, full_schema))
-
-
-def test_missing_column_fails(three_feature_plan):
-    findings = check_completeness(three_feature_plan, _all_manifests(),
-                                  (("cif_id", "string"), ("business_dt", "date")))
-    assert any(f.code == "MISSING_FEATURE_COLUMN" for f in findings)
-
-
-def test_extra_column_fails(three_feature_plan, full_schema):
-    assert any(f.code == "UNEXPECTED_COLUMN" for f in check_completeness(
-        three_feature_plan, _all_manifests(), full_schema + (("surprise", "string"),)))
-
-
-def test_wrong_type_fails(three_feature_plan, full_schema):
-    broken = tuple((c, "string") if c == "total_debit_amount_30d" else (c, t)
-                   for c, t in full_schema)
-    assert any(f.code == "WRONG_COLUMN_TYPE"
-               for f in check_completeness(three_feature_plan, _all_manifests(), broken))
-
-
-def test_complete_group_yields_nothing(three_feature_plan, full_schema):
-    assert check_completeness(three_feature_plan, _all_manifests(), full_schema) == ()
-
-
-def test_adding_a_feature_changes_plan_not_contract(contract, two_entries, three_entries):
-    a, b = build_group_plan(contract, two_entries), build_group_plan(contract, three_entries)
-    assert a.materialization_contract_hash == b.materialization_contract_hash
-    assert group_plan_hash(a) != group_plan_hash(b)
-
-
-def test_name_collision_is_an_error(contract, colliding_entries):
-    with pytest.raises(GroupPlanError, match="collide"):
-        build_group_plan(contract, colliding_entries)
-```
-
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): group plan + completeness proven by staging manifests`
+- [ ] **Step 1: Failing tests** — a matching schema with a wrong `ir_hash` still fails (`IR_HASH_MISMATCH`) · a manifest from a **different generation/run/business_dt** is rejected (`STALE_STAGING_MANIFEST`) · missing manifest · `status="failed"` · duplicate manifest · missing/extra/mistyped column · nullability mismatch · adding a feature changes `group_plan_hash` but not `materialization_contract_hash` · name collision is an error.
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): group plan + generation-bound staging manifests`
 
 ---
 
-### Task 9: Two-phase identity, sandbox-only namespace
+### Task 11: Two-phase identity
 
-Spec §B.
+Spec §7.
 
-**Files:** Create `src/featuregen/materialize/identity.py`; Test `tests/featuregen/materialize/test_identity.py`
+**Files:** Create `src/featuregen/materialize/identity.py`; Test `test_identity.py`
+**Produces:** `CompilationIdentity`; `RenderedArtifactIdentity`; `derive_namespace()`; `sandbox_execution_hash(...)`.
 
-**Produces:** `CompilationIdentity`; `RenderedArtifactIdentity`; `derive_namespace() -> str`; `sandbox_execution_hash(...) -> str`.
-
-- [ ] **Step 1: Failing tests**
-
-```python
-def test_namespace_is_always_sandbox():
-    assert derive_namespace() == "sandbox_feature"
-
-
-def test_there_is_no_production_parameter():
-    import inspect
-    from featuregen.materialize import identity
-    assert inspect.signature(identity.derive_namespace).parameters == {}
-    src = inspect.getsource(identity)
-    assert '"feature"' not in src and "'feature'" not in src
-
-
-def test_compilation_identity_is_plural(compilation_identity):
-    assert isinstance(compilation_identity.formula_content_hashes, tuple)
-    assert len(compilation_identity.formula_content_hashes) == 3
-    assert len(compilation_identity.ir_hashes) == 3
-
-
-def test_rendered_identity_is_built_AFTER_rendering(compilation_identity):
-    r = RenderedArtifactIdentity(compilation=compilation_identity,
-                                 generated_project_hash="a" * 64)
-    assert r.compilation is compilation_identity     # no circular dependency
-
-
-def test_project_hash_is_not_embedded_in_hashed_files(rendered_project):
-    for path, text in rendered_project.files.items():
-        assert rendered_project.generated_project_hash not in text, (
-            f"{path} embeds the hash that covers it — self-referential")
-
-
-def test_sandbox_execution_hash_is_reproducible(compilation_identity):
-    kw = dict(generated_project_hash="a" * 64, environment_id="hdfc-local",
-              resolved_parameter_values={"business_dt": "2026-07-27"},
-              business_dt="2026-07-27", input_snapshot_ids=("banking.transactions/2026-07-27",),
-              compiler_version=1, renderer_version=1, capability_attestation_id="cap_1")
-    assert sandbox_execution_hash(compilation_identity, **kw) == \
-           sandbox_execution_hash(compilation_identity, **kw)
-```
-
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): two-phase non-circular identity, sandbox-only`
+- [ ] **Step 1: Failing tests** — `derive_namespace()` takes **no parameters** and the module source contains no production literal · identity hashes are **plural** · `RenderedArtifactIdentity` is built after rendering · **`generated_project_hash` appears in `GENERATED.lock` and in no other file**, and the hash is computed over every file *except* the lock · `sandbox_execution_hash` is reproducible and includes the capability attestation id · there is no `production_execution_hash`.
+- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): two-phase sandbox-only identity`
 
 ---
 
-### Task 10: `render_project()` — a complete runnable Kedro project
+### Task 12: Render the complete runnable project
 
-Spec §F. Not fragments — a directory that runs.
+Spec §7.
 
-**Files:** Create `src/featuregen/materialize/render/project.py`; Test `tests/featuregen/materialize/test_render_project.py`
+**Files:** Create `src/featuregen/materialize/render/{__init__,project}.py`; Test `test_render_project.py` + `goldens/`
+**Produces:** `RENDERER_VERSION = 1`; `RenderedProject`; `render_project(...)`; `materialize_to(project, path)`.
 
-**Produces:** `RENDERER_VERSION = 1`; `RenderedProject` (frozen: `files: Mapping[str, str]`, `generated_project_hash`); `render_project(...) -> RenderedProject`; `materialize_to(project, path) -> None`.
-
-- [ ] **Step 1: Failing tests**
-
-```python
-REQUIRED = (
-    "pyproject.toml", "requirements.lock", "README.md", "GENERATED.lock",
-    "conf/base/catalog.yml", "conf/base/parameters.yml", "conf/base/logging.yml",
-    "src/featuregen_materialized/__init__.py",
-    "src/featuregen_materialized/settings.py",
-    "src/featuregen_materialized/pipeline_registry.py",
-    "src/featuregen_materialized/hooks.py",
-    "src/featuregen_materialized/pipelines/materialize/__init__.py",
-    "src/featuregen_materialized/pipelines/materialize/nodes.py",
-    "src/featuregen_materialized/pipelines/materialize/pipeline.py",
-)
-
-
-def test_every_required_file_is_emitted(render_args):
-    files = render_project(**render_args).files
-    for path in REQUIRED:
-        assert path in files, f"missing {path} — the project would not run"
-
-
-def test_pipeline_wires_nodes_with_explicit_inputs_and_outputs(render_args):
-    src = render_project(**render_args).files[
-        "src/featuregen_materialized/pipelines/materialize/pipeline.py"]
-    assert "inputs=" in src and "outputs=" in src and "node(" in src
-
-
-def test_pipeline_registry_exposes_default(render_args):
-    src = render_project(**render_args).files["src/featuregen_materialized/pipeline_registry.py"]
-    assert "__default__" in src
-
-
-def test_settings_registers_the_hooks(render_args):
-    src = render_project(**render_args).files["src/featuregen_materialized/settings.py"]
-    assert "HOOKS" in src and "MetricsHook" in src and "ProvenanceHook" in src
-
-
-def test_readme_states_how_to_run_and_the_submit_distinction(render_args):
-    readme = render_project(**render_args).files["README.md"]
-    assert "kedro run" in readme and "spark-submit" in readme
-
-
-def test_generated_lock_is_detached_from_the_hashed_files(render_args):
-    p = render_project(**render_args)
-    import json
-    lock = json.loads(p.files["GENERATED.lock"])
-    assert lock["generated_project_hash"] == p.generated_project_hash
-    # and the hash must be computed over the OTHER files only
-    assert "GENERATED.lock" not in _hashed_paths(p)
-
-
-def test_catalog_names_only_read_set_and_spine_tables(render_args):
-    catalog = render_project(**render_args).files["conf/base/catalog.yml"]
-    assert "banking.transactions" in catalog and "banking.customers" in catalog
-    assert "banking.unrelated" not in catalog
-
-
-def test_target_is_sandbox_and_not_parameterised(render_args):
-    files = render_project(**render_args).files
-    assert "sandbox_feature.cif_daily" in files["conf/base/catalog.yml"]
-    assert "publication_target" not in files["conf/base/parameters.yml"]
-
-
-def test_render_is_deterministic(render_args):
-    assert render_project(**render_args).files == render_project(**render_args).files
-
-
-def test_every_rendered_python_file_parses(render_args):
-    import ast
-    for path, text in render_project(**render_args).files.items():
-        if path.endswith(".py"):
-            ast.parse(text)
-
-
-def test_materialize_to_writes_a_real_directory(tmp_path, render_args):
-    p = render_project(**render_args)
-    materialize_to(p, tmp_path)
-    assert (tmp_path / "conf/base/catalog.yml").exists()
-```
-
+- [ ] **Step 1: Failing tests** — every required file emitted (`settings.py`, `pipeline_registry.py`, `pipelines/materialize/{nodes,pipeline}.py`, `conf/base/*`, `GENERATED.lock`, `README.md`, `pyproject.toml`, `requirements.lock`) · pipeline wires explicit `inputs=`/`outputs=` · `settings.py` registers both hooks · README states the `kedro run` vs `spark-submit` distinction · catalog names only read-set + spine tables · target is `sandbox_feature.*` and **not** parameterized · every `.py` parses · deterministic · `materialize_to` writes a real directory.
 - [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): render a complete runnable Kedro project`
 
 ---
 
-### Task 11: Rendered compute nodes — spine, PIT projection, per-feature calculation
+### Task 13: Render compute nodes
 
-Spec §G. Correctness core; independent per feature (no sharing).
+Spec §8.
 
-**Files:** Create `src/featuregen/materialize/render/nodes_compute.py`; Test `tests/featuregen/materialize/test_render_compute.py`
+**Files:** Create `render/nodes_compute.py`; Test `test_render_compute.py`
+**Produces:** `render_spine_node(spine)`; `render_pit_projection(expr_ir)`; `render_calculate_node(feature, ir)`.
 
-**Produces:** `render_spine_node(spine)`; `render_pit_projection(expr_ir)`; `render_calculate_node(feature, ir)` (writes `StagingManifestV1`).
-
-- [ ] **Step 1: Failing tests**
-
-```python
-def test_spine_reads_the_governed_entity_source(spine_spec):
-    src = render_spine_node(spine_spec)
-    assert "banking.customers" in src and "banking.transactions" not in src
-
-
-def test_availability_gate_uses_the_governed_column(expr_ir_posted):
-    assert "posted_at" in render_pit_projection(expr_ir_posted)
-
-
-def test_lagged_basis_renders_its_lag(expr_ir_lagged):
-    assert "6" in render_pit_projection(expr_ir_lagged)
-
-
-def test_calendar_window_is_not_converted_to_days(expr_ir_monthly):
-    src = render_pit_projection(expr_ir_monthly)
-    assert "30" not in src           # a calendar month is NOT 30 days
-
-
-def test_projection_selects_only_read_set_columns(expr_ir_posted):
-    src = render_pit_projection(expr_ir_posted)
-    assert "select(" in src and "*" not in src
-
-
-def test_fan_out_is_collapsed_before_joining(expr_ir_fanout):
-    src = render_calculate_node(_feature(), _ir_with(expr_ir_fanout))
-    # Aggregate/de-duplicate BEFORE the join, or a 1:N hop inflates the SUM.
-    assert "dropDuplicates" in src or src.index("groupBy") < src.index("join")
-
-
-def test_calculate_writes_a_staging_manifest_with_its_ir_hash(feature, ir):
-    src = render_calculate_node(feature, ir)
-    assert "StagingManifest" in src or "staging_manifest" in src
-    assert ir.ir_hash[:8] in src
-
-
-def test_each_feature_writes_its_own_staging_output(feature, ir):
-    assert "feature_staging" in render_calculate_node(feature, ir)
-
-
-def test_ratio_renders_both_expressions_and_zero_denominator_policy(ratio_feature, ratio_ir):
-    src = render_calculate_node(ratio_feature, ratio_ir)
-    assert src.count("groupBy") >= 2
-    assert "when" in src              # zero-denominator -> NULL policy
-
-
-def test_rendered_compute_parses(feature, ir):
-    import ast
-    ast.parse(render_calculate_node(feature, ir))
-```
-
+- [ ] **Step 1: Failing tests** — spine reads the **declared** source, never a fact table · availability gate uses the governed column · `event_time_plus_lag` renders its lag · **calendar windows are not converted to days** · projection selects only read-set columns, never `*` · calculate writes a `StagingManifestV1` carrying its `ir_hash`, generation, run and business_dt · each feature writes its own staging output · rendered overflow behaviour **raises** rather than yielding NULL · rendered rounding is explicit · every rendered node parses.
 - [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): render spine, PIT projection, per-feature calculation`
 
 ---
 
-### Task 12: Rendered gates, hooks, and the control plane
+### Task 14: Render gates + hooks + control plane
 
-Spec §H, §J.
+Spec §9, §12.
 
-**Files:** Create `src/featuregen/materialize/render/nodes_gate.py`, `src/featuregen/materialize/control_plane.py`, `src/featuregen/db/migrations/1021_materialization_control_plane.sql`; Test `test_render_gate.py`, `test_control_plane.py`, `test_migration_1021.py`
+**Files:** Create `render/nodes_gate.py`, `src/featuregen/materialize/control_plane.py`, `src/featuregen/db/migrations/1021_materialization_control_plane.sql`; Test `test_render_gate.py`, `test_control_plane.py`, `test_migration_1021.py`
+**Produces:** `render_assemble`; `render_validate`; `render_hooks`; `RunManifestV1`; `record_generation`; `ingest_validation_report`; `append_run_event`; `ingest_run_manifest`; `run_status`.
 
-**Produces:** `render_assemble(plan)`; `render_validate(plan)`; `render_hooks(compilation_identity)`; `record_generation(...)`; `ingest_validation_report(...)`; `append_run_event(...)`; `run_status(conn, run_id)`.
-
-- [ ] **Step 1: Failing migration tests** — assert `materialization_generation`, `pipeline_validation_report`, `materialization_run_event` all reject UPDATE, DELETE **and TRUNCATE** (statement-level `BEFORE TRUNCATE … FOR EACH STATEMENT` triggers — a `FOR EACH ROW` trigger does **not** fire on TRUNCATE); `materialization_run_event` has `(run_id, seq)` unique and a closed `event_kind` CHECK; the run FKs to `generation_id`.
-
-- [ ] **Step 2: Failing gate tests**
-
-```python
-REQUIRED_GATES = ("KEY_NOT_UNIQUE", "MISSING_FEATURE_COLUMN", "UNEXPECTED_COLUMN",
-                  "WRONG_COLUMN_TYPE", "MISSING_STAGING_MANIFEST", "IR_HASH_MISMATCH",
-                  "SCHEMA_HASH_MISMATCH", "FORBIDDEN_NUMERIC", "PROJECT_INTEGRITY")
-
-
-def test_every_gate_is_rendered(three_feature_plan):
-    src = render_validate(three_feature_plan)
-    for code in REQUIRED_GATES:
-        assert code in src
-
-
-def test_assembly_consumes_staging_manifests(three_feature_plan):
-    src = render_assemble(three_feature_plan)
-    assert "manifest" in src.lower()
-
-
-def test_a_failed_gate_raises(three_feature_plan):
-    assert "raise" in render_validate(three_feature_plan)
-
-
-def test_run_status_is_folded_from_events_not_stored(db, run_events):
-    assert run_status(db, "run_1") == "published"
-```
-
-- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): rendered gates + hooks + append-only control plane`
+- [ ] **Step 1: Failing migration tests** — `materialization_generation`, `pipeline_validation_report`, `materialization_run_event`, `materialization_run_manifest` **all** reject UPDATE, DELETE **and TRUNCATE** (statement-level `BEFORE TRUNCATE … FOR EACH STATEMENT`; a `FOR EACH ROW` trigger does not fire on TRUNCATE) · `(run_id, seq)` unique on events · closed `event_kind` CHECK · run manifest FKs to `generation_id` · one terminal manifest per run.
+- [ ] **Step 2: Failing gate tests** — every §9 code rendered, including `SPINE_INCOMPLETE` · assembly consumes staging manifests · a failed gate raises · the manifest writer never calls `collect()`/`take()`/`head()` · `run_status` is folded from events, not stored.
+- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): rendered gates, hooks, append-only control plane`
 
 ---
 
-### Task 13: Validation loop and local submitter
+### Task 15: Capability attestation, publisher, validation loop, submitter
 
-Spec §N. **L0 imports the project and builds the Kedro DAG** — it does not merely parse text.
+Spec §10, §11.
 
-**Files:** Create `src/featuregen/materialize/validation.py`, `submit.py`; Test `test_validation.py`, `test_submit.py`
+**Files:** Create `src/featuregen/materialize/{publish,validation,submit}.py`, `render/publish.py`; Test `test_publish.py`, `test_validation.py`, `test_submit.py`
+**Produces:** `PublishMechanism`; `PublicationCapabilityAttestation` (with `attestation_id`); `record_attestation`; `PublisherSelection`; `CapabilityUnproven`; `select_publisher(conn, *, environment_id, engine_versions, mechanism, adds_feature) -> PublisherSelection`; `render_publish(plan, *, selection)`; `ValidationLevel`; `FindingClass`; `ValidationReportV1`; `run_l0`; `run_l1`; `classify`; `may_regenerate`; `LocalClusterSubmitter`.
 
-**Produces:** `ValidationLevel`; `FindingClass`; `ValidationFinding`; `ValidationReportV1`; `run_l0(project) -> ValidationReportV1`; `run_l1(conn, ir, project, *, roles)`; `classify(code, *, expected, observed)`; `may_regenerate(report)`; `PipelineSubmitter`; `LocalClusterSubmitter`.
-
-- [ ] **Step 1: Failing tests**
-
-```python
-def test_l0_actually_imports_and_builds_the_kedro_pipeline(good_project, tmp_path):
-    report = run_l0(good_project, workdir=tmp_path)
-    assert report.status == "passed"
-    assert any("pipeline" in f.lower() for f in report.checks_performed)
-
-
-def test_l0_catches_a_project_that_imports_but_has_no_pipeline(no_pipeline_project, tmp_path):
-    # ast.parse would PASS this; only a real import+build catches it.
-    report = run_l0(no_pipeline_project, workdir=tmp_path)
-    assert report.status == "failed"
-    assert report.findings[0].classification is FindingClass.RENDERER_DEFECT
-
-
-def test_l0_detects_a_hand_edited_project(edited_project, tmp_path):
-    assert any(f.code == "PROJECT_HASH_MISMATCH"
-               for f in run_l0(edited_project, workdir=tmp_path).findings)
-
-
-def test_type_contradiction_is_a_governed_fact_mismatch():
-    assert classify("COLUMN_TYPE_MISMATCH", expected="decimal(18,2)",
-                    observed="string") is FindingClass.GOVERNED_FACT_MISMATCH
-
-
-def test_missing_partition_is_environmental():
-    assert classify("PARTITION_ABSENT", expected="2026-07-27",
-                    observed=None) is FindingClass.ENVIRONMENT_OR_DATA
-
-
-def test_unknown_code_fails_closed():
-    assert classify("SOMETHING_NEW", expected=None, observed=None) is FindingClass.UNCLASSIFIED
-
-
-def test_governed_fact_mismatch_blocks_regeneration(mismatch_report):
-    assert may_regenerate(mismatch_report) is False
-
-
-def test_unclassified_also_blocks_regeneration(unclassified_report):
-    assert may_regenerate(unclassified_report) is False
-
-
-def test_findings_never_carry_data_values(l2_duplicate_report):
-    for f in l2_duplicate_report.findings:
-        assert "1001" not in f"{f.location}{f.expected}{f.observed}"
-        assert f.count == 3
-
-
-def test_l1_reads_metadata_only(db, good_project, ir, spy_conn):
-    run_l1(spy_conn, ir, good_project, roles=("feature_engineer",))
-    assert not spy_conn.read_any_data_rows
-
-
-def test_unreachable_cluster_invents_no_findings(good_project, dead_runner):
-    report = LocalClusterSubmitter(runner=dead_runner).submit(
-        good_project, level=ValidationLevel.L1, environment_id="e")
-    assert report.status == "error" and report.findings == ()
-
-
-def test_l2_is_not_run_unless_requested(good_project, fake_runner):
-    LocalClusterSubmitter(runner=fake_runner).submit(
-        good_project, level=ValidationLevel.L1, environment_id="e")
-    assert fake_runner.spark_jobs == []
-```
-
-- [ ] **Step 2–5:** Run/implement/run/commit — `feat(materialize): validation loop with real L0 import + fail-closed classification`
+- [ ] **Step 1: Failing publisher tests** — no attestation ⇒ `CapabilityUnproven` · failed attestation ⇒ refused · attestation for a **different environment** ⇒ refused · **engine versions not matching the attestation** ⇒ refused · adding a feature without `covers_schema_evolution` ⇒ refused · `render_publish` takes a **`PublisherSelection`, not a mechanism** (introspect the signature) · no `INSERT OVERWRITE` in any rendered text · the target is derived, not a parameter.
+- [ ] **Step 2: Failing validation tests** — **L0 imports the project and builds the Kedro pipeline** (a project that `ast.parse` accepts but has no pipeline must FAIL) · L0 catches a hand-edited project · L1 runs over **all** IRs, all expressions and the spine, and verifies **every resolved partition exists** · L1 reads metadata only · type contradiction ⇒ `GOVERNED_FACT_MISMATCH` · missing partition ⇒ `ENVIRONMENT_OR_DATA` · unknown code ⇒ `UNCLASSIFIED` · both `GOVERNED_FACT_MISMATCH` and `UNCLASSIFIED` block regeneration · findings carry no data values · unreachable cluster ⇒ `status="error"` with zero findings · L2 not run unless requested.
+- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): capability-gated publisher + validation loop + submitter`
 
 ---
 
-### Task 14: Publication capability attestation and the publisher
+### Task 16: LIVE — Spark-local proof, then a published cluster partition
 
-Spec §K. **No mechanism is selectable without a passing proof for that environment.**
-
-**Files:** Create `src/featuregen/materialize/publish.py`, `render/publish.py`; Test `test_publish.py`, `test_publish_capability.py`
-
-**Produces:** `PublishMechanism` (StrEnum `VERSIONED_POINTER`, `LOCATION_SWAP`, `EXCHANGE_PARTITION`); `PublicationCapabilityAttestation` (frozen: `environment_id`, `hive_version`, `spark_version`, `metastore_version`, `mechanism`, `passed`, `covers_schema_evolution`, `attested_at`); `CapabilityUnproven(Exception)`; `select_publisher(conn, *, environment_id, mechanism) -> GroupPublisher`; `render_publish(plan, *, mechanism)`.
-
-- [ ] **Step 1: Failing tests**
-
-```python
-def test_no_attestation_means_no_publisher(db):
-    with pytest.raises(CapabilityUnproven):
-        select_publisher(db, environment_id="hdfc-local",
-                         mechanism=PublishMechanism.LOCATION_SWAP)
-
-
-def test_failed_attestation_means_no_publisher(db, failed_attestation):
-    with pytest.raises(CapabilityUnproven):
-        select_publisher(db, environment_id="hdfc-local",
-                         mechanism=PublishMechanism.LOCATION_SWAP)
-
-
-def test_attestation_for_a_DIFFERENT_environment_does_not_count(db, attestation_for_other_env):
-    with pytest.raises(CapabilityUnproven, match="hdfc-local"):
-        select_publisher(db, environment_id="hdfc-local",
-                         mechanism=PublishMechanism.LOCATION_SWAP)
-
-
-def test_attestation_not_covering_schema_evolution_is_refused_when_adding_a_feature(
-        db, attestation_without_schema_evolution):
-    with pytest.raises(CapabilityUnproven, match="schema"):
-        select_publisher(db, environment_id="hdfc-local",
-                         mechanism=PublishMechanism.LOCATION_SWAP, adds_feature=True)
-
-
-def test_insert_overwrite_is_not_even_a_mechanism():
-    assert not any("OVERWRITE" in m.upper() for m in PublishMechanism)
-
-
-def test_rendered_publish_never_emits_insert_overwrite(three_feature_plan):
-    assert "INSERT OVERWRITE" not in render_publish(
-        three_feature_plan, mechanism=PublishMechanism.VERSIONED_POINTER).upper()
-
-
-def test_target_is_derived_not_passed(three_feature_plan):
-    import inspect
-    assert "target" not in inspect.signature(render_publish).parameters
-```
-
-- [ ] **Step 2: The cluster capability probe (its own runnable command)**
-
-```python
-# tests/featuregen/materialize/test_publish_capability.py
-"""Spec §K — the probe that PROVES a mechanism on the target cluster.
-
-Run explicitly against the live cluster:
-    PYTHONPATH=src .venv/bin/python -m pytest tests/featuregen/materialize/test_publish_capability.py \
-      --cluster-dsn=... -q
-It records a PublicationCapabilityAttestation. Until it passes, publication is refused.
-"""
-
-def test_concurrent_reader_sees_only_complete_states(hive_cluster, staged_group):
-    obs = hive_cluster.poll_while(
-        lambda: hive_cluster.read_generation_marker_and_content("sandbox_feature.cif_daily"),
-        during=lambda: hive_cluster.publish(staged_group))
-    assert obs, "reader observed nothing — the probe is vacuous"
-    for o in obs:
-        assert o in (staged_group.complete_old_marker, staged_group.complete_new_marker)
-
-
-def test_adding_a_feature_is_also_atomic(hive_cluster, group_with_added_feature):
-    """Schema evolution: swapping one partition does NOT atomically change table schema."""
-    obs = hive_cluster.poll_while(
-        lambda: hive_cluster.read_schema_and_marker("sandbox_feature.cif_daily"),
-        during=lambda: hive_cluster.publish(group_with_added_feature))
-    assert obs
-    for o in obs:
-        assert o in (group_with_added_feature.old_state, group_with_added_feature.new_state)
-```
-
-The probe uses a **generation marker plus a content check**, never schema-and-row-count alone (those can coincide across versions).
-
-- [ ] **Step 3–6:** Run/implement/run/commit — `feat(materialize): publication capability attestation + publisher`
-
----
-
-### Task 15: LIVE — end-to-end generation, Spark-local proof, and a published cluster partition
-
-Spec §L. **This task is the deliverable.** It is not complete until a real partition is published on the cluster.
+Spec §13. **The deliverable.** Blocked on Task 0.
 
 **Files:** Create `src/featuregen/materialize/pipeline.py`, `tests/featuregen/materialize/spark_fixtures/`; Test `test_spark_local.py`, `test_live_cluster.py`
+**Produces:** `generate_group(conn, inputs, *, roles, cadence, availability_class, spine_decl, environment_id, inventory) -> GenerationResult`
 
-**Produces:** `generate_group(conn, inputs: Sequence[ResolvedFeatureInput], *, roles, cadence, availability_class, environment_id) -> GenerationResult`.
+- [ ] **Step 1: Hand-author the tiny fixtures** — `transactions` (a row dated `2026-07-01` **posted** `2026-07-05` for the look-ahead case; several merchants; a value forcing decimal rounding; a value forcing overflow under the declared precision), `accounts`, `customers` (including a customer with **no** transactions). Every expected value computed by hand and written in a comment beside its assertion. Add `pyspark` to dev dependencies.
 
-- [ ] **Step 1: Write the hand-authored tiny data fixtures**
-
-`spark_fixtures/` holds small CSV/Parquet inputs written by hand: `transactions` (including a row dated `2026-07-01` **posted** `2026-07-05` for the look-ahead case, a customer with several merchants, cross-border and domestic rows, and an account with two customers to exercise a `1:N` hop), `accounts`, `customers` (including customer `1099` with **no** transactions). Every expected value is computed by hand and written in a comment beside the assertion.
-
-- [ ] **Step 2: Failing Spark-local tests (MANDATORY — not marked, not skipped)**
+- [ ] **Step 2: Failing Spark-local tests (MANDATORY, run by default)**
 
 ```python
-def test_total_debit_amount_30d(spark_run):
+def test_each_first_slice_feature_matches_its_hand_computed_value(spark_run):
     out = spark_run(business_dt="2026-07-27")
-    assert out.value("1001", "total_debit_amount_30d") == 5500   # 3000 + 2000 + 500 debits
-
-
-def test_distinct_merchant_count_90d(spark_run):
-    out = spark_run(business_dt="2026-07-27")
-    assert out.value("1001", "distinct_merchant_count_90d") == 3  # M1, M2, M3
-
-
-def test_cross_border_value_ratio_90d(spark_run):
-    out = spark_run(business_dt="2026-07-27")
-    assert out.value("1001", "cross_border_value_ratio_90d") == Decimal("0.20")  # 1000/5000
-
-
-def test_zero_denominator_yields_null_per_policy(spark_run):
-    out = spark_run(business_dt="2026-07-27")
-    assert out.value("1002", "cross_border_value_ratio_90d") is None  # no txns in window
-
-
-def test_decimal_rounding_is_half_up_at_scale_2(spark_run):
-    out = spark_run(business_dt="2026-07-27")
-    assert out.value("1003", "cross_border_value_ratio_90d") == Decimal("0.33")  # 1/3
+    assert out.value("1001", "total_debit_amount_30d") == Decimal("5500.00")  # 3000+2000+500
+    # …one assertion per feature in the slice, each with its arithmetic in a comment
 
 
 def test_look_ahead_row_is_excluded(spark_run):
     """Dated 2026-07-01, posted 2026-07-05 — invisible on the 3rd, visible on the 6th."""
     assert spark_run(business_dt="2026-07-03").value("1004", "total_debit_amount_30d") == 0
     assert spark_run(business_dt="2026-07-06").value("1004", "total_debit_amount_30d") == 250
-
-
-def test_empty_window_policy_yields_zero(spark_run):
-    assert spark_run(business_dt="2026-07-27").value("1099", "total_debit_amount_30d") == 0
 
 
 def test_entity_with_no_transactions_still_appears(spark_run):
@@ -1252,59 +771,76 @@ def test_exactly_one_row_per_key_and_date(spark_run):
     assert out.row_count() == out.distinct_key_count()
 
 
-def test_a_one_to_many_hop_does_not_inflate_the_sum(spark_run):
-    """Account shared by two customers: the SUM must not double-count."""
-    out = spark_run(business_dt="2026-07-27")
-    assert out.value("1005", "total_debit_amount_30d") == 400   # NOT 800
+def test_declared_rounding_is_applied(spark_run):
+    assert spark_run(business_dt="2026-07-27").value("1003", "ratio_feature") == Decimal("0.33")
 
 
-def test_duplicate_key_group_is_rejected_by_the_gate(spark_run_broken):
+def test_overflow_RAISES_rather_than_yielding_null(spark_run_overflow):
+    """Spark's default is NULL on decimal overflow; OverflowBehavior.ERROR must fail."""
+    with pytest.raises(Exception, match="overflow|OVERFLOW"):
+        spark_run_overflow(business_dt="2026-07-27")
+
+
+def test_empty_window_policy_yields_zero(spark_run):
+    assert spark_run(business_dt="2026-07-27").value("1099", "total_debit_amount_30d") == 0
+
+
+def test_orphan_grain_key_blocks_a_complete_population_claim(spark_run_orphan):
+    with pytest.raises(Exception, match="SPINE_INCOMPLETE"):
+        spark_run_orphan(business_dt="2026-07-27")
+
+
+def test_duplicate_key_group_is_rejected(spark_run_dup):
     with pytest.raises(Exception, match="KEY_NOT_UNIQUE"):
-        spark_run_broken(business_dt="2026-07-27")
+        spark_run_dup(business_dt="2026-07-27")
 
 
-def test_missing_staging_manifest_blocks_publication(spark_run_missing_manifest):
-    with pytest.raises(Exception, match="MISSING_STAGING_MANIFEST"):
-        spark_run_missing_manifest(business_dt="2026-07-27")
+def test_stale_staging_manifest_blocks_publication(spark_run_stale_manifest):
+    with pytest.raises(Exception, match="STALE_STAGING_MANIFEST"):
+        spark_run_stale_manifest(business_dt="2026-07-27")
 ```
 
-Add `pyspark` to the dev dependencies in `pyproject.toml`. These tests run by default.
+- [ ] **Step 3: Run — FAIL. Then iterate: run → read the failure → fix the RENDERER (never the expected value) → re-run**, until every number is right.
 
-- [ ] **Step 3: Run — expect FAIL, then implement `generate_group` and fix the renderer until every number is right**
-
-This is where renderer defects surface. Iterate: run → read the failure → fix the *renderer* (never the fixture's expected value) → re-run.
-
-- [ ] **Step 4: The live cluster task**
+- [ ] **Step 4: Failing live-cluster tests**
 
 ```python
-# tests/featuregen/materialize/test_live_cluster.py
-"""The deliverable. Run against the real Hadoop/Hive cluster."""
-
-def test_publication_capability_is_attested(live_cluster, control_plane):
+def test_capability_is_attested_for_this_environment(live, control_plane):
     att = control_plane.attestation(environment_id="hdfc-local")
     assert att.passed and att.covers_schema_evolution
+    assert att.hive_version == live.hive_version      # the attestation must match reality
 
 
-def test_generate_validate_run_and_publish(live_cluster, control_plane, resolved_inputs):
-    result = generate_group(control_plane.conn, resolved_inputs, roles=("feature_engineer",),
-                            cadence=DAILY, availability_class=AvailabilityClass.T_PLUS_1,
-                            environment_id="hdfc-local")
-    assert run_l0(result.project, workdir=live_cluster.workdir).status == "passed"
-    assert run_l1(control_plane.conn, result.irs[0], result.project,
-                  roles=("feature_engineer",)).status == "passed"
-    live_cluster.submit_and_run(result.project, business_dt="2026-07-27")
-    rows = live_cluster.query(
-        "SELECT COUNT(*) FROM sandbox_feature.cif_daily WHERE business_dt='2026-07-27'")
-    assert rows[0][0] > 0
+def test_generate_validate_run_and_publish(live, control_plane, resolved_inputs):
+    result = generate_group(control_plane.conn, resolved_inputs, ...)
+    assert run_l0(result.project, workdir=live.workdir).status == "passed"
+    for ir in result.irs:                              # ALL IRs, not just the first
+        assert run_l1(control_plane.conn, ir, result.project, roles=(...)).status == "passed"
+    live.submit_and_run(result.project, business_dt="2026-07-27")
+
+    published = live.describe("sandbox_feature.cif_daily")
+    assert published.schema == expected_schema(result.plan)          # exact schema
+    for f in result.plan.features:
+        assert f.column_name in published.columns
+        assert published.non_null_count(f.column_name) > 0           # not a table of nulls
+    assert published.generation_marker == result.generation_id
+    assert published.row_count == control_plane.latest_manifest().published_row_count
+    assert published.project_hash == result.project.generated_project_hash
     assert control_plane.run_status(result.run_id) == "published"
 
 
-def test_manifest_and_reports_are_ingested(live_cluster, control_plane, resolved_inputs):
-    manifest = control_plane.latest_manifest()
-    assert manifest.generation_id and manifest.published_row_count > 0
+def test_the_acceptance_fixture_gives_the_SAME_numbers_on_the_cluster(live, acceptance_fixture):
+    """The Spark-local proof, re-run on real Hadoop. Same inputs, same expected values."""
+    out = live.run_acceptance(acceptance_fixture, business_dt="2026-07-27")
+    assert out.value("1001", "total_debit_amount_30d") == Decimal("5500.00")
+
+
+def test_reports_and_manifest_are_ingested(live, control_plane):
+    assert control_plane.latest_manifest().generation_id
+    assert control_plane.reports_for(level="L1")
 ```
 
-- [ ] **Step 5: Full sweep + commit**
+- [ ] **Step 5: Full sweep, then commit**
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m pytest tests/featuregen/materialize -p no:cacheprovider -q
@@ -1319,10 +855,12 @@ git commit -m "feat(materialize): end-to-end generation, Spark-local proof, live
 
 ## Self-Review
 
-**Spec coverage.** §0→T2 · §A2→T5 · §A3→T3,T6 · §A4→T4 · §B→T9 · §C→T7 · §D→T8 · §E (no sharing)→T11 by construction · §F→T10 · §G→T11,T15 · §H→T12 · §J→T12 · §K→T14 · §L→T10 (goldens), T15 (Spark-local, mandatory), T15 (cluster) · §M→the fail-closed paths in T2–T7,T14 · §N→T13.
+**Spec coverage.** §0→T0 · §1.2→T2 · §1.3→T7 · §3.1–3.2→T3 · §3.3→T5 · §3 IR→T6 · §4→T4 · §5→T9 · §6→T8 · §7 identity→T11, project→T12 · §8→T13, T16 · §9→T10, T14 · §10→T15 · §11→T15 · §12→T14 · §13→T12 (goldens), T16 (execution, cluster) · §14 vocabulary→every refusing task.
 
-**Rev-1 defects, each now owned by a task:** governed input gate→T2 · `classify_join_path` reuse + cardinality→T3 · governed spine→T4 · per-expression IR→T5 · classification adapter + window-out-of-contract→T7 · manifest-based completeness→T8 · non-circular sandbox-only identity→T9 · complete runnable project + real L0→T10,T13 · no scan sharing→T11 · TRUNCATE-blocking append-only control plane→T12 · capability attestation + schema evolution→T14 · mandatory execution with all three features→T15 · verified fixture fields→T2.
+**Rev-2 findings, each owned:** forged result→T2 (terminal-event verification) · two authorization gates→T2/T7 · population source→T4 · bare table names + authority retention→T3 · fan-out refusal→T3 · snapshot identity→T5 · classification axes→T9 · fixture forgery→T2 (fixtures carry verified NON_ADDITIVE) · physical types→T8 · contract union→T9 (`MULTIPLE_MATERIALIZATION_CONTRACTS`) · stale staging→T10 · lock circularity→T11 · run manifest→T14 · attestation persistence + `PublisherSelection`→T15 · L1 over all IRs→T15/T16 · live assertions→T16.
 
-**Placeholder scan.** No "TBD"/"handle errors appropriately"/"check the names yourself". Fixture field names are stated as verified and listed at the top; the one instruction to run a construction check first is a *verification* step, not a gap.
+**Placeholder scan.** No "TBD"/"handle errors appropriately". Tasks 6, 10, 11, 12, 13 list their discriminating assertions in prose rather than full code blocks — deliberate, because each is a straightforward application of a pattern shown in full in T2/T3/T8/T9, and the assertions name the exact codes and behaviours. Every *novel* mechanism has complete test code.
 
-**Type consistency.** `materialize_hash` (T1) is the only hasher. `AdmittedFeature` (T2) → `compile_ir` (T6). `JoinPlan` (T3) is consumed by T5 and its `fans_out` drives T11's collapse. `PitSpec` is per `ExpressionExecutionIR` (T5) throughout. `StagingManifestV1` is defined in T8, rendered in T11, consumed in T12. `CompilationIdentity` (T9) is embedded in rendered files; `generated_project_hash` is detached (T10). `ValidationReportV1` (T13) is returned by `LocalClusterSubmitter.submit`.
+**Type consistency.** `materialize_hash` (T1) is the sole hasher. `AdmittedFeature` (T2) → `compile_ir` (T7). `JoinPlan` (T3) is consumed by T6. `PhysicalInputSnapshot` (T5) → T6 → `input_snapshot_ids` (T11) → L1 (T15). `PhysicalType` (T8) → `PlannedFeature` (T10) → the type gate (T14). `StagingManifestV1` (T10) is rendered in T13 and verified in T14. `CompilationIdentity` (T11) is embedded in rendered files; `generated_project_hash` lives only in `GENERATED.lock` (T12). `PublisherSelection` (T15) is what `render_publish` consumes.
+
+**Unverified-interface check.** Every API named here appears in `docs/architecture/2026-07-27-verified-interfaces-materialization.md`. Two entries were added while writing this plan (§14: authoring result + terminal payload; and the absence of a public trace reader, which is why T2 adds one). If implementation meets an interface not in that file: **read the source, add the entry, then implement.**
