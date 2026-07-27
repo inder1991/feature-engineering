@@ -254,3 +254,43 @@ SENSITIVITY_ROLES: dict[str, str] = {          # :13
 
 `access_requirements` derive from this mapping over the `graph_node.sensitivity` tags present in the
 read set. Note it is keyed by read-scope tag, NOT by `effective_restriction` (§2).
+
+---
+
+## 14. Authoring result + terminal event — what Gate 1 can actually verify
+
+`AuthoringResult` (`formula/result.py:97`) fields — note it **already carries `authoring_run_id`**, so
+`ResolvedFeatureInput` needs no separate run-id field:
+
+```python
+structural_status · capability_status · output_status · expectation_status
+critic_status · technical_status                       # the six axes
+authoring_disposition · disposition_policy_version · authoring_run_id
+candidate_formula · candidate_formula_hash · candidate_proposal
+output_requirements · authority_failures · capability_reason · critic_findings_hash
+```
+
+**The terminal trace event payload** (`formula/authoring.py:393-408`) contains:
+
+```python
+authoring_disposition · disposition_policy_version
+structural_status · capability_status · output_status
+expectation_status · critic_status · technical_status
+candidate_formula_hash · critic_findings_hash
+output_requirements: [requirement, ...]
+authority_failures: [{reason, operand, field}, ...]
+```
+
+So Gate 1 can verify disposition, all six axes and the candidate hash against an immutable,
+`payload_hash`-protected record. 
+
+**⚠️ `_TERMINAL_FOR_DISPOSITION = {"TECHNICAL_FAILURE": FAILED}`** (`authoring.py:188`) — every other
+disposition, INCLUDING `REJECTED` and `UNSUPPORTED`, writes a `COMPLETED` event. Gate 1 must therefore
+check the **payload's `authoring_disposition`**, never merely that a `COMPLETED` event exists.
+
+**⚠️ `trace.py` exposes NO public event reader** — only `open_authoring_run` (`:156`), `append_event`
+(`:173`) and `run_status` (`:212`). A `read_terminal_event(conn, run_id)` must be ADDED, using the
+existing private `_durable_read` (`:432`) so it inherits the same cross-connection visibility
+semantics `run_status` relies on.
+
+`authoring_intent_hash(intent)` lives at `formula/authoring.py:253`.
