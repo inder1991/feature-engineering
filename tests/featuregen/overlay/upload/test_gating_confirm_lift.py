@@ -22,6 +22,12 @@ concept- or role-based one). Result: **28/28 -> 11/11** unit/currency questions,
 DESIGN_CHECKED**. The MIXED_UNITS / MIXED_CURRENCY hard rejects are untouched and still read every
 derive, so a positive contradiction still rejects outright.
 
+**E4a Task 2 rides in these numbers.** The fixture's LLM now also PROPOSES a unit + currency for
+every measure whose file declares none, stored as ``llm/proposed`` field evidence. Every number
+above is measured WITH those proposals in place and is unchanged by them — which is exactly the
+safety claim: an AI guess never clears ``UNIT_CONSISTENT``/``CURRENCY_CONSISTENT``, because the
+gauntlet reads ``graph_node.unit`` and the LLM is excluded from that field's resolution.
+
 This is the permanent regression guard for the whole E4 thesis, and it is deliberately end-to-end:
 the catalog is built through the REAL FTR path (``read_ftr_glossary`` -> ``to_glossary_upload`` ->
 ``ingest_upload``) with Pass B / table synthesis ENABLED (``OVERLAY_TABLE_SYNTH=1``, exactly as the
@@ -120,6 +126,13 @@ def ai_proposed_catalog(overlay_conn, monkeypatch):
         "overlay.enrich.domain": FakeResponse(output={"results": [
             {"ref": TABLE, "domain": "payments"}]}),
         "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
+        # E4a Task 2: the AI PROPOSES a unit/currency for every measure whose file declares none.
+        # It lands as `llm/proposed` evidence and must change NOTHING here — the numbers pinned
+        # below are measured WITH these proposals in place, which is the whole safety claim:
+        # an AI guess never clears UNIT_CONSISTENT / CURRENCY_CONSISTENT.
+        "overlay.enrich.unit": FakeResponse(output={"results": [
+            {"ref": h, "unit": "AED", "currency": "AED"} for h, c in concepts.items()
+            if c in ("monetary_flow", "monetary_stock", "custody_holding", "count")]}),
         # Pass B: phase-1 chunk summary (one chunk — the table is far under the 64-column bound)
         # then the phase-2 per-table synthesis.
         "table_synth_summary": FakeResponse(output={"results": [

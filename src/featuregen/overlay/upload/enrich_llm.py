@@ -438,6 +438,12 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     ("overlay_synonyms", 1): {"type": "object", "additionalProperties": False,
                               "properties": {"synonyms": {"type": "string"}},
                               "required": ["synonyms"]},
+    # E4a T2 — the MEASURE ANNOTATION a file did not declare. The flat (single / batch-fallback)
+    # shape carries only the `unit`; `currency` rides the per-item batch schema below, exactly like
+    # the domain task's two-level split. Both are EVIDENCE-only proposals: `_MEASURE_ANNOTATION`
+    # excludes the LLM from display AND operational resolution, so neither can reach `graph_node`.
+    ("overlay_unit", 1): {"type": "object", "additionalProperties": False,
+                          "properties": {"unit": {"type": "string"}}, "required": ["unit"]},
     ("overlay_entity", 1): {"type": "object", "additionalProperties": False,
                             "properties": {"entity": {"type": "string"}}, "required": ["entity"]},
     ("overlay_contract", 1): {"type": "object", "additionalProperties": False,
@@ -476,6 +482,20 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                       "properties": {"ref": {"type": "string", "maxLength": 128},
                                      "synonyms": {"type": "string", "maxLength": 200}},
                       "required": ["ref", "synonyms"]}}},
+        "required": ["results"]},
+    # E4a T2 — one measure annotation per column: the `unit` (required — it is the whole question)
+    # plus an OPTIONAL ISO-4217 `currency` (absent from `required`, so a non-monetary measure like a
+    # count or a percentage returns a unit alone rather than inventing a currency for it). Bounded
+    # short tokens, never prose; the closed shape is enforced CODE-side in `enrich._accept_unit` /
+    # `_accept_currency` (a schema enum would fail the WHOLE chunk on one off-vocabulary value).
+    ("overlay_unit_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array",
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 128},
+                                     "unit": {"type": "string", "maxLength": 32},
+                                     "currency": {"type": "string", "maxLength": 8}},
+                      "required": ["ref", "unit"]}}},
         "required": ["results"]},
     # E1a T3 — the domain result is TWO-LEVEL: `domain` is the TABLE's default (the context all of
     # its columns inherit) and `column_domains` lists ONLY the columns whose domain DIFFERS from it.

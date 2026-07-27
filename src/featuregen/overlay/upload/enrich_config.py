@@ -13,17 +13,17 @@ from dataclasses import dataclass
 # Per-task default execution mode. Pass A stages batch by default (#4); table_synth's entry is inert
 # (synthesize_tables never reads mode()) and stays single so the config-namespace tests are unmoved.
 _DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
-                 "synonyms": "batch", "table_synth": "single"}
+                 "synonyms": "batch", "unit": "batch", "table_synth": "single"}
 # MF-8a — conservative ISOLATION boundaries, not throughput maxima. The old 40/12/20/8 were picked
 # for throughput with NO accuracy evidence (the hermetic gold gate drives a scripted FakeLLM that
 # echoes each column's expected answer, so it measures the harness, not the provider, and compares no
 # batch sizes / no cross-item contamination). Until the key-gated real-provider sweep
 # (tests/eval/test_batch_size_sweep.py) produces evidence a higher ceiling holds accuracy, keep these
 # small so cross-item contamination has less room. The env override still raises a ceiling per task.
-_DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8,
+_DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8, "unit": 8,
                       "table_synth": 4}
 _DEFAULT_MAX_INPUT_TOKENS = {"concept": 14000, "definition": 8000, "domain": 8000,
-                             "synonyms": 8000, "table_synth": 6000}
+                             "synonyms": 8000, "unit": 8000, "table_synth": 6000}
 
 
 def mode(short: str) -> str:

@@ -45,13 +45,16 @@ from featuregen.overlay.upload.contract.invalidation import (
 )
 from featuregen.overlay.upload.enrich import (
     _definition_targets,
+    _unit_targets,
     _write_definition_evidence,
     _write_domain_evidence,
     _write_synonym_evidence,
+    _write_unit_evidence,
     classify_domains,
     content_hash,
     draft_definitions,
     draft_synonyms,
+    draft_units,
     enrich_concepts,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
@@ -1941,7 +1944,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if client is None:
         # No LLM provider configured: the enrichment stages honestly never ran (#22) — recorded as
         # skipped, never as a failure, and ingestion continues normally.
-        for _stage in ("enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms"):
+        for _stage in ("enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms",
+                       "enrich_unit"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
@@ -2091,6 +2095,47 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             internal_failures=syn_evidence_failures,
             not_attempted=syn_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_synonyms", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
+        stage_started = datetime.now(UTC)
+        units = None
+        unit_stats: dict = {}      # honest-labeling: receives batch not_attempted (budget/deadline)
+        unit_currencies: dict[str, str] = {}   # {content_hash: ISO-4217} — monetary measures only
+        unit_evidence_failures = 0
+        try:
+            with conn.transaction():
+                # E4a T2: the measure annotation the FILE never declared. The AI's unit/currency is
+                # written as `llm/proposed` field EVIDENCE only — `_MEASURE_ANNOTATION` excludes the
+                # LLM from display AND operational resolution and the resolver has no display
+                # projection for these fields, so the proposal can never reach `graph_node.unit`,
+                # which is the column the feature gauntlet reads. It is therefore structurally
+                # incapable of clearing UNIT_CONSISTENT/CURRENCY_CONSISTENT; a human confirm (T3)
+                # is what makes a unit operational. Gated exactly like the definition/domain/synonym
+                # evidence (glossary + snapshot); its CONTAINED failures ride into the stage report.
+                units = draft_units(conn, vr.good, client, actor, concepts=concepts,
+                                    currencies=unit_currencies,
+                                    ingestion_run_id=ingestion_run_id, stats=unit_stats)
+                if glossary is not None and snapshot_id is not None:
+                    try:
+                        unit_evidence_failures = _write_unit_evidence(
+                            conn, source=catalog_source, rows=vr.good, units=units,
+                            currencies=unit_currencies, concepts=concepts, glossary=glossary,
+                            bindings=bindings, source_snapshot_id=snapshot_id)
+                    except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
+                        # per-item try) rolls this savepoint back, so leaving the count at 0 would
+                        # report `succeeded` for a run that wrote nothing. Count it, then re-raise
+                        # to the advisory handler below, which logs it.
+                        unit_evidence_failures = 1
+                        raise
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory unit enrichment failed for %r", catalog_source, exc_info=True)
+        state, reason, detail = _enrichment_outcome(
+            # The SAME target set the drafter selects with and the reconciler keeps — a measure
+            # column whose file declares no unit. A non-measure (or an already-declared) column was
+            # never asked, so it must not count as an unresolved item degrading the stage.
+            units, len(_unit_targets(vr.good, concepts)),
+            internal_failures=unit_evidence_failures,
+            not_attempted=unit_stats.get("not_attempted", 0))
+        record_stage(stage_recorder, "enrich_unit", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
     stage_started = datetime.now(UTC)
     # Additive schema preservation (round-4 #5): object_ref-keyed maps from the glossary's

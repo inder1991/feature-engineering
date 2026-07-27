@@ -22,6 +22,7 @@ from featuregen.overlay.upload.concepts import (
     classification_vocabulary,
     is_known_concept,
 )
+from featuregen.overlay.upload.concepts import concept as concept_record
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import (
@@ -44,6 +45,7 @@ _MAX_META_LEN = 200
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 _SYN_TASK = "overlay.enrich.synonyms"
+_UNIT_TASK = "overlay.enrich.unit"
 
 # Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
 _MAX_SYNONYMS_LEN = 200
@@ -334,6 +336,114 @@ def _parse_domain_result(raw: str) -> tuple[str, dict[str, str]]:
         return raw, {}
     overrides = payload.get("column_domains")
     return str(payload.get("domain") or ""), overrides if isinstance(overrides, dict) else {}
+
+
+# ── E4a T2: the MEASURE ANNOTATION accept gate ────────────────────────────────────────────────────
+# A unit is a short measurement TOKEN, never prose — "AED", "fils", "%", "bps", "days", "shares",
+# "transactions", "USD per share". 32 chars is generous for every real one and far too small for a
+# sentence, so a model that starts explaining itself is rejected rather than stored as a unit.
+_MAX_UNIT_LEN = 32
+# Starts with a letter/digit/% (never punctuation or a list-stringified `['a','b']`) and continues
+# with the characters real units use. Deliberately NOT a closed vocabulary: units are open (every
+# commodity, rate basis and count noun is one), so a closed list would reject legitimate values
+# while buying no safety — the safety comes from the value being EVIDENCE the resolver never reads.
+_UNIT_TOKEN_RE = re.compile(r"[A-Za-z0-9%][A-Za-z0-9 %/().,_+-]*")
+# currency, by contrast, IS a closed shape: ISO-4217 is exactly three ASCII letters. Anything else
+# ("dollars", "AED/USD", "n/a") is not a currency code and is dropped. The value is normalized to
+# upper case so `AED`/`aed` are one proposal, not two. A hard closed LIST of the ~180 live codes was
+# considered and rejected: it would have to be maintained against ISO revisions and would silently
+# drop a legitimate exotic code, while the shape gate already excludes everything that is not
+# code-shaped — and a human confirms the value before it can ever become load-bearing (Task 3).
+_CURRENCY_CODE_RE = re.compile(r"[A-Za-z]{3}")
+
+
+def _accept_unit(raw: str) -> tuple[str | None, str]:
+    """Accept ONE unit token (bounded, single-line, token-shaped, not a prompt/task echo)."""
+    value = _bounded(raw.strip(), _MAX_UNIT_LEN)
+    if value is None or not _UNIT_TOKEN_RE.fullmatch(value) or _is_task_echo(value):
+        return None, "invalid_value"
+    return value, "valid"
+
+
+def _accept_currency(raw: str) -> str | None:
+    """The ISO-4217-SHAPED currency code, upper-cased — or ``None`` for anything else."""
+    value = raw.strip()
+    return value.upper() if _CURRENCY_CODE_RE.fullmatch(value) else None
+
+
+def _extract_unit_result(entry: dict) -> str:
+    """Serialize ONE batch result's measure annotation (unit + optional currency) into the single
+    canonical string the batch harness carries per item (the ``extract`` seam ``domain`` uses)."""
+    return json.dumps({"unit": str(entry.get("unit") or "").strip(),
+                       "currency": str(entry.get("currency") or "").strip()}, sort_keys=True)
+
+
+def _accept_unit_result(raw: str) -> tuple[str | None, str]:
+    """Acceptor for the measure-annotation envelope. BATCH carries ``{unit, currency}``; the flat
+    SINGLE seam (and the batch's single-item fallback) returns a BARE unit string, accepted here as
+    the same envelope with no currency.
+
+    PER-FIELD SALVAGE, deliberately asymmetric: an unusable UNIT rejects the whole item (it is the
+    question the stage exists to answer, and an item with no unit is not a result), while an
+    off-shape CURRENCY drops only the currency — losing a good unit because the model wrote
+    "dirhams" instead of "AED" would be a worse outcome than storing the unit alone."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = raw                       # a bare unit from the flat single/fallback schema
+    if not isinstance(payload, dict):
+        payload = {"unit": payload}
+    unit, reason = _accept_unit(str(payload.get("unit") or ""))
+    if unit is None:
+        return None, reason
+    currency = _accept_currency(str(payload.get("currency") or ""))
+    return json.dumps({"unit": unit, "currency": currency or ""}, sort_keys=True), "valid"
+
+
+def _parse_unit_result(raw: str) -> tuple[str, str]:
+    """Decode one measure-annotation envelope into ``(unit, currency)``; currency may be ``""``."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return raw, ""
+    if not isinstance(payload, dict):
+        return raw, ""
+    return str(payload.get("unit") or ""), str(payload.get("currency") or "")
+
+
+# The taxonomy's own definition of a MEASURE: a concept that carries an AGGREGATION behaviour.
+# `additivity` is "n/a" for every identifier, date, code, flag and free-text concept and is set only
+# where the registry says the column holds a quantity that can be summed / averaged / taken latest
+# (monetary_flow additive, monetary_stock semi_additive, monetary_rate / price / dpd / count
+# non_additive, …). Reading the target set off the registry keeps it a DATA question, not a second
+# hand-maintained list that could drift from the taxonomy.
+_MEASURE_ADDITIVITY = frozenset({"additive", "semi_additive", "non_additive"})
+
+
+def _is_measure_concept(name: str) -> bool:
+    """True iff ``name`` is a known concept the taxonomy treats as a MEASURE (see above)."""
+    rec = concept_record(name) if name else None
+    return rec is not None and rec.additivity in _MEASURE_ADDITIVITY
+
+
+def _unit_targets(rows: list[CanonicalRow], concepts: dict[str, str] | None) -> set[str]:
+    """The content hashes this run EXPECTS a measure annotation for — a column where a unit is
+    MEANINGFUL and the file declares none:
+
+    * its assigned concept is a MEASURE (``_is_measure_concept``) — asking a customer id or a
+      settlement status for its unit is the unanswerable question E4a Task 1 removed, and drafting
+      one would put AI noise on a column that can never carry a unit;
+    * the upload DECLARES no ``unit`` for it. The AI fills a blank; it never contests a declared
+      value (a source proposal and a competing LLM one would resolve to a display CONFLICT).
+
+    ONE definition of the target set, shared by all three readers (the drafter's selection, ingest's
+    honest expected count, and the evidence reconciler's keep-set) — drift between them is
+    asymmetric and dangerous: a reconciler narrower than the drafter would silently RETIRE a live
+    target on a transient miss. An unclassified column (no concept, or the concept stage failed) is
+    NOT a target: with no measure signal there is nothing to be confident about."""
+    concepts = concepts or {}
+    return {h for r in rows
+            if not r.unit and _is_measure_concept(concepts.get((h := content_hash(r)), ""))}
 
 
 def _norm(value: str) -> str:
@@ -799,6 +909,88 @@ def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
     return failures
 
 
+def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                         units: dict[str, str], currencies: dict[str, str],
+                         concepts: dict[str, str] | None, glossary: GlossaryUpload,
+                         bindings: dict[str, ObjectBinding] | None,
+                         source_snapshot_id: str) -> int:
+    """Store the LLM's drafted measure annotation (E4a T2) as ``llm/proposed`` ``unit`` /
+    ``currency`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
+    MUST propagate into its stage report (``partial``/``items_failed``).
+
+    EVIDENCE ONLY — AND THAT IS THE WHOLE SAFETY DESIGN. The feature gauntlet reads ``unit`` and
+    ``currency`` from ``graph_node`` (``feature_assist._column_meta``, a plain SELECT), and
+    ``field_policies._MEASURE_ANNOTATION`` keeps BOTH its ``display_rule`` and its
+    ``operational_rule`` at ``_SOURCE_OR_HUMAN``. The LLM is therefore excluded from resolution, the
+    resolver has no display projection for these fields at all, and ``build_graph`` populates
+    ``graph_node.unit`` from the FILE. An AI proposal consequently CANNOT reach the column the
+    gauntlet reads, so it cannot clear ``UNIT_CONSISTENT``/``CURRENCY_CONSISTENT``. The hole is
+    designed out, not guarded — and pinned by
+    ``test_ai_unit_proposal.test_an_ai_proposed_unit_does_not_clear_the_unit_consistent_safety_check``.
+
+    TARGETS: ``_unit_targets`` (a MEASURE concept whose file declares no unit). ``currency`` is
+    written on the same items MINUS any column whose file already declares one — the AI fills a
+    blank at both levels and never contests a declared value.
+
+    GLOSSARY columns only, and the two identities are never collapsed: attachability is checked at
+    the row's PUBLIC-flattened ref, the evidence is stored at the record's SCHEMA-preserving one.
+
+    RECONCILIATION by disposition, per field: every ref in this source still carrying active LLM
+    ``unit`` (resp. ``currency``) evidence is retired EXCEPT the refs written this run and the refs
+    that are STILL targets. So a column that gained a source-declared unit, was reclassified to a
+    non-measure concept, or dropped out of the upload is RETIRED, while a transient miss on a
+    still-live target KEEPS its prior proposal (the safe default this branch takes everywhere).
+
+    Scoped safely: ``unit``/``currency`` LLM evidence has exactly ONE writer — this one. A technical
+    CSV's declared unit is SOURCE-produced and a correction is HUMAN; both are invisible to this
+    producer-scoped retirement."""
+    by_hash = {content_hash(r): r for r in rows}
+    rec_by_tc = _records_by_tc(glossary)
+    concepts = concepts or {}
+    targets = _unit_targets(rows, concepts)
+
+    def _ref_of(h: str, *, field: str) -> tuple[str, str, object] | None:
+        row = by_hash.get(h)
+        if row is None or h not in targets:
+            return None   # not a measure, or the file declares the unit itself
+        if field == "currency" and row.currency:
+            return None   # the file declares the currency — never contested
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        if rec is None:
+            return None   # not a glossary column term — no schema-preserving identity to key on
+        return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
+                {"table": row.table, "column": row.column, "type": row.type,
+                 "concept": concepts.get(h, "")})
+
+    def unit_ref_of(h: str) -> tuple[str, str, object] | None:
+        return _ref_of(h, field="unit")
+
+    def currency_ref_of(h: str) -> tuple[str, str, object] | None:
+        return _ref_of(h, field="currency")
+
+    failures = _write_llm_field_evidence(
+        conn, field_name="unit", items=units, ref_of=unit_ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        bindings=bindings)
+    failures += _write_llm_field_evidence(
+        conn, field_name="currency", items=currencies, ref_of=currency_ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        bindings=bindings)
+
+    # KEEP = written this run ∪ still an expected target, computed through the SAME `ref_of` the
+    # write used (so a ref written this run is never handed to retirement, and a non-target is never
+    # kept alive). Per field — a column that declares a currency but no unit keeps its AI unit while
+    # its AI currency is retired.
+    for field_name, ref_of, drafted in (("unit", unit_ref_of, units),
+                                        ("currency", currency_ref_of, currencies)):
+        keep = {ref[0] for h in set(drafted) | targets if (ref := ref_of(h)) is not None}
+        _reconcile_llm_field_evidence(
+            conn, field_name=field_name,
+            retire_refs=_active_llm_field_refs(conn, source=source,
+                                               field_name=field_name) - keep)
+    return failures
+
+
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
                     glossary: GlossaryUpload | None = None,
                     bindings: dict[str, ObjectBinding] | None = None,
@@ -1162,4 +1354,92 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
         drafted, _reason = accept(raw)
         if drafted is not None:
             result[h] = drafted
+    return result
+
+
+_UNIT_INSTRUCTION = (
+    "For EACH item give the UNIT OF MEASURE the column's values are expressed in — the short token "
+    "a data dictionary would print, never a sentence: a currency minor/major unit (AED, fils), a "
+    "count noun (transactions, shares, days), a rate basis (%, bps) or a physical unit. When the "
+    "column holds a MONETARY amount also give the ISO-4217 `currency` code (three letters, e.g. "
+    "AED); omit `currency` entirely for a non-monetary measure. Treat each item independently: use "
+    "only that item's table/column/type/concept; return exactly one result per input ref.")
+
+
+def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
+                *, concepts: dict[str, str] | None = None,
+                currencies: dict[str, str] | None = None,
+                ingestion_run_id: str | None = None,
+                stats: dict | None = None) -> dict[str, str]:
+    """Draft the MEASURE ANNOTATION for the columns a unit is meaningful for and the file left blank
+    (E4a T2); returns ``{content_hash: unit}``.
+
+    THE POINT: a feature whose measure has no declared unit is created and flagged
+    ``NEEDS_EXTERNAL_VALIDATION`` with a ``UNIT_CONSISTENT`` requirement that nobody could answer —
+    the FTR export declares no unit and the LLM was never asked. It is asked here. What comes back
+    is a PROPOSAL: it is stored as ``llm/proposed`` evidence (``_write_unit_evidence``), it cannot
+    win field resolution, it never reaches ``graph_node.unit``, and it therefore cannot clear the
+    requirement. A human confirms it (Task 3); the AI only ever drafts the answer.
+
+    Targets are ``_unit_targets`` — the ONE definition the writer and ingest's expected count share.
+    NO CACHE (like ``draft_synonyms``): the evidence writer supersedes-and-rewrites unconditionally,
+    and reuse is a deferred optimization.
+
+    ``currencies`` (optional out-param; the RETURN shape stays ``{hash: unit}`` so the stage report
+    reads exactly like every other Pass A stage) receives ``{content_hash: ISO-4217 code}`` for the
+    monetary measures only — a count or a percentage yields a unit with no currency, and nothing
+    downstream may invent one for it.
+
+    ``stats`` (optional out-param): in batch mode receives ``not_attempted``, the count the
+    budget/deadline cutoff skipped WITHOUT dispatch, so the caller labels a truncated run
+    ``truncated`` rather than ``items_failed``. ``ingestion_run_id`` (C5-T5) attributes every
+    dispatch to the run + the exact column subjects drafted (stage ``enrich_unit``)."""
+    concepts = concepts or {}
+    targets = _unit_targets(rows, concepts)
+    blank = {h: r for r in rows if (h := content_hash(r)) in targets}
+    result: dict[str, str] = {}
+
+    def _record(h: str, envelope: str) -> None:
+        unit, currency = _parse_unit_result(envelope)
+        if not unit:
+            return
+        result[h] = unit
+        if currency and currencies is not None:
+            currencies[h] = currency
+
+    if enrich_config.mode("unit") == "batch":
+        # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
+        refs = sorted(blank, key=lambda h: (blank[h].table, h))
+        items = [BatchItem(h, {"table": blank[h].table, "column": blank[h].column,
+                               "type": blank[h].type,
+                               **({"concept": concepts[h]} if concepts.get(h) else {})})
+                 for h in refs]
+        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        resolved = run_batched(
+            conn, client, short="unit", task=_UNIT_TASK, prompt_id="overlay_unit_batch_v1",
+            schema_id="overlay_unit_batch", shared_metadata={}, items=items, out_key="unit",
+            instruction=_UNIT_INSTRUCTION, accept=_accept_unit_result,
+            extract=_extract_unit_result, actor=actor,
+            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            report=batch_report,
+            ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_unit",
+            dispatch_subjects=({h: _column_subject(blank[h]) for h in refs}
+                               if ingestion_run_id is not None else None))
+        if stats is not None:
+            stats["not_attempted"] = batch_report.get("not_attempted", 0)
+        for h, envelope in resolved.items():
+            _record(h, envelope)
+        return result
+
+    for h, row in blank.items():                      # single mode — the per-item path
+        raw = _call(conn, client, _UNIT_TASK, "overlay_unit_v1", "overlay_unit",
+                    {"table": row.table, "column": row.column, "type": row.type,
+                     **({"concept": concepts[h]} if concepts.get(h) else {})}, "unit",
+                    _UNIT_INSTRUCTION, actor,
+                    _single_ctx(ingestion_run_id, "enrich_unit", _column_subject(row)))
+        if raw is None:
+            continue   # provider failure / empty
+        envelope, _reason = _accept_unit_result(raw)
+        if envelope is not None:
+            _record(h, envelope)
     return result
