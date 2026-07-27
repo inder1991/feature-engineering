@@ -1,4 +1,4 @@
-# Spec A — Executable Materialization Vertical Slice (design, rev 3)
+# Spec A — Executable Materialization Vertical Slice (design, rev 4)
 
 **Goal:** Turn a **governed, provenance-verified** feature authoring result into a **complete runnable Kedro/PySpark project** that computes the worked-example features on the Hadoop/Hive cluster and publishes them as one atomically-visible feature-group partition — proven by executing them and reading the published table.
 
@@ -6,7 +6,9 @@
 
 **Scope.** First of three specs. **Spec B** owns profiling/EDA and its UI. **Spec C** owns `model_input` assembly.
 
-> **Rev 3** follows a second code-grounded review (16 findings on rev 2, 12 on rev 1). Every API this spec names is verified in `docs/architecture/2026-07-27-verified-interfaces-materialization.md` with `file:line` citations. **Nothing may enter this spec or its plan unless it is verified there first** — both earlier revisions failed because plausible detail was written faster than it was checked.
+> **Rev 4** follows a third review (10 findings on rev 3), several of which were self-contradictions inside rev 3 itself. Changes: **static IR is separated from run-time snapshots** (§3.3) so a generated project does not change every business date · the atomic-publication **probe is executable and its evidence is what an attestation ingests** (§10) · `SnapshotPolicy` is **fully specified** (§4.2) · the physical target is **bound to its contract** (§10.1) · Gate 2 is **group-wide** (§1.3) · unknown join cardinality and ambiguous intermediate hops are **refused** (§3.1) · failure codes are **three closed enums** (§14) · the spine declaration's **provenance is excluded from identity** (§4) · the fictional `FormulaPlannerIntentV1` stage is **removed** (§2).
+
+> **Rev 3** followed a second code-grounded review (16 findings on rev 2, 12 on rev 1). Every API this spec names is verified in `docs/architecture/2026-07-27-verified-interfaces-materialization.md` with `file:line` citations. **Nothing may enter this spec or its plan unless it is verified there first** — both earlier revisions failed because plausible detail was written faster than it was checked.
 
 **Material changes in rev 3:** admission verifies the **immutable terminal authoring event**, not a caller-constructed result · authorization is **two gates** (artifact, then complete physical read set) · the spine source is an **explicit declaration** with facts as validators only · `1:N` traversal toward the grain is **refused** · contracts are derived **per feature then grouped**, never unioned · a **versioned physical-type adapter** replaces the logical/physical conflation · `PhysicalInputSnapshot` carries **plural** partition specs · publication requires a `PublisherSelection` carrying a passing capability attestation.
 
@@ -42,7 +44,10 @@ Before cluster acceptance, an inventory task captures from the metastore, for `b
 - whether historical partitions are rewritten in place;
 - how a customer snapshot corresponding to a business date is selected;
 - **how account-to-customer ownership is modelled** (see §H — a joint-account bridge makes the traversal `1:N` and would refuse the worked feature);
-- **the Hive, Spark and metastore versions** (§K's capability attestation is keyed on that exact triple).
+- **the Hive, Spark and metastore versions** (§10's capability attestation is keyed on that exact triple);
+- **the full runtime compatibility set needed to RUN the generated project**: Python, Java, Spark/PySpark and Kedro versions. A project that compiles against the wrong PySpark cannot run, and that is discovered at `kedro run`, not at render.
+
+**The inventory is a typed object, not a document.** The Markdown write-up is the human record; compilation and run preparation consume `ClusterInventoryV1` — a frozen schema with a loader and a **metastore adapter** that can refresh it. A prose file cannot be a runtime input.
 
 Compilation contracts are parameterized on this inventory and can be specified before it exists; **cluster acceptance is blocked until it is complete.**
 
@@ -57,8 +62,9 @@ Compilation contracts are parameterized on this inventory and can be specified b
 class ResolvedFeatureInput:
     intent: AuthoringIntent     # carries the feature NAME; AuthoringResult does not
     result: AuthoringResult
-    authoring_run_id: str       # the run whose terminal event proves the result
 ```
+
+`AuthoringResult` already carries `authoring_run_id` (verified, `result.py:97`), so no separate field is needed — and a forger citing a legitimate run is exactly the attack Gate 1 defeats, because that run's terminal payload will not carry their formula's hash.
 
 ### §1.2 Gate 1 — artifact admission against the immutable terminal event
 
@@ -83,7 +89,16 @@ Gate 1 cannot authorize reads, because availability columns, join hops, bridge t
 Gate 1: admit authored artifact   →  compile complete physical IR  →  Gate 2: authorize read set
 ```
 
-Gate 2 checks every element of the union of all expression read sets **plus the spine source, its keys, every join step's endpoints, and every availability column** against `allowed_sensitivities(roles)`. One denied element refuses the whole compilation with `READ_SCOPE_INSUFFICIENT`. There is no partial authorization and no per-feature bypass.
+**Gate 2 is group-wide, not per feature:**
+
+```python
+authorize_compilation(conn, irs: tuple[FormulaExecutionIRV1, ...], spine: SpineSpec,
+                      *, roles) -> AuthorizedCompilation | AuthorizationRefused
+```
+
+It checks the **union** of every expression read set across every feature, plus the spine source and its keys, every join step's endpoints, and every availability column, against `allowed_sensitivities(roles)`.
+
+A per-feature signature would be wrong in a way that matters: a public feature genuinely *is* individually authorized, so testing "every IR is refused" asserts the wrong thing. What must fail is the **group operation** — one denied element anywhere returns a single `READ_SCOPE_INSUFFICIENT`, and **no contract, group plan or project is produced.** There is no partial authorization and no per-feature bypass.
 
 ---
 
@@ -91,8 +106,8 @@ Gate 2 checks every element of the union of all expression read sets **plus the 
 
 ```
 ResolvedFeatureInput  →  §1.2 Gate 1
-  ↓ logical requirements, logical_refs preserved byte-exactly
-FormulaPlannerIntentV1
+AdmittedFeature
+  ↓ formula-to-expression adapter (logical_refs preserved byte-exactly)
   ↓ PER-EXPRESSION physical resolution (§3)
 ExpressionExecutionIR (one per body path)   → expression_ir_hash
   ↓ + spine (§4) + carried output policy
@@ -111,6 +126,14 @@ ValidationReportV1 → classified findings → fix renderer OR re-attest fact �
 per-feature staging + StagingManifestV1
   ↓ assemble (manifest-verified) → validate (§9) → publish (§10) → run manifest (§12)
 ```
+
+---
+
+### §2.1 Reference completeness (replaces the removed intent stage)
+
+Rev 3 named a `FormulaPlannerIntentV1` stage that **does not exist in the repository** and had no owning task. It is removed rather than invented: expressions compile directly from the admitted formula through a formula-to-expression adapter.
+
+What that stage was meant to guarantee is kept as a **test**, which is stronger than an abstraction: every `logical_ref` reachable from the formula — operands, filter `left` refs, event-time refs, grain keys, source tables — must appear in the compiled IR's physical read set **or** be explicitly classified as non-physical with a stated reason. An unaccounted reference is a compilation defect.
 
 ---
 
@@ -140,6 +163,10 @@ class ExpressionExecutionIR:
 
 Outcome mapping: `OPERATIONAL` → proceed · `UNVERIFIED` → `JOIN_PATH_NOT_VERIFIED` (naming the fact keys) · `DENIED` → `JOIN_PATH_DENIED_BY_READ_SCOPE` (naming endpoints) · `NO_PATH` → `GRAIN_PATH_NOT_GOVERNED`.
 
+**Unknown cardinality is refused.** `JoinStep.cardinality` is `str | None` and `graph_edge.cardinality` is nullable (both verified). Refusing only `1:N` would let `None` proceed — and an unknown edge may *be* `1:N`, inflating a SUM. Any step with `cardinality is None` refuses with `JOIN_CARDINALITY_UNKNOWN`. Unknown is never assumed safe.
+
+**Schema continuity is validated across every step, not just the endpoints.** The planner's BFS indexes nodes by **bare table name**, so an ambiguous *intermediate* hop can silently cross schemas — `banking.transactions → banking.accounts → archive.customers` is reachable whenever two schemas share a table name, even when both endpoints look unambiguous. The adapter validates full schema-qualified continuity across every returned step and refuses with `AMBIGUOUS_TABLE_NAME`. Reverse-edge provenance and cardinality are verified in the same pass.
+
 ### §3.2 Fan-out is refused, not repaired
 
 **Any traversal step that fans `1:N` toward the target grain refuses the feature with `JOIN_FANOUT_UNSUPPORTED`.**
@@ -150,25 +177,46 @@ A later governed allocation policy will own those semantics. Until then, refusal
 
 **Known consequence:** if account-to-customer ownership is modelled as a joint-holder bridge, `total_debit_amount_30d` is refused in this slice. §0's inventory must establish this before acceptance planning.
 
-### §3.3 Physical input snapshots
+### §3.3 Physical inputs — STATIC requirement vs RUN-TIME snapshot
+
+`business_dt` is a **run** parameter, not a compilation parameter. Resolving concrete partitions during compilation would put run-specific observations into `ir_hash` and `CompilationIdentity`, so **the generated project would change every business date** — defeating the point of a stable, hash-identified artifact.
+
+Two phases, two objects:
 
 ```python
+# GENERATION TIME — static, enters ir_hash and CompilationIdentity
+@dataclass(frozen=True, slots=True)
+class PhysicalInputRequirement:
+    catalog_source: str
+    schema: str
+    table: str
+    partition_columns: tuple[tuple[str, str], ...] | None   # ordered (column, type); None = verified unpartitioned
+    partition_mapping: PartitionMapping | None              # HOW a business_dt maps to partitions
+    catalog_state_stamp: tuple[tuple[str, str], ...]
+
+# RUN PREPARATION — business_dt + live metastore; NEVER in ir_hash
 @dataclass(frozen=True, slots=True)
 class PartitionSpec:
     columns: tuple[tuple[str, str], ...]      # ordered (column, value)
 
 @dataclass(frozen=True, slots=True)
 class PhysicalInputSnapshot:
-    catalog_source: str
-    schema: str
-    table: str
-    partition_specs: tuple[PartitionSpec, ...] | None
-    catalog_state_stamp: tuple[tuple[str, str], ...]
+    requirement: PhysicalInputRequirement
+    partition_specs: tuple[PartitionSpec, ...] | None       # the exact partitions THIS run reads
+    resolved_at_business_dt: str
 ```
 
-**Plural** — a 90-day feature reads many partitions. `None` means **verified unpartitioned**, never "unknown"; unknown is a refusal. Partitioned inputs carry the exact ordered partition list actually read; L1 verifies every one exists; `input_snapshot_ids` is that ordered set. The environment adapter resolves partitions from the inventory (§0) — materialization never derives them from `business_dt`.
+```
+generation:  formula → IR (PhysicalInputRequirement)      → ir_hash, CompilationIdentity
+run prep:    business_dt + ClusterInventoryV1 + metastore  → PhysicalInputSnapshot
+                                                           → sandbox_execution_hash
+                                                           → L1 partition validation
+                                                           → execution
+```
 
-For an unpartitioned mutable table the snapshot is **not content-addressed**; that is recorded honestly and is one more reason this slice is sandbox-only.
+**Plural** — a 90-day feature reads many partitions. `partition_columns is None` means **verified unpartitioned**, never "unknown"; unknown refuses with `PARTITION_IDENTITY_UNKNOWN`. `input_snapshot_ids` (a run-time value, inside `sandbox_execution_hash` only) is the exact ordered partition set read. L1 runs at **run preparation**, after snapshots resolve, and verifies every one exists.
+
+For an unpartitioned mutable table the snapshot is **not content-addressed** — recorded honestly, and one more reason this slice is sandbox-only.
 
 ---
 
@@ -200,11 +248,46 @@ class PopulationSemantics(StrEnum):           # CLOSED
 **Rules (normative):**
 
 - Declared **once per materialization contract**, never per feature.
-- Included in the contract hash and `CompilationIdentity`.
+- **Only its SEMANTIC payload enters the contract hash.** The declaration carries provenance (`declared_by`, `declaration_reason`, recorded-at, record id) which must NOT affect identity — otherwise two people making the identical semantic declaration produce different contract hashes and therefore different groups, which contradicts the global no-provenance-in-hashes rule.
+
+```python
+SpineSourceDeclarationV1.identity_payload()    # entity, source_table_ref, ordered_key_refs,
+                                               # population_semantics, availability_ref,
+                                               # snapshot_policy, declaration_version
+SpineSourceDeclarationV1.provenance_payload()  # declared_by, declaration_reason,
+                                               # recorded_at, declaration_record_id
+```
 - **Governed facts validate the declaration; they never choose it.** `ENTITY_ASSIGNMENT`, `GRAIN`, read scope and `AVAILABILITY_TIME` may *reject* a declaration (wrong entity, non-unique keys, denied read, missing availability) but must never select a source.
 - A `CURRENT_COMPLETE_POPULATION` claim is recorded as a **human declaration**, not a governed catalog fact, and is labelled as such wherever it is surfaced.
 - **No arbitrary SQL predicate.** Any active/current-row selection is structured via `snapshot_policy`; free-text SQL would smuggle ungoverned business logic into the population definition where no governance check can see it.
 - When a governed `ENTITY_POPULATION_SOURCE` fact is later introduced it **supersedes** the declaration; existing declarations are checked against it and disagreement blocks further materialization.
+
+### §4.2 `SnapshotPolicy` — closed and fully specified
+
+Rev 3 named `SnapshotPolicy` without designing it, which left an implementation free to read the whole customer table — producing duplicate spine keys or leaking future customer versions into a past `business_dt`. Closed variants:
+
+```python
+class SnapshotPolicyKind(StrEnum):
+    CURRENT_SNAPSHOT = "current_snapshot"
+    LATEST_AVAILABLE_AS_OF = "latest_available_as_of"
+    PARTITION_MAPPED = "partition_mapped"
+    ACTIVE_POPULATION = "active_population"
+
+CurrentSnapshot()                       # the table IS the current population; no history
+LatestAvailableAsOf(effective_time_ref, availability_ref,
+                    deterministic_tie_break_refs)   # SCD-style history
+PartitionMappedSnapshot(ordered_partition_mapping)  # business_dt → partition values
+ActivePopulation(status_ref, allowed_status_values) # closed status set, no free-text predicate
+```
+
+**Normative PIT rules for the spine — these mirror §8 and are not optional:**
+
+1. **Future versions are excluded.** Under `LATEST_AVAILABLE_AS_OF`, a row is eligible only if `effective_time_ref <= business_dt` cutoff **and** its `availability_ref` is `<=` the same cutoff. A customer record created after `business_dt` must not appear.
+2. **Exactly one row per entity key.** For each key, the eligible row with the greatest `effective_time_ref` wins.
+3. **Ties are broken deterministically.** When two eligible rows share an `effective_time_ref`, `deterministic_tie_break_refs` orders them. If ties remain unresolved the spine refuses with `SPINE_NON_DETERMINISTIC` — a non-deterministic spine silently changes the population between runs.
+4. **`CURRENT_ACTIVE_ONLY` requires `ActivePopulation`.** The status column and its allowed values are declared; there is no implicit notion of "active" and no free-text predicate.
+5. **Duplicate spine keys are a blocking gate**, not a de-duplication step.
+6. **The spine's `availability_ref` participates in PIT filtering** exactly as an expression's does.
 
 ### §4.1 Completeness is checked against the claim
 
@@ -349,6 +432,33 @@ Without the generation/run/date binding, a reused staging path could leave an ol
 
 **Invariant:** a reader sees either the complete previous partition or the complete new one — never mixed columns, a missing partition, or partial rows.
 
+### §10.1 The physical target is bound to its contract
+
+The contract hash is the group key, but `sandbox_feature.cif_daily` is a human name. Nothing yet stops a *different* contract — changed cutoff semantics, spine declaration, sensitivity, retention or cadence — from overwriting the same physical table, silently replacing one materialization contract with a semantically different one under an unchanged name.
+
+```python
+@dataclass(frozen=True, slots=True)
+class GroupBindingV1:
+    logical_group_name: str                # "cif_daily"
+    materialization_contract_hash: str     # bound ONCE
+    physical_target: str                   # "sandbox_feature.cif_daily"
+    current_group_plan_hash: str           # moves when features are added
+```
+
+Persisted in an immutable registry. Publication refuses with `GROUP_BINDING_CONFLICT` when the contract hash for a logical name differs from its binding. **Adding a feature changes `current_group_plan_hash` and keeps the binding**; changing the contract requires a new logical name or an explicit rebinding decision.
+
+### §10.2 Published generation metadata lives in the data
+
+The atomicity probe depends on a generation marker being visible in **the same atomic state as the data**, so the marker cannot live in side metadata that moves separately. For this slice it is **system columns in the immutable physical output**:
+
+```
+__generation_id · __generated_project_hash · __sandbox_execution_hash
+```
+
+They are part of `expected_schema(plan)` and therefore part of the §9 schema gate. A pointer/view switch then moves data and identity together by construction. Spec C omits them from model inputs.
+
+### §10.3 Capability attestation — ingested only from a probe
+
 **Capability attestation.** No mechanism is selectable without a passing attestation for the **exact** environment:
 
 ```python
@@ -362,6 +472,25 @@ class PublicationCapabilityAttestation:
     covers_schema_evolution: bool
     attested_at: str
 ```
+
+**An attestation may be created ONLY by ingesting a probe result.** Rev 3 allowed `record_attestation` to store `passed=True` directly, so the live test proved only that someone had stored a boolean — not that publication is atomic. There is now an executable probe:
+
+```python
+probe_publication_capability(cluster, *, mechanism, engine_versions) -> ProbeResult
+```
+
+The probe must, against the real cluster:
+
+1. materialize **generation A** and publish it;
+2. start concurrent readers **polling continuously**, each observation recording the `__generation_id` system column **and** a content check (§10.2);
+3. publish **generation B**;
+4. assert every observation is a *complete* A state or a *complete* B state — schema and row count alone can coincide, so the generation marker is what discriminates;
+5. **repeat the whole sequence while ADDING a feature column**, since a partition-location swap does not atomically change table schema;
+6. return the actual observations plus an `evidence_hash` over them.
+
+`record_attestation(probe_result)` accepts nothing else. An attestation with no probe evidence cannot exist.
+
+**`adds_feature` is derived, never passed.** Rev 3 let the caller supply it, so passing `False` bypassed the schema-evolution requirement entirely. It is computed by comparing the **currently published schema** against the group plan's expected schema.
 
 Recorded append-only. `select_publisher` verifies current engine versions against the attestation and returns an immutable
 
@@ -437,9 +566,37 @@ Fixtures are hand-authored and validated against the real Child-1 resolver — a
 
 ---
 
-## §14 Failure vocabulary
+## §14 Failure vocabulary — three closed enums
 
-`AUTHORING_RUN_INCOMPLETE` · `TERMINAL_PAYLOAD_TAMPERED` · `NOT_RESOLVED` · `FORMULA_HASH_MISMATCH` · `AXES_MISMATCH` · `INTENT_HASH_MISMATCH` · `READ_SCOPE_INSUFFICIENT` · `AMBIGUOUS_TABLE_NAME` · `JOIN_PATH_NOT_VERIFIED` · `JOIN_PATH_DENIED_BY_READ_SCOPE` · `GRAIN_PATH_NOT_GOVERNED` · `JOIN_FANOUT_UNSUPPORTED` · `SPINE_SOURCE_NOT_DECLARED` · `SPINE_DECLARATION_REJECTED_BY_FACTS` · `SPINE_INCOMPLETE` · `AVAILABILITY_TIME_NOT_GOVERNED` · `PROHIBITED_INPUT` · `PHYSICAL_TYPE_UNSUPPORTED` · `MULTIPLE_MATERIALIZATION_CONTRACTS` · `PARTITION_IDENTITY_UNKNOWN` · `CAPABILITY_UNPROVEN` · `PROJECT_INTEGRITY`.
+Every refusal uses a value from one of these enums. **A governed refusal never surfaces as a bare `TypeError`/`ValueError`**, and no code may be used that is not listed here.
+
+```python
+class CompilationRefusalCode(StrEnum):          # raised/returned during compile
+    AUTHORING_RUN_INCOMPLETE · TERMINAL_PAYLOAD_TAMPERED · NOT_RESOLVED
+    FORMULA_HASH_MISMATCH · AXES_MISMATCH · INTENT_HASH_MISMATCH
+    READ_SCOPE_INSUFFICIENT · PROHIBITED_INPUT
+    AMBIGUOUS_TABLE_NAME · JOIN_PATH_NOT_VERIFIED · JOIN_PATH_DENIED_BY_READ_SCOPE
+    GRAIN_PATH_NOT_GOVERNED · JOIN_FANOUT_UNSUPPORTED · JOIN_CARDINALITY_UNKNOWN
+    SPINE_SOURCE_NOT_DECLARED · SPINE_DECLARATION_REJECTED_BY_FACTS
+    SPINE_NON_DETERMINISTIC · AVAILABILITY_TIME_NOT_GOVERNED
+    PHYSICAL_TYPE_UNSUPPORTED · MULTIPLE_MATERIALIZATION_CONTRACTS
+    PARTITION_IDENTITY_UNKNOWN · UNACCOUNTED_LOGICAL_REF
+
+class ValidationGateCode(StrEnum):              # BLOCKING gates in the generated pipeline (§9)
+    KEY_NOT_UNIQUE · MISSING_FEATURE_COLUMN · UNEXPECTED_COLUMN
+    WRONG_COLUMN_TYPE · WRONG_NULLABILITY · SCHEMA_HASH_MISMATCH
+    MISSING_STAGING_MANIFEST · STALE_STAGING_MANIFEST · DUPLICATE_STAGING_MANIFEST
+    IR_HASH_MISMATCH · INCOMPLETE_COMPUTATION · FORBIDDEN_NUMERIC
+    OVERFLOW_VIOLATION · SPINE_INCOMPLETE · SPINE_DUPLICATE_KEY
+    PROJECT_INTEGRITY · GROUP_BINDING_CONFLICT · CAPABILITY_UNPROVEN
+
+class ValidationFindingCode(StrEnum):           # L0/L1/L2 findings (§11), non-blocking by themselves
+    PROJECT_DOES_NOT_BUILD · PROJECT_HASH_MISMATCH · PIPELINE_NOT_CONSTRUCTIBLE
+    COLUMN_ABSENT · COLUMN_TYPE_MISMATCH · PARTITION_ABSENT · READ_DENIED
+    UNKNOWN_FINDING                              # → FindingClass.UNCLASSIFIED, fails closed
+```
+
+**Normalize-then-refuse.** Classification normalizes an unknown `effective_restriction` to `prohibited` **internally** (per `safety_floor`) and then refuses with `PROHIBITED_INPUT`. Rev 3 asserted both that unknown *returns* `prohibited` and that `prohibited` *raises* — which cannot both hold through one public API. Internal normalization, single public refusal.
 
 ---
 
@@ -456,6 +613,8 @@ The three worked features are the **target**; §0 may reveal that a joint-accoun
 **From the parent architecture:** Iceberg revisions/time-travel/restatement · run state machine · outbox/reconciliation · external attestation and authenticated callbacks (Child-6) · execution-signature batching · quarantine by bisection · profiling privacy (Spec B) · the full Child-2 lifecycle · the full `TemporalPolicyV1`.
 
 **Identified here:** governed **source-delivery SLA** (prerequisite for deriving `availability_class`) · governed **`ENTITY_POPULATION_SOURCE`** fact, superseding §4's declaration — *trigger: before production publication, or supporting multiple entity populations* · governed **fan-out allocation policy** (§3.2) · `dependencies_ready` trigger · authenticated submission into a real bank environment · content-addressed input snapshots · multi-partition/backfill runs · multi-environment promotion · computation scan sharing · governed per-column retention · `SATURATE` overflow behaviour.
+
+**Newly recorded in rev 4:** governed `ENTITY_POPULATION_SOURCE` fact (supersedes §4's declaration) · governed fan-out **allocation policy** (§3.2) · content-addressed input snapshots (§3.3) · production publication path (Child-2 must supply a binding-validating factory).
 
 **NOT deferred despite resembling NFRs:** PIT correctness · join cardinality handling · atomic group publication · the §9 gates · derived sensitivity/access classification · physical type and overflow semantics · Spark-local and cluster execution proofs.
 
