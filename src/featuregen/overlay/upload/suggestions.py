@@ -13,8 +13,18 @@ whose distinctive columns exist on only one table were lost entirely, having gro
 need on the alphabetically-first table and then been rejected NO_JOIN_PATH there. Per-table grounding
 is also CHEAPER (grounding cost scales with the columns considered, so a page view is O(recipes ×
 table columns) instead of O(recipes × catalog columns)) and it removed the second grounding pass the
-rejection list used to need: every rejection now comes from a candidate grounded on this table's
-columns alone, so the engine's list is already this table's and needs no re-attribution.
+rejection list used to need: every rejection now comes from a candidate grounded on this table's own
+grounding set, so the engine's list is already this screen's and needs no re-attribution.
+
+Grounding is asked for this table AND the tables a CLEARING join makes reachable from it. Per-table
+grounding alone could no longer produce a cross-table candidate AT ALL — not even one a governed join
+legitimately authorises: "average transaction amount per customer", where the amount lives on
+`transactions` and the customer key comes over a VERIFIED join to `customers`, became invisible on
+this screen. The reachable set comes from `join_path.clearing_reachable_tables`, which is the
+gauntlet's OWN machinery (same fetch, same read-scope check, same clearing rule), so the columns this
+screen may reach and the gauntlet's `JOIN_CONNECTIVITY` disposition cannot disagree. An UNVERIFIED
+join does NOT widen — a candidate reached over one would arrive carrying a `JOIN_CONNECTIVITY`
+requirement or be rejected `NO_JOIN_PATH`, which is precisely the noise per-table grounding removed.
 
 The catalog-wide question is a DIFFERENT question and still has its own caller: `build_considered_set`
 (the hypothesis-driven feature-generation flow) asks what the CATALOG can produce and passes no
@@ -26,6 +36,7 @@ from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.gate1 import _template_candidates
 from featuregen.overlay.upload.feature_assist import FeatureIdea
+from featuregen.overlay.upload.join_path import clearing_reachable_tables, table_of_ref
 from featuregen.overlay.upload.recipe_grounding_context import RecipeGroundingContextV1
 
 
@@ -47,15 +58,15 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
                 "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
                 "groups": [], "rejections": []}
     table = known                                   # the catalog's own bare name — the engine's key
+    # The join NEIGHBOURHOOD, decided by the gauntlet's own rule (one statement). Read-scoped: an edge
+    # with an endpoint this caller cannot see is DENIED there, so it never widens anything here.
+    reachable = clearing_reachable_tables(conn, catalog_source, table, roles=roles)
     ideas, rejections, _grounded, _rejected, binding_by_id, _incomplete, contexts, keys_by_recipe = (
         _template_candidates(conn, catalog_source=catalog_source, roles=roles,
                              target_ref=None, now=None,           # no intent, no clock, no LLM
-                             table=table))                        # ...and only THIS table's columns
-    # Grounding is now scoped to the table, so every idea is already this table's — but a template
-    # whose needs are ALL optional and all unmet grounds with no bindings at all and therefore no
-    # grain table, and such an idea is not a suggestion FOR this table. The filter is what makes the
-    # per-table guarantee a property of this function rather than of the engine's internals.
-    mine = [idea for idea in ideas if idea.grain_table == table]
+                             table=table,                         # ...THIS table's columns...
+                             also_tables=sorted(reachable - {table})))   # ...+ what it can join to
+    mine = [idea for idea in ideas if _binds(idea, table)]
     # Keyed on the entity REF alone: keying on (ref, label) lets one column open two groups, which
     # the screen then renders with the same React key.
     groups: dict[str, list[dict]] = {}
@@ -77,10 +88,29 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
         # page's lead.
         "groups": [{"entity_ref": ref, "entity_label": labels.get(ref, ""), "suggestions": items}
                    for ref, items in sorted(groups.items(), key=lambda kv: (kv[0] == "", kv[0]))],
-        # Every rejection came from a candidate grounded on THIS table's columns alone, so the
-        # engine's list is already this table's — see the module docstring.
+        # Every rejection came from a candidate grounded on THIS table's grounding NEIGHBOURHOOD (its
+        # own columns, plus whatever a clearing join reaches), so the engine's list is already this
+        # screen's and needs no re-attribution — see the module docstring. With no join the
+        # neighbourhood is the table itself and the list is exactly the table's, as before.
         "rejections": rejections,
     }
+
+
+def _binds(idea: FeatureIdea, table: str) -> bool:
+    """Does this candidate actually READ a column of ``table``?
+
+    This is what makes "a suggestion FOR this table" a property of this function rather than of the
+    engine's internals, and it is the un-widened rule generalised, not a new one: with the candidate
+    columns narrowed to one table, ``grain_table == table`` was exactly "bound at least one column"
+    (a template whose needs are all optional and all unmet grounds with NO bindings, hence no grain
+    table, and is nobody's suggestion). Once the set is widened across a join, the grain moves to the
+    ENTITY's table — "average transaction amount per customer" is grained on ``customers`` — so a
+    grain test would file the ledger's own feature away from the ledger. A candidate that binds
+    nothing here is a pure neighbour candidate and belongs on the neighbour's screen.
+
+    ``table_of_ref`` is the join BFS's own ref->table function, so the tables the widening reasoned
+    about and the tables counted here are the same names."""
+    return any(table_of_ref(ref) == table for _src, ref in idea.derives_pairs)
 
 
 def _resolve_table(conn, catalog_source: str, table: str) -> str | None:

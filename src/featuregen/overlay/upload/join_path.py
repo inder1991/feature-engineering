@@ -134,16 +134,29 @@ def _adjacency(edges: Iterable[_Edge]) -> dict[str, list[tuple[str, JoinStep]]]:
     return adj
 
 
-def classify_join_path(conn, catalog_source: str, from_table: str, to_table: str, *,
-                       roles: Iterable[str] = ()) -> JoinOutcome:
-    """Discriminated per-hop join classification (spec §7). Drops the VERIFIED-status + sensitivity
-    predicates from the fetch (KEEPS authority='operational' + endpoint existence, per #12) and
-    classifies each edge in Python: clearing (declared or VERIFIED), unverified (fact-linked, not yet
-    VERIFIED), or denied (an endpoint hidden by read-scope). Layered BFS: the shortest clearing path
-    -> OPERATIONAL; else the shortest clearing+unverified path -> UNVERIFIED; else if a path exists
-    only through a denied hop -> DENIED; else NO_PATH."""
-    if from_table == to_table:
-        return JoinOutcome(kind=JoinOutcome.OPERATIONAL)
+@dataclass(frozen=True, slots=True)
+class _ClassifiedEdges:
+    """This catalog's operational ``joins`` edges, split by the SINGLE authority + read-scope rule.
+
+    Extracted so that every consumer of "which joins may this caller traverse" — the per-hop
+    classifier below and the suggestions screen's grounding-set widening — decides it with the same
+    machinery. A second, hand-rolled copy of the clearing rule (or of the read-scope check) would be
+    free to drift, and the two ways it could drift are both defects: a widening that admits a hop the
+    gauntlet then refuses (mis-attributed JOIN_CONNECTIVITY / NO_JOIN_PATH noise on the screen), or a
+    widening that crosses a hop the caller cannot see (a read-scope leak).
+    """
+    clearing: tuple[_Edge, ...]         # declared (no fact) or governed-VERIFIED — traversable
+    unverified: tuple[_Edge, ...]       # fact-linked but not yet VERIFIED — authorized, not cleared
+    unverified_fact: dict[tuple[str, str], str]   # (from_ref, to_ref) -> the approved_join fact key
+    denied: tuple[_Edge, ...]           # an endpoint hidden by this caller's read scope
+
+
+def _classified_edges(conn, catalog_source: str, roles: Iterable[str]) -> _ClassifiedEdges:
+    """Fetch this catalog's operational join edges and classify each one. Drops the VERIFIED-status +
+    sensitivity predicates from the fetch (KEEPS authority='operational' + endpoint existence, per
+    #12) and classifies in Python: an edge whose BOTH endpoint columns are visible under
+    ``allowed_sensitivities(roles)`` is clearing when ``fact_key is None or status == 'VERIFIED'``
+    and unverified otherwise; an edge with a hidden endpoint is denied outright. ONE statement."""
     allowed = allowed_sensitivities(roles)
     rows = conn.execute(
         "SELECT e.from_ref, e.to_ref, e.cardinality, e.approved_join_fact_key, "
@@ -169,6 +182,55 @@ def classify_join_path(conn, catalog_source: str, from_table: str, to_table: str
         else:
             unverified.append(edge)
             unverified_fact[(from_ref, to_ref)] = fact_key
+    return _ClassifiedEdges(tuple(clearing), tuple(unverified), unverified_fact, tuple(denied))
+
+
+def _reachable(adj: dict[str, list[tuple[str, JoinStep]]], from_table: str) -> set[str]:
+    """Every table reachable from ``from_table`` over ``adj`` (``from_table`` itself included). The
+    closure form of :func:`_bfs` — same adjacency, same hops, no target."""
+    seen = {from_table}
+    queue: deque[str] = deque([from_table])
+    while queue:
+        table = queue.popleft()
+        for neighbor, _step in adj.get(table, []):
+            if neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    return seen
+
+
+def clearing_reachable_tables(conn, catalog_source: str, from_table: str, *,
+                              roles: Iterable[str] = ()) -> frozenset[str]:
+    """The tables reachable from ``from_table`` over CLEARING join edges only, ``from_table``
+    included. Read-scoped exactly like :func:`classify_join_path`: an edge with an endpoint this
+    caller cannot see is DENIED, so it never widens reachability.
+
+    "Clearing" is deliberately the same predicate :func:`classify_join_path` calls OPERATIONAL —
+    declared or governed-VERIFIED. UNVERIFIED edges are excluded ON PURPOSE: a table reached over one
+    would yield candidates the gauntlet then either burdens with a ``JOIN_CONNECTIVITY`` requirement
+    or rejects ``NO_JOIN_PATH``, which is exactly the mis-attributed noise the per-table screen exists
+    to remove. Surfacing "you could build X if you confirmed this join" is a separate product
+    decision, not a side effect of this helper.
+
+    Costs ONE statement — the same single ``graph_edge`` fetch the classifier makes."""
+    edges = _classified_edges(conn, catalog_source, roles)
+    return frozenset(_reachable(_adjacency(edges.clearing), from_table))
+
+
+def classify_join_path(conn, catalog_source: str, from_table: str, to_table: str, *,
+                       roles: Iterable[str] = ()) -> JoinOutcome:
+    """Discriminated per-hop join classification (spec §7). Classifies every operational edge
+    (:func:`_classified_edges`) as clearing (declared or VERIFIED), unverified (fact-linked, not yet
+    VERIFIED), or denied (an endpoint hidden by read-scope), then runs a layered BFS: the shortest
+    clearing path -> OPERATIONAL; else the shortest clearing+unverified path -> UNVERIFIED; else if a
+    path exists only through a denied hop -> DENIED; else NO_PATH."""
+    if from_table == to_table:
+        return JoinOutcome(kind=JoinOutcome.OPERATIONAL)
+    edges = _classified_edges(conn, catalog_source, roles)
+    clearing = list(edges.clearing)
+    unverified = list(edges.unverified)
+    unverified_fact = edges.unverified_fact
+    denied = list(edges.denied)
 
     path = _bfs(_adjacency(clearing), from_table, to_table)
     if path is not None:

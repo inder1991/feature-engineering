@@ -209,6 +209,7 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
                          table: str | None = None,
+                         also_tables: Sequence[str] = (),
                          ) -> tuple[list[FeatureIdea], list[dict],
                                     frozenset[str], dict[str, tuple[str, ...]], dict[str, str],
                                     dict[str, tuple[str, ...]],
@@ -234,11 +235,21 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     the per-table suggestions screen ONLY: this pass yields at most one candidate per template, so
     catalog-wide the first table to bind a recipe uses it up and every other table shows nothing for it.
     The feature-generation flow (``build_considered_set``) asks the CATALOG-wide question and must keep
-    asking it, so the default is ``None`` — unchanged, one candidate per template, whole catalog."""
-    # The kwarg is passed ONLY when narrowing: `_ground_template_outcomes` is a long-standing
+    asking it, so the default is ``None`` — unchanged, one candidate per template, whole catalog.
+
+    ``also_tables`` widens that narrowing to the sibling tables a CLEARING join makes reachable from
+    ``table`` (the suggestions screen resolves them via ``join_path.clearing_reachable_tables``), so a
+    cross-table candidate a governed join authorises can ground. It is INERT when ``table is None``:
+    the catalog-wide pass already considers every table and must stay byte-identical."""
+    # The kwargs are passed ONLY when narrowing: `_ground_template_outcomes` is a long-standing
     # substitution seam (tests and the measurement harness replace it), so the catalog-wide call must
-    # stay argument-for-argument what it has always been.
-    narrowing = {} if table is None else {"table": table}
+    # stay argument-for-argument what it has always been — and an un-widened per-table call must stay
+    # argument-for-argument what IT has been since P4.
+    narrowing: dict = {}
+    if table is not None:
+        narrowing["table"] = table
+        if also_tables:
+            narrowing["also_tables"] = tuple(also_tables)
     outcomes = _ground_template_outcomes(
         conn, templates, catalog_source=catalog_source, roles=roles, **narrowing)
     grounded = [

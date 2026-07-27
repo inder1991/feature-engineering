@@ -636,7 +636,8 @@ def ground_template(conn, template: Template, *, catalog_source: str,
 def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: str,
                         roles: Iterable[str] = (),
                         use_case: str | None = None,
-                        table: str | None = None) -> list[GroundingOutcome]:
+                        table: str | None = None,
+                        also_tables: Iterable[str] = ()) -> list[GroundingOutcome]:
     """Ground ``templates`` against ``catalog_source``, one outcome per template.
 
     ``table`` narrows the candidate columns to that one table. It is a pure NARROWING applied AFTER
@@ -647,6 +648,16 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
     shows nothing for that recipe. A per-table screen wants "what can THIS table produce"; the
     catalog-wide default answers "what can this CATALOG produce" and is what the feature-generation
     flow asks. Default ``None`` = catalog-wide, exactly as before.
+
+    ``also_tables`` widens that narrowing back out to a NAMED set of sibling tables — the tables a
+    CLEARING join makes reachable from ``table`` (``join_path.clearing_reachable_tables``). Without
+    it a per-table pass can no longer produce a cross-table candidate at all, not even one a governed
+    join legitimately authorises ("average transaction amount per customer", where the amount is on
+    one table and the customer key comes over a verified join). It is still a NARROWING of the same
+    read-scoped list — the caller names tables, never columns, and a table it names contributes only
+    the columns ``_load_columns`` already cleared — so it cannot widen a read scope. It is IGNORED
+    when ``table is None``: there is no anchor to widen FROM, and the catalog-wide pass is already
+    every table.
     """
     # The read-scoped column list is IDENTICAL for every template in this pass, so load it ONCE and
     # hand it down — grounding the whole registry re-read the entire catalog per template (157 full
@@ -654,7 +665,8 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
     # Scoped to THIS pass's (catalog_source, roles) and never held beyond it: no cache, no global.
     cols = _load_columns(conn, catalog_source, roles)
     if table is not None:
-        cols = [col for col in cols if col.table == table]
+        wanted = {table, *also_tables}
+        cols = [col for col in cols if col.table in wanted]
     outcomes: list[GroundingOutcome] = []
     for template in templates:
         if use_case is not None and use_case not in template.use_cases:

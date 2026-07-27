@@ -79,7 +79,34 @@ _COLUMNS = {
         "REPAY_CNT": ("count", "integer", "Repayment Count"),
     },
 }
-_CONCEPT_OF = {col: spec[0] for cols in _COLUMNS.values() for col, spec in cols.items()}
+
+# ── the JOIN-WIDENING catalog: TWO tables, and the split is the whole point ───────────────────────
+# The measure table carries amounts but NO customer key; the entity table carries the customer key
+# but no amount. "Average/trend of a balance PER CUSTOMER" is therefore unbuildable on either table
+# alone and buildable only across the join — the exact feature per-table grounding made invisible.
+_JOIN_SOURCE = "p4_suggestions_join_ftr"
+_MEASURE_TABLE = "txn_ledger"
+_ENTITY_TABLE = "cust_master"
+_JOIN_COLUMNS = {
+    _MEASURE_TABLE: {
+        "LEDGER_ACCT": ("account_id", "varchar", "Ledger Account Identifier"),
+        "TXN_AMT": ("monetary_flow", "decimal", "Ledger Transaction Amount"),
+        "BAL_AMT": ("monetary_stock", "decimal", "Ledger Balance"),
+        "TXN_TS": ("event_timestamp", "timestamp", "Ledger Posting Timestamp"),
+        "LEDGER_DT": ("as_of_date", "date", "Ledger As Of Date"),
+        # account-anchored concepts, so the ledger's UNWIDENED screen is not empty: the widening has
+        # to be shown ADDING cards to a working screen, not rescuing a blank one.
+        "CUST_HOLD": ("custody_holding", "decimal", "Ledger Custody Holding"),
+        "SETL_STAT": ("settlement_status", "varchar", "Ledger Settlement Status"),
+    },
+    _ENTITY_TABLE: {
+        "MASTER_CIF": ("customer_id", "varchar", "Master Customer Identifier"),
+        "MASTER_ACCT": ("account_id", "varchar", "Master Account Identifier"),
+        "MASTER_DT": ("as_of_date", "date", "Master As Of Date"),
+    },
+}
+_JOIN_FROM = f"public.{_MEASURE_TABLE}.ledger_acct"
+_JOIN_TO = f"public.{_ENTITY_TABLE}.master_acct"
 
 _SERVICE = IdentityEnvelope(subject="featuregen-overlay-enrichment", actor_kind="service",
                             authenticated=True, auth_method="internal", role_claims=())
@@ -100,19 +127,41 @@ def _seal() -> None:
         profiler_require_restricted_role=False))
 
 
-def _ftr_csv() -> str:
+def _ftr_csv(columns: dict) -> str:
     return _HDR + "".join(
         _row(source_row=str(n), fqn=f"{_FQN_PREFIX}{table.upper()}.{col}", term_name=term,
              definition=f'"{term}, recorded on {table}."', data_type=declared)
         for n, (table, col, (_concept, declared, term)) in enumerate(
-            ((t, c, spec) for t, cols in _COLUMNS.items() for c, spec in cols.items()), start=1))
+            ((t, c, spec) for t, cols in columns.items() for c, spec in cols.items()), start=1))
 
 
-def _govern_table_facts(conn, table: str, grain_column: str, as_of_column: str) -> None:
+def _ingest(conn, source: str, columns: dict) -> None:
+    """Build ``source`` through the REAL FTR path, tagged with the concepts the enrichment stage
+    would have proposed. Grounding is the router, so those concepts are what decide which template
+    families surface."""
+    upload = to_glossary_upload(read_ftr_glossary(_ftr_csv(columns), source=source))
+    good = validate_rows(upload.rows, source, profile=FTR_GLOSSARY_PROFILE).good
+    concept_of = {col: spec[0] for cols in columns.values() for col, spec in cols.items()}
+    concepts = {content_hash(r): concept_of[r.column.upper()] for r in good}
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"results": [
+            {"ref": h, "concept": c} for h, c in concepts.items()]}),
+        "overlay.enrich.definition": FakeResponse(output={"results": []}),
+        "overlay.enrich.domain": FakeResponse(output={"results": [
+            {"ref": t, "domain": "payments"} for t in columns]}),
+        "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
+    })
+    res = ingest_upload(conn, source, upload.rows, actor=_UPLOADER, now=NOW,
+                        client=client, glossary=upload)
+    assert res.status == "ingested", res.status
+
+
+def _govern_table_facts(conn, table: str, grain_column: str, as_of_column: str,
+                        source: str = SOURCE) -> None:
     """Grain + availability through the REAL governance path: the service enrichment actor proposes,
     a platform admin confirms, the confirm-time bridge projects onto ``graph_node``."""
     admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
-    ref = table_ref(SOURCE, table)
+    ref = table_ref(source, table)
     for fact_type, value in (("grain", {"columns": [grain_column], "is_unique": True}),
                              ("availability_time", {"column": as_of_column, "basis": "posted_at"})):
         res = propose_fact(conn, Command(
@@ -127,26 +176,13 @@ def _govern_table_facts(conn, table: str, grain_column: str, as_of_column: str) 
              "target_event_id": ctx["target_event_id"]},
             admin, f"confirm-{ctx['target_event_id']}"))
         assert res.accepted, res.denied_reason
-        assert project_verified_table_fact(conn, SOURCE, ref, fact_type, now=NOW) == "projected"
+        assert project_verified_table_fact(conn, source, ref, fact_type, now=NOW) == "projected"
 
 
 @pytest.fixture
 def ftr_catalog(overlay_conn):
     _seal()
-    upload = to_glossary_upload(read_ftr_glossary(_ftr_csv(), source=SOURCE))
-    good = validate_rows(upload.rows, SOURCE, profile=FTR_GLOSSARY_PROFILE).good
-    concepts = {content_hash(r): _CONCEPT_OF[r.column.upper()] for r in good}
-    client = FakeLLM(script={
-        "overlay.enrich.concept": FakeResponse(output={"results": [
-            {"ref": h, "concept": c} for h, c in concepts.items()]}),
-        "overlay.enrich.definition": FakeResponse(output={"results": []}),
-        "overlay.enrich.domain": FakeResponse(output={"results": [
-            {"ref": t, "domain": "payments"} for t in _COLUMNS]}),
-        "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
-    })
-    res = ingest_upload(overlay_conn, SOURCE, upload.rows, actor=_UPLOADER, now=NOW,
-                        client=client, glossary=upload)
-    assert res.status == "ingested", res.status
+    _ingest(overlay_conn, SOURCE, _COLUMNS)
     _govern_table_facts(overlay_conn, TABLE, "cif_id", "as_of_dt")
     _govern_table_facts(overlay_conn, OTHER_TABLE, "book_id", "risk_dt")
     _govern_table_facts(overlay_conn, SIBLING_TABLE, "loan_cif", "due_dt")
@@ -370,6 +406,171 @@ def test_the_feature_generation_path_is_still_catalog_wide(overlay_conn, ftr_cat
     assert TABLE in grains and SIBLING_TABLE not in grains
     # one candidate per template — the catalog-wide invariant this change must not touch
     assert len({i.recipe_id for i in default[0]}) == len(default[0])
+
+
+# ── widening the grounding set across a CLEARING join ────────────────────────────────────────────
+# Per-table grounding fixed starvation but could no longer produce a cross-table candidate AT ALL —
+# not even one a governed join legitimately authorises. The widening reuses `join_path`'s own rule
+# (`clearing_reachable_tables`), so the columns a screen may reach and the gauntlet's JOIN_CONNECTIVITY
+# disposition are decided by ONE piece of machinery and cannot drift apart.
+@pytest.fixture
+def join_catalog(overlay_conn):
+    """Two tables, split so that the interesting feature is ONLY buildable across the join."""
+    _seal()
+    _ingest(overlay_conn, _JOIN_SOURCE, _JOIN_COLUMNS)
+    _govern_table_facts(overlay_conn, _MEASURE_TABLE, "ledger_acct", "ledger_dt",
+                        source=_JOIN_SOURCE)
+    _govern_table_facts(overlay_conn, _ENTITY_TABLE, "master_cif", "master_dt",
+                        source=_JOIN_SOURCE)
+    return _Catalog(source=_JOIN_SOURCE, table=_MEASURE_TABLE)
+
+
+def _join_edge(conn, *, fact_key: str | None, status: str | None) -> None:
+    """One operational `joins` edge between the two tables. ``fact_key=None`` is a FILE-DECLARED edge;
+    a fact key with ``VERIFIED`` is a governed-verified one — `join_path` treats both as CLEARING."""
+    conn.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority, "
+        "approved_join_fact_key, approved_join_status) "
+        "VALUES (%s, 'joins', %s, %s, 'N:1', 'operational', %s, %s)",
+        (_JOIN_SOURCE, _JOIN_FROM, _JOIN_TO, fact_key, status))
+
+
+def _screen(conn, table: str = _MEASURE_TABLE, roles=()) -> dict:
+    return suggest_features_for_table(conn, catalog_source=_JOIN_SOURCE, table=table, roles=roles)
+
+
+def test_a_verified_join_widens_the_grounding_set_across_tables(overlay_conn, join_catalog):
+    """THE HEADLINE. ``balance_trend_90d`` needs a customer key and a balance. The balance lives on
+    ``txn_ledger``, the customer key only on ``cust_master`` — so on the ledger's screen the recipe is
+    UNBUILDABLE under per-table grounding. A VERIFIED join makes ``cust_master`` reachable, the
+    grounding set widens to both tables' columns, and the card appears with operands SPANNING both."""
+    before = _screen(overlay_conn)
+    assert "balance_trend_90d" not in _names(before)              # per-table: invisible
+    assert all(ref.startswith(f"public.{_MEASURE_TABLE}.") for ref in _uses(before))
+
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    after = _screen(overlay_conn)
+    assert _names(before) < _names(after)                          # strictly more, nothing lost
+    cards = {s["name"]: s for g in after["groups"] for s in g["suggestions"]}
+    card = cards["balance_trend_90d"]
+    # the SPECIFIC bound columns span both tables — a mere non-empty count would not show this
+    assert f"public.{_MEASURE_TABLE}.bal_amt" in card["uses"]
+    assert f"public.{_ENTITY_TABLE}.master_cif" in card["uses"]
+    # and it clears the join gauntlet outright — a VERIFIED path raises no external-validation need
+    assert "JOIN_CONNECTIVITY" not in {r["code"] for r in card["requirements"]}
+    # every card still touches THIS table: a purely cust_master candidate is not the ledger's card
+    for s in cards.values():
+        assert any(ref.startswith(f"public.{_MEASURE_TABLE}.") for ref in s["uses"]), s["name"]
+
+
+def test_a_file_declared_join_also_widens(overlay_conn, join_catalog):
+    """`join_path`'s clearing rule is ``fact_key is None or status == 'VERIFIED'`` — a file-declared
+    edge clears too, and the widening must use that rule, not a re-implementation of half of it."""
+    _join_edge(overlay_conn, fact_key=None, status=None)
+    assert "balance_trend_90d" in _names(_screen(overlay_conn))
+
+
+def test_an_unverified_join_does_not_widen(overlay_conn, join_catalog):
+    """The SCOPE DECISION. An authorized-but-unverified edge would re-admit exactly the candidates
+    per-table grounding removed — they would surface carrying a JOIN_CONNECTIVITY requirement or be
+    rejected NO_JOIN_PATH. So it does not widen, and the screen is byte-identical to no join at all."""
+    before = _screen(overlay_conn)
+    _join_edge(overlay_conn, fact_key="ajf-draft", status="DRAFT")
+    after = _screen(overlay_conn)
+    assert after == before                                        # not one card, not one rejection
+    assert "balance_trend_90d" not in _names(after)
+    assert not [r for r in after["rejections"]
+                if r["code"] in ("NO_JOIN_PATH", "JOIN_DENIED")]
+    assert not [s for g in after["groups"] for s in g["suggestions"]
+                if "JOIN_CONNECTIVITY" in {r["code"] for r in s["requirements"]}]
+
+
+def test_no_join_leaves_the_per_table_screen_exactly_as_it_was(overlay_conn, join_catalog):
+    """No join edge at all -> today's per-table behaviour, unchanged: every operand is this table's."""
+    out = _screen(overlay_conn)
+    assert out["summary"]["suggested"] >= 1
+    assert all(ref.startswith(f"public.{_MEASURE_TABLE}.") for ref in _uses(out))
+    assert {s["grain_table"] for g in out["groups"] for s in g["suggestions"]} == {_MEASURE_TABLE}
+
+
+def test_a_caller_who_cannot_see_the_join_endpoint_gets_no_widening(overlay_conn, join_catalog):
+    """READ-SCOPING — the critical risk. The widening reuses `classify_join_path`'s visibility rule:
+    an edge is usable only when BOTH endpoint columns are visible under the caller's read scope. Hide
+    ONE endpoint and the blind caller must reach NOTHING of the far table — not merely miss the hidden
+    column — while the privileged caller crosses the same edge."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND object_ref = %s", (_JOIN_SOURCE, _JOIN_TO))
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+
+    blind = _screen(overlay_conn, roles=())
+    privileged = _screen(overlay_conn, roles=("restricted_reader",))
+
+    # the blind caller: no far-table column at all, and certainly not the restricted endpoint
+    assert all(ref.startswith(f"public.{_MEASURE_TABLE}.") for ref in _uses(blind)), _uses(blind)
+    assert _JOIN_TO not in _uses(blind)
+    assert "balance_trend_90d" not in _names(blind)
+    # the privileged caller crosses it — non-vacuous proof the fixture really does widen
+    assert "balance_trend_90d" in _names(privileged)
+    assert f"public.{_ENTITY_TABLE}.master_cif" in _uses(privileged)
+
+
+def test_widening_never_binds_a_column_the_caller_could_not_already_see(overlay_conn, join_catalog):
+    """The general statement: whatever the widening admits is a SUBSET of this caller's own read-scoped
+    column list. A join can only ever make a VISIBLE column reachable — never make one visible."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'pii' "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (_JOIN_SOURCE, f"public.{_ENTITY_TABLE}.master_cif"))
+    for roles in ((), ("pii_reader",)):
+        visible = {c.object_ref
+                   for c in templates_module._load_columns(overlay_conn, _JOIN_SOURCE, roles)}
+        for table in (_MEASURE_TABLE, _ENTITY_TABLE):
+            assert _uses(_screen(overlay_conn, table=table, roles=roles)) <= visible, (roles, table)
+
+
+def test_the_catalog_wide_path_never_widens(overlay_conn, join_catalog):
+    """The SCOPE guarantee for the feature-generation flow: widening is meaningless without an anchor
+    table, so the catalog-wide default is inert to it — argument-for-argument the pass it always was."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    default = _template_candidates(overlay_conn, catalog_source=_JOIN_SOURCE, roles=(),
+                                   target_ref=None, now=None)
+    inert = _template_candidates(overlay_conn, catalog_source=_JOIN_SOURCE, roles=(),
+                                 target_ref=None, now=None, table=None,
+                                 also_tables=(_MEASURE_TABLE, _ENTITY_TABLE))
+    assert [(i.name, i.grain_table, i.recipe_id) for i in default[0]] == [
+        (i.name, i.grain_table, i.recipe_id) for i in inert[0]]
+    assert default[1:] == inert[1:]
+
+
+def test_the_widened_screen_still_writes_nothing(overlay_conn, join_catalog):
+    """Widening adds ONE read (the join-edge fetch) and no write — including to ``graph_edge``."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    tables = ("graph_node", "graph_edge", "field_decision_event", "contract_intent")
+    def fingerprint():
+        return tuple(overlay_conn.execute(
+            f"SELECT count(*), md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) "
+            f"FROM {t} t").fetchone() for t in tables)
+    before = fingerprint()
+    assert _screen(overlay_conn)["summary"]["suggested"] >= 1
+    assert fingerprint() == before
+
+
+def test_one_page_view_still_reads_the_catalog_columns_once(overlay_conn, join_catalog, monkeypatch):
+    """Widening must not reintroduce a second grounding pass: the read-scoped column list is still
+    loaded ONCE per page view, and the join neighbourhood is resolved in ONE further statement."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    real = templates_module._load_columns
+
+    def _spy(conn, catalog_source, roles):
+        calls.append((catalog_source, tuple(roles)))
+        return real(conn, catalog_source, roles)
+
+    monkeypatch.setattr(templates_module, "_load_columns", _spy)
+    _screen(overlay_conn)
+    assert calls == [(_JOIN_SOURCE, ())]
 
 
 def _idea(**kw) -> FeatureIdea:
