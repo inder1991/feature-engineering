@@ -26,6 +26,15 @@ from featuregen.overlay.upload.feature_assist import REQUIREMENT_CODES, Requirem
 
 DEFAULT_SCHEMA_VERSION = "v1"
 
+# E4a T3: the version of the two MEASURE-ANNOTATION requirement schemas, bumped from "v1" when the
+# AI's `llm/proposed` unit/currency suggestion was added to their params. A registry schema is a
+# CONTRACT with the EXTERNAL check that reads it — an unknown param is a hard validation error there
+# just as it is here (`_validate_params`), so a NEW param is a NEW version, never a silent widening
+# of "v1". Requirements minted at v2 carry `schema_version="v2"`; the serializers emit it (it differs
+# from DEFAULT_SCHEMA_VERSION) and `schema_for` resolves it, so a v1 consumer that never learned
+# about the suggestion keeps refusing to interpret a v2 payload — which is the point of versioning.
+MEASURE_SUGGESTION_SCHEMA_VERSION = "v2"
+
 
 class UnknownRequirement(Exception):
     """Raised by `schema_for` when a (code, schema_version) pair is not in the registry."""
@@ -110,24 +119,31 @@ _SCHEMAS: tuple[ValidationRequirementSchema, ...] = (
         result_schema={"is_connected": bool, "orphan_count": int},
     ),
     # A unit-consistency check verifies the operand carries a single, consistent unit-of-measure.
+    # `suggested_unit` (E4a T3, v2) is OPTIONAL and PURELY ADVISORY: the `llm/proposed` unit the AI
+    # drafted for this operand, carried so the review card can read "unit not confirmed — AI suggests
+    # AED" instead of a bare "unit unknown". It is a SUGGESTION, never an answer — the check clears
+    # only from `graph_node.unit`, which an LLM proposal can never reach (`_MEASURE_ANNOTATION`
+    # excludes it from both the display and the operational rule).
     ValidationRequirementSchema(
         code="UNIT_CONSISTENT",
-        schema_version="v1",
+        schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION,
         subject_kind="column_ref",
-        params_schema={},
+        params_schema={"suggested_unit": str},
         result_schema={"is_consistent": bool, "distinct_units": int},
+        optional_params=frozenset({"suggested_unit"}),
     ),
     # A currency-consistency check agrees against a reference currency column WHEN one is bound.
     # `currency_ref` is OPTIONAL: `_validate_idea` mints this requirement precisely for an operand
     # whose currency is UNKNOWN (no bound currency column), so the reference ref is genuinely
     # unavailable at mint time — supply it when known, omit it (the external check discovers it) when not.
+    # `suggested_currency` (E4a T3, v2) mirrors `suggested_unit` above: advisory surfacing only.
     ValidationRequirementSchema(
         code="CURRENCY_CONSISTENT",
-        schema_version="v1",
+        schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION,
         subject_kind="column_ref",
-        params_schema={"currency_ref": tuple},
+        params_schema={"currency_ref": tuple, "suggested_currency": str},
         result_schema={"is_consistent": bool, "distinct_currencies": int},
-        optional_params=frozenset({"currency_ref"}),
+        optional_params=frozenset({"currency_ref", "suggested_currency"}),
     ),
     # An additivity check needs the operation being applied and returns whether it is supported.
     ValidationRequirementSchema(

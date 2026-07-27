@@ -6,15 +6,12 @@ v1 emits EXACTLY the pre-Slice-3 field set/order so a flag-OFF response is byte-
 Slice-3 fields. The flag is captured ONCE at the route and passed in as `feature_context`."""
 from __future__ import annotations
 
-from featuregen.overlay.upload.feature_assist import FeatureIdea, Requirement
+from featuregen.overlay.upload.contract._serial import requirements_to_json
+from featuregen.overlay.upload.feature_assist import FeatureIdea
 
 
 def _pair(p: tuple[str, str] | None) -> list[str] | None:
     return list(p) if p is not None else None
-
-
-def _req(r: Requirement) -> dict:
-    return {"code": r.code, "operand": list(r.operand), "detail": r.detail}
 
 
 def serialize_feature_idea_v1(idea: FeatureIdea) -> dict:
@@ -45,7 +42,13 @@ def serialize_feature_idea_v2(idea: FeatureIdea) -> dict:
     out["window"] = idea.window
     out["grouping_refs"] = [list(g) for g in idea.grouping_refs]
     out["validation_status"] = idea.validation_status
-    out["requirements"] = [_req(r) for r in idea.requirements]
+    # The requirement wire shape is the SINGLE one `contract/_serial.py` owns — this module used to
+    # keep a private copy that dropped `params` / `schema_version`, so a REGISTRY-typed requirement
+    # reached the UI stripped of the very fields the reviewer needs (E4a T3: the AI's suggested
+    # unit; C2-C3: ADDITIVITY's `operation`). Both are emitted ADDITIVELY (params only when
+    # non-empty, schema_version only when non-default), so a no-param v1 requirement's JSON is
+    # byte-identical to what this route emitted before.
+    out["requirements"] = requirements_to_json(idea.requirements)
     # ── H1a carry-through metadata — only-when-non-default (see docstring) ──
     if idea.generation_source != "llm_freeform":
         out["generation_source"] = idea.generation_source

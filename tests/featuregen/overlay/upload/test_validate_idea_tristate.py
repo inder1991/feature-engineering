@@ -659,8 +659,12 @@ def test_full_requirement_set_is_registry_validated_and_unchanged(db):
         ("TEMPORAL_IS_POPULATED", ("t", "public.accounts.posted_at")),
         ("GRAIN_IS_UNIQUE", ("t", "public.accounts.id")),
     }
-    # every requirement is registry-validated (pinned schema version)
-    assert all(r.schema_version == "v1" for r in idea.requirements)
+    # every requirement is registry-validated (pinned schema version). E4a T3 moved the two
+    # MEASURE-ANNOTATION codes to "v2" — the version that carries the AI's suggested unit/currency —
+    # and left every other code on "v1".
+    assert {r.code: r.schema_version for r in idea.requirements} == {
+        "ADDITIVITY_SUPPORTS_OPERATION": "v1", "TEMPORAL_IS_POPULATED": "v1",
+        "GRAIN_IS_UNIQUE": "v1", "UNIT_CONSISTENT": "v2", "CURRENCY_CONSISTENT": "v2"}
     # the additivity checks carry their typed operation param; currency omits its OPTIONAL ref
     for r in idea.requirements:
         if r.code == "ADDITIVITY_SUPPORTS_OPERATION":

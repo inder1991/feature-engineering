@@ -8,6 +8,7 @@ This module exposes it per table. It WRITES NOTHING.
 from __future__ import annotations
 
 from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.gate1 import (
     _ground_template_outcomes,
     _template_candidates,
@@ -126,8 +127,11 @@ def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: st
         "description": idea.description,
         "grain_table": idea.grain_table,
         "validation_status": idea.validation_status,
-        "requirements": [{"code": r.code, "operand": list(r.operand), "detail": r.detail}
-                         for r in idea.requirements],
+        # The SINGLE requirement wire shape (`contract/_serial.py`). The private copy this used to
+        # hold dropped `params` / `schema_version`, so E4a T3's "AI suggests AED" never reached the
+        # card the reviewer actually reads. Additive emission keeps a no-param requirement's JSON
+        # byte-identical.
+        "requirements": requirements_to_json(idea.requirements),
         "uses": list(dict.fromkeys(ref for _src, ref in idea.derives_pairs)),
         "binding_quality": binding_by_id.get(idea.recipe_id or "", ""),
         "recipe": render_recipe(idea, entity_ref),

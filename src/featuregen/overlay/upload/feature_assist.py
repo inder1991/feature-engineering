@@ -24,6 +24,8 @@ import psycopg
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.evidence import EvidenceProducer
+from featuregen.overlay.field_evidence import read_active_field_evidence
 from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
     read_column_facts,
@@ -604,6 +606,34 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
     return out
 
 
+# The AI's suggestion is DISPLAY TEXT on a review card, so it is bounded like one. T2's drafter
+# already caps a drafted unit at 32 chars; this is the independent read-side ceiling (a suggestion
+# from any future writer can never turn a requirement into an unbounded payload).
+_MAX_SUGGESTION_LEN = 64
+
+
+def _ai_suggestion(conn, logical_ref: str, field_name: str) -> str | None:
+    """The AI's ACTIVE ``llm/proposed`` value for ``field_name`` at this column, for SURFACING on a
+    requirement (E4a T3) — or ``None`` when the AI proposed nothing.
+
+    THIS NEVER AFFECTS A DISPOSITION. The gauntlet clears ``UNIT_CONSISTENT`` /
+    ``CURRENCY_CONSISTENT`` from ``graph_node.unit``/``.currency`` (``_column_meta``) and from
+    nothing else; this reads ``field_evidence``, which that path never consults. Its only job is to
+    turn "unit unknown" into "unit not confirmed — AI suggests AED" so a human can confirm it in one
+    action. Producer-scoped to ``llm`` (a source/human value would have projected and there would be
+    no requirement to decorate), and a self-contradicting AI (two active values) suggests NOTHING
+    rather than picking one arbitrarily."""
+    values = {
+        str(e.proposed_value).strip()
+        for e in read_active_field_evidence(conn, logical_ref, field_name)
+        if e.producer == EvidenceProducer.LLM.value and e.proposed_value is not None
+    }
+    values.discard("")
+    if len(values) != 1:
+        return None
+    return next(iter(values))[:_MAX_SUGGESTION_LEN]
+
+
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
                    target_ref: str | None, now: datetime | None, fresh_within: timedelta,
                    *, roles: Iterable[str] = ()):
@@ -755,20 +785,40 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    The MIXED_UNITS / MIXED_CURRENCY hard rejects above are untouched and still read EVERY
     #    derive, grain and as-of included: a positive contradiction still rejects outright. Only the
     #    unanswerable "unit unknown" question is narrowed. ──
+    #
+    #    E4a T3 — SURFACING THE AI's ANSWER. A question no reviewer can answer is as useless as an
+    #    unanswerable one, so each requirement CARRIES the `llm/proposed` unit/currency the drafter
+    #    wrote (T2) as a registry-typed, OPTIONAL `suggested_unit` / `suggested_currency` param: the
+    #    card reads "unit not confirmed — AI suggests AED" and the confirm is one action away. This
+    #    is SURFACING ONLY and changes NO disposition: the mint CONDITION is still an empty
+    #    `graph_node.unit` (read above via `meta`), the requirement still FIRES, and the suggestion
+    #    is read from `field_evidence` — a store the gauntlet's clear path never consults. ──
+    from featuregen.overlay.upload.validation_requirements import (
+        MEASURE_SUGGESTION_SCHEMA_VERSION,
+    )
+
     structural = {op for op in (grain_operand, time_operand) if op is not None}
     measures = [p for p in pairs if p not in structural]
     if len(measures) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
         for src, d in measures:
             if not meta[d]["unit"]:
+                suggested = _ai_suggestion(conn, logical_ref_of(conn, src, d), "unit")
                 requirements.append(build_requirement(
                     code="UNIT_CONSISTENT", operand=(src, d),
-                    detail="unit unknown across a combining op", params=None))
+                    detail=("unit unknown across a combining op"
+                            + (f"; AI suggests {suggested}" if suggested else "")),
+                    params={"suggested_unit": suggested} if suggested else None,
+                    schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION))
             if not meta[d]["currency"]:
                 # currency is UNKNOWN here (that is the mint condition), so no bound currency_ref is
                 # available — pass none; currency_ref is OPTIONAL in the registry (C2C3-T1 tweak).
+                suggested = _ai_suggestion(conn, logical_ref_of(conn, src, d), "currency")
                 requirements.append(build_requirement(
                     code="CURRENCY_CONSISTENT", operand=(src, d),
-                    detail="currency unknown across a combining op", params={}))
+                    detail=("currency unknown across a combining op"
+                            + (f"; AI suggests {suggested}" if suggested else "")),
+                    params={"suggested_currency": suggested} if suggested else {},
+                    schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION))
 
     # ── disposition: cross-table join authority (spec §7). A measure in a different table than the
     #    grain needs a real path; UNVERIFIED -> JOIN_CONNECTIVITY, no-path / read-scope-denied -> reject ──

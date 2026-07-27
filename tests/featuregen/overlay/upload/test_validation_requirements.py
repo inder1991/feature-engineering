@@ -12,6 +12,7 @@ import pytest
 
 from featuregen.overlay.upload.feature_assist import REQUIREMENT_CODES, Requirement
 from featuregen.overlay.upload.validation_requirements import (
+    MEASURE_SUGGESTION_SCHEMA_VERSION,
     REQUIREMENT_SCHEMA_REGISTRY,
     RequirementValidationError,
     UnknownRequirement,
@@ -19,6 +20,10 @@ from featuregen.overlay.upload.validation_requirements import (
     build_requirement,
     schema_for,
 )
+
+# The two MEASURE-ANNOTATION codes E4a T3 moved off "v1" to carry the AI's suggested unit/currency.
+_MEASURE_CODES = {"UNIT_CONSISTENT": MEASURE_SUGGESTION_SCHEMA_VERSION,
+                  "CURRENCY_CONSISTENT": MEASURE_SUGGESTION_SCHEMA_VERSION}
 
 
 # ── the registry ────────────────────────────────────────────────────────────────────────────────
@@ -29,12 +34,20 @@ def test_registry_covers_exactly_the_closed_vocabulary():
 
 def test_schema_for_returns_each_code_schema():
     for code in REQUIREMENT_CODES:
-        schema = schema_for(code)
+        schema = schema_for(code, _MEASURE_CODES.get(code, "v1"))
         assert isinstance(schema, ValidationRequirementSchema)
         assert schema.code == code
-        assert schema.schema_version == "v1"
+        assert schema.schema_version == _MEASURE_CODES.get(code, "v1")
         assert schema.subject_kind == "column_ref"
         assert isinstance(schema.blocking, bool)
+
+
+def test_only_the_measure_annotation_codes_moved_off_v1():
+    # E4a T3 bumped exactly two schemas (the AI's suggested unit/currency is a NEW param, so it is a
+    # NEW version, never a silent widening of v1). Everything else stays v1 — pinned so a future
+    # bump is a deliberate, visible edit here.
+    assert {c: s.schema_version for c, s in REQUIREMENT_SCHEMA_REGISTRY.items()
+            if s.schema_version != "v1"} == _MEASURE_CODES
 
 
 def test_schema_for_unknown_code_raises():
@@ -94,9 +107,19 @@ def test_grain_is_unique_result_schema():
 def test_currency_consistent_declares_optional_currency_ref():
     # C2-C3 Task 2: currency_ref is DECLARED (typed tuple) but OPTIONAL — `_validate_idea` mints this
     # requirement for an operand whose currency is UNKNOWN, so no reference ref is available at mint.
-    schema = schema_for("CURRENCY_CONSISTENT")
-    assert schema.params_schema == {"currency_ref": tuple}
-    assert schema.optional_params == frozenset({"currency_ref"})
+    # E4a T3 (v2) adds `suggested_currency`, likewise OPTIONAL: the AI's proposal, for SURFACING only.
+    schema = schema_for("CURRENCY_CONSISTENT", MEASURE_SUGGESTION_SCHEMA_VERSION)
+    assert schema.params_schema == {"currency_ref": tuple, "suggested_currency": str}
+    assert schema.optional_params == frozenset({"currency_ref", "suggested_currency"})
+
+
+def test_unit_consistent_declares_the_optional_ai_suggestion():
+    # E4a T3: the AI's `llm/proposed` unit rides on the requirement so the review card can read
+    # "unit not confirmed — AI suggests AED". OPTIONAL — the AI is often silent, and a suggestion is
+    # never an answer (the check still clears only from graph_node.unit).
+    schema = schema_for("UNIT_CONSISTENT", MEASURE_SUGGESTION_SCHEMA_VERSION)
+    assert schema.params_schema == {"suggested_unit": str}
+    assert schema.optional_params == frozenset({"suggested_unit"})
 
 
 # ── build_requirement — the sanctioned factory ────────────────────────────────────────────────────
@@ -189,16 +212,25 @@ def test_build_currency_consistent_valid():
         code="CURRENCY_CONSISTENT",
         operand=("bank", "public.t.amount"),
         params={"currency_ref": ("bank", "public.t.ccy")},
+        schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION,
     )
     assert r.params == (("currency_ref", ("bank", "public.t.ccy")),)
 
 
 def test_build_currency_consistent_without_optional_ref():
     # the OPTIONAL currency_ref may be omitted (the unknown-currency mint case in _validate_idea)
-    r = build_requirement(code="CURRENCY_CONSISTENT", operand=("bank", "public.t.amount"))
+    r = build_requirement(code="CURRENCY_CONSISTENT", operand=("bank", "public.t.amount"),
+                          schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION)
     assert r.code == "CURRENCY_CONSISTENT"
     assert r.params == ()
-    assert r.schema_version == "v1"
+    assert r.schema_version == MEASURE_SUGGESTION_SCHEMA_VERSION
+
+
+def test_build_measure_requirement_at_the_stale_v1_version_is_refused():
+    # A version bump must FAIL CLOSED, not fall back: minting the bumped code at the retired "v1"
+    # is exactly the "unknown code / version" programmer error the registry exists to catch.
+    with pytest.raises(UnknownRequirement):
+        build_requirement(code="UNIT_CONSISTENT", operand=("bank", "public.t.amount"))
 
 
 def test_build_currency_consistent_wrong_type_ref_still_rejected():
@@ -208,6 +240,7 @@ def test_build_currency_consistent_wrong_type_ref_still_rejected():
             code="CURRENCY_CONSISTENT",
             operand=("bank", "public.t.amount"),
             params={"currency_ref": "not-a-tuple"},
+            schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION,
         )
 
 
@@ -221,6 +254,7 @@ def test_build_rejects_unhashable_nested_param_value():
             code="CURRENCY_CONSISTENT",
             operand=("bank", "public.t.amount"),
             params={"currency_ref": (["cat"], "ref")},
+            schema_version=MEASURE_SUGGESTION_SCHEMA_VERSION,
         )
 
 
