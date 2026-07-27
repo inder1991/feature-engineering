@@ -154,9 +154,16 @@ def test_release_mode_accepts_owned_recognition_then_confirmed_scope(
         make_client, conn, monkeypatch):
     monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")
     _bank_multi(conn)
+    # A hypothesis unique to THIS test. /contract/recognitions deliberately reuses the earliest
+    # intent already recorded for an exact (actor, hypothesis, mode), and persist_intent is
+    # ON CONFLICT (intent_id) DO NOTHING — so reusing the shared HYPOTHESIS would silently adopt an
+    # intent some earlier API test committed (the TestClient commits; the rollback-per-test `conn`
+    # fixture does not reach those rows) and inherit its non-null target_ref, making the final
+    # assertion below pass or fail purely on collection order.
+    hypothesis = "release-mode owned recognition then confirmed scope hypothesis"
     recognition = make_client(_recognizer()).post(
         "/contract/recognitions",
-        json={"hypothesis": HYPOTHESIS, "objective": "predict churn"},
+        json={"hypothesis": hypothesis, "objective": "predict churn"},
         headers=AUTH,
     )
     assert recognition.status_code == 200
@@ -165,7 +172,7 @@ def test_release_mode_accepts_owned_recognition_then_confirmed_scope(
     response = make_client(_fake()).post(
         "/contract/considered-set",
         json={
-            "hypothesis": HYPOTHESIS,
+            "hypothesis": hypothesis,
             "objective": "predict churn",
             "catalog_source": "bank",
             "target_ref": TARGET,
@@ -191,7 +198,7 @@ def test_release_mode_accepts_owned_recognition_then_confirmed_scope(
         (run_id,),
     ).fetchone()
     assert sealed is not None
-    assert sealed[:3] == (HYPOTHESIS, "predict churn", TARGET)
+    assert sealed[:3] == (hypothesis, "predict churn", TARGET)
     assert sealed[3] and sealed[4]
     # The old intent-level target remains NULL because the run-specific record is now authoritative.
     assert conn.execute(

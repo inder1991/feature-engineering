@@ -1,6 +1,25 @@
 -- Delivery R5: relational integrity for generation authority records and server-derived
 -- use-case provenance. Refuse inconsistent history before adding constraints; never repair it.
 
+-- ONE narrow exception to "never repair", applied BEFORE the audit runs.
+--
+-- feature_generation_run.intent_id has been nullable and UNPOPULATED since 1006: the pre-R5
+-- _ensure_run inserted only (generation_run_id, actor, flags), and the run→intent binding lived
+-- solely on confirmed_generation_scope. Every run minted before R5 therefore carries intent_id
+-- NULL, which the audit below reads as "mismatched intent/run" and aborts on — so without this
+-- backfill the migration cannot be applied to ANY database that has ever recorded a confirmed
+-- scope (the audit passes only on a fresh DB, which is why the test suite never saw it).
+--
+-- This copies a DERIVED provenance value from the row that already holds the authoritative
+-- binding onto the row that was merely missing its denormalized copy. It invents no authority and
+-- resolves no conflict: the WHERE clause touches only NULLs, so a run bound to a genuinely
+-- DIFFERENT intent stays mismatched and still aborts the audit, as do orphan intents/runs.
+UPDATE feature_generation_run g
+   SET intent_id = s.intent_id
+  FROM confirmed_generation_scope s
+ WHERE s.generation_run_id = g.generation_run_id
+   AND g.intent_id IS NULL;
+
 CREATE OR REPLACE FUNCTION featuregen_assert_generation_lineage_integrity() RETURNS void AS $$
 DECLARE
     bad_count bigint;
@@ -356,7 +375,7 @@ CREATE CONSTRAINT TRIGGER recipe_formula_shadow_work_item_lineage_deferred
     FOR EACH ROW EXECUTE FUNCTION featuregen_check_formula_work_item_lineage();
 
 ALTER TABLE confirmed_scope_use_case
-    DROP CONSTRAINT confirmed_scope_use_case_origin_check;
+    DROP CONSTRAINT IF EXISTS confirmed_scope_use_case_origin_check;
 ALTER TABLE confirmed_scope_use_case
     ADD CONSTRAINT confirmed_scope_use_case_origin_check CHECK (
         origin IN ('llm_proposed', 'accepted_llm_proposal', 'user_added', 'user_overridden')

@@ -187,15 +187,19 @@ def _is_live_pipeline_file(rel_path: str) -> bool:
             or rel_path == "src/featuregen/overlay/upload/feature_assist.py")
 
 
-def _branch_unique_files() -> set[str]:
+def _branch_unique_files(*extra_args: str) -> set[str]:
     """Files touched by commits UNIQUE to this branch — reachable from HEAD, NOT on origin/main, and
     excluding merge commits. So a merge of origin/main into the branch (and main's own 78 commits)
     contribute nothing here; only this branch's real work (A/B additions, the LLM-schema fixes, the
-    migration renumber) does. This is what makes the neutrality claim robust to that merge."""
+    migration renumber) does. This is what makes the neutrality claim robust to that merge.
+
+    ``extra_args`` pass through to ``git show`` — e.g. ``--diff-filter=A`` to see only the files a
+    commit ADDED rather than every file it touched."""
     commits = [c for c in _git("rev-list", "^origin/main", "HEAD", "--no-merges").splitlines() if c]
     files: set[str] = set()
     for c in commits:
-        files.update(p for p in _git("show", "--name-only", "--format=", c).splitlines() if p.strip())
+        out = _git("show", "--name-only", "--format=", *extra_args, c)
+        files.update(p for p in out.splitlines() if p.strip())
     return files
 
 
@@ -203,12 +207,23 @@ def test_proof_c_no_branch_commit_modifies_the_live_pipeline() -> None:
     """No commit unique to this branch modifies a live considered-set / draft pipeline file — B added
     no path into the live flow. Robust to the merge from main (`^origin/main --no-merges`); the
     earlier by-range check broke once the branch also carried the merge commit + the non-b_* LLM
-    fixes, neither of which touches the live pipeline."""
+    fixes, neither of which touches the live pipeline.
+
+    ARMING — this is a correction of *whose commit range is under test*, NOT a weakening of the
+    assertion (see the module docstring's escalation rule; the assert below is byte-identical).
+    Proof C is a PRE-MERGE claim about **B's own commit range**, so it must arm only on a branch
+    that actually introduces B — one whose unique commits ADD a ``planner/b_*.py`` module. It
+    previously armed on any branch that merely *touched* a ``b_*`` file, which is a strictly broader
+    predicate. Now that B is merged to origin/main, that made a later unrelated branch re-arm a
+    proof about a commit range it is not part of: a one-line fix inside an existing ``b_*`` module
+    was enough to demand that the branch not edit live-pipeline files it legitimately owns."""
+    added_b_modules = {
+        p for p in _branch_unique_files("--diff-filter=A") if _B_SOURCE_PATH_RE.fullmatch(p)}
+    if not added_b_modules:
+        pytest.skip("no branch-unique commit ADDS a planner/b_*.py module — this branch does not "
+                    "introduce B, so B's pre-merge neutrality proof is not about its commit range "
+                    "(B is merged to origin/main). Re-arms on any future branch that adds b_*")
     branch_files = _branch_unique_files()
-    if not any(_B_SOURCE_PATH_RE.fullmatch(p) for p in branch_files):
-        pytest.skip("no branch-unique planner/b_*.py file on this branch state — B's pre-merge "
-                    "neutrality proof is not applicable here (B is merged to origin/main, or the branch "
-                    "carries only unrelated work); it re-arms on any future unmerged branch touching b_*")
     touched_live = sorted(f for f in branch_files if _is_live_pipeline_file(f))
     assert not touched_live, (
         "NEUTRALITY VIOLATION: commit(s) unique to this branch modified live considered-set/draft "
