@@ -46,6 +46,7 @@ function payload(over: Partial<api.TableSuggestions> = {}): api.TableSuggestions
   return {
     catalog_source: SOURCE,
     table: TABLE,
+    table_known: true,
     summary: { suggested: 2, clean_ready: 1, needs_review: 1, entities: 2 },
     groups: [
       {
@@ -108,6 +109,20 @@ describe('SuggestedFeaturesScreen', () => {
     expect(screen.queryByText(/per entity/i)).not.toBeInTheDocument()
   })
 
+  it('shows only the column for a group whose entity the catalog could not name', async () => {
+    getTableSuggestions.mockResolvedValue(payload({
+      summary: { suggested: 1, clean_ready: 1, needs_review: 0, entities: 1 },
+      groups: [{
+        entity_ref: 'public.comp_fin_tran.cif_id', entity_label: '', suggestions: [suggestion()],
+      }],
+    }))
+    renderScreen()
+    expect(await screen.findByText('account_balance_trend_90d')).toBeInTheDocument()
+    // no heading is invented from the column: 'cif_id features' would claim an unattested entity
+    expect(screen.queryAllByRole('heading', { level: 2 })).toHaveLength(0)
+    expect(screen.getByText(/per entity cif_id/i)).toBeInTheDocument()
+  })
+
   it('shows the real recipe line and the columns a suggestion uses', async () => {
     getTableSuggestions.mockResolvedValue(payload())
     renderScreen()
@@ -151,6 +166,22 @@ describe('SuggestedFeaturesScreen', () => {
     expect(screen.queryAllByRole('button')).toHaveLength(0)
     expect(screen.queryAllByRole('textbox')).toHaveLength(0)
     expect(screen.getByText(/read-only/i)).toBeInTheDocument()
+  })
+
+  it('says the table does not exist rather than diagnosing its columns', async () => {
+    // The trap: an unknown table returns the SAME zero payload as a table with no concepts, so
+    // without table_known the screen tells the user a nonexistent table's columns carry no meaning.
+    getTableSuggestions.mockResolvedValue(payload({
+      table_known: false,
+      summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
+      groups: [],
+      rejections: [],
+    }))
+    renderScreen()
+    expect(await screen.findByText(/no such table in this catalog/i)).toBeInTheDocument()
+    expect(screen.getByText(SOURCE)).toBeInTheDocument()
+    expect(screen.queryByText(/business concepts/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('group', { name: /suggestion summary/i })).not.toBeInTheDocument()
   })
 
   it('names the no-concepts cause when there is nothing suggested and nothing blocked', async () => {
@@ -205,8 +236,22 @@ describe('SuggestedFeaturesScreen', () => {
     })
 
   it('surfaces a load failure honestly', async () => {
-    getTableSuggestions.mockRejectedValue(new api.ApiError(403, 'requires feature:read'))
+    getTableSuggestions.mockRejectedValue(new api.ApiError(500, 'grounding blew up'))
     renderScreen()
-    expect(await screen.findByRole('alert')).toHaveTextContent(/requires feature:read/i)
+    expect(await screen.findByRole('alert')).toHaveTextContent(/grounding blew up/i)
+  })
+
+  it('names the missing permission on a 403 instead of a blank page or a raw error', async () => {
+    // The route is gated on feature:read and the app's default session is data_owner, which does
+    // not hold it. That is a product decision this screen does not get to change — but it must not
+    // present as a broken page.
+    getTableSuggestions.mockRejectedValue(new api.ApiError(403, 'requires permission feature:read'))
+    renderScreen()
+    expect(await screen.findByText(/don’t have access to feature suggestions/i)).toBeInTheDocument()
+    expect(screen.getByText('feature:read')).toBeInTheDocument()
+    expect(screen.getByText(/data_owner/)).toBeInTheDocument()
+    // not a red failure, and no control that would pretend the user can grant it here
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
   })
 })

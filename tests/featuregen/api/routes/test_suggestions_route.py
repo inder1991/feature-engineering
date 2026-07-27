@@ -76,7 +76,7 @@ def test_read_scope_roles_come_from_the_session(client, monkeypatch):
 
     def _capture(conn, *, catalog_source, table, roles):
         seen.update(catalog_source=catalog_source, table=table, roles=roles)
-        return {"catalog_source": catalog_source, "table": table,
+        return {"catalog_source": catalog_source, "table": table, "table_known": False,
                 "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
                 "groups": [], "rejections": []}
 
@@ -104,10 +104,26 @@ def test_the_route_is_get_only(client):
         assert r.status_code == 405, f"{method} -> {r.status_code}"
 
 
-def test_unknown_table_returns_an_honest_empty_payload(client, ftr_catalog):  # noqa: F811
-    """A table this catalog does not hold has no suggestions — that is data, not a server error."""
+def test_unknown_table_is_reported_as_unknown_not_as_an_empty_catalog(client, ftr_catalog):  # noqa: F811
+    """A table this catalog does not hold has no suggestions — still data, not a server error — but
+    it must say WHICH kind of nothing it is. An empty payload alone is read by the screen as "this
+    table's columns carry no business concepts": a confident, false diagnosis of a table that does
+    not exist. `table_known` is the fourth state that keeps that message honest."""
     r = client.get(f"/catalog/{SOURCE}/tables/no_such_table/suggestions", headers=_h())
     assert r.status_code == 200, r.text
     body = r.json()
+    assert body["table_known"] is False
     assert body["summary"] == {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0}
     assert body["groups"] == [] and body["rejections"] == []
+    assert client.get(PATH, headers=_h()).json()["table_known"] is True
+
+
+def test_the_read_runs_under_a_statement_timeout(client, conn):
+    """One request grounds the WHOLE template registry against the catalog, so its cost scales with
+    catalog WIDTH (~1.7k SELECTs on a 2-table fixture). The engine is not this route's to optimise,
+    but a wide catalog must fail FAST rather than pin a connection for minutes: the request
+    transaction carries a bounded `statement_timeout`. Read back off the SAME still-open transaction
+    the request ran on — `SET LOCAL` is transaction-scoped."""
+    r = client.get("/catalog/no_such_catalog/tables/no_such_table/suggestions", headers=_h())
+    assert r.status_code == 200, r.text
+    assert conn.execute("SHOW statement_timeout").fetchone()[0] == "30s"

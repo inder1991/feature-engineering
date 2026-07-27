@@ -14,8 +14,11 @@ import {
 //   * no relevance percentage — no percentage scorer exists in this system, so the only signal shown
 //     is the engine's own `binding_quality` string;
 //   * an empty or all-needs-review screen names its CAUSE. A bare "0 suggested" reads as broken; the
-//     three measured causes (no business concepts / no confirmed as-of / undeclared unit-currency)
-//     each get their own sentence pointing at the surface that fixes it.
+//     measured causes (no such table / no business concepts / no confirmed as-of / undeclared
+//     unit-currency) each get their own sentence pointing at the surface that fixes it. "No such
+//     table" comes FIRST and stands alone: a table the catalog does not hold returns exactly the
+//     same zero payload as one with no concepts, and diagnosing the columns of a table that does not
+//     exist is a confident falsehood.
 
 // The closed requirement vocabulary in plain words. A card says what is missing, not an enum; the
 // code still renders beside it so it stays traceable to the gauntlet. An unknown code (a newer
@@ -57,11 +60,16 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
   const [data, setData] = useState<TableSuggestions | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  // A 403 is not a failure to report as one: the route is gated on feature:read and this session's
+  // roles do not carry it. Named separately so the screen can say WHICH permission is missing
+  // instead of leaking the server's detail string into a red alert.
+  const [forbidden, setForbidden] = useState(false)
 
   useEffect(() => {
     let live = true
     setLoading(true)
     setError('')
+    setForbidden(false)
     getTableSuggestions(source, table)
       .then(body => {
         if (!live) return
@@ -69,7 +77,8 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
       })
       .catch((e: unknown) => {
         if (!live) return
-        setError(e instanceof ApiError ? e.detail : String(e))
+        if (e instanceof ApiError && e.status === 403) setForbidden(true)
+        else setError(e instanceof ApiError ? e.detail : String(e))
         setData(null)
       })
       .finally(() => {
@@ -90,12 +99,57 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
     )
   }
 
+  // Read-only and permission-gated: the honest answer is which permission is missing, not a red
+  // "could not load". Deliberately no fix-it control — the role model is not this screen's to change.
+  if (forbidden) {
+    return (
+      <section className="sug">
+        <div className="callout callout--warn">
+          <div className="callout-body">
+            <p role="status">
+              <strong>You don’t have access to feature suggestions.</strong> This view needs the{' '}
+              <code>feature:read</code> permission and this session’s roles don’t carry it.
+            </p>
+            <p className="hint">
+              Roles that hold it: catalog_viewer and feature_engineer. data_owner publishes the
+              catalog but does not build features, so it is denied here.
+            </p>
+          </div>
+        </div>
+      </section>
+    )
+  }
+
   if (error || !data) {
     return (
       <section className="sug">
         <p role="alert" className="error">
           Could not load suggestions: {error || 'no payload returned'}
         </p>
+      </section>
+    )
+  }
+
+  // Cause #0: there is no such table. Stands alone — every count below would be a claim about a
+  // table this catalog does not hold.
+  if (!data.table_known) {
+    return (
+      <section className="sug">
+        <div className="callout callout--warn">
+          <div className="callout-body">
+            <p role="status">
+              <strong>No such table in this catalog.</strong>{' '}
+              <span className="mono">{data.catalog_source}</span> holds no table called{' '}
+              <span className="mono">{data.table}</span>, so there is nothing to suggest on — and
+              nothing here is a statement about its columns.
+            </p>
+            <p className="hint">
+              Check the catalog and the table name (the bare name, e.g. <code>comp_fin_tran</code>,
+              or its full <code>schema.table</code> ref). Search the catalog to find the table, then
+              open Suggested features from one of its hits.
+            </p>
+          </div>
+        </div>
       </section>
     )
   }
@@ -168,7 +222,8 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
       )}
 
       {groups.map(group => (
-        <EntityGroup key={group.entity_ref || group.entity_label || 'unlabelled'} group={group} />
+        // entity_ref is unique across groups (the backend keys them on it), so it IS the key.
+        <EntityGroup key={group.entity_ref || 'unlabelled'} group={group} />
       ))}
 
       {rejections.length > noPointInTime.length && (
@@ -200,14 +255,15 @@ function Stat({ n, label }: { n: number; label: string }) {
 }
 
 // One entity's features. The heading is the ENTITY (entity_label, e.g. 'account'); the suffix is the
-// COLUMN it is computed per (entity_ref). A group whose entity could not be named renders NO
-// heading — inventing one would claim an entity the catalog never attested.
+// COLUMN it is computed per (entity_ref). A group bound to a column the catalog could not NAME an
+// entity for shows only that column — a heading built from the column would read "cif_id features"
+// beside "customer features", claiming an entity the catalog never attested.
 function EntityGroup({ group }: { group: SuggestionGroup }) {
   return (
     <section className="sug-group">
       {group.entity_ref && (
         <div className="sug-group-head">
-          <h2 className="sug-group-title">{group.entity_label} features</h2>
+          {group.entity_label && <h2 className="sug-group-title">{group.entity_label} features</h2>}
           <span className="hint mono" title={group.entity_ref}>
             per entity {columnOf(group.entity_ref)}
           </span>

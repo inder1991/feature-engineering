@@ -21,6 +21,7 @@ from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.commands import confirm_fact, propose_fact
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
+from featuregen.overlay.upload import suggestions as suggestions_module
 from featuregen.overlay.upload.canonical import validate_rows
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_assist import FeatureIdea
@@ -183,6 +184,70 @@ def test_grouped_by_entity(overlay_conn, ftr_catalog):
     assert "balance_trend_90d" in {s["name"] for s in by_label["customer"]["suggestions"]}
 
 
+def test_a_table_this_catalog_does_not_hold_is_a_distinct_state(overlay_conn, ftr_catalog):
+    """The truthfulness fix: an unknown table and a table with no concepts both produce zero
+    suggestions, so without ``table_known`` the screen diagnoses a NONEXISTENT table as "your
+    columns don't carry business concepts" — a confident, false claim about the catalog."""
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table="no_such_table")
+    assert out["table_known"] is False
+    assert out["summary"] == {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0}
+    assert out["groups"] == [] and out["rejections"] == []
+    # a table it DOES hold is the other state, on the same payload key
+    assert suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)["table_known"]
+
+
+def test_the_schema_qualified_table_ref_resolves_to_the_same_table(overlay_conn, ftr_catalog):
+    """A deep link naturally carries the table's ``object_ref`` (``public.comp_fin_tran``) while the
+    engine keys on the bare name. The ref is unique per catalog, so it resolves — and the payload
+    echoes the name the engine actually filtered on."""
+    bare = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    qualified = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=f"public.{ftr_catalog.table}")
+    assert qualified["table_known"] and qualified["table"] == ftr_catalog.table
+    assert _names(qualified) == _names(bare)
+
+
+def test_each_entity_appears_in_exactly_one_group(overlay_conn, ftr_catalog):
+    """Groups are keyed on the entity REF alone. Keying on (ref, label) let one column open two
+    groups — which the screen renders under the same React key."""
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    refs = [g["entity_ref"] for g in out["groups"]]
+    assert len(refs) == len(set(refs))
+
+
+def test_the_unlabelled_group_sorts_last(overlay_conn, ftr_catalog, monkeypatch):
+    """A group whose entity could not be NAMED renders no heading, so sorting it first stacks
+    headingless cards above the named groups and they read as the page's lead."""
+    calls: list[str] = []
+
+    def _alternating(idea, *_a, **_k):
+        """Half the ideas resolve an entity, half do not — the fixture names no un-nameable entity,
+        so the only way to see the ordering is to make one."""
+        calls.append(idea.name)
+        return ("", "") if len(calls) % 2 else (f"public.{TABLE}.acct_id", "account")
+
+    monkeypatch.setattr(suggestions_module, "_entity_of", _alternating)
+    out = suggest_features_for_table(
+        overlay_conn, catalog_source=ftr_catalog.source, table=ftr_catalog.table)
+    refs = [g["entity_ref"] for g in out["groups"]]
+    assert "" in refs and len(refs) > 1
+    assert refs[-1] == ""
+
+
+def test_a_rejection_the_grain_pass_cannot_place_is_kept_not_dropped(monkeypatch):
+    """The grain rebuild is a SECOND grounding pass. A rejection whose name that pass does not
+    produce was silently dropped — and the screen counts these into "N features are blocked", so the
+    drop UNDER-reports a readiness gap. Keep it and let it be seen."""
+    monkeypatch.setattr(suggestions_module, "_ground_template_outcomes", lambda *a, **k: [])
+    kept = suggestions_module._rejections_here(
+        None, SOURCE, (), TABLE, [{"name": "ghost", "reason": "no basis", "code": "NO_POINT_IN_TIME"}])
+    assert [r["name"] for r in kept] == ["ghost"]
+
+
 def test_rejections_are_this_tables_only(overlay_conn, ftr_catalog):
     """A rejection is a claim ABOUT this table's catalog readiness, but the engine's rejection list is
     catalog-wide and carries no grain — an unfiltered pass-through shows one table's rejects on another."""
@@ -209,7 +274,7 @@ def test_recipe_renders_the_real_operation_label_not_an_invented_sql_verb():
         measure_refs=((SOURCE, f"public.{TABLE}.bal_amt"), (SOURCE, f"public.{TABLE}.cif_id"),
                       (SOURCE, f"public.{TABLE}.as_of_dt")),
         grain_ref=(SOURCE, f"public.{TABLE}.cif_id"),
-        time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="90d"))
+        time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="90d"), "")
     assert line == "trend_90d(bal_amt) BY cif_id OVER 90d [as_of_dt]"
 
 
@@ -222,7 +287,7 @@ def test_recipe_does_not_render_the_grain_or_time_column_as_a_measure():
                                (SOURCE, f"public.{TABLE}.as_of_dt")),
                  grain_ref=(SOURCE, f"public.{TABLE}.cif_id"),
                  time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="30d")
-    assert render_recipe(idea) == "inflow_outflow_30d(txn_amt) BY cif_id OVER 30d [as_of_dt]"
+    assert render_recipe(idea, "") == "inflow_outflow_30d(txn_amt) BY cif_id OVER 30d [as_of_dt]"
 
 
 def test_recipe_omits_the_clauses_that_do_not_apply():
@@ -231,7 +296,7 @@ def test_recipe_omits_the_clauses_that_do_not_apply():
     line = render_recipe(_idea(
         operation_kind="product_breadth",
         measure_refs=((SOURCE, f"public.{TABLE}.setl_stat"), (SOURCE, f"public.{TABLE}.cif_id")),
-        grain_ref=(SOURCE, f"public.{TABLE}.cif_id")))
+        grain_ref=(SOURCE, f"public.{TABLE}.cif_id")), "")
     assert line == "product_breadth(setl_stat) BY cif_id"
     assert "OVER" not in line and "[" not in line
     assert line == line.strip()
@@ -244,8 +309,8 @@ def test_recipe_renders_multiple_measures_in_a_stable_order():
                                (SOURCE, f"public.{TABLE}.bal_amt"),
                                (SOURCE, f"public.{TABLE}.cif_id")),
                  grain_ref=(SOURCE, f"public.{TABLE}.cif_id"))
-    assert render_recipe(idea) == "payment_ratio(txn_amt, bal_amt) BY cif_id"
-    assert render_recipe(idea) == render_recipe(idea)
+    assert render_recipe(idea, "") == "payment_ratio(txn_amt, bal_amt) BY cif_id"
+    assert render_recipe(idea, "") == render_recipe(idea, "")
 
 
 def test_every_card_carries_a_recipe_and_its_parts(overlay_conn, ftr_catalog):

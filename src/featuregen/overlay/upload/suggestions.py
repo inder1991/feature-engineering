@@ -23,27 +23,58 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     ``target_ref=None, now=None``: there is no hypothesis to leak into and no clock to fail freshness
     against — the gauntlet's remaining checks (type / additivity / units / point-in-time / grain /
     join authority) still run exactly as they do on the governed path. ``roles`` is the caller's read
-    scope: a column the caller may not see is not a grounding candidate, so it cannot be suggested."""
+    scope: a column the caller may not see is not a grounding candidate, so it cannot be suggested.
+
+    ``table_known`` is a FOURTH state, and the load-bearing one for honesty: a table this catalog does
+    not hold produces exactly the same zero-suggestion payload as a table whose columns carry no
+    concepts, so without it the screen diagnoses a NONEXISTENT table as "your columns don't carry
+    business concepts". Resolved from ``graph_node`` alone, before the engine runs."""
+    known = _resolve_table(conn, catalog_source, table)
+    if known is None:
+        return {"catalog_source": catalog_source, "table": table, "table_known": False,
+                "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
+                "groups": [], "rejections": []}
+    table = known                                   # the catalog's own bare name — the engine's key
     ideas, rejections, _grounded, _rejected, binding_by_id, _incomplete, contexts, keys_by_recipe = (
         _template_candidates(conn, catalog_source=catalog_source, roles=roles,
                              target_ref=None, now=None))          # no intent, no clock, no LLM
     mine = [idea for idea in ideas if idea.grain_table == table]
-    groups: dict[tuple[str, str], list[dict]] = {}
+    # Keyed on the entity REF alone: keying on (ref, label) lets one column open two groups, which
+    # the screen then renders with the same React key.
+    groups: dict[str, list[dict]] = {}
+    labels: dict[str, str] = {}
     for idea in mine:
-        entity = _entity_of(idea, contexts, keys_by_recipe)
-        groups.setdefault(entity, []).append(_suggestion(idea, binding_by_id, entity[0]))
+        ref, label = _entity_of(idea, contexts, keys_by_recipe)
+        groups.setdefault(ref, []).append(_suggestion(idea, binding_by_id, ref))
+        if label and not labels.get(ref):
+            labels[ref] = label
     clean = sum(1 for idea in mine if idea.validation_status == "DESIGN_CHECKED")
     return {
-        "catalog_source": catalog_source, "table": table,
+        "catalog_source": catalog_source, "table": table, "table_known": True,
         "summary": {"suggested": len(mine), "clean_ready": clean,
                     "needs_review": len(mine) - clean,
                     # an UNLABELLED bucket is not an entity — it is the ideas whose entity could not
                     # be named, and no entity heading is rendered for it.
-                    "entities": sum(1 for ref, _label in groups if ref)},
-        "groups": [{"entity_ref": ref, "entity_label": label, "suggestions": items}
-                   for (ref, label), items in sorted(groups.items())],
+                    "entities": sum(1 for ref in groups if ref)},
+        # the unlabelled bucket sorts LAST: headingless cards above the named groups read as the
+        # page's lead.
+        "groups": [{"entity_ref": ref, "entity_label": labels.get(ref, ""), "suggestions": items}
+                   for ref, items in sorted(groups.items(), key=lambda kv: (kv[0] == "", kv[0]))],
         "rejections": _rejections_here(conn, catalog_source, roles, table, rejections),
     }
+
+
+def _resolve_table(conn, catalog_source: str, table: str) -> str | None:
+    """This catalog's own ``graph_node.table_name`` for ``table`` — ``None`` when it holds no such
+    table. The bare name is the engine's key (``FeatureIdea.grain_table``), but a deep link naturally
+    carries the schema-qualified table ``object_ref`` (``public.txns``), which is UNIQUE per catalog
+    (the node's primary key), so accepting it too is unambiguous. A bare match wins the tie."""
+    row = conn.execute(
+        "SELECT table_name FROM graph_node WHERE catalog_source = %s "
+        "AND (table_name = %s OR (kind = 'table' AND object_ref = %s)) "
+        "ORDER BY (table_name = %s) DESC LIMIT 1",
+        (catalog_source, table, table, table)).fetchone()
+    return row[0] if row else None
 
 
 def _entity_of(idea: FeatureIdea, contexts: dict[str, RecipeGroundingContextV1],
@@ -61,8 +92,10 @@ def _entity_of(idea: FeatureIdea, contexts: dict[str, RecipeGroundingContextV1],
     linked = concept(binding.expected_concept) if binding is not None else None
     if binding is not None and linked is not None and linked.entity_link:
         return binding.graph_object_ref, linked.entity_link
-    ref = idea.grain_ref[1] if idea.grain_ref else ""
-    return ref, _entity_label(ref)
+    # No unambiguous source entity: the group is the table's grain COLUMN, and it has no entity
+    # NAME. Labelling it with the column would put "cif_id features" beside "customer features" as
+    # though the catalog had attested an entity called cif_id — it attested nothing.
+    return (idea.grain_ref[1] if idea.grain_ref else ""), ""
 
 
 def _rejections_here(conn, catalog_source: str, roles, table: str,
@@ -70,7 +103,9 @@ def _rejections_here(conn, catalog_source: str, roles, table: str,
     """This table's rejections. The engine's list is CATALOG-wide and each entry carries only
     ``{name, reason, code}`` — no grain — so ``name -> grain table(s)`` is rebuilt from the same
     grounding the engine ran (through gate-1's own seam, so a substituted grounder stays consistent).
-    A name that grounds on more than one table is kept for each, never silently dropped."""
+    A name that grounds on more than one table is kept for each, never silently dropped — and a name
+    the second pass does not produce at all is kept HERE rather than dropped: the screen counts these
+    into "N features are blocked", so a silent drop under-reports a readiness gap."""
     if not rejections:
         return []
     grain_of: dict[str, set[str | None]] = {}
@@ -78,10 +113,10 @@ def _rejections_here(conn, catalog_source: str, roles, table: str,
                                              roles=roles):
         if outcome.feature is not None:
             grain_of.setdefault(outcome.feature.name, set()).add(outcome.feature.grain_table)
-    return [r for r in rejections if table in grain_of.get(r["name"], ())]
+    return [r for r in rejections if r["name"] not in grain_of or table in grain_of[r["name"]]]
 
 
-def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: str = "") -> dict:
+def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: str) -> dict:
     """One card. Every field is the engine's own: the status is the gauntlet's tri-state, the
     description is the template's SME intent, the requirements are the typed ones the gauntlet
     minted, and ``binding_quality`` is the signal the engine already returns per surviving template.
@@ -100,7 +135,7 @@ def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: st
     }
 
 
-def render_recipe(idea: FeatureIdea, entity_ref: str = "") -> str:
+def render_recipe(idea: FeatureIdea, entity_ref: str) -> str:
     """The one-line recipe this feature computes, e.g. ``trend_90d(bal_amt) BY cif_id OVER 90d
     [as_of_dt]``.
 
@@ -120,7 +155,7 @@ def render_recipe(idea: FeatureIdea, entity_ref: str = "") -> str:
     return line
 
 
-def _recipe_parts(idea: FeatureIdea, entity_ref: str = "") -> dict:
+def _recipe_parts(idea: FeatureIdea, entity_ref: str) -> dict:
     """The rendered line's pieces, structured. ``measure_refs`` carries EVERY bound pair — the grain
     and point-in-time columns included — so both are subtracted here: a card listing the grain column
     as a measure would claim the feature aggregates its own key. Order is the engine's binding order
@@ -149,8 +184,3 @@ def _column(object_ref: str) -> str:
     """The column name — the ref's last segment. A full ``schema.table.column`` ref is unreadable on
     a card, and nothing is invented by taking the name the catalog already holds."""
     return object_ref.rsplit(".", 1)[-1]
-
-
-def _entity_label(entity_ref: str) -> str:
-    """The grain column's name — a display label, formatted from the ref, never invented."""
-    return entity_ref.rsplit(".", 1)[-1] if entity_ref else ""

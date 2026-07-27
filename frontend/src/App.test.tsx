@@ -93,6 +93,7 @@ describe('app shell', () => {
     getTableSuggestions.mockResolvedValue({
       catalog_source: 'core_banking',
       table: 'public.comp_fin_tran',
+      table_known: true,
       summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
       groups: [],
       rejections: [],

@@ -1950,7 +1950,8 @@ export interface FeatureSuggestion {
 }
 
 // entity_label is the ENTITY the features are computed per ('account'); entity_ref is the COLUMN
-// that entity is bound to. Both empty = the ideas whose entity could not be named (no heading).
+// that entity is bound to. An empty entity_label = an entity the catalog could not NAME, so no
+// heading is rendered for it; an empty entity_ref = no bound entity at all.
 export interface SuggestionGroup {
   entity_ref: string
   entity_label: string
@@ -1966,6 +1967,9 @@ export interface SuggestionRejection {
 export interface TableSuggestions {
   catalog_source: string
   table: string
+  // false = this catalog holds no such table. An unknown table and a table with no concepts both
+  // return zero suggestions, so this is what keeps the empty screen's DIAGNOSIS honest.
+  table_known: boolean
   summary: { suggested: number; clean_ready: number; needs_review: number; entities: number }
   groups: SuggestionGroup[]
   rejections: SuggestionRejection[]
