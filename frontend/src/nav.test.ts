@@ -89,6 +89,14 @@ describe('useHashRoute', () => {
     expect(result.current.params.get('object_ref')).toBe('schema/accounts.balance')
   })
 
+  it('resolves the suggested route with its source + table params', () => {
+    window.location.hash = '#/suggested?source=core_banking&table=public.comp_fin_tran'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('suggested')
+    expect(result.current.params.get('source')).toBe('core_banking')
+    expect(result.current.params.get('table')).toBe('public.comp_fin_tran')
+  })
+
   it('navigate accepts a URLSearchParams with repeated values for faceted deep links', () => {
     const { result } = renderHook(() => useHashRoute())
     act(() => {

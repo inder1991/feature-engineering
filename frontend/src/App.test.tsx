@@ -7,11 +7,18 @@ import { getSession, setSession } from './session'
 
 vi.mock('./api', async importOriginal => {
   const actual = await importOriginal<typeof import('./api')>()
-  return { ...actual, listQuarantine: vi.fn(), uploadFile: vi.fn(), listIntegrations: vi.fn() }
+  return {
+    ...actual,
+    listQuarantine: vi.fn(),
+    uploadFile: vi.fn(),
+    listIntegrations: vi.fn(),
+    getTableSuggestions: vi.fn(),
+  }
 })
 const listQuarantine = vi.mocked(api.listQuarantine)
 const uploadFile = vi.mocked(api.uploadFile)
 const listIntegrations = vi.mocked(api.listIntegrations)
+const getTableSuggestions = vi.mocked(api.getTableSuggestions)
 
 beforeEach(() => {
   setSession({ user: 'dev', roles: ['data_owner'] })
@@ -20,6 +27,7 @@ beforeEach(() => {
   uploadFile.mockReset()
   listIntegrations.mockReset()
   listIntegrations.mockResolvedValue([])
+  getTableSuggestions.mockReset()
 })
 
 const ingest = (over: Partial<api.IngestResult>): api.IngestResult => ({
@@ -79,6 +87,27 @@ describe('app shell', () => {
     render(<App />)
     expect(screen.getByRole('heading', { level: 1, name: 'Search' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /search the catalog/i })).toBeInTheDocument()
+  })
+
+  it('deep-links #/suggested to the read-only suggested-features sheet, off the left rail', async () => {
+    getTableSuggestions.mockResolvedValue({
+      catalog_source: 'core_banking',
+      table: 'public.comp_fin_tran',
+      summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
+      groups: [],
+      rejections: [],
+    })
+    window.location.hash = '#/suggested?source=core_banking&table=public.comp_fin_tran'
+    render(<App />)
+    expect(screen.getByText('CATALOG · SUGGESTED FEATURES')).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', { level: 1, name: 'Suggested features' }),
+    ).toBeInTheDocument()
+    expect(await screen.findByText(/no suggestions yet/i)).toBeInTheDocument()
+    // a detail sheet, not a nav destination: no rail item was added
+    const nav = within(screen.getByRole('navigation'))
+    expect(nav.queryByRole('button', { name: /suggested/i })).not.toBeInTheDocument()
+    expect(getTableSuggestions).toHaveBeenCalledWith('core_banking', 'public.comp_fin_tran')
   })
 
   it('overview start-here button navigates to Ingest (the route hash stays #/upload)', async () => {

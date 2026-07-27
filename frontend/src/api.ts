@@ -1918,6 +1918,65 @@ export interface FieldDecisionResult {
   actions: string[]
 }
 
+// ---- P4 v1: read-only per-table suggested features ----
+// GET-only, by design: the payload is what the deterministic engine can ground on ONE table (no
+// hypothesis, no intent, no LLM), and v1 offers no verb to accept, dismiss or govern a suggestion.
+// Every field below is the engine's own — statuses are the gauntlet's tri-state, `binding_quality`
+// is the signal it already returns. There is no relevance score in this system, so there is none here.
+export interface SuggestionRequirement {
+  code: string            // the closed REQUIREMENT_CODES vocabulary (UNIT_CONSISTENT, ...)
+  operand: string[]       // [catalog_source, object_ref] the requirement concerns
+  detail: string
+}
+
+export interface RecipeParts {
+  operation: string
+  measures: string[]
+  grain: string
+  window: string
+  time: string
+}
+
+export interface FeatureSuggestion {
+  name: string
+  description: string
+  recipe: string
+  recipe_parts: RecipeParts
+  validation_status: string      // DESIGN_CHECKED | NEEDS_EXTERNAL_VALIDATION
+  requirements: SuggestionRequirement[]
+  uses: string[]                 // the object_refs it binds
+  binding_quality: string
+  grain_table: string
+}
+
+// entity_label is the ENTITY the features are computed per ('account'); entity_ref is the COLUMN
+// that entity is bound to. Both empty = the ideas whose entity could not be named (no heading).
+export interface SuggestionGroup {
+  entity_ref: string
+  entity_label: string
+  suggestions: FeatureSuggestion[]
+}
+
+export interface SuggestionRejection {
+  name: string
+  reason: string
+  code: string
+}
+
+export interface TableSuggestions {
+  catalog_source: string
+  table: string
+  summary: { suggested: number; clean_ready: number; needs_review: number; entities: number }
+  groups: SuggestionGroup[]
+  rejections: SuggestionRejection[]
+}
+
+export function getTableSuggestions(source: string, table: string): Promise<TableSuggestions> {
+  return request(
+    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}/suggestions`,
+  )
+}
+
 // POST one scalar field-correction. Maps the camelCase request to the backend snake_case body
 // (defaults mirror the server model: selected_evidence_ids [], replacement_value/reason null). A CAS
 // conflict (a concurrent decision/evidence/policy drift) fails closed as HTTP 409, and a four-eyes /

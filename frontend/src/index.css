@@ -3478,3 +3478,63 @@ button.stat:hover {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+
+/* ---------------------------------------------------------------- suggested features (P4 v1)
+   Appended for SuggestedFeaturesScreen: the read-only per-table suggestion sheet. Composes the
+   existing .stats/.stat, .rows/.row/.q-item/.q-head, .badge/.gj-*, .callout, .mono/.hint
+   vocabulary — the only additions are the entity group head, the recipe line, and the
+   requirement list's spacing. There is deliberately NO score bar: no relevance percentage
+   exists in this system. Nothing above this line is modified. */
+
+.sug > * + * {
+  margin-top: 14px;
+}
+
+.sug-scope,
+.sug-readonly {
+  margin: 0;
+}
+
+.sug-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.sug-group-title {
+  margin: 0;
+  font-size: 15px;
+  text-transform: capitalize;
+}
+
+.sug-card > * + * {
+  margin-top: 6px;
+}
+
+.sug-name {
+  font-family: var(--font-mono);
+}
+
+.sug-desc {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.sug-recipe {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.sug-uses {
+  margin: 0;
+}
+
+.sug-reqs {
+  font-size: 12.5px;
+}

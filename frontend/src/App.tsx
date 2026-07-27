@@ -12,6 +12,7 @@ import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
+import { SuggestedFeaturesScreen } from './screens/SuggestedFeaturesScreen'
 import { UploadScreen } from './screens/UploadScreen'
 import { WorkbenchScreen } from './screens/WorkbenchScreen'
 
@@ -144,6 +145,14 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M5.5 5.75h5M5.5 8h5M5.5 10.25h3" />
     </NavIcon>
   ),
+  // Also a detail sheet, not a nav tab (absent from PAGES): one table's suggested features. The
+  // entry exists only because ICONS is an exhaustive Record<Route> (mirrors 'asset' / 'gate').
+  suggested: (
+    <NavIcon>
+      <path d="M8 2.75a3.75 3.75 0 0 0-2.25 6.75V11h4.5V9.5A3.75 3.75 0 0 0 8 2.75z" />
+      <path d="M6.75 13.25h2.5" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
@@ -252,6 +261,24 @@ const ASSET_PAGE = {
     + 'evidence layer, they never rewrite the source.',
 }
 
+// The suggested-features sheet's page-head (P4 v1). Kept OUT of PAGES for the same reason as the
+// asset sheet: it is a per-table destination, not a top-nav one.
+const SUGGESTED_PAGE = {
+  route: 'suggested' as Route,
+  label: 'Suggested features',
+  eyebrow: 'CATALOG · SUGGESTED FEATURES',
+  title: 'Suggested features',
+  description:
+    'What this catalog can already build on one table — no hypothesis, no LLM. Read-only: these '
+    + 'are proposals with the engine’s own statuses, and nothing here changes the catalog.',
+}
+
+// The detail sheets, keyed by route: reached from an action elsewhere, never from the left rail.
+const DETAIL_PAGES: Partial<Record<Route, typeof ASSET_PAGE>> = {
+  asset: ASSET_PAGE,
+  suggested: SUGGESTED_PAGE,
+}
+
 export default function App() {
   const { route, navigate, params } = useHashRoute()
   // The upload -> review handoff travels entirely in the URL (?source=). No component state:
@@ -276,7 +303,9 @@ export default function App() {
   // 'asset' is a detail sheet, not a nav tab (absent from PAGES, so no rail item highlights) — but
   // it still needs an honest page-head, so it selects a dedicated entry instead of falling back to
   // Overview's copy.
-  const page = route === 'asset' ? ASSET_PAGE : (pages.find(p => p.route === route) ?? pages[0])
+  // A detail route (absent from PAGES, so no rail item highlights) selects its dedicated page-head
+  // instead of falling back to Overview's copy.
+  const page = DETAIL_PAGES[route] ?? (pages.find(p => p.route === route) ?? pages[0])
   return (
     <div className="shell">
       <aside className="rail">
@@ -339,6 +368,15 @@ export default function App() {
             key={`${params.get('source') ?? ''}:${params.get('object_ref') ?? ''}`}
             source={params.get('source') ?? ''}
             objectRef={params.get('object_ref') ?? ''}
+          />
+        )}
+        {route === 'suggested' && (
+          // One table's suggested features — source + table ride the hash. Keyed so a
+          // suggested -> suggested deep link (a different table) remounts to a clean load.
+          <SuggestedFeaturesScreen
+            key={`${params.get('source') ?? ''}:${params.get('table') ?? ''}`}
+            source={params.get('source') ?? ''}
+            table={params.get('table') ?? ''}
           />
         )}
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
