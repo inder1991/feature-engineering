@@ -1,383 +1,463 @@
-# Spec A — Executable Materialization Vertical Slice (design, rev 2)
+# Spec A — Executable Materialization Vertical Slice (design, rev 3)
 
-**Goal:** Turn a **governed, RESOLVED** feature authoring result into a **complete runnable Kedro/PySpark project** that computes the three worked-example features on a Hadoop/Hive cluster and publishes them as one atomically-visible feature-group partition — proven by actually executing them.
+**Goal:** Turn a **governed, provenance-verified** feature authoring result into a **complete runnable Kedro/PySpark project** that computes the worked-example features on the Hadoop/Hive cluster and publishes them as one atomically-visible feature-group partition — proven by executing them and reading the published table.
 
 **One line:** Child-1 decided *what a feature means*; Spec A generates *the code that computes it*, proves the numbers, and publishes completely or not at all.
 
-**Tech stack:** Kedro (nodes/pipelines/hooks) · PySpark · HDFS Parquet (`intermediate`/`primary`/`feature_staging`) · Hive (`sandbox_feature`) · Postgres control plane · Python 3.11.
+**Scope.** First of three specs. **Spec B** owns profiling/EDA and its UI. **Spec C** owns `model_input` assembly.
 
-**Scope.** First of three specs. **Spec B** owns profiling/EDA and its UI. **Spec C** owns `model_input` assembly. Spec A owns calculation correctness and atomic publication, reporting through a **run manifest** only.
+> **Rev 3** follows a second code-grounded review (16 findings on rev 2, 12 on rev 1). Every API this spec names is verified in `docs/architecture/2026-07-27-verified-interfaces-materialization.md` with `file:line` citations. **Nothing may enter this spec or its plan unless it is verified there first** — both earlier revisions failed because plausible detail was written faster than it was checked.
 
-> **Rev 2** rewrites rev 1 after a code-grounded review found twelve defects, several of which would have produced silently wrong feature values. The material changes: the only public input is a governed `ResolvedFeatureInput`; joins go through the existing `classify_join_path` planner (cardinality- and role-aware) instead of a hand-rolled bridge match; the IR is **per expression**; the spine has a governed source; contract PIT semantics exclude the calculation window; identity is split into two non-circular phases and is **sandbox-only**; computation sharing is **removed** from this slice; completeness is proven by per-feature staging manifests rather than schema; and Spark-local execution plus a cluster publication proof are **mandatory gates**, not opt-in tests.
+**Material changes in rev 3:** admission verifies the **immutable terminal authoring event**, not a caller-constructed result · authorization is **two gates** (artifact, then complete physical read set) · the spine source is an **explicit declaration** with facts as validators only · `1:N` traversal toward the grain is **refused** · contracts are derived **per feature then grouped**, never unioned · a **versioned physical-type adapter** replaces the logical/physical conflation · `PhysicalInputSnapshot` carries **plural** partition specs · publication requires a `PublisherSelection` carrying a passing capability attestation.
 
 ---
 
 ## Global Constraints
 
-- **Functional-first (2026-07-27 directive).** NFRs are deferred and recorded in `docs/DEFERRED-WORK.md`. **Exception 1:** governed authority is the *feature*. **Exception 2:** an NFR whose damage is irreversible while deferred is fixed immediately.
-- **Render-only.** The generated project **is** the execution path. Nothing in `src/` computes a feature value; no `pyspark` import outside rendered text.
+- **Functional-first.** NFRs deferred and recorded in `docs/DEFERRED-WORK.md`. Exceptions: governed authority is the *feature*; an NFR whose damage is irreversible while deferred is fixed now.
+- **Render-only.** The generated project **is** the execution path. No `pyspark` import in `src/featuregen/materialize/`.
 - **The control plane never reads feature data.** It generates code and ingests small manifests/reports.
 - **Frozen slotted dataclasses + `StrEnum`** — NOT pydantic.
-- **Every new hash is RFC 8785 (JCS) + sha256** via one helper wrapping `featuregen.formula._jcs.dumps`. Hashes cover identity fields only; provenance and live observations stay out.
-- **Reuse governed machinery; do not re-implement it.** Joins go through `classify_join_path`; sensitivity gating through `allowed_sensitivities`; C1 reads through `read_operational_value`.
-- **Fail closed.** Ungoverned, unverified, denied or unresolvable ⇒ a typed refusal. Never a guess.
+- **One hasher:** RFC 8785 (JCS) + sha256 wrapping `featuregen.formula._jcs.dumps`. Identity fields only.
+- **Reuse governed machinery.** Joins → `classify_join_path`. Sensitivity → `graph_node` + `safety_floor.SENSITIVITY_ORDER` + `read_scope`. C1 → `read_operational_value`. Actor → `IdentityEnvelope`.
+- **Never mint identity.** `declared_by` records the `IdentityEnvelope` threaded from the request. Materialization never constructs one with `authenticated=True` — that is a trust-root violation this codebase has already been bitten by.
+- **Fail closed.** Ungoverned, unverified, denied, unknown or ambiguous ⇒ a typed refusal.
 - **Manifests and findings carry counts, types, hashes and locations — never data values.**
-- **Sandbox only.** Spec A cannot publish to `feature.*` at all (§B).
-- **`INSERT OVERWRITE` is forbidden** as a publication mechanism.
-- Timezones validate through `zoneinfo.ZoneInfo`. No new LLM call.
+- **Sandbox only.** No production publication path exists.
+- **`INSERT OVERWRITE` is forbidden.**
 - Commit trailer: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 
 ---
 
-## §0 The only public input: `ResolvedFeatureInput`
+## §0 Prerequisite: target-cluster inventory (blocking)
 
-Materialization has exactly one entry point and it cannot be handed a bare formula.
+**Nothing may assume how the source tables are physically laid out.** No partition key — `business_dt`, `transaction_date`, `load_dt` or otherwise — may be named as an assumption anywhere in this spec or its plan.
+
+Before cluster acceptance, an inventory task captures from the metastore, for `banking.transactions`, `banking.accounts` and `banking.customers`:
+
+- whether the table is partitioned at all;
+- ordered partition columns and their types;
+- example partition values covering the acceptance date;
+- physical location;
+- whether historical partitions are rewritten in place;
+- how a customer snapshot corresponding to a business date is selected;
+- **how account-to-customer ownership is modelled** (see §H — a joint-account bridge makes the traversal `1:N` and would refuse the worked feature);
+- **the Hive, Spark and metastore versions** (§K's capability attestation is keyed on that exact triple).
+
+Compilation contracts are parameterized on this inventory and can be specified before it exists; **cluster acceptance is blocked until it is complete.**
+
+---
+
+## §1 Admission — two gates, provenance-verified
+
+### §1.1 The only public input
 
 ```python
 @dataclass(frozen=True, slots=True)
 class ResolvedFeatureInput:
-    intent: AuthoringIntent      # carries the feature NAME (AuthoringResult does not)
-    result: AuthoringResult      # carries candidate_formula + disposition
+    intent: AuthoringIntent     # carries the feature NAME; AuthoringResult does not
+    result: AuthoringResult
+    authoring_run_id: str       # the run whose terminal event proves the result
 ```
 
-**Admission checks (all normative, all fail closed):**
+### §1.2 Gate 1 — artifact admission against the immutable terminal event
 
-1. `result.authoring_disposition == "RESOLVED"`.
-2. `result.candidate_formula is not None`.
-3. `formula_content_hash(result.candidate_formula) == result.candidate_formula_hash`.
-4. `authoring_intent_hash(intent)` matches the `intent_hash` recorded on the authoring run.
-5. The caller's `roles` authorize **the entire physical read set** — every operand, filter column, event-time column, join key, joined table, bridge hop **and the spine source** (§A4). A single denied element refuses the whole compilation.
+`AuthoringResult` is a publicly constructible frozen dataclass. A caller can fabricate a "RESOLVED" result, attach any formula, and cite a legitimate run id. **In-memory self-consistency proves nothing.**
 
-`AuthoringResult` deliberately does not carry a feature name, which is why the intent travels with it: the name becomes the output column and must be governed provenance, not a caller-supplied string.
+Child-1's authoring trace records a terminal `COMPLETED`/`FAILED` event carrying a canonical `payload` and a sha256 `payload_hash`, making it tamper-evident. Gate 1 verifies the supplied result **against that event**:
+
+1. A terminal event exists for `authoring_run_id` — no terminal ⇒ `AUTHORING_RUN_INCOMPLETE`.
+2. `payload_hash` validates the payload ⇒ else `TERMINAL_PAYLOAD_TAMPERED`.
+3. The terminal payload's disposition is `RESOLVED` ⇒ else `NOT_RESOLVED`.
+4. The terminal payload's recorded candidate-formula hash equals `formula_content_hash(result.candidate_formula)` ⇒ else `FORMULA_HASH_MISMATCH`.
+5. The supplied status axes equal the terminal payload's axes ⇒ else `AXES_MISMATCH`.
+6. `authoring_intent_hash(intent)` matches the run's recorded `intent_hash` ⇒ else `INTENT_HASH_MISMATCH`.
+
+The feature name is `intent.name`, normalized to a Hive identifier; a post-normalization collision within a group is a plan error, never a silent overwrite.
+
+### §1.3 Gate 2 — authorization over the complete physical read set
+
+Gate 1 cannot authorize reads, because availability columns, join hops, bridge tables and the spine are only discovered during compilation. Authorization therefore runs **after** the IR is complete:
+
+```
+Gate 1: admit authored artifact   →  compile complete physical IR  →  Gate 2: authorize read set
+```
+
+Gate 2 checks every element of the union of all expression read sets **plus the spine source, its keys, every join step's endpoints, and every availability column** against `allowed_sensitivities(roles)`. One denied element refuses the whole compilation with `READ_SCOPE_INSUFFICIENT`. There is no partial authorization and no per-feature bypass.
 
 ---
 
-## §A The compilation chain
+## §2 Compilation chain
 
 ```
-ResolvedFeatureInput (RESOLVED + admission checks §0)
-  ↓ A1  logical requirements, exact logical_refs preserved
+ResolvedFeatureInput  →  §1.2 Gate 1
+  ↓ logical requirements, logical_refs preserved byte-exactly
 FormulaPlannerIntentV1
-  ↓ A2  PER-EXPRESSION physical resolution
-ExpressionExecutionIR  (one per body path)  →  expression_ir_hash
-  ↓ A3  assemble
-FormulaExecutionIRV1   (expressions + grain + spine + output policy)  →  ir_hash
-  ↓ A4  governed spine resolution
-SpineSpec
-  ↓ A5  classify sensitivity/access/retention over the UNION of all read sets
-MaterializationContractV1  →  materialization_contract_hash
-  ↓ A6  fix the packing list
-FeatureGroupPlanV1  →  group_plan_hash          }  CompilationIdentity
-  ↓ A7  render a COMPLETE runnable project
-RenderedProject  →  generated_project_hash      }  RenderedArtifactIdentity
-  ↓ A8  submit + validate (§N): L0 import+DAG · L1 schema/access · L2 on demand
+  ↓ PER-EXPRESSION physical resolution (§3)
+ExpressionExecutionIR (one per body path)   → expression_ir_hash
+  ↓ + spine (§4) + carried output policy
+FormulaExecutionIRV1                        → ir_hash
+  ↓ §1.3 Gate 2 over the complete read set
+  ↓ physical type resolution (§6)
+  ↓ contract PER FEATURE (§5), then group by contract hash
+MaterializationContractV1                   → materialization_contract_hash
+  ↓ exactly ONE group in this slice, else MULTIPLE_MATERIALIZATION_CONTRACTS
+FeatureGroupPlanV1                          → group_plan_hash    } CompilationIdentity
+  ↓ render a COMPLETE runnable project (§7)
+RenderedProject                             → generated_project_hash } RenderedArtifactIdentity
+  ↓ submit + validate (§11): L0 import+DAG · L1 schema/access/partitions · L2 on demand
 ValidationReportV1 → classified findings → fix renderer OR re-attest fact → regenerate
-  ↓ A9  execute (Spark local, then the cluster)
-per-feature staging + StagingManifestV1 each
-  ↓ A10 assemble → validate → publish atomically → run manifest
-RunManifestV1
+  ↓ execute
+per-feature staging + StagingManifestV1
+  ↓ assemble (manifest-verified) → validate (§9) → publish (§10) → run manifest (§12)
 ```
 
-### §A2 Expression-level IR (was a rev-1 defect)
+---
 
-Child-1 permits each `AggregateExpression` its own `source_relation`, `filter`, and `window`. A legal ratio can therefore read **two different tables with two different event-time columns and two different windows**, sharing only the catalog source. One `PitSpec` per formula cannot represent that.
+## §3 Expression-level IR and joins
+
+Each `AggregateExpression` owns its `source_relation`, `filter` **and** `window`, so a legal ratio may read two tables with two event-time columns and two windows. One PIT spec per formula cannot represent Child-1's grammar.
 
 ```python
 @dataclass(frozen=True, slots=True)
 class ExpressionExecutionIR:
-    expr_path: str                       # "body.expr" | "body.numerator" | ... (Child-1 vocabulary)
-    physical_read_set: tuple[PhysicalRef, ...]   # operand + filters + event time + join keys + hops
-    join_plan: JoinPlan                  # from classify_join_path — steps, cardinality, authority
-    pit: PitSpec                         # THIS expression's event-time, availability basis, window
+    expr_path: str                     # body.expr | body.numerator | body.denominator | ...
+    physical_read_set: tuple[PhysicalRef, ...]
+    join_plan: JoinPlan
+    pit: PitSpec                       # THIS expression's event time, availability basis, window
+    input_snapshots: tuple[PhysicalInputSnapshot, ...]
     aggregation: AggregateFunction
     filter_tree: Mapping[str, Any] | None
 ```
 
-`FormulaExecutionIRV1` holds `expressions: tuple[ExpressionExecutionIR, ...]`, the grain, the `SpineSpec`, the carried `FormulaOutputPolicyV1`, the final operation and decimal/null policy, and a `catalog_state_stamp`.
+### §3.1 Joins go through the existing planner
 
-### §A3 Joins — reuse the governed planner
+`classify_join_path(conn, catalog_source, from_table, to_table, *, roles) -> JoinOutcome`.
 
-Grain reaching and any expression-level join **must** go through `classify_join_path(conn, catalog_source, from_table, to_table, *, roles) -> JoinOutcome` (`overlay/upload/join_path.py`). It already provides multi-hop BFS, per-step **cardinality oriented to traversal direction**, clearing (declared or VERIFIED) vs unverified vs denied classification, read-scope denial, and four discriminated outcomes.
+**Table arguments are BARE table names.** `_table_of` returns the second dotted segment, so a schema-qualified destination never matches. The adapter parses schema-qualified logical refs, passes bare names, keeps schema/source identity separately, and **refuses ambiguity** (`AMBIGUOUS_TABLE_NAME`) when one catalog source has the same table name in two schemas.
 
-**Normative mapping:**
+**Authority provenance must be carried, not reconstructed.** `classify_join_path` currently drops `approved_join_fact_key`/`approved_join_status` for clearing (operational) edges even though its SQL selects them. Extend the planner **inside its own query** so each returned step carries `from_ref`, `to_ref`, `cardinality`, `approved_join_fact_key`, `approved_join_status` and `authority`. Reconstructing provenance later with a second read risks drift.
 
-| `JoinOutcome.kind` | Spec A behaviour |
-|---|---|
-| `OPERATIONAL` | proceed; retain every `JoinStep` verbatim in `JoinPlan` |
-| `UNVERIFIED` | refuse — `JOIN_PATH_NOT_VERIFIED`, naming the fact keys needing confirmation |
-| `DENIED` | refuse — `JOIN_PATH_DENIED_BY_READ_SCOPE`, naming the endpoints |
-| `NO_PATH` | refuse — `GRAIN_PATH_NOT_GOVERNED` |
+Outcome mapping: `OPERATIONAL` → proceed · `UNVERIFIED` → `JOIN_PATH_NOT_VERIFIED` (naming the fact keys) · `DENIED` → `JOIN_PATH_DENIED_BY_READ_SCOPE` (naming endpoints) · `NO_PATH` → `GRAIN_PATH_NOT_GOVERNED`.
 
-**Cardinality is load-bearing.** A traversal step that fans `1:N` toward the grain multiplies rows and silently inflates a SUM. `JoinPlan` records each step's cardinality, and the renderer **must** collapse fan-out (aggregate before joining, or de-duplicate on the grain key) — never emit a naive join across an N-side hop. This is a correctness requirement, not an optimization.
+### §3.2 Fan-out is refused, not repaired
 
-`JoinPlan` retains: ordered steps (`from_ref`, `to_ref`, `cardinality`), the authority reference for each step, the roles the classification was performed under, and the resulting outcome kind.
+**Any traversal step that fans `1:N` toward the target grain refuses the feature with `JOIN_FANOUT_UNSUPPORTED`.**
 
-### §A4 `SpineSpec` — the entity population has a governed source
+No `dropDuplicates`, no pre-aggregation, no renderer-level repair. Those are not equivalent, they differ per operation (SUM vs COUNT DISTINCT vs RATIO), and — decisively — a joint account whose transaction is attributable to two customers is a **business allocation decision**, not a technical de-duplication. Deduplicating would discard real transactions; pre-aggregating would silently pick an allocation rule nobody approved.
 
-"Every customer appears, including those with no transactions" is impossible if the spine is built from the transaction table. The spine needs its own governed source.
+A later governed allocation policy will own those semantics. Until then, refusal is the honest outcome.
+
+**Known consequence:** if account-to-customer ownership is modelled as a joint-holder bridge, `total_debit_amount_30d` is refused in this slice. §0's inventory must establish this before acceptance planning.
+
+### §3.3 Physical input snapshots
 
 ```python
 @dataclass(frozen=True, slots=True)
-class SpineSpec:
+class PartitionSpec:
+    columns: tuple[tuple[str, str], ...]      # ordered (column, value)
+
+@dataclass(frozen=True, slots=True)
+class PhysicalInputSnapshot:
+    catalog_source: str
+    schema: str
+    table: str
+    partition_specs: tuple[PartitionSpec, ...] | None
+    catalog_state_stamp: tuple[tuple[str, str], ...]
+```
+
+**Plural** — a 90-day feature reads many partitions. `None` means **verified unpartitioned**, never "unknown"; unknown is a refusal. Partitioned inputs carry the exact ordered partition list actually read; L1 verifies every one exists; `input_snapshot_ids` is that ordered set. The environment adapter resolves partitions from the inventory (§0) — materialization never derives them from `business_dt`.
+
+For an unpartitioned mutable table the snapshot is **not content-addressed**; that is recorded honestly and is one more reason this slice is sandbox-only.
+
+---
+
+## §4 `SpineSourceDeclarationV1` — the entity population
+
+`ENTITY_ASSIGNMENT` + `GRAIN` prove that a column represents an entity and that some columns uniquely identify rows. **They do not prove the table contains every member**, retains inactive members, or is authoritative — several tables can carry a unique `cif_id` over incomplete populations. Choosing one from those facts is inference, which this spec forbids.
+
+```python
+@dataclass(frozen=True, slots=True)
+class SpineSourceDeclarationV1:
     entity: str
-    source_table_ref: str                    # e.g. hdfc::banking.customers
-    key_columns: tuple[str, ...]             # exact, ordered, matching Grain.keys semantics
-    availability: PitSpec                    # the spine's own as-of policy
-    join_plan: JoinPlan | None               # if spine keys need a governed hop to the grain keys
-    snapshot_identity: str                   # the physical partition/snapshot read
+    source_table_ref: str                     # exact; no table inference
+    ordered_key_refs: tuple[str, ...]         # exact column refs
+    population_semantics: PopulationSemantics
+    availability_ref: str | None
+    snapshot_policy: SnapshotPolicy           # structured; how a snapshot maps to business_dt
+    declared_by: IdentityEnvelope             # threaded from the request, never minted
+    declaration_reason: str
+    declaration_version: int
 ```
-
-The spine source is part of the physical read set for **role authorization (§0.5), sensitivity classification (§C) and `input_snapshot_ids`**. There is no default and no inference: a formula whose entity has no governed spine source refuses with `SPINE_SOURCE_NOT_GOVERNED`.
-
----
-
-## §B Identity — two phases, non-circular, sandbox-only
-
-Rev 1 was circular (identity contained `generated_project_hash`, yet was consumed to render the files that produce it) and scalar (one `formula_content_hash` for a multi-feature group).
 
 ```python
-@dataclass(frozen=True, slots=True)
-class CompilationIdentity:
-    formula_content_hashes: tuple[str, ...]      # one per feature, sorted
-    ir_hashes: tuple[str, ...]                   # one per feature, sorted
-    materialization_contract_hash: str
-    group_plan_hash: str
-
-@dataclass(frozen=True, slots=True)
-class RenderedArtifactIdentity:
-    compilation: CompilationIdentity
-    generated_project_hash: str                  # computed AFTER rendering
+class PopulationSemantics(StrEnum):           # CLOSED
+    CURRENT_COMPLETE_POPULATION = "current_complete_population"
+    CURRENT_ACTIVE_ONLY = "current_active_only"
+    HISTORICAL_AS_OF = "historical_as_of"
 ```
 
-**Non-circularity (normative).** The rendered files embed the **`CompilationIdentity`** only. `generated_project_hash` is computed over the rendered bytes afterwards and lives in a **detached** `GENERATED.lock` file and the control-plane row — never inside a file that the hash covers.
+**Rules (normative):**
 
-**Sandbox only.** Spec A has **no production publication path**. `derive_namespace()` returns `sandbox_feature` unconditionally, and there is no parameter that changes it. Rev 1's "two non-empty strings unlock production" gate is removed: Child-2 must later supply a factory that *validates actual frozen bindings*, and that factory does not exist, so neither does the door.
+- Declared **once per materialization contract**, never per feature.
+- Included in the contract hash and `CompilationIdentity`.
+- **Governed facts validate the declaration; they never choose it.** `ENTITY_ASSIGNMENT`, `GRAIN`, read scope and `AVAILABILITY_TIME` may *reject* a declaration (wrong entity, non-unique keys, denied read, missing availability) but must never select a source.
+- A `CURRENT_COMPLETE_POPULATION` claim is recorded as a **human declaration**, not a governed catalog fact, and is labelled as such wherever it is surfaced.
+- **No arbitrary SQL predicate.** Any active/current-row selection is structured via `snapshot_policy`; free-text SQL would smuggle ungoverned business logic into the population definition where no governance check can see it.
+- When a governed `ENTITY_POPULATION_SOURCE` fact is later introduced it **supersedes** the declaration; existing declarations are checked against it and disagreement blocks further materialization.
 
-`sandbox_execution_hash` covers: `CompilationIdentity`, `generated_project_hash`, `environment_id`, resolved parameter values, `business_dt`, `input_snapshot_ids`, compiler and renderer versions, and the **publication capability attestation id** (§K). It is never recorded under the name `execution_hash`.
+### §4.1 Completeness is checked against the claim
 
-`input_snapshot_ids` = the `(schema, table, partition)` set actually read (including the spine) plus the `catalog_state_stamp`. **Not** a content snapshot — an in-place source rewrite is invisible to it. Recorded, not papered over; one more reason this slice is sandbox-only.
+You cannot prove a population is complete, but you can prove it is not: a grain key present in the aggregates and absent from the spine is a member the spine is missing. The response depends on what was claimed:
+
+| `population_semantics` | Orphan grain key ⇒ |
+|---|---|
+| `CURRENT_COMPLETE_POPULATION` | the declaration is **provably false** → **block publication** (`SPINE_INCOMPLETE`) |
+| anything narrower | orphans are expected → **count and report an orphan rate** in the run manifest; do not block |
+
+This makes the declaration self-checking against its own claim rather than against an assumption, and converts an otherwise undetectable population bias into a first-run failure.
 
 ---
 
-## §C `MaterializationContractV1` — the group key
+## §5 `MaterializationContractV1`
 
-### §C.1 What PIT semantics means here (rev-1 contradiction fixed)
+### §5.1 Derived per feature, then grouped
 
-Rev 1 said the contract's PIT semantics include the formula window, while also requiring 30-day and 90-day features to share a group. Both cannot hold.
+**A contract is derived for each feature independently and features are then grouped by equal contract hash.** Deriving one contract from the union of supplied IRs would let a caller force a public feature into a restricted group merely by passing them together.
 
-**Normative:** the contract's `pit_semantics` is the meaning of the **landing key** — `(entity keys, business_dt, cutoff timezone, cutoff time, availability basis class)`. It answers "does `(cif_id, 2026-07-27)` mean the same thing in every column of this row?"
+This slice publishes exactly one group: more than one distinct contract hash returns `MULTIPLE_MATERIALIZATION_CONTRACTS`, listing the groups. Nothing is silently promoted.
 
-The **calculation window lives in the expression IR and is NOT hashed into the contract.** `total_debit_amount_30d` and `distinct_merchant_count_90d` therefore share a contract, which is the intended behaviour.
+### §5.2 Classification — two independent axes
 
-### §C.2 Classification adapter (rev-1 defect: unimplementable)
+`graph_node.sensitivity` (read-scope tags `pii`, `restricted`) and `graph_node.effective_restriction` (ordered `public < internal < confidential < restricted < prohibited`) are **different fields**. Conflating them is a governance error.
 
-`read_column_facts` returns `{value, authority, provenance}` — it carries no sensitivity, access or retention. Classification therefore needs its own **versioned adapter**, `CLASSIFICATION_POLICY_VERSION`, defined once and hashed into the contract.
+- **`sensitivity_class`** = the maximum `effective_restriction` across the complete physical read set **including the spine**, ranked by `safety_floor.SENSITIVITY_ORDER`. Do not mint a parallel enum.
+- **`access_requirements`** = the union of roles required by the `graph_node.sensitivity` tags present, via `SENSITIVITY_ROLES` (`pii → pii_reader`, `restricted → restricted_reader`).
+- **Unknown restriction labels fail closed to `prohibited`** (`safety_floor` behaviour) and are never returned verbatim.
+- **Missing classification has an explicit policy** stated in `CLASSIFICATION_POLICY_VERSION`, not an implicit default.
+- **A `prohibited` input refuses materialization** (`PROHIBITED_INPUT`). It does not produce a "prohibited feature group".
+- `retention_class` comes from an explicit platform retention **policy version** — no governed per-column retention exists.
 
-The repository has two vocabularies: read-scope tags (`pii`, `restricted`) and effective restrictions (`public`, `internal`, `confidential`, `restricted`, `prohibited`). The adapter:
+### §5.3 PIT semantics exclude the calculation window
 
-- reads `graph_node.sensitivity` for every element of the **union of all expression read sets plus the spine**;
-- maps to the **effective-restriction** vocabulary (`public < internal < confidential < restricted < prohibited`) — that ordered five-value scale is the contract's `sensitivity_class`; the plan does not invent a third vocabulary;
-- derives `access_requirements` as the set of role predicates needed to read that maximum, expressed as `allowed_sensitivities` requires them, so the contract states what a reader must hold;
-- takes `retention_class` from an explicit **platform retention policy version** — no governed per-column retention policy exists, and inventing one per column would be dishonest.
+`pit_semantics` is the meaning of the **landing key**: `(entity keys, business_dt, cutoff timezone, cutoff time, availability basis class)`. It answers "does `(cif_id, 2026-07-27)` mean the same thing in every column of this row?"
 
-Derivation runs over the **IR**, not the formula: join keys, bridge tables and the spine can each be the most restrictive element.
+The **calculation window lives in the expression IR and is not hashed into the contract**, so a 30-day and a 90-day trailing feature share a group — the intended behaviour.
 
-### §C.3 Derived vs declared, and the monotonic rule
+### §5.4 Derived, declared, defaulted
 
-Derived: grain/keys, landing PIT semantics, sensitivity, access requirements, retention (policy default). Declared: **cadence** (the one mandatory human input) and **`availability_class`** (declared per contract — the governed source-delivery SLA needed to derive it does not exist; see `DEFERRED-WORK.md`). Platform defaults: publication policy `atomic_group`, backfill boundary `group_level`.
+Derived: grain/keys, landing PIT semantics, sensitivity class, access requirements, retention (policy default), physical types (§6).
+Declared: **cadence** (structured; `ZoneInfo`-validated; `trigger ∈ {scheduled, manual}` — `dependencies_ready` deferred), **`availability_class`**, and the **spine source declaration** (§4).
+Defaults: publication policy `atomic_group`, backfill boundary `group_level`.
 
-Overrides are **monotonic**: stricter/later accepted, looser/earlier **refused as an error**.
+Overrides are **monotonic** — stricter/later accepted, looser/earlier refused as an error.
 
-Cadence is structured — `{period, timezone, business_date_cutoff, trigger}` — with `timezone` validated through `ZoneInfo` and `trigger ∈ {scheduled, manual}`; `dependencies_ready` is deferred.
+### §5.5 Hash contents
 
-### §C.4 Hash contents
-
-**Include:** entity, ordered keys, landing PIT semantics, sensitivity class, access requirements, retention class + policy version, `availability_class`, cadence, publication policy, backfill boundary/isolation key, `CLASSIFICATION_POLICY_VERSION`.
+**Include:** entity, ordered keys, landing PIT semantics, sensitivity class, access requirements, retention class + policy version, `availability_class`, cadence, publication policy, backfill boundary, spine declaration, `CLASSIFICATION_POLICY_VERSION`, `PHYSICAL_TYPE_POLICY_VERSION`.
 **Exclude:** calculation windows, current watermark, arrival timestamps, job status, run ids, wall-clock.
 
 ---
 
-## §D `FeatureGroupPlanV1` and completeness by manifest
+## §6 Physical type adapter (`PHYSICAL_TYPE_POLICY_VERSION`)
 
-The plan carries `materialization_contract_hash` and, per feature: `intent_feature_name` (from the authoring intent, normalized to a Hive identifier; a post-normalization collision is a plan error), `column_name`, `column_type`, `formula_content_hash`, `ir_hash`.
+`FormulaOutputPolicyV1.output_type` is *logical* (`numeric`, `integer`, `decimal`). No mapping to physical Hive/Spark types exists anywhere in the repository. **The operation determines the physical type — not the logical word alone.**
 
-**Completeness is proven by manifests, not schema (rev-1 defect).** A matching schema cannot show that a column was produced by the expected IR. Each `calculate_*` node writes:
+| Formula operation | Published type |
+|---|---|
+| `COUNT_ROWS` / `COUNT_NON_NULL` / `COUNT_DISTINCT` | `BIGINT` |
+| `SUM` | `DECIMAL(precision, scale)` from `DecimalPolicy` |
+| `RATIO` | `DECIMAL(precision, scale)` from `DecimalPolicy` |
+| `DIFFERENCE` | `DECIMAL(precision, scale)` from `DecimalPolicy` |
+
+**Rules:**
+
+- Intermediate accumulation may use a wider decimal (Spark widens `SUM` over `DECIMAL(18,2)` to `DECIMAL(38,2)`), but the **published result is rounded and cast to the formula's declared precision and scale**.
+- `RoundingMode` is implemented explicitly, never left to engine default.
+- **`OverflowBehavior.ERROR` must fail the feature.** Spark's default decimal behaviour on overflow returns **NULL**, so genuine ERROR semantics require deliberate configuration plus explicit checks in generated code. All three first-slice features declare ERROR, so this is on the critical path — a silent NULL where the formula demanded an error is exactly the quiet wrongness this system exists to prevent.
+- **`SATURATE` is refused** in this slice unless its clamping behaviour is explicitly implemented and tested.
+- **Nullability is part of the decision**, derived from `EmptyWindowResult` and `ZeroDenominator`: a `ZERO` empty-window yields a non-null column; `ZeroDenominator.NULL` yields a nullable one. The §9 type gate cannot check honestly otherwise.
+- Hive/Spark `DECIMAL` maxes at **precision 38**; a policy exceeding it, or any ambiguous conversion, returns `PHYSICAL_TYPE_UNSUPPORTED`. **Never silently map ambiguous numerics to `DOUBLE`.**
+- `DECIMAL(p,s)` and `BIGINT` support is validated during the environment capability check (§10).
+
+The resolved physical type and `PHYSICAL_TYPE_POLICY_VERSION` enter `FeatureGroupPlanV1`, `group_plan_hash` and therefore `CompilationIdentity`. They do **not** alter the formula hash — physical type is a materialization concern, not formula identity.
+
+---
+
+## §7 Identity and the complete project
+
+```python
+CompilationIdentity(formula_content_hashes, ir_hashes, materialization_contract_hash,
+                    group_plan_hash)          # all plural where a group has many features
+RenderedArtifactIdentity(compilation, generated_project_hash)
+```
+
+Rendered files embed the **`CompilationIdentity` only**. `generated_project_hash` is computed over the rendered bytes **excluding `GENERATED.lock`**, and is written *into* `GENERATED.lock` — the detached manifest. That precise exclusion is what makes the identity non-circular; every other generated file must be free of it.
+
+**Sandbox only.** `derive_namespace()` takes no parameters and returns `sandbox_feature`. There is no production path; Child-2 must later supply a factory that validates actual frozen bindings.
+
+`sandbox_execution_hash` covers `CompilationIdentity`, `generated_project_hash`, `environment_id`, resolved parameter values, `business_dt`, `input_snapshot_ids`, compiler/renderer versions and the **publication capability attestation id**. It is never recorded as `execution_hash`.
+
+**The project is complete and runnable** — `pyproject.toml`, `requirements.lock`, `conf/base/{catalog,parameters,logging}.yml`, `src/<pkg>/{__init__,settings,pipeline_registry,hooks}.py`, `src/<pkg>/pipelines/materialize/{__init__,nodes,pipeline}.py`, `GENERATED.lock`, `README.md`. The README states how it is launched: `kedro run` inside a Spark session configured by a Kedro hook, with `spark-submit` used only to place that run on the cluster.
+
+Layers: `raw` (read-only sources) → `intermediate` (per-feature PIT projection) → `primary` (the spine) → `feature_staging` (independent per feature + manifest) → `feature` = `sandbox_feature.<group>` (Hive). `model_input` is Spec C.
+
+**No scan sharing in this slice.** Each feature computes independently from `raw`. A duplicated scan is slower; an incorrectly shared filter or window produces a wrong feature. Sharing returns later behind a strict compatibility fingerprint covering catalog source, schema, table, availability column/basis/lag, event-time column, timezone, window basis and unit, the full join plan, access scope and input snapshots — with calendar-period windows never normalized to days.
+
+---
+
+## §8 Point-in-time correctness
+
+1. **Availability gate per expression** — keep a row only if its governed availability column (per `AVAILABILITY_TIME.basis`, plus `lag_hours` for `event_time_plus_lag`) is `<=` the `business_dt` cutoff derived from the cadence's timezone and `business_date_cutoff`.
+2. **Window boundaries per expression** — `basis`, `length`, `unit`, `start_inclusive`, `end_inclusive` honoured exactly. **Calendar-period windows are computed as calendar periods, never as day counts.**
+3. **Spine reduction** — LEFT JOIN each feature's grain-level aggregate onto the spine; exactly one row per `(keys…, business_dt)`; entities with no source rows still present.
+4. **Empty-window / null / ÷0** — from the formula's own policies.
+
+Worked example: `transaction_date = 2026-07-01`, `posted_at = 2026-07-05` — excluded at `business_dt = 2026-07-03`, included at `2026-07-06`. Asserted by **executing** the generated code, never by inspecting rendered text.
+
+---
+
+## §9 Validation gates (blocking)
+
+Run after assembly, before publication. Any failure rejects the group; the previous partition stays untouched.
+
+Key uniqueness · required columns present, none extra · physical types match §6 including nullability · **every staging manifest present, `completed`, `ir_hash`-matching, and bound to this generation/run/business_dt** · assembled schema hash matches the plan · forbidden numerics · overflow behaviour honoured · `SPINE_INCOMPLETE` when a `CURRENT_COMPLETE_POPULATION` declaration has orphan grain keys (§4.1) · `generated_project_hash` matches `GENERATED.lock`.
+
+**Completeness is proven by manifest, not schema** — a matching schema cannot show which IR produced a column.
 
 ```python
 @dataclass(frozen=True, slots=True)
 class StagingManifestV1:
     intent_feature_name: str
     ir_hash: str
+    generation_id: str          # binds the output to THIS compilation
+    run_id: str                 # …and THIS run
+    business_dt: str
+    generated_project_hash: str
+    sandbox_execution_hash: str
     output_location: str
     schema_hash: str
     row_count: int
-    status: str          # "completed" | "failed"
+    status: str                 # "completed" | "failed"
 ```
 
-Assembly **consumes every planned feature's staging manifest** and refuses when one is missing, `status != "completed"`, or its `ir_hash` differs from the plan's. Schema equality is a necessary check, never a sufficient one.
+Without the generation/run/date binding, a reused staging path could leave an older successful manifest with a matching `ir_hash` and publish stale output. Staging paths are **generation-scoped and immutable**; assembly requires exactly one manifest per planned feature and rejects duplicates or unexpected manifests.
 
 ---
 
-## §E Computation: independent per feature in this slice
+## §10 Atomic publication
 
-Rev 1 shared projections keyed on `(schema, table, availability_basis)`, which omitted catalog source, availability column, lag, event-time column, timezone, window basis, joins, access scope and snapshot — and converted month/quarter/year windows to days, changing calendar-period semantics.
+**Invariant:** a reader sees either the complete previous partition or the complete new one — never mixed columns, a missing partition, or partial rows.
 
-**Normative for Spec A: no scan sharing.** Every feature computes independently from `raw`. A duplicated scan is slower; an incorrectly shared filter or window produces a **wrong feature**, and this slice's job is to prove the numbers.
+**Capability attestation.** No mechanism is selectable without a passing attestation for the **exact** environment:
 
-Sharing returns in a later slice behind a strict compatibility fingerprint covering **all** of: catalog source, schema, table, availability column + basis + lag, event-time column, timezone, window basis and unit, the full join plan, access scope, and input snapshot — with calendar-period windows never normalized to days.
-
-The three grouping decisions remain separate concerns: computation (here), materialization (§C), model-input (Spec C).
-
----
-
-## §F Layers and the **complete runnable** project
-
-| Layer | Storage | Contents |
-|---|---|---|
-| `raw` | existing Hive/HDFS, read-only | governed sources; catalog entries generated from the read sets + spine |
-| `intermediate` | HDFS Parquet | per-feature PIT-filtered projection (independent in this slice) |
-| `primary` | HDFS Parquet | the entity × `business_dt` spine from its governed source (§A4) |
-| `feature_staging` | HDFS Parquet | one independent output per feature + its `StagingManifestV1` |
-| `feature` | Hive, partitioned by `business_dt` | the published group — **always `sandbox_feature.<group>`** |
-| `model_input` | — | Spec C |
-
-**A complete project, not fragments (rev-1 defect).** `render_project()` emits a directory that runs:
-
-```
-<project>/
-  pyproject.toml            pinned deps
-  requirements.lock
-  conf/base/catalog.yml     every dataset, storage locations as CONFIG
-  conf/base/parameters.yml  business_dt, cadence, group plan, CompilationIdentity
-  conf/base/logging.yml
-  src/<pkg>/__init__.py
-  src/<pkg>/settings.py     Kedro settings incl. hook registration
-  src/<pkg>/pipeline_registry.py
-  src/<pkg>/pipelines/materialize/__init__.py
-  src/<pkg>/pipelines/materialize/nodes.py
-  src/<pkg>/pipelines/materialize/pipeline.py    explicit input/output wiring
-  src/<pkg>/hooks.py        MetricsHook + ProvenanceHook
-  GENERATED.lock            detached identity incl. generated_project_hash
-  README.md                 how to run: `kedro run --params business_dt=...`
+```python
+@dataclass(frozen=True, slots=True)
+class PublicationCapabilityAttestation:
+    attestation_id: str
+    environment_id: str
+    hive_version: str; spark_version: str; metastore_version: str
+    mechanism: PublishMechanism
+    passed: bool
+    covers_schema_evolution: bool
+    attested_at: str
 ```
 
-**Execution entry point (normative).** The project is launched by `kedro run` inside a Spark session configured by a Kedro hook; `spark-submit` is used only to place that `kedro run` on the cluster, with the project shipped as a packaged wheel plus `conf/`. The distinction is stated in the generated README so no operator guesses.
+Recorded append-only. `select_publisher` verifies current engine versions against the attestation and returns an immutable
 
-Nodes: `build_spine` · `build_pit_projection_<feature>` · `calculate_<feature>` (writes its `StagingManifestV1`) · `assemble_feature_group` (consumes manifests) · `validate_feature_group` · `publish_feature_group`. Hooks capture metrics and stamp provenance; profiling is Spec B and is not a hook.
+```python
+PublisherSelection(environment_id, mechanism, capability_attestation_id, engine_versions)
+```
 
----
+**The renderer consumes a `PublisherSelection`, never a bare mechanism enum** — so rendered publication code cannot exist without evidence that selection succeeded. The target table is derived internally from the sandbox identity, never accepted as a caller string.
 
-## §G Point-in-time correctness
+**Constraints the probe must settle:** `EXCHANGE PARTITION` cannot exchange into a destination where the partition already exists and requires matching schemas · `ALTER TABLE … SET LOCATION` is documented DDL but does not by itself prove atomic visibility across Spark, Hive, cached sessions and other readers · **schema evolution is unresolved by partition swapping** — adding a feature changes the table schema, which a partition-location swap does not atomically change.
 
-A look-ahead feature is **wrong**, not unhardened.
+**Preferred first-slice mechanism:** immutable versioned physical outputs with one reader-visible pointer/view switch — still requiring demonstration.
 
-1. **Availability gate per expression** — keep a row only if its governed availability column (per `AVAILABILITY_TIME.basis`, plus `lag_hours` for `event_time_plus_lag`) is `<= business_dt` cutoff, where the cutoff comes from the cadence's timezone and `business_date_cutoff`.
-2. **Window boundaries per expression** — `basis`, `length`, `unit`, `start_inclusive`, `end_inclusive` honoured exactly. Calendar-period windows are computed as calendar periods, never as day counts.
-3. **Fan-out control** — where the join plan crosses a `1:N` step toward the grain, aggregate or de-duplicate before joining (§A3).
-4. **Spine reduction** — LEFT JOIN each feature's grain-level aggregate onto the spine; exactly one row per `(keys…, business_dt)`; entities with no source rows still present.
-5. **Empty-window / null / ÷0** — from the formula's policies, never re-invented.
-
-Worked example: `transaction_date = 2026-07-01`, `posted_at = 2026-07-05` — excluded at `business_dt = 2026-07-03`, included at `2026-07-06`. Asserted by executing the generated code (§L), not by inspecting rendered text.
+**Proof requirements:** concurrent readers polling throughout the swap observe only complete states, discriminated by a **generation marker plus a content check** (schema and row count alone can coincide), and the probe **must include adding a feature to an existing group**. `INSERT OVERWRITE` is rejected outright.
 
 ---
 
-## §H Validation gates (blocking)
+## §11 Validation loop
 
-Run after assembly, before publication; any failure rejects the group and leaves the previous partition untouched.
+**L0** — materialize to a temp directory, install into an isolated environment, **import the project and build the Kedro pipeline object**, and verify `generated_project_hash` against `GENERATED.lock`. Parsing source text does not prove what L0 claims.
+**L1** — metastore metadata only, over **every feature IR, every expression, and the spine**: each read-set column exists with the declared type, is readable under the caller's roles, and **every resolved partition in `input_snapshots` exists**.
+**L2 (on demand)** — tiny-sample execution: Spark analysis errors, the §9 gates.
+**L3** — the real run.
 
-Key uniqueness · required columns present, no extras · output types match each `FormulaOutputPolicyV1` · **every staging manifest present, `completed`, and `ir_hash`-matching** · assembled schema hash matches the plan · forbidden numerics (NaN/±Inf where policy forbids) · `generated_project_hash` matches `GENERATED.lock`.
-
-Statistical judgements are never gates here — that is Spec B, observational.
-
----
-
-## §J `RunManifestV1`
-
-`run_id` · `generation_id` (**FK to the exact generation**) · `group_plan_hash` · `materialization_contract_hash` · `generated_project_hash` · `sandbox_execution_hash` · `business_dt` · `publication_mechanism` + capability attestation id · expected feature columns · staged and published row counts · schema hash · key-uniqueness and required-column results · publication location · `started_at` · `published_at` · `status ∈ {running, validated, published, rejected, failed}`.
-
-**Append-only run events.** Because `status` implies mutation, the control plane records **`materialization_run_event`** rows (append-only, write-once, UPDATE/DELETE/**TRUNCATE** all blocked) and derives current status by folding them — the same discipline as the Child-1 authoring trace. A single terminal manifest row may be inserted at the end; nothing is ever updated in place.
-
-Ingestion of `ValidationReportV1` and `RunManifestV1` into the control plane is **in scope** and has its own task — rev 1 left it implied.
-
----
-
-## §K Atomic publication — capability must be attested
-
-**Invariant:** a reader sees either the complete previous partition or the complete new one. Never mixed columns, missing partition, or partial rows.
-
-**Capability attestation (normative).** Before any mechanism may be selected, the platform records a `PublicationCapabilityAttestation` for the **exact** Hive/Spark/metastore versions of the target environment: version triple, mechanism, the proof-test result, and a timestamp. **`select_publisher` refuses any mechanism lacking a passing attestation for that environment.** No mechanism is selectable "by default".
-
-**Known constraints that the probe must settle:**
-- `EXCHANGE PARTITION` cannot exchange into a destination where the partition already exists, and requires matching source/destination schemas.
-- `ALTER TABLE … PARTITION … SET LOCATION` is documented DDL but its syntax does **not** by itself prove atomic visibility across Spark, Hive, cached sessions and other readers.
-- **Schema evolution is unresolved by partition swapping:** adding a feature changes the wide table's schema, and swapping one partition's location does not atomically change table schema. The probe must cover *adding a feature to an existing group*, not only replacing a partition.
-
-**Preferred first-slice mechanism:** immutable versioned physical outputs with a single reader-visible pointer/view switch — still requiring demonstration on the actual cluster.
-
-**Proof test requirements:** concurrent readers polling throughout the swap must observe only complete states, discriminated by a **generation marker or content check** (not schema and row count alone, which can coincide), and the test must include the add-a-feature case. `INSERT OVERWRITE` is rejected outright.
-
-The publication target is derived internally from the sandbox identity; it is never accepted as a caller-supplied string.
-
----
-
-## §L Testing — execution is a mandatory gate
-
-Rev 1 could go green without ever computing a feature. Corrected:
-
-1. **Golden-file render tests** (default CI). Rendered bytes vs committed goldens; identity headers; `generated_project_hash` stability.
-2. **Spark-local execution — MANDATORY.** Runs in default CI. Executes the generated project on tiny hand-authored fixtures and asserts real numbers for **all three** worked features: `total_debit_amount_30d` (SUM + filter), `distinct_merchant_count_90d` (COUNT DISTINCT), `cross_border_value_ratio_90d` (RATIO). Plus: the look-ahead exclusion; exactly one row per `(keys…, business_dt)`; an entity with no source rows still present; zero-denominator policy; decimal rounding; empty-window policy; null policy; a `1:N` join step not inflating a SUM; and every §H gate firing on a deliberately broken group. **If pyspark cannot run in CI the task is not complete** — it is not an opt-in marker.
-3. **Cluster acceptance — MANDATORY final task.** Publication capability probe on the real cluster; `kedro run` producing a published `sandbox_feature.cif_daily` partition; the atomicity proof including add-a-feature; manifest and validation-report ingestion verified. **If the cluster cannot be reached or the run cannot publish, Spec A is not done.**
-
-Fixtures are hand-authored, never generated by the code under test, and every fixture has an owning task.
-
----
-
-## §M Failure handling
-
-| Failure | Outcome |
-|---|---|
-| Input not `RESOLVED` / hash mismatch / intent mismatch | refused at §0; nothing compiled |
-| Caller roles do not cover the full read set incl. spine | `READ_SCOPE_INSUFFICIENT`; refused |
-| `classify_join_path` → `UNVERIFIED` / `DENIED` / `NO_PATH` | `JOIN_PATH_NOT_VERIFIED` / `..._DENIED_BY_READ_SCOPE` / `GRAIN_PATH_NOT_GOVERNED` |
-| No governed spine source | `SPINE_SOURCE_NOT_GOVERNED` |
-| Missing `AVAILABILITY_TIME` fact | `AVAILABILITY_TIME_NOT_GOVERNED` |
-| Override loosens a derived field | refused |
-| A `calculate_*` node fails | its staging manifest is absent/failed → assembly refuses → previous partition intact |
-| Any §H gate fails | group rejected, run event `rejected`, reason recorded |
-| No passing publication capability attestation | publication refused; reported, never downgraded |
-| `generated_project_hash` ≠ `GENERATED.lock` | publication refused (tamper evidence) |
-
----
-
-## §N Validation loop and local submission
-
-**Levels.** **L0** — materialize the project to a temp directory, install it into an isolated environment, **import it and build the Kedro pipeline object** (rev 1 only parsed text, which does not prove what L0 claims); verify `generated_project_hash` against `GENERATED.lock`. **L1** — metastore metadata only: every read-set and spine column exists with the declared type, is readable under the caller's roles, and the `business_dt` partition exists. **L2 (on demand)** — tiny-sample execution catching Spark analysis errors, join fan-out and the §H gates. **L3** — the real run.
-
-**`ValidationReportV1`** carries `report_id`, `generation_id`, `generated_project_hash`, `group_plan_hash`, `level`, `environment_id`, timing, `status ∈ {passed, failed, error}`, and findings. Each finding: closed-vocabulary `code`, `severity`, `classification`, `location`, `expected`/`observed` as **type and schema facts only**, and a `count`.
-
-**Egress rule.** Counts, types, hashes and locations only — never data values.
+`ValidationReportV1` carries `report_id`, `generation_id`, `generated_project_hash`, `group_plan_hash`, `level`, `environment_id`, timing, `status ∈ {passed, failed, error}` and findings. Each finding: closed-vocabulary `code`, `severity`, `classification`, `location`, `expected`/`observed` **as type and schema facts only**, and a `count`.
 
 **Classification** routes the fix: `RENDERER_DEFECT` (fix renderer, regenerate) · `GOVERNED_FACT_MISMATCH` (code is right, catalog is wrong — re-attest; **blocks regeneration**) · `ENVIRONMENT_OR_DATA` (operator acts) · `UNCLASSIFIED` (**fails closed**; never silently environmental). A regenerated project restarts at L0; results never carry across a changed `generated_project_hash`.
 
-**Submission** is behind a `PipelineSubmitter` seam with one implementation, `LocalClusterSubmitter` (`spark-submit`/Livy on localhost). An unreachable cluster yields `status="error"` with **zero** findings — never invented ones. Authenticated cross-organisation submission is Child-6.
+Submission is behind a `PipelineSubmitter` seam with one implementation, `LocalClusterSubmitter`. An unreachable cluster yields `status="error"` with **zero** findings — never invented ones.
+
+---
+
+## §12 `RunManifestV1` and the control plane
+
+```python
+@dataclass(frozen=True, slots=True)
+class RunManifestV1:
+    run_id: str
+    generation_id: str                    # FK to the exact generation
+    group_plan_hash: str
+    materialization_contract_hash: str
+    generated_project_hash: str
+    sandbox_execution_hash: str
+    business_dt: str
+    publication_mechanism: str
+    capability_attestation_id: str
+    expected_feature_columns: tuple[str, ...]
+    staged_row_count: int | None
+    published_row_count: int | None
+    schema_hash: str | None
+    key_uniqueness_result: str | None
+    required_column_result: str | None
+    orphan_grain_key_count: int | None    # §4.1
+    publication_location: str | None
+    started_at: str | None
+    published_at: str | None
+    status: str
+```
+
+Because `status` implies mutation, the control plane records **append-only `materialization_run_event` rows** (UPDATE, DELETE **and TRUNCATE** all blocked — a `FOR EACH ROW` trigger does not fire on TRUNCATE) and folds them to derive current status. A single terminal manifest row may be inserted at the end; nothing is updated in place.
+
+Generation records, validation reports, run events and the terminal manifest all have owning implementations and ingestion paths — none is assumed.
+
+---
+
+## §13 Testing
+
+1. **Golden-file render tests** — rendered bytes vs committed goldens; identity headers; `generated_project_hash` stability.
+2. **Spark-local execution — MANDATORY, runs by default.** Executes the generated project on tiny hand-authored fixtures with hand-computed expected values for **every** first-slice feature, plus: look-ahead exclusion; one row per `(keys…, business_dt)`; an entity with no source rows still present; zero-denominator policy; declared rounding; overflow ERROR actually failing (not NULL); empty-window policy; null policy; and every §9 gate firing on a deliberately broken group.
+3. **Cluster acceptance — MANDATORY final task**, blocked on §0. Capability probe recorded; L0/L1 pass over **all** IRs; `kedro run`; then verify the published table: exact expected schema, all feature columns present, generation marker matching this run, manifest row count equal to Hive's, bounded non-null/type checks per feature, atomic reader observations, published project hash matching the generated project, and **the acceptance fixture executed on the cluster producing the same numbers as Spark-local**.
+
+Fixtures are hand-authored and validated against the real Child-1 resolver — a fixture claiming `ADDITIVE` for a plain `SUM` is a forgery, since Child-1 resolves `NON_ADDITIVE` without `path_additive`, and `COUNT_DISTINCT` resolves `NON_ADDITIVE` with logical type `integer`.
+
+---
+
+## §14 Failure vocabulary
+
+`AUTHORING_RUN_INCOMPLETE` · `TERMINAL_PAYLOAD_TAMPERED` · `NOT_RESOLVED` · `FORMULA_HASH_MISMATCH` · `AXES_MISMATCH` · `INTENT_HASH_MISMATCH` · `READ_SCOPE_INSUFFICIENT` · `AMBIGUOUS_TABLE_NAME` · `JOIN_PATH_NOT_VERIFIED` · `JOIN_PATH_DENIED_BY_READ_SCOPE` · `GRAIN_PATH_NOT_GOVERNED` · `JOIN_FANOUT_UNSUPPORTED` · `SPINE_SOURCE_NOT_DECLARED` · `SPINE_DECLARATION_REJECTED_BY_FACTS` · `SPINE_INCOMPLETE` · `AVAILABILITY_TIME_NOT_GOVERNED` · `PROHIBITED_INPUT` · `PHYSICAL_TYPE_UNSUPPORTED` · `MULTIPLE_MATERIALIZATION_CONTRACTS` · `PARTITION_IDENTITY_UNKNOWN` · `CAPABILITY_UNPROVEN` · `PROJECT_INTEGRITY`.
 
 ---
 
 ## First-slice bounds
 
-One entity (CIF) · one cadence (daily) · one materialization group · three features (`total_debit_amount_30d`, `distinct_merchant_count_90d`, `cross_border_value_ratio_90d`) · one `business_dt` per run · one Hadoop/Hive environment · **no scan sharing** · L0+L1 standard, L2 on demand · local submitter only · **sandbox only** · no UI · no cross-cadence assembly · no statistical profiling.
+One entity (CIF) · one cadence (daily) · one materialization group · one `business_dt` per run · one Hadoop/Hive environment · no scan sharing · no fan-out · L0+L1 standard with L2 on demand · local submitter only · sandbox only · no UI · no cross-cadence assembly · no statistical profiling.
+
+The three worked features are the **target**; §0 may reveal that a joint-account model refuses one of them, in which case the slice substitutes a feature whose traversal is `N:1`.
 
 ---
 
 ## Deferred NFRs
 
-Recorded with triggers in `docs/DEFERRED-WORK.md`.
-
 **From the parent architecture:** Iceberg revisions/time-travel/restatement · run state machine · outbox/reconciliation · external attestation and authenticated callbacks (Child-6) · execution-signature batching · quarantine by bisection · profiling privacy (Spec B) · the full Child-2 lifecycle · the full `TemporalPolicyV1`.
 
-**Identified here:** governed **source-delivery SLA** (prerequisite for deriving `availability_class`) · `dependencies_ready` trigger · authenticated submission into a real bank environment · content-addressed input snapshots · multi-partition/backfill runs · multi-environment promotion · **computation scan sharing** (§E — returns behind a strict compatibility fingerprint) · governed per-column retention policy (platform policy version used instead).
+**Identified here:** governed **source-delivery SLA** (prerequisite for deriving `availability_class`) · governed **`ENTITY_POPULATION_SOURCE`** fact, superseding §4's declaration — *trigger: before production publication, or supporting multiple entity populations* · governed **fan-out allocation policy** (§3.2) · `dependencies_ready` trigger · authenticated submission into a real bank environment · content-addressed input snapshots · multi-partition/backfill runs · multi-environment promotion · computation scan sharing · governed per-column retention · `SATURATE` overflow behaviour.
 
-**NOT deferred despite resembling NFRs:** PIT correctness · join cardinality handling · atomic group publication · the §H gates · derived sensitivity/access classification · Spark-local and cluster execution proofs.
+**NOT deferred despite resembling NFRs:** PIT correctness · join cardinality handling · atomic group publication · the §9 gates · derived sensitivity/access classification · physical type and overflow semantics · Spark-local and cluster execution proofs.
 
 ---
 

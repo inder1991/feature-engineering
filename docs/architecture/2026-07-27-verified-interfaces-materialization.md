@@ -221,3 +221,36 @@ Recorded so they are not silently assumed:
 2. **Partition identity.** Nothing verified defines how a physical partition is identified for a source table, and **source tables must not be assumed partitioned by `business_dt`**.
 3. **Entity population source.** No governed fact declares an authoritative, complete entity population (§4). A new declaration is required.
 4. **Fan-out semantics.** No governed allocation policy exists for a `1:N` traversal toward the grain (e.g. a joint account's transaction attributable to two customers). Until one does, such a path must be **refused**, not repaired by `dropDuplicates` or pre-aggregation — those encode a business allocation decision as a technical one, and differ per operation (SUM vs COUNT DISTINCT vs RATIO).
+
+---
+
+## 12. Actor identity — `contracts/envelopes.py`
+
+```python
+@dataclass(frozen=True, slots=True)
+class IdentityEnvelope:                       # :17  "Identity-at-time-of-action" (§6.1)
+    subject: str; actor_kind: str; authenticated: bool; auth_method: str
+    role_claims: tuple[str, ...]; groups: tuple[str, ...] = ()
+    tenant: str | None = None; on_behalf_of: str | None = None
+    impersonation: str | None = None; break_glass: bool = False
+    source_of_authority: str | None = None; attestation: str | None = None
+```
+
+Use this for `SpineSourceDeclarationV1.declared_by`. **⚠️ Never construct one with
+`authenticated=True` inside materialization** — minting authenticated identity outside the sanctioned
+trust-root modules is a violation this codebase has already been bitten by (caught during the B-slice
+merge). Thread the envelope from the request.
+
+---
+
+## 13. Read-scope roles — `overlay/upload/read_scope.py`
+
+```python
+SENSITIVITY_ROLES: dict[str, str] = {          # :13
+    "pii": "pii_reader",
+    "restricted": "restricted_reader",
+}
+```
+
+`access_requirements` derive from this mapping over the `graph_node.sensitivity` tags present in the
+read set. Note it is keyed by read-scope tag, NOT by `effective_restriction` (§2).
