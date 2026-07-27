@@ -384,14 +384,46 @@ The **calculation window lives in the expression IR and is not hashed into the c
 ### §5.4 Derived, declared, defaulted
 
 Derived: grain/keys, landing PIT semantics, sensitivity class, access requirements, retention (policy default), physical types (§6).
-Declared: **cadence** (structured; `ZoneInfo`-validated; `trigger ∈ {scheduled, manual}` — `dependencies_ready` deferred), **`availability_class`**, and the **spine source declaration** (§4).
+Declared: **cadence** (structured; `ZoneInfo`-validated; `trigger ∈ {scheduled, manual}` — `dependencies_ready` deferred), **`availability_promise`** (§5.6), and the **spine source declaration** (§4).
 Defaults: publication policy `atomic_group`, backfill boundary `group_level`.
 
 Overrides are **monotonic** — stricter/later accepted, looser/earlier refused as an error.
 
+### §5.6 `AvailabilityPromiseV1` — a canonical value, not a label
+
+Rev 5 named an `availability_class` without a vocabulary, so an enum was invented and entered the contract hash — making an arbitrary member list load-bearing. Replaced by a structured value:
+
+```python
+@dataclass(frozen=True, slots=True)
+class AvailabilityPromiseV1:
+    kind: AvailabilityPromiseKind = CALENDAR_OFFSET   # discriminator, present from v1
+    calendar_days: int = 0
+    plus_minutes: int = 0
+```
+
+**v1 meaning is fixed and canonical:**
+
+```
+business_dt at CadenceDecl.business_date_cutoff
+  + calendar_days   (in CadenceDecl.timezone)
+  + plus_minutes
+```
+
+so `T+3 plus two hours` is `AvailabilityPromiseV1(calendar_days=3, plus_minutes=120)`.
+
+**Rules (normative):**
+
+- `calendar_days >= 0`; `0 <= plus_minutes < 1440`.
+- **Non-canonical representations are rejected at construction** (`days=0, plus_minutes=1560` is not a valid value); a separate normalizing constructor turns that input into `days=1, plus_minutes=120`. Group equality then compares one canonical form, never two spellings of the same promise.
+- **Minutes, not hours**, so `T+1 plus 30 minutes` needs no schema change.
+- A monotonic override compares `(calendar_days, plus_minutes)` **only when the cadence timezone, cutoff and day basis match** — otherwise the two promises are not comparable and the override is refused. Later is accepted; **earlier is a caller error**, not a governed refusal (§14's codes describe valid requests rejected by catalog or data state).
+- **`T+N` means CALENDAR days in v1, explicitly.** If it must ever mean banking days, the promise additionally requires a **governed holiday-calendar identifier and version** — one must never be silently interpreted as the other.
+
+**Forward compatibility.** `kind` is carried in the canonical payload **from v1** precisely so that adding `BUSINESS_DAY_OFFSET` or `END_OF_PERIOD` later leaves existing payloads byte-identical and re-keys nothing. Omitting it in v1 would defeat that: every existing contract would gain a field and re-key on the day a second kind appears. **Different kinds are incomparable for monotonic overrides** unless an explicit ordering policy is defined.
+
 ### §5.5 Hash contents
 
-**Include:** entity, ordered keys, landing PIT semantics, sensitivity class, access requirements, retention class + policy version, `availability_class`, cadence, publication policy, backfill boundary, spine declaration, `CLASSIFICATION_POLICY_VERSION`, `PHYSICAL_TYPE_POLICY_VERSION`.
+**Include:** entity, ordered keys, landing PIT semantics, sensitivity class, access requirements, retention class + policy version, `availability_promise` (canonical payload incl. `kind`), cadence, publication policy, backfill boundary, spine declaration, `CLASSIFICATION_POLICY_VERSION`, `PHYSICAL_TYPE_POLICY_VERSION`.
 **Exclude:** calculation windows, current watermark, arrival timestamps, job status, run ids, wall-clock.
 
 ---

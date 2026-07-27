@@ -602,6 +602,36 @@ def test_a_join_key_or_the_spine_can_be_the_most_restrictive(db, restricted_join
 
 ---
 
+### Task 9.1: Adopt `AvailabilityPromiseV1` (BEFORE Task 10 freezes group identity)
+
+Spec §5.6. Architect ruling, 2026-07-27. Replaces the invented `AvailabilityClass` enum, which entered the contract hash and so made an arbitrary member list load-bearing.
+
+**Files:** Modify `src/featuregen/materialize/contract.py`; Test `test_contract.py`
+
+**Produces:** `AvailabilityPromiseKind` (`CALENDAR_OFFSET` in v1); `AvailabilityPromiseV1(kind, calendar_days, plus_minutes)`; a normalizing constructor; `availability_class` renamed **`availability_promise`** throughout.
+
+- [ ] **Step 1: Failing tests** — the ruling fixes these seven:
+
+```python
+def test_t3_plus_2h_hashes_differently_from_t3(): ...
+def test_semantically_equivalent_inputs_have_ONE_canonical_form(): ...
+    # days=0, plus_minutes=1560 is REJECTED at construction; the normalizing
+    # constructor yields days=1, plus_minutes=120 — and that hashes identically to
+    # a directly-constructed (1, 120).
+def test_a_later_override_succeeds(): ...
+def test_an_earlier_override_is_a_CALLER_ERROR(): ...        # ValueError, not a governed code
+def test_negative_or_noncanonical_declarations_fail_construction(): ...
+def test_promise_identity_contains_no_live_arrival_observation(): ...
+def test_differing_cadence_timezone_or_cutoff_makes_promises_INCOMPARABLE(): ...
+    # not "greater" or "lesser" — incomparable, so the override is refused
+```
+
+Plus: **`kind` is present in the canonical payload in v1** — assert it, because the whole forward-compatibility property depends on it. Without it, adding a second kind later re-keys every existing contract.
+
+- [ ] **Step 2: Run — FAIL** · **Step 3: Implement** · **Step 4: Run — PASS** · **Step 5: Commit** — `feat(materialize): AvailabilityPromiseV1 replaces the invented class enum`
+
+---
+
 ### Task 10: Group plan, staging manifest, group binding
 
 Spec §9, §10.1.
