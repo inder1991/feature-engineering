@@ -425,3 +425,40 @@ The module is **vendored VERBATIM** from `trailofbits/rfc8785.py` v0.1.4 (Apache
 **Object key order** is the UTF-16BE encoding of the key (`:256`), so mapping insertion order never affects the bytes.
 
 **Precedent:** `formula/canonical.py:75-81` — `formula_content_hash` is `sha256(_jcs_dumps(plain)).hexdigest()`. Spec A's `materialize.canonical.materialize_hash` is the same construction over a plain mapping, and is the ONE hasher for `src/featuregen/materialize/`.
+
+---
+
+## 17. Logical refs are SCHEMA-FLATTENED — the physical schema is separate
+
+Found during Task 2; invalidates an assumption that ran through spec revs 1–5.
+
+```python
+_SCHEMA = "public"            # graph.py:20 — EVERY object_ref is written under this
+```
+
+`build_graph` flattens every `object_ref` to `public.<table>[.<column>]`. **The real declared schema
+survives only in `graph_node.schema_name`** (`1000_graph_node_schema_declared.sql:6,17` — "the REAL
+(pre-flatten) schema the upload declared", **nullable**: a schema-less or generic glossary leaves it
+`NULL`).
+
+The existing resolver to REUSE rather than reinvent (`column_authority.py:66-77`):
+
+```python
+logical_ref_of(conn, catalog_source, object_ref) -> str
+# splits object_ref -> (table, column), SELECTs schema_name from graph_node,
+# falls back to "public" when it is NULL, then normalize_ref(source, schema, table, column)
+```
+
+**Consequences for materialization:**
+
+1. A logical ref's schema segment is **catalog-side**, not necessarily the physical Hive schema. Refs
+   may legitimately read `hdfc::public.transactions.amount` even though the table lives in `banking`.
+2. **Physical schema resolution is an explicit step** — read it from the governed catalog, never parse
+   it out of the ref, and never assume the ref segment is the Hive schema.
+3. `schema_name` being nullable means resolution can fail; that must refuse
+   (`PHYSICAL_SCHEMA_NOT_RESOLVED`), not silently fall back to `public` and read the wrong table.
+4. `AMBIGUOUS_TABLE_NAME` is still needed but for a different reason than spec §3.1 claimed: the
+   ambiguity is not "two schemas appear in the refs" (they cannot — everything is flattened to
+   `public`) but "two resolved physical schemas contain the same table name". The upload path cannot
+   currently produce the former, so a test written against it would be unreachable rather than
+   discriminating.
