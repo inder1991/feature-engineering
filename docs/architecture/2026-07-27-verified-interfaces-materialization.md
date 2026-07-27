@@ -989,3 +989,54 @@ on its own (§6).
 `DECIMAL` under version 1 can refuse under version 2 (a float denominator was invisible to the word;
 an ungoverned operand type was accepted). A contract keyed on the old version describes a column
 decided by a rule that no longer applies.
+
+## 27. What Task 9.1 established
+
+**`AvailabilityPromiseV1` replaced Task 9's invented `AvailabilityClass`, and A.10's 🔴 is closed.**
+The promise is a value — `(kind, calendar_days, plus_minutes)` — so `T+0`, `T+5` and `T+1 plus 30
+minutes` are all expressible without adding a member to anything. The old vocabulary entered the
+contract hash, which made an arbitrary member list load-bearing: every group already keyed under it
+would have re-keyed the day someone needed a value it did not spell.
+
+**Non-canonical input is refused at construction; `normalized()` is a SEPARATE entry point.**
+`AvailabilityPromiseV1(calendar_days=0, plus_minutes=1560)` raises;
+`AvailabilityPromiseV1.normalized(calendar_days=0, plus_minutes=1560)` returns `(1, 120)`, which
+hashes identically to a directly constructed `(1, 120)` — asserted on both
+`materialize_hash(promise.identity_payload())` and `contract_hash(...)`. Normalizing silently inside
+the main constructor would make two spellings of one promise both "work", leaving no call site able
+to show which was meant, and group equality would then compare spellings.
+
+**The bound `0 <= plus_minutes < 1440` is not decoration.** It is what makes `(calendar_days,
+plus_minutes)` orderable as a plain tuple: once minutes may reach a whole day, `(1, 0)` and
+`(0, 1440)` are the same instant and the tuple comparison deciding a monotonic override starts lying.
+
+**`kind` is in the canonical payload from v1**, with one member (`CALENDAR_OFFSET`). That is the
+whole forward-compatibility property: adding `BUSINESS_DAY_OFFSET` later must leave every existing
+payload byte-identical, and it cannot if v1 omitted the field. **`T+N` means CALENDAR days in v1,
+explicitly** — a banking-day promise is a different kind and additionally requires a governed
+holiday-calendar identifier and version, and neither may ever be silently read as the other.
+
+**Incomparable is a fourth VERDICT, not the absence of "later".** `compare_availability_promises`
+returns `PromiseComparison.{EARLIER, SAME, LATER, INCOMPARABLE}`, and returns `INCOMPARABLE`
+whenever `_comparison_basis` — `(kind, cadence.timezone, cadence.business_date_cutoff)` — differs on
+the two sides. "T+3 at 23:59 Asia/Dubai" and "T+3 at 18:00 UTC" are the same three digits on
+different clocks; equal components do **not** make two promises the same promise. Collapsing that
+into "not later" would let a monotonic override succeed on a comparison that means nothing, so
+`override_availability_promise` refuses instead — with a message that never claims an ordering.
+
+**An earlier override is a `ValueError`, not a governed code — the Task 9 boundary, now settled by
+ruling.** §14's vocabularies describe valid requests rejected by the catalog or by data state;
+asking to promise earlier than what was derived is a bad request. `test_an_earlier_override_is_a_
+CALLER_ERROR` asserts both directions: the exception is not a `MaterializationRefused`, and no
+member of `CompilationRefusalCode` appears in its message.
+
+**The kind's contribution to comparability cannot be shown behaviourally in v1** — one member means
+two promises of different kinds cannot be constructed — so `_comparison_basis` is pinned by value
+instead. It is pinned at all because the day a second kind arrives is the day a calendar-day promise
+could otherwise be declared "later" than a banking-day one.
+
+**An override carries no cadence of its own.** `ContractOverrides.availability_promise` is read
+against the ONE cadence the derivation was given, so a promise cannot be re-based without
+re-declaring the cadence; the two-cadence form of the rule lives in the public
+`override_availability_promise`, which a later stage comparing a new declaration against an
+already-persisted contract must use.
