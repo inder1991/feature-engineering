@@ -713,3 +713,77 @@ a second rendering there could disagree with `formula_content_hash` about what t
   is no single governed path to *the* grain) rather than widening the field. §8 rule 1 likewise
   specifies ONE availability gate per expression, so a joined dimension table's own availability is
   not gated in this slice — recorded as a known bound, not designed around.
+
+---
+
+## 23. What Task 7 established
+
+**Two helpers made PUBLIC, for the reason `filter_plain` and `table_of_ref` were before them** — an
+adapter must ask the question the owning module already answers, or the two answers can drift:
+
+```python
+formula.schema.body_expressions(body) -> tuple[tuple[str, AggregateExpression], ...]  # was _body_expressions
+materialize.expression_ir.join_key_ref(catalog_source, step_ref) -> str               # was _key_ref
+```
+
+`materialize.ir.compile_ir` compiles ONE `ExpressionExecutionIR` per body path, and a second
+enumeration there could disagree about how many expressions a body has or what each is called — the
+path names the staging output every later stage reads. `join_key_ref` is shared because Gate 2
+authorizes each join endpoint as its own element class: an endpoint addressed by a second conversion
+would authorize one node and read another. (`capability.py` and `critic.py` keep their own private,
+differently-shaped `_body_expressions`; they return expressions without paths and are untouched.)
+
+**Gate 2's union is derived from FOUR structural sources, deliberately overlapping.** Task 6 already
+folds join endpoints and the availability column into `physical_read_set`, and Task 4 builds
+`SpineSpec.read_set` as keys + availability + policy columns — so in a healthy artifact several
+sources name the same node. §1.3 nevertheless names them as separate element classes, so each is
+derived from its own source (`physical_read_set`, `join_plan.steps`, `pit.availability_ref`, the
+spine's `source_table_ref`/`ordered_key_refs`/`read_set`/`availability_ref`). The overlap makes the
+obvious test non-discriminating, so the element-class tests hand Gate 2 a DOCTORED artifact with the
+element removed from the overlapping source — each with a control proving the doctored group is
+otherwise authorizable. Without that, five of these derivations survived mutation.
+
+**"No contract, plan or project is produced" is only testable with a positive control.** The plan's
+own sketch counted derived contracts after calling `authorize_compilation` alone, which cannot
+derive one under any implementation — a vacuous assertion. `test_ir.py` runs §2's chain end to end
+against a downstream double that REFUSES anything but an `AuthorizedCompilation`, asserts the
+untagged group really does reach it (2 contracts, 1 project), and only then asserts zero.
+
+**Gate 2 owns the read-scope axis ONLY.** `graph_node.sensitivity` vs `allowed_sensitivities(roles)`
+(§2/§13 above). `effective_restriction` is §5.2's axis and refuses with `PROHIBITED_INPUT` during
+classification — a `prohibited` restriction with no read-scope tag therefore passes Gate 2, which is
+asserted rather than assumed.
+
+⚠️ **Migration `0993_graph_check_constraints.sql:22-24` constrains `graph_node.sensitivity` to
+exactly `SENSITIVITY_ROLES`' keys** (`'pii' | 'restricted' | NULL`). The fail-closed branch for an
+unknown tag is therefore unreachable through the database, and is a guard rather than a tested path;
+the tested property is that each tag needs its OWN granting role.
+
+**Two bounds and one spec ambiguity, recorded rather than worked around:**
+
+1. **A ref with no `graph_node` row is treated as untagged, i.e. authorized.** It carries no tag to
+   hide behind, so nothing sensitive passes; what it is, is a read of a column the catalog does not
+   describe, which §11's L1 reports as `COLUMN_ABSENT` against the live metastore. Refusing it here
+   would report a missing column as an insufficient role. Note the wider gap: **nothing in
+   compilation verifies that a formula's column refs exist as catalog nodes** — Task 6 resolves the
+   TABLE, not the columns — so L1 is the first place a typo'd column is caught.
+2. **Group-assembly errors raise `ValueError`, not a §14 code**: an empty group, an IR compiled
+   against a different spine declaration than the one supplied, and an IR carrying join steps with an
+   empty read set. None is a governed verdict about an artifact (the line `plan_join` and
+   `admission.FeatureNamePlanError` already draw), and the closed vocabulary has no member for them.
+3. **§14 has no code for "the formula's grain entity is not the declared population's entity."**
+   `GRAIN_PATH_NOT_GOVERNED` is used as the closest governed reading — there is no governed path from
+   this feature's grain to that population — the same reading Task 6 took for a two-table grain.
+
+**`compile_ir` validates the spine declaration on every call**, so a group of N features performs N
+validations. §4's "declared once per materialization contract" is enforced where the group actually
+exists: `authorize_compilation` refuses (`ValueError`) to authorize IRs whose spine identity payload
+differs from the supplied spine's.
+
+**`ir_hash` payload.** Identity: feature name, `formula_content_hash`, final operation,
+`zero_denominator`, grain entity + ORDERED keys, every expression keyed by BODY PATH (sorted — never
+tuple position, the same defect Task 6 found one level down), the spine's semantic payload, the
+carried output policy. Excluded: `authoring_run_id`, the declaration's provenance, `roles_used`, and
+every run-time value. The formula-side fields are also inside `formula_content_hash`; they are
+repeated because the IR is read on its own, and an identity only interpretable by fetching the
+formula would push every reader back to the object the IR summarizes.
