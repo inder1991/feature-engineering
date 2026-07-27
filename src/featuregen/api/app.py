@@ -33,6 +33,7 @@ from featuregen.api.routes import (
     readiness,
     search,
     semantics,
+    suggestions,
     uploads,
 )
 from featuregen.config import get_settings
@@ -149,6 +150,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(assist.router)
     app.include_router(contract.router)
     app.include_router(entity.router)
+    app.include_router(suggestions.router)
 
     @app.get("/health")
     def health() -> dict:
