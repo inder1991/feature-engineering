@@ -108,10 +108,13 @@ def test_top_values_are_not_requested_by_default():
 
 # ── approximate by default, and say which ────────────────────────────────────────────────────────
 
-def test_distinct_counts_are_approximate_by_default():
-    """Exact DISTINCT on a large Hive table is a shuffle. The method is recorded because it decides
-    what the evidence can later support."""
-    sql = _sql()
+def test_distinct_counts_are_approximate_where_the_ENGINE_supports_it():
+    """Exact DISTINCT on a large table is a shuffle, so approximate is preferred WHERE AVAILABLE.
+
+    An earlier version of this test asserted approximate unconditionally and so encoded a bug: it
+    was satisfied by emitting `APPROX_COUNT_DISTINCT` against plain HiveQL, which has no such
+    function and would have failed on the first real cluster run."""
+    sql = HiveDialect(flavour="spark").render_column_profile(_plan())
     assert "APPROX_COUNT_DISTINCT(" in sql
     assert "COUNT(DISTINCT" not in sql.upper()
 
@@ -180,3 +183,44 @@ def test_value_bounds_are_emitted_only_for_opted_in_columns():
 def test_a_bounds_column_must_be_one_of_the_profiled_columns():
     with pytest.raises(ObservationPlanError, match="bounds"):
         _plan(bounds_columns=("not_profiled",))
+
+
+# ── engine capability: approximate distinct is not universal ─────────────────────────────────────
+# `APPROX_COUNT_DISTINCT` is SPARK SQL. Plain HiveQL on Tez/MR has no built-in approximate distinct,
+# so emitting it against HiveServer2 fails at runtime — and reporting "approximate" when the engine
+# actually ran an exact COUNT(DISTINCT) misstates what the evidence can support in BOTH directions.
+
+def test_spark_flavour_uses_the_approximate_function():
+    sql = HiveDialect(flavour="spark").render_column_profile(_plan())
+    assert "APPROX_COUNT_DISTINCT(" in sql
+    assert HiveDialect(flavour="spark").effective_method(_plan()) == "approximate"
+
+
+def test_hive_flavour_falls_back_to_exact_and_SAYS_SO():
+    """The honest fallback. HiveQL has no approximate distinct, so the request degrades to exact —
+    and the reported method must degrade with it, or a consumer believes it holds a sample when it
+    holds a census (and refuses a uniqueness proof it could actually make)."""
+    dialect = HiveDialect(flavour="hive")
+    sql = dialect.render_column_profile(_plan())
+    assert "COUNT(DISTINCT" in sql.upper()
+    assert "APPROX_COUNT_DISTINCT(" not in sql
+    assert dialect.effective_method(_plan()) == "exact"
+
+
+def test_an_exact_request_is_exact_on_every_flavour():
+    exact = _plan(policy=ProfilePolicyV1(exact_distinct=True))
+    for flavour in ("hive", "spark"):
+        dialect = HiveDialect(flavour=flavour)
+        assert "COUNT(DISTINCT" in dialect.render_column_profile(exact).upper()
+        assert dialect.effective_method(exact) == "exact"
+
+
+def test_the_default_flavour_is_the_conservative_one():
+    """Defaulting to Spark would emit a function that does not exist on a plain HiveServer2 — a
+    runtime failure on the first real run. Default to what always works."""
+    assert HiveDialect().flavour == "hive"
+
+
+def test_an_unknown_flavour_is_refused():
+    with pytest.raises(ObservationPlanError, match="flavour"):
+        HiveDialect(flavour="impala")

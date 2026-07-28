@@ -29,6 +29,12 @@ class PostgresDialect:
 
     name = "postgres"
 
+    def effective_method(self, plan: ObservationPlanV1) -> str:
+        """Always `exact`. PostgreSQL has no built-in approximate distinct, so an approximate
+        REQUEST runs a census here — and the result must report the census, not the request. An
+        earlier version reported the plan's method and so overstated its own imprecision."""
+        return "exact"
+
     def table_ref(self, plan: ObservationPlanV1) -> str:
         identity = plan.binding.identity
         # The database is selected by the CONNECTION, not named in the statement — the one place

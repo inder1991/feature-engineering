@@ -10,10 +10,17 @@ already safe to render.
 """
 from __future__ import annotations
 
-from featuregen.data_agent.observation import ObservationPlanV1
+from featuregen.data_agent.observation import ObservationPlanError, ObservationPlanV1
 
-#: Hive's HLL sketch. Approximate by default because exact DISTINCT is a shuffle on a large table.
-_APPROX_DISTINCT = "APPROX_COUNT_DISTINCT"
+#: Which engines behind HiveServer2 offer a built-in approximate distinct.
+#:
+#: `APPROX_COUNT_DISTINCT` is SPARK SQL. Plain HiveQL on Tez/MR has no built-in equivalent (the
+#: DataSketches UDFs are an optional install, not a guarantee), so emitting it against a plain
+#: HiveServer2 fails at RUNTIME — on the first real run, against a real cluster.
+#:
+#: The default is therefore `hive`: the flavour that always works. Being slower on the first profile
+#: is recoverable; a failed first run against a bank cluster is a worse way to learn this.
+_APPROX_BY_FLAVOUR = {"spark": "APPROX_COUNT_DISTINCT", "hive": None}
 
 
 def _ident(name: str) -> str:
@@ -28,9 +35,32 @@ def _literal(value: str) -> str:
 
 
 class HiveDialect:
-    """SQL text for HiveServer2 / Spark SQL."""
+    """SQL text for HiveServer2 — plain HiveQL by default, Spark SQL on request."""
 
     name = "hive"
+
+    def __init__(self, flavour: str = "hive") -> None:
+        if flavour not in _APPROX_BY_FLAVOUR:
+            raise ObservationPlanError(
+                "DIALECT_UNKNOWN_FLAVOUR",
+                f"flavour {flavour!r} is not one of {sorted(_APPROX_BY_FLAVOUR)}")
+        self.flavour = flavour
+
+    @property
+    def supports_approx_distinct(self) -> bool:
+        return _APPROX_BY_FLAVOUR[self.flavour] is not None
+
+    def effective_method(self, plan: ObservationPlanV1) -> str:
+        """What this engine will ACTUALLY do — not what the plan asked for.
+
+        A plan requesting `approximate` against an engine without an approximate function runs an
+        exact COUNT(DISTINCT). Reporting the REQUEST would misstate the evidence in both directions:
+        a consumer would believe it holds a sample when it holds a census, and would refuse a
+        uniqueness proof it could legitimately make.
+        """
+        if plan.policy.exact_distinct or not self.supports_approx_distinct:
+            return "exact"
+        return "approximate"
 
     def table_ref(self, plan: ObservationPlanV1) -> str:
         identity = plan.binding.identity
@@ -62,12 +92,13 @@ class HiveDialect:
             quoted = _ident(column)
             safe = column.strip().lower()
             projections.append(f"COUNT({quoted}) AS {_ident(safe + '__non_null')}")
-            if plan.policy.exact_distinct:
+            approx = _APPROX_BY_FLAVOUR[self.flavour]
+            if plan.policy.exact_distinct or approx is None:
                 projections.append(
                     f"COUNT(DISTINCT {quoted}) AS {_ident(safe + '__distinct')}")
             else:
                 projections.append(
-                    f"{_APPROX_DISTINCT}({quoted}) AS {_ident(safe + '__distinct')}")
+                    f"{approx}({quoted}) AS {_ident(safe + '__distinct')}")
             if safe in bounds:
                 projections.append(f"MIN({quoted}) AS {_ident(safe + '__min')}")
                 projections.append(f"MAX({quoted}) AS {_ident(safe + '__max')}")

@@ -132,10 +132,16 @@ def test_the_result_carries_its_input_snapshot_and_method(fixture_table):
     assert result.complete is True and result.failures == ()
 
 
-def test_an_approximate_run_says_so(fixture_table):
+def test_the_result_reports_what_the_ENGINE_did_not_what_was_asked(fixture_table):
+    """PostgreSQL has no approximate distinct, so an APPROXIMATE request runs a census here. The
+    result must report the census.
+
+    An earlier version of this test asserted `approximate` and so enshrined a lie: the number was
+    exact, and a downstream consumer would have refused a uniqueness proof it could legitimately
+    have made. Overstating imprecision is still misstating the evidence."""
     result = _run(fixture_table, _plan(policy=ProfilePolicyV1(exact_distinct=False),
                                        bounds_columns=("tran_amt",)))
-    assert result.method == "approximate"
+    assert result.method == "exact"
 
 
 def test_the_result_carries_no_raw_rows(fixture_table):

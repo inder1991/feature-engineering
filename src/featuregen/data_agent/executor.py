@@ -27,6 +27,12 @@ class Dialect(Protocol):
 
     def render_column_profile(self, plan: ObservationPlanV1) -> str: ...
 
+    def effective_method(self, plan: ObservationPlanV1) -> str:
+        """What this engine ACTUALLY does — `exact` or `approximate`. Not what the plan requested:
+        an engine without an approximate function silently runs a census, and the result must say
+        so."""
+        ...
+
 
 class DirectSqlExecutor:
     """Run an observation over an existing read-only connection."""
@@ -56,11 +62,17 @@ class DirectSqlExecutor:
             logger.info("observation failed for %s: %s", physical_id, reason)
             return DataObservationResultV1(
                 physical_id=physical_id, row_count=0, columns=(), partitions_read=partitions,
-                method=plan.method, complete=False, failures=(reason,))
+                method=self._method(plan), complete=False, failures=(reason,))
 
         return self._shape(plan, row, physical_id, partitions)
 
     # ── internals ────────────────────────────────────────────────────────────────────────────────
+
+    def _method(self, plan: ObservationPlanV1) -> str:
+        """Prefer the dialect's answer; fall back to the plan for a dialect that predates the
+        capability (the PostgresDialect's own fallback is documented in its docstring)."""
+        effective = getattr(self._dialect, "effective_method", None)
+        return effective(plan) if callable(effective) else plan.method
 
     def _apply_timeout(self, plan: ObservationPlanV1) -> None:
         """Transaction-scoped, so the bound dies with the caller's transaction rather than leaking
@@ -91,4 +103,5 @@ class DirectSqlExecutor:
 
         return DataObservationResultV1(
             physical_id=physical_id, row_count=row_count, columns=tuple(columns),
-            partitions_read=partitions, method=plan.method, complete=True, failures=())
+            partitions_read=partitions, method=self._method(plan), complete=True,
+            failures=())
