@@ -17,6 +17,7 @@ keeps no data-plane runtime dependency, and so an ODS engine is an addition rath
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 #: Refusal codes — closed vocabulary.
@@ -24,6 +25,7 @@ SECRET_IN_REFERENCE = "CONNECTION_SECRET_IN_REFERENCE"
 NO_SECRET_REFERENCE = "CONNECTION_NO_SECRET_REFERENCE"
 UNSUPPORTED_KIND = "CONNECTION_UNSUPPORTED_KIND"
 NO_PRINCIPAL = "CONNECTION_NO_EXECUTION_PRINCIPAL"
+DRIVER_MISSING = "CONNECTION_DRIVER_NOT_INSTALLED"
 NOT_ACTIVE = "CONNECTION_NOT_ACTIVE"
 SCHEMA_NOT_ALLOWED = "CONNECTION_SCHEMA_NOT_IN_ALLOWLIST"
 WRONG_CONNECTION = "CONNECTION_BINDING_MISMATCH"
@@ -114,3 +116,52 @@ def authorize_binding(connection: DataSourceConnectionV1,
             f"schema {schema!r} is not on connection {connection.connection_id!r}'s allowlist "
             f"{allowed}")
     return connection
+
+
+#: Which package provides each engine's DB-API driver. Named so a missing dependency is a typed
+#: refusal telling an operator what to install, rather than an ImportError from inside a driver.
+#:
+#: Lazily imported: the control-plane package must carry no data-plane runtime dependency, and a
+#: deployment that only reaches PostgreSQL should not need a Hive client installed.
+_DRIVERS: dict[str, tuple[str, str]] = {
+    "postgres": ("psycopg", "psycopg"),
+    # PyHive is the common HiveServer2 client. impyla or JayDeBeApi work equally well through the
+    # `connect=` seam below — all three implement DB-API 2.0, which is the whole point of routing
+    # the executor through a cursor.
+    "hive": ("pyhive.hive", "PyHive"),
+}
+
+
+def open_connection(connection: DataSourceConnectionV1, *,
+                    secret_resolver: Callable[[str], str],
+                    connect: Callable[..., object] | None = None):
+    """Open a live connection for one governed spec.
+
+    The credential is fetched from `secret_resolver` at the point of use and is never stored on the
+    spec, returned on the connection object, or included in a refusal message.
+
+    `connect` lets a caller supply the callable — used by tests, and the seam a future engine
+    adapter plugs into without touching the driver table above.
+    """
+    if not connection.active:
+        raise ConnectionError_(
+            NOT_ACTIVE, f"connection {connection.connection_id!r} is not active")
+
+    secret = secret_resolver(connection.secret_ref)
+
+    if connect is None:
+        module_name, package = _DRIVERS[connection.kind]
+        try:
+            module = __import__(module_name, fromlist=["connect"])
+        except ImportError as exc:
+            # Deliberately does not echo the secret or the exception's own text, which on some
+            # drivers includes the connection string.
+            raise ConnectionError_(
+                DRIVER_MISSING,
+                f"no driver for kind {connection.kind!r}: install {package} "
+                f"(import of {module_name!r} failed)") from None
+        connect = module.connect
+
+    return connect(host=connection.host, port=connection.port,
+                   username=connection.execution_principal, password=secret,
+                   auth=connection.auth_mechanism)

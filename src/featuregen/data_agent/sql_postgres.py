@@ -29,6 +29,11 @@ class PostgresDialect:
 
     name = "postgres"
 
+    def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+        """`SET LOCAL` is transaction-scoped, so the bound dies with the caller's transaction rather
+        than leaking onto a pooled connection."""
+        return (f"SET LOCAL statement_timeout = {int(plan.policy.statement_timeout_ms)}",)
+
     def effective_method(self, plan: ObservationPlanV1) -> str:
         """Always `exact`. PostgreSQL has no built-in approximate distinct, so an approximate
         REQUEST runs a census here — and the result must report the census, not the request. An

@@ -46,6 +46,17 @@ class HiveDialect:
                 f"flavour {flavour!r} is not one of {sorted(_APPROX_BY_FLAVOUR)}")
         self.flavour = flavour
 
+    def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+        """Hive's query timeout is a SESSION setting measured in SECONDS — not PostgreSQL's
+        transaction-scoped milliseconds.
+
+        Two traps this closes: sending the millisecond number would set a bound roughly a thousand
+        times longer than intended, and rounding a sub-second request DOWN would reach 0, which Hive
+        reads as "no limit". So it rounds UP, with a floor of one second.
+        """
+        seconds = max(1, -(-int(plan.policy.statement_timeout_ms) // 1000))   # ceil, min 1
+        return (f"SET hive.query.timeout.seconds={seconds}",)
+
     @property
     def supports_approx_distinct(self) -> bool:
         return _APPROX_BY_FLAVOUR[self.flavour] is not None

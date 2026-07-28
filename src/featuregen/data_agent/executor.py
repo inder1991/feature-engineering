@@ -27,6 +27,11 @@ class Dialect(Protocol):
 
     def render_column_profile(self, plan: ObservationPlanV1) -> str: ...
 
+    def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+        """Statements bounding one query's runtime. Engine-specific: PostgreSQL is transaction
+        milliseconds, Hive is session seconds. Empty for an engine with no reliable bound."""
+        ...
+
     def effective_method(self, plan: ObservationPlanV1) -> str:
         """What this engine ACTUALLY does — `exact` or `approximate`. Not what the plan requested:
         an engine without an approximate function silently runs a census, and the result must say
@@ -53,8 +58,7 @@ class DirectSqlExecutor:
         statement = self._dialect.render_column_profile(plan)
 
         try:
-            self._apply_timeout(plan)
-            row = self._conn.execute(statement).fetchone()
+            row = self._run(plan, statement)
         except Exception as exc:                      # noqa: BLE001 — any engine error is coverage
             # The message is the engine's and may name a column, which is metadata rather than data.
             # It must never carry a VALUE, so nothing from a result row is included.
@@ -74,11 +78,28 @@ class DirectSqlExecutor:
         effective = getattr(self._dialect, "effective_method", None)
         return effective(plan) if callable(effective) else plan.method
 
-    def _apply_timeout(self, plan: ObservationPlanV1) -> None:
-        """Transaction-scoped, so the bound dies with the caller's transaction rather than leaking
-        onto a pooled connection. Mirrors the suggestions route's precedent."""
-        ms = int(plan.policy.statement_timeout_ms)
-        self._conn.execute(f"SET LOCAL statement_timeout = {ms}")
+    def _run(self, plan: ObservationPlanV1, statement: str):
+        """Execute through a CURSOR — the DB-API 2.0 contract every driver implements.
+
+        An earlier version called `conn.execute(...)`, which is a psycopg3 convenience the standard
+        does not define, so a PyHive or impyla connection would have failed with AttributeError
+        before running anything. The connection is BORROWED, so the cursor is closed and the
+        connection is not.
+        """
+        cursor = self._conn.cursor()
+        try:
+            for bound in self._timeouts(plan):
+                cursor.execute(bound)
+            cursor.execute(statement)
+            return cursor.fetchone()
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+
+    def _timeouts(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+        statements = getattr(self._dialect, "timeout_statements", None)
+        return tuple(statements(plan)) if callable(statements) else ()
 
     def _shape(self, plan: ObservationPlanV1, row, physical_id: str,
                partitions: tuple[str, ...]) -> DataObservationResultV1:
