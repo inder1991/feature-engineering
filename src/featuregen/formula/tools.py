@@ -132,10 +132,10 @@ def _get_column_metadata(conn, arguments: Mapping, roles: tuple[str, ...]) -> di
     normalized = normalize_ref(source, schema, table, column)
     object_ref = f"public.{table}.{column}"
     row = conn.execute(
-        "SELECT data_type, sensitivity FROM graph_node "
+        "SELECT data_type, visible_requires FROM graph_node "
         "WHERE catalog_source = %s AND lower(object_ref) = %s AND kind = 'column'",
         (source, object_ref.lower())).fetchone()
-    if row is None or (row[1] is not None and row[1] not in allowed_sensitivities(roles)):
+    if row is None or not set(row[1] or ()).issubset(allowed_sensitivities(roles)):
         return {"found": False}   # hidden by read-scope == nonexistent (never leak existence)
     facts = {}
     for field_name in _COLUMN_FACT_FIELDS:
@@ -157,7 +157,7 @@ def _fact_columns(conn, arguments: Mapping, roles: tuple[str, ...], *,
     rows = conn.execute(
         f"SELECT object_ref, column_name FROM graph_node "  # flag_column is an internal constant
         f"WHERE catalog_source = %s AND kind = 'column' AND table_name = %s AND {flag_column} "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) ORDER BY object_ref",
+        "AND visible_requires <@ %s ORDER BY object_ref",
         (source.lower(), table, allowed_sensitivities(roles))).fetchall()
     out = []
     for object_ref, column in rows:

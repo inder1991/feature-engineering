@@ -83,7 +83,7 @@ def lineage_graph(conn, catalog_source: str, ref: str, *, now: datetime,
     """
     anchor = conn.execute(
         "SELECT table_name FROM graph_node WHERE catalog_source = %s AND object_ref = %s "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "AND visible_requires <@ %s",
         (catalog_source, ref, allowed_sensitivities(roles))).fetchone()
     if anchor is None:
         return None
@@ -226,7 +226,7 @@ class _Builder:
             cols = self.conn.execute(
                 "SELECT object_ref, column_name, is_grain, is_as_of, sensitivity, entity, "
                 "concept, domain FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
-                "AND table_name = %s AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+                "AND table_name = %s AND visible_requires <@ %s "
                 "ORDER BY object_ref",
                 (source, table, self.allowed)).fetchall()
             self._table_cols[(source, table)] = [c[0] for c in cols]
@@ -295,8 +295,8 @@ class _Builder:
             "  AND tn.catalog_source = e.catalog_source "
             "WHERE e.catalog_source = %s AND e.kind = 'joins' "
             "  AND (e.from_ref = ANY(%s) OR e.to_ref = ANY(%s)) "
-            "  AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
-            "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+            "  AND COALESCE(fn.visible_requires, '{}') <@ %s "
+            "  AND COALESCE(tn.visible_requires, '{}') <@ %s "
             "ORDER BY e.from_ref, e.to_ref",
             (source, cols, cols, self.allowed, self.allowed)).fetchall()
         colset = set(cols)
@@ -329,7 +329,7 @@ class _Builder:
         keys = self.conn.execute(
             "SELECT entity, min(object_ref) FROM graph_node "
             "WHERE kind = 'column' AND catalog_source = %s AND table_name = %s "
-            "AND entity IS NOT NULL AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+            "AND entity IS NOT NULL AND visible_requires <@ %s "
             "GROUP BY entity ORDER BY entity",
             (source, table, self.allowed)).fetchall()
         out: list[tuple[_Unit | None, dict | None, dict]] = []
@@ -337,7 +337,7 @@ class _Builder:
             partners = self.conn.execute(
                 "SELECT catalog_source, table_name, min(object_ref) FROM graph_node "
                 "WHERE kind = 'column' AND entity = %s AND catalog_source <> %s "
-                "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+                "AND visible_requires <@ %s "
                 "GROUP BY catalog_source, table_name ORDER BY catalog_source, table_name",
                 (entity, source, self.allowed)).fetchall()
             for p_source, p_table, p_ref in partners:
@@ -373,7 +373,7 @@ class _Builder:
             "FROM feature_derives_from d "
             "JOIN graph_node n ON n.catalog_source = d.catalog_source "
             "  AND n.object_ref = d.object_ref "
-            "WHERE d.feature_id = %s AND (n.sensitivity IS NULL OR n.sensitivity = ANY(%s)) "
+            "WHERE d.feature_id = %s AND COALESCE(n.visible_requires, '{}') <@ %s "
             "ORDER BY d.catalog_source, d.object_ref",
             (feature_id, self.allowed)).fetchall()
         return [(("table", src, tname), None,

@@ -91,7 +91,7 @@ def _column_defs(conn, pairs: tuple[tuple[str, str], ...], roles: Iterable[str])
     refs = [ref for _, ref in pairs]
     rows = conn.execute(
         "SELECT catalog_source, object_ref, column_name, concept, definition FROM graph_node "
-        "WHERE object_ref = ANY(%s) AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "WHERE object_ref = ANY(%s) AND visible_requires <@ %s",
         (refs, allowed_sensitivities(roles))).fetchall()
     wanted = set(pairs)
     return [{"object_ref": r[1], "column": r[2], "concept": r[3], "definition": r[4]}

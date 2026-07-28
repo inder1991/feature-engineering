@@ -279,10 +279,10 @@ def _column_context(conn, ref: str, roles: tuple[str, ...]) -> dict:
     normalized = normalize_ref(source, schema, table, column)
     object_ref = f"public.{table}.{column}"
     row = conn.execute(
-        "SELECT data_type, sensitivity FROM graph_node "
+        "SELECT data_type, visible_requires FROM graph_node "
         "WHERE catalog_source = %s AND lower(object_ref) = %s AND kind = 'column'",
         (source.strip().lower(), object_ref.lower())).fetchone()
-    if row is None or (row[1] is not None and row[1] not in allowed_sensitivities(roles)):
+    if row is None or not set(row[1] or ()).issubset(allowed_sensitivities(roles)):
         return {"logical_ref": normalized, "found": False}
     facts = {}
     for field_name in _COLUMN_FACT_FIELDS:

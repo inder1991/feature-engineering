@@ -160,7 +160,7 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
            "LEFT JOIN graph_node t ON t.catalog_source = c.catalog_source AND t.kind = 'table' "
            "AND t.table_name = c.table_name "
            "WHERE c.kind = 'column' "
-           "AND (c.sensitivity IS NULL OR c.sensitivity = ANY(%s))")
+           "AND COALESCE(c.visible_requires, '{}') <@ %s")
     params: list = [allowed_sensitivities(roles)]
     if entity:
         # Cross-domain gather: candidates from EVERY catalog that contains this entity, not one source.

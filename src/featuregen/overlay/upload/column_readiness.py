@@ -349,8 +349,8 @@ def _join_requirement(
         "WHERE e.catalog_source = %s AND e.kind = 'joins' "
         "AND e.approved_join_status = 'VERIFIED' "
         "AND (e.from_ref = %s OR e.to_ref = %s) "
-        "AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
-        "AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "AND COALESCE(fn.visible_requires, '{}') <@ %s "
+        "AND COALESCE(tn.visible_requires, '{}') <@ %s "
         "LIMIT 1",
         (source, object_ref_flat, object_ref_flat, allowed, allowed),
     ).fetchone() is not None

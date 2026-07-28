@@ -82,7 +82,7 @@ def _identifier_columns(conn, *, roles: Iterable[str]) -> list[_IdCol]:
         "SELECT catalog_source, table_name, column_name, data_type, concept, is_grain, declared_type "
         "FROM graph_node "
         "WHERE kind = 'column' AND concept IS NOT NULL "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "AND visible_requires <@ %s "
         "ORDER BY catalog_source, object_ref",
         (allowed_sensitivities(roles),)).fetchall()
     out: list[_IdCol] = []

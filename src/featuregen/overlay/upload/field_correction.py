@@ -265,7 +265,7 @@ def apply_field_correction(
     allowed = allowed_sensitivities(actor.role_claims)
     anchor = conn.execute(
         "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = lower(%s) "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "AND visible_requires <@ %s",
         (norm_source, object_ref, allowed)).fetchone()
     if anchor is None:
         raise FieldCorrectionError(404, "asset not found")

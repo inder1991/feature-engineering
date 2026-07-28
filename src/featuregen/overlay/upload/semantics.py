@@ -86,7 +86,7 @@ def list_semantics_pending(conn, catalog_source: str, *,
     rows = conn.execute(
         "SELECT object_ref, table_name, column_name, data_type, is_as_of, additivity, unit, "
         "currency, entity FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) ORDER BY object_ref",
+        "AND visible_requires <@ %s ORDER BY object_ref",
         (catalog_source, allowed_sensitivities(roles))).fetchall()
     return [SemanticsPendingItem(ref, table, column, data_type,
                                  missing_semantic_fields(as_of=as_of, additivity=additivity,
@@ -138,7 +138,7 @@ def complete_semantics(conn, catalog_source: str, object_ref: str, *,
     node = conn.execute(
         "SELECT object_ref, table_name FROM graph_node WHERE catalog_source = %s "
         "AND lower(object_ref) = lower(%s) AND kind = 'column' "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "AND visible_requires <@ %s",
         (catalog_source, object_ref, allowed_sensitivities(actor.role_claims))).fetchone()
     if node is None:
         return None

@@ -23,7 +23,7 @@ def resolve_catalog_scope(conn, *, roles: Iterable[str] = (), target_entity: str
                           now: datetime, requested_sources: tuple[str, ...] | None = None) -> CatalogScopeV1:
     rows = conn.execute(
         "SELECT DISTINCT catalog_source FROM graph_node WHERE kind = 'column' "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) ORDER BY catalog_source",
+        "AND visible_requires <@ %s ORDER BY catalog_source",
         (allowed_sensitivities(roles),)).fetchall()
     readable = [r[0] for r in rows]
     if requested_sources is not None:

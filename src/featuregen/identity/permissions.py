@@ -5,8 +5,16 @@ strings). So a role can be renamed, or a sixth persona added, without touching a
 "who can do X?" is a one-line lookup in ROLE_PERMISSIONS.
 
 Functional roles (this file) answer "what OPERATIONS may you perform". They are a SEPARATE axis from
-the data-sensitivity roles pii_reader / restricted_reader (see read_scope), which answer "which
-sensitive COLUMNS may you see". A user legitimately holds one of each, e.g. {feature_engineer, pii_reader}.
+the data-sensitivity roles pii_reader / restricted_reader / confidential_reader (see read_scope),
+which answer "which sensitive COLUMNS may you see". A user legitimately holds one of each, e.g.
+{feature_engineer, pii_reader}.
+
+The sensitivity axis has TWO vocabularies, deliberately kept apart (read_scope): the raw file TAG
+(pii / restricted, the set migration 0993 enforces on `graph_node.sensitivity`) and the GOVERNED
+floor (confidential / restricted, from safety_floor.SENSITIVITY_ORDER). `confidential_reader` grants
+the floor level that had no role at all until 1032 — so a column the concept cascade ruled
+confidential was previously ungrantable, and therefore either invisible to everyone or (as shipped,
+because read scope only ever consulted the tag) visible to everyone.
 """
 from __future__ import annotations
 
