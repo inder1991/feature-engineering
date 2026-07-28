@@ -119,7 +119,7 @@ def get_feature(conn, feature_id: str, *, roles: Iterable[str] = ()) -> dict | N
     derives = conn.execute(
         "SELECT d.catalog_source, d.object_ref FROM feature_derives_from d "
         "LEFT JOIN graph_node n ON n.catalog_source = d.catalog_source AND n.object_ref = d.object_ref "
-        "WHERE d.feature_id = %s AND (n.sensitivity IS NULL OR n.sensitivity = ANY(%s)) "
+        "WHERE d.feature_id = %s AND COALESCE(n.visible_requires, '{}') <@ %s "
         "ORDER BY d.object_ref", (feature_id, allowed_sensitivities(roles))).fetchall()
     return {"feature_id": row[0], "name": row[1], "description": row[2], "grain_table": row[3],
             "aggregation": row[4], "as_of_column": row[5], "verification": row[6],

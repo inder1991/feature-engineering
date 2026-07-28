@@ -100,7 +100,7 @@ def _build_predicates(
         # that node is fresh for the SLA window after its resolution and never re-blessed by a
         # later scan of the OTHER rows (round-3 #5). NULL attested_at = watermark, as before.
         "COALESCE(n.attested_at, w.last_completed_at) >= %(cutoff)s",
-        "(n.sensitivity IS NULL OR n.sensitivity = ANY(%(allowed)s))",   # read-scope hard filter
+        "COALESCE(n.visible_requires, '{}') <@ %(allowed)s",   # read-scope hard filter
     ]
     if query:
         base_preds.append("n.search_doc @@ plainto_tsquery('english', %(q)s)")

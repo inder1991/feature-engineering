@@ -273,7 +273,7 @@ def _visible_column_counts(conn, catalog_source: str, tables: Iterable[str],
     rows = conn.execute(
         "SELECT table_name, count(*) FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s "
-        "  AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "  AND visible_requires <@ %s "
         "  AND table_name = ANY(%s) "
         "GROUP BY table_name",
         (catalog_source, allowed_sensitivities(roles), list(tables))).fetchall()

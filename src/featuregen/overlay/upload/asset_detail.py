@@ -99,7 +99,7 @@ def _load_anchor(conn: DbConn, source: str, object_ref: str, allowed: list[str])
         # F7: object_ref is canonical lowercase, so equality against lower(%s) uses the (source,
         # object_ref) PK directly instead of forcing a functional scan over lower(object_ref).
         "WHERE catalog_source = %s AND object_ref = lower(%s) "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "AND visible_requires <@ %s",
         (source, object_ref, allowed),
     ).fetchone()
     if row is None:
@@ -270,7 +270,7 @@ def _relationships_section(
         "SELECT object_ref, column_name, data_type, sensitivity FROM graph_node "
         "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
         "AND lower(object_ref) <> lower(%s) "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "AND visible_requires <@ %s "
         "ORDER BY object_ref",
         (source, table, anchor["object_ref"], allowed),
     ).fetchall()
@@ -304,8 +304,8 @@ def _relationships_section(
             "AND (e.from_ref = ANY(%s) OR e.to_ref = ANY(%s)) "
             # M-5 fail-closed (same leak as the F2b endpoint filters): require BOTH join endpoints to
             # EXIST and pass scope, so a join to an absent/hidden node is OMITTED, never NULL-admitted.
-            "AND fn.object_ref IS NOT NULL AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
-            "AND tn.object_ref IS NOT NULL AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+            "AND fn.object_ref IS NOT NULL AND COALESCE(fn.visible_requires, '{}') <@ %s "
+            "AND tn.object_ref IS NOT NULL AND COALESCE(tn.visible_requires, '{}') <@ %s "
             "ORDER BY e.from_ref, e.to_ref",
             (source, endpoint_refs, endpoint_refs, allowed, allowed),
         ).fetchall()
@@ -398,8 +398,8 @@ def _semantic_subsection(
         # M-5 fail-closed: a MISSING endpoint row must NOT read as visible (a LEFT JOIN leaves its
         # sensitivity NULL, which `IS NULL` would wrongly admit) — require BOTH endpoints to EXIST
         # and pass scope, so an edge to an absent/hidden node is OMITTED (no leak).
-        "AND fn.object_ref IS NOT NULL AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
-        "AND tn.object_ref IS NOT NULL AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "AND fn.object_ref IS NOT NULL AND COALESCE(fn.visible_requires, '{}') <@ %s "
+        "AND tn.object_ref IS NOT NULL AND COALESCE(tn.visible_requires, '{}') <@ %s "
         "ORDER BY e.from_ref, e.to_ref",
         (source, object_ref, object_ref, allowed, allowed),
     ).fetchall():
@@ -427,8 +427,8 @@ def _semantic_subsection(
         "AND (c.subject_graph_ref = %s OR c.target_graph_ref = %s) "
         # M-5 fail-closed: require BOTH endpoints to EXIST and pass scope — a candidate whose other
         # endpoint has no graph_node row (or is hidden) is OMITTED, never admitted via a NULL join.
-        "AND sn.object_ref IS NOT NULL AND (sn.sensitivity IS NULL OR sn.sensitivity = ANY(%s)) "
-        "AND tn.object_ref IS NOT NULL AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "AND sn.object_ref IS NOT NULL AND COALESCE(sn.visible_requires, '{}') <@ %s "
+        "AND tn.object_ref IS NOT NULL AND COALESCE(tn.visible_requires, '{}') <@ %s "
         "ORDER BY c.subject_graph_ref, c.binding_kind, c.candidate_id",
         (source, object_ref, object_ref, allowed, allowed),
     ).fetchall():

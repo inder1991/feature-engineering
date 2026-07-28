@@ -68,7 +68,7 @@ def entity_key_columns(conn, entity: str, *, roles: Iterable[str] = ()) -> list[
     rows = conn.execute(
         "SELECT catalog_source, table_name, object_ref FROM graph_node "
         "WHERE kind = 'column' AND entity = %s "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "AND visible_requires <@ %s "
         "ORDER BY catalog_source, object_ref",
         (entity, allowed_sensitivities(roles))).fetchall()
     return [EntityColumn(entity=entity, catalog_source=r[0], table=r[1], object_ref=r[2])
@@ -87,7 +87,7 @@ def _table_entity_keys(conn, catalog_source: str, table: str,
     rows = conn.execute(
         "SELECT entity, object_ref FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s AND table_name = %s AND entity IS NOT NULL "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "AND visible_requires <@ %s",
         (catalog_source, table, allowed_sensitivities(roles))).fetchall()
     return {r[0]: r[1] for r in rows}
 
@@ -166,7 +166,7 @@ def suggest_entities(conn, client, catalog_source: str, *, roles: Iterable[str] 
     cols = conn.execute(
         "SELECT object_ref, table_name, column_name, data_type, concept FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s AND entity IS NULL "
-        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        "AND visible_requires <@ %s",
         (catalog_source, allowed_sensitivities(roles))).fetchall()
     written = 0
     for object_ref, table, column, data_type, concept in cols:
@@ -205,7 +205,7 @@ def list_entity_suggestions(conn, catalog_source: str, *, status: str = "pending
         "FROM entity_suggestion s "
         "LEFT JOIN graph_node n ON n.object_ref = s.object_ref AND n.catalog_source = s.catalog_source "
         "WHERE s.catalog_source = %s AND s.status = %s "
-        "  AND (n.sensitivity IS NULL OR n.sensitivity = ANY(%s)) ORDER BY s.object_ref",
+        "  AND COALESCE(n.visible_requires, '{}') <@ %s ORDER BY s.object_ref",
         (catalog_source, status, allowed_sensitivities(roles))).fetchall()
     return [EntitySuggestion(r[0], r[1], r[2], r[3], r[4],
                              authority=LEGACY_FILE_DECLARED if r[4] == "applied" else None)

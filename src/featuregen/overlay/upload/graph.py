@@ -373,8 +373,8 @@ def column_joins(conn, catalog_source: str, object_ref: str, *,
         "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref AND fn.catalog_source = e.catalog_source "
         "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref AND tn.catalog_source = e.catalog_source "
         "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.from_ref = %s "
-        "  AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
-        "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "  AND COALESCE(fn.visible_requires, '{}') <@ %s "
+        "  AND COALESCE(tn.visible_requires, '{}') <@ %s "
         "ORDER BY e.to_ref",
         (catalog_source, object_ref, allowed, allowed)).fetchall()
     return [JoinEdge(from_ref=r[0], to_ref=r[1], cardinality=r[2], resolved=r[3],

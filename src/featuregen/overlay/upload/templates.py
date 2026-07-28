@@ -259,7 +259,7 @@ def _load_columns(conn, catalog_source: str, roles: Iterable[str]) -> list[_Col]
         "       concept, entity, additivity, sensitivity, currency "
         "FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s "
-        "  AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "  AND visible_requires <@ %s "
         "ORDER BY table_name, column_name",
         (catalog_source, allowed_sensitivities(roles))).fetchall()
     return [_Col(*r) for r in rows]
