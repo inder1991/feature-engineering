@@ -203,6 +203,10 @@ _MEASURE_ANNOTATION = FieldPolicy(
 _POLICIES: dict[str, FieldPolicy] = {
     "concept": _CONCEPT,
     "definition": _MEANING,
+    # An AI-written per-column summary. Same MEANING shape as `definition` — display from an LLM
+    # proposal, operational only on source/human authority — so it can never become load-bearing on
+    # an AI's say-so, and a human can correct it through the ordinary field-decision surface.
+    "ai_summary": _MEANING,
     "domain": _MEANING,
     "feature_role": _MEANING,
     "logical_representation": _LOGICAL_REPRESENTATION,

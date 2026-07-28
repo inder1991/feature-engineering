@@ -46,14 +46,17 @@ from featuregen.overlay.upload.contract.invalidation import (
 )
 from featuregen.overlay.upload.enrich import (
     _definition_targets,
+    _summary_targets,
     _unit_targets,
     _write_definition_evidence,
+    _write_summary_evidence,
     _write_domain_evidence,
     _write_synonym_evidence,
     _write_unit_evidence,
     classify_domains,
     content_hash,
     draft_definitions,
+    draft_summaries,
     draft_synonyms,
     draft_units,
     enrich_concepts,
@@ -2091,6 +2094,39 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             not_attempted=def_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
+
+        # A per-column SUMMARY for every column — the answer to a source whose description column is
+        # filled by BUCKET (CIB: 47 distinct descriptions over 111 columns). Distinct from
+        # enrich_definition in the one way that matters: that stage only fills a BLANK definition, so
+        # a boilerplate description occupies the field and it never runs. This one always runs and
+        # writes to its OWN field, so the source keeps its text at its own authority.
+        stage_started = datetime.now(UTC)
+        summaries: dict[str, str] = {}
+        summary_stats: dict = {}
+        summary_evidence_failures = 0
+        try:
+            with conn.transaction():
+                summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
+                                            concepts=concepts, ingestion_run_id=ingestion_run_id,
+                                            stats=summary_stats)
+                if glossary is not None and snapshot_id is not None:
+                    try:
+                        summary_evidence_failures = _write_summary_evidence(
+                            conn, source=catalog_source, rows=vr.good, summaries=summaries,
+                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id)
+                    except Exception:  # noqa: BLE001 — an escape past the writer's per-item guard
+                        # would otherwise report `succeeded` for a run that wrote nothing.
+                        summary_evidence_failures = 1
+                        raise
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory summary enrichment failed for %r", catalog_source, exc_info=True)
+        state, reason, detail = _enrichment_outcome(
+            summaries, len(_summary_targets(vr.good, glossary)),
+            internal_failures=summary_evidence_failures,
+            not_attempted=summary_stats.get("not_attempted", 0))
+        record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
+
         stage_started = datetime.now(UTC)
         domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         domain_evidence_failures = 0

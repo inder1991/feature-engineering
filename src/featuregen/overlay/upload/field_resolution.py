@@ -87,6 +87,7 @@ _CONCEPT_SENSITIVITY_TO_RESTRICTION: dict[str, str] = {
 _DISPLAY_COLUMN: dict[str, str] = {
     "concept": "concept",
     "definition": "definition",
+    "ai_summary": "ai_summary",
     "domain": "domain",
     "additivity": "additivity",
     "table_role": "table_role",

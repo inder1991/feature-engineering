@@ -744,6 +744,44 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
     return failures
 
 
+def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                            summaries: dict[str, str], glossary: GlossaryUpload,
+                            bindings: dict[str, ObjectBinding] | None,
+                            source_snapshot_id: str) -> int:
+    """Promote drafted summaries into governed ``llm/proposed`` ``field_evidence`` under
+    ``ai_summary``. Returns the CONTAINED per-item failure count for the caller's stage report.
+
+    Mirrors :func:`_write_definition_evidence` but the RECONCILIATION is simpler for one reason: the
+    target universe is EVERY column, so a column can only drop out by leaving the upload entirely.
+    Keep = written this run ∪ still present, which retires a genuinely removed column and never
+    retires a live one on a transient provider miss (KEEP stays the safe default — AI evidence is
+    never retired on ambiguity).
+    """
+    by_hash = {content_hash(r): r for r in rows}
+    rec_by_tc = _records_by_tc(glossary)
+
+    def ref_of(h: str) -> tuple[str, str, object] | None:
+        row = by_hash.get(h)
+        if row is None:
+            return None
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        if rec is None:
+            return None   # not a glossary column term — no schema-preserving identity to key on
+        return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
+                {"table": row.table, "column": row.column, "type": row.type})
+
+    failures = _write_llm_field_evidence(
+        conn, field_name="ai_summary", items=summaries, ref_of=ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        producer_configuration_hash=None, bindings=bindings)
+    keep = {ref[0] for h in set(summaries) | _summary_targets(rows, glossary)
+            if (ref := ref_of(h)) is not None}
+    _reconcile_llm_field_evidence(
+        conn, field_name="ai_summary",
+        retire_refs=_active_llm_field_refs(conn, source=source, field_name="ai_summary") - keep)
+    return failures
+
+
 def _table_refs(glossary: GlossaryUpload) -> dict[str, str]:
     """Normalized table name -> the SCHEMA-PRESERVING ref of its TABLE node — the identity
     table-grained evidence stores under. Built from the glossary's own records (a table term names

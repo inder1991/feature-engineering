@@ -69,6 +69,8 @@ def _client(rows: list[CanonicalRow], *, pass_b: bool = False) -> FakeLLM:
             {"ref": "accounts", "domain": "deposits"}]}),
         "overlay.enrich.synonyms": FakeResponse(output={"results": [
             {"ref": h, "synonyms": "account column, ledger column"} for h in hashes]}),
+        "overlay.enrich.summary": FakeResponse(output={"results": [
+            {"ref": h, "summary": "A plain-English summary of this column."} for h in hashes]}),
     }
     if pass_b:
         script["table_synth"] = FakeResponse(output={"results": [
@@ -162,7 +164,7 @@ def test_real_ingest_attributes_pass_a_dispatches_to_run_and_columns(db, durable
             (durable_run,)).fetchone()[0]
 
     # All three Pass A stages fired a pre-audited dispatch under THIS run.
-    assert {"enrich_concept", "enrich_definition", "enrich_domain"} <= stages
+    assert {"enrich_concept", "enrich_definition", "enrich_domain", "enrich_summary"} <= stages
     # Every dispatch resolves back to a recorded logical llm_call (none left unattributable).
     assert orphan_dispatches == 0
     # Every joined row belongs to THIS run, with a non-empty subject set overall.

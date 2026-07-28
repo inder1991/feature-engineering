@@ -102,14 +102,20 @@ _SEARCH_DOC = (
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # table name
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # concept
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # domain
-    "setweight(to_tsvector('english', coalesce(%s, '')), 'C')"       # semantic_terms (glossary)
+    "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # semantic_terms (glossary)
+    # The AI per-column summary rides at 'B' beside the definition: DISCOVERY is half its purpose.
+    # A source whose description column is filled by bucket makes the definition slot useless for
+    # search — a query for "new to bank" matched nothing, though two columns are exactly that — and
+    # the summary is the only text that distinguishes such columns.
+    "setweight(to_tsvector('english', coalesce(%s, '')), 'B')"       # ai_summary
 )
 
 
 def _search_doc_params(kind: str, table: str | None, column: str | None, definition: str | None,
                        concept: str | None, domain: str | None, entity: str | None,
-                       semantic_terms: str | None) -> tuple[str | None, str, str | None, str, str,
-                                                            str]:
+                       semantic_terms: str | None,
+                       ai_summary: str | None = None) -> tuple[str | None, str, str | None, str,
+                                                               str, str, str]:
     """The six ``_SEARCH_DOC`` inputs — name(A), definition(B), table(C), concept(C),
     domain+entity(C), semantic_terms(C) — derived from a node's field values. Shared by the insert
     paths AND :func:`rebuild_search_doc` (#20), so an insert-time doc and a rebuilt doc can never
@@ -119,9 +125,9 @@ def _search_doc_params(kind: str, table: str | None, column: str | None, definit
     (Task 8) — NULL for technical/generic nodes (the INSERT sites pass None; only the glossary
     projection populates it, after which the doc is rebuilt)."""
     if kind == "table":
-        return (table, "", table, "", domain or "", semantic_terms or "")
+        return (table, "", table, "", domain or "", semantic_terms or "", "")
     return (column, definition or "", table, humanize(concept) if concept else "",
-            (domain or "") + " " + (entity or ""), semantic_terms or "")
+            (domain or "") + " " + (entity or ""), semantic_terms or "", ai_summary or "")
 
 
 def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
