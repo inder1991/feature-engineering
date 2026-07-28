@@ -1302,7 +1302,7 @@ def resolve_concept_evidence(conn, logical_ref: str) -> FieldEvidenceView | None
 
 
 def derive_and_write_concept_cascade(conn, logical_ref: str, *, producer_ref: str,
-                                     snapshot_id: str) -> None:
+                                     snapshot_id: str, declared_type: str = "") -> None:
     """Derive a column's behavioural TAXONOMY evidence from its RESOLVED concept, at THAT record's
     strength, with a root link back to it (Task 6 — transitive provenance).
 
@@ -1334,7 +1334,13 @@ def derive_and_write_concept_cascade(conn, logical_ref: str, *, producer_ref: st
                     "root_strength": winner.strength.value,
                     "root_evidence_id": winner.evidence_id,
                     "resolver_version": RESOLVER_VERSION}
-        for field_name, value, strength in derive_concept_evidence(winner.value, winner.strength):
+        # `declared_type` lets the derivation refuse ONE provable contradiction — a temporal column
+        # cannot be additive whatever its concept claims (a bureau-inquiry DATE inheriting the
+        # inquiry COUNT's `additive`). Suppression is a normal absence: `_stale_absent_fields` below
+        # already stales a field this derivation did not emit, so a re-classification cannot leave a
+        # stale `additivity='additive'` row behind for resolve_and_project to re-project.
+        for field_name, value, strength in derive_concept_evidence(
+                winner.value, winner.strength, declared_type):
             present.add(field_name)
             _write_producer_field(
                 conn, logical_ref=logical_ref, field_name=field_name, value=value,
@@ -1499,7 +1505,8 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                     # in-memory `concepts` dict, which would ignore a human's correction and could
                     # only ever be asserted at a hard-coded PROPOSED strength.
                     derive_and_write_concept_cascade(
-                        conn, logical_ref, producer_ref=snapshot_id, snapshot_id=snapshot_id)
+                        conn, logical_ref, producer_ref=snapshot_id, snapshot_id=snapshot_id,
+                        declared_type=rec.declared_type)
                     # The TAXONOMY mirror of the parser/technical retire above (final review F1): a
                     # derived field the re-resolved concept no longer implies has its EVIDENCE staled
                     # by the cascade, and this round's resolve_and_project then SKIPS the evidence-less

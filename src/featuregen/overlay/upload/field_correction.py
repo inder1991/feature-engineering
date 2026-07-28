@@ -346,8 +346,19 @@ def apply_field_correction(
         #     then re-resolve exactly the derived fields.
         if field == "concept":
             correction_ref = f"human-correction:{idempotency_key}"
+            # The DECLARED type travels with the re-derivation for the same reason it does at ingest:
+            # a temporal column cannot be additive whatever concept a human just selected. Without it
+            # this path would silently re-introduce `additive` on a timestamp and defeat the guard
+            # until a re-upload that may never come. Read from the graph (the same public-flattened
+            # key the projection uses) since a correction carries no glossary record.
+            _gs, _gr = _graph_key(norm_source, logical_ref)
+            _dt_row = conn.execute(
+                "SELECT declared_type FROM graph_node "
+                "WHERE catalog_source = %s AND lower(object_ref) = %s",
+                (_gs, _gr)).fetchone()
             derive_and_write_concept_cascade(
-                conn, logical_ref, producer_ref=correction_ref, snapshot_id=correction_ref)
+                conn, logical_ref, producer_ref=correction_ref, snapshot_id=correction_ref,
+                declared_type=(_dt_row[0] if _dt_row and _dt_row[0] else ""))
             _retire_dropped_field_decisions(
                 conn, source=norm_source, logical_ref=logical_ref, fields=_TAXONOMY_FIELDS,
                 now=None)

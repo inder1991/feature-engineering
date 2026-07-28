@@ -35,9 +35,27 @@ from featuregen.overlay.upload.concepts import concept as lookup_concept
 # identifier, a coded category, a bare date). Nothing to derive when a concept carries it.
 _ADDITIVITY_NOT_APPLICABLE = "n/a"
 
+# A column whose DECLARED type is temporal cannot be additive, whatever its concept claims. Summing
+# timestamps is meaningless, and additivity is not cosmetic — the planner reads it to decide what may
+# be summed across a grain, so an `additive` timestamp invites a generated `SUM(some_date)` that
+# would look like a valid feature.
+#
+# Real case: `cust_aecb_dt` (timestamp(0), the date of an Al Etihad Credit Bureau inquiry) was
+# classified `bureau_inquiry`, whose own description says "Count of recent hard inquiries is the
+# feature (additive)" — right for the COUNT, wrong for the DATE, and inherited wholesale.
+#
+# Matched on the leading token so parameterised and qualified spellings are covered:
+# `timestamp(0)`, `timestamp(6)`, `timestamp without time zone`, `date`, `datetime`.
+_TEMPORAL_TYPE_PREFIXES = ("timestamp", "date", "datetime", "time")
+
+
+def _is_temporal(declared_type: str) -> bool:
+    head = declared_type.strip().lower().split("(")[0].split()[0] if declared_type.strip() else ""
+    return head in _TEMPORAL_TYPE_PREFIXES
+
 
 def derive_concept_evidence(
-    concept: str, concept_strength: AssertionStrength
+    concept: str, concept_strength: AssertionStrength, declared_type: str = ""
 ) -> list[tuple[str, object, AssertionStrength]]:
     """Derive the behavioural evidence a concept implies, at the concept's own strength.
 
@@ -61,8 +79,13 @@ def derive_concept_evidence(
         return []
 
     triples: list[tuple[str, object, AssertionStrength]] = []
-    # additivity: only when the concept declares a real aggregation rule (skip the "n/a" default).
-    if record.additivity != _ADDITIVITY_NOT_APPLICABLE:
+    # additivity: only when the concept declares a real aggregation rule (skip the "n/a" default),
+    # and only when the column's DECLARED type does not contradict it (see _TEMPORAL_TYPE_PREFIXES).
+    # The type guard is deliberately NARROW: it does not judge whether the concept is right — that is
+    # the vocabulary's job and a human's — it refuses one PROVABLE contradiction, so a concept
+    # mis-assignment costs a MISSING behaviour rather than a WRONG one. Absent a declared type there
+    # is no contradiction to prove and the concept stands.
+    if record.additivity != _ADDITIVITY_NOT_APPLICABLE and not _is_temporal(declared_type):
         triples.append(("additivity", record.additivity, concept_strength))
     # Safety & lineage behaviour — always a meaningful assertion, so always derived.
     triples.append(("temporal_role", record.pit_role, concept_strength))
