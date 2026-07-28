@@ -48,17 +48,31 @@ const PROVENANCE_LABEL: Record<string, string> = {
   human_staged: 'human staged',
 }
 
-function provenanceLabel(provenance: string | null): string {
-  if (!provenance) return 'unattested'
-  return PROVENANCE_LABEL[provenance] ?? provenance.replaceAll('_', ' ')
+// Returns a LABEL only for a value that genuinely is one. `provenance` carries
+// `decision_event_id or fact_event_id` (asset_detail.py) — an opaque audit id such as
+// `fde_01KYM…` (fde = field decision event). The old fallback prettified any unrecognised string by
+// swapping underscores for spaces, and the badge CSS uppercases it, so an id rendered as
+// `FDE 01KYMVECPH7ER0VPC0A9DW4HSB` and looked entirely deliberate. Anything unrecognised is now
+// treated as an id, not a label: null, so the caller falls through to the real author.
+function provenanceLabel(provenance: string | null): string | null {
+  if (!provenance) return null
+  return PROVENANCE_LABEL[provenance] ?? null
 }
 
 // The badge shows the value's author: the governed decision provenance if any, else the evidence-layer
 // author (source attested / AI proposed / rulebook proposed), else "unattested" only when truly nothing.
 function attestedByLabel(field: EffectiveMetadataField): string {
-  if (field.provenance) return provenanceLabel(field.provenance)
-  if (field.evidence_provenance) return field.evidence_provenance
-  return 'unattested'
+  return provenanceLabel(field.provenance) ?? field.evidence_provenance ?? 'unattested'
+}
+
+// The decision id is real and an auditor needs it to find the decision record — it just is not the
+// label. It rides the badge's tooltip alongside the authority, so nothing is discarded.
+function attributionTitle(field: EffectiveMetadataField): string {
+  const parts = [`authority: ${field.authority}`, `c1: ${field.c1_status}`]
+  if (field.provenance && !PROVENANCE_LABEL[field.provenance]) {
+    parts.push(`decision: ${field.provenance}`)
+  }
+  return parts.join(' · ')
 }
 
 // governed = a verified, load-bearing attestation (solid ok); hint = a proposal not yet governed
@@ -342,7 +356,7 @@ function AuthorityBadge({ field }: { field: EffectiveMetadataField }) {
   return (
     <span
       className={`badge ${authorityTone(field.authority)}`}
-      title={`authority: ${field.authority} · c1: ${field.c1_status}`}
+      title={attributionTitle(field)}
     >
       {attestedByLabel(field)}
     </span>
