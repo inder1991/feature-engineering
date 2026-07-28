@@ -80,13 +80,15 @@ tier needs **real data**, so it arrives with Release 1, not before.
 
 ## 5. Corrections to the plans as written
 
-**The Kedro/PySpark renderer does not exist.** The agent plan's baseline table calls it earned and
-M4 builds on "the proven materialization renderer conventions". Verified: `materialize/` contains
-admission, binding, canonical, classify, codes, contract, expression_ir, group_plan, inputs,
-inventory, ir, joins, physical_types, spine — and **emits nothing**. No templates, no `.j2`, no file
-writing, no `catalog.yml`/`pipeline.py` generation, no renderer test. The package docstring's claim
-that it "emits the Kedro/PySpark project" is forward-looking prose. **Writing the renderer is its own
-funded piece of work, before M4 depends on it.**
+**The Kedro/PySpark renderer EXISTS — an earlier revision of this document said it did not.**
+`origin/main` carries `materialize/render/project.py::render_project` with spine, projection and
+calculation node renderers and render-time refusal tests. The agent plan's baseline claim was
+correct; my contradiction of it was not.
+
+The error is instructive enough to keep: I verified against `fix/join-neighbourhood-cap`, which is
+**17 commits behind** `origin/main`, and every one of those 17 commits is renderer work. Checking
+the wrong baseline produced a confident, wrong finding — which is exactly the failure mode §1 of the
+release plan exists to remove, and the sharpest possible argument for doing Release 0 first.
 
 **BIAN/FIBO are persisted — an earlier claim of mine was wrong.** They live in `field_evidence`
 (migration 0983), 114 rows each on the deployment, written at `ingest.py:1044` and already consumed

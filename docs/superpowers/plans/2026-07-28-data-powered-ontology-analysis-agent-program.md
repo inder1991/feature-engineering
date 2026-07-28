@@ -45,7 +45,7 @@ This plan must start from the repository as it exists, not from the desired arch
 | Metadata ingestion | Durable ingestion runs, append-only status events, heartbeats, lease reconciliation, metadata graph ingestion | A post-ingestion data-observation trigger |
 | Existing profiler | Bounded PostgreSQL/catalog profiling with allowlists, sampling and timeouts | Hive/Spark profiling; it cannot be reused as a Hive runtime |
 | LLM use | Structured outputs, bounded repair, fake provider, append-only `llm_call` audit records | Analysis-agent schemas, prompts and deterministic analysis idempotency |
-| Materialization | `origin/main` contains typed physical input requirements, the execution IR, join/cardinality/fan-out refusal, admission gates and canonical hashing | **The renderer itself.** `materialize/` EMITS NOTHING — no templates, no file writing, no `catalog.yml`/`pipeline.py` generation, no renderer test. The package docstring's "emits the Kedro/PySpark project" is forward-looking prose. Also: verified cluster inventory, job submission/polling, live Hadoop publication |
+| Materialization | `origin/main` contains typed physical input requirements, the execution IR, join/cardinality/fan-out refusal, admission gates, canonical hashing **and a working renderer** (`materialize/render/project.py::render_project`, plus spine/projection/calculation nodes and render-time refusal tests) | Verified cluster inventory, general job submission/polling, and live Hadoop publication |
 | Source integrations | OpenMetadata/catalog integration | Governed Hive/ODS connection registry and data-plane worker protocol |
 | Ontology | A reviewed E3/E5 program exists as a plan | E3 link types and E5 ontology behavior are not implemented facts |
 | UI | React application and governed catalog screens | A safe chart renderer and analysis workspace |
@@ -488,9 +488,8 @@ partition correctness, source readiness or performance until it passes.
 
 1. Implement a deterministic observation planner from binding, snapshot selector and
    `ProfilePolicyV1`.
-2. **Write the renderer** — it does not exist (see §2); this is funded work inside this milestone,
-   not reuse. Render a self-contained Kedro/PySpark project following the materialization package's
-   established conventions: pinned runtime, complete catalog, generated lock, exact source declarations and no
+2. Render a self-contained Kedro/PySpark project using the proven materialization renderer
+   (`materialize/render/`) conventions: pinned runtime, complete catalog, generated lock, exact source declarations and no
    control-plane imports.
 3. Apply partition pruning first. Use sampling or approved approximate statistics by default;
    exact full scans require an explicit policy and budget.
