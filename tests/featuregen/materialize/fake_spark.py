@@ -16,8 +16,20 @@ Python lists:
   test can prove the rendered code does not use it.
 * ``to_utc_timestamp(ts, zone)`` reads ``ts``'s wall-clock fields AS ``zone`` and returns the UTC
   instant, matching Spark under a UTC session timezone.
+* ``add_months`` and ``trunc`` are the CALENDAR operations, with Spark's end-of-month clamping.
+  They exist so §8 rule 2's "calendar periods, never day counts" is a behaviour a test can see: a
+  stand-in that quietly turned three months into ninety days would pass a renderer that did too.
+* ``expr`` parses ``INTERVAL <n> <UNIT>`` and NOTHING else. A stand-in that accepted arbitrary SQL
+  and returned something inert would make every ``event_time_plus_lag`` test pass whether or not
+  the lag was rendered at all — the loosest possible model of the one rule under test.
 * Nulls, types, coercion, partitioning and every optimisation are OUT of scope. A test that needs
   any of those needs real Spark, which is L0.
+
+**Every method here raises rather than degrading.** An unmodelled cast, an unmodelled ``trunc``
+format and an unparseable ``expr`` all raise :class:`NotImplementedError`. That is the rule that
+keeps the stand-in honest: the failure mode of a fake is not being wrong, it is being permissive —
+returning something plausible for an operation it does not model, so a test passes for a reason
+nobody chose.
 
 Nothing here may be imported from ``src`` — it is test support, and the package-wide rule is that
 ``pyspark`` (real or fake) never appears outside rendered text.
@@ -25,6 +37,7 @@ Nothing here may be imported from ``src`` — it is test support, and the packag
 from __future__ import annotations
 
 import datetime as _dt
+import re as _re
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -32,6 +45,23 @@ from zoneinfo import ZoneInfo
 __all__ = ["DataFrame", "Window", "functions", "run_rendered"]
 
 _MISSING = object()
+
+
+def _as_datetime(value: Any) -> _dt.datetime:
+    """A date or a timestamp as a timestamp — a date becomes MIDNIGHT, as Spark's cast does."""
+    if isinstance(value, _dt.datetime):
+        return value
+    if isinstance(value, _dt.date):
+        return _dt.datetime(value.year, value.month, value.day)
+    return _dt.datetime.fromisoformat(str(value))
+
+
+def _as_date(value: Any) -> _dt.date:
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    return _dt.date.fromisoformat(str(value))
 
 
 class Column:
@@ -92,6 +122,28 @@ class Column:
 
     def __hash__(self) -> int:
         return id(self)
+
+    def __add__(self, other: Any) -> Column:
+        """Only ``timestamp + INTERVAL`` — the one addition a rendered PIT node performs."""
+        def add(row: dict[str, Any]) -> Any:
+            left = self._evaluate(row)
+            right = other._evaluate(row) if isinstance(other, Column) else other
+            if not isinstance(right, _dt.timedelta):
+                raise NotImplementedError(
+                    f"fake_spark models Column + INTERVAL only, got {type(right).__name__}")
+            return _as_datetime(left) + right
+        return Column(f"({self._name} + {getattr(other, 'name', other)})", add)
+
+    def cast(self, sql_type: str) -> Column:
+        """``date -> timestamp`` (midnight) and ``timestamp -> date``. Nothing else is modelled."""
+        wanted = sql_type.strip().lower()
+        if wanted not in {"timestamp", "date"}:
+            raise NotImplementedError(f"fake_spark models no cast to {sql_type!r}")
+
+        def convert(row: dict[str, Any]) -> Any:
+            value = self._evaluate(row)
+            return _as_datetime(value) if wanted == "timestamp" else _as_date(value)
+        return Column(f"CAST({self._name} AS {wanted.upper()})", convert)
 
     def isin(self, values: Iterable[Any]) -> Column:
         allowed = list(values)
@@ -306,13 +358,82 @@ class _Functions:
 
     @staticmethod
     def to_date(column: Column) -> Column:
-        def parse(row: dict[str, Any]) -> Any:
-            value = column._eval(row)
-            if isinstance(value, _dt.datetime):
-                return value.date()
-            return value if isinstance(value, _dt.date) else _dt.date.fromisoformat(value)
-        return Column(f"to_date({column.name})", parse)
+        return Column(f"to_date({column.name})", lambda row: _as_date(column._eval(row)))
 
+    # ── §8 rule 2's CALENDAR arithmetic ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def date_sub(column: Column, days: int) -> Column:
+        """Exactly ``days`` days back, on a DATE. A day and a week are whole numbers of days in
+        every calendar, which is why these two units may be counted; a month is not."""
+        if not isinstance(days, int) or isinstance(days, bool):
+            raise NotImplementedError(f"fake_spark models date_sub over whole days, got {days!r}")
+        return Column(f"date_sub({column.name}, {days})",
+                      lambda row: _as_date(column._eval(row)) - _dt.timedelta(days=days))
+
+    @staticmethod
+    def add_months(column: Column, months: int) -> Column:  # noqa: N802 — Spark's name is snake
+        """Spark's ``add_months``: real month arithmetic, clamped to the end of the month.
+
+        ``2026-01-31`` plus one month is ``2026-02-28`` — not ``2026-03-03``, which is what adding
+        thirty days gives. That difference is the whole of "calendar periods, never day counts", so
+        this is modelled properly rather than approximated.
+        """
+        if not isinstance(months, int) or isinstance(months, bool):
+            raise NotImplementedError(
+                f"fake_spark models add_months over whole months, got {months!r}")
+
+        def shift(row: dict[str, Any]) -> Any:
+            start = _as_date(column._eval(row))
+            index = (start.year * 12 + start.month - 1) + months
+            year, month = divmod(index, 12)
+            last = _MONTH_LENGTHS[month] + (
+                1 if month == 1 and (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 0)
+            return _dt.date(year, month + 1, min(start.day, last))
+        return Column(f"add_months({column.name}, {months})", shift)
+
+    @staticmethod
+    def trunc(column: Column, unit: str) -> Column:
+        """The first day of the calendar period ``unit`` names — Spark's ``trunc`` over a date.
+
+        Spark's week starts on MONDAY. Spark returns NULL for an unrecognized format; this raises
+        instead, because a NULL boundary silently keeps or drops every row.
+        """
+        wanted = unit.strip().lower()
+        if wanted not in _TRUNC_UNITS:
+            raise NotImplementedError(f"fake_spark models no trunc format {unit!r}")
+
+        def truncate(row: dict[str, Any]) -> Any:
+            value = _as_date(column._eval(row))
+            if wanted == "week":
+                return value - _dt.timedelta(days=value.weekday())
+            if wanted == "month":
+                return value.replace(day=1)
+            if wanted == "quarter":
+                return value.replace(month=((value.month - 1) // 3) * 3 + 1, day=1)
+            return value.replace(month=1, day=1)
+        return Column(f"trunc({column.name}, {wanted})", truncate)
+
+    @staticmethod
+    def expr(sql: str) -> Column:
+        """``INTERVAL <n> <UNIT>`` and nothing else — see this module's docstring."""
+        match = _INTERVAL.fullmatch(sql.strip())
+        if match is None:
+            raise NotImplementedError(
+                f"fake_spark parses `INTERVAL <n> <UNIT>` only, got {sql!r}: accepting arbitrary "
+                f"SQL and returning something inert is how a lag that was never rendered passes")
+        amount, unit = int(match.group(1)), match.group(2).lower().rstrip("s")
+        delta = _dt.timedelta(**{f"{unit}s": amount})
+        return Column(f"INTERVAL {amount} {unit.upper()}S", lambda _row: delta)
+
+
+#: Days per month, indexed 0–11. February's leap day is added by ``add_months``.
+_MONTH_LENGTHS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+#: The ``trunc`` formats this stand-in models — Spark accepts more spellings of each.
+_TRUNC_UNITS = frozenset({"week", "month", "quarter", "year"})
+
+_INTERVAL = _re.compile(r"INTERVAL\s+(\d+)\s+(HOURS?|MINUTES?|SECONDS?)", _re.IGNORECASE)
 
 functions = _Functions()
 

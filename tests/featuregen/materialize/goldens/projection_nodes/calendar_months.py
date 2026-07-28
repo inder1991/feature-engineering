@@ -1,0 +1,59 @@
+def project_total_debit_amount_30d__body_expr(source: DataFrame, business_dt: str) -> DataFrame:
+    """Point-in-time rows for total_debit_amount_30d (§8).
+
+    Which rows total_debit_amount_30d / body.expr may SEE — nothing is aggregated here. A row
+    survives only if it had ARRIVED by the cutoff (rule 1) and its event time falls inside the
+    declared 3-month calendar_period window (rule 2).
+    """
+    business_date = str(business_dt)
+
+    # §1.3's authorized read set, named column by column. NEVER a star: a star reads
+    # whatever the table happens to hold today, including a column added AFTER the
+    # authorization — so the group would read more than it was granted, and nothing would
+    # say so.
+    rows = source.select(
+        F.col('cif_id'), F.col('dr_cr_flag'), F.col('posted_ts'), F.col('status_cd'),
+        F.col('txn_amt'), F.col('txn_dt'))
+
+    # §8's cutoff: the business date at 00:00:00 in Asia/Kolkata. The rendered
+    # session timezone is pinned to UTC, so the governed zone is STATED here rather
+    # than inherited — a cutoff computed in the wrong zone moves silently.
+    cutoff = F.to_utc_timestamp(
+        F.to_timestamp(F.lit(business_date + ' 00:00:00')), 'Asia/Kolkata')
+
+    # §8 rule 1 — the availability gate. This is the filter whose violation is INVISIBLE:
+    # a row kept here that could not yet have been READ at the cutoff produces a feature
+    # that backtests beautifully and is wrong in production, and nothing raises.
+    # Basis posted_at: 'posted_ts' IS the instant the row became readable, so it is compared to
+    # the cutoff as it stands. It is the GOVERNED availability column and deliberately not the
+    # event-time column — a row can happen long before anyone can see it, which is the entire
+    # point of the gate.
+    rows = rows.where(F.col('posted_ts') <= cutoff)
+
+    # §8 rule 2 — the window. Its boundaries are computed as DATES with calendar
+    # arithmetic and turned into instants only at the end. A month is NOT thirty days:
+    # three months before 2026-07-06 is 2026-04-06 and ninety days before it is
+    # 2026-04-07, so a day-count conversion moves the boundary and changes the answer.
+    anchor = F.to_date(F.lit(business_date))
+    # A calendar period: the window ends where the CURRENT month begins, so
+    # the incomplete month the business date sits in is outside it. That is
+    # the whole difference from a trailing window, and it is a different set of rows.
+    window_end = F.trunc(anchor, 'month')
+    # 3 month(s) back, as CALENDAR months: `add_months`
+    # steps whole months and clamps to the end of the month, so 2026-01-31 back one month
+    # is 2026-02-28. Subtracting a day count instead would land on 2026-01-01.
+    window_start = F.add_months(window_end, -3)
+
+    # The window's OWN governed zone is Asia/Kolkata — a different field from the cadence's cutoff
+    # zone, and stated here for the same reason: the rendered session is pinned to UTC, so a zone
+    # left to be inherited moves both boundaries by hours.
+    starts_at = F.to_utc_timestamp(
+        window_start.cast('timestamp'), 'Asia/Kolkata')
+    ends_at = F.to_utc_timestamp(
+        window_end.cast('timestamp'), 'Asia/Kolkata')
+
+    # Both flags as DECLARED: start inclusive (>=), end exclusive (<). Two filters, because they
+    # are two boundaries.
+    rows = rows.where(F.col('txn_dt') >= starts_at)
+    rows = rows.where(F.col('txn_dt') < ends_at)
+    return rows

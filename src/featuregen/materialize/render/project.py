@@ -268,8 +268,13 @@ def _fold(value: str) -> str:
 # ── the datasets ─────────────────────────────────────────────────────────────────────────────────
 
 
-def _slug(value: str) -> str:
-    """A ref fragment as a dataset-name segment: everything outside ``[a-z0-9_]`` becomes ``_``."""
+def slug(value: str) -> str:
+    """A ref fragment as a dataset-name segment: everything outside ``[a-z0-9_]`` becomes ``_``.
+
+    Public because Task 13 derives its node and function names from the same fragments this derives
+    dataset names from, and a second spelling of the rule is a node whose name and whose dataset
+    disagree about which expression it computes.
+    """
     return "".join(char if char.isalnum() or char == "_" else "_" for char in _fold(value))
 
 
@@ -315,7 +320,7 @@ def project_datasets(
     raw: dict[str, str] = {}
     for requirement in (spine_input, *_expression_requirements(authorized)):
         key = f"{_fold(requirement.schema)}.{_fold(requirement.table)}"
-        raw.setdefault(key, f"raw_{_slug(requirement.schema)}__{_slug(requirement.table)}")
+        raw.setdefault(key, f"raw_{slug(requirement.schema)}__{slug(requirement.table)}")
 
     projections: dict[tuple[str, str], str] = {}
     staging: dict[str, str] = {}
@@ -326,7 +331,7 @@ def project_datasets(
         manifests[column] = f"feature_staging_manifest_{column}"
         for expression in sorted(ir.expressions, key=lambda e: e.expr_path):
             projections[(column, expression.expr_path)] = (
-                f"intermediate_{column}__{_slug(expression.expr_path)}")
+                f"intermediate_{column}__{slug(expression.expr_path)}")
 
     datasets = ProjectDatasets(
         raw=dict(sorted(raw.items())),
@@ -452,7 +457,7 @@ def _catalog_entries(datasets: ProjectDatasets, *, published_target: str) -> tup
             comment=f"governed source, read-only: {physical}"))
     for (column, expr_path), name in sorted(datasets.projections.items()):
         entries.append(_parquet_entry(
-            name, DatasetLayer.INTERMEDIATE, path=f"intermediate/{column}/{_slug(expr_path)}",
+            name, DatasetLayer.INTERMEDIATE, path=f"intermediate/{column}/{slug(expr_path)}",
             comment=f"point-in-time projection for {column} / {expr_path} (§8)"))
     entries.append(_parquet_entry(
         datasets.spine, DatasetLayer.PRIMARY, path="primary/spine",

@@ -536,3 +536,407 @@ def test_the_rendered_spine_matches_its_golden(compiled, kind):
         golden.parent.mkdir(parents=True, exist_ok=True)
         golden.write_text(rendered, encoding="utf-8")
     assert rendered == golden.read_text(encoding="utf-8")
+
+
+# ══ Task 13b — the PIT projection (§8 rules 1 and 2) ═════════════════════════════════════════════
+#
+# The rules here are the ones whose violation raises NOTHING. A gate that admits a row the bank
+# could not yet read, and a three-month window silently computed as ninety days, both produce a
+# feature that backtests beautifully and is wrong in production. So every rule below is asserted by
+# RUNNING the rendered source and reading the rows that survive — the spec's own instruction for the
+# worked example ("asserted by executing the generated code, never by inspecting rendered text").
+#
+# Still not Spark. `fake_spark` is a stand-in; L0 (§11.2, Task 15) is what proves the project runs.
+
+PROJECTION_GOLDENS = pathlib.Path(__file__).parent / "goldens" / "projection_nodes"
+
+#: The window's own governed zone, and the cadence's: both `Asia/Kolkata` in the worked fixture, and
+#: separate FIELDS — one test re-declares the window's to prove they are rendered separately.
+WINDOW_ZONE = "Asia/Kolkata"
+
+#: §8's worked example, verbatim. `posted_at` is five days after the transaction, so the row is
+#: invisible on the 3rd and visible on the 6th — and the window contains 2026-07-01 on both dates,
+#: which is what makes this a test of the AVAILABILITY gate and not of the window.
+WORKED_EVENT = dt.datetime(2026, 7, 1)
+WORKED_POSTED = dt.datetime(2026, 7, 5)
+WORKED_INVISIBLE = "2026-07-03"
+WORKED_VISIBLE = "2026-07-06"
+
+
+@pytest.fixture
+def expression(compiled):
+    """The real compiled expression for `total_debit_amount_30d` — trailing 30 days, posted_at."""
+    return compiled[0].irs[0].expressions[0]
+
+
+def _with_pit(expression, **overrides):
+    return dataclasses.replace(expression, pit=dataclasses.replace(expression.pit, **overrides))
+
+
+def _projection(compiled, expression, **overrides):
+    return nodes_compute.render_projection_node(
+        _with_pit(expression, **overrides) if overrides else expression,
+        compiled[2], feature_column=SUM_30D,
+        source_dataset="raw_banking__transactions",
+        projection_dataset="intermediate_total_debit_amount_30d__body_expr")
+
+
+#: Long before any business date these tests use, so a row carrying it always passes rule 1. The
+#: window tests set it deliberately: a rule-2 test that a rule-1 filter happened to also satisfy
+#: would keep passing after rule 2 was deleted.
+LONG_POSTED = dt.datetime(2000, 1, 1)
+
+
+def _txn(**overrides):
+    """One transaction row. Every read-set column present, plus one that is NOT in the read set."""
+    row = {"cif_id": "c1", "dr_cr_flag": "D", "posted_ts": BEFORE, "status_cd": "posted",
+           "txn_amt": 10, "txn_dt": BEFORE, "pan": "4111111111111111"}
+    row.update(overrides)
+    return row
+
+
+def _windowed(txn_dt, amount):
+    """A row that rule 1 always admits, so what survives is rule 2's answer alone."""
+    return _txn(txn_dt=txn_dt, posted_ts=LONG_POSTED, txn_amt=amount)
+
+
+def _project(node: RenderedNode, rows, business_dt: str = BUSINESS_DT):
+    """Execute a rendered projection against the stand-in and return the frame it produced."""
+    run = fake_spark.run_rendered(node.source, node.func_name)
+    return run(fake_spark.DataFrame(rows), business_dt)
+
+
+def _kept(node: RenderedNode, rows, business_dt: str = BUSINESS_DT):
+    return [row["txn_amt"] for row in _project(node, rows, business_dt).rows]
+
+
+# ── the stand-in itself: a fake that models a rule LOOSELY is a test that lies ────────────────────
+
+
+def test_the_stand_ins_add_months_is_the_CALENDAR_operation_not_a_day_count():
+    """If `add_months` were thirty days, every calendar-window test below would pass against a
+    renderer that converted months to days — which is the one thing they exist to catch."""
+    frame = fake_spark.DataFrame([{"d": dt.date(2026, 7, 6)}, {"d": dt.date(2026, 3, 31)}])
+    stepped = frame.select(fake_spark.functions.add_months(
+        fake_spark.functions.col("d"), -3).alias("back"))
+    assert stepped.rows[0]["back"] == dt.date(2026, 4, 6)      # NOT 2026-04-07, which is 90 days
+    assert stepped.rows[1]["back"] == dt.date(2025, 12, 31)
+
+    clamped = frame.select(fake_spark.functions.add_months(
+        fake_spark.functions.col("d"), -1).alias("back"))
+    assert clamped.rows[1]["back"] == dt.date(2026, 2, 28)     # Spark clamps; 30 days is 2026-03-01
+
+
+def test_the_stand_ins_trunc_is_the_start_of_the_named_calendar_period():
+    frame = fake_spark.DataFrame([{"d": dt.date(2026, 7, 6)}])
+    for unit, expected in (("week", dt.date(2026, 7, 6)), ("month", dt.date(2026, 7, 1)),
+                           ("quarter", dt.date(2026, 7, 1)), ("year", dt.date(2026, 1, 1))):
+        got = frame.select(fake_spark.functions.trunc(
+            fake_spark.functions.col("d"), unit).alias("t")).rows[0]["t"]
+        assert got == expected, unit
+
+
+def test_the_stand_in_REFUSES_what_it_does_not_model():
+    """A fake's failure mode is not being wrong, it is being permissive. An `expr` that swallowed
+    arbitrary SQL would make an `event_time_plus_lag` test pass whether or not the lag rendered."""
+    with pytest.raises(NotImplementedError):
+        fake_spark.functions.expr("current_timestamp()")
+    with pytest.raises(NotImplementedError):
+        fake_spark.functions.trunc(fake_spark.functions.col("d"), "fortnight")
+    with pytest.raises(NotImplementedError):
+        fake_spark.functions.col("d").cast("bigint")
+
+
+# ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
+
+
+def test_the_projection_wires_the_datasets_it_was_given_and_the_business_date(compiled, expression):
+    node = _projection(compiled, expression)
+    assert node.inputs == ("raw_banking__transactions", "params:business_dt")
+    assert node.outputs == ("intermediate_total_debit_amount_30d__body_expr",)
+    assert node.name == node.func_name == "project_total_debit_amount_30d__body_expr"
+    assert node.tags == ("intermediate", "projection")
+    assert "banking" not in node.source and "transactions" not in node.source
+
+
+def test_the_projection_source_parses_and_renders_identically_every_time(compiled, expression):
+    """Determinism: `generated_project_hash` must identify WHAT was built, not the day it was."""
+    first, second = _projection(compiled, expression), _projection(compiled, expression)
+    assert ast.parse(first.source)
+    assert first.source == second.source and first.imports == second.imports
+
+
+# ── §8 rule 1: the availability gate ─────────────────────────────────────────────────────────────
+
+
+def test_rule_1_the_WORKED_EXAMPLE_excludes_then_includes_the_same_row(compiled, expression):
+    """The spec's worked example, EXECUTED: `transaction_date = 2026-07-01`, `posted_at =
+    2026-07-05` — excluded at `business_dt = 2026-07-03`, included at `2026-07-06`.
+
+    Nothing about the row changes between the two runs. What changes is what the bank knew.
+    """
+    node = _projection(compiled, expression)
+    row = _txn(txn_dt=WORKED_EVENT, posted_ts=WORKED_POSTED, txn_amt=100)
+    assert _kept(node, [row], WORKED_INVISIBLE) == []
+    assert _kept(node, [row], WORKED_VISIBLE) == [100]
+
+
+def test_rule_1_gates_on_the_GOVERNED_availability_column_not_the_event_time(compiled, expression):
+    """`posted_ts` is the governed availability column and `txn_dt` is the clock. A row can happen
+    long before anyone can see it — a renderer that gated on the event time would keep this row."""
+    node = _projection(compiled, expression)
+    unposted = _txn(txn_dt=WORKED_EVENT, posted_ts=AFTER, txn_amt=7)
+    assert _kept(node, [unposted], WORKED_VISIBLE) == []
+
+
+def test_rule_1_uses_the_GOVERNED_zone_for_the_cutoff_not_the_sessions(compiled, expression):
+    """The cadence is `00:00:00 Asia/Kolkata`, so 2026-07-27's cutoff is 2026-07-26 **18:30 UTC**.
+    A row posted at 20:00 UTC is after it and before UTC midnight, so a renderer that inherited the
+    pinned-UTC session zone keeps it."""
+    node = _projection(compiled, expression)
+    late = _txn(txn_dt=ALSO_BEFORE, posted_ts=AFTER_IN_UTC_ONLY, txn_amt=3)
+    assert _kept(node, [late]) == []
+    assert _kept(node, [_txn(txn_dt=ALSO_BEFORE, posted_ts=CUTOFF_UTC, txn_amt=3)]) == [3]
+
+
+def test_rule_1_renders_the_DECLARED_LAG_for_event_time_plus_lag(compiled, expression):
+    """Under `event_time_plus_lag` the availability column holds the EVENT time, and the row is not
+    readable until `lag_hours` later. A renderer that dropped the lag admits every row six hours
+    early — six hours of rows the bank had not yet received."""
+    node = _projection(
+        compiled, expression,
+        availability_basis=nodes_compute.AvailabilityBasis.EVENT_TIME_PLUS_LAG,
+        availability_lag_hours="6")
+    # Exactly at the cutoff: readable without the lag, six hours short of readable with it.
+    at_cutoff = _txn(txn_dt=ALSO_BEFORE, posted_ts=CUTOFF_UTC, txn_amt=1)
+    six_hours_earlier = _txn(txn_dt=ALSO_BEFORE, posted_ts=CUTOFF_UTC - dt.timedelta(hours=6),
+                             txn_amt=2)
+    assert _kept(node, [at_cutoff, six_hours_earlier]) == [2]
+    assert "INTERVAL 6 HOURS" in node.source
+
+
+def test_rule_1_renders_a_FRACTIONAL_lag_exactly_rather_than_rounding_it(compiled, expression):
+    """`lag_hours` is a canonical string because a float reaching an identity hash is a rounding
+    decision nobody made. Rendering it must not make that decision either."""
+    node = _projection(
+        compiled, expression,
+        availability_basis=nodes_compute.AvailabilityBasis.EVENT_TIME_PLUS_LAG,
+        availability_lag_hours="1.5")
+    assert "INTERVAL 90 MINUTES" in node.source
+    just_inside = _txn(txn_dt=ALSO_BEFORE, posted_ts=CUTOFF_UTC - dt.timedelta(minutes=90),
+                       txn_amt=5)
+    just_outside = _txn(txn_dt=ALSO_BEFORE, posted_ts=CUTOFF_UTC - dt.timedelta(minutes=89),
+                        txn_amt=6)
+    assert _kept(node, [just_inside, just_outside]) == [5]
+
+
+def test_rule_1_gates_INGESTED_AT_on_the_governed_column_too(compiled, expression):
+    node = _projection(compiled, expression,
+                       availability_basis=nodes_compute.AvailabilityBasis.INGESTED_AT)
+    assert _kept(node, [_txn(txn_dt=ALSO_BEFORE, posted_ts=AFTER, txn_amt=9)]) == []
+    assert "ingested_at" in node.source
+
+
+# ── §8 rule 2: window boundaries ─────────────────────────────────────────────────────────────────
+
+
+def test_rule_2_a_trailing_day_window_ends_at_the_business_date_and_spans_its_length(
+        compiled, expression):
+    """30 trailing days from 2026-07-27, in Asia/Kolkata: `[2026-06-27 00:00 IST, 2026-07-27 00:00
+    IST)` — which is `[2026-06-26 18:30 UTC, 2026-07-26 18:30 UTC)`."""
+    node = _projection(compiled, expression)
+    rows = [
+        _windowed(dt.datetime(2026, 6, 26, 18, 29), 1),   # a minute before the start
+        _windowed(dt.datetime(2026, 6, 26, 18, 30), 2),   # the start itself — inclusive
+        _windowed(dt.datetime(2026, 7, 26, 18, 29), 3),   # a minute before the end
+        _windowed(dt.datetime(2026, 7, 26, 18, 30), 4),   # the end itself — exclusive
+    ]
+    assert _kept(node, rows) == [2, 3]
+
+
+def test_rule_2_BOTH_inclusivity_flags_are_read_as_DATA_not_assumed(compiled, expression):
+    """`start_inclusive` and `end_inclusive` are carried per expression because they vary. Flipping
+    both must move exactly the two boundary rows — a renderer that assumed `[start, end)` cannot."""
+    flipped = _projection(compiled, expression,
+                          window_start_inclusive="exclusive", window_end_inclusive="inclusive")
+    rows = [
+        _windowed(dt.datetime(2026, 6, 26, 18, 30), 2),   # the start — now EXCLUDED
+        _windowed(dt.datetime(2026, 7, 26, 18, 29), 3),
+        _windowed(dt.datetime(2026, 7, 26, 18, 30), 4),   # the end — now INCLUDED
+    ]
+    assert _kept(flipped, rows) == [3, 4]
+
+
+def test_rule_2_a_MONTH_window_is_a_CALENDAR_month_and_NOT_thirty_days(compiled, expression):
+    """The whole of §8 rule 2. Three months before 2026-07-06 is **2026-04-06**; ninety days before
+    it is **2026-04-07**. A row on 2026-04-06 is inside the calendar window and outside the day-count
+    one, so this test fails against any renderer that converts months to days."""
+    node = _projection(compiled, expression, window_length=3, window_unit="month")
+    on_the_calendar_boundary = _windowed(dt.datetime(2026, 4, 6, 12, 0), 1)
+    assert _kept(node, [on_the_calendar_boundary], "2026-07-06") == [1]
+    assert "add_months" in node.source and "90" not in node.source
+
+
+def test_rule_2_a_month_window_CLAMPS_to_the_end_of_the_month(compiled, expression):
+    """One month before 2026-03-31 is 2026-02-28 — `add_months`'s clamping. Thirty days before it
+    is 2026-03-01, three days later and a whole month of rows lighter."""
+    node = _projection(compiled, expression, window_length=1, window_unit="month")
+    late_february = _windowed(dt.datetime(2026, 2, 28, 12, 0), 1)
+    assert _kept(node, [late_february], "2026-03-31") == [1]
+
+
+def test_rule_2_a_CALENDAR_PERIOD_window_excludes_the_INCOMPLETE_current_period(
+        compiled, expression):
+    """A calendar period ends where the current period BEGINS: as of 2026-07-06, three calendar
+    months are `[2026-04-01, 2026-07-01)`. The trailing window of the same length and unit would
+    include 2026-07-03, so the two bases select different rows and the flag is not decoration."""
+    period = _projection(compiled, expression, window_basis="calendar_period",
+                         window_length=3, window_unit="month")
+    trailing = _projection(compiled, expression, window_length=3, window_unit="month")
+    this_month = _windowed(dt.datetime(2026, 7, 3, 12, 0), 1)
+    first_of_the_period = _windowed(dt.datetime(2026, 4, 1, 12, 0), 2)
+    just_before_it = _windowed(dt.datetime(2026, 3, 31, 12, 0), 3)
+    rows = [this_month, first_of_the_period, just_before_it]
+    # Disjoint. The trailing window starts on 2026-04-06 and so drops the 1st of April, and it
+    # ends on the business date and so keeps the 3rd of July. Neither row is in both.
+    assert _kept(period, rows, "2026-07-06") == [2]
+    assert _kept(trailing, rows, "2026-07-06") == [1]
+
+
+def test_rule_2_every_window_unit_renders_its_OWN_calendar_arithmetic(compiled, expression):
+    """Five units, and none of them collapses into another's step. A quarter is three months and a
+    year is twelve, so `add_months` carries the multiplier rather than a separate day count."""
+    starts = {unit: _projection(compiled, expression, window_length=2, window_unit=unit).source
+              for unit in ("day", "week", "month", "quarter", "year")}
+    assert "F.date_sub(window_end, 2)" in starts["day"]
+    assert "F.date_sub(window_end, 14)" in starts["week"]
+    assert "F.add_months(window_end, -2)" in starts["month"]
+    assert "F.add_months(window_end, -6)" in starts["quarter"]
+    assert "F.add_months(window_end, -24)" in starts["year"]
+
+
+def test_rule_2_a_year_window_covers_a_LEAP_day_by_being_a_year(compiled, expression):
+    """One year before 2027-01-01 is 2026-01-01 — 365 days. One year before 2025-01-01 is
+    2024-01-01, which is 366. A renderer using either constant is wrong on the other date."""
+    node = _projection(compiled, expression, window_length=1, window_unit="year")
+    first_day = _windowed(dt.datetime(2024, 1, 1, 12, 0), 1)
+    assert _kept(node, [first_day], "2025-01-01") == [1]
+
+
+def test_rule_2_the_window_uses_ITS_OWN_governed_zone_not_the_cadences(compiled, expression):
+    """`window_timezone` and the cadence's `cutoff_timezone` are separate governed fields. Declared
+    in `America/New_York`, 2026-07-27's midnight is 04:00 UTC rather than the previous 18:30, so a
+    renderer that reused the cutoff's zone — or inherited the session's UTC — moves the boundary."""
+    node = _projection(compiled, expression, window_timezone="America/New_York")
+    assert "'America/New_York'" in node.source and WINDOW_ZONE in node.source  # both, separately
+    rows = [
+        _windowed(dt.datetime(2026, 7, 26, 20, 0), 1),   # 16:00 NY on the 26th — inside
+        _windowed(dt.datetime(2026, 7, 27, 4, 1), 2),    # 00:01 NY on the 27th — outside
+    ]
+    assert _kept(node, rows) == [1]
+
+
+# ── the read set ─────────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_projection_selects_ONLY_the_read_set_columns_and_never_a_star(compiled, expression):
+    """`*` reads whatever the table holds today, including a column added after Gate 2 authorized
+    the read. The `pan` on every fixture row is exactly that column, and it must not come out."""
+    node = _projection(compiled, expression)
+    authorized = sorted({ref.column for ref in expression.physical_read_set if ref.column})
+    assert _project(node, [_txn()]).columns == authorized
+    assert "pan" not in node.source
+    assert "*" not in node.source
+
+
+# ── refusals decidable at RENDER time ────────────────────────────────────────────────────────────
+
+
+def test_it_refuses_an_availability_BASIS_outside_the_closed_vocabulary(compiled, expression):
+    """The default an unmodelled member falls into is no gate at all — every row visible."""
+    with pytest.raises(ValueError, match="availability basis"):
+        _projection(compiled, expression, availability_basis="whenever")
+
+
+def test_it_refuses_a_LAG_that_contradicts_the_declared_basis(compiled, expression):
+    with pytest.raises(ValueError, match="lag"):
+        _projection(compiled, expression, availability_lag_hours="6")
+    with pytest.raises(ValueError, match="lag"):
+        _projection(compiled, expression,
+                    availability_basis=nodes_compute.AvailabilityBasis.EVENT_TIME_PLUS_LAG)
+
+
+def test_it_refuses_a_NEGATIVE_or_unreadable_lag(compiled, expression):
+    for bad in ("-1", "later", "0.0001"):
+        with pytest.raises(ValueError, match="lag"):
+            _projection(compiled, expression,
+                        availability_basis=nodes_compute.AvailabilityBasis.EVENT_TIME_PLUS_LAG,
+                        availability_lag_hours=bad)
+
+
+def test_it_refuses_a_window_UNIT_or_BASIS_or_INCLUSIVITY_outside_the_closed_vocabulary(
+        compiled, expression):
+    with pytest.raises(ValueError, match="unit"):
+        _projection(compiled, expression, window_unit="fortnight")
+    with pytest.raises(ValueError, match="basis"):
+        _projection(compiled, expression, window_basis="rolling")
+    with pytest.raises(ValueError, match="boundaries are declared"):
+        _projection(compiled, expression, window_start_inclusive="maybe")
+
+
+def test_it_refuses_a_window_of_no_length(compiled, expression):
+    """A window spanning no time is an empty projection for every entity, and every feature falls
+    to its empty-window policy with no error anywhere."""
+    with pytest.raises(ValueError, match="window length"):
+        _projection(compiled, expression, window_length=0)
+
+
+def test_it_refuses_an_expression_whose_READ_SET_SPANS_TABLES(compiled, expression):
+    """A projection reads ONE relation; a node handed one dataset cannot name another table's
+    columns. The traversal that would reach it is the join plan, and this renderer emits no join."""
+    from featuregen.materialize.expression_ir import PhysicalRef
+    elsewhere = dataclasses.replace(
+        expression, physical_read_set=(*expression.physical_read_set, PhysicalRef(
+            logical_ref="hdfc::public.accounts.acct_id", catalog_source="hdfc", schema="banking",
+            table="accounts", column="acct_id", roles=())))
+    with pytest.raises(ValueError, match="spans"):
+        nodes_compute.render_projection_node(
+            elsewhere, compiled[2], feature_column=SUM_30D,
+            source_dataset="raw", projection_dataset="intermediate")
+
+
+def test_it_refuses_a_PIT_column_outside_the_authorized_read_set(compiled, expression):
+    """Filtering on a column Gate 2 did not authorize is a read nobody granted — and it is not in
+    the select either, so the node would fail on the cluster instead of here."""
+    with pytest.raises(ValueError, match="read set"):
+        _projection(compiled, expression, availability_ref="hdfc::public.transactions.settled_ts")
+
+
+def test_it_refuses_something_that_is_not_a_compiled_expression(compiled):
+    with pytest.raises(TypeError, match="ExpressionExecutionIR"):
+        nodes_compute.render_projection_node(
+            object(), compiled[2], feature_column=SUM_30D,
+            source_dataset="raw", projection_dataset="intermediate")
+
+
+# ── goldens: a change detector, and the weakest test here ────────────────────────────────────────
+
+
+PROJECTION_VARIANTS = {
+    "trailing_days_posted_at": {},
+    "calendar_months": {"window_basis": "calendar_period", "window_length": 3,
+                        "window_unit": "month"},
+    "event_time_plus_lag": {"availability_basis": "event_time_plus_lag",
+                            "availability_lag_hours": "6"},
+}
+
+
+@pytest.mark.parametrize("variant", sorted(PROJECTION_VARIANTS))
+def test_the_rendered_projection_matches_its_golden(compiled, expression, variant):
+    """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
+    golden = PROJECTION_GOLDENS / f"{variant}.py"
+    rendered = _projection(compiled, expression, **PROJECTION_VARIANTS[variant]).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")

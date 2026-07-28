@@ -1,4 +1,4 @@
-"""Spec §4.2 / §8 — the COMPUTE nodes of the generated pipeline. Task 13a renders the spine.
+"""Spec §4.2 / §8 — the COMPUTE nodes of the generated pipeline: the spine, and the PIT projection.
 
 **This module emits text.** Like the rest of ``render``, it never imports ``pyspark`` and never
 imports ``kedro``; both appear only inside the strings below. The compiler runs wherever the
@@ -41,13 +41,52 @@ What is left is a caller whose plan, contract, spine and physical requirement do
 population, and §14's closed vocabularies have no member for any of those, so they raise. The
 refusals the RENDERED code performs are a different thing entirely: they are §9 gates on real rows,
 and they name :class:`~featuregen.materialize.codes.ValidationGateCode` members.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────
+
+**The PIT projection (§8 rules 1 and 2)** decides which rows one expression is allowed to SEE. It is
+the node whose failure mode is invisible: a gate that keeps a row the bank did not yet know about
+raises nothing, computes a number, validates beautifully in backtest and is wrong in production. So
+both rules render from the expression's own :class:`~featuregen.materialize.expression_ir.PitSpec`,
+and neither has a default.
+
+* **Rule 1, the availability gate.** ``availability_ref <= cutoff``, where the basis says what that
+  column MEANS. ``posted_at`` and ``ingested_at`` name the arrival instant itself; under
+  ``event_time_plus_lag`` the column holds the EVENT time and the declared ``lag_hours`` is when it
+  could first have been read, so the lag is added — a rendering that dropped it would admit rows for
+  a lag the declaration exists to state.
+* **Rule 2, window boundaries.** ``basis``, ``length``, ``unit``, ``start_inclusive`` and
+  ``end_inclusive``, each honoured on its own. The two inclusivity flags are carried PER EXPRESSION
+  precisely because they vary, so they are read as data rather than assumed to be ``[start, end)``.
+
+**Calendar periods are calendar periods.** Boundaries are computed as DATES with date arithmetic —
+``add_months`` for month, quarter and year — and only then converted to instants. A month is not
+thirty days: three months before 2026-07-06 is 2026-04-06, and ninety days before it is 2026-04-07,
+so a day-count conversion moves the boundary and silently changes which rows the feature sums. The
+date-first order matters for a second reason: a boundary computed as ``instant - N*24h`` crosses a
+DST change wrong, while a local midnight converted to UTC does not.
+
+**Two zones, both stated.** The cutoff's zone is the cadence's; the window's is
+``PitSpec.window_timezone``; they are separate governed fields and are separately written into the
+rendered source. The rendered session is pinned to UTC (§7), so a zone left to be inherited is a
+boundary quietly moved by hours.
+
+**Only the read set is selected — never a star.** Gate 2 authorized a SET of columns, and ``*``
+reads whatever the table happens to hold today, including a column added after the authorization.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import MaterializationContractV1
+from featuregen.materialize.expression_ir import (
+    AvailabilityBasis,
+    ExpressionExecutionIR,
+    PitSpec,
+    RefRole,
+)
 from featuregen.materialize.group_plan import FeatureGroupPlanV1
 from featuregen.materialize.inputs import PhysicalInputRequirement
 from featuregen.materialize.inventory import (
@@ -55,7 +94,7 @@ from featuregen.materialize.inventory import (
     PartitionTransform,
     StaticSnapshot,
 )
-from featuregen.materialize.render.project import RenderedNode
+from featuregen.materialize.render.project import RenderedNode, slug
 from featuregen.materialize.spine import (
     ActivePopulation,
     CurrentSnapshot,
@@ -69,6 +108,9 @@ from featuregen.overlay.upload.object_ref import parse_ref
 __all__ = [
     "SPINE_FUNC_NAME",
     "SPINE_NODE_NAME",
+    "projection_func_name",
+    "projection_node_name",
+    "render_projection_node",
     "render_spine_node",
 ]
 
@@ -93,6 +135,32 @@ _RANK_COLUMN = "__spine_rank"
 _DATAFRAME_IMPORT = "from pyspark.sql import DataFrame"
 _FUNCTIONS_IMPORT = "from pyspark.sql import functions as F"
 _WINDOW_IMPORT = "from pyspark.sql import Window"
+
+#: How many MONTHS one window unit is, for the units that are calendar months. ``add_months`` is
+#: the calendar operation; there is deliberately no entry mapping any of these to a day count,
+#: because the day count IS the defect §8 rule 2 names.
+_MONTHS_PER_UNIT: dict[str, int] = {"month": 1, "quarter": 3, "year": 12}
+
+#: How many DAYS one window unit is, for the two units that ARE a whole number of days in every
+#: calendar. A day is one day and a week is seven; neither depends on where in the year it lands,
+#: which is exactly what is untrue of a month.
+_DAYS_PER_UNIT: dict[str, int] = {"day": 1, "week": 7}
+
+#: ``F.trunc``'s format for the calendar period a unit names — the first instant of the period the
+#: business date falls in. ``day`` is absent because a date already IS one, and Spark's ``trunc``
+#: has no ``day`` format: it returns NULL for an unrecognized one, and a NULL boundary silently
+#: keeps or drops every row.
+_PERIOD_START: dict[str, str] = {"week": "week", "month": "month", "quarter": "quarter",
+                                 "year": "year"}
+
+#: The two window bases (``formula.schema.WindowBasis``). Closed, and rendered as two different
+#: anchors rather than one anchor with a flag.
+_TRAILING = "trailing"
+_CALENDAR_PERIOD = "calendar_period"
+
+#: ``formula.schema.Inclusivity`` — which comparison each boundary flag renders as.
+_START_COMPARISON: dict[str, str] = {"inclusive": ">=", "exclusive": ">"}
+_END_COMPARISON: dict[str, str] = {"inclusive": "<=", "exclusive": "<"}
 
 #: How ``PartitionTransform`` renders a business DATE as a partition value. The transform is
 #: DECLARED (§3.4) and this mapping only applies it; a member missing from here is refused rather
@@ -463,6 +531,16 @@ def _wrap(text: str, width: int) -> list[str]:
     return lines
 
 
+def _comment(text: str, *, indent: str = "    ", width: int = 92) -> list[str]:
+    """A rendered comment block, WRAPPED rather than hand-broken.
+
+    Declared column names and timezones are spliced into these, and they vary in length: a comment
+    hand-wrapped around one bank's names is a ragged comment for the next, and a long one is a line
+    a reviewer scrolls past.
+    """
+    return [f"{indent}# {line}" for line in _wrap(text, width)]
+
+
 def _safe_text(value: str, what: str) -> str:
     """A declared value spliced INTO a rendered prose message.
 
@@ -495,6 +573,22 @@ def _refuse(code: ValidationGateCode, text: str, *, tail: str | None = None,
         # The space belongs INSIDE the literal: `"…for:" + repr(x)` renders `for:'2020-01-01'`.
         parts[-1] = f'{inner}"{wrapped[-1]} " + {tail}'
     return [f"{indent}raise RuntimeError(", *parts[:-1], f"{parts[-1]})"]
+
+
+def _cutoff_lines(cutoff_time: str, cutoff_zone: str) -> list[str]:
+    """§8's ``cutoff``, in the CADENCE's governed zone — the one shape both nodes must use.
+
+    Shared rather than spelled twice: the spine's rule 6 and an expression's rule 1 are the same
+    comparison against the same instant, and two renderings of one instant is one of them being
+    wrong later.
+    """
+    return [
+        f"    # §8's cutoff: the business date at {cutoff_time} in {cutoff_zone}. The rendered",
+        "    # session timezone is pinned to UTC, so the governed zone is STATED here rather",
+        "    # than inherited — a cutoff computed in the wrong zone moves silently.",
+        "    cutoff = F.to_utc_timestamp(",
+        f"        F.to_timestamp(F.lit(business_date + {' ' + cutoff_time!r})), {cutoff_zone!r})",
+    ]
 
 
 def _render_source(
@@ -537,14 +631,7 @@ def _render_source(
         and _column(policy.availability_ref, "the policy's availability_ref") == availability)
 
     if availability is not None or isinstance(policy, LatestAvailableAsOf):
-        lines += [
-            f"    # §8's cutoff: the business date at {cutoff_time} in {cutoff_zone}. The rendered",
-            "    # session timezone is pinned to UTC, so the governed zone is STATED here rather",
-            "    # than inherited — a cutoff computed in the wrong zone moves silently.",
-            "    cutoff = F.to_utc_timestamp(",
-            f"        F.to_timestamp(F.lit(business_date + {' ' + cutoff_time!r})), {cutoff_zone!r})",
-            "",
-        ]
+        lines += [*_cutoff_lines(cutoff_time, cutoff_zone), ""]
     lines += [*body.selection]
 
     if availability is not None and not policy_filters_availability:
@@ -587,3 +674,397 @@ def _render_source(
         "    return spine",
     ]
     return "\n".join(lines) + "\n"
+
+
+# ══ §8 rules 1 and 2 — the point-in-time projection ══════════════════════════════════════════════
+
+
+def projection_node_name(feature_column: str, expr_path: str) -> str:
+    """The Kedro node name for one expression's projection — how an operator addresses it."""
+    return f"project_{feature_column}__{slug(expr_path)}"
+
+
+def projection_func_name(feature_column: str, expr_path: str) -> str:
+    """The function ``nodes.py`` defines and ``pipeline.py`` wires BY NAME. One per expression:
+    §7 gives every expression its own projection, and no scan is shared in this slice."""
+    return projection_node_name(feature_column, expr_path)
+
+
+def render_projection_node(
+    expression: ExpressionExecutionIR,
+    contract: MaterializationContractV1,
+    *,
+    feature_column: str,
+    source_dataset: str,
+    projection_dataset: str,
+) -> RenderedNode:
+    """Render the node that decides which rows ONE expression may see (§8 rules 1 and 2).
+
+    Args:
+        expression: the compiled expression. Its ``pit`` is the whole of what is rendered here, and
+            its ``physical_read_set`` is the only set of columns the node is allowed to name.
+        contract: the group's materialization contract. Rule 1's cutoff is derived from ITS cadence
+            — the window's zone is the expression's own and is a different field.
+        feature_column: the published column this expression contributes to. Names the node.
+        source_dataset: the catalog name of the governed source table. A NAME; the location behind
+            it is catalog configuration, which is the only place a location may be written.
+        projection_dataset: the catalog name this node writes.
+
+    Returns:
+        A :class:`~featuregen.materialize.render.project.RenderedNode` whose wiring Task 12 checks.
+
+    Raises:
+        TypeError: an argument is not the type it must be.
+        ValueError: the expression cannot be projected as one relation — its read set spans tables,
+            its clock or its availability column is outside the authorized read set, its window
+            names a basis, unit or inclusivity outside the closed vocabulary, or its declared lag
+            and its declared basis contradict each other.
+    """
+    if not isinstance(expression, ExpressionExecutionIR):
+        raise TypeError(
+            f"rendering a projection needs the compiled ExpressionExecutionIR, got "
+            f"{type(expression).__name__}: the PIT spec, the read set and the join plan are what "
+            f"decide which rows the feature may see, and none of them can be inferred from a name")
+    if not isinstance(contract, MaterializationContractV1):
+        raise TypeError(
+            f"rendering a projection needs the MaterializationContractV1, got "
+            f"{type(contract).__name__}: §8's cutoff is derived from ITS cadence, and a cutoff "
+            f"taken from anywhere else is a second answer to which clock the group runs on")
+    if not isinstance(feature_column, str) or not feature_column.isidentifier():
+        raise ValueError(
+            f"the published column this expression feeds is {feature_column!r}, which is not an "
+            f"identifier: it names the node and the rendered function, and a name Python cannot "
+            f"parse is a generated project that fails at import")
+    _dataset(source_dataset, "the projection's source dataset")
+    _dataset(projection_dataset, "the projection's output dataset")
+
+    pit = expression.pit
+    read_set = _read_set_columns(expression)
+    clock = _read_column(pit.event_time_ref, read_set, "the window's event_time_ref")
+    available = _read_column(pit.availability_ref, read_set, "the expression's availability_ref")
+
+    source = "\n".join([
+        f"def {projection_func_name(feature_column, expression.expr_path)}"
+        f"(source: DataFrame, business_dt: str) -> DataFrame:",
+        *_projection_docstring(expression, feature_column),
+        "    business_date = str(business_dt)",
+        "",
+        *_read_set_lines(read_set),
+        "",
+        *_cutoff_lines(contract.pit_semantics.cutoff_time, contract.pit_semantics.cutoff_timezone),
+        "",
+        *_availability_gate(pit, available),
+        "",
+        *_window_boundaries(pit, clock),
+        "    return rows",
+    ]) + "\n"
+    return RenderedNode(
+        name=projection_node_name(feature_column, expression.expr_path),
+        func_name=projection_func_name(feature_column, expression.expr_path),
+        source=source,
+        inputs=(source_dataset, _BUSINESS_DT_PARAMETER),
+        outputs=(projection_dataset,),
+        imports=(_DATAFRAME_IMPORT, _FUNCTIONS_IMPORT),
+        tags=("intermediate", "projection"),
+    )
+
+
+# ── what the expression must be for one relation to be projectable ───────────────────────────────
+
+
+def _read_set_columns(expression: ExpressionExecutionIR) -> tuple[str, ...]:
+    """The authorized COLUMN names of the one relation this projection reads, sorted.
+
+    Sorted rather than left in read-set order so the rendered bytes cannot move with a change to
+    how the compiler happened to walk the expression — ``generated_project_hash`` must identify
+    what was built.
+
+    A read set spanning two tables is refused rather than rendered. Reaching the second table needs
+    the join plan, and this renderer emits no join: rendering one relation and silently dropping
+    the traversal would compute the aggregate over the wrong rows, which is the failure mode that
+    reports nothing.
+    """
+    if expression.join_plan.steps:
+        raise ValueError(
+            f"the expression's governed join plan has {len(expression.join_plan.steps)} hop(s) and "
+            f"this renderer projects a single relation: rendering the source table alone would "
+            f"drop the traversal that reaches the grain, and the aggregate would be computed over "
+            f"rows that never belonged to the entity — with nothing to report it")
+    tables = {(ref.schema.strip().lower(), ref.table.strip().lower())
+              for ref in expression.physical_read_set}
+    if len(tables) != 1:
+        raise ValueError(
+            f"the expression's read set spans {sorted(tables)}: a projection reads ONE governed "
+            f"relation, and a node handed one dataset cannot name columns of another table")
+    columns = sorted({ref.column for ref in expression.physical_read_set if ref.column is not None})
+    if not columns:
+        raise ValueError(
+            "the expression's read set names no column at all, only the relation: a projection "
+            "that selected nothing would hand the calculation an empty row shape, and `*` — the "
+            "only other thing it could select — reads whatever the table happens to hold today")
+    relation = {ref.logical_ref for ref in expression.physical_read_set
+                if RefRole.SOURCE_TABLE in ref.roles}
+    if len(relation) != 1:
+        raise ValueError(
+            f"the expression's read set names {len(relation)} source relation(s): §2.1 records the "
+            f"relation itself as a read, and a projection with no relation — or two — is not one "
+            f"table's rows")
+    return tuple(columns)
+
+
+def _read_column(ref: str, read_set: tuple[str, ...], what: str) -> str:
+    """One PIT ref reduced to a column, REQUIRED to be inside the authorized read set.
+
+    Gate 2 authorized a set of columns. A filter on a column outside it is a read nobody governed,
+    and it would not appear in the projection's select either — so the node would fail on the
+    cluster, at the point where the cheapest thing to have done was refuse here.
+    """
+    column = _column(ref, what)
+    if column not in read_set:
+        raise ValueError(
+            f"{what} is {ref!r}, whose column {column!r} is not in the authorized read set "
+            f"{list(read_set)}: §1.3 authorized a SET of columns, and filtering on one outside it "
+            f"is a read this group was never granted")
+    return column
+
+
+# ── the rendered body ────────────────────────────────────────────────────────────────────────────
+
+
+def _projection_docstring(expression: ExpressionExecutionIR, feature_column: str) -> list[str]:
+    pit = expression.pit
+    summary = (
+        f"Which rows {_safe_text(feature_column, 'the feature column')} / "
+        f"{_safe_text(expression.expr_path, 'the expression path')} may SEE — nothing is aggregated "
+        f"here. A row survives only if it had ARRIVED by the cutoff (rule 1) and its event time "
+        f"falls inside the declared {pit.window_length}-{_safe_text(pit.window_unit, 'the unit')} "
+        f"{_safe_text(pit.window_basis, 'the basis')} window (rule 2).")
+    return [
+        f'    """Point-in-time rows for {_safe_text(feature_column, "the feature column")} (§8).',
+        "",
+        *(f"    {part}" for part in _wrap(summary, 92)),
+        '    """',
+    ]
+
+
+def _read_set_lines(read_set: tuple[str, ...]) -> list[str]:
+    """The select. Named column by column, and never ``*``."""
+    named = [f"F.col({column!r})" for column in read_set]
+    lines = [
+        "    # §1.3's authorized read set, named column by column. NEVER a star: a star reads",
+        "    # whatever the table happens to hold today, including a column added AFTER the",
+        "    # authorization — so the group would read more than it was granted, and nothing would",
+        "    # say so.",
+        "    rows = source.select(",
+    ]
+    line = "       "
+    for index, part in enumerate(named):
+        piece = part + ("," if index < len(named) - 1 else ")")
+        if len(line) + 1 + len(piece) > 98:
+            lines.append(line)
+            line = "       "
+        line = f"{line} {piece}"
+    lines.append(line)
+    return lines
+
+
+def _lag_interval(lag_hours: str) -> tuple[str, str]:
+    """``(rendered INTERVAL, prose)`` for a declared ``lag_hours`` — exact, never rounded.
+
+    The lag is a canonical STRING because the governed fact types it as a JSON number and a float
+    reaching an identity hash is a rounding decision nobody made. It is read here with ``Decimal``
+    for the same reason, and it is rendered in the LARGEST unit that expresses it exactly: ``6``
+    hours renders as ``INTERVAL 6 HOURS`` and reads as the declaration, while 21600 seconds reads as
+    arithmetic somebody has to check.
+    """
+    try:
+        hours = Decimal(lag_hours)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"the declared availability lag is {lag_hours!r}, which is not a number ({exc}): it is "
+            f"rendered as an interval, and a lag nothing can read is a gate that would either not "
+            f"render or render as something else") from exc
+    if hours.is_nan() or hours.is_infinite() or hours < 0:
+        raise ValueError(
+            f"the declared availability lag is {lag_hours!r}: a lag says how long after the event a "
+            f"row could first be READ, so a negative or non-finite one describes a row available "
+            f"before it happened")
+    for scale, unit, word in ((1, "HOURS", "hour"), (60, "MINUTES", "minute"),
+                              (3600, "SECONDS", "second")):
+        amount = hours * scale
+        if amount == amount.to_integral_value():
+            whole = int(amount)
+            return f"INTERVAL {whole} {unit}", f"{whole} {word}{'' if whole == 1 else 's'}"
+    raise ValueError(
+        f"the declared availability lag {lag_hours!r} hours is not a whole number of seconds: it "
+        f"would have to be rounded to render as an interval, and rounding a governed lag is a "
+        f"decision this renderer has no authority to make")
+
+
+def _availability_gate(pit: PitSpec, available: str) -> list[str]:
+    """§8 rule 1 — the gate whose violation is INVISIBLE.
+
+    A row kept here that the bank could not yet have read produces a feature that backtests
+    beautifully and fails in production, and nothing raises anywhere along the way. So the basis
+    decides the comparison explicitly and there is no default branch.
+    """
+    try:
+        basis = AvailabilityBasis(pit.availability_basis)
+    except ValueError as exc:
+        raise ValueError(
+            f"the expression declares the availability basis {pit.availability_basis!r}, which is "
+            f"not one AVAILABILITY_TIME governs ({exc}): the vocabulary is CLOSED, and a basis "
+            f"nothing recognizes would have to be gated on by guessing what the column means") from exc
+    lag_declared = pit.availability_lag_hours is not None
+    if (basis is AvailabilityBasis.EVENT_TIME_PLUS_LAG) != lag_declared:
+        raise ValueError(
+            f"the expression's availability basis is {basis.value!r} and its "
+            f"declared lag is {pit.availability_lag_hours!r}: a lag is defined for "
+            f"`event_time_plus_lag` and for nothing else, so one basis without it would render a "
+            f"gate that admits rows too early and the other with it would apply a lag to an "
+            f"arrival time that already includes one")
+
+    head = [
+        "    # §8 rule 1 — the availability gate. This is the filter whose violation is INVISIBLE:",
+        "    # a row kept here that could not yet have been READ at the cutoff produces a feature",
+        "    # that backtests beautifully and is wrong in production, and nothing raises.",
+    ]
+    if basis is AvailabilityBasis.EVENT_TIME_PLUS_LAG:
+        interval, prose = _lag_interval(str(pit.availability_lag_hours))
+        return [
+            *head,
+            *_comment(
+                f"Basis {basis.value}: {available!r} holds the EVENT time, and the "
+                f"declared lag of {prose} is how long after it the row could first be read. The lag "
+                f"is added rather than dropped — dropping it admits every row a whole {prose} early."),
+            f"    available_at = F.col({available!r}) + F.expr({interval!r})",
+            "    rows = rows.where(available_at <= cutoff)",
+        ]
+    if basis in (AvailabilityBasis.POSTED_AT, AvailabilityBasis.INGESTED_AT):
+        return [
+            *head,
+            *_comment(
+                f"Basis {basis.value}: {available!r} IS the instant the row became "
+                f"readable, so it is compared to the cutoff as it stands. It is the GOVERNED "
+                f"availability column and deliberately not the event-time column — a row can happen "
+                f"long before anyone can see it, which is the entire point of the gate."),
+            f"    rows = rows.where(F.col({available!r}) <= cutoff)",
+        ]
+    raise ValueError(  # pragma: no cover — every member above; here so a NEW one cannot default
+        f"the expression's availability basis {basis.value!r} is governed and this renderer has no "
+        f"gate for it: the default an unmodelled member falls into is no gate at all — every row "
+        f"visible, on every business date")
+
+
+def _window_boundaries(pit: PitSpec, clock: str) -> list[str]:
+    """§8 rule 2 — ``basis``, ``length``, ``unit`` and BOTH inclusivity flags, each honoured.
+
+    The boundaries are DATES first and instants second. That order is what makes a calendar period
+    a calendar period: ``add_months`` steps whole months, so three months before 2026-07-06 is
+    2026-04-06 — while ninety days before it is 2026-04-07, and 2026-01-31 plus a month is the 28th
+    of February rather than the 3rd of March. It is also what makes the zone conversion right: a
+    boundary computed as ``instant - N x 24h`` crosses a DST change wrong, and a local midnight
+    converted to UTC does not.
+    """
+    if not isinstance(pit.window_length, int) or isinstance(pit.window_length, bool):
+        raise ValueError(
+            f"the declared window length is {pit.window_length!r}, which is not a whole number of "
+            f"units: it is rendered into date arithmetic, where anything else is either a syntax "
+            f"error or a boundary somebody rounded")
+    if pit.window_length < 1:
+        raise ValueError(
+            f"the declared window length is {pit.window_length}: a window of no units spans no "
+            f"time, so the projection would be empty for every entity and every feature would "
+            f"evaluate to its empty-window policy with no error anywhere")
+    start_op = _START_COMPARISON.get(pit.window_start_inclusive)
+    end_op = _END_COMPARISON.get(pit.window_end_inclusive)
+    if start_op is None or end_op is None:
+        raise ValueError(
+            f"the window's boundaries are declared {pit.window_start_inclusive!r} / "
+            f"{pit.window_end_inclusive!r}: Inclusivity is CLOSED, and the two flags are carried "
+            f"per expression precisely because they vary — assuming a half-open window here would "
+            f"move a boundary the declaration states")
+    if pit.window_basis not in (_TRAILING, _CALENDAR_PERIOD):
+        raise ValueError(
+            f"the window's basis is {pit.window_basis!r}: WindowBasis is CLOSED, and the two bases "
+            f"anchor the window at DIFFERENT dates — a trailing window ends at the business date "
+            f"and a calendar period at the start of the period containing it")
+
+    lines = [
+        "    # §8 rule 2 — the window. Its boundaries are computed as DATES with calendar",
+        "    # arithmetic and turned into instants only at the end. A month is NOT thirty days:",
+        "    # three months before 2026-07-06 is 2026-04-06 and ninety days before it is",
+        "    # 2026-04-07, so a day-count conversion moves the boundary and changes the answer.",
+        "    anchor = F.to_date(F.lit(business_date))",
+        *_period_end(pit),
+        *_period_start(pit),
+        "",
+        *_comment(
+            f"The window's OWN governed zone is {pit.window_timezone} — a different field from the "
+            f"cadence's cutoff zone, and stated here for the same reason: the rendered session is "
+            f"pinned to UTC, so a zone left to be inherited moves both boundaries by hours."),
+        "    starts_at = F.to_utc_timestamp(",
+        f"        window_start.cast('timestamp'), {pit.window_timezone!r})",
+        "    ends_at = F.to_utc_timestamp(",
+        f"        window_end.cast('timestamp'), {pit.window_timezone!r})",
+        "",
+        *_comment(
+            f"Both flags as DECLARED: start {pit.window_start_inclusive} ({start_op}), end "
+            f"{pit.window_end_inclusive} ({end_op}). Two filters, because they are two boundaries."),
+        f"    rows = rows.where(F.col({clock!r}) {start_op} starts_at)",
+        f"    rows = rows.where(F.col({clock!r}) {end_op} ends_at)",
+    ]
+    return lines
+
+
+def _period_end(pit: PitSpec) -> list[str]:
+    """Where the window ENDS — the whole difference between the two bases."""
+    if pit.window_basis == _TRAILING:
+        return [
+            "    # Trailing: the window ends at the business date itself.",
+            "    window_end = anchor",
+        ]
+    period = _PERIOD_START.get(pit.window_unit)
+    if period is None:
+        if pit.window_unit == "day":
+            return [
+                "    # A calendar period of days: the period a date falls in IS that date, so there",
+                "    # is nothing to truncate to. The end is the business date.",
+                "    window_end = anchor",
+            ]
+        raise ValueError(
+            f"the window's unit is {pit.window_unit!r}: WindowUnit is CLOSED, and a calendar period "
+            f"this renderer cannot truncate to has no first day — Spark's `trunc` returns NULL for "
+            f"a format it does not know, and a NULL boundary keeps or drops every row silently")
+    return [
+        f"    # A calendar period: the window ends where the CURRENT {pit.window_unit} begins, so",
+        f"    # the incomplete {pit.window_unit} the business date sits in is outside it. That is",
+        "    # the whole difference from a trailing window, and it is a different set of rows.",
+        f"    window_end = F.trunc(anchor, {period!r})",
+    ]
+
+
+def _period_start(pit: PitSpec) -> list[str]:
+    """Where the window STARTS — ``length`` units back, in CALENDAR arithmetic."""
+    days = _DAYS_PER_UNIT.get(pit.window_unit)
+    if days is not None:
+        # A day is a day and a week is seven days in every calendar. Counting these is exact; it is
+        # a month that is not a fixed number of days, and there is deliberately no day count for one.
+        return [
+            f"    # {pit.window_length} {pit.window_unit}(s) back. A {pit.window_unit} is a whole "
+            f"number of days in",
+            "    # every calendar, so counting days here is the calendar operation, not a shortcut.",
+            f"    window_start = F.date_sub(window_end, {pit.window_length * days})",
+        ]
+    months = _MONTHS_PER_UNIT.get(pit.window_unit)
+    if months is None:
+        raise ValueError(
+            f"the window's unit is {pit.window_unit!r}, which this renderer has no calendar "
+            f"arithmetic for: WindowUnit is CLOSED, and the default an unmodelled unit would fall "
+            f"into is a day count — the exact conversion §8 rule 2 forbids")
+    return [
+        f"    # {pit.window_length} {pit.window_unit}(s) back, as CALENDAR months: `add_months`",
+        "    # steps whole months and clamps to the end of the month, so 2026-01-31 back one month",
+        "    # is 2026-02-28. Subtracting a day count instead would land on 2026-01-01.",
+        f"    window_start = F.add_months(window_end, {-pit.window_length * months})",
+    ]
