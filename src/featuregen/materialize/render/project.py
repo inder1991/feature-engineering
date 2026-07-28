@@ -69,7 +69,10 @@ from featuregen.materialize.identity import (
 from featuregen.materialize.inputs import PhysicalInputRequirement
 from featuregen.materialize.inventory import EngineVersions
 from featuregen.materialize.ir import AuthorizedCompilation
+from featuregen.materialize.publish import PublisherSelection
 from featuregen.materialize.render import RENDERER_VERSION
+from featuregen.materialize.render._yaml import yaml_scalar
+from featuregen.materialize.render.publish import publish_entry_body, published_dataset_name
 from featuregen.overlay.upload.object_ref import parse_ref
 
 __all__ = [
@@ -255,11 +258,11 @@ def _unique(values: Sequence[str], what: str) -> tuple[str, ...]:
     return items
 
 
-def _quote(value: str) -> str:
-    """One YAML scalar. Always double-quoted, so a value that looks like a number, a date or a
-    boolean stays the string the catalog meant."""
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+#: The ONE YAML-scalar decision, shared with ``render.publish`` since §10.3 gave the publication
+#: target an entry of its own — see :mod:`featuregen.materialize.render._yaml`. Aliased rather than
+#: re-implemented: this module renders every body at construction precisely so that exactly one
+#: place decides how a location becomes YAML, and a second copy would undo that.
+_quote = yaml_scalar
 
 
 def _fold(value: str) -> str:
@@ -344,7 +347,7 @@ def project_datasets(
         # declared home: an undeclared output is an in-memory dataset, and a gate that failed over
         # one would leave nothing an operator could inspect to see what it judged.
         assembled="feature_staging_assembled",
-        published=f"feature_{plan.logical_group_name}")
+        published=published_dataset_name(plan))
 
     declared = [
         *sorted(datasets.raw.values()), datasets.spine, *sorted(datasets.projections.values()),
@@ -464,7 +467,21 @@ def feature_staging_path(column: str) -> str:
     return f"feature_staging/{column}/data"
 
 
-def _catalog_entries(datasets: ProjectDatasets, *, published_target: str) -> tuple[_CatalogEntry, ...]:
+def _catalog_entries(
+    datasets: ProjectDatasets,
+    *,
+    plan: FeatureGroupPlanV1,
+    published_target: str,
+    selection: PublisherSelection | None,
+) -> tuple[_CatalogEntry, ...]:
+    """Every dataset entry. ``selection`` decides ONLY the last one — the publication target.
+
+    ``None`` renders Task 12's fail-closed Hive entry, which is the right artifact for a project
+    rendered before anything was attested: it cannot publish over anything at all. A selection
+    renders §10.3's attested mechanism instead (:func:`~featuregen.materialize.render.publish
+    .publish_entry_body`). The default is the closed one, so a caller who omits the selection gets
+    *less* capability rather than more.
+    """
     entries: list[_CatalogEntry] = []
     for physical, name in sorted(datasets.raw.items()):
         schema, table = physical.split(".", 1)
@@ -490,10 +507,15 @@ def _catalog_entries(datasets: ProjectDatasets, *, published_target: str) -> tup
         datasets.assembled, DatasetLayer.FEATURE_STAGING, path="feature_staging/_assembled",
         comment="the assembled group — §9's gates run on THIS, and only a group that passes"
                 " every one of them reaches the publication target"))
-    database, table = published_target.split(".", 1)
-    entries.append(_hive_entry(
-        datasets.published, DatasetLayer.FEATURE, database=database, table=table,
-        comment=f"the publication target, derived from the sandbox binding: {published_target}"))
+    if selection is None:
+        database, table = published_target.split(".", 1)
+        entries.append(_hive_entry(
+            datasets.published, DatasetLayer.FEATURE, database=database, table=table,
+            comment=f"the publication target, derived from the sandbox binding: {published_target}"))
+    else:
+        entries.append(_CatalogEntry(
+            name=datasets.published, layer=DatasetLayer.FEATURE,
+            body=publish_entry_body(plan, selection=selection)))
     return tuple(entries)
 
 
@@ -1048,6 +1070,7 @@ def render_project(
     engine_versions: EngineVersions,
     spine_input: PhysicalInputRequirement,
     nodes: Sequence[RenderedNode],
+    publisher_selection: PublisherSelection | None = None,
 ) -> SealedProject:
     """Render the complete project for an AUTHORIZED group, and seal it under its identity (§7).
 
@@ -1068,6 +1091,15 @@ def render_project(
         engine_versions: what that environment was captured RUNNING (§0) — the project's pins.
         spine_input: the resolved physical requirement for the declared population's table.
         nodes: the pipeline's nodes, in the order they should be read.
+        publisher_selection: §10.3's evidence that a publish mechanism was PROVEN for this
+            environment at these engine versions, as returned by
+            :func:`~featuregen.materialize.publish.select_publisher`. Omitting it renders Task 12's
+            fail-closed publication entry, which cannot publish over anything — the default is the
+            *less* capable artifact, so a caller cannot obtain a publishing project by forgetting
+            an argument. Supplying one that disagrees with ``environment_id`` or
+            ``engine_versions`` is refused: a selection proved a mechanism for a specific cluster
+            at specific versions, and rendering it into a project built for another is exactly the
+            un-evidenced publication §10.3 forbids.
 
     Returns:
         A :class:`~featuregen.materialize.identity.SealedProject`: every rendered file plus
@@ -1100,6 +1132,30 @@ def render_project(
             f"render_project needs the environment this artifact is rendered for "
             f"({environment_id!r}): it is what the capability attestation (§10.3) and every "
             f"validation report are keyed on, and a blank one names no environment at all")
+    if publisher_selection is not None:
+        if not isinstance(publisher_selection, PublisherSelection):
+            raise TypeError(
+                f"render_project's publisher_selection must be a PublisherSelection, got "
+                f"{type(publisher_selection).__name__}: §10.3 says the renderer consumes a "
+                f"selection and never a bare mechanism, and a duck-typed stand-in is a mechanism "
+                f"with a different spelling")
+        if publisher_selection.environment_id != environment_id:
+            raise ValueError(
+                f"the publisher selection was made for environment "
+                f"{publisher_selection.environment_id!r} while this project is rendered for "
+                f"{environment_id!r}: a capability attestation is for the EXACT environment "
+                f"(§10.3), so carrying one across would publish on a capability nobody probed for "
+                f"here")
+        if publisher_selection.engine_versions != engine_versions:
+            raise ValueError(
+                f"the publisher selection was made against hive "
+                f"{publisher_selection.engine_versions.hive} / spark "
+                f"{publisher_selection.engine_versions.spark} / metastore "
+                f"{publisher_selection.engine_versions.metastore} while this project pins hive "
+                f"{engine_versions.hive} / spark {engine_versions.spark} / metastore "
+                f"{engine_versions.metastore}: a mechanism proven on one triple is not proven on "
+                f"another, and rendering the selection into a project built for different runtimes "
+                f"would state evidence that does not cover it")
 
     supplied = tuple(nodes)
     for node in supplied:
@@ -1119,7 +1175,8 @@ def render_project(
 
     package = f"{derive_namespace()}_{plan.logical_group_name}"
     published_target = physical_target_for(plan.logical_group_name)
-    entries = _catalog_entries(datasets, published_target=published_target)
+    entries = _catalog_entries(datasets, plan=plan, published_target=published_target,
+                               selection=publisher_selection)
     source_root = f"src/{package}"
 
     files = {
