@@ -235,6 +235,16 @@ in place.
 | ⚪ **The sorts in `_expression_requirements` are EQUIVALENT** | Task 12's mutation run: removing both sorts survives every test. Provably so — the one consumer keys by `(schema, table)` and stores a value derived from nothing else, then sorts the mapping. Kept because the function's contract is an order, and recorded so nobody mistakes it for a tested property. | If a consumer ever reads the sequence rather than the mapping. |
 | ⚪ **`kedro` and `kedro-datasets` are not repository dependencies** | THE RULE could not be satisfied from the repo, so both were installed into a scratch virtualenv (kedro 1.5.0, kedro-datasets 9.5.0) and every emitted API verified against them (interfaces §30.2). The rendered project pins whatever `engine_versions` declares — 0.19.x in the fixture — and the emitted surface was chosen for being identical across 0.19.x and 1.x. | If the cluster's captured Kedro turns out to need an API this surface does not cover, or if CI should verify the render against a pinned Kedro. |
 
+### A.14 Renderer handoffs from Task 12 (2026-07-28)
+
+| Item | Detail | Owner |
+|---|---|---|
+| 🔴 **A rendered project cannot run twice against a live target** | The published entry renders `write_mode: errorifexists` — deliberately fail-closed, since §10 bans `INSERT OVERWRITE` and §10.3 forbids an unproven mechanism. Correct today, but it means a second run against the same partition fails until `render_publish` replaces that entry. | **Task 16** |
+| 🟡 **`staging_root` must derive from `generation_id`** | Otherwise §9's stale-manifest hazard reopens: a reused staging path can leave an older successful manifest whose `ir_hash` still matches, and assembly would publish stale output while passing every other check. | **Task 13** |
+| 🟡 **Session timezone is pinned to UTC** | So rendered node bodies must state each expression's governed timezone explicitly rather than relying on the session default — a window computed in the wrong zone shifts its boundaries silently. | **Task 13** |
+| 🟡 **`compiler_version` has no owner** | `RENDERER_VERSION` is now owned by `render/__init__.py` and its parameter is gone. `compiler_version` remains a parameter belonging to a §2-chain orchestrator that does not exist; recommended home is `materialize/compile.py`, created when Task 15 needs it. | **Task 15** |
+| ⚪ **Node bodies are injected** (`RenderedNode`) | A Task-12-only project has structure but no compute, by design. | Task 13 supplies them |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |
