@@ -76,12 +76,15 @@ from featuregen.materialize.inventory import (
 )
 from featuregen.materialize.ir import FormulaExecutionIRV1
 from featuregen.materialize.render.project import REQUIRED_RUN_PARAMETERS
+from featuregen.materialize.spine import CurrentSnapshot, LatestAvailableAsOf, SpineSpec
 
 __all__ = [
     "DAYS_PER_UNIT",
     "MONTHS_PER_UNIT",
     "PARTITION_VALUE_FORMS",
     "PERIOD_STARTS",
+    "SPINE_EXPR_PATH",
+    "SPINE_FEATURE_NAME",
     "MetastorePartitions",
     "PartitionSpec",
     "PhysicalInputSnapshot",
@@ -91,8 +94,15 @@ __all__ = [
     "prepare_run",
     "resolve_snapshots",
     "run_input_requests",
+    "spine_input_request",
     "staging_root_for",
 ]
+
+#: What the spine's request calls itself. Dunder-wrapped because a request's key is
+#: ``(feature_name, expr_path, requirement_id)`` and :func:`resolve_snapshots` raises on a duplicate:
+#: a spine that named itself after its table could collide with a feature computed from that table.
+SPINE_FEATURE_NAME = "__spine__"
+SPINE_EXPR_PATH = "spine"
 
 #: How a resolved DATE becomes a partition VALUE, one entry per ``PartitionTransform`` member. The
 #: transform is DECLARED (§3.4) and this only applies it; a member missing from here raises rather
@@ -596,6 +606,87 @@ def run_input_requests(
         for ir in irs
         for expression in ir.expressions
         for requirement in expression.input_requirements)
+
+
+def spine_input_request(
+    spine: SpineSpec,
+    spine_input: PhysicalInputRequirement,
+    *,
+    business_dt: str,
+) -> RunInputRequest | MaterializationRefused:
+    """The ONE request that covers the declared entity population (§4.2, §11.2).
+
+    :func:`run_input_requests` walks expressions and therefore cannot produce this one: a spine's
+    population is selected by a ``SnapshotPolicy``, not by a ``PitSpec``, and its
+    ``PhysicalInputRequirement`` is resolved outside the IR. ``pit_spec`` is ``None`` — not a
+    default but a statement that the DECLARED mapping alone selects the set, which for
+    ``PARTITION_MAPPED`` is the business date's own partition, exactly what the rendered spine node
+    selects.
+
+    **This is where §4.2's `CurrentSnapshot` vintage condition becomes reachable.** A table that
+    holds no history was observed at one vintage; asked for any other business date it would answer
+    with the rows it has, and the run would publish one day's population under another day's date.
+    §4.2 says it refuses rather than pretending, so it does. The refusal is typed
+    ``SPINE_DECLARATION_REJECTED_BY_FACTS``: §14's vocabularies are closed and no member names a
+    run-preparation verdict, and of the members that exist this is the only one that says *this
+    spine declaration does not stand*. The strain is real and recorded — the refuting input is the
+    run's business date rather than a governed catalog fact.
+
+    A vintage that is not a calendar date is refused too. It is an opaque declared identifier, a
+    version and a date have no ordering between them, and *"this module cannot check the vintage"*
+    is not *"the vintage is fine"*.
+
+    Returns:
+        The request, or a governed refusal.
+
+    Raises:
+        TypeError: ``spine`` or ``spine_input`` is not the type it must be.
+        ValueError: ``business_dt`` is not an ISO calendar date.
+    """
+    if not isinstance(spine, SpineSpec):
+        raise TypeError(
+            f"the spine's request is built from the SpineSpec §4 validated, got "
+            f"{type(spine).__name__}: a bare declaration is one the governed facts never checked")
+    if not isinstance(spine_input, PhysicalInputRequirement):
+        raise TypeError(
+            f"the spine's request needs the population table's PhysicalInputRequirement, got "
+            f"{type(spine_input).__name__}: the declared partition mapping lives on it")
+    anchor = _business_date(business_dt)
+    policy = spine.snapshot_policy
+
+    if isinstance(policy, CurrentSnapshot):
+        vintage = policy.observed_snapshot_ref.strip()
+        try:
+            observed = dt.date.fromisoformat(vintage)
+        except ValueError:
+            return _refuse(
+                CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
+                f"the population of {spine.source_table_ref} is declared CURRENT_SNAPSHOT observed "
+                f"at {vintage!r}, which is not a calendar date: the run's business date is "
+                f"{anchor.isoformat()}, and a version identifier and a date have no ordering "
+                f"between them — so whether this table can answer this date cannot be established, "
+                f"and an unestablished vintage is not a matching one")
+        if observed != anchor:
+            return _refuse(
+                CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
+                f"the population of {spine.source_table_ref} is declared CURRENT_SNAPSHOT observed "
+                f"at {observed.isoformat()}, and this run's business date is {anchor.isoformat()}: "
+                f"a table that holds no history cannot answer another date, and answering with the "
+                f"rows it happens to hold would publish one day's population under another day's "
+                f"date")
+
+    if isinstance(policy, LatestAvailableAsOf) and isinstance(
+            spine_input.partition_mapping, EventTimePartition | AvailabilityPartition):
+        return _refuse(
+            CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
+            f"the population of {spine.source_table_ref} is declared LATEST_AVAILABLE_AS_OF, which "
+            f"reads effective-dated HISTORY, while the table declares a time-based partition "
+            f"mapping on {spine_input.schema}.{spine_input.table}: the spine carries no PitSpec, so "
+            f"the mapping would select the business date's own partition and the population would "
+            f"be everyone whose record changed that day — a smaller number with no error anywhere")
+
+    return RunInputRequest(feature_name=SPINE_FEATURE_NAME, expr_path=SPINE_EXPR_PATH,
+                           physical_requirement=spine_input, pit_spec=None)
 
 
 def input_snapshot_ids(snapshots: Sequence[PhysicalInputSnapshot]) -> tuple[str, ...]:

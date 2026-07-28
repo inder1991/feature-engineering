@@ -756,3 +756,134 @@ def test_the_business_date_is_recorded_on_every_snapshot() -> None:
                                   business_dt=BUSINESS_DT))
     assert all(s.resolved_at_business_dt == BUSINESS_DT for s in snaps)
     assert dt.date.fromisoformat(snaps[0].resolved_at_business_dt) == dt.date(2026, 7, 27)
+
+
+# ── Task 15b: the SPINE's request, which 15a could not build ─────────────────────────────────────
+#
+# §11.2's L1 covers *every feature IR, every expression, and the spine*. A spine's population is
+# selected by a `SnapshotPolicy` rather than by a `PitSpec`, so `run_input_requests` — which walks
+# expressions — cannot produce one. This is the request that closes that gap, and building it is
+# what makes §4.2's `CurrentSnapshot` vintage condition reachable for the first time.
+
+from featuregen.materialize.runprep import (  # noqa: E402 - the 15b section's own imports
+    SPINE_EXPR_PATH,
+    SPINE_FEATURE_NAME,
+    spine_input_request,
+)
+from featuregen.materialize.spine import (  # noqa: E402
+    ActivePopulation,
+    ClaimAuthority,
+    CurrentSnapshot,
+    LatestAvailableAsOf,
+    PartitionMappedSnapshot,
+    SpineSpec,
+)
+
+
+def _spine(policy):
+    """A `SpineSpec` carrying one snapshot policy — every other field is beside the point here."""
+    from tests.featuregen.materialize.test_ir import DECLARATION
+
+    declaration = dataclasses.replace(DECLARATION, snapshot_policy=policy)
+    return SpineSpec(
+        declaration=declaration, source_table_ref=declaration.source_table_ref,
+        entity=declaration.entity, ordered_key_refs=declaration.ordered_key_refs,
+        population_semantics=declaration.population_semantics,
+        snapshot_policy=declaration.snapshot_policy,
+        availability_ref=declaration.availability_ref,
+        read_set=declaration.ordered_key_refs, governed_grain_refs=declaration.ordered_key_refs,
+        roles_used=("feature_engineer",),
+        completeness_claim_authority=ClaimAuthority.HUMAN_DECLARATION)
+
+
+_CUSTOMERS = _layout(VerifiedUnpartitioned(), partition_columns=None, table="customers")
+_CUSTOMERS_MAPPED = _layout(_event_mapping(column="snapshot_dt"),
+                            partition_columns=(("snapshot_dt", "string"),), table="customers")
+
+
+def test_the_spine_request_carries_NO_pit_spec() -> None:
+    """A `SnapshotPolicy` is not a `PitSpec`, and a spine that borrowed one would read a window."""
+    request = spine_input_request(
+        _spine(PartitionMappedSnapshot(ordered_partition_refs=(f"{SOURCE}::public.customers.snapshot_dt",))),
+        _requirement(_CUSTOMERS_MAPPED), business_dt=BUSINESS_DT)
+    assert isinstance(request, RunInputRequest)
+    assert request.pit_spec is None
+    assert (request.feature_name, request.expr_path) == (SPINE_FEATURE_NAME, SPINE_EXPR_PATH)
+
+
+def test_a_PARTITION_MAPPED_spine_resolves_the_business_dates_OWN_partition() -> None:
+    request = spine_input_request(
+        _spine(PartitionMappedSnapshot(ordered_partition_refs=(f"{SOURCE}::public.customers.snapshot_dt",))),
+        _requirement(_CUSTOMERS_MAPPED), business_dt=BUSINESS_DT)
+    snaps = _ok(resolve_snapshots(_inventory(_CUSTOMERS_MAPPED), _Metastore(),
+                                  requests=(request,), business_dt=BUSINESS_DT))
+    assert [spec.columns for spec in snaps[0].partition_specs] == \
+        [(("snapshot_dt", BUSINESS_DT),)]
+
+
+def test_a_CURRENT_SNAPSHOT_whose_vintage_IS_the_business_date_resolves() -> None:
+    request = spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref=BUSINESS_DT)),
+                                  _requirement(_CUSTOMERS), business_dt=BUSINESS_DT)
+    assert isinstance(request, RunInputRequest)
+
+
+def test_a_CURRENT_SNAPSHOT_asked_for_ANOTHER_date_refuses_rather_than_pretending() -> None:
+    """§4.2, reachable for the first time: a present-day table cannot answer another date.
+
+    Everything is held equal to the passing case above except the run's date — the declaration, the
+    requirement and the policy are the same objects.
+    """
+    refusal = spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref=BUSINESS_DT)),
+                                  _requirement(_CUSTOMERS), business_dt=NEXT_DT)
+    assert isinstance(refusal, MaterializationRefused)
+    assert refusal.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+    assert BUSINESS_DT in refusal.detail and NEXT_DT in refusal.detail
+
+
+def test_a_CURRENT_SNAPSHOT_vintage_that_is_not_a_DATE_cannot_be_compared_and_refuses() -> None:
+    """An opaque version identifier and a calendar date have no ordering between them.
+
+    Fail closed: "this module cannot check the vintage" is not "the vintage is fine".
+    """
+    refusal = spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref="v42")),
+                                  _requirement(_CUSTOMERS), business_dt=BUSINESS_DT)
+    assert isinstance(refusal, MaterializationRefused)
+    assert refusal.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+
+
+def test_an_SCD_spine_over_a_TIME_MAPPED_table_refuses_instead_of_reading_one_day() -> None:
+    """`LATEST_AVAILABLE_AS_OF` needs history; `pit_spec=None` over a time mapping selects one day.
+
+    Resolving it would give the spine a single day of effective-dated rows and a population missing
+    everyone whose record did not change today — a smaller number with no error.
+    """
+    policy = LatestAvailableAsOf(
+        effective_time_ref=f"{SOURCE}::public.customers.effective_dt",
+        availability_ref=f"{SOURCE}::public.customers.load_ts",
+        deterministic_tie_break_refs=(f"{SOURCE}::public.customers.cif_id",))
+    refusal = spine_input_request(_spine(policy), _requirement(_CUSTOMERS_MAPPED),
+                                  business_dt=BUSINESS_DT)
+    assert isinstance(refusal, MaterializationRefused)
+    assert refusal.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+
+
+def test_an_SCD_spine_over_an_UNPARTITIONED_table_is_fine() -> None:
+    """The control for the refusal above: only a TIME mapping makes `pit_spec=None` wrong."""
+    policy = LatestAvailableAsOf(
+        effective_time_ref=f"{SOURCE}::public.customers.effective_dt",
+        availability_ref=f"{SOURCE}::public.customers.load_ts",
+        deterministic_tie_break_refs=(f"{SOURCE}::public.customers.cif_id",))
+    assert isinstance(spine_input_request(_spine(policy), _requirement(_CUSTOMERS),
+                                          business_dt=BUSINESS_DT), RunInputRequest)
+
+
+def test_an_ACTIVE_POPULATION_spine_needs_no_vintage_and_resolves() -> None:
+    policy = ActivePopulation(status_ref=f"{SOURCE}::public.customers.status_cd",
+                              allowed_status_values=("ACTIVE",))
+    assert isinstance(spine_input_request(_spine(policy), _requirement(_CUSTOMERS),
+                                          business_dt=BUSINESS_DT), RunInputRequest)
+
+
+def test_the_spine_request_key_cannot_COLLIDE_with_a_feature_expression() -> None:
+    """`run_input_requests` raises on a duplicate key, so the spine's must not look like a feature."""
+    assert SPINE_FEATURE_NAME.startswith("__") and SPINE_FEATURE_NAME.endswith("__")
