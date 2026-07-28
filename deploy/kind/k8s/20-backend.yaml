@@ -46,6 +46,13 @@ data:
   # concepts and proposed as human-gated facts; a bridge is operational only once VERIFIED. Needs
   # two catalogs loaded before it can find anything.
   OVERLAY_ENTITY_BRIDGES: "1"
+  # Enrichment stage ceiling. The 240s default cut FTR's concept stage off at 126 columns (it needs
+  # ~261s) and lost six columns' concepts, including `transaction_id`; CIB cleared it by ten
+  # seconds. 30 minutes gives a wide real table room to finish. The per-run wall-clock budget
+  # DERIVES from this, so one knob moves the whole ceiling. Trade-off: this stage holds the
+  # per-source lock while it runs, so a slow provider can now block re-uploads of the SAME source
+  # for longer — acceptable here, worth revisiting for concurrent ingestion.
+  OVERLAY_ENRICH_STAGE_DEADLINE_S: "1800"
 ---
 apiVersion: apps/v1
 kind: Deployment

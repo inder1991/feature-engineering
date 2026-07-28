@@ -78,7 +78,13 @@ def budget(short: str) -> Budget:
         max_batch_attempts=_int("OVERLAY_ENRICH_MAX_BATCH_ATTEMPTS", 2),
         max_single_fallback=_int("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", 8),
         max_provider_calls=_int("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", 32),
-        wallclock_budget_ms=_int("OVERLAY_ENRICH_WALLCLOCK_BUDGET_MS", 240000),
+        # DERIVED from the stage deadline, not a second hard-coded 240s. The docstring on
+        # `stage_deadline_s` calls these "one coherent ceiling", and they were two independent env
+        # vars that merely shared a default — so raising the deadline alone left this binding at
+        # 240s and the change did nothing. An explicit override still wins: deriving is a default,
+        # not a coupling.
+        wallclock_budget_ms=_int("OVERLAY_ENRICH_WALLCLOCK_BUDGET_MS",
+                                 int(stage_deadline_s() * 1000)),
         keep_threshold=float(os.environ.get("OVERLAY_ENRICH_KEEP_THRESHOLD", "0.75")),
         min_split=_int("OVERLAY_ENRICH_MIN_SPLIT", 4),
     )
