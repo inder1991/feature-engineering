@@ -192,7 +192,7 @@ describe('lineage view', () => {
     await userEvent.click(screen.getByLabelText('Feature lineage'))
     expect(screen.queryByText('avg_eod_balance_30d')).not.toBeInTheDocument()
     expect(screen.queryByText('churn_risk_model')).not.toBeInTheDocument()
-    const list = screen.getByRole('region', { name: 'Edges as text' })
+    const list = screen.getByRole('region', { name: 'Links in this view, as text' })
     expect(within(list).queryByText(/derives feature/)).not.toBeInTheDocument()
 
     await userEvent.click(screen.getByLabelText('Entity bridges'))
@@ -297,7 +297,7 @@ describe('lineage view', () => {
     lineageGraph.mockResolvedValue(WITH_CARDS)
     render(<LineageView anchor={ANCHOR} />)
     await screen.findByText('accounts')
-    const list = screen.getByRole('region', { name: 'Edges as text' })
+    const list = screen.getByRole('region', { name: 'Links in this view, as text' })
     const lines = within(list)
       .getAllByRole('listitem')
       .map(li => li.textContent)
@@ -480,7 +480,7 @@ describe('lineage view', () => {
 
       // a quiet structural containment edge ties the column node to its table card
       expect(container.querySelector('.ln-edge--contain')).not.toBeNull()
-      const a11y = screen.getByRole('region', { name: 'Edges as text' })
+      const a11y = screen.getByRole('region', { name: 'Links in this view, as text' })
       expect(within(a11y).getByText('balance belongs to accounts')).toBeInTheDocument()
 
       // the owning table renders compact: a count chip and only the structural spine plus
@@ -640,7 +640,7 @@ describe('lineage view', () => {
     render(<LineageView anchor={selfAnchor} />)
     expect(await screen.findByText('employees')).toBeInTheDocument()
     // the self-join lands in the accessible edge list, both ends named, one table unit — no crash
-    const list = screen.getByRole('region', { name: 'Edges as text' })
+    const list = screen.getByRole('region', { name: 'Links in this view, as text' })
     expect(
       within(list).getByText(/employees\.manager_id joins employees\.id · N:1 · verified/),
     ).toBeInTheDocument()

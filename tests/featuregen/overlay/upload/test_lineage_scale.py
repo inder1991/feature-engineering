@@ -98,3 +98,56 @@ def test_no_edge_points_at_a_dropped_node(wide):
 
 def test_the_link_edge_survives_the_prune(wide):
     assert any(e.get("kind") == "entity_bridge" for e in _graph(wide)["edges"])
+
+
+# ── a COLUMN anchor shows THAT column's links, not its table's ───────────────────────────────────
+
+def test_a_column_anchor_shows_only_its_own_links(wide):
+    """Clicking Graph on `cust_num` drew nine links, eight of which belong to OTHER columns of the
+    same table. The header says "Graph of: …cust_num (column)"; it should mean it."""
+    db = wide
+    # A second, unrelated link on a DIFFERENT column of the anchor's table.
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               " data_type) VALUES ('cib','public.cust.branch_cd','column','cust','branch_cd','text')")
+    ev = {"entity_id": "branch", "type_basis": "declared", "candidate_id": "c9",
+          "left_is_grain": False, "right_is_grain": False, "data_type_family": "text",
+          "derivation_version": "1.0.0"}
+    db.execute(
+        "INSERT INTO entity_bridge_candidate_evidence (entity_id, left_catalog_source, "
+        " left_object_ref, right_catalog_source, right_object_ref, candidate_id, fact_key, "
+        " data_type_family, evidence_json, derivation_version) "
+        "VALUES ('branch','cib','public.cust.branch_cd','ftr','public.txn.f01','c9','fk-9',"
+        " 'text',%s,'1.0.0')", (json.dumps(ev),))
+    bridges = [e for e in _graph(db)["edges"] if e.get("kind") == "entity_bridge"]
+    assert len(bridges) == 1, bridges
+    assert bridges[0]["from"].endswith("cust_num") or bridges[0]["to"].endswith("cust_num")
+
+
+def test_narrowing_applies_to_LINKS_only_not_to_joins_or_features(wide):
+    """The narrowing is deliberately confined to cross-catalog links. A join two hops from the
+    anchor column is exactly what someone exploring is looking for; applying the same rule to every
+    edge kind collapsed multi-hop lineage and broke eight lineage tests."""
+    import inspect
+
+    from featuregen.overlay.upload import lineage as mod
+    src = inspect.getsource(mod._prune_to_neighbourhood)
+    assert 'e.get("kind") != "entity_bridge"' in src
+
+
+def test_a_TABLE_anchor_still_shows_the_whole_table(wide):
+    """The narrowing is a property of asking about a COLUMN. Asking about the table is a different
+    question and still gets every link the table has."""
+    db = wide
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               " data_type) VALUES ('cib','public.cust.branch_cd','column','cust','branch_cd','text')")
+    ev = {"entity_id": "branch", "type_basis": "declared", "candidate_id": "c9",
+          "left_is_grain": False, "right_is_grain": False, "data_type_family": "text",
+          "derivation_version": "1.0.0"}
+    db.execute(
+        "INSERT INTO entity_bridge_candidate_evidence (entity_id, left_catalog_source, "
+        " left_object_ref, right_catalog_source, right_object_ref, candidate_id, fact_key, "
+        " data_type_family, evidence_json, derivation_version) "
+        "VALUES ('branch','cib','public.cust.branch_cd','ftr','public.txn.f01','c9','fk-9',"
+        " 'text',%s,'1.0.0')", (json.dumps(ev),))
+    g = lineage_graph(db, "cib", "public.cust", now=_NOW, fresh_within=_FRESH, depth=2)
+    assert len([e for e in g["edges"] if e.get("kind") == "entity_bridge"]) == 2

@@ -90,13 +90,17 @@ def lineage_graph(conn, catalog_source: str, ref: str, *, now: datetime,
     b = _Builder(conn, layers=frozenset(layers), direction=direction, roles=roles,
                  now=now, fresh_within=fresh_within, max_nodes=max_nodes)
     b.run(("table", catalog_source, anchor[0]), depth)
-    nodes, edges = _prune_to_neighbourhood(list(b.nodes.values()), b.edges,
-                                           anchor_id=f"{catalog_source}:{ref}")
+    nodes, edges = _prune_to_neighbourhood(
+        list(b.nodes.values()), b.edges, anchor_id=f"{catalog_source}:{ref}",
+        # A COLUMN anchor asks "what does THIS column link to". Expansion starts from the column's
+        # TABLE (that is how neighbours are discovered), so without this the answer was the table's
+        # whole neighbourhood — nine links on the real catalog, eight belonging to other columns.
+        anchor_is_column=ref.count(".") >= 2)
     return {"nodes": nodes, "edges": edges, "truncated": b.truncated}
 
 
-def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *,
-                            anchor_id: str) -> tuple[list[dict], list[dict]]:
+def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *, anchor_id: str,
+                            anchor_is_column: bool = False) -> tuple[list[dict], list[dict]]:
     """Drop columns that neither anchor the view nor participate in a relationship.
 
     A table unit expands to EVERY visible column, so opening one column of a 111-column table beside
@@ -111,6 +115,16 @@ def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *,
     A dropped column takes its `contains` edge with it, so the graph can never draw an edge to a
     node that is not there.
     """
+    if anchor_is_column:
+        # Cross-catalog links ONLY: a bridge is column-to-column, so a SIBLING column's bridge is a
+        # fact about the table, not about the column the header names. Anchoring on `cust_num` drew
+        # nine, eight of them belonging to other columns' branch codes.
+        #
+        # Narrow on purpose. Joins and feature lineage are how you EXPLORE from a column — a join
+        # two hops away is exactly what someone is looking for — so they keep the table's
+        # neighbourhood. Applying this to every edge kind collapsed multi-hop lineage entirely.
+        edges = [e for e in edges
+                 if e.get("kind") != "entity_bridge" or anchor_id in (e["from"], e["to"])]
     participating = {end for e in edges if e.get("kind") != "contains"
                      for end in (e["from"], e["to"])}
     keep = {

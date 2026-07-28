@@ -1091,8 +1091,11 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         </p>
       )}
 
-      <section className="ln-a11y" aria-label="Edges as text">
-        <h3 className="micro-label">Edges (accessible parallel list)</h3>
+      {/* A readable text equivalent of the canvas. It exists for screen readers, but it is the
+          clearer view for everyone when edges overlap — so it gets a name that means something to a
+          banker rather than "accessible parallel list", which describes the MECHANISM. */}
+      <section className="ln-a11y" aria-label="Links in this view, as text">
+        <h3 className="micro-label">Links in this view</h3>
         {layout.contain && matchId && (
           // The structural containment tie, kept out of the relationship list so the list
           // stays a faithful mirror of the drawn lineage edges.

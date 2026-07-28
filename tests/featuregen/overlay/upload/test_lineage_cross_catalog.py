@@ -108,6 +108,9 @@ def test_two_near_columns_linking_to_the_SAME_far_column_both_draw(two_catalogs)
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('customer','cib','public.bo_cib_customer.cust_alt','ftr',"
         " 'public.tran_repos.cif_id','c2','fk-2','text',%s,'1.0.0')", (json.dumps(ev),))
-    bridges = [e for e in _graph(db)["edges"] if e.get("kind") == "entity_bridge"]
+    # Asked of the TABLE: a column anchor now shows only its OWN links, so the two-near-columns
+    # case has to be posed at table scope to be visible at all.
+    g = lineage_graph(db, "cib", "public.bo_cib_customer", now=_NOW, fresh_within=_FRESH, depth=2)
+    bridges = [e for e in g["edges"] if e.get("kind") == "entity_bridge"]
     near = {e["from"] for e in bridges}
     assert len(near) == 2, bridges     # both near columns reach cif_id
