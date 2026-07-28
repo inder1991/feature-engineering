@@ -182,20 +182,18 @@ def test_readiness_table_diagnostic_read_scoped_no_hidden_column_leak(client, co
     # NO LEAK ANYWHERE: grep the WHOLE payload (readiness requirements/gaps/scores + relationships).
     assert "national_id" not in json.dumps(body)
 
-    # And specifically the read-scoped table diagnostic keeps the VISIBLE ref, drops the hidden one.
-    diag = body["readiness"]["table_diagnostic"]
-    named = [rq["requirement_id"] for rq in
-             diag["blocking_requirements"] + diag["review_requirements"]] + list(diag["advisory_gaps"])
-    assert any("salary" in n for n in named), named          # visible sibling still reported
-    assert not any("national_id" in n for n in named)        # hidden sibling gone
+    # The payload now carries a ROLL-UP rather than the requirement rows, so the leak surface moves
+    # from NAMES to the COUNT — and a count that included a column the caller cannot see would be an
+    # existence oracle ("there is something here you are not allowed to know about"), which is the
+    # same leak class in a smaller package. Assert the count itself is read-scoped.
+    rollup = body["readiness"]["table_rollup"]
+    assert rollup["columns_outstanding"] == 1, rollup      # salary only — the hidden one is not counted
 
-    # SANITY: a pii_reader (who MAY see national_id) does get its concept requirement — the scope,
-    # not an empty diagnostic, is what hid it above.
-    pii_diag = _asset(client, "hr", "public.employees.salary",
-                      headers=PII_AUTH).json()["readiness"]["table_diagnostic"]
-    pii_named = [rq["requirement_id"] for rq in
-                 pii_diag["blocking_requirements"] + pii_diag["review_requirements"]]
-    assert any("national_id" in n for n in pii_named), pii_named
+    # SANITY: a pii_reader (who MAY see national_id) counts BOTH — proving the scope, not an empty
+    # roll-up, is what hid it above.
+    pii_rollup = _asset(client, "hr", "public.employees.salary",
+                        headers=PII_AUTH).json()["readiness"]["table_rollup"]
+    assert pii_rollup["columns_outstanding"] == 2, pii_rollup
 
 
 # ── (2c) F4: as_join_key confirms a TO-side (dimension) join, consistent with relationships ───────
@@ -371,8 +369,16 @@ def test_readiness_section_carries_capability_matrix(client):
         assert caps[use]["use"] == use
         assert caps[use]["operational_status"] in ("ready", "blocked")
         assert caps[use]["requirements"]                  # a non-empty requirement list
-    # The parent-table blocker diagnostic (compute_readiness TABLE scope).
-    assert body["readiness"]["table_diagnostic"]["scope"] == "table"
+    # The parent table now rides as a ROLL-UP, not the 341-blocking/445-review rows it used to ship
+    # to every column page. The full lists keep their own route (/sources/{source}/readiness).
+    rollup = body["readiness"]["table_rollup"]
+    assert rollup["table"] == "accounts"
+    assert rollup["headline"]                              # a sentence, not a row dump
+    assert "blocked" not in rollup["headline"].lower()     # the vocabulary is retired
+    # And the product view of this column: five roles, each with a plain-English verdict.
+    usability = body["readiness"]["usability"]
+    assert len(usability["roles"]) == 5
+    assert usability["headline"].startswith("Usable for")
 
 
 # ── (5) history reflects the ingestion_run_object provenance for the ref ──────────────────────────

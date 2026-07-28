@@ -44,6 +44,7 @@ from featuregen.identity.permissions import AUDIT_READ, CATALOG_READ, has_permis
 from featuregen.overlay.identity import _norm
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.column_readiness import column_readiness
+from featuregen.overlay.upload.column_usability import column_usability, table_rollup
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
@@ -459,18 +460,25 @@ def _readiness_section(
     name/id/count via a ``field:...`` requirement, an ``advisory_gaps`` ref, or a ``summary_scores``
     tally — the same no-leak guarantee the anchor load and relationships section already carry."""
     section: dict = {}
-    if anchor["kind"] == "column":
-        section["column_capabilities"] = asdict(
-            column_readiness(conn, source=source, object_ref=anchor["object_ref"], roles=roles)
-        )
-    else:
-        section["column_capabilities"] = None   # a table asset has no per-column matrix
-    section["table_diagnostic"] = asdict(
-        compute_readiness(
-            conn, source=source, scope=ReadinessScopeType.TABLE, subset=anchor["table_name"],
-            roles=roles,
-        )
+    caps = (column_readiness(conn, source=source, object_ref=anchor["object_ref"], roles=roles)
+            if anchor["kind"] == "column" else None)
+    # A table asset has no per-column matrix.
+    section["column_capabilities"] = asdict(caps) if caps is not None else None
+    diagnostic = compute_readiness(
+        conn, source=source, scope=ReadinessScopeType.TABLE, subset=anchor["table_name"],
+        roles=roles,
     )
+    # The parent table as a ROLL-UP, not as rows. Shipping the diagnostic whole meant 341 blocking
+    # plus 445 review rows on EVERY column page, to say one thing — all 341 shared the single cause
+    # `unresolved_authority`. The full lists keep their dedicated home at
+    # `GET /sources/{source}/readiness?subset={table}`, which the "show all" disclosure fetches, so
+    # nothing is lost and the common page stops carrying 786 rows it never displays usefully.
+    section["table_rollup"] = asdict(table_rollup(diagnostic, table=anchor["table_name"]))
+    # The product view of this column: per-role usability in plain English. The raw capability
+    # matrix stays above it — this is a translation, not a replacement, so anything reading
+    # `column_capabilities` is untouched.
+    # Computed from the SAME matrix above — one read, two views.
+    section["usability"] = asdict(column_usability(caps)) if caps is not None else None
     return section
 
 
