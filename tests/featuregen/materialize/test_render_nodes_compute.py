@@ -1776,9 +1776,11 @@ def test_it_refuses_when_the_PLAN_and_the_IR_describe_different_columns(compiled
             compiled[0].irs[0], feature_name="something_else"))
 
 
-def test_it_refuses_an_expression_whose_JOIN_PLAN_HAS_HOPS(compiled, feature):
-    """The same refusal 13b's projection makes, reached through the calculation: a traversal this
-    renderer drops would aggregate over rows that never belonged to the entity."""
+def test_it_refuses_an_expression_whose_JOIN_PLAN_IS_NOT_RENDERABLE(compiled, feature):
+    """13e made the calculation read the projection's OUTPUT rather than the whole read set, so a
+    well-formed traversal now renders (see the 13e section). A malformed one still refuses HERE, at
+    the calculation, because the grain it groups by is the one the traversal was supposed to reach.
+    """
     expression = compiled[0].irs[0].expressions[0]
     hopped = dataclasses.replace(
         expression, join_plan=dataclasses.replace(
@@ -2414,8 +2416,26 @@ def _pref(table, column, *roles):
                        table=table, column=column, roles=tuple(roles))
 
 
-def _traversed(expression, *, steps=(HOP_1, HOP_2), **plan_overrides):
-    """The worked expression re-grained onto `customers.cif_id`, two hops away.
+#: Every endpoint the two hops travel on, as §1.3 authorized them: `(table, column, *roles)`.
+TWO_HOP_READS = (
+    (fixtures.TABLE, "acct_num", RefRole.JOIN_KEY),
+    (_ACCOUNTS, "acct_id", RefRole.JOIN_KEY),
+    (_ACCOUNTS, "owner_id", RefRole.JOIN_KEY),
+    (_CUSTOMERS, "cif_id", RefRole.JOIN_KEY, RefRole.GRAIN_KEY),
+)
+
+#: The shorter shape, and the commoner one: the grain sits on the table directly joined.
+ONE_HOP = (JoinStep(from_ref="public.transactions.cif_num", to_ref="public.customers.cif_id",
+                    cardinality="N:1", approved_join_fact_key="ajf-txn-cust",
+                    approved_join_status="VERIFIED", authority="operational"),)
+ONE_HOP_READS = (
+    (fixtures.TABLE, "cif_num", RefRole.JOIN_KEY),
+    (_CUSTOMERS, "cif_id", RefRole.JOIN_KEY, RefRole.GRAIN_KEY),
+)
+
+
+def _traversed(expression, *, steps=(HOP_1, HOP_2), reads=TWO_HOP_READS, **plan_overrides):
+    """The worked expression re-grained onto `customers.cif_id`, `steps` hops away.
 
     Everything else is the real compilation: the same operand, the same governed filter, the same
     window and the same availability column. Only the grain moves off the source relation — which
@@ -2423,13 +2443,7 @@ def _traversed(expression, *, steps=(HOP_1, HOP_2), **plan_overrides):
     """
     kept = tuple(ref for ref in expression.physical_read_set
                  if not (ref.column == "cif_id" and ref.table == fixtures.TABLE))
-    read_set = (
-        *kept,
-        _pref(fixtures.TABLE, "acct_num", RefRole.JOIN_KEY),
-        _pref(_ACCOUNTS, "acct_id", RefRole.JOIN_KEY),
-        _pref(_ACCOUNTS, "owner_id", RefRole.JOIN_KEY),
-        _pref(_CUSTOMERS, "cif_id", RefRole.JOIN_KEY, RefRole.GRAIN_KEY),
-    )
+    read_set = (*kept, *(_pref(*read) for read in reads))
     return dataclasses.replace(
         expression, physical_read_set=read_set,
         join_plan=dataclasses.replace(expression.join_plan, steps=tuple(steps), **plan_overrides))
@@ -2770,3 +2784,81 @@ def test_a_REAL_PROJECT_renders_with_the_traversal_wired_into_it(compiled, expre
                     if path.endswith("pipelines/materialize/pipeline.py"))
     assert "raw_banking__accounts" in pipeline and "raw_banking__customers" in pipeline
     assert materialize_to(project, tmp_path / "generated")
+
+
+def test_the_stand_ins_join_NEVER_MATCHES_A_NULL_KEY_to_a_null_key():
+    """Spark's equi-join never matches NULL to NULL, itself included. A stand-in that did would
+    attribute every unreachable source row to whichever dimension row happened to carry a null key
+    — and the traversal tests above would agree with that answer."""
+    left = fake_spark.DataFrame([{"k": "A1", "v": 1}, {"k": None, "v": 2}])
+    right = fake_spark.DataFrame([{"k": "A1", "owner": "C1"}, {"k": None, "owner": "C9"}])
+    joined = left.join(right, on=["k"], how="left")
+    assert [row["owner"] for row in joined.rows] == ["C1", None]
+    assert left.join(right, on=["k"], how="inner").count() == 1
+
+
+# ── one hop: the grain sits on the table directly joined ─────────────────────────────────────────
+
+
+def _one_hop(compiled, expression):
+    return nodes_compute.render_projection_node(
+        _traversed(expression, steps=ONE_HOP, reads=ONE_HOP_READS), compiled[2],
+        feature_column=SUM_30D, source_dataset="raw_banking__transactions",
+        joined_datasets={"banking.customers": "raw_banking__customers"},
+        projection_dataset="intermediate_total_debit_amount_30d__body_expr")
+
+
+def test_a_SINGLE_HOP_traversal_reaches_the_grain_on_the_table_it_joins(compiled, expression):
+    node = _one_hop(compiled, expression)
+    assert node.inputs == ("raw_banking__transactions", "raw_banking__customers",
+                           "params:business_dt")
+    run = fake_spark.run_rendered(node.source, node.func_name)
+    rows = run(fake_spark.DataFrame([_windowed(BEFORE, 10) | {"cif_num": "C1"},
+                                     _windowed(BEFORE, 20) | {"cif_num": "C2"},
+                                     _windowed(BEFORE, 30) | {"cif_num": "C404"}]),
+               fake_spark.DataFrame(CUSTOMERS_ROWS), BUSINESS_DT).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [
+        (10, "C1"), (20, "C2"), (30, None)]
+    assert sorted(rows[0]) == ["cif_id", "dr_cr_flag", "cif_num", "posted_ts", "status_cd",
+                               "txn_amt", "txn_dt"][:0] + sorted(
+        ["cif_id", "cif_num", "dr_cr_flag", "posted_ts", "status_cd", "txn_amt", "txn_dt"])
+
+
+def test_the_traversal_hands_on_the_SOURCE_COLUMNS_AND_THE_GRAIN_KEY_and_nothing_else(
+        compiled, expression):
+    """The hops' own join keys stop at the projection: they were read to travel on, and two tables
+    on one path spell one entity's key the same way — `accounts.cif_id` and `customers.cif_id`
+    would be one ambiguous output column, not two."""
+    rows = _traverse(_traversal(compiled, expression),
+                     [_windowed(BEFORE, 10) | {"acct_num": "A1", "pan": "4111"}]).rows
+    assert sorted(rows[0]) == ["acct_num", "cif_id", "dr_cr_flag", "posted_ts", "status_cd",
+                               "txn_amt", "txn_dt"]
+
+
+# ── goldens: a change detector, and the weakest test here ────────────────────────────────────────
+
+
+TRAVERSAL_VARIANTS = {"one_hop": _one_hop, "two_hop": _traversal}
+
+
+@pytest.mark.parametrize("variant", sorted(TRAVERSAL_VARIANTS))
+def test_the_rendered_traversal_matches_its_golden(compiled, expression, variant):
+    """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
+    golden = TRAVERSAL_GOLDENS / f"{variant}.py"
+    rendered = TRAVERSAL_VARIANTS[variant](compiled, expression).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_a_row_that_reaches_a_DANGLING_DIMENSION_lands_on_no_entity_not_on_the_dangling_id(
+        compiled, expression):
+    """Why each hop's key is dropped rather than carried out as the answer. Spark's name-form join
+    keeps ONE key column and it holds the LEFT side's value — so an account owned by a customer who
+    is not in the customer table would come out claiming that customer, and the feature would land
+    a value under an entity the population has never heard of."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [_windowed(BEFORE, 55) | {"acct_num": "A3"}],
+                     accounts=[*ACCOUNTS, {"acct_id": "A3", "owner_id": "C9"}]).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(55, None)]

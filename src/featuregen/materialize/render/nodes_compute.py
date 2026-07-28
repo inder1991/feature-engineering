@@ -76,6 +76,7 @@ reads whatever the table happens to hold today, including a column added after t
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -1011,13 +1012,19 @@ class _Hop:
     schema: str
     table: str
     left_name: str
+    from_key: tuple[str, str]
     from_table: str
     from_column: str
     to_column: str
     columns: tuple[str, ...]
+    carried: tuple[str, ...]
     cardinality: str
     fact_key: str | None
     status: str | None
+
+    @property
+    def key_of(self) -> tuple[str, str]:
+        return (self.schema.strip().lower(), self.table.strip().lower())
 
     @property
     def prefix(self) -> str:
@@ -1139,6 +1146,19 @@ def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
             f"them: the traversal exists to reach the grain, so one that emits nothing joins the "
             f"tables and then throws the answer away")
 
+    # What each joined table has to CARRY out of its hop: the column a later hop travels on from
+    # it, and any grain key it holds. Everything else it was authorized to read stays where it is —
+    # a column selected into the frame and never named again is a line a reviewer of the generated
+    # project has to resolve before they can say the traversal is right.
+    needed: dict[tuple[str, str], set[str]] = {}
+    for hop in hops:
+        needed.setdefault(hop.from_key, set()).add(hop.from_column)
+    for ref in read:
+        if RefRole.GRAIN_KEY in ref.roles and ref.column is not None:
+            needed.setdefault(_physical(ref), set()).add(ref.column)
+    hops = tuple(dataclasses.replace(
+        hop, carried=tuple(sorted(needed.get(hop.key_of, set())))) for hop in hops)
+
     return _Traversal(
         columns=tuple(sorted((*source_columns, *carried))),
         source_columns=source_columns,
@@ -1218,8 +1238,9 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
                 f"of columns, and joining on one outside it is a read this group was never granted")
         hop = _Hop(
             index=index, schema=target.schema, table=target.table, left_name=left,
-            from_table=f"{origin.schema}.{origin.table}", from_column=origin.column or "",
-            to_column=target.column or "", columns=columns, cardinality=str(step.cardinality),
+            from_key=_physical(origin), from_table=f"{origin.schema}.{origin.table}",
+            from_column=origin.column or "", to_column=target.column or "", columns=columns,
+            carried=(), cardinality=str(step.cardinality),
             fact_key=step.approved_join_fact_key, status=step.approved_join_status)
         for column in columns:
             current[f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}.{column}"] = (
@@ -1368,26 +1389,32 @@ def _traversal_lines(plan: _Traversal) -> list[str]:
     """
     if not plan.hops:
         return []
+    count = f"{len(plan.hops)} hop" + ("" if len(plan.hops) == 1 else "s")
     lines = [
         "",
         *_comment(
-            f"§3.1 — the governed traversal to the grain: {len(plan.hops)} hop(s), each one an edge "
-            f"the join planner returned as OPERATIONAL. The gates above ran first, on the source "
-            f"relation's own columns, so the rows joined here are already the ones this feature may "
-            f"see."),
+            f"§3.1 — the governed traversal to the grain: {count}, each one an edge the join "
+            f"planner returned as OPERATIONAL. The gates above ran first, on the source relation's "
+            f"own columns, so the rows joined here are already the ones this feature may see. Every "
+            f"hop is a LEFT join: the traversal says which entity a row belongs to and must not "
+            f"decide which rows EXIST, so a row whose dimension row is missing survives with a null "
+            f"key and lands on no entity rather than disappearing from the feature's population. "
+            f"Each hop's key travels under a name of its own, dropped once the hop is done — the "
+            f"key column a join keeps takes the LEFT side's value, which for an unmatched row names "
+            f"an entity that is not there."),
     ]
     for hop in plan.hops:
         backing = (f"approved_join fact {hop.fact_key} ({hop.status})" if hop.fact_key is not None
                    else "a FILE-DECLARED edge, backed by no approved_join fact")
+        lines.append("")
         lines.extend(_comment(
             f"Hop {hop.index}: {hop.from_table}.{hop.from_column} -> {hop.schema}.{hop.table}."
             f"{hop.to_column}, cardinality {hop.cardinality} toward {hop.table} — authorized by "
-            f"{backing}. LEFT, so a row whose {hop.table} row is missing survives with a null key "
-            f"and lands on no entity, rather than disappearing from the feature's population."))
+            f"{backing}."))
         lines.extend(_select_lines(
             f"    {hop.frame} = {hop.parameter}.select(",
             [f"F.col({hop.to_column!r}).alias({hop.key!r})",
-             *(f"F.col({column!r}).alias({hop.prefix + column!r})" for column in hop.columns)]))
+             *(f"F.col({column!r}).alias({hop.prefix + column!r})" for column in hop.carried)]))
         lines.append(f"    rows = rows.withColumn({hop.key!r}, F.col({hop.left_name!r}))")
         lines.append(f"    rows = rows.join({hop.frame}, [{hop.key!r}], {_HOP_JOIN_HOW!r})"
                      f".drop({hop.key!r})")
