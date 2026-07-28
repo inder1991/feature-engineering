@@ -899,6 +899,23 @@ function NeighborhoodGraph({
     add(`join:${neighborRef}`, shortRef(neighborRef), join.status === 'VERIFIED',
       `joins (${join.cardinality ?? 'n/a'})`)
   }
+  // Cross-catalog links belong ON the graph, not only in a list below it: the whole point of the
+  // link is that it is a HOP to another catalog, and a hop is a graph fact. The neighbour label
+  // carries the other catalog's name — without it `comp_financial_tran_repos_dly.cif_id` reads as a
+  // same-catalog neighbour and the one thing that makes the link interesting is invisible.
+  //
+  // Drawn whether or not a human confirmed it, for the same reason the list shows it: confirmation
+  // annotates, it does not gate. `verified` only drives the stroke, so a proposed link is visually
+  // distinct without looking broken.
+  for (const link of relationships.cross_catalog ?? []) {
+    const anchorIsLeft = link.left_object_ref === anchorRef
+    const neighborRef = anchorIsLeft ? link.right_object_ref : link.left_object_ref
+    const neighborSource = anchorIsLeft ? link.right_catalog_source : link.left_catalog_source
+    add(`xcat:${neighborSource}:${neighborRef}`,
+      `${neighborSource}.${shortRef(neighborRef)}`,
+      link.status === 'confirmed',
+      `${link.entity_id} (cross-catalog)`)
+  }
   if (relationships.semantic.status === 'available') {
     for (const edge of relationships.semantic.verified_edges) {
       if ('object_ref' in edge) {
