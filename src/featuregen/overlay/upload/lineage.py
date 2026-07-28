@@ -90,7 +90,38 @@ def lineage_graph(conn, catalog_source: str, ref: str, *, now: datetime,
     b = _Builder(conn, layers=frozenset(layers), direction=direction, roles=roles,
                  now=now, fresh_within=fresh_within, max_nodes=max_nodes)
     b.run(("table", catalog_source, anchor[0]), depth)
-    return {"nodes": list(b.nodes.values()), "edges": b.edges, "truncated": b.truncated}
+    nodes, edges = _prune_to_neighbourhood(list(b.nodes.values()), b.edges,
+                                           anchor_id=f"{catalog_source}:{ref}")
+    return {"nodes": nodes, "edges": edges, "truncated": b.truncated}
+
+
+def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *,
+                            anchor_id: str) -> tuple[list[dict], list[dict]]:
+    """Drop columns that neither anchor the view nor participate in a relationship.
+
+    A table unit expands to EVERY visible column, so opening one column of a 111-column table beside
+    a 126-column one returned 188 nodes — the screen showed "88 COLUMNS" and "+90 more columns",
+    which is the UI collapsing a payload it cannot draw. Browsing a table's columns is the asset
+    screen's job; this is a neighbourhood.
+
+    KEPT: the anchor; any column on a real edge (join key, bridge endpoint, feature source); and the
+    grain / as-of columns, which define the table's identity and its time axis, are few, and whose
+    badges the table card renders. Non-column nodes (tables, features, consumers) are never pruned.
+
+    A dropped column takes its `contains` edge with it, so the graph can never draw an edge to a
+    node that is not there.
+    """
+    participating = {end for e in edges if e.get("kind") != "contains"
+                     for end in (e["from"], e["to"])}
+    keep = {
+        n["id"] for n in nodes
+        if n.get("kind") != "column"
+        or n["id"] == anchor_id
+        or n["id"] in participating
+        or n.get("grain") or n.get("as_of")
+    }
+    return ([n for n in nodes if n["id"] in keep],
+            [e for e in edges if e["from"] in keep and e["to"] in keep])
 
 
 class _Builder:

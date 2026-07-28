@@ -48,10 +48,16 @@ def test_anchor_column_depth1_returns_table_and_joined_tables(client):
     assert "deposits:public.transactions" in ids                   # joined via reverse N:1
     assert "deposits:public.customers" in ids                      # joined via forward N:1
     assert body["truncated"] is False
-    # every table carries its columns via contains edges (the UI collapses them)
+    # A table carries the columns that PARTICIPATE, not all of them: expanding every column of
+    # every touched table returned 188 nodes on the real catalog and the UI could only collapse
+    # them into "+90 more columns". The anchor is kept...
     contains = {(e["from"], e["to"]) for e in body["edges"] if e["kind"] == "contains"}
     assert ("deposits:public.accounts", "deposits:public.accounts.balance") in contains
-    assert ("deposits:public.transactions", "deposits:public.transactions.amount") in contains
+    # ...and so is a join KEY on the joined table, because it is on an edge...
+    assert ("deposits:public.transactions",
+            "deposits:public.transactions.account_id") in contains
+    # ...while a column that neither anchors the view nor joins anything is not drawn.
+    assert "deposits:public.transactions.amount" not in ids
     # forward join keeps the declared orientation + cardinality
     joins = {(e["from"], e["to"]): e for e in body["edges"] if e["kind"] == "join"}
     fwd = joins[("deposits:public.accounts.cust_id", "deposits:public.customers.cust_id")]
@@ -189,7 +195,10 @@ def test_entity_bridge_reaches_cross_catalog_table(client):
     upload_csv(client, "cards", CARDS_CSV)
     body = _lineage(client, ref="public.customers.cust_id").json()
     assert "cards:public.card_holders" in _ids(body)
-    assert "cards:public.card_holders.credit_limit" in _ids(body)  # partner carries its columns
+    # The partner carries its LINKED column, not its whole roster — `credit_limit` participates in
+    # nothing and is not part of this neighbourhood.
+    assert "cards:public.card_holders.holder_id" in _ids(body)
+    assert "cards:public.card_holders.credit_limit" not in _ids(body)
     bridge = next(e for e in body["edges"] if e["kind"] == "entity_bridge")
     assert bridge["layer"] == "entity" and bridge["resolved"] is False
     assert bridge["from"] == "deposits:public.customers.cust_id"
@@ -301,10 +310,11 @@ def test_node_cap_truncates_but_keeps_units_atomic(client, conn):
                       now=datetime.now(UTC), max_nodes=6)
     assert g["truncated"] is True
     ids = {n["id"] for n in g["nodes"]}
-    # the anchor unit is complete: accounts + all 4 visible columns, and nothing partial beyond
+    # The anchor unit is complete and nothing partial lies beyond it. "Complete" now means the
+    # anchor plus the columns that matter — the grain (`id`), the as-of (`posted_at`) and the
+    # anchor itself — since a unit no longer drags in every column of its table.
     assert ids == {"deposits:public.accounts", "deposits:public.accounts.id",
-                   "deposits:public.accounts.posted_at", "deposits:public.accounts.balance",
-                   "deposits:public.accounts.cust_id"}
+                   "deposits:public.accounts.posted_at", "deposits:public.accounts.balance"}
     assert {e["kind"] for e in g["edges"]} == {"contains"}         # no dangling join edges
 
 

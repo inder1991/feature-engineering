@@ -848,8 +848,11 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           : [e.cardinality, 'declared'].filter(Boolean).join(' · ')
       } else if (e.kind === 'entity_bridge') {
         stroke = 'var(--warn)'
-        const entity = byId.get(e.from)?.entity ?? byId.get(e.to)?.entity
-        label = entity ? `entity: ${entity}` : 'entity'
+        // `entity_id` off the EDGE. Reading the NODE's `entity` always fell through to the bare
+        // word "entity" — graph_node.entity is null on every column — so four different links drew
+        // four identical labels stacked on top of each other.
+        const entity = e.entity_id ?? byId.get(e.from)?.entity ?? byId.get(e.to)?.entity
+        label = entity ?? 'linked'
       } else {
         stroke = 'var(--proposal)'
         label = e.kind
@@ -911,17 +914,12 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   useEffect(() => {
     const inst = rf.current
     if (!inst || nodeCount === 0) return
-    if (!centered.current) {
-      const p =
-        layout.placed.find(pp => pp.node.id === matchId) ??
-        layout.placed.find(pp => pp.node.id === anchorUnitId)
-      if (p) {
-        inst.setCenter(p.x + p.w / 2, p.y + p.h / 2, { zoom: 1, duration: 0 })
-        centered.current = true
-        return
-      }
-    }
-    inst.fitView({ duration: 0 })
+    // FIT, do not centre-at-zoom-1. The centring existed because fitView over a 188-node graph
+    // pinned the anchor to the viewport edge; now that a neighbourhood is the participating columns
+    // only, centring instead leaves a small cluster marooned in a large empty canvas. `maxZoom`
+    // stops a two-node graph being blown up absurdly, and the padding keeps edge labels off the rim.
+    inst.fitView({ padding: 0.18, maxZoom: 1.1, duration: 0 })
+    centered.current = true
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reframe only when the node set changes
   }, [nodeCount])
 
@@ -1053,6 +1051,9 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             </Panel>
           )}
           <Controls showInteractive={false} position="bottom-right" />
+          {/* Only when there is something to navigate. On a pruned neighbourhood the minimap was
+              a large panel rendering three grey blocks — cost with no information. */}
+          {flow.nodes.length > 14 && (
           <MiniMap
             position="bottom-left"
             pannable={false}
@@ -1060,6 +1061,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             nodeColor={n => (n.id === anchorUnitId ? 'var(--accent)' : 'var(--line-strong)')}
             maskColor="oklch(0.955 0.009 215 / 0.65)"
           />
+          )}
         </ReactFlow>
         {drawerNode && (
           <Drawer
