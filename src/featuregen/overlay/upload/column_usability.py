@@ -79,22 +79,22 @@ _ROLE_LABEL: dict[str, str] = {
     "as_join_key": "Join key",
 }
 
-#: A bare C1 status means NO ONE proposed anything — distinct from a proposal nobody has confirmed.
-_NO_PROPOSAL_AUTHORITIES = frozenset({
-    "no_decision", "no_value", "none", "not_operational", "projection_unavailable",
-})
-
-
 def _has_proposal(req: ColumnRequirement) -> bool:
-    """Does SOMEBODY's answer exist for this requirement, confirmed or not?
+    """Does SOMEBODY's answer exist for this requirement, confirmed or not? ``status`` says so.
 
-    ``hint`` is an advisory value; a ``producer/strength`` pair is a real evidence-backed proposal.
-    Either way an answer exists, and the old UI reported both as MISSING.
+    NOT ``authority``. An earlier draft read `authority == "hint"` as "a proposal exists", which is
+    the same error the old UI made, in reverse: it called a proposal MISSING, this called a MISSING
+    requirement a proposal. `column_readiness` sets
+    ``authority = governed if ov.status == "resolved" else "hint"`` — so `hint` is merely the
+    else-branch of "is it resolved", carried even when nothing was ever proposed.
+
+    It showed up as `cust_num` — a customer number — reporting "AI proposed" as an EVENT TIME,
+    because its `event_time` requirement was `status='missing', authority='hint'`. Nothing had
+    proposed it; the label was manufactured from a default.
+
+    `table_rollup` already split on status; this brings the per-role view onto the same footing.
     """
-    authority = (req.authority or "").strip().lower()
-    if authority in _NO_PROPOSAL_AUTHORITIES or not authority:
-        return False
-    return authority == "hint" or "/" in authority or authority == "governed"
+    return req.status == "proposed"
 
 
 def _outstanding(cap: ColumnCapability) -> tuple[ColumnRequirement, ...]:

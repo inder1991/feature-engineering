@@ -65,21 +65,24 @@ def _role(result, name):
 # ── the three states that replace one red badge ──────────────────────────────────────────────────
 
 def test_an_unreviewed_AI_proposal_is_USABLE_not_blocked():
-    """THE reframe. `authority hint` means a proposal exists — the old UI called it MISSING and
-    painted the role red."""
+    """THE reframe: a PROPOSED requirement is usable, not a failure."""
     caps = _cap("as_event_time", "blocked", (
-        _req("event_time", status="missing", blocking=True, authority="hint"),))
+        _req("event_time", status="proposed", blocking=True, authority="hint"),))
     role = _role(column_usability(_readiness(caps)), "as_event_time")
     assert role.state is Usability.AI_PROPOSED
     assert "blocked" not in role.headline.lower()
 
 
-def test_a_producer_strength_authority_also_counts_as_a_proposal():
-    """Taxonomy-derived behaviour from an LLM concept arrives as `taxonomy/proposed`. That is a
-    proposal, not an absence — it is the single most common authority in a fresh catalog."""
-    caps = _cap("as_measure", "blocked", (
-        _req("additivity", status="missing", blocking=True, authority="taxonomy/proposed"),))
-    assert _role(column_usability(_readiness(caps)), "as_measure").state is Usability.AI_PROPOSED
+def test_a_MISSING_requirement_is_not_a_proposal_however_its_authority_reads():
+    """This test previously ENSHRINED the defect: it asserted a `status='missing'` requirement was
+    an AI proposal because its authority string looked like one.
+
+    `column_readiness` sets `authority = governed if resolved else "hint"`, so a hint authority is
+    the DEFAULT on anything unresolved — including a requirement nobody ever proposed. Reading it as
+    a proposal made `cust_num` (a customer number) report "AI proposed" as an EVENT TIME."""
+    caps = _cap("as_event_time", "blocked", (
+        _req("event_time", status="missing", blocking=True, authority="hint"),))
+    assert _role(column_usability(_readiness(caps)), "as_event_time").state is Usability.NOT_SET
 
 
 def test_an_external_check_is_UNKNOWN_not_a_failure():
@@ -122,7 +125,7 @@ def test_a_proposal_with_a_pending_data_check_reports_usable_and_says_what_to_ch
     """Both facts are true at once and the old UI could only show one. `as measure` literally
     rendered READY while carrying a review saying a type check was required first."""
     caps = _cap("as_event_time", "blocked", (
-        _req("event_time", status="missing", blocking=True, authority="hint"),
+        _req("event_time", status="proposed", blocking=True, authority="hint"),
         _req("external:TEMPORAL_IS_POPULATED", status="review", blocking=False,
              authority="external_check", external_preview=True),))
     role = _role(column_usability(_readiness(caps)), "as_event_time")
@@ -137,7 +140,7 @@ def test_the_headline_counts_USABLE_roles_not_ready_ones():
     is the number that matters, because usable is what the tool will act on."""
     result = column_usability(_readiness(
         _cap("as_event_time", "blocked",
-             (_req("event_time", status="missing", blocking=True, authority="hint"),)),
+             (_req("event_time", status="proposed", blocking=True, authority="hint"),)),
         _cap("as_entity_key", "blocked",
              (_req("entity_assignment", status="missing", blocking=True, authority="no_decision"),)),
     ))
