@@ -935,7 +935,7 @@ def render_projection_node(
         *_availability_gate(pit, available),
         "",
         *_window_boundaries(pit, clock, contract.pit_semantics.cutoff_timezone),
-        *_traversal_lines(plan),
+        *_traversal_lines(plan, tuple(expression.join_plan.roles_used)),
         "    return rows",
     ]) + "\n"
     return RenderedNode(
@@ -1365,7 +1365,7 @@ def _read_set_lines(read_set: tuple[str, ...]) -> list[str]:
     ]
 
 
-def _traversal_lines(plan: _Traversal) -> list[str]:
+def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]:
     """§3.1–3.2 — the governed traversal, rendered in the direction of travel.
 
     Three things about the shape below are load-bearing and none of them is stylistic.
@@ -1390,19 +1390,26 @@ def _traversal_lines(plan: _Traversal) -> list[str]:
     if not plan.hops:
         return []
     count = f"{len(plan.hops)} hop" + ("" if len(plan.hops) == 1 else "s")
+    roles = ("read roles " + ", ".join(_safe_text(role, "a read role") for role in roles_used)
+             if roles_used else "an EMPTY read scope")
     lines = [
         "",
         *_comment(
             f"§3.1 — the governed traversal to the grain: {count}, each one an edge the join "
-            f"planner returned as OPERATIONAL. The gates above ran first, on the source relation's "
-            f"own columns, so the rows joined here are already the ones this feature may see. Every "
-            f"hop is a LEFT join: the traversal says which entity a row belongs to and must not "
-            f"decide which rows EXIST, so a row whose dimension row is missing survives with a null "
-            f"key and lands on no entity rather than disappearing from the feature's population. "
-            f"Each hop's key travels under a name of its own and is dropped once the hop is done, "
-            f"so nothing downstream can mistake it for the entity: the key column a join keeps "
-            f"takes the LEFT side's value, which for an unmatched row names an entity that is not "
-            f"there."),
+            f"planner returned as OPERATIONAL, planned under {roles}. The roles are part of the "
+            f"answer and not provenance decoration: they decide whether a hop is DENIED, so the "
+            f"same catalog yields a different path for a different reader and this one cannot be "
+            f"re-checked without them. The gates above ran first, on the source relation's own "
+            f"columns, so the rows joined here are already the ones this feature may see."),
+        "",
+        *_comment(
+            "Every hop is a LEFT join: the traversal says which entity a row belongs to and must "
+            "not decide which rows EXIST, so a row whose dimension row is missing survives with a "
+            "null key and lands on no entity rather than disappearing from the feature's "
+            "population. Each hop's key travels under a name of its own and is dropped once the "
+            "hop is done, so nothing downstream can mistake it for the entity: the key column a "
+            "join keeps takes the LEFT side's value, which for an unmatched row names an entity "
+            "that is not there."),
     ]
     for hop in plan.hops:
         backing = (f"approved_join fact {hop.fact_key} ({hop.status})" if hop.fact_key is not None

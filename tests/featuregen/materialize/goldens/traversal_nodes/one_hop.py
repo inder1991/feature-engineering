@@ -57,14 +57,18 @@ def project_total_debit_amount_30d__body_expr(
     rows = rows.where(F.col('txn_dt') < ends_at)
 
     # §3.1 — the governed traversal to the grain: 1 hop, each one an edge the join planner
-    # returned as OPERATIONAL. The gates above ran first, on the source relation's own columns, so
-    # the rows joined here are already the ones this feature may see. Every hop is a LEFT join:
-    # the traversal says which entity a row belongs to and must not decide which rows EXIST, so a
-    # row whose dimension row is missing survives with a null key and lands on no entity rather
-    # than disappearing from the feature's population. Each hop's key travels under a name of its
-    # own and is dropped once the hop is done, so nothing downstream can mistake it for the
-    # entity: the key column a join keeps takes the LEFT side's value, which for an unmatched row
-    # names an entity that is not there.
+    # returned as OPERATIONAL, planned under read roles feature_engineer. The roles are part of
+    # the answer and not provenance decoration: they decide whether a hop is DENIED, so the same
+    # catalog yields a different path for a different reader and this one cannot be re-checked
+    # without them. The gates above ran first, on the source relation's own columns, so the rows
+    # joined here are already the ones this feature may see.
+
+    # Every hop is a LEFT join: the traversal says which entity a row belongs to and must not
+    # decide which rows EXIST, so a row whose dimension row is missing survives with a null key
+    # and lands on no entity rather than disappearing from the feature's population. Each hop's
+    # key travels under a name of its own and is dropped once the hop is done, so nothing
+    # downstream can mistake it for the entity: the key column a join keeps takes the LEFT side's
+    # value, which for an unmatched row names an entity that is not there.
 
     # Hop 1: banking.transactions.cif_num -> banking.customers.cif_id, cardinality N:1 toward
     # customers — authorized by approved_join fact ajf-txn-cust (VERIFIED).

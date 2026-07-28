@@ -2862,3 +2862,22 @@ def test_a_row_that_reaches_a_DANGLING_DIMENSION_lands_on_no_entity_not_on_the_d
     rows = _traverse(node, [_windowed(BEFORE, 55) | {"acct_num": "A3"}],
                      accounts=[*ACCOUNTS, {"acct_id": "A3", "owner_id": "C9"}]).rows
     assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(55, None)]
+
+
+def test_the_rendered_traversal_states_the_ROLES_the_path_was_planned_under(compiled, expression):
+    """`roles_used` is load-bearing, not decoration: roles decide whether a hop is DENIED, so the
+    same catalog yields a different path for a different reader — and a rendered artifact that did
+    not say which reader's path it computed could not be re-checked against the catalog."""
+    node = _traversal(compiled, expression)
+    roles = _traversed(expression).join_plan.roles_used
+    assert roles, "the worked compilation plans under at least one role"
+    for role in roles:
+        assert role in node.source
+    empty = dataclasses.replace(_traversed(expression),
+                                join_plan=dataclasses.replace(
+                                    _traversed(expression).join_plan, roles_used=()))
+    rendered = nodes_compute.render_projection_node(
+        empty, compiled[2], feature_column=SUM_30D,
+        source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
+        projection_dataset="intermediate").source
+    assert "an EMPTY read scope" in rendered
