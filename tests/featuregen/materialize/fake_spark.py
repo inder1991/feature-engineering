@@ -61,7 +61,7 @@ import hashlib as _hashlib
 import json as _json
 import pathlib as _pathlib
 import re as _re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -85,6 +85,26 @@ def _as_date(value: Any) -> _dt.date:
     if isinstance(value, _dt.date):
         return value
     return _dt.date.fromisoformat(str(value))
+
+
+def _lit_type(value: Any) -> str | None:
+    """The Spark type a literal of ``value`` carries — only where it is unambiguous.
+
+    ``bool`` is tested before ``int`` because it IS one in Python and is not one in Spark. A
+    ``Decimal`` deliberately answers None: its precision and scale come from the value, and this
+    stand-in stating one would be a claim about Spark it cannot check.
+    """
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "bigint"
+    if isinstance(value, _dt.datetime):
+        return "timestamp"
+    if isinstance(value, _dt.date):
+        return "date"
+    return None
 
 
 def _is_aggregate(value: Any) -> bool:
@@ -116,11 +136,17 @@ class Column:
     """
 
     def __init__(self, name: str, evaluate: Callable[[Any], Any],
-                 *, window: _WindowExpr | None = None, aggregate: bool = False) -> None:
+                 *, window: _WindowExpr | None = None, aggregate: bool = False,
+                 sql_type: str | None = None) -> None:
         self._name = name
         self._evaluate = evaluate
         self._window = window
         self._aggregate = aggregate
+        # The type this expression is KNOWN to produce, or None where this stand-in does not know.
+        # Only `lit` and `cast` know one — everything else leaves it None, and a frame asked for a
+        # dtype it was never given RAISES rather than inventing one. §9's type gate is the reason:
+        # a fake that guessed "string" would grade a rendered gate against its own guess.
+        self._sql_type = sql_type
 
     # ── naming ───────────────────────────────────────────────────────────────────────────────────
 
@@ -129,7 +155,8 @@ class Column:
         return self._name
 
     def alias(self, name: str) -> Column:
-        return Column(name, self._evaluate, window=self._window, aggregate=self._aggregate)
+        return Column(name, self._evaluate, window=self._window, aggregate=self._aggregate,
+                      sql_type=self._sql_type)
 
     # ── evaluation ───────────────────────────────────────────────────────────────────────────────
 
@@ -267,7 +294,7 @@ class Column:
             precision, scale = int(decimal_type.group(1)), int(decimal_type.group(2))
             return Column(f"CAST({self._name} AS {wanted.upper()})",
                           lambda row: _fit_decimal(self._evaluate(row), precision, scale),
-                          aggregate=self._aggregate)
+                          aggregate=self._aggregate, sql_type=wanted)
 
         def convert(row: Any) -> Any:
             value = self._evaluate(row)
@@ -275,7 +302,7 @@ class Column:
                 return None if value is None else int(value)
             return _as_datetime(value) if wanted == "timestamp" else _as_date(value)
         return Column(f"CAST({self._name} AS {wanted.upper()})", convert,
-                      aggregate=self._aggregate)
+                      aggregate=self._aggregate, sql_type=wanted)
 
     def isin(self, values: Iterable[Any]) -> Column:
         allowed = list(values)
@@ -464,8 +491,10 @@ class DataFrame:
     """
 
     def __init__(self, rows: Sequence[dict[str, Any]],
-                 columns: Sequence[str] | None = None) -> None:
+                 columns: Sequence[str] | None = None,
+                 types: Mapping[str, str] | None = None) -> None:
         self._rows = [dict(row) for row in rows]
+        self._types = dict(types or {})
         if columns is None:
             seen: list[str] = []
             for row in self._rows:
@@ -485,18 +514,45 @@ class DataFrame:
     def columns(self) -> list[str]:
         return list(self._columns)
 
+    @property
+    def dtypes(self) -> list[tuple[str, str]]:
+        """``[(name, type), …]`` — Spark's own shape, and only for types this frame was GIVEN.
+
+        A frame's schema exists independently of its rows, and this stand-in has no type inference:
+        a column whose type nobody stated RAISES here. That is deliberate. §9's WRONG_COLUMN_TYPE
+        gate is judged against these values, and a fake that answered "string" for anything it did
+        not know would let the gate pass on the fake's guess rather than on a declared type.
+        """
+        unknown = [name for name in self._columns if name not in self._types]
+        if unknown:
+            raise NotImplementedError(
+                f"fake_spark was never told the type of {unknown}: `dtypes` answers only what a "
+                f"frame was given, because a guessed type would be the gate under test grading "
+                f"this stand-in's invention")
+        return [(name, self._types[name]) for name in self._columns]
+
     # ── the operations the rendered spine uses ───────────────────────────────────────────────────
 
     def where(self, condition: Column) -> DataFrame:
-        return DataFrame([row for row in self._rows if bool(condition._eval(row))], self._columns)
+        return DataFrame([row for row in self._rows if bool(condition._eval(row))],
+                         self._columns, self._types)
 
     filter = where
 
     def withColumn(self, name: str, expression: Column) -> DataFrame:  # noqa: N802 — Spark's name
         columns = self._columns if name in self._columns else (*self._columns, name)
+        types = dict(self._types)
+        # A replaced column takes the new expression's type, or LOSES its old one where the
+        # expression's type is unknown: keeping the previous answer would state a type for a value
+        # that is no longer the value it described.
+        if expression._sql_type is None:
+            types.pop(name, None)
+        else:
+            types[name] = expression._sql_type
         if expression._window is not None:
-            return DataFrame(self._windowed(name, expression._window), columns)
-        return DataFrame([{**row, name: expression._eval(row)} for row in self._rows], columns)
+            return DataFrame(self._windowed(name, expression._window), columns, types)
+        return DataFrame([{**row, name: expression._eval(row)} for row in self._rows], columns,
+                         types)
 
     def _windowed(self, name: str, window: _WindowExpr) -> list[dict[str, Any]]:
         spec = window.spec
@@ -522,14 +578,22 @@ class DataFrame:
         return produced
 
     def select(self, *expressions: Column) -> DataFrame:
+        types = {}
+        for column in expressions:
+            # A plain `F.col(x)` keeps x's type; anything else keeps only a type it states itself.
+            known = column._sql_type if column._sql_type is not None else self._types.get(
+                column.name)
+            if known is not None:
+                types[column.name] = known
         return DataFrame([{column.name: column._eval(row) for column in expressions}
                           for row in self._rows],
-                         [column.name for column in expressions])
+                         [column.name for column in expressions], types)
 
     def drop(self, *names: str) -> DataFrame:
         dropped = set(names)
         return DataFrame([{k: v for k, v in row.items() if k not in dropped} for row in self._rows],
-                         [name for name in self._columns if name not in dropped])
+                         [name for name in self._columns if name not in dropped],
+                         {k: v for k, v in self._types.items() if k not in dropped})
 
     def groupBy(self, *columns: Column) -> _GroupedData:  # noqa: N802 — Spark's name
         return _GroupedData(self._rows, columns)
@@ -568,10 +632,10 @@ class DataFrame:
                 produced.extend({**row, **match} for match in matches)
             elif how == "left":
                 produced.append({**row, **dict.fromkeys(added)})
-        return DataFrame(produced, [*self._columns, *added])
+        return DataFrame(produced, [*self._columns, *added], {**self._types, **other._types})
 
     def limit(self, n: int) -> DataFrame:
-        return DataFrame(self._rows[:n], self._columns)
+        return DataFrame(self._rows[:n], self._columns, self._types)
 
     def count(self) -> int:
         return len(self._rows)
@@ -596,7 +660,7 @@ class _Functions:
 
     @staticmethod
     def lit(value: Any) -> Column:
-        return Column(repr(value), lambda _row, v=value: v)
+        return Column(repr(value), lambda _row, v=value: v, sql_type=_lit_type(value))
 
     @staticmethod
     def rank() -> _WindowExpr:

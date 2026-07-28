@@ -612,3 +612,175 @@ def test_a_ONE_feature_group_renders_a_TUPLE_and_not_a_STRING(db, catalog) -> No
                 if isinstance(target, ast.Name) and target.id in {"planned", "system_columns"}}
     assert literals["planned"] == (SUM_30D,)
     assert literals["system_columns"] == SYSTEM_COLUMNS
+
+
+# ══ §9 — the shape gates over the ASSEMBLED group ════════════════════════════════════════════════
+
+
+def _expected_types(plan) -> dict[str, str]:
+    """What Spark would answer for a correctly assembled group, in Spark's own spelling.
+
+    The feature types are the PLAN's, lower-cased: `dtypes` reports `decimal(38,6)` where §6
+    resolved `DECIMAL(38,6)`, and a gate that could not see past that would fire on every correct
+    run. The landing key and the business date are typed here only because the stand-in refuses to
+    invent a type — §9 checks neither, because nothing governed states one at compile time.
+    """
+    types = {plan.entity_key_columns[0]: "string", plan.business_dt_column: "date"}
+    for feature in plan.features:
+        types[feature.column_name] = feature.physical_type.sql_type.lower()
+    for system in SYSTEM_COLUMNS:
+        types[system] = "string"
+    return types
+
+
+def _assembled(plan, *, rows=None, types=None, order=None) -> fake_spark.DataFrame:
+    """A group assembled exactly as the plan describes, or as near to it as a test needs."""
+    declared = _expected_types(plan)
+    declared.update(types or {})
+    columns = list(order) if order is not None else [c.name for c in expected_schema(plan)]
+    if rows is None:
+        rows = [_assembled_row(plan)]
+    return fake_spark.DataFrame(
+        [{name: row.get(name) for name in columns} for row in rows], columns,
+        {name: declared[name] for name in columns if name in declared})
+
+
+def _assembled_row(plan, **overrides) -> dict:
+    row = {plan.entity_key_columns[0]: "C1", plan.business_dt_column: BUSINESS_DT,
+           "__generation_id": GENERATION, "__generated_project_hash": "p" * 64,
+           "__sandbox_execution_hash": EXECUTION_HASH}
+    row.update({feature.column_name: 1 for feature in plan.features})
+    row.update(overrides)
+    return row
+
+
+def _run_gate(gate, frame):
+    return fake_spark.run_rendered(gate.source, GATE_FUNC_NAME)(frame)
+
+
+def test_a_group_that_matches_the_plan_passes_EVERY_shape_gate(gate, plan) -> None:
+    """The control every gate test below needs, and more: the schema hash the rendered node
+    compares against is `expected_schema_hash(plan)`, computed in this process by RFC 8785 and in
+    the rendered node by `json.dumps(sort_keys=True)`. Passing here is what proves those two
+    canonicalizations agree — a claim no assertion about the rendered text could make."""
+    passed = _run_gate(gate, _assembled(plan))
+    assert passed.columns == [column.name for column in expected_schema(plan)]
+
+
+def test_a_DUPLICATE_landing_key(gate, plan) -> None:
+    """§9 — a duplicate is a blocking gate, never a de-duplication step."""
+    frame = _assembled(plan, rows=[_assembled_row(plan), _assembled_row(plan)])
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, frame)
+    findings = _findings(exc)
+    assert set(findings) == {ValidationGateCode.KEY_NOT_UNIQUE}
+    assert "1" in findings[ValidationGateCode.KEY_NOT_UNIQUE]
+
+
+def test_a_MISSING_planned_column(gate, plan) -> None:
+    """§9 — required columns present. A shorter published row is a different contract."""
+    absent = plan.features[0].column_name
+    order = [c.name for c in expected_schema(plan) if c.name != absent]
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, _assembled(plan, order=order))
+    findings = _findings(exc)
+    assert set(findings) == {ValidationGateCode.MISSING_FEATURE_COLUMN}
+    assert absent in findings[ValidationGateCode.MISSING_FEATURE_COLUMN]
+
+
+def test_a_column_the_plan_does_NOT_contain(gate, plan) -> None:
+    """§9 — none extra. A column nobody planned is a column nobody governed."""
+    order = [*(c.name for c in expected_schema(plan)), "smuggled_in"]
+    frame = _assembled(plan, order=order, types={"smuggled_in": "string"},
+                       rows=[_assembled_row(plan, smuggled_in="x")])
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, frame)
+    findings = _findings(exc)
+    assert set(findings) == {ValidationGateCode.UNEXPECTED_COLUMN}
+    assert "smuggled_in" in findings[ValidationGateCode.UNEXPECTED_COLUMN]
+
+
+def test_a_feature_column_of_the_WRONG_declared_type(gate, plan) -> None:
+    """§9 — physical types match §6, including the decimal's precision and scale."""
+    column = plan.features[0].column_name
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, _assembled(plan, types={column: "decimal(9,2)"}))
+    findings = _findings(exc)
+    assert set(findings) == {ValidationGateCode.WRONG_COLUMN_TYPE}
+    detail = findings[ValidationGateCode.WRONG_COLUMN_TYPE]
+    assert column in detail and "decimal(9,2)" in detail
+
+
+def test_binary_floating_point_is_reported_as_FORBIDDEN_and_not_as_a_type_mismatch(
+        gate, plan) -> None:
+    """Both gates can see a `double` in a DECIMAL column. Only one of them says what is wrong with
+    it, so the type gate deliberately stands down: 'this column is a double' and 'this column is
+    the wrong decimal' have different fixes, and reporting both would name neither."""
+    column = plan.features[0].column_name
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, _assembled(plan, types={column: "double"}))
+    findings = _findings(exc)
+    assert set(findings) == {ValidationGateCode.FORBIDDEN_NUMERIC}
+    assert column in findings[ValidationGateCode.FORBIDDEN_NUMERIC]
+
+
+def test_a_NULL_in_a_column_declared_NOT_NULL(gate, plan) -> None:
+    """§9 — nullability, judged on the ROWS. Spark widens the schema flag through a left join, so
+    the flag says nothing; a NULL landing key reaching the published table says everything."""
+    key = plan.entity_key_columns[0]
+    frame = _assembled(plan, rows=[_assembled_row(plan), _assembled_row(plan, **{key: None})])
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, frame)
+    findings = _findings(exc)
+    assert set(findings) == {ValidationGateCode.WRONG_NULLABILITY}
+    assert key in findings[ValidationGateCode.WRONG_NULLABILITY]
+
+
+def test_a_PERMUTED_published_row_is_caught_by_the_schema_hash_ALONE(gate, plan) -> None:
+    """The gate that would be dead code if it were redundant. Every name, type and nullability is
+    right; only the ORDER moved, which every name-keyed check above is blind to by construction."""
+    names = [column.name for column in expected_schema(plan)]
+    permuted = [names[1], names[0], *names[2:]]
+    with pytest.raises(RuntimeError) as exc:
+        _run_gate(gate, _assembled(plan, order=permuted))
+    assert set(_findings(exc)) == {ValidationGateCode.SCHEMA_HASH_MISMATCH}
+
+
+def test_the_gate_reads_the_assembled_group_and_writes_the_publication_target(
+        gate, datasets) -> None:
+    assert gate.inputs == (datasets.assembled,)
+    assert gate.outputs == (datasets.published,)
+
+
+def test_the_gate_names_no_publish_MECHANISM(gate) -> None:
+    """§10.3 — the renderer consumes a `PublisherSelection` or renders no mechanism at all. This
+    node renders none: no DDL, no table, no partition swap. The catalog entry is the mechanism, and
+    it is fail-closed until Task 16's probe attests one."""
+    for banned in ("INSERT OVERWRITE", "ALTER TABLE", "EXCHANGE PARTITION", "saveAsTable",
+                   "write.", "SET LOCATION"):
+        assert banned not in gate.source, banned
+
+
+# ══ assembly → gates, end to end ═════════════════════════════════════════════════════════════════
+
+
+def test_the_assembled_group_the_ASSEMBLY_node_produces_passes_the_GATE_node(
+        assembly, gate, plan, materialized) -> None:
+    """The seam between the two nodes, executed rather than assumed: the shape one produces is the
+    shape the other requires, including the three system columns it stamps and the order it puts
+    them in. Two nodes that agreed only on paper would fail here."""
+    types = _expected_types(plan)
+    key = plan.entity_key_columns[0]
+    spine = fake_spark.DataFrame(
+        [{key: "C1", plan.business_dt_column: BUSINESS_DT}],
+        [key, plan.business_dt_column],
+        {key: types[key], plan.business_dt_column: types[plan.business_dt_column]})
+    staged = {
+        column: fake_spark.DataFrame(
+            [{key: "C1", plan.business_dt_column: BUSINESS_DT, column: 1}],
+            [key, plan.business_dt_column, column],
+            {key: types[key], plan.business_dt_column: types[plan.business_dt_column],
+             column: types[column]})
+        for column in _columns(plan)}
+    assembled = _run_assembly(assembly, plan, materialized, spine=spine, staged=staged)
+    assert _run_gate(gate, assembled).columns == [c.name for c in expected_schema(plan)]

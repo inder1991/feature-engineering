@@ -722,13 +722,19 @@ def _schema_hash_lines(plan: FeatureGroupPlanV1) -> list[str]:
     nullability agree, the one thing left that this can see is a published row whose columns arrive
     in a different sequence — which changes nothing a name-keyed check can detect and changes the
     bytes of every downstream reader that reads positionally.
+
+    It is therefore reported ONLY when nothing more specific was: the hash moves for a wrong type
+    too, and a message that carried ``WRONG_COLUMN_TYPE`` and ``SCHEMA_HASH_MISMATCH`` would name
+    one defect and then echo it under a code that says nothing about which column moved.
     """
     return [
         *_comment(
             "§9 — the assembled schema hash, over the columns IN THE ORDER they arrive. The checks "
-            "above match names to types, so what this adds is order: a published row whose columns "
+            "above match names to types, so what this adds is ORDER: a published row whose columns "
             "are permuted passes every one of them and is still not the row the plan describes. "
-            "The payload is `expected_schema`'s, so the two hashes are comparable by construction."),
+            "The payload is `expected_schema`'s, so the two hashes are comparable by construction. "
+            "Reported only when nothing more specific was found: this hash also moves for a wrong "
+            "type, and a run that reported both would name the defect once and echo it once."),
         "    payload = []",
         "    by_name = {name: (role, declared, nullable)",
         "               for name, role, declared, nullable in expected}",
@@ -739,7 +745,7 @@ def _schema_hash_lines(plan: FeatureGroupPlanV1) -> list[str]:
         "    schema_hash = hashlib.sha256(json.dumps(",
         "        {'columns': payload}, separators=(',', ':'), sort_keys=True,",
         "        ensure_ascii=False).encode('utf-8')).hexdigest()",
-        f"    if schema_hash != {expected_schema_hash(plan)!r}:",
+        f"    if failures == [] and schema_hash != {expected_schema_hash(plan)!r}:",
         *_finding(
             ValidationGateCode.SCHEMA_HASH_MISMATCH,
             "the assembled group's schema hash is not the plan's. Observed:",
