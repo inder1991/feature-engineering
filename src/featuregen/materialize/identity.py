@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from featuregen.materialize import binding, render
+from featuregen.materialize import binding, compile, render
 from featuregen.materialize.admission import hive_identifier
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.group_plan import FeatureGroupPlanV1, group_plan_hash
@@ -412,7 +412,6 @@ def sandbox_execution_hash(
     parameters: Mapping[str, Any],
     business_dt: str,
     input_snapshot_ids: Sequence[str],
-    compiler_version: str,
     capability_attestation_id: str,
 ) -> str:
     """The identity of ONE execution (§7) — everything the compilation identity may not contain.
@@ -429,14 +428,15 @@ def sandbox_execution_hash(
     preparation makes, not this module. ``parameters``' key order is irrelevant, because RFC 8785
     sorts object keys.
 
-    **The renderer's version is READ, not accepted** (Task 12). §7 says this hash covers it, and the
-    one thing it exists to detect is a change of renderer — so a call site free to pass a literal
-    could silently freeze it at whatever it typed, and the hash would keep answering the same value
-    across a renderer that had changed underneath it. There is therefore no ``renderer_version``
-    parameter: the value is ``render.RENDERER_VERSION``, read *through the module* so a test can
-    move the constant and see this answer move with it. ``compiler_version`` is still a parameter
-    because §2's chain has no orchestrating module to own one (A.13); the same treatment is owed to
-    it the moment one exists.
+    **Both toolchain versions are READ, not accepted** (Tasks 12 and 15). §7 says this hash covers
+    them, and the one thing they exist to detect is a compiler or renderer that changed — so a call
+    site free to pass a literal could silently freeze one at whatever it typed, and the hash would
+    keep answering the same value across a toolchain that had changed underneath it. There is
+    therefore neither a ``renderer_version`` nor a ``compiler_version`` parameter: the values are
+    ``render.RENDERER_VERSION`` and ``compile.COMPILER_VERSION``, read *through* their modules so a
+    test can move a constant and see this answer move with it. Both live in package ``__init__``
+    files that import nothing, because the modules that will use them (``render.project``, §2's
+    chain) import this one.
 
     There is no production counterpart, and this value is never recorded as ``execution_hash``.
 
@@ -482,7 +482,7 @@ def sandbox_execution_hash(
         "parameters": dict(parameters),
         "business_dt": _required(business_dt, "business_dt"),
         "input_snapshot_ids": list(snapshots),
-        "compiler_version": _required(compiler_version, "compiler_version"),
+        "compiler_version": _required(compile.COMPILER_VERSION, "compiler_version"),
         "renderer_version": _required(render.RENDERER_VERSION, "renderer_version"),
         "capability_attestation_id": _required(capability_attestation_id,
                                                "capability_attestation_id"),
