@@ -1783,3 +1783,53 @@ def test_the_two_POLICY_arguments_have_no_defaults_and_reject_a_word_outside_the
         _calculate(compiled, feature, empty_window="nothing")
     with pytest.raises(ValueError):
         _calculate(compiled, feature, null_input="skip")
+
+
+# ── goldens: a change detector, and the weakest test here ────────────────────────────────────────
+
+
+CALCULATION_GOLDENS = pathlib.Path(__file__).parent / "goldens" / "calculation_nodes"
+
+CALCULATION_VARIANTS = {
+    "sum_decimal_null_window": {},
+    "sum_decimal_zero_window": {"empty_window": EmptyWindowResult.ZERO},
+    "sum_decimal_error_window": {"empty_window": EmptyWindowResult.ERROR},
+    "sum_decimal_propagate_nulls": {"null_input": NullInput.PROPAGATE},
+    "sum_decimal_zero_nulls": {"null_input": NullInput.ZERO},
+}
+
+
+@pytest.mark.parametrize("variant", sorted(CALCULATION_VARIANTS))
+def test_the_rendered_calculation_matches_its_golden(compiled, feature, variant):
+    """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
+    golden = CALCULATION_GOLDENS / f"{variant}.py"
+    rendered = _calculate(compiled, feature, **CALCULATION_VARIANTS[variant]).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_the_count_variant_renders_its_own_golden(compiled, feature):
+    """A BIGINT feature: no rounding, no overflow check, a COUNT DISTINCT and no operand policy to
+    apply. Rendered from the SAME code path, so the golden is evidence the branches are branches."""
+    expression = dataclasses.replace(compiled[0].irs[0].expressions[0],
+                                     aggregation=AggregateFunction.COUNT_DISTINCT)
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
+    counted = dataclasses.replace(feature, physical_type=dataclasses.replace(
+        feature.physical_type, sql_type="BIGINT", nullable=False, rounding=None, overflow=None))
+    golden = CALCULATION_GOLDENS / "count_distinct_bigint.py"
+    rendered = _calculate(compiled, counted, ir=ir,
+                          plan=dataclasses.replace(compiled[1], features=(counted,))).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_every_rendered_calculation_line_fits_the_width_it_states(compiled, feature):
+    """`_RENDERED_WIDTH` is a claim about the emitted bytes. Task 13a and 13b each shipped a line
+    past it that only reading the golden caught; this makes the next one fail instead."""
+    for variant in CALCULATION_VARIANTS.values():
+        for line in _calculate(compiled, feature, **variant).source.splitlines():
+            assert len(line) <= 100, line

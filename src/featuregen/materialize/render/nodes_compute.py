@@ -224,6 +224,14 @@ _ROUNDING_CALLS: dict[RoundingMode, str] = {
     RoundingMode.HALF_EVEN: "F.bround",
 }
 
+#: What each rendered rounding mode DOES, in the generated project's own terms. The renderer's menu
+#: of implementable modes is not the bank's business: a comment saying "the two available modes"
+#: describes this compiler's limits rather than this feature's declared behaviour.
+_ROUNDING_NOTES: dict[RoundingMode, str] = {
+    RoundingMode.HALF_UP: "a tie rounds AWAY from zero, so 2.5 becomes 3.",
+    RoundingMode.HALF_EVEN: "a tie rounds to the EVEN neighbour, so 2.5 becomes 2 and 3.5 becomes 4.",
+}
+
 #: ``FilterPredicateOp`` → the Python operator its rendered comparison uses.
 _COMPARISONS: dict[FilterPredicateOp, str] = {
     FilterPredicateOp.EQUAL: "==",
@@ -1790,12 +1798,20 @@ def _decimal_scale(sql_type: str) -> tuple[int, int]:
 
 
 def _rounding_lines(column: str, physical: PhysicalType) -> list[str]:
-    """§6 — rounding is EXPLICIT. Never left to whatever the engine happens to do."""
+    """§6 — rounding is EXPLICIT. Never left to whatever the engine happens to do.
+
+    An integral published type gets ONE comment covering both this obligation and the overflow one
+    (:func:`_overflow_lines` then emits none), rather than two blocks each saying that nothing is
+    done. Seven lines of prose stating twice that nothing happens reads as generated boilerplate,
+    and a comment a reviewer skims is a comment that can be wrong without anyone noticing.
+    """
     if physical.rounding is None:
         return [*_comment(
             f"§6 — the published type is {_safe_text(physical.sql_type, 'the published type')}, "
-            f"which is integral: there is no decimal arithmetic for a rounding mode to govern, and "
-            f"one recorded against it would be an instruction this node could act on wrongly."), ""]
+            f"which is integral. Neither of §6's decimal obligations applies to it: there is no "
+            f"decimal arithmetic for a rounding mode to govern, and no decimal overflow to check "
+            f"for. A rounding mode recorded against it would be an instruction this node could act "
+            f"on wrongly."), ""]
     if physical.rounding not in _ROUNDING_CALLS:
         raise ValueError(
             f"the formula declares {physical.rounding.value!r} rounding, and no Spark function "
@@ -1807,8 +1823,9 @@ def _rounding_lines(column: str, physical: PhysicalType) -> list[str]:
         *_comment(
             f"§6 — rounding is applied EXPLICITLY, from the formula's own declared "
             f"`{physical.rounding.value}` mode, and never inherited from an engine default. "
-            f"`{_ROUNDING_CALLS[physical.rounding]}` is Spark's function for exactly that mode; the "
-            f"two available modes disagree on ties, which is the whole of the distinction."),
+            f"`{_ROUNDING_CALLS[physical.rounding]}` is Spark's function for exactly that mode — "
+            f"{_ROUNDING_NOTES[physical.rounding]} A different mode would move every tie in this "
+            f"column, and an engine default states no mode at all."),
         *_call_lines(
             "    staged = staged.withColumn(",
             [repr(column), f"{_ROUNDING_CALLS[physical.rounding]}(F.col({column!r}), {scale})"],
@@ -1820,10 +1837,10 @@ def _rounding_lines(column: str, physical: PhysicalType) -> list[str]:
 def _overflow_lines(column: str, physical: PhysicalType) -> list[str]:
     """§9's ``OVERFLOW_VIOLATION`` — the check that turns Spark's silent NULL into a refusal."""
     if physical.overflow is None:
-        return [*_comment(
-            "§6 — an integral published type has no decimal overflow behaviour to honour, so "
-            "nothing is checked here. The check below exists only where a DECIMAL(p,s) is "
-            "published, which is where a value can fail to fit."), ""]
+        # Nothing at all: `_rounding_lines` already said so for both obligations at once. A second
+        # block here would state it twice, and the first draft's version pointed at "the check
+        # below" — which is not in the file when this branch is taken.
+        return []
     if physical.overflow is not OverflowBehavior.ERROR:
         raise ValueError(
             f"the formula declares {physical.overflow.value!r} overflow: nothing in this slice "
@@ -1886,8 +1903,8 @@ def _manifest_lines(column: str, feature: PlannedFeature) -> list[str]:
             "out of every other generated file, because the hash is taken OVER those files, so a "
             "literal here would be a value the hash is computed from."),
         f"    project_root = pathlib.Path(__file__).resolve().parents[{_LOCK_DEPTH}]",
-        f"    lock = json.loads((project_root / {GENERATED_LOCK_FILENAME!r})",
-        "                      .read_text(encoding='utf-8'))",
+        f"    lock = json.loads("
+        f"(project_root / {GENERATED_LOCK_FILENAME!r}).read_text(encoding='utf-8'))",
         "",
         *_comment(
             "The staged output's own column NAMES, plus the type THIS compilation declared for the "
