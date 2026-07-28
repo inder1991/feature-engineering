@@ -147,15 +147,15 @@ def test_no_parameter_anywhere_in_the_module_can_assert_capability() -> None:
     """Stronger than the one signature: NOTHING public here takes a bare capability claim.
 
     `record_attestation` could be clean while a sibling writer took `passed=`, and the attestation
-    would be back — recorded by the other door. The only functions allowed to name `passed` or
-    `covers_schema_evolution` are the ones that DERIVE them from observations.
+    would be back — recorded by the other door. Not even `assess_probe_observations` is exempt:
+    it DERIVES the verdict from the readings it is given, so it has no reason to accept one, and
+    exempting it would leave the one function whose whole job is the verdict able to be handed it.
     """
-    derivers = {"assess_probe_observations"}
+    offending = {"passed", "covers_schema_evolution", "adds_feature", "evidence_hash"}
     for name in publish_module.__all__:
         member = getattr(publish_module, name)
-        if not inspect.isfunction(member) or name in derivers:
+        if not inspect.isfunction(member):
             continue
-        offending = {"passed", "covers_schema_evolution", "adds_feature", "evidence_hash"}
         assert not (set(inspect.signature(member).parameters) & offending), (
             f"{name} takes a capability claim as a parameter")
 
