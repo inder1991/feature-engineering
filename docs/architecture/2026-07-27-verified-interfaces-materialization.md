@@ -1117,3 +1117,68 @@ separates `plan_revision`'s cross-group check from `bind_group`'s conflict.
 **A.11's two-cadence override rule does not reach here.** The binding compares contract HASHES,
 never promises: a different promise is a different contract hash and therefore a conflict, not an
 override. Its first real consumer is T14's control plane or an API accepting a re-declaration.
+
+---
+
+## 29. What Task 11 established
+
+`materialize/identity.py` — spec §7. Pure functions over values; no connection, no `pyspark`.
+
+```python
+GENERATED_LOCK_FILENAME = "GENERATED.lock"
+
+CompilationIdentity(formula_content_hashes, ir_hashes,          # PLURAL, positionally paired
+                    materialization_contract_hash, group_plan_hash)
+RenderedArtifactIdentity(compilation, generated_project_hash)
+SealedProject(identity, files)                                  # `files` is a read-only mapping
+
+build_compilation_identity(irs, plan) -> CompilationIdentity
+generated_project_hash(files: Mapping[str, str]) -> str         # EXCLUDES the lock, always
+seal_project(compilation, files) -> SealedProject               # the ONLY writer of the lock
+read_lock(document: str) -> RenderedArtifactIdentity            # the ONLY parser of it
+derive_namespace() -> str                                       # no parameters
+sandbox_execution_hash(rendered, *, environment_id, parameters, business_dt,
+                       input_snapshot_ids, compiler_version, renderer_version,
+                       capability_attestation_id) -> str        # nothing defaulted
+```
+
+**The exclusion is the whole non-circularity argument.** `generated_project_hash` skips
+`GENERATED.lock` **whether or not it is present**, so it answers the same value for the files about
+to be sealed and for the COMPLETE project L0 later verifies (§11.2). Each file contributes
+`sha256` of its UTF-8 bytes under its path, so an edit, a rename, an addition and a deletion all
+move it. `seal_project` is the only path that writes a lock and **refuses one the renderer
+supplied**: such a lock either states a hash the renderer could not yet know, or feeds an older one
+back into the bytes being hashed. A seal-time scan for the computed hash was deliberately NOT
+added — a single-pass renderer cannot embed a hash it was never given, so the branch would be dead
+code. **T14 therefore keeps its own assertion that no generated source file carries the literal**,
+and reads `__generated_project_hash` from the lock at run time (§10.2).
+
+**The two tuples are paired, not sorted independently.** `formula_content_hashes[i]` and
+`ir_hashes[i]` are one feature's, so `__post_init__` neither re-orders nor de-duplicates them (two
+features may be authored from one formula, and collapsing them would report a two-feature group as
+a one-feature group). Order-independence comes from `build_compilation_identity` instead, which
+emits both in the PLAN's order — already sorted by column name.
+
+**`build_compilation_identity` closes a gap nothing else covered:** it recomputes `ir_hash(ir)` and
+compares it with the `ir_hash` the plan carries for that column. `PlannedFeature.ir_hash` is a value
+Task 10's *caller* supplies, and §9 gates every staging manifest against it, so a plan naming a hash
+no IR produced would only have surfaced at run time as an `IR_HASH_MISMATCH` against a computation
+nobody performed. The feature closure is the same one `build_group_plan` draws.
+
+**`sandbox_execution_hash` takes the RENDERED identity**, not a compilation identity plus a project
+hash, so a caller cannot pair one compilation with another project's bytes. **No parameter has a
+default** — a defaulted `capability_attestation_id` would let an execution be identified without
+naming the attestation §10.3 requires before anything may publish. `input_snapshot_ids` keeps the
+caller's ORDER (§3.4 calls it *the exact ordered partition set read*; sorting would declare two
+different read orders equivalent, which is run preparation's judgement, not this module's), while
+`parameters`' key order is not identity because RFC 8785 sorts object keys. A bare `str` for
+`input_snapshot_ids` — or for either hash tuple — is a `TypeError`, since it would be read one
+character at a time.
+
+**`derive_namespace()` reads `binding.SANDBOX_NAMESPACE` through the MODULE**, so the test can move
+the constant and see the answer move. `is` would prove nothing: CPython interns identifier-shaped
+literals, so a re-spelled `"sandbox_feature"` is the very same object. The test therefore also scans
+the module's AST for code string literals (docstrings excluded) and asserts none names a namespace.
+
+**There is no `production_execution_hash` and no bare `execution_hash`**, and `__all__` is pinned
+with `==` in the tests so neither can be added quietly.
