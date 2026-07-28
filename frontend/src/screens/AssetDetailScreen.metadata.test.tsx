@@ -126,3 +126,37 @@ it('keeps a field that HAS a value as a top-level row', async () => {
   await openTab(detail())
   expect(row('currency')).toBeInTheDocument()   // USD
 })
+
+// ── Overview's "Attested metadata" — the twin panel, same disease ────────────────────────────────
+
+async function openOverview(d: api.AssetDetail) {
+  getAssetDetail.mockResolvedValue({ detail: d, etag: 'etag-1' })
+  render(<AssetDetailScreen source="deposits" objectRef="public.accounts.balance" />)
+  await screen.findByRole('group', { name: /asset sections/i })
+}
+
+it('the overview summary does not print raw C1 internals', async () => {
+  // `authority missing · c1 no_decision` is the row saying "not set" for the THIRD time — once as
+  // the value, once as the badge, once in machine words. It is the noise, not the information.
+  await openOverview(detail())
+  expect(screen.queryByText(/c1 no_decision/)).toBeNull()
+  expect(screen.queryByText(/authority missing/)).toBeNull()
+  expect(screen.queryByText(/authority hint/)).toBeNull()
+})
+
+it('the overview summary shows only fields that have a value', async () => {
+  await openOverview(detail(d => {
+    d.effective_metadata!.fields.unit = { ...d.effective_metadata!.fields.unit, value: null }
+  }))
+  const panel = screen.getByTestId('attested-metadata')
+  expect(within(panel).queryByText(/^— not set$/)).toBeNull()
+  expect(within(panel).getByText('USD')).toBeInTheDocument()
+})
+
+it('the overview summary still accounts for the unset ones', async () => {
+  await openOverview(detail(d => {
+    d.effective_metadata!.fields.unit = { ...d.effective_metadata!.fields.unit, value: null }
+  }))
+  // The line sits beside the list, not inside it — it accounts for what the list omits.
+  expect(screen.getByText(/^Not set:/)).toBeInTheDocument()
+})

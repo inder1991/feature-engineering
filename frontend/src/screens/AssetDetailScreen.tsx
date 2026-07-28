@@ -421,21 +421,38 @@ function OverviewTab({
         ) : !metadata || fieldNames.length === 0 ? (
           <p className="hint">{metadata?.note ?? 'No per-field metadata on this asset.'}</p>
         ) : (
-          <ul className="rows adg-fieldsum">
-            {fieldNames.map(name => {
-              const field = metadata.fields[name]
-              return (
-                <li className="row adg-field" key={name}>
-                  <span className="adg-field-label">{humanizeField(name)}</span>
-                  <span className="adg-field-value mono">{fieldValueText(field)}</span>
-                  <AuthorityBadge field={field} />
-                  <span className="adg-auth-meta">
-                    authority {field.authority} · c1 {field.c1_status}
-                  </span>
-                </li>
-              )
-            })}
-          </ul>
+          // A SUMMARY: what we know about this column and who said it. Only fields that carry a
+          // value — an unset one has nothing to summarise, and six "— not set / UNATTESTED" rows
+          // out of nine drowned the three that meant something. The unset ones are named in one
+          // line, and the Metadata & evidence tab is where you act on them.
+          //
+          // The old tail — `authority missing · c1 no_decision` — was the row stating "not set" for
+          // the THIRD time, in machine words, after the value and the badge had each said it. Raw
+          // C1 internals belong in that tab's Detail disclosure, not in a summary.
+          <>
+            <ul className="rows adg-fieldsum" data-testid="attested-metadata">
+              {fieldNames.filter(n => metadata.fields[n]?.value != null).map(name => {
+                const field = metadata.fields[name]
+                return (
+                  <li className="row adg-field" key={name}>
+                    <span className="adg-field-label">{humanizeField(name)}</span>
+                    <span className="adg-field-value mono">{fieldValueText(field)}</span>
+                    <AuthorityBadge field={field} />
+                  </li>
+                )
+              })}
+              {fieldNames.every(n => metadata.fields[n]?.value == null) && (
+                <li className="row adg-field"><span className="hint">Nothing set yet.</span></li>
+              )}
+            </ul>
+            {fieldNames.some(n => metadata.fields[n]?.value == null) && (
+              <p className="hint">
+                Not set:{' '}
+                {fieldNames.filter(n => metadata.fields[n]?.value == null)
+                  .map(humanizeField).join(', ')}
+              </p>
+            )}
+          </>
         )}
       </section>
     </>
