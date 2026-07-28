@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import datetime as dt
+import decimal
 import inspect
 import pathlib
 
@@ -639,12 +640,90 @@ def test_the_stand_ins_trunc_is_the_start_of_the_named_calendar_period():
 def test_the_stand_in_REFUSES_what_it_does_not_model():
     """A fake's failure mode is not being wrong, it is being permissive. An `expr` that swallowed
     arbitrary SQL would make an `event_time_plus_lag` test pass whether or not the lag rendered."""
+    F = fake_spark.functions
     with pytest.raises(NotImplementedError):
-        fake_spark.functions.expr("current_timestamp()")
+        F.expr("current_timestamp()")
     with pytest.raises(NotImplementedError):
-        fake_spark.functions.trunc(fake_spark.functions.col("d"), "fortnight")
+        F.trunc(F.col("d"), "fortnight")
     with pytest.raises(NotImplementedError):
-        fake_spark.functions.col("d").cast("bigint")
+        F.col("d").cast("bigint")
+
+    # Task 13c's additions. Each one is a way a permissive fake would launder a wrong renderer.
+    one = fake_spark.DataFrame([{"k": "a", "v": 1}])
+    with pytest.raises(NotImplementedError, match="left"):
+        one.join(one, on=["k"], how="right")          # an outer join changes the population
+    with pytest.raises(NotImplementedError, match="SEQUENCE"):
+        one.join(one, on=F.col("k"), how="left")      # the expression form duplicates key columns
+    with pytest.raises(NotImplementedError, match="not an aggregate"):
+        one.groupBy(F.col("k")).agg(F.col("v"))       # a bare column against a GROUP
+    with pytest.raises(AttributeError):
+        F.col("v").otherwise(0)                       # `otherwise` without a `when`
+
+
+# ── the stand-in's Task 13c surface: aggregation, joining, rounding, overflow ─────────────────────
+
+
+def test_the_stand_ins_LEFT_join_keeps_the_unmatched_row_and_INNER_drops_it():
+    """§8 rule 3 is only a claim if the stand-in can tell the two apart. If `join` ignored `how`,
+    the LEFT-join test would pass against a renderer that emitted an INNER one."""
+    F = fake_spark.functions
+    spine = fake_spark.DataFrame([{"cif_id": "c1"}, {"cif_id": "c2"}])
+    aggregate = fake_spark.DataFrame([{"cif_id": "c1", "v": 7}], columns=["cif_id", "v"])
+
+    left = spine.join(aggregate, on=["cif_id"], how="left")
+    assert [row["cif_id"] for row in left.rows] == ["c1", "c2"]
+    assert left.rows[1]["v"] is None                  # present, and carrying nothing
+    assert left.columns == ["cif_id", "v"]            # ONE copy of the key column
+
+    inner = spine.join(aggregate, on=["cif_id"], how="inner")
+    assert [row["cif_id"] for row in inner.rows] == ["c1"]
+
+    # The case rule 3 is really about: NOTHING matched. An empty right side still has its column,
+    # because a frame's schema does not depend on whether it has rows.
+    empty = fake_spark.DataFrame([], columns=["cif_id", "v"])
+    nothing = spine.join(empty, on=["cif_id"], how="left")
+    assert len(nothing.rows) == 2 and all(row["v"] is None for row in nothing.rows)
+    assert F.col("v")._eval(nothing.rows[0]) is None
+
+
+def test_the_stand_ins_aggregates_SKIP_nulls_and_an_all_null_SUM_is_NULL_not_zero():
+    """"Zero" is a value a formula must DECLARE (`EmptyWindowResult.ZERO`). A stand-in whose SUM
+    produced 0 on its own would make the empty-window policy untestable — every path would look
+    like the declared one."""
+    F = fake_spark.functions
+    rows = [{"k": "a", "v": 1}, {"k": "a", "v": None}, {"k": "a", "v": 1},
+            {"k": "b", "v": None}]
+    grouped = fake_spark.DataFrame(rows).groupBy(F.col("k")).agg(
+        F.sum(F.col("v")).alias("total"),
+        F.count(F.col("v")).alias("non_null"),
+        F.count(F.lit(1)).alias("rows"),
+        F.countDistinct(F.col("v")).alias("distinct"))
+    by_key = {row["k"]: row for row in grouped.rows}
+    assert by_key["a"] == {"k": "a", "total": 2, "non_null": 2, "rows": 3, "distinct": 1}
+    assert by_key["b"] == {"k": "b", "total": None, "non_null": 0, "rows": 1, "distinct": 0}
+    assert grouped.columns == ["k", "total", "non_null", "rows", "distinct"]
+
+
+def test_the_stand_ins_round_is_HALF_UP_and_bround_is_HALF_EVEN():
+    """The two modes disagree on exactly the ties, which is the whole of the distinction. A fake
+    that implemented one for both would pass a renderer that emitted the wrong function."""
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([{"v": "2.5"}, {"v": "3.5"}, {"v": None}])
+    half_up = frame.select(F.round(F.col("v"), 0).alias("r")).rows
+    half_even = frame.select(F.bround(F.col("v"), 0).alias("r")).rows
+    assert [row["r"] for row in half_up] == [3, 4, None]
+    assert [row["r"] for row in half_even] == [2, 4, None]
+
+
+def test_the_stand_ins_decimal_cast_OVERFLOWS_to_NULL_exactly_as_spark_does():
+    """This is the behaviour §9's OVERFLOW_VIOLATION check exists to convert into a refusal. If the
+    cast raised instead, the rendered check would be untestable and the gate would be decoration."""
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([{"v": "99.994"}, {"v": "1000"}, {"v": None}])
+    fitted = frame.select(F.col("v").cast("decimal(5,2)").alias("d")).rows
+    assert fitted[0]["d"] == decimal.Decimal("99.99")   # quantized, not lost
+    assert fitted[1]["d"] is None                       # 1000.00 needs 6 digits, p=5 — NULL
+    assert fitted[2]["d"] is None                       # NULL in, NULL out
 
 
 # ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
