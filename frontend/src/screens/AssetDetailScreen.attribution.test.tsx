@@ -90,7 +90,11 @@ it('falls back to the evidence author when there is no governed decision', async
 
 // ── the id is kept, where an auditor can use it ──────────────────────────────────────────────────
 
-it('keeps the decision id reachable on the badge rather than discarding it', async () => {
+it('keeps the decision id OFF the badge entirely — label and tooltip', async () => {
+  // An opaque `fde_01KYM…` revealed on hover is still an opaque id on screen. It belongs in the
+  // Detail disclosure and the payload, not on a badge whose job is to name the author.
   const card = await conceptCard(field({ provenance: DECISION_ID }))
-  expect(badgeOf(card).getAttribute('title') ?? '').toContain(DECISION_ID)
+  const badge = badgeOf(card)
+  expect(badge.textContent ?? '').not.toContain('KYMVECPH')
+  expect(badge.getAttribute('title') ?? '').not.toContain('KYMVECPH')
 })

@@ -63,14 +63,11 @@ function attestedByLabel(field: EffectiveMetadataField): string {
   return provenanceLabel(field.provenance) ?? field.evidence_provenance ?? 'unattested'
 }
 
-// The decision id is real and an auditor needs it to find the decision record — it just is not the
-// label. It rides the badge's tooltip alongside the authority, so nothing is discarded.
+// The decision id is NOT on the badge — not as the label, not as a tooltip. An opaque
+// `fde_01KYM…` on hover is still an opaque id on screen. It lives in the Detail disclosure, where
+// someone tracing a decision is actually looking, and in the payload for anyone querying it.
 function attributionTitle(field: EffectiveMetadataField): string {
-  const parts = [`authority: ${field.authority}`, `c1: ${field.c1_status}`]
-  if (field.provenance && !PROVENANCE_LABEL[field.provenance]) {
-    parts.push(`decision: ${field.provenance}`)
-  }
-  return parts.join(' · ')
+  return `authority: ${field.authority} · c1: ${field.c1_status}`
 }
 
 // governed = a verified, load-bearing attestation (solid ok); hint = a proposal not yet governed
@@ -575,6 +572,7 @@ function FieldRow({
               Latest decision: <strong>{latest.event_type}</strong>
               {latest.conflict_status ? ` · ${latest.conflict_status}` : ''}
               {latest.load_bearing ? ' · load-bearing' : ''} · {latest.decided_at}
+              {latest.decision_event_id ? ` · ${latest.decision_event_id}` : ''}
             </p>
           )}
           <p className="hint">
