@@ -63,7 +63,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms", "enrich_unit",
         "graph_persistence",
-        "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+        "governed_joins", "pass_c", "pass_b", "glossary_evidence", "entity_bridges",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
         "quarantine"]
@@ -77,6 +77,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "graph_persistence": "succeeded",
         "governed_joins": "disabled", "pass_c": "disabled", "pass_b": "disabled",  # flags off
         "glossary_evidence": "not_applicable",
+        "entity_bridges": "disabled",                          # OVERLAY_ENTITY_BRIDGES off
         "semantic_binding_candidates": "disabled",             # OVERLAY_SEMANTIC_BINDING_* off
         "semantic_binding_proposals": "disabled",
         "projection_drain": "succeeded", "table_fact_projection": "succeeded",
@@ -119,7 +120,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 23
+    assert len(rec.reports) == 24
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────

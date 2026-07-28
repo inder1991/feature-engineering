@@ -39,7 +39,8 @@ INGEST_RESULT_KEYS = {"status", "reason", "asserted", "changed_objects", "quaran
                       "objects_stored", "tables", "columns", "containment_edges", "facts_asserted",
                       "join_candidates", "passb_proposed", "passb_abstained",
                       "semantic_binding_candidates", "semantic_binding_proposed",
-                      "semantic_binding_abstained", "semantic_binding_failed"}
+                      "semantic_binding_abstained", "semantic_binding_failed",
+                      "entity_bridges_proposed"}
 
 # IngestionRun (api.ts): the fields the client reads off GET /ingestion-runs/{id}. Keyed `id` —
 # NOT `run_id` — the exact contract the #15 bug violated.

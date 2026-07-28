@@ -41,6 +41,11 @@ data:
   # REQUIRE candidates (the code warns if proposals is on while candidates is off), so both are on.
   OVERLAY_SEMANTIC_BINDING_CANDIDATES: "1"
   OVERLAY_SEMANTIC_BINDING_PROPOSALS: "1"
+  # Cross-catalog entity bridges — the link between the SAME business entity in two catalogs (the
+  # customer in the customer master vs. the customer on a transaction). Derived from resolved
+  # concepts and proposed as human-gated facts; a bridge is operational only once VERIFIED. Needs
+  # two catalogs loaded before it can find anything.
+  OVERLAY_ENTITY_BRIDGES: "1"
 ---
 apiVersion: apps/v1
 kind: Deployment

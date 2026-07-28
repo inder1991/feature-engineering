@@ -114,6 +114,11 @@ export interface IngestResult {
   semantic_binding_proposed?: number
   semantic_binding_abstained?: number
   semantic_binding_failed?: number
+  // Cross-catalog entity bridges PROPOSED this upload (behind OVERLAY_ENTITY_BRIDGES; 0 when off).
+  // A bridge links the SAME business entity across two catalogs — the customer on a transaction and
+  // the customer in the customer master. PROPOSED, never confirmed: this counts governance work
+  // created, not links that are usable yet, so it must never be presented as a working join.
+  entity_bridges_proposed?: number
   // CLIENT-attached from the X-Ingestion-Run-Id response header, never a body field: the id of
   // the per-stage run record behind GET /ingestion-runs/{id}. Optional so existing fixtures and
   // callers keep compiling; null when the server sent no header.
