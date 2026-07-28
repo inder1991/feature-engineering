@@ -72,6 +72,7 @@ _AUDIT_SUMMARY_LIMIT = 50
 _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("concept", "concept", "concept"),
     ("definition", "definition", "definition"),
+    ("ai summary", "ai_summary", "ai_summary"),
     ("domain", "domain", "domain"),
     ("additivity", "additivity", "additivity"),
     ("unit", "unit", "unit"),

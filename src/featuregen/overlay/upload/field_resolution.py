@@ -123,7 +123,10 @@ _SOURCE_AUTHORED_DISPLAY_COLUMNS = frozenset({"unit", "currency"})
 # The display columns that feed graph.build_graph's weighted search_doc (definition-B, concept/
 # domain-C). A projection into one of these must rebuild the node's FTS doc via
 # graph.rebuild_search_doc (#20) — search must match the projected values, not the insert-time ones.
-_SEARCH_DOC_DISPLAY_COLUMNS = frozenset({"concept", "definition", "domain"})
+# `ai_summary` is doc-bearing for the same reason `definition` is — and more so where a source fills
+# descriptions by bucket, since the summary is then the ONLY text distinguishing two columns. Without
+# it here the projection would write the column and the index would silently never see it.
+_SEARCH_DOC_DISPLAY_COLUMNS = frozenset({"concept", "definition", "domain", "ai_summary"})
 
 # The companion *_decision_id link column per projected field (the display ≠ authority pointer).
 # ``logical_representation`` owns ``logical_type_decision_id``; ``semantic_type`` stays decision-only

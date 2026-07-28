@@ -139,15 +139,16 @@ def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
     row its UPDATE matched. A ref matching no node is a no-op."""
     rows = conn.execute(
         "SELECT object_ref, kind, table_name, column_name, definition, concept, domain, entity, "
-        "semantic_terms "
+        "semantic_terms, ai_summary "
         "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = lower(%s)",
         (catalog_source, object_ref)).fetchall()
-    for ref, kind, table, column, definition, concept, domain, entity, semantic_terms in rows:
+    for (ref, kind, table, column, definition, concept, domain, entity, semantic_terms,
+         ai_summary) in rows:
         conn.execute(
             f"UPDATE graph_node SET search_doc = {_SEARCH_DOC} "
             "WHERE catalog_source = %s AND object_ref = %s",
             (*_search_doc_params(kind, table, column, definition, concept, domain, entity,
-                                 semantic_terms),
+                                 semantic_terms, ai_summary),
              catalog_source, ref))
 
 
