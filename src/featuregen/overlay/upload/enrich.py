@@ -46,6 +46,7 @@ _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 _SYN_TASK = "overlay.enrich.synonyms"
 _UNIT_TASK = "overlay.enrich.unit"
+_SUMMARY_TASK = "overlay.enrich.summary"
 
 # Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
 _MAX_SYNONYMS_LEN = 200
@@ -89,6 +90,10 @@ def _vocab_fingerprint() -> str:
 # than leaving them orphaned under a same-version key.
 _CONCEPT_CACHE_VERSION = f"concept:v2:{_vocab_fingerprint()}"
 _DEFINITION_CACHE_VERSION = "definition:v1"
+# The summary is written FROM the metadata, so the key folds in the metadata it was written from —
+# an enriched payload (a new source_attributes column, a corrected term_name) must re-draft rather
+# than serve a summary written from less.
+_SUMMARY_CACHE_VERSION = "summary:v1"
 # v2 (E1a T3): a domain result is no longer a bare table-domain string but the TWO-LEVEL envelope
 # (`_accept_domain_result`) — the table default plus the column overrides. The bump versions the v1
 # bare-string rows out rather than leaving them to decode as a domain with no overrides.
@@ -135,6 +140,7 @@ _CACHES = {
     "enrichment_concept": "concept",
     "enrichment_definition": "definition",
     "enrichment_domain": "domain",
+    "enrichment_summary": "summary",
 }
 
 
@@ -1143,6 +1149,88 @@ def _definition_targets(rows: list[CanonicalRow],
     than the drafter would silently RETIRE a live target on a transient miss."""
     return ({content_hash(r) for r in rows if not r.definition}
             - suppressed_definition_hashes(rows, glossary))
+
+
+def _summary_targets(rows: list[CanonicalRow],
+                     glossary: GlossaryUpload | None = None) -> set[str]:
+    """EVERY column. Deliberately not `_definition_targets`.
+
+    The definition drafter only fills a blank ("a drafted one only ever fills a blank"), which is
+    right for a field that carries SOURCE authority — a draft must never displace a declared value.
+    The summary carries no such authority and lives in its own field, so it has no reason to defer to
+    a declared description, and every reason not to: a source whose description column is filled by
+    BUCKET (CIB: 47 distinct descriptions over 111 columns, one sentence covering 12) has a
+    description present for every column and a useful one for almost none.
+
+    Targeting every column also avoids inventing a "is this description good enough?" threshold,
+    which nobody can set correctly and which would silently change what gets written as sources vary.
+    """
+    del glossary   # accepted for signature symmetry with _definition_targets; nothing is excluded
+    return {content_hash(r) for r in rows}
+
+
+def _summary_cache_key(row_hash: str, metadata: dict) -> str:
+    """Keyed on the row AND the metadata the summary is written from, so enriching the payload
+    re-drafts instead of serving a summary written from less information."""
+    raw = json.dumps([row_hash, metadata], sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
+                    *, glossary: GlossaryUpload | None = None,
+                    concepts: dict[str, str] | None = None,
+                    ingestion_run_id: str | None = None,
+                    stats: dict | None = None) -> dict[str, str]:
+    """One plain-English summary per column, written from that column's full metadata.
+    Returns ``{content_hash: summary}``.
+
+    NEVER touches ``definition``: the source keeps its own text at its own authority, and a summary
+    that overwrote it would both lose the specifics AND downgrade a source-attested fact to an
+    llm-proposed one. The two coexist.
+
+    The payload is :func:`_concept_metadata` — the SAME full metadata the classifier receives
+    (term_name, the declared type, BIAN path, and every column of the uploader's file we have no
+    first-class slot for). The definition drafter sends only table/column/type/concept, which cannot
+    tell `cust_curr_ntb_flg` from `cust_prev_9mnth_ntb_flg`; `term_name` is the field that can.
+    """
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+
+    def _rec_of(row: CanonicalRow) -> GlossaryRecord | None:
+        return rec_by_tc.get((_norm(row.table), _norm(row.column)))
+
+    targets = _summary_targets(rows, glossary)
+    by_hash = {h: r for r in rows if (h := content_hash(r)) in targets}
+    meta_by_hash = {h: _concept_metadata(r, _rec_of(r)) for h, r in by_hash.items()}
+    key_of = {h: _summary_cache_key(h, meta_by_hash[h]) for h in by_hash}
+    cached = _cache_get(conn, "enrichment_summary", list(key_of.values()), _SUMMARY_CACHE_VERSION)
+    result = {h: cached[key_of[h]] for h in by_hash if key_of[h] in cached}
+
+    misses = sorted((h for h in by_hash if h not in result), key=lambda h: (by_hash[h].table, h))
+    if not misses:
+        return result
+    items = [BatchItem(h, meta_by_hash[h]) for h in misses]
+    batch_report: dict = {}
+    resolved = run_batched(
+        conn, client, short="summary", task=_SUMMARY_TASK,
+        prompt_id="overlay_summary_batch_v1", schema_id="overlay_summary_batch",
+        shared_metadata={}, items=items, out_key="summary",
+        instruction="Write ONE plain-English sentence describing EACH column, for a data catalog a "
+                    "banker will read. Use that item's own term_name, type and attributes. The "
+                    "supplied business_definition may be a CATEGORY label shared by many columns — "
+                    "if so, say what THIS column specifically is, do not repeat it. Treat each item "
+                    "independently; never reuse another item's facts; return exactly one result per "
+                    "input ref.",
+        accept=_accept_bounded(400), actor=actor,
+        deadline_s=enrich_config.stage_deadline_s(), report=batch_report,
+        ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_summary",
+        dispatch_subjects=({h: _column_subject(by_hash[h]) for h in misses}
+                           if ingestion_run_id is not None else None))
+    if stats is not None:
+        stats["not_attempted"] = batch_report.get("not_attempted", 0)
+    for h, text in resolved.items():
+        _cache_put(conn, "enrichment_summary", key_of[h], text, _SUMMARY_CACHE_VERSION)
+        result[h] = text
+    return result
 
 
 def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,

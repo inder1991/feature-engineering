@@ -15,6 +15,9 @@ from featuregen.overlay.upload import enrich_config
 def test_conservative_default_ceilings():
     assert enrich_config._DEFAULT_MAX_ITEMS == {
         "concept": 20, "definition": 8, "domain": 8, "synonyms": 8, "unit": 8,
+        # `summary` runs over EVERY column, so it is the widest fan-out of any task — it sits at the
+        # prose-task ceiling rather than above it, keeping cross-item contamination equally bounded.
+        "summary": 8,
         "table_synth": 4}
 
 

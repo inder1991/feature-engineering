@@ -477,6 +477,17 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                      "definition": {"type": "string", "maxLength": 500}},
                       "required": ["ref", "definition"]}}},
         "required": ["results"]},
+    # One plain-English sentence per column, for a human reading the catalog. Bounded at 400 to keep
+    # a wide table's chunk inside its input budget; the CODE-side `_accept_bounded(400)` is the real
+    # gate (a schema maxLength failure would reject the WHOLE chunk over one long answer).
+    ("overlay_summary_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array",
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 128},
+                                     "summary": {"type": "string", "maxLength": 400}},
+                      "required": ["ref", "summary"]}}},
+        "required": ["results"]},
     ("overlay_synonyms_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
