@@ -32,9 +32,14 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None) -> st
     ref = EntityBridgeRef(entity_id=candidate.entity_id, left_ref=candidate.left_ref,
                           right_ref=candidate.right_ref)
     key = fact_key(ref, "entity_bridge")
+    # `type_basis` travels with the evidence so the CONFIRMER can see how the type match was
+    # established: `declared` means a glossary file's own answer (someone's spreadsheet entry), not a
+    # structural read of the physical schema. It is advisory context for the human gate, never an
+    # authority input — the fact still requires the same confirmation either way.
     evidence = {"entity_id": candidate.entity_id, "candidate_id": candidate.candidate_id,
                 "data_type_family": candidate.data_type_family, "left_is_grain": candidate.left_is_grain,
-                "right_is_grain": candidate.right_is_grain, "derivation_version": BRIDGE_DERIVATION_VERSION}
+                "right_is_grain": candidate.right_is_grain, "type_basis": candidate.type_basis,
+                "derivation_version": BRIDGE_DERIVATION_VERSION}
     evidence_ref = write_evidence(
         conn, fact_key=key, table_snapshot_at=ts, row_count=0, sample_size=0,
         profile_version=BRIDGE_DERIVATION_VERSION, thresholds_used={}, metric_values=evidence,

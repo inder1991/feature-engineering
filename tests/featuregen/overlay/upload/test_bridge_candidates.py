@@ -81,5 +81,60 @@ def test_deterministic_candidate_id_is_orientation_independent(db):
     assert derive_bridge_candidates(db)[0].candidate_id == id1
 
 
+def _glossary_col(db, source, table, column, concept_name, declared_type, *, is_grain=False):
+    """A GLOSSARY-sourced column: the row attests no physical type (``type='unknown'``) and the
+    file's declared type lands in ``graph_node.declared_type`` — exactly what the FTR adapter
+    produces (`to_glossary_upload` emits `CanonicalRow.type='unknown'` while the sidecar record
+    carries `declared_type`)."""
+    row = CanonicalRow(source, table, column, "unknown", is_grain=is_grain)
+    build_graph(db, source, [row], concepts={content_hash(row): concept_name},
+                declared_types={f"public.{table}.{column}": declared_type})
+
+
+def test_glossary_declared_type_bridges_when_nothing_attested_a_type(db):
+    """THE FTR CASE. A glossary upload attests no physical type, so `data_type` is 'unknown' for
+    every column and only `declared_type` carries the file's own answer. Matching on `data_type`
+    alone classified all of them as an unknown family and skipped them, which made a bridge
+    candidate STRUCTURALLY IMPOSSIBLE for any glossary-sourced catalog — measured on the deployed
+    FTR catalog: 126/126 columns `data_type='unknown'`, 113 of them `declared_type='string'`,
+    including the one `customer_id` (`cif_id`) the cross-catalog story depends on."""
+    _glossary_col(db, "ftr", "tran_repos", "cif_id", "customer_id", "string")
+    _glossary_col(db, "cust", "customer_master", "customer_no", "customer_id", "string", is_grain=True)
+    cands = derive_bridge_candidates(db)
+    assert len(cands) == 1, "a declared string<->string identifier pair must bridge"
+    assert cands[0].entity_id == "customer"
+    assert cands[0].data_type_family == "text"       # 'string' -> text, same family both sides
+    assert cands[0].type_basis == "declared"         # weaker basis, surfaced not hidden
+
+
+def test_attested_type_still_wins_over_a_declared_one(db):
+    """The fallback is a fallback: an attested `data_type` is the stronger authority and decides the
+    family whenever it is present, so a declared value can never override or weaken it."""
+    row = CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True)
+    build_graph(db, "core", [row], concepts={content_hash(row): "customer_id"},
+                declared_types={"public.customer_master.customer_id": "string"})
+    _glossary_col(db, "crm", "customers", "customer_id", "customer_id", "integer")
+    cands = derive_bridge_candidates(db)
+    assert len(cands) == 1
+    assert cands[0].data_type_family == "integer"    # attested 'integer' beat declared 'string'
+    assert cands[0].type_basis == "mixed"            # one attested side, one declared
+
+
+def test_a_declared_type_cannot_bridge_across_incompatible_families(db):
+    """The safety rule the family check exists for survives the fallback: falling back to a declared
+    value must not start matching text to integers."""
+    _glossary_col(db, "ftr", "tran_repos", "cif_id", "customer_id", "string")
+    _glossary_col(db, "cust", "customer_master", "customer_no", "customer_id", "bigint")
+    assert derive_bridge_candidates(db) == ()
+
+
+def test_an_unclassifiable_declared_type_still_does_not_bridge(db):
+    """A declared value the platform cannot classify is no better than none: it stays out rather
+    than being admitted as a wildcard that matches everything."""
+    _glossary_col(db, "ftr", "tran_repos", "cif_id", "customer_id", "struct<a:int>")
+    _glossary_col(db, "cust", "customer_master", "customer_no", "customer_id", "string")
+    assert derive_bridge_candidates(db) == ()
+
+
 def test_version_pinned():
     assert BRIDGE_DERIVATION_VERSION == "1.0.0"

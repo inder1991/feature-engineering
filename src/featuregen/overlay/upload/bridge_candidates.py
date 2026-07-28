@@ -38,6 +38,12 @@ class BridgeCandidateV1:
     data_type_family: str
     left_is_grain: bool
     right_is_grain: bool
+    #: How the matched family was established: ``attested`` (both sides from a structural source),
+    #: ``declared`` (both from a glossary file's own answer), or ``mixed``. Advisory metadata for the
+    #: human confirmer — a DECLARED type is someone's spreadsheet entry, not a read of the physical
+    #: schema — and deliberately OUTSIDE ``candidate_id``, so re-deriving the same pair after a
+    #: structural source attests the type keeps the SAME candidate rather than forking a second one.
+    type_basis: str = "attested"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,22 +54,46 @@ class _IdCol:
     entity: str
     type_family: str
     is_grain: bool
+    type_basis: str
+
+
+def _resolve_family(data_type: str | None, declared_type: str | None) -> tuple[str, str]:
+    """``(family, basis)`` for one column, attested first.
+
+    A GLOSSARY upload attests no physical type — the FTR adapter emits ``CanonicalRow.type='unknown'``
+    and carries the file's own answer in ``graph_node.declared_type`` — so reading ``data_type`` alone
+    classified every glossary column as an unrecognised family and dropped it. That made a bridge
+    candidate structurally impossible for a glossary-sourced catalog: measured on the deployed FTR
+    catalog, 126/126 columns are ``data_type='unknown'`` while 113 carry ``declared_type='string'``,
+    including the single ``customer_id`` the whole cross-catalog story hangs on.
+
+    The attested value stays the stronger authority and decides whenever it classifies. The declared
+    value is consulted ONLY when nothing was attested, and the caller records that weaker basis on the
+    candidate rather than hiding it. An unclassifiable declared value is NOT a wildcard — it stays
+    ``other`` and is excluded, so the family check keeps doing the job it exists for."""
+    attested = _type_family(data_type)
+    if attested != "other":
+        return attested, "attested"
+    return _type_family(declared_type), "declared"
 
 
 def _identifier_columns(conn, *, roles: Iterable[str]) -> list[_IdCol]:
     rows = conn.execute(
-        "SELECT catalog_source, table_name, column_name, data_type, concept, is_grain FROM graph_node "
+        "SELECT catalog_source, table_name, column_name, data_type, concept, is_grain, declared_type "
+        "FROM graph_node "
         "WHERE kind = 'column' AND concept IS NOT NULL "
         "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
         "ORDER BY catalog_source, object_ref",
         (allowed_sensitivities(roles),)).fetchall()
     out: list[_IdCol] = []
-    for catalog_source, table_name, column_name, data_type, concept_name, is_grain in rows:
+    for catalog_source, table_name, column_name, data_type, concept_name, is_grain, declared_type in rows:
         c = concept(concept_name)
         if c is None or c.group != "identifier" or not c.entity_link:
             continue
+        family, basis = _resolve_family(data_type, declared_type)
         out.append(_IdCol(catalog_source=catalog_source, table_name=table_name, column_name=column_name,
-                          entity=c.entity_link, type_family=_type_family(data_type), is_grain=bool(is_grain)))
+                          entity=c.entity_link, type_family=family, is_grain=bool(is_grain),
+                          type_basis=basis))
     return out
 
 
@@ -77,9 +107,11 @@ def _candidate(entity: str, a: _IdCol, b: _IdCol) -> BridgeCandidateV1:
     material = (f"{entity}|{left.catalog_source}.{left.table_name}.{left.column_name}"
                 f"|{right.catalog_source}.{right.table_name}.{right.column_name}|{BRIDGE_DERIVATION_VERSION}")
     candidate_id = hashlib.sha256(material.encode()).hexdigest()[:16]
+    basis = left.type_basis if left.type_basis == right.type_basis else "mixed"
     return BridgeCandidateV1(
         candidate_id=candidate_id, entity_id=entity, left_ref=_col_ref(left), right_ref=_col_ref(right),
-        data_type_family=left.type_family, left_is_grain=left.is_grain, right_is_grain=right.is_grain)
+        data_type_family=left.type_family, left_is_grain=left.is_grain, right_is_grain=right.is_grain,
+        type_basis=basis)
 
 
 def derive_bridge_candidates(conn, *, roles: Iterable[str] = ()) -> tuple[BridgeCandidateV1, ...]:
@@ -88,6 +120,8 @@ def derive_bridge_candidates(conn, *, roles: Iterable[str] = ()) -> tuple[Bridge
     output). Read-only."""
     by_entity: dict[str, list[_IdCol]] = {}
     for col in _identifier_columns(conn, roles=roles):
+        # `other` = neither an attested nor a declared type this platform can classify. Excluded, so
+        # the family check below can never degrade into "unknown matches anything".
         if col.type_family != "other":
             by_entity.setdefault(col.entity, []).append(col)
     cands: dict[str, BridgeCandidateV1] = {}
