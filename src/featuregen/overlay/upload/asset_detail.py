@@ -45,6 +45,7 @@ from featuregen.overlay.identity import _norm
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.column_readiness import column_readiness
 from featuregen.overlay.upload.column_usability import column_usability, table_rollup
+from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
@@ -323,6 +324,14 @@ def _relationships_section(
         "containment": containment,
         "approved_joins": approved_joins,
         "semantic": semantic,
+        # Cross-catalog links — the SAME business entity in another catalog. Included whether or not
+        # a human has confirmed them: confirmation ANNOTATES, it does not gate visibility. Before
+        # this the candidate ledger had no readers at all, so a derived link
+        # (`cib.cust_num <-> ftr.cif_id`) existed in the database and appeared nowhere.
+        "cross_catalog": [
+            {**asdict(link), "status": str(link.status), "why": link.why}
+            for link in cross_catalog_links(conn, object_ref=anchor["object_ref"])
+        ],
     }
     return section, semantic_unavailable
 
