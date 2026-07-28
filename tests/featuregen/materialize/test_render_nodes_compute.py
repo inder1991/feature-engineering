@@ -53,13 +53,14 @@ from featuregen.formula.schema import (
     NullInput,
     OverflowBehavior,
     RoundingMode,
+    ZeroDenominator,
 )
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     ContractGroup,
     derive_group_contract,
 )
-from featuregen.materialize.expression_ir import RefRole
+from featuregen.materialize.expression_ir import BODY_PATHS, RefRole
 from featuregen.materialize.group_plan import (
     StagingManifestV1,
     StagingStatus,
@@ -1904,3 +1905,454 @@ def test_every_rendered_calculation_line_fits_the_width_it_states(compiled, feat
     for variant in CALCULATION_VARIANTS.values():
         for line in _calculate(compiled, feature, **variant).source.splitlines():
             assert len(line) <= 100, line
+
+
+# ══ Task 13d — the two FINAL OPERATIONS (§8 rule 4's ÷0 half) ════════════════════════════════════
+#
+# The rule that produces a plausible number rather than an error here is the ÷0 policy. Spark's
+# division returns NULL for a zero denominator and NULL for an absent one, so a renderer that read
+# the QUOTIENT back — or that coalesced — would answer one declaration's question with another's
+# answer and publish a column nobody declared. Every assertion below therefore RUNS the rendered
+# source and reads the rows: `zero_denominator=error` is a raise or it is nothing, and the
+# difference between "no rows at all" and "rows summing to zero" is invisible in the text.
+
+RATIO_90D = "cross_border_value_ratio_90d"
+NUMERATOR_PATH = "body.numerator"
+DENOMINATOR_PATH = "body.denominator"
+RATIO_STAGING = "feature_staging_cross_border_value_ratio_90d"
+RATIO_MANIFEST = "feature_staging_manifest_cross_border_value_ratio_90d"
+RATIO_PROJECTIONS = {NUMERATOR_PATH: "intermediate_ratio__body_numerator",
+                     DENOMINATOR_PATH: "intermediate_ratio__body_denominator"}
+
+
+@pytest.fixture
+def ratio(catalog, db):  # noqa: F811 — `catalog` seeds the governed facts `db` is read through
+    """The REAL compilation of the worked ratio — two expressions, two windows, one filter."""
+    authorized, plan, spine_input = _compiled(db, RATIO_90D)
+    group = derive_group_contract(db, authorized, cadence=CADENCE,
+                                  availability_promise=AvailabilityPromiseV1(calendar_days=1))
+    assert isinstance(group, ContractGroup), group
+    return authorized, plan, group.contract, spine_input
+
+
+@pytest.fixture
+def ratio_feature(ratio):
+    """The real PlannedFeature for `cross_border_value_ratio_90d` — DECIMAL(38,6), HALF_EVEN."""
+    return next(planned for planned in ratio[1].features if planned.column_name == RATIO_90D)
+
+
+def _render_ratio(ratio, ratio_feature, *, zero_denominator=None, ir=None, plan=None,
+                  empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE,
+                  projections=None):
+    ir = ir if ir is not None else ratio[0].irs[0]
+    if zero_denominator is not None:
+        ir = dataclasses.replace(ir, zero_denominator=zero_denominator)
+    return nodes_compute.render_calculation_node(
+        ir, ratio_feature, plan if plan is not None else ratio[1],
+        empty_window=_per_path(empty_window, ir), null_input=_per_path(null_input, ir),
+        projection_datasets=projections if projections is not None else RATIO_PROJECTIONS,
+        spine_dataset="primary_spine", staging_dataset=RATIO_STAGING,
+        manifest_dataset=RATIO_MANIFEST)
+
+
+def _ratio_txn(cif, amount, *, cross_border=True):
+    """One row as the PROJECTION emits it — already point-in-time filtered, no governed filter."""
+    return {"cif_id": cif, "txn_amt": decimal.Decimal(str(amount)),
+            "cross_border_flag": cross_border, "posted_ts": LONG_POSTED, "txn_dt": BEFORE}
+
+
+def _run_ratio(node, lock_tree, *, numerator, denominator, spine, business_dt=BUSINESS_DT,
+               generation="gen-0001", run="run-0001"):
+    run_node = fake_spark.run_rendered(node.source, node.func_name, module_file=lock_tree)
+    return run_node(fake_spark.DataFrame(numerator), fake_spark.DataFrame(denominator),
+                    fake_spark.DataFrame(spine, columns=["cif_id", "business_dt"]),
+                    business_dt, generation, run, "exec-0001", "hdfs://nn/staging/gen-0001")
+
+
+def _ratio_values(node, lock_tree, *, rows=None, numerator=None, denominator=None, spine):
+    """The feature column per entity. `rows` feeds BOTH projections, which is the real shape: the
+    two PIT projections of this formula select the same window over the same table, and it is the
+    GOVERNED filter inside the node that separates cross-border value from total value."""
+    frame, _manifest = _run_ratio(
+        node, lock_tree,
+        numerator=rows if numerator is None else numerator,
+        denominator=rows if denominator is None else denominator, spine=spine)
+    return {row["cif_id"]: row[RATIO_90D] for row in frame.rows}
+
+
+# ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
+
+
+def test_the_ratio_wires_BOTH_projections_IN_SLOT_ORDER_and_both_outputs(ratio, ratio_feature):
+    """Kedro binds positionally. The numerator's dataset must be the FIRST input, or the generated
+    pipeline runs, computes a number, and computes the reciprocal of the one that was declared."""
+    node = _render_ratio(ratio, ratio_feature)
+    assert node.inputs == (RATIO_PROJECTIONS[NUMERATOR_PATH], RATIO_PROJECTIONS[DENOMINATOR_PATH],
+                           "primary_spine", "params:business_dt", "params:generation_id",
+                           "params:run_id", "params:sandbox_execution_hash", "params:staging_root")
+    assert node.outputs == (RATIO_STAGING, RATIO_MANIFEST)
+    assert node.name == node.func_name == "calculate_cross_border_value_ratio_90d"
+    signature = node.source.split(") -> ")[0]
+    assert signature.index("numerator_projection") < signature.index("denominator_projection")
+
+
+def test_the_ratio_source_parses_and_renders_identically_every_time(ratio, ratio_feature):
+    first, second = _render_ratio(ratio, ratio_feature), _render_ratio(ratio, ratio_feature)
+    assert ast.parse(first.source)
+    assert first.source == second.source and first.imports == second.imports
+
+
+def test_the_body_slots_are_CHILD_ONES_own_body_paths(ratio, ratio_feature):
+    """`_BODY_SLOTS` says which operation owns which path; `BODY_PATHS` says which paths exist. If
+    they drift, this renderer names an operand Child-1 does not compile and refuses every feature."""
+    declared = {path for paths in nodes_compute._BODY_SLOTS.values() for path in paths}
+    assert declared == set(BODY_PATHS)
+
+
+# ── the two operands are two EXPRESSIONS ─────────────────────────────────────────────────────────
+
+
+def test_the_WORKED_RATIO_divides_the_numerator_by_the_denominator(ratio, ratio_feature, lock_tree):
+    """`cross_border_value_ratio_90d` — the feature that compiled, passed governance and then had
+    no calculation node at all. 30 of 100 is 0.3, and the governed filter is what makes it 30."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1"), rows=[
+        _ratio_txn("c1", 30, cross_border=True), _ratio_txn("c1", 70, cross_border=False)])
+    assert values == {"c1": decimal.Decimal("0.300000")}
+
+
+def test_each_operand_applies_its_OWN_governed_filter(ratio, ratio_feature, lock_tree):
+    """The numerator declares `cross_border_flag = true` and the denominator declares nothing. The
+    same rows reach both, so a renderer applying ONE filter to both would answer 1.0 for everyone —
+    a number with no error anywhere, and exactly the shape a share-of-total feature would take."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2"), rows=[
+        _ratio_txn("c1", 25, cross_border=True), _ratio_txn("c1", 75, cross_border=False),
+        _ratio_txn("c2", 40, cross_border=True), _ratio_txn("c2", 40, cross_border=False)])
+    assert values == {"c1": decimal.Decimal("0.250000"), "c2": decimal.Decimal("0.500000")}
+
+
+def test_the_two_projections_are_read_INDEPENDENTLY_and_NOT_swapped(ratio, ratio_feature,
+                                                                    lock_tree):
+    """Two frames, deliberately different. A node reading one input twice, or reading them the
+    other way round, produces 4 or 0.25 — both plausible, neither declared."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(
+        node, lock_tree, spine=_spine_rows("c1"),
+        numerator=[_ratio_txn("c1", 20)], denominator=[_ratio_txn("c1", 80)])
+    assert values == {"c1": decimal.Decimal("0.250000")}
+
+
+def test_each_operand_resolves_ITS_OWN_empty_window_policy(ratio, ratio_feature, lock_tree):
+    """§8 rule 4's policies live on each expression's own WindowPolicy, not on the feature. The
+    same rows and the same ÷0 policy give different columns when ONE operand's declaration moves —
+    which is only true if the renderer read two declarations rather than one."""
+    spine, rows = _spine_rows("c1"), []
+    both_null = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ZERO)
+    assert _ratio_values(both_null, lock_tree, spine=spine, rows=rows) == {"c1": None}
+
+    denominator_zero = _render_ratio(
+        ratio, ratio_feature, zero_denominator=ZeroDenominator.ZERO,
+        empty_window={NUMERATOR_PATH: EmptyWindowResult.NULL,
+                      DENOMINATOR_PATH: EmptyWindowResult.ZERO})
+    # The denominator's OWN declaration turned the empty window into a real zero, and the ÷0 policy
+    # then answered it. Nothing about the numerator's declaration changed.
+    assert _ratio_values(denominator_zero, lock_tree, spine=spine, rows=rows) == {"c1": 0}
+
+
+def test_a_NULL_numerator_over_a_present_denominator_is_NULL_and_not_zero(ratio, ratio_feature,
+                                                                          lock_tree):
+    """An entity with total value but no cross-border value at all. Its numerator is an empty
+    window under a `null` declaration, and `NULL / 100` is NULL — not the 0 a coalesce would give,
+    which reads downstream as "this customer sends nothing abroad" rather than "not known"."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1"),
+                           rows=[_ratio_txn("c1", 100, cross_border=False)])
+    assert values == {"c1": None}
+
+
+# ── §8 rule 4's ÷0 half: three members, three different columns ──────────────────────────────────
+
+
+def _zero_denominator_rows():
+    """c1 has a ratio; c2's denominator is exactly ZERO; c3 has no rows at all — ABSENT.
+
+    c2 and c3 are the pair the whole policy turns on. Both end as "no value" under a naive
+    implementation, and §8 rule 4 gives them different declared answers.
+    """
+    return [_ratio_txn("c1", 30, cross_border=True), _ratio_txn("c1", 70, cross_border=False),
+            _ratio_txn("c2", 50, cross_border=True), _ratio_txn("c2", -50, cross_border=False)]
+
+
+def test_rule_4_zero_denominator_NULL_leaves_a_null_and_stops_nothing(ratio, ratio_feature,
+                                                                      lock_tree):
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.NULL)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2", "c3"),
+                           rows=_zero_denominator_rows())
+    assert values == {"c1": decimal.Decimal("0.300000"), "c2": None, "c3": None}
+
+
+def test_rule_4_zero_denominator_ZERO_tells_a_ZERO_denominator_from_an_ABSENT_one(
+        ratio, ratio_feature, lock_tree):
+    """The test this whole task turns on. c2 has rows and its denominator is exactly zero, so the
+    ÷0 policy answers it with 0. c3 has NO rows, so its own empty_window policy answers it with
+    NULL. An implementation that coalesced the quotient, or that read "the result is null" as "the
+    denominator was zero", gives c3 = 0 — a customer with no transactions reported as having a
+    cross-border share of nought, which is a claim about them nobody made."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ZERO)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2", "c3"),
+                           rows=_zero_denominator_rows())
+    assert values == {"c1": decimal.Decimal("0.300000"), "c2": 0, "c3": None}
+
+
+def test_rule_4_zero_denominator_ERROR_genuinely_RAISES(ratio, ratio_feature, lock_tree):
+    """`error` is not a mode Spark has: division by zero returns the same NULL the `null` policy
+    asks for, so a formula declaring that the run should STOP would publish a column of nulls and
+    report nothing. The rendered node makes it a real refusal, naming the count and no value."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ERROR)
+    with pytest.raises(RuntimeError, match="zero_denominator=error") as raised:
+        _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2", "c3"),
+                      rows=_zero_denominator_rows())
+    assert "Entities affected: 1" in str(raised.value)
+    assert "50" not in str(raised.value)      # a count, never a data value (§14)
+
+
+def test_rule_4_zero_denominator_ERROR_does_NOT_fire_for_an_ABSENT_denominator(
+        ratio, ratio_feature, lock_tree):
+    """The other half of the same distinction, and the one a naive implementation gets wrong in the
+    louder direction: every entity with no rows in its window would stop the run."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ERROR)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c3"), rows=[
+        _ratio_txn("c1", 30, cross_border=True), _ratio_txn("c1", 70, cross_border=False)])
+    assert values == {"c1": decimal.Decimal("0.300000"), "c3": None}
+
+
+def test_the_three_zero_denominator_members_render_DIFFERENTLY(ratio, ratio_feature):
+    """Three declarations, three sources. If two of them rendered the same bytes, one formula's
+    declared behaviour would be another's and no execution test could tell which."""
+    rendered = {policy: _render_ratio(ratio, ratio_feature, zero_denominator=policy).source
+                for policy in ZeroDenominator}
+    assert len(set(rendered.values())) == 3
+    for policy, source in rendered.items():
+        assert f"zero_denominator is `{policy.value}`" in source
+
+
+# ── §8 rule 3 and §10.2, over two aggregates ─────────────────────────────────────────────────────
+
+
+def test_rule_3_an_entity_with_no_rows_in_EITHER_window_is_still_present(ratio, ratio_feature,
+                                                                         lock_tree):
+    node = _render_ratio(ratio, ratio_feature)
+    frame, _manifest = _run_ratio(node, lock_tree, numerator=[], denominator=[],
+                                  spine=_spine_rows("c1", "c2"))
+    assert [row["cif_id"] for row in frame.rows] == ["c1", "c2"]
+    assert all(row[RATIO_90D] is None for row in frame.rows)
+
+
+def test_the_staged_frame_carries_only_the_keys_the_date_and_the_FEATURE(ratio, ratio_feature,
+                                                                         lock_tree):
+    """§10.2. The two operand columns and their markers are this node's own working state; either
+    one surviving is an extra column §9 reports against the whole group at assembly."""
+    node = _render_ratio(
+        ratio, ratio_feature,
+        empty_window={NUMERATOR_PATH: EmptyWindowResult.ZERO,
+                      DENOMINATOR_PATH: EmptyWindowResult.ZERO},
+        zero_denominator=ZeroDenominator.ZERO)
+    frame, _manifest = _run_ratio(node, lock_tree, numerator=[_ratio_txn("c1", 3)],
+                                  denominator=[_ratio_txn("c1", 6)], spine=_spine_rows("c1"))
+    assert frame.columns == ["cif_id", "business_dt", RATIO_90D]
+
+
+def test_the_ratio_emits_no_row_collapsing_repair(ratio, ratio_feature, lock_tree):
+    """Two joins instead of one is two more chances to "fix" a fan-out that is refused upstream."""
+    node = _render_ratio(ratio, ratio_feature)
+    assert ".dropDuplicates(" not in node.source and ".distinct(" not in node.source
+    _ratio_values(node, lock_tree, spine=_spine_rows("c1"), rows=[_ratio_txn("c1", 1)])
+
+
+def test_the_ratios_manifest_is_read_by_SECTION_NINES_own_completeness_check(ratio, ratio_feature,
+                                                                             lock_tree):
+    node = _render_ratio(ratio, ratio_feature)
+    _frame, manifest = _run_ratio(node, lock_tree, numerator=[_ratio_txn("c1", 3)],
+                                  denominator=[_ratio_txn("c1", 6)], spine=_spine_rows("c1"),
+                                  generation=GENERATION, run="run-0001")
+    assert set(manifest) == {field.name for field in dataclasses.fields(StagingManifestV1)}
+    parsed = StagingManifestV1(**json.loads(json.dumps(manifest)))
+    assert check_completeness(ratio[1], [parsed], generation_id=GENERATION, run_id="run-0001",
+                              business_dt=BUSINESS_DT) == ()
+
+
+# ── the DIFFERENCE body ──────────────────────────────────────────────────────────────────────────
+
+
+def _difference(ratio):
+    """The worked ratio's compilation, re-declared as a DIFFERENCE and nothing else.
+
+    No worked fixture declares a difference, and adding one to `fixtures` would change what every
+    other test in the program compiles. So the real compilation's two expressions are re-pathed onto
+    the difference's slots — the same aggregates, the same windows, the same governed filter, under
+    the other operation. The feature keeps its name because the plan publishes that column and a
+    node staged under any other name has no manifest §9 would read.
+    """
+    ir = ratio[0].irs[0]
+    renamed = {NUMERATOR_PATH: "body.minuend", DENOMINATOR_PATH: "body.subtrahend"}
+    return dataclasses.replace(
+        ir, final_operation=FinalOperation.DIFFERENCE, zero_denominator=None,
+        expressions=tuple(dataclasses.replace(expression, expr_path=renamed[expression.expr_path])
+                          for expression in ir.expressions))
+
+
+DIFFERENCE_PROJECTIONS = {"body.minuend": "intermediate_diff__body_minuend",
+                          "body.subtrahend": "intermediate_diff__body_subtrahend"}
+
+
+def _render_difference(ratio, ratio_feature, **overrides):
+    return _render_ratio(ratio, ratio_feature, ir=_difference(ratio),
+                         projections=DIFFERENCE_PROJECTIONS, **overrides)
+
+
+def test_the_DIFFERENCE_subtracts_the_subtrahend_from_the_minuend(ratio, ratio_feature, lock_tree):
+    node = _render_difference(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1"),
+                           numerator=[_ratio_txn("c1", 90)], denominator=[_ratio_txn("c1", 40)])
+    assert values == {"c1": decimal.Decimal("50.000000")}
+    assert node.inputs[:2] == ("intermediate_diff__body_minuend",
+                               "intermediate_diff__body_subtrahend")
+
+
+def test_the_DIFFERENCE_answers_an_EMPTY_side_from_that_SIDES_own_policy(ratio, ratio_feature,
+                                                                         lock_tree):
+    """What a difference means when one side is an empty window is not this renderer's question.
+    Under `null` the difference is NULL; under `zero` the same rows give `0 - 40 = -40`. Both are
+    the declaration's answer, and picking either as a default would publish it as the formula's."""
+    absent_minuend = {"numerator": [], "denominator": [_ratio_txn("c1", 40)]}
+    propagated = _render_difference(ratio, ratio_feature)
+    assert _ratio_values(propagated, lock_tree, spine=_spine_rows("c1"), **absent_minuend) == {
+        "c1": None}
+
+    zeroed = _render_difference(ratio, ratio_feature, empty_window={
+        "body.minuend": EmptyWindowResult.ZERO, "body.subtrahend": EmptyWindowResult.NULL})
+    assert _ratio_values(zeroed, lock_tree, spine=_spine_rows("c1"), **absent_minuend) == {
+        "c1": decimal.Decimal("-40.000000")}
+
+
+def test_the_DIFFERENCE_does_not_COALESCE_either_side(ratio, ratio_feature):
+    """The plausible shortcut, named. `F.coalesce` anywhere in the final operation would turn every
+    `null` empty-window declaration into a `zero` one, silently and for both halves at once."""
+    source = _render_difference(ratio, ratio_feature).source
+    final = source.split("The DIFFERENCE.")[1]
+    assert "F.coalesce" not in final
+
+
+# ── refusals decidable at RENDER time ────────────────────────────────────────────────────────────
+
+
+def test_it_refuses_a_body_path_with_NO_declared_policy_or_NO_projection(ratio, ratio_feature):
+    """A path with nothing declared for it would be rendered under a default, and every default
+    here is this renderer answering a question §8 rule 4 assigns to the formula."""
+    for missing in ("empty_window", "null_input"):
+        policy = {EmptyWindowResult.NULL if missing == "empty_window" else NullInput.IGNORE}
+        with pytest.raises(ValueError, match=f"{missing} for"):
+            _render_ratio(ratio, ratio_feature,
+                          **{missing: {NUMERATOR_PATH: policy.pop()}})
+    with pytest.raises(ValueError, match="projection_datasets for"):
+        _render_ratio(ratio, ratio_feature,
+                      projections={NUMERATOR_PATH: RATIO_PROJECTIONS[NUMERATOR_PATH]})
+    with pytest.raises(ValueError, match="projection_datasets for"):
+        _render_ratio(ratio, ratio_feature,
+                      projections={**RATIO_PROJECTIONS, "body.expr": "intermediate_extra"})
+
+
+def test_it_refuses_a_policy_that_is_NOT_a_mapping_over_body_paths(ratio, ratio_feature):
+    """One value shared between the operands would apply the numerator's declaration to the
+    denominator — a ratio may legitimately declare `zero` for one and `null` for the other."""
+    with pytest.raises(TypeError, match="mapping from body path"):
+        nodes_compute.render_calculation_node(
+            ratio[0].irs[0], ratio_feature, ratio[1],
+            empty_window=EmptyWindowResult.ZERO,          # the scalar 13c took, deliberately
+            null_input=dict.fromkeys(RATIO_PROJECTIONS, NullInput.IGNORE),
+            projection_datasets=RATIO_PROJECTIONS, spine_dataset="primary_spine",
+            staging_dataset=RATIO_STAGING, manifest_dataset=RATIO_MANIFEST)
+
+
+def test_it_refuses_a_RATIO_with_no_zero_denominator_and_a_NON_ratio_with_one(ratio,
+                                                                             ratio_feature):
+    ir = dataclasses.replace(ratio[0].irs[0], zero_denominator=None)
+    with pytest.raises(ValueError, match="carries no zero_denominator"):
+        _render_ratio(ratio, ratio_feature, ir=ir)
+    difference = dataclasses.replace(_difference(ratio), zero_denominator=ZeroDenominator.NULL)
+    with pytest.raises(ValueError, match="no division in that body"):
+        _render_ratio(ratio, ratio_feature, ir=difference,
+                      projections=DIFFERENCE_PROJECTIONS)
+
+
+def test_it_refuses_a_RATIO_whose_operands_declare_DIFFERENT_grains(ratio, ratio_feature):
+    """One groupBy serves both aggregates. An operand grouped by something else would land its
+    values against another entity's key, which is a full column of plausible numbers."""
+    ir = ratio[0].irs[0]
+    elsewhere = dataclasses.replace(ir.expressions[1], physical_read_set=tuple(
+        ref for ref in ir.expressions[1].physical_read_set if ref.column != "cif_id"))
+    with pytest.raises(ValueError, match="authorized read set"):
+        _render_ratio(ratio, ratio_feature,
+                      ir=dataclasses.replace(ir, expressions=(ir.expressions[0], elsewhere)))
+
+
+# ── the node inside a real project ───────────────────────────────────────────────────────────────
+
+
+def test_the_RATIO_closes_the_wiring_of_a_REAL_rendered_project(ratio):
+    """The whole of A.18's first row, end to end: the worked ratio now has a calculation node, and
+    Task 12's six wiring checks accept it — two projection inputs and all."""
+    datasets = project_datasets(ratio[0], ratio[1], spine_input=ratio[3])
+    project = render_project(
+        ratio[0], ratio[1], environment_id=ENVIRONMENT,
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=ratio[3],
+        nodes=_wired_nodes(ratio, datasets))
+    nodes_py = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/nodes.py"))
+    assert f"def {nodes_compute.calculation_func_name(RATIO_90D)}(" in nodes_py
+    assert ast.parse(nodes_py)
+
+
+# ── goldens: a change detector, and the weakest test here ────────────────────────────────────────
+
+
+RATIO_VARIANTS = {
+    "ratio_zero_denominator_null": {"zero_denominator": ZeroDenominator.NULL},
+    "ratio_zero_denominator_zero": {"zero_denominator": ZeroDenominator.ZERO},
+    "ratio_zero_denominator_error": {"zero_denominator": ZeroDenominator.ERROR},
+    "ratio_per_operand_empty_windows": {
+        "zero_denominator": ZeroDenominator.ZERO,
+        "empty_window": {NUMERATOR_PATH: EmptyWindowResult.NULL,
+                         DENOMINATOR_PATH: EmptyWindowResult.ZERO},
+        "null_input": {NUMERATOR_PATH: NullInput.PROPAGATE,
+                       DENOMINATOR_PATH: NullInput.IGNORE}},
+}
+
+
+@pytest.mark.parametrize("variant", sorted(RATIO_VARIANTS))
+def test_the_rendered_ratio_matches_its_golden(ratio, ratio_feature, variant):
+    """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
+    golden = CALCULATION_GOLDENS / f"{variant}.py"
+    rendered = _render_ratio(ratio, ratio_feature, **RATIO_VARIANTS[variant]).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_the_rendered_difference_matches_its_golden(ratio, ratio_feature):
+    golden = CALCULATION_GOLDENS / "difference_decimal.py"
+    rendered = _render_difference(ratio, ratio_feature).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_every_rendered_FINAL_OPERATION_line_fits_the_width_it_states(ratio, ratio_feature):
+    for variant in RATIO_VARIANTS.values():
+        for line in _render_ratio(ratio, ratio_feature, **variant).source.splitlines():
+            assert len(line) <= 100, line
+    for line in _render_difference(ratio, ratio_feature).source.splitlines():
+        assert len(line) <= 100, line

@@ -1873,6 +1873,22 @@ def _grain_aggregate_lines(slot: _Slot, keys: tuple[str, ...],
     ]
 
 
+def _when_lines(indent: str, condition: str, value: str, otherwise: str,
+                tail: str) -> list[str]:
+    """``F.when(c, v).otherwise(o)`` on one line where it fits, split at ``.otherwise(`` where not.
+
+    The same rule :func:`_call_lines` applies to a call, for the one expression shape that is not
+    one: a policy's replacement value and the value it replaces, which is as long as the two column
+    names it names. Split at ``.otherwise(`` and never mid-argument, so the two branches of the
+    condition stay whole and a reader can still see which is which.
+    """
+    single = f"{indent}F.when({condition}, {value}).otherwise({otherwise}){tail}"
+    if len(single) <= _RENDERED_WIDTH:
+        return [single]
+    return [f"{indent}F.when({condition}, {value}).otherwise(",
+            f"{indent}    {otherwise}){tail}"]
+
+
 def _call_lines(head: str, arguments: list[str], tail: str) -> list[str]:
     """``head(arg, arg)tail`` on one line where it fits, one argument per line where it does not.
 
@@ -2003,7 +2019,7 @@ def _empty_window_lines(slot: _Slot, physical: PhysicalType) -> list[str]:
             f"    {value} = {_typed_literal('0', physical)}",
             "    staged = staged.withColumn(",
             f"        {column!r},",
-            f"        F.when({absent}, {value}).otherwise(F.col({column!r})))",
+            *_when_lines("        ", absent, value, f"F.col({column!r})", ")"),
         ]
     else:
         empty = f"{slot.local}empty"
@@ -2129,7 +2145,8 @@ def _zero_denominator_lines(policy: ZeroDenominator, column: str, numerator: str
         f"    zero_value = {_typed_literal('0', physical)}",
         "    staged = staged.withColumn(",
         f"        {column!r},",
-        f"        F.when(denominator_is_zero, zero_value).otherwise({numerator} / divisor))",
+        *_when_lines("        ", "denominator_is_zero", "zero_value",
+                     f"{numerator} / divisor", ")"),
     ]
 
 
@@ -2281,7 +2298,8 @@ def _manifest_lines(column: str, feature: PlannedFeature) -> list[str]:
             "catalog's OWN relative path for this dataset, so the manifest cannot name a path "
             "nothing wrote to. The root is a run parameter because §9's staging area is "
             "generation-scoped: one fixed at render time would be shared by every run."),
-        f"    output_location = str(staging_root).rstrip('/') + {location!r}",
+        f"    staging_path = {location!r}",
+        "    output_location = str(staging_root).rstrip('/') + staging_path",
         "",
         *_comment(
             "No data value appears in a manifest and none may be added (§14): counts, types, hashes "
