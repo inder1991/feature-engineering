@@ -2163,6 +2163,21 @@ def test_the_staged_frame_carries_only_the_keys_the_date_and_the_FEATURE(ratio, 
     assert frame.columns == ["cif_id", "business_dt", RATIO_90D]
 
 
+def test_the_operand_columns_are_dropped_BEFORE_the_staging_select(ratio, ratio_feature):
+    """§10.2 is enforced TWICE, deliberately, and this asserts the second belt.
+
+    The staging select carries the keys, the business date and one feature column, so it already
+    removes the two operand columns whether or not they are dropped — the drop is not observable in
+    the output, and a mutation that removes it survives every execution test in this file. It is
+    rendered anyway because the node's own working state should have a stated lifetime in the
+    generated project a bank reads, and because §10.2 then does not depend on one line: a change to
+    the select alone cannot leak `__numerator` into an assembled group.
+    """
+    source = _render_ratio(ratio, ratio_feature).source
+    dropped = source.index("staged = staged.drop('__numerator', '__denominator')")
+    assert dropped < source.index("staged = staged.select(")
+
+
 def test_the_ratio_emits_no_row_collapsing_repair(ratio, ratio_feature, lock_tree):
     """Two joins instead of one is two more chances to "fix" a fan-out that is refused upstream."""
     node = _render_ratio(ratio, ratio_feature)
