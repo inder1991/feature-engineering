@@ -16,12 +16,22 @@ Three properties carry the whole task, and each is asserted directly rather than
 """
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
+import sys
 
 import pytest
 
+from featuregen.materialize import validation
 from featuregen.materialize.codes import ValidationFindingCode
+from featuregen.materialize.identity import (
+    GENERATED_LOCK_FILENAME,
+    CompilationIdentity,
+    read_lock,
+    seal_project,
+)
+from featuregen.materialize.render.project import materialize_to
 from featuregen.materialize.validation import (
     FINDING_CLASSES,
     FindingClass,
@@ -32,6 +42,7 @@ from featuregen.materialize.validation import (
     ValidationStatus,
     classify,
     may_regenerate,
+    run_l0,
 )
 
 GEN = "gen-15b"
@@ -285,3 +296,221 @@ def test_every_L0_and_L1_finding_this_slice_can_emit_is_an_ERROR() -> None:
     """
     assert all(_finding(code).severity is FindingSeverity.ERROR
                for code in ValidationFindingCode)
+
+
+# ── L0: parsing is not building ──────────────────────────────────────────────────────────────────
+#
+# Every project below is stdlib-only and hand-authored, so the suite proves L0's behaviour without
+# importing `pyspark` or `kedro` and without paying for them. The generated project's own build is
+# the L0 GATE (`tests/featuregen/materialize/l0_gate.py`), which runs against `.venv-l0`.
+
+PACKAGE = "sandbox_l0_demo"
+
+_PIPELINE_STUB = (
+    "class Pipeline:\n"
+    "    def __init__(self, nodes):\n"
+    "        self.nodes = list(nodes)\n")
+
+
+def _project_files(*, create_pipeline_body: str, registry_prelude: str = "") -> dict[str, str]:
+    """A project laid out exactly as the renderer lays one out — importable, stdlib only."""
+    root = f"src/{PACKAGE}"
+    return {
+        "README.md": "# a project\n",
+        f"{root}/__init__.py": "",
+        f"{root}/pipeline_registry.py": (
+            registry_prelude
+            + f"from {PACKAGE}.pipelines.materialize import create_pipeline\n"
+            "\n"
+            "\n"
+            "def register_pipelines():\n"
+            "    materialize = create_pipeline()\n"
+            '    return {"materialize": materialize, "__default__": materialize}\n'),
+        f"{root}/pipelines/__init__.py": "",
+        f"{root}/pipelines/materialize/__init__.py": (
+            f"from {PACKAGE}.pipelines.materialize.pipeline import create_pipeline\n"
+            '\n__all__ = ["create_pipeline"]\n'),
+        f"{root}/pipelines/materialize/pipeline.py": _PIPELINE_STUB + "\n\n" + create_pipeline_body,
+    }
+
+
+_BUILDS = "def create_pipeline():\n    return Pipeline([\"assemble\", \"publish\"])\n"
+_NO_NODES = "def create_pipeline():\n    return Pipeline([])\n"
+_RAISES = "def create_pipeline():\n    raise RuntimeError(\"the group plan and the IRs disagree\")\n"
+
+
+def _identity() -> CompilationIdentity:
+    return CompilationIdentity(formula_content_hashes=("f" * 64,), ir_hashes=("e" * 64,),
+                               materialization_contract_hash="c" * 64, group_plan_hash=PLAN_HASH)
+
+
+def _on_disk(tmp_path, files: dict[str, str]):
+    """Seal the files under a real ``GENERATED.lock`` and write them to a real directory."""
+    return materialize_to(seal_project(_identity(), files), tmp_path / "generated")
+
+
+def _l0(root, *, python_executable: str = sys.executable) -> ValidationReportV1:
+    return run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-l0",
+                  python_executable=python_executable, clock=_clock())
+
+
+def _clock():
+    stamps = iter((T0, T1))
+    return lambda: next(stamps)
+
+
+def _codes(report: ValidationReportV1) -> list[ValidationFindingCode]:
+    return [finding.code for finding in report.findings]
+
+
+def test_a_project_that_builds_PASSES_L0_with_no_findings(tmp_path) -> None:
+    report = _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS)))
+    assert (report.status, report.findings) == (ValidationStatus.PASSED, ())
+    assert report.level is ValidationLevel.L0
+
+
+def test_a_project_that_PARSES_but_yields_no_pipeline_is_PIPELINE_NOT_CONSTRUCTIBLE(tmp_path):
+    """The whole point of L0: `ast.parse` accepts this project, and it publishes nothing.
+
+    The parse is asserted here rather than assumed, so the test proves the distinction instead of
+    describing it.
+    """
+    files = _project_files(create_pipeline_body=_NO_NODES)
+    for path, text in files.items():
+        if path.endswith(".py"):
+            ast.parse(text)                      # every file parses — that is the trap
+
+    report = _l0(_on_disk(tmp_path, files))
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE]
+    assert report.findings[0].classification is FindingClass.RENDERER_DEFECT
+
+
+def test_a_registry_that_registers_NOTHING_is_PIPELINE_NOT_CONSTRUCTIBLE(tmp_path) -> None:
+    files = _project_files(create_pipeline_body=_BUILDS)
+    files[f"src/{PACKAGE}/pipeline_registry.py"] = "def register_pipelines():\n    return {}\n"
+    report = _l0(_on_disk(tmp_path, files))
+    assert _codes(report) == [ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE]
+
+
+def test_a_pipeline_whose_CONSTRUCTION_raises_is_not_reported_as_an_import_failure(tmp_path):
+    """Imported fine, would not build: the two codes route to different renderer bugs."""
+    report = _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_RAISES)))
+    assert _codes(report) == [ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE]
+
+
+def test_a_project_that_cannot_be_IMPORTED_is_PROJECT_DOES_NOT_BUILD(tmp_path) -> None:
+    files = _project_files(create_pipeline_body=_BUILDS,
+                           registry_prelude="import a_module_nobody_installed\n")
+    ast.parse(files[f"src/{PACKAGE}/pipeline_registry.py"])       # parses; does not import
+    report = _l0(_on_disk(tmp_path, files))
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.PROJECT_DOES_NOT_BUILD]
+    assert report.findings[0].classification is FindingClass.RENDERER_DEFECT
+    assert report.findings[0].observed == "ModuleNotFoundError"
+
+
+def test_L0_never_imports_the_project_into_THIS_interpreter(tmp_path) -> None:
+    """An isolated environment, not `importlib` in the validator's own process.
+
+    A project imported here would leave modules in `sys.modules` that the next validation would
+    import in preference to the files on disk — so a hand-edited project could pass because its
+    predecessor was still loaded.
+    """
+    _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS)))
+    assert not [name for name in sys.modules if name.startswith(PACKAGE)]
+
+
+# ── L0: the hand-edited project ──────────────────────────────────────────────────────────────────
+
+
+def test_an_UNEDITED_project_reports_no_hash_mismatch(tmp_path) -> None:
+    """The control for the three edits below: the same project, untouched."""
+    report = _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS)))
+    assert ValidationFindingCode.PROJECT_HASH_MISMATCH not in _codes(report)
+
+
+def test_an_EDITED_file_is_caught_as_PROJECT_HASH_MISMATCH(tmp_path) -> None:
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    edited = root / "README.md"
+    edited.write_text(edited.read_text(encoding="utf-8") + "\n<!-- one character of drift -->\n",
+                      encoding="utf-8")
+
+    report = _l0(root)
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.PROJECT_HASH_MISMATCH]
+    assert report.findings[0].classification is FindingClass.ENVIRONMENT_OR_DATA
+    assert may_regenerate(report) is True
+
+
+def test_an_ADDED_file_is_caught_too(tmp_path) -> None:
+    """An added module can shadow a rendered one, so the hash covers absence as well as content."""
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    (root / "src" / PACKAGE / "sitecustomize_helper.py").write_text("X = 1\n", encoding="utf-8")
+    assert _codes(_l0(root)) == [ValidationFindingCode.PROJECT_HASH_MISMATCH]
+
+
+def test_a_DELETED_file_is_caught_too(tmp_path) -> None:
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    (root / "README.md").unlink()
+    assert ValidationFindingCode.PROJECT_HASH_MISMATCH in _codes(_l0(root))
+
+
+def test_pythons_byte_CACHE_is_not_drift(tmp_path) -> None:
+    """`__pycache__` appears by IMPORTING the project, which is the thing L0 does to it."""
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    cache = root / "src" / PACKAGE / "__pycache__"
+    cache.mkdir()
+    (cache / "__init__.cpython-311.pyc").write_bytes(b"\x00\x01")
+    assert _l0(root).status is ValidationStatus.PASSED
+
+
+def test_the_report_names_the_hash_the_LOCK_records(tmp_path) -> None:
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    recorded = read_lock((root / "GENERATED.lock").read_text(encoding="utf-8"))
+    report = _l0(root)
+    assert report.generated_project_hash == recorded.generated_project_hash
+    assert report.group_plan_hash == recorded.compilation.group_plan_hash
+
+
+def test_L0_carries_no_run_id(tmp_path) -> None:
+    assert _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))).run_id is None
+
+
+# ── L0: an environment that could not be reached ─────────────────────────────────────────────────
+
+
+def test_an_L0_environment_that_cannot_be_REACHED_is_error_with_zero_findings(tmp_path) -> None:
+    """Not a finding and not a pass: the isolated environment never ran, so nothing was observed."""
+    report = _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS)),
+                 python_executable=str(tmp_path / "no-such-interpreter"))
+    assert report.status is ValidationStatus.ERROR
+    assert report.findings == ()
+
+
+def test_an_unreachable_environment_does_not_hide_a_hash_mismatch_as_a_PASS(tmp_path) -> None:
+    """`error` is not `passed`, and the difference is the only thing separating the two reports."""
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    (root / "README.md").write_text("edited\n", encoding="utf-8")
+    report = _l0(root, python_executable=str(tmp_path / "no-such-interpreter"))
+    assert report.status is ValidationStatus.ERROR
+    assert report.findings == ()
+    assert may_regenerate(report) is False
+
+
+def test_a_directory_that_is_not_a_generated_project_RAISES_rather_than_failing(tmp_path) -> None:
+    """No lock means nothing states what this project should hash to — there is no verdict to give."""
+    (tmp_path / "loose").mkdir()
+    (tmp_path / "loose" / "thing.py").write_text("x = 1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=GENERATED_LOCK_FILENAME):
+        _l0(tmp_path / "loose")
+
+
+# ── L2 is not run unless requested ───────────────────────────────────────────────────────────────
+
+
+def test_no_validation_this_slice_runs_L2(tmp_path) -> None:
+    """L2 is on demand (§11.2). There is no `run_l2`, so nothing can reach it by default."""
+    assert not hasattr(validation, "run_l2")
+    assert _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))).level \
+        is ValidationLevel.L0

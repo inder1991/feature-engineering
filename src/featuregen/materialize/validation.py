@@ -38,13 +38,22 @@ what keeps this module's behaviour proved without a pyspark import.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import os
+import pathlib
+import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.codes import ValidationFindingCode
+from featuregen.materialize.identity import (
+    GENERATED_LOCK_FILENAME,
+    RenderedArtifactIdentity,
+    generated_project_hash,
+    read_lock,
+)
 
 __all__ = [
     "FINDING_CLASSES",
@@ -58,6 +67,7 @@ __all__ = [
     "classify",
     "may_regenerate",
     "record_validation_report",
+    "run_l0",
 ]
 
 
@@ -319,3 +329,219 @@ class ClusterUnreachable(Exception):
     ``Exception`` would turn a defect in this module into "the cluster was unreachable", which is an
     invented verdict of exactly the kind §11.2 forbids.
     """
+
+
+# ── L0: the generated project itself ─────────────────────────────────────────────────────────────
+
+#: What the build probe prints, on its own line, so the project's own output cannot be mistaken for
+#: a verdict. A project that prints during import is legal; a project that prints something shaped
+#: like a verdict would otherwise be able to declare itself buildable.
+_VERDICT_MARKER = "@@L0-VERDICT@@ "
+
+#: The probe. Stdlib ONLY and run in ANOTHER interpreter, which is what lets the suite exercise it
+#: against ``sys.executable`` and hand-authored projects while the gate runs the identical code
+#: against the environment that has ``kedro`` and ``pyspark``. It duck-types the registry's answer
+#: rather than importing ``kedro.pipeline.Pipeline``: importing it here would put this platform's
+#: control plane one dependency away from the artifact it validates.
+_BUILD_PROBE = r'''
+import importlib, json, sys, traceback
+
+MARKER, root, package = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, root + "/src")
+
+
+def emit(stage, ok, observed=""):
+    print(MARKER + json.dumps({"stage": stage, "ok": ok, "observed": observed}))
+    raise SystemExit(0)
+
+
+try:
+    importlib.import_module(package)
+    registry = importlib.import_module(package + ".pipeline_registry")
+except BaseException as error:            # noqa: BLE001 - the project's failure, not the probe's
+    del traceback
+    emit("import", False, type(error).__name__)
+
+try:
+    pipelines = registry.register_pipelines()
+    named = dict(pipelines.items())
+    counts = {name: len(list(getattr(pipeline, "nodes"))) for name, pipeline in named.items()}
+except BaseException as error:            # noqa: BLE001
+    emit("build", False, type(error).__name__)
+
+if not counts:
+    emit("build", False, "0 pipelines")
+empty = sorted(name for name, count in counts.items() if count == 0)
+if empty:
+    emit("build", False, "0 nodes in " + ",".join(empty))
+emit("build", True, str(max(counts.values())) + " nodes")
+'''
+
+
+def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
+                   timeout_seconds: float) -> dict[str, Any] | None:
+    """Run the probe in its own interpreter. ``None`` means the environment never answered.
+
+    ``None`` is deliberately distinct from every verdict the probe can print: an interpreter that
+    could not be launched, a probe killed by a timeout and a probe whose output carries no verdict
+    line are all *the validation did not run*, which §11.2 records as ``status="error"`` with no
+    findings. Turning any of them into ``PROJECT_DOES_NOT_BUILD`` would blame the artifact for the
+    environment.
+    """
+    try:
+        completed = subprocess.run(                                       # noqa: S603 - fixed argv
+            [python_executable, "-c", _BUILD_PROBE, _VERDICT_MARKER, str(root), package],
+            capture_output=True, text=True, timeout=timeout_seconds, check=False,
+            cwd=str(root))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(_VERDICT_MARKER):
+            try:
+                verdict = json.loads(line[len(_VERDICT_MARKER):])
+            except json.JSONDecodeError:
+                return None
+            return verdict if isinstance(verdict, dict) else None
+    return None
+
+
+def _project_package(root: pathlib.Path) -> str | None:
+    """The one importable package under ``src/``. ``None`` when there is not exactly one."""
+    source_root = root / "src"
+    if not source_root.is_dir():
+        return None
+    packages = sorted(entry.name for entry in source_root.iterdir()
+                      if entry.is_dir() and (entry / "__init__.py").is_file())
+    return packages[0] if len(packages) == 1 else None
+
+
+def _files_on_disk(root: pathlib.Path) -> Mapping[str, str] | None:
+    """The project as it EXISTS, in ``generated_project_hash``'s shape. ``None`` if not all text.
+
+    The skip list is the rendered ``PROJECT_INTEGRITY`` gate's, for the reason that gate states:
+    ``__pycache__``, ``*.egg-info`` and dot-directories appear by *using* a project rather than by
+    rendering one, and L0's own probe creates the first of them. Anything else unsealed is drift —
+    an added module can shadow a rendered one.
+    """
+    files: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        parts = path.relative_to(root).parts
+        if any(part == "__pycache__" or part.startswith(".") or part.endswith(".egg-info")
+               for part in parts):
+            continue
+        relative = "/".join(parts)
+        if relative.endswith(".pyc"):
+            continue
+        try:
+            files[relative] = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return None
+    return files
+
+
+def _lock_of(root: pathlib.Path) -> RenderedArtifactIdentity:
+    lock = root / GENERATED_LOCK_FILENAME
+    if not lock.is_file():
+        raise ValueError(
+            f"{root} has no {GENERATED_LOCK_FILENAME}: L0 verifies a project against the hash the "
+            f"lock records, and a directory that states no hash is not a generated project — there "
+            f"is no verdict to give about it, which is different from a failing one")
+    return read_lock(lock.read_text(encoding="utf-8"))
+
+
+def run_l0(
+    root: str | os.PathLike[str],
+    *,
+    generation_id: str,
+    environment_id: str,
+    report_id: str,
+    python_executable: str,
+    clock: Callable[[], str],
+    timeout_seconds: float = 300.0,
+) -> ValidationReportV1:
+    """L0 (§11.2): the project on disk hashes to its lock, imports, and yields a pipeline.
+
+    It takes a DIRECTORY, not a
+    :class:`~featuregen.materialize.identity.SealedProject`. A sealed object's files are by
+    construction the ones its lock was computed from, so ``PROJECT_HASH_MISMATCH`` would be
+    unreachable through it — and a hand-edited project, which is the whole reason that code exists,
+    only exists on disk. Materializing a sealed project to a temporary directory is
+    :func:`~featuregen.materialize.render.project.materialize_to`; L0 validates what that wrote.
+
+    Both checks always run: a project may be edited *and* fail to build, and reporting one of the
+    two would send an operator to fix the half that was visible.
+
+    Args:
+        root: the materialized project.
+        generation_id: the generation these bytes were rendered for.
+        environment_id: the environment the report is keyed on.
+        report_id: supplied, never minted — this module has no id factory, matching
+            :mod:`featuregen.materialize.control_plane`.
+        python_executable: the interpreter the project is imported in. It is a parameter because
+            the generated project imports ``kedro`` and ``pyspark``, which this platform does not
+            depend on; there is no default, so nothing can silently validate the artifact against
+            the validator's own environment.
+        clock: read twice — once before the work and once after — so ``finished_at`` is the time
+            the validation ended rather than a value the caller supplied in advance.
+        timeout_seconds: after which the probe is *unreachable*, not failing.
+
+    Raises:
+        ValueError: ``root`` holds no ``GENERATED.lock``, so nothing states what it should hash to.
+    """
+    directory = pathlib.Path(root)
+    lock = _lock_of(directory)
+    started_at = clock()
+
+    findings: list[ValidationFinding] = []
+    observed_files = _files_on_disk(directory)
+    if observed_files is None or \
+            generated_project_hash(observed_files) != lock.generated_project_hash:
+        findings.append(ValidationFinding(
+            code=ValidationFindingCode.PROJECT_HASH_MISMATCH,
+            location=str(directory),
+            expected=lock.generated_project_hash,
+            observed=("not all files are UTF-8 text" if observed_files is None
+                      else generated_project_hash(observed_files)),
+            count=1))
+
+    package = _project_package(directory)
+    if package is None:
+        findings.append(ValidationFinding(
+            code=ValidationFindingCode.PROJECT_DOES_NOT_BUILD, location=f"{directory}/src",
+            expected="exactly one importable package", observed="0 or more than 1", count=1))
+        verdict: dict[str, Any] | None = {"stage": "import", "ok": False, "observed": "no package"}
+    else:
+        verdict = _probe_verdict(directory, package, python_executable=python_executable,
+                                 timeout_seconds=timeout_seconds)
+        if verdict is None:
+            # The environment, not the artifact. Every finding above is DISCARDED: §11.2's zero
+            # findings under `error` means a report that could not complete reports nothing at all,
+            # not the part of itself that happened to finish.
+            return ValidationReportV1(
+                report_id=report_id, generation_id=generation_id, run_id=None,
+                generated_project_hash=lock.generated_project_hash,
+                group_plan_hash=lock.compilation.group_plan_hash, level=ValidationLevel.L0,
+                environment_id=environment_id, status=ValidationStatus.ERROR,
+                started_at=started_at, finished_at=clock(), findings=())
+        if not verdict.get("ok"):
+            findings.append(ValidationFinding(
+                code=(ValidationFindingCode.PROJECT_DOES_NOT_BUILD
+                      if verdict.get("stage") == "import"
+                      else ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE),
+                location=f"{package}.pipeline_registry",
+                expected=("importable" if verdict.get("stage") == "import"
+                          else "a pipeline with at least one node"),
+                # The exception TYPE, never its message: §11 closes a finding to type and schema
+                # facts, and a message is unbounded text this module cannot bound.
+                observed=str(verdict.get("observed") or "unknown") or "unknown",
+                count=1))
+
+    return ValidationReportV1(
+        report_id=report_id, generation_id=generation_id, run_id=None,
+        generated_project_hash=lock.generated_project_hash,
+        group_plan_hash=lock.compilation.group_plan_hash, level=ValidationLevel.L0,
+        environment_id=environment_id,
+        status=ValidationStatus.FAILED if findings else ValidationStatus.PASSED,
+        started_at=started_at, finished_at=clock(), findings=tuple(findings))
