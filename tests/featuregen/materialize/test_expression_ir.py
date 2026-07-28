@@ -24,6 +24,7 @@ import dataclasses
 import inspect
 
 import pytest
+from tests.featuregen.materialize import fixtures
 
 from featuregen.formula.schema import (
     AggregateExpression,
@@ -260,6 +261,7 @@ def _inventory(*, tables=None, schema_map=None) -> ClusterInventoryV1:
         environment_id="hdfc-local", tables=declared,
         logical_schema_map=schema_map if schema_map is not None else {
             TXN: "banking", CARDS: "banking", ACCOUNTS: "banking", CUSTOMERS: "banking"},
+        engine_versions=fixtures.ENGINE_VERSIONS,
         captured_at="2026-07-27T00:00:00Z")
 
 

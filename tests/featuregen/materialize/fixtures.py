@@ -81,6 +81,7 @@ from featuregen.formula.schema import (
     ZeroDenominator,
 )
 from featuregen.formula.turns import AuthoringIntent
+from featuregen.materialize.inventory import EngineVersions
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -101,6 +102,13 @@ REF_CROSS_BORDER = f"{TABLE_REF}.cross_border_flag"
 #: The one column whose ``logical_representation`` is seeded as a GOVERNED decision — the reason a
 #: SUM over it reaches ``external_type_required=False`` and the resolved type ``"numeric"``.
 GOVERNED_TYPE_REFS: tuple[str, ...] = (REF_AMT,)
+
+#: What the `hdfc-local` environment is DECLARED to run (spec §0). Real values are Task 0's to
+#: capture from the cluster; what every test below needs is that an inventory carries a complete,
+#: non-blank set, because §7's generated project pins its dependencies from exactly these.
+ENGINE_VERSIONS = EngineVersions(
+    hive="3.1.3", spark="3.5.1", metastore="3.1.3", python="3.11.9", java="11.0.22",
+    pyspark="3.5.1", kedro="0.19.9", kedro_datasets="4.1.0")
 
 #: The three worked features of the slice (spec "First-slice bounds").
 FEATURE_NAMES: tuple[str, ...] = (

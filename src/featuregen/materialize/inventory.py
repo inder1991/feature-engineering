@@ -25,10 +25,13 @@ kept because run preparation and the honesty note in §3.4 (an unpartitioned mut
 content-addressed) need them — they are simply not identity.
 
 **Status: partial.** Task 5 needs the typed declarations, so they live here, in the module Task 0
-owns. Task 0 adds ``EngineVersions``, ``load_inventory(path)`` and ``MetastoreInventoryAdapter``,
-plus the ``conf/environments/*.yml`` these are loaded from. It should extend this file rather than
-restate it — two definitions of a layout are two layouts, and the second one is the one nobody
-governs.
+owns. Task 12 added :class:`EngineVersions` and :attr:`ClusterInventoryV1.engine_versions` — the
+generated project pins its dependencies from them (§7), and a renderer that accepted the versions
+as loose strings would pin the project to whatever a caller happened to type rather than to what the
+environment was captured as. Task 0 still adds ``load_inventory(path)`` and
+``MetastoreInventoryAdapter``, plus the ``conf/environments/*.yml`` these are loaded from. It should
+extend this file rather than restate it — two definitions of a layout are two layouts, and the
+second one is the one nobody governs.
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ __all__ = [
     "PARTITION_MAPPING_TYPES",
     "AvailabilityPartition",
     "ClusterInventoryV1",
+    "EngineVersions",
     "EventTimePartition",
     "FullScan",
     "PartitionMappingKind",
@@ -235,6 +239,53 @@ class TableLayout:
 
 
 @dataclass(frozen=True, slots=True)
+class EngineVersions:
+    """The runtimes the target environment actually runs (spec §0), all of them REQUIRED.
+
+    Three of these — ``python``, ``pyspark``, ``kedro`` (and ``kedro_datasets``, below) — are what
+    §7's generated project pins its own dependencies to. The other four describe the cluster the
+    project is rendered FOR: they decide whether a publish mechanism is even available (§10.3's
+    attestation is keyed on ``hive``/``spark``/``metastore``), and ``java`` is what a Spark version
+    is only meaningful against.
+
+    Every field is required and non-blank, because the failure mode of a missing one is silent. An
+    unpinned dependency resolves to whatever the installer's index offers on the day, so a project
+    that "ran last week" is not the project that runs today — and a rendered artifact identified by
+    the hash of its bytes would be claiming an identity its behaviour does not have.
+
+    ``kedro_datasets`` is not in the plan's field sketch, and it is here because Kedro moved its
+    dataset implementations into a SEPARATELY VERSIONED distribution: ``spark.SparkHiveDataset``
+    resolves out of ``kedro-datasets``, not out of ``kedro``, so a lock naming only ``kedro`` leaves
+    the class that reads every governed source table unpinned.
+    """
+
+    hive: str
+    spark: str
+    metastore: str
+    python: str
+    java: str
+    pyspark: str
+    kedro: str
+    kedro_datasets: str
+
+    def __post_init__(self) -> None:
+        for name in ("hive", "spark", "metastore", "python", "java", "pyspark", "kedro",
+                     "kedro_datasets"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"engine version {name} is blank ({value!r}): an environment is described by "
+                    f"what it RUNS, and a blank version pins nothing — the generated project would "
+                    f"install whatever the index offers on the day it is built")
+
+    def identity_payload(self) -> dict[str, str]:
+        """Every field, in a stable order. TOTAL — no parsing, nothing that can raise."""
+        return {"hive": self.hive, "spark": self.spark, "metastore": self.metastore,
+                "python": self.python, "java": self.java, "pyspark": self.pyspark,
+                "kedro": self.kedro, "kedro_datasets": self.kedro_datasets}
+
+
+@dataclass(frozen=True, slots=True)
 class ClusterInventoryV1:
     """A target environment as somebody looked at it and wrote it down.
 
@@ -248,12 +299,18 @@ class ClusterInventoryV1:
     is nullable: a schema-less upload leaves the catalog with no opinion, and the alternative to a
     declaration is defaulting to ``public`` and reading a different table.
 
+    ``engine_versions`` is what the environment RUNS. It is required rather than optional for the
+    same reason a table's layout is: an inventory that omitted it would let a project be rendered
+    against an environment nobody established the runtimes of, and the resulting artifact would pin
+    nothing (§7).
+
     ``captured_at`` is OBSERVATION provenance and never enters identity.
     """
 
     environment_id: str
     tables: Mapping[str, TableLayout]
     logical_schema_map: Mapping[str, str]
+    engine_versions: EngineVersions
     captured_at: str
 
     def layout_for(self, schema: str, table: str) -> TableLayout | None:

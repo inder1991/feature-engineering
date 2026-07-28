@@ -45,7 +45,7 @@ from tests.featuregen.materialize.test_group_plan import (  # noqa: F401 — `ca
 from tests.featuregen.materialize.test_ir import _compile, _ok
 
 from featuregen.formula._jcs import dumps as jcs_dumps
-from featuregen.materialize import binding, identity
+from featuregen.materialize import binding, identity, render
 from featuregen.materialize.binding import physical_target_for
 from featuregen.materialize.group_plan import group_plan_hash
 from featuregen.materialize.identity import (
@@ -71,18 +71,19 @@ SNAPSHOTS = ("snap-transactions-0001", "snap-customers-0001")
 PARAMETERS = {"transactions_partitions": ["load_dt=2026-07-26", "load_dt=2026-07-27"],
               "business_dt": BUSINESS_DT}
 COMPILER = "compiler-1.2.3"
-RENDERER = "renderer-4.5.6"
 
 #: Every literal above that a run supplies, as bytes — searched for inside the compilation-phase
 #: payloads. Kept as one list so a value added to the execution hash is added to the proof too.
-RUN_TIME_LITERALS = (BUSINESS_DT, ENVIRONMENT, ATTESTATION, COMPILER, RENDERER, *SNAPSHOTS,
+RUN_TIME_LITERALS = (BUSINESS_DT, ENVIRONMENT, ATTESTATION, COMPILER, *SNAPSHOTS,
                      "load_dt=2026-07-27")
 
 #: The parameter NAMES §7 puts on the run side. A compilation-phase entry point that named one of
 #: these would be taking a run-time value however carefully its body then ignored it.
+#: `renderer_version` is deliberately NOT here. Task 12 removed the parameter: the value is read
+#: from `render.RENDERER_VERSION`, so there is no argument on which a stale literal could arrive.
 RUN_TIME_PARAMETERS = frozenset({
     "environment_id", "parameters", "business_dt", "input_snapshot_ids", "compiler_version",
-    "renderer_version", "capability_attestation_id"})
+    "capability_attestation_id"})
 
 FILES = {
     "pyproject.toml": "[project]\nname = \"generated_cif_daily\"\n",
@@ -117,7 +118,6 @@ def _exec(**overrides) -> str:
         "business_dt": BUSINESS_DT,
         "input_snapshot_ids": SNAPSHOTS,
         "compiler_version": COMPILER,
-        "renderer_version": RENDERER,
         "capability_attestation_id": ATTESTATION,
     }
     fields.update(overrides)
@@ -434,12 +434,34 @@ def test_the_execution_hash_covers_everything_section_7_names() -> None:
     ("business_dt", "2026-07-28"),
     ("capability_attestation_id", "att-0002"),
     ("compiler_version", "compiler-1.2.4"),
-    ("renderer_version", "renderer-4.5.7"),
     ("input_snapshot_ids", ("snap-transactions-0002", "snap-customers-0001")),
     ("parameters", {**PARAMETERS, "business_dt": "2026-07-28"}),
 ])
 def test_EVERY_covered_value_moves_the_execution_hash(field: str, value: object) -> None:
     assert _exec(**{field: value}) != _exec()
+
+
+def test_the_RENDERER_version_is_read_rather_than_accepted_and_still_moves_the_hash() -> None:
+    """Task 12. §7 covers the renderer's version, and the one thing this hash exists to detect is a
+    renderer that changed — so a call site free to pass a literal could freeze it at whatever it
+    typed while the renderer moved underneath. There is no parameter, and the value is read THROUGH
+    the module, which is what this proves by moving the constant."""
+    assert "renderer_version" not in inspect.signature(sandbox_execution_hash).parameters
+    baseline = _exec()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(render, "RENDERER_VERSION", "renderer-9.9.9")
+        assert _exec() != baseline
+
+
+def test_the_render_package_init_imports_NOTHING() -> None:
+    """`identity` reads `RENDERER_VERSION` out of `featuregen.materialize.render`, and
+    `render.project` imports `identity`. An import added to that `__init__` closes the loop, and the
+    failure would surface as an ImportError in whichever module was imported first."""
+    source = pathlib.Path(render.__file__).read_text(encoding="utf-8")
+    parsed = ast.parse(source)
+    assert [node for node in ast.walk(parsed)
+            if isinstance(node, ast.Import | ast.ImportFrom)
+            and not (isinstance(node, ast.ImportFrom) and node.module == "__future__")] == []
 
 
 def test_a_different_PROJECT_moves_the_execution_hash() -> None:
@@ -489,7 +511,7 @@ def test_a_snapshot_id_list_given_as_a_bare_STRING_is_refused() -> None:
 
 
 @pytest.mark.parametrize("field", ["environment_id", "business_dt", "capability_attestation_id",
-                                   "compiler_version", "renderer_version"])
+                                   "compiler_version"])
 def test_a_blank_run_value_is_refused(field: str) -> None:
     with pytest.raises(ValueError):
         _exec(**{field: "   "})

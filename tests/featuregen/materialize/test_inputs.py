@@ -24,6 +24,7 @@ import dataclasses
 import inspect
 
 import pytest
+from tests.featuregen.materialize import fixtures
 
 from featuregen.materialize import inputs
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
@@ -157,6 +158,7 @@ def _inventory(*layouts, schema_map=SCHEMA_MAP, captured_at="2026-07-27T09:00:00
         environment_id=environment_id,
         tables={f"{layout.schema}.{layout.table}": layout for layout in layouts},
         logical_schema_map=dict(schema_map),
+        engine_versions=fixtures.ENGINE_VERSIONS,
         captured_at=captured_at)
 
 
@@ -417,7 +419,8 @@ def test_an_inventory_entry_keyed_under_the_wrong_table_REFUSES(db, seeded_catal
     inv = ClusterInventoryV1(
         environment_id="hdfc-local",
         tables={"banking.transactions": _txn_layout(table="txns_archive")},
-        logical_schema_map=dict(SCHEMA_MAP), captured_at="2026-07-27T09:00:00+05:30")
+        logical_schema_map=dict(SCHEMA_MAP), engine_versions=fixtures.ENGINE_VERSIONS,
+        captured_at="2026-07-27T09:00:00+05:30")
     r = derive_requirement(seeded_catalog, inv, table_ref=TXN)
     assert r.code is CompilationRefusalCode.PARTITION_IDENTITY_UNKNOWN
 

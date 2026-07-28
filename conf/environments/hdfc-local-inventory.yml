@@ -26,6 +26,10 @@ engine_versions:                # UNKNOWN until Task 0 runs against the cluster
   java: null
   pyspark: null
   kedro: null
+  kedro_datasets: null           # Kedro's dataset implementations ship SEPARATELY
+                                 # versioned; `spark.SparkHiveDataset` resolves out of
+                                 # kedro-datasets, so a lock naming only `kedro` leaves
+                                 # the class that reads every source table unpinned.
 
 tables: {}                      # UNKNOWN: partition columns, partition mapping,
                                 # late_arrival_days, location, rewritten_in_place.

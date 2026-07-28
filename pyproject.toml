@@ -90,7 +90,10 @@ timeout_method = "signal"
 target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
-extend-exclude = ["docs", ".venv"]
+# `goldens/` holds RENDERED PROJECT bytes, not repository source: linting them would lint the
+# artifact under test, and a fix applied to a golden is a golden that no longer matches what
+# the renderer emits.
+extend-exclude = ["docs", ".venv", "tests/featuregen/materialize/goldens"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "PIE"]

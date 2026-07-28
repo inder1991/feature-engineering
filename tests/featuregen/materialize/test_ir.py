@@ -271,6 +271,7 @@ INVENTORY = ClusterInventoryV1(
         "banking.customers": _layout("customers", ("cif_id", "load_ts", "status_cd")),
     },
     logical_schema_map={TXN: "banking", ACCOUNTS: "banking", CUSTOMERS: "banking"},
+    engine_versions=fixtures.ENGINE_VERSIONS,
     captured_at="2026-07-27T00:00:00Z")
 
 
