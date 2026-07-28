@@ -325,6 +325,34 @@ Two are settled in our favour and recorded so they are not re-litigated:
 | ⚪ **The `.drop` of each hop's key is hygiene, not correctness** | Proved: the mutation that removes it SURVIVES (C4), because the output select names the output columns and a key left in the intermediate frame changes no value. It is rendered so that nothing downstream can reach for the column M6 proves would be the wrong answer. | Recorded so a later reader does not delete it as dead code, or trust it as a gate. |
 | ⚪ **`fake_spark.join` now models Spark's NULL-key semantics** | A NULL key matched a NULL key, which Spark never does. A dimension carrying a null key would have collected every unreachable source row and the traversal tests would have agreed with it. One guard, on the lookup — a second on the index has no case of its own, which the mutation run proved by surviving. | Resolved, recorded so it is not re-added twice. |
 
+### A.22 Control-plane decisions and handoffs from Task 14a (2026-07-28)
+
+The plane landed as migration **`1034`**, not `1031`. 1031 was taken before the plan was written;
+**1032 and 1033 are also taken** — `1032_graph_node_visibility_requires.sql` and
+`1033_data_observation.sql` are not on `origin/main` yet but exist on `fix/join-neighbourhood-cap`
+and `integration/ontology-data-agent` and will collide when those merge. Whoever integrates should
+check `git log --all --diff-filter=A -- 'src/featuregen/db/migrations/10*'`, not just the working
+tree.
+
+Two PostgreSQL facts were **measured** here (PG 18), not read, and both change how a guard must be
+tested. A `FOR EACH ROW` trigger does not fire on TRUNCATE at all — a table carrying a row-level
+INSERT/UPDATE/DELETE trigger was silently emptied — so every table carries a separate statement-level
+`BEFORE TRUNCATE` trigger. And a bare `TRUNCATE <parent>` on an FK-referenced table raises
+`FeatureNotSupported` **before** any BEFORE-TRUNCATE trigger runs, so a test asserting only "TRUNCATE
+raises" on such a table passes with **no trigger installed**: it measures the FK graph. Use
+`TRUNCATE … CASCADE` and assert the guard's own message. Migration 1012 has only the `featuregen_app`
+REVOKE as its TRUNCATE control, which a superuser bypasses — `contract` is emptiable by a superuser
+session today.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **`pipeline_validation_report` has a table and no writer** | The plan puts all six tables in T14, but `ValidationReportV1` is T15's type, so ingesting one here would invent its shape a task early. The columns follow §11.2's sentence exactly (`report_id`, `generation_id`, `generated_project_hash`, `group_plan_hash`, `level`, `environment_id`, timing, `status`, findings), and §11.2's *"an unreachable cluster yields `status="error"` with **zero** findings"* is a CHECK. Two calls T15 may want to revisit: `level` is closed to `L0/L1/L2` (L3 is "the real run", recorded as run EVENTS), and `run_id` is nullable because L0 precedes any run. | Task 15, when `ValidationReportV1` exists. |
+| 🟡 **`publication_capability_attestation` likewise, plus one column §10.3 does not list** | `evidence_hash text NOT NULL` was added deliberately: without it a stored attestation carries no probe evidence, and *"an attestation with no probe evidence cannot exist"* would be unprovable from the record. `record_attestation` (T16) has the `ProbeResult` and can supply it. `mechanism` is NOT a closed CHECK — a vocabulary written before the probe exists would either invent members or refuse the one the probe proves. | Task 16. |
+| ⚪ **`group_binding` is the plan's name; the pair is `group_binding` + `group_plan_revision`** | T10 recorded "the `group_binding` **tables**" (plural) for §10.1's two records. The write-once record keeps the plan's name so the checklist matches; the appended one is named for its dataclass. `UNIQUE(logical_group_name)` makes "written ONCE per logical name" a database fact. | Recorded, not deferred. |
+| ⚪ **A run may hold at most ONE terminal event** | A partial unique index, mirroring "exactly one terminal manifest per run". Two terminal events would make "current status" a choice rather than a reading, which is the same ambiguity `current_plan_revision` refuses rather than breaks. `fold_run_status` refuses the same shape in memory, since the pure fold sees tuples the database never held. | Recorded. If a lifecycle later needs a second terminal event, the index is the thing to argue with. |
+| ⚪ **`published_generation_ids` closes §10.1's open seam** | `current_plan_revision` takes published generations as evidence because publication success cannot live on an append-only revision row. That evidence now has a source: the `PUBLISHED` run events. Proven end to end — a newer revision nobody published is not the current plan. | Recorded. |
+| ⚪ **`CREATE TABLE IF NOT EXISTS` is fail-open against a same-named foreign table** | Repo style, and required for the direct re-execute the idempotency test performs. `apply_migrations` ledgers by filename so production never re-runs it; the exposure is a database where the table exists and the ledger row does not, in which case the guards would be installed on someone else's table. All seven names are unique across the repo today. | If a future stream introduces a table with one of these names. |
+
 ## C. Repo / infra health
 
 | Item | Detail | Trigger |
