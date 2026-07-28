@@ -22,3 +22,14 @@ build/
 # local worktrees (frontend session, etc.)
 .claude/worktrees/
 deploy/kind/.llm-key
+
+# Local L0 validation environment (PySpark + Kedro; not a project dependency)
+.venv-l0/
+
+# Real bank glossary exports — LOCAL ONLY, never committed.
+# These carry production schema, business definitions and PII/sensitivity classifications.
+# They live outside the repo (~/Downloads); these patterns are a backstop for the case where
+# one is copied in by accident. Never `git add -A` while one is present.
+*Column_Mapping*.csv
+FTR_Column_Mapping*.csv
+CIB_Customer_Column_Mapping.csv
