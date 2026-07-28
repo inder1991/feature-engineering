@@ -1,12 +1,27 @@
-# E3 → E5 — Cross-Catalog Ontology Program Plan (rev 5)
+# Cross-Catalog Identity & Ontology — Programme Plan (rev 6)
 
-Date: 2026-07-27 · Revised: 2026-07-28 · Status: revised after fourth adversarial review
-(three independent lenses — earned-vs-assumed, safety/authority integrity, buildability/scope) ·
-Grounded against `origin/main@ef213a83`, the merge that lands the join-neighbourhood cap. Every
-"already earned" claim below carries a source citation verified against that tree; a claim without
-a citation is a claim this plan does not make · Parents:
-`../specs/2026-07-26-llm-metadata-enrichment-design.md` and
+Date: 2026-07-27 · Revised: 2026-07-28 · Status: restructured — one document per job ·
+Grounded against `origin/main@ef213a83` plus the on-branch fix `e6e5f31d`.
+
+**This document is the plan: contracts, phases, gates, targets.** It states *what to build and in
+what order*. It deliberately does **not** carry the evidence base — every "already earned" claim
+cites
+**[`../../architecture/2026-07-28-verified-interfaces-cross-catalog.md`](../../architecture/2026-07-28-verified-interfaces-cross-catalog.md)**,
+which owns the verified interfaces, the citations, and the measured numbers, and changes when the
+code changes rather than when the plan does.
+
+Parents: `../specs/2026-07-26-llm-metadata-enrichment-design.md` and
 `../specs/2026-07-26-cross-catalog-ontology-view-design.md`
+
+> **Rev 6 (2026-07-28) — restructured, and the identifier-link work folded in.** Rev 5 had grown to
+> ~2,600 lines doing three jobs at once — reference, design, and plan — and the identifier-link
+> design had been written as a *separate* spec, which promptly drifted: within a day the plan
+> asserted the planner keeps to existing bridges while the spec had proposed links reaching
+> materialization. Two documents describing one subject is what caused that. Rev 6 cuts by **job**
+> rather than by topic: the evidence base moves to the verified-interfaces reference, and the
+> identifier-link spec is folded in as **Phase E0b**, so there is exactly one home describing how
+> cross-catalog links work. The retired spec's content is preserved in full — its verified-baseline
+> section in the reference, everything else in E0b.
 
 > **Rev 5 keeps the Rev-4 contract design and repairs its factual base.** The fourth review
 > found the contracts sound but the earned/not-earned ledger wrong in the direction that hurts:
@@ -94,313 +109,37 @@ in the build order.
 > the E3.0 verified-interfaces reference where they belong, and leaving a short plan behind. The
 > ledger is a reference artifact with a long life; the plan should be able to change without it.
 
-## What is already earned
+## Verified baseline
 
-The program reuses these shipped capabilities; it does not recreate them. **Every entry carries a
-source citation.** Rev 4 asserted several of these without one and three turned out to be inert —
-an uncited claim is now a defect in this document, not a shortcut.
+Both ledgers — *what is already earned* and *what is not earned* — now live in
+**`../../architecture/2026-07-28-verified-interfaces-cross-catalog.md`**, with a file citation for
+every claim, alongside the identifier-link substrate, the evidence available about a column, the
+`attest/` harness contract, the gauntlet and LLM seams, and the measured baselines.
 
-- **Bounded join-neighbourhood traversal is SHIPPED — adopt it, do not respecify it.**
-  `join_path.py` provides `MAX_HOPS_DEFAULT = 1`, `MAX_NEIGHBOUR_TABLES = 20`,
-  `MAX_COLUMNS_CONSIDERED = 300`, `MAX_HOPS_CEILING = 3`, deterministic pre-truncation ordering by
-  `(hop distance, table name)` with a stop-at-first-breach rule, typed `limit_reason`, and
-  `JoinNeighbourhood.as_metadata()` returning
-  `tables_considered / tables_available / truncated / max_hops / limit_reason`
-  (`src/featuregen/overlay/upload/join_path.py:219-265, 283-343`). It is already consumed by the P4
-  suggestions surface and its numbers were measured against a hub fixture (12,710 → 6,284 statements
-  at 40 neighbours; bounded, not merely smaller). `OntologyServerLimitsV1` **extends** this with the
-  collections `join_path` does not bound; it does not restate it.
-- **Per-field property authority is SHIPPED — adopt it, do not respecify it.** `field_evidence`
-  stores per-`(logical_ref, field_name)` proposals with producer, strength, lifecycle, evidence
-  spans, confidence band and source snapshot (`db/migrations/0983_field_evidence.sql`);
-  `field_policies._POLICIES` + `field_authority.resolve_field_authority` resolve each field
-  independently with influence tiers, disqualifiers and conflict strategies
-  (`overlay/upload/field_policies.py:203-228`, `overlay/field_authority.py:262-310`); and
-  `build_asset_detail` already assembles identity + per-field effective value with
-  authority/provenance + per-field evidence, read-scope applied to the anchor first, one
-  `REPEATABLE READ` snapshot, and a content-hash `consistency_token`/ETag
-  (`overlay/upload/asset_detail.py:71-81, 126-141, 562`). That is the shape `OntologyPropertyV1`
-  specifies. E3 maps onto it and fills its two real gaps (below), rather than building a parallel
-  assembler.
-- `graph_node` and `graph_edge` provide source-qualified table/column metadata and
-  intra-catalog joins at the **public-flattened graph identity**. `schema_name` (migration
-  `1000_graph_node_schema_declared.sql`) is a nullable non-key column populated **only by the
-  FTR/glossary adapter** (`overlay/upload/graph.py:156-178`). It is evidence on one ingest path, not
-  a catalog-wide attestation, and graph identity alone is not sufficient physical identity.
-- The concept registry is global across catalogs and currently contains 283 concepts,
-  19 groups, 52 `is_a` declarations, and 38 entity identifiers. These counts are an
-  audit snapshot, **not an API contract**.
-- `EntityRelationshipDefinitionV1` and `ENTITY_RELATIONSHIPS_V1` provide five curated
-  grain-rollup relationships used by the planner.
-- `derive_catalog_realizations` binds governed/declared joins to those five
-  relationships and detects cardinality conflicts.
-- `entity_bridge_edge` is the VERIFIED cross-catalog identity-key projection —
-  **cross-catalog only, by code and by constraint.** `_bridge_write_error` refuses
-  `left.catalog_source == right.catalog_source` (`overlay/identity.py:131-133`),
-  `derive_bridge_candidates` skips same-source pairs (`bridge_candidates.py:98`), and migration
-  `0989` enforces `CHECK (left_catalog_source <> right_catalog_source)`. Two same-named schemas
-  under **one** source therefore cannot be bridged by the shipped fact at all — see the
-  intra-source namespace gap in "What is not earned".
-- `derive_bridge_candidates` already considers identifier columns across all loaded
-  catalogs. E5 must not build a duplicate candidate lifecycle, but E3 reuses only this
-  algorithmic seam after replacing its unbounded pair enumeration, public-schema identity loss,
-  and scalar-only key model. It must not treat every bridged foreign key as an object primary key.
-  **Its matching rule is weak and E3 must strengthen it**: concept group `identifier` + identical
-  `entity_link` + identical coarse type family (`_TYPE_FAMILY` collapses `int4` and `bigserial`)
-  + distinct source (`bridge_candidates.py:19-29, 85-102`). There is no format, prefix, range,
-  key-shape or uniqueness evidence.
-- E1a has landed governed definition, domain, synonym, and concept-cascade evidence.
-  **Caveat that E3 inherits:** synonyms are written as `llm/proposed` `semantic_terms` field
-  evidence (`enrich.py:856-899`) but `semantic_terms` has **no entry in `_POLICIES`**, so
-  `policy_for('semantic_terms')` returns `None` and there is no resolvable value or authority for
-  it today. `OntologyPropertyV1` lists synonyms as a field envelope; that envelope needs a policy
-  first (E3.Foundation).
-- Governed `entity_assignment`, `currency_binding`, `grain`, `availability_time`,
-  `approved_join`, and `entity_bridge` facts already exist. **The `grain` fact value carries
-  `is_unique: boolean`** (`overlay/facts.py:70-83`) and the profiler deliberately proposes
-  `is_unique=False` for sampled uniqueness in `[0.99, 1.0)` so a human adjudicates
-  (`src/featuregen/overlay/profiler_heuristics.py:54-66`). `is_unique` asserts STRICT uniqueness —
-  `True` only when the sampled ratio is exactly `1.0` — while a near-unique candidate is still
-  proposed with `is_unique=False` and the ratio carried in evidence for the reviewer. A VERIFIED
-  grain is therefore **not automatically a key**.
-- The semantic-binding deliveries already provide immutable candidate sets, a CAS
-  current-set projection, candidate-to-governed-fact links, schema-preserving column
-  references, and the closed `entity_assignment`/`currency_binding` candidate kinds.
-  They do **not** yet provide stable semantic candidate ids separate from revisions,
-  candidate-family-scoped currentness, or extensible candidate kinds. E3 migrates and adapts this
-  substrate; it does not create a parallel column-link candidate lifecycle. **Both candidate tables
-  are physically immutable (WORM):** `BEFORE UPDATE OR DELETE ... RAISE EXCEPTION` row triggers plus
-  `REVOKE UPDATE, DELETE, TRUNCATE ... FROM featuregen_app`
-  (`db/migrations/1014_semantic_binding_candidate.sql`). Adding a nullable column is fine;
-  **populating it on existing rows is an UPDATE the store refuses.** See the backfill rule below.
-- **Two further candidate lifecycles already exist** and must be reconciled, not ignored:
-  `entity_bridge_candidate_evidence` (`0989_entity_bridge_governance.sql:6-22`) already persists
-  candidate id, canonical unordered endpoint pair, fact_key, proposed_event_id, derivation_version
-  and evidence_json — i.e. the identity `IdentifierNamespaceBridgeCandidateV1` re-invents; and
-  `entity_suggestion` (`0967_entity_suggestion.sql:6-16`) is a pending/applied/dismissed column-
-  entity advisory lifecycle that `build_graph` re-applies. Without an explicit decision, a column
-  entity proposal would live in **four** places (`entity_suggestion`,
-  `semantic_binding_candidate(kind=entity_assignment)`, `field_evidence('entity')`, and the new
-  family). E3.0 must pick one home per proposal class and state the migration for the rest.
-- `/search`, `/graph/lineage`, asset detail, read-scope filtering, and the committed
-  `LineageView` provide useful implementation seams. **`search()` is already cross-catalog,
-  fresh-only and read-scoped, and already returns `n.concept` in its hit projection**
-  (`overlay/upload/search.py:33-38`), which the UI already renders
-  (`frontend/src/screens/SearchScreen.tsx:435`). `concept` is simply absent from `_COLUMN_FACETS`
-  (`search.py:15-22`). This is the basis of the E5.0a slice below.
+They were moved out of this plan for two reasons. They are a **reference**: they change when the
+code changes, not when the plan changes, and keeping them here meant every plan revision carried 300
+lines of code archaeology. And they are **shared**: the identifier-link work cites the same facts,
+and restating them in two documents is what produced a live contradiction between this plan and its
+spec within a day.
 
-## What is not earned
+**The rule this plan follows from here:** a claim that something is already earned cites that
+document. It does not restate it. When an entry there turns out to be wrong, it is fixed there and
+this plan inherits the correction.
 
-- There is no E3 ontology-link contract or advisory edge store.
-- The five planner roll-ups are not a general link-type vocabulary. They cannot
-  represent labels such as `owned_by`, `denominated_in`, `converted_by`, or `as_of`.
-- No entity title/display-property binding exists. The E2 design explicitly deferred
-  it to E3.
-- There is no source-agnostic object-type read model or ontology API.
-- There is no object-resolution projection or conflict model.
-- There is no schema-safe cross-catalog identifier-namespace contract.
-- Existing catalog realization derivation maps a missing cardinality to `N:1`; that
-  default is planner compatibility behavior, not ontology evidence.
-- Existing object-grain derivation reads the first flat `is_grain` column and does not
-  prove compatibility with the complete ordered governed `grain` fact.
-- Current authority values cannot be truthfully compressed into one ordered tier:
-  producer/derivation, verification status, and operational eligibility are distinct.
-- `entity_bridge_edge` is a rebuildable projection whose active reader does not itself
-  prove that the backing event stream is current. E3 needs an explicit projection
-  readiness and authoritative-state revalidation protocol.
-- The generic fact spine has no cross-fact uniqueness rule capable of enforcing one
-  operational title when each candidate property receives a different fact key.
-- **The fact spine has no confirmation-time CAS, and Rev 4's three CAS acceptance tests described
-  behaviour it cannot exhibit.** `propose_fact` denies **at propose time** whenever a non-terminal
-  fact already exists for the `fact_key`, and sticky-denies a previously rejected proposal
-  fingerprint (`overlay/proposal_commands.py:34-40, 71-80`). Because `fact_key` hashes
-  `(ref, fact_type, use_case)` only (`identity.py:79-111`) and this plan puts the selected
-  entity/property in the fact **value**, two competing object types — or two competing title
-  properties — collide on **one** fact key and the second is refused before any confirmation. The
-  real semantics are "first proposal blocks all rivals until explicitly rejected", which is a
-  different product behaviour (it needs a reject path in the UI, not a race winner) and must be
-  specified as such.
-- **A new fact type is not registered by declaring its schema.** Every authority-side seam is
-  opt-in and fails open or crashes by default: `enter_fact` — the audited single-party four-eyes
-  exception — is blocked only by an explicit denylist
-  `if fact_type in ("entity_assignment", "currency_binding")`
-  (`confirmation_commands.py:325-333`), so a new owner-known `object_type_binding` would be
-  **single-party self-assertable**; `resolve_authority` has no branch for the new types and falls
-  through to `if not isinstance(ref, CatalogObjectRef): raise TypeError`
-  (`overlay/authority.py:167-170`) for a tuple ref; `Authority.dual`/`task_assignees` per-side
-  planning is `approved_join`-only (`authority.py:62-95`); and the `FactType` Literal
-  (`overlay/_types.py:45-54`), reverify, expiry and drift paths all need entries.
-- **The refs this plan needs are not expressible.** Every governed fact ref is a
-  `CatalogObjectRef(catalog_source, object_kind, schema, table, column)`
-  (`identity.py:9-15`), `_CATALOG_OBJECT_REF_SCHEMA` sets `additionalProperties: False`
-  (`overlay/facts.py:39-50`), and `_ref_from_payload` decodes exactly three shapes
-  (`identity.py:42-57`). A realization-scoped title ref (which must carry `entity_id`) and a
-  tuple-scoped bridge ref (ordered column tuples) are therefore **new ref types**, not new value
-  schemas — each needing `_ref_from_payload` extension, `fact_key` canonicalization, and updates to
-  the freshness/expiry pollers that decode payload refs.
-- **Cardinality is part of `approved_join` fact IDENTITY, so it cannot be corrected.**
-  `identity.fact_key` hashes cardinality into the canonical tuple (`identity.py:93-103`, line 99).
-  Correcting a wrong cardinality therefore does not demote the wrong fact — it mints a **second,
-  distinct fact on the same column pair, and both can be VERIFIED**. `passc/projection.py:109-118,
-  134-137` arbitrates by `min(verified, key=fact_key)` — the lexicographically smallest sha256 —
-  while its own comment calls the situation "impossible under the Pass-C ledger's one-row-per-
-  unordered-pair invariant", an invariant the ingest propose path (`ingest.py:383-398`) does not
-  share. `join_drift._declared_join_map`/`detect_governed_join_divergences` compare only
-  `from_ref → to_ref` (`join_drift.py:50-64, 92-110`), so a re-upload flipping `N:1` to `1:N` raises
-  **no divergence at all**. A property this plan itself calls silently-aggregation-corrupting is
-  currently arbitrated by a hash.
-- **Honest `unknown` cardinality is unimplementable on the shipped path without a schema change.**
-  `graph.py:93` fabricates the default **at propose time** (`cardinality=row.cardinality or "N:1"`),
-  so the governed fact VALUE asserts `N:1` for a blank upload; the `approved_join` value schema
-  **requires** cardinality and admits only `1:1|1:N|N:1` with no `unknown` and no basis field
-  (`overlay/facts.py:100, 118`); and after dual confirmation the projection overwrites the honest
-  `NULL` on `graph_edge.cardinality` with the fabricated value (`passc/projection.py:139-149`). By
-  the time E3.1 tries to "revalidate the raw backing cardinality" the raw missing-ness has been
-  erased from **both** the fact and the edge.
-- **There is no product surface that can create an `entity_bridge`.** `api/routes/governance.py`
-  exposes list/confirm/reject for joins, table facts and semantic bindings only
-  (route decorators at `governance.py:155-442`); there is no bridge route anywhere in
-  `api/routes/`. Every VERIFIED bridge in existence was made by a fixture or a script. E5.3, E5.6,
-  E5.7 and E5.8 are all built on VERIFIED bridges.
-- **Bridge confirmation is single-party today, and E5 is exactly what invalidates that.**
-  `overlay/authority.py:132-145` returns `Authority(role='platform-admin', subjects=(),
-  governance_queue=True)` with `dual` left at its default `False`, and every shipped
-  `CatalogAdapter.owner_of` returns `None` (`upload_catalog.py:65-66, 101-102`), so the same-owner
-  collapse never fires and **every bridge takes the single-admin path**. The in-code deferral says
-  "Two-owner dual sign-off is deferred to 3C (when a bridge becomes live-traversable)"
-  (`authority.py:135-144`) — bridges are already traversed by the planner
-  (`planner/assembly.py:156`, `planner/plan.py:76`, `planner/multisource_assembly.py:241`), and E5
-  widens that reach further. Because `owner_of` is `None` everywhere, **every four-eyes claim in
-  this plan degenerates to "two platform admins" at best, and "one platform admin" for bridges.**
-- **Durable LLM result reuse does not exist.** `llm_dispatch`
-  (`db/migrations/1005_llm_dispatch_provenance.sql:19-34`) stores `redacted_input` and **no
-  response**; `llm_dispatch_outcome` stores only `response_received|transport_failed`. Its
-  `UNIQUE(logical_call_ref, attempt_no)` is not content-addressed because `logical_call_ref` is a
-  fresh `mint_id("lc")` per invocation (`enrich_llm.py:882, 1258`), and it is documented as "one
-  physical dispatch record per attempt" — a retry deliberately creates a **new** key, the opposite
-  of what replay requires. The only store holding `raw_output` is `llm_call` (migration `0510`),
-  keyed `(run_id, task, input_hash)` with `run_id NOT NULL` — a key a run-less system-principal
-  generation cannot form. The one full-identity probe, `find_llm_call` (`intake/llm.py:409-453`),
-  has **zero production callers** and includes `run_id` in its identity.
-- **Read scope filters the raw tag, not the governed one.** Every read-scope predicate filters
-  `graph_node.sensitivity` — the raw file-declared tag (`read_scope.allowed_sensitivities`
-  consumed at `join_path.py:163,176,276`, `bridge_candidates.py:57`, `graph.py:376-377`,
-  `search.py:103`, `semantics.py:90,142`, `column_readiness.py:342`). The governed, floor-clamped
-  value is written to a **different column**, `graph_node.effective_restriction`
-  (`field_resolution.py:326, 353-356`), and `sensitivity` is deliberately absent from
-  `_DISPLAY_COLUMN` so the resolver never updates it. `effective_restriction`'s only reader is
-  `materialize/classify.py:204`. Net effect: **the concept-derived sensitivity floor never restricts
-  catalog visibility.** The two vocabularies also disagree — `read_scope.SENSITIVITY_ROLES` knows
-  only `{pii, restricted}` while `safety_floor.SENSITIVITY_ORDER` is
-  `{public, internal, confidential, restricted, prohibited}`, so `effective_restriction`
-  of `confidential` or `prohibited` has **no grantable role at all**.
-- **Tables have no sensitivity, so "a fully hidden object is absent" is not achievable today.**
-  `graph.py:239-245` inserts `kind='table'` rows with no `sensitivity` in the INSERT list, so the
-  value is NULL and every `(sensitivity IS NULL OR sensitivity = ANY(...))` predicate admits them
-  unconditionally. No shipped rule derives a table's visibility from its columns'.
-- **Read scope is not durable state.** `build_graph` executes
-  `DELETE FROM graph_node WHERE catalog_source = %s` (`graph.py:234`) and re-inserts each column
-  with `r.sensitivity or None` (`graph.py:256-266`). A re-upload omitting the sensitivity column
-  silently blanks the tag and the column becomes visible everywhere. The only guards are an
-  object-COUNT brake (`brake.py:22-38`) and an intra-upload duplicate-conflict check
-  (`ingest.py:2753-2793`), neither of which sees a tag that simply vanished between uploads.
-- **No registry content fingerprint exists.** `entity_registry.GRAPH_VERSION = "1.0.0"` carries an
-  explicit NOTE that a content fingerprint "would catch a definition change made without bumping the
-  version. Omitted" (`taxonomy/entity_registry.py:15-17, 29`), and
-  `catalog_realizations.CONCEPT_REGISTRY_FOR_REALIZATION = "concepts@1"` is a hand-maintained
-  literal folded into `realization_fingerprint` (`catalog_realizations.py:120, 147-152`). **Editing
-  a concept definition changes no fingerprint today**, so every cursor/candidate-revision binding
-  this plan makes to "registry content fingerprint" binds to something that does not exist.
-- **The concept registry has no cycle check.** `concepts._validate_registry` checks only duplicate
-  names and `is_a` resolvability (`concepts.py:856-867`) — no self-parent, no cycle. Descendant
-  traversal is unsafe until E5.1's validation lands, so E5.1's validation is a **prerequisite for
-  its own traversal**, not a nice-to-have.
-- **`AuthorityEnvelopeV1`'s enums are not a superset of the shipped ones.** `derivation ∈ {source,
-  registry, rulebook, llm, human, legacy}` has no slot for `EvidenceProducer.PROFILER`, `PARSER`,
-  `STRUCTURAL_CONNECTOR` or `TAXONOMY` (`overlay/evidence.py:15-30`) — and `STRUCTURAL_CONNECTOR` is
-  what proposes **every** bridge and Pass-C join (`bridge_propose.py:42`). Folding a sampled
-  statistical inference (profiler) into `source` misattributes an observation as an attestation.
-  `verification ∈ {proposed, verified, rejected, expired, unknown_legacy}` has no value for the
-  shipped `PARTIALLY_CONFIRMED` or `REVERIFY` fold states nor fact-lifecycle `STALE`
-  (`overlay/state.py:67-124`, `_types.py:33-42`): mapping a drift-STALEd fact to
-  `verification=verified, freshness=stale` renders a **demoted** fact as verified, and mapping
-  `PARTIALLY_CONFIRMED` to `verified` is an outright fail-open.
-- **A global metadata revision would convert per-source ingest serialization into global
-  serialization.** Ingest is one transaction holding a **per-source advisory lock** across the
-  Pass-A LLM enrichment stages, which cannot be released mid-transaction
-  (`ingest.py:1670-1686`). Bumping one global counter row inside that transaction makes every
-  concurrent upload of every catalog block on one row for the duration of another source's LLM
-  enrichment — minutes on a 126-column file.
-- **Schema does not reach ingest at all on the mainstream path — this is the program's largest
-  single gap and Rev 4 mis-stated it.** `CanonicalRow` has **no schema field**
-  (`overlay/upload/canonical.py:44-69`) and `_headers._ALIASES` has **no schema alias**
-  (`overlay/upload/_headers.py:13-28`), so a CSV/Excel/OpenMetadata upload cannot express a schema
-  — there is no collision to detect because the concept is inexpressible. Schema exists only on the
-  FTR/glossary path, and there the reader **quarantines** same-`(table, column)` cross-schema terms
-  fail-closed in its own pass 2, emitting no `CanonicalRow` and no sidecar
-  (`glossary_reader.py:183-205`; `ftr_adapter.py:259`), precisely because "the schema is dropped
-  from the `CanonicalRow`, so no later stage can see the collision".
-  Consequences the plan must own rather than assume away:
-  1. There is **no single "public-flattening collision step"** to persist a roster in front of.
-     The loss happens in the readers, before any `CanonicalRow` exists.
-  2. `validate_rows` keys dedup on `(source, table, column)` with no schema
-     (`canonical.py:208`); identical load-bearing metadata silently dedups, differing metadata
-     quarantines all rows fail-closed (`canonical.py:226-229`).
-  3. `_cross_schema_conflicts` (`ingest.py:836-902`) is a **cross-upload** re-attribution fence
-     against already-persisted nodes only, and within one file `incoming_tables.setdefault(table,
-     rec.schema)` means first schema wins (`ingest.py:870`).
-  4. Therefore, under this plan's own gate that unknown schema cannot be operational, **a
-     CSV-ingested catalog would produce zero operational realizations, zero identifier bindings and
-     zero namespace bridges.** E3.1's read contract would be structurally empty for the primary
-     ingest path.
-  E3 cannot recover a physical object that ingestion did not retain, and it cannot retain one
-  without a reader/`CanonicalRow` contract change. That change is now E3.Foundation.0 and is a
-  funding gate, not a bullet.
-- **There is no intra-source identifier namespace.** Two same-named schemas under one source are
-  the motivating example for physical identity, yet the shipped bridge is cross-catalog by code and
-  by DB `CHECK` (see above). Bridging `sales.orders.id ↔ hr.orders.id` is a **new capability**, not
-  an adaptation of `entity_bridge`, and Rev 4 budgeted nothing for it.
-- **Existing `entity_bridge` facts have `public` fabricated into their immutable identity.**
-  `bridge_candidates._col_ref` hard-codes `schema="public"` (`bridge_candidates.py:70-72`), that ref
-  is hashed into `fact_key` (`identity.py:64-71, 87-92`), and `entity_bridge_edge` stores only
-  public-flattened endpoint refs with no schema column (`0989:24-34`). This directly contradicts
-  this plan's rule "E3 never silently substitutes `public`". Under E3's own gate **every existing
-  bridge is non-operational** — the opposite of what Rev 4's "a legacy bridge adapts as a one-element
-  tuple" acceptance asserted. E3.0 must choose explicitly between re-attesting legacy bridges and
-  admitting them under a named, audited legacy exception.
-- `entity_assignment` governs a **column's** entity. It does not assert which canonical object type
-  a table models. The advisory `primary_entity` field and a complete `grain` fact do not replace a
-  table-level governed object-type binding.
-- The v1 `entity_bridge` fact binds one column to one column. Independent member bridges do not
-  prove equivalence of two ordered composite keys.
-- There is no cross-request metadata revision covering physical metadata, governed facts, and E3
-  projections. PostgreSQL `REPEATABLE READ` protects one request only; it is not a continuation
-  snapshot for the next page.
-- Current catalog authorization provides deployment-wide `catalog:read` plus sensitivity roles.
-  It has no source-entitlement policy. `IdentityEnvelope.tenant` exists, but current catalog keys do
-  not carry tenant.
-- `derive_bridge_candidates` is unbounded pairwise enumeration. It is not a bounded seam.
-- ~~There is no ontology property contract capable of retaining different authority/freshness/
-  provenance for concept, definition, domain, type, sensitivity, and synonyms.~~
-  **Corrected in Rev 5: this was wrong.** A per-field policy, resolver and assembled reader all
-  ship (see "already earned"), covering concept, definition, domain, sensitivity, data_type, unit,
-  currency, entity, additivity and temporal_role, with `asset_detail` returning per-field display
-  value + authority + provenance for 8 of this plan's fields. The **two real gaps** are narrower:
-  (a) `semantic_terms` (synonyms) has no `_POLICIES` entry, so it has no resolvable
-  value/authority; and (b) the resolver is single-catalog and anchor-scoped — E3 needs the same
-  envelopes assembled across a paged, source-entitled, cross-catalog result set. Scope
-  `OntologyPropertyV1` to those two gaps.
-- The shipped semantic-binding current-set primary key is one row per table, and the candidate kind
-  constraint admits only `entity_assignment` and `currency_binding`. Adding title/link generation
-  without a migration would either fail the constraint or replace unrelated currentness.
-- The current formula grammar supports aggregate, ratio, and difference bodies only.
-  It cannot execute a currency conversion/product expression. E3 must not claim that
-  `converted_by` produces an executable feature until that grammar is extended.
-- `AssetDetailSampleScreen.tsx` is a local, hard-coded, uncommitted prototype on the
-  inspected worktree. It is design input, not a reusable mainline dependency. The
-  committed `LineageView` is the implementation baseline unless the prototype is
-  separately reviewed and landed.
+The findings most load-bearing for what follows, by way of orientation only — the reference is
+authoritative:
 
+- attested physical **schema does not reach ingest** on the CSV/Excel path at all, and the
+  FTR/glossary path quarantines cross-schema collisions inside the reader;
+- **bounded join traversal and per-field property authority are shipped** and are reused here, not
+  respecified;
+- the fact spine has **no confirm-time CAS** — it denies a competing proposal at propose time;
+- **cardinality is part of `approved_join` identity**, so a correction forks a second fact rather
+  than demoting the first;
+- there is **no product route to create an identifier link**, and confirmation is single-admin
+  because no catalog has a recorded owner;
+- **durable LLM result reuse does not exist**;
+- read scope filters the **raw** sensitivity tag, not the governed floor.
 ## Corrections required in the E5 design before implementation
 
 1. **Object-type resolution, not row-level entity resolution.** The control plane has
@@ -566,10 +305,8 @@ an uncited claim is now a defect in this document, not a shortcut.
   boundary now forbids is silence, not use: every feature and every materialized artifact standing
   on an unconfirmed link carries `JOIN_IDENTITY_UNCONFIRMED` naming that link, and a human
   confirming clears it while a rejection demotes what rests on it. Admission, the critic panel and
-  the provenance rule are specified in
-  `../specs/2026-07-28-bridge-critic-and-proposed-link-planning-design.md`, which this plan does not
-  restate. A later explicit adapter is still required before any **other** E3 link type (entity
-  links, column semantic links) reaches the planner.
+  the provenance rule are specified in **Phase E0b**. A later explicit adapter is still required
+  before any **other** E3 link type (entity links, column semantic links) reaches the planner.
 - Visibility is graph-closed: filter properties, grain keys, title bindings,
   identifier bindings, backing refs, and links before computing objects, counts, or
   facets. If an endpoint or backing ref is not visible, its link and counts are absent.
@@ -1508,7 +1245,13 @@ again when a later page starts; no database snapshot is claimed to survive betwe
 
 ---
 
-## Phase E0 — Semantic map v0 (ships first, on shipped machinery)
+## Phases that ship now, on shipped machinery
+
+E0 and E0b depend on nothing in E3. They run against what is already merged, they are the only two
+phases a user can contradict in days rather than months, and they are where the programme earns the
+right to continue.
+
+### Phase E0 — Semantic map v0
 
 **Purpose**
 
@@ -1556,6 +1299,153 @@ projection. E5.1 adds per-field authority envelopes, schema-preserving identity,
 an explicit freshness policy, node-closed pagination and signed cursors. E0 buys the time to build
 that properly, and — more importantly — tells us whether anyone actually wants the semantic map
 before the program spends six phases on it.
+
+---
+
+### Phase E0b — Identifier-link admission, critic panel, and proposed-link planning
+
+**Purpose**
+
+Make cross-catalog identity links flow all the way to features, and make what flows trustworthy
+enough to be worth flowing. This phase runs against the **shipped single-column `entity_bridge`**,
+not E3's tuple bridges, so it does not wait for Foundation.
+
+*(Folded in from the standalone bridge-critic spec, 2026-07-28. That document is retired — this is
+the single home for identifier-link admission.)*
+
+**Directives**
+
+1. Links are created by the system, shown as `proposed`, and used by the feature planner, feature
+   generation **and materialization** regardless of confirmation status. Human confirmation changes
+   status; it is not an admission gate.
+2. A link only becomes `proposed` if it survives strong evidence — deterministic corroboration plus
+   an independent LLM critic panel that can say no.
+
+**Decisions**
+
+- **D1 — Proposed links reach the planner.** `active_bridges` widens from VERIFIED-only to
+  `VERIFIED | PROPOSED`, each row carrying its status.
+- **D2 — The critic gates admission, not features.** A `no` prevents the link from becoming
+  `proposed` at all, so it never reaches the planner; it remains visible with reasons and is
+  human-overridable. The AI therefore only ever *narrows* what features may join — the filter sits
+  before the planner, not as a gate after it.
+- **D3 — Features on unconfirmed links are created and flagged, never blocked.**
+  `JOIN_IDENTITY_UNCONFIRMED` puts the feature in `NEEDS_EXTERNAL_VALIDATION` naming the link it
+  rests on; confirmation clears it, rejection demotes. This is the E4a unit loop applied to identity.
+- **D4 — Materialization runs on unconfirmed links too. No gate anywhere.** *(User decision, after
+  the alternative was raised and declined.)* What replaces the gate is provenance that cannot be
+  separated from the output: the requirement serializes onto the governed contract via
+  `contract/_serial.py::requirements_to_json` and travels onto the materialized artifact beside
+  `access_requirements` — the pattern `materialize/classify.py:40` already establishes. Stated
+  plainly: a wrong link produces numbers that look entirely reasonable, and for glossary catalogs
+  the evidence is semantic rather than value-level. The panel and grounding keep the false-match
+  rate down; the flag is what makes a mistake findable afterwards.
+- **D5 — The critic's verdict is evidence, not authority.** Recorded with reasons, replayable,
+  human-overridable in both directions, override audited.
+- **D6 — A panel of two critics with different lenses; unanimity to admit.** *(User decision.)*
+
+**The panel**
+
+Two identical critics cost double and catch nothing extra, so the lenses differ:
+
+| Lens | Question |
+| --- | --- |
+| **Meaning** | Do these denote the same *kind* of identifier? Definitions, concept, domain, taxonomy. |
+| **Population** | Do they identify the same *set of real-world things*? A bank customer and a cardholder are both "customers" and are not the same population. |
+
+Both `same_namespace` → admit. Any `different_namespace` or `insufficient_evidence` → suppress.
+The two disagree → suppress **and** surface as a distinct `critics_disagree` state, because
+disagreement marks where human judgement is worth most and is the natural top of the review queue.
+Dispatched independently so the opinions stay uncorrelated; one failed call is not unanimity.
+
+**Architecture**
+
+```
+identifier columns (read-scoped)
+   → [1] deterministic pre-checks  ──reject──▶ dropped, reason recorded, no model call spent
+   → [2] ground_bridge()  → GroundingV1(checks, coverage, conflict)
+   → [3] blind critic panel → BridgeCriticPanelV1(verdicts, reasons, panel_outcome)
+   → [4] fuse_bridge()    → FusionV1(confidence, agreement)      [pure]
+        ├─ conflict OR not-unanimous ──▶ suppressed, retained as audit evidence
+        └─ otherwise ──▶ propose_bridge() → PROPOSED → active_bridges → planner
+                                    → feature + JOIN_IDENTITY_UNCONFIRMED → materialization
+```
+
+Stages [2] and [4] reuse the `attest/` contracts (`GroundingV1`, `fuse`) unchanged; stage [3]
+follows `ColumnContext`'s blindness rule — the critic is never shown that the system proposed this
+pair, nor any confidence, and is asked adversarially for *the strongest reason these are NOT the
+same namespace*, with `insufficient_evidence` an expected, unpenalised answer.
+
+`ground_bridge` checks, each `agree | disagree | absent`: `type_family` (carrying `type_basis`),
+`entity_link`, `domain_compatible`, `name_tokens` (reuse `grounding._name_tokens`),
+`definition_overlap`, `synonym_overlap`, `grain_role` (one side being a table's key corroborates;
+**neither** being a key is not a conflict — an FK↔FK link is legitimate), `uniqueness` (`absent`
+when unprofiled — the FTR case), `taxonomy_alignment`.
+
+**Work**
+
+- Deterministic pre-checks as a named, testable stage that records *why* a pair was dropped.
+- `ground_bridge` returning the `attest` grounding shape so `fuse` is reused, not reimplemented.
+- The two-lens critic panel over `drive_structured_call`, closed response vocabulary, schema
+  validated, fail-closed on off-vocabulary or failed calls.
+- `fuse_bridge`; confidence is **display and review-routing only** and may never feed
+  `operational_eligibility` — the influence ceiling is the hard guarantee.
+- Widen `bridge_projection` and `active_bridges` to `VERIFIED | PROPOSED` with status carried;
+  review all 12 planner consumers. **`status` stays out of every hash** so confirming a link does
+  not invalidate existing plans.
+- `JOIN_IDENTITY_UNCONFIRMED` added to `REQUIREMENT_CODES` and the versioned
+  `validation_requirements` registry, operand naming the link's `fact_key`; carried onto the
+  contract and the materialized artifact; cleared on confirm, demoted on reject.
+- **Persist the taxonomy evidence — optional, never required.** Add `bian_path`, `fibo_path`,
+  `term_type`, `process_path`, `related_terms` to durable storage (preferred: a schema-preserving
+  glossary-record sidecar keyed by `logical_ref`, not more columns on the flattened `graph_node`).
+  Absence reports `absent`, never `disagree`; cannot contribute to `conflict`; only lowers
+  `coverage`, which is exactly what `fuse` already does with it. The envelope omits missing fields
+  rather than announcing their absence. A mixed pair — one side with taxonomy, one without — is
+  normal.
+- Bound the candidate roster per entity/source, order deterministically, page, and carry a
+  `pairs_examined` budget, recording honestly when it stopped early. One critic call per surviving
+  pair, so unbounded pairing plus a model call each is the failure mode this closes.
+
+**Prerequisites — both hard**
+
+- **The identifier-link governance route.** None exists (`api/routes/governance.py` covers joins,
+  table facts and semantic bindings only), so every bridge anywhere came from a fixture or a script.
+  Under D4 links now reach materialized numbers, which makes the ability to **reject** a wrong one
+  and demote what rests on it the only correction mechanism in the loop. This is task one.
+- **Deterministic replay.** The same pair with the same metadata must return the same verdict rather
+  than re-rolling the model. Requires a content-addressed key over
+  `(candidate_id, both endpoints' metadata fingerprint, prompt/schema/model versions)`, the
+  validated response body persisted, and a reuse probe on the dispatch path. Without it,
+  re-derivation admits different links on identical inputs and shadow measurement is meaningless.
+
+**Acceptance**
+
+- A `string`↔`string` identifier pair across two sources is admitted and reaches the planner as
+  `proposed`; a feature built on it is created, carries `JOIN_IDENTITY_UNCONFIRMED` naming the link,
+  and **materializes**.
+- Confirming the link clears the requirement on every feature resting on it; rejecting demotes them,
+  including already-materialized artifacts.
+- A pair the panel splits on is suppressed and surfaced as `critics_disagree`, distinct from an
+  ordinary rejection.
+- A failed critic call suppresses; it never defaults to admit.
+- **A pair with no taxonomy on either side reaches the same admission outcome as the same pair with
+  matching taxonomy**, differing only in confidence. This is what stops an optional field quietly
+  becoming mandatory.
+- Contradictory BIAN level-1 paths, where both sides have them, set `conflict` and suppress.
+- Confirming a link does not change any existing plan's fingerprint.
+- LLM confidence never changes `operational_eligibility`; a mutation raising eligibility from
+  confidence fails a test.
+- Re-running derivation on unchanged inputs makes no second provider call and admits an identical
+  set.
+
+**Shadow first**
+
+The panel runs in shadow via the existing `attest/` runner and `shadow_store`, suppressing nothing,
+until two numbers are published: **agreement with human confirm/reject decisions**, and **rejection
+rate**. A critic that never says no is theatre — it adds cost and false assurance. If it approves
+everything in shadow, it does not gate. The ~40 provisional gold labels from the P0 work are a
+starting point, not a sufficient sample.
 
 ---
 
@@ -2465,39 +2355,33 @@ The program passes when:
 17. cursor tampering or replay after scope/policy/registry/metadata-revision/freshness transition is
     refused before graph work.
 
-### Measured criteria (new in Rev 5)
+### Measured criteria
 
-The seventeen conditions above are correctness assertions about a synthetic fixture. **A program can
-satisfy all of them and deliver nothing observable.** These are the criteria that say whether it
-worked, each stated as a baseline measured before the phase and a target measured after. Where a
-baseline turns out to be zero, that fact is published rather than hidden — it is the most useful
-signal the program can produce.
+The correctness conditions above are assertions about a synthetic fixture. **A programme can satisfy
+all of them and deliver nothing observable.** These are the criteria that say whether it worked.
 
-| # | Measure | Baseline (measure before starting) | Target |
-| --- | --- | --- | --- |
-| M1 | Catalog columns carrying a concept, per source | measure at E0 | states the ceiling on every semantic-map claim |
-| M2 | Tables with a complete governed grain **and** `is_unique = true` — i.e. tables that could qualify as an operational realization at all | measure at E3.0 | if near zero, E5.2 has nothing to assemble and the program stops here |
-| M3 | VERIFIED `entity_bridge` rows creatable **through the product** | **currently zero — no route exists** | ≥ 1 through the UI before any E5 slice that consumes bridges is called done |
-| M3a | Identifier columns **eligible** for bridge candidacy (type family resolvable) | was **0 of 28** on FTR; **28 of 28** after `e6e5f31d` | stays at parity with the identifier-concept count; a drop to zero means a reader is consulting the wrong metadata column again |
-| M7 | Catalog sources loaded with a concept-bearing catalog | **1** (`ftr`) | **≥ 2.** This is the binding constraint on the whole programme: with one source there is nothing to cross, and every bridge-consuming phase is fixture-only. Rev 5 originally omitted this measure, which was the plan's single largest blind spot |
-| M4 | Sources with attested schema | **currently FTR/glossary only; zero for CSV/Excel** | states which sources E3 operational identity actually covers |
-| M5 | Columns whose `effective_restriction` is stricter than their raw `sensitivity` — i.e. columns the governed floor would hide but read-scope currently shows | measure at E3.0 | drives the Correction-25 decision with a number rather than an opinion |
-| M6 | Distinct `(concept, source)` pairs a user can reach in one cross-catalog query | zero before E0 | > 0 after E0; the first honest proof the ontology idea has value |
+**The measured values live in the verified-interfaces reference** (§8), because they are
+observations about the current catalog and go stale as the catalog changes. The plan owns the
+targets; the reference owns the numbers.
+
+| # | Measure | Target |
+| --- | --- | --- |
+| M1 | Columns carrying a concept | states the ceiling on every semantic-map claim; published at E0 |
+| M2 | Tables with a complete governed grain **and** `is_unique = true` | if near zero, E5.2 has nothing to assemble and the programme stops |
+| M3 | VERIFIED links creatable **through the product** | ≥ 1 through the UI before any phase consuming links is called done |
+| M3a | Identifier columns eligible for candidacy | parity with the identifier-concept count; a drop to zero means a reader is consulting the wrong metadata column again |
+| M4 | Sources with attested schema | states which sources E3 operational identity actually covers |
+| M5 | Columns whose governed floor is stricter than the tag read-scope consults | drives the Correction-25 decision with a number rather than an opinion |
+| M6 | Distinct `(concept, source)` pairs reachable in one query | > 0 after E0 — the first honest proof the idea has value |
+| M7 | Catalog sources loaded with a concept-bearing catalog | **≥ 2.** The binding constraint on the whole programme |
+| M8 | Panel rejection rate in shadow (E0b) | **> 0.** A critic that never rejects is theatre and does not gate |
+| M9 | Panel agreement with human confirm/reject decisions (E0b) | published before the panel gates anything |
 
 **Stop rule.** If M2, M4 or **M7** is below target at E3.0 and the corresponding prerequisite is not
-funded, the program does not proceed to E3.1 on the assumption it will improve later. It amends the
-Outcome and says which of the six promises it can still keep. **M7 is the one that actually binds
-today** — measured 2026-07-28, the catalog holds one source and one table, so every cross-catalog
-promise is currently undemonstrable regardless of how much of E3 gets built.
-
-**These baselines were measured, not estimated** (2026-07-28, deployed demo cluster): M1 = 120/126
-columns carry a concept across 33 concepts; M2 = 1 of 1 tables has a VERIFIED grain with
-`is_unique=true` (`tran_id`) — 100%, but n=1 proves nothing about coverage; M3 = 0;
-M3a = 0 → 28 after the fix above; M4 = 1 of 1 sources schema-attested, via the FTR/glossary path
-only; M5 = **28 columns whose governed floor is stricter than the raw tag read-scope actually
-consults** (16 `restricted`, 12 `confidential`) — the Correction-25 decision now has a number
-behind it, and those 28 include customer names, addresses, phone numbers and a national ID;
-M6 = 33; M7 = 1.
+funded, the programme does not proceed to E3.1 on the assumption it will improve later. It amends
+the Outcome and says which of the six promises it can still keep. **M7 is the one that binds today**
+— the catalog holds one source and one table, so every cross-catalog promise is currently
+undemonstrable regardless of how much of E3 gets built.
 
 ---
 
@@ -2509,6 +2393,12 @@ fully green while delivering nothing observable.
 
 0. **E0 — semantic map v0.** A concept facet on the shipped cross-catalog search, plus registry
    cycle validation. Days, not phases. Publishes the concept-coverage baseline.
+0b. **E0b — identifier-link admission.** The governance route first, then deterministic grounding,
+   the two-lens critic panel, proposed links reaching the planner, and the
+   `JOIN_IDENTITY_UNCONFIRMED` provenance loop. Runs on the shipped single-column link and the
+   shipped `attest/` harness, so it does not wait for Foundation. **This is where cross-catalog
+   features actually come from** — the planner already consumes links, so admission plus a
+   confirm/reject surface is the whole path.
 1. **E3.0** — approve the contracts, exact limits, migration/backfill, scope, cursor, and vocabulary.
    **Begins with the falsification pass**, which gates everything else in the phase.
 2. **E3.Foundation.0 — the ingest schema contract.** Readers, `CanonicalRow`, `validate_rows`.
@@ -2552,8 +2442,11 @@ Stop/go gates:
 - Do not start E3.1 or E5.1 until E3.Foundation passes its physical collision, unknown-schema,
   source/tenant denial, revision/cursor, independent candidate-family, object-binding
   propose-time-denial, composite-bridge, and new-bounds acceptance tests.
-- **E0 is not gated on any of the above** and does not wait for E3.0. It runs on shipped machinery
-  and its only new dependency — registry cycle validation — is self-contained.
+- **E0 and E0b are not gated on any of the above** and do not wait for E3.0. Both run on shipped
+  machinery. E0's only new dependency, registry cycle validation, is self-contained; E0b's two
+  prerequisites — the governance route and deterministic LLM replay — are inside its own scope.
+- **E0b's panel does not gate until its shadow numbers are published** (M8, M9). Until then it
+  observes and suppresses nothing.
 - Do not start E3 persistence or LLM work until E3.1 passes the read-only adversarial
   fixture for foreign keys, partial composite keys, schema collisions, missing
   cardinality, projection lag, candidate currentness, and hidden/stale metadata.
