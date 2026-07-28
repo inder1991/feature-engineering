@@ -72,6 +72,7 @@ from featuregen.materialize.inventory import (
     PartitionTransform,
     StaticSnapshot,
 )
+from featuregen.materialize.ir import ir_hash
 from featuregen.materialize.render import nodes_compute
 from featuregen.materialize.render.nodes_compute import SPINE_FUNC_NAME, render_spine_node
 from featuregen.materialize.render.project import (
@@ -2492,3 +2493,280 @@ def test_a_source_row_whose_DIMENSION_ROW_IS_MISSING_survives_with_a_NULL_key(
     ]).rows
     assert len(rows) == 2
     assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(10, "C1"), (99, None)]
+
+
+def test_a_hop_rendered_BACKWARDS_refuses_rather_than_joining(compiled, expression):
+    """`JoinStep` is oriented to the direction of travel. Replayed in the other order, hop 2 starts
+    at a table the frame has not reached — and rendered anyway it would land rows on the wrong
+    entities while producing a perfectly plausible column."""
+    with pytest.raises(ValueError, match="has not reached it"):
+        _traversal(compiled, expression, steps=(HOP_2, HOP_1))
+
+
+def test_a_traversal_that_REVISITS_A_TABLE_refuses(compiled, expression):
+    back = JoinStep(from_ref="public.customers.cif_id", to_ref="public.accounts.acct_id",
+                    cardinality="1:1", authority="operational")
+    with pytest.raises(ValueError, match="already reached"):
+        _traversal(compiled, expression, steps=(HOP_1, HOP_2, back))
+
+
+def test_a_DISPLAY_ONLY_hop_refuses(compiled, expression):
+    """`authority` is `operational` (usable for feature construction) vs `display_only` (an
+    ungoverned edge kept for lineage display). Computing over the second produces a number whose
+    path nobody governed, and it looks exactly like a governed one."""
+    ungoverned = dataclasses.replace(HOP_2, authority="display_only")
+    with pytest.raises(ValueError, match="display_only"):
+        _traversal(compiled, expression, steps=(HOP_1, ungoverned))
+
+
+def test_a_hop_whose_APPROVED_JOIN_FACT_IS_NOT_VERIFIED_refuses(compiled, expression):
+    """A fact that exists and is not VERIFIED is a join somebody proposed. `None` is different and
+    is NOT covered — a file-declared edge is a meaningful answer, not a missing one."""
+    proposed = dataclasses.replace(HOP_1, approved_join_status="DRAFT")
+    with pytest.raises(ValueError, match="not.*VERIFIED|VERIFIED"):
+        _traversal(compiled, expression, steps=(proposed, HOP_2))
+    assert HOP_2.approved_join_fact_key is None                 # file-declared, and it renders
+    assert _traversal(compiled, expression).source
+
+
+@pytest.mark.parametrize("cardinality", ["1:N", None, "M:N"])
+def test_a_hop_that_FANS_OUT_OR_IS_UNATTESTED_refuses(compiled, expression, cardinality):
+    """Refusing only the hops that SAY 1:N is a fail-open: an unattested edge may BE 1:N. 'We do
+    not know' is not 'it is safe' — and neither is repaired here, because de-duplicating a fanned
+    join picks a business allocation rule nobody approved (§3.2)."""
+    fanning = dataclasses.replace(HOP_2, cardinality=cardinality)
+    with pytest.raises(ValueError, match="cardinality"):
+        _traversal(compiled, expression, steps=(HOP_1, fanning))
+
+
+def test_a_plan_that_REPORTS_FANS_OUT_refuses_even_though_every_hop_fans_in(compiled, expression):
+    """`fans_out` is READ, not inferred from the absence of a warning — which is what `JoinPlan`'s
+    own docstring asks a consumer to do. Every hop here is N:1, so a renderer that inferred the
+    answer from the steps would render this plan and multiply nothing it could see."""
+    with pytest.raises(ValueError, match="fans_out"):
+        _traversal(compiled, expression, fans_out=True)
+
+
+def test_a_plan_whose_GOVERNED_OUTCOME_IS_NOT_OPERATIONAL_refuses(compiled, expression):
+    with pytest.raises(ValueError, match="outcome"):
+        _traversal(compiled, expression, outcome_kind="UNVERIFIED")
+
+
+def test_a_hop_ENDPOINT_OUTSIDE_THE_AUTHORIZED_READ_SET_refuses(compiled, expression):
+    """§1.3 records every join endpoint as its own read. An endpoint missing from the read set is a
+    column the group would join on and was never granted."""
+    elsewhere = dataclasses.replace(HOP_1, to_ref="public.accounts.branch_cd")
+    with pytest.raises(ValueError, match="authorized read set does not carry"):
+        _traversal(compiled, expression, steps=(elsewhere, HOP_2))
+
+
+def test_a_read_set_table_NO_HOP_REACHES_refuses(compiled, expression):
+    """The zero-hop case of the same rule, and 13b's original refusal: a node handed no dataset for
+    a table cannot name its columns."""
+    with pytest.raises(ValueError, match="spans"):
+        _traversal(compiled, expression, steps=(HOP_1,))
+
+
+def test_a_traversal_with_NO_GRAIN_KEY_AT_THE_END_refuses(compiled, expression):
+    """A traversal exists to reach the grain. One that emits nothing joins the tables and throws
+    the answer away — while costing exactly as much and looking exactly as governed."""
+    ungrained = dataclasses.replace(
+        _traversed(expression),
+        physical_read_set=tuple(
+            dataclasses.replace(ref, roles=tuple(r for r in ref.roles if r is not RefRole.GRAIN_KEY))
+            for ref in _traversed(expression).physical_read_set))
+    with pytest.raises(ValueError, match="no grain key is reached"):
+        nodes_compute.render_projection_node(
+            ungrained, compiled[2], feature_column=SUM_30D,
+            source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
+            projection_dataset="intermediate")
+
+
+def test_a_grain_key_the_SOURCE_ALSO_SPELLS_refuses(compiled, expression):
+    """Two spellings of one entity and nothing declaring the mapping between them (A.18's first
+    row, reached the other way): choosing one here lands every entity's value under a key this
+    compilation picked."""
+    both = dataclasses.replace(
+        _traversed(expression),
+        physical_read_set=(*_traversed(expression).physical_read_set,
+                           _pref(fixtures.TABLE, "cif_id", RefRole.FILTER_LEFT)))
+    with pytest.raises(ValueError, match="already carries a column of that name"):
+        nodes_compute.render_projection_node(
+            both, compiled[2], feature_column=SUM_30D,
+            source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
+            projection_dataset="intermediate")
+
+
+def test_the_hop_DATASETS_must_be_exactly_the_tables_the_traversal_reaches(compiled, expression):
+    """Kedro binds inputs positionally, so a dataset supplied against the wrong hop reads the wrong
+    table through a name that parses perfectly."""
+    with pytest.raises(ValueError, match="missing"):
+        _traversal(compiled, expression, joined_datasets={"banking.accounts": "raw_a"})
+    with pytest.raises(ValueError, match="unexpected"):
+        _traversal(compiled, expression,
+                   joined_datasets={**TRAVERSAL_DATASETS, "banking.branches": "raw_b"})
+    with pytest.raises(ValueError, match="missing"):
+        _traversal(compiled, expression, joined_datasets={})
+
+
+# ── the wiring, and what a reviewer counts it against ────────────────────────────────────────────
+
+
+def test_the_traversal_wires_ONE_INPUT_PER_JOINED_TABLE_in_traversal_order(compiled, expression):
+    node = _traversal(compiled, expression)
+    assert node.inputs == ("raw_banking__transactions", "raw_banking__accounts",
+                           "raw_banking__customers", "params:business_dt")
+    assert node.outputs == ("intermediate_total_debit_amount_30d__body_expr",)
+
+
+def test_the_rendered_SIGNATURE_matches_the_wiring_position_for_position(compiled, expression):
+    """The one defect a parse check cannot see: Kedro binds positionally, so a signature and a
+    wiring that disagree produce a pipeline that runs and computes the wrong thing."""
+    node = _traversal(compiled, expression)
+    module = ast.parse(node.source)
+    parameters = [arg.arg for arg in module.body[0].args.args]
+    assert parameters == ["source", "join_1_accounts", "join_2_customers", "business_dt"]
+    assert len(parameters) == len(node.inputs)
+
+
+def test_the_traversal_emits_NO_ROW_COLLAPSING_REPAIR(compiled, expression):
+    """A `dropDuplicates` here would hide a fan-out instead of reporting it, and a hidden fan-out is
+    a SUM wrong by a factor nobody can see. Asserted on the text AND by execution: the stand-in
+    raises when either is called, so a renderer that emitted one dies in every test above."""
+    source = _traversal(compiled, expression).source
+    assert "dropDuplicates" not in source
+    assert "distinct" not in source
+
+
+def test_the_traversal_never_JOINS_BEFORE_THE_PIT_GATES(compiled, expression):
+    """The gates read the source relation's own columns, so they are rendered first — on the rows
+    the feature may see, not on the joined product of them."""
+    source = _traversal(compiled, expression)
+    assert source.source.index("rows.where(") < source.source.index("rows.join(")
+
+
+def test_every_rendered_TRAVERSAL_line_fits_the_width_it_states(compiled, expression):
+    for line in _traversal(compiled, expression).source.splitlines():
+        assert len(line) <= 100, line
+
+
+def test_the_traversal_renders_identically_every_time(compiled, expression):
+    first, second = _traversal(compiled, expression), _traversal(compiled, expression)
+    assert ast.parse(first.source)
+    assert first.source == second.source and first.inputs == second.inputs
+
+
+# ── through the calculation, and through Task 12's wiring ────────────────────────────────────────
+
+
+def _traversed_ir(compiled, expression, **kwargs):
+    """The worked feature re-grained onto the customer two hops away — IR and all."""
+    return dataclasses.replace(
+        compiled[0].irs[0], expressions=(_traversed(expression, **kwargs),),
+        grain_keys=(f"{fixtures.SOURCE}::public.customers.cif_id",))
+
+
+def test_the_CALCULATION_accepts_a_multi_hop_projection_and_sums_per_ENTITY(
+        compiled, expression, feature, lock_tree):
+    """End to end, by execution: the traversal's own output frame is what the calculation reads.
+    A hop landed on the wrong customer produces the same shape and different numbers, so the
+    assertion is on the numbers."""
+    projection = _traversal(compiled, expression)
+    staged_rows = _traverse(projection, [
+        _windowed(BEFORE, 10) | {"acct_num": "A1"},
+        _windowed(BEFORE, 20) | {"acct_num": "A2"},
+        _windowed(BEFORE, 30) | {"acct_num": "A1"},
+        _windowed(BEFORE, 99) | {"acct_num": "A404"},          # reaches no customer at all
+    ]).rows
+
+    node = _calculate(compiled, feature, ir=_traversed_ir(compiled, expression))
+    assert _staged(node, lock_tree, projection=staged_rows,
+                   spine=_spine_rows("C1", "C2")) == {"C1": 40, "C2": 20}
+
+
+def test_the_ORPHANED_ROW_lands_on_no_entity_rather_than_on_the_wrong_one(
+        compiled, expression, feature, lock_tree):
+    """The other half of the LEFT decision. The row survives the projection with a null key, and
+    §8 rule 3's reduction then never joins it to anybody — so it changes no entity's number."""
+    projection = _traversal(compiled, expression)
+    orphan_only = _traverse(projection, [_windowed(BEFORE, 99) | {"acct_num": "A404"}]).rows
+    assert orphan_only[0]["cif_id"] is None
+
+    node = _calculate(compiled, feature, ir=_traversed_ir(compiled, expression))
+    assert _staged(node, lock_tree, projection=orphan_only,
+                   spine=_spine_rows("C1", "C2")) == {"C1": None, "C2": None}
+
+
+def _traversed_compilation(compiled, expression):
+    """The whole authorized compilation re-grained two hops away, physical requirements included."""
+    source_requirement = compiled[0].irs[0].expressions[0].input_requirements[0]
+    ir = _traversed_ir(compiled, expression)
+    expressions = (dataclasses.replace(
+        ir.expressions[0],
+        input_requirements=(source_requirement,
+                            dataclasses.replace(source_requirement, table=_ACCOUNTS),
+                            dataclasses.replace(source_requirement, table=_CUSTOMERS))),)
+    authorized = dataclasses.replace(
+        compiled[0], irs=(dataclasses.replace(ir, expressions=expressions),))
+    plan = dataclasses.replace(compiled[1], features=tuple(
+        dataclasses.replace(item, ir_hash=ir_hash(authorized.irs[0]))
+        if item.column_name == ir.feature_name else item
+        for item in compiled[1].features))
+    return authorized, plan
+
+
+def test_the_TRAVERSAL_CLOSES_TASK_12s_WIRING_with_one_raw_dataset_per_hop(compiled, expression):
+    """The evidence that decided WHICH node renders the traversal. `project_datasets` already
+    declares one `raw` dataset per table an expression's `input_requirements` cover — the hops
+    included — and `_check_wiring` refuses a governed source that no node reads. The projection is
+    the node that reads raw datasets, so it is the node that must read them."""
+    authorized, plan = _traversed_compilation(compiled, expression)
+    datasets = project_datasets(authorized, plan, spine_input=compiled[3])
+    assert datasets.raw["banking.accounts"] == "raw_banking__accounts"
+    assert datasets.raw["banking.customers"] == "raw_banking__customers"
+
+    node = _traversal(compiled, expression)
+    with pytest.raises(ValueError, match="read by no node"):
+        render_project(authorized, plan, environment_id=ENVIRONMENT,
+                       engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+                       nodes=(*_wired_nodes(compiled, datasets)[:1],
+                              dataclasses.replace(node, inputs=("raw_banking__transactions",
+                                                                "params:business_dt")),
+                              *_wired_nodes(compiled, datasets)[2:]))
+
+
+def test_a_REAL_PROJECT_renders_with_the_traversal_wired_into_it(compiled, expression, tmp_path):
+    """Task 12 checks six ways a pipeline can be wrong while parsing perfectly. The traversal's
+    three inputs are checked by THAT, not by a claim here."""
+    authorized, plan = _traversed_compilation(compiled, expression)
+    datasets = project_datasets(authorized, plan, spine_input=compiled[3])
+    ir = authorized.irs[0]
+    planned = next(item for item in plan.features if item.column_name == ir.feature_name)
+    nodes = [
+        render_spine_node(authorized.spine, plan, compiled[2], spine_input=compiled[3],
+                          source_dataset=datasets.raw["banking.customers"],
+                          spine_dataset=datasets.spine),
+        nodes_compute.render_projection_node(
+            ir.expressions[0], compiled[2], feature_column=ir.feature_name,
+            source_dataset=datasets.raw["banking.transactions"],
+            joined_datasets={"banking.accounts": datasets.raw["banking.accounts"],
+                             "banking.customers": datasets.raw["banking.customers"]},
+            projection_dataset=datasets.projections[(ir.feature_name, "body.expr")]),
+        nodes_compute.render_calculation_node(
+            ir, planned, plan, empty_window={"body.expr": EmptyWindowResult.NULL},
+            null_input={"body.expr": NullInput.IGNORE},
+            projection_datasets={"body.expr": datasets.projections[(ir.feature_name, "body.expr")]},
+            spine_dataset=datasets.spine, staging_dataset=datasets.staging[ir.feature_name],
+            manifest_dataset=datasets.manifests[ir.feature_name]),
+        _assembly_stub(datasets),
+    ]
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+                             nodes=tuple(nodes))
+    nodes_py = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/nodes.py"))
+    assert ast.parse(nodes_py)
+    pipeline = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/pipeline.py"))
+    assert "raw_banking__accounts" in pipeline and "raw_banking__customers" in pipeline
+    assert materialize_to(project, tmp_path / "generated")
