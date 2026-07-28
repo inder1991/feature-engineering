@@ -755,7 +755,7 @@ def render_projection_node(
         "",
         *_availability_gate(pit, available),
         "",
-        *_window_boundaries(pit, clock),
+        *_window_boundaries(pit, clock, contract.pit_semantics.cutoff_timezone),
         "    return rows",
     ]) + "\n"
     return RenderedNode(
@@ -851,10 +851,11 @@ def _read_set_lines(read_set: tuple[str, ...]) -> list[str]:
     """The select. Named column by column, and never ``*``."""
     named = [f"F.col({column!r})" for column in read_set]
     lines = [
-        "    # §1.3's authorized read set, named column by column. NEVER a star: a star reads",
-        "    # whatever the table happens to hold today, including a column added AFTER the",
-        "    # authorization — so the group would read more than it was granted, and nothing would",
-        "    # say so.",
+        *_comment(
+            "§1.3's authorized read set, named column by column. NEVER a star: a star reads "
+            "whatever the table happens to hold today, including a column added AFTER the "
+            "authorization — so the group would read more than it was granted, and nothing at all "
+            "would say so."),
         "    rows = source.select(",
     ]
     line = "       "
@@ -925,9 +926,8 @@ def _availability_gate(pit: PitSpec, available: str) -> list[str]:
             f"arrival time that already includes one")
 
     head = [
-        "    # §8 rule 1 — the availability gate. This is the filter whose violation is INVISIBLE:",
-        "    # a row kept here that could not yet have been READ at the cutoff produces a feature",
-        "    # that backtests beautifully and is wrong in production, and nothing raises.",
+        "    # §8 rule 1 — the availability gate, and the filter whose violation is INVISIBLE: a row",
+        "    # kept here that could not yet have been READ at the cutoff raises nothing at all.",
     ]
     if basis is AvailabilityBasis.EVENT_TIME_PLUS_LAG:
         interval, prose = _lag_interval(str(pit.availability_lag_hours))
@@ -956,7 +956,7 @@ def _availability_gate(pit: PitSpec, available: str) -> list[str]:
         f"visible, on every business date")
 
 
-def _window_boundaries(pit: PitSpec, clock: str) -> list[str]:
+def _window_boundaries(pit: PitSpec, clock: str, cutoff_zone: str) -> list[str]:
     """§8 rule 2 — ``basis``, ``length``, ``unit`` and BOTH inclusivity flags, each honoured.
 
     The boundaries are DATES first and instants second. That order is what makes a calendar period
@@ -990,31 +990,42 @@ def _window_boundaries(pit: PitSpec, clock: str) -> list[str]:
             f"anchor the window at DIFFERENT dates — a trailing window ends at the business date "
             f"and a calendar period at the start of the period containing it")
 
-    lines = [
-        "    # §8 rule 2 — the window. Its boundaries are computed as DATES with calendar",
-        "    # arithmetic and turned into instants only at the end. A month is NOT thirty days:",
-        "    # three months before 2026-07-06 is 2026-04-06 and ninety days before it is",
-        "    # 2026-04-07, so a day-count conversion moves the boundary and changes the answer.",
+    same_zone = pit.window_timezone.strip() == cutoff_zone.strip()
+    zone_note = (
+        f"The window's zone is {pit.window_timezone} — the same string as the cutoff's, and stated "
+        f"again rather than reused because they are two governed fields that are free to differ."
+        if same_zone else
+        f"The window's OWN governed zone is {pit.window_timezone}, which is NOT the cutoff's "
+        f"({cutoff_zone}). They are separate governed fields and this is the window's.")
+    return [
+        *_comment(
+            f"§8 rule 2 — the declared window: {pit.window_length} "
+            f"{_plural(pit.window_length, pit.window_unit)}, {pit.window_basis}. Both boundaries "
+            f"are computed as DATES with calendar arithmetic and turned into instants only at the "
+            f"end — which is also what keeps a boundary from crossing a daylight-saving change "
+            f"wrong, as `instant - N x 24h` would."),
         "    anchor = F.to_date(F.lit(business_date))",
         *_period_end(pit),
         *_period_start(pit),
         "",
         *_comment(
-            f"The window's OWN governed zone is {pit.window_timezone} — a different field from the "
-            f"cadence's cutoff zone, and stated here for the same reason: the rendered session is "
-            f"pinned to UTC, so a zone left to be inherited moves both boundaries by hours."),
-        "    starts_at = F.to_utc_timestamp(",
-        f"        window_start.cast('timestamp'), {pit.window_timezone!r})",
-        "    ends_at = F.to_utc_timestamp(",
-        f"        window_end.cast('timestamp'), {pit.window_timezone!r})",
+            f"{zone_note} The rendered session is pinned to UTC, so a zone left to be inherited "
+            f"moves both boundaries by hours."),
+        f"    starts_at = F.to_utc_timestamp(window_start.cast('timestamp'), "
+        f"{pit.window_timezone!r})",
+        f"    ends_at = F.to_utc_timestamp(window_end.cast('timestamp'), {pit.window_timezone!r})",
         "",
         *_comment(
             f"Both flags as DECLARED: start {pit.window_start_inclusive} ({start_op}), end "
-            f"{pit.window_end_inclusive} ({end_op}). Two filters, because they are two boundaries."),
+            f"{pit.window_end_inclusive} ({end_op}). Two filters, because they are two boundaries "
+            f"— and they are carried per expression precisely because they vary."),
         f"    rows = rows.where(F.col({clock!r}) {start_op} starts_at)",
         f"    rows = rows.where(F.col({clock!r}) {end_op} ends_at)",
     ]
-    return lines
+
+
+def _plural(count: int, word: str) -> str:
+    return word if count == 1 else f"{word}s"
 
 
 def _period_end(pit: PitSpec) -> list[str]:
@@ -1028,8 +1039,8 @@ def _period_end(pit: PitSpec) -> list[str]:
     if period is None:
         if pit.window_unit == "day":
             return [
-                "    # A calendar period of days: the period a date falls in IS that date, so there",
-                "    # is nothing to truncate to. The end is the business date.",
+                *_comment("A calendar period of days: the period a date falls in IS that date, so "
+                          "there is nothing to truncate to. The end is the business date."),
                 "    window_end = anchor",
             ]
         raise ValueError(
@@ -1037,9 +1048,10 @@ def _period_end(pit: PitSpec) -> list[str]:
             f"this renderer cannot truncate to has no first day — Spark's `trunc` returns NULL for "
             f"a format it does not know, and a NULL boundary keeps or drops every row silently")
     return [
-        f"    # A calendar period: the window ends where the CURRENT {pit.window_unit} begins, so",
-        f"    # the incomplete {pit.window_unit} the business date sits in is outside it. That is",
-        "    # the whole difference from a trailing window, and it is a different set of rows.",
+        *_comment(
+            f"A calendar period: the window ends where the CURRENT {pit.window_unit} begins, so the "
+            f"incomplete {pit.window_unit} the business date sits in is outside it. That is the "
+            f"whole difference from a trailing window, and it is a different set of rows."),
         f"    window_end = F.trunc(anchor, {period!r})",
     ]
 
@@ -1051,9 +1063,10 @@ def _period_start(pit: PitSpec) -> list[str]:
         # A day is a day and a week is seven days in every calendar. Counting these is exact; it is
         # a month that is not a fixed number of days, and there is deliberately no day count for one.
         return [
-            f"    # {pit.window_length} {pit.window_unit}(s) back. A {pit.window_unit} is a whole "
-            f"number of days in",
-            "    # every calendar, so counting days here is the calendar operation, not a shortcut.",
+            *_comment(
+                f"{pit.window_length} {_plural(pit.window_length, pit.window_unit)} back. A "
+                f"{pit.window_unit} is a whole number of days in every calendar, so counting days "
+                f"here IS the calendar operation rather than a conversion into one."),
             f"    window_start = F.date_sub(window_end, {pit.window_length * days})",
         ]
     months = _MONTHS_PER_UNIT.get(pit.window_unit)
@@ -1063,8 +1076,11 @@ def _period_start(pit: PitSpec) -> list[str]:
             f"arithmetic for: WindowUnit is CLOSED, and the default an unmodelled unit would fall "
             f"into is a day count — the exact conversion §8 rule 2 forbids")
     return [
-        f"    # {pit.window_length} {pit.window_unit}(s) back, as CALENDAR months: `add_months`",
-        "    # steps whole months and clamps to the end of the month, so 2026-01-31 back one month",
-        "    # is 2026-02-28. Subtracting a day count instead would land on 2026-01-01.",
+        *_comment(
+            f"{pit.window_length} {_plural(pit.window_length, pit.window_unit)} back, as CALENDAR "
+            f"months. A month is NOT thirty days: `add_months` steps whole months and clamps to the "
+            f"end of one, so 2026-01-31 back a month is 2026-02-28 where a 30-day count gives "
+            f"2026-01-01, and 3 months back from 2026-07-06 is 2026-04-06 where 90 days gives "
+            f"2026-04-07. Either conversion moves the boundary and changes which rows are summed."),
         f"    window_start = F.add_months(window_end, {-pit.window_length * months})",
     ]

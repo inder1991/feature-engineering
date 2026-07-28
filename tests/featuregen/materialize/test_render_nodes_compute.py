@@ -774,7 +774,10 @@ def test_rule_2_a_MONTH_window_is_a_CALENDAR_month_and_NOT_thirty_days(compiled,
     node = _projection(compiled, expression, window_length=3, window_unit="month")
     on_the_calendar_boundary = _windowed(dt.datetime(2026, 4, 6, 12, 0), 1)
     assert _kept(node, [on_the_calendar_boundary], "2026-07-06") == [1]
-    assert "add_months" in node.source and "90" not in node.source
+    # And the arithmetic itself: a month window renders `add_months` and never `date_sub`, which
+    # is the only shape a day-count conversion could take.
+    assert "F.add_months(window_end, -3)" in node.source
+    assert "F.date_sub" not in node.source
 
 
 def test_rule_2_a_month_window_CLAMPS_to_the_end_of_the_month(compiled, expression):
