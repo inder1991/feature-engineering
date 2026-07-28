@@ -2371,3 +2371,124 @@ def test_every_rendered_FINAL_OPERATION_line_fits_the_width_it_states(ratio, rat
             assert len(line) <= 100, line
     for line in _render_difference(ratio, ratio_feature).source.splitlines():
         assert len(line) <= 100, line
+
+
+# ══ Task 13e — the governed multi-hop traversal (§3.1–3.2) ═══════════════════════════════════════
+#
+# The shape A.17 names, and the normal shape in a bank: a feature grained on the CUSTOMER, computed
+# over TRANSACTIONS, whose rows reach their customer through the ACCOUNT. Every hop fans IN toward
+# the destination (N:1) because that is the only kind `plan_join` returns — a fanning path is
+# refused there, never repaired here.
+#
+# The failure this section is written against is not an exception. A hop rendered backwards still
+# joins and still produces rows; an inner join silently drops the source rows whose dimension row is
+# missing. Both leave a full table of plausible numbers. So the traversal is proved by EXECUTION —
+# one row per source row, each carrying the entity it actually belongs to.
+
+TRAVERSAL_GOLDENS = pathlib.Path(__file__).parent / "goldens" / "traversal_nodes"
+
+_ACCOUNTS = "accounts"
+_CUSTOMERS = "customers"
+
+#: `transactions -> accounts -> customers`. The two hops join on DIFFERENT column names on each
+#: side (`acct_num`/`acct_id`, `owner_id`/`cif_id`), so a renderer that read the endpoints in the
+#: wrong order names a column that is not there rather than silently joining on the right one.
+HOP_1 = JoinStep(from_ref="public.transactions.acct_num", to_ref="public.accounts.acct_id",
+                 cardinality="N:1", approved_join_fact_key="ajf-txn-acct",
+                 approved_join_status="VERIFIED", authority="operational")
+HOP_2 = JoinStep(from_ref="public.accounts.owner_id", to_ref="public.customers.cif_id",
+                 cardinality="N:1", approved_join_fact_key=None,
+                 approved_join_status=None, authority="operational")
+
+TRAVERSAL_DATASETS = {"banking.accounts": "raw_banking__accounts",
+                      "banking.customers": "raw_banking__customers"}
+
+
+def _pref(table, column, *roles):
+    """One PhysicalRef in the shape Task 5 resolves: a schema-flattened logical ref, and the
+    physical `banking.<table>` the metastore answers to."""
+    from featuregen.materialize.expression_ir import PhysicalRef
+    ref = f"{fixtures.SOURCE}::public.{table}" + (f".{column}" if column else "")
+    return PhysicalRef(logical_ref=ref, catalog_source=fixtures.SOURCE, schema="banking",
+                       table=table, column=column, roles=tuple(roles))
+
+
+def _traversed(expression, *, steps=(HOP_1, HOP_2), **plan_overrides):
+    """The worked expression re-grained onto `customers.cif_id`, two hops away.
+
+    Everything else is the real compilation: the same operand, the same governed filter, the same
+    window and the same availability column. Only the grain moves off the source relation — which
+    is the ONLY reason `_plan_to_grain` ever produces a hop.
+    """
+    kept = tuple(ref for ref in expression.physical_read_set
+                 if not (ref.column == "cif_id" and ref.table == fixtures.TABLE))
+    read_set = (
+        *kept,
+        _pref(fixtures.TABLE, "acct_num", RefRole.JOIN_KEY),
+        _pref(_ACCOUNTS, "acct_id", RefRole.JOIN_KEY),
+        _pref(_ACCOUNTS, "owner_id", RefRole.JOIN_KEY),
+        _pref(_CUSTOMERS, "cif_id", RefRole.JOIN_KEY, RefRole.GRAIN_KEY),
+    )
+    return dataclasses.replace(
+        expression, physical_read_set=read_set,
+        join_plan=dataclasses.replace(expression.join_plan, steps=tuple(steps), **plan_overrides))
+
+
+def _traversal(compiled, expression, *, joined_datasets=None, **kwargs):
+    return nodes_compute.render_projection_node(
+        _traversed(expression, **kwargs), compiled[2], feature_column=SUM_30D,
+        source_dataset="raw_banking__transactions",
+        joined_datasets=TRAVERSAL_DATASETS if joined_datasets is None else joined_datasets,
+        projection_dataset="intermediate_total_debit_amount_30d__body_expr")
+
+
+#: Two customers, two accounts, and a transaction on an account NOBODY owns. The orphan is the whole
+#: point: it is what tells a LEFT traversal from an INNER one, and an inner one silently changes
+#: which source rows the feature is computed over.
+ACCOUNTS = [{"acct_id": "A1", "owner_id": "C1"}, {"acct_id": "A2", "owner_id": "C2"}]
+CUSTOMERS_ROWS = [{"cif_id": "C1"}, {"cif_id": "C2"}]
+
+
+def _traverse(node, txns, *, accounts=None, customers=None, business_dt=BUSINESS_DT):
+    run = fake_spark.run_rendered(node.source, node.func_name)
+    return run(fake_spark.DataFrame(txns),
+               fake_spark.DataFrame(ACCOUNTS if accounts is None else accounts),
+               fake_spark.DataFrame(CUSTOMERS_ROWS if customers is None else customers),
+               business_dt)
+
+
+def test_the_traversal_lands_every_source_row_on_the_entity_it_ACTUALLY_belongs_to(
+        compiled, expression):
+    """The number test. A hop rendered backwards, or joined on the wrong endpoint, still produces
+    rows — it produces them under the wrong customer, and nothing downstream would say so."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [
+        _windowed(BEFORE, 10) | {"acct_num": "A1"},
+        _windowed(BEFORE, 20) | {"acct_num": "A2"},
+        _windowed(BEFORE, 30) | {"acct_num": "A1"},
+    ]).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [
+        (10, "C1"), (20, "C2"), (30, "C1")]
+
+
+def test_the_traversal_produces_EXACTLY_ONE_ROW_PER_SOURCE_ROW(compiled, expression):
+    """`JoinPlan.fans_out` is False by construction, so a rendered traversal that multiplied rows
+    would be inflating every SUM over it. Counted, because a wrong SUM raises nothing."""
+    node = _traversal(compiled, expression)
+    txns = [_windowed(BEFORE, n) | {"acct_num": acct}
+            for n, acct in ((10, "A1"), (20, "A2"), (30, "A1"), (40, "A1"))]
+    assert _traverse(node, txns).count() == len(txns)
+
+
+def test_a_source_row_whose_DIMENSION_ROW_IS_MISSING_survives_with_a_NULL_key(
+        compiled, expression):
+    """The join type, made observable. An INNER traversal drops this row — which changes the rows
+    the feature is computed over on a referential-integrity fact nobody governed. A LEFT one keeps
+    it with a null entity key, and §8 rule 3's spine reduction then never lands it on anybody."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [
+        _windowed(BEFORE, 10) | {"acct_num": "A1"},
+        _windowed(BEFORE, 99) | {"acct_num": "A404"},      # an account that does not exist
+    ]).rows
+    assert len(rows) == 2
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(10, "C1"), (99, None)]

@@ -81,7 +81,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from featuregen.formula.schema import (
     AggregateFunction,
@@ -104,6 +104,7 @@ from featuregen.materialize.expression_ir import (
     ExpressionExecutionIR,
     PitSpec,
     RefRole,
+    join_key_ref,
 )
 from featuregen.materialize.group_plan import (
     FeatureGroupPlanV1,
@@ -213,6 +214,35 @@ _TRANSFORMS: dict[PartitionTransform, str] = {
 #: when the declared ``empty_window`` needs the distinction; double-underscored so it cannot collide
 #: with a governed column, and dropped so it can never reach the published table.
 _SOURCE_ROWS = "__source_rows"
+
+#: The cardinality tokens that fan IN toward a hop's destination — one source row matches at most
+#: one destination row, so a rendered hop cannot multiply rows. ``joins._FANS_IN`` is the same set,
+#: and this is deliberately a SECOND statement of it rather than an import: the planner decides
+#: whether a path may be computed on, and this decides whether THIS renderer knows how to render
+#: what it was handed. A token added to the governed vocabulary without being given a direction here
+#: refuses instead of rendering a join whose row behaviour nothing has stated.
+_FANS_IN: frozenset[str] = frozenset({"N:1", "1:1"})
+
+#: The governed outcome a renderable plan carries (``JoinOutcome.OPERATIONAL``). Read explicitly, so
+#: a plan built by hand — or a governance extension that mints a new outcome — cannot arrive here
+#: and be rendered as though it had been approved.
+_OPERATIONAL_OUTCOME = "OPERATIONAL"
+
+#: ``graph_edge.authority`` a hop must carry to be COMPUTED on. ``display_only`` is an ungoverned
+#: edge kept for lineage display; rendering one would compute the feature over a path nobody
+#: governed, and the number it produced would look exactly like a governed one.
+_OPERATIONAL_AUTHORITY = "operational"
+
+#: The ``approved_join`` status an authority-bearing hop must hold. A hop with no fact key at all is
+#: a FILE-DECLARED edge — "a meaningful answer, not a missing one" — and is not covered by this.
+_VERIFIED_STATUS = "VERIFIED"
+
+#: How every governed hop is joined. LEFT, always, and never inferred: the traversal's job is to say
+#: which entity each source row belongs to, not to change WHICH source rows exist. An inner join
+#: additionally drops every source row whose dimension row is missing — a referential-integrity fact
+#: nobody governed — and it does so silently. §4 decides the population and §8 rule 3's spine
+#: reduction lands it; a row that reaches no entity carries a null key and lands on nobody.
+_HOP_JOIN_HOW = "left"
 
 #: The body paths each ``FinalOperation`` compiles to, **in slot order**. The order is semantic and
 #: not a convenience: a numerator rendered where the denominator belongs inverts every value in the
@@ -827,28 +857,45 @@ def render_projection_node(
     feature_column: str,
     source_dataset: str,
     projection_dataset: str,
+    joined_datasets: Mapping[str, str] | None = None,
 ) -> RenderedNode:
-    """Render the node that decides which rows ONE expression may see (§8 rules 1 and 2).
+    """Render the node that decides which rows ONE expression may see (§8 rules 1 and 2, §3.1–3.2).
+
+    The governed traversal is rendered HERE, after the two PIT gates and before the output select.
+    It lives in the projection because the projection is the node that reads governed sources: Task
+    12 already declares one ``raw`` dataset per table an expression's ``input_requirements`` cover
+    — the join hops included — and its wiring check requires every one of them to be READ by some
+    node. A node between raw and projection would have to write an intermediate dataset
+    ``ProjectDatasets`` does not declare, which the same check refuses.
 
     Args:
-        expression: the compiled expression. Its ``pit`` is the whole of what is rendered here, and
-            its ``physical_read_set`` is the only set of columns the node is allowed to name.
+        expression: the compiled expression. Its ``pit`` is the whole of what is gated here, its
+            ``join_plan`` the whole of what is traversed, and its ``physical_read_set`` the only
+            set of columns the node is allowed to name.
         contract: the group's materialization contract. Rule 1's cutoff is derived from ITS cadence
             — the window's zone is the expression's own and is a different field.
         feature_column: the published column this expression contributes to. Names the node.
         source_dataset: the catalog name of the governed source table. A NAME; the location behind
             it is catalog configuration, which is the only place a location may be written.
         projection_dataset: the catalog name this node writes.
+        joined_datasets: the catalog name of each table the traversal reaches, keyed by the resolved
+            physical ``"<schema>.<table>"`` — the same key ``ProjectDatasets.raw`` uses, so a caller
+            passes the entries it already has rather than re-deriving a name. Exactly the tables the
+            hops arrive at, no more: an entry for a table this expression does not join would wire a
+            node to a source it never reads, which Task 12's check reports as a source read by
+            nobody one layer further out.
 
     Returns:
         A :class:`~featuregen.materialize.render.project.RenderedNode` whose wiring Task 12 checks.
 
     Raises:
         TypeError: an argument is not the type it must be.
-        ValueError: the expression cannot be projected as one relation — its read set spans tables,
-            its clock or its availability column is outside the authorized read set, its window
-            names a basis, unit or inclusivity outside the closed vocabulary, or its declared lag
-            and its declared basis contradict each other.
+        ValueError: the expression cannot be projected — its read set names a relation the traversal
+            never reaches, a hop is oriented against the direction of travel, fans out, carries a
+            ``display_only`` authority or an unverified ``approved_join`` fact, a dataset is missing
+            for a joined table, its clock or its availability column is outside the authorized read
+            set, its window names a basis, unit or inclusivity outside the closed vocabulary, or its
+            declared lag and its declared basis contradict each other.
     """
     if not isinstance(expression, ExpressionExecutionIR):
         raise TypeError(
@@ -869,77 +916,360 @@ def render_projection_node(
     _dataset(projection_dataset, "the projection's output dataset")
 
     pit = expression.pit
-    read_set = _read_set_columns(expression)
-    clock = _read_column(pit.event_time_ref, read_set, "the window's event_time_ref")
-    available = _read_column(pit.availability_ref, read_set, "the expression's availability_ref")
+    plan = _projection_plan(expression)
+    wired = _hop_datasets(plan, joined_datasets)
+    clock = _read_column(pit.event_time_ref, plan.source_columns, "the window's event_time_ref")
+    available = _read_column(pit.availability_ref, plan.source_columns,
+                             "the expression's availability_ref")
 
     source = "\n".join([
-        f"def {projection_func_name(feature_column, expression.expr_path)}"
-        f"(source: DataFrame, business_dt: str) -> DataFrame:",
-        *_projection_docstring(expression, feature_column),
+        *_projection_signature(projection_func_name(feature_column, expression.expr_path), plan),
+        *_projection_docstring(expression, feature_column, plan),
         "    business_date = str(business_dt)",
         "",
-        *_read_set_lines(read_set),
+        *_read_set_lines(plan.source_columns),
         "",
         *_cutoff_lines(contract.pit_semantics.cutoff_time, contract.pit_semantics.cutoff_timezone),
         "",
         *_availability_gate(pit, available),
         "",
         *_window_boundaries(pit, clock, contract.pit_semantics.cutoff_timezone),
+        *_traversal_lines(plan),
         "    return rows",
     ]) + "\n"
     return RenderedNode(
         name=projection_node_name(feature_column, expression.expr_path),
         func_name=projection_func_name(feature_column, expression.expr_path),
         source=source,
-        inputs=(source_dataset, _BUSINESS_DT_PARAMETER),
+        inputs=(source_dataset, *wired, _BUSINESS_DT_PARAMETER),
         outputs=(projection_dataset,),
         imports=(_DATAFRAME_IMPORT, _FUNCTIONS_IMPORT),
         tags=("intermediate", "projection"),
     )
 
 
-# ── what the expression must be for one relation to be projectable ───────────────────────────────
+def _hop_datasets(plan: _Traversal, joined_datasets: Mapping[str, str] | None) -> tuple[str, ...]:
+    """One catalog dataset name per hop, in traversal order — checked to be exactly the hops'.
+
+    Kedro binds a node's inputs POSITIONALLY against its signature, so the order here IS the
+    meaning: a dataset supplied against the wrong hop reads the wrong table through a name that
+    parses perfectly. The mapping is keyed by physical table rather than ordered by the caller for
+    the same reason ``projection_datasets`` is keyed by body path — a positional list of two
+    dimensions differ only by position, and swapping them still joins.
+    """
+    supplied = dict(joined_datasets or {})
+    if not isinstance(joined_datasets, Mapping) and joined_datasets is not None:
+        raise TypeError(
+            f"joined_datasets must be a mapping from '<schema>.<table>' to a catalog dataset name, "
+            f"got {type(joined_datasets).__name__}: a sequence would be matched to the hops by "
+            f"position, and two dimension tables differ only by position")
+    needed = [f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}" for hop in plan.hops]
+    missing = [table for table in needed if table not in supplied]
+    extra = sorted(set(supplied) - set(needed))
+    if missing or extra:
+        raise ValueError(
+            f"the traversal reaches {needed} and joined_datasets declares {sorted(supplied)} "
+            f"(missing {missing}, unexpected {extra}): a hop with no dataset has no table to read, "
+            f"and a dataset for a table nothing joins is a governed source this node would claim "
+            f"and never read")
+    return tuple(_dataset(supplied[table], f"the {table} hop dataset") for table in needed)
 
 
-def _read_set_columns(expression: ExpressionExecutionIR) -> tuple[str, ...]:
-    """The authorized COLUMN names of the one relation this projection reads, sorted.
+def _projection_signature(func_name: str, plan: _Traversal) -> list[str]:
+    """``def project_x(…)`` — one parameter per line once the traversal brings more than the source.
+
+    Kedro binds the node's inputs positionally against this signature, so a reviewer of a
+    multi-input node must be able to count the parameters against the wiring. The zero-hop form is
+    unchanged: one source needs no such care.
+    """
+    if not plan.hops:
+        return [f"def {func_name}(source: DataFrame, business_dt: str) -> DataFrame:"]
+    parameters = ["source: DataFrame", *(f"{hop.parameter}: DataFrame" for hop in plan.hops),
+                  "business_dt: str"]
+    return [
+        f"def {func_name}(",
+        *(f"        {parameter}," for parameter in parameters[:-1]),
+        f"        {parameters[-1]}) -> DataFrame:",
+    ]
+
+
+# ── the governed traversal, and what the expression must be for it to be renderable ──────────────
+
+
+@dataclass(frozen=True, slots=True)
+class _Hop:
+    """One governed hop, resolved into the names the rendered source will use.
+
+    ``left_name`` is the column ALREADY in ``rows`` that this hop joins FROM — the source
+    relation's own spelling on the first hop, and an earlier hop's prefixed spelling after that.
+    It is what makes the direction of travel real in the rendered code: a hop whose ``from`` side
+    is not yet in the frame cannot be rendered at all, so a plan replayed in the wrong order
+    refuses here instead of joining backwards and producing rows for the wrong entities.
+    """
+
+    index: int
+    schema: str
+    table: str
+    left_name: str
+    from_table: str
+    from_column: str
+    to_column: str
+    columns: tuple[str, ...]
+    cardinality: str
+    fact_key: str | None
+    status: str | None
+
+    @property
+    def prefix(self) -> str:
+        """What every column this hop introduces is named under, for the rest of the body.
+
+        Double-underscored and hop-numbered so it can collide with nothing: two tables on one path
+        legitimately carry a column of the same name (an account's ``cif_id`` and a customer's
+        ``cif_id`` are the two ends of the same hop), and Spark answers an ambiguous reference with
+        an error at best and the wrong column at worst.
+        """
+        return f"__join_{self.index}__"
+
+    @property
+    def key(self) -> str:
+        """The single name both sides of the join carry for the duration of this hop."""
+        return f"{self.prefix}key"
+
+    @property
+    def frame(self) -> str:
+        return f"hop_{self.index}"
+
+    @property
+    def parameter(self) -> str:
+        return f"join_{self.index}_{slug(self.table)}"
+
+
+@dataclass(frozen=True, slots=True)
+class _Traversal:
+    """What one expression's projection reads, joins and hands on.
+
+    ``columns`` is the projection's OUTPUT — the source relation's authorized columns plus the
+    grain keys the traversal reaches. It is deliberately NOT the whole read set: the join keys on
+    the tables travelled through are READ (they are what the hops join on) and are not emitted,
+    because two tables on one path routinely spell one entity's key the same way and an output
+    carrying both would be ambiguous by construction.
+    """
+
+    columns: tuple[str, ...]
+    source_columns: tuple[str, ...]
+    hops: tuple[_Hop, ...]
+    reached: tuple[tuple[str, str], ...]
+
+
+def _physical(ref: Any) -> tuple[str, str]:
+    return (ref.schema.strip().lower(), ref.table.strip().lower())
+
+
+def _projection_columns(expression: ExpressionExecutionIR) -> tuple[str, ...]:
+    """The columns the projection HANDS ON, sorted — what the calculation may name.
 
     Sorted rather than left in read-set order so the rendered bytes cannot move with a change to
     how the compiler happened to walk the expression — ``generated_project_hash`` must identify
     what was built.
-
-    A read set spanning two tables is refused rather than rendered. Reaching the second table needs
-    the join plan, and this renderer emits no join: rendering one relation and silently dropping
-    the traversal would compute the aggregate over the wrong rows, which is the failure mode that
-    reports nothing.
     """
-    if expression.join_plan.steps:
-        raise ValueError(
-            f"the expression's governed join plan has {len(expression.join_plan.steps)} hop(s) and "
-            f"this renderer projects a single relation: rendering the source table alone would "
-            f"drop the traversal that reaches the grain, and the aggregate would be computed over "
-            f"rows that never belonged to the entity — with nothing to report it")
-    tables = {(ref.schema.strip().lower(), ref.table.strip().lower())
-              for ref in expression.physical_read_set}
-    if len(tables) != 1:
-        raise ValueError(
-            f"the expression's read set spans {sorted(tables)}: a projection reads ONE governed "
-            f"relation, and a node handed one dataset cannot name columns of another table")
-    columns = sorted({ref.column for ref in expression.physical_read_set if ref.column is not None})
-    if not columns:
-        raise ValueError(
-            "the expression's read set names no column at all, only the relation: a projection "
-            "that selected nothing would hand the calculation an empty row shape, and `*` — the "
-            "only other thing it could select — reads whatever the table happens to hold today")
-    relation = {ref.logical_ref for ref in expression.physical_read_set
-                if RefRole.SOURCE_TABLE in ref.roles}
-    if len(relation) != 1:
+    return _projection_plan(expression).columns
+
+
+def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
+    """The whole shape of one projection: its source columns, its hops, and its output.
+
+    Everything here refuses rather than defaults. A traversal is the one part of this renderer
+    whose defects are silent in every direction — a hop rendered backwards still joins, a hop
+    dropped still produces a frame, an ungoverned edge still has rows — so each check below is a
+    way the rendered node would compute a plausible number over rows that never belonged to the
+    entity.
+    """
+    read = expression.physical_read_set
+    relation = [ref for ref in read if RefRole.SOURCE_TABLE in ref.roles]
+    if len({ref.logical_ref for ref in relation}) != 1:
         raise ValueError(
             f"the expression's read set names {len(relation)} source relation(s): §2.1 records the "
             f"relation itself as a read, and a projection with no relation — or two — is not one "
             f"table's rows")
-    return tuple(columns)
+    source_table = _physical(relation[0])
+
+    authorized: dict[tuple[str, str], set[str]] = {}
+    for ref in read:
+        if ref.column is not None:
+            authorized.setdefault(_physical(ref), set()).add(ref.column)
+    source_columns = tuple(sorted(authorized.get(source_table, ())))
+    if not source_columns:
+        raise ValueError(
+            "the expression's read set names no column at all, only the relation: a projection "
+            "that selected nothing would hand the calculation an empty row shape, and `*` — the "
+            "only other thing it could select — reads whatever the table happens to hold today")
+
+    hops = _hops(expression, relation[0], authorized)
+    reached = {source_table: None} | {(hop.schema, hop.table): None for hop in hops}
+    unreached = sorted(f"{schema}.{table}" for schema, table in authorized
+                       if (schema, table) not in reached)
+    if unreached:
+        raise ValueError(
+            f"the expression's read set spans {sorted(f'{s}.{t}' for s, t in authorized)} and its "
+            f"governed join plan reaches none of {unreached}: a projection reads the relations its "
+            f"traversal arrives at, and a node handed no dataset for a table cannot name its "
+            f"columns")
+
+    carried: dict[str, str] = {}
+    for ref in read:
+        if RefRole.GRAIN_KEY not in ref.roles or ref.column is None:
+            continue
+        if _physical(ref) == source_table:
+            continue
+        rendered = f"{_hop_reaching(hops, _physical(ref)).prefix}{ref.column}"
+        if ref.column in source_columns:
+            raise ValueError(
+                f"the grain key column {ref.column!r} is reached through the traversal and the "
+                f"source relation already carries a column of that name: nothing declares which of "
+                f"the two spellings the feature is grained on, and choosing one here would land "
+                f"every entity's value under a key this compilation picked")
+        if carried.setdefault(ref.column, rendered) != rendered:
+            raise ValueError(
+                f"the grain key column {ref.column!r} is reached on two different tables "
+                f"({carried[ref.column]} and {rendered}): one output column cannot be two entities' "
+                f"keys, and whichever were rendered second would silently replace the first")
+    if hops and not carried:
+        raise ValueError(
+            f"the governed join plan has {len(hops)} hop(s) and no grain key is reached through "
+            f"them: the traversal exists to reach the grain, so one that emits nothing joins the "
+            f"tables and then throws the answer away")
+
+    return _Traversal(
+        columns=tuple(sorted((*source_columns, *carried))),
+        source_columns=source_columns,
+        hops=hops,
+        reached=tuple(sorted(carried.items())))
+
+
+def _hop_reaching(hops: tuple[_Hop, ...], table: tuple[str, str]) -> _Hop:
+    for hop in hops:
+        if (hop.schema, hop.table) == table:
+            return hop
+    raise ValueError(  # pragma: no cover — `unreached` above refuses first
+        f"no hop reaches {table[0]}.{table[1]}")
+
+
+def _hops(expression: ExpressionExecutionIR, relation: Any,
+          authorized: Mapping[tuple[str, str], set[str]]) -> tuple[_Hop, ...]:
+    """The join plan's steps, checked and resolved into the direction of travel.
+
+    ``fans_out`` and ``outcome_kind`` are READ rather than inferred. ``JoinPlan``'s own docstring
+    asks for exactly that: a fanning path is refused by the planner and never returned, and the
+    field is recorded "so a consumer reads an explicit answer instead of inferring one from the
+    absence of a warning". Nothing here repairs a fan-out — no ``dropDuplicates``, no
+    pre-aggregation — because de-duplicating a fanned join is a business allocation decision, and
+    encoding one here would silently pick an allocation rule nobody approved (§3.2).
+    """
+    plan = expression.join_plan
+    if not plan.steps:
+        return ()
+    if plan.outcome_kind != _OPERATIONAL_OUTCOME:
+        raise ValueError(
+            f"the governed join plan's outcome is {plan.outcome_kind!r} and only "
+            f"{_OPERATIONAL_OUTCOME!r} may be computed on: every other outcome is a path governance "
+            f"did not approve, and a hop rendered from one produces rows that look exactly like "
+            f"governed ones")
+    if plan.fans_out:
+        raise ValueError(
+            "the governed join plan reports fans_out=True: a fanning hop multiplies rows and "
+            "inflates every aggregate over them, and this renderer emits no de-duplication for it "
+            "— allocating one row across many is a governed business decision (§3.2), so a plan "
+            "that fans is a defect upstream rather than something to repair here")
+
+    catalog = relation.catalog_source
+    by_ref = {ref.logical_ref: ref for ref in expression.physical_read_set}
+    current: dict[str, str] = {}
+    source_table = _physical(relation)
+    for column in sorted(authorized.get(source_table, ())):
+        current[f"{source_table[0]}.{source_table[1]}.{column}"] = column
+    reached: dict[tuple[str, str], None] = {source_table: None}
+
+    hops: list[_Hop] = []
+    for index, step in enumerate(plan.steps, start=1):
+        _check_authority(step, index)
+        origin = _endpoint(step.from_ref, catalog, by_ref, index, "from")
+        target = _endpoint(step.to_ref, catalog, by_ref, index, "to")
+        if _physical(origin) not in reached:
+            raise ValueError(
+                f"hop {index} travels from {origin.schema}.{origin.table} and the traversal has not "
+                f"reached it: steps are ORIENTED to the direction of travel, so one whose `from` "
+                f"side is not in the frame yet is a plan being replayed in the wrong order — "
+                f"rendered anyway it would join backwards and land rows on the wrong entities")
+        if _physical(target) in reached:
+            raise ValueError(
+                f"hop {index} arrives at {target.schema}.{target.table}, which the traversal has "
+                f"already reached: a path that revisits a table joins it to itself, and every row "
+                f"count downstream is then a property of that join rather than of the data")
+        left = current.get(f"{origin.schema.strip().lower()}."
+                           f"{origin.table.strip().lower()}.{origin.column}")
+        if left is None:
+            raise ValueError(  # pragma: no cover — `reached` above refuses first
+                f"hop {index} joins from {origin.logical_ref}, which is not in the frame")
+        columns = tuple(sorted(authorized.get(_physical(target), ())))
+        if target.column not in columns:
+            raise ValueError(
+                f"hop {index} arrives on {target.logical_ref}, which is not in the authorized read "
+                f"set for {target.schema}.{target.table} ({list(columns)}): §1.3 authorized a SET "
+                f"of columns, and joining on one outside it is a read this group was never granted")
+        hop = _Hop(
+            index=index, schema=target.schema, table=target.table, left_name=left,
+            from_table=f"{origin.schema}.{origin.table}", from_column=origin.column or "",
+            to_column=target.column or "", columns=columns, cardinality=str(step.cardinality),
+            fact_key=step.approved_join_fact_key, status=step.approved_join_status)
+        for column in columns:
+            current[f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}.{column}"] = (
+                f"{hop.prefix}{column}")
+        reached[_physical(target)] = None
+        hops.append(hop)
+    return tuple(hops)
+
+
+def _check_authority(step: Any, index: int) -> None:
+    """A hop's last three fields — why this edge was allowed to be traversed at all."""
+    if step.authority != _OPERATIONAL_AUTHORITY:
+        raise ValueError(
+            f"hop {index} ({step.from_ref} -> {step.to_ref}) carries authority "
+            f"{step.authority!r}: only {_OPERATIONAL_AUTHORITY!r} edges may be computed on, and a "
+            f"{step.authority!r} edge is kept for lineage DISPLAY — computing over one would "
+            f"produce a number nobody governed the path of")
+    if step.approved_join_fact_key is not None and step.approved_join_status != _VERIFIED_STATUS:
+        raise ValueError(
+            f"hop {index} ({step.from_ref} -> {step.to_ref}) is backed by approved_join fact "
+            f"{step.approved_join_fact_key!r} whose status is {step.approved_join_status!r} rather "
+            f"than {_VERIFIED_STATUS!r}: a fact that exists and is not verified is a join somebody "
+            f"proposed, not one anybody approved")
+    if step.cardinality not in _FANS_IN:
+        raise ValueError(
+            f"hop {index} ({step.from_ref} -> {step.to_ref}) declares cardinality "
+            f"{step.cardinality!r} toward its destination, and this renderer joins only "
+            f"{sorted(_FANS_IN)}: an unattested hop may BE 1:N — 'we do not know' is not 'it is "
+            f"safe' — and a hop that fans multiplies rows, which inflates every aggregate over "
+            f"them with nothing raised anywhere")
+
+
+def _endpoint(step_ref: str, catalog: str, by_ref: Mapping[str, Any], index: int,
+              side: str) -> Any:
+    """One hop endpoint as the resolved read-set entry it must be.
+
+    The step's graph-side ``schema.table.column`` is converted with ``expression_ir.join_key_ref``
+    — the SAME conversion the compiler used when it put the endpoint in the read set. A second
+    spelling of that conversion here could name a different node than the one that was authorized,
+    so the endpoint would be checked under one address and read under another.
+    """
+    key = join_key_ref(catalog, step_ref)
+    found = by_ref.get(key)
+    if found is None or found.column is None:
+        raise ValueError(
+            f"hop {index}'s {side} endpoint {step_ref!r} resolves to {key!r}, which the expression's "
+            f"authorized read set does not carry: §1.3 records every join endpoint as its own read, "
+            f"so an endpoint missing from it is a column the group would join on and was never "
+            f"granted")
+    return found
 
 
 def _read_column(ref: str, read_set: tuple[str, ...], what: str) -> str:
@@ -961,7 +1291,8 @@ def _read_column(ref: str, read_set: tuple[str, ...], what: str) -> str:
 # ── the rendered body ────────────────────────────────────────────────────────────────────────────
 
 
-def _projection_docstring(expression: ExpressionExecutionIR, feature_column: str) -> list[str]:
+def _projection_docstring(expression: ExpressionExecutionIR, feature_column: str,
+                          plan: _Traversal) -> list[str]:
     pit = expression.pit
     summary = (
         f"Which rows {_safe_text(feature_column, 'the feature column')} / "
@@ -969,33 +1300,108 @@ def _projection_docstring(expression: ExpressionExecutionIR, feature_column: str
         f"here. A row survives only if it had ARRIVED by the cutoff (rule 1) and its event time "
         f"falls inside the declared {pit.window_length}-{_safe_text(pit.window_unit, 'the unit')} "
         f"{_safe_text(pit.window_basis, 'the basis')} window (rule 2).")
+    traversal: list[str] = []
+    if plan.hops:
+        route = " -> ".join([
+            _safe_text(plan.hops[0].from_table, "the source relation"),
+            *(_safe_text(f"{hop.schema}.{hop.table}", "a joined table") for hop in plan.hops)])
+        traversal = ["", *(f"    {part}" for part in _wrap(
+            f"Each surviving row then reaches the entity it belongs to over the governed path "
+            f"{route} ({len(plan.hops)} hop(s), §3.1). Every hop fans IN, so the traversal ANNOTATES "
+            f"rows and never multiplies them.", 92))]
     return [
         f'    """Point-in-time rows for {_safe_text(feature_column, "the feature column")} (§8).',
         "",
         *(f"    {part}" for part in _wrap(summary, 92)),
+        *traversal,
         '    """',
     ]
 
 
-def _read_set_lines(read_set: tuple[str, ...]) -> list[str]:
-    """The select. Named column by column, and never ``*``."""
-    named = [f"F.col({column!r})" for column in read_set]
-    lines = [
-        *_comment(
-            "§1.3's authorized read set, named column by column. NEVER a star: a star reads "
-            "whatever the table happens to hold today, including a column added AFTER the "
-            "authorization — so the group would read more than it was granted, and nothing at all "
-            "would say so."),
-        "    rows = source.select(",
-    ]
+def _select_lines(opening: str, parts: Sequence[str]) -> list[str]:
+    """A rendered ``select(...)`` call, wrapped at the width this module states."""
+    lines = [opening]
     line = "       "
-    for index, part in enumerate(named):
-        piece = part + ("," if index < len(named) - 1 else ")")
+    for index, part in enumerate(parts):
+        piece = part + ("," if index < len(parts) - 1 else ")")
         if len(line) + 1 + len(piece) > 98:
             lines.append(line)
             line = "       "
         line = f"{line} {piece}"
     lines.append(line)
+    return lines
+
+
+def _read_set_lines(read_set: tuple[str, ...]) -> list[str]:
+    """The select. Named column by column, and never ``*``."""
+    return [
+        *_comment(
+            "§1.3's authorized read set, named column by column. NEVER a star: a star reads "
+            "whatever the table happens to hold today, including a column added AFTER the "
+            "authorization — so the group would read more than it was granted, and nothing at all "
+            "would say so."),
+        *_select_lines("    rows = source.select(", [f"F.col({column!r})" for column in read_set]),
+    ]
+
+
+def _traversal_lines(plan: _Traversal) -> list[str]:
+    """§3.1–3.2 — the governed traversal, rendered in the direction of travel.
+
+    Three things about the shape below are load-bearing and none of them is stylistic.
+
+    **The join is LEFT, on every hop.** The traversal says which entity a row belongs to; it does
+    not decide which rows exist. An inner join would additionally drop every source row whose
+    dimension row is missing, on a referential-integrity fact nobody governed, and would do it
+    silently. A row that reaches no entity comes out with a null key and §8 rule 3's spine reduction
+    lands it on nobody.
+
+    **The join is on ONE column name, carried by both sides for the duration of the hop.** Spark
+    keeps a single copy of the key only for that form; the column-expression form leaves both
+    copies in the frame, and a later reference to either is ambiguous — which Spark answers with an
+    error at best and the wrong column at worst. Two tables on one path routinely spell one entity's
+    key identically, so this is the normal case rather than the exotic one.
+
+    **Nothing is de-duplicated.** ``JoinPlan.fans_out`` is ``False`` by construction and every hop
+    fans in, so one source row comes out as exactly one row. A ``dropDuplicates`` here would hide a
+    fan-out that got through instead of reporting it, and a hidden fan-out is a SUM that is wrong by
+    a factor nobody can see.
+    """
+    if not plan.hops:
+        return []
+    lines = [
+        "",
+        *_comment(
+            f"§3.1 — the governed traversal to the grain: {len(plan.hops)} hop(s), each one an edge "
+            f"the join planner returned as OPERATIONAL. The gates above ran first, on the source "
+            f"relation's own columns, so the rows joined here are already the ones this feature may "
+            f"see."),
+    ]
+    for hop in plan.hops:
+        backing = (f"approved_join fact {hop.fact_key} ({hop.status})" if hop.fact_key is not None
+                   else "a FILE-DECLARED edge, backed by no approved_join fact")
+        lines.extend(_comment(
+            f"Hop {hop.index}: {hop.from_table}.{hop.from_column} -> {hop.schema}.{hop.table}."
+            f"{hop.to_column}, cardinality {hop.cardinality} toward {hop.table} — authorized by "
+            f"{backing}. LEFT, so a row whose {hop.table} row is missing survives with a null key "
+            f"and lands on no entity, rather than disappearing from the feature's population."))
+        lines.extend(_select_lines(
+            f"    {hop.frame} = {hop.parameter}.select(",
+            [f"F.col({hop.to_column!r}).alias({hop.key!r})",
+             *(f"F.col({column!r}).alias({hop.prefix + column!r})" for column in hop.columns)]))
+        lines.append(f"    rows = rows.withColumn({hop.key!r}, F.col({hop.left_name!r}))")
+        lines.append(f"    rows = rows.join({hop.frame}, [{hop.key!r}], {_HOP_JOIN_HOW!r})"
+                     f".drop({hop.key!r})")
+    lines.append("")
+    lines.extend(_comment(
+        "What the traversal hands on: the source relation's authorized columns, plus the grain "
+        "key(s) it reached, each under the name the feature is grained BY. The hops' own join keys "
+        "stop here — they were read to travel on, and two tables on one path spell one entity's "
+        "key the same way."))
+    lines.extend(_select_lines(
+        "    rows = rows.select(",
+        [f"F.col({column!r})" if column in plan.source_columns
+         else f"F.col({dict(plan.reached)[column]!r}).alias({column!r})"
+         for column in plan.columns]))
     return lines
 
 
@@ -1488,7 +1894,7 @@ def _body_slots(ir: FormulaExecutionIRV1, column: str,
     for path in paths:
         leaf = path.rsplit(".", 1)[-1]
         expression = compiled[path]
-        read_set = _read_set_columns(expression)
+        read_set = _projection_columns(expression)
         slots.append(_Slot(
             expr_path=path,
             expression=expression,
