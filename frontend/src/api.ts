@@ -1792,7 +1792,7 @@ export interface ReadinessRequirement {
 // badge that stood for three unrelated situations. This product uses AI-proposed values whether or
 // not a human has reviewed them, so "blocked" is not a state it has.
 export type Usability =
-  | 'confirmed' | 'ai_proposed' | 'needs_data_check' | 'not_set' | 'unavailable'
+  | 'confirmed' | 'ai_proposed' | 'needs_data_check' | 'not_set' | 'not_suitable' | 'unavailable'
 
 export interface RoleUsability {
   role: string

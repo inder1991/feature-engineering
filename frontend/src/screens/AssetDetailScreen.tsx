@@ -1010,6 +1010,9 @@ const USABILITY_TONE: Record<string, string> = {
   ai_proposed: 'gj-proposed',
   needs_data_check: 'gj-partial',
   not_set: 'gj-none',
+  // A structural refusal is not an alarm and not a to-do — a varchar simply is not a measure.
+  // Quiet, like not_set: there is nothing here for anyone to act on.
+  not_suitable: 'gj-none',
   unavailable: 'gj-none',
 }
 

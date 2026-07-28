@@ -61,6 +61,9 @@ class Usability(StrEnum):
     AI_PROPOSED = "ai_proposed"
     NEEDS_DATA_CHECK = "needs_data_check"
     NOT_SET = "not_set"
+    #: A structural fact rules the role out — a declared varchar can never be a numeric measure.
+    #: Distinct from NOT_SET, which is "nobody has decided": there is nothing here to decide.
+    NOT_SUITABLE = "not_suitable"
     UNAVAILABLE = "unavailable"
 
 
@@ -95,6 +98,12 @@ def _has_proposal(req: ColumnRequirement) -> bool:
     `table_rollup` already split on status; this brings the per-role view onto the same footing.
     """
     return req.status == "proposed"
+
+
+#: A requirement the engine settled STRUCTURALLY against the role — nothing to decide, no check to
+#: run. Marked by `column_readiness` with this authority so the product view can tell "ruled out"
+#: from "nobody has said yet", which need opposite responses from a user.
+_STRUCTURAL_REFUSAL = "declared"
 
 
 def _outstanding(cap: ColumnCapability) -> tuple[ColumnRequirement, ...]:
@@ -147,6 +156,13 @@ def _describe(cap: ColumnCapability) -> tuple[Usability, str, str, str | None]:
 
     outstanding = _outstanding(cap)
     checks = _data_checks(cap)
+
+    # A structural refusal is not a to-do. Reporting "nobody has decided" for a varchar-as-measure
+    # invites someone to go and decide it, and there is nothing to decide.
+    refused = [r for r in outstanding if r.authority == _STRUCTURAL_REFUSAL]
+    if refused:
+        return (Usability.NOT_SUITABLE, "Not suitable",
+                "; ".join(r.reason for r in refused), None)
     check_text = ("Needs a data check first: "
                   + "; ".join(_check_phrase(c) for c in checks) + ".") if checks else ""
 

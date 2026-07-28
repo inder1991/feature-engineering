@@ -267,7 +267,17 @@ def _is_numeric(data_type: str | None) -> bool:
     return base in _NUMERIC_TYPES
 
 
-def _type_requirement(conn: DbConn, logical_ref: str) -> ColumnRequirement:
+def _declared_type(conn: DbConn, source: str, object_ref_flat: str) -> str:
+    """The glossary-DECLARED SQL type from the graph node, or "" when the source omitted it."""
+    row = conn.execute(
+        "SELECT declared_type FROM graph_node "
+        "WHERE catalog_source = %s AND lower(object_ref) = lower(%s)",
+        (source, object_ref_flat)).fetchone()
+    return (row[0] or "") if row else ""
+
+
+def _type_requirement(conn: DbConn, logical_ref: str,
+                      declared_type: str = "") -> ColumnRequirement:
     """The ``as_measure`` operational-type requirement. The value axis of ``logical_representation``
     IS the operational ``data_type``. A KNOWN numeric type satisfies it (governed -> ``confirmed``,
     a non-governed numeric hint -> ``proposed``; either way numeric, so it never blocks). An UNKNOWN
@@ -286,6 +296,25 @@ def _type_requirement(conn: DbConn, logical_ref: str) -> ColumnRequirement:
         return _mk_c1_requirement("operational_type", status, True, reason, ov)
     base = (ov.value or "").strip().lower()
     if base in ("", UNKNOWN_TYPE):
+        # A glossary upload leaves the OPERATIONAL type unknown by design (a business glossary is
+        # not the physical-type authority), so reading only that made every glossary column claim a
+        # numeric check was pending — 237 of them here, including `cust_num varchar(150)`. We do not
+        # need to profile the data to learn that a varchar customer number is not a measure: the
+        # file said so.
+        #
+        # NARROW, like the additivity guard. A declared type is a HINT, so it may settle a PROVABLE
+        # contradiction (declared text cannot be numeric) and may NEVER manufacture a pass — a
+        # declared `numeric` still leaves the check outstanding, because a spreadsheet saying
+        # "numeric" is not a measurement of the data.
+        declared = (declared_type or "").strip().lower()
+        if declared and not _is_numeric(declared):
+            return ColumnRequirement(
+                requirement_id="operational_type", status="missing", blocking=True,
+                authority="declared", c1_status=ov.status, evidence_ids=(),
+                fact_event_id=None, decision_event_id=None, external_preview=False,
+                reason=f"declared type {declared.split('(')[0]} is not numeric — this column "
+                       f"cannot serve as a measure",
+            )
         return _preview_requirement(
             _PREVIEW_TYPE_IS_NUMERIC,
             "operational type not established; a numeric-type check is required before this column "
@@ -432,11 +461,12 @@ def column_readiness(
     object_ref_flat = ".".join(["public", table, *([column] if column else [])])
 
     identity = _identity_requirement(conn, norm_source, object_ref_flat)
+    declared_type = _declared_type(conn, norm_source, object_ref_flat)
 
     as_measure = _capability("as_measure", (
         identity,
         _c1_requirement(conn, logical_ref, "concept", "semantic_role", gate="advisory"),
-        _type_requirement(conn, logical_ref),
+        _type_requirement(conn, logical_ref, declared_type),
         _c1_requirement(conn, logical_ref, "additivity", "additivity", gate="advisory"),
         _currency_requirement(conn, logical_ref),
         _c1_requirement(conn, logical_ref, "sensitivity", "safety", gate="advisory"),
