@@ -573,15 +573,32 @@ def test_execution_hash_DOES_change_with_business_dt() -> None:
     assert first.sandbox_execution_hash != second.sandbox_execution_hash
 
 
-def test_the_execution_hash_moves_with_the_DATE_even_when_the_snapshots_do_not() -> None:
-    """The sharp half. Over a verified-unpartitioned input the two runs resolve byte-identical
-    snapshots, so a hash that only saw the date THROUGH the partitions would not move — and two
-    runs over two dates would share one execution identity that §9's manifests bind against."""
+def test_the_execution_hash_moves_with_the_DATE_and_NOTHING_ELSE_CHANGING() -> None:
+    """The sharp half, and the one that caught a hole: EVERYTHING else is held equal.
+
+    A prepared run over two dates differs in several covered values at once — the parameters, the
+    snapshot ids, the partitions — so it cannot show that the date itself is inside the identity.
+    Removing `business_dt` from the hashed payload passes that test and fails this one. Two runs
+    that shared an execution identity would be indistinguishable to §9's staging manifests, which
+    bind an output to a generation, a run AND a date.
+    """
+    rendered = _rendered()
+    held = dict(environment_id="hdfc-local", parameters={"generation_id": "gen-0001"},
+                input_snapshot_ids=("snap-0001",), capability_attestation_id="att-0001")
+    assert identity.sandbox_execution_hash(rendered, business_dt=BUSINESS_DT, **held) != \
+        identity.sandbox_execution_hash(rendered, business_dt=NEXT_DT, **held)
+
+
+def test_an_UNPARTITIONED_read_is_still_two_runs_on_two_dates() -> None:
+    """§3.4 records an unpartitioned mutable table honestly: the snapshot is NOT content-addressed,
+    so the same `None` partition set on two dates is two different reads of two different tables'
+    worth of rows. The business date is therefore part of the snapshot's own id, and a run over it
+    is a distinct execution."""
     layout = _layout(VerifiedUnpartitioned(), partition_columns=None)
     first = _ok(_prepared(layout=layout))
     second = _ok(_prepared(layout=layout, business_dt=NEXT_DT))
-    assert first.snapshots[0].partition_specs is None
-    assert [s.snapshot_id() for s in first.snapshots] != [s.snapshot_id() for s in second.snapshots]
+    assert first.snapshots[0].partition_specs is second.snapshots[0].partition_specs is None
+    assert first.snapshots[0].snapshot_id() != second.snapshots[0].snapshot_id()
     assert first.sandbox_execution_hash != second.sandbox_execution_hash
 
 
