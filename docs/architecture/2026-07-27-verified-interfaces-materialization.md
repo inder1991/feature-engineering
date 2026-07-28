@@ -1182,3 +1182,68 @@ the module's AST for code string literals (docstrings excluded) and asserts none
 
 **There is no `production_execution_hash` and no bare `execution_hash`**, and `__all__` is pinned
 with `==` in the tests so neither can be added quietly.
+
+---
+
+## 30. What Task 12 established — the renderer, and the Kedro surface it renders against
+
+### 30.1 ⚠️ `ClusterInventoryV1.engine_versions` did not exist
+
+The plan's Task-12 sketch says *"pinned dependency versions come from `ClusterInventoryV1.engine_versions`"*, and there was no such field: **Task 0 is unstarted**, and `inventory.py`'s own docstring records that Task 0 still owes `EngineVersions`, `load_inventory` and `MetastoreInventoryAdapter`. Task 12 added the type and the required field to `inventory.py` — extending the module Task 0 owns rather than restating it, as that docstring asks — and left the loader and the adapter to Task 0.
+
+```python
+@dataclass(frozen=True, slots=True)
+class EngineVersions:      # every field required and non-blank
+    hive: str; spark: str; metastore: str; python: str; java: str
+    pyspark: str; kedro: str; kedro_datasets: str
+
+ClusterInventoryV1(environment_id, tables, logical_schema_map, engine_versions, captured_at)
+```
+
+**`kedro_datasets` is not in the plan's field list, and it must be.** Kedro moved its dataset implementations into a separately versioned distribution: `spark.SparkHiveDataset` and `spark.SparkDataset` resolve out of **`kedro-datasets`**, not out of `kedro`. A lock naming only `kedro` leaves the class that reads every governed source table unpinned.
+
+Adding the field changes **no hash**: only `TableLayout.semantic_payload()` is hashed (per table), and `ClusterInventoryV1` itself never enters an identity payload.
+
+### 30.2 The Kedro API surface, VERIFIED (kedro 1.5.0 · kedro-datasets 9.5.0)
+
+Neither package is a repository dependency and neither is importable from `.venv`, so THE RULE could not be satisfied from the repo. Both were installed into a scratch virtualenv and inspected. What the renderer emits is written against this surface, chosen for being stable across 0.19.x and 1.x:
+
+| Emitted | Verified |
+|---|---|
+| `from kedro.pipeline import Pipeline, node` | `node(func, inputs, outputs, *, name=None, tags=None, …)`; `Pipeline(nodes, *, inputs=…, outputs=…, …)` |
+| `settings.HOOKS = (…)` · `CONFIG_LOADER_ARGS` | the project template's own `settings.py` |
+| `default_run_env: "base"` | `OmegaConfigLoader` skips the run env when it equals `base_env`, so a project shipping only `conf/base` needs no `conf/local` |
+| `config_patterns={"spark": [...]}` then `context.config_loader["spark"]` | `OmegaConfigLoader.__init__(config_patterns=…)` |
+| `${runtime_params:staging_root}` in `catalog.yml` | `OmegaConfigLoader._register_runtime_params_resolver` (allowed in catalog/parameters, **banned in globals**) |
+| `@hook_impl def after_context_created(self, context)` | `kedro.framework.hooks.specs.KedroContextSpecs` |
+| `@hook_impl def before_pipeline_run(self, run_params, pipeline, catalog)` | `PipelineSpecs`; the prepared `--params` arrive as **`run_params["runtime_params"]`** |
+| `conf/base/logging.yml` | selected by `KEDRO_LOGGING_CONFIG`; Kedro's own default is `conf/logging.yml`, which is why §7's location needs the env var |
+| `spark.SparkHiveDataset` | `__init__(*, database, table, write_mode="errorifexists", table_pk=None, save_args=None, metadata=None)`; write modes are `append/error/errorifexists/upsert/overwrite` |
+| `spark.SparkDataset` | `__init__(*, filepath, file_format="parquet", load_args=None, save_args=None, version=None, credentials=None, metadata=None)` |
+| `json.JSONDataset` | `kedro_datasets/json/json_dataset.py` |
+| `metadata: {kedro-viz: {layer: …}}` | `metadata` is documented as *"ignored by Kedro"* — safe to carry §7's layer |
+
+**Beyond `ast.parse`, and short of L0.** The rendered project was written to disk, `pyspark` was stubbed, and `configure_project("sandbox_feature_cif_daily")` + `register_pipelines()` were run under the real Kedro: a real `Pipeline` object with **10 nodes**, free inputs exactly `{raw_banking__customers, raw_banking__transactions}`, and one terminal output `feature_cif_daily`. `OmegaConfigLoader` then loaded all 15 catalog entries with `${runtime_params:staging_root}` interpolated. This is **not** L0 (§11.2) — L0 installs into an isolated environment and is Task 15's — but it is evidence a parse test cannot give.
+
+### 30.3 `RENDERER_VERSION` — owned, and unpassable
+
+A.13 recorded that nothing owned the compiler/renderer versions §7 puts in the execution hash. The renderer half is closed:
+
+- the constant lives in **`featuregen/materialize/render/__init__.py`**, not in `project.py`;
+- **`sandbox_execution_hash` no longer takes `renderer_version`.** It reads `render.RENDERER_VERSION` *through the module*, the same shape `derive_namespace` uses for `binding.SANDBOX_NAMESPACE`, so the drift test moves the constant and watches the hash move.
+
+The placement is forced by the import graph: `render.project` imports `identity` (for `seal_project`), so `identity` cannot import `render.project` back — but it can import the package `__init__`, **provided that file imports nothing**. A test asserts exactly that, because an `from .project import …` added there closes the loop and surfaces as an `ImportError` in whichever module is imported first.
+
+`compiler_version` is still a required parameter: §2's chain has no orchestrating module, and A.13's argument against `identity` inventing one is unchanged.
+
+### 30.4 The renderer's shape
+
+`render_project(authorized, plan, *, environment_id, engine_versions, spine_input, nodes) -> SealedProject`
+
+- takes **Gate 2's `AuthorizedCompilation`** (§1.3: no contract, group plan *or project* from an unauthorized group) and derives the compilation identity rather than accepting one;
+- takes the **spine's resolved `PhysicalInputRequirement`**, because `SpineSpec` carries only the schema-flattened logical ref and §3.5 resolution needs a connection the renderer must not have. It refuses a requirement naming another table;
+- takes **`RenderedNode`** values — source, declared imports, explicit `inputs`/`outputs` — from Tasks 13/14. The catalog is the only place a storage location may be written, so the module that writes the catalog decides the dataset names, and `project_datasets(...)` is the public function Tasks 13/14 wire against;
+- `_check_wiring` refuses six things Kedro would otherwise discover on the cluster: an undeclared output (becomes an in-memory dataset — run succeeds, output gone), a write to a `raw` governed source, two writers of one dataset, a declared dataset nobody writes, a governed source nobody reads, and a pipeline that publishes nothing;
+- `materialize_to(project, root)` refuses a non-empty directory: a file left from an earlier render is part of the project on disk and not part of the project the lock was computed over.
+
+**`feature_staging_assembled`** was added to §7's layers because §9's gates run *after* assembly and *before* publication and the assembled group needs a declared home. The published entry's `write_mode` is **`errorifexists`** — fail-closed, since §10 bans `INSERT OVERWRITE` and §10.3 forbids selecting any mechanism before the probe proves one. Task 16 replaces that entry.
