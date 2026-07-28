@@ -679,6 +679,15 @@ def test_the_stand_in_REFUSES_what_it_does_not_model():
     with pytest.raises(AttributeError):
         F.col("v").otherwise(0)                       # `otherwise` without a `when`
 
+    # Task 13d's additions.
+    with pytest.raises(NotImplementedError, match="divided by zero"):
+        # Non-ANSI Spark answers this with a NULL. Modelling that would make the rendered
+        # zero_denominator guard invisible: a renderer that never applied the policy at all would
+        # produce the very same NULL, and the test written for the policy would agree with it.
+        one.withColumn("q", F.col("v") / F.lit(0))
+    with pytest.raises(NotImplementedError, match="subtraction"):
+        one.withColumn("d", F.col("k") - F.lit(1))    # arithmetic over a non-numeric
+
 
 # ── the stand-in's Task 13c surface: aggregation, joining, rounding, overflow ─────────────────────
 
@@ -744,6 +753,45 @@ def test_the_stand_ins_decimal_cast_OVERFLOWS_to_NULL_exactly_as_spark_does():
     assert fitted[0]["d"] == decimal.Decimal("99.99")   # quantized, not lost
     assert fitted[1]["d"] is None                       # 1000.00 needs 6 digits, p=5 — NULL
     assert fitted[2]["d"] is None                       # NULL in, NULL out
+
+
+# ── the stand-in's Task 13d surface: the two final operations ─────────────────────────────────────
+
+
+def test_the_stand_ins_division_PROPAGATES_nulls_and_REFUSES_a_zero_divisor():
+    """A ratio's two failure modes, told apart.
+
+    A NULL on either side is a NULL — that is how an absent operand (an empty window under a `null`
+    policy) reaches the feature column without anything inventing a number for it. A ZERO divisor
+    raises instead, and deliberately does not model non-ANSI Spark's silent NULL: §8 rule 4 assigns
+    a zero denominator to the formula's own `zero_denominator` policy, and a stand-in that answered
+    it with a NULL would produce exactly what a renderer that never applied the policy produces.
+    """
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([
+        {"n": decimal.Decimal("30"), "d": decimal.Decimal("100")},
+        {"n": None, "d": decimal.Decimal("100")},
+        {"n": decimal.Decimal("30"), "d": None},
+    ])
+    quotients = [row["q"] for row in frame.withColumn("q", F.col("n") / F.col("d")).rows]
+    assert quotients == [decimal.Decimal("0.3"), None, None]
+
+    with pytest.raises(NotImplementedError, match="divided by zero"):
+        fake_spark.DataFrame([{"n": 1, "d": decimal.Decimal("0.000000")}]).withColumn(
+            "q", F.col("n") / F.col("d"))
+
+
+def test_the_stand_ins_subtraction_PROPAGATES_nulls_rather_than_treating_one_side_as_zero():
+    """A DIFFERENCE over an empty window. If subtraction coerced a NULL to 0 the declared `null`
+    empty-window policy would silently become `zero`, and `0 - x` is a real, plausible number."""
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([
+        {"a": decimal.Decimal("7"), "b": decimal.Decimal("4")},
+        {"a": None, "b": decimal.Decimal("4")},
+        {"a": decimal.Decimal("7"), "b": None},
+    ])
+    differences = [row["d"] for row in frame.withColumn("d", F.col("a") - F.col("b")).rows]
+    assert differences == [decimal.Decimal("3"), None, None]
 
 
 # ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
