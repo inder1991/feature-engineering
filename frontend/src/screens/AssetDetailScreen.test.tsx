@@ -222,15 +222,17 @@ describe('asset detail — relationships: verified distinct from proposed', () =
 })
 
 describe('asset detail — readiness matrix', () => {
-  it('summarizes the capability matrix from the real statuses (2 / 5 ready)', async () => {
+  it('leads with what the column is USABLE for, naming each role in plain words', async () => {
+    // Was: "2 / 5 ready · 2 blocked" over `as measure` / `no entity assignment`. That framing read
+    // as failure for a catalog behaving exactly as designed, and "blocked" is not a state this
+    // product has — it uses AI-proposed values whether or not a human has reviewed them.
     renderScreen()
     await screen.findByRole('group', { name: /asset sections/i })
     await userEvent.click(screen.getByRole('button', { name: 'Readiness' }))
-    // as_measure + as_join_key ready; as_entity_key + as_grain_key blocked; as_event_time unavailable.
-    expect(await screen.findByText(/2 \/ 5 ready/)).toBeInTheDocument()
-    expect(screen.getByText(/2 blocked/)).toBeInTheDocument()
-    expect(screen.getByText('as measure')).toBeInTheDocument()
-    expect(screen.getByText(/no entity assignment/)).toBeInTheDocument()
+    expect(await screen.findByText(/Usable for 3 of 5 roles/)).toBeInTheDocument()
+    expect(screen.getByText('Measure')).toBeInTheDocument()
+    expect(screen.getByText('AI proposed')).toBeInTheDocument()
+    expect(screen.queryByText(/blocked/i)).toBeNull()
   })
 })
 
@@ -254,7 +256,11 @@ describe('asset detail — correction drawer (OCC + 409)', () => {
     // Exactly one Correct… button (currency); entity + unit are read-only (no server command).
     const correctButtons = await screen.findAllByRole('button', { name: /^correct/i })
     expect(correctButtons).toHaveLength(1)
-    expect(screen.getAllByText(/read-only — the server returned no correction command/i)).toHaveLength(2)
+    // A read-only field now shows NO affordance at all. The old copy — "read-only, the server
+    // returned no correction command for this field" — was implementation talk aimed at the wrong
+    // audience, repeated on every such row. Absence is the clearer statement, and asserting the
+    // absence is a stronger contract than asserting the apology.
+    expect(screen.queryByText(/returned no correction command/i)).toBeNull()
   })
 
   it('echoes the OCC CAS triple + idempotency key + honesty copy in the drawer', async () => {

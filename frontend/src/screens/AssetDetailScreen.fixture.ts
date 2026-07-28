@@ -114,14 +114,35 @@ export function fixture(): api.AssetDetail {
         as_grain_key: { use: 'as_grain_key', operational_status: 'blocked', requirements: [] },
         as_join_key: { use: 'as_join_key', operational_status: 'ready', requirements: [] },
       },
-      table_diagnostic: {
-        scope: 'TABLE', operational_status: 'blocked',
-        blocking_requirements: [{
-          requirement_id: 'table.grain', scope: 'TABLE', status: 'missing', blocking: true,
-          cause: 'no confirmed grain', authority_required: 'platform_admin',
-        }],
-        review_requirements: [], advisory_gaps: ['as_of column not confirmed'],
-        summary_scores: {},
+      // The product view the screen renders: five roles, each usable or not, in plain words.
+      usability: {
+        object_ref: 'public.accounts.balance',
+        roles: [
+          { role: 'as_measure', label: 'Measure', state: 'confirmed', headline: 'Confirmed',
+            detail: 'Confirmed, with nothing outstanding.', action: null,
+            outstanding: [], data_checks: [] },
+          { role: 'as_entity_key', label: 'Entity key', state: 'not_set', headline: 'Not set',
+            detail: 'Nothing — person or AI — has proposed entity.assigned for this column.',
+            action: 'assign', outstanding: ['entity.assigned'], data_checks: [] },
+          { role: 'as_event_time', label: 'Event time', state: 'unavailable',
+            headline: 'Unavailable',
+            detail: 'The governed projection could not be read.', action: null,
+            outstanding: [], data_checks: [] },
+          { role: 'as_grain_key', label: 'Grain key', state: 'ai_proposed',
+            headline: 'AI proposed',
+            detail: 'Proposed by AI and not yet reviewed by a person.', action: 'confirm',
+            outstanding: ['grain'], data_checks: [] },
+          { role: 'as_join_key', label: 'Join key', state: 'confirmed', headline: 'Confirmed',
+            detail: 'Confirmed, with nothing outstanding.', action: null,
+            outstanding: [], data_checks: [] },
+        ],
+        usable_roles: 3, total_roles: 5, headline: 'Usable for 3 of 5 roles',
+      },
+      table_rollup: {
+        table: 'accounts', headline: '1 columns need a decision (waiting on a review decision).',
+        columns_unreviewed: 0, columns_needing_decision: 1, requirements_total: 1,
+        dominant_cause: 'unresolved_authority',
+        dominant_cause_plain: 'waiting on a review decision', columns_outstanding: 1,
       },
     },
     history: {

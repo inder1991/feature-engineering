@@ -5,18 +5,16 @@ import {
   type AssetDetail,
   type AssetHistoryRun,
   type AuditSummary,
-  type ColumnCapabilities,
-  type ColumnCapability,
-  type ColumnRequirement,
   type EffectiveMetadataField,
   type EvidenceProposal,
   type FieldDecisionAction,
+  type RoleUsability,
+  type TableRollup,
   type Relationships,
   type SemanticCandidate,
   type SemanticDivergence,
   type SemanticSubsection,
   type SemanticVerifiedEdge,
-  type TableDiagnostic,
   getAssetDetail,
   postFieldDecision,
 } from '../api'
@@ -479,71 +477,112 @@ function MetadataTab({
         const proposalsByLifecycle = evidence?.proposals_by_field[name]
         const latest = evidence?.latest_decision_by_field[name]
         return (
-          <li className="row q-item adg-field-card" key={name}>
-            <div className="q-head">
-              <span className="mono gj-kind">{humanizeField(name)}</span>
-              <AuthorityBadge field={field} />
-              <span className="gj-score">
-                authority {field.authority} · c1 {field.c1_status}
-              </span>
-            </div>
-            <p className="adg-field-value mono">{fieldValueText(field)}</p>
-            <p className="adg-auth-meta">
-              Attested by <strong>{attestedByLabel(field)}</strong>. This is a fact about
-              who attested the value, not about whether a value is present.
-            </p>
-
-            {!evidenceUnavailable && (
-              <div className="adg-evidence">
-                <p className="micro-label">Evidence</p>
-                {!proposalsByLifecycle || Object.keys(proposalsByLifecycle).length === 0 ? (
-                  <p className="hint">No proposals recorded for this field.</p>
-                ) : (
-                  Object.entries(proposalsByLifecycle).map(([lifecycle, proposals]) => (
-                    <div className="adg-lifecycle" key={lifecycle}>
-                      <span className={`badge ${lifecycleTone(lifecycle)}`}>{lifecycle}</span>
-                      <ul className="adg-proposals">
-                        {proposals.map((p: EvidenceProposal) => (
-                          <li key={p.evidence_id}>
-                            <span className="mono">{p.proposed_value ?? '—'}</span>{' '}
-                            <span className="hint">
-                              {p.producer} · {p.strength}
-                              {p.confidence_band ? ` · ${p.confidence_band}` : ''}
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ))
-                )}
-                {latest && (
-                  <p className="hint">
-                    Latest decision: <strong>{latest.event_type}</strong>
-                    {latest.conflict_status ? ` · ${latest.conflict_status}` : ''}
-                    {latest.load_bearing ? ' · load-bearing' : ''} · {latest.decided_at}
-                  </p>
-                )}
-              </div>
-            )}
-            {evidenceUnavailable && (
-              <p className="adg-unavailable" role="status">
-                Evidence is not available to your roles.
-              </p>
-            )}
-
-            {action ? (
-              <div className="gj-actions">
-                <button type="button" className="btn q-ghost" onClick={() => onEdit(name)}>
-                  Correct…
-                </button>
-              </div>
-            ) : (
-              <p className="hint">Read-only — the server returned no correction command for this field.</p>
-            )}
-          </li>
+          <FieldRow
+            key={name}
+            name={name}
+            field={field}
+            action={action}
+            proposalsByLifecycle={proposalsByLifecycle}
+            latest={latest}
+            evidenceUnavailable={evidenceUnavailable}
+            onEdit={onEdit}
+          />
         )
       })}
     </ul>
+  )
+}
+
+// ONE LINE per field: the value, who said it, and an action if the server offered one. Everything
+// else — evidence lifecycle, decision history, ids, timestamps — moves behind "Detail".
+//
+// What this replaces spent ten lines and four coloured bars per field to say "concept is
+// boolean_flag, the AI proposed it, nobody reviewed it", and repeated that for nine fields. The
+// worst part was the empty buckets: STALE / REJECTED / SUPERSEDED rendered as full-width coloured
+// bars even when EMPTY, so a red REJECTED bar appeared where nothing had been rejected — stating
+// something alarming that was not true.
+function FieldRow({
+  name,
+  field,
+  action,
+  proposalsByLifecycle,
+  latest,
+  evidenceUnavailable,
+  onEdit,
+}: {
+  name: string
+  field: EffectiveMetadataField
+  action: FieldAction | undefined
+  proposalsByLifecycle: Record<string, EvidenceProposal[]> | undefined
+  latest: LatestDecision | undefined
+  evidenceUnavailable: boolean
+  onEdit: (field: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  // Only buckets that actually contain something. An empty bucket is not news.
+  const buckets = Object.entries(proposalsByLifecycle ?? {}).filter(
+    ([, proposals]) => Array.isArray(proposals) && proposals.length > 0,
+  )
+  return (
+    <li className="row q-item adg-field-card" data-testid={`field-row-${name}`} key={name}>
+      <div className="adg-field-line">
+        <span className="mono gj-kind adg-field-label">{humanizeField(name)}</span>
+        <span className="adg-field-value mono">{fieldValueText(field)}</span>
+        {/* Who said it, in words. `authority hint · c1 no_value` is machinery, not an author. */}
+        <AuthorityBadge field={field} />
+        <span className="adg-field-controls">
+          <button type="button" className="btn btn--ghost" onClick={() => setOpen(o => !o)}>
+            {open ? 'Hide detail' : 'Detail'}
+          </button>
+          {/* No action, no affordance — an apology that "the server returned no correction
+              command" is implementation talk aimed at the wrong audience. */}
+          {action && (
+            <button type="button" className="btn q-ghost" onClick={() => onEdit(name)}>
+              Correct…
+            </button>
+          )}
+        </span>
+      </div>
+
+      {open && (
+        <div className="adg-field-detail">
+          {evidenceUnavailable ? (
+            <p className="adg-unavailable" role="status">
+              Evidence is not available to your roles.
+            </p>
+          ) : buckets.length === 0 ? (
+            <p className="hint">No proposals recorded for this field.</p>
+          ) : (
+            buckets.map(([lifecycle, proposals]) => (
+              <div className="adg-lifecycle" key={lifecycle}>
+                <span className={`badge ${lifecycleTone(lifecycle)}`}>{lifecycle}</span>
+                <ul className="adg-proposals">
+                  {proposals.map((p: EvidenceProposal) => (
+                    <li key={p.evidence_id}>
+                      <span className="mono">{p.proposed_value ?? '—'}</span>{' '}
+                      <span className="hint">
+                        {p.producer} · {p.strength}
+                        {p.confidence_band ? ` · ${p.confidence_band}` : ''}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))
+          )}
+          {latest && (
+            <p className="hint">
+              Latest decision: <strong>{latest.event_type}</strong>
+              {latest.conflict_status ? ` · ${latest.conflict_status}` : ''}
+              {latest.load_bearing ? ' · load-bearing' : ''} · {latest.decided_at}
+            </p>
+          )}
+          <p className="hint">
+            authority {field.authority} · c1 {field.c1_status}
+          </p>
+        </div>
+      )}
+    </li>
   )
 }
 
@@ -855,38 +894,6 @@ function NeighborhoodGraph({
 
 // ---- readiness ------------------------------------------------------------------------------
 
-const CAP_LABELS: Record<string, string> = {
-  as_measure: 'as measure',
-  as_entity_key: 'as entity key',
-  as_event_time: 'as event time',
-  as_grain_key: 'as grain key',
-  as_join_key: 'as join key',
-}
-
-function capabilityList(caps: ColumnCapabilities): [string, ColumnCapability][] {
-  return [
-    ['as_measure', caps.as_measure],
-    ['as_entity_key', caps.as_entity_key],
-    ['as_event_time', caps.as_event_time],
-    ['as_grain_key', caps.as_grain_key],
-    ['as_join_key', caps.as_join_key],
-  ]
-}
-
-const CAP_STATUS_TONE: Record<string, string> = {
-  ready: 'gj-verified',
-  blocked: 'gj-rejected',
-  unavailable: 'gj-none',
-}
-
-const REQ_STATUS_TONE: Record<string, string> = {
-  confirmed: 'gj-verified',
-  proposed: 'gj-proposed',
-  conflicting: 'gj-rejected',
-  review: 'gj-partial',
-  missing: 'gj-none',
-}
-
 function ReadinessTab({
   detail,
   isUnavailable,
@@ -900,76 +907,90 @@ function ReadinessTab({
       <p className="adg-unavailable" role="status">Readiness is not available to your roles.</p>
     )
   }
-  const caps = readiness.column_capabilities
-  const capList = caps ? capabilityList(caps) : []
-  const ready = capList.filter(([, c]) => c.operational_status === 'ready').length
-  const blocked = capList.filter(([, c]) => c.operational_status === 'blocked').length
+  const usability = readiness.usability
+  const rollup = readiness.table_rollup
   return (
     <>
-      {capList.length > 0 && (
+      {usability && (
         <>
-          <p className="tabular-nums" role="status">
-            {ready} / {capList.length} ready
-            {blocked > 0 ? ` · ${blocked} blocked` : ''}
-          </p>
+          <p className="tabular-nums adg-usable-head" role="status">{usability.headline}</p>
           <ul className="rows">
-            {capList.map(([use, cap]) => (
-              <li className="row q-item" key={use}>
-                <div className="q-head">
-                  <span className="mono gj-kind">{CAP_LABELS[use] ?? use}</span>
-                  <span className={`badge ${CAP_STATUS_TONE[cap.operational_status] ?? 'gj-none'}`}>
-                    {cap.operational_status}
-                  </span>
-                </div>
-                {cap.requirements.length > 0 && (
-                  <ul className="adg-reqs">
-                    {cap.requirements.map((req: ColumnRequirement) => (
-                      <li key={req.requirement_id}>
-                        <span className={`badge ${REQ_STATUS_TONE[req.status] ?? 'gj-none'}`}>
-                          {req.status}
-                        </span>{' '}
-                        <span className="mono">{req.requirement_id}</span>{' '}
-                        <span className="hint">
-                          {req.blocking ? 'blocking · ' : ''}authority {req.authority} · {req.reason}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </li>
+            {usability.roles.map(r => (
+              <RoleRow key={r.role} role={r} />
             ))}
           </ul>
         </>
       )}
-      <TableDiagnosticView diagnostic={readiness.table_diagnostic} />
+      {rollup && <TableRollupView rollup={rollup} />}
     </>
   )
 }
 
-function TableDiagnosticView({ diagnostic }: { diagnostic: TableDiagnostic }) {
+// Tone by STATE, never by "is something outstanding". `ai_proposed` is a normal, usable state — the
+// most common one in a freshly-ingested catalog — so it must not read as a warning.
+const USABILITY_TONE: Record<string, string> = {
+  confirmed: 'gj-verified',
+  ai_proposed: 'gj-proposed',
+  needs_data_check: 'gj-partial',
+  not_set: 'gj-none',
+  unavailable: 'gj-none',
+}
+
+const ACTION_COPY: Record<string, string> = {
+  confirm: 'Confirm',
+  run_data_check: 'Run data check',
+  assign: 'Assign',
+}
+
+function RoleRow({ role }: { role: RoleUsability }) {
+  const [open, setOpen] = useState(false)
+  const ids = [...role.outstanding, ...role.data_checks]
   return (
-    <section className="adg-section">
-      <h3 className="micro-label">Parent table diagnostic</h3>
-      <p>
-        <span
-          className={`badge ${diagnostic.operational_status === 'ready' ? 'gj-verified' : 'gj-rejected'}`}
-        >
-          {diagnostic.operational_status}
+    <li className="row q-item" data-testid={`role-${role.role}`}>
+      <div className="adg-field-line">
+        <span className="mono gj-kind adg-field-label">{role.label}</span>
+        <span className={`badge ${USABILITY_TONE[role.state] ?? 'gj-none'}`}>{role.headline}</span>
+        <span className="adg-field-controls">
+          {ids.length > 0 && (
+            <button type="button" className="btn btn--ghost" onClick={() => setOpen(o => !o)}>
+              {open ? 'Hide detail' : 'Detail'}
+            </button>
+          )}
+          {role.action && (
+            <button type="button" className="btn q-ghost">
+              {ACTION_COPY[role.action] ?? role.action}
+            </button>
+          )}
         </span>
-      </p>
-      {diagnostic.blocking_requirements.length > 0 && (
+      </div>
+      <p className="hint">{role.detail}</p>
+      {open && ids.length > 0 && (
         <ul className="adg-reqs">
-          {diagnostic.blocking_requirements.map(req => (
-            <li key={req.requirement_id}>
-              <span className="badge gj-rejected">blocking</span>{' '}
-              <span className="mono">{req.requirement_id}</span>{' '}
-              <span className="hint">{req.cause} · needs {req.authority_required}</span>
-            </li>
+          {ids.map(id => (
+            <li key={id}><span className="mono">{id}</span></li>
           ))}
         </ul>
       )}
-      {diagnostic.advisory_gaps.length > 0 && (
-        <p className="hint">Advisory gaps: {diagnostic.advisory_gaps.join(' · ')}</p>
+    </li>
+  )
+}
+
+// The parent table in ONE sentence plus a count. This replaces a list of every blocking requirement
+// on the table — 341 of them on a real CIB table, all sharing one cause — rendered on every column
+// page. The full lists keep their own route (GET /sources/{source}/readiness?subset={table}), so
+// the number stays visible and the rows stay reachable without riding on this page.
+function TableRollupView({ rollup }: { rollup: TableRollup }) {
+  return (
+    <section className="adg-section">
+      <h3 className="micro-label">Parent table · {rollup.table}</h3>
+      <p>{rollup.headline}</p>
+      {rollup.requirements_total > 0 && (
+        <p className="hint">
+          {rollup.requirements_total} individual items across the table.{' '}
+          {rollup.columns_needing_decision > 0
+            ? `${rollup.columns_needing_decision} columns need a decision.`
+            : 'None of them need a decision right now.'}
+        </p>
       )}
     </section>
   )

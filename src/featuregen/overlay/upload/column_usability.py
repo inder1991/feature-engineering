@@ -50,17 +50,25 @@ from featuregen.overlay.upload.readiness import FeatureReadiness
 
 
 class Usability(StrEnum):
-    READY = "ready"
-    USABLE_UNREVIEWED = "usable_unreviewed"
+    """Named for what a banker would say, not for the machinery.
+
+    An earlier draft used `usable_unreviewed`, which is a machine enum wearing a product label:
+    nobody says "unreviewed", and the `usable_` prefix was arguing with the old design rather than
+    naming the thing. Usability needs no word of its own once nothing looks like an error.
+    """
+
+    CONFIRMED = "confirmed"
+    AI_PROPOSED = "ai_proposed"
     NEEDS_DATA_CHECK = "needs_data_check"
-    NO_CANDIDATE = "no_candidate"
+    NOT_SET = "not_set"
     UNAVAILABLE = "unavailable"
 
 
 #: The states in which the tool will actually use the column for that role. `NEEDS_DATA_CHECK`
 #: counts: the metadata is settled and only an external observation is outstanding, so the planner
 #: can propose with the check attached rather than being barred.
-_USABLE = frozenset({Usability.READY, Usability.USABLE_UNREVIEWED, Usability.NEEDS_DATA_CHECK})
+_USABLE = frozenset({Usability.CONFIRMED, Usability.AI_PROPOSED,
+                     Usability.NEEDS_DATA_CHECK})
 
 #: Role -> what a banker calls it. The engine's `as_measure` is an internal name, not a label.
 _ROLE_LABEL: dict[str, str] = {
@@ -144,18 +152,18 @@ def _describe(cap: ColumnCapability) -> tuple[Usability, str, str, str | None]:
 
     if not outstanding:
         if checks:
-            return (Usability.NEEDS_DATA_CHECK, "Usable — needs a data check",
+            return (Usability.NEEDS_DATA_CHECK, "Needs a data check",
                     "The metadata is settled. " + check_text, "run_data_check")
-        return (Usability.READY, "Ready", "Confirmed, with nothing outstanding.", None)
+        return (Usability.CONFIRMED, "Confirmed", "Confirmed, with nothing outstanding.", None)
 
     if all(_has_proposal(r) for r in outstanding):
         detail = ("Proposed by AI and not yet reviewed by a person. The tool will use it as-is; "
                   "confirming it makes it governed.")
-        return (Usability.USABLE_UNREVIEWED, "Usable — AI proposed",
+        return (Usability.AI_PROPOSED, "AI proposed",
                 (detail + " " + check_text).strip(), "confirm")
 
     missing = ", ".join(r.requirement_id for r in outstanding if not _has_proposal(r))
-    return (Usability.NO_CANDIDATE, "No candidate yet",
+    return (Usability.NOT_SET, "Not set",
             f"Nothing — person or AI — has proposed {missing} for this column. "
             f"{check_text}".strip(), "assign")
 

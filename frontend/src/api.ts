@@ -1787,19 +1787,51 @@ export interface ReadinessRequirement {
   authority_required: string
 }
 
-// The parent-table blocker diagnostic (readiness.FeatureReadiness at TABLE scope).
-export interface TableDiagnostic {
-  scope: string
-  operational_status: 'ready' | 'blocked'
-  blocking_requirements: ReadinessRequirement[]
-  review_requirements: ReadinessRequirement[]
-  advisory_gaps: string[]
-  summary_scores: Record<string, number>
+// What a column can be USED for, in the language of someone deciding whether to build a feature
+// from it. `confirmed` / `ai_proposed` / `needs_data_check` / `not_set` replace one red BLOCKED
+// badge that stood for three unrelated situations. This product uses AI-proposed values whether or
+// not a human has reviewed them, so "blocked" is not a state it has.
+export type Usability =
+  | 'confirmed' | 'ai_proposed' | 'needs_data_check' | 'not_set' | 'unavailable'
+
+export interface RoleUsability {
+  role: string
+  label: string
+  state: Usability
+  headline: string
+  detail: string
+  action: string | null
+  // The raw requirement ids behind the verdict — for the disclosure, never the headline.
+  outstanding: string[]
+  data_checks: string[]
+}
+
+export interface ColumnUsability {
+  object_ref: string
+  roles: RoleUsability[]
+  usable_roles: number
+  total_roles: number
+  headline: string
+}
+
+// The parent table as COUNTS plus a sentence — never the rows. Shipping the diagnostic whole meant
+// 341 blocking plus 445 review rows on every column page to say one thing. The full lists keep
+// their own route: GET /sources/{source}/readiness?subset={table}.
+export interface TableRollup {
+  table: string
+  headline: string
+  columns_unreviewed: number
+  columns_needing_decision: number
+  requirements_total: number
+  dominant_cause: string | null
+  dominant_cause_plain: string
+  columns_outstanding: number
 }
 
 export interface ReadinessSection {
   column_capabilities: ColumnCapabilities | null
-  table_diagnostic: TableDiagnostic
+  usability: ColumnUsability | null
+  table_rollup: TableRollup
 }
 
 // ---- history section ----

@@ -70,7 +70,7 @@ def test_an_unreviewed_AI_proposal_is_USABLE_not_blocked():
     caps = _cap("as_event_time", "blocked", (
         _req("event_time", status="missing", blocking=True, authority="hint"),))
     role = _role(column_usability(_readiness(caps)), "as_event_time")
-    assert role.state is Usability.USABLE_UNREVIEWED
+    assert role.state is Usability.AI_PROPOSED
     assert "blocked" not in role.headline.lower()
 
 
@@ -79,7 +79,7 @@ def test_a_producer_strength_authority_also_counts_as_a_proposal():
     proposal, not an absence — it is the single most common authority in a fresh catalog."""
     caps = _cap("as_measure", "blocked", (
         _req("additivity", status="missing", blocking=True, authority="taxonomy/proposed"),))
-    assert _role(column_usability(_readiness(caps)), "as_measure").state is Usability.USABLE_UNREVIEWED
+    assert _role(column_usability(_readiness(caps)), "as_measure").state is Usability.AI_PROPOSED
 
 
 def test_an_external_check_is_UNKNOWN_not_a_failure():
@@ -98,14 +98,14 @@ def test_nothing_proposed_by_anyone_is_NO_CANDIDATE():
     caps = _cap("as_entity_key", "blocked", (
         _req("entity_assignment", status="missing", blocking=True, authority="no_decision"),))
     role = _role(column_usability(_readiness(caps)), "as_entity_key")
-    assert role.state is Usability.NO_CANDIDATE
+    assert role.state is Usability.NOT_SET
     assert role.action is not None
 
 
 def test_a_confirmed_capability_is_READY():
     caps = _cap("as_join_key", "ready", (
         _req("identity", status="confirmed", blocking=False, authority="governed"),))
-    assert _role(column_usability(_readiness(caps)), "as_join_key").state is Usability.READY
+    assert _role(column_usability(_readiness(caps)), "as_join_key").state is Usability.CONFIRMED
 
 
 def test_a_degraded_projection_stays_UNAVAILABLE():
@@ -126,7 +126,7 @@ def test_a_proposal_with_a_pending_data_check_reports_usable_and_says_what_to_ch
         _req("external:TEMPORAL_IS_POPULATED", status="review", blocking=False,
              authority="external_check", external_preview=True),))
     role = _role(column_usability(_readiness(caps)), "as_event_time")
-    assert role.state is Usability.USABLE_UNREVIEWED
+    assert role.state is Usability.AI_PROPOSED
     assert "check" in role.detail.lower()
 
 
