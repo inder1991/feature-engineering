@@ -505,6 +505,14 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
                 meta[key] = val[:_MAX_META_LEN]
         if rec.synonyms:
             meta["synonyms"] = [s[:_MAX_META_LEN] for s in rec.synonyms]
+        # Every column of the uploader's own file this platform has no first-class slot for. These
+        # are the columns that used to be dropped: `attribute_category`, `security_classification`,
+        # the PCI/AML/KYC and `pi_*` governance flags. A mapping file's columns describe COLUMNS —
+        # meaning, not customer rows — and when a source auto-fills its description column by bucket
+        # (12 of CIB's columns share one sentence) they are the only per-column signal that varies.
+        # Bounded + capped at the reader; PII-scanned on egress as list-of-prose like `synonyms`.
+        if rec.source_attributes:
+            meta["source_attributes"] = [a[:_MAX_META_LEN] for a in rec.source_attributes]
     return meta
 
 

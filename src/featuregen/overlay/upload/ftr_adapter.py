@@ -172,6 +172,44 @@ _OPTIONAL = frozenset(_norm_header(h) for h in (
 _CONSEQUENTIAL_OPTIONAL = frozenset({_norm_header("data_type")})
 
 
+#: Headers the reader consumes into a first-class field, so they must NOT also ride as extras —
+#: two copies of one value waste per-item budget and can disagree once one side is transformed.
+_MAPPED_HEADERS = _CORE | _OPTIONAL | frozenset({_norm_header("bian_reference_1"),
+                                                 _norm_header("bian_reference_2")})
+
+#: Breadth is the goal; unboundedness is not. A file with hundreds of columns must not push the real
+#: signal out of a batch, so the passenger list is capped and each entry bounded.
+_MAX_SOURCE_ATTRIBUTES = 40
+_MAX_SOURCE_ATTRIBUTE_LEN = 240
+
+
+def _source_attributes(hmap: Mapping[str, str], raw: Mapping[str, object], redact) -> tuple[str, ...]:
+    """Every column this reader has no slot for, as bounded ``"header: value"`` strings.
+
+    A mapping file's columns describe COLUMNS — meaning, not customer rows — and for a source that
+    auto-fills its description column by bucket they are the only per-column signal that varies. So
+    they are carried rather than dropped. An EMPTY value is skipped (it states nothing and only
+    consumes budget); a falsey one like ``pci_flag: N`` is kept, because "explicitly not PCI" is a
+    real statement and dropping it would turn a stated no into an unknown.
+
+    Values are redacted on the same seam as every other free-text field, and the ORIGINAL header
+    spelling is used so the model reads the uploader's own vocabulary.
+    """
+    out: list[str] = []
+    for norm, original in hmap.items():
+        if norm in _MAPPED_HEADERS or norm is None:
+            continue
+        value = raw.get(original)
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            continue
+        entry = f"{original.strip()}: {redact(text)}"
+        out.append(entry[:_MAX_SOURCE_ATTRIBUTE_LEN])
+        if len(out) >= _MAX_SOURCE_ATTRIBUTES:
+            break
+    return tuple(out)
+
+
 def is_glossary_mapping(headers: list[str]) -> bool:
     """True when this file can be parsed as a glossary mapping — the CORE present, none duplicated.
 
@@ -300,6 +338,7 @@ class _ParsedRow:
     related_terms: tuple[str, ...]
     synonyms: tuple[str, ...]
     bian_path: str
+    source_attributes: tuple[str, ...]
     fibo_path: str
     declared_type: str
 
@@ -418,10 +457,18 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
                                             split_list(_cell(hmap, raw, "relatedterms"))) if t),
             synonyms=tuple(s for s in (_redact(item) for item in
                                        split_list(_cell(hmap, raw, "synonymsaliases"))) if s),
+            # BIAN under EITHER spelling. FTR names them `bian_level_1..4`; CIB names the same
+            # taxonomy `bian_reference_1/2`, so the level lookup read empty and a real BIAN path was
+            # lost. `bian_path` is consumed beyond the classifier (grounding's path-agreement), so
+            # the alias feeds the FIRST-CLASS field rather than riding along as an extra. FTR's own
+            # levels win when present — the alias only fills a gap, never overrides.
             bian_path=_redact(join_path([_cell(hmap, raw, "bianlevel1"),
                                          _cell(hmap, raw, "bianlevel2"),
                                          _cell(hmap, raw, "bianlevel3"),
-                                         _cell(hmap, raw, "bianlevel4")])),
+                                         _cell(hmap, raw, "bianlevel4")])
+                              or join_path([_cell(hmap, raw, "bianreference1"),
+                                            _cell(hmap, raw, "bianreference2")])),
+            source_attributes=_source_attributes(hmap, raw, _redact),
             fibo_path=_redact(_cell(hmap, raw, "fibolevel1")),
             declared_type=_bounded_declared_type(_cell(hmap, raw, "datatype")),
         )
@@ -516,6 +563,7 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             logical_ref=normalize_ref(source, r.schema, r.table, r.column),
             term_name=r.term_name, definition=r.definition, domain=r.domain,
             synonyms=r.synonyms, bian_path=r.bian_path, fibo_path=r.fibo_path,
+            source_attributes=r.source_attributes,
             is_table=r.column is None, source_row=r.source_row, term_type=r.term_type,
             process_path=r.process_path, related_terms=r.related_terms,
             schema=r.schema or "", physical_fqn=r.physical_fqn,

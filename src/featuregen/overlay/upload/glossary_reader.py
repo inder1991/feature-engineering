@@ -72,6 +72,12 @@ class GlossaryRecord:
     synonyms: tuple[str, ...] = ()
     bian_path: str = ""
     fibo_path: str = ""
+    #: Every column of the source file this reader has no first-class slot for, as bounded
+    #: ``"header: value"`` strings. A mapping file's columns DESCRIBE columns (meaning, not customer
+    #: rows), and they are often the only per-column signal that varies when a source auto-fills its
+    #: description column by bucket — so they are carried to the classifier rather than dropped.
+    #: List-of-prose deliberately mirrors ``synonyms`` so they inherit its PII scan and egress caps.
+    source_attributes: tuple[str, ...] = ()
     is_table: bool = False
     # FTR-adapter fields (A1) — ALL defaulted so existing constructors and the generic glossary
     # reader above keep working unchanged; only the FTR adapter populates them.

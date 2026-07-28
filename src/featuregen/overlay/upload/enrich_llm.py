@@ -87,7 +87,9 @@ _REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing 
 _DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition"})
 # [F6] `synonyms` is prose emitted as list[str] (enrich.py) — a LIST of prose values, each
 # PII-scanned per item and audited at an indexed path (`synonyms[0]`).
-_LIST_PROSE_META_KEYS = frozenset({"synonyms"})
+# `source_attributes` joins `synonyms` here deliberately: these are uploader-authored values, so
+# they are never presumable-clean and each entry is PII-scanned at an indexed path.
+_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes"})
 _SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path"})
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
 _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
@@ -968,6 +970,12 @@ _ITEM_META_ALLOWED = frozenset({
     # and are bounded field-by-field below — the phase-2 item carries these INSTEAD of a giant
     # column_profiles list, so a >64-col table's synthesis input still passes the per-item egress cap.
     "chunk_summaries", "column_roster",
+    # Every column of the uploader's file this platform has no first-class slot for, as bounded
+    # "header: value" strings. A mapping file's columns DESCRIBE columns — meaning, not customer
+    # rows — and for a source that auto-fills its description column by bucket they are the only
+    # per-column signal that varies. Carried as list-of-prose so they ride the SAME per-item PII
+    # scan and length cap as `synonyms`, rather than opening an unscanned channel.
+    "source_attributes",
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
@@ -988,6 +996,9 @@ _COLUMN_PROFILE_KEYS = frozenset({
     "term_type", "domain", "process_path",
 })
 _MAX_COLUMN_PROFILES = 64
+#: Breadth is the point of `source_attributes`; unboundedness is not. A file with hundreds of columns
+#: must not push the real signal out of a batch.
+_MAX_SOURCE_ATTRIBUTES = 40
 
 # A STRUCTURED wide-roster entry (Task 4): only the three identity keys, short strings only —
 # structured (never the old `name:type` flat string) because a column name may itself contain
@@ -1115,6 +1126,11 @@ def _item_shape_ok(metadata: dict) -> bool:
             if not isinstance(v, list) or len(v) > _MAX_ROSTER:
                 return False
             if not all(_roster_entry_ok(e) for e in v):
+                return False
+        elif k == "source_attributes":
+            if not isinstance(v, list) or len(v) > _MAX_SOURCE_ATTRIBUTES:
+                return False
+            if not all(isinstance(x, str) for x in v):
                 return False
         elif isinstance(v, list):
             if not all(isinstance(x, str) for x in v):
