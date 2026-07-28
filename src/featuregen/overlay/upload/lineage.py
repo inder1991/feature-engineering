@@ -344,6 +344,64 @@ class _Builder:
                 edge = {"from": f"{source}:{key_ref}", "to": f"{p_source}:{p_ref}",
                         "layer": "entity", "kind": "entity_bridge", "resolved": False}
                 out.append((("table", p_source, p_table), None, edge))
+        out.extend(self._expand_derived_bridges(unit))
+        return out
+
+    def _expand_derived_bridges(self, unit: _Unit) -> list[tuple[_Unit | None, dict | None, dict]]:
+        """The DERIVED cross-catalog links, from the bridge ledger.
+
+        The entity-column path above finds partners by matching ``graph_node.entity``, which is NULL
+        on every column of every real source loaded so far — nothing populates it (the same
+        bootstrap gap that leaves entity_assignment with zero candidates). So that path has never
+        produced an edge here, and clicking Graph on a linked column drew nothing.
+
+        The links are not in doubt; they are in the ledger. Read them. Shown whether or not a human
+        confirmed one — confirmation annotates, it does not gate — with ``resolved`` saying which.
+
+        READ-SCOPE is preserved exactly as the entity path preserves it: the partner column must be
+        visible to THIS caller, or a bridge would become an existence oracle for a column the caller
+        may not see.
+        """
+        from featuregen.overlay.upload.cross_catalog_links import (
+            LinkStatus,
+            cross_catalog_links,
+        )
+
+        _, source, table = unit
+        mine = {
+            r[0] for r in self.conn.execute(
+                "SELECT object_ref FROM graph_node WHERE kind = 'column' "
+                "AND catalog_source = %s AND table_name = %s AND visible_requires <@ %s",
+                (source, table, self.allowed)).fetchall()
+        }
+        if not mine:
+            return []
+        out: list[tuple[_Unit | None, dict | None, dict]] = []
+        seen: set[tuple[str, str]] = set()
+        for link in cross_catalog_links(self.conn):
+            if link.left_catalog_source == source and link.left_object_ref in mine:
+                near_ref, far_src, far_ref = link.left_object_ref, link.right_catalog_source, \
+                    link.right_object_ref
+            elif link.right_catalog_source == source and link.right_object_ref in mine:
+                near_ref, far_src, far_ref = link.right_object_ref, link.left_catalog_source, \
+                    link.left_object_ref
+            else:
+                continue
+            far = self.conn.execute(
+                "SELECT table_name FROM graph_node WHERE kind = 'column' "
+                "AND catalog_source = %s AND object_ref = %s AND visible_requires <@ %s",
+                (far_src, far_ref, self.allowed)).fetchone()
+            if far is None:      # hidden from this caller — absence must equal nonexistence
+                continue
+            if (far_src, far_ref) in seen:
+                continue
+            seen.add((far_src, far_ref))
+            out.append((("table", far_src, far[0]), None, {
+                "from": f"{source}:{near_ref}", "to": f"{far_src}:{far_ref}",
+                "layer": "entity", "kind": "entity_bridge",
+                "resolved": link.status is LinkStatus.CONFIRMED,
+                "entity_id": link.entity_id,
+            }))
         return out
 
     def _expand_derived_features(self, unit: _Unit) -> list[tuple[_Unit | None, dict | None, dict]]:
