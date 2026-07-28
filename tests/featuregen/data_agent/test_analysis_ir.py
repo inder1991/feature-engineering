@@ -30,6 +30,12 @@ from featuregen.data_agent.analysis import (
     compile_analysis,
     run_analysis,
 )
+from featuregen.data_agent.dimensions import (
+    AttributionBasis,
+    AttributionError,
+    DimensionAttributionPolicyV1,
+    MissingValueBehavior,
+)
 from featuregen.data_agent.eligibility import (
     NullBehavior,
     ReversalMode,
@@ -41,6 +47,8 @@ from tests.featuregen.data_agent.pilot_fixture import (
     CURRENT_MONTH,
     CUSTOMER_SCHEMA,
     CUSTOMER_TABLE,
+    DIMENSION_TABLE,
+    REPORT_CUTOFF,
     EXPECTED,
     PREVIOUS_MONTH,
     TRANSACTION_SCHEMA,
@@ -74,6 +82,15 @@ def _policy(**over) -> TransactionEligibilityPolicyV1:
     return TransactionEligibilityPolicyV1(**kw)
 
 
+def _attribution(**over) -> DimensionAttributionPolicyV1:
+    kw = dict(attribution_basis=AttributionBasis.REPORT_CUTOFF,
+              effective_from_column="effective_from", effective_to_column="effective_to",
+              report_cutoff=REPORT_CUTOFF,
+              missing_value_behavior=MissingValueBehavior.UNKNOWN_BUCKET)
+    kw.update(over)
+    return DimensionAttributionPolicyV1(**kw)
+
+
 def _ir(**over) -> AnalysisExecutionIRV1:
     kw = dict(
         question="customers whose transaction count decreased last month, by segment and sector",
@@ -86,6 +103,8 @@ def _ir(**over) -> AnalysisExecutionIRV1:
         comparison=Comparison.DECREASED,
         dimensions=(Dimension(column="segment"), Dimension(column="sector")),
         eligibility=_policy(),
+        dimension_binding=_binding(CUSTOMER_SCHEMA, DIMENSION_TABLE),
+        attribution=_attribution(),
     )
     kw.update(over)
     return AnalysisExecutionIRV1(**kw)
@@ -141,7 +160,7 @@ def test_counts_match_the_hand_computed_fixture(pilot):
 
 def test_the_answer_carries_its_dimensions(pilot):
     by_key = {r.key: r for r in _rows(pilot)}
-    assert by_key["C1"].dimensions == {"segment": "RETAIL", "sector": "TRADING"}
+    assert by_key["C1"].dimensions == {"segment": "SME", "sector": "TRADING"}
     assert by_key["C4"].dimensions == {"segment": "CORPORATE", "sector": "REAL_ESTATE"}
 
 
@@ -151,7 +170,7 @@ def test_grouping_the_decreased_customers_by_segment(pilot):
     for row in _rows(pilot):
         if row.decreased:
             counts[row.dimensions["segment"]] = counts.get(row.dimensions["segment"], 0) + 1
-    assert counts == EXPECTED["decreased_by_segment"] == {"RETAIL": 1, "CORPORATE": 1}
+    assert counts == EXPECTED["decreased_by_segment"] == {"SME": 1, "CORPORATE": 1}
 
 
 # ── the compiled SQL ─────────────────────────────────────────────────────────────────────────────
@@ -296,3 +315,145 @@ def test_a_reversal_shape_we_cannot_model_is_refused(mode):
     from featuregen.data_agent.eligibility import EligibilityError
     with pytest.raises(EligibilityError, match="reversal mode"):
         _policy(reversal_mode=mode)
+
+
+# ── point-in-time dimension attribution ──────────────────────────────────────────────────────────
+# Joining TODAY's segment to LAST MONTH's transactions silently reattributes activity whenever a
+# customer changes segment, and the answer looks entirely reasonable. Same class as counting
+# reversals: it changes the number, not the presentation.
+#
+# The rule implemented here: classify each customer using the row valid at the REPORT CUTOFF, and
+# use that single classification for their whole period-over-period result.
+
+def _segments(conn):
+    return {r.key: r.dimensions["segment"] for r in _rows(conn)}
+
+
+def test_a_change_BEFORE_the_cutoff_uses_the_new_segment(pilot):
+    """C1 moved RETAIL -> SME on 2026-06-15, before the 06-30 cutoff."""
+    assert _segments(pilot)["C1"] == "SME"
+
+
+def test_a_change_AFTER_the_cutoff_retains_the_earlier_segment(pilot):
+    """C2 becomes SME on 2026-07-15. A June report must not know that yet."""
+    assert _segments(pilot)["C2"] == "RETAIL"
+
+
+def test_a_future_dated_row_is_ignored(pilot):
+    """C5's only row starts 2026-08-01, so at the cutoff C5 has no classification at all."""
+    assert _segments(pilot)["C5"] == "Unknown"
+
+
+def test_effective_from_EQUAL_to_the_cutoff_is_included(pilot):
+    """C4's CORPORATE row starts exactly on 2026-06-30."""
+    assert _segments(pilot)["C4"] == "CORPORATE"
+
+
+def test_effective_to_EQUAL_to_the_cutoff_is_excluded(pilot):
+    """C4's earlier RETAIL row ends exactly on 2026-06-30. Half-open [from, to) means the two
+    boundary rules are complementary — for adjacent rows they select exactly ONE. `>=`/`<=` on both
+    sides would select both and duplicate the customer."""
+    assert _segments(pilot)["C4"] == "CORPORATE"
+    assert len([r for r in _rows(pilot) if r.key == "C4"]) == 1
+
+
+def test_the_current_open_ended_record_is_not_used_for_a_HISTORICAL_cutoff(pilot):
+    """C2's open-ended row (SME, from 2026-07-15) is the "current" one. Using it for a June report
+    is the exact defect this rule prevents."""
+    historical = _ir(attribution=_attribution(report_cutoff="2026-06-30"))
+    later = _ir(attribution=_attribution(report_cutoff="2026-08-01"))
+    assert {r.key: r.dimensions["segment"] for r in _rows(pilot, historical)}["C2"] == "RETAIL"
+    assert {r.key: r.dimensions["segment"] for r in _rows(pilot, later)}["C2"] == "SME"
+
+
+def test_a_missing_dimension_row_does_not_remove_the_customer(pilot):
+    """C6 has no history at all. The population guarantee applies to dimensions too — a customer
+    with no classification is Unknown, not absent."""
+    rows = _rows(pilot)
+    assert "C6" in {r.key for r in rows}
+    assert _segments(pilot)["C6"] == "Unknown"
+
+
+def test_an_unknown_customers_dimension_row_cannot_invent_a_population_member(pilot):
+    """C9 has a history row and no customer row."""
+    assert "C9" not in {r.key for r in _rows(pilot)}
+
+
+def test_segment_and_sector_resolve_at_the_SAME_instant(pilot):
+    """Both come from one selected history row, so they cannot disagree about when the customer was
+    classified. Asserted on C1, whose segment changed but whose sector did not."""
+    c1 = {r.key: r for r in _rows(pilot)}["C1"]
+    assert c1.dimensions == {"segment": "SME", "sector": "TRADING"}
+    sql = compile_analysis(_ir(), dialect=PostgresDialect())
+    assert sql.count(REPORT_CUTOFF) == 2, "one cutoff, used once per interval bound"
+
+
+def test_group_totals_reconcile_to_the_whole_population(pilot):
+    """Including Unknown. If a bucket vanished, the totals would silently stop adding up."""
+    rows = _rows(pilot)
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.dimensions["segment"]] = counts.get(row.dimensions["segment"], 0) + 1
+    assert sum(counts.values()) == len(rows) == EXPECTED["customer_rows"]
+    assert counts["Unknown"] == 2      # C5 (future-dated) and C6 (absent)
+
+
+def test_every_customer_classifies_as_the_fixture_says(pilot):
+    assert _segments(pilot) == EXPECTED["segment_at_cutoff"]
+
+
+# ── overlap is refused, never resolved ───────────────────────────────────────────────────────────
+
+def test_overlapping_records_REFUSE_rather_than_picking_one(pilot):
+    """Taking MAX(effective_from) would choose a classification and hide a dimension-table defect."""
+    pilot.execute(
+        f"INSERT INTO {CUSTOMER_SCHEMA}.{DIMENSION_TABLE} VALUES "
+        "('C3', 'RETAIL', 'TRADING', '2019-01-01', NULL)")
+    with pytest.raises(AttributionError, match="more than one"):
+        _rows(pilot)
+
+
+def test_two_identical_active_records_cannot_duplicate_a_customer(pilot):
+    pilot.execute(
+        f"INSERT INTO {CUSTOMER_SCHEMA}.{DIMENSION_TABLE} VALUES "
+        "('C3', 'CORPORATE', 'TRADING', '2020-01-01', NULL)")
+    with pytest.raises(AttributionError, match="more than one"):
+        _rows(pilot)
+
+
+# ── the policy is declared, never defaulted ──────────────────────────────────────────────────────
+
+def test_dimensions_without_an_attribution_policy_are_REFUSED(pilot):
+    with pytest.raises(AnalysisIRError, match="attribution"):
+        _ir(attribution=None)
+
+
+def test_a_missing_cutoff_is_refused_rather_than_defaulting_to_today(pilot):
+    with pytest.raises(AttributionError, match="cutoff"):
+        _attribution(report_cutoff="")
+
+
+@pytest.mark.parametrize("basis", [
+    AttributionBasis.PERIOD_END_PER_PERIOD,
+    AttributionBasis.TRANSACTION_EVENT_TIME,
+    AttributionBasis.CURRENT_VALUE,
+])
+def test_an_unimplemented_attribution_basis_is_refused(basis):
+    """All are defensible business definitions giving different answers. The renderer must not pick."""
+    with pytest.raises(AttributionError, match="basis"):
+        _attribution(attribution_basis=basis)
+
+
+def test_changing_the_attribution_policy_changes_the_plan_hash(pilot):
+    base = _ir().plan_hash
+    assert _ir(attribution=_attribution(report_cutoff="2026-05-31")).plan_hash != base
+    assert _ir(attribution=_attribution(
+        missing_value_behavior=MissingValueBehavior.RETAIN_NULL)).plan_hash != base
+
+
+def test_pit_predicates_are_INSIDE_the_snapshot_never_the_outer_query(pilot):
+    """Effective-date predicates in the outer WHERE would drop every customer with no dimension
+    history — repeating the population-spine mistake one layer up."""
+    sql = compile_analysis(_ir(), dialect=PostgresDialect())
+    outer = sql[sql.index('FROM "dpl_eib"."customer_master"'):]
+    assert "effective_from" not in outer and "effective_to" not in outer

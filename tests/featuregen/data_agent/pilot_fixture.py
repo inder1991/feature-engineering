@@ -29,6 +29,13 @@ from __future__ import annotations
 
 CUSTOMER_SCHEMA = "dpl_eib"
 CUSTOMER_TABLE = "customer_master"
+#: SCD2 dimension history, SEPARATE from the spine. It cannot be the spine: several history rows per
+#: customer would duplicate the population, and the population must be one row per customer.
+DIMENSION_TABLE = "customer_segment_history"
+
+#: The instant the customer is classified AT. A business decision, not a rendering detail — see
+#: `dimensions.DIMENSION_ATTRIBUTION_AS_OF_UNRESOLVED`.
+REPORT_CUTOFF = "2026-06-30"
 TRANSACTION_SCHEMA = "dpl_eib"
 TRANSACTION_TABLE = "tran_repos"
 
@@ -38,14 +45,33 @@ CURRENT_MONTH = "2026-06"
 POSTED = "POSTED"
 NOT_REVERSED = "N"
 
-#: cif_id, segment, sector
-CUSTOMERS: tuple[tuple[str, str, str], ...] = (
-    ("C1", "RETAIL", "TRADING"),
-    ("C2", "RETAIL", "MANUFACTURING"),
-    ("C3", "CORPORATE", "TRADING"),
-    ("C4", "CORPORATE", "REAL_ESTATE"),
-    ("C5", "RETAIL", "TRADING"),
-    ("C6", "RETAIL", "MANUFACTURING"),
+#: The POPULATION — one row per customer, no dimensions.
+CUSTOMERS: tuple[tuple[str], ...] = (
+    ("C1",), ("C2",), ("C3",), ("C4",), ("C5",), ("C6",),
+)
+
+#: cif_id, segment, sector, effective_from, effective_to  (half-open: [from, to))
+#
+# Each row exists for a specific rule, at cutoff 2026-06-30:
+#   C1  changed BEFORE the cutoff              -> SME        (not the old RETAIL)
+#   C2  changes AFTER the cutoff               -> RETAIL     (not the future SME)
+#   C3  one open-ended row                     -> CORPORATE
+#   C4  effective_from == cutoff (INCLUDED) and the prior row's effective_to == cutoff (EXCLUDED),
+#       so the two boundary rules must AGREE and select exactly one row -> CORPORATE
+#   C5  only a FUTURE-dated row                -> no valid row -> Unknown
+#   C6  no dimension row at all                -> Unknown
+DIMENSION_HISTORY: tuple[tuple[str, str, str, str, str | None], ...] = (
+    ("C1", "RETAIL", "TRADING", "2020-01-01", "2026-06-15"),
+    ("C1", "SME", "TRADING", "2026-06-15", None),
+    ("C2", "RETAIL", "MANUFACTURING", "2020-01-01", "2026-07-15"),
+    ("C2", "SME", "MANUFACTURING", "2026-07-15", None),
+    ("C3", "CORPORATE", "TRADING", "2020-01-01", None),
+    ("C4", "RETAIL", "REAL_ESTATE", "2020-01-01", "2026-06-30"),
+    ("C4", "CORPORATE", "REAL_ESTATE", "2026-06-30", None),
+    ("C5", "RETAIL", "TRADING", "2026-08-01", None),
+    # C6: deliberately absent
+    # an unknown customer's history must not invent a population member
+    ("C9", "CORPORATE", "TRADING", "2020-01-01", None),
 )
 
 #: cif_id, tran_amt, tran_type, tran_month, tran_status, reversal_flag
@@ -117,7 +143,11 @@ EXPECTED = {
     "max_rows_per_customer": 6,
     # the pilot question, over ELIGIBLE rows only
     "decreased_customers": ("C1", "C4"),
-    "decreased_by_segment": {"RETAIL": 1, "CORPORATE": 1},
+    # segments AT THE CUTOFF: C1 changed to SME before it; C4's new row starts exactly on it
+    "decreased_by_segment": {"SME": 1, "CORPORATE": 1},
+    #: what each customer classifies as at REPORT_CUTOFF
+    "segment_at_cutoff": {"C1": "SME", "C2": "RETAIL", "C3": "CORPORATE", "C4": "CORPORATE",
+                          "C5": "Unknown", "C6": "Unknown"},
 }
 
 
@@ -126,16 +156,23 @@ def create_pilot_tables(conn) -> None:
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {CUSTOMER_SCHEMA}")
     conn.execute(f"DROP TABLE IF EXISTS {TRANSACTION_SCHEMA}.{TRANSACTION_TABLE}")
     conn.execute(f"DROP TABLE IF EXISTS {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE}")
+    conn.execute(f"DROP TABLE IF EXISTS {CUSTOMER_SCHEMA}.{DIMENSION_TABLE}")
     conn.execute(
-        f"CREATE TABLE {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE} ("
-        "  cif_id text, segment text, sector text)")
+        f"CREATE TABLE {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE} (cif_id text)")
+    conn.execute(
+        f"CREATE TABLE {CUSTOMER_SCHEMA}.{DIMENSION_TABLE} ("
+        "  cif_id text, segment text, sector text,"
+        "  effective_from text, effective_to text)")
     conn.execute(
         f"CREATE TABLE {TRANSACTION_SCHEMA}.{TRANSACTION_TABLE} ("
         "  cif_id text, tran_amt numeric, tran_type text, tran_month text,"
         "  tran_status text, reversal_flag text)")
     for row in CUSTOMERS:
+        conn.execute(f"INSERT INTO {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE} VALUES (%s)", row)
+    for row in DIMENSION_HISTORY:
         conn.execute(
-            f"INSERT INTO {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE} VALUES (%s, %s, %s)", row)
+            f"INSERT INTO {CUSTOMER_SCHEMA}.{DIMENSION_TABLE} "
+            "VALUES (%s, %s, %s, %s, %s)", row)
     for row in TRANSACTIONS:
         conn.execute(
             f"INSERT INTO {TRANSACTION_SCHEMA}.{TRANSACTION_TABLE} "
