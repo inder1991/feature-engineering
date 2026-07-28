@@ -3325,6 +3325,64 @@ button.stat:hover {
   gap: 8px;
 }
 
+/* ONE LINE per field: label | value | who said it | actions.
+   A GRID, not flex, because the point of a one-line list is that the columns line up DOWN the
+   list — with flex each row sizes to its own content and nothing scans. `minmax(0, 1fr)` lets the
+   value column shrink so a long definition truncates instead of shoving the badge off-screen. */
+.adg-field-line {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.adg-field-line .adg-field-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A value nobody has set is not the story on the row — mute it so the set ones carry the eye. */
+.adg-field-line .adg-field-value:empty::after,
+.adg-field-line .adg-field-value[data-unset='true'] {
+  color: var(--ink-faint);
+}
+
+.adg-field-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* The disclosure sits UNDER the line, indented to the value column so it reads as belonging to it. */
+.adg-field-detail {
+  display: grid;
+  gap: 6px;
+  margin-left: 152px;
+  padding: 8px 0 2px;
+  border-top: 1px solid var(--line);
+}
+
+.adg-usable-head {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+@media (max-width: 720px) {
+  .adg-field-line {
+    grid-template-columns: 1fr auto;
+    row-gap: 4px;
+  }
+  .adg-field-line .adg-field-value {
+    grid-column: 1 / -1;
+    white-space: normal;
+  }
+  .adg-field-detail {
+    margin-left: 0;
+  }
+}
+
 .adg-evidence {
   display: grid;
   gap: 6px;

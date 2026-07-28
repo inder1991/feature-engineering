@@ -94,6 +94,10 @@ describe('asset detail — authority rendered from the response, never from the 
     await screen.findByRole('group', { name: /asset sections/i })
     await userEvent.click(screen.getByRole('button', { name: 'Metadata & evidence' }))
     expect(authorityChip('AI proposed', 'gj-proposed')).toBeTruthy()   // known author, not "unattested"
+    // `unit` has no value, so it now sits in the collapsed "not set" group — a field nobody has set
+    // is not the story on the page. Expand it: the assertion is about the LABEL being honest, and
+    // that property is unchanged by where the row lives.
+    await userEvent.click(screen.getByRole('button', { name: /not set/i }))
     expect(authorityChip('unattested', 'gj-none')).toBeTruthy()        // genuinely nothing
   })
 })

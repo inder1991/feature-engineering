@@ -95,7 +95,34 @@ it('an action still shows where the server offered one', async () => {
 it('renders a row for every field the server returned', async () => {
   const d = detail()
   await openTab(d)
-  for (const name of Object.keys(d.effective_metadata.fields)) {
+  for (const name of Object.keys(d.effective_metadata?.fields ?? {})) {
     expect(row(name)).toBeInTheDocument()
   }
+})
+
+// ── the fields nobody has set are grouped, not nine rows of nothing ──────────────────────────────
+
+/** The shared fixture sets every field; a real column leaves most unset. */
+const withUnset = () => detail(d => {
+  d.effective_metadata!.fields.entity = { ...d.effective_metadata!.fields.entity, value: null }
+  d.effective_metadata!.fields.unit = { ...d.effective_metadata!.fields.unit, value: null }
+})
+
+it('does not spend a row on every unset field', async () => {
+  // Five of nine fields on a real column are "not set". Nine rows where five say nothing is why
+  // the tab read as noise — the ones that carry information should carry the eye.
+  await openTab(withUnset())
+  expect(screen.queryAllByText(/^— not set$/)).toHaveLength(0)
+  expect(screen.getByRole('button', { name: /not set/i })).toBeInTheDocument()
+})
+
+it('still reaches an unset field, and its action, on demand', async () => {
+  await openTab(withUnset())
+  await userEvent.click(screen.getByRole('button', { name: /not set/i }))
+  expect(row('entity')).toBeInTheDocument()
+})
+
+it('keeps a field that HAS a value as a top-level row', async () => {
+  await openTab(detail())
+  expect(row('currency')).toBeInTheDocument()   // USD
 })

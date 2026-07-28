@@ -10,6 +10,8 @@ import {
   type FieldDecisionAction,
   type RoleUsability,
   type TableRollup,
+  type EffectiveMetadataSection,
+  type LatestFieldDecision,
   type Relationships,
   type SemanticCandidate,
   type SemanticDivergence,
@@ -466,9 +468,17 @@ function MetadataTab({
   }
   const evidence = detail.evidence
   const evidenceUnavailable = isUnavailable('evidence')
+  // A field nobody has set is not the story. On a real column five of nine are unset — `unit` and
+  // `currency` on a boolean flag never will be — and nine rows where five say nothing is exactly
+  // why the tab read as noise. The set ones get the eye; the rest collapse behind one line that
+  // still opens into normal rows, so their Correct… action stays reachable.
+  const isSet = (n: string) => metadata.fields[n]?.value != null
+  const setNames = fieldNames.filter(isSet)
+  const unsetNames = fieldNames.filter(n => !isSet(n))
   return (
+    <>
     <ul className="rows">
-      {fieldNames.map(name => {
+      {setNames.map(name => {
         const field = metadata.fields[name]
         const action = fieldActions.get(name)
         const proposalsByLifecycle = evidence?.proposals_by_field[name]
@@ -487,6 +497,58 @@ function MetadataTab({
         )
       })}
     </ul>
+    {unsetNames.length > 0 && (
+      <UnsetFields
+        names={unsetNames}
+        metadata={metadata}
+        fieldActions={fieldActions}
+        evidence={evidence}
+        evidenceUnavailable={evidenceUnavailable}
+        onEdit={onEdit}
+      />
+    )}
+    </>
+  )
+}
+
+function UnsetFields({
+  names,
+  metadata,
+  fieldActions,
+  evidence,
+  evidenceUnavailable,
+  onEdit,
+}: {
+  names: string[]
+  metadata: EffectiveMetadataSection
+  fieldActions: Map<string, FieldAction>
+  evidence: AssetDetail['evidence']
+  evidenceUnavailable: boolean
+  onEdit: (field: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <section className="adg-section">
+      <button type="button" className="btn btn--ghost" onClick={() => setOpen(o => !o)}>
+        {open ? 'Hide' : 'Show'} {names.length} not set — {names.map(humanizeField).join(', ')}
+      </button>
+      {open && (
+        <ul className="rows">
+          {names.map(name => (
+            <FieldRow
+              key={name}
+              name={name}
+              field={metadata.fields[name]}
+              action={fieldActions.get(name)}
+              proposalsByLifecycle={evidence?.proposals_by_field[name]}
+              latest={evidence?.latest_decision_by_field[name]}
+              evidenceUnavailable={evidenceUnavailable}
+              onEdit={onEdit}
+            />
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 
@@ -511,7 +573,7 @@ function FieldRow({
   field: EffectiveMetadataField
   action: FieldAction | undefined
   proposalsByLifecycle: Record<string, EvidenceProposal[]> | undefined
-  latest: LatestDecision | undefined
+  latest: LatestFieldDecision | undefined
   evidenceUnavailable: boolean
   onEdit: (field: string) => void
 }) {
