@@ -47,6 +47,8 @@ from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compi
 from featuregen.formula.schema import (
     EmptyWindowResult,
     NullInput,
+    OverflowBehavior,
+    RoundingMode,
 )
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
@@ -1132,3 +1134,342 @@ def test_the_calculations_signature_is_positionally_the_wiring(compiled, feature
     expected = [name.removeprefix("params:") for name in node.inputs]
     assert arguments == ["projection", "spine", *expected[2:]]
 
+
+
+# ── §8 rule 3: the spine reduction ───────────────────────────────────────────────────────────────
+
+
+def test_rule_3_an_entity_with_NO_source_rows_is_STILL_PRESENT(compiled, feature, lock_tree):
+    """The mutant this is written against is `how='inner'`. It raises nothing, computes numbers
+    that are all individually right, and silently publishes a smaller population."""
+    node = _calculate(compiled, feature)
+    values = _staged(node, lock_tree,
+                     projection=[_debit("c1", 10), _debit("c1", 5)],
+                     spine=_spine_rows("c1", "c2", "c3"))
+    assert sorted(values) == ["c1", "c2", "c3"]
+    assert values["c1"] == 15
+    assert values["c2"] is None and values["c3"] is None
+
+
+def test_rule_3_EVERY_entity_is_present_when_NOTHING_matched_at_all(compiled, feature, lock_tree):
+    """The degenerate case, and the one an inner join makes look like a successful empty run."""
+    node = _calculate(compiled, feature)
+    values = _staged(node, lock_tree, projection=[], spine=_spine_rows("c1", "c2"))
+    assert values == {"c1": None, "c2": None}
+
+
+def test_rule_3_produces_EXACTLY_ONE_row_per_key_and_business_date(compiled, feature, lock_tree):
+    node = _calculate(compiled, feature)
+    frame, _manifest = _run_calculation(
+        node, lock_tree, projection=[_debit("c1", 1), _debit("c1", 2), _debit("c2", 3)],
+        spine=_spine_rows("c1", "c2"))
+    keyed = [(row["cif_id"], row["business_dt"]) for row in frame.rows]
+    assert len(keyed) == len(set(keyed)) == 2
+
+
+def test_rule_3_an_entity_NOT_in_the_spine_is_not_invented_by_the_join(compiled, feature,
+                                                                      lock_tree):
+    """The population is the SPINE's. A left join from the spine cannot add a member, and a
+    right or outer one would — which is why the stand-in refuses both."""
+    node = _calculate(compiled, feature)
+    values = _staged(node, lock_tree, projection=[_debit("ghost", 99), _debit("c1", 1)],
+                     spine=_spine_rows("c1"))
+    assert values == {"c1": 1}
+
+
+def test_the_staged_output_carries_ONLY_keys_business_dt_and_the_ONE_feature(compiled, feature,
+                                                                            lock_tree):
+    """§10.2. The three system columns are added once, at assembly; one per staging output would
+    collide there. The marker column must be gone too — it is this node's invention."""
+    node = _calculate(compiled, feature, empty_window=EmptyWindowResult.ZERO)
+    frame, _manifest = _run_calculation(node, lock_tree, projection=[_debit("c1", 4)],
+                                        spine=_spine_rows("c1"))
+    assert frame.columns == ["cif_id", "business_dt", SUM_30D]
+    assert "__source_rows" not in frame.columns
+
+
+def test_the_business_date_on_the_staged_row_is_the_SPINES(compiled, feature, lock_tree):
+    """Not the run parameter re-derived. The spine decides which population the row belongs to."""
+    node = _calculate(compiled, feature)
+    frame, _manifest = _run_calculation(node, lock_tree, projection=[_debit("c1", 4)],
+                                        spine=_spine_rows("c1", business_dt="2026-07-27"))
+    assert frame.rows[0]["business_dt"] == dt.date(2026, 7, 27)
+
+
+def test_no_row_collapsing_repair_is_ever_emitted(compiled, feature, lock_tree):
+    """Fan-out is refused upstream (`joins.py`), so a `dropDuplicates` here would be masking a
+    `1:N` that got through — the way row inflation becomes invisible.
+
+    Asserted on the CALL, not the word: the rendered prose argues the case for not collapsing, so
+    a search for "distinct" matches this node's own explanation of why it does not use one. The
+    stand-in raises on both, so their USE is detectable and not merely their spelling — the
+    execution below is the load-bearing half."""
+    for empty in EmptyWindowResult:
+        node = _calculate(compiled, feature, empty_window=empty)
+        assert ".dropDuplicates(" not in node.source and ".distinct(" not in node.source
+        assert "how='left'" in node.source and "how='inner'" not in node.source
+        _run_calculation(node, lock_tree, projection=[_debit("c1", 1)], spine=_spine_rows("c1"))
+
+
+# ── §8 rule 4: the empty-window value, and null_input ─────────────────────────────────────────────
+
+
+def test_rule_4_an_empty_window_carries_the_DECLARED_zero_not_a_null(compiled, feature, lock_tree):
+    node = _calculate(compiled, feature, empty_window=EmptyWindowResult.ZERO)
+    values = _staged(node, lock_tree, projection=[_debit("c1", 7)], spine=_spine_rows("c1", "c2"))
+    assert values["c1"] == 7
+    assert values["c2"] == 0 and values["c2"] is not None
+
+
+def test_rule_4_an_empty_window_carries_NULL_when_that_is_what_is_declared(compiled, feature,
+                                                                          lock_tree):
+    """The pair with the test above: the same rows and the same spine produce different values,
+    so a renderer that ignored the policy and always did one of them fails one of the two."""
+    node = _calculate(compiled, feature, empty_window=EmptyWindowResult.NULL)
+    values = _staged(node, lock_tree, projection=[_debit("c1", 7)], spine=_spine_rows("c1", "c2"))
+    assert values == {"c1": 7, "c2": None}
+
+
+def test_rule_4_an_empty_window_STOPS_THE_RUN_when_that_is_what_is_declared(compiled, feature,
+                                                                           lock_tree):
+    node = _calculate(compiled, feature, empty_window=EmptyWindowResult.ERROR)
+    with pytest.raises(RuntimeError, match="empty_window=error"):
+        _run_calculation(node, lock_tree, projection=[_debit("c1", 7)],
+                         spine=_spine_rows("c1", "c2"))
+    # …and does NOT stop when every entity has rows: the gate fires on the declared condition and
+    # not on the policy being declared at all.
+    frame, _manifest = _run_calculation(node, lock_tree,
+                                        projection=[_debit("c1", 7), _debit("c2", 1)],
+                                        spine=_spine_rows("c1", "c2"))
+    assert len(frame.rows) == 2
+
+
+def test_rule_4_the_empty_window_value_is_told_apart_from_a_NULL_AGGREGATE(compiled, feature,
+                                                                          lock_tree):
+    """The distinction the marker column exists for. `c2` HAS a row in the window; its operand is
+    null, so `ignore` sums nothing and Spark returns NULL. That is not an empty window, and under
+    `zero` it must NOT be filled — a coalesce would answer this entity's policy question with the
+    other one's answer."""
+    node = _calculate(compiled, feature, empty_window=EmptyWindowResult.ZERO)
+    values = _staged(node, lock_tree,
+                     projection=[_debit("c1", 3), _debit("c2", None)],
+                     spine=_spine_rows("c1", "c2", "c3"))
+    assert values["c1"] == 3
+    assert values["c2"] is None      # a row EXISTED; its aggregate is null. Not an empty window.
+    assert values["c3"] == 0         # no row at all. THIS is the empty window.
+
+
+def test_rule_4_null_input_IGNORE_skips_a_null_operand(compiled, feature, lock_tree):
+    node = _calculate(compiled, feature, null_input=NullInput.IGNORE)
+    values = _staged(node, lock_tree,
+                     projection=[_debit("c1", 5), _debit("c1", None), _debit("c1", 5)],
+                     spine=_spine_rows("c1"))
+    assert values["c1"] == 10
+
+
+def test_rule_4_null_input_ZERO_counts_a_null_operand_as_zero(compiled, feature, lock_tree):
+    """For a SUM the total is the same as `ignore`; the policy is still read, and a COUNT over the
+    same rows would differ. Asserted alongside `propagate`, which the same rows must not equal."""
+    node = _calculate(compiled, feature, null_input=NullInput.ZERO)
+    values = _staged(node, lock_tree,
+                     projection=[_debit("c1", 5), _debit("c1", None)], spine=_spine_rows("c1"))
+    assert values["c1"] == 5
+    assert "F.coalesce" in _calculate(compiled, feature, null_input=NullInput.ZERO).source
+
+
+def test_rule_4_null_input_PROPAGATE_makes_ONE_null_operand_null_the_whole_aggregate(
+        compiled, feature, lock_tree):
+    """Spark's aggregates all skip nulls, so this is the member that has to be RENDERED. A
+    renderer that ignored `null_input` entirely would return 10 here and pass every test above."""
+    node = _calculate(compiled, feature, null_input=NullInput.PROPAGATE)
+    values = _staged(node, lock_tree,
+                     projection=[_debit("c1", 5), _debit("c1", None), _debit("c1", 5),
+                                 _debit("c2", 4)],
+                     spine=_spine_rows("c1", "c2"))
+    assert values["c1"] is None      # one null anywhere in the group
+    assert values["c2"] == 4         # and a group with none is unaffected
+
+
+# ── §6 / §9: rounding is explicit, and overflow RAISES ───────────────────────────────────────────
+
+
+def test_overflow_RAISES_rather_than_publishing_the_NULL_spark_would_substitute(
+        compiled, feature, lock_tree):
+    """The whole point of OVERFLOW_VIOLATION. Spark's default on decimal overflow is a NULL, which
+    reads downstream as "no activity" — a wrong number that raises nothing anywhere."""
+    node = _calculate(compiled, feature)
+    huge = decimal.Decimal(10) ** 33          # 10^33 needs 34 integer digits; DECIMAL(38,6) has 32
+    with pytest.raises(RuntimeError, match="OVERFLOW_VIOLATION"):
+        _run_calculation(node, lock_tree, projection=[_debit("c1", huge)],
+                         spine=_spine_rows("c1"))
+
+
+def test_a_value_that_FITS_is_published_and_does_not_trip_the_overflow_gate(compiled, feature,
+                                                                            lock_tree):
+    """The pair with the test above: a gate that fired on every row would also pass it."""
+    node = _calculate(compiled, feature)
+    fits = decimal.Decimal(10) ** 30
+    values = _staged(node, lock_tree, projection=[_debit("c1", fits)], spine=_spine_rows("c1"))
+    assert values["c1"] == fits
+
+
+def test_a_null_that_was_ALREADY_null_is_not_reported_as_an_overflow(compiled, feature, lock_tree):
+    """An entity with no rows is NULL by the declared empty-window policy. Reporting it as an
+    overflow would fire the wrong gate and stop a run that is behaving exactly as declared."""
+    node = _calculate(compiled, feature, empty_window=EmptyWindowResult.NULL)
+    values = _staged(node, lock_tree, projection=[_debit("c1", 1)], spine=_spine_rows("c1", "c2"))
+    assert values["c2"] is None
+
+
+def test_the_overflow_check_reads_the_DECLARED_precision_and_scale(compiled, feature, lock_tree):
+    """Not a constant. A narrower declared type must refuse a value the wider one accepts."""
+    narrow = dataclasses.replace(
+        feature, physical_type=dataclasses.replace(
+            feature.physical_type, sql_type="DECIMAL(9,2)"))
+    plan = dataclasses.replace(compiled[1], features=(narrow,))
+    node = _calculate(compiled, narrow, plan=plan)
+    assert "decimal(9,2)" in node.source
+    with pytest.raises(RuntimeError, match="OVERFLOW_VIOLATION"):
+        _run_calculation(node, lock_tree, projection=[_debit("c1", 10_000_000)],
+                         spine=_spine_rows("c1"))
+
+
+def test_rounding_is_the_DECLARED_mode_and_the_two_modes_disagree_on_ties(compiled, feature,
+                                                                          lock_tree):
+    """HALF_UP and HALF_EVEN differ on exactly the ties. A renderer that emitted one for both, or
+    that left rounding to an engine default, gives the same answer for one of these and not both."""
+    def value(mode):
+        typed = dataclasses.replace(feature.physical_type, rounding=mode,
+                                    sql_type="DECIMAL(18,0)")
+        planned = dataclasses.replace(feature, physical_type=typed)
+        node = _calculate(compiled, planned,
+                          plan=dataclasses.replace(compiled[1], features=(planned,)))
+        return _staged(node, lock_tree, projection=[_debit("c1", decimal.Decimal("2.5"))],
+                       spine=_spine_rows("c1"))["c1"]
+
+    assert value(RoundingMode.HALF_UP) == 3
+    assert value(RoundingMode.HALF_EVEN) == 2
+
+
+def test_rounding_is_rendered_at_the_DECLARED_scale(compiled, feature, lock_tree):
+    node = _calculate(compiled, feature)
+    assert "F.bround(F.col('total_debit_amount_30d'), 6)" in node.source
+    values = _staged(node, lock_tree,
+                     projection=[_debit("c1", decimal.Decimal("1.00000049"))],
+                     spine=_spine_rows("c1"))
+    assert values["c1"] == decimal.Decimal("1.000000")
+
+
+def test_an_INTEGRAL_published_type_renders_no_rounding_and_no_overflow_check(compiled, feature):
+    """§6 attaches both obligations to decimal arithmetic only. A rounding mode recorded against a
+    BIGINT would be an instruction this node could act on wrongly."""
+    counted = dataclasses.replace(
+        feature, physical_type=dataclasses.replace(
+            feature.physical_type, sql_type="BIGINT", rounding=None, overflow=None))
+    node = _calculate(compiled, counted,
+                      plan=dataclasses.replace(compiled[1], features=(counted,)))
+    assert "F.bround" not in node.source and "F.round" not in node.source
+    assert "OVERFLOW_VIOLATION" not in node.source
+
+
+def test_it_refuses_a_ROUNDING_MODE_no_spark_function_implements_exactly(compiled, feature):
+    for mode in (RoundingMode.DOWN, RoundingMode.UP, RoundingMode.FLOOR, RoundingMode.CEILING):
+        planned = dataclasses.replace(
+            feature, physical_type=dataclasses.replace(feature.physical_type, rounding=mode))
+        with pytest.raises(ValueError, match="no Spark function implements it exactly"):
+            _calculate(compiled, planned,
+                       plan=dataclasses.replace(compiled[1], features=(planned,)))
+
+
+def test_it_refuses_SATURATE_overflow_rather_than_quietly_not_clamping(compiled, feature):
+    planned = dataclasses.replace(
+        feature, physical_type=dataclasses.replace(
+            feature.physical_type, overflow=OverflowBehavior.SATURATE))
+    with pytest.raises(ValueError, match="nothing in this slice clamps"):
+        _calculate(compiled, planned, plan=dataclasses.replace(compiled[1], features=(planned,)))
+
+
+# ── §6: the governed filter ──────────────────────────────────────────────────────────────────────
+
+
+def test_the_GOVERNED_FILTER_is_applied_before_the_aggregate(compiled, feature, lock_tree):
+    """`total_debit_amount_30d` filters `dr_cr_flag = 'D' AND status_cd = 'posted'`. Neither the
+    projection nor anything else applies it, so a renderer that dropped it sums the credits too —
+    a bigger, plausible number with nothing to report it."""
+    node = _calculate(compiled, feature)
+    values = _staged(node, lock_tree, spine=_spine_rows("c1"), projection=[
+        _debit("c1", 10),
+        _debit("c1", 500, dr_cr_flag="C"),               # a credit
+        _debit("c1", 700, status_cd="pending"),          # not posted
+        _debit("c1", 900, dr_cr_flag="C", status_cd="pending"),
+    ])
+    assert values["c1"] == 10
+
+
+def test_an_expression_with_NO_filter_aggregates_every_projected_row(compiled, feature, lock_tree):
+    unfiltered = dataclasses.replace(compiled[0].irs[0].expressions[0], filter_tree=None)
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(unfiltered,))
+    node = _calculate(compiled, feature, ir=ir)
+    assert "rows = projection\n" in node.source
+    values = _staged(node, lock_tree, spine=_spine_rows("c1"),
+                     projection=[_debit("c1", 10), _debit("c1", 500, dr_cr_flag="C")])
+    assert values["c1"] == 510
+
+
+@pytest.mark.parametrize(("tree", "expected"), [
+    ({"kind": "predicate", "op": "greater_than", "left": fixtures.REF_AMT,
+      "right_literal": {"type": "decimal", "value": "7.5"}, "right_param": None,
+      "right_set": None},
+     "F.col('txn_amt') > Decimal('7.5')"),
+    ({"kind": "predicate", "op": "in", "left": fixtures.REF_DR_CR, "right_literal": None,
+      "right_param": None,
+      "right_set": [{"type": "string", "value": "D"}, {"type": "string", "value": "C"}]},
+     "F.col('dr_cr_flag').isin(['D', 'C'])"),
+    ({"kind": "predicate", "op": "not_in", "left": fixtures.REF_DR_CR, "right_literal": None,
+      "right_param": None, "right_set": [{"type": "string", "value": "C"}]},
+     "~F.col('dr_cr_flag').isin(['C'])"),
+    ({"kind": "predicate", "op": "is_null", "left": fixtures.REF_AMT, "right_literal": None,
+      "right_param": None, "right_set": None},
+     "F.col('txn_amt').isNull()"),
+    ({"kind": "bool", "op": "not", "children": [
+        {"kind": "predicate", "op": "equal", "left": fixtures.REF_DR_CR,
+         "right_literal": {"type": "string", "value": "C"}, "right_param": None,
+         "right_set": None}]},
+     "~(F.col('dr_cr_flag') == 'C')"),
+    ({"kind": "bool", "op": "or", "children": [
+        {"kind": "predicate", "op": "equal", "left": fixtures.REF_DR_CR,
+         "right_literal": {"type": "string", "value": "C"}, "right_param": None,
+         "right_set": None},
+        {"kind": "predicate", "op": "less_or_equal", "left": fixtures.REF_AMT,
+         "right_literal": {"type": "integer", "value": "3"}, "right_param": None,
+         "right_set": None}]},
+     "(F.col('dr_cr_flag') == 'C') | (F.col('txn_amt') <= 3)"),
+])
+def test_every_filter_op_renders_a_TYPED_comparison_not_the_canonical_string(
+        compiled, feature, tree, expected):
+    """Child-1 canonicalizes every literal value to a string so an identity hash never sees a
+    float. Rendering that string straight through would compare a governed decimal against text,
+    which Spark resolves by coercing one side — silently, and not always the same way."""
+    expression = dataclasses.replace(compiled[0].irs[0].expressions[0], filter_tree=tree)
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
+    source = _calculate(compiled, feature, ir=ir).source
+    assert f"rows = projection.where({expected})" in source
+
+
+def test_it_refuses_a_filter_that_compares_against_a_RUN_PARAMETER(compiled, feature):
+    tree = {"kind": "predicate", "op": "equal", "left": fixtures.REF_DR_CR, "right_literal": None,
+            "right_param": {"name": "min_amount"}, "right_set": None}
+    expression = dataclasses.replace(compiled[0].irs[0].expressions[0], filter_tree=tree)
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
+    with pytest.raises(ValueError, match="run parameter"):
+        _calculate(compiled, feature, ir=ir)
+
+
+def test_it_refuses_a_filter_on_a_column_OUTSIDE_the_authorized_read_set(compiled, feature):
+    tree = {"kind": "predicate", "op": "equal", "left": fixtures.TABLE_REF + ".pan",
+            "right_literal": {"type": "string", "value": "4111"}, "right_param": None,
+            "right_set": None}
+    expression = dataclasses.replace(compiled[0].irs[0].expressions[0], filter_tree=tree)
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
+    with pytest.raises(ValueError, match="authorized read set"):
+        _calculate(compiled, feature, ir=ir)

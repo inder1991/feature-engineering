@@ -251,6 +251,21 @@ def _value_of(value: Any, row: Any) -> Any:
     return value._eval(row) if isinstance(value, Column) else value
 
 
+def _quantize(value: Any, scale: int, rounding: str) -> _decimal.Decimal:
+    """``value`` at ``scale``, under a context WIDE enough that quantizing never itself overflows.
+
+    Python's default decimal context is 28 digits and raises ``InvalidOperation`` above it. Letting
+    that stand would put a second, undeclared precision limit into the stand-in — and it would fire
+    before the ``decimal(p,s)`` cast, so the rendered OVERFLOW_VIOLATION check would never be
+    reached and the test written for it would pass for the wrong reason. Rounding decides the SCALE
+    here; only the cast decides whether a value fits.
+    """
+    with _decimal.localcontext() as context:
+        context.prec = _WIDE_PRECISION
+        return _decimal.Decimal(str(value)).quantize(
+            _decimal.Decimal(1).scaleb(-scale), rounding=rounding)
+
+
 def _fit_decimal(value: Any, precision: int, scale: int) -> Any:
     """``value`` as ``DECIMAL(precision, scale)``, or ``None`` if it does not fit.
 
@@ -260,9 +275,10 @@ def _fit_decimal(value: Any, precision: int, scale: int) -> Any:
     """
     if value is None:
         return None
-    quantized = _decimal.Decimal(str(value)).quantize(
-        _decimal.Decimal(1).scaleb(-scale), rounding=_decimal.ROUND_HALF_UP)
-    unscaled = abs(quantized).scaleb(scale).to_integral_value()
+    with _decimal.localcontext() as context:
+        context.prec = _WIDE_PRECISION
+        quantized = _quantize(value, scale, _decimal.ROUND_HALF_UP)
+        unscaled = abs(quantized).scaleb(scale).to_integral_value()
     return None if unscaled >= 10 ** precision else quantized
 
 
@@ -670,15 +686,17 @@ def _quantized(column: Column, scale: int, rounding: str, label: str) -> Column:
     """One rounding mode, applied EXPLICITLY. NULL in, NULL out."""
     if not isinstance(scale, int) or isinstance(scale, bool) or scale < 0:
         raise NotImplementedError(f"fake_spark models {label} to a whole scale >= 0, got {scale!r}")
-    exponent = _decimal.Decimal(1).scaleb(-scale)
-
     def apply(row: Any) -> Any:
         value = column._eval(row)
-        if value is None:
-            return None
-        return _decimal.Decimal(str(value)).quantize(exponent, rounding=rounding)
+        return None if value is None else _quantize(value, scale, rounding)
     return Column(f"{label}({column.name}, {scale})", apply, aggregate=column._aggregate)
 
+
+#: The decimal context this stand-in quantizes under. Python's default is 28 digits and RAISES
+#: above it; a `DECIMAL(38,6)` is 38. Left at the default, the stand-in would carry a second,
+#: undeclared precision limit that fired BEFORE the cast — and the rendered overflow check would
+#: never be reached by the test written for it.
+_WIDE_PRECISION = 80
 
 #: Days per month, indexed 0–11. February's leap day is added by ``add_months``.
 _MONTH_LENGTHS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
