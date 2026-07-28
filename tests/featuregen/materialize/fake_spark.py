@@ -34,6 +34,12 @@ Python lists:
   returns NULL — Spark's non-ANSI overflow behaviour, and the reason §9's ``OVERFLOW_VIOLATION``
   check exists at all. If that reading of Spark is wrong, the check and this model are wrong
   together; only L0 can tell.
+* ``-`` and ``/`` are the two FINAL operations, with SQL's null propagation: a NULL on either side
+  is a NULL, so an absent operand reaches the feature column without anything inventing a number
+  for it. Division by ZERO **raises** rather than returning non-ANSI Spark's NULL — see
+  :meth:`Column.__truediv__`. That is the one place this stand-in deliberately declines to model
+  Spark, and the reason is that the NULL would be indistinguishable from a renderer that never
+  applied the formula's ``zero_denominator`` policy at all.
 * Nulls in FILTERS, types, coercion, partitioning and every optimisation are OUT of scope. A test
   that needs any of those needs real Spark, which is L0. Null handling is modelled ONLY where an
   aggregate, a coalesce or a cast reads it.
@@ -83,6 +89,21 @@ def _as_date(value: Any) -> _dt.date:
 
 def _is_aggregate(value: Any) -> bool:
     return isinstance(value, Column) and value._aggregate
+
+
+def _numeric(value: Any, operation: str) -> _decimal.Decimal:
+    """``value`` as an exact decimal, or a refusal — this stand-in does arithmetic on numbers only.
+
+    Via ``str`` so a float never contributes its binary representation to a comparison against a
+    governed decimal. ``bool`` is excluded explicitly because it is an ``int`` in Python and is not
+    one in the grammar, so a boolean reaching arithmetic is a wrong operand rather than a small one.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | _decimal.Decimal):
+        raise NotImplementedError(
+            f"fake_spark models {operation} over numbers only, got "
+            f"{type(value).__name__}: guessing at what any other type means would model an "
+            f"arithmetic the grammar does not contain")
+    return _decimal.Decimal(str(value))
 
 
 class Column:
@@ -177,6 +198,53 @@ class Column:
                     f"fake_spark models Column + INTERVAL only, got {type(right).__name__}")
             return _as_datetime(left) + right
         return Column(f"({self._name} + {getattr(other, 'name', other)})", add)
+
+    def __sub__(self, other: Any) -> Column:
+        """Numeric subtraction with SQL's null propagation — a DIFFERENCE body's final operation.
+
+        A NULL on either side makes the difference NULL. That is not a policy this stand-in chose:
+        it is SQL's arithmetic under every Spark configuration, and it is what carries an operand's
+        declared empty-window NULL through to the feature column instead of quietly substituting a
+        zero. ``0 - x`` is a real, plausible number, which is why the distinction matters.
+        """
+        def subtract(row: Any) -> Any:
+            left, right = self._evaluate(row), _value_of(other, row)
+            if left is None or right is None:
+                return None
+            return _numeric(left, "subtraction") - _numeric(right, "subtraction")
+        return Column(f"({self._name} - {getattr(other, 'name', other)})", subtract,
+                      aggregate=self._aggregate or _is_aggregate(other))
+
+    def __truediv__(self, other: Any) -> Column:
+        """Decimal division with SQL's null propagation, and a REFUSAL on a zero divisor.
+
+        A NULL on either side is a NULL, which is how an absent operand reaches the feature column
+        without anything inventing a number for it.
+
+        A ZERO divisor **raises**, and that is deliberate. Non-ANSI Spark answers ``x / 0`` with a
+        NULL; modelling that here would make the rendered ``zero_denominator`` guard invisible,
+        because a renderer that never applied the policy at all would produce the very same NULL and
+        the test written for the policy would agree with it. §8 rule 4 assigns a zero denominator to
+        the formula's own declared policy, and the rendered node's claim is that no zero ever
+        reaches the division. This is what makes that claim checkable rather than assumed. (Under
+        ANSI mode Spark raises too — so relying on the NULL would also be relying on configuration.)
+        """
+        def divide(row: Any) -> Any:
+            left, right = self._evaluate(row), _value_of(other, row)
+            if left is None or right is None:
+                return None
+            divisor = _numeric(right, "division")
+            if divisor == 0:
+                raise NotImplementedError(
+                    "the rendered node divided by zero: fake_spark deliberately does not model "
+                    "non-ANSI Spark's silent NULL here, because §8 rule 4 assigns a zero "
+                    "denominator to the formula's own zero_denominator policy — and a NULL is what "
+                    "a renderer that never applied that policy would produce")
+            with _decimal.localcontext() as context:
+                context.prec = _WIDE_PRECISION
+                return _numeric(left, "division") / divisor
+        return Column(f"({self._name} / {getattr(other, 'name', other)})", divide,
+                      aggregate=self._aggregate or _is_aggregate(other))
 
     def cast(self, sql_type: str) -> Column:
         """``date -> timestamp`` (midnight), ``timestamp -> date``, ``decimal(p,s)``, ``bigint``.
@@ -490,7 +558,12 @@ class DataFrame:
         added = [name for name in other.columns if name not in keys]
         produced: list[dict[str, Any]] = []
         for row in self._rows:
-            matches = index.get(tuple(row[key] for key in keys), [])
+            # A NULL key never equals anything in Spark, itself included — so a row that reaches no
+            # key matches NOTHING, rather than matching whichever right-hand row happens to carry a
+            # null of its own. One guard, on the LOOKUP: a null on either side ends up here, and a
+            # second guard on the index would be a rule with no case of its own.
+            side = tuple(row[key] for key in keys)
+            matches = [] if any(value is None for value in side) else index.get(side, [])
             if matches:
                 produced.extend({**row, **match} for match in matches)
             elif how == "left":

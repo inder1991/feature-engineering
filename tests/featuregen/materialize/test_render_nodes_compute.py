@@ -53,13 +53,14 @@ from featuregen.formula.schema import (
     NullInput,
     OverflowBehavior,
     RoundingMode,
+    ZeroDenominator,
 )
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     ContractGroup,
     derive_group_contract,
 )
-from featuregen.materialize.expression_ir import RefRole
+from featuregen.materialize.expression_ir import BODY_PATHS, RefRole
 from featuregen.materialize.group_plan import (
     StagingManifestV1,
     StagingStatus,
@@ -71,6 +72,7 @@ from featuregen.materialize.inventory import (
     PartitionTransform,
     StaticSnapshot,
 )
+from featuregen.materialize.ir import ir_hash
 from featuregen.materialize.render import nodes_compute
 from featuregen.materialize.render.nodes_compute import SPINE_FUNC_NAME, render_spine_node
 from featuregen.materialize.render.project import (
@@ -679,6 +681,15 @@ def test_the_stand_in_REFUSES_what_it_does_not_model():
     with pytest.raises(AttributeError):
         F.col("v").otherwise(0)                       # `otherwise` without a `when`
 
+    # Task 13d's additions.
+    with pytest.raises(NotImplementedError, match="divided by zero"):
+        # Non-ANSI Spark answers this with a NULL. Modelling that would make the rendered
+        # zero_denominator guard invisible: a renderer that never applied the policy at all would
+        # produce the very same NULL, and the test written for the policy would agree with it.
+        one.withColumn("q", F.col("v") / F.lit(0))
+    with pytest.raises(NotImplementedError, match="subtraction"):
+        one.withColumn("d", F.col("k") - F.lit(1))    # arithmetic over a non-numeric
+
 
 # ── the stand-in's Task 13c surface: aggregation, joining, rounding, overflow ─────────────────────
 
@@ -744,6 +755,45 @@ def test_the_stand_ins_decimal_cast_OVERFLOWS_to_NULL_exactly_as_spark_does():
     assert fitted[0]["d"] == decimal.Decimal("99.99")   # quantized, not lost
     assert fitted[1]["d"] is None                       # 1000.00 needs 6 digits, p=5 — NULL
     assert fitted[2]["d"] is None                       # NULL in, NULL out
+
+
+# ── the stand-in's Task 13d surface: the two final operations ─────────────────────────────────────
+
+
+def test_the_stand_ins_division_PROPAGATES_nulls_and_REFUSES_a_zero_divisor():
+    """A ratio's two failure modes, told apart.
+
+    A NULL on either side is a NULL — that is how an absent operand (an empty window under a `null`
+    policy) reaches the feature column without anything inventing a number for it. A ZERO divisor
+    raises instead, and deliberately does not model non-ANSI Spark's silent NULL: §8 rule 4 assigns
+    a zero denominator to the formula's own `zero_denominator` policy, and a stand-in that answered
+    it with a NULL would produce exactly what a renderer that never applied the policy produces.
+    """
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([
+        {"n": decimal.Decimal("30"), "d": decimal.Decimal("100")},
+        {"n": None, "d": decimal.Decimal("100")},
+        {"n": decimal.Decimal("30"), "d": None},
+    ])
+    quotients = [row["q"] for row in frame.withColumn("q", F.col("n") / F.col("d")).rows]
+    assert quotients == [decimal.Decimal("0.3"), None, None]
+
+    with pytest.raises(NotImplementedError, match="divided by zero"):
+        fake_spark.DataFrame([{"n": 1, "d": decimal.Decimal("0.000000")}]).withColumn(
+            "q", F.col("n") / F.col("d"))
+
+
+def test_the_stand_ins_subtraction_PROPAGATES_nulls_rather_than_treating_one_side_as_zero():
+    """A DIFFERENCE over an empty window. If subtraction coerced a NULL to 0 the declared `null`
+    empty-window policy would silently become `zero`, and `0 - x` is a real, plausible number."""
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([
+        {"a": decimal.Decimal("7"), "b": decimal.Decimal("4")},
+        {"a": None, "b": decimal.Decimal("4")},
+        {"a": decimal.Decimal("7"), "b": None},
+    ])
+    differences = [row["d"] for row in frame.withColumn("d", F.col("a") - F.col("b")).rows]
+    assert differences == [decimal.Decimal("3"), None, None]
 
 
 # ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
@@ -1083,13 +1133,31 @@ def lock_tree(tmp_path):
     return str(nodes)
 
 
-def _calculate(compiled, feature, *, ir=None, plan=None,
+def _per_path(value, ir):
+    """A scalar policy fanned out over the body's paths — the shape the renderer requires.
+
+    Tests that care about ONE expression say `EmptyWindowResult.ZERO`; tests that care about the two
+    halves declaring different things pass the mapping straight through.
+    """
+    if isinstance(value, dict):
+        return value
+    return dict.fromkeys(_paths(ir), value)
+
+
+def _paths(ir):
+    """The body paths of `ir` — empty for the deliberately-wrong arguments the type checks reject."""
+    return [expression.expr_path for expression in getattr(ir, "expressions", ())]
+
+
+def _calculate(compiled, feature, *, ir=None, plan=None, projections=None,
                empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE):
+    ir = ir if ir is not None else compiled[0].irs[0]
+    if projections is None:
+        projections = dict.fromkeys(_paths(ir), PROJECTION)
     return nodes_compute.render_calculation_node(
-        ir if ir is not None else compiled[0].irs[0], feature,
-        plan if plan is not None else compiled[1],
-        empty_window=empty_window, null_input=null_input,
-        projection_dataset=PROJECTION, spine_dataset="primary_spine",
+        ir, feature, plan if plan is not None else compiled[1],
+        empty_window=_per_path(empty_window, ir), null_input=_per_path(null_input, ir),
+        projection_datasets=projections, spine_dataset="primary_spine",
         staging_dataset=STAGING, manifest_dataset=MANIFEST)
 
 
@@ -1615,10 +1683,13 @@ def _wired_nodes(compiled, datasets):
                 projection_dataset=datasets.projections[(ir.feature_name,
                                                          expression.expr_path)]))
         planned = next(item for item in plan.features if item.column_name == ir.feature_name)
+        paths = [expression.expr_path for expression in ir.expressions]
         nodes.append(nodes_compute.render_calculation_node(
-            ir, planned, plan, empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE,
-            projection_dataset=datasets.projections[(ir.feature_name,
-                                                     ir.expressions[0].expr_path)],
+            ir, planned, plan,
+            empty_window=dict.fromkeys(paths, EmptyWindowResult.NULL),
+            null_input=dict.fromkeys(paths, NullInput.IGNORE),
+            projection_datasets={path: datasets.projections[(ir.feature_name, path)]
+                                 for path in paths},
             spine_dataset=datasets.spine, staging_dataset=datasets.staging[ir.feature_name],
             manifest_dataset=datasets.manifests[ir.feature_name]))
     nodes.append(_assembly_stub(datasets))
@@ -1667,20 +1738,22 @@ def test_the_renderer_still_imports_no_pyspark_and_writes_no_location(compiled, 
 # ── refusals decidable at RENDER time ────────────────────────────────────────────────────────────
 
 
-def test_it_refuses_a_RATIO_or_DIFFERENCE_rather_than_staging_HALF_of_it(compiled, feature):
-    """A ratio has two aggregates, a final operation and its own zero_denominator policy. None of
-    that is rendered here, and staging the numerator under the feature's own name would publish a
-    numerator as though it were the ratio — a plausible number with no error anywhere."""
+def test_it_refuses_a_BODY_whose_compiled_PATHS_are_not_the_operations_own(compiled, feature):
+    """The body path is the only thing that says WHICH operand an expression is. A ratio compiled
+    to `body.expr` would be rendered as its own numerator and its own denominator — the number is 1
+    for every entity that has any rows at all, and nothing anywhere would call that an error."""
+    identity = compiled[0].irs[0]
     for operation in (FinalOperation.RATIO, FinalOperation.DIFFERENCE):
-        ir = dataclasses.replace(compiled[0].irs[0], final_operation=operation)
-        with pytest.raises(ValueError, match="single aggregate"):
+        ir = dataclasses.replace(identity, final_operation=operation,
+                                 zero_denominator=None)
+        with pytest.raises(ValueError, match="body path is what says WHICH operand"):
             _calculate(compiled, feature, ir=ir)
 
 
 def test_it_refuses_an_identity_body_that_compiled_to_more_than_ONE_expression(compiled, feature):
     expression = compiled[0].irs[0].expressions[0]
     ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression, expression))
-    with pytest.raises(ValueError, match="expression"):
+    with pytest.raises(ValueError, match="body path is what says WHICH operand"):
         _calculate(compiled, feature, ir=ir)
 
 
@@ -1703,9 +1776,11 @@ def test_it_refuses_when_the_PLAN_and_the_IR_describe_different_columns(compiled
             compiled[0].irs[0], feature_name="something_else"))
 
 
-def test_it_refuses_an_expression_whose_JOIN_PLAN_HAS_HOPS(compiled, feature):
-    """The same refusal 13b's projection makes, reached through the calculation: a traversal this
-    renderer drops would aggregate over rows that never belonged to the entity."""
+def test_it_refuses_an_expression_whose_JOIN_PLAN_IS_NOT_RENDERABLE(compiled, feature):
+    """13e made the calculation read the projection's OUTPUT rather than the whole read set, so a
+    well-formed traversal now renders (see the 13e section). A malformed one still refuses HERE, at
+    the calculation, because the grain it groups by is the one the traversal was supposed to reach.
+    """
     expression = compiled[0].irs[0].expressions[0]
     hopped = dataclasses.replace(
         expression, join_plan=dataclasses.replace(
@@ -1833,3 +1908,976 @@ def test_every_rendered_calculation_line_fits_the_width_it_states(compiled, feat
     for variant in CALCULATION_VARIANTS.values():
         for line in _calculate(compiled, feature, **variant).source.splitlines():
             assert len(line) <= 100, line
+
+
+# ══ Task 13d — the two FINAL OPERATIONS (§8 rule 4's ÷0 half) ════════════════════════════════════
+#
+# The rule that produces a plausible number rather than an error here is the ÷0 policy. Spark's
+# division returns NULL for a zero denominator and NULL for an absent one, so a renderer that read
+# the QUOTIENT back — or that coalesced — would answer one declaration's question with another's
+# answer and publish a column nobody declared. Every assertion below therefore RUNS the rendered
+# source and reads the rows: `zero_denominator=error` is a raise or it is nothing, and the
+# difference between "no rows at all" and "rows summing to zero" is invisible in the text.
+
+RATIO_90D = "cross_border_value_ratio_90d"
+NUMERATOR_PATH = "body.numerator"
+DENOMINATOR_PATH = "body.denominator"
+RATIO_STAGING = "feature_staging_cross_border_value_ratio_90d"
+RATIO_MANIFEST = "feature_staging_manifest_cross_border_value_ratio_90d"
+RATIO_PROJECTIONS = {NUMERATOR_PATH: "intermediate_ratio__body_numerator",
+                     DENOMINATOR_PATH: "intermediate_ratio__body_denominator"}
+
+
+@pytest.fixture
+def ratio(catalog, db):  # noqa: F811 — `catalog` seeds the governed facts `db` is read through
+    """The REAL compilation of the worked ratio — two expressions, two windows, one filter."""
+    authorized, plan, spine_input = _compiled(db, RATIO_90D)
+    group = derive_group_contract(db, authorized, cadence=CADENCE,
+                                  availability_promise=AvailabilityPromiseV1(calendar_days=1))
+    assert isinstance(group, ContractGroup), group
+    return authorized, plan, group.contract, spine_input
+
+
+@pytest.fixture
+def ratio_feature(ratio):
+    """The real PlannedFeature for `cross_border_value_ratio_90d` — DECIMAL(38,6), HALF_EVEN."""
+    return next(planned for planned in ratio[1].features if planned.column_name == RATIO_90D)
+
+
+def _render_ratio(ratio, ratio_feature, *, zero_denominator=None, ir=None, plan=None,
+                  empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE,
+                  projections=None):
+    ir = ir if ir is not None else ratio[0].irs[0]
+    if zero_denominator is not None:
+        ir = dataclasses.replace(ir, zero_denominator=zero_denominator)
+    return nodes_compute.render_calculation_node(
+        ir, ratio_feature, plan if plan is not None else ratio[1],
+        empty_window=_per_path(empty_window, ir), null_input=_per_path(null_input, ir),
+        projection_datasets=projections if projections is not None else RATIO_PROJECTIONS,
+        spine_dataset="primary_spine", staging_dataset=RATIO_STAGING,
+        manifest_dataset=RATIO_MANIFEST)
+
+
+def _ratio_txn(cif, amount, *, cross_border=True):
+    """One row as the PROJECTION emits it — already point-in-time filtered, no governed filter."""
+    return {"cif_id": cif, "txn_amt": decimal.Decimal(str(amount)),
+            "cross_border_flag": cross_border, "posted_ts": LONG_POSTED, "txn_dt": BEFORE}
+
+
+def _run_ratio(node, lock_tree, *, numerator, denominator, spine, business_dt=BUSINESS_DT,
+               generation="gen-0001", run="run-0001"):
+    run_node = fake_spark.run_rendered(node.source, node.func_name, module_file=lock_tree)
+    return run_node(fake_spark.DataFrame(numerator), fake_spark.DataFrame(denominator),
+                    fake_spark.DataFrame(spine, columns=["cif_id", "business_dt"]),
+                    business_dt, generation, run, "exec-0001", "hdfs://nn/staging/gen-0001")
+
+
+def _ratio_values(node, lock_tree, *, rows=None, numerator=None, denominator=None, spine):
+    """The feature column per entity. `rows` feeds BOTH projections, which is the real shape: the
+    two PIT projections of this formula select the same window over the same table, and it is the
+    GOVERNED filter inside the node that separates cross-border value from total value."""
+    frame, _manifest = _run_ratio(
+        node, lock_tree,
+        numerator=rows if numerator is None else numerator,
+        denominator=rows if denominator is None else denominator, spine=spine)
+    return {row["cif_id"]: row[RATIO_90D] for row in frame.rows}
+
+
+# ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
+
+
+def test_the_ratio_wires_BOTH_projections_IN_SLOT_ORDER_and_both_outputs(ratio, ratio_feature):
+    """Kedro binds positionally. The numerator's dataset must be the FIRST input, or the generated
+    pipeline runs, computes a number, and computes the reciprocal of the one that was declared."""
+    node = _render_ratio(ratio, ratio_feature)
+    assert node.inputs == (RATIO_PROJECTIONS[NUMERATOR_PATH], RATIO_PROJECTIONS[DENOMINATOR_PATH],
+                           "primary_spine", "params:business_dt", "params:generation_id",
+                           "params:run_id", "params:sandbox_execution_hash", "params:staging_root")
+    assert node.outputs == (RATIO_STAGING, RATIO_MANIFEST)
+    assert node.name == node.func_name == "calculate_cross_border_value_ratio_90d"
+    signature = node.source.split(") -> ")[0]
+    assert signature.index("numerator_projection") < signature.index("denominator_projection")
+
+
+def test_the_ratio_source_parses_and_renders_identically_every_time(ratio, ratio_feature):
+    first, second = _render_ratio(ratio, ratio_feature), _render_ratio(ratio, ratio_feature)
+    assert ast.parse(first.source)
+    assert first.source == second.source and first.imports == second.imports
+
+
+def test_the_body_slots_are_CHILD_ONES_own_body_paths(ratio, ratio_feature):
+    """`_BODY_SLOTS` says which operation owns which path; `BODY_PATHS` says which paths exist. If
+    they drift, this renderer names an operand Child-1 does not compile and refuses every feature."""
+    declared = {path for paths in nodes_compute._BODY_SLOTS.values() for path in paths}
+    assert declared == set(BODY_PATHS)
+
+
+# ── the two operands are two EXPRESSIONS ─────────────────────────────────────────────────────────
+
+
+def test_the_WORKED_RATIO_divides_the_numerator_by_the_denominator(ratio, ratio_feature, lock_tree):
+    """`cross_border_value_ratio_90d` — the feature that compiled, passed governance and then had
+    no calculation node at all. 30 of 100 is 0.3, and the governed filter is what makes it 30."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1"), rows=[
+        _ratio_txn("c1", 30, cross_border=True), _ratio_txn("c1", 70, cross_border=False)])
+    assert values == {"c1": decimal.Decimal("0.300000")}
+
+
+def test_each_operand_applies_its_OWN_governed_filter(ratio, ratio_feature, lock_tree):
+    """The numerator declares `cross_border_flag = true` and the denominator declares nothing. The
+    same rows reach both, so a renderer applying ONE filter to both would answer 1.0 for everyone —
+    a number with no error anywhere, and exactly the shape a share-of-total feature would take."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2"), rows=[
+        _ratio_txn("c1", 25, cross_border=True), _ratio_txn("c1", 75, cross_border=False),
+        _ratio_txn("c2", 40, cross_border=True), _ratio_txn("c2", 40, cross_border=False)])
+    assert values == {"c1": decimal.Decimal("0.250000"), "c2": decimal.Decimal("0.500000")}
+
+
+def test_the_two_projections_are_read_INDEPENDENTLY_and_NOT_swapped(ratio, ratio_feature,
+                                                                    lock_tree):
+    """Two frames, deliberately different. A node reading one input twice, or reading them the
+    other way round, produces 4 or 0.25 — both plausible, neither declared."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(
+        node, lock_tree, spine=_spine_rows("c1"),
+        numerator=[_ratio_txn("c1", 20)], denominator=[_ratio_txn("c1", 80)])
+    assert values == {"c1": decimal.Decimal("0.250000")}
+
+
+def test_each_operand_resolves_ITS_OWN_empty_window_policy(ratio, ratio_feature, lock_tree):
+    """§8 rule 4's policies live on each expression's own WindowPolicy, not on the feature. The
+    same rows and the same ÷0 policy give different columns when ONE operand's declaration moves —
+    which is only true if the renderer read two declarations rather than one."""
+    spine, rows = _spine_rows("c1"), []
+    both_null = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ZERO)
+    assert _ratio_values(both_null, lock_tree, spine=spine, rows=rows) == {"c1": None}
+
+    denominator_zero = _render_ratio(
+        ratio, ratio_feature, zero_denominator=ZeroDenominator.ZERO,
+        empty_window={NUMERATOR_PATH: EmptyWindowResult.NULL,
+                      DENOMINATOR_PATH: EmptyWindowResult.ZERO})
+    # The denominator's OWN declaration turned the empty window into a real zero, and the ÷0 policy
+    # then answered it. Nothing about the numerator's declaration changed.
+    assert _ratio_values(denominator_zero, lock_tree, spine=spine, rows=rows) == {"c1": 0}
+
+
+def test_a_NULL_numerator_over_a_present_denominator_is_NULL_and_not_zero(ratio, ratio_feature,
+                                                                          lock_tree):
+    """An entity with total value but no cross-border value at all. Its numerator is an empty
+    window under a `null` declaration, and `NULL / 100` is NULL — not the 0 a coalesce would give,
+    which reads downstream as "this customer sends nothing abroad" rather than "not known"."""
+    node = _render_ratio(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1"),
+                           rows=[_ratio_txn("c1", 100, cross_border=False)])
+    assert values == {"c1": None}
+
+
+# ── §8 rule 4's ÷0 half: three members, three different columns ──────────────────────────────────
+
+
+def _zero_denominator_rows():
+    """c1 has a ratio; c2's denominator is exactly ZERO; c3 has no rows at all — ABSENT.
+
+    c2 and c3 are the pair the whole policy turns on. Both end as "no value" under a naive
+    implementation, and §8 rule 4 gives them different declared answers.
+    """
+    return [_ratio_txn("c1", 30, cross_border=True), _ratio_txn("c1", 70, cross_border=False),
+            _ratio_txn("c2", 50, cross_border=True), _ratio_txn("c2", -50, cross_border=False)]
+
+
+def test_rule_4_zero_denominator_NULL_leaves_a_null_and_stops_nothing(ratio, ratio_feature,
+                                                                      lock_tree):
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.NULL)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2", "c3"),
+                           rows=_zero_denominator_rows())
+    assert values == {"c1": decimal.Decimal("0.300000"), "c2": None, "c3": None}
+
+
+def test_rule_4_zero_denominator_ZERO_tells_a_ZERO_denominator_from_an_ABSENT_one(
+        ratio, ratio_feature, lock_tree):
+    """The test this whole task turns on. c2 has rows and its denominator is exactly zero, so the
+    ÷0 policy answers it with 0. c3 has NO rows, so its own empty_window policy answers it with
+    NULL. An implementation that coalesced the quotient, or that read "the result is null" as "the
+    denominator was zero", gives c3 = 0 — a customer with no transactions reported as having a
+    cross-border share of nought, which is a claim about them nobody made."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ZERO)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2", "c3"),
+                           rows=_zero_denominator_rows())
+    assert values == {"c1": decimal.Decimal("0.300000"), "c2": 0, "c3": None}
+
+
+def test_rule_4_zero_denominator_ERROR_genuinely_RAISES(ratio, ratio_feature, lock_tree):
+    """`error` is not a mode Spark has: division by zero returns the same NULL the `null` policy
+    asks for, so a formula declaring that the run should STOP would publish a column of nulls and
+    report nothing. The rendered node makes it a real refusal, naming the count and no value."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ERROR)
+    with pytest.raises(RuntimeError, match="zero_denominator=error") as raised:
+        _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c2", "c3"),
+                      rows=_zero_denominator_rows())
+    assert "Entities affected: 1" in str(raised.value)
+    assert "50" not in str(raised.value)      # a count, never a data value (§14)
+
+
+def test_rule_4_zero_denominator_ERROR_does_NOT_fire_for_an_ABSENT_denominator(
+        ratio, ratio_feature, lock_tree):
+    """The other half of the same distinction, and the one a naive implementation gets wrong in the
+    louder direction: every entity with no rows in its window would stop the run."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.ERROR)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1", "c3"), rows=[
+        _ratio_txn("c1", 30, cross_border=True), _ratio_txn("c1", 70, cross_border=False)])
+    assert values == {"c1": decimal.Decimal("0.300000"), "c3": None}
+
+
+def test_the_three_zero_denominator_members_render_DIFFERENTLY(ratio, ratio_feature):
+    """Three declarations, three sources. If two of them rendered the same bytes, one formula's
+    declared behaviour would be another's and no execution test could tell which."""
+    rendered = {policy: _render_ratio(ratio, ratio_feature, zero_denominator=policy).source
+                for policy in ZeroDenominator}
+    assert len(set(rendered.values())) == 3
+    for policy, source in rendered.items():
+        assert f"zero_denominator is `{policy.value}`" in source
+
+
+# ── §8 rule 3 and §10.2, over two aggregates ─────────────────────────────────────────────────────
+
+
+def test_rule_3_an_entity_with_no_rows_in_EITHER_window_is_still_present(ratio, ratio_feature,
+                                                                         lock_tree):
+    node = _render_ratio(ratio, ratio_feature)
+    frame, _manifest = _run_ratio(node, lock_tree, numerator=[], denominator=[],
+                                  spine=_spine_rows("c1", "c2"))
+    assert [row["cif_id"] for row in frame.rows] == ["c1", "c2"]
+    assert all(row[RATIO_90D] is None for row in frame.rows)
+
+
+def test_the_staged_frame_carries_only_the_keys_the_date_and_the_FEATURE(ratio, ratio_feature,
+                                                                         lock_tree):
+    """§10.2. The two operand columns and their markers are this node's own working state; either
+    one surviving is an extra column §9 reports against the whole group at assembly."""
+    node = _render_ratio(
+        ratio, ratio_feature,
+        empty_window={NUMERATOR_PATH: EmptyWindowResult.ZERO,
+                      DENOMINATOR_PATH: EmptyWindowResult.ZERO},
+        zero_denominator=ZeroDenominator.ZERO)
+    frame, _manifest = _run_ratio(node, lock_tree, numerator=[_ratio_txn("c1", 3)],
+                                  denominator=[_ratio_txn("c1", 6)], spine=_spine_rows("c1"))
+    assert frame.columns == ["cif_id", "business_dt", RATIO_90D]
+
+
+def test_the_operand_columns_are_dropped_BEFORE_the_staging_select(ratio, ratio_feature):
+    """§10.2 is enforced TWICE, deliberately, and this asserts the second belt.
+
+    The staging select carries the keys, the business date and one feature column, so it already
+    removes the two operand columns whether or not they are dropped — the drop is not observable in
+    the output, and a mutation that removes it survives every execution test in this file. It is
+    rendered anyway because the node's own working state should have a stated lifetime in the
+    generated project a bank reads, and because §10.2 then does not depend on one line: a change to
+    the select alone cannot leak `__numerator` into an assembled group.
+    """
+    source = _render_ratio(ratio, ratio_feature).source
+    dropped = source.index("staged = staged.drop('__numerator', '__denominator')")
+    assert dropped < source.index("staged = staged.select(")
+
+
+def test_the_ratio_emits_no_row_collapsing_repair(ratio, ratio_feature, lock_tree):
+    """Two joins instead of one is two more chances to "fix" a fan-out that is refused upstream."""
+    node = _render_ratio(ratio, ratio_feature)
+    assert ".dropDuplicates(" not in node.source and ".distinct(" not in node.source
+    _ratio_values(node, lock_tree, spine=_spine_rows("c1"), rows=[_ratio_txn("c1", 1)])
+
+
+def test_the_ratios_manifest_is_read_by_SECTION_NINES_own_completeness_check(ratio, ratio_feature,
+                                                                             lock_tree):
+    node = _render_ratio(ratio, ratio_feature)
+    _frame, manifest = _run_ratio(node, lock_tree, numerator=[_ratio_txn("c1", 3)],
+                                  denominator=[_ratio_txn("c1", 6)], spine=_spine_rows("c1"),
+                                  generation=GENERATION, run="run-0001")
+    assert set(manifest) == {field.name for field in dataclasses.fields(StagingManifestV1)}
+    parsed = StagingManifestV1(**json.loads(json.dumps(manifest)))
+    assert check_completeness(ratio[1], [parsed], generation_id=GENERATION, run_id="run-0001",
+                              business_dt=BUSINESS_DT) == ()
+
+
+# ── the DIFFERENCE body ──────────────────────────────────────────────────────────────────────────
+
+
+def _difference(ratio):
+    """The worked ratio's compilation, re-declared as a DIFFERENCE and nothing else.
+
+    No worked fixture declares a difference, and adding one to `fixtures` would change what every
+    other test in the program compiles. So the real compilation's two expressions are re-pathed onto
+    the difference's slots — the same aggregates, the same windows, the same governed filter, under
+    the other operation. The feature keeps its name because the plan publishes that column and a
+    node staged under any other name has no manifest §9 would read.
+    """
+    ir = ratio[0].irs[0]
+    renamed = {NUMERATOR_PATH: "body.minuend", DENOMINATOR_PATH: "body.subtrahend"}
+    return dataclasses.replace(
+        ir, final_operation=FinalOperation.DIFFERENCE, zero_denominator=None,
+        expressions=tuple(dataclasses.replace(expression, expr_path=renamed[expression.expr_path])
+                          for expression in ir.expressions))
+
+
+DIFFERENCE_PROJECTIONS = {"body.minuend": "intermediate_diff__body_minuend",
+                          "body.subtrahend": "intermediate_diff__body_subtrahend"}
+
+
+def _render_difference(ratio, ratio_feature, **overrides):
+    return _render_ratio(ratio, ratio_feature, ir=_difference(ratio),
+                         projections=DIFFERENCE_PROJECTIONS, **overrides)
+
+
+def test_the_DIFFERENCE_subtracts_the_subtrahend_from_the_minuend(ratio, ratio_feature, lock_tree):
+    node = _render_difference(ratio, ratio_feature)
+    values = _ratio_values(node, lock_tree, spine=_spine_rows("c1"),
+                           numerator=[_ratio_txn("c1", 90)], denominator=[_ratio_txn("c1", 40)])
+    assert values == {"c1": decimal.Decimal("50.000000")}
+    assert node.inputs[:2] == ("intermediate_diff__body_minuend",
+                               "intermediate_diff__body_subtrahend")
+
+
+def test_the_DIFFERENCE_answers_an_EMPTY_side_from_that_SIDES_own_policy(ratio, ratio_feature,
+                                                                         lock_tree):
+    """What a difference means when one side is an empty window is not this renderer's question.
+    Under `null` the difference is NULL; under `zero` the same rows give `0 - 40 = -40`. Both are
+    the declaration's answer, and picking either as a default would publish it as the formula's."""
+    absent_minuend = {"numerator": [], "denominator": [_ratio_txn("c1", 40)]}
+    propagated = _render_difference(ratio, ratio_feature)
+    assert _ratio_values(propagated, lock_tree, spine=_spine_rows("c1"), **absent_minuend) == {
+        "c1": None}
+
+    zeroed = _render_difference(ratio, ratio_feature, empty_window={
+        "body.minuend": EmptyWindowResult.ZERO, "body.subtrahend": EmptyWindowResult.NULL})
+    assert _ratio_values(zeroed, lock_tree, spine=_spine_rows("c1"), **absent_minuend) == {
+        "c1": decimal.Decimal("-40.000000")}
+
+
+def test_the_DIFFERENCE_does_not_COALESCE_either_side(ratio, ratio_feature):
+    """The plausible shortcut, named. `F.coalesce` anywhere in the final operation would turn every
+    `null` empty-window declaration into a `zero` one, silently and for both halves at once."""
+    source = _render_difference(ratio, ratio_feature).source
+    final = source.split("The DIFFERENCE.")[1]
+    assert "F.coalesce" not in final
+
+
+# ── refusals decidable at RENDER time ────────────────────────────────────────────────────────────
+
+
+def test_it_refuses_a_body_path_with_NO_declared_policy_or_NO_projection(ratio, ratio_feature):
+    """A path with nothing declared for it would be rendered under a default, and every default
+    here is this renderer answering a question §8 rule 4 assigns to the formula."""
+    for missing in ("empty_window", "null_input"):
+        policy = {EmptyWindowResult.NULL if missing == "empty_window" else NullInput.IGNORE}
+        with pytest.raises(ValueError, match=f"{missing} for"):
+            _render_ratio(ratio, ratio_feature,
+                          **{missing: {NUMERATOR_PATH: policy.pop()}})
+    with pytest.raises(ValueError, match="projection_datasets for"):
+        _render_ratio(ratio, ratio_feature,
+                      projections={NUMERATOR_PATH: RATIO_PROJECTIONS[NUMERATOR_PATH]})
+    with pytest.raises(ValueError, match="projection_datasets for"):
+        _render_ratio(ratio, ratio_feature,
+                      projections={**RATIO_PROJECTIONS, "body.expr": "intermediate_extra"})
+
+
+def test_it_refuses_a_policy_that_is_NOT_a_mapping_over_body_paths(ratio, ratio_feature):
+    """One value shared between the operands would apply the numerator's declaration to the
+    denominator — a ratio may legitimately declare `zero` for one and `null` for the other."""
+    with pytest.raises(TypeError, match="mapping from body path"):
+        nodes_compute.render_calculation_node(
+            ratio[0].irs[0], ratio_feature, ratio[1],
+            empty_window=EmptyWindowResult.ZERO,          # the scalar 13c took, deliberately
+            null_input=dict.fromkeys(RATIO_PROJECTIONS, NullInput.IGNORE),
+            projection_datasets=RATIO_PROJECTIONS, spine_dataset="primary_spine",
+            staging_dataset=RATIO_STAGING, manifest_dataset=RATIO_MANIFEST)
+
+
+def test_it_refuses_a_RATIO_with_no_zero_denominator_and_a_NON_ratio_with_one(ratio,
+                                                                             ratio_feature):
+    ir = dataclasses.replace(ratio[0].irs[0], zero_denominator=None)
+    with pytest.raises(ValueError, match="carries no zero_denominator"):
+        _render_ratio(ratio, ratio_feature, ir=ir)
+    difference = dataclasses.replace(_difference(ratio), zero_denominator=ZeroDenominator.NULL)
+    with pytest.raises(ValueError, match="no division in that body"):
+        _render_ratio(ratio, ratio_feature, ir=difference,
+                      projections=DIFFERENCE_PROJECTIONS)
+
+
+def test_it_refuses_a_RATIO_whose_operands_declare_DIFFERENT_grains(ratio, ratio_feature):
+    """One groupBy serves both aggregates. An operand grouped by something else would land its
+    values against another entity's key, which is a full column of plausible numbers."""
+    ir = ratio[0].irs[0]
+    elsewhere = dataclasses.replace(ir.expressions[1], physical_read_set=tuple(
+        ref for ref in ir.expressions[1].physical_read_set if ref.column != "cif_id"))
+    with pytest.raises(ValueError, match="authorized read set"):
+        _render_ratio(ratio, ratio_feature,
+                      ir=dataclasses.replace(ir, expressions=(ir.expressions[0], elsewhere)))
+
+
+# ── the node inside a real project ───────────────────────────────────────────────────────────────
+
+
+def test_the_RATIO_closes_the_wiring_of_a_REAL_rendered_project(ratio):
+    """The whole of A.18's first row, end to end: the worked ratio now has a calculation node, and
+    Task 12's six wiring checks accept it — two projection inputs and all."""
+    datasets = project_datasets(ratio[0], ratio[1], spine_input=ratio[3])
+    project = render_project(
+        ratio[0], ratio[1], environment_id=ENVIRONMENT,
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=ratio[3],
+        nodes=_wired_nodes(ratio, datasets))
+    nodes_py = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/nodes.py"))
+    assert f"def {nodes_compute.calculation_func_name(RATIO_90D)}(" in nodes_py
+    assert ast.parse(nodes_py)
+
+
+# ── goldens: a change detector, and the weakest test here ────────────────────────────────────────
+
+
+RATIO_VARIANTS = {
+    "ratio_zero_denominator_null": {"zero_denominator": ZeroDenominator.NULL},
+    "ratio_zero_denominator_zero": {"zero_denominator": ZeroDenominator.ZERO},
+    "ratio_zero_denominator_error": {"zero_denominator": ZeroDenominator.ERROR},
+    "ratio_per_operand_empty_windows": {
+        "zero_denominator": ZeroDenominator.ZERO,
+        "empty_window": {NUMERATOR_PATH: EmptyWindowResult.NULL,
+                         DENOMINATOR_PATH: EmptyWindowResult.ZERO},
+        "null_input": {NUMERATOR_PATH: NullInput.PROPAGATE,
+                       DENOMINATOR_PATH: NullInput.IGNORE}},
+}
+
+
+@pytest.mark.parametrize("variant", sorted(RATIO_VARIANTS))
+def test_the_rendered_ratio_matches_its_golden(ratio, ratio_feature, variant):
+    """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
+    golden = CALCULATION_GOLDENS / f"{variant}.py"
+    rendered = _render_ratio(ratio, ratio_feature, **RATIO_VARIANTS[variant]).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_the_rendered_difference_matches_its_golden(ratio, ratio_feature):
+    golden = CALCULATION_GOLDENS / "difference_decimal.py"
+    rendered = _render_difference(ratio, ratio_feature).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_every_rendered_FINAL_OPERATION_line_fits_the_width_it_states(ratio, ratio_feature):
+    for variant in RATIO_VARIANTS.values():
+        for line in _render_ratio(ratio, ratio_feature, **variant).source.splitlines():
+            assert len(line) <= 100, line
+    for line in _render_difference(ratio, ratio_feature).source.splitlines():
+        assert len(line) <= 100, line
+
+
+# ══ Task 13e — the governed multi-hop traversal (§3.1–3.2) ═══════════════════════════════════════
+#
+# The shape A.17 names, and the normal shape in a bank: a feature grained on the CUSTOMER, computed
+# over TRANSACTIONS, whose rows reach their customer through the ACCOUNT. Every hop fans IN toward
+# the destination (N:1) because that is the only kind `plan_join` returns — a fanning path is
+# refused there, never repaired here.
+#
+# The failure this section is written against is not an exception. A hop rendered backwards still
+# joins and still produces rows; an inner join silently drops the source rows whose dimension row is
+# missing. Both leave a full table of plausible numbers. So the traversal is proved by EXECUTION —
+# one row per source row, each carrying the entity it actually belongs to.
+
+TRAVERSAL_GOLDENS = pathlib.Path(__file__).parent / "goldens" / "traversal_nodes"
+
+_ACCOUNTS = "accounts"
+_CUSTOMERS = "customers"
+
+#: `transactions -> accounts -> customers`. The two hops join on DIFFERENT column names on each
+#: side (`acct_num`/`acct_id`, `owner_id`/`cif_id`), so a renderer that read the endpoints in the
+#: wrong order names a column that is not there rather than silently joining on the right one.
+HOP_1 = JoinStep(from_ref="public.transactions.acct_num", to_ref="public.accounts.acct_id",
+                 cardinality="N:1", approved_join_fact_key="ajf-txn-acct",
+                 approved_join_status="VERIFIED", authority="operational")
+HOP_2 = JoinStep(from_ref="public.accounts.owner_id", to_ref="public.customers.cif_id",
+                 cardinality="N:1", approved_join_fact_key=None,
+                 approved_join_status=None, authority="operational")
+
+TRAVERSAL_DATASETS = {"banking.accounts": "raw_banking__accounts",
+                      "banking.customers": "raw_banking__customers"}
+
+
+def _pref(table, column, *roles):
+    """One PhysicalRef in the shape Task 5 resolves: a schema-flattened logical ref, and the
+    physical `banking.<table>` the metastore answers to."""
+    from featuregen.materialize.expression_ir import PhysicalRef
+    ref = f"{fixtures.SOURCE}::public.{table}" + (f".{column}" if column else "")
+    return PhysicalRef(logical_ref=ref, catalog_source=fixtures.SOURCE, schema="banking",
+                       table=table, column=column, roles=tuple(roles))
+
+
+#: Every endpoint the two hops travel on, as §1.3 authorized them: `(table, column, *roles)`.
+TWO_HOP_READS = (
+    (fixtures.TABLE, "acct_num", RefRole.JOIN_KEY),
+    (_ACCOUNTS, "acct_id", RefRole.JOIN_KEY),
+    (_ACCOUNTS, "owner_id", RefRole.JOIN_KEY),
+    (_CUSTOMERS, "cif_id", RefRole.JOIN_KEY, RefRole.GRAIN_KEY),
+)
+
+#: The shorter shape, and the commoner one: the grain sits on the table directly joined.
+ONE_HOP = (JoinStep(from_ref="public.transactions.cif_num", to_ref="public.customers.cif_id",
+                    cardinality="N:1", approved_join_fact_key="ajf-txn-cust",
+                    approved_join_status="VERIFIED", authority="operational"),)
+ONE_HOP_READS = (
+    (fixtures.TABLE, "cif_num", RefRole.JOIN_KEY),
+    (_CUSTOMERS, "cif_id", RefRole.JOIN_KEY, RefRole.GRAIN_KEY),
+)
+
+
+def _traversed(expression, *, steps=(HOP_1, HOP_2), reads=TWO_HOP_READS, **plan_overrides):
+    """The worked expression re-grained onto `customers.cif_id`, `steps` hops away.
+
+    Everything else is the real compilation: the same operand, the same governed filter, the same
+    window and the same availability column. Only the grain moves off the source relation — which
+    is the ONLY reason `_plan_to_grain` ever produces a hop.
+    """
+    kept = tuple(ref for ref in expression.physical_read_set
+                 if not (ref.column == "cif_id" and ref.table == fixtures.TABLE))
+    read_set = (*kept, *(_pref(*read) for read in reads))
+    return dataclasses.replace(
+        expression, physical_read_set=read_set,
+        join_plan=dataclasses.replace(expression.join_plan, steps=tuple(steps), **plan_overrides))
+
+
+def _traversal(compiled, expression, *, joined_datasets=None, **kwargs):
+    return nodes_compute.render_projection_node(
+        _traversed(expression, **kwargs), compiled[2], feature_column=SUM_30D,
+        source_dataset="raw_banking__transactions",
+        joined_datasets=TRAVERSAL_DATASETS if joined_datasets is None else joined_datasets,
+        projection_dataset="intermediate_total_debit_amount_30d__body_expr")
+
+
+#: Two customers, two accounts, and a transaction on an account NOBODY owns. The orphan is the whole
+#: point: it is what tells a LEFT traversal from an INNER one, and an inner one silently changes
+#: which source rows the feature is computed over.
+ACCOUNTS = [{"acct_id": "A1", "owner_id": "C1"}, {"acct_id": "A2", "owner_id": "C2"}]
+CUSTOMERS_ROWS = [{"cif_id": "C1"}, {"cif_id": "C2"}]
+
+
+def _traverse(node, txns, *, accounts=None, customers=None, business_dt=BUSINESS_DT):
+    run = fake_spark.run_rendered(node.source, node.func_name)
+    return run(fake_spark.DataFrame(txns),
+               fake_spark.DataFrame(ACCOUNTS if accounts is None else accounts),
+               fake_spark.DataFrame(CUSTOMERS_ROWS if customers is None else customers),
+               business_dt)
+
+
+def test_the_traversal_lands_every_source_row_on_the_entity_it_ACTUALLY_belongs_to(
+        compiled, expression):
+    """The number test. A hop rendered backwards, or joined on the wrong endpoint, still produces
+    rows — it produces them under the wrong customer, and nothing downstream would say so."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [
+        _windowed(BEFORE, 10) | {"acct_num": "A1"},
+        _windowed(BEFORE, 20) | {"acct_num": "A2"},
+        _windowed(BEFORE, 30) | {"acct_num": "A1"},
+    ]).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [
+        (10, "C1"), (20, "C2"), (30, "C1")]
+
+
+def test_the_traversal_produces_EXACTLY_ONE_ROW_PER_SOURCE_ROW(compiled, expression):
+    """`JoinPlan.fans_out` is False by construction, so a rendered traversal that multiplied rows
+    would be inflating every SUM over it. Counted, because a wrong SUM raises nothing."""
+    node = _traversal(compiled, expression)
+    txns = [_windowed(BEFORE, n) | {"acct_num": acct}
+            for n, acct in ((10, "A1"), (20, "A2"), (30, "A1"), (40, "A1"))]
+    assert _traverse(node, txns).count() == len(txns)
+
+
+def test_a_source_row_whose_DIMENSION_ROW_IS_MISSING_survives_with_a_NULL_key(
+        compiled, expression):
+    """The join type, made observable. An INNER traversal drops this row — which changes the rows
+    the feature is computed over on a referential-integrity fact nobody governed. A LEFT one keeps
+    it with a null entity key, and §8 rule 3's spine reduction then never lands it on anybody."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [
+        _windowed(BEFORE, 10) | {"acct_num": "A1"},
+        _windowed(BEFORE, 99) | {"acct_num": "A404"},      # an account that does not exist
+    ]).rows
+    assert len(rows) == 2
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(10, "C1"), (99, None)]
+
+
+def test_a_hop_rendered_BACKWARDS_refuses_rather_than_joining(compiled, expression):
+    """`JoinStep` is oriented to the direction of travel. Replayed in the other order, hop 2 starts
+    at a table the frame has not reached — and rendered anyway it would land rows on the wrong
+    entities while producing a perfectly plausible column."""
+    with pytest.raises(ValueError, match="has not reached it"):
+        _traversal(compiled, expression, steps=(HOP_2, HOP_1))
+
+
+def test_a_traversal_that_REVISITS_A_TABLE_refuses(compiled, expression):
+    back = JoinStep(from_ref="public.customers.cif_id", to_ref="public.accounts.acct_id",
+                    cardinality="1:1", authority="operational")
+    with pytest.raises(ValueError, match="already reached"):
+        _traversal(compiled, expression, steps=(HOP_1, HOP_2, back))
+
+
+def test_a_DISPLAY_ONLY_hop_refuses(compiled, expression):
+    """`authority` is `operational` (usable for feature construction) vs `display_only` (an
+    ungoverned edge kept for lineage display). Computing over the second produces a number whose
+    path nobody governed, and it looks exactly like a governed one."""
+    ungoverned = dataclasses.replace(HOP_2, authority="display_only")
+    with pytest.raises(ValueError, match="display_only"):
+        _traversal(compiled, expression, steps=(HOP_1, ungoverned))
+
+
+def test_a_hop_whose_APPROVED_JOIN_FACT_IS_NOT_VERIFIED_refuses(compiled, expression):
+    """A fact that exists and is not VERIFIED is a join somebody proposed. `None` is different and
+    is NOT covered — a file-declared edge is a meaningful answer, not a missing one."""
+    proposed = dataclasses.replace(HOP_1, approved_join_status="DRAFT")
+    with pytest.raises(ValueError, match="not.*VERIFIED|VERIFIED"):
+        _traversal(compiled, expression, steps=(proposed, HOP_2))
+    assert HOP_2.approved_join_fact_key is None                 # file-declared, and it renders
+    assert _traversal(compiled, expression).source
+
+
+@pytest.mark.parametrize("cardinality", ["1:N", None, "M:N"])
+def test_a_hop_that_FANS_OUT_OR_IS_UNATTESTED_refuses(compiled, expression, cardinality):
+    """Refusing only the hops that SAY 1:N is a fail-open: an unattested edge may BE 1:N. 'We do
+    not know' is not 'it is safe' — and neither is repaired here, because de-duplicating a fanned
+    join picks a business allocation rule nobody approved (§3.2)."""
+    fanning = dataclasses.replace(HOP_2, cardinality=cardinality)
+    with pytest.raises(ValueError, match="cardinality"):
+        _traversal(compiled, expression, steps=(HOP_1, fanning))
+
+
+def test_a_plan_that_REPORTS_FANS_OUT_refuses_even_though_every_hop_fans_in(compiled, expression):
+    """`fans_out` is READ, not inferred from the absence of a warning — which is what `JoinPlan`'s
+    own docstring asks a consumer to do. Every hop here is N:1, so a renderer that inferred the
+    answer from the steps would render this plan and multiply nothing it could see."""
+    with pytest.raises(ValueError, match="fans_out"):
+        _traversal(compiled, expression, fans_out=True)
+
+
+def test_a_plan_whose_GOVERNED_OUTCOME_IS_NOT_OPERATIONAL_refuses(compiled, expression):
+    with pytest.raises(ValueError, match="outcome"):
+        _traversal(compiled, expression, outcome_kind="UNVERIFIED")
+
+
+def test_a_hop_ENDPOINT_OUTSIDE_THE_AUTHORIZED_READ_SET_refuses(compiled, expression):
+    """§1.3 records every join endpoint as its own read. An endpoint missing from the read set is a
+    column the group would join on and was never granted."""
+    elsewhere = dataclasses.replace(HOP_1, to_ref="public.accounts.branch_cd")
+    with pytest.raises(ValueError, match="authorized read set does not carry"):
+        _traversal(compiled, expression, steps=(elsewhere, HOP_2))
+
+
+def test_a_read_set_table_NO_HOP_REACHES_refuses(compiled, expression):
+    """The zero-hop case of the same rule, and 13b's original refusal: a node handed no dataset for
+    a table cannot name its columns."""
+    with pytest.raises(ValueError, match="spans"):
+        _traversal(compiled, expression, steps=(HOP_1,))
+
+
+def test_a_traversal_with_NO_GRAIN_KEY_AT_THE_END_refuses(compiled, expression):
+    """A traversal exists to reach the grain. One that emits nothing joins the tables and throws
+    the answer away — while costing exactly as much and looking exactly as governed."""
+    ungrained = dataclasses.replace(
+        _traversed(expression),
+        physical_read_set=tuple(
+            dataclasses.replace(ref, roles=tuple(r for r in ref.roles if r is not RefRole.GRAIN_KEY))
+            for ref in _traversed(expression).physical_read_set))
+    with pytest.raises(ValueError, match="no grain key is reached"):
+        nodes_compute.render_projection_node(
+            ungrained, compiled[2], feature_column=SUM_30D,
+            source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
+            projection_dataset="intermediate")
+
+
+def test_a_grain_key_the_SOURCE_ALSO_SPELLS_refuses(compiled, expression):
+    """Two spellings of one entity and nothing declaring the mapping between them (A.18's first
+    row, reached the other way): choosing one here lands every entity's value under a key this
+    compilation picked."""
+    both = dataclasses.replace(
+        _traversed(expression),
+        physical_read_set=(*_traversed(expression).physical_read_set,
+                           _pref(fixtures.TABLE, "cif_id", RefRole.FILTER_LEFT)))
+    with pytest.raises(ValueError, match="already carries a column of that name"):
+        nodes_compute.render_projection_node(
+            both, compiled[2], feature_column=SUM_30D,
+            source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
+            projection_dataset="intermediate")
+
+
+def test_the_hop_DATASETS_must_be_exactly_the_tables_the_traversal_reaches(compiled, expression):
+    """Kedro binds inputs positionally, so a dataset supplied against the wrong hop reads the wrong
+    table through a name that parses perfectly."""
+    with pytest.raises(ValueError, match="missing"):
+        _traversal(compiled, expression, joined_datasets={"banking.accounts": "raw_a"})
+    with pytest.raises(ValueError, match="unexpected"):
+        _traversal(compiled, expression,
+                   joined_datasets={**TRAVERSAL_DATASETS, "banking.branches": "raw_b"})
+    with pytest.raises(ValueError, match="missing"):
+        _traversal(compiled, expression, joined_datasets={})
+
+
+# ── the wiring, and what a reviewer counts it against ────────────────────────────────────────────
+
+
+def test_the_traversal_wires_ONE_INPUT_PER_JOINED_TABLE_in_traversal_order(compiled, expression):
+    node = _traversal(compiled, expression)
+    assert node.inputs == ("raw_banking__transactions", "raw_banking__accounts",
+                           "raw_banking__customers", "params:business_dt")
+    assert node.outputs == ("intermediate_total_debit_amount_30d__body_expr",)
+
+
+def test_the_rendered_SIGNATURE_matches_the_wiring_position_for_position(compiled, expression):
+    """The one defect a parse check cannot see: Kedro binds positionally, so a signature and a
+    wiring that disagree produce a pipeline that runs and computes the wrong thing."""
+    node = _traversal(compiled, expression)
+    module = ast.parse(node.source)
+    parameters = [arg.arg for arg in module.body[0].args.args]
+    assert parameters == ["source", "join_1_accounts", "join_2_customers", "business_dt"]
+    assert len(parameters) == len(node.inputs)
+
+
+def test_the_traversal_emits_NO_ROW_COLLAPSING_REPAIR(compiled, expression):
+    """A `dropDuplicates` here would hide a fan-out instead of reporting it, and a hidden fan-out is
+    a SUM wrong by a factor nobody can see. Asserted on the text AND by execution: the stand-in
+    raises when either is called, so a renderer that emitted one dies in every test above."""
+    source = _traversal(compiled, expression).source
+    assert "dropDuplicates" not in source
+    assert "distinct" not in source
+
+
+def test_the_traversal_never_JOINS_BEFORE_THE_PIT_GATES(compiled, expression):
+    """The gates read the source relation's own columns, so they are rendered first — on the rows
+    the feature may see, not on the joined product of them."""
+    source = _traversal(compiled, expression)
+    assert source.source.index("rows.where(") < source.source.index("rows.join(")
+
+
+def test_every_rendered_TRAVERSAL_line_fits_the_width_it_states(compiled, expression):
+    for line in _traversal(compiled, expression).source.splitlines():
+        assert len(line) <= 100, line
+
+
+def test_the_traversal_renders_identically_every_time(compiled, expression):
+    first, second = _traversal(compiled, expression), _traversal(compiled, expression)
+    assert ast.parse(first.source)
+    assert first.source == second.source and first.inputs == second.inputs
+
+
+# ── through the calculation, and through Task 12's wiring ────────────────────────────────────────
+
+
+def _traversed_ir(compiled, expression, **kwargs):
+    """The worked feature re-grained onto the customer two hops away — IR and all."""
+    return dataclasses.replace(
+        compiled[0].irs[0], expressions=(_traversed(expression, **kwargs),),
+        grain_keys=(f"{fixtures.SOURCE}::public.customers.cif_id",))
+
+
+def test_the_CALCULATION_accepts_a_multi_hop_projection_and_sums_per_ENTITY(
+        compiled, expression, feature, lock_tree):
+    """End to end, by execution: the traversal's own output frame is what the calculation reads.
+    A hop landed on the wrong customer produces the same shape and different numbers, so the
+    assertion is on the numbers."""
+    projection = _traversal(compiled, expression)
+    staged_rows = _traverse(projection, [
+        _windowed(BEFORE, 10) | {"acct_num": "A1"},
+        _windowed(BEFORE, 20) | {"acct_num": "A2"},
+        _windowed(BEFORE, 30) | {"acct_num": "A1"},
+        _windowed(BEFORE, 99) | {"acct_num": "A404"},          # reaches no customer at all
+    ]).rows
+
+    node = _calculate(compiled, feature, ir=_traversed_ir(compiled, expression))
+    assert _staged(node, lock_tree, projection=staged_rows,
+                   spine=_spine_rows("C1", "C2")) == {"C1": 40, "C2": 20}
+
+
+def test_the_ORPHANED_ROW_lands_on_no_entity_rather_than_on_the_wrong_one(
+        compiled, expression, feature, lock_tree):
+    """The other half of the LEFT decision. The row survives the projection with a null key, and
+    §8 rule 3's reduction then never joins it to anybody — so it changes no entity's number."""
+    projection = _traversal(compiled, expression)
+    orphan_only = _traverse(projection, [_windowed(BEFORE, 99) | {"acct_num": "A404"}]).rows
+    assert orphan_only[0]["cif_id"] is None
+
+    node = _calculate(compiled, feature, ir=_traversed_ir(compiled, expression))
+    assert _staged(node, lock_tree, projection=orphan_only,
+                   spine=_spine_rows("C1", "C2")) == {"C1": None, "C2": None}
+
+
+def _traversed_compilation(compiled, expression):
+    """The whole authorized compilation re-grained two hops away, physical requirements included."""
+    source_requirement = compiled[0].irs[0].expressions[0].input_requirements[0]
+    ir = _traversed_ir(compiled, expression)
+    expressions = (dataclasses.replace(
+        ir.expressions[0],
+        input_requirements=(source_requirement,
+                            dataclasses.replace(source_requirement, table=_ACCOUNTS),
+                            dataclasses.replace(source_requirement, table=_CUSTOMERS))),)
+    authorized = dataclasses.replace(
+        compiled[0], irs=(dataclasses.replace(ir, expressions=expressions),))
+    plan = dataclasses.replace(compiled[1], features=tuple(
+        dataclasses.replace(item, ir_hash=ir_hash(authorized.irs[0]))
+        if item.column_name == ir.feature_name else item
+        for item in compiled[1].features))
+    return authorized, plan
+
+
+def test_the_TRAVERSAL_CLOSES_TASK_12s_WIRING_with_one_raw_dataset_per_hop(compiled, expression):
+    """The evidence that decided WHICH node renders the traversal. `project_datasets` already
+    declares one `raw` dataset per table an expression's `input_requirements` cover — the hops
+    included — and `_check_wiring` refuses a governed source that no node reads. The projection is
+    the node that reads raw datasets, so it is the node that must read them."""
+    authorized, plan = _traversed_compilation(compiled, expression)
+    datasets = project_datasets(authorized, plan, spine_input=compiled[3])
+    assert datasets.raw["banking.accounts"] == "raw_banking__accounts"
+    assert datasets.raw["banking.customers"] == "raw_banking__customers"
+
+    node = _traversal(compiled, expression)
+    with pytest.raises(ValueError, match="read by no node"):
+        render_project(authorized, plan, environment_id=ENVIRONMENT,
+                       engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+                       nodes=(*_wired_nodes(compiled, datasets)[:1],
+                              dataclasses.replace(node, inputs=("raw_banking__transactions",
+                                                                "params:business_dt")),
+                              *_wired_nodes(compiled, datasets)[2:]))
+
+
+def test_a_REAL_PROJECT_renders_with_the_traversal_wired_into_it(compiled, expression, tmp_path):
+    """Task 12 checks six ways a pipeline can be wrong while parsing perfectly. The traversal's
+    three inputs are checked by THAT, not by a claim here."""
+    authorized, plan = _traversed_compilation(compiled, expression)
+    datasets = project_datasets(authorized, plan, spine_input=compiled[3])
+    ir = authorized.irs[0]
+    planned = next(item for item in plan.features if item.column_name == ir.feature_name)
+    nodes = [
+        render_spine_node(authorized.spine, plan, compiled[2], spine_input=compiled[3],
+                          source_dataset=datasets.raw["banking.customers"],
+                          spine_dataset=datasets.spine),
+        nodes_compute.render_projection_node(
+            ir.expressions[0], compiled[2], feature_column=ir.feature_name,
+            source_dataset=datasets.raw["banking.transactions"],
+            joined_datasets={"banking.accounts": datasets.raw["banking.accounts"],
+                             "banking.customers": datasets.raw["banking.customers"]},
+            projection_dataset=datasets.projections[(ir.feature_name, "body.expr")]),
+        nodes_compute.render_calculation_node(
+            ir, planned, plan, empty_window={"body.expr": EmptyWindowResult.NULL},
+            null_input={"body.expr": NullInput.IGNORE},
+            projection_datasets={"body.expr": datasets.projections[(ir.feature_name, "body.expr")]},
+            spine_dataset=datasets.spine, staging_dataset=datasets.staging[ir.feature_name],
+            manifest_dataset=datasets.manifests[ir.feature_name]),
+        _assembly_stub(datasets),
+    ]
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+                             nodes=tuple(nodes))
+    nodes_py = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/nodes.py"))
+    assert ast.parse(nodes_py)
+    pipeline = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/pipeline.py"))
+    assert "raw_banking__accounts" in pipeline and "raw_banking__customers" in pipeline
+    assert materialize_to(project, tmp_path / "generated")
+
+
+def test_the_stand_ins_join_NEVER_MATCHES_A_NULL_KEY_to_a_null_key():
+    """Spark's equi-join never matches NULL to NULL, itself included. A stand-in that did would
+    attribute every unreachable source row to whichever dimension row happened to carry a null key
+    — and the traversal tests above would agree with that answer."""
+    left = fake_spark.DataFrame([{"k": "A1", "v": 1}, {"k": None, "v": 2}])
+    right = fake_spark.DataFrame([{"k": "A1", "owner": "C1"}, {"k": None, "owner": "C9"}])
+    joined = left.join(right, on=["k"], how="left")
+    assert [row["owner"] for row in joined.rows] == ["C1", None]
+    assert left.join(right, on=["k"], how="inner").count() == 1
+
+
+# ── one hop: the grain sits on the table directly joined ─────────────────────────────────────────
+
+
+def _one_hop(compiled, expression):
+    return nodes_compute.render_projection_node(
+        _traversed(expression, steps=ONE_HOP, reads=ONE_HOP_READS), compiled[2],
+        feature_column=SUM_30D, source_dataset="raw_banking__transactions",
+        joined_datasets={"banking.customers": "raw_banking__customers"},
+        projection_dataset="intermediate_total_debit_amount_30d__body_expr")
+
+
+def test_a_SINGLE_HOP_traversal_reaches_the_grain_on_the_table_it_joins(compiled, expression):
+    node = _one_hop(compiled, expression)
+    assert node.inputs == ("raw_banking__transactions", "raw_banking__customers",
+                           "params:business_dt")
+    run = fake_spark.run_rendered(node.source, node.func_name)
+    rows = run(fake_spark.DataFrame([_windowed(BEFORE, 10) | {"cif_num": "C1"},
+                                     _windowed(BEFORE, 20) | {"cif_num": "C2"},
+                                     _windowed(BEFORE, 30) | {"cif_num": "C404"}]),
+               fake_spark.DataFrame(CUSTOMERS_ROWS), BUSINESS_DT).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [
+        (10, "C1"), (20, "C2"), (30, None)]
+    assert sorted(rows[0]) == ["cif_id", "dr_cr_flag", "cif_num", "posted_ts", "status_cd",
+                               "txn_amt", "txn_dt"][:0] + sorted(
+        ["cif_id", "cif_num", "dr_cr_flag", "posted_ts", "status_cd", "txn_amt", "txn_dt"])
+
+
+def test_the_traversal_hands_on_the_SOURCE_COLUMNS_AND_THE_GRAIN_KEY_and_nothing_else(
+        compiled, expression):
+    """The hops' own join keys stop at the projection: they were read to travel on, and two tables
+    on one path spell one entity's key the same way — `accounts.cif_id` and `customers.cif_id`
+    would be one ambiguous output column, not two."""
+    rows = _traverse(_traversal(compiled, expression),
+                     [_windowed(BEFORE, 10) | {"acct_num": "A1", "pan": "4111"}]).rows
+    assert sorted(rows[0]) == ["acct_num", "cif_id", "dr_cr_flag", "posted_ts", "status_cd",
+                               "txn_amt", "txn_dt"]
+
+
+# ── goldens: a change detector, and the weakest test here ────────────────────────────────────────
+
+
+TRAVERSAL_VARIANTS = {"one_hop": _one_hop, "two_hop": _traversal}
+
+
+@pytest.mark.parametrize("variant", sorted(TRAVERSAL_VARIANTS))
+def test_the_rendered_traversal_matches_its_golden(compiled, expression, variant):
+    """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
+    golden = TRAVERSAL_GOLDENS / f"{variant}.py"
+    rendered = TRAVERSAL_VARIANTS[variant](compiled, expression).source
+    if not golden.exists():  # pragma: no cover — first run only
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
+
+
+def test_a_row_that_reaches_a_DANGLING_DIMENSION_lands_on_no_entity_not_on_the_dangling_id(
+        compiled, expression):
+    """Why each hop's key is dropped rather than carried out as the answer. Spark's name-form join
+    keeps ONE key column and it holds the LEFT side's value — so an account owned by a customer who
+    is not in the customer table would come out claiming that customer, and the feature would land
+    a value under an entity the population has never heard of."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [_windowed(BEFORE, 55) | {"acct_num": "A3"}],
+                     accounts=[*ACCOUNTS, {"acct_id": "A3", "owner_id": "C9"}]).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(55, None)]
+
+
+def test_the_rendered_traversal_states_the_ROLES_the_path_was_planned_under(compiled, expression):
+    """`roles_used` is load-bearing, not decoration: roles decide whether a hop is DENIED, so the
+    same catalog yields a different path for a different reader — and a rendered artifact that did
+    not say which reader's path it computed could not be re-checked against the catalog."""
+    node = _traversal(compiled, expression)
+    roles = _traversed(expression).join_plan.roles_used
+    assert roles, "the worked compilation plans under at least one role"
+    for role in roles:
+        assert role in node.source
+    empty = dataclasses.replace(_traversed(expression),
+                                join_plan=dataclasses.replace(
+                                    _traversed(expression).join_plan, roles_used=()))
+    rendered = nodes_compute.render_projection_node(
+        empty, compiled[2], feature_column=SUM_30D,
+        source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
+        projection_dataset="intermediate").source
+    assert "an EMPTY read scope" in rendered

@@ -117,7 +117,8 @@ def calculate_total_debit_amount_30d(
     # relative path for this dataset, so the manifest cannot name a path nothing wrote to. The
     # root is a run parameter because §9's staging area is generation-scoped: one fixed at render
     # time would be shared by every run.
-    output_location = str(staging_root).rstrip('/') + '/feature_staging/total_debit_amount_30d/data'
+    staging_path = '/feature_staging/total_debit_amount_30d/data'
+    output_location = str(staging_root).rstrip('/') + staging_path
 
     # No data value appears in a manifest and none may be added (§14): counts, types, hashes and
     # locations only. The generation/run/date binding is what makes a reused staging path
