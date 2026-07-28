@@ -13,7 +13,8 @@ def build_spine(source: DataFrame, business_dt: str) -> DataFrame:
         raise RuntimeError(
             "SPINE_INCOMPLETE: the declared population is a snapshot observed at 2026-07-27 and "
             "holds no history, so it cannot honestly answer another business date. The spine "
-            "refuses rather than answering with the rows it holds today. Asked for: " + repr(business_date))
+            "refuses rather than answering with the rows it holds today. Asked for: "
+            + repr(business_date))
 
     # §8's cutoff: the business date at 00:00:00 in Asia/Kolkata. The rendered
     # session timezone is pinned to UTC, so the governed zone is STATED here rather

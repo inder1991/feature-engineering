@@ -79,6 +79,7 @@ __all__ = [
     "DatasetLayer",
     "ProjectDatasets",
     "RenderedNode",
+    "feature_staging_path",
     "materialize_to",
     "project_datasets",
     "render_project",
@@ -448,6 +449,21 @@ def _json_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -> _
     ))
 
 
+def feature_staging_path(column: str) -> str:
+    """One feature's staging output, RELATIVE to ``staging_root``.
+
+    Public because two things must agree about it: the catalog entry that decides where the dataset
+    is written, and the ``StagingManifestV1`` the calculation node writes, whose ``output_location``
+    states where the output went. A second spelling would be a manifest that names a path nothing
+    wrote to — evidence about a location rather than about the output.
+
+    The ROOT is never here. It arrives as ``${runtime_params:staging_root}`` in the catalog and as
+    the ``staging_root`` run parameter in the node, because §9's staging area is generation-scoped
+    and a root fixed at render time would be shared by every run of the artifact.
+    """
+    return f"feature_staging/{column}/data"
+
+
 def _catalog_entries(datasets: ProjectDatasets, *, published_target: str) -> tuple[_CatalogEntry, ...]:
     entries: list[_CatalogEntry] = []
     for physical, name in sorted(datasets.raw.items()):
@@ -464,7 +480,7 @@ def _catalog_entries(datasets: ProjectDatasets, *, published_target: str) -> tup
         comment="the declared entity population (§4) — one row per (keys…, business_dt)"))
     for column, name in sorted(datasets.staging.items()):
         entries.append(_parquet_entry(
-            name, DatasetLayer.FEATURE_STAGING, path=f"feature_staging/{column}/data",
+            name, DatasetLayer.FEATURE_STAGING, path=feature_staging_path(column),
             comment=f"{column}: (keys…, business_dt, {column}) only — no system columns (§10.2)"))
     for column, name in sorted(datasets.manifests.items()):
         entries.append(_json_entry(

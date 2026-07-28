@@ -26,6 +26,7 @@ import dataclasses
 import datetime as dt
 import decimal
 import inspect
+import json
 import pathlib
 
 import pytest
@@ -43,6 +44,10 @@ from tests.featuregen.materialize.test_ir import (
 )
 from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compiled
 
+from featuregen.formula.schema import (
+    EmptyWindowResult,
+    NullInput,
+)
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     ContractGroup,
@@ -646,7 +651,7 @@ def test_the_stand_in_REFUSES_what_it_does_not_model():
     with pytest.raises(NotImplementedError):
         F.trunc(F.col("d"), "fortnight")
     with pytest.raises(NotImplementedError):
-        F.col("d").cast("bigint")
+        F.col("d").cast("string")
 
     # Task 13c's additions. Each one is a way a permissive fake would launder a wrong renderer.
     one = fake_spark.DataFrame([{"k": "a", "v": 1}])
@@ -1022,3 +1027,108 @@ def test_the_rendered_projection_matches_its_golden(compiled, expression, varian
         golden.parent.mkdir(parents=True, exist_ok=True)
         golden.write_text(rendered, encoding="utf-8")
     assert rendered == golden.read_text(encoding="utf-8")
+
+
+# ══ Task 13c — the per-feature calculation (§8 rules 3 and 4, §6, §9) ════════════════════════════
+#
+# The rules here are the ones that produce a plausible number rather than an error. An INNER join
+# instead of a LEFT one shrinks the population and every entity that survives still looks right; a
+# decimal overflow under Spark's default returns NULL, which reads as "no activity". So both are
+# asserted by RUNNING the rendered source and reading the rows — a string assertion cannot tell a
+# `how='left'` from a comment about one, and cannot see a NULL at all.
+#
+# Still not Spark. `fake_spark` models joins, aggregates, rounding and the decimal cast to the best
+# of my reading of them; L0 (§11.2, Task 15) is what proves the project runs.
+
+STAGING = "feature_staging_total_debit_amount_30d"
+MANIFEST = "feature_staging_manifest_total_debit_amount_30d"
+PROJECTION = "intermediate_total_debit_amount_30d__body_expr"
+
+
+@pytest.fixture
+def feature(compiled):
+    """The real PlannedFeature for `total_debit_amount_30d` — DECIMAL(38,6), HALF_EVEN, ERROR."""
+    return next(planned for planned in compiled[1].features
+                if planned.column_name == SUM_30D)
+
+
+@pytest.fixture
+def lock_tree(tmp_path):
+    """The minimal project shape a rendered node's `GENERATED.lock` read resolves against.
+
+    A real sealed project is used by one test below; this stand-in tree exists so the other twenty
+    do not each have to render, seal and materialize one to assert something about a join.
+    """
+    nodes = tmp_path / "src" / "pkg" / "pipelines" / "materialize" / "nodes.py"
+    nodes.parent.mkdir(parents=True)
+    nodes.write_text("", encoding="utf-8")
+    (tmp_path / "GENERATED.lock").write_text(
+        json.dumps({"compilation": {}, "generated_project_hash": "project-hash-0001"}),
+        encoding="utf-8")
+    return str(nodes)
+
+
+def _calculate(compiled, feature, *, ir=None, plan=None,
+               empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE):
+    return nodes_compute.render_calculation_node(
+        ir if ir is not None else compiled[0].irs[0], feature,
+        plan if plan is not None else compiled[1],
+        empty_window=empty_window, null_input=null_input,
+        projection_dataset=PROJECTION, spine_dataset="primary_spine",
+        staging_dataset=STAGING, manifest_dataset=MANIFEST)
+
+
+def _run_calculation(node, lock_tree, *, projection, spine, business_dt=BUSINESS_DT,
+                     generation="gen-0001", run="run-0001", execution="exec-0001",
+                     staging_root="hdfs://nn/staging/gen-0001"):
+    run_node = fake_spark.run_rendered(node.source, node.func_name, module_file=lock_tree)
+    return run_node(fake_spark.DataFrame(projection), fake_spark.DataFrame(spine, columns=[
+        "cif_id", "business_dt"]), business_dt, generation, run, execution, staging_root)
+
+
+def _spine_rows(*cifs, business_dt=BUSINESS_DT):
+    return [{"cif_id": cif, "business_dt": dt.date.fromisoformat(business_dt)} for cif in cifs]
+
+
+def _debit(cif, amount, **overrides):
+    """One row as the PROJECTION emits it: the read set, already point-in-time filtered."""
+    row = {"cif_id": cif, "dr_cr_flag": "D", "status_cd": "posted", "txn_amt": amount,
+           "posted_ts": LONG_POSTED, "txn_dt": BEFORE}
+    row.update(overrides)
+    return row
+
+
+def _staged(node, lock_tree, *, projection, spine, **kwargs):
+    frame, _manifest = _run_calculation(node, lock_tree, projection=projection, spine=spine,
+                                        **kwargs)
+    return {row["cif_id"]: row[SUM_30D] for row in frame.rows}
+
+
+# ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
+
+
+def test_the_calculation_wires_both_projections_inputs_and_BOTH_outputs(compiled, feature):
+    node = _calculate(compiled, feature)
+    assert node.inputs == (PROJECTION, "primary_spine", "params:business_dt",
+                           "params:generation_id", "params:run_id",
+                           "params:sandbox_execution_hash", "params:staging_root")
+    assert node.outputs == (STAGING, MANIFEST)
+    assert node.name == node.func_name == "calculate_total_debit_amount_30d"
+    assert node.tags == ("feature_staging", "calculation")
+
+
+def test_the_calculation_source_parses_and_renders_identically_every_time(compiled, feature):
+    first, second = _calculate(compiled, feature), _calculate(compiled, feature)
+    assert ast.parse(first.source)
+    assert first.source == second.source and first.imports == second.imports
+
+
+def test_the_calculations_signature_is_positionally_the_wiring(compiled, feature):
+    """Kedro binds inputs POSITIONALLY. A signature and a wiring that disagree produce a pipeline
+    that runs and computes the wrong thing — the spine's frame arriving as the projection."""
+    node = _calculate(compiled, feature)
+    tree = ast.parse(node.source)
+    arguments = [arg.arg for arg in tree.body[0].args.args]
+    expected = [name.removeprefix("params:") for name in node.inputs]
+    assert arguments == ["projection", "spine", *expected[2:]]
+

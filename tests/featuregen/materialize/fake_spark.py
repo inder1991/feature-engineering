@@ -179,16 +179,21 @@ class Column:
         return Column(f"({self._name} + {getattr(other, 'name', other)})", add)
 
     def cast(self, sql_type: str) -> Column:
-        """``date -> timestamp`` (midnight), ``timestamp -> date``, and ``decimal(p,s)``.
+        """``date -> timestamp`` (midnight), ``timestamp -> date``, ``decimal(p,s)``, ``bigint``.
 
         The decimal cast is the one §9's ``OVERFLOW_VIOLATION`` gate depends on: a value that does
         not fit ``DECIMAL(p, s)`` becomes **NULL** rather than raising, which is Spark's behaviour
         with ANSI mode off and precisely the quiet wrongness the rendered check exists to convert
         into a refusal. Modelling it any other way would make that check untestable.
+
+        ``bigint`` truncates toward zero and passes NULL through — what a node casting a declared
+        literal to an integral published type asks for. Nothing here models the 64-bit range: a
+        stand-in over Python ints cannot overflow, and pretending otherwise would be a claim about
+        Spark this file has no way to check.
         """
         wanted = sql_type.strip().lower()
         decimal_type = _DECIMAL_TYPE.fullmatch(wanted)
-        if decimal_type is None and wanted not in {"timestamp", "date"}:
+        if decimal_type is None and wanted not in {"timestamp", "date", "bigint"}:
             raise NotImplementedError(f"fake_spark models no cast to {sql_type!r}")
         if decimal_type is not None:
             precision, scale = int(decimal_type.group(1)), int(decimal_type.group(2))
@@ -198,6 +203,8 @@ class Column:
 
         def convert(row: Any) -> Any:
             value = self._evaluate(row)
+            if wanted == "bigint":
+                return None if value is None else int(value)
             return _as_datetime(value) if wanted == "timestamp" else _as_date(value)
         return Column(f"CAST({self._name} AS {wanted.upper()})", convert,
                       aggregate=self._aggregate)
