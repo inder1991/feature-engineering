@@ -28,9 +28,16 @@ summaries, and the ontology learning loop. What moves later is the standalone on
 product* — the semantic-map service, the ER screen and the navigable graph — because none of them
 answers a question or produces a feature.
 
-What is **permanently removed** is duplicate machinery, not functionality: several candidate stores
-for one proposal, three LLM replay stores, two metadata-snapshot models, two physical-identity
-models, and a second execution interpreter alongside generated Kedro code.
+**"Deferred" and "optional" are different words and this document means one of them.** E5 exploration
+**remains in the product roadmap**; it is simply not committed to the first functional programme,
+and its implementation order and funding are decided after data-agent and E0 usage evidence. It has
+not been deleted.
+
+What is **permanently removed** is duplicate machinery, not functionality: several competing
+candidate *contracts* for one proposal, three LLM *reuse* stores, and a second execution
+*interpreter* alongside generated Kedro code. Note what is NOT removed — physical identity and its
+runtime binding are layered, and a metadata revision and a dependency snapshot are built one from
+the other (§3).
 
 ## 2. Document disposition
 
@@ -49,13 +56,82 @@ kept "for reference".
 
 | Concern | Competing definitions | Owner |
 | --- | --- | --- |
-| Physical object | E3 `PhysicalObjectIdentityV1`; agent `PhysicalDatasetBindingV1` | **Both, layered.** The physical object identifies *what exists*; the binding authorizes *how a worker reads it* and references the object id. Neither is deleted; the reference is made explicit. |
-| Metadata revision | E3 `OntologyMetadataRevisionV1`; agent `CatalogMetadataSnapshotV1` | **One dependency snapshot** carrying a per-source revision vector, physical binding revisions, fact heads and registry fingerprints. |
-| Candidate lifecycle | `entity_suggestion` (0967), `entity_bridge_candidate_evidence` (0989), `semantic_binding_candidate` (1014), E3 `CandidateIdentityV1`, agent `OntologyCandidateV1` | **One** candidate identity/revision/currentness substrate with typed families. The agent's generic ontology candidate contracts are removed in favour of it. |
-| Relationship | `approved_join`, `entity_bridge`, E3 link types, agent `RelationshipDefinitionV1` | The **governed relationship fact is authoritative**; semantic definitions reference its fact key and revision. |
-| LLM replay | E0b replay store, E3 selection store, agent `llm_call` extension | **One content-addressed structured-result store**, shared by every LLM task. |
-| Execution IR | `materialize/` IR; agent `AnalysisPlanV1` | The analysis plan **compiles into the shared execution IR** for reads, joins, PIT, spine, types and policy. No second interpreter. |
-| Permissions | catalog roles, E3 source entitlement, agent connection permissions | **One effective authorization decision** combining operation, source, sensitivity, purpose and row policy. |
+| Physical identity | E3 `PhysicalObjectIdentityV1`; agent `PhysicalDatasetBindingV1` | **One identity, one binding — layered, not duplicated.** `PhysicalObjectIdentityV1` says *what exists*; `PhysicalDatasetBindingV1` is a runtime-access binding that **references** it. Once the binding is correctly named they are not two identity models. |
+| Metadata state | E3 `OntologyMetadataRevisionV1`; agent `CatalogMetadataSnapshotV1` | **Both — a snapshot is built FROM revisions.** Keep the per-source metadata revision primitive; build one immutable dependency snapshot capturing a vector of those revisions plus fact heads, registry and binding revisions. They are not duplicates. |
+| Candidate lifecycle | `entity_suggestion` (0967), `entity_bridge_candidate_evidence` (0989), `semantic_binding_candidate` (1014), E3 `CandidateIdentityV1`, agent `OntologyCandidateV1` | **One public contract and API now; one physical table later.** Freeze `CandidateIdentityV1` plus a typed family vocabulary, put new families through it, and adapt the existing tables behind it. Physically migrating WORM tables, currentness semantics, fact links and backfill is Release 6 work and would consume a release without improving the agent. The hard rule is **no fifth ad-hoc lifecycle**. |
+| Relationship | `approved_join`, `entity_bridge`, E3 link types, agent `RelationshipDefinitionV1` | **Keep the three typed meanings distinct** — physical join, identifier equivalence, semantic relationship — stored through one governed fact framework. The governed fact is authoritative; semantic definitions reference its fact key and revision. |
+| LLM record vs reuse | E0b replay store, E3 selection store, agent `llm_call` | **Complementary, not competing.** `llm_call` stays the attempt/audit record; ONE new content-addressed validated-result store handles reuse. Build the reuse store once, shared by every LLM task. |
+| Execution IR | `FormulaExecutionIRV1`; agent `AnalysisPlanV1` | **Two top-level IRs sharing lower-level primitives** — see §3a. `AnalysisPlanV1 → AnalysisExecutionIRV1`, distinct from `TypedFormulaV1 → FormulaExecutionIRV1`. Still no second *interpreter*: both render through the same Kedro shell. |
+| Permissions | catalog roles, E3 source entitlement, agent connection permissions | **Define one decision interface now**, defer the complete policy machinery per the security deferral. |
+
+## 3a. Execution IR — two, sharing primitives
+
+**`FormulaExecutionIRV1` cannot be the analysis IR.** Verified on `origin/main`
+(`materialize/ir.py:106-128`): it carries `feature_name`, ONE `final_operation`, ONE
+`grain_entity`/`grain_keys`, aggregate `expressions`, ONE `spine`, and a feature-group
+`output_policy`. `FinalOperation` is `identity | ratio | difference` (`formula/schema.py:49-54`) —
+so `current_count < previous_count` is not expressible as a final operation at all.
+
+The pilot question needs current and comparison periods, per-entity current and previous counts, a
+comparison predicate, PIT dimension joins, post-comparison filtering, multiple result measures, and
+a **result table** rather than a feature-group table. Forcing that into the feature IR would either
+deform the analysis semantics or turn the feature IR into a general query language.
+
+```text
+TypedFormulaV1   → FormulaExecutionIRV1     (features)
+AnalysisPlanV1   → AnalysisExecutionIRV1    (analysis)
+```
+
+**Shared primitives** (reuse, do not fork): `PhysicalInputRequirement`, `PhysicalInputSnapshot`,
+`JoinPlan`, `PitSpec`, `SpineSpec`, physical types and decimal rules, refusal codes where the
+semantics match, canonical hashing, the generated Kedro project **shell**, and the
+projection/scan-sharing patterns.
+
+**Renderer**: reuse the project shell, not the whole feature renderer. The existing renderer's
+layers, dataset names, required parameters and publication target are built around a feature group;
+profiling and analysis need their own DAG and dataset renderers over the common shell.
+
+## 3b. Execution mode — what makes the link tiers enforceable
+
+§4's tiers are policy prose until something carries the tier. Widening `active_bridges` globally to
+include `PROPOSED` would make all twelve consumers responsible for remembering which tier they are,
+and one missed check puts a proposed relationship into production.
+
+```text
+ExecutionMode = discovery | sandbox | production
+
+RelationshipUseDecision
+  relationship_fact_key
+  execution_mode
+  relationship_status
+  decision_basis
+  fact_event_or_revision
+  automatic_attestation_policy_version?
+  evidence_snapshot?
+```
+
+Resolution takes the mode and returns the decision. Discovery may receive proposed relationships;
+sandbox may, and must target a sandbox namespace; **production returns only verified or currently
+policy-attested relationships**. Materialization consumes the decision, never raw `active_bridges`.
+
+Prefer two explicit readers — `advisory_bridges(...)` and `operational_bridges(...)` — over
+redefining what "active" means for everyone.
+
+### The hash rule, corrected
+
+E0b said relationship status stays out of **every** hash. That is right for the stable identity and
+wrong for authorization:
+
+```text
+stable plan hash          : relationship fact key
+execution/authorization   : fact key + exact fact event/revision + effective status
+                            + execution mode + attestation policy/evidence revision
+```
+
+Without the second, a sandbox run on a proposed link caches a result under an execution hash, the
+link is later verified or rejected, and the same execution identity is reused under a different
+eligibility state. Confirmation must not rename the logical relationship; it must change whether a
+particular execution is authorized.
 
 ## 4. Link policy — three tiers
 
@@ -72,11 +148,24 @@ materialization and two acceptance criteria in another said a proposed link is n
 outcomes (`UNVERIFIED` / `DENIED` / `NO_PATH`), refusal on unknown cardinality, and per-hop fan-out
 refusal. That is the policy; nothing should weaken it.
 
-**Automatic attestation** is what stops this becoming "a human approves 100,000 columns". It
-requires deterministic evidence: compatible physical types, target uniqueness, referential coverage,
-observed duplicate multiplier and cardinality, identifier-format compatibility, no conflicting
-governed facts, and bounded drift monitoring. Ambiguous or high-impact cases go to humans. Note this
-tier needs **real data**, so it arrives with Release 1, not before.
+**Automatic attestation** is what stops this becoming "a human approves 100,000 columns" — but it
+is currently a phrase, not a contract. It needs an owner, evidence-completeness rules, thresholds, a
+version, an expiry and a drift response before it can gate anything. Staged:
+
+- **Release 1 produces relationship EVIDENCE only, and promotes nothing**: left/right uniqueness,
+  null rates, exact or bounded overlap, unmatched-key rate, join row multiplier, observed
+  cardinality, format compatibility, plus the input snapshot and method.
+- **Release 2 implements policy attestation in SHADOW.** A policy-attested relationship carries at
+  minimum `relationship_fact_key`, `policy_id + policy_version`, `evidence_ids`,
+  `input_snapshot_ids`, `decision ∈ {operational, insufficient, conflict}`, and
+  `valid_until`/revalidation condition.
+
+**Sampling does not prove uniqueness.** A sampled profile that *finds* a duplicate disproves
+uniqueness; a sample that finds none proves nothing. Operational attestation requires exact
+evidence, a physical constraint, or an explicit governed approximation policy.
+
+For the first vertical slice, **human verification is acceptable** — attestation is measured in
+shadow and does not block the agent.
 
 ## 5. Corrections to the plans as written
 
@@ -92,8 +181,11 @@ release plan exists to remove, and the sharpest possible argument for doing Rele
 
 **BIAN/FIBO are persisted — an earlier claim of mine was wrong.** They live in `field_evidence`
 (migration 0983), 114 rows each on the deployment, written at `ingest.py:1044` and already consumed
-by `attest/grounding.py`'s **`path_agreement`** check. Nothing needs to persist them; anything
-needing taxonomy corroboration extends that check.
+by `attest/grounding.py`'s **`path_agreement`** check. Nothing needs to persist them.
+
+**But `path_agreement` is a concept-name token heuristic, not BIAN/FIBO hierarchy alignment** — its
+own docstring says `concepts.py` has no canonical path field. Reuse its evidence-LOADING pattern;
+implement direct normalized path comparison for identifier-link corroboration.
 
 **E0b must not promise artifact demotion.** Rejecting a link and deleting the projection row does
 not correct published outputs. That needs artifact-to-fact lineage, a publication pointer, a
@@ -112,55 +204,106 @@ a single critic otherwise. A panel on every column pair is cost without signal �
 panel entirely is wrong too, since a single confident model on an identity claim is where the damage
 is largest.
 
+## 5a. Superseded sections — DO NOT EXECUTE
+
+A precedence sentence in a header is too easy for an implementer to skim past. These named sections
+are **superseded**. An implementation agent must not build them as written.
+
+| Document | Section / task | Ruling |
+| --- | --- | --- |
+| Data-agent programme | §5.3 `OntologyCandidateV1`, `OntologyCandidateRevisionV1` | **Superseded** by the single candidate contract (§3). Do not create a parallel candidate family. |
+| Data-agent programme | §5.1 `CatalogMetadataSnapshotV1` | **Retained, but layered** — built from per-source metadata revisions, not instead of them. |
+| Data-agent programme | M1-M13 build order | **Superseded** by §6. The milestone CONTENT stands; the order does not. |
+| Data-agent programme | M3 durable scheduler/outbox, M5 pull worker | **Deferred to Release 6.** Not before the functional slice. |
+| Data-agent programme | M9 "Freeze `AnalysisPlanV1`" | Stands, plus `AnalysisExecutionIRV1` (§3a). Its population spine and zero-observation handling are the reference behaviour. |
+| E3/E5 programme | Non-negotiable boundary "…feeds feature generation **and materialization**, confirmed or not" | **Superseded** by the three tiers (§4). Corrected in place. |
+| E3/E5 programme | Build order incl. source entitlement, signed cursors, full Foundation gates before E3.1 | **Superseded** by §6. Entitlement and cursors are deferred security. |
+| E3/E5 programme | E5.5, E5.6, E5.7 (semantic map, ER, graph screens) | **Not committed** to the first programme. Roadmap items pending usage evidence. |
+| E3/E5 programme | Title bindings, `StaleObjectStubV1`, general entity-link types | **Deferred** — no named consumer. |
+| E0b | Task 6 "widen `active_bridges` globally to `VERIFIED \| PROPOSED`" | **Superseded** by §3b: separate `advisory_bridges` / `operational_bridges` readers plus `RelationshipUseDecision`. |
+| E0b | Global constraint "`status` stays out of every hash" | **Superseded** by §3b's split: out of the stable plan hash, IN the execution/authorization hash. |
+| E0b | Task 7 "reaches the materialized artifact" | **Corrected**: reaches a SANDBOX artifact and feature suggestions; production materialization refuses before artifact creation. |
+| E0b | Task ordering 5 → 8 | **Superseded**: shadow-measure the critic and publish M8/M9 BEFORE admission gates on it. Task 5 must not suppress candidates until the gate is enabled. |
+| E0 | — | No supersessions. Build as written. |
+
 ## 6. Release sequence
 
 ### Release 0 — one trustworthy baseline
 
-Create the integration branch and merge the selected fixes, the materialization package and any
-retained analysis contracts. Re-run migrations and tests, re-ingest the fixture, regenerate the
-verified-interfaces reference against **one commit**. Commit the agent plan (still untracked). Freeze
-the §4 link policy.
+**DONE.** `integration/ontology-data-agent` branched from `origin/main@c1582753`, with the three code
+fixes and all plan documents merged in clean. 5,690 tests pass; the one failure is the planner
+neutrality guard, which fires because the read-scope fix touches `planner/scope.py` (open decision).
+The read-scope fix is **in this branch** — an already-complete divergence left "until convenient"
+would defeat the point of having one baseline.
+
+Remaining: re-run migrations, re-ingest the fixture, and regenerate the verified-interfaces
+reference against this single commit. Freeze the §4 link policy and the §3b execution mode.
+
+> **Releases 1-5 are SANDBOX / NON-PRODUCTION.** Security is deferred by decision, so nothing in
+> them is production-approved. Real sensitive data stays inside the bank-controlled Hadoop
+> environment; results are marked sandbox and never written to production feature or model-input
+> tables.
 
 ### Release 1 — prove real data access
 
+**Minimal schema-preserving physical identity** — source, catalog/database, schema, table, column,
+object kind, normalized identity, and unknown-schema refusal. This moves UP from Release 2 because
+every profile observation must attach to an unambiguous physical object; without it, Release 1's
+evidence binds to flattened `public.table.column` identities and has to be re-bound later. The full
+CSV/OpenMetadata ingest migration stays in Release 2 — the *pilot bindings* cannot.
+
 Cluster inventory. Bind one customer and one transaction table with explicitly configured connection
-and manually declared mappings — **not** the full connection-governance system. Write the renderer.
-Run a bounded generated Kedro/Spark profile manually on Hadoop. Prove partitions, read-only access
-and aggregate-only return. Load a second catalog source before claiming any cross-catalog success.
+and manually declared mappings — **not** the full connection-governance system.
+
+**Extend the existing Kedro project-rendering shell** with an observation IR and profiling nodes.
+The renderer exists (§5); what it does not do is compute null rates, quantiles, patterns, uniqueness
+or relationship overlap.
+
+Run a bounded profile manually on Hadoop. Prove partitions, read-only access and aggregate-only
+return. Produce relationship evidence — **promote nothing**. Load a second catalog source before
+claiming any cross-catalog success.
 
 Do not build the scheduler/worker platform before this proof.
 
 ### Release 2 — minimum ontology core
 
-Schema-preserving physical identity; corrected cardinality semantics; the single evidence/candidate
-substrate; concepts, synonyms, domains, entity/object roles; identifier relationships with
-deterministic data evidence; E0's concept facet and a governance queue.
+One candidate API with adapters over the existing tables (§3). Ontology evidence production.
+Concepts, synonyms, domains, entity/object roles. Identifier relationship candidates with
+deterministic data evidence. Automatic attestation **in shadow**. E0's concept facet and a
+governance queue.
 
-### Release 3 — first governed analysis
+### Release 3 — first governed analysis, end to end
 
-The pilot semantic definitions and the exact question above. Must demonstrate the population spine,
-zero-transaction customers, PIT dimensions, verified joins, reversal/status filtering and
-hand-reconciled results.
+Governed pilot semantic definitions. A **manually constructed** typed analysis request — no natural
+language yet. `AnalysisExecutionIRV1` and the **deterministic compiler** (moved up from Release 4:
+Release 3 cannot produce a result without compilation). Generated Kedro/PySpark, a real Hadoop run,
+and a validated tabular result.
+
+Must demonstrate the population spine, zero-transaction customers, PIT dimensions, verified joins,
+reversal/status filtering and hand-reconciled results.
+
+**Start recording learning evidence here**, not in Release 5: unresolved semantic term, missing
+relationship, ambiguous period, missing dimension, and every failed or refused plan reason.
+Otherwise the first working question's evidence is discarded.
 
 ### Release 4 — natural language and presentation
 
-Structured intent extraction, bounded semantic retrieval, clarification, typed plan preview,
-deterministic compilation, validated result table, safe charts, grounded narrative with cell
-citations.
+Structured intent extraction, bounded semantic retrieval, clarification, typed plan preview, safe
+charts, grounded narrative with cell citations, and the analysis workspace. The compiler is already
+in place from Release 3; this release adds the LLM and the UI.
 
-### Release 5 — the learning loop
+### Release 5 — the learning loop, automated
 
-Every unresolved or corrected question produces an ontology-improvement candidate: unknown term,
-missing synonym, unclear measure, missing relationship, uncertain key, ambiguous period, missing
-dimension. This is what makes the ontology grow from real demand rather than as an independent
-modelling project.
+The recording from Release 3 becomes an automated question-to-ontology feedback loop, plus
+additional metrics, dimensions and questions. This is what makes the ontology grow from real demand
+rather than as an independent modelling project.
 
 ### Release 6 — operationalize, then expand
 
 Durable observation workflow, pull worker, leases/retries/outbox, immutable manifests, artifact
-dependency invalidation, caches, quotas. Then use query logs and unresolved questions to decide
-whether to fund the E5 semantic-map service, the ER view, the ontology graph, composite bridges or
-ODS adapters.
+dependency invalidation, caches, quotas, security hardening, and **physical** candidate-store
+consolidation. Then use query logs and unresolved questions to decide whether to fund the E5
+exploration product, composite bridges or ODS adapters.
 
 ## 7. Functional correctness — keep now, do not defer
 
@@ -185,8 +328,9 @@ recovery; automatic artifact demotion; production-scale caching; retention autom
 hardening; comprehensive small-cell and privacy enforcement; E5 ER and graph visualizers; signed
 ontology cursors; direct ODS adapters; multiple LLM critics on every candidate.
 
-Keep placeholders in contracts where a later field would otherwise force a breaking change. Do not
-implement the machinery.
+Do **not** add speculative placeholder fields. Use explicit schema versions and add a later contract
+version when the need is real — a field with no current semantics is a guess that future code will
+read as a promise.
 
 **One already-built exception.** The governed read-scope fix (`9766c415`, migration 1032) is
 committed and green. Deferring security means it **no longer gates Release 0** — not that it is
@@ -210,13 +354,29 @@ put the whole catalog in a prompt.
 **Never LLM-controlled:** SQL; physical source selection; authorization; join approval; cardinality
 or fan-out; PIT semantics; population; suppression; cost limits; numerical validation.
 
-**Two global rules**, both already proven in `attest/`:
+**Grounding is per-task, not one global rule.** An earlier revision called evidence-ID binding
+"already proven in `attest/`". It is not: `GroundingV1` returns `(checks, coverage, conflict)` and
+the blind reclassifier returns a bare concept value — neither returns or requires evidence ids.
+Evidence-ID binding is a good **new** requirement. What each task must ground against differs:
 
-1. **Evidence-ID binding** — an LLM proposal that does not reference existing evidence ids is
-   rejected. This is the single strongest governance idea in any of these plans; apply it to every
-   LLM task, not just ontology candidates.
-2. **Blind second opinion** — never show the model the proposed answer
-   (`attest/reclassify.ColumnContext`). A critic shown the answer agrees with it.
+| Task | Required grounding |
+| --- | --- |
+| Ontology proposal | evidence ids |
+| Semantic selection | definition / candidate ids |
+| Intent extraction | exact spans from the user's question |
+| Plan critic | plan-node ids and typed findings |
+| Chart proposal | result-column ids |
+| Narrative | result-cell and semantic-definition ids |
+| Follow-up suggestion | existing metric / dimension ids |
+
+**Blindness is critic-specific.** `attest/reclassify.ColumnContext` is genuinely proven and must be
+kept for critic and second-opinion tasks — never show the model the proposed answer. It is not a
+requirement for intent parsing or narrative generation, where the input *is* the thing being read.
+
+**Embeddings are not mandatory.** On a 126-column catalog, start with lexical search, synonyms,
+concepts, domains, bounded direct relationships and deterministic ranking. Add embeddings only when
+a retrieval gold set shows material recall improvement — otherwise they bring an index, revision
+semantics and a model dependency before demonstrating value.
 
 **Risk-tiered cascade.** A smaller model handles routine extraction; a stronger model is justified
 for ambiguous grounding, high-impact link criticism and narrative quality. A second critic is used

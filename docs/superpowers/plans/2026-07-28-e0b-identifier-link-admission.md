@@ -43,9 +43,12 @@ the review surface.
   confident model on an identity claim is where the damage is largest. Any `different_namespace` or
   `insufficient_evidence` suppresses. Disagreement is its own `critics_disagree` state, not an
   ordinary rejection — it marks where human judgement is worth most.
-- **`status` stays out of every hash.** Bridge `fact_key`s are hashed into plan identity
-  (`plan.py:76`, `declarations.py:826`, `fingerprint.py:75`). If `status` entered a hash, confirming
-  a link would invalidate every plan resting on it. This is the trap `operand_roles` hit.
+- **`status` stays out of the STABLE PLAN hash, and belongs IN the execution/authorization hash**
+  (roadmap §3b). Bridge `fact_key`s are hashed into plan identity (`plan.py:76`,
+  `declarations.py:826`, `fingerprint.py:75`); if `status` entered THAT, confirming a link would
+  invalidate every plan resting on it — the `operand_roles` trap. But it must enter the execution
+  hash, or a sandbox result computed on a proposed link is reused unchanged after the link is
+  verified or rejected.
 - **Confidence never feeds eligibility.** It may order a review queue. The `influence_max` ceiling
   (`field_policies.py:58-65`, enforced at `field_authority.py:296-297`) is the hard guarantee.
 - **Blind critic.** Following `attest/reclassify.ColumnContext`: the critic is never told the system
@@ -433,6 +436,11 @@ def test_a_feature_on_a_verified_link_carries_nothing(db):
 ---
 
 ### Task 8: Shadow measurement, then the gate
+
+> **ORDERING — read before Task 5.** The critic runs in SHADOW first and gates nothing. Task 5 must
+> not suppress a candidate until M8/M9 are published and a threshold has been chosen. Implement
+> grounding (Task 2) → run the critic in shadow (this task) → publish M8/M9 → decide thresholds and
+> risk routing → only then enable admission gating in Task 5.
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/attest/runner.py`, `report.py`

@@ -303,16 +303,15 @@ authoritative:
   evaluated structurally before any policy rule runs. Neither `source_declared` nor
   `human_verified` is a universal shortcut, and **LLM confidence is never an input to
   eligibility** — it may route review and nothing else.
-- No new edge authorizes a feature-planner join **silently**. *(Revised 2026-07-28 by user
-  decision — the earlier form of this boundary said the planner keeps using only its existing
-  governed joins/bridges, which is no longer the intended behaviour.)* An identifier link that has
-  survived admission (deterministic grounding + a two-critic panel) reaches the planner as
-  `proposed` and feeds feature generation **and materialization**, confirmed or not. What the
-  boundary now forbids is silence, not use: every feature and every materialized artifact standing
-  on an unconfirmed link carries `JOIN_IDENTITY_UNCONFIRMED` naming that link, and a human
-  confirming clears it while a rejection demotes what rests on it. Admission, the critic panel and
-  the provenance rule are specified in **Phase E0b**. A later explicit adapter is still required
-  before any **other** E3 link type (entity links, column semantic links) reaches the planner.
+- No new edge authorizes a feature-planner join **silently**, and no proposed edge authorizes a
+  PRODUCTION one at all. *(Revised twice: the original blanket ban, then an over-correction that let
+  proposed links reach materialization, now the three tiers.)* An identifier link that survives
+  admission reaches the planner as `proposed` and is usable for **discovery and feature suggestion**,
+  and in a **marked sandbox analysis**; **production materialization requires a VERIFIED or
+  policy-attested link**. Resolution goes through `RelationshipUseDecision` under an explicit
+  `ExecutionMode`, never raw `active_bridges` — see the roadmap §3b and §4. Every feature and
+  artifact standing on an unconfirmed link carries `JOIN_IDENTITY_UNCONFIRMED` naming it. A later
+  explicit adapter is still required before any **other** E3 link type reaches the planner.
 - Visibility is graph-closed: filter properties, grain keys, title bindings,
   identifier bindings, backing refs, and links before computing objects, counts, or
   facets. If an endpoint or backing ref is not visible, its link and counts are absent.
