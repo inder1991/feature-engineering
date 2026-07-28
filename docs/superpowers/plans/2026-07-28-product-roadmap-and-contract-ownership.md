@@ -236,8 +236,18 @@ neutrality guard, which fires because the read-scope fix touches `planner/scope.
 The read-scope fix is **in this branch** — an already-complete divergence left "until convenient"
 would defeat the point of having one baseline.
 
-Remaining: re-run migrations, re-ingest the fixture, and regenerate the verified-interfaces
-reference against this single commit. Freeze the §4 link policy and the §3b execution mode.
+**Migrations, reingest and regeneration are DONE.** All 110 migrations (including 1032) apply from
+scratch to an empty database; the real operator export re-ingests on this branch; and the reference
+is regenerated against one commit by `tests/featuregen/overlay/upload/test_release0_baseline.py`,
+which anyone can re-run with `FTR_CSV=... pytest ...`. Every code-derived number reproduces the
+deployment exactly — 126 columns, 127 schema-attested, declared_type 113/7/6, field_evidence
+127/127/127/114/114, 0 attested types, 1 source, 0 bridges.
+
+The concept-dependent numbers (M1, M5, M6) are properties of an ENRICHED catalog, not of the code,
+so they cannot be re-derived without an LLM provider and stay labelled as deployment observations.
+
+Remaining in Release 0: freeze the §4 link policy and the §3b execution mode, and resolve the
+planner neutrality guard (the one failing test).
 
 > **Releases 1-5 are SANDBOX / NON-PRODUCTION.** Security is deferred by decision, so nothing in
 > them is production-approved. Real sensitive data stays inside the bank-controlled Hadoop

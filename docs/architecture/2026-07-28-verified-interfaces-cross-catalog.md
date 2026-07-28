@@ -1,30 +1,29 @@
 # Verified Interfaces — Cross-Catalog Identity, Bridges, and Ontology
 
-Date: 2026-07-28 · **Baseline: NOT YET REPRODUCIBLE — regenerate against one integration branch.**
+Date: 2026-07-28 · **Baseline: REPRODUCIBLE on `integration/ontology-data-agent`.**
 
-> **Read this before trusting a line below.** These observations were taken against
-> `origin/main@ef213a83` plus fixes living only on `fix/join-neighbourhood-cap`. Since then:
-> `origin/main` has moved to `c1582753` (**17 commits ahead** of that branch); the branch checked
-> out in the main working tree carries **no `materialize/` package at all**; and the three fixes
-> (`e6e5f31d` declared-type, `9766c415` read-scope, `daa82022` analysis prototype) exist on no other
-> branch. **No single commit contains everything the plans assume**, so nothing here can be
-> reproduced by checking out one ref.
->
-> Release 0 creates that integration branch, re-runs migrations and tests, re-ingests the fixture,
-> and regenerates this document against one commit. Until then, treat every measured number as
-> "observed on the deployment", not "true of the code you have".
+Release 0 is complete. This document is now verified against **one branch**, not a mixture:
+`integration/ontology-data-agent` (branched from `origin/main@c1582753`, with the three code fixes
+and every plan document merged clean). 5,690 tests pass; the single failure is the planner
+neutrality guard, which fires because the read-scope fix touches `planner/scope.py` — an open
+decision, not an unknown.
 
-**This is a reference, not a plan.** It records what the code actually does, with a citation for
-every claim, so that the cross-catalog plan and the specs built on it can cite rather than restate.
-It changes when the code changes.
+**Regenerate it yourself.** The measurements below are re-derived by a harness on this branch:
 
-**Why it exists.** Three separate defects this week were "the capability is already there" claims
-that dissolved on contact with the code: the bridge matcher never reading `declared_type`, BIAN/FIBO
-taxonomy never being persisted, and confirm-time CAS not existing in the fact spine. Each survived
-multiple adversarial reviews because the reviews checked reasoning, not the interfaces underneath
-it. **A claim here without a file citation is a defect in this document.**
+```bash
+FTR_CSV=/path/to/FTR_Column_Mapping_final.csv \
+  .venv/bin/python -m pytest tests/featuregen/overlay/upload/test_release0_baseline.py -q
+```
 
-Companion documents:
+It applies all 110 migrations to an empty database, ingests the real operator export, and recomputes
+every claim. It skips without `FTR_CSV`, because that file is customer metadata and is deliberately
+not in the repository.
+
+**One honest limit.** Concept assignment is LLM enrichment, so the concept-dependent numbers (M1,
+M5, M6) are properties of an *enriched catalog*, not of the code, and the harness cannot re-derive
+them without a provider. They remain as observed on the deployment and are labelled as such below.
+
+Companion documents:Companion documents:
 
 - `../superpowers/plans/2026-07-27-e3-e5-cross-catalog-ontology-program.md` — the plan. Owns
   contracts, phases, gates.
@@ -482,19 +481,31 @@ retry_budget) -> StructuredCallOutcome` is the provider-agnostic, fail-closed ca
 
 ## 8. Measured baselines
 
-Measured 2026-07-28 against the deployed demo cluster. These are facts about the current catalog,
-not targets; the plan owns the targets.
+**Re-derived on `45b167bb`** by `test_release0_baseline.py` — these are properties of the code and
+this commit reproduces them exactly:
 
-| # | Measure | Value |
+| Measure | Value | Note |
 | --- | --- | --- |
-| M1 | Columns carrying a concept | **120 / 126**, across 33 concepts |
-| M2 | Tables with a VERIFIED grain and `is_unique = true` | **1 of 1** (`tran_id`) — 100%, but n=1 proves nothing about coverage |
-| M3 | VERIFIED bridges creatable **through the product** | **0** — no route exists |
-| M3a | Identifier columns eligible for bridge candidacy | **0 → 28** after `e6e5f31d` |
-| M4 | Sources with attested schema | **1 of 1**, via the FTR/glossary path only; zero for CSV/Excel |
-| M5 | Columns whose governed floor is stricter than the raw tag read-scope consults | **28** (16 `restricted`, 12 `confidential`) |
-| M6 | Distinct `(concept, source)` pairs reachable in one cross-catalog query | **33** |
-| M7 | Catalog sources loaded with a concept-bearing catalog | **1** (`ftr`) |
+| Columns / tables ingested | **126 / 1** | matches the deployment |
+| Schema-attested nodes (M4) | **127 of 127** | the FTR adapter attests a schema for every node |
+| `declared_type` distribution | **string 113, double 7, timestamp 6** | exactly what the file declares |
+| Attested `data_type` | **0** | a glossary attests no physical type — the fact that made the bridge matcher inert |
+| `field_evidence` per field | **business_term 127, definition 127, domain 127, bian_path 114, fibo_path 114** | confirms the taxonomy IS persisted (§5) |
+| `visible_requires` (M5 mechanism) | all `{}` pre-enrichment; a floor immediately produces `{restricted}` | GENERATED, so it cannot drift from its inputs |
+| Identifier columns classifiable | **≥100 of 126**, all basis `declared` | the `declared_type` fallback; was 0 before it |
+| Catalog sources (M7) | **1** | |
+| VERIFIED bridges (M3) | **0** | no route exists to create one |
+
+**Observed on the deployment, NOT re-derivable here** — these need LLM enrichment, so they describe
+an enriched catalog rather than the code:
+
+| Measure | Value |
+| --- | --- |
+| M1 — columns carrying a concept | 120 / 126, across 33 concepts |
+| M2 — tables with a VERIFIED grain and `is_unique=true` | 1 of 1 (`tran_id`); n=1 proves nothing about coverage |
+| M5 — columns whose governed floor is stricter than the raw tag | **28** (16 `restricted`, 12 `confidential`) |
+| M6 — distinct `(concept, source)` pairs | 33 |
+| M3a — identifier-CONCEPT columns eligible for candidacy | 0 → 28 after `e6e5f31d` |
 
 **M7 is the binding constraint.** With one source there is nothing to cross, and every
 bridge-consuming phase is fixture-only regardless of how much is built.
