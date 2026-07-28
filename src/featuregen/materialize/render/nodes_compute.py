@@ -1322,9 +1322,7 @@ def render_calculation_node(
         body.extend(_expression_lines(slot, keys, physical))
         body.append("")
     body.extend(_spine_reduction_lines(slots, keys))
-    for slot in slots:
-        body.append("")
-        body.extend(_empty_window_lines(slot, physical))
+    body.extend(_empty_window_section(slots, physical))
     final = _final_operation_lines(ir, column, slots, physical)
     if final:
         body.append("")
@@ -1686,12 +1684,10 @@ def _slot_header(slot: _Slot) -> list[str]:
     """
     if not slot.local:
         return []
-    return _comment(
+    return [*_comment(
         f"`{slot.expr_path}` — a FULL aggregate with its own governed filter, its own point-in-time "
         f"projection and its own window; the operands of a final operation are separate expressions "
-        f"and are not guaranteed to share any of the three. Any literal it needs carries the "
-        f"PUBLISHED type, because §6 resolves a type for the published column and none for an "
-        f"operand, so that is the only declared type there is to state.")
+        f"and are not guaranteed to share any of the three."), ""]
 
 
 def _filter_lines(slot: _Slot) -> list[str]:
@@ -1987,6 +1983,27 @@ def _spine_reduction_lines(slots: tuple[_Slot, ...], keys: tuple[str, ...]) -> l
     return lines
 
 
+def _empty_window_section(slots: tuple[_Slot, ...], physical: PhysicalType) -> list[str]:
+    """§8 rule 4's empty-window step for every operand — as ONE block where they agree.
+
+    Two operands both declaring ``null`` would otherwise emit two four-line comments, back to back,
+    each saying that nothing is done. That reads as generated boilerplate, and a comment a reviewer
+    skims is a comment that can be wrong without anyone noticing — 13c's own finding, one shape up.
+    """
+    if len(slots) > 1 and all(slot.empty is EmptyWindowResult.NULL for slot in slots):
+        named = " and ".join(f"`{slot.expr_path}`" for slot in slots)
+        return ["", *_comment(
+            f"§8 rule 4 — {named} both declare empty_window `null`, which is what the LEFT joins "
+            f"already leave for an entity with no rows. No marker column is rendered for either "
+            f"because none is needed: a null from an empty window and a null from the aggregate are "
+            f"the same declared answer here, so nothing has to tell them apart.")]
+    lines: list[str] = []
+    for slot in slots:
+        lines.append("")
+        lines.extend(_empty_window_lines(slot, physical))
+    return lines
+
+
 def _empty_window_lines(slot: _Slot, physical: PhysicalType) -> list[str]:
     """§8 rule 4's empty-window value, told apart from a null the AGGREGATE produced.
 
@@ -2080,17 +2097,19 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
     policy = _zero_denominator(ir)
     body = [
         *_comment(
-            f"§8 rule 4's ÷0 half — the declared zero_denominator is `{policy.value}`. The test is "
-            f"on the DENOMINATOR's value and never on the quotient: a zero denominator and an "
-            f"ABSENT one are different facts that both look like 'no value' at the end, the second "
-            f"was already answered by {denominator}'s own empty_window declaration above, and a "
-            f"division answers both with the same NULL. Reading that back would settle one policy's "
-            f"question with the other's answer."),
-        *_comment(
-            "The literal carries no cast. The denominator is an OPERAND, and §6 resolves a type for "
-            "the published column only — so there is no declared operand type for a cast to state, "
-            "and a comparison against zero is exact in every numeric type Spark would promote to."),
+            f"§8 rule 4's ÷0 half — the declared zero_denominator is `{policy.value}`. It is tested "
+            f"on the DENOMINATOR's value and never on the quotient. A denominator that is zero and "
+            f"one that is ABSENT are different facts, and a division answers both with the same "
+            f"NULL — so reading the quotient back would settle one declaration's question with "
+            f"another's answer. What an absent denominator becomes was decided above by "
+            f"`{slots[1].expr_path}`'s own empty_window declaration; this reads whatever value "
+            f"that declaration left behind."),
         *values,
+        *_comment(
+            "The literal below carries no cast. The denominator is an OPERAND, and §6 resolves a "
+            "type for the published column only — so there is no declared operand type for a cast "
+            "to state, and a comparison against zero is exact in every numeric type Spark would "
+            "promote to."),
         f"    denominator_is_zero = {denominator}.isNotNull() & ({denominator} == F.lit(0))",
         *_zero_denominator_lines(policy, column, numerator, denominator, physical),
     ]
@@ -2128,25 +2147,30 @@ def _zero_denominator_lines(policy: ZeroDenominator, column: str, numerator: str
                 f"Entities affected: ",
                 tail="str(divided_by_zero.count())"),
             *_comment(
-                "The division is unguarded because the check above proved there is nothing to "
-                "guard against: no denominator reaching this line is zero."),
-            *_call_lines("    staged = staged.withColumn(",
-                         [repr(column), f"{numerator} / {denominator}"], ")"),
+                "The divisor needs no guard here because the check above proved there is nothing "
+                "to guard against: no denominator reaching this line is zero."),
+            f"    quotient = {numerator} / {denominator}",
+            *_call_lines("    staged = staged.withColumn(", [repr(column), "quotient"], ")"),
         ]
     lines = [
+        *_comment(
+            "The DIVISOR is replaced, rather than the quotient repaired afterwards. Non-ANSI Spark "
+            "answers a division by zero with a NULL and ANSI Spark raises, so a `/` left to meet a "
+            "zero would make this declared policy depend on a session setting — right by accident "
+            "today, and an error the day ANSI is enabled."),
         f"    undefined = {_typed_literal('None', physical)}",
         f"    divisor = F.when(denominator_is_zero, undefined).otherwise({denominator})",
+        f"    quotient = {numerator} / divisor",
     ]
     if policy is ZeroDenominator.NULL:
         return [*lines, *_call_lines("    staged = staged.withColumn(",
-                                     [repr(column), f"{numerator} / divisor"], ")")]
+                                     [repr(column), "quotient"], ")")]
     return [
         *lines,
         f"    zero_value = {_typed_literal('0', physical)}",
         "    staged = staged.withColumn(",
         f"        {column!r},",
-        *_when_lines("        ", "denominator_is_zero", "zero_value",
-                     f"{numerator} / divisor", ")"),
+        *_when_lines("        ", "denominator_is_zero", "zero_value", "quotient", ")"),
     ]
 
 
@@ -2156,8 +2180,9 @@ def _operand_drop_lines(slots: tuple[_Slot, ...]) -> list[str]:
     return [
         *_comment(
             "The operand columns are dropped: per-feature staging carries the keys, the business "
-            "date and ONE feature column, and the two halves of an operation the caller never asked "
-            "for would be extra columns §9 reports against the whole group at assembly."),
+            "date and ONE feature column. The two halves are this node's own working state, and "
+            "either one surviving is an extra column §9 reports against the whole group at "
+            "assembly."),
         f"    staged = staged.drop({dropped})",
     ]
 

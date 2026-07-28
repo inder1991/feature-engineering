@@ -31,9 +31,8 @@ def calculate_cross_border_value_ratio_90d(
 
     # `body.minuend` — a FULL aggregate with its own governed filter, its own point-in-time
     # projection and its own window; the operands of a final operation are separate expressions
-    # and are not guaranteed to share any of the three. Any literal it needs carries the PUBLISHED
-    # type, because §6 resolves a type for the published column and none for an operand, so that
-    # is the only declared type there is to state.
+    # and are not guaranteed to share any of the three.
+
     # §6's governed filter, read from the compiled filter tree — never assembled from text. It
     # runs BEFORE the aggregate: the projection decided which rows this expression may SEE, and
     # this decides which of those it counts.
@@ -53,9 +52,8 @@ def calculate_cross_border_value_ratio_90d(
 
     # `body.subtrahend` — a FULL aggregate with its own governed filter, its own point-in-time
     # projection and its own window; the operands of a final operation are separate expressions
-    # and are not guaranteed to share any of the three. Any literal it needs carries the PUBLISHED
-    # type, because §6 resolves a type for the published column and none for an operand, so that
-    # is the only declared type there is to state.
+    # and are not guaranteed to share any of the three.
+
     # The expression declares no filter, so every row the point-in-time projection admitted is
     # aggregated. Named rather than silent: a filter dropped between the compiler and here would
     # leave exactly this shape and nothing would say which case it was.
@@ -83,15 +81,10 @@ def calculate_cross_border_value_ratio_90d(
     staged = spine.join(minuend_grouped, on=['cif_id'], how='left')
     staged = staged.join(subtrahend_grouped, on=['cif_id'], how='left')
 
-    # §8 rule 4 — `body.minuend`'s declared empty_window is `null`, which is what the LEFT join
-    # already leaves for an entity with no rows. No marker column is rendered because none is
-    # needed: a null from an empty window and a null from the aggregate are the same declared
-    # answer here, so nothing has to tell them apart.
-
-    # §8 rule 4 — `body.subtrahend`'s declared empty_window is `null`, which is what the LEFT join
-    # already leaves for an entity with no rows. No marker column is rendered because none is
-    # needed: a null from an empty window and a null from the aggregate are the same declared
-    # answer here, so nothing has to tell them apart.
+    # §8 rule 4 — `body.minuend` and `body.subtrahend` both declare empty_window `null`, which is
+    # what the LEFT joins already leave for an entity with no rows. No marker column is rendered
+    # for either because none is needed: a null from an empty window and a null from the aggregate
+    # are the same declared answer here, so nothing has to tell them apart.
 
     # The DIFFERENCE. A NULL on either side makes it NULL, and it is deliberately NOT coalesced:
     # an operand absent from its window was already answered by its own empty_window declaration
@@ -102,8 +95,8 @@ def calculate_cross_border_value_ratio_90d(
     staged = staged.withColumn('cross_border_value_ratio_90d', minuend_value - subtrahend_value)
 
     # The operand columns are dropped: per-feature staging carries the keys, the business date and
-    # ONE feature column, and the two halves of an operation the caller never asked for would be
-    # extra columns §9 reports against the whole group at assembly.
+    # ONE feature column. The two halves are this node's own working state, and either one
+    # surviving is an extra column §9 reports against the whole group at assembly.
     staged = staged.drop('__minuend', '__subtrahend')
 
     # §6 — rounding is applied EXPLICITLY, from the formula's own declared `half_even` mode, and

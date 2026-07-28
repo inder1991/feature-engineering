@@ -32,9 +32,8 @@ def calculate_cross_border_value_ratio_90d(
 
     # `body.numerator` — a FULL aggregate with its own governed filter, its own point-in-time
     # projection and its own window; the operands of a final operation are separate expressions
-    # and are not guaranteed to share any of the three. Any literal it needs carries the PUBLISHED
-    # type, because §6 resolves a type for the published column and none for an operand, so that
-    # is the only declared type there is to state.
+    # and are not guaranteed to share any of the three.
+
     # §6's governed filter, read from the compiled filter tree — never assembled from text. It
     # runs BEFORE the aggregate: the projection decided which rows this expression may SEE, and
     # this decides which of those it counts.
@@ -54,9 +53,8 @@ def calculate_cross_border_value_ratio_90d(
 
     # `body.denominator` — a FULL aggregate with its own governed filter, its own point-in-time
     # projection and its own window; the operands of a final operation are separate expressions
-    # and are not guaranteed to share any of the three. Any literal it needs carries the PUBLISHED
-    # type, because §6 resolves a type for the published column and none for an operand, so that
-    # is the only declared type there is to state.
+    # and are not guaranteed to share any of the three.
+
     # The expression declares no filter, so every row the point-in-time projection admitted is
     # aggregated. Named rather than silent: a filter dropped between the compiler and here would
     # leave exactly this shape and nothing would say which case it was.
@@ -84,26 +82,22 @@ def calculate_cross_border_value_ratio_90d(
     staged = spine.join(numerator_grouped, on=['cif_id'], how='left')
     staged = staged.join(denominator_grouped, on=['cif_id'], how='left')
 
-    # §8 rule 4 — `body.numerator`'s declared empty_window is `null`, which is what the LEFT join
-    # already leaves for an entity with no rows. No marker column is rendered because none is
-    # needed: a null from an empty window and a null from the aggregate are the same declared
-    # answer here, so nothing has to tell them apart.
+    # §8 rule 4 — `body.numerator` and `body.denominator` both declare empty_window `null`, which
+    # is what the LEFT joins already leave for an entity with no rows. No marker column is
+    # rendered for either because none is needed: a null from an empty window and a null from the
+    # aggregate are the same declared answer here, so nothing has to tell them apart.
 
-    # §8 rule 4 — `body.denominator`'s declared empty_window is `null`, which is what the LEFT
-    # join already leaves for an entity with no rows. No marker column is rendered because none is
-    # needed: a null from an empty window and a null from the aggregate are the same declared
-    # answer here, so nothing has to tell them apart.
-
-    # §8 rule 4's ÷0 half — the declared zero_denominator is `error`. The test is on the
-    # DENOMINATOR's value and never on the quotient: a zero denominator and an ABSENT one are
-    # different facts that both look like 'no value' at the end, the second was already answered
-    # by denominator_value's own empty_window declaration above, and a division answers both with
-    # the same NULL. Reading that back would settle one policy's question with the other's answer.
-    # The literal carries no cast. The denominator is an OPERAND, and §6 resolves a type for the
-    # published column only — so there is no declared operand type for a cast to state, and a
-    # comparison against zero is exact in every numeric type Spark would promote to.
+    # §8 rule 4's ÷0 half — the declared zero_denominator is `error`. It is tested on the
+    # DENOMINATOR's value and never on the quotient. A denominator that is zero and one that is
+    # ABSENT are different facts, and a division answers both with the same NULL — so reading the
+    # quotient back would settle one declaration's question with another's answer. What an absent
+    # denominator becomes was decided above by `body.denominator`'s own empty_window declaration;
+    # this reads whatever value that declaration left behind.
     numerator_value = F.col('__numerator')
     denominator_value = F.col('__denominator')
+    # The literal below carries no cast. The denominator is an OPERAND, and §6 resolves a type for
+    # the published column only — so there is no declared operand type for a cast to state, and a
+    # comparison against zero is exact in every numeric type Spark would promote to.
     denominator_is_zero = denominator_value.isNotNull() & (denominator_value == F.lit(0))
     # Rendered as a real refusal. `error` is not a mode Spark has: division by zero returns the
     # same NULL that the `null` policy asks for, so a formula declaring that the run should STOP
@@ -117,13 +111,14 @@ def calculate_cross_border_value_ratio_90d(
             "entity's denominator is exactly zero. An ABSENT denominator is not this: it was "
             "answered by the empty_window policy above and is not reported here. Entities "
             "affected: " + str(divided_by_zero.count()))
-    # The division is unguarded because the check above proved there is nothing to guard against:
-    # no denominator reaching this line is zero.
-    staged = staged.withColumn('cross_border_value_ratio_90d', numerator_value / denominator_value)
+    # The divisor needs no guard here because the check above proved there is nothing to guard
+    # against: no denominator reaching this line is zero.
+    quotient = numerator_value / denominator_value
+    staged = staged.withColumn('cross_border_value_ratio_90d', quotient)
 
     # The operand columns are dropped: per-feature staging carries the keys, the business date and
-    # ONE feature column, and the two halves of an operation the caller never asked for would be
-    # extra columns §9 reports against the whole group at assembly.
+    # ONE feature column. The two halves are this node's own working state, and either one
+    # surviving is an extra column §9 reports against the whole group at assembly.
     staged = staged.drop('__numerator', '__denominator')
 
     # §6 — rounding is applied EXPLICITLY, from the formula's own declared `half_even` mode, and
