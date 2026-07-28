@@ -81,6 +81,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from typing import TypeVar
 
 from featuregen.formula.schema import (
     AggregateFunction,
@@ -93,6 +94,7 @@ from featuregen.formula.schema import (
     NullInput,
     OverflowBehavior,
     RoundingMode,
+    ZeroDenominator,
 )
 from featuregen.materialize.admission import hive_identifier
 from featuregen.materialize.codes import ValidationGateCode
@@ -143,6 +145,10 @@ __all__ = [
     "render_projection_node",
     "render_spine_node",
 ]
+
+#: One declared per-expression policy, whatever its vocabulary — ``_per_path`` polices the KEYS of a
+#: mapping and never reads its values, so it must not narrow what the caller is allowed to declare.
+_Declared = TypeVar("_Declared")
 
 #: The Kedro node's name — how a failure, a resume and a ``--node`` selection all address it.
 SPINE_NODE_NAME = "spine"
@@ -207,6 +213,18 @@ _TRANSFORMS: dict[PartitionTransform, str] = {
 #: when the declared ``empty_window`` needs the distinction; double-underscored so it cannot collide
 #: with a governed column, and dropped so it can never reach the published table.
 _SOURCE_ROWS = "__source_rows"
+
+#: The body paths each ``FinalOperation`` compiles to, **in slot order**. The order is semantic and
+#: not a convenience: a numerator rendered where the denominator belongs inverts every value in the
+#: column, and nothing downstream would say so. Keying the caller's projections and policies by
+#: these paths — rather than pairing them positionally — is what makes that swap unrepresentable.
+#: The paths themselves are Child-1's (``expression_ir.BODY_PATHS``), mirrored here as an ORDERED
+#: mapping because that module's set says which paths exist and not which operation owns which.
+_BODY_SLOTS: Mapping[FinalOperation, tuple[str, ...]] = {
+    FinalOperation.IDENTITY: ("body.expr",),
+    FinalOperation.RATIO: ("body.numerator", "body.denominator"),
+    FinalOperation.DIFFERENCE: ("body.minuend", "body.subtrahend"),
+}
 
 #: Spark's aggregate for each member of Child-1's closed vocabulary. ``COUNT_ROWS`` is absent
 #: because it has no operand to substitute into (``schema.py`` [c9]) and is rendered on its own.
@@ -1217,32 +1235,46 @@ def render_calculation_node(
     feature: PlannedFeature,
     plan: FeatureGroupPlanV1,
     *,
-    empty_window: EmptyWindowResult,
-    null_input: NullInput,
-    projection_dataset: str,
+    empty_window: Mapping[str, EmptyWindowResult],
+    null_input: Mapping[str, NullInput],
+    projection_datasets: Mapping[str, str],
     spine_dataset: str,
     staging_dataset: str,
     manifest_dataset: str,
 ) -> RenderedNode:
     """Render the node that computes ONE feature and writes its own §9 evidence.
 
-    ``empty_window`` and ``null_input`` are REQUIRED keyword arguments with no defaults. They are
-    §8 rule 4's formula-owned policies, and :class:`~featuregen.materialize.expression_ir.PitSpec`
-    excludes them deliberately — so they do not travel on the IR and must be supplied from the
-    formula that declared them. A default would be this renderer answering a policy question the
-    formula exists to answer: ``ignore`` and ``propagate`` produce different numbers from the same
-    rows, and neither is more conservative than the other.
+    Every ``FinalOperation`` renders: an ``IDENTITY`` body is one aggregate staged as the feature, a
+    ``RATIO`` is two aggregates divided under the formula's own ``zero_denominator`` policy, and a
+    ``DIFFERENCE`` is two aggregates subtracted. The two operands of a final operation are FULL
+    aggregates — each has its own governed filter, its own point-in-time projection and its own
+    window — so they are supplied and policed per body path rather than as one thing.
+
+    ``empty_window`` and ``null_input`` are REQUIRED keyword arguments with no defaults, and are
+    keyed BY BODY PATH. They are §8 rule 4's formula-owned policies, declared on each expression's
+    own ``WindowPolicy``, and :class:`~featuregen.materialize.expression_ir.PitSpec` excludes them
+    deliberately — so they do not travel on the IR and must be supplied from the formula that
+    declared them. A default would be this renderer answering a policy question the formula exists to
+    answer: ``ignore`` and ``propagate`` produce different numbers from the same rows, and neither is
+    more conservative than the other. One value shared across both operands would be a second guess
+    of the same kind: a ratio may declare ``zero`` for its denominator and ``null`` for its
+    numerator, and the two produce different columns.
+
+    ``projection_datasets`` is keyed by body path for a sharper reason still. Passed as a sequence,
+    a numerator and a denominator differ only by position — and swapping them inverts every value in
+    the column while leaving a perfectly plausible number behind. Keyed, the swap is unrepresentable.
 
     Args:
-        ir: the feature's compiled plan. Its ONE expression is what is rendered; its ``grain_keys``
-            are what the aggregate groups by.
+        ir: the feature's compiled plan. Its expressions are what is rendered, one per body path of
+            its ``final_operation``; its ``grain_keys`` are what each aggregate groups by.
         feature: the planned column — its ``ir_hash`` binds the manifest to this computation and its
             ``PhysicalType`` carries §6's rounding and overflow obligations.
         plan: the group's packing list, which decides the landing key columns and the business-date
             column the staged row is keyed by.
-        empty_window: what an entity with NO source rows evaluates to (§8 rule 4).
-        null_input: what a NULL operand value does to the aggregate (§8 rule 4).
-        projection_dataset: the catalog name of this expression's PIT projection (Task 13b's output).
+        empty_window: per body path, what an entity with NO source rows evaluates to (§8 rule 4).
+        null_input: per body path, what a NULL operand value does to that aggregate (§8 rule 4).
+        projection_datasets: per body path, the catalog name of that expression's PIT projection
+            (Task 13b's output). One entry for an identity body; two for a ratio or a difference.
         spine_dataset: the catalog name of the declared population (Task 13a's output).
         staging_dataset: the catalog name this node writes the feature to.
         manifest_dataset: the catalog name this node writes the staging manifest to.
@@ -1255,9 +1287,11 @@ def render_calculation_node(
     Raises:
         TypeError: an argument is not the type it must be.
         ValueError: the feature cannot be calculated as one node — the plan and the IR describe
-            different columns, the body is not a single expression, the grain keys are not the
-            landing keys, the rounding mode has no exact Spark rendering, or the expression's
-            governed filter names a run parameter.
+            different columns, the compiled body paths are not the ones the final operation has, a
+            body path has no declared policy or no projection, a ratio carries no
+            ``zero_denominator`` (or a non-ratio carries one), the grain keys are not the landing
+            keys, the rounding mode has no exact Spark rendering, or a governed filter names a run
+            parameter.
     """
     if not isinstance(ir, FormulaExecutionIRV1):
         raise TypeError(
@@ -1274,41 +1308,39 @@ def render_calculation_node(
             f"rendering a calculation needs the FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"landing key columns and the business-date column are the plan's, and a staged row "
             f"keyed by anything else has no spine row to land on")
-    empty = EmptyWindowResult(empty_window)
-    nulls = NullInput(null_input)
-
-    _dataset(projection_dataset, "the calculation's projection dataset")
     _dataset(spine_dataset, "the calculation's spine dataset")
     _dataset(staging_dataset, "the calculation's staging dataset")
     _dataset(manifest_dataset, "the calculation's manifest dataset")
 
     column = _staged_column(ir, feature, plan)
-    expression = _one_expression(ir)
-    read_set = _read_set_columns(expression)
-    keys = _grain_key_columns(ir, plan, read_set)
-    operand = _operand_column(expression, read_set)
+    slots = _body_slots(ir, column, empty_window, null_input, projection_datasets)
+    keys = _grain_key_columns(ir, plan, slots)
     physical = feature.physical_type
 
+    body: list[str] = []
+    for slot in slots:
+        body.extend(_expression_lines(slot, keys, physical))
+        body.append("")
+    body.extend(_spine_reduction_lines(slots, keys))
+    for slot in slots:
+        body.append("")
+        body.extend(_empty_window_lines(slot, physical))
+    final = _final_operation_lines(ir, column, slots, physical)
+    if final:
+        body.append("")
+        body.extend(final)
+    body.append("")
+
     source = "\n".join([
-        f"def {calculation_func_name(column)}(",
-        "        projection: DataFrame, spine: DataFrame, business_dt: str,",
-        "        generation_id: str, run_id: str, sandbox_execution_hash: str,",
-        "        staging_root: str) -> tuple[DataFrame, dict]:",
-        *_calculation_docstring(ir, column, keys, empty),
+        *_signature_lines(calculation_func_name(column), slots),
+        *_calculation_docstring(ir, column, keys, slots),
         *_comment(
             "The business date is read only to BIND the manifest to this run. The staged frame's "
             "own business_dt comes from the spine, which decides which population the row belongs "
             "to — deriving it here as well would be a second answer that could disagree with it."),
         "    business_date = str(business_dt)",
         "",
-        *_filter_lines(expression, read_set),
-        "",
-        *_grain_aggregate_lines(expression, column, keys, operand, nulls, empty, physical),
-        "",
-        *_spine_reduction_lines(keys),
-        "",
-        *_empty_window_lines(column, empty, physical),
-        "",
+        *body,
         *_rounding_lines(column, physical),
         *_overflow_lines(column, physical),
         *_staging_shape_lines(column, keys, plan.business_dt_column),
@@ -1326,13 +1358,39 @@ def render_calculation_node(
         name=calculation_node_name(column),
         func_name=calculation_func_name(column),
         source=source,
-        inputs=(projection_dataset, spine_dataset, _BUSINESS_DT_PARAMETER,
+        inputs=(*(slot.dataset for slot in slots), spine_dataset, _BUSINESS_DT_PARAMETER,
                 "params:generation_id", "params:run_id", "params:sandbox_execution_hash",
                 "params:staging_root"),
         outputs=(staging_dataset, manifest_dataset),
         imports=tuple(sorted(imports)),
         tags=("feature_staging", "calculation"),
     )
+
+
+def _signature_lines(func_name: str, slots: tuple[_Slot, ...]) -> list[str]:
+    """``def calculate_x(…)`` — one parameter per line once there is more than one projection.
+
+    Kedro binds a node's inputs POSITIONALLY against this signature, so the one thing a reviewer of a
+    multi-input node must be able to do is count the parameters against the wiring. A ratio's two
+    projections differ only by position, and a reader who miscounts them reads the ratio upside down.
+    One aggregate needs no such care and keeps the grouping it has, so the identity form is unchanged.
+    """
+    tail = ") -> tuple[DataFrame, dict]:"
+    if len(slots) == 1:
+        return [
+            f"def {func_name}(",
+            f"        {slots[0].parameter}: DataFrame, spine: DataFrame, business_dt: str,",
+            "        generation_id: str, run_id: str, sandbox_execution_hash: str,",
+            f"        staging_root: str{tail}",
+        ]
+    parameters = [f"{slot.parameter}: DataFrame" for slot in slots] + [
+        "spine: DataFrame", "business_dt: str", "generation_id: str", "run_id: str",
+        "sandbox_execution_hash: str", "staging_root: str"]
+    return [
+        f"def {func_name}(",
+        *(f"        {parameter}," for parameter in parameters[:-1]),
+        f"        {parameters[-1]}{tail}",
+    ]
 
 
 # ── what the caller must have got right (calculation) ────────────────────────────────────────────
@@ -1356,30 +1414,148 @@ def _staged_column(ir: FormulaExecutionIRV1, feature: PlannedFeature,
     return column
 
 
-def _one_expression(ir: FormulaExecutionIRV1) -> ExpressionExecutionIR:
-    """The single expression this renderer can calculate, or the refusal saying why not.
+@dataclass(frozen=True, slots=True)
+class _Slot:
+    """One operand of the final operation: its expression, its policies and its rendered names.
 
-    A RATIO or a DIFFERENCE has two aggregates, a final operation between them and — for a ratio —
-    its own ``zero_denominator`` policy. None of that is rendered here, and rendering ONE half of a
-    ratio into a column named for the whole feature would publish a numerator as though it were the
-    ratio. Refusing is fail-closed; it is also a functional hole, recorded as such.
+    A slot exists because the two halves of a ratio are not two views of one thing. Each carries its
+    own governed filter, its own point-in-time projection, its own window and its own §8 rule 4
+    policies — so every rendered binding a slot produces is namespaced by it, and nothing can be
+    computed for one half and read for the other.
+
+    ``value_column`` is where the grain aggregate LANDS. For an identity body that is the published
+    column itself; for an operand it is a double-underscored intermediate, which cannot collide with
+    a governed column and is dropped before staging so it can never reach the published table.
     """
-    if ir.final_operation is not FinalOperation.IDENTITY:
+
+    expr_path: str
+    expression: ExpressionExecutionIR
+    dataset: str
+    parameter: str
+    local: str
+    value_column: str
+    what: str
+    empty: EmptyWindowResult
+    nulls: NullInput
+    operand: str | None
+    read_set: tuple[str, ...]
+
+    @property
+    def marker_column(self) -> str:
+        """The ``__source_rows`` marker for THIS slot — see :data:`_SOURCE_ROWS`."""
+        return _SOURCE_ROWS if not self.local else f"__{self.local}source_rows"
+
+    @property
+    def subject(self) -> str:
+        """How a rendered comment REFERS to this slot's declarations.
+
+        A single aggregate needs no qualification — there is no other half its policy could be
+        confused with — so it keeps the plain form. An operand is named by its body path, because
+        that is the only thing that says which half of the operation the sentence is about.
+        """
+        return "the" if not self.local else f"`{self.expr_path}`'s"
+
+
+def _body_slots(ir: FormulaExecutionIRV1, column: str,
+                empty_window: Mapping[str, EmptyWindowResult],
+                null_input: Mapping[str, NullInput],
+                projection_datasets: Mapping[str, str]) -> tuple[_Slot, ...]:
+    """One slot per body path of ``ir.final_operation``, in slot order — or the refusal saying why not.
+
+    Everything checked here is a way the rendered node would compute a plausible number for the wrong
+    reason. A compiled body whose paths are not the operation's would render one operand twice or
+    silently drop one; a policy or a projection missing for a path would need a default, and every
+    default here is this renderer answering a question §8 rule 4 assigns to the formula.
+    """
+    if ir.final_operation not in _BODY_SLOTS:
         raise ValueError(
             f"{ir.feature_name!r} declares a {ir.final_operation.value!r} body, and this renderer "
-            f"calculates a single aggregate: the final operation, the second expression and (for a "
-            f"ratio) the zero_denominator policy have no rendering here, and staging one half under "
-            f"the feature's own name would publish a numerator as though it were the ratio")
-    if len(ir.expressions) != 1:
+            f"knows the operand slots of {sorted(op.value for op in _BODY_SLOTS)} only: rendering "
+            f"an operation whose operands it cannot name would be a guess at which half is which")
+    paths = _BODY_SLOTS[ir.final_operation]
+    compiled = {expression.expr_path: expression for expression in ir.expressions}
+    if len(compiled) != len(ir.expressions) or tuple(sorted(compiled)) != tuple(sorted(paths)):
         raise ValueError(
-            f"{ir.feature_name!r} compiles to {len(ir.expressions)} expression(s) under an identity "
-            f"body: the feature's value IS the one aggregate, and a body with another number of "
-            f"them is a compilation this renderer cannot read as one column")
-    return ir.expressions[0]
+            f"{ir.feature_name!r} declares a {ir.final_operation.value!r} body, whose operands are "
+            f"{list(paths)}, and compiles to {[e.expr_path for e in ir.expressions]}: the body path "
+            f"is what says WHICH operand an expression is, so a set that is not the operation's own "
+            f"would render one of them twice or drop one and still produce a number")
+    _one_zero_denominator(ir)
+    empties = _per_path(empty_window, paths, "empty_window", ir.feature_name)
+    nulls = _per_path(null_input, paths, "null_input", ir.feature_name)
+    datasets = _per_path(projection_datasets, paths, "projection_datasets", ir.feature_name)
+
+    single = len(paths) == 1
+    slots = []
+    for path in paths:
+        leaf = path.rsplit(".", 1)[-1]
+        expression = compiled[path]
+        read_set = _read_set_columns(expression)
+        slots.append(_Slot(
+            expr_path=path,
+            expression=expression,
+            dataset=_dataset(datasets[path], f"the {path} projection dataset"),
+            parameter="projection" if single else f"{leaf}_projection",
+            local="" if single else f"{leaf}_",
+            value_column=column if single else f"__{leaf}",
+            what=column if single else f"{path} of {column}",
+            empty=EmptyWindowResult(empties[path]),
+            nulls=NullInput(nulls[path]),
+            operand=_operand_column(expression, read_set),
+            read_set=read_set,
+        ))
+    return tuple(slots)
+
+
+def _one_zero_denominator(ir: FormulaExecutionIRV1) -> None:
+    """``zero_denominator`` is declared for a RATIO and for nothing else (``ir.py``).
+
+    Both directions refuse. A ratio without one has no declared answer for the ÷0 case and the
+    renderer would have to choose one; anything else WITH one describes a division that is not in the
+    body, so the two objects disagree about what the feature is.
+    """
+    if ir.final_operation is FinalOperation.RATIO:
+        _zero_denominator(ir)
+        return
+    if ir.zero_denominator is not None:
+        raise ValueError(
+            f"{ir.feature_name!r} declares a {ir.final_operation.value!r} body and carries a "
+            f"zero_denominator policy of {ir.zero_denominator.value!r}: there is no division in "
+            f"that body for it to govern, so the compiled objects disagree about what the feature is")
+
+
+def _zero_denominator(ir: FormulaExecutionIRV1) -> ZeroDenominator:
+    """A RATIO's declared ÷0 policy — TOTAL, so every ratio branch reads exactly one answer."""
+    if ir.zero_denominator is None:
+        raise ValueError(
+            f"{ir.feature_name!r} declares a ratio body and carries no zero_denominator policy: §8 "
+            f"rule 4 assigns the ÷0 answer to the formula, and null, zero and error are three "
+            f"different columns — picking one here would publish this renderer's choice as the "
+            f"formula's")
+    return ir.zero_denominator
+
+
+def _per_path(declared: Mapping[str, _Declared], paths: tuple[str, ...], what: str,
+              feature_name: str) -> Mapping[str, _Declared]:
+    """``declared`` proved to carry exactly ``paths`` — no missing key, and no extra one."""
+    if not isinstance(declared, Mapping):
+        raise TypeError(
+            f"{what} must be a mapping from body path to policy, got {type(declared).__name__}: the "
+            f"operands of a final operation declare their own, and one value shared between them "
+            f"would apply the numerator's declaration to the denominator")
+    missing = [path for path in paths if path not in declared]
+    extra = sorted(set(declared) - set(paths))
+    if missing or extra:
+        raise ValueError(
+            f"{what} for {feature_name!r} declares {sorted(declared)} and the body's operands are "
+            f"{list(paths)} (missing {missing}, unexpected {extra}): a path with nothing declared "
+            f"for it would be rendered under a default, and every default here is this renderer "
+            f"answering a question §8 rule 4 assigns to the formula")
+    return declared
 
 
 def _grain_key_columns(ir: FormulaExecutionIRV1, plan: FeatureGroupPlanV1,
-                       read_set: tuple[str, ...]) -> tuple[str, ...]:
+                       slots: tuple[_Slot, ...]) -> tuple[str, ...]:
     """The columns the aggregate groups by — the LANDING keys, in the plan's order.
 
     The grain keys and the landing keys are separate declarations: ``derive_contract`` says a
@@ -1390,12 +1566,14 @@ def _grain_key_columns(ir: FormulaExecutionIRV1, plan: FeatureGroupPlanV1,
     numbers keyed to the wrong entities.
     """
     grain = tuple(_column(ref, "a grain key") for ref in ir.grain_keys)
-    outside = sorted(set(grain) - set(read_set))
-    if outside:
-        raise ValueError(
-            f"grain key column(s) {outside} are not in the authorized read set {list(read_set)}: "
-            f"the aggregate groups by them and the projection selects only the read set, so the "
-            f"node would fail on the cluster reading a column Gate 2 never granted")
+    for slot in slots:
+        outside = sorted(set(grain) - set(slot.read_set))
+        if outside:
+            raise ValueError(
+                f"grain key column(s) {outside} are not in {slot.expr_path}'s authorized read set "
+                f"{list(slot.read_set)}: the aggregate groups by them and the projection selects "
+                f"only the read set, so the node would fail on the cluster reading a column Gate 2 "
+                f"never granted")
     landing = tuple(plan.entity_key_columns)
     if sorted(grain) != sorted(landing):
         raise ValueError(
@@ -1439,49 +1617,104 @@ def _operand_column(expression: ExpressionExecutionIR, read_set: tuple[str, ...]
 
 
 def _calculation_docstring(ir: FormulaExecutionIRV1, column: str,
-                           keys: tuple[str, ...], empty: EmptyWindowResult) -> list[str]:
+                           keys: tuple[str, ...], slots: tuple[_Slot, ...]) -> list[str]:
     landing = f"({', '.join(_safe_text(key, 'a landing key column') for key in keys)}, business_dt)"
-    summary = (
-        f"Exactly one row per {landing}, carrying {_safe_text(column, 'the feature column')} and "
-        f"nothing else. The aggregate is reduced onto the SPINE with a LEFT join (§8 rule 3), so an "
-        f"entity with no source rows is still present and carries this formula's declared "
-        f"empty-window value ({empty.value}). An inner join here would shrink the population and "
-        f"the feature would still look plausible.")
+    if len(slots) == 1:
+        summary = (
+            f"Exactly one row per {landing}, carrying {_safe_text(column, 'the feature column')} and "
+            f"nothing else. The aggregate is reduced onto the SPINE with a LEFT join (§8 rule 3), so "
+            f"an entity with no source rows is still present and carries this formula's declared "
+            f"empty-window value ({slots[0].empty.value}). An inner join here would shrink the "
+            f"population and the feature would still look plausible.")
+        paragraphs = [summary]
+    else:
+        declared = ", ".join(f"{slot.expr_path}: {slot.empty.value}" for slot in slots)
+        summary = (
+            f"Exactly one row per {landing}, carrying {_safe_text(column, 'the feature column')} and "
+            f"nothing else. EACH of this body's aggregates is reduced onto the SPINE with its own "
+            f"LEFT join (§8 rule 3), so an entity with no source rows is still present and carries "
+            f"that expression's own declared empty-window value ({declared}). An inner join here "
+            f"would shrink the population and the feature would still look plausible.")
+        paragraphs = [summary, _final_operation_note(ir)]
     returns = (
         "Returns the staged frame and its StagingManifestV1 (§9) — both, or neither. A gate below "
         "raises, Kedro writes no output for the node at all, and assembly reports a MISSING "
         "manifest rather than reading a column no manifest describes.")
+    wrapped: list[str] = []
+    for paragraph in [*paragraphs, returns]:
+        wrapped.extend([*(f"    {part}" for part in _wrap(paragraph, 92)), ""])
     return [
         f'    """{_safe_text(ir.feature_name, "the feature name")} for one business date (§8).',
         "",
-        *(f"    {part}" for part in _wrap(summary, 92)),
-        "",
-        *(f"    {part}" for part in _wrap(returns, 92)),
+        *wrapped[:-1],
         '    """',
     ]
 
 
-def _filter_lines(expression: ExpressionExecutionIR, read_set: tuple[str, ...]) -> list[str]:
+def _final_operation_note(ir: FormulaExecutionIRV1) -> str:
+    """The docstring paragraph naming the operation between the two operands, and its own policy."""
+    if ir.final_operation is FinalOperation.RATIO:
+        return (
+            f"The final operation is a RATIO, and the formula's declared zero_denominator policy is "
+            f"`{_zero_denominator(ir).value}`. A denominator of ZERO and an ABSENT denominator are "
+            f"different facts that both look like 'no value' at the end: the first is answered by "
+            f"that policy and the second by the denominator's own empty_window declaration, so the "
+            f"test below is on the denominator's VALUE and never on the quotient.")
+    return (
+        "The final operation is a DIFFERENCE. A NULL on either side makes the difference NULL, and "
+        "it is deliberately not coalesced: an operand absent from its window has already been "
+        "answered by its own empty_window declaration, and substituting a zero here would replace "
+        "that answer with this node's — 0 - x is a real, plausible number.")
+
+
+def _expression_lines(slot: _Slot, keys: tuple[str, ...], physical: PhysicalType) -> list[str]:
+    """One operand, end to end: its header, its governed filter and its grain-level aggregate."""
+    return [
+        *_slot_header(slot),
+        *_filter_lines(slot),
+        "",
+        *_grain_aggregate_lines(slot, keys, physical),
+    ]
+
+
+def _slot_header(slot: _Slot) -> list[str]:
+    """The comment naming WHICH operand the block below computes — nothing for a single aggregate.
+
+    A reader of a two-operand node has to keep track of which half they are looking at, and the only
+    thing that says so is the body path. It is stated once per block rather than repeated on every
+    line, and the identity body emits none: there is no other half to confuse it with.
+    """
+    if not slot.local:
+        return []
+    return _comment(
+        f"`{slot.expr_path}` — a FULL aggregate with its own governed filter, its own point-in-time "
+        f"projection and its own window; the operands of a final operation are separate expressions "
+        f"and are not guaranteed to share any of the three. Any literal it needs carries the "
+        f"PUBLISHED type, because §6 resolves a type for the published column and none for an "
+        f"operand, so that is the only declared type there is to state.")
+
+
+def _filter_lines(slot: _Slot) -> list[str]:
     """§6's GOVERNED filter, applied before the aggregate — or a comment saying there is none.
 
     The projection selects the filter's columns (they are in the read set) but applies nothing: it
     decides which rows the expression may SEE, and the filter decides which of those it COUNTS.
     """
-    if expression.filter_tree is None:
+    if slot.expression.filter_tree is None:
         return _comment(
             "The expression declares no filter, so every row the point-in-time projection admitted "
             "is aggregated. Named rather than silent: a filter dropped between the compiler and "
             "here would leave exactly this shape and nothing would say which case it was.") + [
-            "    rows = projection",
+            f"    {slot.local}rows = {slot.parameter}",
         ]
-    condition = _filter_condition(expression.filter_tree, read_set, "filter")
+    condition = _filter_condition(slot.expression.filter_tree, slot.read_set, "filter")
     condition = _unwrapped(condition)
     return [
         *_comment(
             "§6's governed filter, read from the compiled filter tree — never assembled from text. "
             "It runs BEFORE the aggregate: the projection decided which rows this expression may "
             "SEE, and this decides which of those it counts."),
-        f"    rows = projection.where({condition})",
+        f"    {slot.local}rows = {slot.parameter}.where({condition})",
     ]
 
 
@@ -1615,8 +1848,7 @@ def _filter_literal(literal: object, path: str) -> str:
     return f"date.fromisoformat({value!r})"
 
 
-def _grain_aggregate_lines(expression: ExpressionExecutionIR, column: str, keys: tuple[str, ...],
-                           operand: str | None, nulls: NullInput, empty: EmptyWindowResult,
+def _grain_aggregate_lines(slot: _Slot, keys: tuple[str, ...],
                            physical: PhysicalType) -> list[str]:
     """The grain-level aggregate §8 rule 3 reduces onto the spine, plus rule 4's null policy.
 
@@ -1624,19 +1856,20 @@ def _grain_aggregate_lines(expression: ExpressionExecutionIR, column: str, keys:
     a single paragraph that changes subject halfway, and a reader then has to work out which claim
     describes what — which is exactly how a comment ends up describing a line it is not about.
     """
-    aggregated = [f"aggregate.alias({column!r})"]
-    if empty is not EmptyWindowResult.NULL:
-        aggregated.append(f"F.count(F.lit(1)).alias({_SOURCE_ROWS!r})")
+    aggregated = [f"{slot.local}aggregate.alias({slot.value_column!r})"]
+    if slot.empty is not EmptyWindowResult.NULL:
+        aggregated.append(f"F.count(F.lit(1)).alias({slot.marker_column!r})")
     grouping = ", ".join(f"F.col({key!r})" for key in keys)
     return [
-        *_comment(_null_input_note(expression.aggregation, nulls, operand)),
-        *_aggregate_expression(expression.aggregation, operand, nulls, physical),
+        *_comment(_null_input_note(slot)),
+        *_aggregate_expression(slot, physical),
         "",
         *_comment(
-            f"The grain-level aggregate. `{expression.aggregation.value}` is the expression's own "
-            f"declared aggregate, and the grouping is the DECLARED grain — one row per landing key, "
-            f"which is what the spine reduction below can then join onto exactly once."),
-        *_call_lines(f"    grouped = rows.groupBy({grouping}).agg(", aggregated, ")"),
+            f"The grain-level aggregate. `{slot.expression.aggregation.value}` is the expression's "
+            f"own declared aggregate, and the grouping is the DECLARED grain — one row per landing "
+            f"key, which is what the spine reduction below can then join onto exactly once."),
+        *_call_lines(f"    {slot.local}grouped = {slot.local}rows.groupBy({grouping}).agg(",
+                     aggregated, ")"),
     ]
 
 
@@ -1654,26 +1887,28 @@ def _call_lines(head: str, arguments: list[str], tail: str) -> list[str]:
     return [head, *(f"{indent}{argument}," for argument in arguments), f"{' ' * 4}{tail}"]
 
 
-def _aggregate_expression(aggregation: AggregateFunction, operand: str | None,
-                          nulls: NullInput, physical: PhysicalType) -> list[str]:
+def _aggregate_expression(slot: _Slot, physical: PhysicalType) -> list[str]:
     """``aggregate = …`` — a NAMED binding, because the propagate form is two aggregates deep."""
+    aggregation, operand, nulls = slot.expression.aggregation, slot.operand, slot.nulls
+    name = f"{slot.local}aggregate"
     if aggregation is AggregateFunction.COUNT_ROWS:
-        return ["    aggregate = F.count(F.lit(1))"]
+        return [f"    {name} = F.count(F.lit(1))"]
     value = f"F.col({operand!r})"
     if nulls is NullInput.ZERO:
         value = f"F.coalesce({value}, {_typed_literal('0', physical)})"
     core = f"{_AGGREGATE_CALLS[aggregation]}({value})"
     if nulls is not NullInput.PROPAGATE:
-        return [f"    aggregate = {core}"]
+        return [f"    {name} = {core}"]
     # `count(x)` skips nulls and `count(1)` does not, so a shortfall between them IS "some value in
     # this group was null". Spark's aggregates all skip nulls, so propagation has to be rendered.
-    absent = f"    any_null = F.count(F.col({operand!r})) < F.count(F.lit(1))"
-    single = f"    aggregate = F.when(any_null, {_typed_literal('None', physical)}).otherwise({core})"
+    marker = f"{slot.local}any_null"
+    absent = f"    {marker} = F.count(F.col({operand!r})) < F.count(F.lit(1))"
+    single = f"    {name} = F.when({marker}, {_typed_literal('None', physical)}).otherwise({core})"
     if len(single) <= _RENDERED_WIDTH:
         return [absent, single]
     return [
         absent,
-        f"    aggregate = F.when(any_null, {_typed_literal('None', physical)}).otherwise(",
+        f"    {name} = F.when({marker}, {_typed_literal('None', physical)}).otherwise(",
         f"        {core})",
     ]
 
@@ -1690,8 +1925,8 @@ def _typed_literal(value: str, physical: PhysicalType) -> str:
     return f"F.lit({value}).cast({physical.sql_type.lower()!r})"
 
 
-def _null_input_note(aggregation: AggregateFunction, nulls: NullInput,
-                     operand: str | None) -> str:
+def _null_input_note(slot: _Slot) -> str:
+    aggregation, nulls, operand = slot.expression.aggregation, slot.nulls, slot.operand
     if aggregation is AggregateFunction.COUNT_ROWS:
         return (f"§8 rule 4 — the declared null_input is `{nulls.value}` and this aggregate has no "
                 f"operand at all, so there is no value for it to act on. Stated rather than "
@@ -1709,14 +1944,16 @@ def _null_input_note(aggregation: AggregateFunction, nulls: NullInput,
             f"rendered explicitly; it is not what any of them does on its own.")
 
 
-def _spine_reduction_lines(keys: tuple[str, ...]) -> list[str]:
+def _spine_reduction_lines(slots: tuple[_Slot, ...], keys: tuple[str, ...]) -> list[str]:
     """§8 rule 3 — LEFT JOIN onto the spine. The one line the whole population depends on.
 
-    One paragraph and one line, deliberately. The join is the statement a reviewer must be able to
-    check at a glance, and ``how='left'`` on a continuation line is the half of it that would be
-    read last.
+    One paragraph and one line per aggregate, deliberately. A join is the statement a reviewer must
+    be able to check at a glance, and ``how='left'`` on a continuation line is the half of it that
+    would be read last. Each operand joins separately because each is its own grain-level aggregate;
+    neither can fan out, because ``groupBy(...).agg(...)`` produces one row per group by
+    construction and the spine holds one row per key by §4.2 rule 5's blocking gate.
     """
-    return [
+    lines = [
         *_comment(
             "§8 rule 3 — the spine reduction. LEFT, and never INNER: an entity with no source rows "
             "in this window must still be present, carrying the declared empty-window value, and "
@@ -1726,64 +1963,186 @@ def _spine_reduction_lines(keys: tuple[str, ...]) -> list[str]:
             "blocking gate) and the aggregate holds one row per key. Nothing de-duplicates here; "
             "fan-out is refused upstream, and a row-collapsing repair in the renderer is how row "
             "inflation becomes invisible."),
-        *_call_lines("    staged = spine.join(",
-                     ["grouped", f"on={list(keys)!r}", "how='left'"], ")"),
     ]
+    for index, slot in enumerate(slots):
+        left = "spine" if index == 0 else "staged"
+        lines.extend(_call_lines(f"    staged = {left}.join(",
+                                 [f"{slot.local}grouped", f"on={list(keys)!r}", "how='left'"], ")"))
+    return lines
 
 
-def _empty_window_lines(column: str, empty: EmptyWindowResult,
-                        physical: PhysicalType) -> list[str]:
+def _empty_window_lines(slot: _Slot, physical: PhysicalType) -> list[str]:
     """§8 rule 4's empty-window value, told apart from a null the AGGREGATE produced.
 
     The marker column is why the two are distinguishable at all. After a left join, an entity with
     no rows and an entity whose aggregate evaluated to NULL both show NULL — and they are different
     facts with different declared answers.
+
+    Resolved PER OPERAND and BEFORE the final operation, because that is where the declaration sits:
+    each ``AggregateExpression`` carries its own ``WindowPolicy``. The final operation then combines
+    whatever the two declarations produced, and never re-answers either.
     """
-    if empty is EmptyWindowResult.NULL:
+    column, marker = slot.value_column, slot.marker_column
+    if slot.empty is EmptyWindowResult.NULL:
         return _comment(
-            "§8 rule 4 — the declared empty_window is `null`, which is what the LEFT join already "
-            "leaves for an entity with no rows. No marker column is rendered because none is "
-            "needed: a null from an empty window and a null from the aggregate are the same "
-            "declared answer here, so nothing has to tell them apart.")
-    absent = [f"    no_source_rows = F.col({_SOURCE_ROWS!r}).isNull()"]
-    if empty is EmptyWindowResult.ZERO:
+            f"§8 rule 4 — {slot.subject} declared empty_window is `null`, which is what the LEFT "
+            f"join already leaves for an entity with no rows. No marker column is rendered because "
+            f"none is needed: a null from an empty window and a null from the aggregate are the "
+            f"same declared answer here, so nothing has to tell them apart.")
+    absent = f"{slot.local}no_source_rows"
+    lines = [f"    {absent} = F.col({marker!r}).isNull()"]
+    if slot.empty is EmptyWindowResult.ZERO:
+        value = f"{slot.local}empty_value"
         body = [
             *_comment(
-                "§8 rule 4 — the declared empty_window is `zero`. The marker is what distinguishes "
-                "an entity with NO rows from one whose aggregate evaluated to NULL: both are null "
-                "after the join, and only the first is an empty window. Coalescing instead would "
-                "answer the second one's policy question with this one's answer."),
-            *absent,
-            f"    empty_value = {_typed_literal('0', physical)}",
+                f"§8 rule 4 — {slot.subject} declared empty_window is `zero`. The marker is what "
+                f"distinguishes an entity with NO rows from one whose aggregate evaluated to NULL: "
+                f"both are null after the join, and only the first is an empty window. Coalescing "
+                f"instead would answer the second one's policy question with this one's answer."),
+            *lines,
+            f"    {value} = {_typed_literal('0', physical)}",
             "    staged = staged.withColumn(",
             f"        {column!r},",
-            f"        F.when(no_source_rows, empty_value).otherwise(F.col({column!r})))",
+            f"        F.when({absent}, {value}).otherwise(F.col({column!r})))",
         ]
     else:
+        empty = f"{slot.local}empty"
         body = [
             *_comment(
-                "§8 rule 4 — the declared empty_window is `error`, so an entity with no rows in "
-                "the window STOPS the run. The marker is what makes that decidable: after the "
-                "join an empty window and a null aggregate look identical, and only one of them "
-                "is what the formula declared an error."),
+                f"§8 rule 4 — {slot.subject} declared empty_window is `error`, so an entity with no "
+                f"rows in the window STOPS the run. The marker is what makes that decidable: after "
+                f"the join an empty window and a null aggregate look identical, and only one of "
+                f"them is what the formula declared an error."),
             *_comment(
                 "This is the FORMULA's policy, not a §9 validation gate, so it deliberately carries "
                 "no ValidationGateCode: §14's vocabulary has no member for it, and borrowing one "
                 "would put this decision into the gate table's mouth."),
-            *absent,
-            "    empty = staged.where(no_source_rows)",
-            "    if empty.limit(1).count() > 0:",
+            *lines,
+            f"    {empty} = staged.where({absent})",
+            f"    if {empty}.limit(1).count() > 0:",
             *_raise_lines(
-                f"{_safe_text(column, 'the feature column')} declares empty_window=error, and at "
-                f"least one entity in the declared population has no source row in its window. The "
-                f"formula asks for the run to stop rather than for a value to be invented for it. "
-                f"Entities affected: ",
-                tail="str(empty.count())"),
+                f"{_safe_text(slot.what, 'the feature column')} declares empty_window=error, and "
+                f"at least one entity in the declared population has no source row in its window. "
+                f"The formula asks for the run to stop rather than for a value to be invented for "
+                f"it. Entities affected: ",
+                tail=f"str({empty}.count())"),
         ]
     return [*body, "", *_comment(
         "The marker is dropped here: per-feature staging carries the keys, the business date and "
         "ONE feature column, and a column this node invented would collide at assembly."),
-        f"    staged = staged.drop({_SOURCE_ROWS!r})"]
+        f"    staged = staged.drop({marker!r})"]
+
+
+def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_Slot, ...],
+                           physical: PhysicalType) -> list[str]:
+    """The operation BETWEEN the operands — nothing at all for an identity body.
+
+    It runs last of the compute, after each operand's own §8 rule 4 policies have been applied, and
+    it never re-answers one of them. That ordering is the whole design: an operand absent from its
+    window has already been given the value its declaration asks for, and the operation combines
+    whatever the two declarations produced.
+    """
+    if ir.final_operation is FinalOperation.IDENTITY:
+        return []
+    values = [f"    {slot.local}value = F.col({slot.value_column!r})" for slot in slots]
+    names = [f"{slot.local}value" for slot in slots]
+    if ir.final_operation is FinalOperation.DIFFERENCE:
+        minuend, subtrahend = names
+        body = [
+            *_comment(
+                "The DIFFERENCE. A NULL on either side makes it NULL, and it is deliberately NOT "
+                "coalesced: an operand absent from its window was already answered by its own "
+                "empty_window declaration above, and substituting a zero here would replace that "
+                "answer with this node's — `0 - x` is a real, plausible number and nothing "
+                "downstream would question it."),
+            *values,
+            *_call_lines("    staged = staged.withColumn(",
+                         [repr(column), f"{minuend} - {subtrahend}"], ")"),
+        ]
+        return [*body, "", *_operand_drop_lines(slots)]
+    numerator, denominator = names
+    policy = _zero_denominator(ir)
+    body = [
+        *_comment(
+            f"§8 rule 4's ÷0 half — the declared zero_denominator is `{policy.value}`. The test is "
+            f"on the DENOMINATOR's value and never on the quotient: a zero denominator and an "
+            f"ABSENT one are different facts that both look like 'no value' at the end, the second "
+            f"was already answered by {denominator}'s own empty_window declaration above, and a "
+            f"division answers both with the same NULL. Reading that back would settle one policy's "
+            f"question with the other's answer."),
+        *_comment(
+            "The literal carries no cast. The denominator is an OPERAND, and §6 resolves a type for "
+            "the published column only — so there is no declared operand type for a cast to state, "
+            "and a comparison against zero is exact in every numeric type Spark would promote to."),
+        *values,
+        f"    denominator_is_zero = {denominator}.isNotNull() & ({denominator} == F.lit(0))",
+        *_zero_denominator_lines(policy, column, numerator, denominator, physical),
+    ]
+    return [*body, "", *_operand_drop_lines(slots)]
+
+
+def _zero_denominator_lines(policy: ZeroDenominator, column: str, numerator: str,
+                            denominator: str, physical: PhysicalType) -> list[str]:
+    """One rendering per ``ZeroDenominator`` member — three genuinely different columns.
+
+    ``null`` and ``zero`` replace the divisor BEFORE the division rather than repairing the quotient
+    afterwards, so no zero ever reaches a ``/``. Non-ANSI Spark would answer ``x / 0`` with a NULL
+    and ANSI Spark raises, which means leaving the division unguarded would make the DECLARED policy
+    depend on a session setting — the ``null`` case would be right by accident today and become an
+    error the day someone enables ANSI.
+
+    ``error`` genuinely RAISES. `error` is not a mode Spark has for this either: it would return the
+    same NULL that the `null` policy asks for, so a formula that declared "stop the run" would
+    publish a column of nulls and report nothing.
+    """
+    if policy is ZeroDenominator.ERROR:
+        return [
+            *_comment(
+                "Rendered as a real refusal. `error` is not a mode Spark has: division by zero "
+                "returns the same NULL that the `null` policy asks for, so a formula declaring "
+                "that the run should STOP would otherwise publish a column of nulls and report "
+                "nothing. It is the FORMULA's policy and not a §9 validation gate, so it carries "
+                "no ValidationGateCode — §14's vocabulary has no member for it."),
+            "    divided_by_zero = staged.where(denominator_is_zero)",
+            "    if divided_by_zero.limit(1).count() > 0:",
+            *_raise_lines(
+                f"{_safe_text(column, 'the feature column')} declares zero_denominator=error, and "
+                f"at least one entity's denominator is exactly zero. An ABSENT denominator is not "
+                f"this: it was answered by the empty_window policy above and is not reported here. "
+                f"Entities affected: ",
+                tail="str(divided_by_zero.count())"),
+            *_comment(
+                "The division is unguarded because the check above proved there is nothing to "
+                "guard against: no denominator reaching this line is zero."),
+            *_call_lines("    staged = staged.withColumn(",
+                         [repr(column), f"{numerator} / {denominator}"], ")"),
+        ]
+    lines = [
+        f"    undefined = {_typed_literal('None', physical)}",
+        f"    divisor = F.when(denominator_is_zero, undefined).otherwise({denominator})",
+    ]
+    if policy is ZeroDenominator.NULL:
+        return [*lines, *_call_lines("    staged = staged.withColumn(",
+                                     [repr(column), f"{numerator} / divisor"], ")")]
+    return [
+        *lines,
+        f"    zero_value = {_typed_literal('0', physical)}",
+        "    staged = staged.withColumn(",
+        f"        {column!r},",
+        f"        F.when(denominator_is_zero, zero_value).otherwise({numerator} / divisor))",
+    ]
+
+
+def _operand_drop_lines(slots: tuple[_Slot, ...]) -> list[str]:
+    """The two operand columns, dropped once the operation has consumed them."""
+    dropped = ", ".join(repr(slot.value_column) for slot in slots)
+    return [
+        *_comment(
+            "The operand columns are dropped: per-feature staging carries the keys, the business "
+            "date and ONE feature column, and the two halves of an operation the caller never asked "
+            "for would be extra columns §9 reports against the whole group at assembly."),
+        f"    staged = staged.drop({dropped})",
+    ]
 
 
 def _decimal_scale(sql_type: str) -> tuple[int, int]:

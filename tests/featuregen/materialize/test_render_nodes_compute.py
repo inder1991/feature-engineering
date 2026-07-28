@@ -1131,13 +1131,31 @@ def lock_tree(tmp_path):
     return str(nodes)
 
 
-def _calculate(compiled, feature, *, ir=None, plan=None,
+def _per_path(value, ir):
+    """A scalar policy fanned out over the body's paths — the shape the renderer requires.
+
+    Tests that care about ONE expression say `EmptyWindowResult.ZERO`; tests that care about the two
+    halves declaring different things pass the mapping straight through.
+    """
+    if isinstance(value, dict):
+        return value
+    return dict.fromkeys(_paths(ir), value)
+
+
+def _paths(ir):
+    """The body paths of `ir` — empty for the deliberately-wrong arguments the type checks reject."""
+    return [expression.expr_path for expression in getattr(ir, "expressions", ())]
+
+
+def _calculate(compiled, feature, *, ir=None, plan=None, projections=None,
                empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE):
+    ir = ir if ir is not None else compiled[0].irs[0]
+    if projections is None:
+        projections = dict.fromkeys(_paths(ir), PROJECTION)
     return nodes_compute.render_calculation_node(
-        ir if ir is not None else compiled[0].irs[0], feature,
-        plan if plan is not None else compiled[1],
-        empty_window=empty_window, null_input=null_input,
-        projection_dataset=PROJECTION, spine_dataset="primary_spine",
+        ir, feature, plan if plan is not None else compiled[1],
+        empty_window=_per_path(empty_window, ir), null_input=_per_path(null_input, ir),
+        projection_datasets=projections, spine_dataset="primary_spine",
         staging_dataset=STAGING, manifest_dataset=MANIFEST)
 
 
@@ -1663,10 +1681,13 @@ def _wired_nodes(compiled, datasets):
                 projection_dataset=datasets.projections[(ir.feature_name,
                                                          expression.expr_path)]))
         planned = next(item for item in plan.features if item.column_name == ir.feature_name)
+        paths = [expression.expr_path for expression in ir.expressions]
         nodes.append(nodes_compute.render_calculation_node(
-            ir, planned, plan, empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE,
-            projection_dataset=datasets.projections[(ir.feature_name,
-                                                     ir.expressions[0].expr_path)],
+            ir, planned, plan,
+            empty_window=dict.fromkeys(paths, EmptyWindowResult.NULL),
+            null_input=dict.fromkeys(paths, NullInput.IGNORE),
+            projection_datasets={path: datasets.projections[(ir.feature_name, path)]
+                                 for path in paths},
             spine_dataset=datasets.spine, staging_dataset=datasets.staging[ir.feature_name],
             manifest_dataset=datasets.manifests[ir.feature_name]))
     nodes.append(_assembly_stub(datasets))
@@ -1715,20 +1736,22 @@ def test_the_renderer_still_imports_no_pyspark_and_writes_no_location(compiled, 
 # ── refusals decidable at RENDER time ────────────────────────────────────────────────────────────
 
 
-def test_it_refuses_a_RATIO_or_DIFFERENCE_rather_than_staging_HALF_of_it(compiled, feature):
-    """A ratio has two aggregates, a final operation and its own zero_denominator policy. None of
-    that is rendered here, and staging the numerator under the feature's own name would publish a
-    numerator as though it were the ratio — a plausible number with no error anywhere."""
+def test_it_refuses_a_BODY_whose_compiled_PATHS_are_not_the_operations_own(compiled, feature):
+    """The body path is the only thing that says WHICH operand an expression is. A ratio compiled
+    to `body.expr` would be rendered as its own numerator and its own denominator — the number is 1
+    for every entity that has any rows at all, and nothing anywhere would call that an error."""
+    identity = compiled[0].irs[0]
     for operation in (FinalOperation.RATIO, FinalOperation.DIFFERENCE):
-        ir = dataclasses.replace(compiled[0].irs[0], final_operation=operation)
-        with pytest.raises(ValueError, match="single aggregate"):
+        ir = dataclasses.replace(identity, final_operation=operation,
+                                 zero_denominator=None)
+        with pytest.raises(ValueError, match="body path is what says WHICH operand"):
             _calculate(compiled, feature, ir=ir)
 
 
 def test_it_refuses_an_identity_body_that_compiled_to_more_than_ONE_expression(compiled, feature):
     expression = compiled[0].irs[0].expressions[0]
     ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression, expression))
-    with pytest.raises(ValueError, match="expression"):
+    with pytest.raises(ValueError, match="body path is what says WHICH operand"):
         _calculate(compiled, feature, ir=ir)
 
 
