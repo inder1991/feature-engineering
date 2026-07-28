@@ -377,7 +377,7 @@ class _Builder:
         if not mine:
             return []
         out: list[tuple[_Unit | None, dict | None, dict]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for link in cross_catalog_links(self.conn):
             if link.left_catalog_source == source and link.left_object_ref in mine:
                 near_ref, far_src, far_ref = link.left_object_ref, link.right_catalog_source, \
@@ -393,9 +393,13 @@ class _Builder:
                 (far_src, far_ref, self.allowed)).fetchone()
             if far is None:      # hidden from this caller — absence must equal nonexistence
                 continue
-            if (far_src, far_ref) in seen:
+            # Keyed on the PAIR, not the far column alone: two different near columns can link to
+            # the SAME far column (cust_pref_branch_cd and cust_prim_branch_cd both reach
+            # tran_branch_sol_id), and keying on the far ref silently dropped all but the first —
+            # 6 edges drawn for 9 real links.
+            if (near_ref, far_src, far_ref) in seen:
                 continue
-            seen.add((far_src, far_ref))
+            seen.add((near_ref, far_src, far_ref))
             out.append((("table", far_src, far[0]), None, {
                 "from": f"{source}:{near_ref}", "to": f"{far_src}:{far_ref}",
                 "layer": "entity", "kind": "entity_bridge",

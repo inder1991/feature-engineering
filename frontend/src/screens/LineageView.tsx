@@ -420,9 +420,22 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
     return parts.join(' · ')
   }
   if (e.kind === 'entity_bridge') {
-    const entity = from?.entity ?? to?.entity ?? 'shared'
-    const target = to ? `${to.catalog_source ?? idSource(e.to)}.${to.table}` : e.to
-    return `${from?.table ?? e.from} is ${entity} entity bridge to ${target} · declared, not value-verified`
+    // Name the COLUMNS. Describing a bridge table-to-table made six genuinely different column
+    // links render as six identical sentences, and hid the only one that matters
+    // (cust_num <-> cif_id) among five weak branch pairs.
+    //
+    // `entity_id` comes off the EDGE. Reading it from the node's `entity` field always fell through
+    // to "shared", because graph_node.entity is null on every column — the same never-populated
+    // column that kept this expansion from firing at all.
+    //
+    // And `resolved` is honoured rather than hard-coding "declared": a confirmed bridge used to
+    // report itself as unconfirmed.
+    const entity = e.entity_id ?? from?.entity ?? to?.entity ?? 'shared'
+    const target = to
+      ? `${to.catalog_source ?? idSource(e.to)}.${shortRef(to, e.to)}`
+      : e.to
+    const state = e.resolved ? 'confirmed by a person' : 'proposed, not yet reviewed'
+    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${state}`
   }
   if (e.kind === 'derives') {
     return `${shortRef(from, e.from)} derives feature ${shortRef(to, e.to)} · registered`

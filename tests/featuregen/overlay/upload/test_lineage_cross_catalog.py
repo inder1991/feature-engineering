@@ -89,3 +89,25 @@ def test_a_hidden_partner_column_never_leaks_through_a_link(two_catalogs):
     g = _graph(two_catalogs)   # roles=() — no pii_reader
     assert not any(e.get("kind") == "entity_bridge" for e in g["edges"])
     assert "cif_id" not in json.dumps(g)
+
+
+def test_two_near_columns_linking_to_the_SAME_far_column_both_draw(two_catalogs):
+    """The dedupe key was the FAR column alone, so a second link into the same far column was
+    silently dropped — 6 edges drawn for 9 real links on the live catalog. `cust_pref_branch_cd`
+    and `cust_prim_branch_cd` both reach `tran_branch_sol_id`; both are real and both must draw."""
+    db = two_catalogs
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               " data_type) VALUES ('cib','public.bo_cib_customer.cust_alt','column',"
+               " 'bo_cib_customer','cust_alt','text')")
+    ev = {"entity_id": "customer", "type_basis": "declared", "candidate_id": "c2",
+          "left_is_grain": False, "right_is_grain": False, "data_type_family": "text",
+          "derivation_version": "1.0.0"}
+    db.execute(
+        "INSERT INTO entity_bridge_candidate_evidence (entity_id, left_catalog_source, "
+        " left_object_ref, right_catalog_source, right_object_ref, candidate_id, fact_key, "
+        " data_type_family, evidence_json, derivation_version) "
+        "VALUES ('customer','cib','public.bo_cib_customer.cust_alt','ftr',"
+        " 'public.tran_repos.cif_id','c2','fk-2','text',%s,'1.0.0')", (json.dumps(ev),))
+    bridges = [e for e in _graph(db)["edges"] if e.get("kind") == "entity_bridge"]
+    near = {e["from"] for e in bridges}
+    assert len(near) == 2, bridges     # both near columns reach cif_id

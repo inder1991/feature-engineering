@@ -818,6 +818,9 @@ export interface LineageEdge {
   kind: 'contains' | 'join' | 'entity_bridge' | 'derives' | 'consumes'
   cardinality?: string
   resolved: boolean
+  // entity_bridge only: WHICH entity the two columns share (customer, branch, …). Carried on the
+  // edge because the node-level `entity` field is null on every column.
+  entity_id?: string
 }
 
 export interface LineageGraph {

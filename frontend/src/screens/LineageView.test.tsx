@@ -307,7 +307,11 @@ describe('lineage view', () => {
       'accounts.ledger_id joins ledger.entry_id · declared, target not uploaded',
       'accounts.balance derives feature avg_eod_balance_30d · registered',
       'avg_eod_balance_30d is read by churn_risk_model · consumer',
-      'customers is Customer entity bridge to cards.card_holders · declared, not value-verified',
+      // Names both COLUMNS, not just the tables: describing a bridge table-to-table made six
+      // genuinely different column links render as six identical sentences on the real catalog,
+      // hiding the only one that mattered. Also states review status honestly instead of
+      // hard-coding "declared".
+      'customers.cust_id links to cards.card_holders.holder_id on Customer · proposed, not yet reviewed',
     ])
   })
 
