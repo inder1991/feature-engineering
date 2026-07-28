@@ -23,7 +23,7 @@ Do not implement the four plans independently as written.
 **Scope is being re-sequenced, not cut.** Every user-facing capability stays in the programme:
 metadata ingestion, Hive profiling, profiles improving the ontology, concepts/domains/synonyms,
 LLM-powered proposals, entity and identifier detection, relationship discovery, governance evidence,
-the NL agent, typed plans, generated Kedro/PySpark, Hadoop execution, tables and charts, grounded
+the NL agent, typed plans, real execution against Hive, tables and charts, grounded
 summaries, and the ontology learning loop. What moves later is the standalone ontology *exploration
 product* — the semantic-map service, the ER screen and the navigable graph — because none of them
 answers a question or produces a feature.
@@ -133,6 +133,68 @@ link is later verified or rejected, and the same execution identity is reused un
 eligibility state. Confirmation must not rename the logical relationship; it must change whether a
 particular execution is authorized.
 
+## 3c. Execution — one plan, pluggable executors
+
+**Kedro is packaging, not connectivity.** An earlier revision of this roadmap routed all data access
+through a generated Kedro/Spark project, which made it read as mandatory. It is not. The three
+concerns are separate:
+
+```text
+Hive / ODS   = where the data lives
+Spark / SQL  = what performs the calculation
+Kedro        = how calculation steps, config and inputs are organised
+```
+
+A Kedro node ultimately uses Spark SQL or a connector anyway. For a handful of `COUNT`, `MIN` and
+`MAX` aggregates, generating a whole project is more machinery than the job needs.
+
+**The rule: one typed plan, more than one executor, one result shape.**
+
+```text
+DataObservationPlan / AnalysisExecutionIRV1
+      │
+      ├── direct Hive SQL executor      ← fastest functional proof; Release 1
+      ├── ODS native SQL executor       ← later, once the engine is known
+      └── Spark/Kedro executor          ← scale, multi-stage, and production materialization
+```
+
+Every executor returns the identical typed result — table identity, input snapshot/partitions, row
+count, column statistics, relationship statistics, **exact-vs-approximate method**, coverage,
+failures. **The ontology must not be able to tell which executor produced its evidence.** That is
+what keeps the executor a swappable detail instead of a fork in the architecture.
+
+This applies to **analysis as well as observation**. The pilot question is expressible as SQL — two
+period CTEs, a left join to the population spine, group by segment and sector — so the sandbox slice
+runs it directly. `AnalysisExecutionIRV1` stays the artifact of record and *compiles to* either
+backend. One plan with two backends, never SQL in one place and Kedro in another.
+
+**Where the generated project genuinely earns its place:** hundreds of columns and shared scans;
+multi-stage pipelines with intermediates; retries and partial-failure semantics; sealed
+reproducibility; and production materialization, where feature generation already lives. Switch when
+one of those is true, not by default.
+
+### What the existing profiler already gives us
+
+`ProfilerLimits` carries a **server-owned schema allowlist**, statement timeout, sampling threshold
+and column cap; and `profiler_command.py` enforces the property that matters — *a caller's
+self-attested `allowed_schemas` must not authorize a scan*, failing closed when no config is sealed.
+That is the hard part of safe profiling and it is built.
+
+**But the query layer is PostgreSQL-shaped** (`TABLESAMPLE BERNOULLI`, `sql.Identifier`,
+`SET LOCAL statement_timeout`). So Release 1 reuses the **policy and limits** and adds a **dialect
+layer**; it does not simply point the existing profiler at Hive.
+
+### Two rules that hold regardless of executor
+
+**Partition pruning is correctness and cost, not a Kedro feature.** `SELECT COUNT(*) FROM
+banking.transactions` with no predicate is a full scan of a partitioned bank table. Pruning belongs
+in the observation plan, or the first profiling run is the one the DBA remembers.
+
+**Approximate by default, and record which.** Exact distinct counts are expensive on Hive and worse
+on an operational ODS. The result carries the method because it decides what the evidence can later
+support: **sampled uniqueness cannot prove uniqueness** — finding a duplicate disproves it, finding
+none proves nothing.
+
 ## 4. Link policy — three tiers
 
 This replaces the contradiction between the plans, where one admitted proposed links to
@@ -215,6 +277,7 @@ are **superseded**. An implementation agent must not build them as written.
 | Data-agent programme | §5.1 `CatalogMetadataSnapshotV1` | **Retained, but layered** — built from per-source metadata revisions, not instead of them. |
 | Data-agent programme | M1-M13 build order | **Superseded** by §6. The milestone CONTENT stands; the order does not. |
 | Data-agent programme | M3 durable scheduler/outbox, M5 pull worker | **Deferred to Release 6.** Not before the functional slice. |
+| Data-agent programme | M4 "render a self-contained Kedro/PySpark project" for PROFILING | **Superseded** by §3c. Release 1 profiles over a direct Hive executor; the Kedro executor is Release 6. M4's profiling SEMANTICS (partition pruning first, bounded column batches sharing one filtered intermediate, shortlisted relationship probes, sensitivity inheritance, aggregate-only export) all stand — they are plan properties, not executor properties. |
 | Data-agent programme | M9 "Freeze `AnalysisPlanV1`" | Stands, plus `AnalysisExecutionIRV1` (§3a). Its population spine and zero-observation handling are the reference behaviour. |
 | E3/E5 programme | Non-negotiable boundary "…feeds feature generation **and materialization**, confirmed or not" | **Superseded** by the three tiers (§4). Corrected in place. |
 | E3/E5 programme | Build order incl. source entitlement, signed cursors, full Foundation gates before E3.1 | **Superseded** by §6. Entitlement and cursors are deferred security. |
@@ -254,26 +317,53 @@ planner neutrality guard (the one failing test).
 > environment; results are marked sandbox and never written to production feature or model-input
 > tables.
 
-### Release 1 — prove real data access
+### Release 1 — look at real data, by the shortest honest path
 
-**Minimal schema-preserving physical identity** — source, catalog/database, schema, table, column,
-object kind, normalized identity, and unknown-schema refusal. This moves UP from Release 2 because
-every profile observation must attach to an unambiguous physical object; without it, Release 1's
-evidence binds to flattened `public.table.column` identities and has to be re-bound later. The full
-CSV/OpenMetadata ingest migration stays in Release 2 — the *pilot bindings* cannot.
+**Goal:** the first time the system sees actual data. Bounded, read-only, aggregates only.
 
-Cluster inventory. Bind one customer and one transaction table with explicitly configured connection
-and manually declared mappings — **not** the full connection-governance system.
+**0. Answer the question everything rests on.** Can the platform reach HiveServer2, with a
+read-only account, under the bank's rules? Confirm the account genuinely cannot write. If the answer
+is no, the pull-worker becomes mandatory and this release changes shape — so establish it *before*
+writing an executor, not after.
 
-**Extend the existing Kedro project-rendering shell** with an observation IR and profiling nodes.
-The renderer exists (§5); what it does not do is compute null rates, quantiles, patterns, uniqueness
-or relationship overlap.
+**1. Give the two pilot tables an unambiguous address.** Minimal schema-preserving physical identity
+— source, catalog/database, schema, table, column, object kind, normalized identity, and
+unknown-schema refusal. This moved up from Release 2 because a profile attached to the wrong object
+poisons everything built on it. The full CSV/OpenMetadata ingest migration stays in Release 2; the
+*pilot bindings* cannot wait.
 
-Run a bounded profile manually on Hadoop. Prove partitions, read-only access and aggregate-only
-return. Produce relationship evidence — **promote nothing**. Load a second catalog source before
-claiming any cross-catalog success.
+Map one customer table and one transaction table by hand. No connection-governance system yet.
 
-Do not build the scheduler/worker platform before this proof.
+**2. Add a Hive dialect layer over the existing profiler policy.** Reuse `ProfilerLimits` — the
+server-owned schema allowlist, statement timeout, sampling threshold, column cap — and the
+`profiler_command` rule that a caller cannot self-authorize a scan. Write the Hive query dialect;
+the current one is PostgreSQL-shaped.
+
+**3. Build the direct Hive executor** behind the `DataObservationPlan` contract, returning the
+shared typed result. **Partition pruning is part of the plan, not an optimisation.** Approximate
+distinct counts by default, with the method recorded.
+
+**4. Validate against a small local fixture first.** Hand-computed null rates, distinct counts,
+ranges and patterns on rows you wrote yourself. This is what makes the first cluster run a
+confirmation rather than an experiment.
+
+**5. Run bounded profiles on the two pilot tables.** Prove the partitions actually read, that the
+account is read-only, and that only aggregates cross the boundary — never rows.
+
+**6. Store the profiles as typed evidence** — with input snapshot, coverage and method.
+
+**7. Produce relationship evidence and promote NOTHING.** Left/right uniqueness, null rates, overlap,
+unmatched-key rate, join row multiplier, observed cardinality, format compatibility. Automatic
+attestation is Release 2, in shadow.
+
+**8. Load a second catalog source** before claiming any cross-catalog result. M7 is still 1.
+
+**Not in this release:** the Kedro/Spark executor, the scheduler, the pull worker, the outbox, and
+ODS. ODS waits until the engine and access method are known — and when it comes, the choice is
+bounded native SQL, a read replica, or an approved Hive snapshot, decided on workload impact rather
+than in advance.
+
+**Buildable today without any cluster:** steps 1, 2, 3 and 4. Only steps 5-8 need access.
 
 ### Release 2 — minimum ontology core
 
@@ -286,8 +376,14 @@ governance queue.
 
 Governed pilot semantic definitions. A **manually constructed** typed analysis request — no natural
 language yet. `AnalysisExecutionIRV1` and the **deterministic compiler** (moved up from Release 4:
-Release 3 cannot produce a result without compilation). Generated Kedro/PySpark, a real Hadoop run,
-and a validated tabular result.
+Release 3 cannot produce a result without compilation).
+
+**Compile to direct Hive SQL for this slice** (§3c) — the pilot question is two period CTEs, a left
+join to the population spine and a group-by, so the direct executor is the shortest honest proof. The
+typed plan stays the artifact of record and can compile to the generated project later without the
+ontology or the audit trail noticing.
+
+A real run against Hive, and a validated tabular result.
 
 Must demonstrate the population spine, zero-transaction customers, PIT dimensions, verified joins,
 reversal/status filtering and hand-reconciled results.
@@ -310,9 +406,11 @@ rather than as an independent modelling project.
 
 ### Release 6 — operationalize, then expand
 
-Durable observation workflow, pull worker, leases/retries/outbox, immutable manifests, artifact
-dependency invalidation, caches, quotas, security hardening, and **physical** candidate-store
-consolidation. Then use query logs and unresolved questions to decide whether to fund the E5
+The **Spark/Kedro executor** (§3c) — for shared scans across hundreds of columns, multi-stage
+profiling with intermediates, partial-failure semantics, and sealed reproducibility for production
+materialization, which is where feature generation already lives. Plus the durable observation
+workflow, pull worker, leases/retries/outbox, immutable manifests, artifact dependency invalidation,
+caches, quotas, security hardening, and **physical** candidate-store consolidation. Then use query logs and unresolved questions to decide whether to fund the E5
 exploration product, composite bridges or ODS adapters.
 
 ## 7. Functional correctness — keep now, do not defer
