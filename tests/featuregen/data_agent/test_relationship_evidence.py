@@ -67,10 +67,10 @@ def test_uniqueness_differs_between_the_two_sides(pilot):
     """The customer side is a key; the transaction side is not. A join between them therefore has a
     direction and a multiplier — which is exactly what a fabricated `N:1` guesses at."""
     e = _run(pilot)
-    assert e.right_distinct == EXPECTED["customer_cif_distinct"] == 5
-    assert e.right_rows == EXPECTED["customer_rows"] == 5
+    assert e.right_distinct == EXPECTED["customer_cif_distinct"] == 6
+    assert e.right_rows == EXPECTED["customer_rows"] == 6
     assert e.right_is_unique is True
-    assert e.left_distinct == EXPECTED["transaction_cif_distinct"] == 6
+    assert e.left_distinct == EXPECTED["transaction_cif_distinct"] == 7
     assert e.left_is_unique is False
 
 
@@ -84,15 +84,15 @@ def test_referential_coverage_finds_the_unmatched_key(pilot):
     for whether two identifier columns really share a namespace."""
     e = _run(pilot)
     assert e.unmatched_distinct == EXPECTED["unmatched_ids"] == 1
-    assert e.matched_distinct == EXPECTED["matched_ids"] == 5
-    assert e.coverage_ratio == pytest.approx(5 / 6)
+    assert e.matched_distinct == EXPECTED["matched_ids"] == 6
+    assert e.coverage_ratio == pytest.approx(6 / 7)
 
 
 def test_the_observed_join_multiplier(pilot):
     """How many left rows a single right row attracts. This is the fan-out fact, measured rather
     than declared."""
     e = _run(pilot)
-    assert e.max_left_rows_per_right_key == EXPECTED["max_rows_per_customer"] == 5   # C3: 1 + 4
+    assert e.max_left_rows_per_right_key == EXPECTED["max_rows_per_customer"] == 6   # C1 and C3 both reach 6 raw rows
     assert e.observed_cardinality == "many_to_one"
 
 
@@ -130,5 +130,5 @@ def test_the_evidence_carries_no_identifier_values(pilot):
     """Counts and ratios only. An unmatched-key COUNT is a statistic; the unmatched keys themselves
     are customer identifiers."""
     text = repr(_run(pilot))
-    for identifier in ("C1", "C2", "C3", "C4", "C5", "C9"):
+    for identifier in ("C1", "C2", "C3", "C4", "C5", "C6", "C9"):
         assert identifier not in text

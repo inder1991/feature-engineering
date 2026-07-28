@@ -16,9 +16,12 @@ a generated Kedro project later without the ontology or the audit trail noticing
 """
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from featuregen.data_agent.eligibility import TransactionEligibilityPolicyV1
 from featuregen.data_agent.observation import ObservationPlanError, require_identifier
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 
@@ -90,6 +93,10 @@ class AnalysisExecutionIRV1:
     measure: str = "count"
     comparison: Comparison = Comparison.DECREASED
     dimensions: tuple[Dimension, ...] = ()
+    #: Which transactions count. REQUIRED — an analysis with no eligibility policy would count
+    #: pending, failed and reversed transactions as activity, which changes the answer rather than
+    #: merely widening it.
+    eligibility: TransactionEligibilityPolicyV1 | None = None
 
     def __post_init__(self) -> None:
         # The identifier rule is genuinely shared with observation, so it is reused rather than
@@ -106,12 +113,42 @@ class AnalysisExecutionIRV1:
         if self.measure != "count":
             raise AnalysisIRError("ANALYSIS_UNSUPPORTED_MEASURE",
                                   f"measure {self.measure!r} is not supported in this slice")
+        if self.eligibility is None:
+            raise AnalysisIRError(
+                "ANALYSIS_NO_ELIGIBILITY_POLICY",
+                "no transaction eligibility policy: without one, pending, failed and REVERSED "
+                "transactions count as activity")
         for period in (self.current, self.previous):
             if not period.values:
                 raise AnalysisIRError(
                     "ANALYSIS_EMPTY_PERIOD",
                     f"period {period.label!r} selects no values; an empty period is either a "
                     "mistake or an unbounded scan awaiting a fallback")
+
+
+    @property
+    def plan_hash(self) -> str:
+        """Stable identity of WHAT this plan computes.
+
+        `question` is deliberately EXCLUDED: it is provenance, and two differently-worded questions
+        that resolve to the same computation are the same plan — mirroring `authoring_run_id` being
+        outside `FormulaExecutionIRV1.identity_payload`.
+
+        The eligibility policy IS included: changing which transactions count changes the answer, so
+        it must change the identity, or a cached result computed under a different definition of
+        "counts" could be reused.
+        """
+        e = self.eligibility
+        material = "|".join([
+            self.spine.binding.identity.table_id, self.spine.key_column,
+            self.event_binding.identity.table_id, self.event_key_column, self.period_column,
+            ",".join(self.current.values), ",".join(self.previous.values),
+            self.measure, str(self.comparison),
+            ",".join(d.column for d in self.dimensions),
+            e.status_column, ",".join(e.included_status_values), str(e.reversal_mode),
+            e.reversal_column, ",".join(e.non_reversed_values), str(e.null_behavior),
+        ])
+        return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 def _q(name: str) -> str:
@@ -137,9 +174,16 @@ def compile_analysis(ir: AnalysisExecutionIRV1, *, dialect) -> str:
     event_ref = dialect.table_ref(_Shim(ir.event_binding))
     key, event_key, period = _q(ir.spine.key_column), _q(ir.event_key_column), _q(ir.period_column)
 
+    # CRITICAL PLACEMENT: eligibility predicates belong INSIDE each period aggregation. In the outer
+    # query, after the spine LEFT JOIN, a `WHERE tran_status = 'POSTED'` would drop every customer
+    # whose joined columns are NULL — i.e. exactly the customers with no eligible transactions — and
+    # silently destroy the population-spine guarantee the LEFT JOIN exists to provide.
+    eligibility = " AND ".join(ir.eligibility.predicates(_q))
+
     def _period_cte(name: str, values: tuple[str, ...]) -> str:
         return (f"{name} AS (SELECT {event_key} AS k, COUNT(*) AS n FROM {event_ref} "
                 f"WHERE {period} IN ({_literals(values)}) AND {event_key} IS NOT NULL "
+                f"AND {eligibility} "
                 f"GROUP BY {event_key})")
 
     dimension_select = "".join(f", s.{_q(d.column)}" for d in ir.dimensions)
