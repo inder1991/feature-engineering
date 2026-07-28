@@ -44,6 +44,8 @@ and they name :class:`~featuregen.materialize.codes.ValidationGateCode` members.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import MaterializationContractV1
 from featuregen.materialize.group_plan import FeatureGroupPlanV1
@@ -172,13 +174,13 @@ def render_spine_node(
 
     policy = spine.snapshot_policy
     if isinstance(policy, CurrentSnapshot):
-        selection, needs_window = _current_snapshot(policy), False
+        body, needs_window = _current_snapshot(policy), False
     elif isinstance(policy, LatestAvailableAsOf):
-        selection, needs_window = _latest_available_as_of(policy, keys), True
+        body, needs_window = _latest_available_as_of(policy, keys), True
     elif isinstance(policy, PartitionMappedSnapshot):
-        selection, needs_window = _partition_mapped(policy, spine_input), False
+        body, needs_window = _partition_mapped(policy, spine_input), False
     elif isinstance(policy, ActivePopulation):
-        selection, needs_window = _active_population(policy), False
+        body, needs_window = _active_population(policy), False
     else:
         raise ValueError(
             f"the declaration carries a snapshot policy this renderer has no body for "
@@ -191,7 +193,7 @@ def render_spine_node(
         name=SPINE_NODE_NAME,
         func_name=SPINE_FUNC_NAME,
         source=_render_source(
-            spine, keys, selection,
+            spine, keys, body,
             availability=availability, cutoff_zone=cutoff_zone, cutoff_time=cutoff_time,
             business_dt_column=plan.business_dt_column),
         inputs=(source_dataset, _BUSINESS_DT_PARAMETER),
@@ -275,33 +277,54 @@ def _check_claim(spine: SpineSpec) -> None:
             f"of values")
 
 
+@dataclass(frozen=True, slots=True)
+class _Body:
+    """One policy's contribution to the node: what it REFUSES up front, and what it SELECTS.
+
+    The two are kept apart so a guard is rendered before anything else the node does. A refusal that
+    ran after the run had begun deriving values would read as though the date were answerable right
+    up to the point where it turned out not to be.
+    """
+
+    guard: tuple[str, ...]
+    selection: tuple[str, ...]
+
+
 # ── the four policy bodies ───────────────────────────────────────────────────────────────────────
 
 
-def _current_snapshot(policy: CurrentSnapshot) -> list[str]:
+def _current_snapshot(policy: CurrentSnapshot) -> _Body:
     """The vintage guard, and then the whole table — because the table IS the population.
 
     There is no time filter to render: a table that holds no history has nothing to filter BY. What
     it has instead is the vintage it was observed at, and any other business date refuses.
+
+    The guard is a GUARD and is rendered before anything else the node does, including the cutoff.
+    A refusal that came after the run had started deriving values would read as though the date were
+    answerable right up to the point where it was not.
     """
-    observed = policy.observed_snapshot_ref
-    return [
-        "    # §4.2 — the declared population is a CURRENT snapshot: the table IS the population and",
-        "    # holds no history, so the ONLY business date it can answer is the one it was observed",
-        "    # at. Answering another one would be today's rows wearing a past date.",
-        f"    if business_date != {observed!r}:",
-        "        raise RuntimeError(",
-        f"            {_gate(ValidationGateCode.SPINE_INCOMPLETE)} + "
-        f"\"the declared population is a snapshot observed at \"",
-        f"            + {observed!r} + \" and this run asks for \" + repr(business_date)",
-        "            + \": a table that holds no history cannot honestly answer another business \"",
-        "            \"date, so the spine refuses rather than answering with the rows it holds "
-        "today\")",
-        "    rows = source",
-    ]
+    observed = _safe_text(policy.observed_snapshot_ref, "the declared observed_snapshot_ref")
+    return _Body(
+        guard=(
+            "    # §4.2 — the declared population is a CURRENT snapshot: the table IS the population",
+            "    # and holds no history, so the ONLY business date it can answer is the one it was",
+            "    # observed at. Answering another one would be today's rows wearing a past date.",
+            f"    if business_date != {policy.observed_snapshot_ref!r}:",
+            *_refuse(
+                ValidationGateCode.SPINE_INCOMPLETE,
+                f"the declared population is a snapshot observed at {observed} and holds no "
+                f"history, so it cannot honestly answer another business date. The spine refuses "
+                f"rather than answering with the rows it holds today. Asked for:",
+                tail="repr(business_date)"),
+        ),
+        selection=(
+            "    # No time filter: a table that holds no history has nothing to filter BY, and the",
+            "    # vintage it can answer was settled by the guard above.",
+            "    rows = source",
+        ))
 
 
-def _latest_available_as_of(policy: LatestAvailableAsOf, keys) -> list[str]:
+def _latest_available_as_of(policy: LatestAvailableAsOf, keys: tuple[tuple[str, str], ...]) -> _Body:
     """SCD history: rules 1, 2 and 3 — three obligations, rendered as three separate things.
 
     Rule 1 is a CONJUNCTION and both halves are load-bearing. The effective-time half keeps out a
@@ -321,38 +344,39 @@ def _latest_available_as_of(policy: LatestAvailableAsOf, keys) -> list[str]:
               for ref in policy.deterministic_tie_break_refs]
     ordering = ", ".join(f"F.col({name!r}).desc()" for name in (effective, *breaks))
     partition = ", ".join(f"F.col({name!r})" for name, _published in keys)
-    declared = ", ".join(repr(name) for name in breaks) or "none declared"
-    return [
-        "    # §4.2 rule 1 — a CONJUNCTION, and both halves matter. The first keeps out a version",
+    declared = ", ".join(_safe_text(name, "a tie-break column") for name in breaks) or "none declared"
+    return _Body(guard=(), selection=(
+        "    # §4.2 rule 1 — a CONJUNCTION, and BOTH halves matter. The first keeps out a version",
         "    # that had not taken effect by the cutoff; the second keeps out one that had taken",
-        "    # effect and had not yet ARRIVED. Same cutoff for both.",
-        f"    eligible = source.where(F.col({effective!r}) <= cutoff).where(F.col({available!r}) <= cutoff)",
+        "    # effect and had not yet ARRIVED. The same cutoff for both, and they are written as two",
+        "    # filters because they are two obligations.",
+        f"    eligible = source.where(F.col({effective!r}) <= cutoff)",
+        f"    eligible = eligible.where(F.col({available!r}) <= cutoff)",
         "",
         "    # §4.2 rules 2 and 3 — the greatest effective time per key wins, and the declared",
         "    # tie-break refs order rows that share one. F.rank() deliberately, NOT a row-numbering",
-        "    # window: numbering the rows would invent an order the declaration does not provide,",
-        "    # and every tie would resolve silently. Under rank() a tie survives to be refused.",
-        "    ranked = eligible.withColumn(",
-        f"        {_RANK_COLUMN!r}, F.rank().over(Window.partitionBy({partition}).orderBy({ordering})))",
+        "    # window: numbering the rows would invent an order the declaration does not provide, so",
+        "    # every tie would resolve and none would be seen. Under rank() a tie SURVIVES, below.",
+        f"    latest_first = Window.partitionBy({partition}).orderBy(",
+        f"        {ordering})",
+        f"    ranked = eligible.withColumn({_RANK_COLUMN!r}, F.rank().over(latest_first))",
         f"    winners = ranked.where(F.col({_RANK_COLUMN!r}) == 1).drop({_RANK_COLUMN!r})",
         "",
-        "    # A key with more than one rank-1 row is a tie NO declared ordering separates. It is a",
-        "    # gate on real rows, so it is discovered here rather than at compile time.",
+        "    # A key with more than one rank-1 row is a tie NO declared ordering separates. It",
+        "    # depends on the actual rows, so it is a gate here and not a compilation refusal.",
         f"    unresolved = winners.groupBy({partition}).count().where(F.col('count') > 1)",
         "    if unresolved.limit(1).count() > 0:",
-        "        raise RuntimeError(",
-        f"            {_gate(ValidationGateCode.SPINE_NON_DETERMINISTIC)} + \"two eligible rows "
-        f"share an effective time \"",
-        f"            \"and every declared tie-break ({declared}), so no declared ordering "
-        f"separates \"",
-        "            \"them. Picking one would change the population between runs and move every \"",
-        "            \"feature value with it, so the spine refuses.\")",
+        *_refuse(
+            ValidationGateCode.SPINE_NON_DETERMINISTIC,
+            f"two eligible rows share an effective time and every declared tie-break "
+            f"({declared}), so no declared ordering separates them. Picking one would change the "
+            f"population between runs and move every feature value with it, so the spine refuses."),
         "    rows = winners",
-    ]
+    ))
 
 
 def _partition_mapped(policy: PartitionMappedSnapshot,
-                      spine_input: PhysicalInputRequirement) -> list[str]:
+                      spine_input: PhysicalInputRequirement) -> _Body:
     """A business date selects partition values — through §3.4's DECLARED mapping.
 
     The mapping is READ off the physical requirement, never re-declared here and never inferred: two
@@ -394,14 +418,14 @@ def _partition_mapped(policy: PartitionMappedSnapshot,
     lines = [
         "    # §4.2 / §3.4 — the business date selects partition values through the DECLARED",
         "    # mapping. The mapping is governed in the environment inventory; this applies it.",
-        "    rows = source",
     ]
-    for column, value in values:
-        lines.append(f"    rows = rows.where(F.col({column!r}) == F.lit({value}))")
-    return lines
+    for index, (column, value) in enumerate(values):
+        read_from = "source" if index == 0 else "rows"
+        lines.append(f"    rows = {read_from}.where(F.col({column!r}) == F.lit({value}))")
+    return _Body(guard=(), selection=tuple(lines))
 
 
-def _active_population(policy: ActivePopulation) -> list[str]:
+def _active_population(policy: ActivePopulation) -> _Body:
     """A CLOSED set of declared status values — no implicit "active", no free-text predicate."""
     if not policy.allowed_status_values:
         raise ValueError(
@@ -410,66 +434,133 @@ def _active_population(policy: ActivePopulation) -> list[str]:
             "with no error at all")
     status = _column(policy.status_ref, "the policy's status_ref")
     allowed = list(policy.allowed_status_values)
-    return [
+    return _Body(guard=(), selection=(
         "    # §4.2 — current rows restricted to a CLOSED set of DECLARED status values. A reviewer",
         "    # can read the population rule here without reading any SQL, which is the point.",
         f"    rows = source.where(F.col({status!r}).isin({allowed!r}))",
-    ]
+    ))
 
 
 # ── the shared frame around every policy ─────────────────────────────────────────────────────────
 
 
-def _gate(code: ValidationGateCode) -> str:
-    """A §9 gate code, rendered as the first thing its message says.
+def _wrap(text: str, width: int) -> list[str]:
+    """Greedy word wrap. Deterministic by construction — it observes nothing but ``text``.
 
-    The generated project cannot import ``featuregen``, so the CODE travels as text. It is emitted
-    from the enum rather than spelled, so a code that leaves §14's vocabulary stops rendering.
+    Rendered prose is wrapped rather than hand-broken because the values spliced into it vary in
+    length: a message hand-wrapped around one bank's column names is a ragged message for the next.
     """
-    return repr(f"{code.value}: ")
+    lines: list[str] = []
+    line = ""
+    for word in text.split():
+        candidate = f"{line} {word}".strip()
+        if line and len(candidate) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    lines.append(line)
+    return lines
+
+
+def _safe_text(value: str, what: str) -> str:
+    """A declared value spliced INTO a rendered prose message.
+
+    Column names and status values reach the rendered source through ``repr``, which quotes them.
+    A value written into a message has no such protection, so a quote or a backslash in one would
+    end the literal early — and the node would either fail to parse or parse into something else.
+    """
+    if any(character in value for character in '"\\\n\r'):
+        raise ValueError(
+            f"{what} is {value!r}, which carries a quote, a backslash or a newline: it is written "
+            f"into a rendered message, where any of the three would end the string literal early")
+    return value
+
+
+def _refuse(code: ValidationGateCode, text: str, *, tail: str | None = None,
+            indent: str = "        ") -> list[str]:
+    """``raise RuntimeError("CODE: …")`` — one §9 gate, word-wrapped.
+
+    The generated project cannot import ``featuregen``, so the code travels as TEXT; taking it from
+    the enum rather than spelling it means a code that leaves §14's vocabulary stops rendering.
+
+    ``tail`` is a rendered EXPRESSION appended to the message, and it is the only way a run-time
+    value enters one. Always at the end: a value spliced into the middle forces the prose around it
+    to be hand-wrapped, which is how a message ends up saying something its author did not check.
+    """
+    wrapped = _wrap(f"{code.value}: {text}", 84)
+    inner = indent + "    "
+    parts = [f'{inner}"{part} "' for part in wrapped[:-1]] + [f'{inner}"{wrapped[-1]}"']
+    if tail is not None:
+        # The space belongs INSIDE the literal: `"…for:" + repr(x)` renders `for:'2020-01-01'`.
+        parts[-1] = f'{inner}"{wrapped[-1]} " + {tail}'
+    return [f"{indent}raise RuntimeError(", *parts[:-1], f"{parts[-1]})"]
 
 
 def _render_source(
     spine: SpineSpec,
-    keys,
-    selection: list[str],
+    keys: tuple[tuple[str, str], ...],
+    body: _Body,
     *,
     availability: str | None,
     cutoff_zone: str,
     cutoff_time: str,
     business_dt_column: str,
 ) -> str:
-    """The whole node: the cutoff, the policy's own selection, rule 6, the landing shape, rule 5."""
-    policy_kind = spine.snapshot_policy.kind.value
-    key_columns = ", ".join(published for _source, published in keys)
+    """The whole node, in the order it must be read: the policy's guard, the cutoff, the policy's
+    own selection, rule 6, the landing shape, rule 5."""
+    policy = spine.snapshot_policy
+    key_columns = ", ".join(_safe_text(published, "a landing key column")
+                            for _source, published in keys)
+    landing = f"({key_columns}, {_safe_text(business_dt_column, 'the business-date column')})"
 
+    summary = (
+        f"Exactly one row per {landing}. Every feature is LEFT JOINed onto this, so an entity "
+        f"missing here has no row to land on, and an entity duplicated here duplicates every "
+        f"feature value in the published table.")
     lines = [
         f"def {SPINE_FUNC_NAME}(source: DataFrame, business_dt: str) -> DataFrame:",
-        f'    """The declared entity population for one business date — {policy_kind} (§4).',
+        f'    """The declared entity population for one business date — {policy.kind.value} (§4).',
         "",
-        f"    Exactly one row per ({key_columns}, {business_dt_column}). Every feature is LEFT",
-        "    JOINed onto this, so an entity missing here has no row to land on and an entity",
-        "    duplicated here duplicates every feature value in the published table.",
+        *(f"    {part}" for part in _wrap(summary, 92)),
         '    """',
         "    business_date = str(business_dt)",
     ]
-    if availability is not None or isinstance(spine.snapshot_policy, LatestAvailableAsOf):
+    if body.guard:
+        lines += [*body.guard, ""]
+
+    # The policy's own availability filter, when it has one, already applies the spine's own column
+    # at this same cutoff. Filtering twice on one column is noise a reviewer has to rule out.
+    policy_filters_availability = (
+        isinstance(policy, LatestAvailableAsOf)
+        and availability is not None
+        and _column(policy.availability_ref, "the policy's availability_ref") == availability)
+
+    if availability is not None or isinstance(policy, LatestAvailableAsOf):
         lines += [
-            f"    # §8's cutoff: {business_dt_column} at {cutoff_time} in {cutoff_zone}. The rendered",
+            f"    # §8's cutoff: the business date at {cutoff_time} in {cutoff_zone}. The rendered",
             "    # session timezone is pinned to UTC, so the governed zone is STATED here rather",
             "    # than inherited — a cutoff computed in the wrong zone moves silently.",
             "    cutoff = F.to_utc_timestamp(",
             f"        F.to_timestamp(F.lit(business_date + {' ' + cutoff_time!r})), {cutoff_zone!r})",
+            "",
         ]
-    lines += ["", *selection]
+    lines += [*body.selection]
 
-    if availability is not None:
+    if availability is not None and not policy_filters_availability:
         lines += [
             "",
             "    # §4.2 rule 6 — the spine's OWN availability_ref participates in PIT filtering",
             "    # exactly as an expression's does: a member that had not yet arrived at the cutoff",
-            "    # was not knowable, so it is not in the population.",
+            "    # was not knowable then, so it is not in the population.",
             f"    rows = rows.where(F.col({availability!r}) <= cutoff)",
+        ]
+    elif policy_filters_availability:
+        lines += [
+            "",
+            f"    # §4.2 rule 6 — the spine's OWN availability_ref is {availability!r}, which the",
+            "    # eligibility filter above already applied at this same cutoff. Filtering on it a",
+            "    # second time would change nothing and would read as though it were a second rule.",
         ]
 
     selected = ", ".join(f"F.col({source!r}).alias({published!r})" for source, published in keys)
@@ -485,14 +576,14 @@ def _render_source(
         "    # §4.2 rule 5 — duplicate spine keys are a BLOCKING GATE, never a de-duplication step.",
         "    # Collapsing the rows here would turn a declaration that does not hold into a smaller",
         "    # population that looks right, and every count downstream would move with it.",
-        f"    duplicated = spine.groupBy({grouped}).count().where(F.col('count') > 1)",
+        "    duplicated = spine.groupBy(",
+        f"        {grouped}).count().where(F.col('count') > 1)",
         "    if duplicated.limit(1).count() > 0:",
-        "        raise RuntimeError(",
-        f"            {_gate(ValidationGateCode.SPINE_DUPLICATE_KEY)} + \"the declared population "
-        f"produced more than one \"",
-        f"            \"row for a ({key_columns}, {business_dt_column}). §4.2 makes that a blocking "
-        f"gate: \"",
-        "            \"collapsing the rows would hide a population the declaration got wrong.\")",
+        *_refuse(
+            ValidationGateCode.SPINE_DUPLICATE_KEY,
+            f"the declared population produced more than one row for a {landing}. §4.2 makes that "
+            f"a blocking gate rather than a de-duplication step: collapsing the rows would hide a "
+            f"population the declaration got wrong."),
         "    return spine",
     ]
     return "\n".join(lines) + "\n"
