@@ -385,3 +385,40 @@ session today.
 | 2 | **Schema-collision handling** (#9) | Chose fail-closed quarantine over multi-schema support. |
 | 3 | **`not_run` axis value for §F** | Would fix both `critic_status="clean"`-with-technical-critic and the wasted critic call on out-of-capability proposals. Needs a §F vocabulary change. |
 | 4 | **Whether C1 gets a `roles` seam** | Today C1 authority reads are un-scoped (B-1 #8). Cross-task change to T5/T6. |
+
+### A.23 Rendered-gate decisions and corrections from Task 14b (2026-07-28)
+
+**`ValidationGateCode` has EIGHTEEN members, not fifteen.** The five groups in its own source —
+output shape 6, staging manifests 3, computation integrity 4, spine integrity 3, run wiring 2 — sum
+to 18, and `len(list(ValidationGateCode))` confirms it. Any plan or brief sizing the coverage
+obligation at fifteen is under-counting by three.
+
+**"Every code is rendered" cannot be true of ONE project, and asking for that is a wrong test.**
+`SPINE_NON_DETERMINISTIC` is rendered only where §4.2's `LATEST_AVAILABLE_AS_OF` policy is
+declared: a group whose population is a current snapshot has no tie to break, so its artifact
+carries no such gate and should not. The coverage test's corpus is therefore the full rendered
+project **plus a spine rendered under every snapshot policy**. Ownership of the 18, verified by
+rendering:
+
+| Renderer | Codes |
+|---|---|
+| Task 12 `_render_hooks` | `RUN_PARAMETERS_MISSING` |
+| Task 13a/13c `nodes_compute` | `SPINE_INCOMPLETE`, `SPINE_DUPLICATE_KEY`, `SPINE_NON_DETERMINISTIC`, `OVERFLOW_VIOLATION` |
+| Task 14b `nodes_gate` assembly | `DUPLICATE_STAGING_MANIFEST`, `STALE_STAGING_MANIFEST`, `MISSING_STAGING_MANIFEST`, `INCOMPLETE_COMPUTATION`, `IR_HASH_MISMATCH`, `UNEXPECTED_COLUMN`, `PROJECT_INTEGRITY` |
+| Task 14b `nodes_gate` shape gate | `KEY_NOT_UNIQUE`, `MISSING_FEATURE_COLUMN`, `UNEXPECTED_COLUMN`, `FORBIDDEN_NUMERIC`, `WRONG_COLUMN_TYPE`, `WRONG_NULLABILITY`, `SCHEMA_HASH_MISMATCH` |
+
+A.15 is confirmed: `hooks.py` — both hooks and the run-parameter refusal — is Task 12's and was not
+re-rendered.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| ⚪ **`WRONG_NULLABILITY` is judged on ROWS, not on the schema flag** | Spark widens `nullable` through a left join and through most reads, so a flag comparison would refuse every correct run of a group that has any non-nullable column. What a `NOT NULL` declaration forbids is a NULL reaching the published table, and that is what the rendered gate counts. Task 10's note that "the comparison against a real DataFrame is T14's" is satisfied by the row count, not by a flag read. | Recorded. Revisit only if a later task writes the published table with an explicitly narrowed schema. |
+| ⚪ **`SCHEMA_HASH_MISMATCH` fires only when nothing more specific did** | The hash moves for a wrong type as well as a wrong ORDER, and a message carrying both `WRONG_COLUMN_TYPE` and `SCHEMA_HASH_MISMATCH` would name the defect once and echo it under a code that names no column. Its unique reach is column order, which every name-keyed check is blind to by construction — proven by a permuted-row test that trips it ALONE. | Recorded. |
+| ⚪ **`FORBIDDEN_NUMERIC` stands the type gate down for the same column** | A `double` in a `DECIMAL` slot is visible to both gates and only one says what is wrong with it. | Recorded. |
+| ⚪ **`PROJECT_INTEGRITY` recomputes the hash on the cluster, and skips three kinds of file** | `__pycache__`, `*.egg-info` (an editable install writes it INSIDE the project — L0 does exactly that) and dot-prefixed directories. All three are created by RUNNING the project; a gate that fired on them would refuse every run that had ever been imported. Anything else unsealed FAILS, because an added module can shadow a rendered one. The rendered recomputation is a SECOND canonicalization — `json.dumps(sort_keys=True, separators=(',', ':'))` against `identity.generated_project_hash`'s RFC 8785 — and they agree here because every key is an ASCII project-relative path and every value a hex digest. That agreement is proven by EXECUTING the gate against a really sealed project, not asserted. | If a generated file path ever carries a non-ASCII or astral character, the two canonicalizations diverge (JCS sorts by UTF-16 code units, Python by code points). |
+| ⚪ **The gate node writes the publication dataset, and that is not a publish mechanism** | §10.3 forbids selecting a mechanism before the probe attests one; Task 12's `_check_wiring` requires SOME node to write the published dataset. Resolved by having the gate node return the frame it validated: no DDL, no table name, no partition swap in its source — the catalog entry is the mechanism, and it is `errorifexists` and fail-closed until Task 16 replaces it. A test pins the absence of `INSERT OVERWRITE`, `ALTER TABLE`, `EXCHANGE PARTITION`, `saveAsTable` and `SET LOCATION`. | Task 16 replaces the entry and may replace this node. |
+| ⚪ **A.16 answered: the `RuntimeError` + leading-token convention is KEPT, not replaced** | A shared rendered exception TYPE would have to live in a rendered module, and the only place to put it is inside one node's source block for another node to reference — implicit coupling `RenderedNode` cannot check. Instead the convention was made a CONTRACT: `nodes_gate.gate_code_of` parses the leading token back into §14's closed vocabulary and is anchored at the start, so a code merely mentioned in prose is not a verdict. 13a's three raises are unchanged and already satisfy it. | If Task 16 adds a rendered `_gates.py` module, the type should move there and both renderers should use it. |
+| ⚪ **14b's gate nodes collect findings and raise ONCE; 13a raises per rule** | `check_completeness` returns every failure so an operator does not walk the regenerate/rerun loop once per broken feature, and the rendered gates answer the same way, joined by `" \| "`. The leading token still names the gate that fired first. 13a's shape is right for its case — a spine that fails one rule has nothing further worth reporting. | Recorded so the difference is deliberate. |
+| ⚪ **None of 14b's thirteen gates depends on `spark.sql.ansi.enabled`** | They are schema reads (`dtypes`), row counts (`limit(1).count()`, `groupBy().count()`) and pure-Python reads of JSON manifests. A.21's open ANSI decision therefore changes nothing here; it remains live for 13c's `OVERFLOW_VIOLATION`, which is built for the NULL-on-overflow behaviour and is dead code on Spark 4's default. | A.21's decision. |
+| ⚪ **`fake_spark` now models `dtypes`, and RAISES for a type it was never given** | §9's type gate is judged against these values, so a stand-in that answered "string" for an unknown column would have the gate grading the stand-in's invention. Only `lit` and `cast` state a type; everything else leaves it unknown and the frame refuses. | Recorded. |
+| ⚪ **The stand-in's `withColumn` REPLACES a same-named column; real Spark's join would produce two** | The assembly node's "no system column may ARRIVE here" check runs BEFORE the join for that reason, so the difference does not reach it. A check placed after the join would be measuring the stand-in. | Recorded. |
