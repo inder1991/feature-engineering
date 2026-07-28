@@ -136,13 +136,51 @@ code `JOIN_IDENTITY_UNCONFIRMED` puts the feature in `NEEDS_EXTERNAL_VALIDATION`
 rests on. Human confirmation clears it → `DESIGN_CHECKED`. This is the E4a unit loop applied to
 identity.
 
-**D4 — Generation is unconditional; materialization is not.** Proposal, grounding, display and
-gauntlet evaluation all run on proposed links. Producing actual numbers from a feature whose
-identity link is unconfirmed requires the confirm. *(Flagged for the user as my recommendation —
-overridable. If overridden, the flag still travels with the output.)*
+**D4 — Materialization runs on unconfirmed links too. No gate anywhere.** *(User decision,
+2026-07-28, after the alternative was raised and declined.)* Proposal, grounding, display, gauntlet
+evaluation **and materialization** all run on proposed links. There is no point in the pipeline at
+which an unconfirmed identity link stops the work.
+
+What replaces the gate is **provenance that cannot be separated from the output**. The codebase
+already holds this exact pattern: `materialize/classify.py:40` — "the requirement travels with the
+artifact" — for access requirements. `JOIN_IDENTITY_UNCONFIRMED` gets the same treatment:
+
+- it is serialized onto the governed contract through the existing
+  `contract/_serial.py::requirements_to_json`, so it survives snapshotting and reload;
+- it names the specific link `fact_key`, so "which link is this standing on" is always answerable;
+- it travels onto the materialized artifact alongside `access_requirements`, so a consumer of the
+  numbers can see the basis without going back to the catalog;
+- it clears on confirmation and demotes on rejection, updating existing artifacts' status rather
+  than silently leaving stale claims behind.
+
+The residual risk is stated plainly here so it is never a surprise: a wrong link produces numbers
+that look entirely reasonable — two customers' payments aggregated into one row — and the evidence
+available for glossary catalogs is semantic, not value-level (§2.3). The critic panel (D6) and the
+deterministic grounding are what keep the false-match rate down; the flag is what makes a mistake
+findable afterwards.
 
 **D5 — The critic's verdict is evidence, not authority.** Recorded with its reasons, replayable,
 and overridable by a human in both directions, with the override audited.
+
+**D6 — A panel of two critics with different lenses; unanimity to admit.** *(User decision.)*
+
+Two identical critics cost double and add nothing — redundancy does not catch what a single lens
+misses, so the two are deliberately **different**:
+
+| Lens | Question it is asked |
+| --- | --- |
+| **Meaning** | Do these two columns denote the same *kind* of identifier? Definitions, concept, domain, taxonomy. |
+| **Population** | Do they identify the same *set of real-world things*? A bank customer and a cardholder are both "customers" and are not the same population; a group-level CIF and a branch-scoped customer number are not interchangeable. |
+
+Decision rule, with only two voices and therefore no majority available:
+
+- **both `same_namespace` → admit** as `proposed`;
+- **any `different_namespace` or `insufficient_evidence` → suppress**, retained with reasons;
+- **the two disagree → suppress AND surface as a distinct `critics_disagree` state.**
+
+Disagreement is the most informative outcome the panel produces and must not be flattened into an
+ordinary rejection: it marks the pairs where human judgement has the highest value, and it is the
+natural top of the review queue.
 
 ---
 
@@ -238,6 +276,12 @@ driving_evidence: [field names it actually used]
 `different_namespace` and `insufficient_evidence` both suppress. Anything off-vocabulary is a
 failure, and a failed critic call suppresses (fail-closed) rather than defaulting to admit.
 
+**Both panel members (D6) receive the same envelope and the same response schema**; only the
+question differs. Each is dispatched independently — neither sees the other's verdict — so the two
+opinions stay genuinely uncorrelated. If one call fails while the other returns, that is not
+unanimity: the pair suppresses. `BridgeCriticPanelV1` carries both verdicts, both reason sets, and
+the derived `panel_outcome` (`admit | suppress | critics_disagree`).
+
 ### [4] `fuse_bridge`
 
 Reuse `fusion.fuse`'s structure and constants. `agreement` records
@@ -267,18 +311,35 @@ Confidence is **display and review-routing only**. It may order a queue. It may 
 
 ---
 
-## 6. Persist the taxonomy evidence
+## 6. Persist the taxonomy evidence — optional, never required
 
 Add `bian_path`, `fibo_path`, `term_type`, `process_path`, `related_terms` to durable storage so the
-critic and grounding can read them after ingest.
+critic and grounding can read them after ingest. Currently they are read, used once at ingest, and
+discarded (§2.3).
 
-This is a small change with reach beyond this spec — it is also the evidence the E3/E5 ontology
-programme would need, and it is currently thrown away on every upload. Preferred shape: a
-schema-preserving glossary-record sidecar table keyed by `logical_ref`, rather than more columns on
-the public-flattened `graph_node`.
+Preferred shape: a schema-preserving glossary-record sidecar table keyed by `logical_ref`, rather
+than more columns on the public-flattened `graph_node`. The value reaches beyond this spec — it is
+also the evidence the E3/E5 ontology programme would need.
 
-Until it lands, `taxonomy_alignment` reports `absent` and the critic runs without the single
-strongest signal the file provides.
+**Optional by design** *(user decision)*. Most catalogs will not carry BIAN/FIBO — your customer
+catalog may well not — and a file without them must be a first-class citizen, not a degraded one.
+Concretely:
+
+- absence is reported by `ground_bridge` as **`absent`**, never `disagree`. An `absent` check cannot
+  contribute to `conflict` and therefore cannot suppress a link;
+- absence lowers `coverage`, which is exactly what `fusion.fuse` already does with it — the LLM
+  agreement signal is weighted *less* when there is less deterministic corroboration, rather than
+  the pair being penalised. This is existing behaviour (`_AGREE_COVERAGE_WEIGHT`), not new logic;
+- the critic envelope simply omits the fields when they are missing. It is never told "taxonomy
+  unavailable" in a way that invites it to treat absence as suspicious;
+- a mixed pair — one side with taxonomy, one without — is normal and scores as `absent`, not as a
+  mismatch;
+- **an acceptance test asserts that a pair with no taxonomy on either side reaches the same
+  admission outcome as the same pair with matching taxonomy**, differing only in confidence. That
+  test is what stops the optional field quietly becoming mandatory.
+
+Where the taxonomy *is* present on both sides, a contradiction at BIAN level 1 (e.g.
+`Customer Management` vs `Payment Execution`) is a genuine `disagree` and may set `conflict`.
 
 ---
 
@@ -334,13 +395,27 @@ mode.
 
 ---
 
-## 11. Open decisions for the user
+## 11. Decisions — resolved 2026-07-28
 
-1. **D4** — materialization on unconfirmed links: gate (recommended) or allow?
-2. **One critic or a panel?** One by default. For links whose confirmation would merge a large
-   group, or on compliance-domain tables, require agreement from 2–3 critics with different lenses.
-   Worth deciding before build, since it changes cost.
-3. **§6 sequencing** — persist BIAN/FIBO before the critic ships, or accept a weaker first version?
+All three open questions are settled by the user:
+
+1. **Materialization runs on unconfirmed links.** No gate at any stage; provenance travels with the
+   artifact instead (D4).
+2. **Panel of two, different lenses, unanimity to admit**, with `critics_disagree` surfaced as its
+   own state (D6).
+3. **Persist BIAN/FIBO, but strictly optional** — `absent`, never `disagree`; pinned by an
+   acceptance test that a taxonomy-free pair admits identically (§6).
+
+### Remaining dependency, not a decision
+
+D3's "confirmation clears the flag" is **unreachable through the product** until an
+identifier-bridge governance route exists (§2.1 — `api/routes/governance.py` covers joins, table
+facts and semantic bindings only, and every bridge that exists anywhere came from a fixture or a
+script). Under D4 this matters more, not less: links now flow all the way to materialized numbers,
+so the ability to confirm — and, more importantly, to **reject** a wrong one and have that demote
+the artifacts resting on it — is the only correction mechanism in the loop.
+
+**The bridge governance route is therefore a hard prerequisite of this spec, not a follow-up.**
 
 ---
 
