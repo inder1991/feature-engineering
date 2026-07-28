@@ -554,17 +554,14 @@ class DataFrame:
         keys = list(on)
         index: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         for row in other._rows:
-            side = tuple(row[key] for key in keys)
-            # A NULL key never equals anything in Spark, itself included. Indexing one here would
-            # match every unmatched LEFT row against it — so a traversal whose dimension carries a
-            # null key would attribute rows to it, and the test written for the traversal would
-            # agree with the wrong answer.
-            if any(value is None for value in side):
-                continue
-            index.setdefault(side, []).append(row)
+            index.setdefault(tuple(row[key] for key in keys), []).append(row)
         added = [name for name in other.columns if name not in keys]
         produced: list[dict[str, Any]] = []
         for row in self._rows:
+            # A NULL key never equals anything in Spark, itself included — so a row that reaches no
+            # key matches NOTHING, rather than matching whichever right-hand row happens to carry a
+            # null of its own. One guard, on the LOOKUP: a null on either side ends up here, and a
+            # second guard on the index would be a rule with no case of its own.
             side = tuple(row[key] for key in keys)
             matches = [] if any(value is None for value in side) else index.get(side, [])
             if matches:

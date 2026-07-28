@@ -1399,9 +1399,10 @@ def _traversal_lines(plan: _Traversal) -> list[str]:
             f"hop is a LEFT join: the traversal says which entity a row belongs to and must not "
             f"decide which rows EXIST, so a row whose dimension row is missing survives with a null "
             f"key and lands on no entity rather than disappearing from the feature's population. "
-            f"Each hop's key travels under a name of its own, dropped once the hop is done — the "
-            f"key column a join keeps takes the LEFT side's value, which for an unmatched row names "
-            f"an entity that is not there."),
+            f"Each hop's key travels under a name of its own and is dropped once the hop is done, "
+            f"so nothing downstream can mistake it for the entity: the key column a join keeps "
+            f"takes the LEFT side's value, which for an unmatched row names an entity that is not "
+            f"there."),
     ]
     for hop in plan.hops:
         backing = (f"approved_join fact {hop.fact_key} ({hop.status})" if hop.fact_key is not None

@@ -63,8 +63,9 @@ def project_total_debit_amount_30d__body_expr(
     # the traversal says which entity a row belongs to and must not decide which rows EXIST, so a
     # row whose dimension row is missing survives with a null key and lands on no entity rather
     # than disappearing from the feature's population. Each hop's key travels under a name of its
-    # own, dropped once the hop is done — the key column a join keeps takes the LEFT side's value,
-    # which for an unmatched row names an entity that is not there.
+    # own and is dropped once the hop is done, so nothing downstream can mistake it for the
+    # entity: the key column a join keeps takes the LEFT side's value, which for an unmatched row
+    # names an entity that is not there.
 
     # Hop 1: banking.transactions.acct_num -> banking.accounts.acct_id, cardinality N:1 toward
     # accounts — authorized by approved_join fact ajf-txn-acct (VERIFIED).
