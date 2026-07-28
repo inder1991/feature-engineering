@@ -20,8 +20,9 @@ from featuregen.overlay.upload.csv_reader import read_csv_rows
 from featuregen.overlay.upload.excel_reader import read_excel_rows
 from featuregen.overlay.upload.ftr_adapter import (
     PreparedFtrUpload,
-    ftr_fingerprint_error,
+    glossary_shape_error,
     is_ftr_glossary,
+    is_glossary_mapping,
     read_ftr_glossary,
     to_glossary_upload,
 )
@@ -96,13 +97,20 @@ def _read_rows(
     if name.endswith(".csv"):
         text = data.decode("utf-8-sig")
         headers = _peek_headers(text)
-        if is_ftr_glossary(headers):
+        # A glossary MAPPING — the FTR layout or any other source's, which is the normal case once
+        # a second catalog exists. `is_ftr_glossary` stays the exact check for anything keyed to
+        # that layout specifically; routing uses the relaxed one so a source may carry its own
+        # columns. What still refuses is a file that cannot be read: no row key, or a duplicated
+        # header whose meaning cannot be resolved by guessing.
+        if is_glossary_mapping(headers):
             prepared = read_ftr_glossary(text, source=source)
             g = to_glossary_upload(prepared)
             return g.rows, FTR_GLOSSARY_PROFILE, g, prepared
-        err = ftr_fingerprint_error(headers)
-        if err is not None:
-            raise HTTPException(status_code=400, detail=f"FTR glossary format error: {err}")
+        err = glossary_shape_error(headers)
+        if err is not None and "no 'schema.table.column'" not in err:
+            # Names the exact problem so the uploader fixes the file, rather than letting a
+            # half-readable glossary fall through to a reader that would mangle it.
+            raise HTTPException(status_code=400, detail=f"glossary format error: {err}")
         if is_glossary_csv(headers):
             upload = read_glossary(text, source=source)
             return upload.rows, FTR_GLOSSARY_PROFILE, upload, None

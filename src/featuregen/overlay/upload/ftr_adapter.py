@@ -8,10 +8,12 @@ generic glossary reader produces, so the unchanged validate → graph spine inge
 decisions follow the round-4/round-5 review resolutions in the A1 plan:
 
 - **Exact fingerprint (#10/#12):** :func:`is_ftr_glossary` is an exact normalized header-MULTISET
-  match — a missing, extra, or duplicated header disqualifies the file. A near-miss that still
-  carries the FTR-distinctive ``schema.table.column`` header gets a specific diagnostic from
-  :func:`ftr_fingerprint_error` (the route turns it into a 400 in Task 3b) instead of silently
-  falling through to another reader.
+  match — a missing, extra, or duplicated header disqualifies the file. It remains the exact check
+  for anything keyed to the FTR layout specifically, but it is NO LONGER what the route admits on:
+  once a second catalog exists, demanding FTR's exact 17 columns of every source would refuse the
+  real files. Admission is :func:`is_glossary_mapping` (required core, recognised optional,
+  tolerated-but-reported extras) and the diagnostic is :func:`glossary_shape_error`; a file that
+  cannot be read is still refused loudly rather than falling through to another reader.
 - **Type honesty (#1/#3):** the OPERATIONAL ``CanonicalRow.type`` is ALWAYS ``UNKNOWN_TYPE`` — a
   business glossary is not the physical-type authority. The FTR-declared type is retained only as
   ``GlossaryRecord.declared_type``, validated against a bounded SQL-type token (≤64 chars,
@@ -37,10 +39,14 @@ decisions follow the round-4/round-5 review resolutions in the A1 plan:
   each synonym/related term, joined taxonomy/process paths) is PII-redacted via
   :func:`~featuregen.overlay.upload.sanitize.redact_text`. Quarantined rows carry the SANITIZED
   definition too — nothing raw may reach the durable quarantine.
-- **Provenance (#12):** ``source_row`` must be a non-empty integer, unique (as parsed int) across
-  the upload; it is stamped on every emitted ``CanonicalRow``/``GlossaryRecord`` for quarantine
-  provenance. Rows violating it are quarantined (all members of a duplicate group — fail closed,
-  mirroring the duplicate-FQN rule).
+- **Provenance (#12):** ``source_row`` exists so a data owner can locate the offending row in their
+  OWN file; it is stamped on every emitted ``CanonicalRow``/``GlossaryRecord``. When the file
+  DECLARES the column it must be a non-empty integer, unique (as parsed int) across the upload, and
+  rows violating that are quarantined (all members of a duplicate group — fail closed, mirroring the
+  duplicate-FQN rule). When the file does not carry the column at all — it is FTR's, not every
+  glossary's — the spreadsheet row number is DERIVED instead, which locates the row just as well and
+  is unique by construction. Absence of the column is a different file shape; a blank cell in a
+  column the file claims to have is a broken identity column, and still fails closed.
 
 Structure mirrors ``read_glossary``'s two passes: Pass 1 parses and indexes the collision keys
 (multi-schema folds, multi-schema TABLE spans — R5-4: same table, different columns, different
@@ -299,9 +305,17 @@ class _ParsedRow:
 
 
 def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
-    """Read an exact-fingerprint FTR glossary CSV into the prepared envelope (module docstring)."""
+    """Read a glossary-mapping CSV — FTR's layout or another source's — into the prepared envelope
+    (module docstring). Admission is :func:`is_glossary_mapping`, not the exact FTR fingerprint."""
     reader = csv.DictReader(io.StringIO(text))
     hmap = {_norm_header(h): h for h in (reader.fieldnames or [])}
+    declared_width = len(reader.fieldnames or ())
+    # `source_row` is FTR's provenance column, not every glossary's. It exists so a data owner can
+    # find the offending row in their OWN file — when the file does not carry it, the spreadsheet
+    # row number serves that purpose exactly as well, so it is derived rather than demanded. A file
+    # that DECLARES the column and leaves it blank still fails closed: that is a broken identity
+    # column, not a different file shape.
+    declares_source_row = "sourcerow" in hmap
 
     sanitized_count = 0
     definitions_stripped = 0
@@ -338,6 +352,11 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     srcrow_counts: Counter[int] = Counter()
     for raw in reader:
         input_row_count += 1
+        # Header occupies spreadsheet row 1, so the Nth data row is row N+1 — the number the
+        # uploader actually sees. Unique by construction, so the duplicate check below can never
+        # fire spuriously on a file that never claimed the column.
+        declared_or_derived_source_row = (
+            _cell(hmap, raw, "sourcerow") if declares_source_row else str(input_row_count + 1))
         san = sanitize_definition(_cell(hmap, raw, "descriptionbusinessdefinition"))
         sanitized_count += san.removed
         # R5-8: the honest breakdown. `removed` conflates stripped clauses, blanked fields and PII
@@ -363,14 +382,15 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             # cell sanitized so nothing raw persists; source_row kept so the row is locatable).
             # The reason echoes only counts, never cell content — no redaction needed.
             pending.append((
-                f"malformed row width: {len(_FTR_HEADERS) + len(extra)} cells, expected "
-                f"{len(_FTR_HEADERS)} (an unquoted comma likely shifted fields)",
+                f"malformed row width: {declared_width + len(extra)} cells, expected "
+                f"{declared_width} (an unquoted comma likely shifted fields)",
                 CanonicalRow(source=source, table="", column="", type=UNKNOWN_TYPE,
-                             definition=san.clean, source_row=_cell(hmap, raw, "sourcerow"))))
+                             definition=san.clean,
+                             source_row=declared_or_derived_source_row)))
             continue
         fqn_raw = _cell(hmap, raw, "schema.table.column")
         schema, table, column = _split_fqn(fqn_raw)
-        source_row = _cell(hmap, raw, "sourcerow")
+        source_row = declared_or_derived_source_row
         try:
             source_row_int: int | None = int(source_row)
         except ValueError:

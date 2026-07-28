@@ -102,9 +102,17 @@ def test_ftr_upload_ingests(client):
 # ── Dispatch: near-FTR is a 400 with a fingerprint diagnostic (#10) ──────────────────────────────
 
 def test_near_ftr_upload_rejected_with_diagnostic(client):
+    """Still refused, and the diagnostic is now MORE precise: it names the missing header rather
+    than "not the exact 17-column layout".
+
+    The message dropped "FTR" because the check is no longer FTR-specific — a second source may
+    carry its own columns, but `term_name` is a required CORE header for any glossary mapping, so
+    removing it still fails closed."""
     res = upload_csv(client, "ftr", _NEAR_FTR_CSV)
     assert res.status_code == 400
-    assert "FTR glossary format error" in res.json()["detail"]
+    detail = res.json()["detail"]
+    assert "glossary format error" in detail
+    assert "termname" in detail, "the diagnostic must name what is missing"
 
 
 # ── Quarantine provenance: _adapter="ftr" + source_row persist on the durable row (#9) ───────────
