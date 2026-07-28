@@ -485,8 +485,15 @@ def record_plan_revision(conn: DbConn, revision: GroupPlanRevision) -> None:
 
 
 def read_plan_revisions(conn: DbConn, binding_id: str) -> tuple[GroupPlanRevision, ...]:
-    """Every revision appended under ``binding_id`` — the sequence the derivation folds."""
+    """Every revision appended under ``binding_id`` — the sequence the derivation folds.
+
+    Ordered by ``recorded_at`` (the insertion instant), **never** by ``created_at``: that column is
+    text carrying a UTC offset, and ordering mixed offsets as text is the exact defect §10.1 warns
+    about — ``2026-07-27T23:00:00+05:30`` sorts after ``…T19:00:00+00:00`` and is 90 minutes before
+    it in fact. Which revision is *current* is not this function's answer anyway;
+    ``current_plan_revision`` derives it from instants and from what published.
+    """
     rows = conn.execute(
         "SELECT binding_id, group_plan_hash, generation_id, created_at FROM group_plan_revision "
-        "WHERE binding_id = %s ORDER BY created_at", (binding_id,)).fetchall()
+        "WHERE binding_id = %s ORDER BY recorded_at", (binding_id,)).fetchall()
     return tuple(GroupPlanRevision(*row) for row in rows)
