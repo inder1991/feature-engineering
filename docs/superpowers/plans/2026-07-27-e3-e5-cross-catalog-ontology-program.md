@@ -348,6 +348,38 @@ explicitly lists the subset E3 publishes; E5-owned view contracts are assembled 
 after that handoff. These semantic separations are fixed here; E3.0 verifies exact
 repository interfaces and field names before implementation.
 
+### The consumer gate
+
+**No contract is built before its consumer is named, and the consumer must be built in this
+programme.** Rev 4 defined ~30 `*V1` types, 13 of which appeared only in their own definition. Rev 5
+cut those. Rev 6 applies a stronger test, because "named in a Work item" turned out to be too weak —
+a contract can be named all the way through E3 and still reach nothing a user experiences.
+
+A contract now needs one of:
+
+- **a feature-generation consumer** — it arrives through one of the two doors in Phase C
+  (a grounding input, or a gauntlet requirement), with a stated before/after feature count; or
+- **a view consumer that someone has asked for** — a specific screen, where E0's evidence says
+  people want it. "A screen we have not validated anyone wants" is not a consumer.
+
+The plan already applies this rule to relation kinds: `converted_by` was cut because its consumer
+(an extended formula grammar) does not exist. Rev 6 applies it to the whole contract set.
+
+**What the gate does to the current inventory:**
+
+| Contract | Consumer | Verdict |
+| --- | --- | --- |
+| `IdentifierBindingV1`, `IdentifierNamespaceBridgeV1`, `ObjectTypeBindingV1`, `RealizationCardinalityV1`, `ColumnSemanticLinkV1(denominated_in)`, `OntologyPropertyV1` | Phase C — grounding input or gauntlet requirement | **Build.** Each carries a feature-count claim. |
+| `PhysicalObjectIdentityV1`, `PhysicalMetadataObjectV1`, `CandidateIdentityV1`, `AuthorityEnvelopeV1`, `OntologySourceScopePolicyV1`, `OntologyServerLimitsV1`, `OntologyMetadataRevisionV1`, `OntologyCursorV1`, `OntologyFreshnessPolicyV1`, `OntologyReadBoundsV1` | infrastructure the above cannot exist without | **Build**, but justified as *load-bearing for a consumer*, never on their own. |
+| `EntityLinkTypeV1`, `EntityLinkRealizationV1` | needs a template-library change before a recipe can declare a relationship need | **Gated.** Build only once that template work is funded in the same breath. A typed link with no recipe that wants one changes nothing. |
+| `TitlePropertyBindingV1`, `TitlePropertyBindingCandidateV1` | display only | **Gated on a view consumer.** Not feature generation — do not let it ride in on E3's coat-tails. |
+| `SemanticObjectTypeV1`, `E3OntologyInputsV1`, the E5 view contracts | the three E5 views | **Gated on E0's evidence.** If E0 shows people want the semantic map, these earn their place; if it shows they want cross-catalog features instead, most of E5 waits. |
+| `StaleObjectStubV1`, `ColumnSemanticLinkV1(converted_by, as_of)` | none | **Deferred** (already, in Rev 5). |
+
+This is deliberately uncomfortable. It puts roughly half the contract set behind evidence that does
+not exist yet — which is the point, since the alternative is building all of it and discovering
+afterwards that feature generation consumed none of it.
+
 ### Contract inventory and v1 scope
 
 **A contract earns its place by being named in a Work or Acceptance item.** Rev 4 defined ~30 `*V1`
@@ -2032,6 +2064,72 @@ Make confirmed links and title bindings durable and safely reversible.
 
 ---
 
+## Phase C — Feature-generation consumption
+
+**Purpose**
+
+Connect E3's outputs to the thing this tool exists to do. Without this phase the programme builds an
+ontology and hands it to a viewer: E3 terminates at `read_e3_ontology_inputs`, its only specified
+consumer is E5, and E5 builds screens. **No E3 contract would reach feature generation at all.**
+
+**There are exactly two doors into feature generation. Verified, not assumed.**
+
+1. **Grounding inputs.** `templates._load_columns` (`templates.py:258-260`) loads precisely twelve
+   fields per column — `catalog_source, object_ref, table_name, column_name, data_type, is_grain,
+   is_as_of, concept, entity, additivity, sensitivity, currency` — plus governed joins via
+   `join_path` and confirmed identity links via `active_bridges`. That is the entire surface a
+   recipe can bind against.
+2. **Gauntlet requirements.** `REQUIREMENT_CODES` (`feature_assist.py:110-114`), a closed
+   vocabulary, riding on a `NEEDS_EXTERNAL_VALIDATION` idea and naming the operand it concerns.
+
+Anything that does not arrive through one of these two doors does not affect a single generated
+feature, however well modelled it is.
+
+**The mapping — every E3 output, and the door it uses**
+
+| E3 output | Door | What actually changes |
+| --- | --- | --- |
+| `ObjectTypeBindingV1` | grounding input | An entity need binds to a **governed** table entity instead of inferring one. Today `_load_columns` selects `graph_node.entity`, which is empty for all 126 columns in the live catalog, so entity resolution falls back to the concept registry's `entity_link`. |
+| `IdentifierBindingV1` (tuple) | grounding + `join_path` | Composite-key joins become expressible. Currently impossible at any key width above one. |
+| `IdentifierNamespaceBridgeV1` (tuple) | `active_bridges` | Cross-catalog features over composite keys. The single-column path is already live (E0b). |
+| `RealizationCardinalityV1` | gauntlet requirement | A new `CARDINALITY_UNVERIFIED` requirement: a recipe aggregating across a relationship whose cardinality is `unknown` or `defaulted` is **created and flagged**, not silently trusted. Today the value is fabricated at propose time and the recipe cannot tell. |
+| `ColumnSemanticLinkV1(denominated_in)` | gauntlet | Strengthens the existing `CURRENCY_CONSISTENT` check — a governed currency link is better evidence than a flat column, for a check that already exists. |
+| `OntologyPropertyV1` per-field authority | gauntlet requirement | `CONCEPT_UNCONFIRMED`: a feature whose binding rests on an `llm/proposed` concept is created and flagged, in the E4a shape. Today the gauntlet cannot see authority at all. |
+| `EntityLinkTypeV1` / `EntityLinkRealizationV1` | **needs template work first** | Typed relationships only pay off when a recipe can *declare* it wants one. That is a template-library change on top of the contract, and it must be budgeted as such rather than assumed free. |
+| `TitlePropertyBindingV1` | **none** | Display only. |
+| `SemanticObjectTypeV1`, E5 view contracts | **none** | Human comprehension. Legitimate, but not feature generation. |
+
+**Work**
+
+- Widen `_load_columns` to carry the governed table entity, keeping the read-scope hard filter and
+  proving the catalog-wide path byte-identical when no governed binding exists.
+- Thread tuple identifier bindings through `join_path` and `active_bridges`.
+- Add `CARDINALITY_UNVERIFIED` and `CONCEPT_UNCONFIRMED` to `REQUIREMENT_CODES` and the versioned
+  `validation_requirements` registry, each naming its operand, each clearing on the corresponding
+  confirmation — the E4a loop, which is the proven pattern here.
+- Route the governed currency link into the existing `CURRENCY_CONSISTENT` evaluation rather than
+  adding a parallel check.
+- For each item: measure `DESIGN_CHECKED` feature count before and after.
+
+**Acceptance — feature counts, not structure**
+
+This phase is judged the way E4a was judged, because that is the only measure that means anything
+here. E4a moved `DESIGN_CHECKED` from **0 → 5 of 10** by narrowing the unit check structurally, then
+operand roles took it **5 → 10 of 10**. Each item below states its own before/after:
+
+- A governed table entity binds at least one recipe that previously failed to ground.
+- A composite-key bridge yields at least one cross-catalog feature that is not expressible today.
+- A recipe aggregating across an `unknown`-cardinality relationship is **created** and carries
+  `CARDINALITY_UNVERIFIED`; confirming the cardinality clears it.
+- A feature bound through an `llm/proposed` concept is **created** and carries
+  `CONCEPT_UNCONFIRMED`; a human confirming the concept clears it.
+- The catalog-wide (`table=None`) grounding path is pinned byte-identical wherever no governed E3
+  input exists, so the phase can never regress today's behaviour.
+- **Every item that does not move a feature count is reported as not moving one.** A consumption
+  item that grounds nothing new is a finding, not a failure to hide.
+
+---
+
 ## Phase E5 — Cross-catalog ontology
 
 ### E5.0 — Revise and freeze the E5 design
@@ -2376,6 +2474,13 @@ targets; the reference owns the numbers.
 | M7 | Catalog sources loaded with a concept-bearing catalog | **≥ 2.** The binding constraint on the whole programme |
 | M8 | Panel rejection rate in shadow (E0b) | **> 0.** A critic that never rejects is theatre and does not gate |
 | M9 | Panel agreement with human confirm/reject decisions (E0b) | published before the panel gates anything |
+| **M10** | **`DESIGN_CHECKED` features attributable to an E3 output** (Phase C) | **> 0 per consumption item, or the item is reported as moving nothing.** This is the programme's headline number: it is the only measure that says the ontology changed what gets generated |
+| **M11** | **Cross-catalog features expressible** (E0b, then Phase C for composite keys) | **> 0.** Currently zero — one catalog, zero confirmed links |
+
+**M10 is the measure the programme lives or dies by.** E4a is the precedent: it moved
+`DESIGN_CHECKED` from 0 → 5 of 10, then operand roles took it to 10 of 10, and both were judged on
+that number rather than on having shipped a contract. Any E3 contract whose Phase-C item reports
+M10 = 0 has not earned its place, however complete its modelling.
 
 **Stop rule.** If M2, M4 or **M7** is below target at E3.0 and the corresponding prerequisite is not
 funded, the programme does not proceed to E3.1 on the assumption it will improve later. It amends
@@ -2414,6 +2519,11 @@ fully green while delivering nothing observable.
    - **E5.1** — the governed semantic-map service, superseding E0's facet.
 5. **E3.2–E3.4** — proposals, governance, title binding, **the bridge governance route**, stable E5
    handoff.
+5b. **Phase C — feature-generation consumption.** Every E3 output that is going to affect a feature
+   arrives through a grounding input or a gauntlet requirement, each with a measured before/after
+   feature count. **This runs before E5, not after.** If it runs after, the programme spends its
+   remaining budget on screens without ever having proved the ontology changes what gets generated —
+   and Phase C is the only phase whose success is measured in features.
 6. **E5.2–E5.4** — object types, verified components, unified read model.
 7. **E5.5** — semantic-map UI.
 8. **E5.6** — ER UI.
@@ -2450,7 +2560,13 @@ Stop/go gates:
 - Do not start E3 persistence or LLM work until E3.1 passes the read-only adversarial
   fixture for foreign keys, partial composite keys, schema collisions, missing
   cardinality, projection lag, candidate currentness, and hidden/stale metadata.
-- Do not start E5 object/relationship assembly until E3.4's handoff is accepted.
+- Do not start E5 object/relationship assembly until E3.4's handoff is accepted **and Phase C has
+  reported M10 for every consumption item.** If M10 is zero across the board, E3 produced an
+  ontology that feature generation does not consume, and the correct response is to amend the
+  Outcome rather than proceed to build screens on top of it.
+- **Do not build a contract whose consumer is gated** (see the consumer gate above). In particular:
+  no typed entity links until the template-library change that lets a recipe declare a relationship
+  need is funded alongside them; no title bindings until a view consumer exists.
 - E5.1 may proceed after E3.Foundation without waiting for E3.2–E3.4, but only after source
   entitlement, per-field property authority, exact server traversal bounds, fresh-only
   policy-driven reads, the authorized-and-refused diagnostic path, node-closed pagination, and
