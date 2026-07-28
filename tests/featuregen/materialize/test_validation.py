@@ -22,20 +22,36 @@ import inspect
 import sys
 
 import pytest
+from tests.featuregen.materialize.test_group_plan import catalog  # noqa: F401 - a fixture
+from tests.featuregen.materialize.test_ir import INVENTORY, _compile
+from tests.featuregen.materialize.test_ir import _ok as _compiled
 
 from featuregen.materialize import validation
+from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
     CompilationIdentity,
+    RenderedArtifactIdentity,
     read_lock,
     seal_project,
 )
+from featuregen.materialize.inputs import PhysicalInputRequirement
+from featuregen.materialize.inventory import ClusterInventoryV1
 from featuregen.materialize.render.project import materialize_to
+from featuregen.materialize.runprep import (
+    SPINE_FEATURE_NAME,
+    RunInputRequest,
+    resolve_snapshots,
+    run_input_requests,
+    spine_input_request,
+)
 from featuregen.materialize.validation import (
     FINDING_CLASSES,
+    ClusterUnreachable,
     FindingClass,
     FindingSeverity,
+    MetastoreMetadata,
     ValidationFinding,
     ValidationLevel,
     ValidationReportV1,
@@ -43,6 +59,7 @@ from featuregen.materialize.validation import (
     classify,
     may_regenerate,
     run_l0,
+    run_l1,
 )
 
 GEN = "gen-15b"
@@ -514,3 +531,282 @@ def test_no_validation_this_slice_runs_L2(tmp_path) -> None:
     assert not hasattr(validation, "run_l2")
     assert _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))).level \
         is ValidationLevel.L0
+
+
+# ── L1: the physical inputs the run will actually read ───────────────────────────────────────────
+#
+# The IRs are REAL — compiled through the chain against the seeded catalog — so the read set, the
+# requirements and the spine are the ones a run would use rather than a hand-written approximation
+# of them. Every test below moves exactly ONE thing away from an environment that agrees with the
+# catalog in every respect, which is what makes the finding it produces mean something.
+
+BUSINESS_DT = "2026-07-27"
+ROLES = ("feature_engineer", "pii_reader")
+
+
+def _spine_requirement(layout) -> PhysicalInputRequirement:
+    return PhysicalInputRequirement(
+        catalog_source="hdfc", schema=layout.schema, table=layout.table,
+        partition_columns=layout.partition_columns, partition_mapping=layout.partition_mapping,
+        layout_fingerprint=materialize_hash(layout.semantic_payload()),
+        catalog_state_stamp=(("stamp_kind", "drift_watermark"), ("head_seq", "42")))
+
+
+class _Environment:
+    """A metastore that AGREES with the inventory until a test moves one thing.
+
+    Its three questions are §11.2's: which partitions a table has, which columns and physical types
+    it has, and whether these roles may read it. There is deliberately no fourth — a seam that could
+    return a row is a seam through which the control plane could read feature data.
+    """
+
+    def __init__(self, inventory: ClusterInventoryV1) -> None:
+        self._columns = {
+            key: dict(tuple(layout.columns) + tuple(layout.partition_columns or ()))
+            for key, layout in inventory.tables.items()}
+        self._partitions: dict[str, list[tuple[tuple[str, str], ...]]] = {
+            key: [] for key in inventory.tables}
+        self._denied: set[str] = set()
+        self._unreachable = False
+        self._raises: Exception | None = None
+        self.described: list[str] = []
+
+    def stock(self, snapshots) -> _Environment:
+        """Make every partition the run resolved exist. The baseline every test moves away from."""
+        for snapshot in snapshots:
+            if snapshot.partition_specs is None:
+                continue
+            key = f"{snapshot.requirement.schema}.{snapshot.requirement.table}"
+            for spec in snapshot.partition_specs:
+                if spec.columns not in self._partitions[key]:
+                    self._partitions[key].append(spec.columns)
+        return self
+
+    def drop_partition(self, key: str, value: str) -> _Environment:
+        self._partitions[key] = [p for p in self._partitions[key]
+                                 if all(v != value for _c, v in p)]
+        return self
+
+    def drop_column(self, key: str, column: str) -> _Environment:
+        del self._columns[key][column]
+        return self
+
+    def retype_column(self, key: str, column: str, physical_type: str) -> _Environment:
+        self._columns[key][column] = physical_type
+        return self
+
+    def deny(self, key: str) -> _Environment:
+        self._denied.add(key)
+        return self
+
+    def unreachable(self) -> _Environment:
+        self._unreachable = True
+        return self
+
+    def raising(self, error: Exception) -> _Environment:
+        self._raises = error
+        return self
+
+    def _check(self) -> None:
+        if self._unreachable:
+            raise ClusterUnreachable("the metastore did not answer")
+        if self._raises is not None:
+            raise self._raises
+
+    def list_partitions(self, *, schema: str, table: str):
+        self._check()
+        return tuple(self._partitions.get(f"{schema}.{table}", ()))
+
+    def describe_table(self, *, schema: str, table: str):
+        self._check()
+        self.described.append(f"{schema}.{table}")
+        columns = self._columns.get(f"{schema}.{table}")
+        return None if columns is None else tuple(columns.items())
+
+    def can_read(self, *, schema: str, table: str, roles) -> bool:
+        self._check()
+        return f"{schema}.{table}" not in self._denied
+
+
+@pytest.fixture
+def compiled(db, catalog):  # noqa: F811 - `catalog` seeds the governed facts the chain reads
+    """Two real features whose expressions read DIFFERENT windows of one table."""
+    return (_compiled(_compile(db, "total_debit_amount_30d")),
+            _compiled(_compile(db, "distinct_merchant_count_90d")))
+
+
+@pytest.fixture
+def prepared(compiled):
+    """Requests for every expression AND the spine, resolved against a stocked environment."""
+    spine_request = spine_input_request(
+        compiled[0].spine, _spine_requirement(INVENTORY.tables["banking.customers"]),
+        business_dt=BUSINESS_DT)
+    assert isinstance(spine_request, RunInputRequest), spine_request
+    requests = (*run_input_requests(compiled), spine_request)
+    environment = _Environment(INVENTORY)
+    snapshots = resolve_snapshots(INVENTORY, environment, requests=requests,
+                                  business_dt=BUSINESS_DT)
+    assert isinstance(snapshots, tuple), snapshots
+    return snapshots, environment.stock(snapshots)
+
+
+def _rendered() -> RenderedArtifactIdentity:
+    return RenderedArtifactIdentity(compilation=_identity(), generated_project_hash=PROJECT_HASH)
+
+
+def _l1(prepared, *, irs, roles=ROLES, snapshots=None) -> ValidationReportV1:
+    resolved, environment = prepared
+    return run_l1(_rendered(), resolved if snapshots is None else snapshots, irs=irs,
+                  inventory=INVENTORY, metastore=environment, roles=roles,
+                  generation_id=GEN, run_id=RUN, report_id="rep-l1", clock=_clock())
+
+
+def test_an_environment_that_agrees_with_the_catalog_PASSES_L1(prepared, compiled) -> None:
+    report = _l1(prepared, irs=compiled)
+    assert (report.status, report.findings) == (ValidationStatus.PASSED, ())
+    assert (report.level, report.run_id) == (ValidationLevel.L1, RUN)
+
+
+def test_ONE_missing_partition_is_PARTITION_ABSENT_and_nothing_else(prepared, compiled) -> None:
+    """Held equal to the passing case in every respect but one absent partition."""
+    _snapshots, environment = prepared
+    environment.drop_partition("banking.transactions", "2026-07-20")
+
+    report = _l1(prepared, irs=compiled)
+    assert report.status is ValidationStatus.FAILED
+    assert {f.code for f in report.findings} == {ValidationFindingCode.PARTITION_ABSENT}
+    assert all(f.classification is FindingClass.ENVIRONMENT_OR_DATA for f in report.findings)
+    assert may_regenerate(report) is True
+
+
+def test_a_partition_only_the_90_DAY_expression_reads_is_still_checked(prepared, compiled) -> None:
+    """L1 runs over EVERY expression, not over the union or over the first one it finds.
+
+    2026-05-01 is inside the 90-day read and outside the 30-day one, so a validator that checked one
+    window — or that de-duplicated the two reads of `transactions` before comparing their semantics
+    — would report nothing here.
+    """
+    _snapshots, environment = prepared
+    environment.drop_partition("banking.transactions", "2026-05-01")
+
+    report = _l1(prepared, irs=compiled)
+    located = [f.location for f in report.findings
+               if f.code is ValidationFindingCode.PARTITION_ABSENT]
+    assert located, "the 90-day expression's own partition set was never checked"
+    assert all("distinct_merchant_count_90d" in location for location in located)
+
+
+def test_a_wrong_TYPE_on_the_cluster_is_a_GOVERNED_FACT_MISMATCH(prepared, compiled) -> None:
+    _snapshots, environment = prepared
+    assert INVENTORY.tables["banking.transactions"].columns[0] == ("txn_amt", "string")
+    environment.retype_column("banking.transactions", "txn_amt", "double")
+
+    report = _l1(prepared, irs=compiled)
+    mismatches = [f for f in report.findings
+                  if f.code is ValidationFindingCode.COLUMN_TYPE_MISMATCH]
+    assert len(mismatches) == 1
+    assert mismatches[0].location == "banking.transactions.txn_amt"
+    assert (mismatches[0].expected, mismatches[0].observed) == ("string", "double")
+    assert mismatches[0].classification is FindingClass.GOVERNED_FACT_MISMATCH
+    assert may_regenerate(report) is False
+
+
+def test_an_absent_COLUMN_is_reported_against_the_column_that_is_absent(prepared, compiled):
+    _snapshots, environment = prepared
+    environment.drop_column("banking.transactions", "merchant_id")
+
+    report = _l1(prepared, irs=compiled)
+    absent = [f for f in report.findings if f.code is ValidationFindingCode.COLUMN_ABSENT]
+    assert [f.location for f in absent] == ["banking.transactions.merchant_id"]
+    assert absent[0].classification is FindingClass.GOVERNED_FACT_MISMATCH
+
+
+def test_a_DENIED_table_is_READ_DENIED_and_its_columns_are_not_then_reported_absent(
+        prepared, compiled) -> None:
+    """A table nobody may read cannot also be a table whose schema was observed."""
+    _snapshots, environment = prepared
+    environment.deny("banking.transactions")
+
+    report = _l1(prepared, irs=compiled)
+    assert {f.code for f in report.findings} == {ValidationFindingCode.READ_DENIED}
+    assert "banking.transactions" in {f.location for f in report.findings}
+    assert may_regenerate(report) is False
+
+
+# ── L1 covers the SPINE, which no feature expression reads ───────────────────────────────────────
+
+
+def test_the_spines_table_is_in_the_read_set_although_no_expression_reads_it(prepared, compiled):
+    """The control for the two spine tests below: `customers` is the spine's alone."""
+    expression_tables = {f"{ref.schema}.{ref.table}"
+                         for ir in compiled for expr in ir.expressions
+                         for ref in expr.physical_read_set}
+    assert "banking.customers" not in expression_tables
+
+    _l1(prepared, irs=compiled)
+    assert "banking.customers" in prepared[1].described
+
+
+def test_a_broken_column_on_the_SPINES_table_is_found(prepared, compiled) -> None:
+    _snapshots, environment = prepared
+    environment.drop_column("banking.customers", "cif_id")
+
+    report = _l1(prepared, irs=compiled)
+    assert [f.location for f in report.findings
+            if f.code is ValidationFindingCode.COLUMN_ABSENT] == ["banking.customers.cif_id"]
+
+
+def test_a_missing_partition_under_the_SPINE_is_found(prepared, compiled) -> None:
+    _snapshots, environment = prepared
+    environment.drop_partition("banking.customers", BUSINESS_DT)
+
+    report = _l1(prepared, irs=compiled)
+    absent = [f for f in report.findings if f.code is ValidationFindingCode.PARTITION_ABSENT]
+    assert [f.location for f in absent] == ["__spine__/spine banking.customers"]
+
+
+def test_L1_REFUSES_to_run_without_the_spines_snapshot(prepared, compiled) -> None:
+    """§11.2 says L1 covers the spine, so a run that resolved no spine read cannot be validated.
+
+    Silently skipping it would make "L1 covers the spine" a claim nothing enforces — the population
+    would be the one part of the run whose inputs were never checked.
+    """
+    snapshots, _environment = prepared
+    without_spine = tuple(s for s in snapshots if s.feature_name != SPINE_FEATURE_NAME)
+    assert len(without_spine) < len(snapshots)
+    with pytest.raises(ValueError, match="spine"):
+        _l1(prepared, irs=compiled, snapshots=without_spine)
+
+
+# ── L1 reads metadata only, and an unreachable cluster invents nothing ───────────────────────────
+
+
+def test_the_metastore_seam_has_no_way_to_read_a_ROW() -> None:
+    """Structural, not a review convention: there is no method that could return data."""
+    assert {name for name in dir(MetastoreMetadata) if not name.startswith("_")} == \
+        {"list_partitions", "describe_table", "can_read"}
+
+
+def test_an_unreachable_cluster_is_error_with_ZERO_findings(prepared, compiled) -> None:
+    _snapshots, environment = prepared
+    environment.drop_partition("banking.transactions", "2026-07-20")   # would have been a finding
+    environment.unreachable()
+
+    report = _l1(prepared, irs=compiled)
+    assert report.status is ValidationStatus.ERROR
+    assert report.findings == ()
+    assert may_regenerate(report) is False
+
+
+def test_a_DEFECT_in_the_metastore_adapter_is_not_reported_as_unreachable(prepared, compiled):
+    """Catching bare `Exception` would turn a bug into a verdict about the cluster."""
+    _snapshots, environment = prepared
+    environment.raising(ValueError("the adapter built a malformed query"))
+    with pytest.raises(ValueError, match="malformed"):
+        _l1(prepared, irs=compiled)
+
+
+def test_L1_reports_the_hashes_the_RENDERED_identity_states(prepared, compiled) -> None:
+    report = _l1(prepared, irs=compiled)
+    assert report.generated_project_hash == PROJECT_HASH
+    assert report.group_plan_hash == PLAN_HASH

@@ -41,10 +41,10 @@ import json
 import os
 import pathlib
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.codes import ValidationFindingCode
@@ -54,12 +54,21 @@ from featuregen.materialize.identity import (
     generated_project_hash,
     read_lock,
 )
+from featuregen.materialize.inventory import ClusterInventoryV1
+from featuregen.materialize.ir import FormulaExecutionIRV1
+from featuregen.materialize.runprep import (
+    SPINE_FEATURE_NAME,
+    MetastorePartitions,
+    PhysicalInputSnapshot,
+)
+from featuregen.materialize.spine import SpineSpec
 
 __all__ = [
     "FINDING_CLASSES",
     "ClusterUnreachable",
     "FindingClass",
     "FindingSeverity",
+    "MetastoreMetadata",
     "ValidationFinding",
     "ValidationLevel",
     "ValidationReportV1",
@@ -68,6 +77,7 @@ __all__ = [
     "may_regenerate",
     "record_validation_report",
     "run_l0",
+    "run_l1",
 ]
 
 
@@ -545,3 +555,242 @@ def run_l0(
         environment_id=environment_id,
         status=ValidationStatus.FAILED if findings else ValidationStatus.PASSED,
         started_at=started_at, finished_at=clock(), findings=tuple(findings))
+
+
+# ── L1: the physical inputs the run will actually read ───────────────────────────────────────────
+
+
+class MetastoreMetadata(MetastorePartitions, Protocol):
+    """The three questions L1 asks the environment — and the fourth it deliberately cannot.
+
+    Partitions, columns-and-physical-types, and whether a set of roles may read the table. Nothing
+    here returns a row: §11.2 says L1 reads metadata only, and a seam with a row-returning method
+    would make that a review convention rather than a property. It is also why a finding *cannot*
+    carry a data value — counts, types and locations are all this seam can produce.
+
+    It extends :class:`~featuregen.materialize.runprep.MetastorePartitions` rather than restating
+    ``list_partitions``: run preparation resolves the partitions and L1 checks the same ones exist,
+    so a second declaration of that method would be a second chance to disagree about its shape.
+    """
+
+    def describe_table(self, *, schema: str, table: str
+                       ) -> Sequence[tuple[str, str]] | None:
+        """Ordered ``(column, physical type)`` for one table, or ``None`` when it does not exist."""
+        ...
+
+    def can_read(self, *, schema: str, table: str, roles: Sequence[str]) -> bool:
+        """Whether these roles may read this table — a metadata question, not a read."""
+        ...
+
+
+def _fold(identifier: str) -> str:
+    return identifier.strip().lower()
+
+
+def _physical_type(declared: str) -> str:
+    """Compare physical types the way a metastore prints them: case- and space-insensitive.
+
+    ``DECIMAL(18, 2)`` and ``decimal(18,2)`` are one type, and reporting them as a contradiction
+    would send an operator to re-attest a column nothing is wrong with.
+    """
+    return "".join(declared.split()).lower()
+
+
+def _declared_columns(inventory: ClusterInventoryV1, schema: str, table: str) -> dict[str, str]:
+    """What the §0 inventory declares this table's columns to be, DATA and partition together.
+
+    ``TableLayout`` lists the two separately because they answer different questions; the read set
+    does not care, and a read of a partition column would otherwise find no declared type at all.
+    """
+    layout = inventory.layout_for(schema, table)
+    if layout is None:
+        return {}
+    return {_fold(name): physical_type
+            for name, physical_type in (*layout.columns, *(layout.partition_columns or ()))}
+
+
+def _canonical_partition(columns: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """A partition as it is IDENTIFIED — its column/value pairs, ordered by column.
+
+    ``PartitionSpec`` keeps the metastore's order because that is how a partition is ADDRESSED, and
+    addressing is the renderer's concern. L1 asks only whether the partition exists, and two
+    listings of one partition that disagree about column order still name the same partition, so
+    sorting here removes a false ``PARTITION_ABSENT`` rather than hiding a real one.
+    """
+    return tuple(sorted((_fold(str(column)), str(value)) for column, value in columns))
+
+
+def _read_set(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec,
+              spine_table: tuple[str, str]) -> dict[tuple[str, str], list[str]]:
+    """Every column the run reads, per physical table — EVERY IR, every expression, and the spine.
+
+    The spine's refs are catalog-side (§3.5 flattens their schema segment), so only the column
+    segment is taken from them; the physical table is the one its own resolved requirement names.
+    """
+    read: dict[tuple[str, str], list[str]] = {}
+
+    def add(schema: str, table: str, column: str) -> None:
+        columns = read.setdefault((schema, table), [])
+        if column not in columns:
+            columns.append(column)
+
+    for ir in irs:
+        for expression in ir.expressions:
+            for ref in expression.physical_read_set:
+                if ref.column:
+                    add(ref.schema, ref.table, ref.column)
+    for spine_ref in spine.read_set:
+        add(spine_table[0], spine_table[1], spine_ref.rsplit(".", 1)[-1])
+    return read
+
+
+def _spine_of(irs: Sequence[FormulaExecutionIRV1]) -> SpineSpec:
+    if not irs:
+        raise ValueError(
+            "L1 was given no IRs: §11.2 runs it over every feature IR, every expression AND the "
+            "spine, and a run with no features has no compiled spine to check either")
+    spine = irs[0].spine
+    if any(ir.spine != spine for ir in irs):
+        raise ValueError(
+            "the IRs carry different spines: a materialization contract declares ONE population "
+            "(§4), and validating one of them would leave the other's inputs unchecked")
+    return spine
+
+
+def _spine_table(snapshots: Sequence[PhysicalInputSnapshot]) -> tuple[str, str]:
+    """The physical table the spine reads, from its own snapshot — which must be present.
+
+    Required rather than optional. §11.2 says L1 covers the spine, and a validator that skipped it
+    when the caller forgot :func:`~featuregen.materialize.runprep.spine_input_request` would make
+    that coverage a claim nothing enforces: the population would be the one part of the run whose
+    inputs were never checked, and it is the part that decides which entities exist at all.
+    """
+    for snapshot in snapshots:
+        if snapshot.feature_name == SPINE_FEATURE_NAME:
+            return (snapshot.requirement.schema, snapshot.requirement.table)
+    raise ValueError(
+        f"no snapshot names the spine ({SPINE_FEATURE_NAME!r}): §11.2's L1 covers every IR, every "
+        f"expression and the SPINE, so a run whose population was never resolved cannot be "
+        f"validated — `runprep.spine_input_request` builds the request this needs")
+
+
+def run_l1(
+    rendered: RenderedArtifactIdentity,
+    snapshots: Sequence[PhysicalInputSnapshot],
+    *,
+    irs: Sequence[FormulaExecutionIRV1],
+    inventory: ClusterInventoryV1,
+    metastore: MetastoreMetadata,
+    roles: Sequence[str],
+    generation_id: str,
+    run_id: str,
+    report_id: str,
+    clock: Callable[[], str],
+) -> ValidationReportV1:
+    """L1 (§11.2): metastore METADATA only, over every IR, every expression and the spine.
+
+    Three questions per physical table — may these roles read it, does every read-set column exist
+    with the type the environment declares, and does every partition this run resolved exist — and
+    the partitions are asked per SNAPSHOT rather than per table, because two expressions over one
+    table under two windows resolved two different partition sets and checking their union would
+    report neither honestly.
+
+    The spine is not a parameter: it is read off the IRs (which must all agree on it) and its
+    physical table off its own snapshot, which must be present. A caller cannot therefore validate a
+    population other than the compiled one, nor omit it.
+
+    ``environment_id`` is read off the inventory for
+    :func:`~featuregen.materialize.runprep.prepare_run`'s reason: a report cannot be filed against
+    one environment while the checks were run against another's declarations.
+
+    Returns:
+        A report. ``status="error"`` with **zero** findings when the cluster could not be asked —
+        including findings already collected, since a validation that could not complete reports
+        nothing rather than the half of itself that finished.
+
+    Raises:
+        ValueError: ``irs`` is empty, the IRs disagree about the spine, or no snapshot names it.
+        Exception: anything the metastore adapter raises that is not
+            :class:`ClusterUnreachable` — a defect in the adapter is not a verdict about the
+            cluster, and converting one into the other is how an invented verdict gets recorded.
+    """
+    spine = _spine_of(irs)
+    spine_table = _spine_table(snapshots)
+    started_at = clock()
+
+    def report(status: ValidationStatus,
+               findings: tuple[ValidationFinding, ...]) -> ValidationReportV1:
+        return ValidationReportV1(
+            report_id=report_id, generation_id=generation_id, run_id=run_id,
+            generated_project_hash=rendered.generated_project_hash,
+            group_plan_hash=rendered.compilation.group_plan_hash, level=ValidationLevel.L1,
+            environment_id=inventory.environment_id, status=status, started_at=started_at,
+            finished_at=clock(), findings=findings)
+
+    findings: list[ValidationFinding] = []
+    try:
+        denied: set[tuple[str, str]] = set()
+        for (schema, table), columns in _read_set(irs, spine, spine_table).items():
+            if not metastore.can_read(schema=schema, table=table, roles=tuple(roles)):
+                denied.add((schema, table))
+                findings.append(ValidationFinding(
+                    code=ValidationFindingCode.READ_DENIED, location=f"{schema}.{table}",
+                    expected=f"readable by {len(tuple(roles))} role(s)", observed="denied",
+                    count=1))
+                # No column checks for a denied table: a schema nobody may read is not a schema
+                # that was observed, and reporting its columns absent would invent a second fault
+                # out of the first one.
+                continue
+            observed = metastore.describe_table(schema=schema, table=table)
+            if observed is None:
+                findings.append(ValidationFinding(
+                    code=ValidationFindingCode.COLUMN_ABSENT, location=f"{schema}.{table}",
+                    expected=f"{len(columns)} column(s)", observed="the table does not exist",
+                    count=len(columns)))
+                continue
+            present = {_fold(name): physical_type for name, physical_type in observed}
+            declared = _declared_columns(inventory, schema, table)
+            for column in columns:
+                key = _fold(column)
+                if key not in present:
+                    findings.append(ValidationFinding(
+                        code=ValidationFindingCode.COLUMN_ABSENT,
+                        location=f"{schema}.{table}.{column}",
+                        expected=declared.get(key, "a column of this table"), observed="absent",
+                        count=1))
+                    continue
+                # Only when the environment DECLARES a type: the inventory is what states one, and
+                # an undeclared column can be checked for existence and nothing more.
+                if key in declared and \
+                        _physical_type(declared[key]) != _physical_type(present[key]):
+                    findings.append(ValidationFinding(
+                        code=ValidationFindingCode.COLUMN_TYPE_MISMATCH,
+                        location=f"{schema}.{table}.{column}",
+                        expected=declared[key], observed=present[key], count=1))
+
+        live: dict[tuple[str, str], set[tuple[tuple[str, str], ...]]] = {}
+        for snapshot in snapshots:
+            if snapshot.partition_specs is None:
+                continue
+            physical = (snapshot.requirement.schema, snapshot.requirement.table)
+            if physical in denied:
+                continue
+            if physical not in live:
+                live[physical] = {
+                    _canonical_partition(partition) for partition
+                    in metastore.list_partitions(schema=physical[0], table=physical[1])}
+            absent = [spec for spec in snapshot.partition_specs
+                      if _canonical_partition(spec.columns) not in live[physical]]
+            if absent:
+                findings.append(ValidationFinding(
+                    code=ValidationFindingCode.PARTITION_ABSENT,
+                    location=(f"{snapshot.feature_name}/{snapshot.expr_path} "
+                              f"{physical[0]}.{physical[1]}"),
+                    expected=f"{len(snapshot.partition_specs)} partition(s)",
+                    observed=f"{len(snapshot.partition_specs) - len(absent)} present",
+                    count=len(absent)))
+    except ClusterUnreachable:
+        return report(ValidationStatus.ERROR, ())
+
+    return report(ValidationStatus.FAILED if findings else ValidationStatus.PASSED,
+                  tuple(findings))
