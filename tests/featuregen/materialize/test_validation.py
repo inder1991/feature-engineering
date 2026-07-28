@@ -29,6 +29,7 @@ from tests.featuregen.materialize.test_ir import _ok as _compiled
 from featuregen.materialize import validation
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import ValidationFindingCode
+from featuregen.materialize.control_plane import MaterializationGeneration, record_generation
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
     CompilationIdentity,
@@ -58,6 +59,7 @@ from featuregen.materialize.validation import (
     ValidationStatus,
     classify,
     may_regenerate,
+    record_validation_report,
     run_l0,
     run_l1,
 )
@@ -833,3 +835,44 @@ def test_the_environment_given_to_L0_reaches_the_interpreter_that_imports_the_pr
     with_env = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-b",
                       python_executable=sys.executable, clock=_clock(), env={"L0_MARKER": "yes"})
     assert (with_env.status, with_env.findings) == (ValidationStatus.PASSED, ())
+
+
+# ── ingestion: the report the control plane deliberately did not invent ──────────────────────────
+
+
+def test_a_report_is_APPENDED_with_its_findings_intact(db) -> None:
+    """`control_plane` created the table and left this path to §11's owner. This is that path."""
+    record_generation(db, MaterializationGeneration(
+        generation_id=GEN, logical_group_name="cif_daily",
+        materialization_contract_hash="c" * 64, group_plan_hash=PLAN_HASH,
+        generated_project_hash=PROJECT_HASH, created_at=T0))
+    report = _report(ValidationStatus.FAILED, (
+        _finding(ValidationFindingCode.COLUMN_TYPE_MISMATCH,
+                 location="banking.transactions.txn_amt", expected="decimal(18,2)",
+                 observed="string"),))
+    record_validation_report(db, report)
+
+    row = db.execute(
+        "SELECT level, status, run_id, findings FROM pipeline_validation_report "
+        "WHERE report_id = %s", (report.report_id,)).fetchone()
+    assert row[:3] == ("L1", "failed", RUN)
+    assert row[3] == [{"code": "COLUMN_TYPE_MISMATCH", "severity": "error",
+                       "classification": "governed_fact_mismatch",
+                       "location": "banking.transactions.txn_amt",
+                       "expected": "decimal(18,2)", "observed": "string", "count": 1}]
+
+
+def test_an_L0_report_records_a_NULL_run_id(db) -> None:
+    record_generation(db, MaterializationGeneration(
+        generation_id=GEN, logical_group_name="cif_daily",
+        materialization_contract_hash="c" * 64, group_plan_hash=PLAN_HASH,
+        generated_project_hash=PROJECT_HASH, created_at=T0))
+    record_validation_report(db, ValidationReportV1(
+        report_id="rep-l0-db", generation_id=GEN, run_id=None,
+        generated_project_hash=PROJECT_HASH, group_plan_hash=PLAN_HASH, level=ValidationLevel.L0,
+        environment_id=ENVIRONMENT, status=ValidationStatus.PASSED, started_at=T0, finished_at=T1,
+        findings=()))
+
+    row = db.execute("SELECT run_id, findings FROM pipeline_validation_report "
+                     "WHERE report_id = 'rep-l0-db'").fetchone()
+    assert row == (None, [])
