@@ -30,10 +30,12 @@ import json
 import pathlib
 
 import pytest
+import yaml
 from tests.featuregen.materialize import fake_spark, fixtures
 from tests.featuregen.materialize.test_group_plan import (  # noqa: F401 — `catalog` is a fixture
     BUSINESS_DT,
     CADENCE,
+    GENERATION,
     SUM_30D,
     catalog,
 )
@@ -45,7 +47,9 @@ from tests.featuregen.materialize.test_ir import (
 from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compiled
 
 from featuregen.formula.schema import (
+    AggregateFunction,
     EmptyWindowResult,
+    FinalOperation,
     NullInput,
     OverflowBehavior,
     RoundingMode,
@@ -54,6 +58,12 @@ from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     ContractGroup,
     derive_group_contract,
+)
+from featuregen.materialize.expression_ir import RefRole
+from featuregen.materialize.group_plan import (
+    StagingManifestV1,
+    StagingStatus,
+    check_completeness,
 )
 from featuregen.materialize.inventory import (
     EventTimePartition,
@@ -65,6 +75,8 @@ from featuregen.materialize.render import nodes_compute
 from featuregen.materialize.render.nodes_compute import SPINE_FUNC_NAME, render_spine_node
 from featuregen.materialize.render.project import (
     RenderedNode,
+    feature_staging_path,
+    materialize_to,
     project_datasets,
     render_project,
 )
@@ -75,6 +87,7 @@ from featuregen.materialize.spine import (
     PartitionMappedSnapshot,
     PopulationSemantics,
 )
+from featuregen.overlay.upload.join_path import JoinStep
 
 GOLDENS = pathlib.Path(__file__).parent / "goldens" / "spine_nodes"
 
@@ -1473,3 +1486,300 @@ def test_it_refuses_a_filter_on_a_column_OUTSIDE_the_authorized_read_set(compile
     ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
     with pytest.raises(ValueError, match="authorized read set"):
         _calculate(compiled, feature, ir=ir)
+
+
+# ── §9: the staging manifest this node writes about itself ───────────────────────────────────────
+
+
+def test_the_manifest_binds_the_output_to_THIS_generation_run_and_business_date(
+        compiled, feature, lock_tree):
+    """§9's stale-manifest hazard: a reused staging path can leave an older SUCCESSFUL manifest
+    whose ir_hash still matches, and assembly would publish stale output past every other check."""
+    node = _calculate(compiled, feature)
+    _frame, manifest = _run_calculation(
+        node, lock_tree, projection=[_debit("c1", 3)], spine=_spine_rows("c1"),
+        generation="gen-0007", run="run-0009", business_dt=BUSINESS_DT)
+    assert manifest["generation_id"] == "gen-0007"
+    assert manifest["run_id"] == "run-0009"
+    assert manifest["business_dt"] == BUSINESS_DT
+    assert manifest["intent_feature_name"] == SUM_30D
+    assert manifest["ir_hash"] == feature.ir_hash
+    assert manifest["status"] == StagingStatus.COMPLETED.value
+    assert manifest["row_count"] == 1
+
+
+def test_the_manifest_is_a_REAL_StagingManifestV1_that_passes_completeness(compiled, feature,
+                                                                          lock_tree):
+    """Constructed from the rendered node's own JSON, then handed to §9's real gate. A manifest
+    this renderer shaped differently from the dataclass would be a run's evidence nothing reads."""
+    node = _calculate(compiled, feature)
+    _frame, manifest = _run_calculation(
+        node, lock_tree, projection=[_debit("c1", 3)], spine=_spine_rows("c1"),
+        generation=GENERATION, run="run-0001")
+    parsed = StagingManifestV1(**json.loads(json.dumps(manifest)))
+    plan = dataclasses.replace(compiled[1], features=(feature,))
+    assert check_completeness(plan, [parsed], generation_id=GENERATION, run_id="run-0001",
+                              business_dt=BUSINESS_DT) == ()
+
+
+def test_the_manifest_carries_NO_data_value_and_the_row_count_MOVES(compiled, feature, lock_tree):
+    """§14: counts, types, hashes and locations only. The count is asserted to move so a hard-coded
+    one — which would satisfy every other assertion here — fails."""
+    node = _calculate(compiled, feature)
+    _one, manifest_one = _run_calculation(node, lock_tree, projection=[_debit("c1", 3)],
+                                          spine=_spine_rows("c1"))
+    _two, manifest_two = _run_calculation(node, lock_tree, projection=[_debit("c1", 3)],
+                                          spine=_spine_rows("c1", "c2", "c3"))
+    assert manifest_one["row_count"] == 1 and manifest_two["row_count"] == 3
+    assert set(manifest_one) == {field.name for field in dataclasses.fields(StagingManifestV1)}
+    # And nothing beyond that field set: a manifest is counts, types, hashes and locations, so a
+    # rendered node that helpfully added a sample value would fail here rather than at review.
+
+
+def test_the_manifests_schema_hash_MOVES_with_the_declared_type(compiled, feature, lock_tree):
+    """A hash that did not move with the type would be a field that proves nothing."""
+    def hashed(sql_type):
+        planned = dataclasses.replace(
+            feature, physical_type=dataclasses.replace(feature.physical_type, sql_type=sql_type))
+        node = _calculate(compiled, planned,
+                          plan=dataclasses.replace(compiled[1], features=(planned,)))
+        _frame, manifest = _run_calculation(node, lock_tree, projection=[_debit("c1", 3)],
+                                            spine=_spine_rows("c1"))
+        return manifest["schema_hash"]
+
+    assert hashed("DECIMAL(38,6)") != hashed("DECIMAL(18,2)")
+
+
+def test_the_manifests_output_location_is_composed_from_the_staging_root_PARAMETER(
+        compiled, feature, lock_tree):
+    """No location is written into node source. The root is a run parameter because §9's staging
+    area is generation-scoped: one fixed at render time would be shared by every run."""
+    node = _calculate(compiled, feature)
+    _frame, manifest = _run_calculation(node, lock_tree, projection=[_debit("c1", 3)],
+                                        spine=_spine_rows("c1"),
+                                        staging_root="hdfs://nn/staging/gen-0042/")
+    assert manifest["output_location"] == \
+        "hdfs://nn/staging/gen-0042/" + feature_staging_path(SUM_30D)
+    assert "hdfs" not in node.source          # the ROOT is never rendered, only the relative path
+
+
+def test_the_manifests_path_is_the_CATALOGS_path_and_not_a_second_spelling(compiled, feature):
+    """One spelling, or the manifest names a path nothing wrote to."""
+    datasets = project_datasets(compiled[0], compiled[1], spine_input=compiled[3])
+    project = render_project(
+        compiled[0], compiled[1], environment_id=ENVIRONMENT,
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+        nodes=_wired_nodes(compiled, datasets))
+    entries = yaml.safe_load(project.files["conf/base/catalog.yml"])
+    declared = entries[datasets.staging[SUM_30D]]["filepath"]
+    assert declared.endswith(feature_staging_path(SUM_30D))
+    assert feature_staging_path(SUM_30D) in _calculate(compiled, feature).source
+
+
+def test_the_generated_project_hash_is_READ_FROM_THE_REAL_LOCK_at_run_time(compiled, feature,
+                                                                          tmp_path):
+    """§7 keeps `generated_project_hash` out of every other generated file, because the hash is
+    taken OVER those files. The node therefore reads the lock — and the depth it walks up from
+    `__file__` is proved against a really rendered project, not counted by eye."""
+    datasets = project_datasets(compiled[0], compiled[1], spine_input=compiled[3])
+    project = render_project(
+        compiled[0], compiled[1], environment_id=ENVIRONMENT,
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+        nodes=_wired_nodes(compiled, datasets))
+    root = materialize_to(project, tmp_path / "generated")
+    nodes_py = next(path for path in project.files if path.endswith("pipelines/materialize/nodes.py"))
+
+    node = _calculate(compiled, feature)
+    _frame, manifest = _run_calculation(node, str(root / nodes_py),
+                                        projection=[_debit("c1", 3)], spine=_spine_rows("c1"))
+    assert manifest["generated_project_hash"] == project.identity.generated_project_hash
+    assert project.identity.generated_project_hash not in node.source
+
+
+# ── the node inside a real project ───────────────────────────────────────────────────────────────
+
+
+def _wired_nodes(compiled, datasets):
+    """The real spine, the real projections and the real calculations, plus stubs for Task 14."""
+    authorized, plan = compiled[0], compiled[1]
+    nodes = [render_spine_node(
+        authorized.spine, plan, compiled[2], spine_input=compiled[3],
+        source_dataset=datasets.raw["banking.customers"], spine_dataset=datasets.spine)]
+    for ir in authorized.irs:
+        for expression in ir.expressions:
+            physical = next(ref for ref in expression.physical_read_set
+                            if RefRole.SOURCE_TABLE in ref.roles)
+            nodes.append(nodes_compute.render_projection_node(
+                expression, compiled[2], feature_column=ir.feature_name,
+                source_dataset=datasets.raw[f"{physical.schema}.{physical.table}"],
+                projection_dataset=datasets.projections[(ir.feature_name,
+                                                         expression.expr_path)]))
+        planned = next(item for item in plan.features if item.column_name == ir.feature_name)
+        nodes.append(nodes_compute.render_calculation_node(
+            ir, planned, plan, empty_window=EmptyWindowResult.NULL, null_input=NullInput.IGNORE,
+            projection_dataset=datasets.projections[(ir.feature_name,
+                                                     ir.expressions[0].expr_path)],
+            spine_dataset=datasets.spine, staging_dataset=datasets.staging[ir.feature_name],
+            manifest_dataset=datasets.manifests[ir.feature_name]))
+    nodes.append(_assembly_stub(datasets))
+    return tuple(nodes)
+
+
+def _assembly_stub(datasets):
+    """Task 14's two nodes, as WIRING only — this file owns no line of their compute."""
+    body = ("def assemble_and_publish(*frames):\n"
+            '    """Task 14 renders this body."""\n    return None, None\n')
+    return RenderedNode(
+        name="assemble_and_publish", func_name="assemble_and_publish", source=body,
+        inputs=(datasets.spine, *sorted(datasets.staging.values()),
+                *sorted(datasets.manifests.values())),
+        outputs=(datasets.assembled, datasets.published), tags=("feature",))
+
+
+def test_the_calculation_closes_the_wiring_of_a_REAL_rendered_project(compiled):
+    """Task 12 checks six ways a pipeline can be wrong while parsing perfectly. The calculation's
+    two outputs and seven inputs are checked by THAT, not by a claim here."""
+    datasets = project_datasets(compiled[0], compiled[1], spine_input=compiled[3])
+    project = render_project(
+        compiled[0], compiled[1], environment_id=ENVIRONMENT,
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=compiled[3],
+        nodes=_wired_nodes(compiled, datasets))
+    nodes_py = next(text for path, text in project.files.items()
+                    if path.endswith("pipelines/materialize/nodes.py"))
+    assert f"def {nodes_compute.calculation_func_name(SUM_30D)}(" in nodes_py
+    assert ast.parse(nodes_py)
+
+
+def test_the_renderer_still_imports_no_pyspark_and_writes_no_location(compiled, feature):
+    """The package-wide rule, re-asserted over 13c's additions: PySpark exists only inside the
+    rendered strings, and every location is a catalog entry."""
+    source = inspect.getsource(nodes_compute)
+    tree = ast.parse(source)
+    imported = {getattr(node, "module", None) for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)}
+    imported |= {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                 for alias in node.names}
+    assert not any((name or "").startswith(("pyspark", "kedro")) for name in imported)
+    rendered = _calculate(compiled, feature).source
+    assert "hdfs://" not in rendered and "s3://" not in rendered
+
+
+# ── refusals decidable at RENDER time ────────────────────────────────────────────────────────────
+
+
+def test_it_refuses_a_RATIO_or_DIFFERENCE_rather_than_staging_HALF_of_it(compiled, feature):
+    """A ratio has two aggregates, a final operation and its own zero_denominator policy. None of
+    that is rendered here, and staging the numerator under the feature's own name would publish a
+    numerator as though it were the ratio — a plausible number with no error anywhere."""
+    for operation in (FinalOperation.RATIO, FinalOperation.DIFFERENCE):
+        ir = dataclasses.replace(compiled[0].irs[0], final_operation=operation)
+        with pytest.raises(ValueError, match="single aggregate"):
+            _calculate(compiled, feature, ir=ir)
+
+
+def test_it_refuses_an_identity_body_that_compiled_to_more_than_ONE_expression(compiled, feature):
+    expression = compiled[0].irs[0].expressions[0]
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression, expression))
+    with pytest.raises(ValueError, match="expression"):
+        _calculate(compiled, feature, ir=ir)
+
+
+def test_it_refuses_when_the_GRAIN_columns_are_not_the_LANDING_key_columns(compiled, feature):
+    """`derive_contract` allows a feature's grain columns to be "a different table's spelling of
+    the same entity", and nothing declares the mapping between the two spellings. Pairing them
+    positionally would land every entity's value under another entity's key."""
+    plan = dataclasses.replace(compiled[1], entity_key_columns=("customer_number",))
+    with pytest.raises(ValueError, match="nothing states how one spelling maps"):
+        _calculate(compiled, feature, plan=plan)
+
+
+def test_it_refuses_when_the_PLAN_and_the_IR_describe_different_columns(compiled, feature):
+    other = dataclasses.replace(feature, column_name="something_else")
+    with pytest.raises(ValueError, match="two different features"):
+        _calculate(compiled, feature, ir=dataclasses.replace(
+            compiled[0].irs[0], feature_name="something_else"))
+    with pytest.raises(ValueError, match="does not publish"):
+        _calculate(compiled, other, ir=dataclasses.replace(
+            compiled[0].irs[0], feature_name="something_else"))
+
+
+def test_it_refuses_an_expression_whose_JOIN_PLAN_HAS_HOPS(compiled, feature):
+    """The same refusal 13b's projection makes, reached through the calculation: a traversal this
+    renderer drops would aggregate over rows that never belonged to the entity."""
+    expression = compiled[0].irs[0].expressions[0]
+    hopped = dataclasses.replace(
+        expression, join_plan=dataclasses.replace(
+            expression.join_plan, steps=(JoinStep(
+                from_ref=fixtures.TABLE_REF, to_ref=CUSTOMERS, cardinality='N:1'),)))
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(hopped,))
+    with pytest.raises(ValueError, match="hop"):
+        _calculate(compiled, feature, ir=ir)
+
+
+def test_it_refuses_an_aggregate_whose_OPERAND_does_not_match_its_kind(compiled, feature):
+    """`operand is None` IFF COUNT_ROWS is Child-1's own grammar rule, checked in both directions:
+    an operand under a row count describes a different expression from the one it says it is."""
+    expression = compiled[0].irs[0].expressions[0]
+    counted = dataclasses.replace(expression, aggregation=AggregateFunction.COUNT_ROWS)
+    ir = dataclasses.replace(compiled[0].irs[0], expressions=(counted,))
+    with pytest.raises(ValueError, match="count_rows aggregate carries operand"):
+        _calculate(compiled, feature, ir=ir)
+
+    without = dataclasses.replace(expression, physical_read_set=tuple(
+        ref for ref in expression.physical_read_set if RefRole.OPERAND not in ref.roles))
+    with pytest.raises(ValueError, match="0 operand column"):
+        _calculate(compiled, feature,
+                   ir=dataclasses.replace(compiled[0].irs[0], expressions=(without,)))
+
+
+def test_it_refuses_a_filter_KIND_or_OP_outside_the_closed_vocabulary(compiled, feature):
+    for tree, pattern in (
+            ({"kind": "predicate", "op": "matches", "left": fixtures.REF_DR_CR,
+              "right_literal": None, "right_param": None, "right_set": None}, "matches"),
+            ({"kind": "regex", "op": "and", "children": []}, "closed vocabulary"),
+            ({"kind": "bool", "op": "and", "children": []}, "no children"),
+            ({"kind": "bool", "op": "not", "children": [
+                {"kind": "predicate", "op": "is_null", "left": fixtures.REF_AMT,
+                 "right_literal": None, "right_param": None, "right_set": None},
+                {"kind": "predicate", "op": "is_null", "left": fixtures.REF_AMT,
+                 "right_literal": None, "right_param": None, "right_set": None}]},
+             "negates 2 children")):
+        expression = dataclasses.replace(compiled[0].irs[0].expressions[0], filter_tree=tree)
+        ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
+        with pytest.raises(ValueError, match=pattern):
+            _calculate(compiled, feature, ir=ir)
+
+
+def test_it_refuses_a_LITERAL_that_is_not_the_type_it_declares(compiled, feature):
+    for literal in ({"type": "integer", "value": "one"},
+                    {"type": "decimal", "value": "1.2.3"},
+                    {"type": "boolean", "value": "TRUE"},
+                    {"type": "date", "value": "07/01/2026"}):
+        tree = {"kind": "predicate", "op": "equal", "left": fixtures.REF_AMT,
+                "right_literal": literal, "right_param": None, "right_set": None}
+        expression = dataclasses.replace(compiled[0].irs[0].expressions[0], filter_tree=tree)
+        ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
+        with pytest.raises(ValueError, match="literal"):
+            _calculate(compiled, feature, ir=ir)
+
+
+def test_it_refuses_arguments_that_are_not_what_they_must_be(compiled, feature):
+    with pytest.raises(TypeError, match="FormulaExecutionIRV1"):
+        _calculate(compiled, feature, ir="total_debit_amount_30d")
+    with pytest.raises(TypeError, match="PlannedFeature"):
+        _calculate(compiled, "total_debit_amount_30d")
+    with pytest.raises(TypeError, match="FeatureGroupPlanV1"):
+        _calculate(compiled, feature, plan=object())
+
+
+def test_the_two_POLICY_arguments_have_no_defaults_and_reject_a_word_outside_the_vocabulary(
+        compiled, feature):
+    """§8 rule 4's policies are the formula's. A default would be this renderer answering a policy
+    question — `ignore` and `propagate` give different numbers and neither is the safer guess."""
+    signature = inspect.signature(nodes_compute.render_calculation_node)
+    for name in ("empty_window", "null_input"):
+        assert signature.parameters[name].default is inspect.Parameter.empty
+    with pytest.raises(ValueError):
+        _calculate(compiled, feature, empty_window="nothing")
+    with pytest.raises(ValueError):
+        _calculate(compiled, feature, null_input="skip")
