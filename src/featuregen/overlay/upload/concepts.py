@@ -844,6 +844,70 @@ _ALL: tuple[Concept, ...] = (
     # legacy alias — superseded by monetary_rate / rank_percentile
     Concept("rate_or_ratio", "monetary", additivity="non_additive",
             description="Legacy alias — generic rate/ratio; superseded by monetary_rate / rank_percentile."),
+
+    # ── §3.18 Customer master — the party record itself ───────────────────────────────────────────
+    # This section exists because a real customer-master table had nowhere to land: the registry was
+    # built for credit risk and payments, so 12 columns collapsed to `boolean_flag` and 13 to
+    # `category_code` — the only honest answers available, which is precisely the problem. Every
+    # concept below is grounded in a column present in a loaded catalog, never invented from a
+    # taxonomy. NONE is additive: these are states, flags and identifiers, not measures to sum.
+    Concept("new_to_bank_flag", "flag",
+            description="Whether the party is within the bank's new-to-bank (NTB) window. Usually "
+                        "arrives as a PAIR at different offsets (current vs 9 months prior); the pair "
+                        "is what yields tenure movement and first-year cohort behaviour, so the "
+                        "offset belongs in the column's own definition, not in this concept."),
+    Concept("customer_relationship_status", "categorical",
+            description="Lifecycle state of the bank's relationship with the party — active, dormant, "
+                        "closed, special handling. The relationship's own state, distinct from any "
+                        "single source system's record status (see source_system_status)."),
+    Concept("source_system_status", "categorical",
+            description="A party's record status WITHIN one originating system (Finacle, Calypso, "
+                        "FinOne, Advent, VisionPlus). Operational plumbing, not a business state: it "
+                        "says whether that system holds the party, never how the bank regards them."),
+    Concept("staff_indicator", "flag", sensitivity="pii",
+            description="Whether the party is an employee of the bank. A POPULATION control as much "
+                        "as a feature — staff accounts carry preferential pricing and insider "
+                        "controls, so they are routinely excluded from behavioural models. Personal "
+                        "employment data about an identifiable person, hence the pii floor."),
+    Concept("legal_entity_type", "categorical",
+            description="What KIND of party this is — individual, sole proprietor, corporate, joint, "
+                        "trust. Constitution / legal structure. Drives which features are even "
+                        "meaningful, since an individual and a corporate share few attributes."),
+    Concept("residency_status", "categorical",
+            description="The party's residency for regulatory and tax purposes — resident, "
+                        "non-resident, free-zone. A jurisdictional eligibility fact, not a location."),
+    Concept("restriction_status", "flag", near_label=True,
+            description="Whether the party is under a servicing restriction — suspended, negated, "
+                        "blacklisted, watch-listed. near_label: these are AML/fraud CONSEQUENCES, so "
+                        "a financial-crime model trained on them reads its own answer back. Not a "
+                        "hard leakage anchor — they are legitimate as controls and as filters."),
+    Concept("restriction_reason", "categorical", near_label=True,
+            description="WHY a party is restricted — the suspension / negation / blacklist reason "
+                        "code or note. Borders an outcome for the same reason restriction_status "
+                        "does, and is more specific, so it leaks more readily."),
+    Concept("nominee_indicator", "flag",
+            description="Whether the party holds in a nominee capacity — the named party is not the "
+                        "beneficial owner. Material to AML beneficial-ownership treatment and to "
+                        "whether party-level behaviour can be attributed to a real person."),
+    Concept("customer_group_id", "identifier", entity_link="customer_group",
+            description="Identifier of the corporate GROUP a party belongs to (parent group / "
+                        "conglomerate). The join key for group-level exposure and concentration."),
+    Concept("parent_customer_id", "identifier", entity_link="customer",
+            description="Reference to another PARTY that is this one's parent — a self-referencing "
+                        "hierarchy. Shares the `customer` entity link with customer_id deliberately: "
+                        "a different entity would make the hierarchy unbridgeable across catalogs."),
+    Concept("record_deleted_flag", "flag",
+            description="Soft-delete marker on the record. A POPULATION filter, never a predictor — "
+                        "a model that treats it as an ordinary feature trains on rows the bank "
+                        "considers deleted, and must exclude them instead."),
+    Concept("record_author", "text", sensitivity="pii",
+            description="The user who created or last updated the record (create_user / update_user). "
+                        "A named member of staff, so personal data; audit lineage rather than "
+                        "customer behaviour, and rarely a legitimate feature."),
+    Concept("kyc_narrative", "text", sensitivity="pii",
+            description="Free-prose KYC commentary — nature of business, corporate background, "
+                        "high-risk rationale. Uploader-authored text about an identifiable party, so "
+                        "it carries a pii floor and is read-scoped rather than freely searchable."),
 )
 
 # Public registry: name -> full Concept record.
