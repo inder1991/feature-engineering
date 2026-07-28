@@ -31,6 +31,10 @@ def search_catalog(
     grain: bool = False,
     as_of: bool = False,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    # Windows the hits only; `total` and the facet counts still describe the whole set, so a client
+    # can tell from any page whether another exists. No upper bound: paging past the end returns an
+    # empty page, which is the honest answer and cheaper than rejecting it.
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> SearchResult:
     # AND across facet groups, OR within one. q is optional — an empty q browses ALL fresh,
     # read-scoped rows. Roles come from the authenticated session — NEVER from the request (M6
@@ -48,4 +52,4 @@ def search_catalog(
     if as_of:
         filters["as_of"] = ["true"]
     return search(conn, q, now=datetime.now(UTC), roles=identity.role_claims,
-                  filters=filters, limit=limit)
+                  filters=filters, limit=limit, offset=offset)

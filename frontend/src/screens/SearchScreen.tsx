@@ -2,6 +2,7 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
   SEARCH_FACET_KEYS,
+  SEARCH_PAGE_SIZE,
   type SearchFacetKey,
   type SearchFilters,
   type SearchHit,
@@ -64,6 +65,10 @@ export function SearchScreen() {
   const [q, setQ] = useState(() => params.get('q') ?? '')
   const [filters, setFilters] = useState<SearchFilters>(() => paramsToFilters(params))
   const [result, setResult] = useState<SearchResult | null>(null)
+  // Which slice of the result set is on screen. Deliberately NOT mirrored into the hash: the hash
+  // is a shareable description of the QUERY, and a shared link should open at the first page rather
+  // than at whatever page its author happened to be on when they copied it.
+  const [offset, setOffset] = useState(0)
   const [error, setError] = useState('')
   // List is today's behavior unchanged; Graph maps lineage around one hit. The anchor is the row
   // the user jumped from, or the first hit of the current (facet-narrowed) set otherwise.
@@ -75,10 +80,11 @@ export function SearchScreen() {
   // The hash we last originated. Guards the sync-from-hash effect from reacting to our own writes.
   const appliedHash = useRef<string | null>(null)
 
-  const runSearch = useCallback((nextQ: string, nextFilters: SearchFilters) => {
+  const runSearch = useCallback((nextQ: string, nextFilters: SearchFilters, nextOffset = 0) => {
     const id = ++seq.current
     setError('')
-    searchCatalog(nextQ, nextFilters)
+    setOffset(nextOffset)
+    searchCatalog(nextQ, nextFilters, SEARCH_PAGE_SIZE, nextOffset)
       .then(res => {
         if (id !== seq.current) return
         setResult(res)
@@ -111,7 +117,10 @@ export function SearchScreen() {
       setQ(nextQ)
       setDraft(nextQ)
       setFilters(nextFilters)
-      runSearch(nextQ, nextFilters)
+      // Back to the first page. A facet toggle or a new query CHANGES the result set, so carrying
+      // the old offset would land past the end of a smaller one and show an empty page for a
+      // filter that genuinely matches rows.
+      runSearch(nextQ, nextFilters, 0)
       navigate('search', new URLSearchParams(hash))
     },
     [navigate, runSearch],
@@ -130,8 +139,14 @@ export function SearchScreen() {
     setQ(parsedQ)
     setDraft(parsedQ)
     setFilters(parsedFilters)
-    runSearch(parsedQ, parsedFilters)
+    runSearch(parsedQ, parsedFilters, 0)
   }, [currentHash, runSearch])
+
+  // Paging re-runs the SAME committed search at a new window, so it does not touch the hash.
+  const goToPage = useCallback(
+    (nextOffset: number) => runSearch(q, filters, Math.max(0, nextOffset)),
+    [q, filters, runSearch],
+  )
 
   function submit(e: FormEvent) {
     e.preventDefault()
@@ -356,9 +371,39 @@ export function SearchScreen() {
               <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
               {result.total === 1 ? 'result' : 'results'}
               {result.total > result.hits.length && (
-                <span className="result-count-note"> · showing the first {result.hits.length}</span>
+                // The SLICE, not just a count: with paging, "showing the first 20" stopped being
+                // true the moment the user moved forward, and a bare count gives no way to tell
+                // which 20 are on screen.
+                <span className="result-count-note">
+                  {' '}· showing {offset + 1}–{offset + result.hits.length} of {result.total}
+                </span>
               )}
             </p>
+          )}
+
+          {!error && hasHits && (offset > 0 || offset + result.hits.length < result.total) && (
+            <nav className="pager" aria-label="Result pages">
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => goToPage(offset - SEARCH_PAGE_SIZE)}
+                disabled={offset === 0}
+              >
+                ← Previous
+              </button>
+              {/* Absent, not disabled, when there is nothing after this page: a control that can
+                  never do anything is noise, and its absence is the clearest possible statement
+                  that this is the end of the set. */}
+              {offset + result.hits.length < result.total && (
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => goToPage(offset + SEARCH_PAGE_SIZE)}
+                >
+                  Next →
+                </button>
+              )}
+            </nav>
           )}
 
           {!error && hasHits && effectiveView === 'list' && (

@@ -205,6 +205,10 @@ export interface FacetBucket {
   count: number
 }
 
+// Hits per page. The backend caps `limit` at 100; this is the page the screen walks in, and the
+// stride its Next/Previous controls move by.
+export const SEARCH_PAGE_SIZE = 20
+
 // The repeated-value facet groups, in the order they ride the /search query string. AND across
 // groups, OR within one. grain/as_of are boolean flags carried separately (=true restricts).
 export const SEARCH_FACET_KEYS = [
@@ -376,7 +380,8 @@ export async function uploadFile(file: File, source: string): Promise<IngestResu
 export function searchCatalog(
   q: string,
   filters: SearchFilters = {},
-  limit = 20,
+  limit = SEARCH_PAGE_SIZE,
+  offset = 0,
 ): Promise<SearchResult> {
   // Repeated params per multi-value facet (?source=deposits&source=cards): AND across groups,
   // OR within one. grain/as_of ride only when true, as the backend reads =true as restrict-to-
@@ -389,6 +394,10 @@ export function searchCatalog(
   if (filters.grain) params.append('grain', 'true')
   if (filters.as_of) params.append('as_of', 'true')
   params.set('limit', String(limit))
+  // Windows the hits only: `total` and the facet counts still describe the whole matching set, so
+  // the caller can tell from any page whether another one exists. Omitted when zero so the first
+  // page's request is byte-identical to what it has always been.
+  if (offset > 0) params.set('offset', String(offset))
   return request(`/search?${params}`)
 }
 

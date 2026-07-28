@@ -131,17 +131,23 @@ def _where(base_preds: list[str], facet_preds: dict[str, str], *, exclude: str |
 
 
 def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
-           fresh_within: timedelta = timedelta(hours=24), limit: int = 20,
+           fresh_within: timedelta = timedelta(hours=24), limit: int = 20, offset: int = 0,
            filters: Mapping[str, Sequence[str]] | None = None) -> SearchResult:
     """Facet-aware catalog search over graph_node.
 
     An empty ``query`` skips the FTS match and browses ALL rows (still read-scoped + fresh + faceted).
     Returns the limit-capped hits, one facet-bucket list per facet computed with EXCLUDE-OWN-FACET
     semantics (each facet counts the set with every OTHER facet applied but not its own selection,
-    so choosing one value does not collapse the sibling counts), and the unlimited total."""
+    so choosing one value does not collapse the sibling counts), and the unlimited total.
+
+    ``offset`` windows the HITS only: ``total`` and every facet count still describe the whole
+    matching set, so a caller can tell from any page whether another page exists. Offset paging is
+    sound here because the hits ORDER BY is a TOTAL order — ``(object_ref, catalog_source)`` is
+    unique, so no ties are left for the database to break arbitrarily, and a row can neither repeat
+    on two pages nor fall between them."""
     filters = filters or {}
     params: dict[str, Any] = {
-        "q": query, "cutoff": now - fresh_within, "limit": limit,
+        "q": query, "cutoff": now - fresh_within, "limit": limit, "offset": offset,
         "allowed": allowed_sensitivities(roles), "none": _NONE, "fl": _FACET_LIMIT,
     }
     base_preds, facet_preds = _build_predicates(query, filters, params)
@@ -153,7 +159,8 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
             f"SELECT {_SELECT_HIT} {_FROM} WHERE {where_all} "
             # object_ref is not unique across catalog_source, so tiebreak on both for a
             # deterministic order at the limit boundary (review Minor 1).
-            "ORDER BY score DESC, n.object_ref, n.catalog_source LIMIT %(limit)s", params)
+            "ORDER BY score DESC, n.object_ref, n.catalog_source "
+            "LIMIT %(limit)s OFFSET %(offset)s", params)
         hits = [_hit(r) for r in cur.fetchall()]
 
         # Total: every facet applied, no limit (may exceed len(hits)).

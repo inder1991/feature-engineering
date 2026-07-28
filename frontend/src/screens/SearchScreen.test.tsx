@@ -2,6 +2,7 @@ import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
+import { SEARCH_PAGE_SIZE } from '../api'
 import './lineage-test-setup' // SearchScreen's graph view mounts the xyflow LineageView canvas
 import { SearchScreen } from './SearchScreen'
 
@@ -75,7 +76,7 @@ describe('search screen — results and rows', () => {
   it('auto-browses on mount (empty query returns the whole set)', async () => {
     render(<SearchScreen />)
     expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
-    expect(searchCatalog).toHaveBeenCalledWith('', {})
+    expect(searchCatalog).toHaveBeenCalledWith('', {}, SEARCH_PAGE_SIZE, 0)
   })
 
   it('renders context-rich result rows (badges, definition, meta line)', async () => {
@@ -109,13 +110,13 @@ describe('search screen — results and rows', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('1 result')
   })
 
-  it('states the total honestly and notes when only the first page is shown', async () => {
+  it('states the total honestly and names the slice on screen', async () => {
     // total counts tables + columns and can exceed the returned (limit-capped) hit page.
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 42))
     render(<SearchScreen />)
     const status = await screen.findByRole('status')
     expect(status).toHaveTextContent('42 results')
-    expect(status).toHaveTextContent('showing the first 1')
+    expect(status).toHaveTextContent('showing 1–1 of 42')
   })
 
   it('omits absent enrichment fields and includes them when present', async () => {
@@ -187,7 +188,7 @@ describe('search screen — facet sidebar', () => {
     )
     await userEvent.click(screen.getByRole('checkbox', { name: 'deposits 3' }))
 
-    expect(searchCatalog).toHaveBeenLastCalledWith('', { source: ['deposits'] })
+    expect(searchCatalog).toHaveBeenLastCalledWith('', { source: ['deposits'] }, SEARCH_PAGE_SIZE, 0)
     expect(window.location.hash).toBe('#/search?source=deposits')
     expect(await screen.findByRole('checkbox', { name: 'deposits 1' })).toBeChecked()
   })
@@ -200,7 +201,9 @@ describe('search screen — facet sidebar', () => {
     await userEvent.click(screen.getByRole('checkbox', { name: 'cards 1' }))
     await userEvent.click(screen.getByRole('checkbox', { name: 'Grain 2' }))
     expect(window.location.hash).toBe('#/search?source=deposits&source=cards&grain=true')
-    expect(searchCatalog).toHaveBeenLastCalledWith('', { source: ['deposits', 'cards'], grain: true })
+    expect(searchCatalog).toHaveBeenLastCalledWith(
+      '', { source: ['deposits', 'cards'], grain: true }, SEARCH_PAGE_SIZE, 0,
+    )
   })
 
   it('renders the pii sensitivity value with a danger dot (label carries the meaning)', async () => {
@@ -243,7 +246,7 @@ describe('search screen — active filters and URL state', () => {
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).toBeChecked()
 
     await userEvent.click(screen.getByRole('button', { name: 'Remove source: deposits' }))
-    expect(searchCatalog).toHaveBeenLastCalledWith('', {})
+    expect(searchCatalog).toHaveBeenLastCalledWith('', {}, SEARCH_PAGE_SIZE, 0)
     expect(screen.queryByText('source: deposits')).not.toBeInTheDocument()
     expect(window.location.hash).toBe('#/search')
   })
@@ -257,7 +260,7 @@ describe('search screen — active filters and URL state', () => {
     expect(screen.getByText('grain')).toBeInTheDocument()
 
     await userEvent.click(screen.getByRole('button', { name: 'Clear all' }))
-    expect(searchCatalog).toHaveBeenLastCalledWith('balance', {})
+    expect(searchCatalog).toHaveBeenLastCalledWith('balance', {}, SEARCH_PAGE_SIZE, 0)
     expect(screen.queryByText('source: deposits')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Query')).toHaveValue('balance')
     expect(window.location.hash).toBe('#/search?q=balance')
@@ -270,9 +273,12 @@ describe('search screen — active filters and URL state', () => {
     render(<SearchScreen />)
     expect(screen.getByLabelText('Query')).toHaveValue('balance')
     expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
-    expect(searchCatalog).toHaveBeenCalledWith('balance', {
-      source: ['deposits', 'cards'], additivity: ['semi_additive'], grain: true,
-    })
+    expect(searchCatalog).toHaveBeenCalledWith(
+      'balance',
+      { source: ['deposits', 'cards'], additivity: ['semi_additive'], grain: true },
+      SEARCH_PAGE_SIZE,
+      0,
+    )
     expect(screen.getByText('source: deposits')).toBeInTheDocument()
     expect(screen.getByText('source: cards')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).toBeChecked()
@@ -286,7 +292,7 @@ describe('search screen — active filters and URL state', () => {
     await screen.findByText('public.accounts.balance')
     await userEvent.type(screen.getByLabelText('Query'), 'balance')
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(searchCatalog).toHaveBeenLastCalledWith('balance', { source: ['deposits'] })
+    expect(searchCatalog).toHaveBeenLastCalledWith('balance', { source: ['deposits'] }, SEARCH_PAGE_SIZE, 0)
     expect(window.location.hash).toBe('#/search?q=balance&source=deposits')
   })
 })
