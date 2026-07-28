@@ -138,3 +138,31 @@ def test_an_unclassifiable_declared_type_still_does_not_bridge(db):
 
 def test_version_pinned():
     assert BRIDGE_DERIVATION_VERSION == "1.0.0"
+
+
+def test_a_parameterised_sql_type_classifies_by_its_base_type(db):
+    """REAL-FILE defect. The second source declares `varchar(150)`, `timestamp(0)`, `decimal(18,2)`
+    — parameterised types, which is how every real DDL export writes them. An exact dict lookup
+    matched only the bare `varchar`, so ALL 111 columns resolved to the unclassifiable family and no
+    bridge candidate was possible. Same inert outcome as the missing declared_type, one layer down.
+
+    The length or precision is not part of the type's FAMILY: a varchar(150) and a varchar(50) hold
+    the same kind of value, and refusing to bridge them would be refusing on a formatting detail."""
+    from featuregen.overlay.upload.bridge_candidates import _resolve_family
+    for declared, expected in (
+        ("varchar(150)", "text"), ("VARCHAR(50)", "text"), ("character varying(100)", "text"),
+        ("decimal(18,2)", "other"), ("numeric(10, 2)", "other"),
+        ("int8", "integer"), ("bigint", "integer"),
+        ("varchar", "text"), ("string", "text"),
+    ):
+        assert _resolve_family(None, declared)[0] == expected, declared
+
+
+def test_a_parameterised_pair_bridges_across_two_sources(db):
+    """End to end on the real shapes: FTR declares `string`, the customer source `varchar(150)`.
+    Both are text, so the pair is a candidate."""
+    _glossary_col(db, "ftr", "tran_repos", "cif_id", "customer_id", "string")
+    _glossary_col(db, "cib", "bo_cib_customer", "cust_num", "customer_id", "varchar(150)")
+    cands = derive_bridge_candidates(db)
+    assert len(cands) == 1
+    assert cands[0].entity_id == "customer" and cands[0].data_type_family == "text"

@@ -7,6 +7,7 @@ and deterministic; a candidate becomes a governed fact only when proposed + conf
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -25,8 +26,21 @@ _TYPE_FAMILY = {
 }
 
 
+#: `varchar(150)`, `timestamp(0)`, `decimal(18,2)` — how every real DDL export writes a type. The
+#: parameter is a length or precision, never part of the type's FAMILY.
+_TYPE_PARAMETER = re.compile(r"\s*\([^)]*\)\s*$")
+
+
 def _type_family(data_type: str | None) -> str:
-    return _TYPE_FAMILY.get((data_type or "").strip().lower(), "other")
+    """The family a declared type belongs to, ignoring any length/precision parameter.
+
+    A `varchar(150)` and a `varchar(50)` hold the same KIND of value, so refusing to bridge them
+    would be refusing on a formatting detail. An exact lookup matched only the bare `varchar`, which
+    made every column of the real second source unclassifiable — the same inert outcome as the
+    missing declared type, one layer further down.
+    """
+    normalized = _TYPE_PARAMETER.sub("", (data_type or "").strip().lower())
+    return _TYPE_FAMILY.get(normalized, "other")
 
 
 @dataclass(frozen=True, slots=True)

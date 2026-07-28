@@ -144,6 +144,74 @@ class PreparedFtrUpload:
     input_row_count: int            # R5-9: every CSV data row read, quarantines + table term incl.
 
 
+#: The headers a glossary mapping CANNOT be parsed without. `schema.table.column` is the row
+#: identity; without the other two a row carries no meaning worth ingesting.
+GLOSSARY_CORE_HEADERS: tuple[str, ...] = (
+    "schema.table.column", "term_name", "description_business_definition",
+)
+_CORE = frozenset(_norm_header(h) for h in GLOSSARY_CORE_HEADERS)
+
+#: Recognised but not required. Present -> used; absent -> that enrichment is simply unavailable.
+_OPTIONAL = frozenset(_norm_header(h) for h in (
+    "source_row", "data_domain", "term_type", "data_type",
+    "related_business_process_l1", "related_business_process_l2", "related_business_process_l3",
+    "related_terms", "synonyms_aliases",
+    "bian_level_1", "bian_level_2", "bian_level_3", "bian_level_4", "fibo_level_1",
+))
+
+#: Optional headers whose ABSENCE has a consequence worth surfacing. `data_type` is the one that
+#: matters: without it every column resolves to an unclassifiable type family and cross-catalog
+#: bridge candidacy becomes impossible — the defect that made FTR inert until the declared-type
+#: fallback landed. Not a parse failure, so not a refusal; reported so it is not discovered late.
+_CONSEQUENTIAL_OPTIONAL = frozenset({_norm_header("data_type")})
+
+
+def is_glossary_mapping(headers: list[str]) -> bool:
+    """True when this file can be parsed as a glossary mapping — the CORE present, none duplicated.
+
+    Deliberately looser than :func:`is_ftr_glossary`. The exact-multiset rule was correct while one
+    source existed and wrong the moment a second arrived: a source carrying its own columns is the
+    normal case in a multi-catalog system, not a mis-shaped file. What the original rule protected —
+    a row-key-less file falling through to a reader that would mangle it — is preserved by requiring
+    the core and refusing duplicates.
+    """
+    return glossary_shape_error(headers) is None
+
+
+def glossary_shape_error(headers: list[str]) -> str | None:
+    """Why this file cannot be read as a glossary mapping, or None."""
+    got = Counter(_norm_header(h) for h in headers)
+    if _FTR_DISTINCTIVE not in got:
+        return "not a glossary mapping: no 'schema.table.column' header"
+    missing = sorted(_CORE - set(got))
+    duplicate = sorted(h for h, c in got.items() if c > 1)
+    parts = []
+    if missing:
+        parts.append(f"missing required [{', '.join(missing)}]")
+    if duplicate:
+        parts.append(f"duplicate [{', '.join(duplicate)}] — two columns claiming one meaning "
+                     "cannot be resolved by guessing")
+    return f"glossary mapping cannot be read: {'; '.join(parts)}" if parts else None
+
+
+def unrecognised_headers(headers: list[str], *,
+                         report_missing_optional: bool = False) -> tuple[str, ...]:
+    """Headers this reader does not consume — tolerated, but never SILENTLY.
+
+    A column nobody reads is a column whose meaning is being lost. The second source's
+    `security_classification` and its PII flags arrive this way, and reporting them is what turns
+    "we ignored 20 columns" into a visible enrichment opportunity.
+
+    With ``report_missing_optional`` the consequential absentees are included too, prefixed nowhere
+    special — the caller decides how loudly to say it.
+    """
+    got = {_norm_header(h) for h in headers}
+    unknown = got - _CORE - _OPTIONAL
+    if report_missing_optional:
+        unknown |= (_CONSEQUENTIAL_OPTIONAL - got)
+    return tuple(sorted(unknown))
+
+
 def is_ftr_glossary(headers: list[str]) -> bool:
     """True iff ``headers`` normalize to EXACTLY the FTR multiset — every FTR header present
     exactly once, nothing missing, nothing extra, nothing duplicated (resolution #10/#12)."""
