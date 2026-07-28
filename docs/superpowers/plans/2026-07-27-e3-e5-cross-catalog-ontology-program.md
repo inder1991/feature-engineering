@@ -3,6 +3,12 @@
 Date: 2026-07-27 · Revised: 2026-07-28 · Status: restructured — one document per job ·
 Grounded against `origin/main@ef213a83` plus the on-branch fix `e6e5f31d`.
 
+> **Sequencing, contract ownership and the link policy now live in
+> [`2026-07-28-product-roadmap-and-contract-ownership.md`](2026-07-28-product-roadmap-and-contract-ownership.md).**
+> That document is the master roadmap; this one is the architectural reference for the ontology
+> core. Where the two disagree on order, ownership or link policy, the roadmap wins. The E5 screens
+> here (E5.5-E5.7) are explicitly an optional later product, not a prerequisite.
+
 **This document is the plan: contracts, phases, gates, targets.** It states *what to build and in
 what order*. It deliberately does **not** carry the evidence base — every "already earned" claim
 cites
@@ -1428,13 +1434,12 @@ when unprofiled — the FTR case), `taxonomy_alignment`.
 - `JOIN_IDENTITY_UNCONFIRMED` added to `REQUIREMENT_CODES` and the versioned
   `validation_requirements` registry, operand naming the link's `fact_key`; carried onto the
   contract and the materialized artifact; cleared on confirm, demoted on reject.
-- **Persist the taxonomy evidence — optional, never required.** Add `bian_path`, `fibo_path`,
-  `term_type`, `process_path`, `related_terms` to durable storage (preferred: a schema-preserving
-  glossary-record sidecar keyed by `logical_ref`, not more columns on the flattened `graph_node`).
-  Absence reports `absent`, never `disagree`; cannot contribute to `conflict`; only lowers
-  `coverage`, which is exactly what `fuse` already does with it. The envelope omits missing fields
-  rather than announcing their absence. A mixed pair — one side with taxonomy, one without — is
-  normal.
+- ~~Persist the taxonomy evidence.~~ **Corrected 2026-07-28: already persisted.** BIAN/FIBO live in
+  `field_evidence` (migration 0983), written at `ingest.py:1044` and listed in `_SOURCE_FIELDS`;
+  the deployment holds 114 rows each. `attest/grounding.py` already implements a `path_agreement`
+  check over `(bian_path, fibo_path, business_term)`, and `attest/runner.py:253` reads them back.
+  Anything needing taxonomy corroboration EXTENDS that check. Still genuinely unpersisted:
+  `term_type`, `process_path`, `related_terms`.
 - Bound the candidate roster per entity/source, order deterministically, page, and carry a
   `pairs_examined` budget, recording honestly when it stopped early. One critic call per surviving
   pair, so unbounded pairing plus a model call each is the failure mode this closes.
@@ -1943,7 +1948,11 @@ Let the LLM label bounded, physically backed candidates without inventing endpoi
 - An unknown-cardinality candidate remains advisory after LLM selection.
 - Re-enrichment retires a deliberately dropped proposal but preserves a proposal
   after a transient provider failure.
-- A proposed link is returned as `ai_proposed` and is never planner-operational.
+- A proposed link is returned as `ai_proposed` and is **tier-gated** per the roadmap's link policy
+  (`2026-07-28-product-roadmap-and-contract-ownership.md` §4): usable for discovery and feature
+  suggestion, usable in a marked sandbox analysis, and **never** in production materialization
+  without a VERIFIED link or policy-based automatic attestation. The earlier blanket "never
+  planner-operational" contradicted Phase E0b in this same document.
 - A same-type candidate such as `employee(manager) → employee(report)` survives
   validation; a same-entity identifier equivalence cannot be relabelled as that link.
 - Over-bound enumeration and partial LLM completion are explicit and deterministic.
@@ -2438,7 +2447,8 @@ The program passes when:
 6. the graph traverses across a VERIFIED identifier-namespace component;
 7. every node/edge shows separate derivation, verification, eligibility, and freshness;
    every property field retains its own envelope;
-8. a proposed/demoted link never appears operational;
+8. a **demoted** link never appears operational, and a **proposed** link appears only at the tiers
+   the roadmap's link policy permits — never in production materialization;
 9. stale or fully hidden metadata is absent from normal results and all counts;
 10. hidden intermediaries do not connect visible components, redundant edges do not
     re-key a component, and incomplete components make no authoritative connectivity

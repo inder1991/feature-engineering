@@ -1,6 +1,18 @@
 # Verified Interfaces — Cross-Catalog Identity, Bridges, and Ontology
 
-Date: 2026-07-28 · Verified against `origin/main@ef213a83` plus the on-branch fix `e6e5f31d`.
+Date: 2026-07-28 · **Baseline: NOT YET REPRODUCIBLE — regenerate against one integration branch.**
+
+> **Read this before trusting a line below.** These observations were taken against
+> `origin/main@ef213a83` plus fixes living only on `fix/join-neighbourhood-cap`. Since then:
+> `origin/main` has moved to `c1582753` (**17 commits ahead** of that branch); the branch checked
+> out in the main working tree carries **no `materialize/` package at all**; and the three fixes
+> (`e6e5f31d` declared-type, `9766c415` read-scope, `daa82022` analysis prototype) exist on no other
+> branch. **No single commit contains everything the plans assume**, so nothing here can be
+> reproduced by checking out one ref.
+>
+> Release 0 creates that integration branch, re-runs migrations and tests, re-ingests the fixture,
+> and regenerates this document against one commit. Until then, treat every measured number as
+> "observed on the deployment", not "true of the code you have".
 
 **This is a reference, not a plan.** It records what the code actually does, with a citation for
 every claim, so that the cross-catalog plan and the specs built on it can cite rather than restate.
@@ -395,16 +407,30 @@ Verified by querying the deployed catalog (126 columns, source `ftr`):
 | `declared_type` | yes | 126/126 |
 | `concept` → `entity_link` | yes (registry-derived) | 120/126 |
 | `schema_name`, `table_name`, `column_name` | yes | 126/126 |
-| **`bian_path`, `fibo_path`** | **NO** | file has 114/127 |
-| **`term_type`, `process_path`, `related_terms`** | **NO** | file has 127/127 |
+| `bian_path`, `fibo_path` | **yes — `field_evidence`** | **114/127** |
+| `business_term` | yes, `field_evidence` | 127/127 |
+| `term_type`, `process_path`, `related_terms` | **NO** | file has 127/127 |
 | `entity` (free-text tag) | yes but empty | 0/126 |
 
-**The taxonomy is discarded.** The FTR file carries banking-standard alignment — `CIF_ID` is BIAN
-`Customer Management / Customer Profile`, FIBO `Business Entities` — and it is the strongest
-semantic signal for deciding whether two identifier columns denote the same namespace. It is read
-(`glossary_reader.py:73-74`), used once to help classify the concept (`enrich.py:503`), and then
-dropped. No table stores it; `information_schema` has no column matching `%bian%` or `%fibo%`, and
-no evidence row contains it.
+**The taxonomy IS persisted — corrected 2026-07-28.** An earlier revision of this document claimed
+BIAN/FIBO were read at ingest and discarded. That was wrong, and the error came from querying the
+wrong store: `graph_node` columns, `information_schema`, and `overlay_evidence`. Per-field glossary
+evidence lives in **`field_evidence`** (migration 0983), keyed by `(logical_ref, field_name)`.
+
+Verified: `ingest.py:1044-1045` writes `bian_path`/`fibo_path`, `_SOURCE_FIELDS` (`ingest.py:774`)
+lists them alongside `definition`, `domain` and `business_term`, and the deployed database holds
+**114 rows each** — e.g. `"Customer Management / Customer Profile / Customer Reference Data /
+Customer and Counterparty Identification"`.
+
+**And a consumer already exists.** `attest/runner.py:253-254` reads them back through
+`_latest_active_evidence`, and `attest/grounding.py` implements a **`path_agreement`** check
+(`_PATH_FIELDS = ("bian_path", "fibo_path", "business_term")`) comparing the attested path against a
+concept's own name tokens. Anything needing taxonomy corroboration should extend that check rather
+than build a second one.
+
+This correction matters beyond bookkeeping: the strongest semantic evidence for deciding whether two
+identifier columns denote the same namespace is already stored **and** already has a grounding
+pattern to copy. Persisting it is not a prerequisite for anything.
 
 **Value-shape evidence is unavailable for glossary catalogs.** The profiler computes
 `distinct_count` and `uniqueness_ratio` (`overlay/profiler_metrics.py`) but samples real data. FTR

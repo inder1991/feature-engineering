@@ -10,8 +10,9 @@ trustworthy enough to be worth flowing.
 **Architecture:** Runs against the **shipped single-column `entity_bridge`**, not E3's tuple bridges,
 so it does not wait for Foundation. Four stages: deterministic pre-checks reject the obvious with no
 model call; `ground_bridge` corroborates from metadata; a two-lens LLM critic panel judges; `fuse`
-combines them. Admitted links become `proposed` facts, reach the planner alongside `VERIFIED` ones,
-and every feature standing on one carries `JOIN_IDENTITY_UNCONFIRMED` through to materialization.
+combines them. Admitted links become `proposed` facts and reach the planner alongside `VERIFIED`
+ones; every feature standing on one carries `JOIN_IDENTITY_UNCONFIRMED`, and the roadmap's link
+policy decides which tiers may act on it.
 Stages 2 and 4 reuse the shipped `attest/` contracts unchanged.
 
 **Parent:** `2026-07-27-e3-e5-cross-catalog-ontology-program.md`, Phase E0b.
@@ -22,12 +23,24 @@ the review surface.
 
 ## Global Constraints
 
-- **Proposed links are USED, not gated.** Planner, feature generation *and* materialization all run
-  on them. There is no stage at which an unconfirmed identifier link stops the work. What replaces
-  the gate is provenance that cannot be separated from the output.
+- **Proposed links are TIER-GATED** (roadmap §4). Discovery and feature suggestion may use them
+  freely; a sandbox analysis may, if visibly marked and never written to production feature or
+  model-input tables; **production materialization requires a VERIFIED link** or policy-based
+  automatic attestation backed by deterministic data evidence.
+  *Revised 2026-07-28.* The earlier rule admitted proposed links all the way to published numbers on
+  the strength of a `JOIN_IDENTITY_UNCONFIRMED` flag. That was wrong twice over: a warning does not
+  make an incorrect customer join safe — users trust the headline number, not the provenance note —
+  and `materialize/joins.py` already refuses unverified joins, unknown cardinality and per-hop
+  fan-out, which is the correct production policy and must not be weakened.
+  Automatic attestation is what keeps this from meaning "a human approves 100,000 columns"; it needs
+  real data, so it arrives with Release 1.
 - **The critic gates admission, never features.** A `no` prevents a link becoming `proposed` at all,
   so the AI only ever *narrows* what features may join.
-- **Unanimity to admit.** Two critics, different lenses. Any `different_namespace` or
+- **Unanimity to admit — on the pairs that warrant a panel.** Two critics with different lenses run
+  for **high-blast-radius or ambiguous** pairs (one that would merge a large component, a
+  compliance-domain table, or a `fuse` confidence in the middle band); a single critic runs
+  otherwise. A panel on every pair is cost without signal; no panel at all is worse, because a lone
+  confident model on an identity claim is where the damage is largest. Any `different_namespace` or
   `insufficient_evidence` suppresses. Disagreement is its own `critics_disagree` state, not an
   ordinary rejection — it marks where human judgement is worth most.
 - **`status` stays out of every hash.** Bridge `fact_key`s are hashed into plan identity
@@ -58,10 +71,10 @@ the review surface.
   `POST /governance/identifier-links/{fact_key}/confirm`, `.../reject`.
 
 **Why first.** There is no route anywhere in `api/routes/` to propose, confirm or reject a bridge —
-every VERIFIED bridge that exists anywhere came from a fixture or a script. Under this plan's first
-constraint, links now reach materialized numbers, which makes the ability to **reject** a wrong one
-and demote what rests on it the only correction mechanism in the loop. Nothing else here is safe to
-ship without it.
+every VERIFIED bridge that exists anywhere came from a fixture or a script. Since production
+materialization now REQUIRES a verified link (roadmap §4), this route is the only way a
+cross-catalog feature can ever become production-eligible — and the only way to reject a wrong one.
+Nothing else here is safe to ship without it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -76,9 +89,10 @@ def test_a_link_can_be_listed_confirmed_and_becomes_operational(client, two_cata
     assert r.json() == {"governance_status": "VERIFIED", "operational_projection": "projected"}
 
 
-def test_rejecting_a_link_demotes_what_rests_on_it(client, two_catalogs):
-    """The correction mechanism. A wrong link that has already produced numbers must be revocable,
-    and the projection must go with it."""
+def test_rejecting_a_link_demotes_the_projection_and_unpublished_artifacts(client, two_catalogs):
+    """The correction mechanism, honestly scoped: the link and anything UNPUBLISHED resting on it.
+    Correcting already-PUBLISHED numbers needs artifact lineage that does not exist — which is the
+    second reason production materialization requires a VERIFIED link."""
     key = _proposed_key(client)
     assert client.post(f"/governance/identifier-links/{key}/reject", json={"note": "different scheme"},
                        headers=_admin()).status_code == 200
@@ -160,7 +174,12 @@ def test_neither_side_being_a_key_is_not_a_conflict(db):
 
 def test_a_missing_taxonomy_is_absent_never_disagree(db):
     """Taxonomy is OPTIONAL. Most catalogs carry none, and absence must not look like evidence
-    against — it may only lower coverage, which is what `fuse` already does with it."""
+    against — it may only lower coverage, which is what `fuse` already does with it.
+
+    NOTE (corrected 2026-07-28): BIAN/FIBO ARE persisted, in `field_evidence` (114 rows each on the
+    deployment), and `attest/grounding.py` already implements `path_agreement` over
+    `(bian_path, fibo_path, business_term)`. `taxonomy_alignment` EXTENDS that check to a column
+    PAIR; it does not build a second one, and nothing needs persisting first."""
     g = ground_bridge(db, _candidate(db, "cif_id", "customer_no"))     # neither side has BIAN/FIBO
     assert g.checks["taxonomy_alignment"] == "absent"
     assert not g.conflict
@@ -454,10 +473,16 @@ the report emits M8 and M9; enabling the gate before the report exists is refuse
 ## Acceptance (Phase E0b)
 
 - A `string`↔`string` identifier pair across two sources is admitted, reaches the planner as
-  `proposed`, and a feature built on it is created, carries `JOIN_IDENTITY_UNCONFIRMED` naming the
-  link, and **materializes**.
-- Confirming clears the requirement on every feature resting on it; rejecting demotes them,
-  including already-materialized artifacts.
+  `proposed`, and a feature built on it is created and carries `JOIN_IDENTITY_UNCONFIRMED` naming
+  the link. It is available for discovery and sandbox analysis; **production materialization refuses
+  it** until the link is VERIFIED.
+- Confirming clears the requirement on every feature resting on it; rejecting demotes the link and
+  every **unpublished** artifact resting on it.
+- **NOT claimed: correcting already-published outputs.** Deleting the projection row does not undo a
+  published number. That needs artifact-to-fact lineage, a publication pointer, a transactional
+  invalidation, a rule for whether the old artifact becomes unavailable or merely invalid, and
+  cache/model-input invalidation — none of which exists. This is the second reason production
+  materialization requires a VERIFIED link.
 - A split panel is suppressed and surfaced as `critics_disagree`.
 - A failed critic call suppresses.
 - A grounding conflict suppresses regardless of the panel.
