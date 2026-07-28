@@ -72,14 +72,24 @@ def test_unverified_bridge_does_not_project(db):
     ref = _ref(db)
     propose_bridge(db, derive_bridge_candidates(db)[0], actor=_ENRICH_ACTOR, now=_NOW)   # DRAFT only
     assert project_verified_bridge(db, ref, now=_NOW) == "pending"
-    assert active_bridges(db) == ()
+    # PROJECTION still requires VERIFIED — that is what this test is named for, and it is unchanged.
+    assert db.execute("SELECT count(*) FROM entity_bridge_edge").fetchone()[0] == 0
+    # But the link is USABLE. `active_bridges` used to return VERIFIED rows only, which is why nine
+    # derived candidates could never be traversed; a DRAFT bridge is now an active, proposed link.
+    active = active_bridges(db)
+    assert [b.status for b in active] == ["proposed"]
 
 
 def test_demote_removes_a_projected_bridge(db):
     ref = _propose_confirm(db)
     project_verified_bridge(db, ref, now=_NOW)
     assert demote_bridge_edges(db, fact_key(ref, "entity_bridge")) == 1
-    assert active_bridges(db) == ()
+    # The EDGE is gone — that is what demote does, and what this test is named for.
+    assert db.execute("SELECT count(*) FROM entity_bridge_edge").fetchone()[0] == 0
+    # The LINK is not un-derived by removing its projection: it drops back to proposed rather than
+    # vanishing. Only a human REJECTION or drift STALE suppresses a link outright (see
+    # test_catalog_drift_stales_a_verified_bridge, which still asserts the empty set).
+    assert [b.status for b in active_bridges(db)] == ["proposed"]
 
 
 def test_bridge_events_skip_the_single_source_read_models(db):

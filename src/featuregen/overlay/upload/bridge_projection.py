@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from featuregen.overlay.identity import EntityBridgeRef, fact_key
+from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
@@ -22,6 +23,12 @@ class ActiveBridgeV1:
     left_object_ref: str
     right_catalog_source: str
     right_object_ref: str
+    #: "confirmed" (a human approved it) or "proposed" (derived, nobody has reviewed it). Defaulted
+    #: so every existing positional constructor still builds.
+    status: str = "confirmed"
+    #: Ranking signal — confirmation dominates, then a grain on either side, then an attested type
+    #: match. Lets a consumer PREFER a strong link without being barred from a weak one.
+    strength: int = 0
 
 
 def _obj_ref_str(d: dict) -> str:
@@ -55,10 +62,19 @@ def demote_bridge_edges(conn, fact_key_value: str) -> int:
 
 
 def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
-    """The currently-projected VERIFIED bridges — the cross-catalog active set 3B.3 consumes. Deterministic
-    (ordered)."""
-    rows = conn.execute(
-        "SELECT fact_key, entity_id, left_catalog_source, left_object_ref, right_catalog_source, "
-        "  right_object_ref FROM entity_bridge_edge WHERE status = 'VERIFIED' "
-        "ORDER BY entity_id, left_object_ref, right_object_ref, fact_key").fetchall()
-    return tuple(ActiveBridgeV1(*r) for r in rows)
+    """The cross-catalog active set every planner surface consumes — CONFIRMED and PROPOSED alike.
+
+    Owner's direction: a link is usable whether or not a human has confirmed it; confirmation marks
+    it approved, it does not gate consumption. This used to select VERIFIED rows only, which is why
+    nine derived candidates — `cib.cust_num <-> ftr.cif_id` among them — could never be traversed.
+
+    Deterministic: STRONGEST first, so a consumer that takes the first workable path prefers a
+    human-confirmed, grain-backed link over a weak type-only match without either being excluded.
+    Ordering inside a strength band is stable (entity, then left ref).
+    """
+    return tuple(
+        ActiveBridgeV1(
+            link.fact_key, link.entity_id, link.left_catalog_source, link.left_object_ref,
+            link.right_catalog_source, link.right_object_ref, str(link.status), link.strength)
+        for link in cross_catalog_links(conn) if link.fact_key is not None
+    )

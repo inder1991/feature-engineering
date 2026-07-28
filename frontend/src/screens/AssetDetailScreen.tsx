@@ -10,6 +10,7 @@ import {
   type FieldDecisionAction,
   type RoleUsability,
   type TableRollup,
+  type CrossCatalogLink,
   type EffectiveMetadataSection,
   type LatestFieldDecision,
   type Relationships,
@@ -695,6 +696,8 @@ function RelationshipsTab({
     <>
       <NeighborhoodGraph detail={detail} relationships={rel} />
 
+      <CrossCatalogLinks links={rel.cross_catalog ?? []} />
+
       <section className="adg-section">
         <h3 className="micro-label">Containment</h3>
         <p className="hint">
@@ -1059,6 +1062,45 @@ function RoleRow({ role }: { role: RoleUsability }) {
 // on the table — 341 of them on a real CIB table, all sharing one cause — rendered on every column
 // page. The full lists keep their own route (GET /sources/{source}/readiness?subset={table}), so
 // the number stays visible and the rows stay reachable without riding on this page.
+// The SAME business entity in another catalog — the cross-catalog link. Listed strongest first and
+// shown whether or not a human has confirmed it: confirmation annotates, it never gates.
+//
+// This section exists because the candidate ledger had no readers anywhere in the codebase, so a
+// derived link (`cib.cust_num <-> ftr.cif_id`) sat in the database and appeared nowhere.
+function CrossCatalogLinks({ links }: { links: CrossCatalogLink[] }) {
+  return (
+    <section className="adg-section">
+      <h3 className="micro-label">Cross-catalog links</h3>
+      {links.length === 0 ? (
+        <p className="hint">
+          No link to another catalog yet. A link is derived when a column in another catalog carries
+          the same entity concept and a compatible type.
+        </p>
+      ) : (
+        <ul className="rows">
+          {links.map(link => (
+            <li className="row q-item" key={`${link.entity_id}:${link.left_object_ref}:${link.right_object_ref}`}>
+              <div className="adg-field-line">
+                <span className="mono gj-kind adg-field-label">{link.entity_id}</span>
+                <span className="adg-field-value mono">
+                  {link.left_catalog_source}.{link.left_object_ref}
+                  {' \u2194 '}
+                  {link.right_catalog_source}.{link.right_object_ref}
+                </span>
+                <span className={`badge ${link.status === 'confirmed' ? 'gj-verified' : 'gj-proposed'}`}>
+                  {link.status === 'confirmed' ? 'approved' : 'proposed'}
+                </span>
+              </div>
+              {/* The reason, not just the verdict — a weak link says so rather than looking equal. */}
+              <p className="hint">{link.why}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
 function TableRollupView({ rollup }: { rollup: TableRollup }) {
   return (
     <section className="adg-section">

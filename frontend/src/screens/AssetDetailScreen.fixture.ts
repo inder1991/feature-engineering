@@ -75,6 +75,26 @@ export function fixture(): api.AssetDetail {
         from_ref: 'public.accounts.balance', to_ref: 'public.customers.id',
         cardinality: 'N:1', status: 'VERIFIED', approved_join_fact_key: 'ajk-1',
       }],
+      // One strong link and one weak one — the real shape. The branch pair matches on type alone
+      // and is exactly the case that must be visible but ranked down.
+      cross_catalog: [
+        {
+          entity_id: 'customer', left_catalog_source: 'cib',
+          left_object_ref: 'public.bo_cib_customer.cust_num', right_catalog_source: 'ftr',
+          right_object_ref: 'public.comp_financial_tran_repos_dly.cif_id',
+          status: 'proposed', strength: 10, data_type_family: 'text',
+          left_is_grain: true, right_is_grain: false, type_basis: 'declared', fact_key: 'fk-cust',
+          why: "one side is its table's key; types as declared in the source file",
+        },
+        {
+          entity_id: 'branch', left_catalog_source: 'cib',
+          left_object_ref: 'public.bo_cib_customer.cust_prim_branch_nm', right_catalog_source: 'ftr',
+          right_object_ref: 'public.comp_financial_tran_repos_dly.sol_desc',
+          status: 'proposed', strength: 0, data_type_family: 'text',
+          left_is_grain: false, right_is_grain: false, type_basis: 'declared', fact_key: 'fk-br',
+          why: 'neither side is a key — types match but this may not be a real join',
+        },
+      ],
       semantic: {
         status: 'available',
         verified_edges: [{

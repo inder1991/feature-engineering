@@ -103,9 +103,30 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     A candidate that has since been confirmed is returned ONCE, as confirmed: the ledger row and the
     verified edge are the same link at two stages of its life, not two links.
     """
+    # Keyed by fact_key so a verified edge can be matched to its candidate row AND so an edge with
+    # no candidate row is still returned. Some verified bridges are written straight to the edge
+    # table; reading only the ledger would silently drop them, turning "show unconfirmed too" into a
+    # regression that loses CONFIRMED links.
+    # A human's NO must still count. The direction is "confirmation is not REQUIRED", not
+    # "disapproval is ignored" — if a rejection did not suppress the link, a reviewer could never
+    # say no and the governance surface would be decorative. STALE is suppressed for a different
+    # reason: drift changed an endpoint, so the link may no longer hold and needs re-deriving.
+    # Folded from the EVENT STREAM, not read off the projected table: the projection can lag, and a
+    # link must stop being usable the moment the decision is made, not once a projector catches up.
+    def _blocked(key: str | None) -> bool:
+        if not key:
+            return False
+        from featuregen.overlay.state import fold_overlay_state
+        from featuregen.overlay.store import load_fact
+        try:
+            return fold_overlay_state(load_fact(conn, key)).status in ("REJECTED", "STALE")
+        except Exception:  # noqa: BLE001 — an unreadable fact must not blank the whole list
+            return False
     verified = {
-        r[0] for r in conn.execute(
-            "SELECT fact_key FROM entity_bridge_edge WHERE status = 'VERIFIED'").fetchall()
+        r[0]: r[1:] for r in conn.execute(
+            "SELECT fact_key, entity_id, left_catalog_source, left_object_ref, "
+            "       right_catalog_source, right_object_ref "
+            "FROM entity_bridge_edge WHERE status = 'VERIFIED'").fetchall()
         if r[0] is not None
     }
     rows = conn.execute(
@@ -115,6 +136,8 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
 
     out: list[CrossCatalogLink] = []
     for entity, l_src, l_ref, r_src, r_ref, key, family, ev in rows:
+        if _blocked(key):
+            continue
         if object_ref is not None:
             want = object_ref.strip().lower()
             if want not in (str(l_ref).lower(), str(r_ref).lower()):
@@ -132,5 +155,20 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
                                right_grain=right_grain, basis=basis),
             data_type_family=family or "", left_is_grain=left_grain, right_is_grain=right_grain,
             type_basis=basis, fact_key=key))
+    # Verified edges with no candidate row — never derived here, or derived before the ledger
+    # existed. They are confirmed links and must not be lost.
+    seen = {l.fact_key for l in out}
+    for key, (entity, l_src, l_ref, r_src, r_ref) in verified.items():
+        if key in seen or _blocked(key):
+            continue
+        if object_ref is not None and object_ref.strip().lower() not in (
+                str(l_ref).lower(), str(r_ref).lower()):
+            continue
+        out.append(CrossCatalogLink(
+            entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
+            right_catalog_source=r_src, right_object_ref=r_ref, status=LinkStatus.CONFIRMED,
+            strength=_strength(confirmed=True, left_grain=False, right_grain=False, basis=""),
+            data_type_family="", left_is_grain=False, right_is_grain=False, type_basis="",
+            fact_key=key))
     out.sort(key=lambda l: (-l.strength, l.entity_id, l.left_object_ref))
     return tuple(out)

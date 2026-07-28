@@ -1740,10 +1740,32 @@ export type SemanticSubsection =
       divergences: SemanticDivergence[]
     }
 
+// One cross-catalog link: the SAME business entity in another catalog. Present whether or not a
+// human has confirmed it — confirmation ANNOTATES, it does not gate visibility or consumption.
+export interface CrossCatalogLink {
+  entity_id: string
+  left_catalog_source: string
+  left_object_ref: string
+  right_catalog_source: string
+  right_object_ref: string
+  status: 'confirmed' | 'proposed'
+  // Ranking, not permission. Confirmation dominates, then a grain on either side, then an attested
+  // type match. A weak link is ranked down, never hidden.
+  strength: number
+  data_type_family: string
+  left_is_grain: boolean
+  right_is_grain: boolean
+  type_basis: string
+  fact_key: string | null
+  // The ranking in words, for someone deciding whether to trust the link.
+  why: string
+}
+
 export interface Relationships {
   containment: Containment
   approved_joins: AssetApprovedJoin[]
   semantic: SemanticSubsection
+  cross_catalog: CrossCatalogLink[]
 }
 
 // ---- readiness section ----

@@ -134,3 +134,21 @@ def test_a_column_matches_from_either_side_of_the_link(db):
 
 def test_no_links_is_an_empty_list_not_an_error(db):
     assert cross_catalog_links(db) == ()
+
+
+# ── a VERIFIED edge with no candidate row must not vanish ────────────────────────────────────────
+
+def test_a_verified_edge_with_no_candidate_row_is_still_returned(db):
+    """Some verified bridges are written straight to the edge table (the multisource gold fixture
+    does exactly that). Reading only the candidate ledger would silently DROP them — turning a
+    "show unconfirmed too" change into a regression that loses confirmed links."""
+    _verify(db, "fk-orphan", "customer", "cust_num", "cif_id")
+    links = cross_catalog_links(db)
+    assert [l.status for l in links] == [LinkStatus.CONFIRMED]
+    assert links[0].entity_id == "customer"
+
+
+def test_the_union_does_not_double_count(db):
+    _candidate(db, "customer", "cust_num", "cif_id", fact_key="fk-1")
+    _verify(db, "fk-1", "customer", "cust_num", "cif_id")
+    assert len(cross_catalog_links(db)) == 1
