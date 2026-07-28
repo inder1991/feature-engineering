@@ -810,3 +810,26 @@ def test_L1_reports_the_hashes_the_RENDERED_identity_states(prepared, compiled) 
     report = _l1(prepared, irs=compiled)
     assert report.generated_project_hash == PROJECT_HASH
     assert report.group_plan_hash == PLAN_HASH
+
+
+def test_the_environment_given_to_L0_reaches_the_interpreter_that_imports_the_project(tmp_path):
+    """The L0 gate needs `PYSPARK_PYTHON` and friends to reach the probe, so prove they do.
+
+    The project refuses to import without the marker, so the two runs below differ in exactly one
+    thing: whether `env` was passed.
+    """
+    files = _project_files(create_pipeline_body=_BUILDS)
+    files[f"src/{PACKAGE}/__init__.py"] = (
+        "import os\n"
+        "\n"
+        'if os.environ.get("L0_MARKER") != "yes":\n'
+        '    raise RuntimeError("the probe did not carry the environment it was given")\n')
+    root = _on_disk(tmp_path, files)
+
+    without = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-a",
+                     python_executable=sys.executable, clock=_clock())
+    assert _codes(without) == [ValidationFindingCode.PROJECT_DOES_NOT_BUILD]
+
+    with_env = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-b",
+                      python_executable=sys.executable, clock=_clock(), env={"L0_MARKER": "yes"})
+    assert (with_env.status, with_env.findings) == (ValidationStatus.PASSED, ())

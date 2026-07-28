@@ -389,7 +389,8 @@ emit("build", True, str(max(counts.values())) + " nodes")
 
 
 def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
-                   timeout_seconds: float) -> dict[str, Any] | None:
+                   timeout_seconds: float,
+                   env: Mapping[str, str] | None) -> dict[str, Any] | None:
     """Run the probe in its own interpreter. ``None`` means the environment never answered.
 
     ``None`` is deliberately distinct from every verdict the probe can print: an interpreter that
@@ -402,7 +403,7 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
         completed = subprocess.run(                                       # noqa: S603 - fixed argv
             [python_executable, "-c", _BUILD_PROBE, _VERDICT_MARKER, str(root), package],
             capture_output=True, text=True, timeout=timeout_seconds, check=False,
-            cwd=str(root))
+            cwd=str(root), env=None if env is None else {**os.environ, **env})
     except (OSError, subprocess.SubprocessError):
         return None
     for line in reversed(completed.stdout.splitlines()):
@@ -469,6 +470,7 @@ def run_l0(
     report_id: str,
     python_executable: str,
     clock: Callable[[], str],
+    env: Mapping[str, str] | None = None,
     timeout_seconds: float = 300.0,
 ) -> ValidationReportV1:
     """L0 (§11.2): the project on disk hashes to its lock, imports, and yields a pipeline.
@@ -495,6 +497,11 @@ def run_l0(
             the validator's own environment.
         clock: read twice — once before the work and once after — so ``finished_at`` is the time
             the validation ended rather than a value the caller supplied in advance.
+        env: variables OVERLAID on this process's environment for the probe. The environment that
+            has ``pyspark`` needs several of them, and the one that costs a debugging cycle is that
+            ``PYSPARK_PYTHON`` and ``PYSPARK_DRIVER_PYTHON`` must BOTH name the same interpreter —
+            without them Spark launches workers on the system Python and its own ``types.py`` dies
+            on ``X | Y``. ``None`` inherits this process's environment unchanged.
         timeout_seconds: after which the probe is *unreachable*, not failing.
 
     Raises:
@@ -524,7 +531,7 @@ def run_l0(
         verdict: dict[str, Any] | None = {"stage": "import", "ok": False, "observed": "no package"}
     else:
         verdict = _probe_verdict(directory, package, python_executable=python_executable,
-                                 timeout_seconds=timeout_seconds)
+                                 timeout_seconds=timeout_seconds, env=env)
         if verdict is None:
             # The environment, not the artifact. Every finding above is DISCARDED: §11.2's zero
             # findings under `error` means a report that could not complete reports nothing at all,
