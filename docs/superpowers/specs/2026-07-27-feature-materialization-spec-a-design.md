@@ -330,7 +330,7 @@ CurrentSnapshot(observed_snapshot_ref)  # the table IS the current population; n
                                         # business_dt, so a mismatch refuses rather than pretending.
 LatestAvailableAsOf(effective_time_ref, availability_ref,
                     deterministic_tie_break_refs)   # SCD-style history
-PartitionMappedSnapshot(ordered_partition_mapping)  # business_dt → partition values
+PartitionMappedSnapshot(ordered_partition_refs)     # business_dt → partition values
 ActivePopulation(status_ref, allowed_status_values) # closed status set, no free-text predicate
 ```
 

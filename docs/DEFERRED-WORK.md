@@ -235,7 +235,7 @@ in place.
 | ⚪ **The sorts in `_expression_requirements` are EQUIVALENT** | Task 12's mutation run: removing both sorts survives every test. Provably so — the one consumer keys by `(schema, table)` and stores a value derived from nothing else, then sorts the mapping. Kept because the function's contract is an order, and recorded so nobody mistakes it for a tested property. | If a consumer ever reads the sequence rather than the mapping. |
 | ⚪ **`kedro` and `kedro-datasets` are not repository dependencies** | THE RULE could not be satisfied from the repo, so both were installed into a scratch virtualenv (kedro 1.5.0, kedro-datasets 9.5.0) and every emitted API verified against them (interfaces §30.2). The rendered project pins whatever `engine_versions` declares — 0.19.x in the fixture — and the emitted surface was chosen for being identical across 0.19.x and 1.x. | If the cluster's captured Kedro turns out to need an API this surface does not cover, or if CI should verify the render against a pinned Kedro. |
 
-### A.14 Renderer handoffs from Task 12 (2026-07-28)
+### A.15 Renderer handoffs from Task 12 (2026-07-28)
 
 | Item | Detail | Owner |
 |---|---|---|
@@ -244,6 +244,14 @@ in place.
 | 🟡 **Session timezone is pinned to UTC** | So rendered node bodies must state each expression's governed timezone explicitly rather than relying on the session default — a window computed in the wrong zone shifts its boundaries silently. | **Task 13** |
 | 🟡 **`compiler_version` has no owner** | `RENDERER_VERSION` is now owned by `render/__init__.py` and its parameter is gone. `compiler_version` remains a parameter belonging to a §2-chain orchestrator that does not exist; recommended home is `materialize/compile.py`, created when Task 15 needs it. | **Task 15** |
 | ⚪ **Node bodies are injected** (`RenderedNode`) | A Task-12-only project has structure but no compute, by design. | Task 13 supplies them |
+
+### A.16 Spine-rendering gaps found in Task 13a (2026-07-28)
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **Rendered gates raise `RuntimeError` with the code as the first token** | The generated project cannot import `featuregen`, so a `ValidationGateCode` member cannot travel into rendered text — only its string value can. The spine's three raises therefore carry the code as a leading token in a `RuntimeError` message, which is parseable but untyped. | **Task 14**, which owns §9's rendered gates. If it defines a shared rendered exception type, the spine's three raises should move onto it rather than each project inventing its own convention. |
+| 🟡 **The partition transform is applied in the node, not in run preparation** | `PartitionTransform`'s docstring assigns it to §3.3 run preparation, which does not exist yet. Task 13a applies the **declared** transform at run time rather than invent a shape for the `input_snapshots` parameter that Task 0 owns and would likely contradict. | **Task 0 / Task 15.** When run preparation exists, decide whether the transform moves there; a shape invented now would have to be unpicked. |
+| ⚪ **`AvailabilityPartition` is refused for spines** | Its late-arrival widening cannot yield exactly one row per key without a collapse rule that nobody has declared, and §4.2 rule 2 demands exactly one. Refusing is fail-closed and consistent with the spec's refusal-over-inference stance, but it is a judgement call that forecloses a policy a declarer might legitimately want. | If a real spine declaration needs it. Requires a declared collapse rule first — inventing one in the renderer would be exactly the ungoverned business logic §4 rule "no arbitrary SQL predicate" exists to prevent. |
 
 ## C. Repo / infra health
 
