@@ -16,19 +16,28 @@ is the very latency the sibling hooks were written to close.
 
 WHAT ACTUALLY LEAKS, precisely — because the two exits differ:
 
-* EXPIRY -> REVERIFY has NO second gate anywhere. `cross_catalog_links._blocked` folds the stream and
-  suppresses REJECTED and STALE, and REVERIFY is in neither set, so the planner kept crossing an
-  expired bridge AS CONFIRMED, at the top of the strength ranking (+100, "approved by a person").
-  This is the arm the traversability tests below turn on.
-* DRIFT -> STALE is blocked from `active_bridges` by `_blocked`, so the assembly planner already
-  stopped crossing it. The leak there is on every reader that goes to `entity_bridge_edge` DIRECTLY,
-  bypassing that fold: `analysis/grounding.py:210` (which suppresses JOIN_IDENTITY_UNCONFIRMED, so
-  an answer built on a drift-invalidated link is presented WITHOUT the "no human confirmed this"
-  warning) and `contract/invalidation.py:214`, whose docstring already ASSERTS the invariant this
-  suite implements: "a reject / expire / stale DELETEs the row".
+* EXPIRY -> REVERIFY had NO second gate anywhere. `cross_catalog_links` suppressed a DENY-LIST of
+  REJECTED and STALE, and REVERIFY is in neither, so the planner kept crossing an expired bridge AS
+  CONFIRMED, at the top of the strength ranking (+100, "approved by a person"). This is the arm the
+  traversability tests below turn on.
+* DRIFT -> STALE was already suppressed from `active_bridges`, so the assembly planner had stopped
+  crossing it. The leak there is on every reader that goes to `entity_bridge_edge` DIRECTLY,
+  bypassing that fold: `analysis/grounding.py` (which suppresses JOIN_IDENTITY_UNCONFIRMED, so an
+  answer built on a drift-invalidated link is presented WITHOUT the "no human confirmed this"
+  warning) and `contract/invalidation.py`, whose docstring already ASSERTS the invariant this suite
+  implements: "a reject / expire / stale DELETEs the row".
 
-Test strength: `test_the_planner_does_not_cross_a_drift_staled_bridge` PASSES without the fix
-(`_blocked` carries it) and is kept only as a defence-in-depth pin — it is NOT the proof. The
+THE LIFECYCLE CORRECTION superseded half of this file's expectations, and the difference is worth
+stating because it is a product decision, not a refactor. Availability is now an ALLOW-LIST over the
+governed lifecycle (`cross_catalog_links.AVAILABLE_STATUSES`), and REVERIFY is not in it, so an
+expired bridge is UNAVAILABLE rather than "still a candidate that lost its rank". The demote makes
+the projection agree; the allow-list is what makes the fold agree, and neither depends on the other.
+Ranking changed with it: a human confirmation is a tie-break inside a safety band (+1), not a +100
+that dominates every measured signal combined — so `strength >= 100` is no longer the signature of a
+confirmed link, and `strength` alone can no longer tell you whether a human approved anything.
+
+Test strength: `test_the_planner_does_not_cross_a_drift_staled_bridge` PASSES without the demote (the
+lifecycle fold carries it) and is kept only as a defence-in-depth pin — it is NOT the proof. The
 load-bearing assertions are the read-gate signature (stale) and the planner crossings (expiry).
 """
 from __future__ import annotations
@@ -158,7 +167,6 @@ def test_control_a_still_verified_bridge_keeps_its_edge_and_is_crossed_as_confir
     assert _edge_rows(db, key) == 1
     link = _planner_link(db, key)
     assert link is not None and link.status == "confirmed"
-    assert link.strength >= 100, "a human confirmation must dominate the ranking"
     assert [m.bridge_fact_key for m in _crossings(db)] == [key]
     assert _bridge_fact_signature(db, f"bridgefact:{key}") != _MISSING
 
@@ -211,26 +219,29 @@ def test_expiry_demotes_the_projected_bridge_edge(db):
     assert _edge_rows(db, key) == 0
 
 
-def test_the_planner_stops_crossing_an_expired_bridge_as_human_confirmed(db):
-    """THE decisive expiry assertion, on planner traversability.
+def test_the_planner_stops_crossing_an_expired_bridge(db):
+    """THE decisive expiry assertion, on planner traversability, driven by the REAL expiry timer.
 
-    REVERIFY is in neither of `_blocked`'s suppressed statuses, so nothing but the edge row decides
-    whether the planner sees this link as human-approved. Before: crossed as `confirmed`, ranked
-    above every derived candidate. After: the crossing survives as a `proposed` candidate — which is
-    correct and deliberate, since confirmation annotates rather than gates — but it has lost the
-    human sanction it no longer has, and its ranking with it.
+    An expired confirmation folds to REVERIFY, which is not in the availability allow-list, so the
+    link leaves the active set entirely and nothing can cross it until it is re-established. Before
+    the correction, REVERIFY was in neither of the deny-list's two statuses, so the planner went on
+    crossing an expired bridge — and, until the projection demote landed, crossed it as `confirmed`
+    at the top of the ranking.
+
+    This is deliberately NOT the DRAFT rule turned back on. A DRAFT bridge has never been reviewed
+    and is fully available (see `test_cross_catalog_links`); a REVERIFY bridge HAD a sanction that
+    has since lapsed, which is a statement about the link, not about anyone's review queue.
     """
     _, key = _verified_bridge(db)
     before = _planner_link(db, key)
-    assert before is not None and before.status == "confirmed" and before.strength >= 100
+    assert before is not None and before.status == "confirmed"
     assert [m.bridge_fact_key for m in _crossings(db)] == [key]
 
     _expire(db)
 
-    after = _planner_link(db, key)
-    assert after is not None, "an expired confirmation retires the SANCTION, not the candidate"
-    assert after.status == "proposed"
-    assert after.strength < 100, "an expired confirmation must not keep a confirmed link's rank"
+    assert fold_overlay_state(load_fact(db, key)).status == "REVERIFY"
+    assert _planner_link(db, key) is None, "an expired bridge is not an available link"
+    assert _crossings(db) == ()
 
 
 def test_the_planner_stops_crossing_an_expired_edge_only_bridge_entirely(db):
