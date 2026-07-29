@@ -853,13 +853,10 @@ def _bridge_core_crm(db):
          "crm", "public.customers.customer_id"))
 
 
-def test_bridge_rollup_hop_is_many_to_one_by_construction(db):
-    # a bridge-rollup hop has NO realization — its fan-in is many_to_one BY CONSTRUCTION (an
-    # E2-key FK column linked to an E2-grain far table); the far (target-grain) endpoint is the
-    # GROUP-BY key and the execution site.
-    _bridge_core_crm(db)
-    ctx = _ctx(db, "core", "crm")
-    plan = _plan(
+def _bridge_rollup_plan():
+    """The bridge-rollup shape: a semantic_rollup announcement realized by a governed_bridge whose
+    far endpoint sits in the segment's catalog."""
+    return _plan(
         bindings=(
             _binding("source_key", "public.accounts.customer_id",
                      join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
@@ -873,23 +870,72 @@ def test_bridge_rollup_hop_is_many_to_one_by_construction(db):
                                    from_entity="account", to_entity="customer",
                                    bridge_fact_key="bridge:customer:c4"),
         ))
+
+
+def test_bridge_rollup_hop_cardinality_is_unknown_never_assumed(db):
+    """THE fail-close correction. This branch used to return `many_to_one` "BY CONSTRUCTION" — an
+    ASSUMPTION presented as evidence. Nothing in the bridge attests the DIRECTION of the join or the
+    grain of its far side; if that side is not actually at the claimed grain the hop is 1:N, rows
+    multiply, and every SUM over it inflates into a plausible number with no error anywhere.
+
+    The codebase already refuses precisely this (`materialize/joins.py`): "Unknown cardinality is
+    refused ... 'We do not know' is not 'it is safe'." Until DIRECTIONAL REALIZATIONS exist there is
+    no evidence to return, so the hop resolves UNKNOWN and every stage on it fails closed.
+
+    Test strength: none of these assertions can pass against the `Cardinality.MANY_TO_ONE` constant.
+    """
+    _bridge_core_crm(db)
+    ctx = _ctx(db, "core", "crm")
+    plan = _bridge_rollup_plan()
+
     assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (
-        Cardinality.MANY_TO_ONE, "bridge_construction", ("public.customers.customer_id",))
+        None, "bridge_unattested", ())
     (hop,) = _c4_compile(ctx, plan)
     assert (hop.semantic_hop_index, hop.segment_index) == (0, 1)
-    assert hop.physical_cardinality is Cardinality.MANY_TO_ONE
-    assert hop.cardinality_source == "bridge_construction"
-    assert hop.grouping_keys == ("public.customers.customer_id",)
-    assert (hop.execution_catalog, hop.execution_table) == ("crm", "public.customers")
+    assert hop.physical_cardinality is None
+    assert hop.cardinality_source == "bridge_unattested"
+    # no cardinality means no proven fan-in, so there is no grouping to claim and no execution site
+    # to claim it at — the same shape every other unresolved hop takes, which is what keeps
+    # `_grouping_survives`' "a cardinality-unavailable hop has neither" invariant true.
+    assert hop.grouping_keys == () and hop.execution_table == ""
     (stage,) = hop.ingredient_stages
     assert stage.need_role == "balance"
-    assert stage.validation is c.AggregationValidation.sound    # semi_additive, single-PIT
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.reason_codes == (c.ReasonCode.physical_cardinality_unavailable,)
 
-    # an unknown fact key resolves NOTHING — fail closed, never many_to_one on faith
+
+def test_an_unattested_bridge_is_still_distinguishable_from_an_absent_one(db):
+    """Unknown is not the same as missing. A bridge the context RESOLVED but cannot vouch for says
+    so (`bridge_unattested`); a fact key that resolves to nothing stays `unavailable`. Both fail
+    closed on cardinality — they differ only in what a human is told to go and fix."""
+    _bridge_core_crm(db)
+    ctx = _ctx(db, "core", "crm")
     ghost = c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
                                    from_entity="account", to_entity="customer",
                                    bridge_fact_key="bridge:customer:ghost")
     assert hop_physical_cardinality(ctx, ghost) == (None, "unavailable", ())
+    assert hop_physical_cardinality(ctx, _bridge_rollup_plan().path_segments[1])[1] \
+        == "bridge_unattested"
+
+
+def test_withholding_the_cardinality_claim_does_not_withdraw_the_bridge(db):
+    """THE OTHER HALF, and the one that is easy to lose. Link AVAILABILITY and AUTOMATIC EXECUTION
+    SAFETY are different axes: what the bridge loses here is the silent claim of a production-safe
+    fan-in, NOT its place in discovery, suggestions or bounded sandbox analysis. Collapsing the two
+    would hide a real link because nobody has yet measured its direction.
+
+    Test strength: a fix that made the rollup branch return `(None, "unavailable", ())` by dropping
+    the bridge from the active set would pass the cardinality test above and fail this one."""
+    from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
+
+    _bridge_core_crm(db)
+    assert [b.fact_key for b in active_bridges(db)] == ["bridge:customer:c4"]
+    assert [l.usable for l in cross_catalog_links(db)] == [True]
+    ctx = _ctx(db, "core", "crm")
+    assert [b.fact_key for b in ctx.active_bridges] == ["bridge:customer:c4"], \
+        "the compiler still SEES the bridge — it just will not claim its cardinality"
+    # and the plan that crosses it still compiles into an honest hop rather than being rejected
+    assert len(_c4_compile(ctx, _bridge_rollup_plan())) == 1
 
 
 def test_reposition_bridge_is_not_an_aggregation_hop(db):
@@ -1072,13 +1118,18 @@ def test_composition_grouping_lost_across_bridge_is_unsupported():
     # additive SUM∘SUM, but hop 2 executes in ANOTHER catalog (a bridge crossing): hop evidence
     # carries no from-side keys for the later hop, so hop 1's grouping key cannot be confirmed
     # to survive → fail closed even though every stage is individually sound.
+    #
+    # The bridge hop below is a DELIBERATELY GENEROUS probe of the catalog-change clause: since the
+    # fail-close correction a real bridge hop carries NO cardinality and NO grouping keys at all, so
+    # it fails on `_grouping_survives`' FIRST clause before the catalog is ever compared. Handing the
+    # clause a hop no compiler would emit is what keeps the clause itself under test.
     hops = (
         _c5_hop(0, 1, from_entity="transaction", to_entity="account",
                 table="public.accounts", key="public.accounts.account_id",
                 stages=(_c5_stage("amount"),)),
         _c5_hop(1, 3, from_entity="account", to_entity="customer", catalog="crm",
                 table="public.customers", key="public.customers.customer_id",
-                source="bridge_construction"),
+                source="bridge_unattested"),
     )
     out = check_composition(hops, c.AdditivityClass.additive)
     assert out.composable is False

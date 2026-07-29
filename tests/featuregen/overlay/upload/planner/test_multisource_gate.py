@@ -24,6 +24,9 @@ from datetime import timedelta
 
 import psycopg
 import pytest
+from tests.featuregen.overlay.upload.planner._unattested_bridge import (
+    needs_attested_bridge_cardinality,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
@@ -86,6 +89,7 @@ def _noop_seed(conn, **_kw):
 
 
 # ── (1) the gate passes on the correct implementation over the clean population ──
+@needs_attested_bridge_cardinality
 def test_gate_passes_on_correct_implementation(db, planning_conn, service_actor, human_actor):
     result = evaluate_assembly_gate(
         planning_conn, db, _adapter(), service_actor=service_actor, human_actor=human_actor,
@@ -216,6 +220,7 @@ def test_fault_control_injected_db_error_is_technical_failure(
     assert "fault_db" not in ("mgate_a", "mgate_b")
 
 
+@needs_attested_bridge_cardinality
 def test_fault_control_budget_truncated_is_exactly_classified(
         db, planning_conn, service_actor, human_actor, monkeypatch):
     """With the per-run compile allowance pinned to 1, the first intent consumes it (a real compile) and

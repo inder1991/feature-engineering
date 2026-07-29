@@ -28,6 +28,9 @@ from datetime import UTC, datetime
 
 import pytest
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
+from tests.featuregen.overlay.upload.planner._unattested_bridge import (
+    needs_attested_bridge_cardinality,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
@@ -260,6 +263,7 @@ def bridged_leakage_anchor(db, service_actor, human_actor):
 
 
 # ── check_operand_path: aggregation soundness via reuse ─────────────────────────────────────────
+@needs_attested_bridge_cardinality
 def test_unsafe_leakage_anchor_column_rejects_via_safety_fold(bridged_leakage_anchor):
     # M16: an operand bound to a genuinely UNSAFE (leakage-anchor) column must reject on the SAFETY
     # branch of check_operand_path — Task-6 convergence deferred safety to here, so an unsafe path can
