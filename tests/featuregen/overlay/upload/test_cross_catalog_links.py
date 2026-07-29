@@ -363,3 +363,86 @@ def test_a_verified_projection_with_no_stream_is_still_available(db):
     them."""
     _verify(db, "fk-gold", "customer", "cust_num", "cif_id", stream=False)
     assert [l.status for l in cross_catalog_links(db)] == [LinkStatus.CONFIRMED]
+
+
+# ── REVIEW STATUS comes from the folded lifecycle, never from the projection's LAG ───────────────
+#
+# `cross_catalog_links` decided CONFIRMED by presence in `entity_bridge_edge` — the human-review
+# PROJECTION. A projection is a cache of a decision, not the decision: it lags, and its writer is
+# fail-soft. So a bridge a person had really confirmed was labelled PROPOSED until a projector caught
+# up (losing its review tie-break for as long as that took), and a row left behind by a failed
+# demotion went on advertising a review that the stream says has been withdrawn.
+#
+# Review status is now folded from the event stream, exactly like availability. The projection row
+# may still carry AUDIT detail (which event confirmed it), but it does not decide WHETHER review
+# happened. Test strength: neither test below can pass against `confirmed = key in verified`.
+
+def test_a_verified_fact_whose_edge_is_not_yet_projected_is_labelled_reviewed(db):
+    """Projector lag must not un-review a link. The fact stream folds VERIFIED — two named
+    confirmers — while `entity_bridge_edge` has no row yet (a delayed or failed projector). The
+    review HAPPENED; the cache simply has not caught up."""
+    from featuregen.overlay.state import fold_overlay_state
+
+    key = _candidate(db, "customer", "cust_num", "cif_id", status="VERIFIED")
+    assert fold_overlay_state(store.load_fact(db, key)).status == "VERIFIED"
+    assert db.execute("SELECT 1 FROM entity_bridge_edge WHERE fact_key = %s",
+                      (key,)).fetchone() is None, "the projection has NOT caught up"
+
+    (link,) = cross_catalog_links(db)
+    assert link.status is LinkStatus.CONFIRMED
+
+
+def test_a_stale_projection_row_cannot_claim_a_review_the_stream_has_withdrawn(db):
+    """The other direction, and the reason presence is not authority: `demote_bridge_edges` is
+    fail-soft, so a VERIFIED row can outlive the confirmation it records. The fold says DRAFT — the
+    link is still AVAILABLE (review gates nothing), but it is not REVIEWED."""
+    _candidate(db, "customer", "cust_num", "cif_id", fact_key="fk-1", status="DRAFT")
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
+        " right_catalog_source, right_object_ref, status) "
+        "VALUES ('fk-1','customer','cib',%s,'ftr',%s,'VERIFIED')",
+        (f"{_LEFT_TABLE}.cust_num", f"{_RIGHT_TABLE}.cif_id"))
+
+    (link,) = cross_catalog_links(db)
+    assert link.usable, "availability is unaffected — review gates nothing"
+    assert link.status is LinkStatus.PROPOSED
+
+
+def test_an_orphan_projection_row_is_reviewed_only_while_its_stream_agrees(db):
+    """The same rule on the second (edge-with-no-candidate-row) pass, which used to hard-code
+    CONFIRMED for every row it found."""
+    _verify(db, "fk-orphan", "customer", "cust_num", "cif_id")            # stream + row agree
+    assert [x.status for x in cross_catalog_links(db)] == [LinkStatus.CONFIRMED]
+
+    db.execute("DELETE FROM entity_bridge_candidate_evidence")
+    _govern(db, "fk-orphan2", "customer", "a", "b", status="DRAFT")
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
+        " right_catalog_source, right_object_ref, status) "
+        "VALUES ('fk-orphan2','customer','cib',%s,'ftr',%s,'VERIFIED')",
+        (f"{_LEFT_TABLE}.a", f"{_RIGHT_TABLE}.b"))
+    by_key = {x.fact_key: x for x in cross_catalog_links(db)}
+    assert by_key["fk-orphan"].status is LinkStatus.CONFIRMED
+    assert by_key["fk-orphan2"].status is LinkStatus.PROPOSED
+
+
+def test_the_lifecycle_is_loaded_and_folded_exactly_once_per_link(db, monkeypatch):
+    """A status and a value read from two SEPARATE folds can disagree if a transition lands between
+    them, yielding a pair that never simultaneously existed. `bridge_lifecycle` is the single fold
+    every caller shares, and it returns both halves of one observation — one `load_fact` per link."""
+    from featuregen.overlay.upload.cross_catalog_links import bridge_lifecycle
+
+    key = _candidate(db, "customer", "cust_num", "cif_id", status="VERIFIED")
+    calls: list[str] = []
+    real = store.load_fact
+
+    def _counting(conn, fact_key, *a, **k):
+        calls.append(fact_key)
+        return real(conn, fact_key, *a, **k)
+
+    monkeypatch.setattr(store, "load_fact", _counting)
+    lifecycle = bridge_lifecycle(db, key, projected_verified=False)
+
+    assert calls == [key], f"expected exactly ONE load-and-fold, got {len(calls)}"
+    assert lifecycle.status == "VERIFIED"
+    assert lifecycle.value["entity_id"] == "customer", "the value comes from the SAME fold"

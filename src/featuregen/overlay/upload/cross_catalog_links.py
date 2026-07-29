@@ -22,7 +22,10 @@ up deciding whether numbers can be computed:
 2. **Automatic execution safety** — has the platform validated what this join does to the data
    (today: grain and type basis; in time: direction, cardinality, scope, fan-out)? Decided by
    evidence the platform derived for itself.
-3. **Human review** — does someone endorse the semantic relationship? Recorded as CONFIRMED.
+3. **Human review** — does someone endorse the semantic relationship? Reported as CONFIRMED, and
+   read from the same governed lifecycle fold (``REVIEWED_STATUS``) — never from the presence of a
+   row in the ``entity_bridge_edge`` PROJECTION, which lags the decision it caches and whose
+   demotion is fail-soft.
 
 **Human review controls neither of the first two.** Confirmation means "a person agrees with this
 semantic relationship", not "permission to execute": it never gates availability, and it never
@@ -43,6 +46,7 @@ already stored, and a weak candidate is ranked down rather than hidden:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -69,6 +73,10 @@ class LinkStatus(StrEnum):
 #: available. REJECTED is a human's NO — "confirmation is not REQUIRED" was never "disapproval is
 #: ignored". STALE means drift moved an endpoint, so the link has to be re-derived before it holds.
 AVAILABLE_STATUSES = frozenset({"DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED"})
+
+#: The ONE lifecycle status that means a person has endorsed the semantics. Review status is read
+#: from the FOLD, never from the presence of a projection row — see :func:`bridge_lifecycle`.
+REVIEWED_STATUS = "VERIFIED"
 
 #: Pseudo-statuses for the two ways a lifecycle fails to resolve. Neither is in the allow-list.
 UNGOVERNED = "UNGOVERNED"   #: readable, but there is no governance record for this link at all
@@ -154,15 +162,27 @@ def _sort_key(link: CrossCatalogLink) -> tuple:
     return (-link.safety, -link.strength, link.entity_id, link.left_object_ref)
 
 
-def bridge_lifecycle_status(conn, fact_key: str | None, *,
-                            projected_verified: bool | None = None) -> str:
-    """The bridge's governed lifecycle status — one of the six canonical statuses, or ``UNGOVERNED``
-    / ``UNREADABLE``. The single place availability is decided, for every consumer.
+@dataclass(frozen=True, slots=True)
+class BridgeLifecycleV1:
+    """ONE reading of a bridge's governed lifecycle: its folded ``status`` and the folded ``value``
+    that status applies to. Returned together, from a SINGLE load-and-fold, because they are two
+    halves of one observation — reading them through two folds lets a transition land in between and
+    yields a status/value pair that never simultaneously existed."""
+
+    status: str
+    value: Mapping[str, object]
+
+
+def bridge_lifecycle(conn, fact_key: str | None, *,
+                     projected_verified: bool | None = None) -> BridgeLifecycleV1:
+    """The bridge's governed lifecycle — one canonical status (with the value it governs), or
+    ``UNGOVERNED`` / ``UNREADABLE``. The single place availability AND review status are decided,
+    for every consumer, from ONE fold.
 
     Folded from the EVENT STREAM, not read off ``entity_bridge_edge``: the projection lags, holds
     VERIFIED rows only, and is a record of HUMAN REVIEW — none of which may decide whether the
-    platform can consider a link. A decision must take effect the moment it is made, not once a
-    projector catches up.
+    platform can consider a link, nor whether a review actually happened. A decision must take
+    effect the moment it is made, not once a projector catches up.
 
     Three resolutions that are NOT the fold, each deliberate:
 
@@ -179,22 +199,27 @@ def bridge_lifecycle_status(conn, fact_key: str | None, *,
       ONLY under a VERIFIED fold and ``demote_bridge_edges`` removes it on every exit from VERIFIED.
       ``multisource_gold`` and the planner fixtures seed bridges this way. An empty stream with no
       such row is ``UNGOVERNED`` — absence of a governance record is not evidence of a benign one.
+      This is the ONLY use the projection has here, and it is a fallback for an ABSENT stream: a row
+      can never override a stream that folded.
 
     ``projected_verified`` lets a caller that already knows the projection state pass it in rather
     than provoke a per-link query; ``None`` means "look it up".
     """
     if not fact_key:
-        return UNGOVERNED
+        return BridgeLifecycleV1(UNGOVERNED, {})
     from featuregen.overlay import store
     from featuregen.overlay.state import fold_overlay_state
     try:
-        status = fold_overlay_state(store.load_fact(conn, fact_key)).status
+        folded = fold_overlay_state(store.load_fact(conn, fact_key))
     except Exception:  # noqa: BLE001 — fail CLOSED: an unreadable lifecycle is not an available link
         logger.warning("bridge lifecycle unreadable, treating as unavailable: %s", fact_key,
                        exc_info=True)
-        return UNREADABLE
-    if status:
-        return status
+        return BridgeLifecycleV1(UNREADABLE, {})
+    # Every UNAVAILABLE state moves the value to `prior_value`, so `value` is empty exactly where
+    # the caller is about to discard the reading anyway.
+    value = folded.value if isinstance(folded.value, Mapping) else {}
+    if folded.status:
+        return BridgeLifecycleV1(folded.status, value)
     if projected_verified is None:
         try:
             projected_verified = conn.execute(
@@ -203,8 +228,14 @@ def bridge_lifecycle_status(conn, fact_key: str | None, *,
         except Exception:  # noqa: BLE001 — same fail-closed rule for the fallback read
             logger.warning("bridge projection unreadable, treating as unavailable: %s", fact_key,
                            exc_info=True)
-            return UNREADABLE
-    return "VERIFIED" if projected_verified else UNGOVERNED
+            return BridgeLifecycleV1(UNREADABLE, {})
+    return BridgeLifecycleV1(REVIEWED_STATUS if projected_verified else UNGOVERNED, value)
+
+
+def bridge_lifecycle_status(conn, fact_key: str | None, *,
+                            projected_verified: bool | None = None) -> str:
+    """:func:`bridge_lifecycle`'s status alone, for the callers that need nothing else."""
+    return bridge_lifecycle(conn, fact_key, projected_verified=projected_verified).status
 
 
 def bridge_is_available(conn, fact_key: str | None, *,
@@ -230,9 +261,13 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     # table; reading only the ledger would silently drop them, turning "show unconfirmed too" into a
     # regression that loses CONFIRMED links.
     #
-    # This table is the HUMAN-REVIEW projection and is used for exactly two things: deciding whether
-    # to label a link CONFIRMED, and (in `bridge_lifecycle_status`) standing in for a stream that
-    # carries no events. AVAILABILITY is never read from here.
+    # This table is the HUMAN-REVIEW projection, and it is used for exactly two things: ENUMERATING
+    # links that have no candidate row, and (in `bridge_lifecycle`) standing in for a stream that
+    # carries no events at all. It decides NEITHER availability NOR whether a review happened —
+    # both come from the folded lifecycle. A projection is a cache of a decision, not the decision:
+    # it lags, and `demote_bridge_edges` is fail-soft, so presence here proved neither that a
+    # confirmation exists (a delayed projector had not written it yet) nor that it still stands (a
+    # failed demotion left the row behind).
     verified = {
         r[0]: r[1:] for r in conn.execute(
             "SELECT fact_key, entity_id, left_catalog_source, left_object_ref, "
@@ -257,7 +292,9 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
 
     out: list[CrossCatalogLink] = []
     for entity, l_src, l_ref, r_src, r_ref, key, family, ev in rows:
-        if not bridge_is_available(conn, key, projected_verified=key in verified):
+        # ONE fold answers both questions, and neither is answered by the projection row.
+        status = bridge_lifecycle_status(conn, key, projected_verified=key in verified)
+        if status not in AVAILABLE_STATUSES:
             continue
         if object_ref is not None:
             want = object_ref.strip().lower()
@@ -269,7 +306,7 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
         left_grain = (l_src, l_ref) in grain or bool(ev.get("left_is_grain"))
         right_grain = (r_src, r_ref) in grain or bool(ev.get("right_is_grain"))
         basis = str(ev.get("type_basis") or "")
-        confirmed = key in verified
+        confirmed = status == REVIEWED_STATUS
         out.append(CrossCatalogLink(
             entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
             right_catalog_source=r_src, right_object_ref=r_ref,
@@ -278,19 +315,25 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
                                right_grain=right_grain, basis=basis),
             data_type_family=family or "", left_is_grain=left_grain, right_is_grain=right_grain,
             type_basis=basis, fact_key=key))
-    # Verified edges with no candidate row — never derived here, or derived before the ledger
-    # existed. They are confirmed links and must not be lost.
+    # Edge rows with no candidate row — never derived here, or derived before the ledger existed.
+    # They must not be lost. Their REVIEW status is folded like every other link's, not assumed from
+    # the row: a row whose stream has since fallen back to DRAFT is an available, unreviewed link.
     seen = {l.fact_key for l in out}
     for key, (entity, l_src, l_ref, r_src, r_ref) in verified.items():
-        if key in seen or not bridge_is_available(conn, key, projected_verified=True):
+        if key in seen:
+            continue
+        status = bridge_lifecycle_status(conn, key, projected_verified=True)
+        if status not in AVAILABLE_STATUSES:
             continue
         if object_ref is not None and object_ref.strip().lower() not in (
                 str(l_ref).lower(), str(r_ref).lower()):
             continue
+        confirmed = status == REVIEWED_STATUS
         out.append(CrossCatalogLink(
             entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
-            right_catalog_source=r_src, right_object_ref=r_ref, status=LinkStatus.CONFIRMED,
-            strength=_strength(confirmed=True, left_grain=False, right_grain=False, basis=""),
+            right_catalog_source=r_src, right_object_ref=r_ref,
+            status=LinkStatus.CONFIRMED if confirmed else LinkStatus.PROPOSED,
+            strength=_strength(confirmed=confirmed, left_grain=False, right_grain=False, basis=""),
             data_type_family="", left_is_grain=False, right_is_grain=False, type_basis="",
             fact_key=key))
     out.sort(key=_sort_key)
