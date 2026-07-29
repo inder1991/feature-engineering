@@ -46,6 +46,12 @@ class HiveDialect:
                 f"flavour {flavour!r} is not one of {sorted(_APPROX_BY_FLAVOUR)}")
         self.flavour = flavour
 
+    def ident(self, name: str) -> str:
+        """Quote one identifier. Public because the analysis compiler needs it: a caller that
+        hardcodes quoting silently produces STRING LITERALS here, which HiveQL accepts and evaluates
+        to something else entirely rather than rejecting."""
+        return _ident(name)
+
     def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
         """Hive's query timeout is a SESSION setting measured in SECONDS — not PostgreSQL's
         transaction-scoped milliseconds.

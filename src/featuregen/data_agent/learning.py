@@ -81,6 +81,45 @@ CHOICE_VOCABULARIES: dict[str, tuple[str, ...]] = {
 }
 
 
+#: Which REFUSALS are ontology gaps, and what a human would do about each.
+#:
+#: This table is the enforcement point for the boundary at the top of this module, and it is CLOSED
+#: in both directions: a refusal absent from it records nothing. That default is deliberate — an
+#: unrecognised code is far more likely to be a capability limit, a malformed request or a technical
+#: failure than a newly-discovered ontology gap, and the cost of the two mistakes is not symmetric.
+#: Missing a gap loses one signal; inventing one puts a candidate into the ontology that no human
+#: ever encountered, sourced from an outage.
+#:
+#: Deliberately absent, each for a stated reason:
+#:   ANALYSIS_UNSUPPORTED_MEASURE / ATTRIBUTION_UNSUPPORTED_BASIS / _INTERVAL
+#:       capability limits — this slice cannot compute it. The ontology is not missing anything.
+#:   ANALYSIS_EMPTY_PERIOD / ELIGIBILITY_NO_STATUS_VALUES / _NO_NON_REVERSED_VALUES
+#:       malformed requests — the caller built the plan wrong; no decision is waiting on anyone.
+#:   ATTRIBUTION_OVERLAPPING_RECORDS
+#:       a DATA defect in the dimension table. Real, and someone must fix it, but it belongs to data
+#:       quality: the ontology already says what it should say.
+REFUSAL_TO_GAP: dict[str, tuple[str, RequiredAction]] = {
+    # The relationship was never observed, was observed for something else, or does not hold.
+    "JOIN_EVIDENCE_MISSING": ("RELATIONSHIP_UNVERIFIED", RequiredAction.CONFIRM_RELATIONSHIP),
+    "JOIN_EVIDENCE_MISMATCHED": ("RELATIONSHIP_UNVERIFIED", RequiredAction.CONFIRM_RELATIONSHIP),
+    "JOIN_KEY_NOT_UNIQUE": ("RELATIONSHIP_UNVERIFIED", RequiredAction.CONFIRM_RELATIONSHIP),
+    # Uniqueness could not be ASSERTED from an approximate probe — so cardinality is unknown, and
+    # the action is to profile exactly rather than to decide anything.
+    "JOIN_UNIQUENESS_UNKNOWN": ("JOIN_CARDINALITY_UNKNOWN", RequiredAction.PROFILE_DATA),
+    # The two business decisions this platform has been parking: which instant classifies a
+    # customer, and whether a transaction counts as reversed as of the cutoff or ever.
+    "ANALYSIS_NO_ATTRIBUTION_POLICY": (
+        "DIMENSION_ATTRIBUTION_AS_OF_UNRESOLVED", RequiredAction.CONFIRM_BUSINESS_POLICY),
+    "ATTRIBUTION_NO_CUTOFF": (
+        "DIMENSION_ATTRIBUTION_AS_OF_UNRESOLVED", RequiredAction.CONFIRM_TIME_SEMANTICS),
+    "ELIGIBILITY_UNSUPPORTED_REVERSAL_MODE": (
+        "REVERSAL_AS_OF_UNRESOLVED", RequiredAction.CONFIRM_BUSINESS_POLICY),
+    # "Count the transactions" is not a definition until someone says WHICH transactions count.
+    "ANALYSIS_NO_ELIGIBILITY_POLICY": (
+        "MEASURE_DEFINITION_UNRESOLVED", RequiredAction.CONFIRM_BUSINESS_POLICY),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisLearningEventV1:
     """One thing a question could not proceed without."""
@@ -155,6 +194,26 @@ def record_gap(conn, event: AnalysisLearningEventV1, *, now: datetime) -> str:
          list(event.subject_refs), str(event.required_action), event.dependency_snapshot_id,
          list(event.candidate_refs_considered), list(event.supporting_evidence_ids), now))
     return event.event_id
+
+
+def record_refusal(conn, *, analysis_request_id: str, refusal_code: str,
+                   subject_refs: tuple[str, ...], dependency_snapshot_id: str,
+                   now: datetime, stage: LearningStage = LearningStage.PLANNING) -> str | None:
+    """Record a refused plan as a gap — or record nothing, and say so by returning `None`.
+
+    The return value is the honest signal: `None` means "this refusal is not evidence about the
+    ontology", which is a normal outcome and not an error. Raising instead would push every caller
+    into classifying refusals itself, and the classification would then drift per call site — which
+    is exactly how a connection timeout ends up recorded as a missing relationship.
+    """
+    mapped = REFUSAL_TO_GAP.get(refusal_code)
+    if mapped is None:
+        return None
+    code, action = mapped
+    return record_gap(conn, AnalysisLearningEventV1(
+        analysis_request_id=analysis_request_id, stage=stage, code=code,
+        subject_refs=tuple(subject_refs), required_action=action,
+        dependency_snapshot_id=dependency_snapshot_id), now=now)
 
 
 def resolve_gap(conn, event_id: str, *, decision: str, actor: str, now: datetime) -> str:

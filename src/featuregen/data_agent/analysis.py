@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 
 from featuregen.data_agent.dimensions import (
@@ -28,14 +30,21 @@ from featuregen.data_agent.dimensions import (
     MissingValueBehavior,
 )
 from featuregen.data_agent.eligibility import TransactionEligibilityPolicyV1
+from featuregen.data_agent.eligibility import EligibilityError
+from featuregen.data_agent.learning import record_refusal
 from featuregen.data_agent.observation import ObservationPlanError, require_identifier
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
+from featuregen.data_agent.relationship import RelationshipEvidenceV1, join_refusal
 
 
 class AnalysisIRError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, subjects: tuple[str, ...] = ()) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
+        #: What the refusal is ABOUT, when the refusal knows more than the request does. A join
+        #: refusal names the two columns; without that a learning event could only say "something
+        #: about this request", which is not actionable.
+        self.subjects = subjects
 
 
 class Comparison(StrEnum):
@@ -108,6 +117,11 @@ class AnalysisExecutionIRV1:
     #: population without duplicating it.
     dimension_binding: PhysicalDatasetBindingV1 | None = None
     attribution: DimensionAttributionPolicyV1 | None = None
+    #: OBSERVED evidence that the event key and the spine key denote the same entity — the release's
+    #: "verified joins". Not validated at construction: like `assert_no_dimension_overlap`, this is a
+    #: statement about the state of the data rather than about the shape of the plan, so a plan can
+    #: be built and previewed before a probe has run. :func:`run_analysis` is the gate.
+    join_evidence: RelationshipEvidenceV1 | None = None
 
     def __post_init__(self) -> None:
         # The identifier rule is genuinely shared with observation, so it is reused rather than
@@ -172,10 +186,6 @@ class AnalysisExecutionIRV1:
         return hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
-def _q(name: str) -> str:
-    return '"' + name.strip() + '"'
-
-
 def _literals(values: tuple[str, ...]) -> str:
     return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
 
@@ -191,6 +201,11 @@ def compile_analysis(ir: AnalysisExecutionIRV1, *, dialect) -> str:
     class _Shim:
         def __init__(self, b): self.binding = b
 
+    # Identifier quoting is the DIALECT's, never this module's. A hardcoded `"name"` is an
+    # identifier in PostgreSQL and a string LITERAL in HiveQL, so the same compiler emitting both
+    # produced a query that ran clean against Hive and answered a different question: constants
+    # compared to constants, a GROUP BY over a single literal, and every count zero.
+    _q = dialect.ident
     spine_ref = dialect.table_ref(_Shim(ir.spine.binding))
     event_ref = dialect.table_ref(_Shim(ir.event_binding))
     key, event_key, period = _q(ir.spine.key_column), _q(ir.event_key_column), _q(ir.period_column)
@@ -255,6 +270,7 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
         return
     class _Shim:
         def __init__(self, b): self.binding = b
+    _q = dialect.ident
     dim_ref = dialect.table_ref(_Shim(ir.dimension_binding))
     key = _q(ir.spine.key_column)
     sql = (f"SELECT COUNT(*) FROM (SELECT {key} FROM {dim_ref} "
@@ -275,8 +291,29 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
             f"{ir.attribution.report_cutoff!r}; choosing one would hide a dimension-table defect")
 
 
+def assert_join_is_verified(ir: AnalysisExecutionIRV1) -> None:
+    """Refuse to execute a join whose relationship has not been observed to hold.
+
+    The rule itself lives in `relationship.join_refusal`; this supplies the two sides. The event
+    table REFERENCES the spine, so the spine is the referenced side — and it is the one that must be
+    a key, because the spine is the left side of the query and a duplicate there multiplies the
+    whole population.
+    """
+    spine_id = ir.spine.binding.identity.table_id
+    event_id = ir.event_binding.identity.table_id
+    refusal = join_refusal(
+        ir.join_evidence,
+        referencing_table_id=event_id, referencing_column=ir.event_key_column,
+        referenced_table_id=spine_id, referenced_column=ir.spine.key_column)
+    if refusal is not None:
+        code, message = refusal
+        raise AnalysisIRError(code, message, subjects=(
+            f"{spine_id}.{ir.spine.key_column}", f"{event_id}.{ir.event_key_column}"))
+
+
 def run_analysis(conn, ir: AnalysisExecutionIRV1, *, dialect) -> tuple[AnalysisRow, ...]:
     """Compile and execute, returning one row per entity in the population."""
+    assert_join_is_verified(ir)
     assert_no_dimension_overlap(conn, ir, dialect=dialect)
     cursor = conn.cursor()
     try:
@@ -294,3 +331,35 @@ def run_analysis(conn, ir: AnalysisExecutionIRV1, *, dialect) -> tuple[AnalysisR
         out.append(AnalysisRow(key=key, previous_count=previous, current_count=current,
                                dimensions=dimensions))
     return tuple(out)
+
+
+@contextmanager
+def recording_refusals(learning_conn, *, analysis_request_id: str, dependency_snapshot_id: str,
+                       subjects: tuple[str, ...], now: datetime):
+    """Turn a refused analysis into learning evidence, then re-raise.
+
+    Release 3 says to start recording here rather than in Release 5, "otherwise the first working
+    question's evidence is discarded". `learning.py` was built to receive that evidence and had no
+    producer; this is it.
+
+    **A context manager rather than a wrapper around `run_analysis`**, because roughly half the
+    refusals happen while the plan is being BUILT — a missing eligibility policy, a missing
+    attribution policy, an unsupported reversal mode are all raised in `__post_init__`, before there
+    is an IR to execute. A seam that only wrapped execution would record none of them.
+
+    **`learning_conn` is the platform database, not the warehouse.** Learning events and data
+    observations are catalog state; the analysis SQL runs somewhere else entirely. Taking them as
+    one connection would work in a test where both are Postgres and fail against Hive.
+
+    Recording is observation, not handling: the exception always propagates. Whether a given refusal
+    is ontology evidence at all is `record_refusal`'s decision — a capability limit or a technical
+    failure records nothing.
+    """
+    try:
+        yield
+    except (AnalysisIRError, AttributionError, EligibilityError) as exc:
+        record_refusal(
+            learning_conn, analysis_request_id=analysis_request_id, refusal_code=exc.code,
+            subject_refs=getattr(exc, "subjects", ()) or subjects,
+            dependency_snapshot_id=dependency_snapshot_id, now=now)
+        raise

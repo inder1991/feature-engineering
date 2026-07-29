@@ -18,7 +18,12 @@ from __future__ import annotations
 
 import pytest
 
-from featuregen.data_agent.connection import ConnectionError_, DataSourceConnectionV1, open_connection
+from featuregen.data_agent.connection import (
+    _DRIVERS,
+    ConnectionError_,
+    DataSourceConnectionV1,
+    open_connection,
+)
 from featuregen.data_agent.executor import DirectSqlExecutor
 from featuregen.data_agent.observation import ObservationPlanV1, PartitionSelector
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
@@ -125,23 +130,67 @@ def test_opening_an_inactive_connection_is_refused_before_any_driver_loads():
         open_connection(_conn_spec(active=False), secret_resolver=lambda ref: "secret")
 
 
-def test_the_secret_is_resolved_through_the_caller_never_stored():
+@pytest.fixture
+def no_driver(monkeypatch):
+    """Force the driver import to fail, whatever is installed.
+
+    These two tests previously relied on PyHive being ABSENT from the environment — "no driver
+    installed in this environment", said the comment. That made them pass only on machines that
+    could not talk to Hive, and fail on exactly the machine where the seam matters. The refusal is
+    the behaviour under test, so it is provoked deliberately rather than by accident of packaging.
+    """
+    monkeypatch.setitem(_DRIVERS, "hive", ("featuregen_no_such_hive_driver", "PyHive"))
+
+
+def test_the_secret_is_resolved_through_the_caller_never_stored(no_driver):
     """The spec holds a REFERENCE; the credential is fetched at the point of use and never returned
     on the connection object or in an error."""
     seen = []
     def resolver(ref):
         seen.append(ref)
         return "kerberos-ticket"
-    with pytest.raises(ConnectionError_) as exc:      # no driver installed in this environment
+    with pytest.raises(ConnectionError_) as exc:
         open_connection(_conn_spec(), secret_resolver=resolver)
     assert seen == ["vault://featuregen/hive-pilot"]
     assert "kerberos-ticket" not in str(exc.value)
 
 
-def test_a_missing_driver_is_a_typed_refusal_naming_what_to_install():
+def test_a_missing_driver_is_a_typed_refusal_naming_what_to_install(no_driver):
     """An ImportError deep in a driver is a bad first experience. Say which package is missing."""
     with pytest.raises(ConnectionError_, match="driver"):
         open_connection(_conn_spec(), secret_resolver=lambda ref: "x")
+
+
+# ── the credential is only sent to mechanisms that consume one ───────────────────────────────────
+
+def test_a_KERBEROS_connection_sends_no_password_to_the_driver():
+    """The bug a real Hive attempt found immediately. `open_connection` passed `password=` on every
+    mechanism, and PyHive refuses one outside LDAP/CUSTOM — "Password should be set if and only if
+    in LDAP or CUSTOM mode". So the default driver path could not open a Kerberos connection at all,
+    which is the mechanism the bank cluster actually uses. Nothing caught it because the only test
+    that reached this line expected an ImportError first.
+    """
+    sent = {}
+    open_connection(_conn_spec(auth_mechanism="kerberos"), secret_resolver=lambda ref: "ticket",
+                    connect=lambda **kw: sent.update(kw) or _DbApiOnly())
+    assert "password" not in sent
+    assert sent["username"] == "svc_ro"
+
+
+def test_an_LDAP_connection_DOES_send_the_password():
+    sent = {}
+    open_connection(_conn_spec(auth_mechanism="ldap"), secret_resolver=lambda ref: "s3cret",
+                    connect=lambda **kw: sent.update(kw) or _DbApiOnly())
+    assert sent["password"] == "s3cret"
+
+
+def test_the_mechanism_reaches_the_driver_in_the_case_it_expects():
+    """PyHive matches `auth` against upper-case names and raises NotImplementedError otherwise, so a
+    spec recording `kerberos` in lower case would be refused by the driver rather than honoured."""
+    sent = {}
+    open_connection(_conn_spec(auth_mechanism="kerberos"), secret_resolver=lambda ref: "t",
+                    connect=lambda **kw: sent.update(kw) or _DbApiOnly())
+    assert sent["auth"] == "KERBEROS"
 
 
 def test_an_injected_factory_is_used_instead_of_a_real_driver():

@@ -27,6 +27,11 @@ expectations did not move — only the raw-row counts did.
 """
 from __future__ import annotations
 
+from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+from featuregen.data_agent.relationship import RelationshipEvidenceV1
+
+CATALOG_SOURCE = "ftr"
+DATABASE = "featuregen_test"
 CUSTOMER_SCHEMA = "dpl_eib"
 CUSTOMER_TABLE = "customer_master"
 #: SCD2 dimension history, SEPARATE from the spine. It cannot be the spine: several history rows per
@@ -149,6 +154,38 @@ EXPECTED = {
     "segment_at_cutoff": {"C1": "SME", "C2": "RETAIL", "C3": "CORPORATE", "C4": "CORPORATE",
                           "C5": "Unknown", "C6": "Unknown"},
 }
+
+
+def binding(schema: str, table: str) -> PhysicalDatasetBindingV1:
+    """The fixture's own physical bindings. Owned here rather than in a test module so the join
+    evidence below and the analysis plans under test cannot end up describing different tables."""
+    identity = PhysicalObjectIdentityV1(catalog_source=CATALOG_SOURCE, database=DATABASE,
+                                        schema=schema, table=table, object_kind="table")
+    return PhysicalDatasetBindingV1(
+        binding_id=f"b-{table}", catalog_logical_ref=f"{CATALOG_SOURCE}::{schema}.{table}",
+        connection_id="local-pg", identity=identity)
+
+
+#: The pilot join, as OBSERVED evidence — transactions.cif_id referencing customers.cif_id.
+#:
+#: Written out here beside `EXPECTED` and derived from the same hand-counted numbers, so every test
+#: can construct a verified analysis without running a probe first. `test_verified_joins` asserts
+#: this equals what an exact probe actually returns, which is what stops it drifting into a
+#: hand-written attestation that no longer describes the data.
+PILOT_JOIN_EVIDENCE = RelationshipEvidenceV1(
+    left_physical_id=binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).identity.table_id,
+    left_column="cif_id",
+    right_physical_id=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).identity.table_id,
+    right_column="cif_id",
+    left_rows=EXPECTED["transaction_rows"],
+    left_distinct=EXPECTED["transaction_cif_distinct"],
+    left_nulls=EXPECTED["transaction_cif_nulls"],
+    right_rows=EXPECTED["customer_rows"],
+    right_distinct=EXPECTED["customer_cif_distinct"],
+    matched_distinct=EXPECTED["matched_ids"],
+    unmatched_distinct=EXPECTED["unmatched_ids"],
+    max_left_rows_per_right_key=EXPECTED["max_rows_per_customer"],
+    method="exact")
 
 
 def create_pilot_tables(conn) -> None:

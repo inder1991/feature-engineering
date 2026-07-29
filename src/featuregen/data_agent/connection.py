@@ -132,6 +132,14 @@ _DRIVERS: dict[str, tuple[str, str]] = {
 }
 
 
+#: Auth mechanisms that consume a password. KERBEROS authenticates from the ambient ticket cache and
+#: NONE/NOSASL carry no credential at all — and a HiveServer2 client does not merely ignore a
+#: password there, it REFUSES the connection ("Password should be set if and only if in LDAP or
+#: CUSTOM mode"). Sending one unconditionally therefore made the default driver path unusable
+#: against the one mechanism the bank cluster uses.
+_PASSWORD_MECHANISMS = frozenset({"ldap", "custom"})
+
+
 def open_connection(connection: DataSourceConnectionV1, *,
                     secret_resolver: Callable[[str], str],
                     connect: Callable[..., object] | None = None):
@@ -162,6 +170,13 @@ def open_connection(connection: DataSourceConnectionV1, *,
                 f"(import of {module_name!r} failed)") from None
         connect = module.connect
 
-    return connect(host=connection.host, port=connection.port,
-                   username=connection.execution_principal, password=secret,
-                   auth=connection.auth_mechanism)
+    # The mechanism reaches the driver upper-cased: HiveServer2 clients match `auth` against
+    # upper-case names and refuse anything else, so a spec recording `kerberos` would be rejected by
+    # the driver rather than honoured.
+    mechanism = (connection.auth_mechanism or "").strip()
+    kwargs: dict[str, object] = {
+        "host": connection.host, "port": connection.port,
+        "username": connection.execution_principal, "auth": mechanism.upper()}
+    if mechanism.lower() in _PASSWORD_MECHANISMS:
+        kwargs["password"] = secret
+    return connect(**kwargs)

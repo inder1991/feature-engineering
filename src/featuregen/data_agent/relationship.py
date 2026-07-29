@@ -102,6 +102,67 @@ class RelationshipEvidenceV1:
         return "unique" if self.method == "exact" else "unknown"
 
 
+#: Why a piece of evidence does not support a join. Named here rather than in `analysis.py` because
+#: the rule is about relationships, not about one query shape — a second consumer would otherwise
+#: re-derive it and drift.
+JOIN_EVIDENCE_MISSING = "JOIN_EVIDENCE_MISSING"
+JOIN_EVIDENCE_MISMATCHED = "JOIN_EVIDENCE_MISMATCHED"
+JOIN_KEY_NOT_UNIQUE = "JOIN_KEY_NOT_UNIQUE"
+JOIN_UNIQUENESS_UNKNOWN = "JOIN_UNIQUENESS_UNKNOWN"
+
+
+def join_refusal(evidence: RelationshipEvidenceV1 | None, *,
+                 referencing_table_id: str, referencing_column: str,
+                 referenced_table_id: str, referenced_column: str) -> tuple[str, str] | None:
+    """`(code, message)` if this evidence does not support joining these two columns, else `None`.
+
+    This is the Release 2 half of the sentence at the top of this module: Release 1 produces the
+    evidence, and this decides what it may support — for exactly one use, an analysis join.
+
+    Three refusals, in order of how badly they mislead:
+
+    * **no evidence** — the relationship has never been looked at. Refusal is the default, because
+      an analysis that joins on an unexamined relationship is indistinguishable from one that joins
+      on a verified relationship once the result is in a spreadsheet.
+    * **mismatched evidence** — worse than none. It reads as verification in the audit trail while
+      describing a relationship the query does not perform.
+    * **the referenced key is not unique, or cannot be shown to be** — the correctness property. In
+      a population-spine analysis the referenced side is the LEFT side of the query, so a duplicate
+      key multiplies the whole population and overstates every total that includes it.
+
+    The uniqueness test goes through :meth:`RelationshipEvidenceV1.uniqueness_verdict` rather than
+    reading `right_is_unique`, because only that method knows an approximate probe may not assert
+    uniqueness. Reading the raw property is how a cheap profile silently promotes a bad key.
+
+    The referencing side is deliberately NOT required to be unique: many transactions per customer
+    is the expected shape, and the analysis aggregates that side before joining anyway.
+    """
+    if evidence is None:
+        return (JOIN_EVIDENCE_MISSING,
+                f"no relationship evidence for {referencing_table_id}.{referencing_column} -> "
+                f"{referenced_table_id}.{referenced_column}: the join has never been observed")
+
+    actual = (evidence.left_physical_id, evidence.left_column,
+              evidence.right_physical_id, evidence.right_column)
+    expected = (referencing_table_id, referencing_column, referenced_table_id, referenced_column)
+    if actual != expected:
+        return (JOIN_EVIDENCE_MISMATCHED,
+                f"evidence describes {actual[0]}.{actual[1]} -> {actual[2]}.{actual[3]}, but the "
+                f"join is {expected[0]}.{expected[1]} -> {expected[2]}.{expected[3]}")
+
+    verdict = evidence.uniqueness_verdict("right")
+    if verdict == "not_unique":
+        return (JOIN_KEY_NOT_UNIQUE,
+                f"{referenced_table_id}.{referenced_column} is not unique "
+                f"({evidence.right_rows} rows, {evidence.right_distinct} distinct); joining on it "
+                "would duplicate the population and overstate every total")
+    if verdict == "unknown":
+        return (JOIN_UNIQUENESS_UNKNOWN,
+                f"uniqueness of {referenced_table_id}.{referenced_column} was probed with method "
+                f"{evidence.method!r}; only an exact probe may assert a key")
+    return None
+
+
 def _qualified(dialect, binding: PhysicalDatasetBindingV1) -> str:
     """Reuse the dialect's own table-reference rules rather than re-deriving quoting here."""
     class _Shim:                                     # minimal duck-type for `table_ref`

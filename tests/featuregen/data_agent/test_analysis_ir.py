@@ -41,7 +41,6 @@ from featuregen.data_agent.eligibility import (
     ReversalMode,
     TransactionEligibilityPolicyV1,
 )
-from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
 from featuregen.data_agent.sql_postgres import PostgresDialect
 from tests.featuregen.data_agent.pilot_fixture import (
     CURRENT_MONTH,
@@ -50,6 +49,8 @@ from tests.featuregen.data_agent.pilot_fixture import (
     DIMENSION_TABLE,
     REPORT_CUTOFF,
     EXPECTED,
+    PILOT_JOIN_EVIDENCE,
+    binding,
     PREVIOUS_MONTH,
     TRANSACTION_SCHEMA,
     TRANSACTION_TABLE,
@@ -63,12 +64,9 @@ def pilot(db):
     return db
 
 
-def _binding(schema: str, table: str) -> PhysicalDatasetBindingV1:
-    identity = PhysicalObjectIdentityV1(catalog_source="ftr", database="featuregen_test",
-                                        schema=schema, table=table, object_kind="table")
-    return PhysicalDatasetBindingV1(
-        binding_id=f"b-{table}", catalog_logical_ref=f"ftr::{schema}.{table}",
-        connection_id="local-pg", identity=identity)
+#: The fixture owns the bindings, so a plan under test and the join evidence beside it cannot drift
+#: onto different physical identities.
+_binding = binding
 
 
 def _policy(**over) -> TransactionEligibilityPolicyV1:
@@ -105,6 +103,10 @@ def _ir(**over) -> AnalysisExecutionIRV1:
         eligibility=_policy(),
         dimension_binding=_binding(CUSTOMER_SCHEMA, DIMENSION_TABLE),
         attribution=_attribution(),
+        # Release 3 must demonstrate VERIFIED joins, so the pilot plan carries the observed evidence
+        # for the one join it performs. `test_verified_joins` owns the rule and proves this constant
+        # matches a real probe; here it simply makes the default plan an admissible one.
+        join_evidence=PILOT_JOIN_EVIDENCE,
     )
     kw.update(over)
     return AnalysisExecutionIRV1(**kw)

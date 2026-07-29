@@ -29,6 +29,11 @@ class PostgresDialect:
 
     name = "postgres"
 
+    def ident(self, name: str) -> str:
+        """Quote one identifier — the counterpart of `HiveDialect.ident`, so the analysis compiler
+        can render column names without knowing which engine it is targeting."""
+        return _ident(name)
+
     def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
         """`SET LOCAL` is transaction-scoped, so the bound dies with the caller's transaction rather
         than leaking onto a pooled connection."""
