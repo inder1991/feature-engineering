@@ -1,184 +1,166 @@
-# Source Metadata vs Platform Enrichment — Plan (rev 2)
+# Column Summaries, End to End — Plan (rev 3)
 
-> **Supersedes rev 1 entirely.** Rev 1 proposed treating any repeated source value as unanswered so
-> the AI could compete with it. Architectural review found that would have **blanked** the field it
-> aimed to enrich. Every claim below was verified against the code, and the three errors rev 1 made
-> are recorded in §6 rather than quietly dropped.
+> **Rev 3 makes this plan SMALLER, not bigger.** Rev 1 would have blanked `domain`. Rev 2 fixed that
+> but kept a `semantic_domain` lane whose ownership, inheritance, payload bound and vocabulary
+> lifecycle were all unspecified — and whose "one-line" safety guard turned out to preserve the AI
+> value rather than the bank's. Rev 3 ships the one thing that is unambiguously correct and already
+> half-built, and moves the domain lane to a separate plan where it can be specified properly.
+>
+> Every claim below was read from the code and re-checked after writing. §5 records what rev 1 and
+> rev 2 got wrong.
 
-**Goal:** make the catalog's metadata specific and searchable, without a platform value ever
-overwriting, blanking, or outranking what the bank declared.
+**Scope:** finish `ai_summary`. Nothing else.
 
-**Principle:** two lanes. The **source lane** is what the file said. The **enrichment lane** is what
-the platform learned. They sit beside each other; they never compete for one slot.
+**Explicitly out of scope, and why:** the `semantic_domain` lane — see §4.
 
 ---
 
-## 1. What is actually wrong
+## 1. Why this, and only this
 
-### 1.1 The Domain facet offers two choices for 237 columns
+The description problem is real: 47 distinct descriptions over 111 CIB columns, one sentence
+covering 12, including the `cust_curr_ntb_flg` / `cust_prev_9mnth_ntb_flg` pair whose difference is
+the whole signal.
 
-```
-cib   Customer     111 columns
-ftr   Compliance   126 columns
-```
+It is already solved, safely, by a field built earlier this session. `ai_summary`:
 
-Both source-declared. 238 source evidence rows, 1 LLM. `_write_domain_evidence`'s `column_ref_of`
-(`enrich.py:872`) refuses to persist an override for any column whose sidecar declares a domain, and
-every column declares one.
+* targets **every** column (`_summary_targets`), so a bucket-filled description cannot block it;
+* writes to its **own** field, so the source's `definition` keeps its text and its
+  `source/attested` authority — no competition, no conflict, nothing to blank;
+* receives the full `_concept_metadata` payload — term_name, declared type, BIAN path, source
+  attributes — where `draft_definitions` sends only `{table, column, type, concept}`, which by its
+  own comment cannot separate the NTB pair;
+* is cached (`enrichment_summary`, migration 1035) and indexed into `search_doc`.
 
-### 1.2 Descriptions are filled by bucket
-
-47 distinct descriptions over 111 CIB columns; 89 rows (80%) share theirs; one sentence covers 12,
-including the `cust_curr_ntb_flg` / `cust_prev_9mnth_ntb_flg` pair whose difference is the entire
-signal.
-
-### 1.3 `ai_summary` already solves 1.2 — and is only half-wired
-
-Built earlier this session, and the safer design: it targets **every** column
-(`_summary_targets`), writes to its **own** field, and receives the full `_concept_metadata`
-payload — term_name, declared type, BIAN path, source attributes — where `draft_definitions` sends
-only `{table, column, type, concept}`, which by its own code comment cannot separate the NTB pair.
-
-Three wires are missing:
+It is **not delivered**. Four wires are missing, and the asset screen consequently declares the field
+and renders it empty on every column:
 
 | gap | evidence |
 |---|---|
 | the value never loads | `ai_summary` absent from `_ANCHOR_COLUMNS` (`asset_detail.py:88`) |
-| the stage is not canonical | `enrich_summary` absent from `CANONICAL_STAGES` (`stage_report.py:50`) |
-| a no-client run misreports | absent from the skip loop (`ingest.py:2012`) |
+| not a canonical stage | absent from `CANONICAL_STAGES` (`stage_report.py:50`) |
+| no-client run misreports | absent from the skip loop (`ingest.py:2012`) |
 | the agent cannot see it | no reference in `feature_assist.py` |
 
-The asset screen declares the field and always renders it empty. **This was reported complete. It is
-not.**
+I reported this slice complete. It is not. That is the debt this plan repays.
 
 ---
 
-## 2. The hazard rev 1 would have triggered
+## 2. The work
 
-Verified chain:
+### 2.1 Load and display the value
 
-1. `FTR_GLOSSARY_PROFILE` (`source_profile.py`) puts `domain` in **`proposed_fields`**, not
-   `attested_fields`. Source domain is `source/proposed`.
-2. The LLM's is `llm/proposed` — **equal strength**.
-3. `PREFER_CONFIRMED` (`field_authority.py:239`) returns `_CONFLICT` when the top strength holds more
-   than one distinct value.
-4. A display conflict resolves to `None`.
-5. `_SOURCE_AUTHORED_DISPLAY_COLUMNS = frozenset({"unit", "currency"})`
-   (`field_resolution.py:121`) — **`domain` is not in it**, yet `build_graph` co-authors
-   `graph_node.domain`. So a `None` display projects unconditionally and **NULLs the column**.
+Add `ai_summary` to `_ANCHOR_COLUMNS` (`asset_detail.py:88`). It is already in `_METADATA_FIELDS`,
+which is exactly why the field renders and is always empty — the display slot was added without
+checking the data reached it.
 
-`Customer` + AI `Payments` → **blank**. Rev 1's central safety claim was false, and its "authority"
-test asserted a property the resolver cannot satisfy.
+### 2.2 Report the stage honestly
 
-This hazard exists **today**, independent of any plan, for any future disagreement on `domain`.
+Add `enrich_summary` to `CANONICAL_STAGES` (`stage_report.py:50`) and to the no-client skip loop
+(`ingest.py:2012`), so a run without an LLM reports `skipped_no_client` rather than the stage simply
+being absent from the report.
 
----
+### 2.3 Reach the feature agent — the part with real depth
 
-## 3. The design
+Adding a SQL column is not enough. `_FEATURE_COLUMN_DEFINITION_KEYS` is
+`frozenset({"definition", "semantic_terms"})` (`enrich_llm.py:203`), so an `ai_summary` key on a
+column descriptor is a genuinely-unknown key and **blocks the item**. The full path:
 
-### 3.1 Guard first (independent of everything else)
+1. `feature_assist._candidate_columns` — select it;
+2. the candidate dict — carry it;
+3. the menu's definition-kind field set — permit it;
+4. `_FEATURE_COLUMN_DEFINITION_KEYS` — allow it as definition-like prose, so it is
+   sample-stripped and PII-scanned like `definition` rather than rejected;
+5. relevance tokenisation — include it, or a column findable by its summary in search stays
+   unfindable to the agent;
+6. the feature-context input schema version — bump, since the item shape changes.
 
-Add `domain` to `_SOURCE_AUTHORED_DISPLAY_COLUMNS`. `build_graph` is a co-author, so a `None`
-resolution means *"I have nothing to say"*, not *"there is nothing here"* — exactly the reasoning
-already written above that constant for `unit`/`currency`. One line; removes a live hazard.
+Miss any one and the field is stored, displayed, and invisible where it matters.
 
-### 3.2 Two lanes, a pattern this codebase already runs
+### 2.4 What "the agent receives it" can and cannot mean
 
-`definition` (source) / `ai_summary` (platform) is the shape. Repeat it:
-
-| concern | source lane | enrichment lane |
-|---|---|---|
-| meaning | `definition` — source/attested | `ai_summary` — llm/proposed |
-| grouping | `domain` — source/proposed | `semantic_domain` — llm/proposed |
-
-Nothing competes. The source keeps its field, its text and its authority. The platform's value is
-usable immediately — searchable, facetable, fed to the agents — without human approval, per the
-standing rule that AI-proposed metadata is usable before review. Provenance stays visible.
-
-### 3.3 Repetition is a DIAGNOSTIC, never a verdict
-
-Rev 1's error. A domain is a *category*; repeating is its purpose. Fifty payment columns reading
-`Payments` is the field working correctly.
-
-So compute reuse statistics and **report** them. Change no authority and no targeting.
-
-Scope per `(source, schema, table, field)` over **distinct logical columns** — not the whole upload,
-and not raw CSV rows, so an unrelated table cannot reclassify this one and duplicate rows cannot
-manufacture a group. Name it `reused_values`, not `inherited_values`: repetition is evidence of
-possible genericness, not proof of it.
-
-### 3.4 Ground the domain classifier, and fix its cache identity
-
-It receives the table name and column names. From `amt`, `code`, `flag`, `dt` it cannot tell a
-transaction amount from a balance. Send what already exists per column: term_name, sanitized
-definition, `ai_summary`, concept, BIAN/FIBO path, declared type.
-
-Keep the **one call per table** shape — a table default plus sparse overrides. Rev 1 wrongly claimed
-~237 column classifications; `column_ref_of` runs *after* the call and only gates persistence.
-
-The cache keys on source + table + sorted column names, so correcting `amt` from "Transaction
-amount" to "Current account balance" serves the stale answer. Key on the full model input plus
-prompt/schema/vocabulary versions.
-
-### 3.5 A controlled, extendable domain vocabulary
-
-Free-text output fragments the facet (`Customer`, `Customers`, `Customer Management`, `Party`…).
-Offer a versioned list — `customer_identity`, `customer_lifecycle`, `customer_segmentation`,
-`payments`, `accounts`, `balances`, `compliance`, `fraud_risk`, `credit_risk`, `merchant`,
-`product`, `operations` — and allow `{"semantic_domain": "other", "proposed_new_domain": "…"}` so a
-genuine gap surfaces instead of being silently invented.
+`data_agent/` contains physical bindings, observation plans, analysis IR, SQL compilation and
+execution. There is **no natural-language catalog-grounding planner** — the roadmap places that in a
+later release. So this plan scopes agent grounding to the **feature agent** (`feature_assist.py`),
+which exists, and makes no claim about the data agent.
 
 ---
 
-## 4. Tasks, in order
+## 3. Acceptance
 
-**Task 1 — Guard `domain` against projection-wipe.** One line + a test that a `None` resolution
-leaves a source-declared domain standing. *Ships alone.*
+Against a committed fixture, not prose:
 
-**Task 2 — Finish `ai_summary`.** Anchor query, `CANONICAL_STAGES`, the no-client skip loop,
-feature-agent grounding. Acceptance: the two NTB columns show **distinct** summaries in asset
-detail, are findable by them, and reach the agent. *Repays a delivery gap.*
-
-**Task 3 — Reuse diagnostics.** Per-table statistics on the parse stage. Reports only; no authority
-or targeting change. Note this IS externally observable via ingestion-run reporting — rev 1's "no API
-change" was wrong.
-
-**Task 4 — `semantic_domain` lane.** Migration, evidence under its own field name, read model, facet.
-Source domain untouched throughout.
-
-**Task 5 — Ground + re-key the classifier.** Full per-column context, controlled vocabulary, cache
-identity over the real input.
+* `cust_curr_ntb_flg` and `cust_prev_9mnth_ntb_flg` carry **distinct** summaries, and a small
+  human-reviewed sample confirms they describe the *current* versus *nine-month-prior* state;
+* both are findable by words appearing only in the summary;
+* the asset screen shows a non-empty `ai_summary` with `llm/proposed` provenance;
+* the source `definition` is byte-identical before and after — asserted, because "we did not touch
+  the bank's text" is the property that makes this safe;
+* a no-LLM run reports `enrich_summary: skipped_no_client`;
+* the feature agent's menu carries the summary through egress without the item being blocked;
+* an unchanged re-upload makes no provider call (cache hit).
 
 ---
 
-## 5. Acceptance (Task 5 is where claims get tested)
+## 4. Why `semantic_domain` is NOT in this plan
 
-- No source `definition` or `domain` is ever blanked — including on an AI disagreement.
-- The NTB pair carries two distinct summaries, human-reviewed on a small sample.
-- The enriched-domain facet holds useful categories beyond `Customer` and `Compliance`.
-- Overrides are sparse: no fabricated per-column row where the table default applies.
-- Duplicate input rows count once; an identical value in another table changes nothing here.
-- Corrected metadata re-classifies; unchanged metadata makes no provider call.
-- The data/feature agent receives `ai_summary` and `semantic_domain`.
+The Domain facet genuinely offers two choices for 237 columns, and that is worth fixing. It is not
+worth fixing badly, and rev 2 underestimated it in five ways — each verified:
+
+**Source ownership is not true today.** `build_graph` receives the classifier's `domains`
+(`ingest.py:2242`) and writes them to `graph_node.domain` (`graph.py:243`); source evidence is
+written later (`ingest.py:2419`). So rev 2's "one-line guard" would have skipped the `None` update —
+`decision_id` is NULL — leaving the **AI** value standing. It converted *blank on conflict* into
+*AI wins by writing first*. Making source ownership true means changing ingest ordering, retiring
+legacy LLM-domain evidence, and restoring source projections: not a line, and not safe to do
+speculatively.
+
+**Inheritance is undefined.** Today `build_graph` physically writes the table default into every
+column row, which is why the facet works. Evidence-only table defaults would leave every
+non-overridden column NULL and produce a large `(none)` bucket. Where the default is stored, when it
+is materialised, and how `origin: direct|inherited` is computed all need deciding.
+
+**The payload does not fit.** `_MAX_COLUMN_PROFILES = 64` (`enrich_llm.py:1009`); CIB is 111 columns
+and FTR 126. A full-context single call per table is rejected before it reaches the provider. This
+needs a bounded contract or a two-stage shape.
+
+**Publishing before grounding is the wrong order.** Rev 2 exposed the facet in Task 4 and improved
+the classifier in Task 5, which permits shipping domains derived from table and column names alone.
+
+**`proposed_new_domain` has nowhere to live.** Resolution is scalar; storing the object makes its
+JSON the field value, and storing only `"other"` loses the proposal. It needs the shared candidate
+contract or an honest deferral.
+
+There is also a design question rev 2 did not raise: the classifier would receive `ai_summary` and
+`concept`, both potentially LLM proposals. Two AI outputs agreeing is not corroboration, and the
+payload must carry provenance so the model treats an AI value as advisory rather than as a second
+independent witness.
+
+**No live bug today.** `resolve_and_project` currently overwrites `build_graph`'s value with the
+resolved source value, and there is no conflict because there is essentially no LLM domain evidence.
+The hazard becomes live only when AI domain writing is enabled — which is what the domain plan does.
+So the ownership fix belongs **with** that plan, tested together, not shipped ahead of it as
+speculative work against a hazard nothing triggers.
+
+The domain lane gets its own plan. It is a vertical slice — ownership, inheritance, bounded payload,
+vocabulary, grounding, publication — not a task.
 
 ---
 
-## 6. What rev 1 got wrong
+## 5. What rev 1 and rev 2 got wrong
 
-Recorded because the errors are instructive, not to be tidied away.
+**Rev 1** claimed source outranks LLM for `domain`. False: `FTR_GLOSSARY_PROFILE` puts `domain` in
+`proposed_fields`, so both sides are `proposed`, `PREFER_CONFIRMED` returns `_CONFLICT`
+(`field_authority.py:239`), display resolves `None`, and `domain` is absent from
+`_SOURCE_AUTHORED_DISPLAY_COLUMNS` (`field_resolution.py:121`) — the value would have been NULLed.
+Rev 1 also named `draft_domains` and `_glossary_rows`, neither of which exists, and mistook a
+persistence gate for LLM targeting.
 
-1. **"Source outranks LLM" — false for `domain`.** True for `definition` (attested), false for
-   `domain` (proposed vs proposed). The plan would have blanked the field it set out to enrich.
-2. **`draft_domains` does not exist.** The function is `_write_domain_evidence` (`enrich.py:814`). I
-   verified every line number and never verified the enclosing function name — which then produced
-   the cost error, since `column_ref_of` gates *persistence*, after the call, not targeting.
-3. **Repetition treated as inheritance.** Sound reasoning for descriptions, transferred to a field
-   where repetition is the point.
-4. **`_glossary_rows` does not exist**; parse-stage reporting is owned by the upload route
-   (`api/routes/uploads.py`), not `ingest.py`. Rev 1 was not literally buildable.
-5. **Empirical claims unreproducible from the repo.** The real CIB/FTR files are untracked. The
-   111/47/89/12 figures should be pinned by a committed deterministic script stating its
-   normalization and grouping rules, or they cannot be re-derived by anyone else.
+**Rev 2** fixed the safety claim and then made a subtler version of the same mistake: it reasoned
+about the projection guard without reading the ingest ORDER, so its guard preserved the AI value.
+It also treated `semantic_domain` as one task when its inheritance, payload bound, vocabulary
+lifecycle and consumer wiring were each unspecified — the same underestimation that left
+`ai_summary` four wires short of working while being reported complete.
 
-The common thread: rev 1 reasoned about authority from memory instead of reading
-`source_profile.py`. Every other error followed from that one.
+The through-line across all three revisions: **every error came from reasoning about a mechanism
+instead of reading it.** Rev 3 is smaller because the parts that were not read have been moved to
+where they can be read first.
