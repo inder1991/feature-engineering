@@ -821,6 +821,9 @@ export interface LineageEdge {
   // entity_bridge only: WHICH entity the two columns share (customer, branch, …). Carried on the
   // edge because the node-level `entity` field is null on every column.
   entity_id?: string
+  // entity_bridge only: ranking, not permission. A weak link is drawn faintly, never hidden.
+  strength?: number
+  why?: string
 }
 
 export interface LineageGraph {

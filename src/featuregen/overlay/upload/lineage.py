@@ -450,6 +450,12 @@ class _Builder:
                 "layer": "entity", "kind": "entity_bridge",
                 "resolved": link.status is LinkStatus.CONFIRMED,
                 "entity_id": link.entity_id,
+                # Ranking, carried onto the edge so the CANVAS can distinguish a grain-backed link
+                # from a type-only match. Without it `cust_num <-> cif_id` drew identically to
+                # `cust_prim_branch_nm <-> sol_desc`, which pairs a name with a description and is
+                # not a real join — the list could say so and the graph could not.
+                "strength": link.strength,
+                "why": link.why,
             }))
         return out
 

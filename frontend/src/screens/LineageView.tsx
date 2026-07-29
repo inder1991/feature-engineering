@@ -435,7 +435,10 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
       ? `${to.catalog_source ?? idSource(e.to)}.${shortRef(to, e.to)}`
       : e.to
     const state = e.resolved ? 'confirmed by a person' : 'proposed, not yet reviewed'
-    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${state}`
+    // `why` names WHY the link ranks where it does ("neither side is a key — types match but this
+    // may not be a real join"). On the canvas that is one word; here there is room to say it.
+    const because = e.why ? ` · ${e.why}` : ''
+    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${state}${because}`
   }
   if (e.kind === 'derives') {
     return `${shortRef(from, e.from)} derives feature ${shortRef(to, e.to)} · registered`
@@ -840,6 +843,9 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       const sourceUnit = unitOf(e.from)
       const targetUnit = unitOf(e.to)
       const isTrace = traced.keys.has(dedupeKey(e))
+      // A type-only link is drawn faint and thin rather than removed — the owner's rule is that a
+      // link is usable before anyone confirms it, so weakness is a matter of EMPHASIS.
+      const weakLink = e.kind === 'entity_bridge' && (e.strength ?? 0) < 10
       let stroke = 'var(--ln-join)'
       let label: string
       if (e.kind === 'join') {
@@ -852,7 +858,12 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         // word "entity" — graph_node.entity is null on every column — so four different links drew
         // four identical labels stacked on top of each other.
         const entity = e.entity_id ?? byId.get(e.from)?.entity ?? byId.get(e.to)?.entity
-        label = entity ?? 'linked'
+        // A grain on either side (weight 10) means the column really is that table's key; below
+        // that the two columns merely share a type, which is how `cust_prim_branch_nm` came to
+        // "link" to `sol_desc` — a name to a description. Rank it, never hide it: the link is real
+        // enough to show and weak enough to say so.
+        const keyed = (e.strength ?? 0) >= 10
+        label = keyed ? (entity ?? 'linked') : `${entity ?? 'linked'} · weak`
       } else {
         stroke = 'var(--proposal)'
         label = e.kind
@@ -872,7 +883,10 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           ? { stroke: 'var(--accent)', strokeWidth: 3 }
           : {
               stroke,
-              strokeWidth: 1.5,
+              // Thinner and semi-transparent for a type-only link, so a grain-backed one reads as
+              // the stronger claim at a glance without the weak one disappearing.
+              strokeWidth: weakLink ? 1 : 1.5,
+              ...(weakLink ? { opacity: 0.45 } : {}),
               ...(e.resolved ? {} : { strokeDasharray: '6 5' }),
             },
       }

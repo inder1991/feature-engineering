@@ -114,3 +114,32 @@ def test_two_near_columns_linking_to_the_SAME_far_column_both_draw(two_catalogs)
     bridges = [e for e in g["edges"] if e.get("kind") == "entity_bridge"]
     near = {e["from"] for e in bridges}
     assert len(near) == 2, bridges     # both near columns reach cif_id
+
+
+def test_the_edge_carries_a_strength_and_a_reason(two_catalogs):
+    """The canvas needs to distinguish a grain-backed link from a type-only match. Without this,
+    `cust_num <-> cif_id` drew identically to `cust_prim_branch_nm <-> sol_desc` — a name paired
+    with a description, which is not a real join. The list could say so; the graph could not."""
+    edge = next(e for e in _graph(two_catalogs)["edges"] if e.get("kind") == "entity_bridge")
+    assert edge["strength"] >= 10          # cust_num is its table's grain
+    assert "key" in edge["why"]
+
+
+def test_a_type_only_link_ranks_below_a_grain_backed_one(two_catalogs):
+    db = two_catalogs
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               " data_type) VALUES ('cib','public.bo_cib_customer.branch_nm','column',"
+               " 'bo_cib_customer','branch_nm','text')")
+    ev = {"entity_id": "branch", "type_basis": "declared", "candidate_id": "c3",
+          "left_is_grain": False, "right_is_grain": False, "data_type_family": "text",
+          "derivation_version": "1.0.0"}
+    db.execute(
+        "INSERT INTO entity_bridge_candidate_evidence (entity_id, left_catalog_source, "
+        " left_object_ref, right_catalog_source, right_object_ref, candidate_id, fact_key, "
+        " data_type_family, evidence_json, derivation_version) "
+        "VALUES ('branch','cib','public.bo_cib_customer.branch_nm','ftr','public.tran_repos.cif_id',"
+        " 'c3','fk-3','text',%s,'1.0.0')", (json.dumps(ev),))
+    g = lineage_graph(db, "cib", "public.bo_cib_customer", now=_NOW, fresh_within=_FRESH, depth=2)
+    by_entity = {e["entity_id"]: e for e in g["edges"] if e.get("kind") == "entity_bridge"}
+    assert by_entity["customer"]["strength"] > by_entity["branch"]["strength"]
+    assert "neither side is a key" in by_entity["branch"]["why"]
