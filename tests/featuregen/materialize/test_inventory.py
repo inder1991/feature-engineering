@@ -354,10 +354,30 @@ def test_the_shipped_environment_file_refuses_until_a_human_fills_it():
 
     Pinned so the placeholder can never be mistaken for a captured environment: the moment somebody
     fills it in, this test tells them by failing, and the fill-in is reviewed rather than assumed.
+    The refusal must name a RUNTIME VERSION, not a structural problem — a template that also had the
+    wrong shape would refuse for a reason that says nothing about how far from done it is.
     """
     assert SHIPPED_ENVIRONMENT.exists()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="engine_versions"):
         load_inventory(SHIPPED_ENVIRONMENT)
+
+
+def test_the_shipped_environment_file_is_otherwise_the_right_shape(tmp_path):
+    """Filling in the versions must be the ONLY thing between the template and a load.
+
+    Read it, substitute plausible versions, and it loads — so the template's remaining nulls are a
+    to-do list and not a second, undiscovered set of problems. It also pins that the `engines:`
+    block the template still carries does not stop the file being read.
+    """
+    document = yaml.safe_load(SHIPPED_ENVIRONMENT.read_text(encoding="utf-8"))
+    assert "engines" in document
+    document["engine_versions"] = _engine_versions()
+    document["captured_at"] = "2026-07-29T09:00:00+05:30"
+
+    inv = load_inventory(_write(tmp_path, document, "filled.yml"))
+    assert inv.environment_id == "hdfc-local"
+    assert inv.tables == {}            # nobody has captured a table yet
+    assert inv.logical_schema_map == {}
 
 
 def test_loading_twice_is_the_same_inventory(inventory_yaml):

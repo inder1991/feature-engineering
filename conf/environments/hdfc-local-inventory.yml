@@ -1,24 +1,44 @@
 # Spec A §0 — target-cluster inventory (TYPED input; the Markdown record is for humans).
 #
-# STATUS: WORKING ASSUMPTIONS, NOT VERIFIED FACTS.
-# The engine block below was supplied to unblock compile-side work (2026-07-27):
-# "assume the sample CSV has source_type and source, and every row is edp / hive".
-# Everything under `tables:` is still UNKNOWN and must come from the metastore before
-# cluster acceptance (Task 17). An unknown layout REFUSES; it does not default.
+# STATUS: A TEMPLATE. NOTHING BELOW HAS BEEN OBSERVED ON A CLUSTER.
+#
+# `featuregen.materialize.inventory.load_inventory` REFUSES this file as it stands (the first null
+# runtime version), and `tests/featuregen/materialize/test_inventory.py` pins that it does. That is
+# the point: an unfilled template must never be mistaken for a captured environment, so filling it
+# in is a test somebody has to change on purpose rather than a default nobody reviews.
+#
+# Two ways to fill it:
+#   1. run `MetastoreInventoryAdapter().capture(...)` against the cluster and write the result out;
+#   2. transcribe `DESCRIBE FORMATTED` / `SHOW PARTITIONS` by hand into the shape below.
+# Either way the partition MAPPING is declared, never captured — see `tables:`.
 
 environment_id: hdfc-local
 
-# Engine mapping is keyed by (source_type, source) — a handful of lines regardless of
-# how many columns the catalog carries. Spec §3.4b.
+# When somebody looked. Observation provenance: it never enters an identity hash, and it is required
+# so that "this inventory is four months old" is an answerable question. Null until a capture.
+captured_at: null
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §3.4b — engine mapping, keyed by (source_type, source): a handful of lines regardless of how many
+# columns the catalog carries. Supplied 2026-07-27 to unblock compile-side work, on the working
+# assumption that every sample row is edp / hive.
+#
+# DECLARED BUT NOT YET READ. `SOURCE_ENGINE_UNSUPPORTED` exists in `codes.py` and nothing raises it;
+# `ClusterInventoryV1` carries no typed field for this block, and `load_inventory` tolerates the key
+# without consuming it. Whoever wires the §3.4b gate types this and deletes this paragraph.
 engines:
   edp/hive:
     kind: hive
-    default_schema: null        # UNKNOWN — see §3.5; null means resolution must find it
-                                # in graph_node.schema_name or refuse.
+    default_schema: null        # UNKNOWN — see §3.5; null means resolution must find the schema in
+                                # graph_node.schema_name or in logical_schema_map below, or refuse.
   # ods/oracle:                 # not present in the sample; Spec A would refuse it
   #   kind: oracle              # (SOURCE_ENGINE_UNSUPPORTED)
 
-engine_versions:                # UNKNOWN until Task 0 runs against the cluster
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# What the environment RUNS (§0). EVERY field is required and non-blank; each null below is a
+# refusal naming that field. The generated project pins python/pyspark/kedro/kedro_datasets from
+# these (§7), and §10.3's capability attestation is keyed on the exact hive/spark/metastore triple.
+engine_versions:
   hive: null
   spark: null
   metastore: null
@@ -26,11 +46,79 @@ engine_versions:                # UNKNOWN until Task 0 runs against the cluster
   java: null
   pyspark: null
   kedro: null
-  kedro_datasets: null           # Kedro's dataset implementations ship SEPARATELY
-                                 # versioned; `spark.SparkHiveDataset` resolves out of
-                                 # kedro-datasets, so a lock naming only `kedro` leaves
-                                 # the class that reads every source table unpinned.
+  kedro_datasets: null           # Kedro's dataset implementations ship SEPARATELY versioned;
+                                 # `spark.SparkHiveDataset` resolves out of kedro-datasets, so a
+                                 # lock naming only `kedro` leaves the class that reads every
+                                 # governed source table unpinned.
 
-tables: {}                      # UNKNOWN: partition columns, partition mapping,
-                                # late_arrival_days, location, rewritten_in_place.
-                                # Populate from DESCRIBE FORMATTED / SHOW PARTITIONS.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §3.5 step 2 — the DECLARED logical→physical schema mapping, keyed by the canonical LOGICAL table
+# ref (`source::schema.table`). Consulted only when `graph_node.schema_name` is NULL; if neither
+# yields a schema, compilation refuses with PHYSICAL_SCHEMA_NOT_RESOLVED rather than falling back to
+# `public` and reading a different table than the catalog governs.
+#
+# The catalog uploads are schema-flattened, so these lines are expected to be needed. One per
+# governed table, once the physical schema is confirmed:
+#   hdfc::public.comp_financial_tran_repos_dly: DPL_EIB_COMPLIANCE
+#   hdfc::public.bo_cib_customer: BO_DPL_CIB
+logical_schema_map: {}
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# The physical tables, keyed `SCHEMA.TABLE` exactly as the cluster spells them (case is preserved —
+# it is what the generated project renders). EMPTY means nobody has captured anything. A table
+# absent from here refuses with PARTITION_IDENTITY_UNKNOWN, which is NOT the same as a table present
+# with `partition_columns: null` (verified unpartitioned).
+#
+# The governed catalogs today are:
+#   DPL_EIB_COMPLIANCE.COMP_FINANCIAL_TRAN_REPOS_DLY  — transactions, 126 columns, Hive bare types
+#                                                       (`string`, `double`, `timestamp`)
+#   BO_DPL_CIB.BO_CIB_CUSTOMER                        — customer, 111 columns, RDBMS types WITH
+#                                                       parameters (`varchar(150)`, `timestamp(0)`,
+#                                                       `decimal(15,5)`); carries `business_dt`
+#                                                       typed `timestamp(0)`
+#   accounts                                          — catalog NOT YET UPLOADED; name and columns
+#                                                       unknown. Needs, on arrival: its SCHEMA.TABLE
+#                                                       name, its ordered partition columns (or a
+#                                                       verified `null`), its declared mapping, its
+#                                                       customer-ownership column, and the §H answer
+#                                                       — a single `cif_id` is N:1 and fine, a
+#                                                       joint-holder bridge is 1:N and refuses the
+#                                                       worked feature.
+#
+# Shape of one entry — every key is REQUIRED, including the ones whose value may be null:
+#
+#   DPL_EIB_COMPLIANCE.COMP_FINANCIAL_TRAN_REPOS_DLY:
+#     # ORDERED [name, physical type]. Order is semantic — the partition path is built from it.
+#     # `null` means the capture VERIFIED there are none. An empty list `[]` is refused: "we do not
+#     # know how this table is partitioned" is not "scan it".
+#     partition_columns:
+#       - [load_dt, string]
+#     # DECLARED, NEVER INFERRED (§3.4). A column named `load_dt` does not tell you how an
+#     # event-time window maps onto load partitions: a transaction that happened on the 1st and
+#     # arrived on the 5th sits in the 5th's partition, so a window resolved by EVENT date silently
+#     # drops it. One of exactly five kinds; `null` is loadable and refuses at compile time with
+#     # PARTITION_MAPPING_NOT_DECLARED.
+#     #   event_time_partition   : time_ref, partition_column, transform, timezone
+#     #   availability_partition : ... plus late_arrival_days  (BY HOW MUCH the read widens)
+#     #   static_snapshot        : partition_values [[column, value], ...]
+#     #   full_scan              : (no fields) — explicit, expensive, reviewable; never a default
+#     #   verified_unpartitioned : (no fields) — pairs with `partition_columns: null`
+#     # transform is `date_iso` (2026-07-29) or `date_compact` (20260729); timezone is an IANA zone.
+#     partition_mapping:
+#       kind: availability_partition
+#       time_ref: hdfc::public.comp_financial_tran_repos_dly.tran_dt
+#       partition_column: load_dt
+#       transform: date_iso
+#       timezone: Asia/Kolkata
+#       late_arrival_days: 3
+#     # ORDERED DATA columns as the metastore prints them. Physical types are NOT normalised —
+#     # `varchar(150)` is not `string`, and §6's adapter is what decides what the difference means.
+#     columns:
+#       - [tran_id, string]
+#       - [tran_amt, double]
+#     location: hdfs://…/dpl_eib_compliance.db/comp_financial_tran_repos_dly
+#     # Whether history is rewritten under the same path. No metastore knows this — it is a
+#     # statement about how the feed operates, and it is why an unpartitioned mutable table's
+#     # snapshot is NOT content-addressed (§3.4).
+#     rewritten_in_place: false
+tables: {}
