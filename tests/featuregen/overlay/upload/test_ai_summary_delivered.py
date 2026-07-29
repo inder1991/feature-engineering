@@ -86,3 +86,19 @@ def test_relevance_scoring_reads_it():
     toks = feature_assist._column_tokens(
         {"ai_summary": "whether the customer is currently new to the bank"})
     assert "bank" in toks and "customer" in toks
+
+
+# ── the audit record must identify WHICH contract egressed ───────────────────────────────────────
+
+def test_the_input_contract_version_was_bumped(monkeypatch):
+    """`_feature_schema_version` is stamped on the immutable llm_call so a reader knows what shape
+    egressed. Adding `ai_summary` to the payload while leaving it at 2 would make a v2 record
+    ambiguous — with or without summaries — defeating the reason it is stamped."""
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    assert feature_assist._feature_schema_version() == 3
+
+
+def test_the_base_contract_is_still_version_1(monkeypatch):
+    """Flag off is unchanged: no summary egresses, so the old contract keeps its number."""
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    assert feature_assist._feature_schema_version() == 1

@@ -196,10 +196,20 @@ def feature_context_enabled() -> bool:
     return os.environ.get(FEATURE_CONTEXT_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+#: The input contract's numeric version, stamped on the immutable llm_call record.
+#:   1 — the base menu.
+#:   2 — the widened feature-context menu (definition + semantic_terms prose).
+#:   3 — v2 plus `ai_summary`.
+#: Bumped because the record must identify WHICH contract egressed. Adding a field to the payload
+#: while leaving the version at 2 makes a v2 record ambiguous — with or without summaries — which
+#: defeats the reason the version is stamped at all.
+_FEATURE_CONTEXT_SCHEMA_VERSION = 3
+
+
 def _feature_schema_version() -> int:
-    """2 when the feature-context flag is on (the widened INPUT contract egressed), else 1 — so the
-    immutable llm_call stamps the real numeric version, not a hardcoded 1 masked by a `…_v1` prompt_id."""
-    return 2 if feature_context_enabled() else 1
+    """The widened contract's version when the feature-context flag is on, else 1 — so the immutable
+    llm_call stamps the real numeric version, not a hardcoded 1 masked by a `…_v1` prompt_id."""
+    return _FEATURE_CONTEXT_SCHEMA_VERSION if feature_context_enabled() else 1
 
 
 # Menu fact key -> read_column_facts field_name. `data_type` reads the OPERATIONAL structural type

@@ -46,11 +46,15 @@ def test_versions_are_1_when_flag_off(db, monkeypatch):
     assert all(tuple(r) == (1, 1) for r in rows), rows
 
 
-def test_versions_are_2_when_flag_on(db, monkeypatch):
+def test_versions_are_3_when_flag_on(db, monkeypatch):
+    """Bumped 2 -> 3 when `ai_summary` joined the column descriptor. Both numbers come from the one
+    `_feature_schema_version`, so the contract carries a single version — leaving it at 2 would make
+    a v2 record ambiguous, with or without summaries, which is the one thing the stamp exists to
+    prevent."""
     monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
     assert feature_context_enabled() is True
     _bank_graph(db)
     recommend_features(db, "predict churn", _fake(), catalog_source="bank", critic=False)
     rows = _feature_ideas_versions(db)
     assert rows, "recommend must record at least one feature_ideas llm_call"
-    assert all(tuple(r) == (2, 2) for r in rows), rows
+    assert all(tuple(r) == (3, 3) for r in rows), rows
