@@ -45,7 +45,7 @@ from tests.featuregen.materialize.test_group_plan import (  # noqa: F401 — `ca
 from tests.featuregen.materialize.test_ir import _compile, _ok
 
 from featuregen.formula._jcs import dumps as jcs_dumps
-from featuregen.materialize import binding, identity, render
+from featuregen.materialize import binding, compile, identity, render
 from featuregen.materialize.binding import physical_target_for
 from featuregen.materialize.group_plan import group_plan_hash
 from featuregen.materialize.identity import (
@@ -70,19 +70,20 @@ ATTESTATION = "att-0001"
 SNAPSHOTS = ("snap-transactions-0001", "snap-customers-0001")
 PARAMETERS = {"transactions_partitions": ["load_dt=2026-07-26", "load_dt=2026-07-27"],
               "business_dt": BUSINESS_DT}
-COMPILER = "compiler-1.2.3"
 
 #: Every literal above that a run supplies, as bytes — searched for inside the compilation-phase
 #: payloads. Kept as one list so a value added to the execution hash is added to the proof too.
-RUN_TIME_LITERALS = (BUSINESS_DT, ENVIRONMENT, ATTESTATION, COMPILER, *SNAPSHOTS,
+RUN_TIME_LITERALS = (BUSINESS_DT, ENVIRONMENT, ATTESTATION, *SNAPSHOTS,
                      "load_dt=2026-07-27")
 
 #: The parameter NAMES §7 puts on the run side. A compilation-phase entry point that named one of
 #: these would be taking a run-time value however carefully its body then ignored it.
 #: `renderer_version` is deliberately NOT here. Task 12 removed the parameter: the value is read
 #: from `render.RENDERER_VERSION`, so there is no argument on which a stale literal could arrive.
+#: `compiler_version` is deliberately NOT here either. Task 15 removed that parameter the same way,
+#: once `featuregen.materialize.compile` existed to own `COMPILER_VERSION`.
 RUN_TIME_PARAMETERS = frozenset({
-    "environment_id", "parameters", "business_dt", "input_snapshot_ids", "compiler_version",
+    "environment_id", "parameters", "business_dt", "input_snapshot_ids",
     "capability_attestation_id"})
 
 FILES = {
@@ -117,7 +118,6 @@ def _exec(**overrides) -> str:
         "parameters": PARAMETERS,
         "business_dt": BUSINESS_DT,
         "input_snapshot_ids": SNAPSHOTS,
-        "compiler_version": COMPILER,
         "capability_attestation_id": ATTESTATION,
     }
     fields.update(overrides)
@@ -433,7 +433,6 @@ def test_the_execution_hash_covers_everything_section_7_names() -> None:
     ("environment_id", "hdfc-uat"),
     ("business_dt", "2026-07-28"),
     ("capability_attestation_id", "att-0002"),
-    ("compiler_version", "compiler-1.2.4"),
     ("input_snapshot_ids", ("snap-transactions-0002", "snap-customers-0001")),
     ("parameters", {**PARAMETERS, "business_dt": "2026-07-28"}),
 ])
@@ -453,11 +452,24 @@ def test_the_RENDERER_version_is_read_rather_than_accepted_and_still_moves_the_h
         assert _exec() != baseline
 
 
-def test_the_render_package_init_imports_NOTHING() -> None:
-    """`identity` reads `RENDERER_VERSION` out of `featuregen.materialize.render`, and
-    `render.project` imports `identity`. An import added to that `__init__` closes the loop, and the
-    failure would surface as an ImportError in whichever module was imported first."""
-    source = pathlib.Path(render.__file__).read_text(encoding="utf-8")
+def test_the_COMPILER_version_is_read_rather_than_accepted_and_still_moves_the_hash() -> None:
+    """Task 15, closing A.13's other half. §7 covers the compiler's version for the same reason it
+    covers the renderer's, and a parameter is a place a caller can freeze one. `compile` now owns
+    `COMPILER_VERSION`, so there is no argument left to pass — proved by moving the constant."""
+    assert "compiler_version" not in inspect.signature(sandbox_execution_hash).parameters
+    baseline = _exec()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(compile, "COMPILER_VERSION", "compiler-9.9.9")
+        assert _exec() != baseline
+
+
+@pytest.mark.parametrize("package", [render, compile])
+def test_the_version_owning_package_init_imports_NOTHING(package: types.ModuleType) -> None:
+    """`identity` reads both versions out of these packages, and both have (or will have) a module
+    that imports `identity` back — `render.project` seals, and §2's chain builds a compilation
+    identity. An import added to either `__init__` closes the loop, and the failure would surface as
+    an ImportError in whichever module was imported first."""
+    source = pathlib.Path(package.__file__).read_text(encoding="utf-8")
     parsed = ast.parse(source)
     assert [node for node in ast.walk(parsed)
             if isinstance(node, ast.Import | ast.ImportFrom)
@@ -510,8 +522,8 @@ def test_a_snapshot_id_list_given_as_a_bare_STRING_is_refused() -> None:
         _exec(input_snapshot_ids="snap-transactions-0001")
 
 
-@pytest.mark.parametrize("field", ["environment_id", "business_dt", "capability_attestation_id",
-                                   "compiler_version"])
+@pytest.mark.parametrize("field", ["environment_id", "business_dt",
+                                   "capability_attestation_id"])
 def test_a_blank_run_value_is_refused(field: str) -> None:
     with pytest.raises(ValueError):
         _exec(**{field: "   "})

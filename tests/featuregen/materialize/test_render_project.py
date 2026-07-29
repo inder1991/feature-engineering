@@ -23,6 +23,8 @@ rendered from a group nobody really compiles is a golden of nothing.
 from __future__ import annotations
 
 import ast
+import dataclasses
+import inspect
 import pathlib
 import re
 
@@ -63,6 +65,7 @@ from featuregen.materialize.inputs import derive_requirement
 from featuregen.materialize.inventory import EngineVersions
 from featuregen.materialize.ir import authorize_compilation, ir_hash
 from featuregen.materialize.physical_types import PhysicalType, resolve_physical_type
+from featuregen.materialize.publish import PublisherSelection, PublishMechanism
 from featuregen.materialize.render.project import (
     PIPELINE_NAME,
     REQUIRED_RUN_PARAMETERS,
@@ -166,13 +169,24 @@ def _nodes(datasets: ProjectDatasets) -> tuple[RenderedNode, ...]:
     return tuple(nodes)
 
 
-def _render(db, *names, engine_versions=None, environment_id=ENVIRONMENT) -> SealedProject:
+def _render(db, *names, engine_versions=None, environment_id=ENVIRONMENT,
+            publisher_selection=None) -> SealedProject:
     authorized, plan, spine_input = _compiled(db, *(names or (SUM_30D, COUNT_90D, RATIO_90D)))
     datasets = project_datasets(authorized, plan, spine_input=spine_input)
     return render_project(
         authorized, plan, environment_id=environment_id,
         engine_versions=engine_versions or fixtures.ENGINE_VERSIONS,
-        spine_input=spine_input, nodes=_nodes(datasets))
+        spine_input=spine_input, nodes=_nodes(datasets),
+        publisher_selection=publisher_selection)
+
+
+def _selection(*, environment_id=ENVIRONMENT, engine_versions=None) -> PublisherSelection:
+    """§10.3's evidence, as `select_publisher` returns it (Task 16). Built directly here because
+    what these tests are about is what the RENDERER does with one, not how one is obtained."""
+    return PublisherSelection(
+        environment_id=environment_id, mechanism=PublishMechanism.VERSIONED_POINTER,
+        capability_attestation_id="att-t16", adds_feature=False,
+        engine_versions=engine_versions or fixtures.ENGINE_VERSIONS)
 
 
 @pytest.fixture
@@ -596,8 +610,13 @@ def test_the_publication_target_is_NOT_parameterized(project: SealedProject) -> 
 
 def test_the_published_target_CANNOT_replace_an_existing_table(project: SealedProject) -> None:
     """§10 bans `INSERT OVERWRITE`, and §10.3 forbids selecting any publish mechanism before the
-    executable probe proves it — so an artifact rendered today must be unable to publish over
-    anything. Task 16 replaces this entry with the mechanism its probe attested."""
+    executable probe proves it — so an artifact rendered WITHOUT a selection must be unable to
+    publish over anything.
+
+    Task 16 did not relax this; it made the target generation-scoped instead, and a render that
+    supplies a `publisher_selection` gets that entry (below). The `project` fixture deliberately
+    supplies none, so this stays the default and the default stays fail-closed.
+    """
     entries = _yaml_of(project, "conf/base/catalog.yml")
     assert entries[f"feature_{GROUP}"]["write_mode"] == "errorifexists"
     assert {entry.get("write_mode") for entry in entries.values()} <= {None, "errorifexists"}
@@ -606,6 +625,81 @@ def test_the_published_target_CANNOT_replace_an_existing_table(project: SealedPr
     # Prose may explain WHY §10 bans it; no SETTING may decide how one behaves.
     spark = _yaml_of(project, "conf/base/spark.yml")
     assert [key for key in spark if "overwrite" in key.lower()] == []
+
+
+# ── §10.3: the publication entry a SELECTION renders (Task 16) ───────────────────────────────────
+
+
+def test_a_selection_makes_the_target_GENERATION_SCOPED(catalog, db) -> None:  # noqa: F811
+    """The blocker A.15 recorded — *a rendered project cannot run twice against the same target* —
+    lifts here, and not by loosening a write mode. `staging_root` resolves to
+    `<base>/<generation_id>` (§11.1), so each generation writes somewhere that did not exist."""
+    entries = _yaml_of(_render(db, publisher_selection=_selection()), "conf/base/catalog.yml")
+    published = entries[f"feature_{GROUP}"]
+    assert published["filepath"].startswith("${runtime_params:staging_root}/")
+    assert published["save_args"]["mode"] == "errorifexists"
+    assert "write_mode" not in published
+
+
+def test_the_selection_entry_still_bans_every_replacing_write(catalog, db) -> None:  # noqa: F811
+    project = _render(db, publisher_selection=_selection())
+    catalog_text = project.files["conf/base/catalog.yml"]
+    assert "INSERT OVERWRITE" not in catalog_text.upper()
+    entries = _yaml_of(project, "conf/base/catalog.yml")
+    assert {entry.get("write_mode") for entry in entries.values()} <= {None, "errorifexists"}
+    assert {entry.get("save_args", {}).get("mode") for entry in entries.values()} \
+        <= {None, "errorifexists"}
+
+
+def test_the_selection_entry_introduces_NO_new_run_parameter(catalog, db) -> None:  # noqa: F811
+    """The rendered hooks refuse a run carrying an unexpected runtime parameter, so a publication
+    entry interpolating one nobody prepared would fail every run at `before_pipeline_run`."""
+    text = _render(db, publisher_selection=_selection()).files["conf/base/catalog.yml"]
+    assert set(re.findall(r"\$\{runtime_params:([a-z_]+)\}", text)) <= set(REQUIRED_RUN_PARAMETERS)
+
+
+def test_the_selection_changes_ONLY_the_publication_entry(catalog, db) -> None:  # noqa: F811
+    """Every other file — the nodes, the wiring, the pins, the lock's inputs — is untouched, so a
+    project rendered with evidence is the same artifact plus a different place to land."""
+    without = _render(db)
+    with_selection = _render(db, publisher_selection=_selection())
+    differing = [path for path in without.files
+                 if without.files[path] != with_selection.files[path]]
+    assert sorted(differing) == ["GENERATED.lock", "conf/base/catalog.yml"], differing
+    plain = _yaml_of(without, "conf/base/catalog.yml")
+    attested = _yaml_of(with_selection, "conf/base/catalog.yml")
+    assert set(plain) == set(attested)
+    assert {name: entry for name, entry in plain.items() if name != f"feature_{GROUP}"} \
+        == {name: entry for name, entry in attested.items() if name != f"feature_{GROUP}"}
+    assert attested[f"feature_{GROUP}"]["metadata"]["kedro-viz"]["layer"] == "feature"
+
+
+def test_a_selection_for_ANOTHER_environment_is_refused(catalog, db) -> None:  # noqa: F811
+    """A capability attestation is for the EXACT environment (§10.3). Carrying one across would
+    publish here on a capability somebody probed somewhere else."""
+    with pytest.raises(ValueError, match="environment"):
+        _render(db, publisher_selection=_selection(environment_id="hdfc-uat"))
+
+
+def test_a_selection_probed_on_OTHER_engine_versions_is_refused(catalog, db) -> None:  # noqa: F811
+    other = dataclasses.replace(fixtures.ENGINE_VERSIONS, spark="3.4.1")
+    with pytest.raises(ValueError, match="spark"):
+        _render(db, publisher_selection=_selection(engine_versions=other))
+
+
+def test_a_bare_MECHANISM_cannot_be_passed_where_a_selection_belongs(catalog, db) -> None:  # noqa: F811
+    """§10.3: the renderer consumes a selection and never a mechanism."""
+    assert "mechanism" not in inspect.signature(render_project).parameters
+    with pytest.raises(TypeError, match="PublisherSelection"):
+        _render(db, publisher_selection=PublishMechanism.VERSIONED_POINTER)
+
+
+def test_OMITTING_the_selection_yields_LESS_capability_not_more(catalog, db) -> None:  # noqa: F811
+    """The default must be the fail-closed artifact, so a caller cannot obtain a publishing project
+    by forgetting an argument."""
+    published = _yaml_of(_render(db), "conf/base/catalog.yml")[f"feature_{GROUP}"]
+    assert published["write_mode"] == "errorifexists"
+    assert published["type"] == "spark.SparkHiveDataset"
 
 
 def test_every_catalog_entry_declares_one_of_section_7s_LAYERS(project: SealedProject) -> None:
