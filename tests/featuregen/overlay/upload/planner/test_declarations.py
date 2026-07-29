@@ -930,7 +930,7 @@ def test_withholding_the_cardinality_claim_does_not_withdraw_the_bridge(db):
 
     _bridge_core_crm(db)
     assert [b.fact_key for b in active_bridges(db)] == ["bridge:customer:c4"]
-    assert [l.usable for l in cross_catalog_links(db)] == [True]
+    assert [x.usable for x in cross_catalog_links(db)] == [True]
     ctx = _ctx(db, "core", "crm")
     assert [b.fact_key for b in ctx.active_bridges] == ["bridge:customer:c4"], \
         "the compiler still SEES the bridge — it just will not claim its cardinality"
