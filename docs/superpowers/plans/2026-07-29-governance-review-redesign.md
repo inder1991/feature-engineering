@@ -45,6 +45,79 @@ Every line below was verified against the tree at `bb0155e6` on 2026-07-29. **No
 
 ---
 
+## ⚠️ Revision 4 (2026-07-29) — REBASED onto main, everything re-verified
+
+**Revs 1–3 were written against a worktree 69 commits behind `main`.** Rebased onto `66461fdf`;
+the materialization work is intact and `tests/featuregen/materialize` is **1368 green** on the merged
+tree. Two claims in rev 2 were wrong: the ingest wiring and the type-parameter fix are **on main**,
+not on a separate branch. `integration/ontology-data-agent` and `main` are now the same commit, so
+**every fix below belongs to this stream — there is nothing to route elsewhere.**
+
+### Citations refreshed (six moved)
+
+| Symbol | Was | **Now** |
+|---|---|---|
+| `derive_bridge_candidates` | 85 | **`bridge_candidates.py:131`** |
+| `BridgeCandidateV1` | 33 | **`bridge_candidates.py:47`** |
+| `project_verified_bridge` | 31 | **`bridge_projection.py:38`** |
+| `demote_bridge_edges` | 50 | **`bridge_projection.py:57`** |
+| `active_bridges` | 57 | **`bridge_projection.py:64`** |
+| `confirm_semantic_binding` | 353 | **`governance.py:355`** |
+
+Unchanged and re-confirmed: `propose_bridge:28`, `EntityBridgeRef:33`, `load_fact:83`,
+`fold_overlay_state:53`, entity_bridge authority `:132`, **the keystone exclusion `projection.py:50`**,
+`list_semantic_binding_proposals:261`, and **R1's `ingest.py:468`**. All of R1, W1, W2, W4, W5 survive
+verification against main.
+
+### 🟢 V1 — most of Task 1 is already built: `cross_catalog_links`
+
+A new module ships `cross_catalog_links(conn, *, object_ref=None) -> tuple[CrossCatalogLink, ...]` —
+*"Every cross-catalog link, strongest first"* — unioning **`entity_bridge_edge WHERE status='VERIFIED'`**
+with **`entity_bridge_candidate_evidence`**, and returning `status`, `strength`, `data_type_family`,
+`type_basis`, `fact_key` and both grain flags. Its `object_ref` filter matches **either side**, since
+a link is symmetric.
+
+**Task 1 shrinks to wrapping this** instead of re-enumerating the evidence table.
+
+**But it takes no `roles` parameter.** `derive_bridge_candidates` is read-scoped; this is not. Exposing
+it through a governance route unchanged would leak the existence of links on sensitivity-hidden
+columns — the exact existence-oracle the semantic-bindings listing warns about. **Read-scoping must be
+added at the wrapper, and tested.**
+
+**W4 now applies to shipped code, not just to this plan:** because the proposed side reads
+`entity_bridge_candidate_evidence`, a governed bridge whose evidence row was skipped by
+`propose_bridge`'s early return is invisible here too.
+
+### 🟠 V2 — two models of "usable" now coexist, and the vocabulary collides
+
+`cross_catalog_links.py:34-40` documents `LinkStatus.PROPOSED` as *"Derived and proposed, nobody has
+reviewed it. **Fully usable.**"* and its `usable` property returns True unconditionally —
+*"confirmation annotates, it does not gate."*
+
+**The planner disagrees, deliberately.** `assembly.py:114`: *"Crossings are governed-bridge-only
+(`active_bridges` = VERIFIED)"*, and `active_bridges` reads `entity_bridge_edge`, which has **0 rows**.
+
+Both are correct in their own layer — a proposed link is usable for **display and ranking**, and only
+a VERIFIED one may be **computed on**. But a reader of `cross_catalog_links` would reasonably conclude
+a proposed bridge can be crossed. It cannot.
+
+**This confirms the plan's premise rather than undermining it:** confirming the customer bridge is
+exactly what makes cross-catalog planning possible, because the planner is bridge-gated and no
+VERIFIED bridge exists. The queue's "what this unblocks" column is sound — but it must say *computed
+on*, never *usable*, or it will collide with the display layer's vocabulary.
+
+### 🟢 V3 — surface `type_basis` to the confirmer
+
+`BridgeCandidateV1` gained `type_basis` (`bridge_candidates.py:56-60`): `attested` (both sides read
+from a structural source), `declared` (both from a glossary file), or `mixed`. Its docstring is
+written for exactly this screen — *"a DECLARED type is someone's spreadsheet entry, not a read of the
+physical schema"* — and it is deliberately **outside `candidate_id`**, so a later attestation keeps
+the same candidate rather than forking one.
+
+**Your customer bridge is `declared`.** The queue must show this: the reviewer is confirming a match
+justified by two spreadsheets, not by the cluster. That is a materially different decision, and the
+data already carries the distinction.
+
 ## ⚠️ Revision 2 (2026-07-29) — what an adversarial review changed
 
 **Rev 1 assumed nothing proposed bridges. That was wrong — it only looked at `main`.**
