@@ -35,7 +35,11 @@ FINDING_CODES: frozenset[str] = frozenset({
     "AVAILABILITY_LAG_UNAPPLIED",  # basis is event_time_plus_lag; the cutoff must be shifted back
     "CURRENCY_MIXED",              # aggregating a monetary measure whose currency varies or is unknown
     "GRAIN_NOT_ESTABLISHED",       # counting per entity without a governed unique grain
-    "JOIN_IDENTITY_UNCONFIRMED",   # the cross-catalog hop rests on an unconfirmed identifier link
+    "JOIN_IDENTITY_UNCONFIRMED",   # the cross-catalog hop rests on an identifier link no human has
+                                   # reviewed — usable, and disclosed
+    "JOIN_IDENTITY_UNAVAILABLE",   # the identifier link is REJECTED / drift-STALEd / expired, or its
+                                   # governance state cannot be read: the platform will not consider
+                                   # it, and no approval brings it back
     # ── the answer may disclose more than intended ────────────────────────────────────────────────
     "SMALL_CELL_RISK",             # a grouped result can isolate individuals; needs a minimum cell size
     # ── the answer is less grounded than it looks ─────────────────────────────────────────────────
@@ -123,8 +127,10 @@ class AnalysisPlanV1:
     windows: tuple[Window, ...] = ()
     dimensions: tuple[Dimension, ...] = ()
     comparison: str = ""            # "" | decrease | increase | change
-    #: Cross-catalog hops this plan needs, as identifier-link fact keys. Grounding checks each one's
-    #: confirmation state and carries JOIN_IDENTITY_UNCONFIRMED rather than refusing.
+    #: Cross-catalog hops this plan needs, as identifier-link fact keys. Grounding reads each one's
+    #: governed lifecycle and DISCLOSES what it finds — JOIN_IDENTITY_UNCONFIRMED for a link no human
+    #: has reviewed, JOIN_IDENTITY_UNAVAILABLE for one the platform will not consider — rather than
+    #: refusing. Neither finding is a gate: availability is enforced where links are traversed.
     join_refs: tuple[str, ...] = ()
 
 

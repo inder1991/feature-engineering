@@ -82,12 +82,13 @@ def demote_projected_bridge_edges(conn: DbConn, fact_key: str, status: str) -> N
     deliberately admits only the dependency index for bridges), and a projector-driven demote would
     leave the sanction readable for the whole drain window anyway.
 
-    The second gate is UNEVEN, which is why this matters more than its siblings.
-    ``cross_catalog_links._blocked`` folds the stream and suppresses REJECTED and STALE, so the
-    planner's active set is independently protected on those two. REVERIFY is in neither set: for an
-    EXPIRED bridge this hook is the ONLY thing that retires the confirmation, and readers that go to
-    ``entity_bridge_edge`` directly (``analysis/grounding``'s JOIN_IDENTITY_UNCONFIRMED check,
-    ``contract/invalidation._bridge_fact_signature``) bypass that fold on every status.
+    The second gate USED TO BE UNEVEN, which is why this hook was written. ``cross_catalog_links``
+    suppressed a DENY-LIST of REJECTED and STALE, and REVERIFY was in neither, so for an EXPIRED
+    bridge this hook was the ONLY thing that retired the confirmation. The lifecycle correction
+    replaced that with an ALLOW-LIST (``AVAILABLE_STATUSES``), so REVERIFY is now independently
+    unavailable to the planner and to ``analysis/grounding``, which reads the same fold. This hook
+    remains load-bearing for readers that go to ``entity_bridge_edge`` DIRECTLY and bypass the fold
+    on every status — ``contract/invalidation._bridge_fact_signature`` is the one that is left.
 
     Savepointed and never-raising, matching the siblings: these hooks run inside the drift SCAN and
     the expiry POLLER, both batch passes over many facts, where a raise would abandon the sweep and
