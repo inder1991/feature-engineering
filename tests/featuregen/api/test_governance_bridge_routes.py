@@ -437,3 +437,245 @@ def test_over_length_note_422(client, seeded_bridge):
     _ref, key = seeded_bridge
     r = _confirm(client, key, note="x" * 1001)
     assert r.status_code == 422
+
+
+# ── (6) Task 2b — bulk reject, where PARTIAL FAILURE is the normal case ────────────────────────────
+#
+# The approved design settles the eight `branch` candidates in one action: they are a 4x2
+# cross-product of the same two facts, not eight findings. There is NO bulk command in the overlay,
+# and inventing one would put eight governed facts behind a single audit row — so this is N commands,
+# each with its own idempotency key and its own audit trail.
+#
+# Task 2 established the constraint this surface has to honour: confirm and reject handle a
+# projection fault in OPPOSITE directions, and reject's demote is all-or-nothing because a soft
+# failure there would report REJECTED over a still-live bridge. Applied to a batch, that means a
+# savepoint PER ITEM, never one around the batch: one item's fault must undo that item's reject and
+# nothing else. Hence `test_a_fault_on_one_item_...`, which is the only test here that a
+# batch-wide-transaction handler fails.
+
+
+def _seed_eight(conn) -> list[str]:
+    """The 4x2 cross-product: four `core` customer keys against two `crm` ones, all the same concept,
+    yielding eight derived bridges over the same two tables — the exact shape of the eight `branch`
+    candidates the design groups into one reject."""
+    _load(conn, "core", [
+        (CanonicalRow("core", "customer_master", f"cust_key_{i}", "integer", is_grain=(i == 0)),
+         "customer_id") for i in range(4)])
+    _load(conn, "crm", [
+        (CanonicalRow("crm", "customers", f"cif_{j}", "integer", is_grain=(j == 0)),
+         "customer_id") for j in range(2)])
+    cands = derive_bridge_candidates(conn)
+    assert len(cands) == 8, f"expected the 4x2 cross-product, got {len(cands)}"
+    return [propose_bridge(conn, c, actor=_ENRICH_ACTOR, now=_NOW) for c in cands]
+
+
+@pytest.fixture
+def eight_bridges(overlay_env):
+    return _seed_eight(overlay_env)
+
+
+def _bulk_reject(client, keys, *, category="not_the_same_entity", note=None, user="priya",
+                 roles="platform-admin"):
+    body = {"fact_keys": list(keys), "category": category}
+    if note is not None:
+        body["note"] = note
+    return client.post("/governance/entity-bridges/bulk-reject", json=body,
+                       headers=_h(user, roles))
+
+
+def _outcomes(body) -> dict[str, str]:
+    return {r["fact_key"]: r["outcome"] for r in body["results"]}
+
+
+def _rejected_events(conn, key: str) -> int:
+    return len([e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_REJECTED"])
+
+
+def test_bulk_reject_settles_all_eight_as_eight_governed_commands(client, eight_bridges, conn):
+    """One reviewer action, EIGHT audit rows. The group is a UI affordance; the governance record
+    stays per-fact, because eight facts behind one audit row is not a governance record."""
+    keys = eight_bridges
+    r = _bulk_reject(client, keys, note="branch code is not a branch description")
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["counts"] == {"rejected": 8, "already_rejected": 0, "denied": 0,
+                              "not_found": 0, "failed": 0}
+    assert [x["fact_key"] for x in body["results"]] == keys, "results must be in REQUEST order"
+    assert set(_outcomes(body).values()) == {"rejected"}
+    for key in keys:
+        assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+        assert _rejected_events(conn, key) == 1
+        rejected = [e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_REJECTED"][-1]
+        assert rejected.payload["category"] == "not_the_same_entity"
+        assert rejected.payload["reason"] == "branch code is not a branch description"
+    # the whole group leaves the queue
+    assert client.get("/sources/core/governance/entity-bridges",
+                      headers=_h("priya")).json()["proposals"] == []
+
+
+def test_control_a_bridge_absent_from_the_request_is_untouched(client, eight_bridges, conn):
+    """MUST-SURVIVE no-op control. A handler that settles the whole listing rather than the requested
+    keys passes every other test in this section and fails this one."""
+    keys = eight_bridges
+    r = _bulk_reject(client, keys[:5])
+    assert r.status_code == 200, r.text
+    assert r.json()["counts"]["rejected"] == 5
+
+    for key in keys[:5]:
+        assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+    for key in keys[5:]:
+        assert fold_overlay_state(load_fact(conn, key)).status == "DRAFT"
+        assert _rejected_events(conn, key) == 0
+
+
+def test_three_denied_leaves_the_other_five_rejected_and_not_rolled_back(
+        prod_tx_client, eight_bridges, conn):
+    """Partial failure is the NORMAL case. Three of the eight are already VERIFIED, and
+    `_AWAITING_CONFIRMATION` excludes VERIFIED, so `reject_fact` denies them. The other five must
+    stand — reported per item, not as a single batch verdict, and NOT rolled back.
+
+    Under `prod_tx_client` a returning route releases its savepoint exactly as production commits,
+    so "not rolled back" is genuinely observable here rather than an artefact of the test override.
+    """
+    keys = eight_bridges
+    verified, rejectable = keys[:3], keys[3:]
+    for key in verified:
+        assert _confirm(prod_tx_client, key, user="dev").status_code == 200
+
+    r = _bulk_reject(prod_tx_client, keys)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["counts"]["rejected"] == 5 and body["counts"]["denied"] == 3
+    outcomes = _outcomes(body)
+    for key in verified:
+        assert outcomes[key] == "denied"
+        detail = next(x["detail"] for x in body["results"] if x["fact_key"] == key)
+        assert "not awaiting confirmation" in detail, "a denial must carry its reason"
+    for key in rejectable:
+        assert outcomes[key] == "rejected"
+
+    # the five SURVIVED the three denials
+    for key in rejectable:
+        assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+    for key in verified:
+        assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
+        assert _edge(conn, key) is not None, "a denied reject must not touch the projection"
+
+
+def test_a_fault_on_one_item_does_not_roll_back_the_others(
+        prod_tx_client, eight_bridges, conn, monkeypatch):
+    """THE per-item savepoint proof — the one test a batch-wide transaction cannot pass.
+
+    The injected fault is a genuine in-transaction DATABASE error, which POISONS the transaction:
+    without a savepoint per item, every later item fails with the connection already broken AND the
+    earlier rejects are lost at commit. A plain Python exception would not distinguish the two
+    designs, which is why this one goes to the database.
+
+    Reject's demote is deliberately all-or-nothing (Task 2): a soft failure there would report
+    REJECTED over a still-live bridge. Per item that means the faulting item's reject is UNDONE — it
+    reports `failed` and its fact is left exactly as it was — while the other seven stand.
+    """
+    import featuregen.api.routes.governance as gov
+
+    keys = eight_bridges
+    poisoned = keys[3]
+    real = gov.demote_bridge_edges
+
+    def _faulty(conn_, fact_key_value):
+        if fact_key_value == poisoned:
+            conn_.execute("SELECT 1 FROM entity_bridge_edge WHERE fact_key = no_such_column")
+        return real(conn_, fact_key_value)
+
+    monkeypatch.setattr(gov, "demote_bridge_edges", _faulty)
+
+    r = _bulk_reject(prod_tx_client, keys)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["counts"] == {"rejected": 7, "already_rejected": 0, "denied": 0,
+                              "not_found": 0, "failed": 1}
+    outcomes = _outcomes(body)
+    assert outcomes[poisoned] == "failed"
+    # all-or-nothing PER ITEM: the faulting item's reject was undone, not half-applied
+    assert fold_overlay_state(load_fact(conn, poisoned)).status == "DRAFT"
+    assert _rejected_events(conn, poisoned) == 0
+    # ...and every other item stands, including the ones AFTER the poisoned one
+    for key in [k for k in keys if k != poisoned]:
+        assert outcomes[key] == "rejected"
+        assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+    assert conn.execute("SELECT 1").fetchone()[0] == 1, "the savepoint rollback un-poisoned the tx"
+
+
+def test_re_running_the_bulk_reject_is_idempotent(client, eight_bridges, conn):
+    """A reviewer who double-clicks, or a UI that retries a timed-out batch, must not produce
+    sixteen audit rows or an error. REJECTED is terminal, so the replay is reported as settled."""
+    keys = eight_bridges
+    assert _bulk_reject(client, keys).json()["counts"]["rejected"] == 8
+
+    r = _bulk_reject(client, keys)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["counts"] == {"rejected": 0, "already_rejected": 8, "denied": 0,
+                              "not_found": 0, "failed": 0}
+    for key in keys:
+        assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+        assert _rejected_events(conn, key) == 1, "a replay must not append a second REJECTED event"
+
+
+def test_bulk_reject_demotes_a_live_edge_per_item(client, eight_bridges, conn):
+    """The demote is per item and reported per item: a drifted bridge holds a live edge under a
+    still-rejectable fact, and rejecting it in a BATCH must retire that edge exactly as the single
+    route does."""
+    keys = eight_bridges
+    drifted = keys[2]
+    assert _confirm(client, drifted, user="dev").status_code == 200
+    assert _edge(conn, drifted) is not None
+    _stale(conn, drifted)
+
+    body = _bulk_reject(client, keys).json()
+
+    assert body["counts"]["rejected"] == 8
+    projections = {x["fact_key"]: x["operational_projection"] for x in body["results"]}
+    assert projections[drifted] == "demoted"
+    assert _edge(conn, drifted) is None, "a REJECTED bridge is still projected"
+    assert all(v == "not_applicable" for k, v in projections.items() if k != drifted)
+
+
+def test_bulk_reject_is_read_scoped_per_item(client, eight_bridges, conn):
+    """Read-scoping must not be lost in the batch: a bridge the caller cannot SEE must not be
+    decidable through the bulk surface either. Reported as `not_found` — the batch equivalent of the
+    single route's 404 — and it must not leak that the key exists by any other answer."""
+    keys = eight_bridges
+    _hide(conn, "crm", "customers", "cif_0")
+    hidden = {k for k in keys
+              if any("cif_0" in str(e.payload.get("proposed_value", {}))
+                     for e in load_fact(conn, k))}
+    assert hidden, "the fixture must hide at least one bridge"
+
+    body = _bulk_reject(client, keys).json()
+
+    outcomes = _outcomes(body)
+    assert body["counts"]["not_found"] == len(hidden)
+    for key in hidden:
+        assert outcomes[key] == "not_found"
+        assert fold_overlay_state(load_fact(conn, key)).status == "DRAFT"
+    for key in set(keys) - hidden:
+        assert outcomes[key] == "rejected"
+
+
+def test_bulk_reject_uses_the_same_category_vocabulary_as_the_single_route(client, eight_bridges):
+    """One vocabulary, not two. `duplicate_bridge` is exactly why the group exists — seven of the
+    eight are duplicates of the same judgement — and a category the single route accepts must be
+    accepted here, while one it rejects must 422 here too."""
+    keys = eight_bridges
+    assert _bulk_reject(client, keys[:1], category="duplicate_bridge").status_code == 200
+    assert _bulk_reject(client, keys[1:2], category="wrong_grain_columns").status_code == 422
+    assert _bulk_reject(client, keys[1:2], category="because").status_code == 422
+
+
+def test_bulk_reject_rejects_an_empty_or_oversized_batch(client, eight_bridges):
+    assert _bulk_reject(client, []).status_code == 422
+    assert _bulk_reject(client, [f"k{i}" for i in range(501)]).status_code == 422
