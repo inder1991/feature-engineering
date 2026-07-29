@@ -25,9 +25,17 @@ def _object_ref_str(ref) -> str:
     return f"{ref.schema}.{ref.table}.{ref.column}"
 
 
-def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None) -> str:
+def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None,
+                   ingestion_run_id: str | None = None) -> str:
     """Propose one bridge candidate as an entity_bridge fact. Returns the fact_key. Deterministic +
-    append-only. The four-eyes gate holds because a human (not this service actor) later confirms."""
+    append-only. The four-eyes gate holds because a human (not this service actor) later confirms.
+
+    ``ingestion_run_id`` is the durable run whose upload triggered this derivation, stamped onto the
+    evidence row's existing ``producer_item_ref``. It is what keeps the audit trail whole once the
+    PROPOSER is a service actor rather than the uploading human: ``ingestion_run.actor_subject``
+    resolves the run back to the person, so the trail answers WHICH upload as well as WHO — strictly
+    more than a human ``proposed_by`` ever said. ``None`` (a direct caller with no run) leaves the
+    column NULL, exactly as before."""
     ts = now if now is not None else datetime.now(UTC)
     ref = EntityBridgeRef(entity_id=candidate.entity_id, left_ref=candidate.left_ref,
                           right_ref=candidate.right_ref)
@@ -43,7 +51,7 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None) -> st
     evidence_ref = write_evidence(
         conn, fact_key=key, table_snapshot_at=ts, row_count=0, sample_size=0,
         profile_version=BRIDGE_DERIVATION_VERSION, thresholds_used={}, metric_values=evidence,
-        created_by=identity_to_jsonb(actor),
+        created_by=identity_to_jsonb(actor), producer_item_ref=ingestion_run_id,
         producer=EvidenceProducer.STRUCTURAL_CONNECTOR, strength=AssertionStrength.PROPOSED)
     value = {"entity_id": candidate.entity_id, "left_ref": asdict(candidate.left_ref),
              "right_ref": asdict(candidate.right_ref)}

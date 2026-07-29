@@ -19,9 +19,18 @@ from datetime import UTC, datetime
 
 import pytest
 
-from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.envelopes import Command, IdentityEnvelope
+from featuregen.overlay._lifecycle import _cas_target
+from featuregen.overlay.commands import confirm_fact
+from featuregen.overlay.identity import EntityBridgeRef, fact_key
+from featuregen.overlay.state import fold_overlay_state
+from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
+from featuregen.overlay.upload.bridge_propose import propose_bridge
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 from featuregen.overlay.upload.ingest import entity_bridges_enabled, ingest_upload
+from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
 
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
@@ -36,19 +45,21 @@ def _rows(source: str, table: str, id_col: str) -> list[CanonicalRow]:
             CanonicalRow(source=source, table=table, column="amount", type="numeric")]
 
 
-def _seed_two_catalogs(db) -> None:
+def _seed_two_catalogs(db, *, actor: IdentityEnvelope | None = None) -> None:
     """Two catalogs whose identifier columns carry the SAME entity concept — the shape that must
     bridge. Concepts are set directly: this test is about the WIRING, not about enrichment."""
+    who = actor or _actor()
     for source, table, id_col in (("cat_a", "customer", "cust_num"),
                                   ("cat_b", "txn", "cif_id")):
-        ingest_upload(db, source, _rows(source, table, id_col), actor=_actor(), now=_NOW)
+        ingest_upload(db, source, _rows(source, table, id_col), actor=who, now=_NOW)
         db.execute(
             "UPDATE graph_node SET concept = 'customer_id', declared_type = 'varchar' "
             "WHERE catalog_source = %s AND kind = 'column' AND column_name = %s",
             (source, id_col))
 
 
-def _trigger(db):
+def _trigger(db, *, actor: IdentityEnvelope | None = None,
+             ingestion_run_id: str | None = None):
     """Upload an UNRELATED third catalog to drive the stage.
 
     `ingest_upload` wipes and rebuilds the uploading catalog's graph nodes, so re-uploading `cat_b`
@@ -60,7 +71,8 @@ def _trigger(db):
     the wiring claims: the stage runs on EVERY upload and derives GLOBALLY, not scoped to the catalog
     being uploaded.
     """
-    return ingest_upload(db, "cat_c", _rows("cat_c", "other", "some_id"), actor=_actor(), now=_NOW)
+    return ingest_upload(db, "cat_c", _rows("cat_c", "other", "some_id"),
+                         actor=actor or _actor(), now=_NOW, ingestion_run_id=ingestion_run_id)
 
 
 def _ledger(db) -> list[tuple]:
@@ -153,6 +165,129 @@ def test_the_count_is_reported_on_the_result(db, monkeypatch):
     _seed_two_catalogs(db)
     result = _trigger(db)
     assert result.entity_bridges_proposed == 1
+
+
+# ── who proposes: the SYSTEM, never the uploading human ──────────────────────────────────────────
+#
+# A derived bridge proposed under the UPLOADER's own identity is permanently unconfirmable BY that
+# uploader: `proposer_ne_confirmer` denies "a proposer may not confirm the same fact". On a small
+# team the uploader IS the reviewer, so every bridge an upload discovers sits in DRAFT forever and
+# nothing explains why. Measured on the deployed cluster: 9 bridges, all `proposed_by = user:inder`,
+# and `entity_bridge_edge` empty.
+#
+# The derivation is the SYSTEM speaking. Its only input is the resolved GLOBAL graph across every
+# catalog — never the file just uploaded — so the uploading human authored neither endpoint. The
+# service actor proposes and a human disposes, exactly as Pass C's `propose_join_candidates` has
+# always done one seam below.
+
+
+def _admin_uploader() -> IdentityEnvelope:
+    """An uploader who is ALSO the reviewer — the small-team shape the lockout hit. An owner-less
+    `entity_bridge` resolves to the platform-admin governance queue (authority.py), so this is the
+    identity that is genuinely entitled to confirm."""
+    return IdentityEnvelope(subject="user:inder", actor_kind="human", authenticated=True,
+                            auth_method="oidc", role_claims=("data_owner", "platform-admin"))
+
+
+def _bridge_ref(db) -> EntityBridgeRef:
+    cand = derive_bridge_candidates(db)[0]
+    return EntityBridgeRef(cand.entity_id, cand.left_ref, cand.right_ref)
+
+
+def _confirm_as(db, ref: EntityBridgeRef, actor: IdentityEnvelope):
+    key = fact_key(ref, "entity_bridge")
+    target = _cas_target(fold_overlay_state(load_fact(db, key)))
+    return confirm_fact(db, Command(
+        "confirm_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "entity_bridge", "use_case": None, "target_event_id": target},
+        actor, f"confirm-{target}"))
+
+
+def _open_run(db, run_id: str, actor: IdentityEnvelope) -> str:
+    db.execute(
+        "INSERT INTO ingestion_run (id, origin_type, catalog_source, actor_subject, status, "
+        "started_at, heartbeat_at) VALUES (%s, 'upload', 'cat_c', %s, 'in_progress', %s, %s)",
+        (run_id, actor.subject, _NOW, _NOW))
+    return run_id
+
+
+def test_the_uploader_can_confirm_a_bridge_their_own_upload_derived(db, monkeypatch):
+    """THE property, stated behaviourally: one human uploads, the upload derives a bridge, and that
+    same human confirms it. Before the fix this confirm was DENIED — the uploader was recorded as
+    the proposer, so four-eyes barred them from ever disposing of what their upload discovered."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    uploader = _admin_uploader()
+    _seed_two_catalogs(db, actor=uploader)
+    _trigger(db, actor=uploader)
+    ref = _bridge_ref(db)
+    key = fact_key(ref, "entity_bridge")
+    assert fold_overlay_state(load_fact(db, key)).status == "DRAFT", "precondition: proposed"
+
+    res = _confirm_as(db, ref, uploader)
+
+    assert res.accepted, res.denied_reason
+    assert fold_overlay_state(load_fact(db, key)).status == "VERIFIED"
+
+
+def test_the_recorded_proposer_is_a_service_subject_not_the_uploader(db, monkeypatch):
+    """The mechanism behind the test above, pinned so a future edit cannot quietly re-thread the
+    human. Also pins the ABSENCE of `source_uploader`: that field arms the SECOND four-eyes gate
+    (`uploader_ne_confirmer`) and would restore the identical lockout. It exists for values
+    DECLARED in an uploaded file (semantic bindings, Pass B grain) — a bridge is DERIVED."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    uploader = _admin_uploader()
+    _seed_two_catalogs(db, actor=uploader)
+    _trigger(db, actor=uploader)
+
+    events = load_fact(db, fact_key(_bridge_ref(db), "entity_bridge"))
+    proposed = [e for e in events if e.type == "OVERLAY_FACT_PROPOSED"]
+    assert len(proposed) == 1
+    assert proposed[0].payload["proposed_by"] != uploader.subject
+    assert proposed[0].payload["proposed_by"] == _ENRICH_ACTOR.subject
+    assert "source_uploader" not in proposed[0].payload
+
+
+def test_the_originating_upload_stays_recoverable_from_the_audit_trail(db, monkeypatch):
+    """Handing the proposal to a service actor must not lose WHICH upload produced the bridge. No
+    new field: the pre-minted evidence row's existing `producer_item_ref` column carries the
+    durable ingestion run id, and `ingestion_run.actor_subject` resolves that back to the human.
+    That is strictly MORE than `proposed_by` ever said — which upload, not just which person."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    uploader = _admin_uploader()
+    _seed_two_catalogs(db, actor=uploader)
+    run_id = _open_run(db, "ingrun_R1BRIDGE", uploader)
+
+    _trigger(db, actor=uploader, ingestion_run_id=run_id)
+
+    key = fact_key(_bridge_ref(db), "entity_bridge")
+    row = db.execute("SELECT producer_item_ref FROM overlay_evidence WHERE fact_key = %s",
+                     (key,)).fetchone()
+    assert row is not None and row[0] == run_id
+    assert db.execute("SELECT actor_subject FROM ingestion_run WHERE id = %s",
+                      (run_id,)).fetchone()[0] == uploader.subject
+
+
+def test_a_bridge_already_proposed_by_a_human_is_left_exactly_as_it_was(db, monkeypatch):
+    """The nine bridges already on the cluster were proposed by a human and STAY that way: this
+    changes who proposes next, it does not rewrite history. `propose_fact` dedups on the
+    deterministic fact_key and `fold_overlay_state` ignores a stray PROPOSED once a fact is past
+    DRAFT, so re-derivation is a no-op — the human proposer, and their lockout, persist until the
+    fact is rejected and re-proposed. That is the designed outcome, not a regression."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    uploader = _admin_uploader()
+    _seed_two_catalogs(db, actor=uploader)
+    ensure_upload_catalog_adapter()
+    legacy_key = propose_bridge(db, derive_bridge_candidates(db)[0], actor=uploader, now=_NOW)
+
+    _trigger(db, actor=uploader)          # a later upload re-derives the very same pair
+
+    events = load_fact(db, legacy_key)
+    proposed = [e for e in events if e.type == "OVERLAY_FACT_PROPOSED"]
+    assert len(proposed) == 1, "re-derivation must not append a second proposal"
+    assert proposed[0].payload["proposed_by"] == uploader.subject
+    assert fold_overlay_state(events).status == "DRAFT"
+    # …and it is still locked for that human: only a FRESH proposal carries the service proposer.
+    assert not _confirm_as(db, _bridge_ref(db), uploader).accepted
 
 
 @pytest.mark.parametrize("flag", ["0", None])
