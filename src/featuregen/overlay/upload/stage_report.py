@@ -50,7 +50,8 @@ STAGE_STATES = frozenset({
 CANONICAL_STAGES: tuple[str, ...] = (
     "connector_pull", "parse",
     "validation", "brake", "fact_assertion", "drift", "glossary_classification",
-    "enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms", "enrich_unit",
+    "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
+    "enrich_unit",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",

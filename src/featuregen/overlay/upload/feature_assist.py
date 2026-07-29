@@ -153,7 +153,8 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
     # and primary_entity — one scoped query, NOT a second unscoped fetch (spec §5). One table node
     # per (catalog, table), so the join never fans a column into duplicate rows.
     sql = ("SELECT c.catalog_source, c.object_ref, c.table_name, c.column_name, c.concept, "
-           "c.domain, c.definition, c.data_type, c.declared_type, c.semantic_terms, c.entity, "
+           "c.domain, c.definition, c.ai_summary, c.data_type, c.declared_type, c.semantic_terms, "
+           "c.entity, "
            "c.additivity, c.unit, c.currency, c.is_grain, c.is_as_of, c.grain_fact_event_id, "
            "c.availability_fact_event_id, t.definition, t.primary_entity "
            "FROM graph_node c "
@@ -172,11 +173,13 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
         params.append(catalog_source)
     rows = conn.execute(sql, params).fetchall()
     return [{"catalog_source": r[0], "object_ref": r[1], "table": r[2], "column": r[3],
-             "concept": r[4], "domain": r[5], "definition": r[6], "data_type": r[7],
-             "declared_type": r[8], "semantic_terms": r[9], "entity": r[10], "additivity": r[11],
-             "unit": r[12], "currency": r[13], "is_grain": r[14], "is_as_of": r[15],
-             "grain_fact_event_id": r[16], "availability_fact_event_id": r[17],
-             "table_definition": r[18], "table_primary_entity": r[19]} for r in rows]
+             "concept": r[4], "domain": r[5], "definition": r[6], "ai_summary": r[7],
+             "data_type": r[8], "declared_type": r[9], "semantic_terms": r[10], "entity": r[11],
+             "additivity": r[12], "unit": r[13], "currency": r[14], "is_grain": r[15],
+             "is_as_of": r[16], "grain_fact_event_id": r[17], "availability_fact_event_id": r[18],
+             # The LEFT JOIN's table fields sit AFTER the column fields — inserting `ai_summary`
+             # shifted every index past it, and these two were the tail I missed first time.
+             "table_definition": r[19], "table_primary_entity": r[20]} for r in rows]
 
 
 def _menu(cols: list[dict]) -> list[dict]:
@@ -212,7 +215,10 @@ _MENU_FACT_FIELDS = {
     "is_as_of": "is_as_of",
 }
 _MENU_IDENTITY_FIELDS = ("object_ref", "table", "column", "concept", "domain")
-_MENU_DEFINITION_FIELDS = ("definition", "semantic_terms")
+# Prose, so it rides the DEFINITION kind: sample-stripped and PII-scanned like `definition`, never
+# passed through raw. Where a source fills descriptions by bucket this is the only text that
+# distinguishes one column from its siblings.
+_MENU_DEFINITION_FIELDS = ("definition", "ai_summary", "semantic_terms")
 # The menu fields whose "governed" authority is LOAD-BEARING (they can clear a design check): the two
 # decision-governed fields + the two fact-governed fields. Their {value, authority} is sourced from C1
 # (read_operational_value) so the menu shows "governed" ONLY for a hash-verified status=="resolved" —
@@ -331,7 +337,10 @@ def _objective_entity(entity: str | None, scope) -> str | None:
 
 def _column_tokens(col: dict) -> set[str]:
     toks: set[str] = set()
-    for k in ("object_ref", "table", "column", "concept", "domain", "semantic_terms", "entity"):
+    # `ai_summary` included so the agent finds a column by the same words SEARCH finds it by —
+    # otherwise the two surfaces disagree about what the catalog contains.
+    for k in ("object_ref", "table", "column", "concept", "domain", "semantic_terms", "entity",
+              "ai_summary"):
         v = col.get(k)
         if isinstance(v, str):
             toks |= _tokenize(v)

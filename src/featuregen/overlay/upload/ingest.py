@@ -2009,8 +2009,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if client is None:
         # No LLM provider configured: the enrichment stages honestly never ran (#22) — recorded as
         # skipped, never as a failure, and ingestion continues normally.
-        for _stage in ("enrich_concept", "enrich_definition", "enrich_domain", "enrich_synonyms",
-                       "enrich_unit"):
+        for _stage in ("enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain",
+                       "enrich_synonyms", "enrich_unit"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not

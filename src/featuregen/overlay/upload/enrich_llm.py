@@ -200,7 +200,10 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
 # below (identity/definition-kind), and a None value in a definition-kind field passes through as
 # content-free — so the legitimate draft path is IMPROVED (its definitions now sample-stripped),
 # never fail-closed. Only a genuinely-unknown key blocks.
-_FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "semantic_terms"})
+# `ai_summary` is definition-KIND prose: it egresses under the same sample-strip + PII scan as
+# `definition`. Without it here an ai_summary key is genuinely-unknown and blocks the WHOLE column
+# descriptor — wiring the query alone would have removed columns from the menu, not enriched them.
+_FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semantic_terms"})
 # Identity strings: `catalog_source` is deliberately NOT emitted by the enriched menu (RF-I7
 # handoff) and `concept`/`domain` may be None — absence/None is structural-optional, never a block.
 _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain"})

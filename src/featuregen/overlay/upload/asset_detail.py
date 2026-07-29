@@ -87,7 +87,8 @@ _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
 # entity_status / entity_fact_key / entity_fact_event_id back the F12 entity-authority gate below.
 _ANCHOR_COLUMNS = (
     "catalog_source, object_ref, kind, table_name, column_name, schema_name, data_type, "
-    "declared_type, definition, is_grain, is_as_of, concept, domain, sensitivity, additivity, "
+    "declared_type, definition, ai_summary, is_grain, is_as_of, concept, domain, sensitivity, "
+    "additivity, "
     "unit, currency, entity, entity_status, entity_fact_key, entity_fact_event_id, "
     "grain_fact_event_id, availability_fact_event_id"
 )
