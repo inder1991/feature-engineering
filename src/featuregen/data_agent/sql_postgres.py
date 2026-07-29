@@ -47,8 +47,9 @@ class PostgresDialect:
 
     def table_ref(self, plan: ObservationPlanV1) -> str:
         identity = plan.binding.identity
-        # The database is selected by the CONNECTION, not named in the statement — the one place
-        # Postgres genuinely differs from Hive's three-part name.
+        # The database is selected by the CONNECTION, not named in the statement. This once claimed
+        # to be "the one place Postgres genuinely differs from Hive's three-part name"; a real
+        # HiveServer2 refuses a three-part name, so the two dialects agree here after all.
         return f"{_ident(identity.schema)}.{_ident(identity.table)}"
 
     def where(self, plan: ObservationPlanV1) -> str:

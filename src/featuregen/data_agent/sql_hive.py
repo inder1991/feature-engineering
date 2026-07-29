@@ -80,8 +80,16 @@ class HiveDialect:
         return "approximate"
 
     def table_ref(self, plan: ObservationPlanV1) -> str:
+        """`schema.table` — TWO parts.
+
+        This emitted `database.schema.table` until a real HiveServer2 refused it
+        (`SemanticException [Error 10001]: Table not found`). HiveQL has one namespace level below
+        the connection, not two: `CREATE SCHEMA` is an alias for `CREATE DATABASE`. The identity
+        keeps its `database` component because an ADDRESS needs it — two clusters can hold the same
+        schema name — but naming it in the statement makes every statement malformed.
+        """
         identity = plan.binding.identity
-        return ".".join(_ident(p) for p in (identity.database, identity.schema, identity.table))
+        return ".".join(_ident(p) for p in (identity.schema, identity.table))
 
     def where(self, plan: ObservationPlanV1) -> str:
         """The partition predicate. Empty only for a table the binding declares unpartitioned —

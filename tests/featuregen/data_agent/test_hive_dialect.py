@@ -149,8 +149,26 @@ def test_the_partition_cap_is_enforced():
 
 def test_identifiers_are_backtick_quoted_and_validated():
     sql = _sql()
-    assert "`banking`.`dpl_eib`.`tran_repos`" in sql
+    assert "`dpl_eib`.`tran_repos`" in sql
     assert "`cif_id`" in sql
+
+
+def test_the_table_name_has_TWO_parts_and_omits_the_database():
+    """This test previously asserted `banking`.`dpl_eib`.`tran_repos` — it PINNED the three-part
+    name rather than verifying it, so the misconception was locked in by a green test.
+
+    A real HiveServer2 4.1.0 settles it:
+
+        SELECT COUNT(*) FROM `dpl_eib`.`tran_repos`                -> 27 rows
+        SELECT COUNT(*) FROM `banking`.`dpl_eib`.`tran_repos`      -> SemanticException 10001,
+                                                                      Table not found
+
+    HiveQL has one namespace level below the connection: `CREATE SCHEMA` is an alias for `CREATE
+    DATABASE`. Every profile statement this dialect emitted was therefore malformed, and no test
+    could see it because none ran against an engine.
+    """
+    sql = _sql()
+    assert "`banking`" not in sql
 
 
 @pytest.mark.parametrize("bad", ["a`b", "a b", "a;drop", "a'b", ""])

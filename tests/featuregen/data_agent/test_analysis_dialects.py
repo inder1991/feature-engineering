@@ -91,6 +91,30 @@ def test_postgres_output_is_unchanged():
     assert "`" not in postgres
 
 
+def test_hive_names_a_table_with_TWO_parts_not_three():
+    """Settled against a real HiveServer2 4.1.0, not by reading:
+
+        SELECT COUNT(*) FROM `dpl_eib`.`tran_repos`                    -> 27
+        SELECT COUNT(*) FROM `featuregen_test`.`dpl_eib`.`tran_repos`  -> SemanticException
+                                                                          Table not found 'tran_repos'
+
+    `HiveDialect.table_ref` emitted the three-part form, so EVERY observation and analysis statement
+    this system has ever produced for Hive was malformed. It never showed up because no test ran
+    against Hive — and unlike the quoting defect this one fails loudly, which means nothing
+    Hive-targeted has ever worked, rather than having worked wrongly.
+
+    The identity keeps all four components — it is an address, and `table_id` is unchanged. Only the
+    SQL rendering drops the database, exactly as PostgreSQL does, because HiveQL's `DATABASE` and
+    `SCHEMA` are the same namespace (`CREATE SCHEMA` is an alias for `CREATE DATABASE`) and the
+    connection selects it.
+    """
+    class _Shim:
+        def __init__(self, b): self.binding = b
+    ref = HiveDialect().table_ref(_Shim(_ir().event_binding))
+    assert ref == "`dpl_eib`.`tran_repos`"
+    assert "featuregen_test" not in ref
+
+
 def test_the_two_dialects_differ_ONLY_in_quoting():
     """Same plan, same shape. If the two ever diverge structurally, the typed plan has stopped being
     the artifact of record and the executors have started disagreeing about the question."""

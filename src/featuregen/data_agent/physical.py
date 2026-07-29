@@ -56,9 +56,16 @@ def _norm(value: str | None) -> str:
 class PhysicalObjectIdentityV1:
     """The address of one physical table or column.
 
-    Every component is identity-bearing. ``database`` is included because two same-named schemas can
-    live in different Hive databases, and ``schema`` because two same-named tables can live in
+    Every component is identity-bearing. ``database`` is included because two CLUSTERS or catalogs
+    can hold the same schema name, and ``schema`` because two same-named tables can live in
     different schemas — the two collisions the public-flattened catalog key cannot express.
+
+    This once said ``database`` was needed because "two same-named schemas can live in different
+    Hive databases", implying a database/schema/table hierarchy. HiveQL has no such level: ``CREATE
+    SCHEMA`` is an alias for ``CREATE DATABASE``, and a real HiveServer2 refuses a three-part name.
+    So ``schema`` IS the Hive database, and ``database`` addresses the thing holding it. The
+    distinction matters because it is why :meth:`HiveDialect.table_ref` renders two parts while the
+    identity keeps four — an ADDRESS is not a SQL name.
     """
 
     catalog_source: str
