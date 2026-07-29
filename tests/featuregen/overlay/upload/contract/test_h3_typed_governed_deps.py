@@ -245,6 +245,7 @@ def test_bridge_fact_signature_resolves_verified_and_missing_on_revoke(db):
 
 def _draft_bridge(db, fact_key, *, status="DRAFT"):
     from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+
     from featuregen.events.registry import event_registry
     from featuregen.overlay.facts import register_overlay_event_types
     register_overlay_event_types(event_registry())

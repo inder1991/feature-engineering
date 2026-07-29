@@ -185,8 +185,8 @@ def bridge_lifecycle_status(conn, fact_key: str | None, *,
     """
     if not fact_key:
         return UNGOVERNED
-    from featuregen.overlay.state import fold_overlay_state
     from featuregen.overlay import store
+    from featuregen.overlay.state import fold_overlay_state
     try:
         status = fold_overlay_state(store.load_fact(conn, fact_key)).status
     except Exception:  # noqa: BLE001 — fail CLOSED: an unreadable lifecycle is not an available link
