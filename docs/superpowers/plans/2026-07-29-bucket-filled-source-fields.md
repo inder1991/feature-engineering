@@ -1,217 +1,184 @@
-# Bucket-Filled Source Fields — Plan
+# Source Metadata vs Platform Enrichment — Plan (rev 2)
 
-> **Status:** proposed, not started. Written 2026-07-29 against verified code paths — every function
-> and line reference below was read from the file, then re-checked after writing. That second pass
-> caught three references that had drifted while `enrich.py` was edited earlier the same day, which
-> is exactly how a plan comes to describe an API that no longer exists.
+> **Supersedes rev 1 entirely.** Rev 1 proposed treating any repeated source value as unanswered so
+> the AI could compete with it. Architectural review found that would have **blanked** the field it
+> aimed to enrich. Every claim below was verified against the code, and the three errors rev 1 made
+> are recorded in §6 rather than quietly dropped.
 
-**Goal:** stop treating a source-declared value that is *the same for every column* as an answered
-field, so AI enrichment runs where it is needed — without ever overruling a genuinely curated value.
+**Goal:** make the catalog's metadata specific and searchable, without a platform value ever
+overwriting, blanking, or outranking what the bank declared.
+
+**Principle:** two lanes. The **source lane** is what the file said. The **enrichment lane** is what
+the platform learned. They sit beside each other; they never compete for one slot.
 
 ---
 
-## 1. The issue
+## 1. What is actually wrong
 
-Two enrichment stages report success and produce nothing, for the same reason.
-
-**`enrich_definition` — expected: 0, resolved: 0.** It only targets columns with NO declared
-definition. `enrich.py:1188`:
-
-```python
-return ({content_hash(r) for r in rows if not r.definition}
-        - suppressed_definition_hashes(rows, glossary))
-```
-
-Every CIB column has a description, so nothing is ever targeted. But those descriptions are filled by
-*bucket*, not by column:
-
-| measure | value |
-|---|---|
-| rows | 111 |
-| distinct descriptions | 47 |
-| rows sharing a description with another row | **89 (80%)** |
-| most-reused sentence | **12 columns** |
-
-Those twelve include `cust_curr_ntb_flg` (new to bank now) and `cust_prev_9mnth_ntb_flg` (new to bank
-nine months ago) — a before-and-after pair whose difference is the whole signal — described
-identically.
-
-**`enrich_domain` — 238 source-declared, 1 LLM.** `enrich.py:834` states the rule:
-
-> *"THE AI FILLS A BLANK, IT NEVER CONTESTS A CURATED VALUE (R3's rule for definitions, applied to
-> domain): a table or column whose glossary sidecar DECLARES a `data_domain` is NOT an AI target at
-> either level."*
-
-Enforced at `enrich.py:872` (`if rec is None or rec.domain: return None`). Every column declares one,
-so the stage never runs. The result:
+### 1.1 The Domain facet offers two choices for 237 columns
 
 ```
 cib   Customer     111 columns
 ftr   Compliance   126 columns
 ```
 
-The Domain facet offers two real choices for a 237-column catalog.
+Both source-declared. 238 source evidence rows, 1 LLM. `_write_domain_evidence`'s `column_ref_of`
+(`enrich.py:872`) refuses to persist an override for any column whose sidecar declares a domain, and
+every column declares one.
 
-### Why the rule is right and the outcome is wrong
+### 1.2 Descriptions are filled by bucket
 
-The rule exists so an AI cannot overrule a bank's curated taxonomy. That is correct and must survive.
+47 distinct descriptions over 111 CIB columns; 89 rows (80%) share theirs; one sentence covers 12,
+including the `cust_curr_ntb_flg` / `cust_prev_9mnth_ntb_flg` pair whose difference is the entire
+signal.
 
-The gap is that it cannot distinguish **a curated value** from **a bucket label**. `Customer`
-repeated 111 times is not a classification of 111 columns; it is one fact about the file. The system
-sees a non-empty string and concludes the question is answered.
+### 1.3 `ai_summary` already solves 1.2 — and is only half-wired
 
-This is the fourth instance today of one shape — a stage runs, reports success, and produces nothing
-because a gate upstream is closed. The others: `derive_bridge_candidates` with no callers, the
-candidate ledger with no readers, `_entity_candidates` gated on a never-populated `graph_node.entity`.
+Built earlier this session, and the safer design: it targets **every** column
+(`_summary_targets`), writes to its **own** field, and receives the full `_concept_metadata`
+payload — term_name, declared type, BIAN path, source attributes — where `draft_definitions` sends
+only `{table, column, type, concept}`, which by its own code comment cannot separate the NTB pair.
 
----
+Three wires are missing:
 
-## 2. The fix
-
-**Measure specificity; do not assume it.** One deterministic pass, no LLM.
-
-A declared value is *specific* when it distinguishes the column from its siblings, and *inherited*
-when it does not. Counting is exact, instant, and works on any source forever without a list of
-known-bad phrasings.
-
-Deliberately narrow: this changes only **whether the AI is invited to write**. It never edits,
-overrides, or lowers the authority of the source's value.
-
-### 2.1 The measurement (new)
-
-`src/featuregen/overlay/upload/field_specificity.py`
-
-```python
-#: A value shared by this many columns or more is a bucket label, not a column's own answer.
-#: 2 is deliberate: in a metadata file, two columns with a byte-identical description are already
-#: making the same statement about different things.
-SHARED_THRESHOLD = 2
-
-def inherited_values(values: Iterable[str]) -> frozenset[str]:
-    """The values that describe a GROUP rather than a column — those appearing on 2+ columns.
-
-    Blank is never returned: an absent value is already handled by the existing blank rule, and
-    conflating the two would report "12 columns share a description" for 12 empty ones.
-    """
-    counts = Counter(v.strip() for v in values if v and v.strip())
-    return frozenset(v for v, n in counts.items() if n >= SHARED_THRESHOLD)
-```
-
-Pure, no DB, no I/O — unit-testable in isolation.
-
-### 2.2 Definitions (`_definition_targets`, `enrich.py:1178`)
-
-```python
-def _definition_targets(rows, glossary=None) -> set[str]:
-    shared = inherited_values(r.definition for r in _glossary_rows(rows, glossary))
-    return ({content_hash(r) for r in rows
-             if not r.definition or r.definition.strip() in shared}
-            - suppressed_definition_hashes(rows, glossary))
-```
-
-One clause added. The suppressed-blank exclusion (R5-3) is untouched: a sanitiser-blanked definition
-stays withheld, because suppressed is not missing.
-
-**Consequence:** ~89 CIB columns become AI targets instead of 0.
-
-### 2.3 Domain (`column_ref_of` inside `draft_domains`, `enrich.py:872`)
-
-```python
-def column_ref_of(key: str):
-    ...
-    if rec is None or (rec.domain and rec.domain.strip() not in shared_domains):
-        return None
-```
-
-`shared_domains` computed once per run from the glossary's column records. `Customer` appears 111
-times, so it is inherited and every column becomes a target.
-
-The table-level rule (`_declared_domain_tables`, `enrich.py:800`) is **unchanged** — a table's
-declared domain is legitimately one value for one table, and the two-level design already models
-column domain as an override of a table default.
-
-### 2.4 Keep the source's value, honestly
-
-Nothing is discarded or overwritten. The declared value stays in `field_evidence` at
-`source/proposed` exactly as today. What changes is that the column also gets an AI proposal, and the
-existing authority rules decide what displays — source still outranks LLM.
-
-`domain` already carries `origin: "direct" | "inherited"` in the asset payload
-(`asset_detail.py:195`). The same distinction now becomes *true of the data* rather than inferred
-from the presence of column evidence.
-
-### 2.5 Tell the uploader (the part that actually fixes the file)
-
-A `parse`-stage detail, so it appears in the run report rather than only in a query:
-
-```python
-{"rows": 111, "shared_descriptions": 89, "largest_shared_group": 12,
- "distinct_domains": 1}
-```
-
-Everything above compensates for the file. This is the only part that improves it — the people who
-produced the mapping cannot fix what nobody told them about.
-
----
-
-## 3. Files touched
-
-| File | Change |
+| gap | evidence |
 |---|---|
-| `overlay/upload/field_specificity.py` | **new** — `inherited_values`, `SHARED_THRESHOLD` |
-| `overlay/upload/enrich.py` | `_definition_targets` (1178); `column_ref_of` in `draft_domains` (872) |
-| `overlay/upload/ingest.py` | parse-stage detail carrying the specificity counts |
-| `tests/.../test_field_specificity.py` | **new** — the measurement in isolation |
-| `tests/.../test_bucket_filled_fields.py` | **new** — targeting behaviour, both fields |
+| the value never loads | `ai_summary` absent from `_ANCHOR_COLUMNS` (`asset_detail.py:88`) |
+| the stage is not canonical | `enrich_summary` absent from `CANONICAL_STAGES` (`stage_report.py:50`) |
+| a no-client run misreports | absent from the skip loop (`ingest.py:2012`) |
+| the agent cannot see it | no reference in `feature_assist.py` |
 
-No migration. No contract change. No API change.
-
----
-
-## 4. Tests
-
-**The measurement.** A value on 2+ columns is inherited; a unique one is not; blank is never
-returned; whitespace variants are one value.
-
-**Definitions.** A column whose description is shared by 12 becomes a target. A column with a unique
-description does NOT (the curated case must stay untouched). A blank one still does. A
-sanitiser-suppressed blank still does not.
-
-**Domain.** With one distinct domain across 111 columns, every column becomes a target. With
-genuinely varied domains, none does. The table-level rule is unaffected.
-
-**Authority.** After enrichment, the source's declared value is still present at `source/proposed`
-and still outranks the LLM's — asserted directly, because "we did not overrule the bank" is the
-property that makes this safe.
-
-**Mutation check.** Set `SHARED_THRESHOLD = 10_000` (nothing is ever inherited) and confirm the
-targeting tests fail. A threshold that no longer bites must not pass silently.
+The asset screen declares the field and always renders it empty. **This was reported complete. It is
+not.**
 
 ---
 
-## 5. Risks
+## 2. The hazard rev 1 would have triggered
 
-**Cost.** ~89 definition targets and ~237 domain targets per upload where there were 0 and 1. Both
-are cached (`enrichment_definition`, `enrichment_domain`), so it is a one-time charge per column, and
-the 30-minute stage ceiling has headroom. Verify against the real files before calling it done.
+Verified chain:
 
-**Threshold of 2 is a judgement.** Two columns legitimately sharing a description is possible. The
-cost of being wrong is asymmetric and cheap: an unnecessary AI proposal that a human can ignore,
-versus a column with no usable description at all. Revisit if it produces noise.
+1. `FTR_GLOSSARY_PROFILE` (`source_profile.py`) puts `domain` in **`proposed_fields`**, not
+   `attested_fields`. Source domain is `source/proposed`.
+2. The LLM's is `llm/proposed` — **equal strength**.
+3. `PREFER_CONFIRMED` (`field_authority.py:239`) returns `_CONFLICT` when the top strength holds more
+   than one distinct value.
+4. A display conflict resolves to `None`.
+5. `_SOURCE_AUTHORED_DISPLAY_COLUMNS = frozenset({"unit", "currency"})`
+   (`field_resolution.py:121`) — **`domain` is not in it**, yet `build_graph` co-authors
+   `graph_node.domain`. So a `None` display projects unconditionally and **NULLs the column**.
 
-**Not fixed by this.** Concept assignment quality; a file whose descriptions are all unique but all
-vacuous (needs judgement, not counting); and the fact that none of it applies to existing rows
-without a re-upload.
+`Customer` + AI `Payments` → **blank**. Rev 1's central safety claim was false, and its "authority"
+test asserted a property the resolver cannot satisfy.
+
+This hazard exists **today**, independent of any plan, for any future disagreement on `domain`.
 
 ---
 
-## 6. Sequence
+## 3. The design
 
-1. `field_specificity.py` + its unit tests — no other code touched, provably correct alone.
-2. Wire into `_definition_targets` + tests. Verify against the real CIB file: 0 → ~89 targets.
-3. Wire into `draft_domains` + tests. Verify: 1 → ~237 targets.
-4. Parse-stage counts + test.
-5. Full suite, then a real re-upload to confirm cost and quality against live data.
+### 3.1 Guard first (independent of everything else)
 
-Steps 1–4 are independently committable. Step 5 is where the claim gets tested, and where every
-previous "done" in this session turned out to be premature.
+Add `domain` to `_SOURCE_AUTHORED_DISPLAY_COLUMNS`. `build_graph` is a co-author, so a `None`
+resolution means *"I have nothing to say"*, not *"there is nothing here"* — exactly the reasoning
+already written above that constant for `unit`/`currency`. One line; removes a live hazard.
+
+### 3.2 Two lanes, a pattern this codebase already runs
+
+`definition` (source) / `ai_summary` (platform) is the shape. Repeat it:
+
+| concern | source lane | enrichment lane |
+|---|---|---|
+| meaning | `definition` — source/attested | `ai_summary` — llm/proposed |
+| grouping | `domain` — source/proposed | `semantic_domain` — llm/proposed |
+
+Nothing competes. The source keeps its field, its text and its authority. The platform's value is
+usable immediately — searchable, facetable, fed to the agents — without human approval, per the
+standing rule that AI-proposed metadata is usable before review. Provenance stays visible.
+
+### 3.3 Repetition is a DIAGNOSTIC, never a verdict
+
+Rev 1's error. A domain is a *category*; repeating is its purpose. Fifty payment columns reading
+`Payments` is the field working correctly.
+
+So compute reuse statistics and **report** them. Change no authority and no targeting.
+
+Scope per `(source, schema, table, field)` over **distinct logical columns** — not the whole upload,
+and not raw CSV rows, so an unrelated table cannot reclassify this one and duplicate rows cannot
+manufacture a group. Name it `reused_values`, not `inherited_values`: repetition is evidence of
+possible genericness, not proof of it.
+
+### 3.4 Ground the domain classifier, and fix its cache identity
+
+It receives the table name and column names. From `amt`, `code`, `flag`, `dt` it cannot tell a
+transaction amount from a balance. Send what already exists per column: term_name, sanitized
+definition, `ai_summary`, concept, BIAN/FIBO path, declared type.
+
+Keep the **one call per table** shape — a table default plus sparse overrides. Rev 1 wrongly claimed
+~237 column classifications; `column_ref_of` runs *after* the call and only gates persistence.
+
+The cache keys on source + table + sorted column names, so correcting `amt` from "Transaction
+amount" to "Current account balance" serves the stale answer. Key on the full model input plus
+prompt/schema/vocabulary versions.
+
+### 3.5 A controlled, extendable domain vocabulary
+
+Free-text output fragments the facet (`Customer`, `Customers`, `Customer Management`, `Party`…).
+Offer a versioned list — `customer_identity`, `customer_lifecycle`, `customer_segmentation`,
+`payments`, `accounts`, `balances`, `compliance`, `fraud_risk`, `credit_risk`, `merchant`,
+`product`, `operations` — and allow `{"semantic_domain": "other", "proposed_new_domain": "…"}` so a
+genuine gap surfaces instead of being silently invented.
+
+---
+
+## 4. Tasks, in order
+
+**Task 1 — Guard `domain` against projection-wipe.** One line + a test that a `None` resolution
+leaves a source-declared domain standing. *Ships alone.*
+
+**Task 2 — Finish `ai_summary`.** Anchor query, `CANONICAL_STAGES`, the no-client skip loop,
+feature-agent grounding. Acceptance: the two NTB columns show **distinct** summaries in asset
+detail, are findable by them, and reach the agent. *Repays a delivery gap.*
+
+**Task 3 — Reuse diagnostics.** Per-table statistics on the parse stage. Reports only; no authority
+or targeting change. Note this IS externally observable via ingestion-run reporting — rev 1's "no API
+change" was wrong.
+
+**Task 4 — `semantic_domain` lane.** Migration, evidence under its own field name, read model, facet.
+Source domain untouched throughout.
+
+**Task 5 — Ground + re-key the classifier.** Full per-column context, controlled vocabulary, cache
+identity over the real input.
+
+---
+
+## 5. Acceptance (Task 5 is where claims get tested)
+
+- No source `definition` or `domain` is ever blanked — including on an AI disagreement.
+- The NTB pair carries two distinct summaries, human-reviewed on a small sample.
+- The enriched-domain facet holds useful categories beyond `Customer` and `Compliance`.
+- Overrides are sparse: no fabricated per-column row where the table default applies.
+- Duplicate input rows count once; an identical value in another table changes nothing here.
+- Corrected metadata re-classifies; unchanged metadata makes no provider call.
+- The data/feature agent receives `ai_summary` and `semantic_domain`.
+
+---
+
+## 6. What rev 1 got wrong
+
+Recorded because the errors are instructive, not to be tidied away.
+
+1. **"Source outranks LLM" — false for `domain`.** True for `definition` (attested), false for
+   `domain` (proposed vs proposed). The plan would have blanked the field it set out to enrich.
+2. **`draft_domains` does not exist.** The function is `_write_domain_evidence` (`enrich.py:814`). I
+   verified every line number and never verified the enclosing function name — which then produced
+   the cost error, since `column_ref_of` gates *persistence*, after the call, not targeting.
+3. **Repetition treated as inheritance.** Sound reasoning for descriptions, transferred to a field
+   where repetition is the point.
+4. **`_glossary_rows` does not exist**; parse-stage reporting is owned by the upload route
+   (`api/routes/uploads.py`), not `ingest.py`. Rev 1 was not literally buildable.
+5. **Empirical claims unreproducible from the repo.** The real CIB/FTR files are untracked. The
+   111/47/89/12 figures should be pinned by a committed deterministic script stating its
+   normalization and grouping rules, or they cannot be re-derived by anyone else.
+
+The common thread: rev 1 reasoned about authority from memory instead of reading
+`source_profile.py`. Every other error followed from that one.
