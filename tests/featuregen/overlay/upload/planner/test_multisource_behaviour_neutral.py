@@ -120,13 +120,45 @@ _BEHAVIOURAL_ENGINE_FILES = (
 _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 
 
-def test_behavioural_engine_files_are_byte_identical_to_origin_main_at_branch_point():
+def _executable_ast(source: str) -> str:
+    """The module's AST with every DOCSTRING removed. Comments never reach the AST at all, so two
+    modules whose ``_executable_ast`` are equal differ only in prose — no statement, expression,
+    constant, default, decorator or import can differ without changing this string."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) \
+                and body and isinstance(body[0], ast.Expr) \
+                and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.dump(ast.fix_missing_locations(tree))
+
+
+def test_behavioural_engine_files_are_behaviourally_identical_to_origin_main_at_branch_point():
+    """Design §12: the multi-source shadow engine never perturbs the single-source frontier.
+
+    Byte-identity where the bytes are identical; AST-identity (docstrings stripped, comments
+    invisible to the parser) where they are not. That distinction was forced by the bridge lifecycle
+    correction, which had to fix a comment in ``assembly.py`` asserting a dead invariant — "Crossings
+    are governed-bridge-only (active_bridges = VERIFIED)", false since ``active_bridges`` began
+    consuming confirmed and proposed alike, and load-bearing enough that it invalidated a plan
+    premise built on it. A proof that a false comment may never be corrected makes it permanent.
+
+    This is NOT the weakening the module docstring warns against. AST-identity is a statement about
+    BEHAVIOUR, which is what §12 is about, and it is strictly stronger than the additive-only line
+    check ``contracts.py`` already gets. Any change to a statement, expression, constant, default,
+    decorator or import still fails here — escalate that, do not relax this further.
+    """
     for rel_path in _BEHAVIOURAL_ENGINE_FILES:
         diff = _diff_for(rel_path)
-        assert diff == "", (
-            f"NEUTRALITY VIOLATION: {rel_path} was modified on this branch relative to the "
-            f"origin/main branch point {_MERGE_BASE} — this file carries single-source planner "
-            f"behaviour and design §12 requires it stay byte-identical. Diff:\n{diff}")
+        if not diff:
+            continue
+        base = _git("show", f"{_MERGE_BASE}:{rel_path}")
+        head = (_REPO_ROOT / rel_path).read_text()
+        assert _executable_ast(base) == _executable_ast(head), (
+            f"NEUTRALITY VIOLATION: {rel_path} changed EXECUTABLE code on this branch relative to "
+            f"the origin/main branch point {_MERGE_BASE} — this file carries single-source planner "
+            f"behaviour and design §12 requires it stay behaviourally identical. Diff:\n{diff}")
 
 
 def test_contracts_file_branch_diff_is_additive_only():
