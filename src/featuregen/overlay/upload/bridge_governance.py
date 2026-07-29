@@ -72,12 +72,25 @@ _LIMIT_MAX = 500
 _PENDING_STATUSES = frozenset({"DRAFT", "PARTIALLY_CONFIRMED", "REVERIFY", "STALE"})
 _DISPLAY_STATUS = {"DRAFT": "PROPOSED"}
 
-#: The server-sanctioned actions per status. A pending bridge awaits a confirm/reject decision. A
-#: VERIFIED bridge is not re-confirmable — the only action this design sanctions on it is REJECT,
-#: which demotes the projected edge (``demote_bridge_edges``). Bridges have no reverify/withdraw/
-#: correct surface, so the semantic-binding triple is deliberately NOT reused here.
+#: The server-sanctioned actions per status — a PROJECTION of the write-side gate, never a second
+#: copy of it. ``_lifecycle._AWAITING_CONFIRMATION`` is the set from which ``confirm_fact`` and
+#: ``reject_fact`` accept a decision: DRAFT, PARTIALLY_CONFIRMED, REVERIFY and STALE. So a drifted
+#: (STALE) or re-verifying bridge is genuinely still decidable and correctly offers both — the queue
+#: is not inventing an action, it is reflecting one the commands already take.
 _ACTIONS_PENDING = ("confirm", "reject")
-_ACTIONS_VERIFIED = ("reject",)
+
+#: VERIFIED offers NOTHING, and that is load-bearing rather than a gap.
+#:
+#: ``_AWAITING_CONFIRMATION`` deliberately EXCLUDES VERIFIED (*"it is replaced via its own re-verify
+#: flow"*), so ``reject_fact`` DENIES a VERIFIED fact — ``confirmation_commands.py:245``. Offering
+#: ``reject`` here would put a button in the queue that the server answers with a denial, which is
+#: precisely what "the UI may not advertise a command the server does not sanction" forbids.
+#:
+#: The semantic-binding peer CAN offer reverify/withdraw/correct on VERIFIED because it first runs
+#: the sanctioned expiry transition (``expiry._apply_expiry``, VERIFIED -> REVERIFY) and only then
+#: dispatches the real command. Bridges have no such surface yet, and inventing one is a governance
+#: decision with its own demote and blast-radius semantics — not something a read model may imply.
+_ACTIONS_VERIFIED: tuple[str, ...] = ()
 
 
 def _endpoint_hidden(conn: DbConn, ref: CatalogObjectRef, allowed: list[str],
@@ -128,6 +141,40 @@ def _stream_bridge_keys(conn: DbConn) -> list[str]:
         "GROUP BY overlay_fact_id ORDER BY seq", (ENTITY_BRIDGE,)).fetchall()]
 
 
+def _ledger_by_fact_key(conn: DbConn) -> dict[str, tuple]:
+    """The raw candidate ledger keyed by ``fact_key`` — the SECOND evidence source, and the reason
+    ``evidence_present`` can be trusted.
+
+    ``cross_catalog_links`` deliberately SUPPRESSES a link whose fact folds to REJECTED or STALE
+    (*"a human's NO must still count"*). REJECTED is terminal here and never listed, but STALE still
+    awaits a decision and IS listed — and reading enrichment only through ``cross_catalog_links``
+    would report that bridge as ``evidence_present=False`` when its ledger row is sitting right
+    there. That would make the W4 discrepancy signal lie about a perfectly ordinary drift state."""
+    return {r[0]: (r[1], r[2]) for r in conn.execute(
+        "SELECT fact_key, data_type_family, evidence_json FROM entity_bridge_candidate_evidence "
+        "WHERE fact_key IS NOT NULL").fetchall()}
+
+
+def _evidence(link, ledger_row: tuple | None) -> dict | None:
+    """The derivation evidence for one bridge, from the ranked link when available and from the raw
+    ledger row otherwise, or None when neither exists (the W4 case).
+
+    ``strength`` is None on the ledger fallback rather than 0: 0 is a REAL rank (a link with no
+    grain, no attestation and no confirmation scores exactly 0), so reporting it for an unranked
+    bridge would be indistinguishable from the weakest genuine candidate."""
+    if link is not None:
+        return {"data_type_family": link.data_type_family, "type_basis": link.type_basis,
+                "left_is_grain": bool(link.left_is_grain),
+                "right_is_grain": bool(link.right_is_grain), "strength": link.strength}
+    if ledger_row is not None:
+        family, ev = ledger_row
+        ev = ev if isinstance(ev, dict) else {}
+        return {"data_type_family": family or "", "type_basis": str(ev.get("type_basis") or ""),
+                "left_is_grain": bool(ev.get("left_is_grain")),
+                "right_is_grain": bool(ev.get("right_is_grain")), "strength": None}
+    return None
+
+
 def _ref_dict(ref: CatalogObjectRef) -> dict:
     return {"catalog_source": ref.catalog_source, "schema": ref.schema,
             "table": ref.table, "column": ref.column}
@@ -144,7 +191,7 @@ def _actions(status: str, stream, actor: IdentityEnvelope | None) -> list[str]:
     return list(sanctioned)
 
 
-def _view(conn: DbConn, key: str, link, allowed: list[str] | None, memo: dict,
+def _view(conn: DbConn, key: str, evidence: dict | None, allowed: list[str] | None, memo: dict,
           actor: IdentityEnvelope | None) -> dict | None:
     """ONE bridge view, or None when the bridge is filtered (terminal/empty status, or a
     read-scoped endpoint). Raises on structural corruption — the caller skips that row."""
@@ -175,14 +222,14 @@ def _view(conn: DbConn, key: str, link, allowed: list[str] | None, memo: dict,
         "left": _ref_dict(ref.left_ref),
         "right": _ref_dict(ref.right_ref),
         # Derivation evidence — enrichment, absent when W4's early return skipped the ledger row.
-        "evidence_present": link is not None,
-        "data_type_family": link.data_type_family if link else "",
+        "evidence_present": evidence is not None,
+        "data_type_family": evidence["data_type_family"] if evidence else "",
         # `declared` means two glossary spreadsheets agreed the types match, NOT a read of the
         # physical schema. The confirmer is approving a materially different claim, so it is shown.
-        "type_basis": link.type_basis if link else "",
-        "left_is_grain": bool(link.left_is_grain) if link else False,
-        "right_is_grain": bool(link.right_is_grain) if link else False,
-        "strength": link.strength if link else 0,
+        "type_basis": evidence["type_basis"] if evidence else "",
+        "left_is_grain": evidence["left_is_grain"] if evidence else False,
+        "right_is_grain": evidence["right_is_grain"] if evidence else False,
+        "strength": evidence["strength"] if evidence else None,
         "proposed_by": payload0.get("proposed_by"),
         "proposed_at": stream[0].occurred_at.isoformat() if stream[0].occurred_at else None,
         "target_event_id": _cas_target(state),
@@ -215,26 +262,35 @@ def list_bridge_proposals(conn: DbConn, *, source: str | None = None, limit: int
     limit = max(1, min(int(limit), _LIMIT_MAX))
     want = _norm(source) if source is not None else None
     allowed = allowed_classes(roles) if roles is not None else None
-    # The ledger, wrapped rather than re-queried: strength, type family, type_basis and the grain
-    # flags all come from here. Keyed by fact_key; a candidate never proposed as a fact has nothing
-    # to govern and no CAS target, so it is not a governance row.
+    # The RANKED links, wrapped rather than re-queried: strength, type family, type_basis and the
+    # CURRENT-graph grain flags all come from here. Keyed by fact_key; a candidate never proposed as
+    # a fact has nothing to govern and no CAS target, so it is not a governance row.
     try:
-        by_key = {link.fact_key: link for link in cross_catalog_links(conn) if link.fact_key}
-    except Exception:  # noqa: BLE001 — the ledger is ENRICHMENT; losing it must not blank the queue
+        links = {link.fact_key: link for link in cross_catalog_links(conn) if link.fact_key}
+    except Exception:  # noqa: BLE001 — evidence is ENRICHMENT; losing it must not blank the queue
         counters.incr("overlay.bridge_governance.links_unreadable")
         logger.warning("bridge governance: cross_catalog_links unreadable — listing without "
-                       "derivation evidence", exc_info=True)
-        by_key = {}
-    # W4: the governed population is the event stream. Union so a bridge whose ledger row was
-    # skipped by `bridge_propose`'s early return is still reviewable.
+                       "ranked derivation evidence", exc_info=True)
+        links = {}
+    try:
+        ledger = _ledger_by_fact_key(conn)
+    except Exception:  # noqa: BLE001 — same rule: no evidence is a degraded view, not a blank queue
+        counters.incr("overlay.bridge_governance.ledger_unreadable")
+        logger.warning("bridge governance: candidate ledger unreadable", exc_info=True)
+        ledger = {}
+    # W4: the governed population is the EVENT STREAM, not the ledger. Union so a bridge whose
+    # ledger row was skipped by `bridge_propose`'s early return is still reviewable, and so a
+    # ledger/edge row whose stream is missing is still ATTEMPTED (and counted when it is not).
     keys = list(_stream_bridge_keys(conn))
-    keys += [k for k in by_key if k not in set(keys)]
+    seen = set(keys)
+    keys += [k for k in (links | ledger) if k not in seen]
 
     memo: dict = {}
     views: list[dict] = []
     for key in keys:
         try:
-            view = _view(conn, key, by_key.get(key), allowed, memo, actor)
+            view = _view(conn, key, _evidence(links.get(key), ledger.get(key)), allowed, memo,
+                         actor)
         except Exception:  # noqa: BLE001 — ONE corrupt bridge must not abort the whole queue
             counters.incr("overlay.bridge_governance.view_skipped")
             logger.warning("bridge governance: view for fact %s unreadable — skipped", key,

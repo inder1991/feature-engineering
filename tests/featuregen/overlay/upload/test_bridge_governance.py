@@ -30,7 +30,7 @@ from featuregen.overlay._lifecycle import _cas_target
 from featuregen.overlay.commands import confirm_fact, reject_fact
 from featuregen.overlay.identity import EntityBridgeRef, fact_key
 from featuregen.overlay.state import fold_overlay_state
-from featuregen.overlay.store import load_fact
+from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_governance import (
     list_bridge_proposals,
@@ -38,6 +38,7 @@ from featuregen.overlay.upload.bridge_governance import (
 )
 from featuregen.overlay.upload.bridge_propose import propose_bridge
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
 
@@ -72,6 +73,18 @@ def _hide(db, source: str, table: str, column: str, *, tag: str = "pii") -> None
     db.execute(
         "UPDATE graph_node SET sensitivity = %s WHERE catalog_source = %s AND object_ref = %s",
         (tag, source, f"public.{table}.{column}"))
+
+
+def _stale(db, key: str) -> None:
+    """Drift a VERIFIED bridge to STALE via the SAME event `detect_catalog_changes` appends
+    (`catalog_changes.py:211`), so the fold under test is the production one."""
+    state = fold_overlay_state(load_fact(db, key))
+    append_overlay_event(
+        db, fact_key=key, type="OVERLAY_FACT_STALED",
+        payload={"catalog_change_ref": "chg-1",
+                 "stales_confirmed_event_id": state.confirmed_event_id},
+        actor=mint_test_identity(subject="user:admin1", role_claims=("platform-admin",)),
+        expected_version=load_fact(db, key)[-1].stream_version)
 
 
 # ── the listing exists at all, and does not follow the overlay_proposal pattern ──────────────────
@@ -138,6 +151,24 @@ def test_evidence_present_is_true_when_the_ledger_row_exists(db):
     """The control for the test above — `evidence_present` must discriminate, not be a constant."""
     _bridge(db)
     assert list_bridge_proposals(db)[0]["evidence_present"] is True
+
+
+def test_a_staled_bridge_still_reports_its_evidence(db):
+    """`cross_catalog_links` deliberately SUPPRESSES a STALE link ("drift changed an endpoint").
+    STALE still awaits a decision, so this surface lists it — and reading enrichment ONLY through
+    that module would report `evidence_present=False` for a bridge whose ledger row is sitting right
+    there, making the W4 signal lie about an ordinary drift state."""
+    ref, key = _bridge(db)
+    _confirm(db, ref)
+    _stale(db, key)
+    assert cross_catalog_links(db) == (), "fixture assumption: a STALE link is suppressed there"
+    row = list_bridge_proposals(db)[0]
+    assert row["status"] == "STALE"
+    assert row["evidence_present"] is True, "a STALE bridge's evidence row still exists"
+    assert row["type_basis"] == "attested"
+    # …but it carries NO rank, because nothing ranked it. 0 is a REAL strength (no grain, no
+    # attestation, no confirmation), so reporting 0 here would fake the weakest genuine candidate.
+    assert row["strength"] is None
 
 
 # ── read-scoping: a hidden endpoint drops the WHOLE row ──────────────────────────────────────────
@@ -248,13 +279,39 @@ def test_a_different_human_may_confirm_a_service_proposed_bridge(db):
     assert "confirm" in list_bridge_proposals(db, actor=someone)[0]["available_actions"]
 
 
-def test_a_verified_bridge_offers_only_reject(db):
-    """The only sanctioned action left on a VERIFIED bridge in this design is reject, which demotes
-    the edge (Task 2). It must not keep advertising `confirm`."""
-    ref, _ = _bridge(db)
+def test_a_verified_bridge_offers_no_actions_because_the_server_sanctions_none(db):
+    """A VERIFIED bridge is still LISTED — the queue must show a decision that has been made — but
+    it offers nothing, and this test proves that by DISPATCHING the command rather than asserting a
+    constant. `_AWAITING_CONFIRMATION` excludes VERIFIED, so `reject_fact` denies it. Advertising
+    `reject` would put a button in the queue that the server answers with a denial."""
+    ref, key = _bridge(db)
     _confirm(db, ref)
     actor = mint_test_identity(subject="user:someone", role_claims=("platform-admin",))
-    assert list_bridge_proposals(db, actor=actor)[0]["available_actions"] == ["reject"]
+    row = list_bridge_proposals(db, actor=actor)[0]
+    assert row["status"] == "VERIFIED"
+    assert row["available_actions"] == []
+
+    # The ground truth the read model is projecting: the write side REFUSES both commands here.
+    state = fold_overlay_state(load_fact(db, key))
+    for action, command in (("reject_fact", reject_fact), ("confirm_fact", confirm_fact)):
+        res = command(db, Command(
+            action, "overlay_fact", None,
+            {"ref": ref, "fact_type": "entity_bridge", "use_case": None,
+             "target_event_id": _cas_target(state), "reason": "x"},
+            actor, f"{action}-verified"))
+        assert not res.accepted, f"{action} was expected to deny a VERIFIED bridge"
+
+
+def test_a_staled_bridge_is_decidable_again(db):
+    """STALE and REVERIFY ARE in `_AWAITING_CONFIRMATION`, so drift genuinely reopens the decision.
+    The queue must offer both actions — this is not the VERIFIED case."""
+    ref, key = _bridge(db)
+    _confirm(db, ref)
+    _stale(db, key)
+    actor = mint_test_identity(subject="user:someone", role_claims=("platform-admin",))
+    row = list_bridge_proposals(db, actor=actor)[0]
+    assert row["status"] == "STALE"
+    assert row["available_actions"] == ["confirm", "reject"]
 
 
 # ── the confirmer's context: type_basis, and the rest of the evidence ────────────────────────────
