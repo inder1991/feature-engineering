@@ -904,6 +904,44 @@ _ALL: tuple[Concept, ...] = (
             description="The user who created or last updated the record (create_user / update_user). "
                         "A named member of staff, so personal data; audit lineage rather than "
                         "customer behaviour, and rarely a legitimate feature."),
+    # ── §3.19 Labels — the readable side of a code ────────────────────────────────────────────────
+    # A NAME is not an IDENTIFIER. `cust_prim_branch_nm` was classified `branch_id` because
+    # `branch_id` was the only branch word in the registry, and `derive_bridge_candidates` pairs any
+    # two columns sharing an identifier concept — so six columns holding `branch_id` produced eight
+    # cross-catalog "links", none of them a real join (`cust_prim_branch_nm <-> sol_desc` pairs a
+    # name with a description). A mislabelled flag misdescribes a column; a mislabelled identifier
+    # MANUFACTURES JOINS.
+    #
+    # Every concept here is `categorical` with NO entity_link — the two conditions the bridge
+    # derivation requires — so a label can never be proposed as a join key. The paired identifier is
+    # untouched and still links catalogs; only the name stops pretending to.
+    Concept("branch_name", "categorical",
+            description="Human-readable name of a branch (the label beside branch_id). Groups and "
+                        "displays; never a join key — two catalogs' branch names are text that may "
+                        "coincide, not a shared identifier."),
+    Concept("relationship_manager_name", "categorical", sensitivity="pii",
+            description="Name of the relationship manager (the label beside "
+                        "relationship_manager_id). An identifiable employee, so it carries a pii "
+                        "floor for the same reason record_author does."),
+    Concept("merchant_name", "categorical",
+            description="Trading name of a merchant (the label beside merchant_id). Notoriously "
+                        "inconsistent across acquirers — the id joins, the name does not."),
+    Concept("account_name", "categorical",
+            description="Display name or title of an account (the label beside account_id). Often "
+                        "carries the holder's name, so treat as free text rather than a key."),
+    Concept("instrument_name", "categorical",
+            description="Readable name of a financial instrument (the label beside instrument_id). "
+                        "The ISIN/CUSIP identifies it; the name only describes it."),
+    Concept("counterparty_name", "categorical",
+            description="Name of the counterparty to a transaction (the label beside "
+                        "counterparty_id). Distinct from beneficiary_name, which names the party a "
+                        "payment is FOR rather than the party it is WITH."),
+    Concept("code_label", "categorical",
+            description="The readable description of a coded value — a sector description beside a "
+                        "sector code, a reason description beside a reason code. Landing these on "
+                        "the CODE's own concept conflates what you GROUP BY with what you DISPLAY, "
+                        "and doubles every code into two apparently-equal columns."),
+
     Concept("kyc_narrative", "text", sensitivity="pii",
             description="Free-prose KYC commentary — nature of business, corporate background, "
                         "high-risk rationale. Uploader-authored text about an identifiable party, so "
