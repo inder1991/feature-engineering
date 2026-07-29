@@ -311,7 +311,9 @@ describe('lineage view', () => {
       // genuinely different column links render as six identical sentences on the real catalog,
       // hiding the only one that mattered. Also states review status honestly instead of
       // hard-coding "declared".
-      'customers.cust_id links to cards.card_holders.holder_id on Customer · proposed, not yet reviewed',
+      // The rank is stated in words. Marking only weak links left a strong one unlabelled, so
+      // "no marker" had to be read as "good" — invisible when only one link is on screen.
+      'customers.cust_id links to cards.card_holders.holder_id on Customer · weak · proposed, not yet reviewed',
     ])
   })
 

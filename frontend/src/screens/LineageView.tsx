@@ -435,10 +435,12 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
       ? `${to.catalog_source ?? idSource(e.to)}.${shortRef(to, e.to)}`
       : e.to
     const state = e.resolved ? 'confirmed by a person' : 'proposed, not yet reviewed'
-    // `why` names WHY the link ranks where it does ("neither side is a key — types match but this
-    // may not be a real join"). On the canvas that is one word; here there is room to say it.
+    // The VERDICT first, then the reason behind it. `why` explains the rank ("neither side is a
+    // key — types match but this may not be a real join"); on the canvas that compresses to one
+    // word, and here there is room for both.
+    const rank = (e.strength ?? 0) >= 10 ? 'strong' : 'weak'
     const because = e.why ? ` · ${e.why}` : ''
-    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${state}${because}`
+    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${rank} · ${state}${because}`
   }
   if (e.kind === 'derives') {
     return `${shortRef(from, e.from)} derives feature ${shortRef(to, e.to)} · registered`
@@ -862,8 +864,11 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         // that the two columns merely share a type, which is how `cust_prim_branch_nm` came to
         // "link" to `sol_desc` — a name to a description. Rank it, never hide it: the link is real
         // enough to show and weak enough to say so.
+        // Both words, not just the negative one. Marking only the weak links left the strong one
+        // unlabelled, so "no marker" had to be read as "good" — an absence is a poor way to state
+        // a verdict, and it is invisible when only one link is on screen.
         const keyed = (e.strength ?? 0) >= 10
-        label = keyed ? (entity ?? 'linked') : `${entity ?? 'linked'} · weak`
+        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'}`
       } else {
         stroke = 'var(--proposal)'
         label = e.kind
