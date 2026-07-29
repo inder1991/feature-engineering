@@ -31,6 +31,8 @@ a stale drift watermark's correct refusal reports "pending".
 """
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 import psycopg
@@ -41,8 +43,17 @@ from pydantic import BaseModel, Field
 from featuregen.api.deps import get_conn, get_identity, require_confirmer
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay.confirmation_commands import confirm_fact, reject_fact
+from featuregen.overlay.identity import EntityBridgeRef
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.bridge_governance import (
+    list_bridge_proposals,
+    load_bridge_context,
+)
+from featuregen.overlay.upload.bridge_projection import (
+    demote_bridge_edges,
+    project_verified_bridge,
+)
 from featuregen.overlay.upload.join_drift import (
     acknowledge_governed_join_divergence,
     list_governed_join_divergences,
@@ -72,6 +83,8 @@ from featuregen.overlay.upload.table_fact_governance import (
     project_verified_table_fact,
 )
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -113,6 +126,21 @@ class ReverifySemanticBindingRequest(BaseModel):
 
 class WithdrawSemanticBindingRequest(BaseModel):
     category: Literal["no_longer_valid", "wrong_binding", "superseded", "needs_data_check"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ConfirmEntityBridgeRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class RejectEntityBridgeRequest(BaseModel):
+    # Why a reviewer says no to a CROSS-CATALOG identifier link. `not_the_same_entity` is the
+    # dominant one (two catalogs use the same word for different things); `wrong_column` is the
+    # right entity bound through the wrong identifier; `values_do_not_match` is the type-compatible
+    # pair whose populations simply do not overlap — the failure `type_basis='declared'` cannot see,
+    # because two glossary spreadsheets agreeing is not a read of the data.
+    category: Literal["not_the_same_entity", "wrong_column", "values_do_not_match",
+                      "duplicate_bridge", "needs_data_check"]
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -461,3 +489,147 @@ def correct_semantic_binding(fact_key: str, body: CorrectSemanticBindingRequest,
             "proposed_event_id": result["proposed_event_id"],
             "requires_distinct_confirmer": True,
             "operational_projection": result["operational_projection"]}
+
+
+# ══════════ Entity-bridge routes (governance-review redesign, Task 2 — cross-catalog links) ═══════
+# The governed `entity_bridge` facts the derivation proposes and `bridge_projection` makes
+# operational. Same shape as the siblings above (require_confirmer, the fact_type-VALIDATED +
+# read-scoped 404 bridge, idempotency key, target-event CAS, return-the-409), over the Task 1 read
+# model (`bridge_governance`). Two things differ, both forced by the projection:
+#
+#   * The route is the ONLY thing that projects. `confirm_fact` carries projection hooks for
+#     `approved_join` and the semantic bindings and NONE for `entity_bridge`; `reject_fact` likewise
+#     demotes joins and bindings and not bridges. So a bridge route that omits these calls reaches
+#     VERIFIED/REJECTED and returns a perfectly normal 200 over a link that is never operational —
+#     or, worse on reject, one that stays traversable after a human said no.
+#
+#   * Confirm and reject handle a projection fault in OPPOSITE directions, deliberately. On confirm
+#     the projection ADDS capability, so failing it is fail-closed and deferrable: the confirmation
+#     is the scarce thing (a human decided), the edge is rebuildable from the stream, and losing the
+#     decision to a projection fault is the W2 defect. On reject the demote REMOVES capability, so a
+#     "soft" failure would leave a REJECTED bridge live in the planner — a governance leak. That one
+#     stays all-or-nothing: it raises, `get_conn` rolls back, and nothing happened.
+#
+# A VERIFIED bridge is offered NO action. `_AWAITING_CONFIRMATION` excludes VERIFIED, so
+# `reject_fact` denies it; a real withdrawal needs the semantic-binding shape (the sanctioned
+# VERIFIED -> REVERIFY transition first) and is a separate governance increment, not a reject call.
+
+
+def _load_bridge_context_or_404(conn: psycopg.Connection, fact_key: str, roles) -> dict:
+    """The fact_type-VALIDATED + READ-SCOPED context bridge: a fact_key that is not a decidable
+    entity_bridge — OR one naming an endpoint column hidden from the caller's ``roles`` — 404s
+    BEFORE any command dispatch. Without the roles check the listing's read-scoping would be
+    cosmetic: a caller could confirm a bridge they are not allowed to see."""
+    ensure_upload_catalog_adapter()
+    ctx = load_bridge_context(conn, fact_key, roles=roles)
+    if ctx is None:
+        raise HTTPException(status_code=404, detail="No such entity-bridge proposal.")
+    return ctx
+
+
+def _project_bridge(conn: psycopg.Connection, ref: EntityBridgeRef) -> str:
+    """Make a just-VERIFIED bridge operational, honestly and WITHOUT risking the confirmation.
+
+    W1 — ``project_verified_bridge`` has no default for ``now`` (its semantic-binding twin does) and
+    feeds it straight into ``entity_bridge_edge.projected_at``, declared ``timestamptz NOT NULL
+    DEFAULT now()``. A column DEFAULT applies when the column is OMITTED, never when NULL is
+    explicitly supplied, so ``now=None`` would insert NULL into a NOT NULL column and error. The
+    projection wall-clock is passed explicitly, matching what the twin's default would have produced.
+
+    W2 — it also has neither a savepoint nor a never-raises guarantee, so a fault here would
+    propagate, roll back the whole request transaction and LOSE the confirmation: the reviewer sees
+    a 500 and the fact is not VERIFIED. ``conn.transaction()`` nests a SAVEPOINT, so a fault (even
+    one that poisons the transaction, which a database error does) is contained and reported as
+    "pending" — the honest answer, since a pending edge is simply not yet traversable and the next
+    projection rebuilds it from the stream. This wrapper lives here rather than in
+    ``bridge_projection`` because that module is owned by the parallel planner stream.
+    """
+    try:
+        with conn.transaction():
+            return project_verified_bridge(conn, ref, now=datetime.now(UTC))
+    except Exception:  # noqa: BLE001 — a projection fault must NEVER roll back the confirmation
+        logger.warning("entity-bridge projection failed after a successful confirm — the fact is "
+                       "VERIFIED and the edge is pending", exc_info=True)
+        return "pending"
+
+
+@router.get("/sources/{source}/governance/entity-bridges",
+            dependencies=[Depends(require_confirmer)])
+def list_entity_bridges(source: str, conn: _Conn, identity: _Identity,
+                        limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    """The entity bridges touching this catalog — pending AND VERIFIED, with the server's sanctioned
+    ``available_actions`` per row. Source-scoped only: every governance route is
+    ``/sources/{source}/…`` and the cross-catalog surface is the queue, which owns its own scoping.
+    A bridge matches if EITHER endpoint is this source (``EntityBridgeRef`` identity is unordered).
+
+    READ-SCOPED: the caller's ``role_claims`` drop any bridge naming a hidden endpoint column, so
+    this cannot become an existence oracle. ``actor`` is passed so four-eyes is decided by the
+    SERVER — the proposer of a bridge is not offered ``confirm``."""
+    ensure_upload_catalog_adapter()
+    proposals = list_bridge_proposals(conn, source=source, limit=limit,
+                                      roles=identity.role_claims, actor=identity)
+    return {"source": source.strip().lower(), "proposals": proposals, "next_cursor": None}
+
+
+@router.post("/governance/entity-bridges/{fact_key}/confirm",
+             dependencies=[Depends(require_confirmer)])
+def confirm_entity_bridge(fact_key: str, body: ConfirmEntityBridgeRequest, conn: _Conn,
+                          identity: _Identity) -> dict:
+    """Confirm a PROPOSED (or re-affirm a REVERIFY/STALE) entity bridge → VERIFIED via the overlay's
+    own ``confirm_fact``, then project the operational ``entity_bridge_edge`` — the ONLY place that
+    projection happens, since ``confirm_fact`` has no bridge hook. Four-eyes is preserved (the
+    derivation's service actor proposes; a human disposes). ``operational_projection`` is honest:
+    "projected" only when the edge actually landed."""
+    ctx = _load_bridge_context_or_404(conn, fact_key, identity.role_claims)
+    cmd = Command(
+        action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "note": _clean(body.note)},
+        actor=identity, idempotency_key=f"confirm:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = confirm_fact(conn, cmd)
+    if not result.accepted:
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row and
+        # releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
+    status = fold_overlay_state(load_fact(conn, fact_key)).status
+    projection = "not_applicable"
+    if status == "VERIFIED":
+        projection = _project_bridge(conn, ctx["ref"])
+    return {"governance_status": status, "operational_projection": projection}
+
+
+@router.post("/governance/entity-bridges/{fact_key}/reject",
+             dependencies=[Depends(require_confirmer)])
+def reject_entity_bridge(fact_key: str, body: RejectEntityBridgeRequest, conn: _Conn,
+                         identity: _Identity) -> dict:
+    """Reject a decidable entity bridge → REJECTED, then DEMOTE any projected edge.
+
+    The demote is load-bearing, not defensive: ``reject_fact`` demotes joins and semantic bindings
+    and has no ``entity_bridge`` branch, and nothing demotes a bridge on drift either — so a bridge
+    that was VERIFIED and has since gone STALE still has a live edge while remaining rejectable.
+    Without this call a human's NO would leave the link traversable.
+
+    Deliberately NOT savepoint-wrapped, unlike the confirm-side projection: this removes capability,
+    so a fault must fail the whole request (``get_conn`` rolls back, nothing happened) rather than
+    report a REJECTED bridge that is still operational."""
+    ctx = _load_bridge_context_or_404(conn, fact_key, identity.role_claims)
+    # `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics key);
+    # `reason` carries ONLY the free-text note (or None) — same shape as the sibling rejects.
+    cmd = Command(
+        action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "reason": _clean(body.note),
+              "category": body.category},
+        actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = reject_fact(conn, cmd)
+    if not result.accepted:
+        # A VERIFIED bridge lands HERE ("fact not awaiting confirmation") — which is why the listing
+        # offers it no action at all. RETURN, don't raise (audit I-3).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
+    removed = demote_bridge_edges(conn, result.aggregate_id or fact_key)
+    return {"governance_status": "REJECTED", "category": body.category,
+            "operational_projection": "demoted" if removed else "not_applicable"}

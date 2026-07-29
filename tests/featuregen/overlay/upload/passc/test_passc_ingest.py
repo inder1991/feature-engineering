@@ -169,6 +169,22 @@ def test_flag_on_strong_candidate_is_proposed_and_stamped(passc_conn, monkeypatc
     assert find_join_path(passc_conn, "crm", "cases", "customers") is None
 
 
+def test_the_join_proposer_is_the_service_actor_not_the_uploader(passc_conn, monkeypatch):
+    """Pass C has always proposed under the SERVICE actor, and must keep doing so. Pinned here as a
+    regression guard for the entity-bridge proposer fix, which touches the sibling seam in the same
+    module: were a join ever proposed under the uploading human, `proposer_ne_confirmer` would bar
+    that human from confirming it and the join would sit in DRAFT forever."""
+    monkeypatch.setenv("OVERLAY_PASS_C", "1")
+
+    ingest_upload(passc_conn, "crm", _crm_rows(), actor=_actor(), now=_NOW,
+                  glossary=_crm_glossary())
+
+    fk = _ledger_rows(passc_conn, "crm")[0][2]
+    proposed = [e for e in load_fact(passc_conn, fk) if e.type == "OVERLAY_FACT_PROPOSED"]
+    assert [e.payload["proposed_by"] for e in proposed] == ["featuregen-overlay-enrichment"]
+    assert proposed[0].payload["proposed_by"] != _actor().subject
+
+
 # ── 4. Flag on: a weak-only pair is a ledger diagnostic, never a proposal ─────────────────────────
 
 def test_flag_on_weak_only_pair_is_ledger_diagnostic_not_proposed(passc_conn, monkeypatch):

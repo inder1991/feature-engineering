@@ -441,7 +441,7 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
                         result.denied_reason)
 
 
-def _propose_entity_bridges(conn, *, actor) -> int:
+def _propose_entity_bridges(conn, *, ingestion_run_id: str | None = None) -> int:
     """Derive cross-catalog entity bridges from the resolved graph and propose each one. Returns the
     number proposed. Behind OVERLAY_ENTITY_BRIDGES (the caller gates on `entity_bridges_enabled()`).
 
@@ -454,8 +454,21 @@ def _propose_entity_bridges(conn, *, actor) -> int:
     Deliberately GLOBAL, not scoped to the uploading catalog: a bridge needs both endpoints, so it
     only becomes derivable when the SECOND catalog lands. Scoping to `catalog_source` would mean the
     pair was never visible from either side's upload.
+
+    THE PROPOSER IS THE SERVICE ACTOR, never the uploading human — and this function takes no
+    `actor` at all so no caller can re-thread one. Proposing under the uploader's identity makes the
+    bridge permanently unconfirmable BY that uploader (`proposer_ne_confirmer`: "a proposer may not
+    confirm the same fact"), and on a small team the uploader IS the reviewer: measured on the
+    deployed cluster, all 9 bridges carried `proposed_by = user:inder` and `entity_bridge_edge` was
+    empty. The value being proposed is DERIVED from the global graph, not declared in the file just
+    uploaded, so no `source_uploader` is recorded either — that field arms the second four-eyes gate
+    (`uploader_ne_confirmer`) and belongs to uploader-AUTHORED values (semantic bindings, Pass B
+    grain), not to a derivation the uploader had no hand in. Same division as the sibling seam
+    `_run_pass_c` below, which has always proposed join candidates under `_ENRICH_ACTOR`. The
+    originating upload stays in the audit trail via `ingestion_run_id` on the evidence row.
     """
     from featuregen.overlay.upload.bridge_propose import propose_bridge
+    from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 
     proposed = 0
     for candidate in derive_bridge_candidates(conn):
@@ -465,7 +478,8 @@ def _propose_entity_bridges(conn, *, actor) -> int:
             # without ROLLBACK TO here the REQUEST tx would stay aborted and the next statement would
             # raise InFailedSqlTransaction, rolling back the already-stored Pass A facts.
             with conn.transaction():
-                propose_bridge(conn, candidate, actor=actor)
+                propose_bridge(conn, candidate, actor=_ENRICH_ACTOR,
+                               ingestion_run_id=ingestion_run_id)
         except Exception:  # noqa: BLE001 — advisory: a proposal failure must never fail an upload
             counters.incr("overlay.entity_bridges.propose_error")
             logger.warning("advisory entity-bridge proposal raised for %s (%s <-> %s)",
@@ -2479,7 +2493,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if entity_bridges_enabled():
         stage_started = datetime.now(UTC)
         try:
-            entity_bridges_proposed = _propose_entity_bridges(conn, actor=actor)
+            entity_bridges_proposed = _propose_entity_bridges(
+                conn, ingestion_run_id=ingestion_run_id)
             record_stage(stage_recorder, "entity_bridges", "succeeded",
                          detail={"proposed": entity_bridges_proposed}, started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: never fail an upload whose facts are stored
