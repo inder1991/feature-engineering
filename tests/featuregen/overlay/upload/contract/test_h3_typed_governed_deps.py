@@ -226,6 +226,89 @@ def test_bridge_fact_signature_resolves_verified_and_missing_on_revoke(db):
     assert _bridge_fact_signature(db, marker) == _MISSING
 
 
+# ══════════ an AVAILABLE bridge must not be poisoned by the absence of a human review ═════════════
+#
+# `_bridge_fact_signature` reads `entity_bridge_edge`, which holds VERIFIED bridges ONLY. Since a
+# link became available whether or not anybody had reviewed it, a governed plan could legitimately
+# cross a DRAFT bridge — and then the read gate resolved that segment to MISSING at confirm, took the
+# `_UNRESOLVED_AT_CONFIRM` poison, and the contract was permanently un-promotable. That is human
+# review deciding contract eligibility through the back door, and it is the same defect the
+# availability allow-list fixes on the traversal side.
+#
+# The bounded fix is additive: when there is NO projection row, fall back to the governed lifecycle.
+# An AVAILABLE bridge resolves (no poison); an unavailable one stays MISSING. The VERIFIED-with-a-row
+# path is untouched, byte for byte, so no stored `item_hash` is re-baselined.
+#
+# What is NOT done here — and is recorded in the module docstring — is the real target: keying on the
+# DIRECTIONAL REALIZATION revision plus deterministic evidence rather than on a governance status at
+# all. That needs a concept the codebase does not have yet.
+
+def _draft_bridge(db, fact_key, *, status="DRAFT"):
+    from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+    from featuregen.events.registry import event_registry
+    from featuregen.overlay.facts import register_overlay_event_types
+    register_overlay_event_types(event_registry())
+    return govern_bridge_fact(db, fact_key, entity="account", left_source="ops",
+                              left_ref="public.transactions.account_id", right_source="rev",
+                              right_ref="public.accounts.account_id", status=status)
+
+
+def test_control_a_verified_bridge_signature_is_unchanged_byte_for_byte(db):
+    """MUST-SURVIVE no-op control, and the no-re-baseline proof. The dict a VERIFIED, projected
+    bridge hashes is EXACTLY what it was before the fallback existed — so every `item_hash` already
+    stored at confirm still recomputes to itself and no promoted contract demotes on deploy."""
+    _cross_seed(db)
+    assert _bridge_fact_signature(db, bridge_fact_marker("bfk_cap")) == {
+        "bridge": True, "status": "VERIFIED", "entity_id": "account",
+        "left": "ops.public.transactions.account_id",
+        "right": "rev.public.accounts.account_id"}
+
+
+def test_an_unreviewed_bridge_resolves_instead_of_poisoning_the_contract(db):
+    """THE defect. A DRAFT bridge is available and crossable, so a contract may legitimately depend
+    on it — and must not be condemned to `_UNRESOLVED_AT_CONFIRM` for want of an approver."""
+    _draft_bridge(db, "bfk_draft")
+    marker = bridge_fact_marker("bfk_draft")
+
+    sig = _bridge_fact_signature(db, marker)
+    assert sig != _MISSING and sig["bridge"] is True and sig["status"] == "DRAFT"
+    assert _catalog_state_signature(db, "rev", marker) == sig    # same via the read gate's entry point
+
+    dep_row = {"contract_id": "c1", "catalog_source": "rev", "graph_ref": marker,
+               "logical_ref": marker, "decision_id": None, "fact_id": None, "event_id": None}
+    at_confirm = confirm_dependency_hash(
+        db, contract_id="c1", catalog_source="rev", graph_ref=marker, logical_ref=marker,
+        decision_id=None, fact_id=None, event_id=None)
+    assert current_dependency_hash(db, dep_row) == at_confirm, "no poison — the contract is promotable"
+
+
+@pytest.mark.parametrize("status", ["REVERIFY", "REJECTED", "STALE"])
+def test_an_unavailable_bridge_still_resolves_to_missing(db, status):
+    """The fallback is an AVAILABILITY fallback, not a blanket one. An expired, rejected or
+    drift-staled bridge has no projection row AND no available lifecycle, so it stays MISSING —
+    a contract that crossed it while it was live drifts, exactly as before."""
+    _draft_bridge(db, "bfk_gone", status=status)
+    assert _bridge_fact_signature(db, bridge_fact_marker("bfk_gone")) == _MISSING
+
+
+def test_confirming_an_unreviewed_bridge_a_contract_crosses_registers_as_drift(db):
+    """Stated, not hidden: the interim signature still carries a governance status, so a bridge going
+    DRAFT -> VERIFIED changes it and the contract re-assesses. Conservative and honest for now; the
+    directional-realization target removes governance status from the signature altogether."""
+    _draft_bridge(db, "bfk_draft")
+    marker = bridge_fact_marker("bfk_draft")
+    dep_row = {"contract_id": "c1", "catalog_source": "rev", "graph_ref": marker,
+               "logical_ref": marker, "decision_id": None, "fact_id": None, "event_id": None}
+    at_confirm = confirm_dependency_hash(
+        db, contract_id="c1", catalog_source="rev", graph_ref=marker, logical_ref=marker,
+        decision_id=None, fact_id=None, event_id=None)
+    assert current_dependency_hash(db, dep_row) == at_confirm, "not poisoned to begin with"
+
+    _draft_bridge(db, "bfk_draft", status="VERIFIED")
+
+    assert current_dependency_hash(db, dep_row) != at_confirm
+
+
 def test_realization_signature_resolves_then_drifts_on_cardinality_and_drop(db):
     """``_realization_signature`` resolves a DERIVED realization's cardinality/authority from its declared
     ``graph_edge`` (a real hash at confirm → promotable), a cardinality retype CHANGES it (drift), and
