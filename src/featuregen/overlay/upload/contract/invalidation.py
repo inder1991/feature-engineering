@@ -105,14 +105,15 @@ def bridge_fact_marker(fact_key: str) -> str:
     dropped / revoked / expired bridge ⟶ ``MISSING`` ⟶ drift. ``fact_key`` is the bridge fact's key
     (the ``entity_bridge_edge`` PK), an opaque id — matched EXACTLY.
 
-    KNOWN INTERIM SHAPE, recorded rather than hidden. The signature is keyed on a GOVERNANCE STATUS —
-    primarily the VERIFIED sanction projected into ``entity_bridge_edge``, i.e. a record of human
-    review — with a lifecycle fallback so an available-but-unreviewed bridge is not poisoned. Human
-    review should not decide contract eligibility at all: the durable answer is to key on the
-    DIRECTIONAL REALIZATION revision (which direction is joined, at what cardinality, in what scope,
-    with what fan-out) plus the deterministic evidence behind it. Neither concept exists in the
-    codebase yet, and adopting it means a one-time re-baseline of every stored
-    ``contract_metadata_dependency.item_hash`` — so it is a separate, migration-bearing change, NOT a
+    KNOWN INTERIM SHAPE, recorded rather than hidden. The signature is keyed on the bridge's GOVERNED
+    LIFECYCLE STATUS — folded first, so a stale projection row can never vouch for a withdrawn bridge
+    — which still means a governance status is load-bearing for contract eligibility. It should not
+    be: the durable answer is to key on the DIRECTIONAL REALIZATION revision (which direction is
+    joined, at what cardinality, in what scope, with what fan-out) plus the deterministic evidence
+    behind it. Neither concept exists in the codebase yet, and adopting it means a one-time
+    re-baseline of every stored ``contract_metadata_dependency.item_hash`` — which that table's WORM
+    rule (migration 1011 rejects UPDATE and DELETE) forbids outright, so it is a separate,
+    migration-bearing V2 dependency scheme with recompilation into new contract versions, NOT a
     half-migration bolted onto this one. See :func:`_bridge_fact_signature` for what is hashed today.
     """
     return f"{_BRIDGEFACT_PREFIX}{fact_key}"
@@ -211,28 +212,41 @@ def _join_edge_signature(conn: DbConn, catalog_source: str, marker: str):
 
 def _bridge_fact_signature(conn: DbConn, marker: str):
     """H3 fix (I-3) — the CURRENT state of the governed cross-catalog BRIDGE a plan segment crossed, keyed
-    by its bridge fact key (the ``bridgefact:`` marker body). The bridge's source of truth is the overlay
-    fact stream projected into ``entity_bridge_edge`` (VERIFIED only); a reject / expire / stale DELETEs
-    the row (``bridge_projection.demote_bridge_edges``). Captures existence + the VERIFIED ``status`` +
-    the projected endpoints + entity: a REVOKED bridge ⟶ the row is gone ⟶ ``MISSING`` (the recomputed
-    hash can no longer match the live hash stored at confirm) ⟶ the read gate downgrades. A live VERIFIED
-    bridge RESOLVES to a real dict at confirm, so the item hash is NOT poisoned — the governed contract is
-    PROMOTABLE. ``fact_key`` is the ``entity_bridge_edge`` PK (global, not catalog-scoped) — matched exactly.
+    by its bridge fact key (the ``bridgefact:`` marker body). ``fact_key`` is the ``entity_bridge_edge``
+    PK (global, not catalog-scoped) — matched exactly.
 
-    LIFECYCLE FALLBACK (bridge lifecycle correction). ``entity_bridge_edge`` holds VERIFIED bridges
-    ONLY, so keying solely on it made HUMAN REVIEW decide contract eligibility: a governed plan may
-    legitimately cross an AVAILABLE-but-unreviewed (DRAFT / PARTIALLY_CONFIRMED) bridge, and that
-    segment then resolved to ``MISSING`` at confirm ⟶ the ``_UNRESOLVED_AT_CONFIRM`` poison ⟶ the
-    contract was permanently un-promotable, for want of an approver rather than for any defect in the
-    join. When there is NO projection row we therefore fall back to the bridge's governed lifecycle:
-    an AVAILABLE status resolves (no poison), an unavailable or unreadable one stays ``MISSING``.
+    LIFECYCLE FIRST, ALWAYS (fail-close correction). The bridge's source of truth is its overlay fact
+    stream; ``entity_bridge_edge`` is a PROJECTION of the VERIFIED ones, and
+    ``bridge_projection.demote_bridge_edges`` is FAIL-SOFT. Reading the row first — and consulting the
+    lifecycle only when there was no row — therefore left the gate's own failure mode open:
 
-    Deliberately ADDITIVE: the VERIFIED-with-a-row path returns exactly the dict it always did, so no
-    stored ``item_hash`` is re-baselined and no promoted contract demotes on deploy. The remaining
+        the bridge is rejected / expires / drift-stales
+          ⟶ the edge demotion fails (or has simply not run yet)
+          ⟶ the old VERIFIED row survives
+          ⟶ the recomputed hash still matches the one stored at confirm
+          ⟶ a contract resting on a WITHDRAWN bridge stays promotable.
+
+    So the governed lifecycle is folded FIRST and it decides: REJECTED / STALE / expired-to-REVERIFY /
+    UNREADABLE / no governance record ⟶ ``MISSING``, whatever the projection row says. ``MISSING`` can
+    never reproduce the live hash stored at confirm, so the read gate downgrades. Only once the
+    lifecycle says AVAILABLE does the row supply the state — it is an AUDIT detail (which endpoints
+    the sanction was projected over), never the authority for whether the bridge still stands.
+
+    UNREVIEWED bridges resolve too. ``entity_bridge_edge`` holds VERIFIED bridges only, so keying on
+    it alone made HUMAN REVIEW decide contract eligibility: a governed plan may legitimately cross an
+    AVAILABLE-but-unreviewed (DRAFT / PARTIALLY_CONFIRMED) bridge, and that segment then resolved to
+    ``MISSING`` at confirm ⟶ the ``_UNRESOLVED_AT_CONFIRM`` poison ⟶ the contract was permanently
+    un-promotable for want of an approver rather than for any defect in the join.
+
+    NO RE-BASELINING. An AVAILABLE bridge WITH a row returns exactly the dict it always did, byte for
+    byte, so every ``item_hash`` already stored in the WORM ``contract_metadata_dependency`` still
+    recomputes to itself and no promoted contract demotes on deploy (pinned by
+    ``test_control_b_the_healthy_verified_dependency_hash_is_not_re_baselined``). The remaining
     interim-ness — that the signature carries a governance status at all, so a DRAFT ⟶ VERIFIED
     confirm registers as drift — is recorded on :func:`bridge_fact_marker` along with the target
     (directional realization revision + deterministic evidence).
     """
+    from featuregen.overlay.upload.cross_catalog_links import AVAILABLE_STATUSES, bridge_lifecycle
     fact_key = marker[len(_BRIDGEFACT_PREFIX):]
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -240,33 +254,27 @@ def _bridge_fact_signature(conn: DbConn, marker: str):
             "right_catalog_source, right_object_ref FROM entity_bridge_edge WHERE fact_key = %s",
             (fact_key,))
         row = cur.fetchone()
-    if row is None:
-        return _unreviewed_bridge_signature(conn, fact_key)
-    return {"bridge": True, "status": row["status"], "entity_id": row["entity_id"],
-            "left": f"{row['left_catalog_source']}.{row['left_object_ref']}",
-            "right": f"{row['right_catalog_source']}.{row['right_object_ref']}"}
-
-
-def _unreviewed_bridge_signature(conn: DbConn, fact_key: str):
-    """The governed state of a bridge with NO projection row: a real dict when its lifecycle is
-    AVAILABLE, ``MISSING`` otherwise (REJECTED / STALE / expired-to-REVERIFY / unreadable / no
-    governance record at all). Endpoints come from the folded value so the signature identifies the
-    same join the projection row would have; when the value is absent — every unavailable state moves
-    it to ``prior_value`` — the status alone is enough, because the item is ``MISSING`` there anyway.
-    Reuses ``cross_catalog_links``' allow-list so availability has ONE definition platform-wide."""
-    from featuregen.overlay.state import fold_overlay_state
-    from featuregen.overlay.store import load_fact
-    from featuregen.overlay.upload.cross_catalog_links import (
-        AVAILABLE_STATUSES,
-        bridge_lifecycle_status,
-    )
-    status = bridge_lifecycle_status(conn, fact_key, projected_verified=False)
-    if status not in AVAILABLE_STATUSES:
+    # ONE load, ONE fold — status and value are two halves of a single observation, and reading them
+    # through separate folds lets a concurrent transition yield a pair that never co-existed.
+    lifecycle = bridge_lifecycle(
+        conn, fact_key, projected_verified=row is not None and row["status"] == "VERIFIED")
+    if lifecycle.status not in AVAILABLE_STATUSES:
         return _MISSING
-    value = fold_overlay_state(load_fact(conn, fact_key)).value
-    value = value if isinstance(value, dict) else {}
+    if row is not None:
+        return {"bridge": True, "status": row["status"], "entity_id": row["entity_id"],
+                "left": f"{row['left_catalog_source']}.{row['left_object_ref']}",
+                "right": f"{row['right_catalog_source']}.{row['right_object_ref']}"}
+    return _unreviewed_bridge_signature(lifecycle)
+
+
+def _unreviewed_bridge_signature(lifecycle):
+    """The governed state of an AVAILABLE bridge with NO projection row, built from the SAME fold that
+    established its availability. Endpoints come from the folded value so the signature identifies the
+    same join the projection row would have; when the value is absent — every unavailable state moves
+    it to ``prior_value`` — the caller has already returned ``MISSING``, so there is nothing to lose."""
+    value = lifecycle.value
     left, right = value.get("left_ref") or {}, value.get("right_ref") or {}
-    return {"bridge": True, "status": status, "entity_id": value.get("entity_id"),
+    return {"bridge": True, "status": lifecycle.status, "entity_id": value.get("entity_id"),
             "left": _endpoint_str(left), "right": _endpoint_str(right)}
 
 
