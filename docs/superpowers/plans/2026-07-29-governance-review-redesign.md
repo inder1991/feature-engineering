@@ -306,10 +306,10 @@ Only `overlay_fact_dependency` is maintained, so catalog drift still stales a br
 
 ## Task 2: Entity-bridge confirm / reject routes
 
-**Files:** Modify `src/featuregen/api/routes/governance.py`; Test `tests/featuregen/api/test_governance_bridges.py`
+**Files:** Modify `src/featuregen/api/routes/governance.py`; Test `tests/featuregen/api/test_governance_bridge_routes.py`
 
-**Routes** (mirroring `confirm_semantic_binding` at `governance.py:353`):
-- `GET /sources/{source}/governance/entity-bridges` and `GET /governance/entity-bridges` (all catalogs)
+**Routes** (mirroring `confirm_semantic_binding` at `governance.py:355`):
+- `GET /sources/{source}/governance/entity-bridges`
 - `POST /governance/entity-bridges/{fact_key}/confirm`
 - `POST /governance/entity-bridges/{fact_key}/reject`
 
@@ -318,17 +318,41 @@ All carry `dependencies=[Depends(require_confirmer)]`.
 **Routes** — note I2: only the source-scoped listing is added here. The cross-catalog surface lives
 on the queue (Task 4), which owns its own scoping story.
 
-Confirm builds `Command(action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key, args={ref, fact_type, use_case, target_event_id, note}, actor=identity, idempotency_key=f"confirm:{fact_key}:{identity.subject}", expected_version=None)`, calls `confirm_fact`, and **on VERIFIED calls `project_verified_bridge(conn, ref, now=None)`** — the bridge equivalent of the semantic-binding projection call, reporting `"projected"`/`"pending"` honestly.
+Confirm builds `Command(action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key, args={ref, fact_type, use_case, target_event_id, note}, actor=identity, idempotency_key=f"confirm:{fact_key}:{identity.subject}", expected_version=None)`, calls `confirm_fact`, and **on VERIFIED calls `project_verified_bridge`** — reporting `"projected"`/`"pending"` honestly. Per W1 it is passed a REAL timestamp (`now=None` inserts NULL into a NOT NULL column) and per W2 the call is wrapped in the route's own `conn.transaction()` savepoint, returning `"pending"` on fault so a projection error cannot roll back the confirmation.
 
-Reject uses `reject_fact` with `category` first-class and `reason` carrying only the note, then `demote_bridge_edges`.
+Reject uses `reject_fact` with `category` first-class and `reason` carrying only the note, then `demote_bridge_edges`. That demote is **deliberately NOT savepoint-wrapped**, unlike the confirm-side projection: confirm's projection ADDS capability (a fault is fail-closed and deferrable), reject's demote REMOVES it (a soft fault would leave a REJECTED bridge live in the planner), so reject stays all-or-nothing.
 
 - [ ] **Step 1: Failing tests**
   - confirming writes a row to `entity_bridge_edge` with `confirmed_event_id` **non-null** and `status='VERIFIED'`
   - **the proposer cannot confirm** — four-eyes returns 409, and the response is a `JSONResponse`, not a raised exception (assert the audit row survives)
   - a non-confirmer role is refused by the dependency
-  - rejecting a VERIFIED bridge demotes the edge
+  - a projection fault leaves the fact VERIFIED and reports `"pending"` rather than 500 (proves W2)
+  - rejecting a **STALE** bridge demotes the edge, and rejecting a **VERIFIED** one is a 409
   - confirm is idempotent under the same idempotency key
 - [ ] **Step 2–5:** Run / implement / run / commit — `feat(governance): confirm and reject entity bridges`
+
+### 🔴 Correction (Task 2, verified by test): rejecting a VERIFIED bridge does NOT demote — it is DENIED
+
+Rev 2 said "rejecting a VERIFIED bridge demotes the edge". It does not. `_AWAITING_CONFIRMATION` is
+`("DRAFT","PARTIALLY_CONFIRMED","REVERIFY","STALE")` and deliberately excludes VERIFIED, so
+`reject_fact` returns `fact not awaiting confirmation (status=VERIFIED)`. Task 1 briefly advertised a
+`reject` action on VERIFIED — a button the server answers with a denial — and removed it. **VERIFIED
+offers NO action**, and Task 6 must not render one. A real withdrawal needs the semantic-binding
+shape (the sanctioned `VERIFIED -> REVERIFY` transition first, then the command); that is a separate
+governance increment with its own demote and blast-radius semantics.
+
+The demote is still load-bearing, on the state where it is reachable: **STALE**. `reject_fact`
+demotes `approved_join` and the semantic bindings and has **no `entity_bridge` branch**, and nothing
+demotes a bridge edge on drift or expiry either — so a bridge that was VERIFIED (edge projected) and
+has since gone STALE holds a live edge while remaining rejectable. That is what the route's
+`demote_bridge_edges` call closes.
+
+**Still open, and owned by nobody:** an EXPIRED or STALED bridge that is never rejected keeps its
+`entity_bridge_edge` row, so the planner can still traverse a link whose governance has lapsed.
+`demote_bridge_edges` had no production caller at all before Task 2. Also, `within_renewal_grace`
+means `confirm_fact` WOULD accept a re-confirm of a VERIFIED bridge inside its pre-expiry window,
+while the queue offers nothing — the safe direction (under-offering), but there is no renewal
+affordance on this surface.
 
 ---
 
