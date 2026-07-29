@@ -145,11 +145,14 @@ def _ledger_by_fact_key(conn: DbConn) -> dict[str, tuple]:
     """The raw candidate ledger keyed by ``fact_key`` — the SECOND evidence source, and the reason
     ``evidence_present`` can be trusted.
 
-    ``cross_catalog_links`` deliberately SUPPRESSES a link whose fact folds to REJECTED or STALE
-    (*"a human's NO must still count"*). REJECTED is terminal here and never listed, but STALE still
-    awaits a decision and IS listed — and reading enrichment only through ``cross_catalog_links``
-    would report that bridge as ``evidence_present=False`` when its ledger row is sitting right
-    there. That would make the W4 discrepancy signal lie about a perfectly ordinary drift state."""
+    ``cross_catalog_links`` deliberately SUPPRESSES a link whose fact is not in an AVAILABLE
+    lifecycle state — REJECTED, STALE or REVERIFY (*"a human's NO must still count"*, plus drift and
+    a lapsed confirmation). REJECTED is terminal here and never listed, but STALE and REVERIFY still
+    await a decision and ARE listed — and reading enrichment only through ``cross_catalog_links``
+    would report those bridges as ``evidence_present=False`` when their ledger row is sitting right
+    there. That would make the W4 discrepancy signal lie about perfectly ordinary drift/expiry
+    states. It is also why this queue enumerates from the EVENT STREAM and not from the ranked
+    links: what is DECIDABLE is a different question from what is AVAILABLE."""
     return {r[0]: (r[1], r[2]) for r in conn.execute(
         "SELECT fact_key, data_type_family, evidence_json FROM entity_bridge_candidate_evidence "
         "WHERE fact_key IS NOT NULL").fetchall()}
