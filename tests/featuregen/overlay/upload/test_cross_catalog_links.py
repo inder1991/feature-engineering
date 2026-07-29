@@ -152,3 +152,29 @@ def test_the_union_does_not_double_count(db):
     _candidate(db, "customer", "cust_num", "cif_id", fact_key="fk-1")
     _verify(db, "fk-1", "customer", "cust_num", "cif_id")
     assert len(cross_catalog_links(db)) == 1
+
+
+# ── strength reflects the catalog NOW, not the catalog at derivation time ────────────────────────
+
+def test_grain_established_AFTER_derivation_still_counts(db):
+    """On the live catalog every link scored 0 — including `cust_num <-> cif_id`, where cust_num IS
+    its table's grain. The candidate was derived before Pass B established the grain fact, and the
+    strength read `evidence_json.left_is_grain`, frozen at derivation time.
+
+    A rank that can never improve as the catalog is enriched is not a rank. Read the graph."""
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name,"
+               " data_type, is_grain) VALUES ('cib','public.bo_cib_customer.cust_num','column',"
+               " 'bo_cib_customer','cust_num','text', true)")
+    _candidate(db, "customer", "cust_num", "cif_id", left_grain=False)   # evidence says NOT grain
+    link = cross_catalog_links(db)[0]
+    assert link.left_is_grain is True, "the graph says grain; the stale evidence said otherwise"
+    assert link.strength >= 10
+    assert "key" in link.why
+
+
+def test_a_column_that_is_genuinely_not_a_key_still_ranks_low(db):
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name,"
+               " data_type) VALUES ('cib','public.bo_cib_customer.branch_nm','column',"
+               " 'bo_cib_customer','branch_nm','text')")
+    _candidate(db, "branch", "branch_nm", "sol_desc")
+    assert cross_catalog_links(db)[0].strength == 0

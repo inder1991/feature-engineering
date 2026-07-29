@@ -129,6 +129,16 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
             "FROM entity_bridge_edge WHERE status = 'VERIFIED'").fetchall()
         if r[0] is not None
     }
+    # Grain read from the graph as it is NOW, not from `evidence_json` as it was at derivation.
+    # The stored flag is frozen at derivation time, and on the live catalog every link scored 0 —
+    # including `cust_num <-> cif_id`, where cust_num IS the table's grain — because the candidate
+    # was derived before Pass B established the grain fact. A rank that can never improve as the
+    # catalog is enriched is not a rank.
+    grain = {
+        (r[0], r[1]) for r in conn.execute(
+            "SELECT catalog_source, object_ref FROM graph_node "
+            "WHERE kind = 'column' AND is_grain").fetchall()
+    }
     rows = conn.execute(
         "SELECT entity_id, left_catalog_source, left_object_ref, right_catalog_source, "
         "       right_object_ref, fact_key, data_type_family, evidence_json "
@@ -143,8 +153,10 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
             if want not in (str(l_ref).lower(), str(r_ref).lower()):
                 continue
         ev = ev if isinstance(ev, dict) else {}
-        left_grain = bool(ev.get("left_is_grain"))
-        right_grain = bool(ev.get("right_is_grain"))
+        # Current graph OR the derivation-time flag — a column that has since become the grain
+        # counts, and one recorded as grain then is not demoted by a read-scoped miss now.
+        left_grain = (l_src, l_ref) in grain or bool(ev.get("left_is_grain"))
+        right_grain = (r_src, r_ref) in grain or bool(ev.get("right_is_grain"))
         basis = str(ev.get("type_basis") or "")
         confirmed = key in verified
         out.append(CrossCatalogLink(
