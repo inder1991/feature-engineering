@@ -45,6 +45,64 @@ Every line below was verified against the tree at `bb0155e6` on 2026-07-29. **No
 
 ---
 
+## ⚠️ Revision 2 (2026-07-29) — what an adversarial review changed
+
+**Rev 1 assumed nothing proposed bridges. That was wrong — it only looked at `main`.**
+
+`integration/ontology-data-agent` wires discovery into ingest (`ingest.py:461-468`), running
+`derive_bridge_candidates` **globally, not scoped to the uploading catalog**, because — its comment —
+*"a bridge needs both endpoints, so it only becomes derivable when the SECOND catalog lands."* Each
+proposal gets its own savepoint so a failure can never fail the upload. This is why nine candidates
+appeared when the customer CSV landed, and the data confirms the path: `derivation_version 1.0.0`,
+a hashed `candidate_id` (not the spike's `b-spike:` prefix), and `type_basis: "declared"`.
+
+**So there is no "wire up discovery" task. There is a one-argument defect instead.**
+
+### 🔴 R1 — ingest proposes under the UPLOADING USER, which locks that user out forever
+
+`ingest.py:468` calls `propose_bridge(conn, candidate, actor=actor)`. Four-eyes is enforced —
+`authority.py:215` (`return proposed_by != actor.subject`) and `confirmation_commands.py:112`
+(*"four-eyes: a proposer may not confirm the same fact"*). Therefore **whoever uploads a catalog can
+never confirm the bridges that upload discovers.** On a small team the uploader and the reviewer are
+routinely the same person, so bridges sit unconfirmed and nobody understands why.
+
+`b_slice_spike.verify_bridge` shows the intended shape: it takes a **`service_actor`** and a
+**`human_actor`**, and proposes with the service actor. The system proposes; a human disposes.
+
+**Fix:** propose under a service actor. **This file belongs to the parallel stream — do NOT edit it
+from this branch.** Route it to that owner (the A.9 precedent). It blocks the acceptance below.
+
+### 🔴 R2 — the existing nine cannot be rescued by re-uploading
+
+Verified at `state.py:67`: `if st.status not in (None, REJECTED): continue` — *"stray PROPOSED after
+a confirm — ignore, do not regress to DRAFT."* The nine are DRAFT, so a second PROPOSED is
+**ignored** and `draft_event_id` stays pinned to the original event. `proposed_by` remains
+`user:inder`. An earlier claim in this plan that a re-upload would re-propose them properly was
+**wrong**.
+
+The only in-model rescue is **reject → re-propose under the service actor → confirm**, because the
+fold reopens a DRAFT after REJECTED (`state.py:76-82` clears all prior-cycle carry-over). Whether the
+proposer may reject their own proposal must be verified before relying on this — four-eyes is
+specified for confirm.
+
+### Other review findings folded in
+
+- **I1 — Task 5's direction hint was backwards.** `overlay_fact_dependency` maps a fact to what it
+  *depends on* (`resolve.py:41`: *"the DISTINCT catalog_sources a fact's referents span"*), and
+  `dependents_of` runs the drift direction. Neither answers "what does this bridge block." The
+  candidate path is `feature_derives_from` (`features.py:67`) — a feature spanning both endpoints'
+  catalogs implies it needs the bridge. **Unverified; Task 5's stop-condition still applies.**
+- **I2 — the unscoped route has no precedent.** Every governance route across all 21 registered
+  routers is `/sources/{source}/…`. Rev 2 drops `GET /governance/entity-bridges` and puts the
+  cross-catalog surface **only** on the queue (Task 4), which must carry its own scoping story
+  rather than inheriting one by accident.
+- **I3 — bulk reject was in the design and in no task.** Now Task 2b.
+- **M1** — `use_case` is blank on all nine live events; the copied Command args assume it is present.
+- **M2** — `governance_analytics.py:360` enumerates catalogs via `SELECT DISTINCT catalog_source FROM
+  overlay_proposal`, which by design never sees a bridge. Do not reuse it in the queue.
+- **M3** — no index supports source-filtering on `entity_bridge_candidate_evidence` (PK is a
+  five-tuple). Deferred per the standing NFR directive; recorded so it is not rediscovered.
+
 ## ⚠️ The finding that shapes this plan
 
 **`overlay_proposal` deliberately does not carry entity bridges, so the listing CANNOT follow the semantic-bindings pattern.**
@@ -122,6 +180,9 @@ Only `overlay_fact_dependency` is maintained, so catalog drift still stales a br
 
 All carry `dependencies=[Depends(require_confirmer)]`.
 
+**Routes** — note I2: only the source-scoped listing is added here. The cross-catalog surface lives
+on the queue (Task 4), which owns its own scoping story.
+
 Confirm builds `Command(action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key, args={ref, fact_type, use_case, target_event_id, note}, actor=identity, idempotency_key=f"confirm:{fact_key}:{identity.subject}", expected_version=None)`, calls `confirm_fact`, and **on VERIFIED calls `project_verified_bridge(conn, ref, now=None)`** — the bridge equivalent of the semantic-binding projection call, reporting `"projected"`/`"pending"` honestly.
 
 Reject uses `reject_fact` with `category` first-class and `reason` carrying only the note, then `demote_bridge_edges`.
@@ -133,6 +194,26 @@ Reject uses `reject_fact` with `category` first-class and `reason` carrying only
   - rejecting a VERIFIED bridge demotes the edge
   - confirm is idempotent under the same idempotency key
 - [ ] **Step 2–5:** Run / implement / run / commit — `feat(governance): confirm and reject entity bridges`
+
+---
+
+## Task 2b: Bulk reject
+
+**Files:** Modify `governance.py`, `bridge_governance.py`; Test alongside Task 2
+
+The approved design rejects the eight `branch` candidates in one action. They are a 4×2
+cross-product of the same two facts, not eight findings, so one judgement should settle them.
+
+**Semantics to decide and state, not discover:** each rejection is its own governed command with its
+own idempotency key — there is no bulk command in the overlay, and inventing one would put eight
+facts behind a single audit row. So this is N commands, and **partial failure is the normal case**:
+the response must report per-item outcomes, and the UI must show which succeeded rather than a
+single success or failure.
+
+- [ ] **Step 1: Failing tests** — 8 rejections produce 8 audit rows; when 3 of 8 are denied the
+      response reports 5 succeeded and 3 denied with reasons, and **does not roll back the 5**;
+      re-running is idempotent
+- [ ] **Step 2–5:** Run / implement / run / commit — `feat(governance): reject a candidate group in one action`
 
 ---
 
@@ -162,7 +243,13 @@ Returns the catalogs the caller may see, with a display label and pending counts
 
 **Files:** Modify `governance_queue.py`; Test as above
 
-The highest-value column in the design and the only one requiring new thought: walk from a pending fact to what depends on it. `overlay_fact_dependency` already indexes a bridge's two catalog endpoints (`projection.py:56-62`) — start there and establish what else is reachable before designing the walk.
+The highest-value column in the design and the only one requiring new thought: walk from a pending fact to what depends on it.
+
+**Do not start from `overlay_fact_dependency`** — rev 1 said to, and that was backwards. It maps a
+fact to what it *depends on* (`resolve.py:41`), and `dependents_of` runs the drift direction
+(changed column → stale facts). The candidate path is `feature_derives_from` (`features.py:67`): a
+feature whose derives-from spans both of the bridge's catalogs implies it needs that bridge.
+**This is unverified — establish it before building on it.**
 
 - [ ] **Step 1: Failing tests** — the customer bridge reports the feature(s) it blocks; the 8 branch bridges report **zero**; a confirmed fact blocks nothing
 - [ ] **Step 2–5:** Run / implement / run / commit — `feat(governance): report what each pending decision blocks`
@@ -197,7 +284,22 @@ Semantic palette (`awaiting`/`blocking`/`confirmed`) defined as tokens **distinc
 
 ## Acceptance
 
-Against the kind cluster: land on Governance Review with **no input**, see 10 items with the customer bridge first marked as blocking, confirm it, and observe `entity_bridge_edge` gain its first row with a non-null `confirmed_event_id`. Reject the 8 branch candidates in one action.
+**Prerequisite (R1): the ingest actor fix must land first**, on the parallel stream. Until it does,
+every bridge is proposed by the uploader and no uploader can confirm one — so acceptance would be
+testing a lockout, not a feature.
+
+Against the kind cluster, once R1 is in: upload a catalog, watch the service actor propose the
+bridges, land on Governance Review with **no input**, see the customer bridge first and marked as
+blocking, confirm it, and observe `entity_bridge_edge` gain its first row with a non-null
+`confirmed_event_id`. Reject the branch group in one action and see per-item outcomes.
+
+The **existing nine stay unconfirmable** (R2) and are not part of acceptance. Rescuing them means
+reject → re-propose → confirm, and whether their proposer may reject them is unverified.
+
+**The design must handle "every item here is yours" as a first-class state, not an edge case.** The
+approved mockup shows one greyed four-eyes row among many; before R1 lands, *every* row is greyed for
+the uploading user. The screen should say whose decision each item waits on rather than presenting a
+list of things the viewer cannot action.
 
 ## Out of scope
 
