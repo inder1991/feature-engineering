@@ -767,8 +767,13 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
         if rec is None:
             return None   # not a glossary column term — no schema-preserving identity to key on
+        # The evidence material must be the SAME metadata the summary was drafted from
+        # (`_concept_metadata`), not a {table, column, type} stub. The input_hash is what decides
+        # whether existing evidence is still current: keyed on the stub, correcting a term_name or a
+        # definition leaves the hash unchanged, so a redraft that fails transiently leaves the OLD
+        # summary active and it is projected again as though it still described the column.
         return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
-                {"table": row.table, "column": row.column, "type": row.type})
+                _concept_metadata(row, rec))
 
     failures = _write_llm_field_evidence(
         conn, field_name="ai_summary", items=summaries, ref_of=ref_of,

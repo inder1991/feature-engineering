@@ -102,3 +102,21 @@ def test_the_base_contract_is_still_version_1(monkeypatch):
     """Flag off is unchanged: no summary egresses, so the old contract keeps its number."""
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
     assert feature_assist._feature_schema_version() == 1
+
+
+# ── the API key must match the evidence field name ───────────────────────────────────────────────
+
+def test_the_payload_key_matches_the_evidence_field_name():
+    """The client looks up `proposals_by_field[key]` and `latest_decision_by_field[key]` using the
+    effective-metadata key. A display-shaped "ai summary" key rendered the value while silently
+    DETACHING its proposal and decision history — visible, but with no provenance behind it."""
+    from featuregen.overlay.upload.asset_detail import _METADATA_FIELDS
+    keys = {label for label, _flat, _c1 in _METADATA_FIELDS}
+    assert "ai_summary" in keys
+    assert "ai summary" not in keys
+
+
+def test_every_metadata_key_is_evidence_shaped():
+    """The general form: no metadata key may contain a space, or its evidence silently detaches."""
+    from featuregen.overlay.upload.asset_detail import _METADATA_FIELDS
+    assert [k for k, _f, _c in _METADATA_FIELDS if " " in k] == []

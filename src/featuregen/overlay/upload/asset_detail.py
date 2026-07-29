@@ -74,7 +74,11 @@ _AUDIT_SUMMARY_LIMIT = 50
 _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("concept", "concept", "concept"),
     ("definition", "definition", "definition"),
-    ("ai summary", "ai_summary", "ai_summary"),
+    # The API key must match the EVIDENCE field_name: the client looks up
+    # `proposals_by_field[key]` / `latest_decision_by_field[key]`, so a display-shaped "ai summary"
+    # key rendered the value while silently detaching its proposal and decision history. The screen
+    # humanises underscores for display already.
+    ("ai_summary", "ai_summary", "ai_summary"),
     ("domain", "domain", "domain"),
     ("additivity", "additivity", "additivity"),
     ("unit", "unit", "unit"),

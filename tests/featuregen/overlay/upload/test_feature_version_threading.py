@@ -58,3 +58,35 @@ def test_versions_are_3_when_flag_on(db, monkeypatch):
     rows = _feature_ideas_versions(db)
     assert rows, "recommend must record at least one feature_ideas llm_call"
     assert all(tuple(r) == (3, 3) for r in rows), rows
+
+
+def test_a_recommendation_SURVIVES_with_the_flag_on(db, monkeypatch):
+    """The version stamp is worthless if the call it stamps fails.
+
+    Bumping the contract to 3 without registering a v3 schema alias made `schema_for(id, 3)` return
+    None, so structured output went unenforced and the response failed repair — feature generation
+    returned NOTHING with the flag on, while the version test above still passed because it only
+    inspects the recorded number.
+
+    Mutation-proven: drop the v3 alias and flag-on yields 0 features while flag-off yields 1.
+    """
+    _bank_graph(db)
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    on = recommend_features(db, "predict churn", _fake(), catalog_source="bank", critic=False)
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    off = recommend_features(db, "predict churn", _fake(), catalog_source="bank", critic=False)
+    assert len(on) > 0, "flag-on produced no features — the widened contract broke generation"
+    assert len(on) == len(off), "the flag changes GROUNDING, never whether generation works"
+
+
+def test_every_feature_schema_resolves_at_the_stamped_version(db):
+    """The general form: whatever version the request stamps must be registered, for every schema
+    the feature path can emit — not just the one the happy-path test happens to exercise."""
+    from featuregen.overlay.upload.enrich_llm import register_enrichment_schemas
+    from featuregen.documents.registry import DocumentSchemaRegistry
+
+    register_enrichment_schemas(db)
+    reg = DocumentSchemaRegistry(db)
+    for schema_id in ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec"):
+        for version in (1, 2, 3):
+            assert reg.schema_for(schema_id, version) is not None, f"{schema_id} v{version}"

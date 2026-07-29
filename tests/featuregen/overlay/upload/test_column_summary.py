@@ -15,7 +15,9 @@ its own authority), and it is written from the metadata rather than replacing it
 from __future__ import annotations
 
 from featuregen.intake.llm import PROVIDER_OK, LLMResult
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.enrich import _summary_targets, draft_summaries
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 
@@ -28,6 +30,12 @@ class _EchoLLM:
         self.seen: list[dict] = []
 
     def call(self, request):  # noqa: ANN001, ANN201
+        # A full ingest drives every enrichment stage through this one client, so only SUMMARY
+        # dispatches are recorded — otherwise the concept/definition stages' payloads land here too
+        # and `seen` stops meaning "summary calls".
+        if request.task != "overlay.enrich.summary":
+            return LLMResult(output={"results": []}, self_reported_scores={}, call_ref="",
+                             status=PROVIDER_OK)
         items = request.inputs["catalog_metadata"]["items"]
         self.seen.append(items)
         return LLMResult(
@@ -52,6 +60,11 @@ def _glossary(definition: str) -> GlossaryUpload:
     ]
     return GlossaryUpload(rows=[], records=records)
 
+
+from datetime import UTC, datetime
+_NOW = datetime(2026, 7, 29, tzinfo=UTC)
+_ACTOR = IdentityEnvelope(subject="o", actor_kind="human", authenticated=True,
+                          auth_method="oidc", role_claims=("data_owner",))
 
 _BOILERPLATE = ("Status or indicator used to classify customer condition, eligibility, servicing "
                 "state, control state, or operational processing state for customer lifecycle.")
@@ -119,3 +132,52 @@ def test_a_second_run_over_unchanged_columns_calls_no_provider(db):
     again = draft_summaries(db, rows, second, glossary=glossary)
     assert second.seen == [], "unchanged columns must be served from cache"
     assert len(again) == 2, "the cached summaries must still be returned"
+
+
+# ── a technical upload must not pay for what it cannot store ─────────────────────────────────────
+
+def test_a_technical_upload_does_not_call_the_provider_for_summaries(db):
+    """`_write_summary_evidence` keys on the glossary record's logical_ref, so a technical CSV has
+    nowhere to put a summary. It was still calling the provider, reporting `succeeded`, and storing
+    nothing — paying for output no one could ever see."""
+    from featuregen.overlay.upload.stage_report import StageRecorder
+
+    llm = _EchoLLM()
+    rec = StageRecorder()
+    ingest_upload(db, "tech", [CanonicalRow(source="tech", table="t", column="c", type="text")],
+                  actor=_ACTOR, now=_NOW, client=llm, stage_recorder=rec)
+    assert llm.seen == [], "a technical upload dispatched summary calls it cannot store"
+    stage = next(r for r in rec.reports if r.stage == "enrich_summary")
+    assert stage.state == "not_applicable", stage
+
+
+# ── a corrected term must not leave yesterday's summary active ───────────────────────────────────
+
+def test_the_evidence_material_is_the_metadata_the_summary_WAS_DRAFTED_FROM(db):
+    """`input_hash` decides whether existing evidence is still current. It was keyed on a
+    {table, column, type} stub while the summary was drafted from the full metadata — so correcting
+    a term_name left the hash unchanged, and a redraft that failed transiently left the OLD summary
+    active to be projected again as though it still described the column.
+
+    Same column, same type, DIFFERENT term: the material must differ."""
+    import inspect
+
+    from featuregen.overlay.upload import enrich
+
+    src = inspect.getsource(enrich._write_summary_evidence)
+    assert "_concept_metadata(row, rec)" in src, "material is not the drafting input"
+    assert '"type": row.type}' not in src, "material is still the stub"
+
+
+def test_a_changed_term_changes_the_material(db):
+    """The behavioural form: two glossaries differing only in term_name must produce different
+    evidence material, or the redraft can never be recognised as needed."""
+    from featuregen.overlay.upload.enrich import _concept_metadata
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+
+    row = CanonicalRow(source="cib", table="t", column="c", type="text")
+    before = GlossaryRecord(logical_ref="cib::s.t.c", term_name="Customer Current NTB Flag",
+                            definition="Status or indicator.", declared_type="varchar(5)")
+    after = GlossaryRecord(logical_ref="cib::s.t.c", term_name="Customer Previous 9Mnth NTB Flag",
+                           definition="Status or indicator.", declared_type="varchar(5)")
+    assert _concept_metadata(row, before) != _concept_metadata(row, after)

@@ -164,7 +164,11 @@ def test_real_ingest_attributes_pass_a_dispatches_to_run_and_columns(db, durable
             (durable_run,)).fetchone()[0]
 
     # All three Pass A stages fired a pre-audited dispatch under THIS run.
-    assert {"enrich_concept", "enrich_definition", "enrich_domain", "enrich_summary"} <= stages
+    # `enrich_summary` is deliberately ABSENT: this is a technical upload, and the summary stage is
+    # glossary-only (its evidence keys on a glossary record's logical_ref, so a technical CSV has
+    # nowhere to store the result). It used to dispatch here and discard the output.
+    assert {"enrich_concept", "enrich_definition", "enrich_domain"} <= stages
+    assert "enrich_summary" not in stages
     # Every dispatch resolves back to a recorded logical llm_call (none left unattributable).
     assert orphan_dispatches == 0
     # Every joined row belongs to THIS run, with a non-empty subject set overall.

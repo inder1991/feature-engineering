@@ -687,8 +687,13 @@ for _synth_schema_id in ("overlay_table_synth_batch", "overlay_table_synth",
 # stamps WHICH input contract egressed (the widened menu / tri-state shape) instead of a hardcoded 1
 # masked by a `…_v1` prompt_id string. Registered as real v2 rows via `register_enrichment_schemas`'s
 # `_SCHEMAS` sweep so `schema_for(schema_id, 2)` resolves them; an intentional alias, never a copy.
+# v3 = v2 plus `ai_summary` on the column descriptor. The OUTPUT schema is unchanged — the version
+# identifies the INPUT contract — so the alias must extend to every version the request may stamp.
+# Registering 2 but requesting 3 makes `schema_for(id, 3)` return None, structured output
+# unenforced, and the response fail repair: feature generation returns NOTHING with the flag on.
 for _feature_schema_id in ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec"):
     _SCHEMAS[(_feature_schema_id, 2)] = _SCHEMAS[(_feature_schema_id, 1)]
+    _SCHEMAS[(_feature_schema_id, 3)] = _SCHEMAS[(_feature_schema_id, 1)]
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads

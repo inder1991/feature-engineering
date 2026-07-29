@@ -2104,28 +2104,38 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         summaries: dict[str, str] = {}
         summary_stats: dict = {}
         summary_evidence_failures = 0
-        try:
-            with conn.transaction():
-                summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
-                                            concepts=concepts, ingestion_run_id=ingestion_run_id,
-                                            stats=summary_stats)
-                if glossary is not None and snapshot_id is not None:
-                    try:
-                        summary_evidence_failures = _write_summary_evidence(
-                            conn, source=catalog_source, rows=vr.good, summaries=summaries,
-                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id)
-                    except Exception:  # noqa: BLE001 — an escape past the writer's per-item guard
-                        # would otherwise report `succeeded` for a run that wrote nothing.
-                        summary_evidence_failures = 1
-                        raise
-        except Exception:  # noqa: BLE001
-            logger.warning("advisory summary enrichment failed for %r", catalog_source, exc_info=True)
-        state, reason, detail = _enrichment_outcome(
-            summaries, len(_summary_targets(vr.good, glossary)),
-            internal_failures=summary_evidence_failures,
-            not_attempted=summary_stats.get("not_attempted", 0))
-        record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
-                     detail=_with_audit_degradations(detail), started_at=stage_started)
+        # GLOSSARY ONLY. `_write_summary_evidence` keys on the glossary record's schema-preserving
+        # logical_ref, so a technical upload has nowhere to put the result — it was paying for the
+        # provider calls, reporting `succeeded`, and storing nothing anyone could see. Skipping is
+        # the honest v1: a technical CSV carries no business terms to summarise from.
+        if glossary is None:
+            record_stage(stage_recorder, "enrich_summary", "not_applicable")
+        else:
+            try:
+                with conn.transaction():
+                    summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
+                                                concepts=concepts,
+                                                ingestion_run_id=ingestion_run_id,
+                                                stats=summary_stats)
+                    if snapshot_id is not None:
+                        try:
+                            summary_evidence_failures = _write_summary_evidence(
+                                conn, source=catalog_source, rows=vr.good, summaries=summaries,
+                                glossary=glossary, bindings=bindings,
+                                source_snapshot_id=snapshot_id)
+                        except Exception:  # noqa: BLE001 — an escape past the writer's per-item
+                            # guard would otherwise report `succeeded` for a run that wrote nothing.
+                            summary_evidence_failures = 1
+                            raise
+            except Exception:  # noqa: BLE001
+                logger.warning("advisory summary enrichment failed for %r", catalog_source,
+                               exc_info=True)
+            state, reason, detail = _enrichment_outcome(
+                summaries, len(_summary_targets(vr.good, glossary)),
+                internal_failures=summary_evidence_failures,
+                not_attempted=summary_stats.get("not_attempted", 0))
+            record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
+                         detail=_with_audit_degradations(detail), started_at=stage_started)
 
         stage_started = datetime.now(UTC)
         domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
