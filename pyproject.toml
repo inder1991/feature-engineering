@@ -30,6 +30,11 @@ dependencies = [
     # The OpenMetadata connector's real transport (behind an injectable fetch seam; tests
     # never touch the network). Promoted from dev — it was already a test dependency.
     "httpx>=0.27",
+    # Spec A §0's target-cluster inventory is a TYPED runtime input read from conf/environments/*.yml
+    # by featuregen.materialize.inventory.load_inventory. PyYAML was already importable transitively
+    # (pre-commit pulls it), and a runtime loader resting on somebody else's transitive dependency is
+    # one lockfile resolution away from an ImportError that only appears in a deployed image.
+    "PyYAML>=6",
     # The formula schema validates a WindowPolicy.timezone as a real IANA zone via zoneinfo.ZoneInfo;
     # python:3.11-slim (the deploy base) ships no system tz database, so declare the data package
     # explicitly — otherwise ZoneInfo raises ZoneInfoNotFoundError and the whole formula suite errors.
