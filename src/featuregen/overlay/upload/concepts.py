@@ -904,6 +904,50 @@ _ALL: tuple[Concept, ...] = (
             description="The user who created or last updated the record (create_user / update_user). "
                         "A named member of staff, so personal data; audit lineage rather than "
                         "customer behaviour, and rarely a legitimate feature."),
+    # ── §3.20 Payments — narrative, party roles, contact details ──────────────────────────────────
+    # Grounded in what FTR's 126 transaction columns landed on: four narrative columns on
+    # `free_text`, six personal/party columns on a bare `pii`, and a row hash on `unclassified`.
+    #
+    # `pii` is a CLASSIFICATION, not a concept. Collapsing an address, a phone number and an ISO
+    # 20022 party role into one word loses the handling difference — a phone can be tokenised, an
+    # address generalised to a region feature, a party role is a structural field of the message.
+    Concept("payment_narrative", "text", sensitivity="pii",
+            description="Free-text remittance information on a payment (narration, "
+                        "sender-to-receiver info, inter-bank information). The single richest signal "
+                        "in transaction data — it drives categorisation, merchant identification and "
+                        "AML screening — and it routinely CONTAINS names and account numbers, hence "
+                        "the pii floor."),
+    Concept("initiating_party", "categorical", sensitivity="pii",
+            description="ISO 20022 InitgPty — the party that initiated the payment instruction, "
+                        "which is not necessarily the party being debited. Distinct from the "
+                        "ultimate debtor: who pushed the button versus whose money it is."),
+    Concept("ultimate_debtor", "categorical", sensitivity="pii",
+            description="ISO 20022 UltmtDbtr — the party the funds are ULTIMATELY from, behind any "
+                        "intermediary. The question a sanctions/AML screen actually asks, and the "
+                        "one a bare `pii` label erases."),
+    Concept("ultimate_creditor", "categorical", sensitivity="pii",
+            description="ISO 20022 UltmtCdtr — the party the funds are ULTIMATELY for, behind any "
+                        "intermediary or collection agent. The receiving mirror of ultimate_debtor."),
+    Concept("postal_address", "sensitive", sensitivity="pii",
+            description="A physical or correspondence address. Kept distinct from the generic `pii` "
+                        "because the handling differs: an address generalises to a region or "
+                        "distance feature, where a raw identifier cannot be used at all."),
+    Concept("phone_number", "sensitive", sensitivity="pii",
+            description="A telephone or mobile number. A SHARED phone across parties is a fraud and "
+                        "AML signal, never a join key — linking catalogs on it would silently merge "
+                        "unrelated parties."),
+    Concept("email_address", "sensitive", sensitivity="pii",
+            description="An email address. Like a phone number, a shared value is a linkage SIGNAL "
+                        "to be modelled, not an identifier to join on."),
+    Concept("row_hash", "categorical",
+            description="A surrogate or dedupe hash over a row's contents — a technical key, not a "
+                        "business entity. Deliberately NOT an identifier: a hash column that "
+                        "bridged would pair with every other hash column in every catalog."),
+    Concept("statement_visibility_flag", "flag",
+            description="Whether a transaction is shown on, or suppressed from, the customer "
+                        "statement. Presentation rather than economics — a suppressed entry still "
+                        "moved money, so it must not be mistaken for a reversal or exclusion."),
+
     # ── §3.19 Labels — the readable side of a code ────────────────────────────────────────────────
     # A NAME is not an IDENTIFIER. `cust_prim_branch_nm` was classified `branch_id` because
     # `branch_id` was the only branch word in the registry, and `derive_bridge_candidates` pairs any
