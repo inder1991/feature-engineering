@@ -376,6 +376,32 @@ single success or failure.
 
 ---
 
+## Task 2c: A confirmed bridge is never demoted when it goes stale 🔴
+
+**Found by Task 2. Files:** `overlay/` (owner TBD by the implementer); Test alongside.
+
+**`demote_bridge_edges` had NO production caller before Task 2** — verified: its only call site now is
+the reject route added in `84359270`. `reject_fact` demotes joins and semantic bindings but has **no
+`entity_bridge` branch**, and `overlay/projection.py:50` short-circuits bridges so *"later bridge
+events (CONFIRMED/EXPIRED/…) are inherently no-ops here."*
+
+**So a VERIFIED bridge that lapses to STALE or expires keeps its `entity_bridge_edge` row and stays
+traversable by the planner** (`assembly.py:114` crosses on `active_bridges` = that table). Drift
+detection correctly stales the *fact* — `overlay_fact_dependency` is maintained for exactly that —
+but the *projection* never hears about it. A catalog change that should retire a bridge silently
+leaves it computable.
+
+Currently **unreachable**, because no bridge has ever been confirmed and the table is empty. It
+becomes reachable on the first confirmation, which this plan is about to make possible.
+
+- [ ] **Step 1: Failing tests** — confirm a bridge, stale it via a real endpoint change, assert the
+      edge row is gone and the planner no longer crosses it; the same for expiry. Test-strength
+      check: would it pass if the demote were never called? The assertion must be on planner
+      traversability, not only on the row.
+- [ ] **Step 2–5:** Run / implement / run / commit — `fix(bridges): demote the projection when a bridge stales or expires`
+
+---
+
 ## Task 3: `GET /catalogs`
 
 **Files:** Create `src/featuregen/api/routes/catalogs.py`; Test `tests/featuregen/api/test_catalogs_route.py`
