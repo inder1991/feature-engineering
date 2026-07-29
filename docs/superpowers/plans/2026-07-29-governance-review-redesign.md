@@ -103,6 +103,68 @@ specified for confirm.
 - **M3** — no index supports source-filtering on `entity_bridge_candidate_evidence` (PK is a
   five-tuple). Deferred per the standing NFR directive; recorded so it is not rediscovered.
 
+## ⚠️ Revision 3 (2026-07-29) — implementation, wiring and data-model review
+
+### 🔴 W1 — rev 2's projection call would RAISE
+
+The plan said `project_verified_bridge(conn, ref, now=None)`, copied from the semantic-binding
+pattern. **The two signatures differ and the difference is fatal:**
+
+| | `project_verified_semantic_binding` | `project_verified_bridge` |
+|---|---|---|
+| `now` | `now: datetime \| None = None` — has a default | `*, now` — **no default** |
+| on fault | *"NEVER raises — the fact stays VERIFIED"*, wrapped in a savepoint | **no try, no savepoint** |
+
+`bridge_projection.py:46` passes `now` **straight into the INSERT** as `projected_at`, and
+`0989_entity_bridge_governance.sql:33` declares that column `timestamptz NOT NULL DEFAULT now()`.
+A column DEFAULT applies when the column is **omitted**, never when NULL is explicitly supplied — so
+`now=None` inserts NULL into a NOT NULL column and the statement errors. **Pass a real timestamp.**
+
+### 🔴 W2 — a projection fault would roll back the confirm
+
+`project_verified_semantic_binding` is explicit that *"a projection fault must not roll back the
+confirm"* and wraps itself in `with conn.transaction():` for exactly that. **`project_verified_bridge`
+has neither the savepoint nor the never-raises guarantee.**
+
+So on the confirm route, if projection fails after `confirm_fact` succeeded, the exception propagates,
+the request transaction rolls back, and **the confirmation is lost** — the reviewer sees a 500 and the
+fact is not VERIFIED. This is the same class as audit finding I-3, which this repo has already paid
+for once on the deny path.
+
+**The route must wrap the projection in its own savepoint and report `"pending"` on failure** rather
+than letting it escape. Do not "fix" `project_verified_bridge` from this branch without checking
+whether the parallel stream owns it.
+
+### ✅ W3 — no drain is needed here, and that is correct
+
+The semantic-binding projection drains the read model to head first, because its resolver reads
+`overlay_fact_state` and the async projector is behind after an in-transaction confirm.
+`project_verified_bridge` folds `load_fact(conn, key)` — the **event stream** — so it already sees the
+uncommitted CONFIRMED. Recorded so nobody adds a drain "for consistency" and reintroduces the lag.
+
+### 🟠 W4 — a governed bridge can exist with NO evidence row, and rev 2's listing would omit it
+
+`bridge_propose.py:53-56` **returns early on a denied propose** (*"bridge propose no-op (already
+governed)"*) **without writing the evidence row.** Since rev 2 enumerates the queue from
+`entity_bridge_candidate_evidence`, any bridge whose evidence write was skipped is **silently absent
+from the queue** — a pending decision nobody can see, which is precisely the failure this redesign
+exists to remove.
+
+**Task 1 must carry a reconciliation test:** seed a bridge fact in the event stream with no evidence
+row and assert the listing either surfaces it or reports a discrepancy. **Silent omission must fail
+the test.**
+
+### 🟠 W5 — evidence shown to a reviewer is never refreshed
+
+The upsert at `bridge_propose.py:64-66` is
+`ON CONFLICT … DO UPDATE SET fact_key, proposed_event_id, updated_at`. **`data_type_family` and
+`evidence_json` are NOT in the SET list**, so once a candidate's evidence row exists it is frozen.
+
+If the catalog changes — a type is corrected, a concept is reassigned — the reviewer is shown the
+**original** evidence while confirming, and confirms against a justification that may no longer hold.
+The queue should either refresh these on re-propose or display `updated_at` prominently so staleness
+is visible. Owned by the parallel stream; route it.
+
 ## ⚠️ The finding that shapes this plan
 
 **`overlay_proposal` deliberately does not carry entity bridges, so the listing CANNOT follow the semantic-bindings pattern.**
