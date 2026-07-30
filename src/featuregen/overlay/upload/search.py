@@ -146,8 +146,21 @@ def _where(base_preds: list[str], facet_preds: dict[str, str], *, exclude: str |
     return " AND ".join(preds)
 
 
+#: A TEST CONVENIENCE, never the production window. Every governed read takes its freshness from
+#: the configured drift SLA (``OverlayConfig.drift_freshness_sla``) and the HTTP route passes that
+#: explicitly. This default exists only so the many search-behaviour tests that are not about
+#: freshness need not thread a timedelta through.
+#:
+#: A PRODUCTION caller that relies on it has created a second, private, non-configurable freshness
+#: window — which is precisely the defect the route once had. On a deployment whose watermark only
+#: advances at ingest (no drift scanner), raising OVERLAY_DRIFT_FRESHNESS_SLA_MIN kept every other
+#: governed read working while search silently returned zero rows the moment a catalog crossed 24
+#: hours. Nothing errored; the catalog simply looked empty.
+_TEST_FRESHNESS_DEFAULT = timedelta(hours=24)
+
+
 def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
-           fresh_within: timedelta = timedelta(hours=24), limit: int = 20, offset: int = 0,
+           fresh_within: timedelta = _TEST_FRESHNESS_DEFAULT, limit: int = 20, offset: int = 0,
            filters: Mapping[str, Sequence[str]] | None = None,
            match: str = MATCH_ALL) -> SearchResult:
     """Facet-aware catalog search over graph_node.

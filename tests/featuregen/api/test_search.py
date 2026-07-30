@@ -137,6 +137,37 @@ def test_fails_closed_on_stale_source(client, conn):
     assert body["hits"] == [] and body["total"] == 0                     # absent, never a 500
 
 
+def test_search_honours_the_CONFIGURED_sla_not_a_private_24h_window(client, conn):
+    """A catalog stale past 24h but INSIDE the configured drift SLA still returns hits.
+
+    The route used to pass no `fresh_within`, so `search()`'s own 24-hour default governed — a
+    second, private, non-configurable freshness window beside the one every other governed read
+    uses. On a deployment whose watermark only advances at ingest (no drift scanner), operators
+    raise OVERLAY_DRIFT_FRESHNESS_SLA_MIN; that kept `resolve` and the planner working while search
+    silently went empty the moment a catalog crossed 24 hours. Nothing errored — the catalog just
+    looked empty, which is indistinguishable from having no data.
+
+    This fails against the old route (0 hits) and passes once freshness comes from config.
+    """
+    from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
+
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    conn.execute(
+        "UPDATE overlay_drift_watermark "
+        "SET last_completed_at = last_completed_at - interval '3 days' "
+        "WHERE catalog_source = %s", ("deposits",))
+
+    # 30 days, the shape of the real deployment's workaround. 3 days stale is far past the private
+    # 24-hour window and comfortably inside this.
+    register_overlay_config(overlay_config_from_env({"OVERLAY_DRIFT_FRESHNESS_SLA_MIN": "43200"}))
+    try:
+        body = client.get("/search", params={"q": "balance"}, headers=AUTH).json()
+        assert body["hits"], "a catalog inside the configured SLA must still be searchable"
+        assert {h["catalog_source"] for h in body["hits"]} == {"deposits"}
+    finally:
+        register_overlay_config(overlay_config_from_env({}))
+
+
 def test_total_can_exceed_limit(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
     upload_csv(client, "cards", CARDS_CSV)
