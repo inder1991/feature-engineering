@@ -129,6 +129,14 @@ class IntentCandidates:
     table_refs: frozenset[str]
     #: Optional human labels, purely to help the model choose. Never used for validation.
     labels: dict[str, str] = field(default_factory=dict)
+    #: The governed structural roles, carried so a CLARIFICATION can offer the right few columns
+    #: rather than all of them — "which column identifies the customer?" should list identifiers, not
+    #: sixty descriptive fields. Retrieval already reads `is_grain`/`is_as_of` to decide what to
+    #: offer, and used to discard the distinction on the way out. Advisory only: validation still
+    #: turns on `column_refs` alone, so a mislabelled role can narrow a question but can never widen
+    #: what may be named.
+    grain_refs: frozenset[str] = frozenset()
+    as_of_refs: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

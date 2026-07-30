@@ -85,7 +85,7 @@ def _table_ref(source: str, table: str) -> str:
 
 
 def _structural_columns(conn, pairs: Iterable[tuple[str, str]], *,
-                        roles: Iterable[str]) -> list[tuple[str, str, str]]:
+                        roles: Iterable[str]) -> list[tuple[str, str, str, bool, bool]]:
     """The governed grain and as-of columns of the given (source, table) pairs.
 
     One query for all of them rather than one per table: a per-item query inside a loop is the defect
@@ -102,7 +102,7 @@ def _structural_columns(conn, pairs: Iterable[tuple[str, str]], *,
     # readable by anyone holding `catalog:read`. It matters more here than anywhere: this set becomes
     # prompt text, so the raw predicate would put a national ID in front of a model.
     rows = conn.execute(
-        "SELECT catalog_source, table_name, column_name FROM graph_node "
+        "SELECT catalog_source, table_name, column_name, is_grain, is_as_of FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = ANY(%s) AND table_name = ANY(%s) "
         "  AND (is_grain OR is_as_of) "
         "  AND COALESCE(visible_requires, '{}') <@ %s "
@@ -111,7 +111,7 @@ def _structural_columns(conn, pairs: Iterable[tuple[str, str]], *,
     # The ANY/ANY cross-product can match a table name that exists under a different source, so the
     # pairs are re-checked rather than trusted.
     wanted = set(pairs)
-    return [(s, t, c) for s, t, c in rows if (s, t) in wanted]
+    return [(s, t, c, g, a) for s, t, c, g, a in rows if (s, t) in wanted]
 
 
 def retrieve_candidates(conn, question: str, *, now: datetime,
@@ -162,8 +162,15 @@ def retrieve_candidates(conn, question: str, *, now: datetime,
             refs.append(ref)
 
     # Leg 1 FIRST — see the module docstring. These are what make a plan expressible.
-    for source, table, column in _structural_columns(conn, kept_tables, roles=roles):
-        _add(_column_ref(source, table, column))
+    grain_refs: set[str] = set()
+    as_of_refs: set[str] = set()
+    for source, table, column, is_grain, is_as_of in _structural_columns(conn, kept_tables,
+                                                                        roles=roles):
+        ref = _column_ref(source, table, column)
+        _add(ref)
+        # The role travels with the ref so a clarification can ask "which column identifies the
+        # customer?" and list the two identifiers rather than all sixty columns.
+        (grain_refs if is_grain else as_of_refs).add(ref)
     structural = len(refs)
 
     # Leg 2 — relevance, filling what is left.
@@ -183,7 +190,8 @@ def retrieve_candidates(conn, question: str, *, now: datetime,
         candidates=IntentCandidates(
             column_refs=frozenset(refs),
             table_refs=frozenset(_table_ref(s, t) for s, t in kept_tables),
-            labels={ref: label for ref, label in sorted(labels.items()) if ref in set(refs)}),
+            labels={ref: label for ref, label in sorted(labels.items()) if ref in set(refs)},
+            grain_refs=frozenset(grain_refs), as_of_refs=frozenset(as_of_refs)),
         tables_considered=tuple(_table_ref(s, t) for s, t in kept_tables),
         # Only the relevance leg can overflow; the structural columns are never dropped, so a
         # negative difference would mean leg 1 alone exceeded the budget — reported as zero rather
