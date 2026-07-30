@@ -1,1019 +1,1068 @@
-import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
-  type JoinDivergence,
-  type JoinProposal,
-  type RejectCategory,
+  ENTITY_BRIDGE_REJECT_CATEGORIES,
+  type EntityBridgeRejectCategory,
+  type GovernanceQueue,
+  type GovernanceQueueItem,
+  type GovernanceQueueUsage,
   REJECT_CATEGORIES,
-  type RelationshipReadiness,
+  type RejectCategory,
   TABLE_FACT_REJECT_CATEGORIES,
-  type TableFactProposal,
   type TableFactRejectCategory,
-  acknowledgeJoinDivergence,
+  bulkRejectEntityBridges,
+  confirmEntityBridge,
   confirmJoin,
   confirmTableFact,
-  listJoinProposals,
-  listRelationshipReadiness,
-  listTableFactProposals,
+  getGovernanceQueue,
+  rejectEntityBridge,
   rejectJoin,
   rejectTableFact,
 } from '../api'
 
-// Governance review: the confirmation surface over what the enrichment passes proposed. Three
-// tabs share one source queue: Joins (Pass C, TWO distinct admins), Grain & availability
-// (Pass B table facts, SINGLE confirmer — one approve reaches VERIFIED and projects), and
-// Readiness (READ-ONLY: the per-table relationship diagnostic — what joins were discovered and
-// where they stand — no actions). The two action tabs are evidence-forward cards with a
-// consequence line, an LLM/metadata caution, and a what-to-verify checklist that GATES the
-// Approve button. Reject is structured (category + optional note).
-// Follows ReviewQueueScreen's shape: source input -> load() -> per-card action handlers -> a
-// session-local decided Map (the durable state lives server-side; a reload refetches the open
-// queue, which no longer contains what was decided).
+// GOVERNANCE REVIEW — a decision queue, not a search box.
+//
+// This screen used to open on a text input labelled "source" and render nothing until the operator
+// guessed a catalog slug (the live ones are `cib` and `ftr` — neither discoverable nor memorable).
+// It now opens on GET /governance/queue: one request, no source argument, every pending decision
+// across every catalog the caller may see. There is no input to fill in and nothing to press first.
+//
+// ── THREE AXES, RENDERED SEPARATELY, NEVER FUSED ─────────────────────────────────────────────────
+//
+//   1. LINK AVAILABILITY          — may the platform consider this link at all?
+//   2. AUTOMATIC EXECUTION SAFETY — has the directional join / cardinality / fan-out been validated
+//                                   automatically? (`production_eligibility`)
+//   3. HUMAN REVIEW               — has a person endorsed the semantics? (`state`)
+//
+// Human review controls NEITHER of the other two. A row can legitimately be unreviewed AND
+// production-eligible, or human-endorsed AND sandbox-only, so the two payload code fields render as
+// two distinct signals with their own labels, their own tone and their own `data-code`. Merging them
+// into one badge would make one of those two ordinary rows unrenderable without lying.
+//
+// Every signal is bound to a `*_code` field, never to the prose: the labels are display text the
+// backend may reword, the codes are the contract. Axis 1 is the one derivation this screen makes —
+// the read model folds availability into the `state` label rather than shipping a field for it — so
+// it is mapped from the known `state_code` values and says NOTHING for a code it does not know.
+//
+// CONFIRMATION MEANS "a human agrees with this semantic relationship". It is never permission to
+// execute: a proposed link is already consumed, and eligibility to run is axis 2, which moves on its
+// own. Nothing here may suggest that a review unlocks or releases anything.
+//
+// ── WHAT THE SERVER DECIDES AND THIS SCREEN ONLY RENDERS ─────────────────────────────────────────
+//
+// `available_actions` is the caller's sanctioned set with four-eyes already applied, so button
+// enablement is read from it and never computed here. A row missing `confirm` renders it DISABLED
+// with the reason on screen and wired via aria-describedby. A row with no actions at all is an
+// endorsed fact whose re-verification has its own flow — the queue must not offer a button the
+// command layer would refuse.
+//
+// ── USAGE: "already depended on by" ──────────────────────────────────────────────────────────────
+//
+// Each category answers counted / not_tracked_yet / unreadable, and an unmeasurable category renders
+// as the WORDS "not tracked yet" — never 0, never blank, never omitted. `count` is null unless the
+// state is `counted`, so there is no path that turns "nothing was recorded" into a number. Joins and
+// table facts have no bridge anchor and carry NO usage at all: their block is absent rather than
+// rendered as zero dependencies.
+//
+// DELIBERATELY NOT HERE (both need a per-catalog surface the queue endpoint does not serve): the
+// governed-join divergence banner and the per-table relationship-readiness diagnostic.
 
-// A decision made this session, kept for display on the (now-closed) card.
-interface Decision {
-  badge: string
-  tone: 'gj-partial' | 'gj-verified' | 'gj-rejected'
-  note: string
+// ── vocabulary ───────────────────────────────────────────────────────────────────────────────────
+
+// Business words for each decision kind. An unknown kind from a newer backend still renders (its
+// code, de-underscored) rather than breaking the client.
+const KIND_LABEL: Record<string, string> = {
+  entity_bridge: 'Cross-catalog identifier links',
+  approved_join: 'Discovered joins',
+  grain: 'Table grain',
+  availability_time: 'As-of date',
+}
+const KIND_LABEL_ONE: Record<string, string> = {
+  entity_bridge: 'Cross-catalog identifier link',
+  approved_join: 'Discovered join',
+  grain: 'Table grain',
+  availability_time: 'As-of date',
+}
+// What each kind IS, for the section lead-in — including the fact that a discovered join lives
+// inside ONE catalog: `list_open_approved_join_proposals` filters on `from_ref.catalog_source` only
+// and is not endpoint-symmetric, so a join must never be presented as a cross-catalog finding.
+const KIND_ABOUT: Record<string, string> = {
+  entity_bridge: 'The same business entity in two different catalogs. These are the decisions no '
+    + 'per-catalog screen could show you.',
+  approved_join: 'A join between two tables inside one catalog, discovered from metadata and '
+    + 'listed under the catalog it starts in.',
+  grain: 'What one row of a table is — the key every feature on it aggregates to.',
+  availability_time: 'Which column carries the as-of date point-in-time features read.',
 }
 
-const STATUS_BADGE: Record<JoinProposal['status'], { label: string; tone: string }> = {
-  PROPOSED: { label: 'proposed', tone: 'gj-proposed' },
-  PARTIALLY_CONFIRMED: { label: 'awaiting 2nd', tone: 'gj-partial' },
+function kindLabel(kind: string): string {
+  return KIND_LABEL[kind] ?? kind.replaceAll('_', ' ')
 }
 
-// Readiness-tab status chips: strong outcomes reuse the solid governance tones (verified green,
-// conflicting red, proposed accent); the two nothing-actionable states stay quiet (muted/faint).
-const READINESS_BADGE: Record<RelationshipReadiness['status'], { label: string; tone: string }> = {
-  confirmed: { label: 'confirmed', tone: 'gj-verified' },
-  conflicting: { label: 'conflicting', tone: 'gj-rejected' },
-  candidate_proposed: { label: 'candidate proposed', tone: 'gj-proposed' },
-  weak_candidates_only: { label: 'weak candidates only', tone: 'gj-weak' },
-  no_candidates: { label: 'no candidates', tone: 'gj-none' },
-}
-
-// "2 confirmed · 1 proposed" — only the non-zero pair categories, in precedence-adjacent order.
-function pairCounts(r: RelationshipReadiness): string {
-  const parts = [
-    [r.confirmed_pairs.length, 'confirmed'] as const,
-    [r.proposed_pairs.length, 'proposed'] as const,
-    [r.weak_pairs.length, 'weak'] as const,
-    [r.conflicting_pairs.length, 'conflicting'] as const,
-  ]
-    .filter(([n]) => n > 0)
-    .map(([n, label]) => `${n} ${label}`)
-  return parts.length > 0 ? parts.join(' · ') : 'no candidate pairs'
+function kindLabelOne(kind: string): string {
+  return KIND_LABEL_ONE[kind] ?? kind.replaceAll('_', ' ')
 }
 
 function categoryLabel(category: string): string {
   return category.replaceAll('_', ' ')
 }
 
-function approvedNote(status: string, projection: string): string {
-  if (status === 'VERIFIED') {
-    return projection === 'projected'
-      ? 'Verified — projected to an operational graph edge. The planner can use it (revocable).'
-      : 'Verified — the operational projection is deferred to the next caught-up ingest.'
-  }
-  return 'You approved — a different, second admin must confirm before it goes live.'
+// No display name exists anywhere in this system: `graph_node` carries no per-catalog label and the
+// upload surface takes the slug as the only identifier. Upper-casing the slug is a rendering choice;
+// inventing a readable name would be inventing a source of truth.
+function catalogLabel(slug: string): string {
+  return slug.toUpperCase()
 }
 
-// Single-confirmer table facts VERIFY on the one approve — only the projection outcome varies.
-function approvedFactNote(projection: string): string {
-  return projection === 'projected'
-    ? 'Verified — projected to the operational table facts. Planners read it now (revocable).'
-    : 'Verified — the operational projection is deferred to the next caught-up ingest.'
+// AXIS 3 — the human axis, keyed by `state_code`. Tone only; the words come from the payload.
+const REVIEW_TONE: Record<string, string> = {
+  unreviewed_available: 'open',
+  partially_endorsed_available: 'open',
+  human_endorsed: 'ok',
+  stale_unavailable: 'warn',
+  rejected: 'off',
+}
+
+// AXIS 2 — the automatic axis, keyed by `production_eligibility_code`.
+const EXECUTION_TONE: Record<string, string> = {
+  grain_resolved: 'ok',
+  cardinality_unresolved: 'warn',
+  not_observed: 'quiet',
+  not_applicable: 'quiet',
+}
+
+// `production_eligibility` is null when this item kind has nothing to derive the axis from. The
+// absence is stated as an absence — never rendered as a pass and never as a failure.
+const EXECUTION_ABSENT: Record<string, string> = {
+  not_applicable: 'Not applicable — this fact describes one table, so there is no directional join '
+    + 'to validate',
+  not_observed: 'Not observed — no derivation evidence was recorded for this crossing',
+}
+
+// AXIS 1 — DERIVED for display from `state_code`, because the read model folds the availability
+// consequence into the state label instead of shipping a field for it. These are the states it
+// names: DRAFT/PARTIALLY_CONFIRMED and VERIFIED are what the platform will consider, REVERIFY/STALE
+// and REJECTED are what it will not. An unrecognized code renders NOTHING rather than a guess.
+const AVAILABILITY: Record<string, string> = {
+  unreviewed_available: 'The platform may use this link now',
+  partially_endorsed_available: 'The platform may use this link now',
+  human_endorsed: 'The platform may use this link now',
+  stale_unavailable: 'The platform will not consider this link',
+  rejected: 'The platform will not consider this link',
+}
+
+const AVAILABILITY_TONE: Record<string, string> = {
+  unreviewed_available: 'ok',
+  partially_endorsed_available: 'ok',
+  human_endorsed: 'ok',
+  stale_unavailable: 'warn',
+  rejected: 'off',
+}
+
+// The per-kind reject vocabulary — each command has its own, and `wrong_grain_columns` means nothing
+// about an identifier link, so they are never pooled.
+function rejectCategories(kind: string): readonly string[] {
+  if (kind === 'entity_bridge') return ENTITY_BRIDGE_REJECT_CATEGORIES
+  if (kind === 'approved_join') return REJECT_CATEGORIES
+  return TABLE_FACT_REJECT_CATEGORIES
+}
+
+// Which `unreadable` listings belong to a kind, so an empty section can say "we could not look"
+// instead of "nothing is waiting". Both table-fact kinds come from the one `table_fact` listing.
+function unreadableListings(kind: string): string[] {
+  if (kind === 'grain' || kind === 'availability_time') return ['table_fact']
+  return [kind]
+}
+
+// ── payload readers (detail is an open map: read defensively, never assume) ───────────────────────
+
+function asStr(v: unknown): string {
+  return typeof v === 'string' ? v : ''
+}
+
+function asRec(v: unknown): Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {}
+}
+
+function asStrArr(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+}
+
+// The subject in business words, from whatever the kind's payload actually carries. Falls back to
+// the read model's own `subject` string, so a kind this screen has never seen still reads.
+function headline(item: GovernanceQueueItem): string {
+  const d = item.detail
+  if (item.kind === 'entity_bridge') {
+    const entity = asStr(d.entity_id) || 'entity'
+    const where = item.catalogs.map(catalogLabel).join(' and ')
+    return where ? `The same ${entity} in ${where}` : `The same ${entity} in two catalogs`
+  }
+  if (item.kind === 'approved_join') {
+    const from = asRec(d.from)
+    const to = asRec(d.to)
+    if (asStr(from.table) && asStr(to.table)) {
+      return `Rows of ${asStr(from.table)} point at ${asStr(to.table)}`
+    }
+  }
+  if (item.kind === 'grain') {
+    const columns = asStrArr(asRec(d.proposed_value).columns)
+    const table = asStr(d.table)
+    if (table && columns.length > 0) return `One row of ${table} is one ${columns.join(' + ')}`
+    if (table) return `What one row of ${table} is`
+  }
+  if (item.kind === 'availability_time') {
+    const column = asStr(asRec(d.proposed_value).column)
+    const table = asStr(d.table)
+    if (table && column) return `${table} is as of ${column}`
+    if (table) return `The as-of date of ${table}`
+  }
+  return item.subject
+}
+
+// The agreement a confirmation RECORDS, in the words of the thing being agreed to. This is the
+// meaning of the act — accountability for a semantic claim — so it is stated per kind, not implied.
+function agreement(item: GovernanceQueueItem): string {
+  const d = item.detail
+  if (item.kind === 'entity_bridge') {
+    const entity = asStr(d.entity_id) || 'business entity'
+    return `I agree that these two columns identify the same real-world ${entity}.`
+  }
+  if (item.kind === 'approved_join') {
+    const from = asRec(d.from)
+    const to = asRec(d.to)
+    const cardinality = asStr(d.cardinality) || 'the stated cardinality'
+    return `I agree that ${asStr(from.table) || 'the from table'} joins into `
+      + `${asStr(to.table) || 'the to table'} in this direction, at ${cardinality}.`
+  }
+  if (item.kind === 'grain') {
+    const columns = asStrArr(asRec(d.proposed_value).columns).join(' + ')
+    return `I agree that one row of ${asStr(d.table) || 'this table'} is one `
+      + `${columns || 'row of the proposed key'}.`
+  }
+  if (item.kind === 'availability_time') {
+    const column = asStr(asRec(d.proposed_value).column) || 'the proposed column'
+    return `I agree that ${column} is the as-of date of ${asStr(d.table) || 'this table'}.`
+  }
+  return 'I agree with this relationship as it is described here.'
+}
+
+// Who put it forward and when — strictly from the payload. The bridge listing carries
+// proposed_by/proposed_at, the table-fact listing carries an origin, and the join listing carries
+// neither (only recorded endorsements), so this line is SHORTER for a join rather than invented.
+function provenanceParts(item: GovernanceQueueItem): string[] {
+  const d = item.detail
+  const parts: string[] = []
+  const by = asStr(d.proposed_by) || asStr(d.origin)
+  if (by) parts.push(`Proposed by ${by}`)
+  const at = asStr(d.proposed_at)
+  // Coarse on purpose: the calendar day is the triage signal, not a stopwatch.
+  if (at) parts.push(at.slice(0, 10))
+  const approvals = Array.isArray(d.approvals) ? d.approvals.map(asRec) : []
+  for (const approval of approvals) {
+    const who = asStr(approval.display_name) || asStr(approval.subject)
+    parts.push(who ? `endorsed by ${who}` : 'one endorsement recorded')
+  }
+  return parts
+}
+
+// The reason `confirm` is not on offer, derived from the SERVER's own decision plus the payload it
+// came with — never from a four-eyes rule recomputed here.
+function withheldReason(item: GovernanceQueueItem): string {
+  if (item.available_actions.length === 0 && item.state_code === 'human_endorsed') {
+    return 'A person has already endorsed this, so there is nothing left to decide here. '
+      + 'Re-verification runs through its own flow.'
+  }
+  if (item.kind === 'approved_join') {
+    return 'The server is not offering you this confirmation: a discovered join needs two '
+      + 'different admins, and an endorsement of yours is already recorded.'
+  }
+  const by = asStr(item.detail.proposed_by)
+  return 'The server is not offering you this confirmation: the proposer of a fact cannot also '
+    + `endorse it${by ? ` (proposed by ${by})` : ''}.`
+}
+
+// A safe DOM id from a fact_key (which carries colons, dots and arrows).
+function domId(prefix: string, factKey: string): string {
+  return `${prefix}-${factKey.replaceAll(/[^a-zA-Z0-9_-]/g, '-')}`
 }
 
 function errorDetail(err: unknown): string {
   return err instanceof ApiError ? err.detail : String(err)
 }
 
-// initialSource: the dashboard -> review handoff rides the URL (?source=), mirroring
-// ReviewQueueScreen — App passes the hash param; a non-empty value auto-loads that queue.
-export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?: string }) {
-  const [source, setSource] = useState(initialSource)
-  const [proposals, setProposals] = useState<JoinProposal[] | null>(null)
-  // Governed-join divergences ride the same joins response: a re-upload retargeted/dropped a
-  // joins_to that admins VERIFIED. Advisory — the verified join stays operational until an
-  // admin acts, so these render as a warning ABOVE the open-proposals list, never as actions
-  // on the join itself.
-  const [divergences, setDivergences] = useState<JoinDivergence[] | null>(null)
-  const [tableFacts, setTableFacts] = useState<TableFactProposal[] | null>(null)
-  const [readiness, setReadiness] = useState<RelationshipReadiness[] | null>(null)
-  const [loadedSource, setLoadedSource] = useState('')
-  // Which queue is on screen. Only one renders at a time — per-card state (checklists, reject
-  // boxes) is keyed component state, so switching tabs does not leak ticks across kinds.
-  const [tab, setTab] = useState<'joins' | 'facts' | 'readiness'>('joins')
-  // Per-QUEUE load errors (whole-branch review FIX 2): each tab surfaces its OWN fetch failure
-  // without blanking the other tab's data.
-  const [joinsError, setJoinsError] = useState('')
-  const [factsError, setFactsError] = useState('')
-  const [readinessError, setReadinessError] = useState('')
-  // Conflict banner (409): survives the reload that follows it, unlike `error`.
-  const [notice, setNotice] = useState('')
-  // Divergence acknowledge in flight (its id) + its failure detail. One at a time: every
-  // Acknowledge button disables while any acknowledge runs, since success reloads the queue.
-  const [ackBusyId, setAckBusyId] = useState<number | null>(null)
-  const [ackError, setAckError] = useState('')
-  // Session-only DISPLAY state for cards decided this session, keyed by fact_key. The durable
-  // state is server-side; clearing on (re)load is correct — a decided fact leaves the open
-  // queue. Join and table-fact keys never collide, so one map serves both tabs.
-  const [decided, setDecided] = useState<Map<string, Decision>>(new Map())
-  // Bumped per successful load: keys the cards so a reload REMOUNTS them (a 409 means the
-  // proposal changed under the reviewer — stale checklist ticks must not survive).
-  const [generation, setGeneration] = useState(0)
+// ── grouping the low-value cluster ───────────────────────────────────────────────────────────────
 
-  // Monotonic id per load(): a late response from an older load must never overwrite newer data.
-  const loadSeq = useRef(0)
+interface Entry {
+  key: string
+  // Non-null for a candidate GROUP: several bridges proposing the same entity between the same two
+  // catalogs are a cross-product of the same two facts, not several findings.
+  group: { entity: string; catalogs: string[] } | null
+  items: GovernanceQueueItem[]
+}
 
-  async function load(name: string) {
-    if (!name.trim()) return
-    const id = ++loadSeq.current
-    setNotice('')
-    // All three fetches load together so the tab counts are honest and a 409 reload refreshes
-    // everything — but they settle INDEPENDENTLY (whole-branch review FIX 2): a table-facts or
-    // readiness endpoint failure must not reject the joins load and blank its tab (or any other
-    // combination). Each tab renders from its own settled result; a failed fetch shows a
-    // per-tab error instead.
-    const [joinsRes, factsRes, readinessRes] = await Promise.allSettled([
-      listJoinProposals(name.trim()),
-      listTableFactProposals(name.trim()),
-      listRelationshipReadiness(name.trim()),
-    ])
-    if (id !== loadSeq.current) return
-    setProposals(joinsRes.status === 'fulfilled' ? joinsRes.value.proposals : null)
-    // `?? null` guards an older backend that predates the additive divergences field.
-    setDivergences(joinsRes.status === 'fulfilled' ? (joinsRes.value.divergences ?? null) : null)
-    setAckError('')
-    setJoinsError(joinsRes.status === 'rejected' ? errorDetail(joinsRes.reason) : '')
-    setTableFacts(factsRes.status === 'fulfilled' ? factsRes.value.proposals : null)
-    setFactsError(factsRes.status === 'rejected' ? errorDetail(factsRes.reason) : '')
-    setReadiness(readinessRes.status === 'fulfilled' ? readinessRes.value.relationships : null)
-    setReadinessError(readinessRes.status === 'rejected' ? errorDetail(readinessRes.reason) : '')
-    setLoadedSource(
-      joinsRes.status === 'fulfilled' ||
-        factsRes.status === 'fulfilled' ||
-        readinessRes.status === 'fulfilled'
-        ? name.trim()
-        : '',
-    )
-    setDecided(new Map())
-    setGeneration(g => g + 1)
+function entriesFor(kind: string, items: GovernanceQueueItem[]): Entry[] {
+  if (kind !== 'entity_bridge') {
+    return items.map(item => ({ key: item.fact_key, group: null, items: [item] }))
   }
-
-  // Adopt the URL-borne source and auto-load its queue — on mount AND when a later deep link
-  // changes the param while the screen stays mounted (same shape as ReviewQueueScreen).
-  useEffect(() => {
-    setSource(initialSource)
-    if (initialSource.trim()) void load(initialSource)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialSource])
-
-  function submit(e: FormEvent) {
-    e.preventDefault()
-    void load(source)
+  const buckets = new Map<string, GovernanceQueueItem[]>()
+  for (const item of items) {
+    const entity = asStr(item.detail.entity_id) || '(unnamed entity)'
+    const key = `${entity}|${[...item.catalogs].sort().join('|')}`
+    const bucket = buckets.get(key)
+    if (bucket) bucket.push(item)
+    else buckets.set(key, [item])
   }
+  return [...buckets].map(([key, bucket]) => bucket.length > 1
+    ? {
+        key,
+        group: {
+          entity: asStr(bucket[0].detail.entity_id) || '(unnamed entity)',
+          catalogs: bucket[0].catalogs,
+        },
+        items: bucket,
+      }
+    : { key: bucket[0].fact_key, group: null, items: bucket })
+}
 
-  function onDecided(factKey: string, decision: Decision) {
-    setDecided(prev => new Map(prev).set(factKey, decision))
+// ── small presentational pieces ──────────────────────────────────────────────────────────────────
+
+function Axis({ testid, code, tone, label, value }: {
+  testid: string
+  code: string
+  tone: string
+  label: string
+  value: string
+}) {
+  return (
+    <div className="gq-axis" data-testid={testid} data-code={code} data-tone={tone}>
+      <dt className="gq-axis-label">{label}</dt>
+      <dd className={`gq-axis-value gq-tone-${tone}`}>{value}</dd>
+    </div>
+  )
+}
+
+// The three axes of one item, as three separate signals. Two come straight from the payload's code
+// fields; the availability one is derived from `state_code` and omitted for a code it cannot map.
+function Axes({ item }: { item: GovernanceQueueItem }) {
+  const availability = AVAILABILITY[item.state_code]
+  return (
+    <dl className="gq-axes">
+      {availability && (
+        <Axis
+          testid="axis-availability"
+          code={item.state_code}
+          tone={AVAILABILITY_TONE[item.state_code] ?? 'quiet'}
+          label="Link availability"
+          value={availability}
+        />
+      )}
+      <Axis
+        testid="axis-execution"
+        code={item.production_eligibility_code}
+        tone={EXECUTION_TONE[item.production_eligibility_code] ?? 'quiet'}
+        label="Automatic execution safety"
+        value={item.production_eligibility
+          ?? EXECUTION_ABSENT[item.production_eligibility_code]
+          ?? 'Not reported'}
+      />
+      <Axis
+        testid="axis-review"
+        code={item.state_code}
+        tone={REVIEW_TONE[item.state_code] ?? 'quiet'}
+        label="Human review"
+        value={item.state}
+      />
+    </dl>
+  )
+}
+
+// One "already depended on by" category. The three states render as three different things, and a
+// number appears ONLY for a real measurement: `count` is null otherwise, so there is no path here
+// that could turn "nothing was recorded" into 0.
+function usageValue(usage: GovernanceQueueUsage): string {
+  if (usage.state === 'counted' && usage.count !== null) return String(usage.count)
+  if (usage.state === 'unreadable') return 'unreadable'
+  return 'not tracked yet'
+}
+
+function Usage({ usages }: { usages: GovernanceQueueUsage[] }) {
+  // Bridges only. A join or table fact has no bridge anchor to count from, so there is nothing to
+  // render — and an absent anchor is never "0 dependencies".
+  if (usages.length === 0) return null
+  return (
+    <div className="gq-usage" data-testid="usage">
+      <p className="gq-usage-head">Already depended on by</p>
+      <dl className="gq-usage-list">
+        {usages.map(usage => (
+          <div className="gq-usage-item" key={usage.category} data-state={usage.state}>
+            <dt className="gq-usage-cat">{categoryLabel(usage.category)}</dt>
+            <dd
+              className={`gq-usage-value gq-usage-${usage.state}`}
+              data-testid={`usage-value-${usage.category}`}
+            >
+              {usageValue(usage)}
+            </dd>
+            <dd className="gq-usage-why">{usage.reason || usage.basis}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function CategoryChips({ kind, chosen, onPick, label }: {
+  kind: string
+  chosen: string | null
+  onPick: (category: string) => void
+  label: string
+}) {
+  return (
+    <div className="gj-chips" role="group" aria-label={label}>
+      {rejectCategories(kind).map(category => (
+        <button
+          type="button"
+          key={category}
+          className={category === chosen ? 'gj-chip gj-chip--on' : 'gj-chip'}
+          aria-pressed={category === chosen}
+          onClick={() => onPick(category)}
+        >
+          {categoryLabel(category)}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// ── the command layer, dispatched by kind ────────────────────────────────────────────────────────
+
+interface Outcome {
+  governance_status: string
+  operational_projection: string
+}
+
+async function confirmItem(item: GovernanceQueueItem, note: string): Promise<Outcome> {
+  const body = note ? { note } : {}
+  if (item.kind === 'entity_bridge') return confirmEntityBridge(item.fact_key, body)
+  if (item.kind === 'approved_join') return confirmJoin(item.fact_key, body)
+  return confirmTableFact(item.fact_key, body)
+}
+
+async function rejectItem(
+  item: GovernanceQueueItem,
+  category: string,
+  note: string,
+): Promise<void> {
+  const rest = note ? { note } : {}
+  // The category came from this kind's OWN vocabulary list, which is why the narrowing is safe.
+  if (item.kind === 'entity_bridge') {
+    await rejectEntityBridge(item.fact_key,
+      { category: category as EntityBridgeRejectCategory, ...rest })
+    return
   }
-
-  // 409 = the proposal moved since it was loaded (already-approved-by-you, CAS-stale). Show the
-  // server's detail and reload the current queue — never blind-retry the command.
-  async function onConflict(detail: string) {
-    await load(loadedSource)
-    setNotice(detail)
+  if (item.kind === 'approved_join') {
+    await rejectJoin(item.fact_key, { category: category as RejectCategory, ...rest })
+    return
   }
+  await rejectTableFact(item.fact_key, { category: category as TableFactRejectCategory, ...rest })
+}
 
-  // Acknowledge = advisory bookkeeping ("seen — the verified join stands / is being handled").
-  // It never touches the join or its edge; on success the row leaves the open list, so the
-  // standard reload refreshes the whole queue (load() never rejects — fetches settle per-tab).
-  async function acknowledge(divergenceId: number) {
-    setAckBusyId(divergenceId)
-    setAckError('')
+function projectionNote(projection: string): string {
+  if (projection === 'projected') return ' The operational link is live and stays revocable.'
+  if (projection === 'pending') {
+    return ' The operational projection is deferred to the next caught-up ingest.'
+  }
+  if (projection === 'demoted') return ' Any operational link it had was removed.'
+  return ''
+}
+
+// ── one row ──────────────────────────────────────────────────────────────────────────────────────
+
+interface RowProps {
+  item: GovernanceQueueItem
+  onDone: (message: string) => void
+  onConflict: (detail: string) => void
+}
+
+function QueueRow({ item, onDone, onConflict }: RowProps) {
+  const [panel, setPanel] = useState<'none' | 'confirm' | 'reject'>('none')
+  const [agreed, setAgreed] = useState(false)
+  const [note, setNote] = useState('')
+  const [category, setCategory] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [rowError, setRowError] = useState('')
+
+  const canConfirm = item.available_actions.includes('confirm')
+  const canReject = item.available_actions.includes('reject')
+  const whyId = domId('why', item.fact_key)
+  const provenance = provenanceParts(item)
+
+  async function run(action: () => Promise<string>) {
+    setBusy(true)
+    setRowError('')
     try {
-      await acknowledgeJoinDivergence(divergenceId)
-      await load(loadedSource)
+      onDone(await action())
     } catch (e) {
-      setAckError(errorDetail(e))
+      if (e instanceof ApiError && e.status === 409) {
+        // The fact moved under the reviewer (a concurrent decision, a stale CAS target). Never
+        // blind-retry: surface the server's sentence and let the reload bring the fresh row.
+        onConflict(e.detail)
+        return
+      }
+      setRowError(errorDetail(e))
     } finally {
-      setAckBusyId(null)
+      setBusy(false)
     }
   }
 
   return (
-    <section>
-      <form onSubmit={submit}>
-        <div className="field">
-          <label htmlFor="governance-source">Source</label>
-          <input
-            id="governance-source"
-            value={source}
-            onChange={e => setSource(e.target.value)}
-            placeholder="source name"
-          />
-        </div>
-        <button type="submit" className="btn">
-          Load proposals
+    <div className="gq-row" data-testid={`row-${item.fact_key}`}>
+      <div className="gq-row-head">
+        <span className="gq-row-kind">{kindLabelOne(item.kind)}</span>
+        {item.catalogs.map(slug => (
+          <span className="badge gq-catalog" key={slug} data-testid="gq-catalog">
+            {catalogLabel(slug)}
+          </span>
+        ))}
+      </div>
+      <p className="gq-row-headline">{headline(item)}</p>
+      <p className="mono gq-row-subject">{item.subject}</p>
+      <Axes item={item} />
+      {provenance.length > 0 && <p className="gq-prov">{provenance.join(' · ')}</p>}
+      <Usage usages={item.already_depended_on_by} />
+
+      <div className="gj-actions gq-actions">
+        <button
+          type="button"
+          className="btn btn--primary"
+          disabled={!canConfirm || busy}
+          aria-describedby={canConfirm ? undefined : whyId}
+          onClick={() => setPanel(p => (p === 'confirm' ? 'none' : 'confirm'))}
+        >
+          {panel === 'confirm' ? 'Cancel' : 'Confirm…'}
         </button>
-      </form>
-      {notice && (
-        <p role="alert" className="error">
-          {notice}
-        </p>
-      )}
-      {(proposals || tableFacts || readiness) && (
-        <div className="viewtoggle" role="group" aria-label="Proposal kind">
-          <button type="button" aria-pressed={tab === 'joins'} onClick={() => setTab('joins')}>
-            Joins ({proposals ? proposals.length : '—'})
-          </button>
-          <button type="button" aria-pressed={tab === 'facts'} onClick={() => setTab('facts')}>
-            Grain &amp; availability ({tableFacts ? tableFacts.length : '—'})
-          </button>
+        {canReject && (
           <button
             type="button"
-            aria-pressed={tab === 'readiness'}
-            onClick={() => setTab('readiness')}
+            className="btn q-ghost"
+            disabled={busy}
+            onClick={() => setPanel(p => (p === 'reject' ? 'none' : 'reject'))}
           >
-            Readiness ({readiness ? readiness.length : '—'})
+            {panel === 'reject' ? 'Cancel reject' : 'Reject…'}
           </button>
-        </div>
-      )}
-      {tab === 'joins' && joinsError && (
-        <p role="alert" className="error">
-          {joinsError}
-        </p>
-      )}
-      {tab === 'facts' && factsError && (
-        <p role="alert" className="error">
-          {factsError}
-        </p>
-      )}
-      {tab === 'readiness' && readinessError && (
-        <p role="alert" className="error">
-          {readinessError}
-        </p>
-      )}
-      {tab === 'joins' && divergences && divergences.length > 0 && (
-        // Governed-join drift (#14): a re-upload disputes what admins VERIFIED. Warning-toned
-        // and ABOVE the proposals list; the only action is Acknowledge ("seen") — adopting a
-        // retarget goes through the existing proposal flow below, never a button here.
-        <div className="callout callout--warn" role="alert">
-          <div className="callout-body">
-            <p>
-              <strong>
-                The latest upload disputes{' '}
-                {divergences.length === 1
-                  ? 'a join you verified'
-                  : `${divergences.length} joins you verified`}
-                .
-              </strong>{' '}
-              Acknowledging records only that a reviewer has seen it — it never retires or
-              changes a verified join.
-            </p>
-            <ul className="gj-drift-list">
-              {divergences.map(d => (
-                <li className="gj-drift-item" key={d.id}>
-                  <p className="gj-drift-line">
-                    {d.kind === 'retargeted' ? (
-                      <>
-                        ⚠ The source changed a join you verified —{' '}
-                        <span className="mono">{d.from_ref}</span>: you verified →{' '}
-                        <span className="mono">{d.verified_to_ref}</span>, but the latest upload
-                        declares → <span className="mono">{d.declared_to_ref}</span>.
-                      </>
-                    ) : (
-                      <>
-                        ⚠ The source dropped a join you verified —{' '}
-                        <span className="mono">{d.from_ref}</span>: you verified →{' '}
-                        <span className="mono">{d.verified_to_ref}</span>, but the latest upload
-                        no longer declares this join.
-                      </>
-                    )}
-                  </p>
-                  <p className="gj-drift-note">
-                    The verified join stays operational until an admin acts — it was not
-                    auto-changed.
-                    {d.kind === 'retargeted' && (
-                      <>
-                        {' '}
-                        To adopt the new target, confirm it in the open proposals below — it
-                        already appears there as a pending proposal.
-                      </>
-                    )}
-                  </p>
-                  <div className="gj-actions">
-                    <button
-                      type="button"
-                      className="btn q-ghost"
-                      aria-label={`Acknowledge divergence for ${d.from_ref}`}
-                      disabled={ackBusyId !== null}
-                      onClick={() => void acknowledge(d.id)}
-                    >
-                      {ackBusyId === d.id ? 'Acknowledging…' : 'Acknowledge'}
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-            {ackError && (
-              <p className="field-error" role="alert">
-                {ackError}
-              </p>
-            )}
+        )}
+        {!canConfirm && (
+          <span className="gq-why" id={whyId} data-testid="gq-action-why">
+            {withheldReason(item)}
+          </span>
+        )}
+      </div>
+
+      {panel === 'confirm' && (
+        <div className="gq-panel">
+          <p className="gq-panel-head">What your confirmation records</p>
+          <label className="gj-check">
+            <input type="checkbox" checked={agreed} onChange={() => setAgreed(a => !a)} />
+            <span>{agreement(item)}</span>
+          </label>
+          <p className="gq-panel-note">
+            This records that a person agrees with the relationship, and who. It does not change
+            whether the platform may use it, and it does not change the automatic execution-safety
+            verdict above — both of those are decided without you.
+          </p>
+          <input
+            aria-label="Note for the record (optional)"
+            placeholder="Optional note — what you checked; recorded for audit"
+            value={note}
+            onChange={e => setNote(e.target.value)}
+          />
+          <div className="gj-actions">
+            <button
+              type="button"
+              className="btn btn--primary"
+              disabled={!agreed || busy}
+              onClick={() => void run(async () => {
+                const result = await confirmItem(item, note.trim())
+                return `Your agreement is recorded — ${headline(item)} is now `
+                  + `${result.governance_status.toLowerCase().replaceAll('_', ' ')}.`
+                  + projectionNote(result.operational_projection)
+              })}
+            >
+              {busy ? 'Recording…' : 'Record my confirmation'}
+            </button>
+            {!agreed && <span className="gj-gate-hint">tick the statement you agree with</span>}
           </div>
         </div>
       )}
-      {tab === 'joins' && proposals?.length === 0 && (
-        <p className="empty" role="status">
-          No open join proposals for this source.
-        </p>
-      )}
-      {tab === 'joins' && proposals && proposals.length > 0 && (
-        <>
-          <div className="callout callout--accent">
-            <div className="callout-body">
-              <p>
-                <strong>Approve deliberately.</strong> The match score is advisory, not a verdict
-                — a plausible-but-wrong join can score high, which is exactly why two different
-                admins must confirm every join before the planner can use it. Nothing here touches
-                the live graph until it is verified.
-              </p>
-            </div>
+
+      {panel === 'reject' && (
+        <div className="gq-panel">
+          <p className="gq-panel-head">Why this is not a real relationship</p>
+          <CategoryChips
+            kind={item.kind}
+            chosen={category}
+            onPick={setCategory}
+            label="Rejection reason"
+          />
+          <input
+            aria-label="Rejection note (optional)"
+            placeholder="Optional note…"
+            value={note}
+            onChange={e => setNote(e.target.value)}
+          />
+          <div className="gj-actions">
+            <button
+              type="button"
+              className="btn btn--danger"
+              disabled={!category || busy}
+              onClick={() => void run(async () => {
+                const chosen = category ?? ''
+                await rejectItem(item, chosen, note.trim())
+                return `Recorded as ${categoryLabel(chosen)} — ${headline(item)} will not be `
+                  + 'treated as a real relationship. Your reason is on the governance dashboard.'
+              })}
+            >
+              {busy ? 'Recording…' : 'Record my rejection'}
+            </button>
+            {!category && <span className="gj-gate-hint">pick a reason first</span>}
           </div>
-          <p className="tabular-nums" role="status">
-            {proposals.length} open proposal{proposals.length === 1 ? '' : 's'} ·{' '}
-            {proposals.filter(p => decided.has(p.fact_key)).length} decided this session
-          </p>
-          <ul className="rows">
-            {proposals.map(p => {
-              const decision = decided.get(p.fact_key)
-              if (decision) {
-                return (
-                  <li className="row q-item q-item--resolved" key={p.fact_key}>
-                    <div className="q-head">
-                      <span className="mono">
-                        Join · {p.from.table}.{p.from.column} → {p.to.table}.{p.to.column}
-                      </span>
-                      <span className={`badge ${decision.tone}`}>{decision.badge}</span>
-                    </div>
-                    <p className="q-note">{decision.note}</p>
-                  </li>
-                )
-              }
-              return (
-                <JoinCard
-                  key={`${generation}:${p.fact_key}`}
-                  proposal={p}
-                  onDecided={onDecided}
-                  onConflict={onConflict}
-                />
-              )
-            })}
-          </ul>
-        </>
+        </div>
       )}
-      {tab === 'facts' && tableFacts?.length === 0 && (
-        <p className="empty" role="status">
-          No open grain or availability proposals for this source.
+
+      {rowError && (
+        <p className="field-error" role="alert">
+          {rowError}
         </p>
       )}
-      {tab === 'facts' && tableFacts && tableFacts.length > 0 && (
-        <>
-          <div className="callout callout--accent">
-            <div className="callout-body">
-              <p>
-                <strong>One approval makes it operational.</strong> These grain and as-of facts
-                were inferred by the LLM from names and descriptions — no data was profiled.
-                Your single confirmation verifies the fact and projects it into what planners
-                read, so work the checklist as the verification the pipeline never did.
-              </p>
-            </div>
+    </div>
+  )
+}
+
+// ── one candidate group ──────────────────────────────────────────────────────────────────────────
+
+// Several bridges proposing the SAME entity between the SAME two catalogs are the cross-product of
+// two facts, not several findings, so they get one card and one judgement. Reject-all fans out to
+// one governed command per key server-side (each with its own audit row and its own savepoint),
+// which is why partial outcomes are ordinary and the result is reported as a split.
+function CandidateGroup({ entry, onDone, onConflict }: {
+  entry: Entry
+  onDone: (message: string) => void
+  onConflict: (detail: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [rejecting, setRejecting] = useState(false)
+  const [category, setCategory] = useState<string | null>(null)
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [groupError, setGroupError] = useState('')
+
+  const items = entry.items
+  const group = entry.group ?? { entity: '(unnamed entity)', catalogs: [] }
+  const count = items.length
+
+  // The two axes again at group level: one distinct value each, or an honest "mixed".
+  function shared(read: (item: GovernanceQueueItem) => string): string {
+    const values = new Set(items.map(read))
+    return values.size === 1 ? [...values][0] : `mixed across the ${count} candidates`
+  }
+
+  async function rejectAll() {
+    if (!category) return
+    setBusy(true)
+    setGroupError('')
+    try {
+      const result = await bulkRejectEntityBridges(
+        items.map(item => item.fact_key),
+        category as EntityBridgeRejectCategory,
+        note.trim() || undefined,
+      )
+      const settled = (result.counts.rejected ?? 0) + (result.counts.already_rejected ?? 0)
+      const refused = (result.counts.denied ?? 0) + (result.counts.not_found ?? 0)
+        + (result.counts.failed ?? 0)
+      onDone(`${settled} of ${count} candidate links recorded as ${categoryLabel(category)}`
+        + `${refused > 0 ? `; ${refused} the server did not settle` : ''}.`)
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        onConflict(e.detail)
+        return
+      }
+      setGroupError(errorDetail(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="gq-group">
+      <div className="gq-row-head">
+        <span className="gq-row-kind">{kindLabelOne('entity_bridge')}s</span>
+        {group.catalogs.map(slug => (
+          <span className="badge gq-catalog" key={slug} data-testid="gq-catalog">
+            {catalogLabel(slug)}
+          </span>
+        ))}
+      </div>
+      <p className="gq-row-headline">
+        {count} candidate links for the same {group.entity}
+        {group.catalogs.length === 2
+          ? `, between ${group.catalogs.map(catalogLabel).join(' and ')}`
+          : ''}
+      </p>
+      <p className="gq-group-note">
+        These are the cross-product of the same two facts — one judgement settles the set. Open them
+        if one of the pairs is the right one.
+      </p>
+      <dl className="gq-axes">
+        <Axis
+          testid="axis-execution"
+          code="group"
+          tone="quiet"
+          label="Automatic execution safety"
+          value={shared(item => item.production_eligibility
+            ?? EXECUTION_ABSENT[item.production_eligibility_code] ?? 'Not reported')}
+        />
+        <Axis
+          testid="axis-review"
+          code="group"
+          tone="quiet"
+          label="Human review"
+          value={shared(item => item.state)}
+        />
+      </dl>
+
+      <div className="gj-actions gq-actions">
+        <button
+          type="button"
+          className="btn q-ghost"
+          disabled={busy}
+          onClick={() => setRejecting(r => !r)}
+        >
+          {rejecting ? 'Cancel' : 'Reject the whole group…'}
+        </button>
+        <button type="button" className="btn q-ghost" onClick={() => setOpen(o => !o)}>
+          {open ? `Hide the ${count} candidates` : `Show the ${count} candidates`}
+        </button>
+      </div>
+
+      {rejecting && (
+        <div className="gq-panel">
+          <p className="gq-panel-head">Why none of these {count} pairs is a real relationship</p>
+          <CategoryChips
+            kind="entity_bridge"
+            chosen={category}
+            onPick={setCategory}
+            label="Rejection reason for the group"
+          />
+          <input
+            aria-label="Group rejection note (optional)"
+            placeholder="Optional note…"
+            value={note}
+            onChange={e => setNote(e.target.value)}
+          />
+          <div className="gj-actions">
+            <button
+              type="button"
+              className="btn btn--danger"
+              disabled={!category || busy}
+              onClick={() => void rejectAll()}
+            >
+              {busy ? 'Recording…' : `Reject all ${count} candidates`}
+            </button>
+            {!category && <span className="gj-gate-hint">pick a reason first</span>}
           </div>
-          <p className="tabular-nums" role="status">
-            {tableFacts.length} open proposal{tableFacts.length === 1 ? '' : 's'} ·{' '}
-            {tableFacts.filter(p => decided.has(p.fact_key)).length} decided this session
+          <p className="gq-panel-note">
+            Each one is recorded as its own governed decision with its own audit trail, so some may
+            settle while others are refused — the result says which.
           </p>
-          <ul className="rows">
-            {tableFacts.map(p => {
-              const decision = decided.get(p.fact_key)
-              if (decision) {
-                return (
-                  <li className="row q-item q-item--resolved" key={p.fact_key}>
-                    <div className="q-head">
-                      <span className="mono">
-                        {p.fact_type === 'grain' ? 'Grain' : 'As-of'} · {p.table}
-                      </span>
-                      <span className={`badge ${decision.tone}`}>{decision.badge}</span>
-                    </div>
-                    <p className="q-note">{decision.note}</p>
-                  </li>
-                )
-              }
-              return (
-                <TableFactCard
-                  key={`${generation}:${p.fact_key}`}
-                  proposal={p}
-                  onDecided={onDecided}
-                  onConflict={onConflict}
-                />
-              )
-            })}
-          </ul>
-        </>
+        </div>
       )}
-      {tab === 'readiness' && readiness?.length === 0 && (
-        <p className="empty" role="status">
-          No tables with relationship readiness for this source.
-        </p>
-      )}
-      {tab === 'readiness' && readiness && readiness.length > 0 && (
-        // READ-ONLY diagnostic: one compact row per table — where its join relationships stand
-        // (the precedence-folded status) plus the per-category pair counts. No actions here;
-        // confirming happens on the Joins tab.
-        <>
-          <p className="tabular-nums" role="status">
-            {readiness.length} table{readiness.length === 1 ? '' : 's'} ·{' '}
-            {readiness.filter(r => r.status === 'confirmed').length} with a confirmed join
-          </p>
-          <ul className="rows">
-            {readiness.map(r => (
-              <li className="row q-item" key={`${r.schema}.${r.table}`}>
-                <div className="q-head">
-                  <span className="mono gj-kind">
-                    {r.schema}.{r.table}
-                  </span>
-                  <span className={`badge ${READINESS_BADGE[r.status].tone}`}>
-                    {READINESS_BADGE[r.status].label}
-                  </span>
-                  <span className="gj-score">{pairCounts(r)}</span>
-                </div>
+
+      {open && (
+        <div role="group" aria-label={`The ${count} candidate links in this group`}>
+          <ul className="rows gq-members">
+            {items.map(item => (
+              <li className="row q-item gq-member" key={item.fact_key}>
+                <QueueRow item={item} onDone={onDone} onConflict={onConflict} />
               </li>
             ))}
           </ul>
-        </>
+        </div>
+      )}
+
+      {groupError && (
+        <p className="field-error" role="alert">
+          {groupError}
+        </p>
+      )}
+    </div>
+  )
+}
+
+// The page's own reason for existing, stated before any row: these are the judgements a machine
+// cannot make on its own behalf.
+function Purpose(): ReactNode {
+  return (
+    <div className="callout callout--accent gq-purpose" data-testid="gq-purpose">
+      <div className="callout-body">
+        <p>
+          <strong>Decisions only a person can make.</strong> The system proposes and you dispose:
+          everything below was derived automatically, and what it needs from you is a judgement
+          about meaning. Confirming records that a human agrees with a relationship — who agreed,
+          and when. It is not a switch, and nothing here is held back pending your say-so.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+// ── the screen ───────────────────────────────────────────────────────────────────────────────────
+
+// initialSource: the governance dashboard -> review handoff rides the URL (?source=). It is a
+// PRESELECTED FILTER now, never a precondition — the queue loads whole either way, and a slug that
+// names no visible catalog is dropped rather than left filtering everything out.
+export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?: string }) {
+  const [queue, setQueue] = useState<GovernanceQueue | null>(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [notice, setNotice] = useState('')
+  const [limit, setLimit] = useState(100)
+  const [catalog, setCatalog] = useState<string | null>(initialSource.trim().toLowerCase() || null)
+  const [kindFilter, setKindFilter] = useState<string | null>(null)
+
+  // Monotonic id per load: a late response from a superseded load must never overwrite newer data.
+  const loadSeq = useRef(0)
+
+  const load = useCallback(async () => {
+    const id = ++loadSeq.current
+    setLoading(true)
+    try {
+      const next = await getGovernanceQueue(limit)
+      if (id !== loadSeq.current) return
+      setQueue(next)
+      setError('')
+      // A handoff slug for a catalog this caller cannot see would otherwise filter the screen down
+      // to nothing — exactly the blank page this rewrite exists to remove.
+      setCatalog(current => (current !== null && !next.catalogs.includes(current) ? null : current))
+    } catch (e) {
+      if (id !== loadSeq.current) return
+      setQueue(null)
+      setError(errorDetail(e))
+    } finally {
+      if (id === loadSeq.current) setLoading(false)
+    }
+  }, [limit])
+
+  // The whole point: the work is fetched on arrival. No source to type, no button to press.
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  // A later deep link can change the handoff source while the screen stays mounted.
+  useEffect(() => {
+    setCatalog(initialSource.trim().toLowerCase() || null)
+  }, [initialSource])
+
+  function onDone(message: string) {
+    setNotice(message)
+    void load()
+  }
+
+  function onConflict(detail: string) {
+    setNotice(detail)
+    void load()
+  }
+
+  if (error) {
+    return (
+      <section className="gq">
+        <Purpose />
+        <p role="alert" className="error">
+          {error}
+        </p>
+      </section>
+    )
+  }
+
+  if (!queue) {
+    return (
+      <section className="gq">
+        <Purpose />
+        <p className="empty" role="status">
+          {loading ? 'Loading every decision waiting for you…' : 'Nothing loaded.'}
+        </p>
+      </section>
+    )
+  }
+
+  const items = queue.items.filter(item =>
+    (catalog === null || item.catalogs.includes(catalog))
+    && (kindFilter === null || item.kind === kindFilter))
+  // The kind list comes from the payload (order included), never from a hardcoded set — an unknown
+  // kind from a newer backend gets a chip, a section and a readable label.
+  const kinds = Object.keys(queue.items_visible_to_you_by_kind)
+  const shownKinds = kindFilter === null ? kinds : kinds.filter(kind => kind === kindFilter)
+  const actionable = items.filter(item => item.available_actions.length > 0).length
+  const elsewhere = items.filter(item =>
+    !item.available_actions.includes('confirm') && item.state_code !== 'human_endorsed').length
+
+  return (
+    <section className="gq">
+      <Purpose />
+
+      {notice && (
+        <p role="status" className="callout callout--accent gq-notice" data-testid="gq-notice">
+          {notice}
+        </p>
+      )}
+
+      {!queue.complete && (
+        <div className="callout callout--warn" data-testid="gq-incomplete" role="status">
+          <div className="callout-body">
+            <p>
+              <strong>This list is incomplete.</strong> Something could not be read, so what is
+              below is what we could see — not necessarily everything that is waiting.
+            </p>
+            <ul>
+              {queue.unreadable.map(entry => (
+                <li key={`${entry.listing}:${entry.source ?? ''}`}>
+                  {kindLabel(entry.listing)}
+                  {entry.source ? ` in ${catalogLabel(entry.source)}` : ''}: {entry.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      <div className="stats gq-summary" data-testid="gq-summary">
+        <div className="stat">
+          <b>{items.length}</b> waiting for a person
+        </div>
+        {shownKinds.map(kind => (
+          <div className="stat" key={kind}>
+            <b>{items.filter(item => item.kind === kind).length}</b> {kindLabel(kind).toLowerCase()}
+          </div>
+        ))}
+        <div className="stat">
+          <b>{actionable}</b> you can decide now
+        </div>
+        <div className="stat">
+          <b>{elsewhere}</b> need a different reviewer
+        </div>
+      </div>
+      <p className="hint" data-testid="gq-scope-note">
+        Across {queue.catalogs.length} catalog{queue.catalogs.length === 1 ? '' : 's'} you can see
+        {queue.catalogs.length > 0 ? `: ${queue.catalogs.map(catalogLabel).join(', ')}` : ''}. Every
+        count here is scope-relative — it describes what you can see, never a catalog total.
+      </p>
+
+      <div className="gq-filters">
+        <div className="gj-chips" role="group" aria-label="Catalog" data-testid="gq-catalog-filter">
+          <button
+            type="button"
+            className={catalog === null ? 'gj-chip gj-chip--on' : 'gj-chip'}
+            aria-pressed={catalog === null}
+            onClick={() => setCatalog(null)}
+          >
+            All catalogs
+          </button>
+          {queue.catalogs.map(slug => (
+            <button
+              type="button"
+              key={slug}
+              className={catalog === slug ? 'gj-chip gj-chip--on' : 'gj-chip'}
+              aria-pressed={catalog === slug}
+              onClick={() => setCatalog(slug)}
+            >
+              {catalogLabel(slug)} ({queue.items_visible_to_you_by_catalog[slug] ?? 0})
+            </button>
+          ))}
+        </div>
+        <div
+          className="gj-chips"
+          role="group"
+          aria-label="Decision kind"
+          data-testid="gq-kind-filter"
+        >
+          <button
+            type="button"
+            className={kindFilter === null ? 'gj-chip gj-chip--on' : 'gj-chip'}
+            aria-pressed={kindFilter === null}
+            onClick={() => setKindFilter(null)}
+          >
+            All kinds
+          </button>
+          {kinds.map(kind => (
+            <button
+              type="button"
+              key={kind}
+              className={kindFilter === kind ? 'gj-chip gj-chip--on' : 'gj-chip'}
+              aria-pressed={kindFilter === kind}
+              onClick={() => setKindFilter(kind)}
+            >
+              {kindLabel(kind)} ({queue.items_visible_to_you_by_kind[kind] ?? 0})
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {shownKinds.map(kind => {
+        const forKind = items.filter(item => item.kind === kind)
+        const entries = entriesFor(kind, forKind)
+        const broken = queue.unreadable.filter(entry =>
+          unreadableListings(kind).includes(entry.listing))
+        const where = catalog === null ? 'the catalogs you can see' : catalogLabel(catalog)
+        return (
+          <section className="gq-kind" key={kind} data-testid={`kind-${kind}`}>
+            <h3 className="gq-kind-head">
+              {kindLabel(kind)} <span className="tabular-nums">{forKind.length}</span>
+            </h3>
+            {KIND_ABOUT[kind] && <p className="hint gq-kind-about">{KIND_ABOUT[kind]}</p>}
+            {forKind.length === 0 && broken.length > 0 && (
+              <p className="empty gq-broken">
+                We could not look here.{' '}
+                {broken.map(entry => `${entry.reason}${entry.source
+                  ? ` (${catalogLabel(entry.source)})`
+                  : ''}`).join('; ')}. An empty list here is not a settled one.
+              </p>
+            )}
+            {forKind.length === 0 && broken.length === 0 && (
+              <p className="empty gq-settled" role="status">
+                Nothing to review — no {kindLabelOne(kind).toLowerCase()} is waiting for a decision
+                in {where}. Everything proposed here has already been decided, and the platform
+                keeps working either way.
+              </p>
+            )}
+            {entries.length > 0 && (
+              <ul className="rows">
+                {entries.map(entry => (
+                  <li className="row q-item" key={entry.key} data-testid="queue-entry">
+                    {entry.group
+                      ? <CandidateGroup entry={entry} onDone={onDone} onConflict={onConflict} />
+                      : (
+                          <QueueRow
+                            item={entry.items[0]}
+                            onDone={onDone}
+                            onConflict={onConflict}
+                          />
+                        )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )
+      })}
+
+      {queue.truncated && (
+        <p className="hint">
+          More decisions are waiting than this page holds (it shows up to {limit}).{' '}
+          <button type="button" className="btn q-ghost" onClick={() => setLimit(500)}>
+            Show more
+          </button>
+        </p>
       )}
     </section>
-  )
-}
-
-interface JoinCardProps {
-  proposal: JoinProposal
-  onDecided: (factKey: string, decision: Decision) => void
-  onConflict: (detail: string) => void
-}
-
-function JoinCard({ proposal: p, onDecided, onConflict }: JoinCardProps) {
-  const [checked, setChecked] = useState<Set<number>>(new Set())
-  const [noteDraft, setNoteDraft] = useState('')
-  const [rejectOpen, setRejectOpen] = useState(false)
-  const [category, setCategory] = useState<RejectCategory | null>(null)
-  const [rejectNote, setRejectNote] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [cardError, setCardError] = useState('')
-
-  const badge = STATUS_BADGE[p.status]
-  const score = typeof p.evidence.score === 'number' ? p.evidence.score : null
-  const cardinality = p.cardinality ?? 'unknown'
-  const firstApproval = p.status === 'PARTIALLY_CONFIRMED' ? p.approvals[0] : undefined
-  const approverName = firstApproval ? (firstApproval.display_name ?? firstApproval.subject) : null
-
-  // The what-to-verify checklist that gates Approve: 4 baseline items, plus one derived item per
-  // positive signal — but ONLY when the evidence actually parsed (a missing/invalid record must
-  // not silently shrink what the reviewer confirms; the baseline still gates).
-  const signals =
-    p.evidence_parse_status === 'parsed' || p.evidence_parse_status === 'partial'
-      ? (p.evidence.positive_signals ?? [])
-      : []
-  const items: ReactNode[] = [
-    <>
-      I reviewed the join <strong>direction</strong> —{' '}
-      <span className="mono">
-        {p.from.table}.{p.from.column}
-      </span>{' '}
-      joins into{' '}
-      <span className="mono">
-        {p.to.table}.{p.to.column}
-      </span>
-      , not the reverse.
-    </>,
-    <>
-      I reviewed the <strong>cardinality</strong> (<span className="mono">{cardinality}</span>) —
-      it matches how these tables actually relate.
-    </>,
-    <>
-      I understand this join was <strong>matched on metadata, not value-verified</strong> — no
-      sample rows were compared.
-    </>,
-    <>
-      I confirm this join becomes <strong>operational</strong> once a second admin approves — the
-      feature planner will traverse it.
-    </>,
-    ...signals.map(s => (
-      <>
-        Signal <span className="mono">{s.signal_name.replaceAll('_', ' ')}</span>{' '}
-        <span className="gj-signal-w">(+{s.score_delta})</span> — I checked it actually holds
-        here.
-      </>
-    )),
-  ]
-  const allChecked = checked.size === items.length
-
-  function toggle(i: number) {
-    setChecked(prev => {
-      const next = new Set(prev)
-      if (next.has(i)) next.delete(i)
-      else next.add(i)
-      return next
-    })
-  }
-
-  async function approve() {
-    setBusy(true)
-    setCardError('')
-    try {
-      const note = noteDraft.trim()
-      const res = await confirmJoin(p.fact_key, note ? { note } : {})
-      onDecided(p.fact_key, {
-        badge: res.governance_status === 'VERIFIED' ? 'verified · live' : 'awaiting 2nd',
-        tone: res.governance_status === 'VERIFIED' ? 'gj-verified' : 'gj-partial',
-        note: approvedNote(res.governance_status, res.operational_projection),
-      })
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
-        onConflict(e.detail) // reloads the list; this card remounts with fresh data
-        return
-      }
-      setCardError(e instanceof ApiError ? e.detail : String(e))
-      setBusy(false)
-    }
-  }
-
-  async function reject() {
-    if (!category) return
-    setBusy(true)
-    setCardError('')
-    try {
-      const note = rejectNote.trim()
-      await rejectJoin(p.fact_key, note ? { category, note } : { category })
-      onDecided(p.fact_key, {
-        badge: `rejected · ${categoryLabel(category)}`,
-        tone: 'gj-rejected',
-        note: `Rejected (${categoryLabel(category)}) — recorded and surfaced on the governance dashboard.`,
-      })
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
-        onConflict(e.detail)
-        return
-      }
-      setCardError(e instanceof ApiError ? e.detail : String(e))
-      setBusy(false)
-    }
-  }
-
-  return (
-    <li className="row q-item">
-      <div className="q-head">
-        <span className="mono gj-kind">Join · {p.from.column}</span>
-        <span className={`badge ${badge.tone}`}>{badge.label}</span>
-        <span className="gj-score">
-          {score !== null ? (
-            <>
-              match <b>{score}</b>/100 · advisory
-            </>
-          ) : (
-            <>score unavailable ({p.evidence_parse_status})</>
-          )}
-        </span>
-      </div>
-
-      <div className="gj-join">
-        <div className="gj-endp">
-          <span className="k">from</span>
-          <span className="tbl">{p.from.table}</span>
-          <span className="col">.{p.from.column}</span>
-        </div>
-        <div className="gj-arrow" aria-hidden="true">
-          <span className="g">→</span>
-          <span className="cr">{cardinality}</span>
-        </div>
-        <div className="gj-endp">
-          <span className="k">to</span>
-          <span className="tbl">{p.to.table}</span>
-          <span className="col">.{p.to.column}</span>
-        </div>
-      </div>
-
-      {firstApproval && (
-        <div className="gj-prior">
-          <span>
-            <span className="who">{approverName ?? 'A first admin'} approved</span>
-            {firstApproval.note ? (
-              <>
-                {' '}
-                — <span className="q">"{firstApproval.note}"</span>
-              </>
-            ) : (
-              <> — no note left.</>
-            )}
-          </span>
-        </div>
-      )}
-
-      <div className="gj-consequence">
-        <span>
-          <b>If approved:</b> the planner can join <span className="mono">{p.from.table}</span> to{' '}
-          <span className="mono">{p.to.table}</span> ({cardinality}) in every feature it builds.{' '}
-          <span className="gj-risk">
-            <b>If wrong:</b> every feature crossing this join attaches {p.from.table} rows to the
-            wrong {p.to.table} row.
-          </span>
-        </span>
-      </div>
-
-      <p className="gj-caution">
-        Matched on metadata (column names + business concepts). No sample rows were compared —
-        you are verifying meaning, not data.
-      </p>
-
-      <div className="gj-verify">
-        <p className="gj-verify-h">
-          {p.status === 'PARTIALLY_CONFIRMED'
-            ? 'Confirm before you complete the approval'
-            : 'Confirm before approving'}
-        </p>
-        {items.map((body, i) => (
-          // eslint-disable-next-line react/no-array-index-key -- positional: items never reorder
-          <label className="gj-check" key={i}>
-            <input type="checkbox" checked={checked.has(i)} onChange={() => toggle(i)} />
-            <span>{body}</span>
-          </label>
-        ))}
-      </div>
-
-      {firstApproval && (
-        <p className="gj-approvals">
-          1 of 2 · approved by <b>{approverName ?? 'unknown'}</b> · a different admin must confirm
-        </p>
-      )}
-
-      <div className="gj-approve-area">
-        {p.status === 'PROPOSED' && (
-          // Only the FIRST approver leaves a note "for the next approver" — once this (second)
-          // approval VERIFIES the join there is no next reader, so the partial card omits it.
-          <input
-            aria-label="Note for the next approver (optional)"
-            placeholder="Note for the 2nd approver (optional) — what you checked, what to watch"
-            value={noteDraft}
-            onChange={e => setNoteDraft(e.target.value)}
-          />
-        )}
-        <div className="gj-actions">
-          <button
-            type="button"
-            className="btn btn--primary"
-            disabled={!allChecked || busy}
-            onClick={() => void approve()}
-          >
-            {busy
-              ? 'Submitting…'
-              : p.status === 'PARTIALLY_CONFIRMED'
-                ? 'Approve as 2nd approver'
-                : 'Approve'}
-          </button>
-          {!allChecked && <span className="gj-gate-hint">tick the checklist to enable</span>}
-          <button
-            type="button"
-            className="btn q-ghost"
-            disabled={busy}
-            onClick={() => setRejectOpen(o => !o)}
-          >
-            {rejectOpen ? 'Cancel reject' : 'Reject…'}
-          </button>
-        </div>
-      </div>
-
-      {rejectOpen && (
-        <div className="gj-rejectbox">
-          <span className="gj-verify-h">Reason (recorded and surfaced on the governance dashboard)</span>
-          <div className="gj-chips" role="group" aria-label="Rejection reason">
-            {REJECT_CATEGORIES.map(c => (
-              <button
-                type="button"
-                key={c}
-                className={c === category ? 'gj-chip gj-chip--on' : 'gj-chip'}
-                aria-pressed={c === category}
-                onClick={() => setCategory(c)}
-              >
-                {categoryLabel(c)}
-              </button>
-            ))}
-          </div>
-          <input
-            aria-label="Rejection note (optional)"
-            placeholder="Optional note…"
-            value={rejectNote}
-            onChange={e => setRejectNote(e.target.value)}
-          />
-          <div className="gj-actions">
-            <button
-              type="button"
-              className="btn btn--danger"
-              disabled={!category || busy}
-              onClick={() => void reject()}
-            >
-              {busy ? 'Submitting…' : 'Confirm rejection'}
-            </button>
-            {!category && <span className="gj-gate-hint">pick a reason to enable</span>}
-          </div>
-        </div>
-      )}
-
-      {cardError && (
-        <p className="field-error" role="alert">
-          {cardError}
-        </p>
-      )}
-    </li>
-  )
-}
-
-interface TableFactCardProps {
-  proposal: TableFactProposal
-  onDecided: (factKey: string, decision: Decision) => void
-  onConflict: (detail: string) => void
-}
-
-// A Pass B grain / availability_time fact. SINGLE-confirmer: one checklist-gated Approve
-// reaches VERIFIED and projects — there is no "1 of 2" partial state on this card.
-function TableFactCard({ proposal: p, onDecided, onConflict }: TableFactCardProps) {
-  const [checked, setChecked] = useState<Set<number>>(new Set())
-  const [noteDraft, setNoteDraft] = useState('')
-  const [rejectOpen, setRejectOpen] = useState(false)
-  const [category, setCategory] = useState<TableFactRejectCategory | null>(null)
-  const [rejectNote, setRejectNote] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [cardError, setCardError] = useState('')
-
-  const isGrain = p.fact_type === 'grain'
-  // Defensive value reads: parse status "missing" means the stored value was unreadable — the
-  // card still renders (and the baseline checklist still gates) with an explicit placeholder,
-  // mirroring the joins gate-stays-gateable property.
-  const value = p.proposed_value ?? {}
-  const columns = isGrain && Array.isArray(value.columns) ? value.columns : []
-  const columnsLabel = columns.length > 0 ? columns.join(' + ') : '(unreadable)'
-  const asOfColumn = (!isGrain && typeof value.column === 'string' && value.column) || '(unreadable)'
-  const basis = (!isGrain && typeof value.basis === 'string' && value.basis) || 'unknown basis'
-  const advisoryParts = [
-    p.advisory.table_role && `role: ${p.advisory.table_role}`,
-    p.advisory.primary_entity && `entity: ${p.advisory.primary_entity}`,
-    p.advisory.event_or_snapshot && `${p.advisory.event_or_snapshot} table`,
-  ].filter((part): part is string => Boolean(part))
-
-  // The what-to-verify checklist that gates Approve: the 4 baseline items per fact_type. Table
-  // facts carry no scored signals, so there are no derived items — the baseline is the whole gate.
-  const items: ReactNode[] = isGrain
-    ? [
-        <>
-          I reviewed the proposed grain <strong>columns</strong> —{' '}
-          <span className="mono">{columnsLabel}</span> — against what one row of{' '}
-          <span className="mono">{p.table}</span> actually is.
-        </>,
-        <>
-          I understand <strong>one row = one {columnsLabel}</strong> determines how every feature
-          on this table aggregates.
-        </>,
-        <>
-          I understand this grain was <strong>LLM-inferred, not value-profiled</strong> —
-          uniqueness was never measured against the data.
-        </>,
-        <>
-          I confirm <span className="mono">{columnsLabel}</span> should be the{' '}
-          <strong>grain</strong> of <span className="mono">{p.table}</span>.
-        </>,
-      ]
-    : [
-        <>
-          I reviewed the as-of <strong>column</strong> (<span className="mono">{asOfColumn}</span>)
-          and its <strong>basis</strong> (<span className="mono">{basis}</span>).
-        </>,
-        <>
-          I understand <strong>point-in-time features</strong> will read{' '}
-          <span className="mono">{asOfColumn}</span> as the as-of date.
-        </>,
-        <>
-          I understand this column was <strong>LLM-inferred, not value-profiled</strong> — no
-          timestamps were sampled.
-        </>,
-        <>
-          I confirm <span className="mono">{asOfColumn}</span> should be the{' '}
-          <strong>availability time</strong> of <span className="mono">{p.table}</span>.
-        </>,
-      ]
-  const allChecked = checked.size === items.length
-
-  function toggle(i: number) {
-    setChecked(prev => {
-      const next = new Set(prev)
-      if (next.has(i)) next.delete(i)
-      else next.add(i)
-      return next
-    })
-  }
-
-  async function approve() {
-    setBusy(true)
-    setCardError('')
-    try {
-      const note = noteDraft.trim()
-      const res = await confirmTableFact(p.fact_key, note ? { note } : {})
-      onDecided(p.fact_key, {
-        badge: res.operational_projection === 'projected' ? 'verified · live' : 'verified · pending',
-        tone: 'gj-verified',
-        note: approvedFactNote(res.operational_projection),
-      })
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
-        onConflict(e.detail) // reloads the list; this card remounts with fresh data
-        return
-      }
-      setCardError(e instanceof ApiError ? e.detail : String(e))
-      setBusy(false)
-    }
-  }
-
-  async function reject() {
-    if (!category) return
-    setBusy(true)
-    setCardError('')
-    try {
-      const note = rejectNote.trim()
-      await rejectTableFact(p.fact_key, note ? { category, note } : { category })
-      onDecided(p.fact_key, {
-        badge: `rejected · ${categoryLabel(category)}`,
-        tone: 'gj-rejected',
-        note: `Rejected (${categoryLabel(category)}) — recorded and surfaced on the governance dashboard.`,
-      })
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
-        onConflict(e.detail)
-        return
-      }
-      setCardError(e instanceof ApiError ? e.detail : String(e))
-      setBusy(false)
-    }
-  }
-
-  return (
-    <li className="row q-item">
-      <div className="q-head">
-        <span className="mono gj-kind">
-          {isGrain ? 'Grain' : 'As-of'} · {p.table}
-        </span>
-        <span className="badge gj-proposed">proposed</span>
-        <span className="gj-score">
-          {p.evidence_parse_status === 'parsed' ? (
-            <>LLM-inferred · not profiled</>
-          ) : (
-            <>value unreadable ({p.evidence_parse_status})</>
-          )}
-        </span>
-      </div>
-
-      <div className="gj-join">
-        <div className="gj-endp">
-          <span className="k">table</span>
-          <span className="tbl">{p.table}</span>
-        </div>
-        <div className="gj-arrow" aria-hidden="true">
-          <span className="g">→</span>
-          <span className="cr">{isGrain ? 'grain' : 'as-of'}</span>
-        </div>
-        {isGrain ? (
-          <div className="gj-endp">
-            <span className="k">one row per</span>
-            <span className="col">{columnsLabel}</span>
-            <span className="tbl">{value.is_unique ? 'proposed unique' : 'uniqueness unconfirmed'}</span>
-          </div>
-        ) : (
-          <div className="gj-endp">
-            <span className="k">as-of column</span>
-            <span className="col">{asOfColumn}</span>
-            <span className="tbl">basis: {basis}</span>
-          </div>
-        )}
-      </div>
-
-      {advisoryParts.length > 0 && (
-        <p className="q-note">Advisory context (LLM-described): {advisoryParts.join(' · ')}</p>
-      )}
-
-      <div className="gj-consequence">
-        {isGrain ? (
-          <span>
-            <b>If approved:</b> one row of <span className="mono">{p.table}</span> = one{' '}
-            <span className="mono">{columnsLabel}</span>; features aggregate to this grain.{' '}
-            <span className="gj-risk">
-              <b>If wrong:</b> counts &amp; per-entity features are miscomputed.
-            </span>
-          </span>
-        ) : (
-          <span>
-            <b>If approved:</b> point-in-time features read{' '}
-            <span className="mono">{asOfColumn}</span> as the as-of date ({basis}).{' '}
-            <span className="gj-risk">
-              <b>If wrong:</b> features silently leak future data or read stale rows.
-            </span>
-          </span>
-        )}
-      </div>
-
-      <p className="gj-caution">
-        LLM-inferred from names &amp; descriptions, not value-profiled — no data was scanned. You
-        are the verification this fact never had.
-      </p>
-
-      <div className="gj-verify">
-        <p className="gj-verify-h">Confirm before approving</p>
-        {items.map((body, i) => (
-          // eslint-disable-next-line react/no-array-index-key -- positional: items never reorder
-          <label className="gj-check" key={i}>
-            <input type="checkbox" checked={checked.has(i)} onChange={() => toggle(i)} />
-            <span>{body}</span>
-          </label>
-        ))}
-      </div>
-
-      <div className="gj-approve-area">
-        <input
-          aria-label="Approval note (optional)"
-          placeholder="Optional note — what you checked; recorded for audit"
-          value={noteDraft}
-          onChange={e => setNoteDraft(e.target.value)}
-        />
-        <div className="gj-actions">
-          <button
-            type="button"
-            className="btn btn--primary"
-            disabled={!allChecked || busy}
-            onClick={() => void approve()}
-          >
-            {busy ? 'Submitting…' : 'Approve'}
-          </button>
-          {!allChecked && <span className="gj-gate-hint">tick the checklist to enable</span>}
-          <button
-            type="button"
-            className="btn q-ghost"
-            disabled={busy}
-            onClick={() => setRejectOpen(o => !o)}
-          >
-            {rejectOpen ? 'Cancel reject' : 'Reject…'}
-          </button>
-        </div>
-      </div>
-
-      {rejectOpen && (
-        <div className="gj-rejectbox">
-          <span className="gj-verify-h">Reason (recorded and surfaced on the governance dashboard)</span>
-          <div className="gj-chips" role="group" aria-label="Rejection reason">
-            {TABLE_FACT_REJECT_CATEGORIES.map(c => (
-              <button
-                type="button"
-                key={c}
-                className={c === category ? 'gj-chip gj-chip--on' : 'gj-chip'}
-                aria-pressed={c === category}
-                onClick={() => setCategory(c)}
-              >
-                {categoryLabel(c)}
-              </button>
-            ))}
-          </div>
-          <input
-            aria-label="Rejection note (optional)"
-            placeholder="Optional note…"
-            value={rejectNote}
-            onChange={e => setRejectNote(e.target.value)}
-          />
-          <div className="gj-actions">
-            <button
-              type="button"
-              className="btn btn--danger"
-              disabled={!category || busy}
-              onClick={() => void reject()}
-            >
-              {busy ? 'Submitting…' : 'Confirm rejection'}
-            </button>
-            {!category && <span className="gj-gate-hint">pick a reason to enable</span>}
-          </div>
-        </div>
-      )}
-
-      {cardError && (
-        <p className="field-error" role="alert">
-          {cardError}
-        </p>
-      )}
-    </li>
   )
 }
