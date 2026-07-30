@@ -668,6 +668,43 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             "target_entity": {"type": ["string", "null"]},
             "ambiguity_note": {"type": ["string", "null"]}},
         "required": ["status", "candidates"]},
+    # Identifier-link semantic critic. Namespace and population are deliberately separate outputs:
+    # neither field carries uniqueness/cardinality/operational eligibility, which remain deterministic.
+    ("bridge_identifier_critique", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "namespace_recommendation": {
+                "type": "string",
+                "enum": ["same", "different", "possible", "unknown"],
+            },
+            "population_hypothesis": {
+                "type": "string",
+                "enum": [
+                    "same",
+                    "left_subset",
+                    "right_subset",
+                    "partial_overlap",
+                    "disjoint",
+                    "unknown",
+                ],
+            },
+            "namespace_reason_codes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "population_reason_codes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "namespace_recommendation",
+            "population_hypothesis",
+            "namespace_reason_codes",
+            "population_reason_codes",
+        ],
+    },
 }
 
 # Pass B v2 (Phase-2 Slice 1, Task 4): the OUTPUT contract is byte-for-byte v1 — v2 exists because

@@ -123,6 +123,42 @@ def _relationship_conflict(observation: RelationshipObservationV2) -> bool:
     )
 
 
+def _observation_matches_stored_realization(
+    conn,
+    observation: RelationshipObservationV2,
+) -> bool:
+    """Verify the evidence tuple/scope against immutable realization bytes before using metrics."""
+    row = conn.execute(
+        "SELECT realization_json FROM bridge_join_realization_revision "
+        "WHERE realization_revision_id=%s",
+        (observation.realization_revision_id,),
+    ).fetchone()
+    if row is None or not isinstance(row[0], dict):
+        return False
+    payload = row[0]
+    try:
+        pairs = payload["column_pairs"]
+        left_columns = tuple(
+            str(pair["from_logical_column_ref"]).rpartition(".")[2]
+            for pair in pairs
+        )
+        right_columns = tuple(
+            str(pair["to_logical_column_ref"]).rpartition(".")[2]
+            for pair in pairs
+        )
+        return (
+            observation.scope_id == payload["applicability_scope"]["scope_id"]
+            and observation.left.binding_revision_id
+            == payload["from_endpoint"]["binding_revision_id"]
+            and observation.right.binding_revision_id
+            == payload["to_endpoint"]["binding_revision_id"]
+            and observation.left.columns == left_columns
+            and observation.right.columns == right_columns
+        )
+    except (KeyError, TypeError):
+        return False
+
+
 def _realization_revision_is_current(conn, realization_revision_id: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM bridge_join_realization_current "
@@ -148,7 +184,8 @@ def record_relationship_observation(
     scope_key = observation.current_scope_key
     payload = observation_to_json(observation)
     quality = _relationship_quality(observation)
-    conflict = _relationship_conflict(observation)
+    applicable = _observation_matches_stored_realization(conn, observation)
+    conflict = applicable and _relationship_conflict(observation)
     conn.execute(
         "INSERT INTO relationship_observation_revision ("
         " observation_revision_id, current_scope_key, realization_revision_id,"
@@ -202,6 +239,14 @@ def record_relationship_observation(
             current_version,
             False,
             "stale_current_pointer",
+        )
+    if not applicable:
+        return RelationshipObservationCurrentV2(
+            scope_key,
+            None if current is None else current[0],
+            current_version,
+            False,
+            "observation_not_for_realization",
         )
     if conflict:
         # A sampled/partial observation cannot prove safety, but one concrete target duplicate or

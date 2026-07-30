@@ -170,10 +170,10 @@ def _executable_pair(
     return (
         _endpoint(
             "cib", "customers", columns,
-            binding=left_binding, binding_revision_id="binding-revision-left-1"),
+            binding=left_binding, binding_revision_id=left_binding.binding_revision_id),
         _endpoint(
             "ftr", "transactions", columns,
-            binding=right_binding, binding_revision_id="binding-revision-right-1"),
+            binding=right_binding, binding_revision_id=right_binding.binding_revision_id),
     )
 
 
@@ -284,12 +284,13 @@ def test_live_evidence_timestamp_is_outside_both_identities():
 
 def test_same_named_physical_table_in_another_hive_database_never_aliases():
     left_a, right = _executable_pair(left_database="hive-primary")
+    dr_binding = _binding(
+        "cib", "customers", database="hive-disaster-recovery",
+        binding_id="binding-cib-dr")
     left_b = replace(
         left_a,
-        physical_binding=_binding(
-            "cib", "customers", database="hive-disaster-recovery",
-            binding_id="binding-cib-dr"),
-        binding_revision_id="binding-revision-left-dr-1",
+        physical_binding=dr_binding,
+        binding_revision_id=dr_binding.binding_revision_id,
     )
     primary = _realization(left_a, right)
     disaster_recovery = _realization(left_b, right)
@@ -299,12 +300,30 @@ def test_same_named_physical_table_in_another_hive_database_never_aliases():
 
 def test_binding_revision_changes_realization_but_not_symmetric_candidate_identity():
     left, right = _executable_pair()
-    rebound = replace(left, binding_revision_id="binding-revision-left-2")
+    assert left.physical_binding is not None
+    changed_binding = replace(
+        left.physical_binding, connection_id="conn-hive-primary-v2")
+    rebound = replace(
+        left,
+        physical_binding=changed_binding,
+        binding_revision_id=changed_binding.binding_revision_id,
+    )
     old_assessment = _assessment(left, right)
     new_assessment = _assessment(rebound, right)
     assert old_assessment.candidate_id == new_assessment.candidate_id
     assert old_assessment.candidate_revision_id != new_assessment.candidate_revision_id
     assert _realization(left, right).realization_id != _realization(rebound, right).realization_id
+
+
+def test_binding_revision_cannot_disagree_with_binding_content():
+    binding = _binding("cib", "customers")
+    with pytest.raises(BridgeContractError, match="must equal"):
+        _endpoint(
+            "cib",
+            "customers",
+            binding=binding,
+            binding_revision_id="fabricated-revision",
+        )
 
 
 def test_parallel_member_and_type_arrays_are_structurally_impossible():

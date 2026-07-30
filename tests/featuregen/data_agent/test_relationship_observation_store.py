@@ -91,7 +91,7 @@ def _observation(db) -> RelationshipObservationV2:
     return RelationshipObservationV2(
         realization_revision_id=revision.realization_revision_id,
         plan_hash="plan-hash-1",
-        scope_id="production-customer-scope",
+        scope_id=revision.applicability_scope.scope_id,
         left=left,
         right=right,
         matched_left_distinct=3,
@@ -175,6 +175,35 @@ def test_newer_partial_conflict_is_history_but_does_not_displace_exact(db) -> No
         db, exact.current_scope_key) is None
     assert latest_relationship_conflict(
         db, exact.realization_revision_id) == partial
+
+
+def test_wrong_tuple_cannot_demote_the_named_realization(db) -> None:
+    observation = _observation(db)
+    wrong_tuple_with_fanout = replace(
+        observation,
+        left=replace(observation.left, columns=("wrong_customer_id",)),
+        right=replace(
+            observation.right,
+            row_count=4,
+            non_null_row_count=4,
+            distinct_tuple_count=3,
+            duplicate_tuple_count=1,
+            duplicate_row_count=1,
+            max_rows_per_tuple=2,
+        ),
+        max_right_matches_per_left_row=2,
+    )
+    result = record_relationship_observation(
+        db, wrong_tuple_with_fanout, expected_pointer_version=0)
+    assert not result.became_current
+    assert result.reason == "observation_not_for_realization"
+    assert db.execute(
+        "SELECT lifecycle FROM bridge_join_realization_current "
+        "WHERE realization_revision_id=%s",
+        (observation.realization_revision_id,),
+    ).fetchone()[0] == "active"
+    assert latest_relationship_conflict(
+        db, observation.realization_revision_id) is None
 
 
 def test_observation_for_a_stale_realization_cannot_become_current(db) -> None:

@@ -146,6 +146,8 @@ def strongest_evidence_label(evidence_refs: Iterable[EvidenceRefV1]) -> str | No
     refs = tuple(evidence_refs)
     if not refs:
         return None
+    if all(ref.kind is EvidenceKind.LLM_RECOMMENDATION for ref in refs):
+        return "llm_only"
     return max(refs, key=lambda ref: (_EVIDENCE_DISPLAY_RANK[ref.kind], ref.kind.value)).kind.value
 
 
@@ -249,6 +251,9 @@ class IdentifierEndpointV1:
         if self.binding_revision_id is not None and self.physical_binding is None:
             raise BridgeContractError("binding_revision_id requires a physical_binding")
         if self.physical_binding is not None:
+            if self.binding_revision_id != self.physical_binding.binding_revision_id:
+                raise BridgeContractError(
+                    "binding_revision_id must equal the resolved physical binding revision")
             physical = self.physical_binding.identity
             if physical.object_kind != "table":
                 raise BridgeContractError("endpoint physical_binding must address a table")
