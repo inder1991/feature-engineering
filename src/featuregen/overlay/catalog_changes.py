@@ -9,6 +9,7 @@ from featuregen.contracts.errors import ConcurrencyError
 from featuregen.idgen import mint_id
 from featuregen.overlay.authority import resolve_authority
 from featuregen.overlay.expiry import (
+    demote_projected_bridge_edges,
     demote_projected_join_edges,
     demote_projected_semantic_binding,
 )
@@ -233,6 +234,15 @@ def _stale_one(
         # governed projection immediately (restore the file entity / demote the currency edge).
         demote_projected_semantic_binding(conn, fact_key, state.fact_type, "STALE",
                                           changed_sink=changed_sink)
+    elif state.fact_type == "entity_bridge":
+        # 2c: drift invalidated an ENDPOINT of a governed cross-catalog link. The planner's active
+        # set is already protected here (STALE is outside `cross_catalog_links.AVAILABLE_STATUSES`)
+        # and `analysis/grounding` now reads that same lifecycle, but a reader that goes to
+        # `entity_bridge_edge` DIRECTLY still bypasses the fold and sees a live VERIFIED sanction.
+        # `contract/invalidation._bridge_fact_signature` is the remaining one, and without this
+        # demote would keep a drift-invalidated contract PROMOTABLE (its docstring already states
+        # the invariant this implements).
+        demote_projected_bridge_edges(conn, fact_key, "STALE")
     if open_reverify:
         # Governance path: route the stale to the data owner(s). The upload-catalog ingest
         # (no owners) passes open_reverify=False — the fact still STALEs via the append above,

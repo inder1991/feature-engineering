@@ -23,11 +23,13 @@ class ActiveBridgeV1:
     left_object_ref: str
     right_catalog_source: str
     right_object_ref: str
-    #: "confirmed" (a human approved it) or "proposed" (derived, nobody has reviewed it). Defaulted
-    #: so every existing positional constructor still builds.
+    #: "confirmed" (a human endorsed the semantic relationship) or "proposed" (derived, nobody has
+    #: reviewed it). An ANNOTATION: every bridge in this set is equally traversable. Defaulted so
+    #: every existing positional constructor still builds.
     status: str = "confirmed"
-    #: Ranking signal — confirmation dominates, then a grain on either side, then an attested type
-    #: match. Lets a consumer PREFER a strong link without being barred from a weak one.
+    #: Ranking signal — a grain on either side, then an attested type match, and only then a human
+    #: confirmation as a tie-break WITHIN a safety band. Lets a consumer PREFER the link the platform
+    #: measured to be safer without being barred from a weaker one.
     strength: int = 0
 
 
@@ -68,9 +70,14 @@ def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
     it approved, it does not gate consumption. This used to select VERIFIED rows only, which is why
     nine derived candidates — `cib.cust_num <-> ftr.cif_id` among them — could never be traversed.
 
-    Deterministic: STRONGEST first, so a consumer that takes the first workable path prefers a
-    human-confirmed, grain-backed link over a weak type-only match without either being excluded.
-    Ordering inside a strength band is stable (entity, then left ref).
+    ACTIVE means AVAILABLE, not reviewed: `cross_catalog_links` has already applied the lifecycle
+    allow-list (DRAFT / PARTIALLY_CONFIRMED / VERIFIED), so a REJECTED, drift-STALEd, expired
+    (REVERIFY) or unreadable bridge is absent from this set and cannot be traversed by anything.
+
+    Deterministic: SAFEST first — a grain-backed, attested link outranks a type-only match, and a
+    human confirmation only breaks ties inside a safety band — so a consumer that takes the first
+    workable path prefers what the platform measured, not what someone endorsed. Ordering inside a
+    band is stable (endorsement, then entity, then left ref).
     """
     return tuple(
         ActiveBridgeV1(

@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.ingest import ingest_upload
@@ -47,6 +49,9 @@ def two_catalogs(db):
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('customer','cib','public.bo_cib_customer.cust_num','ftr',"
         " 'public.tran_repos.cif_id','c1','fk-1','text',%s,'1.0.0')", (json.dumps(ev),))
+    govern_bridge_fact(db, "fk-1", entity="customer", left_source="cib",
+                       left_ref="public.bo_cib_customer.cust_num", right_source="ftr",
+                       right_ref="public.tran_repos.cif_id")
     return db
 
 
@@ -108,6 +113,9 @@ def test_two_near_columns_linking_to_the_SAME_far_column_both_draw(two_catalogs)
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('customer','cib','public.bo_cib_customer.cust_alt','ftr',"
         " 'public.tran_repos.cif_id','c2','fk-2','text',%s,'1.0.0')", (json.dumps(ev),))
+    govern_bridge_fact(db, "fk-2", entity="customer", left_source="cib",
+                       left_ref="public.bo_cib_customer.cust_alt", right_source="ftr",
+                       right_ref="public.tran_repos.cif_id")
     # Asked of the TABLE: a column anchor now shows only its OWN links, so the two-near-columns
     # case has to be posed at table scope to be visible at all.
     g = lineage_graph(db, "cib", "public.bo_cib_customer", now=_NOW, fresh_within=_FRESH, depth=2)
@@ -139,6 +147,9 @@ def test_a_type_only_link_ranks_below_a_grain_backed_one(two_catalogs):
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('branch','cib','public.bo_cib_customer.branch_nm','ftr','public.tran_repos.cif_id',"
         " 'c3','fk-3','text',%s,'1.0.0')", (json.dumps(ev),))
+    govern_bridge_fact(db, "fk-3", entity="branch", left_source="cib",
+                       left_ref="public.bo_cib_customer.branch_nm", right_source="ftr",
+                       right_ref="public.tran_repos.cif_id")
     g = lineage_graph(db, "cib", "public.bo_cib_customer", now=_NOW, fresh_within=_FRESH, depth=2)
     by_entity = {e["entity_id"]: e for e in g["edges"] if e.get("kind") == "entity_bridge"}
     assert by_entity["customer"]["strength"] > by_entity["branch"]["strength"]

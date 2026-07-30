@@ -145,11 +145,14 @@ def _ledger_by_fact_key(conn: DbConn) -> dict[str, tuple]:
     """The raw candidate ledger keyed by ``fact_key`` — the SECOND evidence source, and the reason
     ``evidence_present`` can be trusted.
 
-    ``cross_catalog_links`` deliberately SUPPRESSES a link whose fact folds to REJECTED or STALE
-    (*"a human's NO must still count"*). REJECTED is terminal here and never listed, but STALE still
-    awaits a decision and IS listed — and reading enrichment only through ``cross_catalog_links``
-    would report that bridge as ``evidence_present=False`` when its ledger row is sitting right
-    there. That would make the W4 discrepancy signal lie about a perfectly ordinary drift state."""
+    ``cross_catalog_links`` deliberately SUPPRESSES a link whose fact is not in an AVAILABLE
+    lifecycle state — REJECTED, STALE or REVERIFY (*"a human's NO must still count"*, plus drift and
+    a lapsed confirmation). REJECTED is terminal here and never listed, but STALE and REVERIFY still
+    await a decision and ARE listed — and reading enrichment only through ``cross_catalog_links``
+    would report those bridges as ``evidence_present=False`` when their ledger row is sitting right
+    there. That would make the W4 discrepancy signal lie about perfectly ordinary drift/expiry
+    states. It is also why this queue enumerates from the EVENT STREAM and not from the ranked
+    links: what is DECIDABLE is a different question from what is AVAILABLE."""
     return {r[0]: (r[1], r[2]) for r in conn.execute(
         "SELECT fact_key, data_type_family, evidence_json FROM entity_bridge_candidate_evidence "
         "WHERE fact_key IS NOT NULL").fetchall()}
@@ -307,18 +310,27 @@ def list_bridge_proposals(conn: DbConn, *, source: str | None = None, limit: int
 
 
 def load_bridge_context(conn: DbConn, fact_key: str,
-                        roles: Iterable[str] | None = None) -> dict | None:
+                        roles: Iterable[str] | None = None, *,
+                        include_settled: bool = False) -> dict | None:
     """The typed confirm/reject command args for one bridge ``fact_key``, or None.
 
-    Returns ``{"ref": EntityBridgeRef, "fact_type", "use_case", "target_event_id"}`` — everything
-    the command layer needs, with ``target_event_id`` the EXACT event id confirm/reject CAS against
-    (``_cas_target``), so a superseded decision is denied as stale rather than applied.
+    Returns ``{"ref": EntityBridgeRef, "fact_type", "use_case", "target_event_id", "status"}`` —
+    everything the command layer needs, with ``target_event_id`` the EXACT event id confirm/reject
+    CAS against (``_cas_target``), so a superseded decision is denied as stale rather than applied.
 
     None when the key names nothing, names a fact of ANOTHER type (the generic-approval hole: a
     fact_key for some other governed fact must not be confirmable through the bridge route), holds
     no live decision, is structurally corrupt, or — when ``roles`` is passed — names an endpoint
     this caller may not see. That last case matters: if the loader answered for a hidden endpoint,
-    the listing's drop would be cosmetic, because a caller could confirm what they cannot see."""
+    the listing's drop would be cosmetic, because a caller could confirm what they cannot see.
+
+    ``include_settled`` additionally admits the terminal REJECTED state, for a caller that must tell
+    "already settled" apart from "no such proposal". The BULK reject needs exactly that distinction:
+    a replayed batch is idempotent, not eight failures, and folding it into the not-found answer
+    would report a reviewer's double-click as a fleet of missing bridges. It relaxes ONLY the status
+    gate — the fact_type check and read-scoping are applied identically below — so a settled bridge
+    on a hidden endpoint stays invisible and this cannot become an existence oracle.
+    """
     stream = load_fact(conn, fact_key)
     if not stream:
         return None
@@ -332,7 +344,8 @@ def load_bridge_context(conn: DbConn, fact_key: str,
         logger.warning("bridge governance: fact %s ref undecodable", fact_key, exc_info=True)
         return None
     state = fold_overlay_state(stream)
-    if state.status not in _PENDING_STATUSES and state.status != "VERIFIED":
+    admitted = {*_PENDING_STATUSES, "VERIFIED", *(("REJECTED",) if include_settled else ())}
+    if state.status not in admitted:
         return None
     if roles is not None:
         allowed = allowed_classes(roles)
@@ -341,4 +354,4 @@ def load_bridge_context(conn: DbConn, fact_key: str,
                 or _endpoint_hidden(conn, ref.right_ref, allowed, memo)):
             return None
     return {"ref": ref, "fact_type": ENTITY_BRIDGE, "use_case": payload0.get("use_case"),
-            "target_event_id": _cas_target(state)}
+            "target_event_id": _cas_target(state), "status": state.status}

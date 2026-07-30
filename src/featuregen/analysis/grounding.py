@@ -28,6 +28,10 @@ from featuregen.analysis.plan import (
     GroundedPlan,
     Window,
 )
+from featuregen.overlay.upload.cross_catalog_links import (
+    AVAILABLE_STATUSES,
+    bridge_lifecycle_status,
+)
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 #: Below this many rows in a group, a result can isolate individuals. A default, not a policy: a
@@ -205,15 +209,35 @@ def ground_analysis_plan(conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (
                     "be suppressed before the result is shown")))
 
     # ── cross-catalog hops ────────────────────────────────────────────────────────────────────────
+    # Read the link's GOVERNED LIFECYCLE, not `entity_bridge_edge`. That table is the VERIFIED-only,
+    # lagging projection of HUMAN REVIEW, and it was being consulted for two things it cannot answer:
+    #
+    #   * as availability authority — absence from it meant "unconfirmed", which flattened "nobody
+    #     has looked at this yet" together with "a human REJECTED it" and "the confirmation EXPIRED".
+    #     Only the first is something an approver can act on; the other two send the reader to find
+    #     an approver for a link no approval can bring back;
+    #   * as current review state — a bridge a human had just confirmed kept carrying "no human has
+    #     confirmed this" until a projector drained.
+    #
+    # Both findings are NON-BLOCKING and stay that way: grounding DISCLOSES what an answer rests on.
+    # Availability is enforced where links are actually traversed (`cross_catalog_links`), so this
+    # surface can report an unavailable link without becoming a second, divergent gate on it.
     for fact_key in plan.join_refs:
-        row = conn.execute(
-            "SELECT status FROM entity_bridge_edge WHERE fact_key = %s", (fact_key,)).fetchone()
-        if row is None or row[0] != "VERIFIED":
+        status = bridge_lifecycle_status(conn, fact_key)
+        if status == "VERIFIED":
+            continue
+        if status in AVAILABLE_STATUSES:            # DRAFT / PARTIALLY_CONFIRMED — usable, unreviewed
             findings.append(Finding(
                 code="JOIN_IDENTITY_UNCONFIRMED", subject=fact_key,
                 detail=("this answer joins two catalogs on an identifier link no human has "
                         "confirmed"),
                 clears_when="a human confirms the identifier link"))
+        else:
+            findings.append(Finding(
+                code="JOIN_IDENTITY_UNAVAILABLE", subject=fact_key,
+                detail=("this answer joins two catalogs on an identifier link the platform will not "
+                        f"consider (governance state: {status.lower()})"),
+                clears_when="the identifier link is re-derived and re-established"))
 
     # ── period-over-period coherence ──────────────────────────────────────────────────────────────
     # Two windows must share an anchor and a basis, or "fewer than last month" compares two

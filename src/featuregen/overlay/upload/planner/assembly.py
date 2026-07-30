@@ -111,9 +111,15 @@ def semantic_rollup_paths(source_entity: str, target_entity: str
 # B4 frontier expands: (R) intra-catalog realization, (B) cross-catalog roll-up bridge, and the
 # same-entity reposition crossing. The invariant is EXACT physical continuity: a realizer/bridge
 # is usable ONLY from the position's current table (+ catalog) — never "the entity exists
-# somewhere in the catalog". Crossings are governed-bridge-only (active_bridges = VERIFIED) and
-# fail closed on the frozen CatalogScopeV1 (an out-of-scope endpoint disqualifies the bridge;
-# inaccessible catalogs are never revealed).
+# somewhere in the catalog". Crossings are AVAILABLE-bridge-only: `active_bridges` is every link in
+# an available lifecycle state — DRAFT and PARTIALLY_CONFIRMED (unreviewed) as well as VERIFIED
+# (human-reviewed) — with REJECTED / STALE / REVERIFY and any unreadable lifecycle excluded
+# (`cross_catalog_links.AVAILABLE_STATUSES`). Human review annotates and ranks; it does not decide
+# what the planner may cross. This comment previously read "active_bridges = VERIFIED", which had
+# not been true since `active_bridges` began consuming confirmed and proposed alike — a comment
+# asserting a dead invariant is itself a defect in a governed system, and this one invalidated a
+# plan premise. Crossings also fail closed on the frozen CatalogScopeV1 (an out-of-scope endpoint
+# disqualifies the bridge; inaccessible catalogs are never revealed).
 # ---------------------------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +155,8 @@ def _table_columns(conn, catalog: str, table_ref: str) -> tuple[tuple[str, bool]
 
 
 def _scoped_bridges(conn, entity_id: str, scope: CatalogScopeV1) -> tuple[ActiveBridgeV1, ...]:
-    """The VERIFIED bridges at ``entity_id`` whose BOTH endpoint catalogs are authorized.
+    """The AVAILABLE bridges at ``entity_id`` whose BOTH endpoint catalogs are authorized — reviewed
+    or not; ``active_bridges`` has already applied the lifecycle allow-list.
     Fail-closed: one out-of-scope endpoint disqualifies the bridge entirely — it is neither
     traversed nor revealed."""
     allowed = set(scope.authorized_catalog_sources)

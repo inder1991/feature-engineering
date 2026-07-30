@@ -5,11 +5,21 @@ never edits, monkeypatches, or otherwise perturbs the single-source ``plan_bindi
 Three independent proofs:
 
   1. STATIC — every BEHAVIOURAL reused engine file (``assembly.py``, ``declarations.py``,
-     ``plan.py``, ``enumerate.py``, ``candidates.py``, ``order.py``, ``scope.py``) is byte-identical
-     to ``origin/main`` at this branch's merge-base (``git diff <merge-base> HEAD -- <file>`` is
-     empty). ``contracts.py`` DID change — it carries the new ``MULTISOURCE_*``/``MAX_*``
-     constants — so it is checked separately: its branch diff may only ever APPEND lines, never
-     remove or change an existing one.
+     ``plan.py``, ``enumerate.py``, ``candidates.py``, ``order.py``, ``scope.py``) is
+     BEHAVIOURALLY identical to ``origin/main`` at this branch's merge-base. Not byte-identical:
+     the comparison is over the module's AST with docstrings stripped, so prose may be corrected
+     (see the escalation note below for why that had to be allowed) while any change to a
+     statement, expression, constant, default, decorator or import still fails. A file whose
+     EXECUTABLE code did change is reported per TOP-LEVEL DEFINITION and must name every changed
+     symbol in ``_ALLOWED_BEHAVIOURAL_CHANGES`` — an explicit, reviewable exception per symbol, not
+     a blanket exemption for the file. ``contracts.py`` is checked differently again: its branch
+     diff may only ever APPEND lines, never remove or change an existing one.
+
+     ``_executable_ast`` is itself under test: ``test_ast_identity_survives_prose_and_catches_code``
+     applies six MUTATION CONTROLS — a changed comment and a rewritten docstring must SURVIVE; a
+     changed constant, expression, import or function body must FAIL. Without them this proof is
+     only as strong as an unverified helper, and the git-diff half is vacuous whenever the branch
+     equals ``origin/main`` (every file's diff is empty, so the loop compares nothing).
   2. RUNTIME — a representative single-source ``plan_bindings`` run over a small governed
      single-catalog fixture (the ``test_plan.py`` pattern) produces byte-identical identity-bearing
      fields whether captured in a FRESH subprocess interpreter that imports ONLY the single-source
@@ -119,14 +129,201 @@ _BEHAVIOURAL_ENGINE_FILES = (
 )
 _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 
+# Top-level symbols whose EXECUTABLE code a branch may deliberately change in a behavioural engine
+# file, each with the reason. Per SYMBOL, never per file: everything else in the same file is still
+# held to behavioural identity, so this exception cannot grow silently into a blanket exemption.
+#
+# THE CARDINALITY CORRECTION, in two owner-directed steps. Step 1 (fail-close) removed the
+# `Cardinality.MANY_TO_ONE` a bridge-rollup hop returned "BY CONSTRUCTION" — an assumption about the
+# far side's grain presented as evidence, which silently inflates every SUM taken across a bridge
+# whose far side is not in fact at that grain. Step 2 (tier 2, these entries) restores the capability
+# by DERIVING the fan-in instead: a hop whose far endpoint IS the far table's complete, current,
+# VERIFIED, unique grain really is many_to_one, and anything short of that stays unknown.
+#
+#   `_hop_evidence`                        — the derivation itself, and the fail-closed default.
+#   `CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN`  — the new `source` vocabulary entry naming that evidence.
+#   `CompilerContext`                      — carries the batch-read `governed_grain_by_table` the
+#                                            derivation reads (the context stays conn-free and pure).
+#   `build_compiler_context`               — batch-reads it once per run for the tables the active
+#                                            bridges name.
+#
+# Both steps are CORRECTNESS changes, not shadow-engine perturbations: the branch they touch is
+# reachable only from a cross-catalog plan, which single-source `plan_bindings` never produces, and
+# proof 2 (RUNTIME) measures that directly and still passes.
+#
+# Step 1's own entries (`CARDINALITY_SOURCE_BRIDGE`, `CARDINALITY_SOURCE_BRIDGE_UNATTESTED`) are GONE
+# from this list, not because they stopped mattering but because they are now IN the baseline: the
+# correction landed on origin/main, so the merge-base this proof compares against already contains it.
+# That is the intended end state — the allow-list shrinks as each correction becomes the baseline
+# rather than accumulating forever. Escalate anything that appears here without a matching,
+# owner-directed reason.
+_ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
+    "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
+        "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
+        "build_compiler_context",
+    }),
+}
 
-def test_behavioural_engine_files_are_byte_identical_to_origin_main_at_branch_point():
+
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) \
+                and body and isinstance(body[0], ast.Expr) \
+                and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.fix_missing_locations(tree)
+
+
+def _executable_ast(source: str) -> str:
+    """The module's AST with every DOCSTRING removed. Comments never reach the AST at all, so two
+    modules whose ``_executable_ast`` are equal differ only in prose — no statement, expression,
+    constant, default, decorator or import can differ without changing this string. The mutation
+    controls in ``test_ast_identity_survives_prose_and_catches_code`` prove both halves of that."""
+    return ast.dump(_strip_docstrings(ast.parse(source)))
+
+
+_MODULE_BODY = "<module-level statements and imports>"
+
+
+def _definition_asts(source: str) -> dict[str, str]:
+    """``{top-level symbol -> its docstring-stripped AST dump}``, so a changed file can be reported
+    by the SYMBOL that changed rather than as one opaque blob. Statements that bind no name — imports
+    included, deliberately, so a changed import cannot slip through unnamed — are compared together
+    under ``_MODULE_BODY``."""
+    tree = _strip_docstrings(ast.parse(source))
+    out: dict[str, str] = {}
+    loose: list[str] = []
+    for stmt in tree.body:                       # type: ignore[attr-defined]
+        if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            out[stmt.name] = ast.dump(stmt)
+            continue
+        targets: list[ast.expr] = []
+        if isinstance(stmt, ast.Assign):
+            targets = list(stmt.targets)
+        elif isinstance(stmt, ast.AnnAssign):
+            targets = [stmt.target]
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if names and len(names) == len(targets):
+            for name in names:
+                out[name] = ast.dump(stmt)
+        else:
+            loose.append(ast.dump(stmt))
+    out[_MODULE_BODY] = "\n".join(loose)
+    return out
+
+
+def _changed_definitions(base: str, head: str) -> set[str]:
+    base_defs, head_defs = _definition_asts(base), _definition_asts(head)
+    return {name for name in base_defs.keys() | head_defs.keys()
+            if base_defs.get(name) != head_defs.get(name)}
+
+
+def test_behavioural_engine_files_are_behaviourally_identical_to_origin_main_at_branch_point():
+    """Design §12: the multi-source shadow engine never perturbs the single-source frontier.
+
+    Byte-identity where the bytes are identical; AST-identity (docstrings stripped, comments
+    invisible to the parser) where they are not. That distinction was forced by the bridge lifecycle
+    correction, which had to fix a comment in ``assembly.py`` asserting a dead invariant — "Crossings
+    are governed-bridge-only (active_bridges = VERIFIED)", false since ``active_bridges`` began
+    consuming confirmed and proposed alike, and load-bearing enough that it invalidated a plan
+    premise built on it. A proof that a false comment may never be corrected makes it permanent.
+
+    A file whose EXECUTABLE code did change is then diffed per TOP-LEVEL SYMBOL and every changed
+    symbol must be named in ``_ALLOWED_BEHAVIOURAL_CHANGES`` with its reason. That is strictly
+    stronger than the whole-file check it replaces for every symbol NOT listed — an unexpected change
+    is now reported by name — and it keeps a deliberate, owner-directed correctness fix from either
+    being blocked by a proof about a different concern or quietly disabling that proof for the whole
+    file.
+
+    This is NOT the weakening the module docstring warns against. Any unnamed change to a statement,
+    expression, constant, default, decorator or import still fails — escalate that, do not add it to
+    the allow-list without a reason that survives review.
+    """
     for rel_path in _BEHAVIOURAL_ENGINE_FILES:
         diff = _diff_for(rel_path)
-        assert diff == "", (
-            f"NEUTRALITY VIOLATION: {rel_path} was modified on this branch relative to the "
-            f"origin/main branch point {_MERGE_BASE} — this file carries single-source planner "
-            f"behaviour and design §12 requires it stay byte-identical. Diff:\n{diff}")
+        if not diff:
+            continue
+        base = _git("show", f"{_MERGE_BASE}:{rel_path}")
+        head = (_REPO_ROOT / rel_path).read_text()
+        if _executable_ast(base) == _executable_ast(head):
+            continue                                        # prose only — behaviourally identical
+        allowed = _ALLOWED_BEHAVIOURAL_CHANGES.get(rel_path, frozenset())
+        unexpected = sorted(_changed_definitions(base, head) - allowed)
+        assert not unexpected, (
+            f"NEUTRALITY VIOLATION: {rel_path} changed EXECUTABLE code on this branch relative to "
+            f"the origin/main branch point {_MERGE_BASE} in symbol(s) {unexpected} — this file "
+            "carries single-source planner behaviour and design §12 requires it stay behaviourally "
+            f"identical. Diff:\n{diff}")
+
+
+# ── 1b. the self-check: is `_executable_ast` actually strong enough to carry proof 1? ──
+#
+# The git-diff half of proof 1 is VACUOUS whenever this branch equals origin/main — every file's diff
+# is empty, so the loop above compares nothing at all. Whatever confidence proof 1 carries therefore
+# has to come from `_executable_ast` itself, and an unexercised helper carries none. These controls
+# live in the repo rather than in a one-off verification run so the guarantee re-arms on every run.
+_MUTATION_SUBJECT = '''\
+"""Subject module docstring."""
+from __future__ import annotations
+
+import os
+
+THRESHOLD = 10
+
+
+def widget(x):
+    """Subject function docstring."""
+    # a comment about the arithmetic
+    return x + THRESHOLD
+'''
+
+#: Prose-only mutations. Each MUST leave `_executable_ast` unchanged — this is exactly the freedom
+#: the bridge lifecycle correction needed in order to delete a false comment from `assembly.py`.
+_PROSE_MUTATIONS = {
+    "comment rewritten": ("# a comment about the arithmetic", "# an entirely different remark"),
+    "module docstring rewritten": ('"""Subject module docstring."""', '"""Rewritten."""'),
+    "function docstring rewritten": ('"""Subject function docstring."""', '"""Rewritten too."""'),
+}
+
+#: Executable mutations. Each MUST change `_executable_ast`, or proof 1 is decorative.
+_CODE_MUTATIONS = {
+    "constant changed": ("THRESHOLD = 10", "THRESHOLD = 11"),
+    "expression changed": ("return x + THRESHOLD", "return x - THRESHOLD"),
+    "import changed": ("import os", "import sys"),
+    "function body changed": ("    return x + THRESHOLD", "    raise ValueError('no')"),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_PROSE_MUTATIONS))
+def test_ast_identity_survives_prose(label):
+    """MUST-SURVIVE controls. A helper that failed these would make a false comment permanent."""
+    old, new = _PROSE_MUTATIONS[label]
+    mutated = _MUTATION_SUBJECT.replace(old, new)
+    assert mutated != _MUTATION_SUBJECT, f"{label}: the mutation did not apply — vacuous control"
+    assert _executable_ast(mutated) == _executable_ast(_MUTATION_SUBJECT), label
+
+
+@pytest.mark.parametrize("label", sorted(_CODE_MUTATIONS))
+def test_ast_identity_catches_code(label):
+    """MUST-FAIL controls, one per kind of change proof 1 claims to catch."""
+    old, new = _CODE_MUTATIONS[label]
+    mutated = _MUTATION_SUBJECT.replace(old, new)
+    assert mutated != _MUTATION_SUBJECT, f"{label}: the mutation did not apply — vacuous control"
+    assert _executable_ast(mutated) != _executable_ast(_MUTATION_SUBJECT), label
+    # and the per-symbol report names the right symbol rather than shrugging at the whole file
+    assert _changed_definitions(_MUTATION_SUBJECT, mutated), label
+
+
+def test_ast_identity_controls_hold_on_a_real_engine_file():
+    """The synthetic subject above is small enough to be unrepresentative, so run both directions
+    against a real behavioural engine file: appending a comment survives, appending one statement
+    does not."""
+    source = (_REPO_ROOT / "src/featuregen/overlay/upload/planner/assembly.py").read_text()
+    assert _executable_ast(source + "\n# a trailing remark\n") == _executable_ast(source)
+    assert _executable_ast(source + "\n_NEUTRALITY_PROBE = 1\n") != _executable_ast(source)
+    assert _changed_definitions(source, source + "\n_NEUTRALITY_PROBE = 1\n") == {
+        "_NEUTRALITY_PROBE"}
 
 
 def test_contracts_file_branch_diff_is_additive_only():

@@ -69,6 +69,43 @@ def demote_projected_semantic_binding(conn: DbConn, fact_key: str, fact_type: st
         changed_sink.extend(collected)
 
 
+def demote_projected_bridge_edges(conn: DbConn, fact_key: str, status: str) -> None:
+    """FAIL-SOFT async demotion of the cross-catalog ``entity_bridge_edge`` projected from this
+    ``entity_bridge``: the fact just left VERIFIED (reject / expiry -> REVERIFY / drift -> STALE), so
+    the human sanction it carries must stop being readable NOW — not at the next re-ingest.
+
+    This closes the third of the three exits from VERIFIED for bridges. ``demote_bridge_edges`` had
+    no production caller at all until the reject ROUTE gained one; both sibling hooks above already
+    dispatched on ``approved_join`` and the semantic bindings and fell through for ``entity_bridge``,
+    so a drift-STALEd or EXPIRED bridge kept a live edge. It cannot be done in ``OverlayProjection``:
+    a two-source fact does not fit the single-``catalog_source`` overlay read models (projection.py
+    deliberately admits only the dependency index for bridges), and a projector-driven demote would
+    leave the sanction readable for the whole drain window anyway.
+
+    The second gate USED TO BE UNEVEN, which is why this hook was written. ``cross_catalog_links``
+    suppressed a DENY-LIST of REJECTED and STALE, and REVERIFY was in neither, so for an EXPIRED
+    bridge this hook was the ONLY thing that retired the confirmation. The lifecycle correction
+    replaced that with an ALLOW-LIST (``AVAILABLE_STATUSES``), so REVERIFY is now independently
+    unavailable to the planner and to ``analysis/grounding``, which reads the same fold. This hook
+    remains load-bearing for readers that go to ``entity_bridge_edge`` DIRECTLY and bypass the fold
+    on every status — ``contract/invalidation._bridge_fact_signature`` is the one that is left.
+
+    Savepointed and never-raising, matching the siblings: these hooks run inside the drift SCAN and
+    the expiry POLLER, both batch passes over many facts, where a raise would abandon the sweep and
+    (in ``detect_catalog_changes``) leave the watermark unadvanced. A logged, re-derivable miss is
+    the smaller failure — the edge is always rebuildable from the stream. Lazy import across the
+    overlay/upload boundary (mirrors ``demote_projected_join_edges``). ``status`` is the demoting
+    transition, carried for the log: unlike its siblings the bridge row is DELETED, not re-stamped.
+    """
+    try:
+        with conn.transaction():
+            from featuregen.overlay.upload.bridge_projection import demote_bridge_edges
+            demote_bridge_edges(conn, fact_key)
+    except Exception:  # noqa: BLE001 — advisory: demotion never blocks the poller/drift scan
+        logger.warning("entity_bridge edge demotion (%s) failed for %s", status, fact_key,
+                       exc_info=True)
+
+
 def schedule_expiry(
     conn: DbConn, fact_key: str, confirmed_event_id: str, expires_at: datetime
 ) -> str:
@@ -136,6 +173,11 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
         # E3: EXPIRED folds to REVERIFY — demote the governed semantic binding's projection now
         # (restore the file entity / demote the currency edge), without waiting for a re-ingest.
         demote_projected_semantic_binding(conn, fact_key, state.fact_type, "REVERIFY")
+    elif state.fact_type == "entity_bridge":
+        # 2c: the exit with NO second gate. `cross_catalog_links._blocked` suppresses REJECTED and
+        # STALE but not REVERIFY, so until the edge row goes the planner keeps crossing an expired
+        # bridge AS human-confirmed, ranked above every derived candidate.
+        demote_projected_bridge_edges(conn, fact_key, "REVERIFY")
     ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
     authority = resolve_authority(conn, adapter, ref, state.fact_type)
     open_reverify_task(

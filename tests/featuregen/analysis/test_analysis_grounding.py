@@ -175,13 +175,87 @@ def test_an_ungrouped_result_does_not_carry_it(catalog):
 
 # ── cross-catalog ────────────────────────────────────────────────────────────────────────────────
 
-def test_an_unconfirmed_identifier_link_is_carried_not_refused(catalog):
+def test_an_unconfirmed_identifier_link_is_carried_not_refused(catalog, _overlay_schemas):
     """The user's directive: proposed links are USED, and the answer says what it stands on.
-    Segment and sector live in another catalog, so this is the normal case, not the exception."""
-    grounded = ground_analysis_plan(catalog, _plan(join_refs=("no-such-fact-key",)))
+    Segment and sector live in another catalog, so this is the normal case, not the exception.
+
+    This used to stand a nonexistent fact key in for "unconfirmed" — the exact conflation the
+    lifecycle correction removes. A link nobody has reviewed is a real DRAFT bridge; a fact key with
+    no governance record behind it is a different situation with a different finding (below)."""
+    _bridge(catalog, "bfk-1", status="DRAFT")
+    grounded = ground_analysis_plan(catalog, _plan(join_refs=("bfk-1",)))
     assert grounded.answerable, "an unconfirmed link must not stop the answer"
     join = [f for f in grounded.findings if f.code == "JOIN_IDENTITY_UNCONFIRMED"]
     assert join and join[0].clears_when
+
+
+def test_a_join_ref_with_no_governance_record_is_reported_as_unavailable(catalog):
+    """A plan naming a link the platform has no governed fact for. "No human has confirmed it" would
+    be actively misleading — there is nothing for an approver to approve."""
+    grounded = ground_analysis_plan(catalog, _plan(join_refs=("no-such-fact-key",)))
+    assert grounded.answerable
+    assert [f.code for f in grounded.findings if f.code.startswith("JOIN_IDENTITY")] \
+        == ["JOIN_IDENTITY_UNAVAILABLE"]
+
+
+# ── the join finding reports HUMAN REVIEW, and reads it from the lifecycle ───────────────────────
+#
+# This check used to query `entity_bridge_edge` — the VERIFIED-only, lagging projection of human
+# review — and say "no human has confirmed" about everything absent from it. That conflated three
+# different situations into one sentence: nobody has looked at this yet; someone REJECTED it; the
+# confirmation EXPIRED. Only the first is a review warning. And reading the projection meant a
+# freshly-confirmed bridge kept warning until a projector caught up.
+#
+# The finding stays NON-BLOCKING in every arm — grounding discloses, it does not enforce — but it
+# now reports what the governed lifecycle actually says.
+
+@pytest.fixture
+def _overlay_schemas():
+    """The EVENT registry is reset per test by the root harness; building a real bridge lifecycle
+    needs the overlay fact schemas registered (same as overlay/conftest.py)."""
+    from featuregen.events.registry import event_registry
+    from featuregen.overlay.facts import register_overlay_event_types
+    register_overlay_event_types(event_registry())
+
+
+def _bridge(db, key, *, status):
+    from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+    return govern_bridge_fact(db, key, entity="customer", left_source=SRC,
+                              left_ref=f"public.{TBL}.cif_id", right_source="cib",
+                              right_ref="public.bo_cib_customer.cust_num", status=status)
+
+
+def test_control_a_human_reviewed_link_carries_no_join_finding(catalog, _overlay_schemas):
+    """MUST-SURVIVE no-op control. A check wired to fire unconditionally passes every arm below and
+    fails this one."""
+    _bridge(catalog, "bfk-1", status="VERIFIED")
+    codes = {f.code for f in ground_analysis_plan(catalog, _plan(join_refs=("bfk-1",))).findings}
+    assert "JOIN_IDENTITY_UNCONFIRMED" not in codes
+    assert "JOIN_IDENTITY_UNAVAILABLE" not in codes
+
+
+def test_review_state_is_read_from_the_lifecycle_not_from_the_projection(catalog, _overlay_schemas):
+    """`entity_bridge_edge` is written by a projector AFTER the confirm. Reading it here meant a
+    bridge a human had just confirmed still carried "no human has confirmed this" for the whole
+    drain window — the projection is a LAGGING record of review, and review is what this finding is
+    about."""
+    _bridge(catalog, "bfk-1", status="VERIFIED")
+    assert catalog.execute("SELECT count(*) FROM entity_bridge_edge").fetchone()[0] == 0
+
+    codes = {f.code for f in ground_analysis_plan(catalog, _plan(join_refs=("bfk-1",))).findings}
+    assert "JOIN_IDENTITY_UNCONFIRMED" not in codes, "the fact is VERIFIED; only the projection lags"
+
+
+@pytest.mark.parametrize("status", ["REVERIFY", "REJECTED", "STALE"])
+def test_an_unavailable_link_is_reported_as_unavailable_not_merely_unconfirmed(catalog, _overlay_schemas, status):
+    """An EXPIRED (REVERIFY), REJECTED or drift-STALEd link is not "waiting for a reviewer" — the
+    platform will not consider it at all. Reporting that as "no human has confirmed it" sends the
+    reader off to find an approver for a link no approval can bring back."""
+    _bridge(catalog, "bfk-1", status=status)
+    grounded = ground_analysis_plan(catalog, _plan(join_refs=("bfk-1",)))
+    assert grounded.answerable, "grounding discloses; it does not enforce availability"
+    assert [f.code for f in grounded.findings if f.code.startswith("JOIN_IDENTITY")] \
+        == ["JOIN_IDENTITY_UNAVAILABLE"]
 
 
 # ── read scope, and absence ──────────────────────────────────────────────────────────────────────

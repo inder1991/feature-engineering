@@ -133,14 +133,32 @@ class ConfirmEntityBridgeRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+# Why a reviewer says no to a CROSS-CATALOG identifier link. `not_the_same_entity` is the dominant
+# one (two catalogs use the same word for different things); `wrong_column` is the right entity bound
+# through the wrong identifier; `values_do_not_match` is the type-compatible pair whose populations
+# simply do not overlap — the failure `type_basis='declared'` cannot see, because two glossary
+# spreadsheets agreeing is not a read of the data.
+#
+# Deliberately a per-fact-kind vocabulary, which is the established convention here: the join, table-
+# fact, semantic-binding and withdraw rejects above each carry their own set and share only the
+# `needs_data_check` escape hatch, which this set reuses verbatim. There is no cross-kind vocabulary
+# to have reused — `wrong_grain_columns` means nothing about an identifier link. Named ONCE so the
+# single and bulk rejects cannot drift into two dialects of the same decision.
+EntityBridgeRejectCategory = Literal["not_the_same_entity", "wrong_column", "values_do_not_match",
+                                     "duplicate_bridge", "needs_data_check"]
+
+
 class RejectEntityBridgeRequest(BaseModel):
-    # Why a reviewer says no to a CROSS-CATALOG identifier link. `not_the_same_entity` is the
-    # dominant one (two catalogs use the same word for different things); `wrong_column` is the
-    # right entity bound through the wrong identifier; `values_do_not_match` is the type-compatible
-    # pair whose populations simply do not overlap — the failure `type_basis='declared'` cannot see,
-    # because two glossary spreadsheets agreeing is not a read of the data.
-    category: Literal["not_the_same_entity", "wrong_column", "values_do_not_match",
-                      "duplicate_bridge", "needs_data_check"]
+    category: EntityBridgeRejectCategory
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class BulkRejectEntityBridgesRequest(BaseModel):
+    #: The candidate group being settled in one action — the eight `branch` bridges are a 4x2
+    #: cross-product of the same two facts, not eight findings. Bounded: this fans out to one
+    #: governed command per key, each taking an advisory lock in the request transaction.
+    fact_keys: list[str] = Field(min_length=1, max_length=500)
+    category: EntityBridgeRejectCategory
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -600,6 +618,31 @@ def confirm_entity_bridge(fact_key: str, body: ConfirmEntityBridgeRequest, conn:
     return {"governance_status": status, "operational_projection": projection}
 
 
+def _reject_one_bridge(conn: psycopg.Connection, ctx: dict, fact_key: str, *, category: str,
+                       note: str | None, identity: IdentityEnvelope) -> tuple[str, str]:
+    """ONE governed bridge reject + its demote. Returns ``("rejected", projection)`` or
+    ``("denied", detail)``; a projection fault RAISES, and the caller decides what that costs.
+
+    Shared verbatim by the single and the bulk route so a batch cannot become a second, laxer
+    dialect of the same decision — same command, same ``category``/``reason`` split, and the SAME
+    idempotency key, so rejecting a bridge through the group is indistinguishable from rejecting it
+    on its own. `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics
+    key); `reason` carries ONLY the free-text note (or None), matching the sibling rejects.
+    """
+    cmd = Command(
+        action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "reason": _clean(note),
+              "category": category},
+        actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = reject_fact(conn, cmd)
+    if not result.accepted:
+        return "denied", _deny_to_detail(result.denied_reason)
+    removed = demote_bridge_edges(conn, result.aggregate_id or fact_key)
+    return "rejected", ("demoted" if removed else "not_applicable")
+
+
 @router.post("/governance/entity-bridges/{fact_key}/reject",
              dependencies=[Depends(require_confirmer)])
 def reject_entity_bridge(fact_key: str, body: RejectEntityBridgeRequest, conn: _Conn,
@@ -615,21 +658,95 @@ def reject_entity_bridge(fact_key: str, body: RejectEntityBridgeRequest, conn: _
     so a fault must fail the whole request (``get_conn`` rolls back, nothing happened) rather than
     report a REJECTED bridge that is still operational."""
     ctx = _load_bridge_context_or_404(conn, fact_key, identity.role_claims)
-    # `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics key);
-    # `reason` carries ONLY the free-text note (or None) — same shape as the sibling rejects.
-    cmd = Command(
-        action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
-        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
-              "target_event_id": ctx["target_event_id"], "reason": _clean(body.note),
-              "category": body.category},
-        actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
-        expected_version=None)
-    result = reject_fact(conn, cmd)
-    if not result.accepted:
+    outcome, value = _reject_one_bridge(conn, ctx, fact_key, category=body.category,
+                                        note=body.note, identity=identity)
+    if outcome == "denied":
         # A VERIFIED bridge lands HERE ("fact not awaiting confirmation") — which is why the listing
         # offers it no action at all. RETURN, don't raise (audit I-3).
-        return JSONResponse(status_code=409,
-                            content={"detail": _deny_to_detail(result.denied_reason)})
-    removed = demote_bridge_edges(conn, result.aggregate_id or fact_key)
+        return JSONResponse(status_code=409, content={"detail": value})
     return {"governance_status": "REJECTED", "category": body.category,
-            "operational_projection": "demoted" if removed else "not_applicable"}
+            "operational_projection": value}
+
+
+@router.post("/governance/entity-bridges/bulk-reject",
+             dependencies=[Depends(require_confirmer)])
+def bulk_reject_entity_bridges(body: BulkRejectEntityBridgesRequest, conn: _Conn,
+                               identity: _Identity) -> dict:
+    """Settle a candidate GROUP in one reviewer action — the eight `branch` bridges are a 4x2
+    cross-product of the same two facts, not eight findings, so one judgement should settle them.
+
+    N COMMANDS, NOT A BULK COMMAND. There is no bulk command in the overlay, and inventing one would
+    put eight governed facts behind a single audit row — which is not a governance record. Each key
+    is its own ``reject_fact`` with its own idempotency key and its own audit trail; the group is a
+    UI affordance layered over them, and rejecting a bridge here is indistinguishable from rejecting
+    it on its own route (same helper, same key).
+
+    SO PARTIAL FAILURE IS THE NORMAL CASE, and the response says so. There is no single status code
+    that can express "five settled, three refused, one unreadable", so this always answers 200 with
+    a per-item ``results`` list in REQUEST order plus ``counts``; the UI shows which succeeded rather
+    than one verdict for the batch. Five outcomes, all of them ordinary:
+
+      * ``rejected``         — settled now (``operational_projection`` reports any edge demoted)
+      * ``already_rejected`` — REJECTED is terminal, so a replay/double-click is a no-op, not an
+                               error; the fact is already in the state the reviewer asked for
+      * ``denied``           — the server refused, with the reason (a VERIFIED bridge lands here:
+                               ``_AWAITING_CONFIRMATION`` excludes VERIFIED, so it is not rejectable)
+      * ``not_found``        — not a decidable entity_bridge, or one this caller may not SEE. The
+                               batch equivalent of the single route's 404: read-scoping must not be
+                               lost in the fan-out, or the group becomes an existence oracle
+      * ``failed``           — the demote faulted; that item is fully undone (see below)
+
+    A SAVEPOINT PER ITEM, NEVER ONE AROUND THE BATCH. Task 2 made reject's demote all-or-nothing
+    because a soft failure there would report REJECTED over a still-live bridge. That property has to
+    survive batching, and it only does per item: ``conn.transaction()`` nests a SAVEPOINT around each
+    reject+demote, so a fault rolls that item back to exactly its prior state (reported ``failed``,
+    nothing half-applied) and — crucially — un-poisons the transaction, which a database error
+    otherwise leaves unusable for every later item. One savepoint around the batch would instead
+    discard every sibling decision the reviewer just made because one of eight faulted.
+
+    A DENIAL IS NOT A FAULT: ``reject_fact`` returns it rather than raising, so the savepoint
+    commits and any ``COMMAND_DENIED`` audit row persists (audit I-3), exactly as on the single
+    route. Duplicate keys in one request need no special case — the second occurrence simply reports
+    ``already_rejected``, so ``results`` stays 1:1 with the request.
+    """
+    ensure_upload_catalog_adapter()
+    results: list[dict] = []
+    counts = {"rejected": 0, "already_rejected": 0, "denied": 0, "not_found": 0, "failed": 0}
+
+    for fact_key in body.fact_keys:
+        # `include_settled` so an ALREADY-REJECTED bridge is distinguishable from one this caller
+        # may not see — with read-scoping applied identically, so the distinction leaks nothing.
+        ctx = load_bridge_context(conn, fact_key, roles=identity.role_claims, include_settled=True)
+        if ctx is None:
+            results.append({"fact_key": fact_key, "outcome": "not_found",
+                            "detail": "No such entity-bridge proposal."})
+            counts["not_found"] += 1
+            continue
+        if ctx["status"] == "REJECTED":
+            # Terminal: the fact is already in the state the reviewer asked for. Short-circuited
+            # rather than dispatched — `reject_fact` would deny it as a wrong-state denial, which is
+            # explicitly UNAUDITED, so no audit record is given up by not making the call.
+            results.append({"fact_key": fact_key, "outcome": "already_rejected",
+                            "detail": "already rejected"})
+            counts["already_rejected"] += 1
+            continue
+        try:
+            with conn.transaction():          # SAVEPOINT — this item only
+                outcome, value = _reject_one_bridge(conn, ctx, fact_key, category=body.category,
+                                                    note=body.note, identity=identity)
+        except Exception:  # noqa: BLE001 — one item's fault must not cost the reviewer the others
+            logger.warning("bulk bridge reject: %s failed and was rolled back", fact_key,
+                           exc_info=True)
+            results.append({"fact_key": fact_key, "outcome": "failed",
+                            "detail": "the reject could not be applied and was rolled back"})
+            counts["failed"] += 1
+            continue
+        if outcome == "denied":
+            results.append({"fact_key": fact_key, "outcome": "denied", "detail": value})
+            counts["denied"] += 1
+            continue
+        results.append({"fact_key": fact_key, "outcome": "rejected",
+                        "operational_projection": value})
+        counts["rejected"] += 1
+
+    return {"category": body.category, "counts": counts, "results": results}

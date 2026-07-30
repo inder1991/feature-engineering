@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.ingest import ingest_upload
@@ -51,6 +53,9 @@ def wide(db):
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('customer','cib','public.cust.cust_num','ftr','public.txn.cif_id','c1','fk-1',"
         " 'text',%s,'1.0.0')", (json.dumps(ev),))
+    govern_bridge_fact(db, "fk-1", entity="customer", left_source="cib",
+                       left_ref="public.cust.cust_num", right_source="ftr",
+                       right_ref="public.txn.cif_id")
     return db
 
 
@@ -118,6 +123,9 @@ def test_a_column_anchor_shows_only_its_own_links(wide):
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('branch','cib','public.cust.branch_cd','ftr','public.txn.f01','c9','fk-9',"
         " 'text',%s,'1.0.0')", (json.dumps(ev),))
+    govern_bridge_fact(db, "fk-9", entity="branch", left_source="cib",
+                       left_ref="public.cust.branch_cd", right_source="ftr",
+                       right_ref="public.txn.f01")
     bridges = [e for e in _graph(db)["edges"] if e.get("kind") == "entity_bridge"]
     assert len(bridges) == 1, bridges
     assert bridges[0]["from"].endswith("cust_num") or bridges[0]["to"].endswith("cust_num")
@@ -149,5 +157,8 @@ def test_a_TABLE_anchor_still_shows_the_whole_table(wide):
         " data_type_family, evidence_json, derivation_version) "
         "VALUES ('branch','cib','public.cust.branch_cd','ftr','public.txn.f01','c9','fk-9',"
         " 'text',%s,'1.0.0')", (json.dumps(ev),))
+    govern_bridge_fact(db, "fk-9", entity="branch", left_source="cib",
+                       left_ref="public.cust.branch_cd", right_source="ftr",
+                       right_ref="public.txn.f01")
     g = lineage_graph(db, "cib", "public.cust", now=_NOW, fresh_within=_FRESH, depth=2)
     assert len([e for e in g["edges"] if e.get("kind") == "entity_bridge"]) == 2

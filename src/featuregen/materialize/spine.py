@@ -72,6 +72,7 @@ from featuregen.contracts.db import DbConn
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
+from featuregen.overlay.upload.governed_grain import governed_grain_columns
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
@@ -631,19 +632,14 @@ def _governed_grain_columns(conn: DbConn, located: _Located) -> tuple[str, ...]:
     per-table index there is), and C1's `read_operational_value` then decides which of them are
     actually GOVERNED. Enumerating on the flag alone would accept a file declaration; asking C1
     without the flag would mean guessing column names.
+
+    The read itself now lives in `overlay.upload.governed_grain` so the contract compiler asks the
+    SAME question of the same store (it needs the far side of a bridge to be a table's whole grain
+    before a roll-up hop may claim many_to_one). This is a MOVE, not a reimplementation: one reader,
+    two callers, so neither can drift into its own idea of what "governed" means.
     """
-    rows = conn.execute(
-        "SELECT lower(column_name) FROM graph_node "
-        "WHERE catalog_source = %s AND lower(table_name) = %s AND kind = 'column' "
-        "  AND is_grain = true",
-        (located.catalog_source, located.table)).fetchall()
-    governed = []
-    for (column,) in rows:
-        ref = normalize_ref(located.catalog_source, located.schema, located.table, column)
-        read = read_operational_value(conn, ref, "is_grain")
-        if read.status == _RESOLVED and read.value == _GOVERNED_TRUE:
-            governed.append(column)
-    return tuple(sorted(governed))
+    return governed_grain_columns(
+        conn, located.catalog_source, located.schema, located.table)
 
 
 def _refuse_non_unique_keys(

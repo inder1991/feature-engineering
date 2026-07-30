@@ -48,6 +48,8 @@ def _ctx(db, roles=(), agg=None, columns_override=None) -> CompilerContext:
     return CompilerContext(
         realizations_by_catalog={"core": derive_catalog_realizations(db, "core").realizations},
         active_bridges=active_bridges(db),
+        # single-catalog fixture: no bridge, so no bridge-endpoint grain to read
+        governed_grain_by_table={},
         columns_by_catalog=cols,
         catalog_fingerprint_at_start={"core": realization_fingerprint(db, "core")},
         bridge_fingerprint_at_start=bridge_fingerprint(db),
