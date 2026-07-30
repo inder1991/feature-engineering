@@ -87,7 +87,9 @@ def test_the_pilot_question_becomes_a_candidate_plan():
     assert [d.logical_ref for d in plan.dimensions] == [
         "ftr::dpl_eib.customer_segment_history.segment",
         "ftr::dpl_eib.customer_segment_history.sector"]
-    assert not got.needs_clarification
+    # The population is ALWAYS unresolved for a comparison: the model is not asked, because choosing
+    # among look-alike population tables is inference. See `plan.py` / `materialize/spine.py`.
+    assert got.unresolved == ("population",)
 
 
 def test_the_windows_arrive_as_whole_calendar_periods():
@@ -197,7 +199,23 @@ def test_an_abstained_dimension_stays_EMPTY_rather_than_guessed():
         _QUESTION, _candidates())
     assert got.plan.dimensions == ()
     assert got.needs_clarification
-    assert got.unresolved == ("dimensions",)
+    assert set(got.unresolved) == {"dimensions", "population"}
+
+
+def test_the_population_is_raised_even_when_the_model_resolved_everything_else():
+    """Unconditional for a comparison, and NOT in the output schema — so a model cannot resolve it,
+    omit it, or be blamed for it. A population chosen by a model is inference by something with less
+    standing than the catalog."""
+    got = extract_intent(_llm(), _QUESTION, _candidates())
+    assert "population" in got.unresolved
+    assert "population" not in str(INTENT_SCHEMA["properties"].keys())
+
+
+def test_a_question_with_NO_comparison_needs_no_population():
+    """A single-period question has no spine to lose customers from."""
+    got = extract_intent(_llm(FakeResponse(output=_output(comparison=""))), _QUESTION,
+                         _candidates())
+    assert "population" not in got.unresolved
 
 
 def test_an_abstained_comparison_is_not_silently_a_decrease():

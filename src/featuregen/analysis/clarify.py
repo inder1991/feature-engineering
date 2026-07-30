@@ -79,10 +79,22 @@ def clarifications_for(extraction: IntentExtraction,
                  for code in sorted(raised, key=lambda c: _ORDER.get(c, 99)))
 
 
-_ORDER = {"entity": 0, "measure": 1, "windows": 2, "comparison": 3, "dimensions": 4}
+_ORDER = {"population": 0, "entity": 1, "measure": 2, "windows": 3, "comparison": 4,
+          "dimensions": 5}
 
 
 def _build(code: str, candidates: IntentCandidates) -> Clarification:
+    if code == "population":
+        # Asked FIRST and never optional. `spine.py`: the declaration chooses the source, governed
+        # facts may only validate it — because look-alike population tables are indistinguishable to
+        # the catalog and a wrong choice silently shrinks the answer. Offering the human a list is
+        # not the system inferring; the options are governed identifiers from the already-bounded
+        # retrieval set, and picking one declares BOTH the table and its key.
+        return Clarification(
+            code=code,
+            question="Which table holds the population this question is about — every member, "
+                     "including those with no activity in either period?",
+            options=_options(candidates.grain_refs or candidates.column_refs, candidates))
     if code == "entity":
         # Identifiers only. Offering all sixty columns turns a decidable question into a search.
         refs = candidates.grain_refs or candidates.column_refs
@@ -136,6 +148,16 @@ def apply_answer(plan: AnalysisPlanV1, code: str, chosen: tuple[str, ...],
             code, f"{unknown[0]!r} was not offered for this question; an answer cannot introduce a "
                   "catalog object the plan was never grounded against")
 
+    if code == "population":
+        if len(chosen) != 1:
+            raise ClarificationError(
+                code, "exactly one table is the population; two would mean two different answers")
+        ref = chosen[0]
+        # The table comes from the ref by string, never by looking one up — deriving it is safe,
+        # inferring it is the thing the doctrine forbids.
+        source, _, rest = ref.partition("::")
+        table = ".".join(rest.split(".")[:-1])
+        return replace(plan, population_table_ref=f"{source}::{table}", population_key_ref=ref)
     if code == "entity":
         if len(chosen) != 1:
             raise ClarificationError(code, "exactly one column identifies the entity")

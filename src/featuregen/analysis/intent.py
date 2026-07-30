@@ -61,6 +61,11 @@ UNRESOLVED_CODES: frozenset[str] = frozenset({
     "windows",         # which periods
     "dimensions",      # how to split the answer
     "comparison",      # whether it is a period-over-period question at all
+    # WHICH TABLE IS THE POPULATION. Deliberately absent from the output schema: the model is never
+    # asked, and `extract_intent` raises this unconditionally for a comparison. See `plan.py` —
+    # choosing among look-alike population tables is inference, and a model doing it is inference by
+    # something with less standing than the catalog.
+    "population",
 })
 
 #: Every wire object is CLOSED (`additionalProperties: false`) and every slot declared. A previous
@@ -282,9 +287,14 @@ def extract_intent(client: LLMClient, question: str, candidates: IntentCandidate
         raise IntentUnavailable(outcome.status, outcome.validation_result.get("reason", ""))
 
     output = dict(outcome.output)
+    unresolved = list(output.get("unresolved") or ())
+    # A period-over-period question needs a population spine, and nothing in this pipeline may choose
+    # it. Raised here rather than left to the model's judgement so it cannot be quietly omitted.
+    if str(output.get("comparison", "")).strip() and "population" not in unresolved:
+        unresolved.append("population")
     return IntentExtraction(
         plan=_plan_from(output, question),
-        unresolved=tuple(output.get("unresolved") or ()),
+        unresolved=tuple(unresolved),
         status=outcome.status,
         provider_calls=outcome.provider_calls,
     )

@@ -241,8 +241,10 @@ def test_planning_requires_feature_generate(make_client, catalog):
 def test_an_abstention_comes_back_as_an_answerable_question(make_client, catalog):
     r = _client(make_client, unresolved=["entity"], entity_ref="").post(
         "/analysis/plan", json={"question": _QUESTION}, headers=_h())
-    (clar,) = r.json()["clarifications"]
-    assert clar["code"] == "entity"
+    clars = {c["code"]: c for c in r.json()["clarifications"]}
+    # `population` rides along on every comparison; the entity question is the one under test.
+    assert "population" in clars
+    clar = clars["entity"]
     assert {o["value"] for o in clar["options"]} == {"ftr::tran_repos.cif_id"}
 
 
@@ -268,8 +270,10 @@ def test_an_answer_naming_a_column_that_was_never_offered_is_REFUSED(make_client
 def test_the_answered_question_is_not_asked_again(make_client, catalog):
     client = _client(make_client, unresolved=["entity"], entity_ref="")
     body = {"question": _QUESTION, "code": "entity", "chosen": ["ftr::tran_repos.cif_id"]}
-    assert [c["code"] for c in client.post("/analysis/clarify", json=body,
-                                           headers=_h()).json()["clarifications"]] == []
+    remaining = [c["code"] for c in client.post("/analysis/clarify", json=body,
+                                                headers=_h()).json()["clarifications"]]
+    assert "entity" not in remaining
+    assert remaining == ["population"], "the declaration must keep being asked until it is made"
 
 
 # ── failure shapes ───────────────────────────────────────────────────────────────────────────────

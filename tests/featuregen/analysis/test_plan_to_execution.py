@@ -220,3 +220,34 @@ def test_the_gap_codes_that_had_no_producer_now_have_one():
     declared and unreachable. If a later change orphans them again this test says so."""
     produced = {gap for gap, _ in BRIDGE_REFUSAL_TO_GAP.values()}
     assert {"POPULATION_UNRESOLVED", "POINT_IN_TIME_RULE_MISSING"} <= produced
+
+
+# ── the declared population must BIND ────────────────────────────────────────────────────────────
+
+def test_a_spine_binding_that_is_not_the_DECLARED_population_is_refused():
+    """A population declared and then substituted is worse than one never declared: the audit trail
+    says a person chose it, and the number is from somewhere else.
+
+    `spine.py`'s doctrine is that the declaration chooses the source and governed facts may only
+    validate it. That only means anything if the declaration is checked against what actually runs.
+    """
+    declared = _plan(population_table_ref="ftr::dpl_eib.customer_master",
+                     population_key_ref="ftr::dpl_eib.customer_master.cif_id")
+    with pytest.raises(BridgeRefusal) as exc:
+        plan_to_execution_ir(_grounded(plan=declared),
+                             _inputs(spine_binding=binding(CUSTOMER_SCHEMA, DIMENSION_TABLE)))
+    assert exc.value.code == "SPINE_NOT_THE_DECLARED_POPULATION"
+
+
+def test_a_spine_binding_that_MATCHES_the_declaration_is_accepted():
+    declared = _plan(population_table_ref="ftr::dpl_eib.customer_master",
+                     population_key_ref="ftr::dpl_eib.customer_master.cif_id")
+    ir = plan_to_execution_ir(_grounded(plan=declared), _inputs())
+    assert ir.spine.binding.identity.table == CUSTOMER_TABLE
+
+
+def test_an_UNDECLARED_population_still_works_for_a_caller_that_supplies_its_own_spine():
+    """The check is on the DECLARATION, not a new requirement to declare — a caller assembling
+    ExecutionInputs directly (the executor's own tests, a batch job) is unaffected."""
+    ir = plan_to_execution_ir(_grounded(), _inputs())
+    assert ir.spine.binding.identity.table == CUSTOMER_TABLE

@@ -164,6 +164,18 @@ def plan_to_execution_ir(grounded: GroundedPlan,
             subject=plan.base_table_ref)
 
     spine_id = inputs.spine_binding.identity.table_id
+    if plan.population_table_ref:
+        # The caller resolved a binding; this checks it is the one the human DECLARED. Without the
+        # check the declaration is decorative — a caller could pass any table and the audit trail
+        # would still show a population that was chosen by a person.
+        declared = plan.population_table_ref.rsplit(".", 1)[-1].rsplit("::", 1)[-1].lower()
+        if declared and declared != inputs.spine_binding.identity.table.lower():
+            raise BridgeRefusal(
+                "SPINE_NOT_THE_DECLARED_POPULATION",
+                f"the declared population is {plan.population_table_ref!r} but the supplied spine "
+                f"binding is {spine_id!r}; a population that was declared and then substituted is "
+                "worse than one never declared, because the audit trail says a person chose it",
+                subject=plan.population_table_ref)
     if spine_id == inputs.event_binding.identity.table_id:
         raise BridgeRefusal(
             "SPINE_SAME_AS_EVENTS",

@@ -139,6 +139,18 @@ class AnalysisPlanV1:
     windows: tuple[Window, ...] = ()
     dimensions: tuple[Dimension, ...] = ()
     comparison: str = ""            # "" | decrease | increase | change
+    #: WHICH TABLE IS THE POPULATION, declared — never inferred. `spine.py` states the rule and the
+    #: reason: `kyc_customers`, `card_customers` and `customers` can look identical to the catalog —
+    #: same entity, same unique key, same availability column — so choosing among them from governed
+    #: facts is inference, and when it is wrong the spine simply has fewer rows and every number that
+    #: follows is plausible. Governed facts may VALIDATE this declaration; they may not make it.
+    #:
+    #: Empty means undeclared, which is why a period-over-period plan always raises a `population`
+    #: clarification: the model is not asked, because a model choosing here is inference by something
+    #: with less standing than the catalog.
+    population_table_ref: str = ""
+    population_key_ref: str = ""
+
     #: Cross-catalog hops this plan needs, as identifier-link fact keys. Grounding reads each one's
     #: governed lifecycle and DISCLOSES what it finds — JOIN_IDENTITY_UNCONFIRMED for a link no human
     #: has reviewed, JOIN_IDENTITY_UNAVAILABLE for one the platform will not consider — rather than
