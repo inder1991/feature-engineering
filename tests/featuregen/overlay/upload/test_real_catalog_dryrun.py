@@ -33,10 +33,11 @@ from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.ingest import ingest_upload
 
-_FTR = Path(os.environ.get(
-    "FTR_CSV", "/Users/ascoe/Projects/ai/feature-engineering/FTR_Column_Mapping_final.csv"))
-_CIB = Path(os.environ.get(
-    "CIB_CSV", "/Users/ascoe/Downloads/CIB_Customer_Column_Mapping_final.csv"))
+#: Both are gitignored bank exports. FTR is conventionally dropped at the repo root; CIB has no
+#: conventional home, so it is env-only. Absent either, every test here skips.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_FTR = Path(os.environ.get("FTR_CSV", _REPO_ROOT / "FTR_Column_Mapping_final.csv"))
+_CIB = Path(os.environ.get("CIB_CSV", "/nonexistent/CIB_Customer_Column_Mapping_final.csv"))
 
 
 def _load(db, path: Path, source: str):
