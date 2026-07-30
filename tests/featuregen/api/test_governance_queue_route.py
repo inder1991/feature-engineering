@@ -32,6 +32,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity
+from tests.featuregen.overlay.upload.conftest import _confirm_grain
 from tests.featuregen.overlay.upload.passc.conftest import SERVICE_ACTOR
 from tests.featuregen.overlay.upload.test_bridge_candidates import _load
 from tests.featuregen.overlay.upload.test_join_governance import _seed_join_with_evidence
@@ -125,6 +127,15 @@ def seeded(client, overlay_env):
     # `conn` IS the connection the TestClient's `get_conn` override serves, so a row inserted through
     # it is a row the route reads.
     return {"client": client, "conn": overlay_env, "bridge": bridge, "join": join, "grain": grain}
+
+
+def _verify_grain(conn, source: str, table: str, columns: list[str]) -> None:
+    """A COMPLETE, VERIFIED, unique grain through the REAL four-eyes flow (service proposes,
+    platform-admin confirms, projection drains) — the ONLY thing that makes a grain governed."""
+    _seed_grain(conn, source, table)
+    _confirm_grain(conn, source, table, columns,
+                   actor=mint_test_identity(subject="user:admin",
+                                            role_claims=("platform-admin",)))
 
 
 def _get(client, headers=ADMIN, **params):
@@ -245,11 +256,26 @@ def test_an_unreviewed_relationship_is_presented_as_available_for_use(seeded):
 def test_production_eligibility_is_reported_independently_of_review(seeded):
     """The seeded bridge is UNREVIEWED and automatically validated at the same time — which is the
     product point: review does not gate production, automatic validation of the directional
-    realization does."""
+    realization does. What licenses the automatic half is the GOVERNED grain of `crm.customers`,
+    confirmed here through the real four-eyes flow: `crm`'s endpoint column is that whole grain, so
+    the compiler resolves the same crossing as `bridge_far_grain`."""
+    _verify_grain(seeded["conn"], "crm", "customers", ["customer_id"])
     body = _get(seeded["client"]).json()
     bridge = next(i for i in body["items"] if i["kind"] == "entity_bridge")
     assert bridge["state_code"] == "unreviewed_available"
     assert bridge["production_eligibility"] == "Automatically validated for production"
+    assert bridge["production_eligibility_code"] == "grain_resolved"
+
+
+def test_an_uploaders_own_is_grain_flag_is_never_production_validation_over_the_wire(seeded):
+    """The OVER-CLAIM, at the wire. Both endpoints are `is_grain` in their own uploads and no grain
+    fact is VERIFIED, so the screen must read "sandbox only" — the response used to say
+    "Automatically validated for production" while the compiler refused the identical crossing as
+    `bridge_unattested`."""
+    body = _get(seeded["client"]).json()
+    bridge = next(i for i in body["items"] if i["kind"] == "entity_bridge")
+    assert bridge["production_eligibility"] == "Cardinality unresolved — sandbox only"
+    assert bridge["production_eligibility_code"] == "cardinality_unresolved"
 
 
 # ── Usage: never zero when it cannot measure ──────────────────────────────────────────────────────

@@ -86,6 +86,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from featuregen.contracts import DbConn
@@ -93,6 +94,7 @@ from featuregen.contracts.identity import IdentityEnvelope
 from featuregen.overlay.upload.bridge_governance import list_bridge_proposals
 from featuregen.overlay.upload.catalogs import list_visible_catalogs
 from featuregen.overlay.upload.contract.invalidation import bridge_fact_marker
+from featuregen.overlay.upload.governed_grain import load_governed_grains
 from featuregen.overlay.upload.join_governance import list_open_approved_join_proposals
 from featuregen.overlay.upload.table_fact_governance import (
     list_open_table_fact_proposals_governance,
@@ -102,6 +104,10 @@ from featuregen.runtime.observability import counters
 logger = logging.getLogger(__name__)
 
 _LIMIT_MAX = 500
+
+#: The schema a bridge endpoint's ``object_ref`` is flattened to when the ref carries none
+#: (``upload_catalog._SCHEMA`` / ``governed_grain._FLAT_SCHEMA``).
+_DEFAULT_SCHEMA = "public"
 
 ENTITY_BRIDGE = "entity_bridge"
 APPROVED_JOIN = "approved_join"
@@ -439,21 +445,99 @@ def _state(status: str) -> tuple[str, str]:
     return _STATE_LABEL.get(status, (status, "unknown"))
 
 
-def _bridge_eligibility(view: Mapping[str, Any]) -> tuple[str | None, str]:
+def _endpoint(view: Mapping[str, Any], side: str) -> tuple[str, str, str] | None:
+    """``(catalog_source, table_object_ref, column)`` for one bridge endpoint, or None when the ref
+    is malformed. ``table_object_ref`` is the flattened ``<schema>.<table>`` form ``graph_node`` and
+    every bridge endpoint use — the form :func:`load_governed_grains` keys on."""
+    ref = view.get(side)
+    if not isinstance(ref, Mapping):
+        return None
+    catalog = str(ref.get("catalog_source") or "").strip().lower()
+    table = str(ref.get("table") or "").strip().lower()
+    column = str(ref.get("column") or "").strip().lower()
+    if not (catalog and table and column):
+        return None
+    schema = str(ref.get("schema") or "").strip().lower() or _DEFAULT_SCHEMA
+    return catalog, f"{schema}.{table}", column
+
+
+def bridge_endpoint_grains(conn: DbConn, views: Iterable[Mapping[str, Any]], *,
+                           now: datetime) -> dict[str, dict[str, tuple[str, ...]]]:
+    """The GOVERNED grain of every bridge-endpoint table, read through the ONE governed-``GRAIN``
+    reader — :func:`~featuregen.overlay.upload.governed_grain.load_governed_grains`, the SAME
+    function ``declarations.build_compiler_context`` calls to fill ``governed_grain_by_table``.
+
+    Shared, not mirrored. The queue and the planner now answer "what is this table's grain?" from one
+    implementation, so they cannot drift into two opinions about what "governed" means — which is the
+    defect this replaces: the queue used to read ``view["left_is_grain"]``, a flag
+    ``cross_catalog_links`` ORs out of the current ``graph_node`` row and the derivation-time
+    ``evidence_json``, both of which ``build_graph`` writes STRAIGHT FROM AN UPLOAD.
+    ``governed_grain``'s own docstring forbids that read in as many words: *"is_grain = true alone is
+    a claim an uploader made about their own file. That is why nothing here ever GRANTS grain from
+    the flags."*
+
+    Only ATTESTED grains land in the result (VERIFIED, unexpired at ``now``, ``is_unique`` true,
+    schema-clean, present in ``graph_node``, agreeing with its own column projection). Every refusal
+    — missing, not-yet-VERIFIED, STALE, expired, scope-only uniqueness, contradictory — is an ABSENT
+    key, so a caller cannot mistake a refusal for an answer.
+
+    Fail-closed on an unreadable store: an empty map means every crossing reports ``sandbox only``,
+    which understates eligibility and never over-claims it."""
+    targets: list[tuple[str, str]] = []
+    for view in views:
+        for side in ("left", "right"):
+            endpoint = _endpoint(view, side)
+            if endpoint is not None:
+                targets.append((endpoint[0], endpoint[1]))
+    if not targets:
+        return {}
+    try:
+        return load_governed_grains(conn, targets, now=now)
+    except Exception:  # noqa: BLE001 — no grain evidence is "sandbox only", never a blank queue
+        counters.incr("overlay.governance_queue.governed_grain_unreadable")
+        logger.warning("governance queue: the governed grain read is unreadable — every bridge "
+                       "reports an unresolved cardinality", exc_info=True)
+        return {}
+
+
+def _bridge_eligibility(view: Mapping[str, Any],
+                        grains: Mapping[str, Mapping[str, tuple[str, ...]]],
+                        ) -> tuple[str | None, str]:
     """The AUTOMATIC production axis for a bridge, independent of every human decision.
 
-    A crossing is production-eligible when its directional realization is resolved: one endpoint is
-    the far table's governed GRAIN, which is exactly what makes the hop many-to-one
-    (``declarations._segment_cardinality`` -> ``CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN``; the
-    alternative is ``CARDINALITY_SOURCE_BRIDGE_UNATTESTED``). Neither endpoint a grain means fan-out
-    is unbounded, which is a sandbox answer, not a withheld approval.
+    A crossing is production-eligible when a directional realization of it is resolved: an endpoint
+    is the WHOLE governed grain of ITS OWN table, which is exactly what makes the hop that lands on
+    that table many-to-one. This is ``declarations._segment_cardinality``'s rule, applied to the same
+    evidence through the same reader:
+
+    * **the endpoint's OWN table.** ``_segment_cardinality`` picks the endpoint whose catalog is the
+      segment's — the FAR side, the table the hop lands on — and consults only THAT table's grain,
+      because *"a grain confirmed on the near side is evidence for the opposite direction"*. A queue
+      item carries no hop, and an ``EntityBridgeRef`` is unordered (left/right is storage order), so
+      both directions are considered; but each endpoint is still weighed ONLY against the grain of
+      the table it lives in. A grain governed on one side is never credited to the column on the
+      other, whatever the two columns are called.
+    * **the WHOLE grain.** ``grain == (column,)`` — set equality, as the planner has it. One member
+      of a composite grain ``(a, b)`` derives nothing: joining on ``a`` alone lands on every ``b``
+      for that ``a``, so a bridge onto ``a`` is exactly as unbounded as one onto no key at all.
+    * **governed, not declared.** ``grains`` holds only attested grains (see
+      :func:`bridge_endpoint_grains`); an absent key is a refusal and reads as no evidence.
+
+    Neither endpoint at grain means fan-out is unbounded, which is a sandbox answer, not a withheld
+    approval — the human axis says nothing here either way.
 
     No derivation evidence at all (the W4 case: ``bridge_propose`` skipped the ledger row) -> None.
     Absence of evidence is not evidence of unresolved cardinality."""
     if not view.get("evidence_present"):
         return None, "not_observed"
-    if view.get("left_is_grain") or view.get("right_is_grain"):
-        return _VALIDATED, "grain_resolved"
+    for side in ("left", "right"):
+        endpoint = _endpoint(view, side)
+        if endpoint is None:
+            continue
+        catalog, table_object_ref, column = endpoint
+        grain = grains.get(catalog, {}).get(table_object_ref)
+        if grain is not None and tuple(grain) == (column,):
+            return _VALIDATED, "grain_resolved"
     return _SANDBOX_ONLY, "cardinality_unresolved"
 
 
@@ -477,9 +561,10 @@ def _ref_text(ref: Mapping[str, Any] | None) -> str:
     return ".".join(p for p in parts if p)
 
 
-def _bridge_item(view: Mapping[str, Any], usage: tuple[Usage, ...]) -> QueueItem:
+def _bridge_item(view: Mapping[str, Any], usage: tuple[Usage, ...],
+                 grains: Mapping[str, Mapping[str, tuple[str, ...]]]) -> QueueItem:
     state, code = _state(str(view.get("status") or ""))
-    eligibility, eligibility_code = _bridge_eligibility(view)
+    eligibility, eligibility_code = _bridge_eligibility(view, grains)
     return QueueItem(
         kind=ENTITY_BRIDGE,
         fact_key=str(view["fact_key"]),
@@ -552,7 +637,8 @@ def _table_fact_item(view: Mapping[str, Any], source: str) -> QueueItem:
 
 def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
                      actor: IdentityEnvelope | None = None,
-                     limit: int = 100, usage: bool = True) -> GovernanceQueue:
+                     limit: int = 100, usage: bool = True,
+                     now: datetime | None = None) -> GovernanceQueue:
     """Every pending governance decision the caller may see, across EVERY catalog — no source
     argument. See the module docstring for the scoping, vocabulary and measurability rules.
 
@@ -563,10 +649,15 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
     ``actor`` decides ``available_actions`` (four-eyes projection). ``limit`` is clamped to 1..500
     and bounds the MERGED list; ``truncated`` says whether anything was cut.
 
+    ``now`` is the instant the governed grain read judges EXPIRY against (a VERIFIED grain past its
+    ``expires_at`` is refused at read time, ahead of the async poller's STALE). It defaults to the
+    wall clock; a caller passes one only to pin the boundary.
+
     A listing that cannot be read is recorded in ``unreadable`` and clears ``complete`` — it never
     raises and never silently yields an empty queue.
     """
     limit = max(1, min(int(limit), _LIMIT_MAX))
+    now = now or datetime.now(UTC)
     role_claims = tuple(roles)
     unreadable: list[Unreadable] = []
 
@@ -602,9 +693,12 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
     usage_by_key: dict[str, tuple[Usage, ...]] = {}
     if usage and bridge_views:
         usage_by_key = bridge_usage(conn, [str(v["fact_key"]) for v in bridge_views])
+    # The AUTOMATIC axis, from the SAME governed-grain reader the planner uses — one batched read for
+    # every endpoint table, never a per-item re-derivation and never the uploader's own is_grain flag.
+    grains = bridge_endpoint_grains(conn, bridge_views, now=now)
     for view in bridge_views:
         by_kind[ENTITY_BRIDGE].append(
-            _bridge_item(view, usage_by_key.get(str(view["fact_key"]), ())))
+            _bridge_item(view, usage_by_key.get(str(view["fact_key"]), ()), grains))
 
     # ── joins + table facts: source is REQUIRED, so iterate the VISIBLE catalogs ──────────────────
     seen: set[tuple[str, str]] = set()
