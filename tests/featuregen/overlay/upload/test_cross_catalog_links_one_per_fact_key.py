@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from itertools import permutations
 
 from tests.featuregen.overlay.upload.test_bridge_orientation_identity import (
     bridge_candidate,
@@ -36,7 +37,7 @@ from featuregen.overlay.identity import EntityBridgeRef
 from featuregen.overlay.upload.bridge_governance import list_bridge_proposals
 from featuregen.overlay.upload.bridge_projection import active_bridges
 from featuregen.overlay.upload.bridge_propose import propose_bridge
-from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
+from featuregen.overlay.upload.cross_catalog_links import _merge_ledger_rows, cross_catalog_links
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 
 _T0 = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
@@ -149,6 +150,24 @@ def test_a_rejected_bridge_stays_absent_even_with_duplicate_ledger_rows(db):
     cand = bridge_candidate(db)
     reject(db, EntityBridgeRef(cand.entity_id, cand.left_ref, cand.right_ref), key)
     assert cross_catalog_links(db) == ()
+
+
+def test_the_merge_is_order_independent_by_construction(db):
+    """The query is ordered, so the tests above would still pass if the reader PICKED a row rather
+    than merging — determinism would be coming from the `ORDER BY` alone. This pins the property at
+    the merge itself: every permutation of the same rows yields the identical record, so no future
+    change to the query (or to the planner) can reintroduce an order-dependent answer."""
+    rows = [
+        ("customer", *_CORE, *_CRM, "text", "attested", True, False),
+        ("customer", *_CORE, *_CRM, "uuid", "declared", False, True),
+        ("customer", *_CORE, *_CRM, "text", "", False, False),
+    ]
+    merged = {_merge_ledger_rows("k", list(order)) for order in permutations(rows)}
+    assert len(merged) == 1
+    only = merged.pop()
+    assert (only.left_is_grain, only.right_is_grain) == (True, True)
+    assert only.type_basis == ""            # the weakest reading present, not the first
+    assert only.data_type_family == "text"
 
 
 def test_two_genuinely_different_bridges_are_not_merged(db):
