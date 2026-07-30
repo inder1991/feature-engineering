@@ -137,7 +137,7 @@ def test_an_unclassifiable_declared_type_still_does_not_bridge(db):
 
 
 def test_version_pinned():
-    assert BRIDGE_DERIVATION_VERSION == "1.0.0"
+    assert BRIDGE_DERIVATION_VERSION == "2.0.0"
 
 
 def test_a_parameterised_sql_type_classifies_by_its_base_type(db):

@@ -152,7 +152,10 @@ def test_a_failure_in_the_stage_does_not_fail_the_upload(db, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("derivation exploded")
 
-    monkeypatch.setattr("featuregen.overlay.upload.ingest.derive_bridge_candidates", boom)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.ingest.derive_bridge_candidates_with_report",
+        boom,
+    )
     result = _trigger(db)
     assert result.status == "ingested"
     assert _ledger(db) == []
@@ -165,6 +168,10 @@ def test_the_count_is_reported_on_the_result(db, monkeypatch):
     _seed_two_catalogs(db)
     result = _trigger(db)
     assert result.entity_bridges_proposed == 1
+    assert result.entity_bridge_candidates_considered == 1
+    assert result.entity_bridge_candidates_retained == 1
+    assert result.entity_bridge_candidates_suppressed == 0
+    assert result.entity_bridge_candidates_truncated == 0
 
 
 # ── who proposes: the SYSTEM, never the uploading human ──────────────────────────────────────────
@@ -299,3 +306,7 @@ def test_flag_off_reports_zero(db, monkeypatch, flag):
     _seed_two_catalogs(db)
     result = _trigger(db)
     assert result.entity_bridges_proposed == 0
+    assert result.entity_bridge_candidates_considered == 0
+    assert result.entity_bridge_candidates_retained == 0
+    assert result.entity_bridge_candidates_suppressed == 0
+    assert result.entity_bridge_candidates_truncated == 0

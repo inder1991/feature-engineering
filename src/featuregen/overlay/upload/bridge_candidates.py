@@ -8,12 +8,16 @@ records review but is not a consumption gate.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from itertools import combinations, product
 
 from featuregen.overlay.identity import CatalogObjectRef
 from featuregen.overlay.upload.attest.bridge_grounding import (
     BridgeEndpointGroundingV1,
+    EvidencePresence,
+    RepresentationRole,
     assess_grounded_identifier_link,
     ground_bridge_endpoint,
     resolve_type_family,
@@ -28,7 +32,15 @@ from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
-BRIDGE_DERIVATION_VERSION = "1.0.0"
+BRIDGE_DERIVATION_VERSION = "2.0.0"
+MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR = 20
+MAX_PAIR_POOL_PER_ENDPOINT = 80
+MAX_BRIDGE_DERIVATION_EXAMPLES = 10
+_SMALL_BLOCK_PAIR_LIMIT = MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR**2
+_GENERIC_HINT_TOKENS = frozenset({
+    "id", "identifier", "key", "ref", "reference", "num", "number", "no", "nbr", "code", "cd",
+    "customer", "account", "entity",
+})
 
 def _type_family(data_type: str | None) -> str:
     """The family a declared type belongs to, ignoring any length/precision parameter.
@@ -60,6 +72,69 @@ class BridgeCandidateV1:
     left_concept_authority: str = ConceptAuthority.UNKNOWN.value
     right_concept_authority: str = ConceptAuthority.UNKNOWN.value
     assessment: IdentifierLinkAssessmentV1 | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeDerivationExampleV1:
+    left_ref: str
+    right_ref: str
+    reason_codes: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "left_ref": self.left_ref,
+            "right_ref": self.right_ref,
+            "reason_codes": list(self.reason_codes),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeCandidateDerivationV1:
+    """Bounded candidate output plus an honest account of everything not retained.
+
+    ``considered_count`` means a pair that reached full bridge grounding/scoring.  A cheap block
+    match that was never fully scored is counted only by ``block_matched_count`` and, when omitted,
+    ``truncated_pair_count``.
+    """
+
+    candidates: tuple[BridgeCandidateV1, ...]
+    block_matched_count: int
+    considered_count: int
+    retained_count: int
+    suppressed_count: int
+    truncated_pair_count: int
+    reason_counts: tuple[tuple[str, int], ...] = ()
+    examples: tuple[BridgeDerivationExampleV1, ...] = ()
+
+    @property
+    def truncated(self) -> bool:
+        return self.truncated_pair_count > 0
+
+    @property
+    def truncation_reason(self) -> str | None:
+        return "per_endpoint_source_pair_limit" if self.truncated else None
+
+    def stage_detail(
+        self,
+        *,
+        proposed_count: int | None = None,
+        proposal_error_count: int = 0,
+    ) -> dict[str, object]:
+        detail: dict[str, object] = {
+            "block_matched_count": self.block_matched_count,
+            "considered_count": self.considered_count,
+            "retained_count": self.retained_count,
+            "suppressed_count": self.suppressed_count,
+            "truncated_pair_count": self.truncated_pair_count,
+            "truncated": self.truncated,
+            "truncation_reason": self.truncation_reason,
+            "reason_counts": dict(self.reason_counts),
+            "examples": [example.as_dict() for example in self.examples],
+        }
+        if proposed_count is not None:
+            detail["proposed"] = proposed_count
+            detail["proposal_errors"] = proposal_error_count
+        return detail
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +219,289 @@ def _candidate(entity: str, a: _IdCol, b: _IdCol) -> BridgeCandidateV1:
         left_concept_authority=left.concept_authority,
         right_concept_authority=right.concept_authority,
         assessment=assessment,
+    )
+
+
+def _col_key(col: _IdCol) -> tuple[str, str, str]:
+    return (col.catalog_source, col.table_name, col.column_name)
+
+
+def _specific_tokens(col: _IdCol, field_name: str) -> tuple[str, ...]:
+    facet = col.grounding.facet(field_name)
+    if facet.presence is EvidencePresence.ABSENT:
+        return ()
+    return tuple(
+        token
+        for token in facet.canonical_tokens
+        if token not in _GENERIC_HINT_TOKENS
+    )
+
+
+def _blocking_hints(col: _IdCol) -> tuple[str, ...]:
+    """Cheap deterministic lookup keys; none is itself a namespace conclusion."""
+    hints: list[str] = []
+    grounding = col.grounding
+    if grounding.explicit_namespace:
+        hints.append(f"namespace:{grounding.explicit_namespace}")
+    if grounding.concept.concept:
+        hints.append(f"concept:{grounding.concept.concept}")
+    name_tokens = _specific_tokens(col, "names")
+    if name_tokens:
+        hints.append(f"name:{' '.join(name_tokens)}")
+        hints.extend(f"name-token:{token}" for token in name_tokens)
+    for field_name in ("terms", "synonyms", "taxonomy"):
+        hints.extend(
+            f"{field_name}:{token}"
+            for token in _specific_tokens(col, field_name)
+        )
+    hints.append(f"role:{grounding.representation_role.value}")
+    if col.is_grain:
+        hints.append("key:declared-grain-member")
+    return tuple(dict.fromkeys(hints))
+
+
+def _counterpart_index(columns: tuple[_IdCol, ...]) -> dict[str, tuple[_IdCol, ...]]:
+    index: dict[str, list[_IdCol]] = defaultdict(list)
+    for col in columns:
+        for hint in _blocking_hints(col):
+            index[hint].append(col)
+    return {
+        hint: tuple(sorted(values, key=_col_key))
+        for hint, values in index.items()
+    }
+
+
+def _metadata_overlap(left: _IdCol, right: _IdCol, field_name: str) -> int:
+    return len(
+        set(left.grounding.facet(field_name).canonical_tokens)
+        & set(right.grounding.facet(field_name).canonical_tokens)
+    )
+
+
+def _cheap_pair_score(left: _IdCol, right: _IdCol) -> int:
+    """Rank within a block. Scores order discovery only; they never authorize execution."""
+    score = 0
+    left_grounding = left.grounding
+    right_grounding = right.grounding
+    if left_grounding.explicit_namespace and right_grounding.explicit_namespace:
+        score += (
+            1_000
+            if left_grounding.explicit_namespace == right_grounding.explicit_namespace
+            else -1_000
+        )
+    if left_grounding.concept.concept == right_grounding.concept.concept:
+        score += 80
+    if (
+        left_grounding.representation_role is RepresentationRole.IDENTIFIER_VALUE
+        and right_grounding.representation_role is RepresentationRole.IDENTIFIER_VALUE
+    ):
+        score += 60
+    if left_grounding.representation_role != right_grounding.representation_role:
+        score -= 80
+    left_name = _specific_tokens(left, "names")
+    right_name = _specific_tokens(right, "names")
+    if left_name and left_name == right_name:
+        score += 120
+    score += min(_metadata_overlap(left, right, "terms"), 3) * 35
+    score += min(_metadata_overlap(left, right, "synonyms"), 3) * 30
+    score += min(_metadata_overlap(left, right, "taxonomy"), 3) * 20
+    score += min(_metadata_overlap(left, right, "definition"), 3) * 5
+    if left.is_grain and right.is_grain:
+        score += 10
+    elif left.is_grain or right.is_grain:
+        score += 5
+    return score
+
+
+def _bounded_counterparts(
+    endpoint: _IdCol,
+    *,
+    counterparts: tuple[_IdCol, ...],
+    index: Mapping[str, tuple[_IdCol, ...]],
+) -> tuple[_IdCol, ...]:
+    """Use bounded inverted-index reads, then keep the endpoint's best twenty possibilities."""
+    pool: dict[tuple[str, str, str], _IdCol] = {}
+    for hint in _blocking_hints(endpoint):
+        for candidate in index.get(hint, ())[:MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR]:
+            pool[_col_key(candidate)] = candidate
+            if len(pool) >= MAX_PAIR_POOL_PER_ENDPOINT:
+                break
+        if len(pool) >= MAX_PAIR_POOL_PER_ENDPOINT:
+            break
+    # A reachable fallback is required for differently-named but valid identifiers such as
+    # cust_num <-> cif_id. It is bounded and deterministically ordered.
+    for candidate in counterparts[:MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR]:
+        pool.setdefault(_col_key(candidate), candidate)
+    ranked = sorted(
+        pool.values(),
+        key=lambda candidate: (
+            -_cheap_pair_score(endpoint, candidate),
+            _col_key(candidate),
+        ),
+    )
+    return tuple(ranked[:MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR])
+
+
+def _pair_keys_for_block(
+    left: tuple[_IdCol, ...],
+    right: tuple[_IdCol, ...],
+) -> set[tuple[tuple[str, str, str], tuple[str, str, str]]]:
+    if len(left) * len(right) <= _SMALL_BLOCK_PAIR_LIMIT:
+        return {
+            (_col_key(left_col), _col_key(right_col))
+            for left_col, right_col in product(left, right)
+        }
+    left_index = _counterpart_index(left)
+    right_index = _counterpart_index(right)
+    pairs: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
+    for left_col in left:
+        for right_col in _bounded_counterparts(
+            left_col, counterparts=right, index=right_index
+        ):
+            pairs.add((_col_key(left_col), _col_key(right_col)))
+    # Symmetric nomination prevents source ordering from deciding which strong pairs are visible.
+    for right_col in right:
+        for left_col in _bounded_counterparts(
+            right_col, counterparts=left, index=left_index
+        ):
+            pairs.add((_col_key(left_col), _col_key(right_col)))
+    return pairs
+
+
+def _bound_pairs_before_full_scoring(
+    pair_keys: set[tuple[tuple[str, str, str], tuple[str, str, str]]],
+    *,
+    left_by_key: Mapping[tuple[str, str, str], _IdCol],
+    right_by_key: Mapping[tuple[str, str, str], _IdCol],
+) -> tuple[tuple[tuple[str, str, str], tuple[str, str, str]], ...]:
+    """Apply the symmetric degree cap before constructing full assessments.
+
+    Either side may nominate a pair, but a hub endpoint cannot be fully scored merely because many
+    counterparts nominated it. Cheap metadata ranking decides which bounded pairs reach grounding.
+    """
+    ranked = sorted(
+        pair_keys,
+        key=lambda pair: (
+            -_cheap_pair_score(left_by_key[pair[0]], right_by_key[pair[1]]),
+            pair,
+        ),
+    )
+    left_degree: dict[tuple[str, str, str], int] = defaultdict(int)
+    right_degree: dict[tuple[str, str, str], int] = defaultdict(int)
+    retained: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []
+    for left_key, right_key in ranked:
+        if (
+            left_degree[left_key] >= MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR
+            or right_degree[right_key] >= MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR
+        ):
+            continue
+        left_degree[left_key] += 1
+        right_degree[right_key] += 1
+        retained.append((left_key, right_key))
+    return tuple(retained)
+
+
+def _bounded_example(
+    examples: list[BridgeDerivationExampleV1],
+    example: BridgeDerivationExampleV1,
+) -> None:
+    examples.append(example)
+    examples.sort(key=lambda item: (item.left_ref, item.right_ref, item.reason_codes))
+    del examples[MAX_BRIDGE_DERIVATION_EXAMPLES:]
+
+
+def _derive_from_identifier_columns(
+    columns: Iterable[_IdCol],
+) -> BridgeCandidateDerivationV1:
+    """Pure bounded enumeration over endpoints that were grounded once."""
+    blocks: dict[tuple[str, str], dict[str, list[_IdCol]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for col in columns:
+        if col.type_family == "other":
+            continue
+        blocks[(col.entity, col.type_family)][col.catalog_source].append(col)
+
+    candidates: dict[str, BridgeCandidateV1] = {}
+    reason_counts: dict[str, int] = defaultdict(int)
+    examples: list[BridgeDerivationExampleV1] = []
+    block_matched_count = 0
+    considered_count = 0
+    suppressed_count = 0
+
+    for (entity, _family), by_source in sorted(blocks.items()):
+        normalized = {
+            source: tuple(sorted(values, key=_col_key))
+            for source, values in by_source.items()
+        }
+        for left_source, right_source in combinations(sorted(normalized), 2):
+            left_columns = normalized[left_source]
+            right_columns = normalized[right_source]
+            block_matched_count += len(left_columns) * len(right_columns)
+            left_by_key = {_col_key(col): col for col in left_columns}
+            right_by_key = {_col_key(col): col for col in right_columns}
+            pair_keys = _bound_pairs_before_full_scoring(
+                _pair_keys_for_block(left_columns, right_columns),
+                left_by_key=left_by_key,
+                right_by_key=right_by_key,
+            )
+            considered_count += len(pair_keys)
+
+            scored: list[tuple[int, BridgeCandidateV1]] = []
+            for left_key, right_key in sorted(pair_keys):
+                candidate = _candidate(
+                    entity, left_by_key[left_key], right_by_key[right_key])
+                assessment = candidate.assessment
+                assert assessment is not None
+                if assessment.hard_conflicts:
+                    suppressed_count += 1
+                    for reason in assessment.hard_conflicts:
+                        reason_counts[f"hard_conflict:{reason}"] += 1
+                    _bounded_example(
+                        examples,
+                        BridgeDerivationExampleV1(
+                            assessment.left_endpoint.members[0].logical_column_ref,
+                            assessment.right_endpoint.members[0].logical_column_ref,
+                            assessment.hard_conflicts,
+                        ),
+                    )
+                    continue
+                score = _cheap_pair_score(
+                    left_by_key[left_key], right_by_key[right_key])
+                scored.append((score, candidate))
+
+            for _score, candidate in sorted(
+                scored, key=lambda item: (-item[0], item[1].candidate_id)
+            ):
+                candidates[candidate.candidate_id] = candidate
+                assessment = candidate.assessment
+                assert assessment is not None
+                if assessment.namespace_verdict.value in {"possible", "unknown"}:
+                    _bounded_example(
+                        examples,
+                        BridgeDerivationExampleV1(
+                            assessment.left_endpoint.members[0].logical_column_ref,
+                            assessment.right_endpoint.members[0].logical_column_ref,
+                            ("ambiguous_identifier_namespace",),
+                        ),
+                    )
+
+    retained_count = len(candidates)
+    # Includes both pairs never fully scored and fully-scored valid pairs dropped by the symmetric
+    # endpoint cap. Hard-conflict suppressions are reported separately.
+    truncated_pair_count = max(
+        0, block_matched_count - retained_count - suppressed_count)
+    if truncated_pair_count:
+        reason_counts["per_endpoint_source_pair_limit"] += truncated_pair_count
+    return BridgeCandidateDerivationV1(
+        candidates=tuple(candidates[key] for key in sorted(candidates)),
+        block_matched_count=block_matched_count,
+        considered_count=considered_count,
+        retained_count=retained_count,
+        suppressed_count=suppressed_count,
+        truncated_pair_count=truncated_pair_count,
+        reason_counts=tuple(sorted(reason_counts.items())),
+        examples=tuple(examples),
     )
 
 
@@ -260,21 +618,11 @@ def derive_bridge_candidates(conn, *, roles: Iterable[str] = ()) -> tuple[Bridge
     """Candidate bridges from declared metadata: identifier concepts for the SAME entity_link, in DISTINCT
     catalog sources, with a COMPATIBLE type family. Deterministic (canonical unordered pair + sorted
     output). Read-only."""
-    by_entity: dict[str, list[_IdCol]] = {}
-    for col in _identifier_columns(conn, roles=roles):
-        # `other` = neither an attested nor a declared type this platform can classify. Excluded, so
-        # the family check below can never degrade into "unknown matches anything".
-        if col.type_family != "other":
-            by_entity.setdefault(col.entity, []).append(col)
-    cands: dict[str, BridgeCandidateV1] = {}
-    for entity, group in by_entity.items():
-        for i in range(len(group)):
-            for j in range(i + 1, len(group)):
-                a, b = group[i], group[j]
-                if a.catalog_source == b.catalog_source or a.type_family != b.type_family:
-                    continue
-                c = _candidate(entity, a, b)
-                if c.assessment is not None and c.assessment.hard_conflicts:
-                    continue
-                cands[c.candidate_id] = c
-    return tuple(cands[k] for k in sorted(cands))
+    return derive_bridge_candidates_with_report(conn, roles=roles).candidates
+
+
+def derive_bridge_candidates_with_report(
+    conn, *, roles: Iterable[str] = ()
+) -> BridgeCandidateDerivationV1:
+    """Derive candidates with bounded work and visible suppression/truncation accounting."""
+    return _derive_from_identifier_columns(_identifier_columns(conn, roles=roles))

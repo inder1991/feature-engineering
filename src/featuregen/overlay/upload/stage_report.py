@@ -53,7 +53,7 @@ CANONICAL_STAGES: tuple[str, ...] = (
     "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
     "graph_persistence",
-    "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+    "governed_joins", "pass_c", "pass_b", "glossary_evidence", "entity_bridges",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
     "quarantine", "manifest_finalization")
