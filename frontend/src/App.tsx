@@ -223,10 +223,12 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     route: 'governance',
     label: 'Governance',
     eyebrow: 'CATALOG · GOVERNANCE REVIEW',
-    // The screen hosts three tabs — Joins (Pass C), Grain & availability (Pass B), Readiness —
-    // so the header names the whole review surface, not just the joins tab.
+    // One cross-catalog decision queue now (it used to be three source-keyed tabs behind a text
+    // input): the header names the judgement being asked for, not the fact types it spans.
     title: 'Governance review',
-    description: 'Confirm the joins, grain, and availability facts the enrichment passes proposed.',
+    description:
+      'Every relationship waiting on a person, across every catalog you can see. The system '
+      + 'proposes; you decide whether it means what it says.',
   },
   {
     route: 'dashboard',
