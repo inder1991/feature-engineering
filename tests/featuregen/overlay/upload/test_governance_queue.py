@@ -39,9 +39,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity
+from tests.featuregen.overlay.upload.conftest import _confirm_grain
 from tests.featuregen.overlay.upload.passc.conftest import SERVICE_ACTOR
 from tests.featuregen.overlay.upload.test_bridge_candidates import _load
-from tests.featuregen.overlay.upload.test_join_governance import _seed_join_with_evidence
+from tests.featuregen.overlay.upload.test_join_governance import (
+    _confirm_once,
+    _seed_join_with_evidence,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.commands import propose_fact
@@ -57,6 +62,7 @@ from featuregen.overlay.upload.governance_queue import (
     bridge_usage,
     governance_queue,
 )
+from featuregen.overlay.upload.governed_grain import GovernedGrain, read_governed_grain
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter, table_ref
 
 _NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
@@ -98,6 +104,22 @@ def _seed_grain(db, source: str, table: str = "customer_master") -> str:
         {"ref": ref, "fact_type": "grain", "proposed_value": value},
         SERVICE_ACTOR, proposal_fingerprint(value)))
     assert res.accepted, res.denied_reason
+    return fact_key(ref, "grain")
+
+
+def _verify_grain(db, source: str, table: str, columns: list[str], *, human) -> str:
+    """A COMPLETE, VERIFIED, unique grain through the REAL four-eyes flow — the service actor
+    proposes, a platform-admin confirms, the projection drains. This is the ONLY thing that makes a
+    grain governed: `is_grain` on a `graph_node` row is the uploader's claim about their own file,
+    which `governed_grain` forbids as evidence in as many words."""
+    ref = table_ref(source, table)
+    value = {"columns": columns, "is_unique": True}
+    res = propose_fact(db, Command(
+        "propose_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "grain", "proposed_value": value},
+        SERVICE_ACTOR, proposal_fingerprint(value)))
+    assert res.accepted, res.denied_reason
+    _confirm_grain(db, source, table, columns, actor=human)
     return fact_key(ref, "grain")
 
 
@@ -251,15 +273,112 @@ def test_an_unreviewed_relationship_is_labelled_available_for_use(all_three_kind
     assert bridge.state_code == "unreviewed_available"
 
 
-def test_production_eligibility_is_a_SEPARATE_axis_from_review(all_three_kinds):
+def test_production_eligibility_is_a_SEPARATE_axis_from_review(all_three_kinds, human_actor):
     """Human review does not decide production eligibility; automatic validation of the directional
-    realization does. The seeded bridge is UNREVIEWED and its cardinality IS resolved (both endpoints
-    are governed grains), so the two axes must disagree — which is only expressible if they are two
-    fields."""
-    bridge = _bridge(governance_queue(all_three_kinds.conn, roles=()))
+    realization does. The bridge is UNREVIEWED, and its cardinality IS resolved because `crm`'s
+    endpoint column is the WHOLE, VERIFIED, unique grain of `crm.customers` — the same evidence,
+    read through the same `governed_grain` reader, that makes `declarations._segment_cardinality`
+    answer `bridge_far_grain` instead of `bridge_unattested`. The two axes must disagree, which is
+    only expressible if they are two fields."""
+    conn = all_three_kinds.conn
+    _verify_grain(conn, "crm", "customers", ["customer_id"], human=human_actor)
+
+    bridge = _bridge(governance_queue(conn, roles=()))
     assert bridge.state_code == "unreviewed_available"
     assert bridge.production_eligibility == "Automatically validated for production"
     assert bridge.production_eligibility_code == "grain_resolved"
+
+
+def test_an_uploaders_own_is_grain_flag_is_never_production_validation(all_three_kinds):
+    """THE OVER-CLAIM THIS AXIS EXISTED TO MAKE. Both endpoint columns are declared `is_grain` by
+    their own upload and `core`'s grain fact is merely DRAFT — nobody has confirmed anything. The
+    screen used to answer "Automatically validated for production" off those flags while the
+    compiler resolved the identical crossing as `bridge_unattested` and refused to run it.
+
+    `governed_grain`: *"`is_grain = true` alone is a claim an uploader made about their own file.
+    That is why nothing here ever GRANTS grain from the flags."*"""
+    conn = all_three_kinds.conn
+    flags = conn.execute(
+        "SELECT count(*) FROM graph_node WHERE kind = 'column' AND is_grain "
+        "  AND (catalog_source, object_ref) IN "
+        "      (('core', 'public.customer_master.customer_id'), "
+        "       ('crm', 'public.customers.customer_id'))").fetchone()[0]
+    assert flags == 2, "both endpoints carry the file-declared flag — the defect's whole input"
+
+    bridge = _bridge(governance_queue(conn, roles=()))
+    assert bridge.production_eligibility == "Cardinality unresolved — sandbox only"
+    assert bridge.production_eligibility_code == "cardinality_unresolved"
+
+
+def test_one_member_of_a_COMPOSITE_grain_resolves_nothing(queue_db, human_actor):
+    """Set EQUALITY, exactly as `_segment_cardinality` has it (`grain == (column,)`). The bridge
+    lands on `customer_id`, but `core.customer_master`'s VERIFIED grain is `(customer_id, segment)`:
+    joining on `customer_id` alone lands on every `segment` for that customer, so the hop is as
+    unbounded as one onto no key at all. A `column in grain` membership test would call this
+    validated."""
+    _load(queue_db, "core", [
+        (CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True),
+         "customer_id"),
+        (CanonicalRow("core", "customer_master", "segment", "text", is_grain=True), "categorical"),
+    ])
+    _load(queue_db, "crm", [
+        (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+    ])
+    _seed_bridge(queue_db)
+    _verify_grain(queue_db, "core", "customer_master", ["customer_id", "segment"],
+                  human=human_actor)
+    # the composite grain really IS attested — this is complete-equality failing, not a refusal
+    grain = read_governed_grain(queue_db, "core", "customer_master", now=_NOW)
+    assert isinstance(grain, GovernedGrain) and grain.columns == ("customer_id", "segment")
+
+    bridge = _bridge(governance_queue(queue_db, roles=(), now=_NOW))
+    assert bridge.production_eligibility_code == "cardinality_unresolved"
+
+
+def test_a_grain_governed_on_one_side_is_never_credited_to_the_other_endpoint(queue_db,
+                                                                              human_actor):
+    """DIRECTION. `_segment_cardinality` consults ONLY the table the hop lands on, because *"a grain
+    confirmed on the near side is evidence for the opposite direction"*. Here `core.customer_master`
+    has a complete VERIFIED grain on `customer_id` — but the bridge does not land on it: `core`'s
+    endpoint is `cust_ref`, and the column actually named `customer_id` is `crm`'s endpoint, whose
+    own table has no governed grain at all.
+
+    So the only evidence in the database is grain evidence about the NEAR side of every crossing
+    this bridge can realize, and the honest answer is sandbox-only. An implementation that pooled
+    both tables' grain columns and matched either endpoint by NAME would answer validated — and so
+    does the file-flag implementation this replaced (`crm.customers.customer_id` is flagged)."""
+    _load(queue_db, "core", [
+        # the governed grain of this table — and deliberately NOT a bridge endpoint (no entity)
+        (CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True),
+         "categorical"),
+        # the bridge endpoint on this side — not the grain, and not flagged as one
+        (CanonicalRow("core", "customer_master", "cust_ref", "integer"), "customer_id"),
+    ])
+    _load(queue_db, "crm", [
+        # the bridge endpoint on the other side, carrying the uploader's own is_grain claim
+        (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+    ])
+    _seed_bridge(queue_db)
+    _verify_grain(queue_db, "core", "customer_master", ["customer_id"], human=human_actor)
+
+    bridge = _bridge(governance_queue(queue_db, roles=(), now=_NOW))
+    assert bridge.detail["left"]["column"] == "cust_ref"          # the crossing really is off-grain
+    assert bridge.detail["right"]["column"] == "customer_id"
+    assert bridge.production_eligibility == "Cardinality unresolved — sandbox only"
+    assert bridge.production_eligibility_code == "cardinality_unresolved"
+
+
+def test_no_derivation_evidence_at_all_is_not_observed_never_a_verdict(all_three_kinds):
+    """The W4 case: `bridge_propose`'s early return left no ledger row, so there is no derivation
+    record to reason from. Absence of evidence is not evidence of unresolved cardinality, so the
+    axis withholds a verdict entirely rather than reporting sandbox-only."""
+    conn = all_three_kinds.conn
+    conn.execute("DELETE FROM entity_bridge_candidate_evidence")
+
+    bridge = _bridge(governance_queue(conn, roles=()))
+    assert bridge.detail["evidence_present"] is False
+    assert bridge.production_eligibility is None
+    assert bridge.production_eligibility_code == "not_observed"
 
 
 def test_a_table_fact_has_no_production_eligibility_rather_than_a_guess(all_three_kinds):
@@ -269,6 +388,53 @@ def test_a_table_fact_has_no_production_eligibility_rather_than_a_guess(all_thre
                  if i.kind == "grain")
     assert grain.production_eligibility is None
     assert grain.production_eligibility_code == "not_applicable"
+
+
+# ── available_actions: four-eyes, PROJECTED from the write-side rule ──────────────────────────────
+
+def test_an_admin_who_already_endorsed_a_join_is_not_offered_confirm_again(queue_db):
+    """NEVER ADVERTISE AN ACTION THE WRITE SIDE DENIES — the invariant this surface exists to hold.
+
+    A dual discovered join needs TWO DISTINCT platform-admins:
+    `join_confirmation._confirm_approved_join` denies a repeat subject ("this owner already
+    confirmed; awaiting the other owner") and the route renders that denial as a 409 "You already
+    approved this — a different admin must confirm." So the admin who has already endorsed must be
+    offered `reject` only, while any OTHER admin is still offered both.
+
+    The defect was silent because the key was wrong, not the logic: `_approvals_from_stream` builds
+    each entry as `{"subject": payload["by_owner"], …}` — `by_owner` is the EVENT payload's field
+    and the approvals VIEW renames it — so reading `by_owner` off the view yielded a set of empty
+    strings, the membership test never matched, and every caller was offered `confirm`."""
+    _load(queue_db, "src", [
+        (CanonicalRow("src", "transactions", "cif_id", "text"), "customer_id"),
+        (CanonicalRow("src", "customers", "cif_id", "text", is_grain=True), "customer_id"),
+    ])
+    ref, key = _seed_join_with_evidence(queue_db)
+    admin1 = mint_test_identity(subject="user:admin1", role_claims=("platform-admin",))
+    admin2 = mint_test_identity(subject="user:admin2", role_claims=("platform-admin",))
+    _confirm_once(queue_db, ref, key, admin1, "looks right")
+
+    def _item(actor):
+        queue = governance_queue(queue_db, roles=(), actor=actor)
+        return next(i for i in queue.items if i.kind == "approved_join" and i.fact_key == key)
+
+    # the endorsement really is recorded, and under the key the view publishes
+    assert [a["subject"] for a in _item(admin1).detail["approvals"]] == ["user:admin1"]
+    assert _item(admin1).state_code == "partially_endorsed_available"
+
+    assert _item(admin1).available_actions == ("reject",)          # the write side would 409
+    assert _item(admin2).available_actions == ("confirm", "reject")  # the second, DISTINCT admin
+    assert _item(None).available_actions == ("confirm", "reject")    # unscoped internal read
+
+
+def test_a_join_nobody_has_endorsed_offers_both_actions_to_any_admin(all_three_kinds):
+    """The control for the test above: with an empty `approvals` list the projection must not
+    withhold `confirm` from anyone, or a caller who has done nothing would be told to reject."""
+    admin = mint_test_identity(subject="user:admin1", role_claims=("platform-admin",))
+    queue = governance_queue(all_three_kinds.conn, roles=(), actor=admin)
+    join = next(i for i in queue.items if i.kind == "approved_join")
+    assert join.detail["approvals"] == []
+    assert join.available_actions == ("confirm", "reject")
 
 
 # ── "Already depended on by": measurability is decided PER CATEGORY ───────────────────────────────
@@ -423,6 +589,80 @@ def test_limit_is_clamped_and_truncation_is_reported(all_three_kinds):
     assert len(one.items) == 1 and one.truncated is True
     assert governance_queue(conn, roles=(), limit=0).items != ()          # clamped up to 1
     assert governance_queue(conn, roles=(), limit=10_000).truncated is False
+
+
+def _bridge_everything(db, sources: tuple[str, ...]) -> None:
+    """One bridgeable `customer_id` column per catalog, so every pair derives a candidate."""
+    for source in sources:
+        _load(db, source, [
+            (CanonicalRow(source, "customers", "customer_id", "integer", is_grain=True),
+             "customer_id")])
+
+
+def test_a_sub_listing_that_cut_rows_is_reported_as_truncated(queue_db):
+    """`truncated` is the flag that renders "Show more", and it was blind to the cut that actually
+    happens. Each sub-listing used to be handed the CALLER's limit, so it cut before the merge could
+    observe the loss: six bridges at `limit=3` came back as three, `ordered == items`, `truncated`
+    was False, and the operator was shown half a queue with nothing saying so.
+
+    Four catalogs bridged pairwise are six proposals; three are asked for."""
+    _bridge_everything(queue_db, ("cat_a", "cat_b", "cat_c", "cat_d"))
+    keys = {propose_bridge(queue_db, cand, actor=SERVICE_ACTOR, now=_NOW)
+            for cand in derive_bridge_candidates(queue_db)}
+    assert len(keys) == 6, "four catalogs pairwise — the population the listing must not hide"
+
+    queue = governance_queue(queue_db, roles=(), limit=3)
+    assert len(queue.items) == 3
+    assert queue.truncated is True
+    # ...and this is a CUT, not an outage: the listings were all read.
+    assert queue.complete is True and queue.unreadable == ()
+
+
+def test_scope_narrowing_runs_BEFORE_truncation_so_a_visible_item_is_not_crowded_out(queue_db):
+    """`items == [] and complete` is this payload's own contract for "nothing is waiting", and it
+    was reachable while work WAS waiting.
+
+    The queue drops a bridge whose catalogs are not ALL visible — the KEEP-if-absent case the
+    listing deliberately does not drop (an endpoint with no `graph_node` row carries no sensitivity
+    requirement, so the listing keeps it) — but that narrowing ran AFTER the sub-listing had already
+    spent the caller's whole limit. Bridges the caller can never see crowded out the one they can.
+
+    The two `ghost` catalogs are ingested so a bridge derives, proposed FIRST so they are oldest and
+    the listing reaches them first, then their `graph_node` rows are removed. At `limit=1` the
+    listing used to return the ghost bridge alone, and the queue then narrowed it away to nothing.
+    """
+    _bridge_everything(queue_db, ("ghost_a", "ghost_b"))
+    ghost = propose_bridge(queue_db, derive_bridge_candidates(queue_db)[0],
+                           actor=SERVICE_ACTOR, now=_NOW)
+    _two_catalogs(queue_db)
+    pair = next(c for c in derive_bridge_candidates(queue_db)
+                if {c.left_ref.catalog_source, c.right_ref.catalog_source} == {"core", "crm"})
+    wanted = propose_bridge(queue_db, pair, actor=SERVICE_ACTOR, now=_NOW)
+    queue_db.execute("DELETE FROM graph_node WHERE catalog_source IN ('ghost_a', 'ghost_b')")
+
+    queue = governance_queue(queue_db, roles=(), limit=1)
+    assert set(queue.catalogs) == {"core", "crm"}       # the ghosts are genuinely invisible now
+    assert [i.fact_key for i in queue.items] == [wanted]
+    assert ghost not in _keys(queue)
+
+
+def test_a_listing_that_came_back_at_its_own_ceiling_is_reported_as_truncated(all_three_kinds,
+                                                                             monkeypatch):
+    """The residual cut the merge still cannot measure. Each sibling listing clamps at its own
+    `_LIMIT_MAX`, so past that ceiling the queue holds every row it was handed and no comparison of
+    `ordered` against `items` can reveal the loss.
+
+    A listing that comes back holding exactly what it was asked for MAY have cut, and the
+    conservative answer is the honest one: over-reporting costs a wasted "Show more", while
+    under-reporting tells an operator nothing is waiting when something is. Here nothing is cut at
+    the merge at all — every item fits inside `limit` — and `truncated` is still True."""
+    from featuregen.overlay.upload import governance_queue as mod
+    monkeypatch.setattr(mod, "_FETCH_LIMIT", 1)
+
+    queue = governance_queue(all_three_kinds.conn, roles=(), limit=100)
+    assert len(queue.items) == 3          # nothing was cut HERE — the merge fits inside the limit
+    assert queue.truncated is True        # ...but a listing came back at its ceiling
+    assert queue.complete is True and queue.unreadable == ()
 
 
 # ── Test-local recorders (the REAL stores' minimal legal rows) ─────────────────────────────────────

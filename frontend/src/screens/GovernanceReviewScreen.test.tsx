@@ -139,7 +139,10 @@ function grain(over: Partial<api.GovernanceQueueItem> = {}): api.GovernanceQueue
     available_actions: ['confirm', 'reject'],
     detail: {
       table: 'party_dly', proposed_value: { columns: ['cif_id'], is_unique: true },
-      origin: 'llm_enrichment', advisory: {}, task_id: 'tf-1', target_event_id: 'ev-2',
+      // The ONLY origin the backend emits: `table_fact_governance._ORIGIN`. This fixture used to
+      // say `llm_enrichment`, a plausible-looking string no code path produces — which is exactly
+      // what hid the "Proposed by llm_proposed_not_profiled" rendering from these tests.
+      origin: 'llm_proposed_not_profiled', advisory: {}, task_id: 'tf-1', target_event_id: 'ev-2',
       evidence_parse_status: 'parsed',
     },
     already_depended_on_by: [],
@@ -383,6 +386,160 @@ describe('governance review — the two axes stay separate', () => {
     })
 })
 
+describe('governance review — the basis of the claim being endorsed', () => {
+  it('shows that a declared type match rests on two spreadsheets, not on the schema', async () => {
+    // Every bridge on the live catalogs is `declared`: bridge_candidates._resolve_family falls back
+    // to the glossary-declared type only when nothing was attested. Confirming that is a materially
+    // different act, so the basis is on screen.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${bridge().fact_key}`))
+    const basis = cells.getByTestId('gq-basis')
+    expect(basis).toHaveAttribute('data-type-basis', 'declared')
+    const type = within(basis).getByTestId('basis-type')
+    // The words, not just the code: a reviewer must be able to read what `declared` means.
+    expect(type).toHaveTextContent(/spreadsheets/i)
+    expect(type).toHaveTextContent(/nothing read the physical schema/i)
+    // The other two fields the payload carried and the screen used to swallow.
+    expect(within(basis).getByTestId('basis-family')).toHaveTextContent('string')
+    expect(within(basis).getByTestId('basis-strength')).toHaveTextContent('3')
+    // A ranking score is not a probability, and it is not a claim about the values.
+    expect(within(basis).getByTestId('basis-strength')).toHaveTextContent(/not a probability/i)
+  })
+
+  it('repeats the declared basis where the agreement is actually ticked', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${bridge().fact_key}`))
+    await userEvent.click(cells.getByRole('button', { name: /^confirm/i }))
+    const caution = cells.getByTestId('gq-confirm-basis')
+    expect(caution).toHaveTextContent(/two glossary spreadsheets/i)
+    expect(caution).toHaveTextContent(/nothing read the physical schema/i)
+    // Beside the statement being agreed to, not somewhere else on the page.
+    expect(cells.getByRole('checkbox').closest('.gq-panel')).toContainElement(caution)
+  })
+
+  it('reports an attested basis differently, and a missing one as missing', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [
+        bridge({ fact_key: 'fact:entity_bridge:attested',
+                 detail: bridgeDetail({ entity_id: 'account', type_basis: 'attested' }) }),
+        // W4: bridge_propose skipped the ledger row, so there is no derivation evidence at all.
+        bridge({ fact_key: 'fact:entity_bridge:blank',
+                 detail: bridgeDetail({ entity_id: 'product', type_basis: '', data_type_family: '',
+                                        strength: null, evidence_present: false }) }),
+      ],
+      items_visible_to_you_by_kind: { entity_bridge: 2, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const attested = within(await screen.findByTestId('row-fact:entity_bridge:attested'))
+    expect(attested.getByTestId('gq-basis')).toHaveAttribute('data-type-basis', 'attested')
+    expect(attested.getByTestId('basis-type')).toHaveTextContent(/read from the data/i)
+    expect(attested.getByTestId('basis-type')).not.toHaveTextContent(/spreadsheet/i)
+    // An attested basis carries no caveat, so nothing is manufactured next to the agreement.
+    await userEvent.click(attested.getByRole('button', { name: /^confirm/i }))
+    expect(attested.queryByTestId('gq-confirm-basis')).toBeNull()
+
+    const blank = within(screen.getByTestId('row-fact:entity_bridge:blank'))
+    const basis = blank.getByTestId('gq-basis')
+    expect(basis).toHaveAttribute('data-type-basis', 'not_recorded')
+    expect(within(basis).getByTestId('basis-type')).toHaveTextContent(/not recorded/i)
+    expect(within(basis).getByTestId('basis-family')).toHaveTextContent(/not recorded/i)
+    expect(within(basis).getByTestId('basis-strength')).toHaveTextContent(/not recorded/i)
+    // Never dressed up as a weak pass: the type cell claims no basis it does not have.
+    expect(within(basis).getByTestId('basis-type')).not.toHaveTextContent(/read from the data/i)
+    expect(within(basis).getByTestId('basis-type')).not.toHaveTextContent(/spreadsheet/i)
+  })
+
+  it('renders the join side-tasks and the table advisory, and neither on the wrong kind',
+    async () => {
+      getGovernanceQueue.mockResolvedValue(queue({
+        items: [bridge(), join(), grain({
+          detail: { ...grain().detail,
+                    advisory: { table_role: 'dimension', primary_entity: 'party',
+                                event_or_snapshot: 'snapshot' } },
+        })],
+        items_visible_to_you_by_kind: {
+          entity_bridge: 1, approved_join: 1, grain: 1, availability_time: 0,
+        },
+      }))
+      render(<GovernanceReviewScreen />)
+      const joinRow = within(await screen.findByTestId(`row-${join().fact_key}`))
+      const tasks = joinRow.getByTestId('gq-tasks')
+      expect(tasks).toHaveTextContent(/from side/i)
+      expect(tasks).toHaveTextContent(/open/i)
+      expect(tasks).toHaveTextContent('t1')
+
+      const grainRow = within(screen.getByTestId(`row-${grain().fact_key}`))
+      const advisory = grainRow.getByTestId('gq-advisory')
+      expect(advisory).toHaveTextContent('dimension')
+      expect(advisory).toHaveTextContent('party')
+      // Advisory is context, never part of the claim — and it says so.
+      expect(advisory).toHaveTextContent(/not part of what you are agreeing to/i)
+
+      // A kind whose payload carries none of these renders no empty shell.
+      const bridgeRow = within(screen.getByTestId(`row-${bridge().fact_key}`))
+      expect(bridgeRow.queryByTestId('gq-tasks')).toBeNull()
+      expect(bridgeRow.queryByTestId('gq-advisory')).toBeNull()
+      expect(joinRow.queryByTestId('gq-basis')).toBeNull()
+      // The grain fixture with an EMPTY advisory map must render nothing either.
+      expect(grainRow.queryByTestId('gq-tasks')).toBeNull()
+    })
+
+  it('renders no advisory block when the enrichment recorded nothing', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain()], items_visible_to_you_by_kind: { grain: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const grainRow = within(await screen.findByTestId(`row-${grain().fact_key}`))
+    expect(grainRow.queryByTestId('gq-advisory')).toBeNull()
+  })
+})
+
+describe('governance review — provenance is provenance, never a person', () => {
+  it('reads a table fact origin as a method, not as its proposer', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain()], items_visible_to_you_by_kind: { grain: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const grainRow = await screen.findByTestId(`row-${grain().fact_key}`)
+    // A table fact carries no proposer at all, and `origin` is a constant describing HOW it was
+    // proposed. Naming it as the proposer invented a person called llm_proposed_not_profiled.
+    expect(grainRow).not.toHaveTextContent(/proposed by llm/i)
+    expect(grainRow).not.toHaveTextContent('llm_proposed_not_profiled')
+    expect(grainRow).toHaveTextContent(/proposed automatically/i)
+    // And the honest limit of the method travels with it: schema-read, never profiled.
+    expect(grainRow).toHaveTextContent(/not profiled against the data/i)
+  })
+
+  it('still names a real proposer as the person they are', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge({ detail: bridgeDetail({ proposed_by: 'alice@bank' }) })],
+      items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    expect(await screen.findByTestId(`row-${bridge().fact_key}`))
+      .toHaveTextContent(/proposed by alice@bank/i)
+  })
+
+  it('de-underscores an origin it has never seen rather than guessing at it', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain({ detail: { ...grain().detail, origin: 'some_future_origin' } })],
+      items_visible_to_you_by_kind: { grain: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const grainRow = await screen.findByTestId(`row-${grain().fact_key}`)
+    expect(grainRow).toHaveTextContent(/some future origin/i)
+    expect(grainRow).not.toHaveTextContent(/proposed by some/i)
+    // No claim about profiling is made for a method this client does not know.
+    expect(grainRow).not.toHaveTextContent(/not profiled against the data/i)
+  })
+})
+
 describe('governance review — available_actions drives the buttons', () => {
   it('renders confirm disabled, with the server reason, when the action is withheld', async () => {
     const withheld = bridge({
@@ -512,6 +669,96 @@ describe('governance review — the low-value candidate cluster', () => {
       expect(await screen.findByTestId('gq-notice')).toHaveTextContent(/8/)
     })
 
+  it('shows what settling the group would land on, not just the count of links', async () => {
+    // The one place the consequence matters most: a reviewer settling eight at once never opens the
+    // individual rows, so the usage that lives on them has to be on the card too.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = await screen.findByTestId('queue-entry')
+    // Collapsed, so this usage block is the CARD's own — not one leaking out of a member row.
+    expect(within(group).queryAllByTestId(/^row-fact:entity_bridge:branch:/)).toHaveLength(0)
+    const usage = within(within(group).getByTestId('usage'))
+    // Summed across the eight members (3 selected plans each, 1 published feature each).
+    expect(usage.getByTestId('usage-value-selected_plans')).toHaveTextContent(/^24$/)
+    expect(usage.getByTestId('usage-value-published_features')).toHaveTextContent(/^8$/)
+    // A real 0 stays 0 and an unmeasurable category stays words, exactly as on a single row.
+    expect(usage.getByTestId('usage-value-planned_candidates')).toHaveTextContent(/^0$/)
+    const untracked = usage.getByTestId('usage-value-generated_artifacts')
+    expect(untracked).toHaveTextContent('not tracked yet')
+    expect(untracked.textContent).not.toMatch(/\d/)
+    // How it was aggregated is stated where it is read.
+    expect(within(group).getByTestId('usage')).toHaveTextContent(/across all 8 links/i)
+  })
+
+  it('reports a category as words when one member of the group could not be measured', async () => {
+    // A sum over the members that COULD be counted would understate the consequence of settling
+    // the set, so the whole category falls back to the words.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH.map((item, i) => (i === 0
+        ? { ...item,
+            already_depended_on_by: item.already_depended_on_by.map(usage =>
+              (usage.category === 'selected_plans'
+                ? { ...usage, state: 'unreadable', count: null, display: 'unreadable' }
+                : usage)) }
+        : item)),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const usage = within(within(await screen.findByTestId('queue-entry')).getByTestId('usage'))
+    const plans = usage.getByTestId('usage-value-selected_plans')
+    expect(plans).toHaveTextContent('unreadable')
+    expect(plans.textContent).not.toMatch(/\d/)
+    // The categories that WERE fully measured are unaffected.
+    expect(usage.getByTestId('usage-value-published_features')).toHaveTextContent(/^8$/)
+  })
+
+  it('offers the group reject only over the members the server sanctions it on', async () => {
+    // The ordinary end state after confirming one member of a cross-product: two endorsed bridges
+    // sit in the same entity/catalog bucket as the open ones, and `_ACTIONS_VERIFIED = ()`.
+    const mixed = BRANCH.map((item, i) => (i < 2
+      ? { ...item, state: 'Human endorsed', state_code: 'human_endorsed', available_actions: [] }
+      : item))
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: mixed, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    // Still ONE card — they are still the same cross-product.
+    expect(screen.getAllByTestId('queue-entry')).toHaveLength(1)
+    // The card no longer claims to settle the whole group, and says what it will leave alone.
+    expect(group.queryByRole('button', { name: /reject the whole group/i })).toBeNull()
+    expect(group.getByTestId('gq-group-settled')).toHaveTextContent(/2 of these 8 are already/i)
+    await userEvent.click(group.getByRole('button', { name: /reject the 6 still open/i }))
+    expect(group.getByText(/not sent at all/i)).toBeInTheDocument()
+    await userEvent.click(group.getByRole('button', { name: /not the same entity/i }))
+    await userEvent.click(group.getByRole('button', { name: /^reject the 6 still open$/i }))
+    // ONLY the six the server sanctions are sent — never the two it would refuse.
+    await waitFor(() => expect(bulkRejectEntityBridges).toHaveBeenCalledWith(
+      mixed.slice(2).map(b => b.fact_key), 'not_the_same_entity', undefined))
+    // And the card and its members agree: an endorsed member offers nothing inside either.
+    await userEvent.click(group.getByRole('button', { name: /show the 8 candidates/i }))
+    const endorsed = within(screen.getByTestId(`row-${mixed[0].fact_key}`))
+    expect(endorsed.queryByRole('button', { name: /^reject/i })).toBeNull()
+  })
+
+  it('offers no group action at all when every member is already endorsed', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH.map(item => ({ ...item, state: 'Human endorsed',
+                                   state_code: 'human_endorsed', available_actions: [] })),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    // The card must not offer a reject every one of its members would deny.
+    expect(group.queryByRole('button', { name: /reject/i })).toBeNull()
+    expect(group.getByTestId('gq-group-why')).toHaveTextContent(/already endorsed every one/i)
+    expect(group.getByTestId('gq-group-why')).toHaveTextContent(/own flow/i)
+    // The candidates are still reachable — hiding them would be a different lie.
+    expect(group.getByRole('button', { name: /show the 8 candidates/i })).toBeInTheDocument()
+  })
+
   it('keeps a lone candidate an ordinary row, never a group of one', async () => {
     getGovernanceQueue.mockResolvedValue(queue({
       items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
@@ -594,10 +841,50 @@ describe('governance review — honest emptiness and honest counts', () => {
   })
 
   it('surfaces a load failure as the server said it, not as an empty queue', async () => {
-    getGovernanceQueue.mockRejectedValue(new api.ApiError(403, 'platform-admin required'))
+    // A GENUINE failure. This case used to be written with a 403, which is not a failure at all:
+    // the queue route is gated on the platform-admin claim and nothing gates the navigation to it,
+    // so a 403 is the ordinary answer for three of the five roles — see the refusal test below.
+    getGovernanceQueue.mockRejectedValue(new api.ApiError(500, 'the queue could not be built'))
     render(<GovernanceReviewScreen />)
-    expect(await screen.findByRole('alert')).toHaveTextContent('platform-admin required')
+    expect(await screen.findByRole('alert')).toHaveTextContent('the queue could not be built')
     expect(screen.queryByText(/nothing to review/i)).toBeNull()
+  })
+})
+
+describe('governance review — a refusal is not a breakage', () => {
+  // App.tsx gates the nav on nothing and LineageView links here in prose, so a catalog_viewer,
+  // data_owner or feature_engineer clicking "Governance" is an ordinary visit the server declines.
+  it('reads a 403 as an explanation, never as an error page', async () => {
+    getGovernanceQueue.mockRejectedValue(
+      new api.ApiError(403, 'requires the platform-admin role'))
+    render(<GovernanceReviewScreen />)
+    const explained = await screen.findByTestId('gq-not-yours')
+    // Calm, not alarming: nothing on this page claims something went wrong.
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(explained).toHaveTextContent(/not open to your role/i)
+    // The server's own sentence, quoted rather than paraphrased into a rule this client invented.
+    expect(explained).toHaveTextContent('requires the platform-admin role')
+    // And the true consequence: nothing is broken, and nothing is waiting on this visitor.
+    expect(explained).toHaveTextContent(/nothing is wrong/i)
+    expect(explained).toHaveTextContent(/platform-admin role/i)
+    // Never presented as an empty queue either — that would say "everything is settled".
+    expect(screen.queryByText(/nothing to review/i)).toBeNull()
+  })
+
+  it('keeps a 401 an error: a missing session is not a role answer', async () => {
+    getGovernanceQueue.mockRejectedValue(new api.ApiError(401, 'not authenticated'))
+    render(<GovernanceReviewScreen />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('not authenticated')
+    expect(screen.queryByTestId('gq-not-yours')).toBeNull()
+  })
+
+  it('says nothing about roles when the queue loads', async () => {
+    // The refusal state is reactive, not a prediction: a caller the server serves never sees it.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+    expect(screen.queryByTestId('gq-not-yours')).toBeNull()
+    expect(screen.queryByText(/platform-admin/i)).toBeNull()
   })
 })
 

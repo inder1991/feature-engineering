@@ -40,21 +40,36 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None,
     ref = EntityBridgeRef(entity_id=candidate.entity_id, left_ref=candidate.left_ref,
                           right_ref=candidate.right_ref)
     key = fact_key(ref, "entity_bridge")
+    # A bridge is an UNORDERED pair, and `EntityBridgeRef` canonicalizes its endpoints on
+    # construction — so `ref` may have reordered what the candidate handed us. Everything written
+    # below is derived from `ref`, never from the candidate's own naming: the ledger's primary key
+    # is the ORDERED five-tuple, so storing the candidate's orientation is how one fact_key came to
+    # own two rows with contradictory evidence.
+    #
+    # The per-side flags have to travel WITH the endpoints. `left_is_grain` describes the left
+    # endpoint; reordering the refs while leaving the flags behind credits one catalog's grain to
+    # the other — a silent lie in the evidence a human confirms against, and an input to the link
+    # ranking. `data_type_family` and `type_basis` are properties of the MATCH, so they are
+    # unaffected by which side is named first.
+    swapped = ref.left_ref != candidate.left_ref
+    left_is_grain, right_is_grain = (
+        (candidate.right_is_grain, candidate.left_is_grain) if swapped
+        else (candidate.left_is_grain, candidate.right_is_grain))
     # `type_basis` travels with the evidence so the CONFIRMER can see how the type match was
     # established: `declared` means a glossary file's own answer (someone's spreadsheet entry), not a
     # structural read of the physical schema. It is advisory context for the human gate, never an
     # authority input — the fact still requires the same confirmation either way.
     evidence = {"entity_id": candidate.entity_id, "candidate_id": candidate.candidate_id,
-                "data_type_family": candidate.data_type_family, "left_is_grain": candidate.left_is_grain,
-                "right_is_grain": candidate.right_is_grain, "type_basis": candidate.type_basis,
+                "data_type_family": candidate.data_type_family, "left_is_grain": left_is_grain,
+                "right_is_grain": right_is_grain, "type_basis": candidate.type_basis,
                 "derivation_version": BRIDGE_DERIVATION_VERSION}
     evidence_ref = write_evidence(
         conn, fact_key=key, table_snapshot_at=ts, row_count=0, sample_size=0,
         profile_version=BRIDGE_DERIVATION_VERSION, thresholds_used={}, metric_values=evidence,
         created_by=identity_to_jsonb(actor), producer_item_ref=ingestion_run_id,
         producer=EvidenceProducer.STRUCTURAL_CONNECTOR, strength=AssertionStrength.PROPOSED)
-    value = {"entity_id": candidate.entity_id, "left_ref": asdict(candidate.left_ref),
-             "right_ref": asdict(candidate.right_ref)}
+    value = {"entity_id": ref.entity_id, "left_ref": asdict(ref.left_ref),
+             "right_ref": asdict(ref.right_ref)}
     res = propose_fact(conn, Command(
         "propose_fact", "overlay_fact", None,
         {"ref": ref, "fact_type": "entity_bridge", "proposed_value": value,
@@ -77,8 +92,8 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None,
         "ON CONFLICT (entity_id, left_catalog_source, left_object_ref, right_catalog_source,"
         "  right_object_ref) DO UPDATE SET fact_key = EXCLUDED.fact_key,"
         "  proposed_event_id = EXCLUDED.proposed_event_id, updated_at = EXCLUDED.updated_at",
-        (candidate.entity_id, candidate.left_ref.catalog_source, _object_ref_str(candidate.left_ref),
-         candidate.right_ref.catalog_source, _object_ref_str(candidate.right_ref), candidate.candidate_id,
+        (ref.entity_id, ref.left_ref.catalog_source, _object_ref_str(ref.left_ref),
+         ref.right_ref.catalog_source, _object_ref_str(ref.right_ref), candidate.candidate_id,
          key, proposed_event_id, candidate.data_type_family,
          json.dumps(evidence), BRIDGE_DERIVATION_VERSION, ts))
     return key

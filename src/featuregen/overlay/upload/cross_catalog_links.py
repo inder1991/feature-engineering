@@ -46,9 +46,11 @@ already stored, and a weak candidate is ranked down rather than hidden:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+from featuregen.overlay.identity import CatalogObjectRef, canonical_bridge_endpoints
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +160,114 @@ def _strength(*, confirmed: bool, left_grain: bool, right_grain: bool, basis: st
 def _sort_key(link: CrossCatalogLink) -> tuple:
     """Safety first, endorsement second, then a stable tie-break. Stated structurally rather than
     left to arithmetic: even if ``_W_CONFIRMED`` were re-inflated, a confirmed weak link still could
-    not sort above an unreviewed safer one."""
-    return (-link.safety, -link.strength, link.entity_id, link.left_object_ref)
+    not sort above an unreviewed safer one. ``fact_key`` closes the ordering: two links agreeing on
+    every visible field would otherwise be left in whatever order the database returned them."""
+    return (-link.safety, -link.strength, link.entity_id, link.left_object_ref,
+            link.fact_key or "")
+
+
+# ── the candidate ledger, merged to ONE record per fact_key ──────────────────────────────────────
+#
+# ``entity_bridge_candidate_evidence``'s primary key is the ORDERED five-tuple, while a bridge's
+# identity is its (orientation-free) ``fact_key``. So a bridge written with its endpoints swapped —
+# which the write side allowed before bridge identity was canonicalized — sits in the table as TWO
+# rows under ONE fact_key, and on the live catalog those two rows CONTRADICTED each other
+# (``text``/``attested`` against ``uuid``/``declared``).
+#
+# Reading is therefore a MERGE, never a pick. A pick is the worse failure: it answers confidently
+# with one of two contradictory readings, is indistinguishable from a considered answer, and changes
+# with the order rows happen to come back in.
+
+#: How strongly a `type_basis` claims the type match was established. ``attested`` = the platform
+#: read the physical types; ``declared`` = a glossary file's own answer; anything else claims
+#: nothing. Used to take the WEAKEST reading when rows disagree.
+_BASIS_STRENGTH = {"attested": 2, "declared": 1}
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEvidenceV1:
+    """The derivation evidence for ONE bridge — every ledger row for its ``fact_key``, read in the
+    canonical orientation and merged."""
+
+    entity_id: str
+    left_catalog_source: str
+    left_object_ref: str
+    right_catalog_source: str
+    right_object_ref: str
+    data_type_family: str
+    type_basis: str
+    left_is_grain: bool
+    right_is_grain: bool
+
+
+def _endpoint(catalog_source, object_ref) -> CatalogObjectRef:
+    """A ledger endpoint as the typed ref the ONE ordering rule is defined over. ``object_ref`` is
+    ``schema.table.column`` (what ``bridge_propose`` writes); ``object_kind`` is 'column' for both
+    endpoints of a bridge and so never decides the order."""
+    parts = str(object_ref or "").split(".", 2)
+    schema, table, column = (parts + ["", ""])[:3]
+    return CatalogObjectRef(str(catalog_source or ""), "column", schema, table, column)
+
+
+def _weakest_basis(bases: Iterable[str]) -> str:
+    """The least confident reading among rows that disagree — never the most confident one. A
+    contradicted ``attested`` ranks the link DOWN (it loses ``_W_ATTESTED``), which is the direction
+    an unresolved disagreement should move a join in. Ties break on sorted order, so the result does
+    not depend on which row was read first."""
+    return min(sorted({str(b or "") for b in bases}), key=lambda b: _BASIS_STRENGTH.get(b, 0))
+
+
+def ledger_evidence_by_fact_key(conn) -> dict[str, LedgerEvidenceV1]:
+    """Every governed bridge's derivation evidence, ONE record per ``fact_key``.
+
+    Rows are re-read in the canonical orientation before being merged, so a per-side flag is never
+    credited to the wrong endpoint. The merge itself is commutative — OR, all-agree, weakest — so
+    the answer does not depend on insert order, and the query is ordered as well so nothing rests on
+    that alone.
+
+    Rows with a NULL ``fact_key`` are excluded: ``entity_bridge_candidate_evidence.fact_key`` is
+    NULLable, so a ledger row can name no governed fact, and under the lifecycle allow-list there is
+    nothing to read and therefore nothing to allow (:func:`bridge_lifecycle` already resolves them
+    ``UNGOVERNED``).
+    """
+    rows = conn.execute(
+        "SELECT fact_key, entity_id, left_catalog_source, left_object_ref, right_catalog_source, "
+        "       right_object_ref, data_type_family, evidence_json "
+        "FROM entity_bridge_candidate_evidence WHERE fact_key IS NOT NULL "
+        "ORDER BY fact_key, entity_id, left_catalog_source, left_object_ref").fetchall()
+    grouped: dict[str, list[tuple]] = {}
+    for key, entity, l_src, l_ref, r_src, r_ref, family, ev in rows:
+        ev = ev if isinstance(ev, dict) else {}
+        left, right = (l_src, l_ref), (r_src, r_ref)
+        flags = (bool(ev.get("left_is_grain")), bool(ev.get("right_is_grain")))
+        typed_left = _endpoint(*left)
+        if canonical_bridge_endpoints(typed_left, _endpoint(*right))[0] is not typed_left:
+            left, right = right, left
+            flags = (flags[1], flags[0])
+        grouped.setdefault(key, []).append(
+            (str(entity or ""), *left, *right, str(family or ""),
+             str(ev.get("type_basis") or ""), *flags))
+    return {key: _merge_ledger_rows(key, group) for key, group in grouped.items()}
+
+
+def _merge_ledger_rows(key: str, group: list[tuple]) -> LedgerEvidenceV1:
+    ordered = sorted(group)
+    entity, l_src, l_ref, r_src, r_ref = ordered[0][:5]
+    families = sorted({row[5] for row in ordered})
+    if len(families) > 1:
+        # Deterministic, and SAID rather than hidden: two derivations disagreeing about what type
+        # this join is made of is a real defect in the catalog, not a display detail.
+        logger.warning("bridge %s has contradictory data_type_family across ledger rows (%s) — "
+                       "reporting %s", key, ", ".join(families), families[0])
+    return LedgerEvidenceV1(
+        entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
+        right_catalog_source=r_src, right_object_ref=r_ref,
+        data_type_family=families[0],
+        type_basis=_weakest_basis(row[6] for row in ordered),
+        # A grain is positive evidence ABOUT A COLUMN. Once the rows are read in one orientation,
+        # one row knowing an endpoint is its table's key is not cancelled by another not knowing it.
+        left_is_grain=any(row[7] for row in ordered),
+        right_is_grain=any(row[8] for row in ordered))
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +362,9 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     symmetric, so opening the FTR side must find the same link the CIB side does.
 
     A candidate that has since been confirmed is returned ONCE, as confirmed: the ledger row and the
-    verified edge are the same link at two stages of its life, not two links.
+    verified edge are the same link at two stages of its life, not two links. Exactly ONE link per
+    ``fact_key`` is returned, in the canonical orientation, whatever order the rows behind it were
+    written in — a bridge is one link however many rows describe it.
     """
     # Keyed by fact_key so a verified edge can be matched to its candidate row AND so an edge with
     # no candidate row is still returned. Some verified bridges are written straight to the edge
@@ -285,36 +395,34 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
             "SELECT catalog_source, object_ref FROM graph_node "
             "WHERE kind = 'column' AND is_grain").fetchall()
     }
-    rows = conn.execute(
-        "SELECT entity_id, left_catalog_source, left_object_ref, right_catalog_source, "
-        "       right_object_ref, fact_key, data_type_family, evidence_json "
-        "FROM entity_bridge_candidate_evidence ORDER BY entity_id, left_object_ref").fetchall()
-
+    # ONE record per fact_key. The ledger can hold two rows for one bridge (its primary key is the
+    # ORDERED endpoint tuple, a bridge's identity is not), and those two rows have been seen to
+    # contradict each other — so they are MERGED here, in the canonical orientation, rather than
+    # one of them being picked. See `ledger_evidence_by_fact_key`.
     out: list[CrossCatalogLink] = []
-    for entity, l_src, l_ref, r_src, r_ref, key, family, ev in rows:
+    for key, ev in sorted(ledger_evidence_by_fact_key(conn).items()):
         # ONE fold answers both questions, and neither is answered by the projection row.
         status = bridge_lifecycle_status(conn, key, projected_verified=key in verified)
         if status not in AVAILABLE_STATUSES:
             continue
         if object_ref is not None:
             want = object_ref.strip().lower()
-            if want not in (str(l_ref).lower(), str(r_ref).lower()):
+            if want not in (ev.left_object_ref.lower(), ev.right_object_ref.lower()):
                 continue
-        ev = ev if isinstance(ev, dict) else {}
         # Current graph OR the derivation-time flag — a column that has since become the grain
         # counts, and one recorded as grain then is not demoted by a read-scoped miss now.
-        left_grain = (l_src, l_ref) in grain or bool(ev.get("left_is_grain"))
-        right_grain = (r_src, r_ref) in grain or bool(ev.get("right_is_grain"))
-        basis = str(ev.get("type_basis") or "")
+        left_grain = (ev.left_catalog_source, ev.left_object_ref) in grain or ev.left_is_grain
+        right_grain = (ev.right_catalog_source, ev.right_object_ref) in grain or ev.right_is_grain
         confirmed = status == REVIEWED_STATUS
         out.append(CrossCatalogLink(
-            entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
-            right_catalog_source=r_src, right_object_ref=r_ref,
+            entity_id=ev.entity_id, left_catalog_source=ev.left_catalog_source,
+            left_object_ref=ev.left_object_ref, right_catalog_source=ev.right_catalog_source,
+            right_object_ref=ev.right_object_ref,
             status=LinkStatus.CONFIRMED if confirmed else LinkStatus.PROPOSED,
             strength=_strength(confirmed=confirmed, left_grain=left_grain,
-                               right_grain=right_grain, basis=basis),
-            data_type_family=family or "", left_is_grain=left_grain, right_is_grain=right_grain,
-            type_basis=basis, fact_key=key))
+                               right_grain=right_grain, basis=ev.type_basis),
+            data_type_family=ev.data_type_family, left_is_grain=left_grain,
+            right_is_grain=right_grain, type_basis=ev.type_basis, fact_key=key))
     # Edge rows with no candidate row — never derived here, or derived before the ledger existed.
     # They must not be lost. Their REVIEW status is folded like every other link's, not assumed from
     # the row: a row whose stream has since fallen back to DRAFT is an available, unreviewed link.

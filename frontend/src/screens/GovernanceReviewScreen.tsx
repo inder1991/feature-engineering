@@ -248,14 +248,30 @@ function agreement(item: GovernanceQueueItem): string {
   return 'I agree with this relationship as it is described here.'
 }
 
+// A table fact carries no proposer: `origin` is a CONSTANT describing how the proposal was made
+// (`table_fact_governance._ORIGIN = "llm_proposed_not_profiled"`), and it is the only origin the
+// backend emits. Rendering it in the `proposed_by` slot read "Proposed by llm_proposed_not_profiled"
+// on every grain and as-of row — a provenance stamp dressed up as a person. It is a METHOD, so it
+// is said as one, and an origin this client does not know is de-underscored rather than guessed at.
+const ORIGIN_LABEL: Record<string, string> = {
+  llm_proposed_not_profiled: 'Proposed automatically, by reading the uploaded schema — not '
+    + 'profiled against the data',
+}
+
+function originLine(origin: string): string {
+  return ORIGIN_LABEL[origin] ?? `Proposed automatically (${origin.replaceAll('_', ' ')})`
+}
+
 // Who put it forward and when — strictly from the payload. The bridge listing carries
 // proposed_by/proposed_at, the table-fact listing carries an origin, and the join listing carries
 // neither (only recorded endorsements), so this line is SHORTER for a join rather than invented.
 function provenanceParts(item: GovernanceQueueItem): string[] {
   const d = item.detail
   const parts: string[] = []
-  const by = asStr(d.proposed_by) || asStr(d.origin)
+  const by = asStr(d.proposed_by)
   if (by) parts.push(`Proposed by ${by}`)
+  const origin = asStr(d.origin)
+  if (origin) parts.push(originLine(origin))
   const at = asStr(d.proposed_at)
   // Coarse on purpose: the calendar day is the triage signal, not a stopwatch.
   if (at) parts.push(at.slice(0, 10))
@@ -281,6 +297,54 @@ function withheldReason(item: GovernanceQueueItem): string {
   const by = asStr(item.detail.proposed_by)
   return 'The server is not offering you this confirmation: the proposer of a fact cannot also '
     + `endorse it${by ? ` (proposed by ${by})` : ''}.`
+}
+
+// ── how the machine established the claim ────────────────────────────────────────────────────────
+//
+// `type_basis` changes WHAT a confirmation means, so it is rendered rather than carried silently.
+// On the live catalogs every bridge is `declared`: two glossary SPREADSHEETS each answered with a
+// type and the two answers agreed — nothing read the physical schema (bridge_candidates._resolve_
+// family consults the declared type only when nothing was attested, and records the weaker basis).
+// A reviewer ticking "these two columns identify the same customer" on that basis is endorsing two
+// files, which is a materially different claim, so they see it before they tick.
+const TYPE_BASIS: Record<string, { label: string; what: string; tone: string }> = {
+  attested: {
+    label: 'read from the data',
+    what: 'Both sides were classified from the physical column type the catalog carries.',
+    tone: 'ok',
+  },
+  declared: {
+    label: 'declared in two spreadsheets',
+    what: 'Nothing read the physical schema. The types matched because two glossary files each '
+      + 'declared one and those two declarations agreed, so this rests on the files being right.',
+    tone: 'warn',
+  },
+  mixed: {
+    label: 'one side read, one side declared',
+    what: 'One side was classified from the physical column type; the other only from what a '
+      + 'glossary file declared.',
+    tone: 'warn',
+  },
+}
+
+// The same fact, said once more where the agreement is actually ticked — the one place a reviewer
+// cannot be scrolled past it. Empty for a basis that carries no caveat.
+function basisCaution(item: GovernanceQueueItem): string {
+  if (item.kind !== 'entity_bridge') return ''
+  const code = asStr(item.detail.type_basis)
+  if (code === 'declared') {
+    return 'Before you tick: the types here match because two glossary spreadsheets each said so. '
+      + 'Nothing read the physical schema, so your agreement rests on those two files.'
+  }
+  if (code === 'mixed') {
+    return 'Before you tick: only one of the two types was read from the data — the other is what '
+      + 'a glossary file declared.'
+  }
+  if (!code) {
+    return 'Before you tick: no derivation evidence was recorded for this crossing, so there is '
+      + 'nothing on file about how the two types were matched.'
+  }
+  return ''
 }
 
 // A safe DOM id from a fact_key (which carries colons, dots and arrows).
@@ -387,13 +451,43 @@ function usageValue(usage: GovernanceQueueUsage): string {
   return 'not tracked yet'
 }
 
-function Usage({ usages }: { usages: GovernanceQueueUsage[] }) {
+// The same measurement for a whole GROUP of bridges, category by category. A number is only ever
+// reported when EVERY member of the group was counted: if one of them could not be measured, a sum
+// across the rest would understate the consequence of settling the set, so the category falls back
+// to the words. (In practice a category's state is uniform across one response — `usage_for_bridges`
+// probes once per category and applies the verdict to every key — this is the defensive path.)
+function groupUsages(items: GovernanceQueueItem[]): GovernanceQueueUsage[] {
+  const order: string[] = []
+  const byCategory = new Map<string, GovernanceQueueUsage[]>()
+  for (const item of items) {
+    for (const usage of item.already_depended_on_by) {
+      const seen = byCategory.get(usage.category)
+      if (seen) seen.push(usage)
+      else {
+        byCategory.set(usage.category, [usage])
+        order.push(usage.category)
+      }
+    }
+  }
+  return order.map(category => {
+    const all = byCategory.get(category) ?? []
+    const counted = all.every(usage => usage.state === 'counted' && usage.count !== null)
+    const state = all.some(usage => usage.state === 'unreadable')
+      ? 'unreadable'
+      : counted ? 'counted' : 'not_tracked_yet'
+    const count = counted ? all.reduce((total, usage) => total + (usage.count ?? 0), 0) : null
+    return { ...all[0], state, count, display: count === null ? state : String(count) }
+  })
+}
+
+function Usage({ usages, note }: { usages: GovernanceQueueUsage[]; note?: string }) {
   // Bridges only. A join or table fact has no bridge anchor to count from, so there is nothing to
   // render — and an absent anchor is never "0 dependencies".
   if (usages.length === 0) return null
   return (
     <div className="gq-usage" data-testid="usage">
       <p className="gq-usage-head">Already depended on by</p>
+      {note && <p className="gq-usage-note">{note}</p>}
       <dl className="gq-usage-list">
         {usages.map(usage => (
           <div className="gq-usage-item" key={usage.category} data-state={usage.state}>
@@ -408,6 +502,109 @@ function Usage({ usages }: { usages: GovernanceQueueUsage[] }) {
           </div>
         ))}
       </dl>
+    </div>
+  )
+}
+
+// The derivation the reviewer is being asked to endorse: how the type match was established, which
+// family matched, and where the link ranked. Bridges carry all three; every other kind carries none
+// of them, and the block is ABSENT rather than rendered with blanks.
+function Basis({ item }: { item: GovernanceQueueItem }) {
+  const d = item.detail
+  const code = asStr(d.type_basis)
+  const family = asStr(d.data_type_family)
+  const strength = typeof d.strength === 'number' ? d.strength : null
+  // W4: `bridge_propose` skipped the ledger row, so there is no derivation evidence to describe —
+  // said as an absence, never as a weak pass.
+  const noEvidence = d.evidence_present === false
+  if (!code && !family && strength === null && !noEvidence) return null
+  const note = TYPE_BASIS[code]
+  return (
+    <div className="gq-basis" data-testid="gq-basis" data-type-basis={code || 'not_recorded'}>
+      <p className="gq-basis-head">How this match was established</p>
+      <dl className="gq-basis-list">
+        <div
+          className="gq-basis-item gq-basis-item--lead"
+          data-testid="basis-type"
+          data-tone={note?.tone ?? 'quiet'}
+        >
+          <dt className="gq-basis-label">Type match</dt>
+          <dd className="gq-basis-value">
+            {note?.label ?? (code ? code.replaceAll('_', ' ') : 'not recorded')}
+          </dd>
+          <dd className="gq-basis-why">
+            {note?.what
+              ?? (noEvidence || !code
+                ? 'No derivation evidence was recorded for this crossing, so how the two types '
+                  + 'were matched is not on file.'
+                : 'This client cannot explain that basis, so it says nothing beyond the code.')}
+          </dd>
+        </div>
+        <div className="gq-basis-item" data-testid="basis-family">
+          <dt className="gq-basis-label">Matched type family</dt>
+          <dd className="gq-basis-value">{family || 'not recorded'}</dd>
+          <dd className="gq-basis-why">
+            The two columns were paired because their types fall in the same family. Nothing here
+            compared the values they hold.
+          </dd>
+        </div>
+        <div className="gq-basis-item" data-testid="basis-strength">
+          <dt className="gq-basis-label">Ranking strength</dt>
+          <dd className="gq-basis-value">{strength === null ? 'not recorded' : String(strength)}</dd>
+          <dd className="gq-basis-why">
+            Where this link ranked against the other candidates for the same entity — it rewards a
+            side that is its table key and a type read from the data. It is not a probability.
+          </dd>
+        </div>
+      </dl>
+    </div>
+  )
+}
+
+// A dual join opens TWO side-labelled platform-admin tasks (`join_governance`), and which sides are
+// still open is what tells a reviewer whether their endorsement finishes it. Joins only.
+function Tasks({ item }: { item: GovernanceQueueItem }) {
+  const tasks = (Array.isArray(item.detail.tasks) ? item.detail.tasks : []).map(asRec)
+  if (tasks.length === 0) return null
+  return (
+    <div className="gq-side" data-testid="gq-tasks">
+      <p className="gq-side-head">Approval tasks recorded for this join</p>
+      <ul className="gq-side-list">
+        {tasks.map((task, i) => (
+          <li className="gq-side-item" key={asStr(task.task_id) || String(i)}>
+            <span className="gq-side-key">{asStr(task.side) || 'unlabelled'} side</span>
+            <span className="gq-side-val">{asStr(task.status) || 'status not reported'}</span>
+            <span className="mono gq-side-id">{asStr(task.task_id)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+// The table-level fields Pass B recorded alongside a grain / as-of proposal. DISPLAY-ONLY context
+// (`table_fact_governance._ADVISORY_FIELDS`): it is not part of the claim being endorsed, and it
+// says so, because an advisory field rendered like a finding would be read as one.
+function Advisory({ item }: { item: GovernanceQueueItem }) {
+  const fields = Object.entries(asRec(item.detail.advisory))
+    .map(([key, value]): [string, string] => [key, asStr(value)])
+    .filter(([, value]) => value !== '')
+  if (fields.length === 0) return null
+  return (
+    <div className="gq-side" data-testid="gq-advisory">
+      <p className="gq-side-head">What the enrichment said about this table</p>
+      <ul className="gq-side-list">
+        {fields.map(([key, value]) => (
+          <li className="gq-side-item" key={key}>
+            <span className="gq-side-key">{categoryLabel(key)}</span>
+            <span className="gq-side-val">{value}</span>
+          </li>
+        ))}
+      </ul>
+      <p className="gq-side-note">
+        Advisory context the enrichment offered. It is not part of what you are agreeing to, and
+        nothing downstream reads it.
+      </p>
     </div>
   )
 }
@@ -497,6 +694,7 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
   const canReject = item.available_actions.includes('reject')
   const whyId = domId('why', item.fact_key)
   const provenance = provenanceParts(item)
+  const caution = basisCaution(item)
 
   async function run(action: () => Promise<string>) {
     setBusy(true)
@@ -529,6 +727,9 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
       <p className="gq-row-headline">{headline(item)}</p>
       <p className="mono gq-row-subject">{item.subject}</p>
       <Axes item={item} />
+      <Basis item={item} />
+      <Tasks item={item} />
+      <Advisory item={item} />
       {provenance.length > 0 && <p className="gq-prov">{provenance.join(' · ')}</p>}
       <Usage usages={item.already_depended_on_by} />
 
@@ -562,6 +763,9 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
       {panel === 'confirm' && (
         <div className="gq-panel">
           <p className="gq-panel-head">What your confirmation records</p>
+          {caution && (
+            <p className="gq-panel-caution" data-testid="gq-confirm-basis">{caution}</p>
+          )}
           <label className="gj-check">
             <input type="checkbox" checked={agreed} onChange={() => setAgreed(a => !a)} />
             <span>{agreement(item)}</span>
@@ -660,6 +864,18 @@ function CandidateGroup({ entry, onDone, onConflict }: {
   const items = entry.items
   const group = entry.group ?? { entity: '(unnamed entity)', catalogs: [] }
   const count = items.length
+  // THE SERVER DECIDES HERE TOO. A bridge already endorsed carries no actions at all
+  // (`_ACTIONS_VERIFIED = ()`) and the write side denies rejecting a VERIFIED fact, so a group
+  // whose members are a mix — the ordinary end state after confirming one member of a
+  // cross-product — must offer the reject only over the members that sanction it, and say what it
+  // is leaving alone. The individual rows inside "Show the N candidates" already read their own
+  // `available_actions`; the card that stands in for them may not read something else.
+  const rejectable = items.filter(item => item.available_actions.includes('reject'))
+  const skipped = count - rejectable.length
+  const one = skipped === 1
+  const skipNote = ` The ${skipped} already endorsed ${one ? 'link is' : 'links are'} not sent at `
+    + `all: the command layer refuses a rejection there, so nothing is attempted on `
+    + `${one ? 'it' : 'them'}.`
 
   // The two axes again at group level: one distinct value each, or an honest "mixed".
   function shared(read: (item: GovernanceQueueItem) => string): string {
@@ -668,20 +884,22 @@ function CandidateGroup({ entry, onDone, onConflict }: {
   }
 
   async function rejectAll() {
-    if (!category) return
+    if (!category || rejectable.length === 0) return
     setBusy(true)
     setGroupError('')
     try {
       const result = await bulkRejectEntityBridges(
-        items.map(item => item.fact_key),
+        rejectable.map(item => item.fact_key),
         category as EntityBridgeRejectCategory,
         note.trim() || undefined,
       )
       const settled = (result.counts.rejected ?? 0) + (result.counts.already_rejected ?? 0)
       const refused = (result.counts.denied ?? 0) + (result.counts.not_found ?? 0)
         + (result.counts.failed ?? 0)
-      onDone(`${settled} of ${count} candidate links recorded as ${categoryLabel(category)}`
-        + `${refused > 0 ? `; ${refused} the server did not settle` : ''}.`)
+      onDone(`${settled} of ${rejectable.length} candidate links recorded as `
+        + `${categoryLabel(category)}`
+        + `${refused > 0 ? `; ${refused} the server did not settle` : ''}`
+        + `${skipped > 0 ? `; ${skipped} already endorsed and left as they are` : ''}.`)
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         onConflict(e.detail)
@@ -713,6 +931,13 @@ function CandidateGroup({ entry, onDone, onConflict }: {
         These are the cross-product of the same two facts — one judgement settles the set. Open them
         if one of the pairs is the right one.
       </p>
+      {skipped > 0 && (
+        <p className="gq-group-note" data-testid="gq-group-settled">
+          {skipped} of these {count} {one ? 'is' : 'are'} already endorsed. The server offers no
+          rejection on {one ? 'it' : 'them'}, so a group rejection here settles the other{' '}
+          {rejectable.length} and leaves {one ? 'that one as it is' : 'those as they are'}.
+        </p>
+      )}
       <dl className="gq-axes">
         <Axis
           testid="axis-execution"
@@ -731,15 +956,34 @@ function CandidateGroup({ entry, onDone, onConflict }: {
         />
       </dl>
 
+      <Usage
+        usages={groupUsages(items)}
+        note={`Counted across all ${count} links in this group. A dependent that crosses more than `
+          + 'one of them is counted once per link, and a category is only ever a number when every '
+          + 'one of the links was measured.'}
+      />
+
       <div className="gj-actions gq-actions">
-        <button
-          type="button"
-          className="btn q-ghost"
-          disabled={busy}
-          onClick={() => setRejecting(r => !r)}
-        >
-          {rejecting ? 'Cancel' : 'Reject the whole group…'}
-        </button>
+        {rejectable.length > 0 && (
+          <button
+            type="button"
+            className="btn q-ghost"
+            disabled={busy}
+            onClick={() => setRejecting(r => !r)}
+          >
+            {rejecting
+              ? 'Cancel'
+              : skipped === 0
+                ? 'Reject the whole group…'
+                : `Reject the ${rejectable.length} still open…`}
+          </button>
+        )}
+        {rejectable.length === 0 && (
+          <span className="gq-why" data-testid="gq-group-why">
+            A person has already endorsed every one of these {count} links, so the server offers no
+            decision to make here. Re-verification runs through its own flow.
+          </span>
+        )}
         <button type="button" className="btn q-ghost" onClick={() => setOpen(o => !o)}>
           {open ? `Hide the ${count} candidates` : `Show the ${count} candidates`}
         </button>
@@ -747,7 +991,9 @@ function CandidateGroup({ entry, onDone, onConflict }: {
 
       {rejecting && (
         <div className="gq-panel">
-          <p className="gq-panel-head">Why none of these {count} pairs is a real relationship</p>
+          <p className="gq-panel-head">
+            Why none of these {rejectable.length} pairs is a real relationship
+          </p>
           <CategoryChips
             kind="entity_bridge"
             chosen={category}
@@ -767,13 +1013,18 @@ function CandidateGroup({ entry, onDone, onConflict }: {
               disabled={!category || busy}
               onClick={() => void rejectAll()}
             >
-              {busy ? 'Recording…' : `Reject all ${count} candidates`}
+              {busy
+                ? 'Recording…'
+                : skipped === 0
+                  ? `Reject all ${count} candidates`
+                  : `Reject the ${rejectable.length} still open`}
             </button>
             {!category && <span className="gj-gate-hint">pick a reason first</span>}
           </div>
           <p className="gq-panel-note">
             Each one is recorded as its own governed decision with its own audit trail, so some may
             settle while others are refused — the result says which.
+            {skipped > 0 && skipNote}
           </p>
         </div>
       )}
@@ -824,6 +1075,10 @@ function Purpose(): ReactNode {
 export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?: string }) {
   const [queue, setQueue] = useState<GovernanceQueue | null>(null)
   const [error, setError] = useState('')
+  // The status the FAILURE carried, so a refusal and a breakage can be told apart. There is no
+  // client-side permission check to make here — the session's roles are not on this client — so the
+  // screen reacts to what the server said rather than predicting it.
+  const [errorStatus, setErrorStatus] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [notice, setNotice] = useState('')
   const [limit, setLimit] = useState(100)
@@ -841,6 +1096,7 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
       if (id !== loadSeq.current) return
       setQueue(next)
       setError('')
+      setErrorStatus(null)
       // A handoff slug for a catalog this caller cannot see would otherwise filter the screen down
       // to nothing — exactly the blank page this rewrite exists to remove.
       setCatalog(current => (current !== null && !next.catalogs.includes(current) ? null : current))
@@ -848,6 +1104,7 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
       if (id !== loadSeq.current) return
       setQueue(null)
       setError(errorDetail(e))
+      setErrorStatus(e instanceof ApiError ? e.status : null)
     } finally {
       if (id === loadSeq.current) setLoading(false)
     }
@@ -871,6 +1128,41 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   function onConflict(detail: string) {
     setNotice(detail)
     void load()
+  }
+
+  // NOT AN ERROR. `GET /governance/queue` is gated on the raw `platform-admin` claim, and nothing
+  // in the app gates the navigation to it — the "Governance" item is on every operator's nav, and
+  // LineageView links here in prose — so a catalog_viewer, data_owner or feature_engineer arriving
+  // here is an ordinary, expected visit that the server declines. A red alert would tell them
+  // something is broken and invite them to retry; nothing is broken and there is nothing to retry.
+  //
+  // The screen cannot check the role itself (this client holds no session claims, and inventing a
+  // check would be a second, drifting authority), so it reacts to the 403 the server actually sent
+  // and quotes the server's own sentence rather than paraphrasing the rule.
+  if (errorStatus === 403) {
+    return (
+      <section className="gq">
+        <Purpose />
+        <div className="callout gq-not-yours" data-testid="gq-not-yours" role="status">
+          <div className="callout-body">
+            <p>
+              <strong>This queue is not open to your role.</strong> Recording a governance decision
+              is a platform-administrator act, so the server declined to show this list to your
+              session — it said: “{error}”.
+            </p>
+            <p>
+              Nothing is wrong and nothing here is waiting on you. The catalogs, features and
+              lineage you can see are unaffected: what is behind this page is the record of who
+              agreed with a relationship, not a control over what the platform will use.
+            </p>
+            <p className="hint">
+              If reviewing these decisions is part of your job, ask an administrator for the
+              platform-admin role — this page will then open on the queue itself.
+            </p>
+          </div>
+        </div>
+      </section>
+    )
   }
 
   if (error) {

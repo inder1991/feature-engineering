@@ -35,6 +35,7 @@ from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.identity import fact_key
+from featuregen.overlay.store import append_overlay_event
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -372,6 +373,38 @@ def test_confirmed_event_id_requeried_from_entity_bridge_edge_for_audit(resolved
     # carrying the durable confirmed_event_id (NEVER widening active_bridges)
     audit = confirmed_event_ids_for_audit(conn, plan)
     assert ("bfk_acct", "evt-bfk_acct") in audit
+
+
+def test_a_staled_bridge_whose_projection_row_survived_is_not_audited_as_verified(
+        resolved_topology, service_actor):
+    """THE ROW IS NOT THE DECISION. `entity_bridge_edge` is a projection of the VERIFIED fold and
+    `expiry.demote_bridge_edges` is FAIL-SOFT: when drift STALEs a bridge and the demotion does not
+    run, the VERIFIED row is left behind. Reading the row alone stamped that withdrawn crossing
+    `verified` in the persisted audit record — which is the telemetry the gate's "every crossing is
+    a governed authority" assertion is falsified from.
+
+    Here the STALE event lands on the stream and the row is deliberately left VERIFIED (the exact
+    fail-soft residue). The fold — the one every other `entity_bridge_edge` reader in `src` already
+    goes through — must win: no audit pair, and the crossing recorded as `unverified`."""
+    conn, scope = resolved_topology
+    operand = _operand(slot_id="op_0", catalog="core_banking")
+    ctx, plan = _assemble_identity(conn, scope, operand)
+    assert ("bfk_acct", "evt-bfk_acct") in confirmed_event_ids_for_audit(conn, plan)
+
+    append_overlay_event(
+        conn, fact_key="bfk_acct", type="OVERLAY_FACT_STALED",
+        payload={"catalog_change_ref": "drift:core_banking:account_id",
+                 "stales_confirmed_event_id": "evt-bfk_acct"},
+        actor=service_actor)
+    assert conn.execute(
+        "SELECT status FROM entity_bridge_edge WHERE fact_key = 'bfk_acct'"
+    ).fetchone()[0] == "VERIFIED", "the fail-soft residue the reader must not trust"
+
+    assert confirmed_event_ids_for_audit(conn, plan) == ()
+    bridge = next(c for c in crossing_audit_by_slot(conn, ctx, plan)["op_0"]
+                  if c["kind"] == "governed_bridge")
+    assert bridge["authority"] == "unverified"
+    assert bridge["confirmed_event_id"] is None
 
 
 def test_crossing_audit_by_slot_records_governed_crossings(resolved_topology):

@@ -58,7 +58,11 @@ from featuregen.overlay.facts import ENTITY_BRIDGE
 from featuregen.overlay.identity import CatalogObjectRef, EntityBridgeRef, _norm, _ref_from_payload
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
-from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
+from featuregen.overlay.upload.cross_catalog_links import (
+    LedgerEvidenceV1,
+    cross_catalog_links,
+    ledger_evidence_by_fact_key,
+)
 from featuregen.overlay.upload.read_scope import allowed_classes, visibility_predicate
 from featuregen.runtime.observability import counters
 
@@ -141,8 +145,8 @@ def _stream_bridge_keys(conn: DbConn) -> list[str]:
         "GROUP BY overlay_fact_id ORDER BY seq", (ENTITY_BRIDGE,)).fetchall()]
 
 
-def _ledger_by_fact_key(conn: DbConn) -> dict[str, tuple]:
-    """The raw candidate ledger keyed by ``fact_key`` — the SECOND evidence source, and the reason
+def _ledger_by_fact_key(conn: DbConn) -> dict[str, LedgerEvidenceV1]:
+    """The candidate ledger keyed by ``fact_key`` — the SECOND evidence source, and the reason
     ``evidence_present`` can be trusted.
 
     ``cross_catalog_links`` deliberately SUPPRESSES a link whose fact is not in an AVAILABLE
@@ -152,13 +156,18 @@ def _ledger_by_fact_key(conn: DbConn) -> dict[str, tuple]:
     would report those bridges as ``evidence_present=False`` when their ledger row is sitting right
     there. That would make the W4 discrepancy signal lie about perfectly ordinary drift/expiry
     states. It is also why this queue enumerates from the EVENT STREAM and not from the ranked
-    links: what is DECIDABLE is a different question from what is AVAILABLE."""
-    return {r[0]: (r[1], r[2]) for r in conn.execute(
-        "SELECT fact_key, data_type_family, evidence_json FROM entity_bridge_candidate_evidence "
-        "WHERE fact_key IS NOT NULL").fetchall()}
+    links: what is DECIDABLE is a different question from what is AVAILABLE.
+
+    Shared with ``cross_catalog_links`` rather than re-queried. The ledger's primary key is the
+    ORDERED endpoint tuple while a bridge's identity is its orientation-free ``fact_key``, so one
+    bridge can own two rows — and this used to key a dict comprehension straight off an unordered
+    query, silently keeping whichever contradictory row came back last. A confirmer would then be
+    shown evidence the ranked read model did not agree with, and shown it differently on the next
+    read. :func:`ledger_evidence_by_fact_key` merges instead of picking."""
+    return ledger_evidence_by_fact_key(conn)
 
 
-def _evidence(link, ledger_row: tuple | None) -> dict | None:
+def _evidence(link, ledger_row: LedgerEvidenceV1 | None) -> dict | None:
     """The derivation evidence for one bridge, from the ranked link when available and from the raw
     ledger row otherwise, or None when neither exists (the W4 case).
 
@@ -170,11 +179,10 @@ def _evidence(link, ledger_row: tuple | None) -> dict | None:
                 "left_is_grain": bool(link.left_is_grain),
                 "right_is_grain": bool(link.right_is_grain), "strength": link.strength}
     if ledger_row is not None:
-        family, ev = ledger_row
-        ev = ev if isinstance(ev, dict) else {}
-        return {"data_type_family": family or "", "type_basis": str(ev.get("type_basis") or ""),
-                "left_is_grain": bool(ev.get("left_is_grain")),
-                "right_is_grain": bool(ev.get("right_is_grain")), "strength": None}
+        return {"data_type_family": ledger_row.data_type_family,
+                "type_basis": ledger_row.type_basis,
+                "left_is_grain": ledger_row.left_is_grain,
+                "right_is_grain": ledger_row.right_is_grain, "strength": None}
     return None
 
 
