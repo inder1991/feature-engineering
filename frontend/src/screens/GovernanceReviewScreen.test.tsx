@@ -667,3 +667,154 @@ describe('governance review — the vocabulary that must never appear', () => {
     }
   })
 })
+
+// ── the accessibility properties that are actually assertable here ───────────────────────────────
+//
+// The CONTRAST of a tone is measured against its token and recorded in index.css; jsdom resolves no
+// stylesheet, so an assertion about a colour here would be confidently untrue. What jsdom can prove
+// is the property that matters more: the tone travels as an ATTRIBUTE, so it survives without colour
+// vision — and the words are always there beside it.
+
+describe('governance review — state travels as an attribute, never as colour alone', () => {
+  // Every state code the read model emits, one row each, each a DIFFERENT entity so they render as
+  // their own findings instead of collapsing into a candidate group.
+  //   state_code, entity, expected availability tone, expected review tone
+  const STATES: [string, string, string, string][] = [
+    ['unreviewed_available', 'customer', 'ok', 'open'],
+    ['partially_endorsed_available', 'account', 'ok', 'open'],
+    ['human_endorsed', 'product', 'ok', 'ok'],
+    ['stale_unavailable', 'branch', 'warn', 'warn'],
+    ['rejected', 'merchant', 'off', 'off'],
+  ]
+
+  it('gives each state its own tone on each axis, not one tone per row', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: STATES.map(([code, entity]) => bridge({
+        fact_key: `fact:entity_bridge:${entity}`,
+        state_code: code,
+        state: `state ${code}`,
+        detail: bridgeDetail({ entity_id: entity }),
+      })),
+      items_visible_to_you_by_kind: { entity_bridge: STATES.length, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId('row-fact:entity_bridge:customer')
+
+    for (const [code, entity, availabilityTone, reviewTone] of STATES) {
+      const cells = within(screen.getByTestId(`row-fact:entity_bridge:${entity}`))
+      const availability = cells.getByTestId('axis-availability')
+      const review = cells.getByTestId('axis-review')
+      expect(availability).toHaveAttribute('data-tone', availabilityTone)
+      expect(review).toHaveAttribute('data-tone', reviewTone)
+      // The tone is redundant, never the carrier: the cell says it in words as well.
+      expect(availability.textContent).toMatch(/\S/)
+      expect(review).toHaveTextContent(`state ${code}`)
+    }
+
+    // The mapping is a mapping: a screen that tagged every row the same way would satisfy any
+    // "has a data-tone" check and still tell a reader nothing.
+    const reviewTones = screen.getAllByTestId('axis-review')
+      .map(cell => cell.getAttribute('data-tone'))
+    expect(new Set(reviewTones).size).toBe(4)
+  })
+
+  it('tones the two axes of ONE row independently', async () => {
+    // The row this screen exists to render honestly: no person has looked at it (open) and the
+    // machine has already validated it (ok). One tone per row could not say this.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${bridge().fact_key}`))
+    expect(cells.getByTestId('axis-review')).toHaveAttribute('data-tone', 'open')
+    expect(cells.getByTestId('axis-execution')).toHaveAttribute('data-tone', 'ok')
+    expect(cells.getByTestId('axis-availability')).toHaveAttribute('data-tone', 'ok')
+  })
+
+  it('maps each execution code to its own tone, and an unknown code to the quiet one', async () => {
+    //   production_eligibility_code, entity, expected tone
+    const CODES: [string, string, string][] = [
+      ['grain_resolved', 'customer', 'ok'],
+      ['cardinality_unresolved', 'account', 'warn'],
+      ['not_observed', 'product', 'quiet'],
+      ['not_applicable', 'branch', 'quiet'],
+      // A code from a newer backend must not be dressed up as a pass or as a failure.
+      ['a_code_this_client_has_never_seen', 'merchant', 'quiet'],
+    ]
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: CODES.map(([code, entity]) => bridge({
+        fact_key: `fact:entity_bridge:${entity}`,
+        production_eligibility_code: code,
+        production_eligibility: null,
+        detail: bridgeDetail({ entity_id: entity }),
+      })),
+      items_visible_to_you_by_kind: { entity_bridge: CODES.length, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId('row-fact:entity_bridge:customer')
+    for (const [, entity, tone] of CODES) {
+      expect(within(screen.getByTestId(`row-fact:entity_bridge:${entity}`))
+        .getByTestId('axis-execution')).toHaveAttribute('data-tone', tone)
+    }
+    const tones = screen.getAllByTestId('axis-execution')
+      .map(cell => cell.getAttribute('data-tone'))
+    expect(new Set(tones).size).toBe(3)
+  })
+
+  it('says nothing about availability for a state code it cannot map', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge({ state_code: 'invented_state', state: 'Something new' })],
+      items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${bridge().fact_key}`))
+    // No guessed cell, and the human axis drops to the tone that signals nothing.
+    expect(cells.queryByTestId('axis-availability')).toBeNull()
+    expect(cells.getByTestId('axis-review')).toHaveAttribute('data-tone', 'quiet')
+    expect(cells.getByTestId('axis-review')).toHaveTextContent('Something new')
+  })
+
+  it('is operable from the keyboard: every control has a name and takes focus', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [...BRANCH, bridge(), join(), grain(),
+              bridge({ fact_key: 'fact:entity_bridge:w', available_actions: ['reject'],
+                       detail: bridgeDetail({ entity_id: 'product',
+                                              proposed_by: 'alice@bank' }) })],
+      items_visible_to_you_by_catalog: { cib: 3, ftr: 10 },
+      items_visible_to_you_by_kind: {
+        entity_bridge: 10, approved_join: 1, grain: 1, availability_time: 0,
+      },
+      truncated: true,
+    }))
+    const { container } = render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${bridge().fact_key}`)
+    // Expand everything transient, so the group's members, a confirm panel and a reject panel (with
+    // its chips and its note field) are all on screen at once.
+    await userEvent.click(screen.getByRole('button', { name: /show the 8 candidates/i }))
+    await userEvent.click(within(screen.getByTestId(`row-${bridge().fact_key}`))
+      .getByRole('button', { name: /^confirm/i }))
+    await userEvent.click(within(screen.getByTestId(`row-${join().fact_key}`))
+      .getByRole('button', { name: /^reject/i }))
+
+    const controls = [...container.querySelectorAll<HTMLElement>(
+      'button, input, select, textarea, a[href], [tabindex]')]
+    // Guards the guard: a selector that matched nothing would pass every assertion below.
+    expect(controls.length).toBeGreaterThan(25)
+    for (const control of controls) {
+      // A control with no name is unusable by anyone who cannot see where it sits.
+      expect(control).toHaveAccessibleName()
+      // Nothing is removed from the tab order, and nothing here is a click-handling div.
+      expect(control).not.toHaveAttribute('tabindex', '-1')
+      if (!(control as HTMLButtonElement).disabled) {
+        control.focus()
+        expect(document.activeElement).toBe(control)
+      }
+    }
+    // The one control that cannot take focus is a withheld confirm, disabled by the SERVER's own
+    // action list — with its reason on screen and wired to it, so the row still reads.
+    const withheld = within(screen.getByTestId('row-fact:entity_bridge:w'))
+    const confirm = withheld.getByRole('button', { name: /^confirm/i })
+    expect(confirm).toBeDisabled()
+    expect(confirm).toHaveAttribute('aria-describedby', withheld.getByTestId('gq-action-why').id)
+  })
+})
