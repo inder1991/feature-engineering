@@ -1,0 +1,41 @@
+# Build context exclusions.
+#
+# Without this file, `COPY frontend/ ./` in Dockerfile.frontend copies whatever
+# node_modules the developer has locally over the one `npm ci` just installed inside
+# the image. A real local install bloats the context; a SYMLINK (as a git worktree
+# gets) fails the build outright — "cannot replace to directory ... with file" —
+# because COPY cannot put a file where a directory already exists.
+
+# Dependency trees: always installed inside the image, never copied in.
+node_modules/
+**/node_modules/
+.venv/
+.venv-l0/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Frontend build output — rebuilt in the image.
+frontend/dist/
+build/
+
+# VCS and local tooling
+.git/
+.gitignore
+.claude/
+.superpowers/
+
+# Real bank glossary exports — LOCAL ONLY. Mirrors .gitignore: these carry production
+# schema, business definitions and PII classifications and must never enter an image.
+*Column_Mapping*.csv
+FTR_Column_Mapping*.csv
+CIB_Customer_Column_Mapping*.csv
+
+# Docs and scratch: not needed at runtime.
+docs/
