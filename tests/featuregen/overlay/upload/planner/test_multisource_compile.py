@@ -75,6 +75,7 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
     FinalOperation,
     GovernedEndpointV1,
     GovernedSourceBindingV1,
+    GrainAuthorityProvenance,
     MultiSourceBindingPlanV1,
     MultiSourceDeclarationEvidenceV1,
     MultiSourceReason,
@@ -303,7 +304,11 @@ def test_path_fresh_on_its_own_catalogs_but_union_hits_stale_watermark(stale_uni
     ctx = _union_ctx(conn)
     landing_ep = GovernedEndpointV1(
         catalog="wealth", table_ref="public.customers",
-        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk")
+        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk",
+        grain_is_unique=True,
+        grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="test-revision",
+        grain_dependency_identity="test-dependency")
     plan = _stale_union_plan(landing_ep)
 
     # operand 0's OWN catalogs {core_banking, wealth} are both fresh -> individually fresh
@@ -321,7 +326,11 @@ def test_compile_over_stale_union_is_unresolved_freshness_but_still_minted(stale
     ctx = _union_ctx(conn)
     landing_ep = GovernedEndpointV1(
         catalog="wealth", table_ref="public.customers",
-        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk")
+        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk",
+        grain_is_unique=True,
+        grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="test-revision",
+        grain_dependency_identity="test-dependency")
     plan = _stale_union_plan(landing_ep)
 
     out = compile_multi_source_contract(conn, ctx, plan, _stale_union_spec(), budget=_budget())
@@ -477,7 +486,11 @@ def _bridge_endpoints(db, *, right_sensitivity=""):
 
 _LANDING_EP = GovernedEndpointV1(
     catalog="wealth", table_ref="public.customers",
-    grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk")
+    grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk",
+    grain_is_unique=True,
+    grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+    grain_fact_revision="test-revision",
+    grain_dependency_identity="test-dependency")
 
 
 def test_not_evaluated_key_outside_read_scope_is_unresolved_safety_evaluation(db):

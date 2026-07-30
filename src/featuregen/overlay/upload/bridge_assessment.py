@@ -295,6 +295,10 @@ class IdentifierEndpointV1:
             "binding": _binding_payload(self.physical_binding, self.binding_revision_id),
         }
 
+    def with_tuple_key_role(self, role: TupleKeyRole) -> IdentifierEndpointV1:
+        """Return a reclassified endpoint without fabricating per-member key semantics."""
+        return replace(self, tuple_key_role=role)
+
 
 def resolve_and_record_endpoint_binding(
     conn: DbConn,

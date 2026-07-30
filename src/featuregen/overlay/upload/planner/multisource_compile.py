@@ -95,6 +95,7 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
     PATH_AGG_TO_FUNCTION,
     FinalOperation,
     GovernedEndpointV1,
+    GrainAuthorityProvenance,
     MultiSourceBindingPlanV1,
     MultiSourceDeclarationEvidenceV1,
     MultiSourceReason,
@@ -421,7 +422,11 @@ def _resolved_operand_path(plan: MultiSourceBindingPlanV1, path: OperandPathV1,
     landing = plan.physical_landing
     endpoint = (path.governed_endpoints[-1] if path.governed_endpoints else GovernedEndpointV1(
         catalog=landing.catalog, table_ref=landing.table_ref,
-        grain_key_refs=landing.grain_key_refs, grain_fact_key=""))
+        grain_key_refs=landing.grain_key_refs, grain_fact_key="",
+        grain_is_unique=False,
+        grain_authority_provenance=GrainAuthorityProvenance.legacy_unspecified,
+        grain_fact_revision="",
+        grain_dependency_identity=""))
     candidate = OperandPathCandidateV1(
         binding_plan=path.binding_plan, landing_catalog=landing.catalog,
         landing_table_ref=landing.table_ref, landing_endpoint=endpoint,

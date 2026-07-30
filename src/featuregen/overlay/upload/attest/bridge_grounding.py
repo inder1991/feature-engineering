@@ -670,12 +670,11 @@ def ground_bridge_endpoint(
         data_type_family=family,
         type_basis=basis,
         is_grain=bool(is_grain),
-        key_member_role=(
-            KeyMemberRole.PRIMARY if is_grain else KeyMemberRole.UNKNOWN
-        ),
-        tuple_key_role=(
-            TupleKeyRole.COMPLETE_UNIQUE_KEY if is_grain else TupleKeyRole.UNKNOWN
-        ),
+        # ``graph_node.is_grain`` is a flat upload projection. It may identify a possible member,
+        # but cannot prove completeness or uniqueness of the table's ordered key. Task 5 performs
+        # that classification from the complete governed grain fact.
+        key_member_role=KeyMemberRole.UNKNOWN,
+        tuple_key_role=TupleKeyRole.UNKNOWN,
         observed_format=observed_format,
         metadata_facets=facets,
         evidence_refs=refs,

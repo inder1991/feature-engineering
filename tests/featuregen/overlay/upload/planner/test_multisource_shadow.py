@@ -370,6 +370,16 @@ def test_governed_crossings_persisted_for_resolved_operand(
     operands = read_operands(db, "mrun_cross", "i_a", plan_id)
     assert operands
     for o in operands:
+        for endpoint in o["governed_endpoints"]:
+            assert isinstance(endpoint["grain_is_unique"], bool)
+            assert endpoint["grain_authority_provenance"] in {
+                "catalog_authoritative",
+                "source_declared",
+                "human_confirmed",
+                "legacy_unspecified",
+            }
+            assert endpoint["grain_fact_revision"]
+            assert endpoint["grain_dependency_identity"]
         crossings = list(o["crossings"])
         assert crossings, f"expected governed crossings on slot {o['slot_id']}"
         # every crossing is a governed authority (VERIFIED bridge / approved-or-declared realization)

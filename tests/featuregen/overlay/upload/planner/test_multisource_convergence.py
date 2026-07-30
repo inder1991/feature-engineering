@@ -29,6 +29,7 @@ from featuregen.overlay.upload.planner.multisource_assembly import (
 )
 from featuregen.overlay.upload.planner.multisource_contracts import (
     GovernedEndpointV1,
+    GrainAuthorityProvenance,
     MultiSourceBoundingMetricsV1,
     MultiSourceReason,
     PhysicalLandingV1,
@@ -65,7 +66,11 @@ def _cand(*, pid, catalog, table, keys, rank=0, bridges=1, hops=1, authority=0, 
     positional index) so a test can DIVERGE the two — the OLD (unsound) key summed ``preference_rank``,
     the NEW one sums ``authority_key``."""
     landing_ep = GovernedEndpointV1(
-        catalog=catalog, table_ref=table, grain_key_refs=tuple(keys), grain_fact_key=fk)
+        catalog=catalog, table_ref=table, grain_key_refs=tuple(keys), grain_fact_key=fk,
+        grain_is_unique=True,
+        grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="test-revision",
+        grain_dependency_identity="test-dependency")
     return OperandPathCandidateV1(
         binding_plan=_plan(pid, rank=rank, bridges=bridges),
         landing_catalog=catalog, landing_table_ref=table,

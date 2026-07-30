@@ -79,6 +79,20 @@ class FinalOperation(StrEnum):
     difference = "difference"
 
 
+class GrainAuthorityProvenance(StrEnum):
+    """Where a servable complete-grain declaration gets its authority.
+
+    Review and authority are deliberately not collapsed.  A catalog/source declaration can support
+    deterministic metadata inference without a human confirmer; a human or legacy confirmation is
+    still operational, but cannot be relabelled as source authority.
+    """
+
+    catalog_authoritative = "catalog_authoritative"
+    source_declared = "source_declared"
+    human_confirmed = "human_confirmed"
+    legacy_unspecified = "legacy_unspecified"
+
+
 class MultiSourceReason(StrEnum):
     """Every disposition in spec §9. `resolved` is the sole success; the rest partition into
     semantic (operand/path/landing/temporal governance), technical, and capture-incomplete."""
@@ -181,13 +195,20 @@ class MultiSourcePlannerIntentV1:
 
 @dataclass(frozen=True, slots=True)
 class GovernedEndpointV1:
-    """A path endpoint (source / intermediate / landing) revalidated against a VERIFIED grain fact.
-    Keyed on the deterministic ``grain_fact_key`` (from ref+type), never a per-event id (finding #8).
-    A missing/unverified grain fact => this is not a GovernedEndpointV1 (endpoint ungoverned)."""
+    """A path endpoint revalidated against a complete, servable grain declaration.
+
+    ``grain_fact_key`` is stable dependency identity; ``grain_fact_revision`` names the exact
+    catalog content or overlay event read.  ``grain_is_unique`` is retained even when false—dropping
+    it turns a complete non-unique grain into an invented key.
+    """
     catalog: str
     table_ref: str
     grain_key_refs: tuple[str, ...]
     grain_fact_key: str
+    grain_is_unique: bool
+    grain_authority_provenance: GrainAuthorityProvenance
+    grain_fact_revision: str
+    grain_dependency_identity: str
 
 
 @dataclass(frozen=True, slots=True)
