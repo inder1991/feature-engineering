@@ -28,6 +28,7 @@ from featuregen.api.routes import (
     graph,
     ingestion_runs,
     integrations,
+    learning,
     lineage,
     quarantine,
     readiness,
@@ -151,6 +152,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(contract.router)
     app.include_router(entity.router)
     app.include_router(suggestions.router)
+    app.include_router(learning.router)
 
     @app.get("/health")
     def health() -> dict:
