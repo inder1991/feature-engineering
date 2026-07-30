@@ -160,6 +160,12 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     join_err = join_write_error(ref, fact_type, value, use_case)
     if join_err is not None:
         return _deny_audited(conn, cmd, key, join_err)
+    if fact_type == "entity_bridge":
+        from featuregen.overlay.upload.bridge_candidates import bridge_catalog_write_error
+
+        bridge_err = bridge_catalog_write_error(conn, ref)
+        if bridge_err is not None:
+            return _deny_audited(conn, cmd, key, bridge_err)
     # SP-1.5 Task 7 (+ review #5b): re-confirming a drift-STALEd OR expiry-REVERIFY fact must not
     # re-affirm a value whose object/column the catalog no longer has. Config-gated: full SP-1.5
     # hardening is active only when a deployment has sealed an OverlayConfig.
@@ -321,6 +327,13 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     join_err = join_write_error(ref, fact_type, proposed_value, use_case)  # SP-1.5 F4 + consistency
     if join_err is not None:
         return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
+    if fact_type == "entity_bridge":
+        from featuregen.overlay.upload.bridge_candidates import bridge_catalog_write_error
+
+        bridge_err = bridge_catalog_write_error(conn, ref)
+        if bridge_err is not None:
+            return CommandResult(
+                accepted=False, aggregate_id="", denied_reason=bridge_err)
     key = fact_key(ref, fact_type, use_case)
     # Delivery E four-eyes (E1): a governed semantic fact may NOT be single-party self-confirmed —
     # one principal must not both propose AND approve the same value. enter_fact is the audited

@@ -174,8 +174,13 @@ def binding(schema: str, table: str) -> PhysicalDatasetBindingV1:
 #: hand-written attestation that no longer describes the data.
 PILOT_JOIN_EVIDENCE = RelationshipEvidenceV1(
     left_physical_id=binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).identity.table_id,
+    left_binding_revision_id=(
+        binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).binding_revision_id),
+    left_binding_content_hash=binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).content_hash,
     left_column="cif_id",
     right_physical_id=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).identity.table_id,
+    right_binding_revision_id=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).binding_revision_id,
+    right_binding_content_hash=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).content_hash,
     right_column="cif_id",
     left_rows=EXPECTED["transaction_rows"],
     left_distinct=EXPECTED["transaction_cif_distinct"],

@@ -62,6 +62,17 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     join_err = join_write_error(ref, fact_type, proposed_value, use_case)
     if join_err is not None:
         return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
+    if fact_type == "entity_bridge":
+        # The pure identity gate above proves ref/value consistency. Endpoint existence and current
+        # identifier classification require the catalog connection, so they live in this second,
+        # state-aware gate. LLM-classified identifiers remain admissible; human review is not a
+        # precondition.
+        from featuregen.overlay.upload.bridge_candidates import bridge_catalog_write_error
+
+        bridge_err = bridge_catalog_write_error(conn, ref)
+        if bridge_err is not None:
+            return CommandResult(
+                accepted=False, aggregate_id="", denied_reason=bridge_err)
     key = fact_key(ref, fact_type, use_case)
     fp = proposal_fingerprint(
         proposed_value,

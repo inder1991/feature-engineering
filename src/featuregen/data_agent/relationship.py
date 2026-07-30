@@ -48,8 +48,12 @@ class RelationshipEvidenceV1:
     an unmatched-key COUNT is a statistic, while the unmatched keys themselves are identifiers."""
 
     left_physical_id: str
+    left_binding_revision_id: str
+    left_binding_content_hash: str
     left_column: str
     right_physical_id: str
+    right_binding_revision_id: str
+    right_binding_content_hash: str
     right_column: str
     left_rows: int
     left_distinct: int
@@ -203,8 +207,14 @@ def observe_relationship(conn, probe: RelationshipProbeV1, *, dialect) -> Relati
         f"  WHERE {left_col} IS NOT NULL GROUP BY {left_col}) counts").fetchone()[0]
 
     return RelationshipEvidenceV1(
-        left_physical_id=probe.left_binding.identity.table_id, left_column=probe.left_column,
-        right_physical_id=probe.right_binding.identity.table_id, right_column=probe.right_column,
+        left_physical_id=probe.left_binding.identity.table_id,
+        left_binding_revision_id=probe.left_binding.binding_revision_id,
+        left_binding_content_hash=probe.left_binding.content_hash,
+        left_column=probe.left_column,
+        right_physical_id=probe.right_binding.identity.table_id,
+        right_binding_revision_id=probe.right_binding.binding_revision_id,
+        right_binding_content_hash=probe.right_binding.content_hash,
+        right_column=probe.right_column,
         left_rows=int(left_rows), left_distinct=int(left_distinct), left_nulls=int(left_nulls),
         right_rows=int(right_rows), right_distinct=int(right_distinct),
         matched_distinct=int(matched), unmatched_distinct=int(unmatched),

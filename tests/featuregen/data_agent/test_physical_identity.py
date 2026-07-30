@@ -17,6 +17,7 @@ from featuregen.data_agent.physical import (
     PhysicalDatasetBindingV1,
     PhysicalObjectIdentityV1,
     UnknownSchema,
+    record_binding_revision,
 )
 
 
@@ -133,3 +134,40 @@ def test_a_binding_carries_no_credentials():
     serialized = repr(_binding())
     for smell in ("password", "keytab", "token", "jdbc:", "://"):
         assert smell not in serialized.lower()
+
+
+def test_binding_revision_changes_only_when_identity_bearing_content_changes():
+    base = _binding()
+    recaptured = _binding()
+    moved = _binding(identity=_identity(
+        schema="new_schema", column=None, object_kind="table"))
+    renamed_stream = _binding(binding_id="b-2")
+
+    assert recaptured.content_hash == base.content_hash
+    assert recaptured.binding_revision_id == base.binding_revision_id
+    assert moved.content_hash != base.content_hash
+    assert moved.binding_revision_id != base.binding_revision_id
+    # The same declaration under another durable binding has reusable content but a different
+    # revision identity: observations must name which binding stream was used.
+    assert renamed_stream.content_hash == base.content_hash
+    assert renamed_stream.binding_revision_id != base.binding_revision_id
+
+
+def test_binding_revision_store_is_append_only_and_idempotent(db):
+    binding = _binding()
+    first = record_binding_revision(db, binding, recorded_by="test")
+    second = record_binding_revision(db, binding, recorded_by="some-retry")
+
+    assert first == second == binding.binding_revision_id
+    row = db.execute(
+        "SELECT content_hash, catalog_logical_ref, physical_id, recorded_by, count(*) OVER () "
+        "FROM physical_dataset_binding_revision WHERE binding_revision_id = %s",
+        (first,),
+    ).fetchone()
+    assert row == (
+        binding.content_hash,
+        binding.catalog_logical_ref,
+        binding.identity.table_id,
+        "test",
+        1,
+    )

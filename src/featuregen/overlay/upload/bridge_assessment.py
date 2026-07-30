@@ -14,7 +14,7 @@ Stable identity deliberately excludes review state, clocks, scores and live obse
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -22,12 +22,16 @@ from typing import TYPE_CHECKING
 from featuregen.data_agent.physical import (
     PhysicalDatasetBindingV1,
     PhysicalObjectIdentityV1,
+    record_binding_revision,
+    resolve_dataset_binding,
 )
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
 if TYPE_CHECKING:
     from featuregen.contracts import DbConn, EventEnvelope
+    from featuregen.materialize.codes import MaterializationRefused
+    from featuregen.materialize.inventory import ClusterInventoryV1
 
 
 CANDIDATE_FAMILY_IDENTIFIER_LINK = "identifier_link"
@@ -210,6 +214,7 @@ def _binding_payload(
     return {
         "binding_id": binding.binding_id,
         "binding_revision_id": binding_revision_id,
+        "binding_content_hash": binding.content_hash,
         "physical_table_id": binding.identity.table_id,
     }
 
@@ -289,6 +294,74 @@ class IdentifierEndpointV1:
             **self.logical_identity_payload(),
             "binding": _binding_payload(self.physical_binding, self.binding_revision_id),
         }
+
+
+def resolve_and_record_endpoint_binding(
+    conn: DbConn,
+    inventory: ClusterInventoryV1,
+    endpoint: IdentifierEndpointV1,
+    *,
+    connection_id: str,
+    purposes: tuple[str, ...],
+    business_time_column: str | None = None,
+    recorded_by: str | None = None,
+) -> IdentifierEndpointV1 | MaterializationRefused:
+    """Turn a flat logical endpoint into an executable, revision-pinned physical endpoint.
+
+    Resolution delegates to the materialization input owner. The inventory must also attest every
+    tuple member as a physical data or partition column; a table-level address alone cannot make a
+    relationship probe executable.
+    """
+    from featuregen.materialize.codes import (
+        CompilationRefusalCode,
+        MaterializationRefused,
+    )
+
+    binding = resolve_dataset_binding(
+        conn,
+        inventory,
+        logical_table_ref=endpoint.logical_table_ref,
+        connection_id=connection_id,
+        binding_id=(
+            f"identifier-endpoint:{inventory.environment_id}:{endpoint.logical_table_ref}"),
+        business_time_column=business_time_column,
+        purposes=purposes,
+    )
+    if isinstance(binding, MaterializationRefused):
+        return binding
+    layout = inventory.layout_for(binding.identity.schema, binding.identity.table)
+    # resolve_dataset_binding derived a PhysicalInputRequirement, so this is defensive against a
+    # contradictory inventory implementation rather than a second resolution path.
+    if layout is None:
+        return MaterializationRefused(
+            CompilationRefusalCode.PARTITION_IDENTITY_UNKNOWN,
+            f"no captured layout for {binding.identity.table_id}")
+    available_columns = {
+        name.strip().lower() for name, _physical_type in layout.columns}
+    available_columns.update(
+        name.strip().lower() for name, _physical_type in (layout.partition_columns or ()))
+    member_columns: list[str] = []
+    for member in endpoint.members:
+        _source, _schema, _table, column = parse_ref(member.logical_column_ref)
+        assert column is not None  # IdentifierColumnMemberV1 enforces this at construction
+        if column not in available_columns:
+            return MaterializationRefused(
+                CompilationRefusalCode.UNACCOUNTED_LOGICAL_REF,
+                f"{member.logical_column_ref} is absent from captured physical layout "
+                f"{binding.identity.table_id}")
+        member_columns.append(column)
+    bound_members = tuple(
+        replace(member, physical_identity=binding.column(column))
+        for member, column in zip(endpoint.members, member_columns, strict=True)
+    )
+    bound = replace(
+        endpoint,
+        members=bound_members,
+        physical_binding=binding,
+        binding_revision_id=binding.binding_revision_id,
+    )
+    record_binding_revision(conn, binding, recorded_by=recorded_by)
+    return bound
 
 
 def _logical_endpoint_sort_key(endpoint: IdentifierEndpointV1) -> tuple[str, tuple[str, ...]]:

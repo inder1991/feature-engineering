@@ -16,9 +16,17 @@ from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer, write_evidence
 from featuregen.overlay.identity import EntityBridgeRef, fact_key, proposal_fingerprint
-from featuregen.overlay.upload.bridge_candidates import BRIDGE_DERIVATION_VERSION, BridgeCandidateV1
+from featuregen.overlay.upload.bridge_candidates import (
+    BRIDGE_DERIVATION_VERSION,
+    BridgeCandidateV1,
+    bridge_candidate_write_error,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class BridgeProposalError(ValueError):
+    """A caller supplied a candidate that no longer matches the governed catalog."""
 
 
 def _object_ref_str(ref) -> str:
@@ -37,6 +45,9 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None,
     more than a human ``proposed_by`` ever said. ``None`` (a direct caller with no run) leaves the
     column NULL, exactly as before."""
     ts = now if now is not None else datetime.now(UTC)
+    write_error = bridge_candidate_write_error(conn, candidate)
+    if write_error is not None:
+        raise BridgeProposalError(write_error)
     ref = EntityBridgeRef(entity_id=candidate.entity_id, left_ref=candidate.left_ref,
                           right_ref=candidate.right_ref)
     key = fact_key(ref, "entity_bridge")
@@ -47,6 +58,8 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None,
     evidence = {"entity_id": candidate.entity_id, "candidate_id": candidate.candidate_id,
                 "data_type_family": candidate.data_type_family, "left_is_grain": candidate.left_is_grain,
                 "right_is_grain": candidate.right_is_grain, "type_basis": candidate.type_basis,
+                "left_concept_authority": candidate.left_concept_authority,
+                "right_concept_authority": candidate.right_concept_authority,
                 "derivation_version": BRIDGE_DERIVATION_VERSION}
     evidence_ref = write_evidence(
         conn, fact_key=key, table_snapshot_at=ts, row_count=0, sample_size=0,

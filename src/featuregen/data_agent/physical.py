@@ -20,6 +20,15 @@ reason it exists as a separate contract rather than a field on the existing ref.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from featuregen.materialize.canonical import materialize_hash
+from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+
+if TYPE_CHECKING:
+    from featuregen.contracts import DbConn
+    from featuregen.materialize.codes import MaterializationRefused
+    from featuregen.materialize.inventory import ClusterInventoryV1
 
 #: Refusal codes. Closed vocabulary — a governed refusal never surfaces as a bare ValueError with a
 #: prose message the caller has to parse.
@@ -28,6 +37,9 @@ UNKNOWN_DATABASE = "PHYSICAL_UNKNOWN_DATABASE"
 KIND_MISMATCH = "PHYSICAL_KIND_MISMATCH"
 BINDING_NOT_A_TABLE = "BINDING_NOT_A_TABLE"
 BUSINESS_TIME_NOT_PARTITIONED = "BINDING_BUSINESS_TIME_NOT_PARTITIONED"
+BLANK_BINDING_FIELD = "BINDING_BLANK_IDENTITY_FIELD"
+
+BINDING_CONTRACT_VERSION = "1.0.0"
 
 _OBJECT_KINDS = ("table", "column")
 
@@ -113,6 +125,21 @@ class PhysicalObjectIdentityV1:
         return "::".join([_norm(self.catalog_source), _norm(self.database), _norm(self.schema),
                           _norm(self.table)])
 
+    def identity_payload(self) -> dict[str, str | None]:
+        """Canonical address payload used by binding revisions.
+
+        The normalized values are intentional: Hive identifiers are case-insensitive, so a catalog
+        recapture that changes only casing must not produce a new binding revision.
+        """
+        return {
+            "catalog_source": _norm(self.catalog_source),
+            "database": _norm(self.database),
+            "schema": _norm(self.schema),
+            "table": _norm(self.table),
+            "object_kind": self.object_kind,
+            "column": _norm(self.column) or None,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class PhysicalDatasetBindingV1:
@@ -136,10 +163,42 @@ class PhysicalDatasetBindingV1:
     purposes: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        for name in ("binding_id", "catalog_logical_ref", "connection_id"):
+            if not str(getattr(self, name)).strip():
+                raise PhysicalBindingError(
+                    BLANK_BINDING_FIELD, f"{name} must not be blank")
+        try:
+            source, schema, table, column = parse_ref(
+                self.catalog_logical_ref.strip().lower())
+        except ValueError as exc:
+            raise PhysicalBindingError(
+                BLANK_BINDING_FIELD,
+                f"catalog_logical_ref is not a normalized catalog ref: {exc}") from exc
+        if column is not None:
+            raise PhysicalBindingError(
+                BINDING_NOT_A_TABLE,
+                "a dataset binding catalog_logical_ref must address a table, not a column")
+        logical_ref = normalize_ref(source, schema, table)
+        object.__setattr__(self, "binding_id", self.binding_id.strip())
+        object.__setattr__(self, "catalog_logical_ref", logical_ref)
+        object.__setattr__(self, "connection_id", self.connection_id.strip())
+        object.__setattr__(
+            self, "partition_columns",
+            tuple(_norm(column) for column in self.partition_columns))
+        object.__setattr__(
+            self, "business_time_column",
+            _norm(self.business_time_column) or None)
+        object.__setattr__(
+            self, "purposes",
+            tuple(sorted({_norm(purpose) for purpose in self.purposes if _norm(purpose)})))
         if self.identity.object_kind != "table":
             raise PhysicalBindingError(
                 BINDING_NOT_A_TABLE,
                 "a dataset binding addresses a table; a column is reached through its table")
+        if _norm(self.identity.catalog_source) != source:
+            raise PhysicalBindingError(
+                KIND_MISMATCH,
+                "catalog_logical_ref and physical identity must name the same catalog_source")
         if self.business_time_column is not None:
             declared = {_norm(c) for c in self.partition_columns}
             if _norm(self.business_time_column) not in declared:
@@ -155,3 +214,116 @@ class PhysicalDatasetBindingV1:
             catalog_source=self.identity.catalog_source, database=self.identity.database,
             schema=self.identity.schema, table=self.identity.table,
             object_kind="column", column=name)
+
+    def content_payload(self) -> dict[str, Any]:
+        """Stable declaration sealed by :attr:`content_hash`.
+
+        ``binding_id`` is excluded: it names the durable binding stream, while this payload says
+        what one revision of that stream declares. Observation time and credentials are absent.
+        """
+        return {
+            "contract_version": BINDING_CONTRACT_VERSION,
+            "catalog_logical_ref": self.catalog_logical_ref,
+            "connection_id": self.connection_id,
+            "physical_identity": self.identity.identity_payload(),
+            "partition_columns": list(self.partition_columns),
+            "business_time_column": self.business_time_column,
+            "purposes": list(self.purposes),
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return materialize_hash(self.content_payload())
+
+    @property
+    def binding_revision_id(self) -> str:
+        """Revision identity is scoped to the durable binding, not just its reusable content."""
+        return "pbr_" + materialize_hash({
+            "binding_id": self.binding_id,
+            "content_hash": self.content_hash,
+        })
+
+
+def record_binding_revision(
+    conn: DbConn,
+    binding: PhysicalDatasetBindingV1,
+    *,
+    recorded_by: str | None = None,
+) -> str:
+    """Append the binding revision if absent and return its deterministic revision id.
+
+    Re-recording byte-identical content is idempotent. A changed address, layout declaration,
+    connection, or purpose receives a new revision while the flat catalog ref remains unchanged.
+    """
+    from psycopg.types.json import Jsonb
+
+    conn.execute(
+        "INSERT INTO physical_dataset_binding_revision ("
+        "  binding_revision_id, binding_id, content_hash, catalog_logical_ref, connection_id,"
+        "  physical_id, binding_json, recorded_by) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (binding_revision_id) DO NOTHING",
+        (
+            binding.binding_revision_id,
+            binding.binding_id,
+            binding.content_hash,
+            binding.catalog_logical_ref,
+            binding.connection_id,
+            binding.identity.table_id,
+            Jsonb(binding.content_payload()),
+            recorded_by,
+        ),
+    )
+    return binding.binding_revision_id
+
+
+def resolve_dataset_binding(
+    conn: DbConn,
+    inventory: ClusterInventoryV1,
+    *,
+    logical_table_ref: str,
+    connection_id: str,
+    binding_id: str | None = None,
+    business_time_column: str | None = None,
+    purposes: tuple[str, ...] = (),
+) -> PhysicalDatasetBindingV1 | MaterializationRefused:
+    """Resolve a flat logical table ref through the governed catalog and target inventory.
+
+    This deliberately delegates to :func:`materialize.inputs.derive_requirement`, whose resolution
+    order is catalog ``schema_name`` then declared environment mapping, else a typed refusal. The
+    ref's ``public`` segment is never interpreted as a Hive schema.
+    """
+    from featuregen.materialize.inputs import PhysicalInputRequirement, derive_requirement
+
+    source, schema, table, column = parse_ref(logical_table_ref.strip().lower())
+    if column is not None:
+        raise ValueError(
+            f"logical_table_ref must address a table, got {logical_table_ref!r}")
+    logical_ref = normalize_ref(source, schema, table)
+    requirement = derive_requirement(conn, inventory, table_ref=logical_ref)
+    if not isinstance(requirement, PhysicalInputRequirement):
+        return requirement
+    partition_columns = tuple(
+        column_name for column_name, _physical_type in (requirement.partition_columns or ()))
+    identity = PhysicalObjectIdentityV1(
+        catalog_source=requirement.catalog_source,
+        # In PhysicalObjectIdentityV1, database addresses the cluster/catalog holding the Hive
+        # schema. ClusterInventoryV1.environment_id is exactly that stable environment address.
+        database=inventory.environment_id,
+        schema=requirement.schema,
+        table=requirement.table,
+        object_kind="table",
+    )
+    return PhysicalDatasetBindingV1(
+        binding_id=(
+            binding_id
+            or f"{inventory.environment_id}:{requirement.catalog_source}:{requirement.schema}."
+               f"{requirement.table}"
+        ),
+        catalog_logical_ref=logical_ref,
+        connection_id=connection_id,
+        identity=identity,
+        partition_columns=partition_columns,
+        business_time_column=business_time_column,
+        purposes=purposes,
+    )

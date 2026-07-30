@@ -17,11 +17,6 @@ while a sample that finds none proves nothing.
 from __future__ import annotations
 
 import pytest
-
-from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
-from featuregen.data_agent.profile_policy import ProfilePolicyV1
-from featuregen.data_agent.relationship import RelationshipProbeV1, observe_relationship
-from featuregen.data_agent.sql_postgres import PostgresDialect
 from tests.featuregen.data_agent.pilot_fixture import (
     CUSTOMER_SCHEMA,
     CUSTOMER_TABLE,
@@ -30,6 +25,11 @@ from tests.featuregen.data_agent.pilot_fixture import (
     TRANSACTION_TABLE,
     create_pilot_tables,
 )
+
+from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+from featuregen.data_agent.profile_policy import ProfilePolicyV1
+from featuregen.data_agent.relationship import RelationshipProbeV1, observe_relationship
+from featuregen.data_agent.sql_postgres import PostgresDialect
 
 
 @pytest.fixture
@@ -94,6 +94,16 @@ def test_the_observed_join_multiplier(pilot):
     e = _run(pilot)
     assert e.max_left_rows_per_right_key == EXPECTED["max_rows_per_customer"] == 6   # C1 and C3 both reach 6 raw rows
     assert e.observed_cardinality == "many_to_one"
+
+
+def test_relationship_evidence_is_pinned_to_both_binding_revisions(pilot):
+    probe = _probe()
+    evidence = _run(pilot, probe)
+
+    assert evidence.left_binding_revision_id == probe.left_binding.binding_revision_id
+    assert evidence.left_binding_content_hash == probe.left_binding.content_hash
+    assert evidence.right_binding_revision_id == probe.right_binding.binding_revision_id
+    assert evidence.right_binding_content_hash == probe.right_binding.content_hash
 
 
 # ── what the evidence may and may not support ────────────────────────────────────────────────────

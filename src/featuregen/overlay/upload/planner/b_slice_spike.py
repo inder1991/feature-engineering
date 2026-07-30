@@ -47,7 +47,7 @@ from featuregen.overlay.resolve import resolve_fact
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.task_read import get_task_proposal
-from featuregen.overlay.upload.bridge_candidates import BridgeCandidateV1
+from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_projection import project_verified_bridge
 from featuregen.overlay.upload.bridge_propose import propose_bridge
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -170,18 +170,43 @@ def _column_ref(catalog: str, table: str, column: str) -> CatalogObjectRef:
 
 def verify_bridge(conn, *, entity_id: str, left: tuple[str, str, str], right: tuple[str, str, str],
                   service_actor: IdentityEnvelope, human_actor: IdentityEnvelope,
-                  now: datetime, data_type_family: str = "string",
+                  now: datetime, data_type_family: str = "text",
                   right_is_grain: bool = True) -> tuple[str, str]:
     """Propose -> confirm -> project a VERIFIED ``entity_bridge`` between two cross-catalog columns via
     the REAL commands (``propose_bridge`` service-proposes onto the overlay_fact spine, a platform-admin
     ``confirm_fact`` verifies under four-eyes, ``project_verified_bridge`` writes the active edge).
     ``left``/``right`` are ``(catalog, table, column)``. Returns ``(fact_key, projection_status)``."""
-    left_ref = _column_ref(*left)
-    right_ref = _column_ref(*right)
-    candidate = BridgeCandidateV1(
-        candidate_id=f"b-spike:{entity_id}:{left[0]}.{left[1]}.{left[2]}->{right[0]}.{right[1]}.{right[2]}",
-        entity_id=entity_id, left_ref=left_ref, right_ref=right_ref,
-        data_type_family=data_type_family, left_is_grain=False, right_is_grain=right_is_grain)
+    left_ref, right_ref = _column_ref(*left), _column_ref(*right)
+    wanted = {
+        (left_ref.catalog_source, left_ref.table, left_ref.column),
+        (right_ref.catalog_source, right_ref.table, right_ref.column),
+    }
+    candidate = next(
+        (
+            candidate
+            for candidate in derive_bridge_candidates(conn)
+            if candidate.entity_id == entity_id
+            and {
+                (
+                    candidate.left_ref.catalog_source,
+                    candidate.left_ref.table,
+                    candidate.left_ref.column,
+                ),
+                (
+                    candidate.right_ref.catalog_source,
+                    candidate.right_ref.table,
+                    candidate.right_ref.column,
+                ),
+            } == wanted
+        ),
+        None,
+    )
+    assert candidate is not None, (
+        f"no current governed bridge candidate for {entity_id}: {left} <-> {right}")
+    assert candidate.data_type_family == data_type_family
+    # ``right_is_grain`` remains in the spike API for its old callers, but the actual candidate's
+    # live graph evidence now owns this conclusion; the helper no longer authors it.
+    _ = right_is_grain
     propose_bridge(conn, candidate, actor=service_actor, now=now)
     bref = EntityBridgeRef(entity_id, left_ref, right_ref)
     key = fact_key(bref, "entity_bridge")
