@@ -355,11 +355,8 @@ def test_a_ledger_row_with_no_governance_record_at_all_is_unavailable(db):
     assert cross_catalog_links(db) == ()
 
 
-def test_a_verified_projection_with_no_stream_is_still_available(db):
-    """The one place absence is allowed, and only because the ROW ITSELF is the positive reading:
-    `project_verified_bridge` writes an `entity_bridge_edge` row ONLY under a VERIFIED fold, and
-    `demote_bridge_edges` removes it on every exit from VERIFIED. `multisource_gold` and the planner
-    fixtures seed bridges this way, so treating a projected VERIFIED row as unreadable would blank
-    them."""
+def test_a_verified_projection_with_no_stream_is_unavailable(db):
+    """A projection is rebuildable and may be stale. It cannot replace the authoritative lifecycle:
+    an orphan VERIFIED row with no event stream is unverifiable and must fail closed."""
     _verify(db, "fk-gold", "customer", "cust_num", "cif_id", stream=False)
-    assert [l.status for l in cross_catalog_links(db)] == [LinkStatus.CONFIRMED]
+    assert cross_catalog_links(db) == ()

@@ -258,6 +258,22 @@ def test_an_unavailable_link_is_reported_as_unavailable_not_merely_unconfirmed(c
         == ["JOIN_IDENTITY_UNAVAILABLE"]
 
 
+def test_stale_lifecycle_wins_over_a_leftover_verified_projection(catalog, _overlay_schemas):
+    """Grounding must not downgrade a stale link to the softer 'unconfirmed' warning merely because
+    asynchronous projection cleanup left a VERIFIED row behind."""
+    _bridge(catalog, "bfk-1", status="STALE")
+    catalog.execute(
+        "INSERT INTO entity_bridge_edge "
+        "(fact_key,entity_id,left_catalog_source,left_object_ref,right_catalog_source,"
+        "right_object_ref,status) VALUES "
+        "('bfk-1','customer',%s,%s,'cib','public.bo_cib_customer.cust_num','VERIFIED')",
+        (SRC, f"public.{TBL}.cif_id"))
+
+    grounded = ground_analysis_plan(catalog, _plan(join_refs=("bfk-1",)))
+    assert [f.code for f in grounded.findings if f.code.startswith("JOIN_IDENTITY")] \
+        == ["JOIN_IDENTITY_UNAVAILABLE"]
+
+
 # ── read scope, and absence ──────────────────────────────────────────────────────────────────────
 
 def test_a_hidden_column_is_reported_as_absent_not_as_hidden(db):

@@ -24,6 +24,10 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    requires_directional_bridge_realization,
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -69,11 +73,9 @@ def _seed(db, source, rows_concepts):
 
 
 def _seed_verified_bridge(db, fact_key, entity_id, lc, lref, rc, rref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, lc, lref, rc, rref, f"evt-{fact_key}"))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(db, source, table, columns, *, service_actor, human_actor):
@@ -230,6 +232,7 @@ def ungoverned_endpoint_topology(db, service_actor, human_actor):
 
 
 # ── tests ──────────────────────────────────────────────────────────────────────────────────────
+@requires_directional_bridge_realization
 def test_valid_ratio_resolves_one_selected_candidate(resolved_topology):
     conn, scope = resolved_topology
     result = plan_multi_source(conn, _adapter(), intent=_ratio_intent(), scope=scope,
@@ -296,6 +299,7 @@ def test_ungoverned_landing_endpoint_is_realization_endpoint_ungoverned(ungovern
     assert result.selected_plan_id is None
 
 
+@requires_directional_bridge_realization
 def test_contract_axis_gate_stale_union_is_not_a_resolved_selection(stale_landing_topology):
     """THE TWO-AXIS RESOLVE GATE. The plan compiles to ``resolution_status=resolved`` (the assembly axis
     is sound) but ``contract_result_status=unresolved_freshness`` (the landing catalog is stale). The run
@@ -320,6 +324,7 @@ def test_contract_axis_gate_stale_union_is_not_a_resolved_selection(stale_landin
     assert result.selected_contract_plan_id is None
 
 
+@requires_directional_bridge_realization
 def test_explicit_budget_is_decremented_per_compile(resolved_topology):
     conn, scope = resolved_topology
     budget = CompileBudget(remaining=5, deadline_monotonic=float("inf"), clock=time.monotonic)

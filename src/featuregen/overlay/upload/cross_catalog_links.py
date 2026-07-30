@@ -164,7 +164,7 @@ def bridge_lifecycle_status(conn, fact_key: str | None, *,
     platform can consider a link. A decision must take effect the moment it is made, not once a
     projector catches up.
 
-    Three resolutions that are NOT the fold, each deliberate:
+    Two resolutions that are NOT the fold, each deliberate:
 
     * **no fact_key** -> ``UNGOVERNED``. ``entity_bridge_candidate_evidence.fact_key`` is NULLable,
       so a ledger row can name no governed fact. Under an allow-list there is nothing to read and so
@@ -174,15 +174,11 @@ def bridge_lifecycle_status(conn, fact_key: str | None, *,
       here, i.e. served a link whose governance state it could not read — which also made a REJECTED
       bridge behind a failing read indistinguishable from a sound one. A blank list is a visible,
       diagnosable outage; silently serving ungoverned joins is not.
-    * **empty stream + a VERIFIED projection row** -> VERIFIED. The one place absence is allowed,
-      and only because the ROW ITSELF is a positive reading: ``project_verified_bridge`` writes it
-      ONLY under a VERIFIED fold and ``demote_bridge_edges`` removes it on every exit from VERIFIED.
-      ``multisource_gold`` and the planner fixtures seed bridges this way. An empty stream with no
-      such row is ``UNGOVERNED`` — absence of a governance record is not evidence of a benign one.
-
-    ``projected_verified`` lets a caller that already knows the projection state pass it in rather
-    than provoke a per-link query; ``None`` means "look it up".
+    ``projected_verified`` is retained only for source compatibility with callers on the selected
+    baseline. It is deliberately ignored: a rebuildable projection can lag or survive failed
+    cleanup, so it can annotate review but can never replace a missing authoritative event stream.
     """
+    del projected_verified
     if not fact_key:
         return UNGOVERNED
     from featuregen.overlay import store
@@ -193,18 +189,7 @@ def bridge_lifecycle_status(conn, fact_key: str | None, *,
         logger.warning("bridge lifecycle unreadable, treating as unavailable: %s", fact_key,
                        exc_info=True)
         return UNREADABLE
-    if status:
-        return status
-    if projected_verified is None:
-        try:
-            projected_verified = conn.execute(
-                "SELECT 1 FROM entity_bridge_edge WHERE fact_key = %s AND status = 'VERIFIED'",
-                (fact_key,)).fetchone() is not None
-        except Exception:  # noqa: BLE001 — same fail-closed rule for the fallback read
-            logger.warning("bridge projection unreadable, treating as unavailable: %s", fact_key,
-                           exc_info=True)
-            return UNREADABLE
-    return "VERIFIED" if projected_verified else UNGOVERNED
+    return status or UNGOVERNED
 
 
 def bridge_is_available(conn, fact_key: str | None, *,
@@ -230,9 +215,9 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     # table; reading only the ledger would silently drop them, turning "show unconfirmed too" into a
     # regression that loses CONFIRMED links.
     #
-    # This table is the HUMAN-REVIEW projection and is used for exactly two things: deciding whether
-    # to label a link CONFIRMED, and (in `bridge_lifecycle_status`) standing in for a stream that
-    # carries no events. AVAILABILITY is never read from here.
+    # This table is the HUMAN-REVIEW projection and is used only to label a link CONFIRMED.
+    # AVAILABILITY is never read from here, and an edge with no authoritative event stream is
+    # discarded below.
     verified = {
         r[0]: r[1:] for r in conn.execute(
             "SELECT fact_key, entity_id, left_catalog_source, left_object_ref, "

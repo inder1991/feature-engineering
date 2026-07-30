@@ -315,7 +315,6 @@ def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
 
 # hop_physical_cardinality's `source` vocabulary (F4): where the fan-in evidence came from.
 CARDINALITY_SOURCE_REALIZATION = "realization"
-CARDINALITY_SOURCE_BRIDGE = "bridge_construction"
 CARDINALITY_SOURCE_UNAVAILABLE = "unavailable"
 
 # Declared functions that are provably duplication/order-safe on ANY fan-in without extra inputs.
@@ -357,10 +356,11 @@ def _hop_evidence(
     """One hop segment's physical evidence: (cardinality, source, grouping_keys,
     execution_catalog, execution_table). Realized hop → the REALIZATION's declared_cardinality
     (F4/F8 — the physical authority; the segment's semantic cardinality string is never
-    consulted), its to-side key as the GROUP BY, its to-table as the execution site. Bridge-ROLLUP
-    hop → many_to_one BY CONSTRUCTION (the bridge anchors an E2-key FK column to an E2-grain far
-    table), grouped at the far (target-grain) endpoint — the endpoint in the segment's catalog
-    (endpoint storage order is unordered). Anything the context cannot resolve →
+    consulted), its to-side key as the GROUP BY, its to-table as the execution site. A symmetric
+    bridge supplies NO directional cardinality: matching identifier namespaces does not prove
+    target uniqueness, fan-out, predicates or applicability scope. Task 9 will resolve those from
+    a deterministically validated directional realization. Until then every bridge hop and anything
+    else the context cannot resolve returns
     ``(None, "unavailable", (), <segment catalog>, "")`` — fail closed, never a guessed fan-in."""
     if segment.realization_ref is not None:
         r = next((x for x in ctx.realizations_by_catalog.get(segment.catalog_source, ())
@@ -370,17 +370,6 @@ def _hop_evidence(
         return (r.declared_cardinality, CARDINALITY_SOURCE_REALIZATION, (r.to_key_ref,),
                 segment.catalog_source, r.to_object_ref)
     if segment.bridge_fact_key is not None:
-        br = next((x for x in ctx.active_bridges
-                   if x.fact_key == segment.bridge_fact_key), None)
-        if br is not None:
-            far = [(cat, ref)
-                   for cat, ref in ((br.left_catalog_source, br.left_object_ref),
-                                    (br.right_catalog_source, br.right_object_ref))
-                   if cat == segment.catalog_source]
-            if len(far) == 1:   # exactly one endpoint on the segment's (far) side, else fail closed
-                cat, ref = far[0]
-                return (Cardinality.MANY_TO_ONE, CARDINALITY_SOURCE_BRIDGE, (ref,),
-                        cat, table_of(ref))
         return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
     return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
 

@@ -196,6 +196,27 @@ def test_a_drift_staled_bridge_no_longer_reads_as_a_live_governed_sanction(db):
     assert _bridge_fact_signature(db, marker) == _MISSING
 
 
+def test_authoritative_stale_state_wins_even_if_projection_cleanup_failed(db):
+    """The read-time gate is independent of the fail-soft projection cleanup. Recreate the exact
+    stale VERIFIED row a failed demotion would leave behind and require the lifecycle fold to win."""
+    _, key = _verified_bridge(db)
+    marker = f"bridgefact:{key}"
+    stale_row = db.execute(
+        "SELECT entity_id,left_catalog_source,left_object_ref,right_catalog_source,right_object_ref "
+        "FROM entity_bridge_edge WHERE fact_key=%s", (key,)).fetchone()
+
+    _drift_stale(db)
+    db.execute(
+        "INSERT INTO entity_bridge_edge "
+        "(fact_key,entity_id,left_catalog_source,left_object_ref,right_catalog_source,"
+        "right_object_ref,status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
+        (key, *stale_row))
+
+    assert fold_overlay_state(load_fact(db, key)).status == "STALE"
+    assert _edge_rows(db, key) == 1, "the fixture must preserve the stale projection leak"
+    assert _bridge_fact_signature(db, marker) == _MISSING
+
+
 def test_the_planner_does_not_cross_a_drift_staled_bridge(db):
     """Defence in depth only — this PASSES without the demote, because `_blocked` already suppresses
     a STALE fact from `cross_catalog_links`. Kept so a future change to that fold cannot reopen the

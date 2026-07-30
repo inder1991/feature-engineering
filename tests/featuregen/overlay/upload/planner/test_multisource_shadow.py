@@ -27,6 +27,10 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    requires_directional_bridge_realization,
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -87,11 +91,9 @@ def _seed(conn, source, rows_concepts):
 
 
 def _seed_verified_bridge(conn, fk, entity_id, lc, lref, rc, rref):
-    conn.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fk, entity_id, lc, lref, rc, rref, f"evt-{fk}"))
+    _seed_verified_bridge_fact(
+        conn, fk, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(conn, source, table, columns, *, service_actor, human_actor):
@@ -188,6 +190,7 @@ def _ratio_intent():
 
 
 # ── tests ──
+@requires_directional_bridge_realization
 def test_two_intent_run_manifest_first_persist_reconcile_clean(
         db, planning_conn, service_actor, human_actor):
     """The whole two-connection sequence over 2 gold intents: manifest on telemetry FIRST, plan on
@@ -245,6 +248,7 @@ def test_manifest_written_before_planning(db, planning_conn, service_actor, huma
     assert seen["dispatch_at_first_plan"] == 1   # manifest present before the plan ran
 
 
+@requires_directional_bridge_realization
 def test_injected_db_error_in_one_intent_is_isolated_technical_failure(
         db, planning_conn, service_actor, human_actor, monkeypatch):
     """A per-intent DB error is caught by the per-intent SAVEPOINT: it records ``technical_failure``
@@ -280,6 +284,7 @@ def test_injected_db_error_in_one_intent_is_isolated_technical_failure(
     assert rec.complete
 
 
+@requires_directional_bridge_realization
 def test_budget_exhausting_run_records_truncation(
         db, planning_conn, service_actor, human_actor, monkeypatch):
     """The harness owns ONE mutable ``CompileBudget`` across intents. With the per-run compile
@@ -329,6 +334,7 @@ def test_telemetry_persists_despite_fixture_rollback_two_connection_boundary(
     assert reconcile(db, "mrun_boundary").complete
 
 
+@requires_directional_bridge_realization
 def test_resolved_assembly_stale_union_lands_compile_incomplete(
         db, planning_conn, service_actor, human_actor):
     """M22: a governed plan whose ASSEMBLY axis resolves but whose compile-end UNION freshness is stale
@@ -347,6 +353,7 @@ def test_resolved_assembly_stale_union_lands_compile_incomplete(
     assert row["technical_status"] == "ok"              # not a technical/truncation failure
 
 
+@requires_directional_bridge_realization
 def test_governed_crossings_persisted_for_resolved_operand(
         db, planning_conn, service_actor, human_actor):
     """I-1 end-to-end: a resolved cross-catalog operand persists its governed crossings on the operand

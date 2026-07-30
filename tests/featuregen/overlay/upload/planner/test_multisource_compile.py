@@ -29,6 +29,10 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    requires_directional_bridge_realization,
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -99,11 +103,9 @@ def _seed(db, source, rows_concepts):
 
 
 def _seed_verified_bridge(db, fact_key, entity_id, lc, lref, rc, rref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, lc, lref, rc, rref, f"evt-{fact_key}"))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(db, source, table, columns, *, service_actor, human_actor):
@@ -333,6 +335,7 @@ def test_compile_over_stale_union_is_unresolved_freshness_but_still_minted(stale
 
 
 # ── consistent plan -> resolved, with a deterministic contract_id across two runs ────────────────
+@requires_directional_bridge_realization
 def test_consistent_plan_resolves_with_deterministic_contract_id(resolved_topology):
     conn, scope = resolved_topology
     operand = _operand(slot_id="op_0", catalog="core_banking")
@@ -371,7 +374,10 @@ def test_confirmed_event_id_requeried_from_entity_bridge_edge_for_audit(resolved
     # the operand's governed path crosses via the VERIFIED bridge bfk_acct -> re-queried for audit,
     # carrying the durable confirmed_event_id (NEVER widening active_bridges)
     audit = confirmed_event_ids_for_audit(conn, plan)
-    assert ("bfk_acct", "evt-bfk_acct") in audit
+    expected = conn.execute(
+        "SELECT confirmed_event_id FROM entity_bridge_edge WHERE fact_key='bfk_acct'").fetchone()[0]
+    assert expected is not None
+    assert ("bfk_acct", expected) in audit
 
 
 def test_crossing_audit_by_slot_records_governed_crossings(resolved_topology):
@@ -390,7 +396,10 @@ def test_crossing_audit_by_slot_records_governed_crossings(resolved_topology):
     bridge = next(c for c in crossings if c["kind"] == "governed_bridge")
     assert bridge["bridge_fact_key"] == "bfk_acct"
     assert bridge["authority"] == "verified"
-    assert bridge["confirmed_event_id"] == "evt-bfk_acct"   # AUDIT-only, re-queried from the edge
+    expected = conn.execute(
+        "SELECT confirmed_event_id FROM entity_bridge_edge WHERE fact_key='bfk_acct'").fetchone()[0]
+    assert expected is not None
+    assert bridge["confirmed_event_id"] == expected   # AUDIT-only, re-queried from the edge
     # every recorded crossing is a governed authority (VERIFIED bridge / approved-or-declared realization)
     assert all(c["authority"] in {"verified", "declared_join", "approved_join"} for c in crossings)
 

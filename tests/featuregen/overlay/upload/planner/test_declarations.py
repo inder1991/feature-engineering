@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+
 from featuregen.overlay.config import OverlayConfig
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.bridge_projection import active_bridges
@@ -189,6 +191,10 @@ def test_bridge_endpoint_tables_count_as_path_tables(db):
         (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
         (CanonicalRow("crm", "customers", "churn_flag", "text"), "categorical"),
     ])
+    govern_bridge_fact(
+        db, "bridge:customer:c2", entity="customer",
+        left_source="core", left_ref="public.customer_master.customer_id",
+        right_source="crm", right_ref="public.customers.customer_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
         " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
@@ -846,6 +852,10 @@ def _bridge_core_crm(db):
         (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
         (CanonicalRow("crm", "customers", "spend", "numeric"), "monetary_flow"),
     ])
+    govern_bridge_fact(
+        db, "bridge:customer:c4", entity="customer",
+        left_source="core", left_ref="public.accounts.customer_id",
+        right_source="crm", right_ref="public.customers.customer_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
         " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
@@ -853,10 +863,11 @@ def _bridge_core_crm(db):
          "crm", "public.customers.customer_id"))
 
 
-def test_bridge_rollup_hop_is_many_to_one_by_construction(db):
-    # a bridge-rollup hop has NO realization — its fan-in is many_to_one BY CONSTRUCTION (an
-    # E2-key FK column linked to an E2-grain far table); the far (target-grain) endpoint is the
-    # GROUP-BY key and the execution site.
+def test_symmetric_bridge_never_fabricates_directional_cardinality(db):
+    # A symmetric identifier link says only "these endpoints identify the same entity." It does not
+    # prove which endpoint is unique, which direction is safe, or what predicate/scope applies.
+    # Until Task 9 supplies a deterministically validated directional realization, aggregation must
+    # fail closed instead of converting the bridge into N:1.
     _bridge_core_crm(db)
     ctx = _ctx(db, "core", "crm")
     plan = _plan(
@@ -873,17 +884,18 @@ def test_bridge_rollup_hop_is_many_to_one_by_construction(db):
                                    from_entity="account", to_entity="customer",
                                    bridge_fact_key="bridge:customer:c4"),
         ))
-    assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (
-        Cardinality.MANY_TO_ONE, "bridge_construction", ("public.customers.customer_id",))
+    assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (None, "unavailable", ())
     (hop,) = _c4_compile(ctx, plan)
     assert (hop.semantic_hop_index, hop.segment_index) == (0, 1)
-    assert hop.physical_cardinality is Cardinality.MANY_TO_ONE
-    assert hop.cardinality_source == "bridge_construction"
-    assert hop.grouping_keys == ("public.customers.customer_id",)
-    assert (hop.execution_catalog, hop.execution_table) == ("crm", "public.customers")
+    assert hop.physical_cardinality is None
+    assert hop.cardinality_source == "unavailable"
+    assert hop.grouping_keys == ()
+    assert (hop.execution_catalog, hop.execution_table) == ("crm", "")
     (stage,) = hop.ingredient_stages
     assert stage.need_role == "balance"
-    assert stage.validation is c.AggregationValidation.sound    # semi_additive, single-PIT
+    assert stage.physical_cardinality is None
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.reason_codes == (c.ReasonCode.physical_cardinality_unavailable,)
 
     # an unknown fact key resolves NOTHING — fail closed, never many_to_one on faith
     ghost = c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
@@ -1417,6 +1429,10 @@ def test_bridge_fact_set_change_is_mutation_unverifiable(db):
     _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=2)
     _checkpoint(db, 2)
     ctx = _ctx(db, "core")
+    govern_bridge_fact(
+        db, "bridge:account:c7", entity="account",
+        left_source="core", left_ref="public.transactions.account_id",
+        right_source="crm", right_ref="public.accounts.account_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source,"
         " left_object_ref, right_catalog_source, right_object_ref, status)"

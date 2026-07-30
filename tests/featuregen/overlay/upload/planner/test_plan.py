@@ -12,6 +12,9 @@ from featuregen.overlay.upload.planner.contracts import (
 from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.templates import Need, Template
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 
 _NOW = datetime(2026, 7, 14, tzinfo=UTC)
 
@@ -113,10 +116,9 @@ def _seed(db, source, catalog):
 
 
 def _seed_bridge(db, fact_key, entity_id, left_cat, left_ref, right_cat, right_ref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, left_cat, left_ref, right_cat, right_ref))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=left_cat, left_ref=left_ref,
+        right_source=right_cat, right_ref=right_ref)
 
 
 def _txn_template(extra_needs: tuple = ()):

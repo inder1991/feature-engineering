@@ -233,40 +233,45 @@ def _bridge_fact_signature(conn: DbConn, marker: str):
     confirm registers as drift — is recorded on :func:`bridge_fact_marker` along with the target
     (directional realization revision + deterministic evidence).
     """
-    fact_key = marker[len(_BRIDGEFACT_PREFIX):]
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            "SELECT status, entity_id, left_catalog_source, left_object_ref, "
-            "right_catalog_source, right_object_ref FROM entity_bridge_edge WHERE fact_key = %s",
-            (fact_key,))
-        row = cur.fetchone()
-    if row is None:
-        return _unreviewed_bridge_signature(conn, fact_key)
-    return {"bridge": True, "status": row["status"], "entity_id": row["entity_id"],
-            "left": f"{row['left_catalog_source']}.{row['left_object_ref']}",
-            "right": f"{row['right_catalog_source']}.{row['right_object_ref']}"}
-
-
-def _unreviewed_bridge_signature(conn: DbConn, fact_key: str):
-    """The governed state of a bridge with NO projection row: a real dict when its lifecycle is
-    AVAILABLE, ``MISSING`` otherwise (REJECTED / STALE / expired-to-REVERIFY / unreadable / no
-    governance record at all). Endpoints come from the folded value so the signature identifies the
-    same join the projection row would have; when the value is absent — every unavailable state moves
-    it to ``prior_value`` — the status alone is enough, because the item is ``MISSING`` there anyway.
-    Reuses ``cross_catalog_links``' allow-list so availability has ONE definition platform-wide."""
     from featuregen.overlay.state import fold_overlay_state
     from featuregen.overlay.store import load_fact
-    from featuregen.overlay.upload.cross_catalog_links import (
-        AVAILABLE_STATUSES,
-        bridge_lifecycle_status,
-    )
-    status = bridge_lifecycle_status(conn, fact_key, projected_verified=False)
-    if status not in AVAILABLE_STATUSES:
+    from featuregen.overlay.upload.cross_catalog_links import AVAILABLE_STATUSES
+
+    fact_key = marker[len(_BRIDGEFACT_PREFIX):]
+    try:
+        state = fold_overlay_state(load_fact(conn, fact_key))
+    except Exception:  # noqa: BLE001 — contract reuse must fail closed on unreadable authority
         return _MISSING
-    value = fold_overlay_state(load_fact(conn, fact_key)).value
+    if state.status not in AVAILABLE_STATUSES:
+        return _MISSING
+
+    # Preserve the exact legacy signature for an authoritatively VERIFIED bridge whose projection
+    # is current. Existing write-once dependency hashes therefore remain comparable. Crucially the
+    # lifecycle was checked FIRST, so a stale leftover edge can no longer authorize reuse.
+    if state.status == "VERIFIED":
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT status, entity_id, left_catalog_source, left_object_ref, "
+                "right_catalog_source, right_object_ref FROM entity_bridge_edge WHERE fact_key = %s",
+                (fact_key,))
+            row = cur.fetchone()
+        if row is not None:
+            return {"bridge": True, "status": row["status"], "entity_id": row["entity_id"],
+                    "left": f"{row['left_catalog_source']}.{row['left_object_ref']}",
+                    "right": f"{row['right_catalog_source']}.{row['right_object_ref']}"}
+    return _unreviewed_bridge_signature(state)
+
+
+def _unreviewed_bridge_signature(state):
+    """Signature for an available bridge without a current VERIFIED projection.
+
+    ``state`` is the one authoritative fold already loaded by :func:`_bridge_fact_signature`; do
+    not reload it and create a time-of-check/time-of-use split between availability and endpoints.
+    """
+    value = state.value
     value = value if isinstance(value, dict) else {}
     left, right = value.get("left_ref") or {}, value.get("right_ref") or {}
-    return {"bridge": True, "status": status, "entity_id": value.get("entity_id"),
+    return {"bridge": True, "status": state.status, "entity_id": value.get("entity_id"),
             "left": _endpoint_str(left), "right": _endpoint_str(right)}
 
 

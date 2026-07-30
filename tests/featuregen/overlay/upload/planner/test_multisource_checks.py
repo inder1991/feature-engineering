@@ -27,6 +27,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    requires_directional_bridge_realization,
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -85,10 +89,9 @@ def _seed(db, source, rows_concepts):
 
 
 def _seed_verified_bridge(db, fact_key, entity_id, lc, lref, rc, rref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, lc, lref, rc, rref))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(db, source, table, columns, *, service_actor, human_actor):
@@ -260,6 +263,7 @@ def bridged_leakage_anchor(db, service_actor, human_actor):
 
 
 # ── check_operand_path: aggregation soundness via reuse ─────────────────────────────────────────
+@requires_directional_bridge_realization
 def test_unsafe_leakage_anchor_column_rejects_via_safety_fold(bridged_leakage_anchor):
     # M16: an operand bound to a genuinely UNSAFE (leakage-anchor) column must reject on the SAFETY
     # branch of check_operand_path — Task-6 convergence deferred safety to here, so an unsafe path can

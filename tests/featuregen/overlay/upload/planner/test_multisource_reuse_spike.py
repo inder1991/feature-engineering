@@ -20,6 +20,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    requires_directional_bridge_realization,
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -67,10 +71,9 @@ def _seed_verified_bridge(db, fact_key, entity_id, lc, lref, rc, rref):
     """A VERIFIED cross-catalog bridge in the projection ``active_bridges`` reads. This is exactly
     how the whole assembly test suite seeds a governed crossing (``entity_bridge_edge`` IS the
     projection ``project_verified_bridge`` writes)."""
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, lc, lref, rc, rref))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(db, source, table, columns, *, service_actor, human_actor):
@@ -176,6 +179,7 @@ def two_catalog_take_latest_fixture(db, service_actor, human_actor):
 
 
 # ── the SPIKE ─────────────────────────────────────────────────────────────────────────────────
+@requires_directional_bridge_realization
 def test_injected_operand_template_rolls_up_and_compiles(two_catalog_bridged_fixture):
     conn, scope, now = two_catalog_bridged_fixture
     tmpl = injected_operand_template(recipe_id="ms:op_0", need_role="measure_0",
@@ -239,4 +243,3 @@ def test_injected_take_latest_operand_finds_anchor_and_validates(two_catalog_tak
     # _take_latest validation PASSED: the anchor was proven at row grain before the fan-in hop
     assert stages[0].declared_function is AggregationFunction.take_latest
     assert stages[0].validation is AggregationValidation.sound
-
