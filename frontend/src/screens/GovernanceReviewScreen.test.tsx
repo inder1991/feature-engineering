@@ -841,10 +841,50 @@ describe('governance review — honest emptiness and honest counts', () => {
   })
 
   it('surfaces a load failure as the server said it, not as an empty queue', async () => {
-    getGovernanceQueue.mockRejectedValue(new api.ApiError(403, 'platform-admin required'))
+    // A GENUINE failure. This case used to be written with a 403, which is not a failure at all:
+    // the queue route is gated on the platform-admin claim and nothing gates the navigation to it,
+    // so a 403 is the ordinary answer for three of the five roles — see the refusal test below.
+    getGovernanceQueue.mockRejectedValue(new api.ApiError(500, 'the queue could not be built'))
     render(<GovernanceReviewScreen />)
-    expect(await screen.findByRole('alert')).toHaveTextContent('platform-admin required')
+    expect(await screen.findByRole('alert')).toHaveTextContent('the queue could not be built')
     expect(screen.queryByText(/nothing to review/i)).toBeNull()
+  })
+})
+
+describe('governance review — a refusal is not a breakage', () => {
+  // App.tsx gates the nav on nothing and LineageView links here in prose, so a catalog_viewer,
+  // data_owner or feature_engineer clicking "Governance" is an ordinary visit the server declines.
+  it('reads a 403 as an explanation, never as an error page', async () => {
+    getGovernanceQueue.mockRejectedValue(
+      new api.ApiError(403, 'requires the platform-admin role'))
+    render(<GovernanceReviewScreen />)
+    const explained = await screen.findByTestId('gq-not-yours')
+    // Calm, not alarming: nothing on this page claims something went wrong.
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(explained).toHaveTextContent(/not open to your role/i)
+    // The server's own sentence, quoted rather than paraphrased into a rule this client invented.
+    expect(explained).toHaveTextContent('requires the platform-admin role')
+    // And the true consequence: nothing is broken, and nothing is waiting on this visitor.
+    expect(explained).toHaveTextContent(/nothing is wrong/i)
+    expect(explained).toHaveTextContent(/platform-admin role/i)
+    // Never presented as an empty queue either — that would say "everything is settled".
+    expect(screen.queryByText(/nothing to review/i)).toBeNull()
+  })
+
+  it('keeps a 401 an error: a missing session is not a role answer', async () => {
+    getGovernanceQueue.mockRejectedValue(new api.ApiError(401, 'not authenticated'))
+    render(<GovernanceReviewScreen />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('not authenticated')
+    expect(screen.queryByTestId('gq-not-yours')).toBeNull()
+  })
+
+  it('says nothing about roles when the queue loads', async () => {
+    // The refusal state is reactive, not a prediction: a caller the server serves never sees it.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+    expect(screen.queryByTestId('gq-not-yours')).toBeNull()
+    expect(screen.queryByText(/platform-admin/i)).toBeNull()
   })
 })
 

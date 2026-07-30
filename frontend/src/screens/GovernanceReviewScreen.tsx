@@ -1075,6 +1075,10 @@ function Purpose(): ReactNode {
 export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?: string }) {
   const [queue, setQueue] = useState<GovernanceQueue | null>(null)
   const [error, setError] = useState('')
+  // The status the FAILURE carried, so a refusal and a breakage can be told apart. There is no
+  // client-side permission check to make here — the session's roles are not on this client — so the
+  // screen reacts to what the server said rather than predicting it.
+  const [errorStatus, setErrorStatus] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [notice, setNotice] = useState('')
   const [limit, setLimit] = useState(100)
@@ -1092,6 +1096,7 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
       if (id !== loadSeq.current) return
       setQueue(next)
       setError('')
+      setErrorStatus(null)
       // A handoff slug for a catalog this caller cannot see would otherwise filter the screen down
       // to nothing — exactly the blank page this rewrite exists to remove.
       setCatalog(current => (current !== null && !next.catalogs.includes(current) ? null : current))
@@ -1099,6 +1104,7 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
       if (id !== loadSeq.current) return
       setQueue(null)
       setError(errorDetail(e))
+      setErrorStatus(e instanceof ApiError ? e.status : null)
     } finally {
       if (id === loadSeq.current) setLoading(false)
     }
@@ -1122,6 +1128,41 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   function onConflict(detail: string) {
     setNotice(detail)
     void load()
+  }
+
+  // NOT AN ERROR. `GET /governance/queue` is gated on the raw `platform-admin` claim, and nothing
+  // in the app gates the navigation to it — the "Governance" item is on every operator's nav, and
+  // LineageView links here in prose — so a catalog_viewer, data_owner or feature_engineer arriving
+  // here is an ordinary, expected visit that the server declines. A red alert would tell them
+  // something is broken and invite them to retry; nothing is broken and there is nothing to retry.
+  //
+  // The screen cannot check the role itself (this client holds no session claims, and inventing a
+  // check would be a second, drifting authority), so it reacts to the 403 the server actually sent
+  // and quotes the server's own sentence rather than paraphrasing the rule.
+  if (errorStatus === 403) {
+    return (
+      <section className="gq">
+        <Purpose />
+        <div className="callout gq-not-yours" data-testid="gq-not-yours" role="status">
+          <div className="callout-body">
+            <p>
+              <strong>This queue is not open to your role.</strong> Recording a governance decision
+              is a platform-administrator act, so the server declined to show this list to your
+              session — it said: “{error}”.
+            </p>
+            <p>
+              Nothing is wrong and nothing here is waiting on you. The catalogs, features and
+              lineage you can see are unaffected: what is behind this page is the record of who
+              agreed with a relationship, not a control over what the platform will use.
+            </p>
+            <p className="hint">
+              If reviewing these decisions is part of your job, ask an administrator for the
+              platform-admin role — this page will then open on the queue itself.
+            </p>
+          </div>
+        </div>
+      </section>
+    )
   }
 
   if (error) {

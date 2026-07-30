@@ -4140,3 +4140,18 @@ button.stat:hover {
   font-size: 11.5px;
   color: var(--ink-faint);
 }
+
+/* ---- the queue this caller may not read ----
+
+   A 403 from GET /governance/queue is the ORDINARY answer for three of the five roles: the route is
+   gated on the raw platform-admin claim and nothing gates the navigation to it. So this reads as an
+   ordinary callout on the page surface — no danger tone, no error border — because nothing is
+   broken and there is nothing to retry. */
+
+.gq-not-yours {
+  max-width: 84ch;
+}
+
+.gq-not-yours .hint {
+  margin-top: 10px;
+}
