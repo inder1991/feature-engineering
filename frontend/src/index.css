@@ -3881,6 +3881,15 @@ button.stat:hover {
   color: var(--ink-faint);
 }
 
+/* The group card's usage is an AGGREGATE, so how it was aggregated is stated where it is read —
+   a summed number with the derivation hidden would be a different claim from the per-row one. */
+.gq-usage-note {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  max-width: 78ch;
+}
+
 .gq-usage-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));

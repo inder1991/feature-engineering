@@ -435,13 +435,43 @@ function usageValue(usage: GovernanceQueueUsage): string {
   return 'not tracked yet'
 }
 
-function Usage({ usages }: { usages: GovernanceQueueUsage[] }) {
+// The same measurement for a whole GROUP of bridges, category by category. A number is only ever
+// reported when EVERY member of the group was counted: if one of them could not be measured, a sum
+// across the rest would understate the consequence of settling the set, so the category falls back
+// to the words. (In practice a category's state is uniform across one response — `usage_for_bridges`
+// probes once per category and applies the verdict to every key — this is the defensive path.)
+function groupUsages(items: GovernanceQueueItem[]): GovernanceQueueUsage[] {
+  const order: string[] = []
+  const byCategory = new Map<string, GovernanceQueueUsage[]>()
+  for (const item of items) {
+    for (const usage of item.already_depended_on_by) {
+      const seen = byCategory.get(usage.category)
+      if (seen) seen.push(usage)
+      else {
+        byCategory.set(usage.category, [usage])
+        order.push(usage.category)
+      }
+    }
+  }
+  return order.map(category => {
+    const all = byCategory.get(category) ?? []
+    const counted = all.every(usage => usage.state === 'counted' && usage.count !== null)
+    const state = all.some(usage => usage.state === 'unreadable')
+      ? 'unreadable'
+      : counted ? 'counted' : 'not_tracked_yet'
+    const count = counted ? all.reduce((total, usage) => total + (usage.count ?? 0), 0) : null
+    return { ...all[0], state, count, display: count === null ? state : String(count) }
+  })
+}
+
+function Usage({ usages, note }: { usages: GovernanceQueueUsage[]; note?: string }) {
   // Bridges only. A join or table fact has no bridge anchor to count from, so there is nothing to
   // render — and an absent anchor is never "0 dependencies".
   if (usages.length === 0) return null
   return (
     <div className="gq-usage" data-testid="usage">
       <p className="gq-usage-head">Already depended on by</p>
+      {note && <p className="gq-usage-note">{note}</p>}
       <dl className="gq-usage-list">
         {usages.map(usage => (
           <div className="gq-usage-item" key={usage.category} data-state={usage.state}>
@@ -818,6 +848,18 @@ function CandidateGroup({ entry, onDone, onConflict }: {
   const items = entry.items
   const group = entry.group ?? { entity: '(unnamed entity)', catalogs: [] }
   const count = items.length
+  // THE SERVER DECIDES HERE TOO. A bridge already endorsed carries no actions at all
+  // (`_ACTIONS_VERIFIED = ()`) and the write side denies rejecting a VERIFIED fact, so a group
+  // whose members are a mix — the ordinary end state after confirming one member of a
+  // cross-product — must offer the reject only over the members that sanction it, and say what it
+  // is leaving alone. The individual rows inside "Show the N candidates" already read their own
+  // `available_actions`; the card that stands in for them may not read something else.
+  const rejectable = items.filter(item => item.available_actions.includes('reject'))
+  const skipped = count - rejectable.length
+  const one = skipped === 1
+  const skipNote = ` The ${skipped} already endorsed ${one ? 'link is' : 'links are'} not sent at `
+    + `all: the command layer refuses a rejection there, so nothing is attempted on `
+    + `${one ? 'it' : 'them'}.`
 
   // The two axes again at group level: one distinct value each, or an honest "mixed".
   function shared(read: (item: GovernanceQueueItem) => string): string {
@@ -826,20 +868,22 @@ function CandidateGroup({ entry, onDone, onConflict }: {
   }
 
   async function rejectAll() {
-    if (!category) return
+    if (!category || rejectable.length === 0) return
     setBusy(true)
     setGroupError('')
     try {
       const result = await bulkRejectEntityBridges(
-        items.map(item => item.fact_key),
+        rejectable.map(item => item.fact_key),
         category as EntityBridgeRejectCategory,
         note.trim() || undefined,
       )
       const settled = (result.counts.rejected ?? 0) + (result.counts.already_rejected ?? 0)
       const refused = (result.counts.denied ?? 0) + (result.counts.not_found ?? 0)
         + (result.counts.failed ?? 0)
-      onDone(`${settled} of ${count} candidate links recorded as ${categoryLabel(category)}`
-        + `${refused > 0 ? `; ${refused} the server did not settle` : ''}.`)
+      onDone(`${settled} of ${rejectable.length} candidate links recorded as `
+        + `${categoryLabel(category)}`
+        + `${refused > 0 ? `; ${refused} the server did not settle` : ''}`
+        + `${skipped > 0 ? `; ${skipped} already endorsed and left as they are` : ''}.`)
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         onConflict(e.detail)
@@ -871,6 +915,13 @@ function CandidateGroup({ entry, onDone, onConflict }: {
         These are the cross-product of the same two facts — one judgement settles the set. Open them
         if one of the pairs is the right one.
       </p>
+      {skipped > 0 && (
+        <p className="gq-group-note" data-testid="gq-group-settled">
+          {skipped} of these {count} {one ? 'is' : 'are'} already endorsed. The server offers no
+          rejection on {one ? 'it' : 'them'}, so a group rejection here settles the other{' '}
+          {rejectable.length} and leaves {one ? 'that one as it is' : 'those as they are'}.
+        </p>
+      )}
       <dl className="gq-axes">
         <Axis
           testid="axis-execution"
@@ -889,15 +940,34 @@ function CandidateGroup({ entry, onDone, onConflict }: {
         />
       </dl>
 
+      <Usage
+        usages={groupUsages(items)}
+        note={`Counted across all ${count} links in this group. A dependent that crosses more than `
+          + 'one of them is counted once per link, and a category is only ever a number when every '
+          + 'one of the links was measured.'}
+      />
+
       <div className="gj-actions gq-actions">
-        <button
-          type="button"
-          className="btn q-ghost"
-          disabled={busy}
-          onClick={() => setRejecting(r => !r)}
-        >
-          {rejecting ? 'Cancel' : 'Reject the whole group…'}
-        </button>
+        {rejectable.length > 0 && (
+          <button
+            type="button"
+            className="btn q-ghost"
+            disabled={busy}
+            onClick={() => setRejecting(r => !r)}
+          >
+            {rejecting
+              ? 'Cancel'
+              : skipped === 0
+                ? 'Reject the whole group…'
+                : `Reject the ${rejectable.length} still open…`}
+          </button>
+        )}
+        {rejectable.length === 0 && (
+          <span className="gq-why" data-testid="gq-group-why">
+            A person has already endorsed every one of these {count} links, so the server offers no
+            decision to make here. Re-verification runs through its own flow.
+          </span>
+        )}
         <button type="button" className="btn q-ghost" onClick={() => setOpen(o => !o)}>
           {open ? `Hide the ${count} candidates` : `Show the ${count} candidates`}
         </button>
@@ -905,7 +975,9 @@ function CandidateGroup({ entry, onDone, onConflict }: {
 
       {rejecting && (
         <div className="gq-panel">
-          <p className="gq-panel-head">Why none of these {count} pairs is a real relationship</p>
+          <p className="gq-panel-head">
+            Why none of these {rejectable.length} pairs is a real relationship
+          </p>
           <CategoryChips
             kind="entity_bridge"
             chosen={category}
@@ -925,13 +997,18 @@ function CandidateGroup({ entry, onDone, onConflict }: {
               disabled={!category || busy}
               onClick={() => void rejectAll()}
             >
-              {busy ? 'Recording…' : `Reject all ${count} candidates`}
+              {busy
+                ? 'Recording…'
+                : skipped === 0
+                  ? `Reject all ${count} candidates`
+                  : `Reject the ${rejectable.length} still open`}
             </button>
             {!category && <span className="gj-gate-hint">pick a reason first</span>}
           </div>
           <p className="gq-panel-note">
             Each one is recorded as its own governed decision with its own audit trail, so some may
             settle while others are refused — the result says which.
+            {skipped > 0 && skipNote}
           </p>
         </div>
       )}

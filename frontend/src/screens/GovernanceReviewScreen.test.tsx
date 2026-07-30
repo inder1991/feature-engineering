@@ -626,6 +626,96 @@ describe('governance review — the low-value candidate cluster', () => {
       expect(await screen.findByTestId('gq-notice')).toHaveTextContent(/8/)
     })
 
+  it('shows what settling the group would land on, not just the count of links', async () => {
+    // The one place the consequence matters most: a reviewer settling eight at once never opens the
+    // individual rows, so the usage that lives on them has to be on the card too.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = await screen.findByTestId('queue-entry')
+    // Collapsed, so this usage block is the CARD's own — not one leaking out of a member row.
+    expect(within(group).queryAllByTestId(/^row-fact:entity_bridge:branch:/)).toHaveLength(0)
+    const usage = within(within(group).getByTestId('usage'))
+    // Summed across the eight members (3 selected plans each, 1 published feature each).
+    expect(usage.getByTestId('usage-value-selected_plans')).toHaveTextContent(/^24$/)
+    expect(usage.getByTestId('usage-value-published_features')).toHaveTextContent(/^8$/)
+    // A real 0 stays 0 and an unmeasurable category stays words, exactly as on a single row.
+    expect(usage.getByTestId('usage-value-planned_candidates')).toHaveTextContent(/^0$/)
+    const untracked = usage.getByTestId('usage-value-generated_artifacts')
+    expect(untracked).toHaveTextContent('not tracked yet')
+    expect(untracked.textContent).not.toMatch(/\d/)
+    // How it was aggregated is stated where it is read.
+    expect(within(group).getByTestId('usage')).toHaveTextContent(/across all 8 links/i)
+  })
+
+  it('reports a category as words when one member of the group could not be measured', async () => {
+    // A sum over the members that COULD be counted would understate the consequence of settling
+    // the set, so the whole category falls back to the words.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH.map((item, i) => (i === 0
+        ? { ...item,
+            already_depended_on_by: item.already_depended_on_by.map(usage =>
+              (usage.category === 'selected_plans'
+                ? { ...usage, state: 'unreadable', count: null, display: 'unreadable' }
+                : usage)) }
+        : item)),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const usage = within(within(await screen.findByTestId('queue-entry')).getByTestId('usage'))
+    const plans = usage.getByTestId('usage-value-selected_plans')
+    expect(plans).toHaveTextContent('unreadable')
+    expect(plans.textContent).not.toMatch(/\d/)
+    // The categories that WERE fully measured are unaffected.
+    expect(usage.getByTestId('usage-value-published_features')).toHaveTextContent(/^8$/)
+  })
+
+  it('offers the group reject only over the members the server sanctions it on', async () => {
+    // The ordinary end state after confirming one member of a cross-product: two endorsed bridges
+    // sit in the same entity/catalog bucket as the open ones, and `_ACTIONS_VERIFIED = ()`.
+    const mixed = BRANCH.map((item, i) => (i < 2
+      ? { ...item, state: 'Human endorsed', state_code: 'human_endorsed', available_actions: [] }
+      : item))
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: mixed, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    // Still ONE card — they are still the same cross-product.
+    expect(screen.getAllByTestId('queue-entry')).toHaveLength(1)
+    // The card no longer claims to settle the whole group, and says what it will leave alone.
+    expect(group.queryByRole('button', { name: /reject the whole group/i })).toBeNull()
+    expect(group.getByTestId('gq-group-settled')).toHaveTextContent(/2 of these 8 are already/i)
+    await userEvent.click(group.getByRole('button', { name: /reject the 6 still open/i }))
+    expect(group.getByText(/not sent at all/i)).toBeInTheDocument()
+    await userEvent.click(group.getByRole('button', { name: /not the same entity/i }))
+    await userEvent.click(group.getByRole('button', { name: /^reject the 6 still open$/i }))
+    // ONLY the six the server sanctions are sent — never the two it would refuse.
+    await waitFor(() => expect(bulkRejectEntityBridges).toHaveBeenCalledWith(
+      mixed.slice(2).map(b => b.fact_key), 'not_the_same_entity', undefined))
+    // And the card and its members agree: an endorsed member offers nothing inside either.
+    await userEvent.click(group.getByRole('button', { name: /show the 8 candidates/i }))
+    const endorsed = within(screen.getByTestId(`row-${mixed[0].fact_key}`))
+    expect(endorsed.queryByRole('button', { name: /^reject/i })).toBeNull()
+  })
+
+  it('offers no group action at all when every member is already endorsed', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH.map(item => ({ ...item, state: 'Human endorsed',
+                                   state_code: 'human_endorsed', available_actions: [] })),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    // The card must not offer a reject every one of its members would deny.
+    expect(group.queryByRole('button', { name: /reject/i })).toBeNull()
+    expect(group.getByTestId('gq-group-why')).toHaveTextContent(/already endorsed every one/i)
+    expect(group.getByTestId('gq-group-why')).toHaveTextContent(/own flow/i)
+    // The candidates are still reachable — hiding them would be a different lie.
+    expect(group.getByRole('button', { name: /show the 8 candidates/i })).toBeInTheDocument()
+  })
+
   it('keeps a lone candidate an ordinary row, never a group of one', async () => {
     getGovernanceQueue.mockResolvedValue(queue({
       items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
