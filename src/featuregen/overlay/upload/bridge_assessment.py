@@ -604,6 +604,14 @@ class AvailableIdentifierLinkV1:
             raise BridgeContractError("availability and assessment revisions do not match")
 
 
+def _flat_object_ref(logical_column_ref: str) -> str:
+    _source, schema, table, column = parse_ref(logical_column_ref)
+    if column is None:
+        raise BridgeContractError(
+            f"identifier member is not a column: {logical_column_ref!r}")
+    return f"{schema}.{table}.{column}"
+
+
 def _endpoint_from_legacy_link(
     source: str,
     object_ref: str,
@@ -621,26 +629,58 @@ def _endpoint_from_legacy_link(
         normalize_ref(source, schema, table, column),
         data_type_family or "unknown",
         TypeBasis(type_basis) if type_basis in TypeBasis._value2member_map_ else TypeBasis.UNKNOWN,
-        KeyMemberRole.PRIMARY if is_grain else KeyMemberRole.UNKNOWN,
+        # Legacy flat is_grain is advisory and cannot reconstruct complete tuple keyness.
+        KeyMemberRole.UNKNOWN,
     )
     return IdentifierEndpointV1(
         logical_table_ref=normalize_ref(source, schema, table),
         members=(member,),
         entity_id=entity_id,
-        tuple_key_role=(
-            TupleKeyRole.COMPLETE_UNIQUE_KEY if is_grain else TupleKeyRole.UNKNOWN),
+        tuple_key_role=TupleKeyRole.UNKNOWN,
     )
 
 
 def available_identifier_links(
     conn: DbConn, *, object_ref: str | None = None
 ) -> tuple[AvailableIdentifierLinkV1, ...]:
-    """Adapt the existing candidate+projection union through the one lifecycle interpretation."""
+    """Read modern current assessments, then legacy-only candidates through one lifecycle fold."""
+    from featuregen.overlay.upload.bridge_store import load_current_candidate_assessments
     from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 
+    legacy_links = cross_catalog_links(conn, object_ref=object_ref)
+    ranking_by_fact_key = {
+        link.fact_key: link.strength for link in legacy_links if link.fact_key is not None}
     out: list[AvailableIdentifierLinkV1] = []
-    for link in cross_catalog_links(conn, object_ref=object_ref):
+    modern_fact_keys: set[str] = set()
+    for assessment in load_current_candidate_assessments(conn):
+        if assessment.bridge_fact_key is None:
+            continue
+        if object_ref is not None:
+            wanted = object_ref.strip().lower()
+            endpoint_refs = {
+                _flat_object_ref(member.logical_column_ref)
+                for endpoint in (assessment.left_endpoint, assessment.right_endpoint)
+                for member in endpoint.members
+            }
+            if wanted not in endpoint_refs:
+                continue
+        availability = read_identifier_link_availability(
+            conn,
+            bridge_fact_key=assessment.bridge_fact_key,
+            candidate_revision_id=assessment.candidate_revision_id,
+        )
+        if availability.availability is LinkAvailability.AVAILABLE:
+            out.append(AvailableIdentifierLinkV1(
+                assessment,
+                availability,
+                ranking_by_fact_key.get(assessment.bridge_fact_key, 0),
+            ))
+            modern_fact_keys.add(assessment.bridge_fact_key)
+
+    for link in legacy_links:
         if link.fact_key is None:
+            continue
+        if link.fact_key in modern_fact_keys:
             continue
         left = _endpoint_from_legacy_link(
             link.left_catalog_source, link.left_object_ref, entity_id=link.entity_id,
@@ -664,4 +704,10 @@ def available_identifier_links(
             candidate_revision_id=assessment.candidate_revision_id)
         if availability.availability is LinkAvailability.AVAILABLE:
             out.append(AvailableIdentifierLinkV1(assessment, availability, link.strength))
-    return tuple(out)
+    return tuple(sorted(
+        out,
+        key=lambda link: (
+            -link.ranking_strength,
+            link.assessment.candidate_id,
+        ),
+    ))

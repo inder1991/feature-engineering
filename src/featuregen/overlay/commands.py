@@ -15,6 +15,12 @@ from __future__ import annotations
 
 from featuregen.commands.registry import get_command, register_command
 from featuregen.overlay._lifecycle import OverlayCommandError as OverlayCommandError
+from featuregen.overlay.bridge_realization_commands import (
+    decide_bridge_realization_safety as decide_bridge_realization_safety,
+)
+from featuregen.overlay.bridge_realization_commands import (
+    review_bridge_realization as review_bridge_realization,
+)
 from featuregen.overlay.confirmation_commands import confirm_fact as confirm_fact
 from featuregen.overlay.confirmation_commands import enter_fact as enter_fact
 from featuregen.overlay.confirmation_commands import reject_fact as reject_fact
@@ -38,6 +44,8 @@ _OVERLAY_CATALOG = (
     ("reject_fact", reject_fact),
     ("enter_fact", enter_fact),
     ("run_profiler", _run_profiler),
+    ("decide_bridge_realization_safety", decide_bridge_realization_safety),
+    ("review_bridge_realization", review_bridge_realization),
 )
 
 

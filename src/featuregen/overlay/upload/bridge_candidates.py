@@ -621,6 +621,31 @@ def derive_bridge_candidates(conn, *, roles: Iterable[str] = ()) -> tuple[Bridge
     return derive_bridge_candidates_with_report(conn, roles=roles).candidates
 
 
+def derive_bridge_candidate_for_refs(
+    conn,
+    left_ref: CatalogObjectRef,
+    right_ref: CatalogObjectRef,
+) -> BridgeCandidateV1 | None:
+    """Re-assess one existing logical pair against current endpoint evidence.
+
+    This is deliberately exact rather than a fresh neighbourhood search: a later grain/type/concept
+    projection must refresh the candidate that depends on that endpoint even when discovery caps
+    would rank a different new candidate into the shortlist.
+    """
+    left = _current_identifier_column(conn, left_ref)
+    right = _current_identifier_column(conn, right_ref)
+    if (
+        left is None
+        or right is None
+        or left.catalog_source == right.catalog_source
+        or left.entity != right.entity
+        or left.type_family == "other"
+        or left.type_family != right.type_family
+    ):
+        return None
+    return _candidate(left.entity, left, right)
+
+
 def derive_bridge_candidates_with_report(
     conn, *, roles: Iterable[str] = ()
 ) -> BridgeCandidateDerivationV1:

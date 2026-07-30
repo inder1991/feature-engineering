@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from featuregen.contracts import DbConn
@@ -35,6 +35,7 @@ from featuregen.overlay.upload.bridge_assessment import (
     TypeBasis,
 )
 from featuregen.overlay.upload.concepts import concept as lookup_concept
+from featuregen.overlay.upload.governed_grain import GovernedGrain, read_governed_grain
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
 BRIDGE_GROUNDING_VERSION = "1.0.0"
@@ -640,6 +641,34 @@ def ground_bridge_endpoint(
         domain=domain,
         semantic_terms=semantic_terms,
     )
+    governed_grain = read_governed_grain(
+        conn, source, table, now=datetime.now(UTC), schema=schema)
+    if isinstance(governed_grain, GovernedGrain) and column in governed_grain.columns:
+        tuple_key_role = (
+            TupleKeyRole.COMPLETE_UNIQUE_KEY
+            if len(governed_grain.columns) == 1
+            else TupleKeyRole.COMPOSITE_MEMBER
+        )
+        key_member_role = (
+            KeyMemberRole.PRIMARY
+            if len(governed_grain.columns) == 1
+            else KeyMemberRole.UNKNOWN
+        )
+        grain_evidence = (
+            ()
+            if governed_grain.fact_event_id is None
+            else (
+                EvidenceRefV1(
+                    evidence_id=governed_grain.fact_event_id,
+                    kind=EvidenceKind.GOVERNED_FACT,
+                    producer="overlay_grain",
+                ),
+            )
+        )
+    else:
+        tuple_key_role = TupleKeyRole.UNKNOWN
+        key_member_role = KeyMemberRole.UNKNOWN
+        grain_evidence = ()
     refs = _dedupe_evidence(
         [
             *concept_grounding.evidence_refs,
@@ -648,6 +677,7 @@ def ground_bridge_endpoint(
             *population_evidence,
             *format_evidence,
             *metadata_evidence,
+            *grain_evidence,
         ]
     )
     return BridgeEndpointGroundingV1(
@@ -673,8 +703,8 @@ def ground_bridge_endpoint(
         # ``graph_node.is_grain`` is a flat upload projection. It may identify a possible member,
         # but cannot prove completeness or uniqueness of the table's ordered key. Task 5 performs
         # that classification from the complete governed grain fact.
-        key_member_role=KeyMemberRole.UNKNOWN,
-        tuple_key_role=TupleKeyRole.UNKNOWN,
+        key_member_role=key_member_role,
+        tuple_key_role=tuple_key_role,
         observed_format=observed_format,
         metadata_facets=facets,
         evidence_refs=refs,

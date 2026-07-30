@@ -53,9 +53,10 @@ CANONICAL_STAGES: tuple[str, ...] = (
     "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
     "graph_persistence",
-    "governed_joins", "pass_c", "pass_b", "glossary_evidence", "entity_bridges",
+    "governed_joins", "pass_c", "pass_b", "glossary_evidence",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
-    "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
+    "table_fact_projection", "entity_bridges", "join_projection",
+    "semantic_binding_projection", "join_drift",
     "quarantine", "manifest_finalization")
 INGEST_STAGES: tuple[str, ...] = CANONICAL_STAGES[2:-1]
 # Stages that only exist for a glossary upload: at an early exit of a NON-glossary upload they

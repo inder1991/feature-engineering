@@ -57,6 +57,10 @@ def test_single_confirm_verifies_a_bridge(db):
 
 def test_project_verified_bridge_writes_the_edge(db):
     ref = _propose_confirm(db)
+    assert db.execute(
+        "SELECT count(*) FROM entity_bridge_edge WHERE fact_key = %s",
+        (fact_key(ref, "entity_bridge"),),
+    ).fetchone()[0] == 1
     assert project_verified_bridge(db, ref, now=_NOW) == "projected"
     row = db.execute(
         "SELECT entity_id, left_catalog_source, right_catalog_source, status FROM entity_bridge_edge "

@@ -32,6 +32,7 @@ from featuregen.overlay.authority import (
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import (
+    demote_projected_bridge_edges,
     demote_projected_join_edges,
     demote_projected_semantic_binding,
     schedule_expiry,
@@ -227,6 +228,19 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
 
         project_verified_semantic_binding(conn, ref.catalog_source, ref, fact_type, now=None)
+    elif fact_type == "entity_bridge":
+        # Human review is optional provenance/ranking, never the availability or safety gate. Keep
+        # its legacy VERIFIED projection current synchronously so UI/audit readers do not lag the
+        # event stream; executable realizations remain governed by their separate safety axis.
+        from featuregen.overlay.upload.bridge_projection import project_verified_bridge
+
+        project_verified_bridge(conn, ref, now=datetime.now(UTC))
+    if fact_type == "grain":
+        from featuregen.overlay.upload.bridge_store import (
+            demote_realizations_for_dependency,
+        )
+
+        demote_realizations_for_dependency(conn, "grain_fact", key)
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 
 
@@ -300,6 +314,11 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         # E3: a pre-VERIFIED reject has no projection (no-op); a REVERIFY/STALE reject demotes the
         # governed semantic binding (restore the file entity / demote the currency edge).
         demote_projected_semantic_binding(conn, key, fact_type, "REJECTED")
+    elif fact_type == "entity_bridge":
+        demote_projected_bridge_edges(conn, key, "REJECTED")
+        from featuregen.overlay.upload.bridge_store import demote_realizations_for_bridge
+
+        demote_realizations_for_bridge(conn, key, lifecycle="rejected")
     _close_fact_tasks(conn, key, reason="fact rejected")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))
 
