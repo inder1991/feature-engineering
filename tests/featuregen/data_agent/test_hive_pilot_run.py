@@ -41,14 +41,25 @@ _PORT = int(os.environ.get("HIVE_TEST_PORT", "10000"))
 _CONTAINER = os.environ.get("HIVE_CONTAINER", "featuregen-hive")
 
 
-def _beeline(sql: str) -> str:
+#: These drive a real engine, so they need more than the suite's default per-test ceiling. The probe
+#: below is what keeps that from becoming a way to hang CI.
+pytestmark = pytest.mark.timeout(300)
+
+#: A wedged HiveServer2 is the case that matters. The container reports `Up` while the server answers
+#: nothing, so an unbounded probe turns "no engine available" — which must SKIP — into a suite
+#: failure. Observed exactly that: a container up for 22 hours with beeline hanging past two minutes.
+_PROBE_TIMEOUT_S = 20
+_LOAD_TIMEOUT_S = 180
+
+
+def _beeline(sql: str, *, timeout: int = _LOAD_TIMEOUT_S) -> str:
     """Run SQL inside the container. Setup deliberately does NOT go through the Python driver — a
     driver-side quirk that mangled identifiers would otherwise write and read the same wrong thing
     and hide itself."""
     done = subprocess.run(
         ["docker", "exec", "-i", _CONTAINER, "beeline", "-u", "jdbc:hive2://localhost:10000",
          "--silent=true", "-f", "/dev/stdin"],
-        input=sql, text=True, capture_output=True, timeout=600)
+        input=sql, text=True, capture_output=True, timeout=timeout)
     if done.returncode != 0:
         raise AssertionError(f"beeline failed:\n{done.stdout}\n{done.stderr}")
     return done.stdout
@@ -63,11 +74,14 @@ def hive():
         secret_ref="local://none", execution_principal="hive",
         allowed_schemas=frozenset({HIVE_DATABASE}), active=True)
     try:
-        _beeline("SELECT 1;")
+        # Bounded probe FIRST. `subprocess.TimeoutExpired` is an ordinary exception and lands in the
+        # skip below; a probe left unbounded would instead be killed by pytest-timeout, which no
+        # `except` can turn into a skip.
+        _beeline("SELECT 1;", timeout=_PROBE_TIMEOUT_S)
         conn = open_connection(spec, secret_resolver=lambda ref: "")
         conn.cursor().execute("SELECT 1")
     except Exception as exc:                                  # noqa: BLE001 - any failure = no engine
-        pytest.skip(f"no HiveServer2 at {_HOST}:{_PORT} ({type(exc).__name__}: {exc}); "
+        pytest.skip(f"no usable HiveServer2 at {_HOST}:{_PORT} ({type(exc).__name__}: {exc}); "
                     "run deploy/hive-local/hive-up.sh")
     _beeline(script())
     return conn

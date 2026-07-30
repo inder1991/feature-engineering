@@ -30,11 +30,26 @@ _FACET_LIMIT = 50     # cap buckets per facet, ordered by count desc then value
 
 # The hit projection. score keeps the FTS rank plus the grain/as-of boosts; on an empty query the
 # tsquery is empty (rank 0) so score degrades to just the boosts, giving a stable browse order.
-_SELECT_HIT = """
+#: ALL — every term must appear (a keyword search box). ANY — any term may (a whole QUESTION).
+#: `plainto_tsquery` ANDs its terms, so a natural-language question almost never matches one
+#: column's document and question-driven retrieval would return nothing at all. The ANY form casts
+#: the already-sanitised plainto_tsquery to text and swaps the `&` operators for `|`, so no raw user
+#: text is ever fed to `to_tsquery`.
+MATCH_ALL = "all"
+MATCH_ANY = "any"
+_TSQUERY = {
+    MATCH_ALL: "plainto_tsquery('english', %(q)s)",
+    MATCH_ANY: ("to_tsquery('english', "
+                "replace(plainto_tsquery('english', %(q)s)::text, '&', '|'))"),
+}
+
+
+def _select_hit(match: str) -> str:
+    return f"""
     n.object_ref, n.table_name, n.column_name, n.kind, n.data_type, n.definition,
     n.is_grain, n.is_as_of, n.catalog_source, n.concept, n.domain, n.sensitivity,
     n.additivity, n.unit, n.currency, n.entity,
-    ts_rank_cd(n.search_doc, plainto_tsquery('english', %(q)s))
+    ts_rank_cd(n.search_doc, {_TSQUERY[match]})
       + (CASE WHEN n.is_grain THEN 0.5 ELSE 0 END)
       + (CASE WHEN n.is_as_of THEN 0.3 ELSE 0 END) AS score
 """
@@ -88,6 +103,7 @@ def _hit(r: dict[str, Any]) -> SearchHit:
 
 def _build_predicates(
     query: str, filters: Mapping[str, Sequence[str]], params: dict[str, Any],
+    *, match: str = MATCH_ALL,
 ) -> tuple[list[str], dict[str, str]]:
     """Split the query into HARD base predicates and per-facet predicates, binding params.
 
@@ -103,7 +119,7 @@ def _build_predicates(
         "COALESCE(n.visible_requires, '{}') <@ %(allowed)s",   # read-scope hard filter
     ]
     if query:
-        base_preds.append("n.search_doc @@ plainto_tsquery('english', %(q)s)")
+        base_preds.append(f"n.search_doc @@ {_TSQUERY[match]}")
 
     facet_preds: dict[str, str] = {}
     for name, col in _COLUMN_FACETS.items():
@@ -132,7 +148,8 @@ def _where(base_preds: list[str], facet_preds: dict[str, str], *, exclude: str |
 
 def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
            fresh_within: timedelta = timedelta(hours=24), limit: int = 20, offset: int = 0,
-           filters: Mapping[str, Sequence[str]] | None = None) -> SearchResult:
+           filters: Mapping[str, Sequence[str]] | None = None,
+           match: str = MATCH_ALL) -> SearchResult:
     """Facet-aware catalog search over graph_node.
 
     An empty ``query`` skips the FTS match and browses ALL rows (still read-scoped + fresh + faceted).
@@ -150,13 +167,15 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
         "q": query, "cutoff": now - fresh_within, "limit": limit, "offset": offset,
         "allowed": allowed_sensitivities(roles), "none": _NONE, "fl": _FACET_LIMIT,
     }
-    base_preds, facet_preds = _build_predicates(query, filters, params)
+    if match not in _TSQUERY:
+        raise ValueError(f"unknown match mode {match!r}; use {sorted(_TSQUERY)}")
+    base_preds, facet_preds = _build_predicates(query, filters, params, match=match)
     where_all = _where(base_preds, facet_preds)
 
     with conn.cursor(row_factory=dict_row) as cur:
         # Hits: every facet applied, score-ordered, limit-capped.
         cur.execute(
-            f"SELECT {_SELECT_HIT} {_FROM} WHERE {where_all} "
+            f"SELECT {_select_hit(match)} {_FROM} WHERE {where_all} "
             # object_ref is not unique across catalog_source, so tiebreak on both for a
             # deterministic order at the limit boundary (review Minor 1).
             "ORDER BY score DESC, n.object_ref, n.catalog_source "
