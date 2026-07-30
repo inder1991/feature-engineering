@@ -248,14 +248,30 @@ function agreement(item: GovernanceQueueItem): string {
   return 'I agree with this relationship as it is described here.'
 }
 
+// A table fact carries no proposer: `origin` is a CONSTANT describing how the proposal was made
+// (`table_fact_governance._ORIGIN = "llm_proposed_not_profiled"`), and it is the only origin the
+// backend emits. Rendering it in the `proposed_by` slot read "Proposed by llm_proposed_not_profiled"
+// on every grain and as-of row — a provenance stamp dressed up as a person. It is a METHOD, so it
+// is said as one, and an origin this client does not know is de-underscored rather than guessed at.
+const ORIGIN_LABEL: Record<string, string> = {
+  llm_proposed_not_profiled: 'Proposed automatically, by reading the uploaded schema — not '
+    + 'profiled against the data',
+}
+
+function originLine(origin: string): string {
+  return ORIGIN_LABEL[origin] ?? `Proposed automatically (${origin.replaceAll('_', ' ')})`
+}
+
 // Who put it forward and when — strictly from the payload. The bridge listing carries
 // proposed_by/proposed_at, the table-fact listing carries an origin, and the join listing carries
 // neither (only recorded endorsements), so this line is SHORTER for a join rather than invented.
 function provenanceParts(item: GovernanceQueueItem): string[] {
   const d = item.detail
   const parts: string[] = []
-  const by = asStr(d.proposed_by) || asStr(d.origin)
+  const by = asStr(d.proposed_by)
   if (by) parts.push(`Proposed by ${by}`)
+  const origin = asStr(d.origin)
+  if (origin) parts.push(originLine(origin))
   const at = asStr(d.proposed_at)
   // Coarse on purpose: the calendar day is the triage signal, not a stopwatch.
   if (at) parts.push(at.slice(0, 10))

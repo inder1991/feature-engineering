@@ -139,7 +139,10 @@ function grain(over: Partial<api.GovernanceQueueItem> = {}): api.GovernanceQueue
     available_actions: ['confirm', 'reject'],
     detail: {
       table: 'party_dly', proposed_value: { columns: ['cif_id'], is_unique: true },
-      origin: 'llm_enrichment', advisory: {}, task_id: 'tf-1', target_event_id: 'ev-2',
+      // The ONLY origin the backend emits: `table_fact_governance._ORIGIN`. This fixture used to
+      // say `llm_enrichment`, a plausible-looking string no code path produces — which is exactly
+      // what hid the "Proposed by llm_proposed_not_profiled" rendering from these tests.
+      origin: 'llm_proposed_not_profiled', advisory: {}, task_id: 'tf-1', target_event_id: 'ev-2',
       evidence_parse_status: 'parsed',
     },
     already_depended_on_by: [],
@@ -494,6 +497,46 @@ describe('governance review — the basis of the claim being endorsed', () => {
     render(<GovernanceReviewScreen />)
     const grainRow = within(await screen.findByTestId(`row-${grain().fact_key}`))
     expect(grainRow.queryByTestId('gq-advisory')).toBeNull()
+  })
+})
+
+describe('governance review — provenance is provenance, never a person', () => {
+  it('reads a table fact origin as a method, not as its proposer', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain()], items_visible_to_you_by_kind: { grain: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const grainRow = await screen.findByTestId(`row-${grain().fact_key}`)
+    // A table fact carries no proposer at all, and `origin` is a constant describing HOW it was
+    // proposed. Naming it as the proposer invented a person called llm_proposed_not_profiled.
+    expect(grainRow).not.toHaveTextContent(/proposed by llm/i)
+    expect(grainRow).not.toHaveTextContent('llm_proposed_not_profiled')
+    expect(grainRow).toHaveTextContent(/proposed automatically/i)
+    // And the honest limit of the method travels with it: schema-read, never profiled.
+    expect(grainRow).toHaveTextContent(/not profiled against the data/i)
+  })
+
+  it('still names a real proposer as the person they are', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge({ detail: bridgeDetail({ proposed_by: 'alice@bank' }) })],
+      items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    expect(await screen.findByTestId(`row-${bridge().fact_key}`))
+      .toHaveTextContent(/proposed by alice@bank/i)
+  })
+
+  it('de-underscores an origin it has never seen rather than guessing at it', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain({ detail: { ...grain().detail, origin: 'some_future_origin' } })],
+      items_visible_to_you_by_kind: { grain: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const grainRow = await screen.findByTestId(`row-${grain().fact_key}`)
+    expect(grainRow).toHaveTextContent(/some future origin/i)
+    expect(grainRow).not.toHaveTextContent(/proposed by some/i)
+    // No claim about profiling is made for a method this client does not know.
+    expect(grainRow).not.toHaveTextContent(/not profiled against the data/i)
   })
 })
 
