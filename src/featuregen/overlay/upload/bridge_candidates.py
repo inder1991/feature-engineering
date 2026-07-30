@@ -1,45 +1,34 @@
 """Phase-3B.2B — cross-catalog entity-bridge candidate discovery.
 
-A bridge candidate links two catalog-local identifier columns that denote the SAME entity in DISTINCT
-uploads (e.g. core.customer_master.customer_id <-> crm.customers.customer_id). Governed via the concept
-registry (concept group='identifier' + entity_link), NEVER the free-text graph_node.entity tag. Read-only
-and deterministic; a candidate becomes a governed fact only when proposed + confirmed (later tasks)."""
+A candidate nominates two catalog-local identifier columns for the same entity; it does not claim
+that their identifier namespaces or populations are equal. Bridge-specific grounding keeps those
+claims separate and suppresses hard representation/entity/namespace conflicts. Discovery is
+read-only and deterministic. A proposal becomes available without human confirmation; confirmation
+records review but is not a consumption gate.
+"""
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.identity import CatalogObjectRef
+from featuregen.overlay.upload.attest.bridge_grounding import (
+    BridgeEndpointGroundingV1,
+    assess_grounded_identifier_link,
+    ground_bridge_endpoint,
+    resolve_type_family,
+    type_family,
+)
 from featuregen.overlay.upload.bridge_assessment import (
     CANDIDATE_FAMILY_IDENTIFIER_LINK,
     ConceptAuthority,
-    IdentifierColumnMemberV1,
-    IdentifierEndpointV1,
-    KeyMemberRole,
-    TupleKeyRole,
-    TypeBasis,
-    candidate_id_for,
+    IdentifierLinkAssessmentV1,
 )
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 BRIDGE_DERIVATION_VERSION = "1.0.0"
-
-_TYPE_FAMILY = {
-    "integer": "integer", "int": "integer", "int4": "integer", "int8": "integer",
-    "bigint": "integer", "smallint": "integer", "serial": "integer", "bigserial": "integer",
-    "text": "text", "varchar": "text", "character varying": "text", "char": "text",
-    "character": "text", "string": "text",
-    "uuid": "uuid",
-}
-
-
-#: `varchar(150)`, `timestamp(0)`, `decimal(18,2)` — how every real DDL export writes a type. The
-#: parameter is a length or precision, never part of the type's FAMILY.
-_TYPE_PARAMETER = re.compile(r"\s*\([^)]*\)\s*$")
-
 
 def _type_family(data_type: str | None) -> str:
     """The family a declared type belongs to, ignoring any length/precision parameter.
@@ -49,8 +38,7 @@ def _type_family(data_type: str | None) -> str:
     made every column of the real second source unclassifiable — the same inert outcome as the
     missing declared type, one layer further down.
     """
-    normalized = _TYPE_PARAMETER.sub("", (data_type or "").strip().lower())
-    return _TYPE_FAMILY.get(normalized, "other")
+    return type_family(data_type)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +59,7 @@ class BridgeCandidateV1:
     candidate_family: str = CANDIDATE_FAMILY_IDENTIFIER_LINK
     left_concept_authority: str = ConceptAuthority.UNKNOWN.value
     right_concept_authority: str = ConceptAuthority.UNKNOWN.value
+    assessment: IdentifierLinkAssessmentV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +72,7 @@ class _IdCol:
     is_grain: bool
     type_basis: str
     concept_authority: str
+    grounding: BridgeEndpointGroundingV1
 
 
 def _resolve_family(data_type: str | None, declared_type: str | None) -> tuple[str, str]:
@@ -99,72 +89,38 @@ def _resolve_family(data_type: str | None, declared_type: str | None) -> tuple[s
     value is consulted ONLY when nothing was attested, and the caller records that weaker basis on the
     candidate rather than hiding it. An unclassifiable declared value is NOT a wildcard — it stays
     ``other`` and is excluded, so the family check keeps doing the job it exists for."""
-    attested = _type_family(data_type)
-    if attested != "other":
-        return attested, "attested"
-    return _type_family(declared_type), "declared"
-
-
-def _authority_by_decision(conn, decision_ids: tuple[str, ...]) -> dict[str, str]:
-    """Concept-decision id -> honest producer class, in one query for the whole candidate scan.
-
-    A missing decision is ``unknown`` rather than ``deterministic``. The concept registry can
-    deterministically tell us that ``customer_id`` is an identifier, but it cannot tell us who
-    classified this particular column as ``customer_id``.
-    """
-    if not decision_ids:
-        return {}
-    rows = conn.execute(
-        "SELECT d.decision_event_id, e.producer "
-        "FROM field_decision_event d "
-        "CROSS JOIN LATERAL jsonb_array_elements_text(d.selected_evidence_ids) selected(evidence_id) "
-        "JOIN field_evidence e ON e.evidence_id = selected.evidence_id "
-        "WHERE d.decision_event_id = ANY(%s) "
-        "  AND d.event_type NOT IN ('rejected', 'staled', 'superseded') "
-        "  AND e.lifecycle = 'active'",
-        (list(decision_ids),),
-    ).fetchall()
-    producers: dict[str, set[str]] = {}
-    for decision_id, producer in rows:
-        producers.setdefault(decision_id, set()).add(producer)
-
-    def classify(values: set[str]) -> str:
-        if "human" in values:
-            return ConceptAuthority.HUMAN.value
-        if "source" in values or "structural_connector" in values:
-            return ConceptAuthority.SOURCE.value
-        if "llm" in values:
-            return ConceptAuthority.LLM.value
-        if values & {"parser", "taxonomy"}:
-            return ConceptAuthority.DETERMINISTIC.value
-        return ConceptAuthority.UNKNOWN.value
-
-    return {decision_id: classify(values) for decision_id, values in producers.items()}
+    family, basis = resolve_type_family(data_type, declared_type)
+    return family, basis.value
 
 
 def _identifier_columns(conn, *, roles: Iterable[str]) -> list[_IdCol]:
     rows = conn.execute(
-        "SELECT catalog_source, table_name, column_name, data_type, concept, is_grain, declared_type,"
-        "       concept_decision_id "
+        "SELECT catalog_source, table_name, column_name "
         "FROM graph_node "
         "WHERE kind = 'column' AND concept IS NOT NULL "
         "AND visible_requires <@ %s "
         "ORDER BY catalog_source, object_ref",
         (allowed_sensitivities(roles),)).fetchall()
-    authority = _authority_by_decision(
-        conn, tuple(sorted({row[7] for row in rows if row[7]})))
     out: list[_IdCol] = []
-    for (catalog_source, table_name, column_name, data_type, concept_name, is_grain,
-         declared_type, concept_decision_id) in rows:
-        c = concept(concept_name)
+    for catalog_source, table_name, column_name in rows:
+        logical_ref = normalize_ref(
+            catalog_source, "public", table_name, column_name)
+        grounding = ground_bridge_endpoint(conn, logical_ref)
+        concept_name = grounding.concept.concept
+        c = concept(concept_name) if concept_name is not None else None
         if c is None or c.group != "identifier" or not c.entity_link:
             continue
-        family, basis = _resolve_family(data_type, declared_type)
-        out.append(_IdCol(catalog_source=catalog_source, table_name=table_name, column_name=column_name,
-                          entity=c.entity_link, type_family=family, is_grain=bool(is_grain),
-                          type_basis=basis,
-                          concept_authority=authority.get(
-                              concept_decision_id, ConceptAuthority.UNKNOWN.value)))
+        out.append(_IdCol(
+            catalog_source=catalog_source,
+            table_name=table_name,
+            column_name=column_name,
+            entity=grounding.entity_id or c.entity_link,
+            type_family=grounding.data_type_family,
+            is_grain=grounding.is_grain,
+            type_basis=grounding.type_basis.value,
+            concept_authority=grounding.concept.authority.value,
+            grounding=grounding,
+        ))
     return out
 
 
@@ -175,35 +131,20 @@ def _col_ref(col: _IdCol) -> CatalogObjectRef:
 
 def _candidate(entity: str, a: _IdCol, b: _IdCol) -> BridgeCandidateV1:
     left, right = sorted((a, b), key=lambda c: (c.catalog_source, c.table_name, c.column_name))
-
-    def endpoint(col: _IdCol) -> IdentifierEndpointV1:
-        member = IdentifierColumnMemberV1(
-            logical_column_ref=normalize_ref(
-                col.catalog_source, "public", col.table_name, col.column_name),
-            data_type_family=col.type_family,
-            type_basis=TypeBasis(col.type_basis),
-            key_member_role=KeyMemberRole.PRIMARY if col.is_grain else KeyMemberRole.UNKNOWN,
-        )
-        return IdentifierEndpointV1(
-            logical_table_ref=normalize_ref(col.catalog_source, "public", col.table_name),
-            members=(member,),
-            entity_id=entity,
-            concept=f"{entity}_id",
-            concept_authority=ConceptAuthority(col.concept_authority),
-            tuple_key_role=(
-                TupleKeyRole.COMPLETE_UNIQUE_KEY if col.is_grain
-                else TupleKeyRole.UNKNOWN),
-        )
-
-    candidate_id = candidate_id_for(
-        CANDIDATE_FAMILY_IDENTIFIER_LINK, endpoint(left), endpoint(right))
+    grounding = assess_grounded_identifier_link(left.grounding, right.grounding)
+    assessment = grounding.to_assessment()
     basis = left.type_basis if left.type_basis == right.type_basis else "mixed"
     return BridgeCandidateV1(
-        candidate_id=candidate_id, entity_id=entity, left_ref=_col_ref(left), right_ref=_col_ref(right),
+        candidate_id=assessment.candidate_id,
+        entity_id=entity,
+        left_ref=_col_ref(left),
+        right_ref=_col_ref(right),
         data_type_family=left.type_family, left_is_grain=left.is_grain, right_is_grain=right.is_grain,
         type_basis=basis,
         left_concept_authority=left.concept_authority,
-        right_concept_authority=right.concept_authority)
+        right_concept_authority=right.concept_authority,
+        assessment=assessment,
+    )
 
 
 def _current_identifier_column(conn, ref: CatalogObjectRef) -> _IdCol | None:
@@ -214,34 +155,25 @@ def _current_identifier_column(conn, ref: CatalogObjectRef) -> _IdCol | None:
         or not ref.column
     ):
         return None
-    row = conn.execute(
-        "SELECT catalog_source, table_name, column_name, data_type, concept, is_grain, declared_type,"
-        "       concept_decision_id "
-        "FROM graph_node "
-        "WHERE lower(catalog_source) = %s AND lower(object_ref) = %s AND kind = 'column'",
-        (
-            ref.catalog_source.strip().lower(),
-            f"public.{ref.table.strip().lower()}.{ref.column.strip().lower()}",
-        ),
-    ).fetchone()
-    if row is None:
+    logical_ref = normalize_ref(
+        ref.catalog_source, "public", ref.table, ref.column)
+    grounding = ground_bridge_endpoint(conn, logical_ref)
+    if not grounding.exists:
         return None
-    (source, table, column, data_type, concept_name, is_grain,
-     declared_type, decision_id) = row
-    registered = concept(concept_name)
+    concept_name = grounding.concept.concept
+    registered = concept(concept_name) if concept_name is not None else None
     if registered is None or registered.group != "identifier" or not registered.entity_link:
         return None
-    family, basis = _resolve_family(data_type, declared_type)
-    authority = _authority_by_decision(conn, (decision_id,)) if decision_id else {}
     return _IdCol(
-        catalog_source=source,
-        table_name=table,
-        column_name=column,
-        entity=registered.entity_link,
-        type_family=family,
-        is_grain=bool(is_grain),
-        type_basis=basis,
-        concept_authority=authority.get(decision_id, ConceptAuthority.UNKNOWN.value),
+        catalog_source=ref.catalog_source.strip().lower(),
+        table_name=ref.table.strip().lower(),
+        column_name=ref.column.strip().lower(),
+        entity=grounding.entity_id or registered.entity_link,
+        type_family=grounding.data_type_family,
+        is_grain=grounding.is_grain,
+        type_basis=grounding.type_basis.value,
+        concept_authority=grounding.concept.authority.value,
+        grounding=grounding,
     )
 
 
@@ -256,6 +188,7 @@ def bridge_catalog_write_error(conn, ref) -> str | None:
 
     if not isinstance(ref, EntityBridgeRef):
         return "entity_bridge requires an EntityBridgeRef"
+    current_endpoints: dict[str, _IdCol] = {}
     for side, endpoint in (("left", ref.left_ref), ("right", ref.right_ref)):
         current = _current_identifier_column(conn, endpoint)
         if current is None:
@@ -268,6 +201,16 @@ def bridge_catalog_write_error(conn, ref) -> str | None:
                 f"entity_bridge {side} endpoint is classified for entity {current.entity!r}, "
                 f"not the claimed {ref.entity_id!r}"
             )
+        current_endpoints[side] = current
+    grounding = assess_grounded_identifier_link(
+        current_endpoints["left"].grounding,
+        current_endpoints["right"].grounding,
+    )
+    if grounding.hard_conflicts:
+        return (
+            "entity_bridge endpoints have a hard grounding conflict: "
+            + ", ".join(grounding.hard_conflicts)
+        )
     return None
 
 
@@ -331,5 +274,7 @@ def derive_bridge_candidates(conn, *, roles: Iterable[str] = ()) -> tuple[Bridge
                 if a.catalog_source == b.catalog_source or a.type_family != b.type_family:
                     continue
                 c = _candidate(entity, a, b)
+                if c.assessment is not None and c.assessment.hard_conflicts:
+                    continue
                 cands[c.candidate_id] = c
     return tuple(cands[k] for k in sorted(cands))
