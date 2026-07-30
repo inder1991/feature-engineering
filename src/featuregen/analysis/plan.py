@@ -46,6 +46,8 @@ FINDING_CODES: frozenset[str] = frozenset({
     "DIMENSION_UNGOVERNED",        # a group-by column carries no business concept
     "CODE_SET_INCOMPLETE",         # a slice value came from observed samples, not a known domain
     "MEASURE_NOT_NUMERIC",         # the measure is not a numeric column
+    "ELIGIBILITY_UNCONFIRMED",     # which rows COUNT rests on a definition no human has
+                                   # agreed to — usable, and disclosed
 })
 
 #: A plan that cannot be expressed at all is refused rather than carried. These are not findings.

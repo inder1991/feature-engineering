@@ -37,6 +37,7 @@ from featuregen.analysis.intent import IntentUnavailable, extract_intent
 from featuregen.analysis.preview import preview
 from featuregen.analysis.retrieval import RetrievalBudget, retrieve_candidates
 from featuregen.data_agent.binding_store import resolve_binding
+from featuregen.data_agent.eligibility_store import resolve_eligibility
 from featuregen.data_agent.connection import ConnectionError_
 from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -150,8 +151,27 @@ def _previewed(conn, grounded):
 
     view = preview(grounded, _execution_inputs_or_none(conn, grounded.plan))
     if view.blocked_by and view.blocked_by[0] == "EXECUTION_INPUTS_ABSENT":
-        return _replace(view, blocked_by=_binding_hint(conn, grounded.plan))
-    return view
+        view = _replace(view, blocked_by=_binding_hint(conn, grounded.plan))
+    return _replace(view, findings=view.findings + _eligibility_findings(conn, grounded.plan))
+
+
+def _eligibility_findings(conn, plan) -> tuple:
+    """Disclose an eligibility policy nobody has agreed to.
+
+    Usable before confirmation is the product rule; passing SILENTLY is not. "Which rows count" is
+    the definition every number in the answer rests on, so an unconfirmed one is a finding for the
+    same reason an unconfirmed join identity is.
+    """
+    from featuregen.analysis.preview import FindingPreview
+
+    source, table = _source_and_table(plan.base_table_ref)
+    stored = resolve_eligibility(conn, catalog_source=source, table=table)
+    if stored is None or stored.confirmed:
+        return ()
+    return (FindingPreview(
+        code="ELIGIBILITY_UNCONFIRMED", subject=f"{source}::{table}",
+        detail=f"which rows count was proposed by {stored.proposed_by!r} and confirmed by nobody",
+        clears_when="a human confirms the eligibility policy for this table"),)
 
 
 def _execution_inputs_or_none(conn, plan) -> ExecutionInputs | None:
@@ -185,8 +205,13 @@ def _binding_hint(conn, plan) -> tuple[str, str]:
         return (exc.code, f"{_source}::{table}")
     if resolved is None:
         return ("PHYSICAL_BINDING_ABSENT", f"{_source}::{table}")
-    # Bound and authorized: what remains is not configuration but contract — the plan carries one
-    # base table and cannot name a population spine, and no eligibility policy is stored anywhere.
+    if resolve_eligibility(conn, catalog_source=_source, table=table) is None:
+        # Bound, but nobody has said which rows count. A DECISION, not an operator task — and the IR
+        # refuses without it because counting pending and reversed activity as activity changes the
+        # answer rather than widening it.
+        return ("ELIGIBILITY_ABSENT", f"{_source}::{table}")
+    # Bound, authorized and defined: what remains is contract, not configuration — AnalysisPlanV1
+    # carries one base table and cannot name a population spine distinct from the events.
     return ("EXECUTION_INPUTS_ABSENT", f"{_source}::{table}")
 
 

@@ -98,25 +98,75 @@ def test_an_UNBOUND_table_reports_an_operator_task(make_client, catalog):
     assert view["sql"] == ""
 
 
-def test_a_BOUND_table_changes_the_reason_it_cannot_run(make_client, catalog):
-    """The registry has a real consumer, asserted. Once the address exists, what remains is not
-    configuration but contract — the plan carries one base table and cannot name a population spine,
-    and no eligibility policy is stored anywhere. A different gap, for a different person."""
+def _bind(conn, *, allowed="dpl_eib"):
     from featuregen.data_agent.binding_store import record_binding, record_connection
     from featuregen.data_agent.connection import DataSourceConnectionV1
     from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
 
-    record_connection(catalog, DataSourceConnectionV1(
+    record_connection(conn, DataSourceConnectionV1(
         connection_id="c1", environment_id="uat", kind="hive", host="h", port=10000,
         auth_mechanism="kerberos", secret_ref="vault://x", execution_principal="svc_ro",
-        allowed_schemas=frozenset({"dpl_eib"}), active=True))
-    record_binding(catalog, PhysicalDatasetBindingV1(
+        allowed_schemas=frozenset({allowed}), active=True))
+    record_binding(conn, PhysicalDatasetBindingV1(
         binding_id="b1", catalog_logical_ref="ftr::dpl_eib.tran_repos", connection_id="c1",
         identity=PhysicalObjectIdentityV1(catalog_source="ftr", database="wh", schema="dpl_eib",
                                           table="tran_repos", object_kind="table")))
 
+
+def _set_policy(conn, *, confirmed_by=None):
+    from featuregen.data_agent.eligibility import (
+        NullBehavior,
+        ReversalMode,
+        TransactionEligibilityPolicyV1,
+    )
+    from featuregen.data_agent.eligibility_store import record_eligibility
+
+    record_eligibility(
+        conn, catalog_source="ftr", table="tran_repos", proposed_by="llm",
+        confirmed_by=confirmed_by, now=_NOW,
+        policy=TransactionEligibilityPolicyV1(
+            status_column="tran_status", included_status_values=("POSTED",),
+            reversal_mode=ReversalMode.BOOLEAN_OR_CODE_COLUMN, reversal_column="reversal_flag",
+            non_reversed_values=("N",), null_behavior=NullBehavior.EXCLUDE))
+
+
+def test_a_BOUND_table_with_no_policy_asks_for_a_DECISION_not_an_operator(make_client, catalog):
+    """The registry has a real consumer, asserted. Once the address exists the next gap is not
+    configuration: nobody has said which rows count, and the IR refuses without that because counting
+    pending and reversed activity as activity changes the answer."""
+    _bind(catalog)
+    r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    assert r.json()["preview"]["blocked_by"]["code"] == "ELIGIBILITY_ABSENT"
+
+
+def test_bound_AND_defined_leaves_only_the_contract_gap(make_client, catalog):
+    """Both stores satisfied. What remains is neither an operator task nor a decision — AnalysisPlanV1
+    carries one base table and structurally cannot name a population spine distinct from the events."""
+    _bind(catalog)
+    _set_policy(catalog)
     r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
     assert r.json()["preview"]["blocked_by"]["code"] == "EXECUTION_INPUTS_ABSENT"
+
+
+def test_an_UNCONFIRMED_policy_is_disclosed_as_a_finding(make_client, catalog):
+    """Usable before confirmation is the product rule; passing SILENTLY is not. "Which rows count" is
+    the definition every number rests on, so an unconfirmed one is a finding for the same reason an
+    unconfirmed join identity is."""
+    _bind(catalog)
+    _set_policy(catalog)
+    r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    view = r.json()["preview"]
+    codes = [f["code"] for f in view["findings"]]
+    assert "ELIGIBILITY_UNCONFIRMED" in codes
+    assert view["rests_on_unconfirmed_facts"] is True
+
+
+def test_a_CONFIRMED_policy_raises_no_finding(make_client, catalog):
+    _bind(catalog)
+    _set_policy(catalog, confirmed_by="priya")
+    r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    codes = [f["code"] for f in r.json()["preview"]["findings"]]
+    assert "ELIGIBILITY_UNCONFIRMED" not in codes
 
 
 def test_a_REVOKED_grant_does_not_read_as_unconfigured(make_client, catalog):
