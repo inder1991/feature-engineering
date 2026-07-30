@@ -16,6 +16,7 @@ from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.deps import get_conn, get_identity
 from featuregen.api.routes import (
     admin,
+    analysis,
     assets,
     assist,
     auth,
@@ -159,6 +160,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(entity.router)
     app.include_router(suggestions.router)
     app.include_router(learning.router)
+    # `POST /analysis/plan` + `/analysis/clarify` — the data agent's planning surface.
+    app.include_router(analysis.router)
 
     @app.get("/health")
     def health() -> dict:
