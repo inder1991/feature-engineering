@@ -98,6 +98,16 @@ class Window:
     availability_basis: str = ""
     availability_lag_hours: float | None = None
     label: str = ""
+    #: Set when the window is whole CALENDAR periods rather than a span of days — "month" or "day".
+    #: A day span cannot express a calendar month, and pretending it can changes the answer: 30 days
+    #: ending 30 June overlaps both the 2026-05 and 2026-06 partitions, so reading the partitions it
+    #: touches would fold late-May activity into "this month". With `calendar_unit` set,
+    #: `calendar_length` and `calendar_offset` count whole units — offset 0 is the period containing
+    #: the cutoff, offset 1 the one before it — which is what a monthly-partitioned table can answer
+    #: exactly. Defaults keep the day-span meaning for every existing plan.
+    calendar_unit: str = ""
+    calendar_length: int = 0
+    calendar_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
