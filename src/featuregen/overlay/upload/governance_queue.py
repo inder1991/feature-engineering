@@ -105,6 +105,25 @@ logger = logging.getLogger(__name__)
 
 _LIMIT_MAX = 500
 
+#: What each SUB-LISTING is asked for, independent of the caller's ``limit``. Two separate bugs made
+#: this necessary, and one number fixes both:
+#:
+#: * **the merge could not see what it had lost.** Passing the caller's ``limit`` down let a listing
+#:   cut silently: 120 bridges at ``limit=100`` returned 100, so ``ordered == items``, ``truncated``
+#:   was False and the screen's "Show more" never rendered. The queue can only report a cut it can
+#:   observe, so it has to hold more rows than it will return.
+#: * **scope-narrowing runs AFTER the listing.** The queue additionally drops a bridge whose catalogs
+#:   are not both visible. Spending the caller's whole budget upstream and narrowing afterwards left
+#:   a narrow-scope caller a short — or empty — ``items`` alongside ``complete: true``, which is this
+#:   payload's own contract for "nothing is waiting".
+#:
+#: :data:`_LIMIT_MAX` is the ceiling every sibling listing clamps to, so this asks for everything they
+#: can give and the merge does the cutting. A listing that comes back holding exactly this many MAY
+#: have cut, so ``truncated`` is set — deliberately conservative: over-reporting "there is more"
+#: costs a wasted "Show more", under-reporting it tells an operator their queue is empty when it is
+#: not.
+_FETCH_LIMIT = _LIMIT_MAX
+
 #: The schema a bridge endpoint's ``object_ref`` is flattened to when the ref carries none
 #: (``upload_catalog._SCHEMA`` / ``governed_grain._FLAT_SCHEMA``).
 _DEFAULT_SCHEMA = "public"
@@ -656,7 +675,10 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
     its column-level endpoint scoping. ``roles=()`` is a real caller holding nothing.
 
     ``actor`` decides ``available_actions`` (four-eyes projection). ``limit`` is clamped to 1..500
-    and bounds the MERGED list; ``truncated`` says whether anything was cut.
+    and bounds the MERGED list; ``truncated`` says whether anything was cut — HERE or by a
+    sub-listing that came back at its own ceiling (:data:`_FETCH_LIMIT`). Read
+    ``items == () and complete and not truncated`` as "nothing is waiting"; ``truncated`` alone
+    never means the queue is whole.
 
     ``now`` is the instant the governed grain read judges EXPIRY against (a VERIFIED grain past its
     ``expires_at`` is refused at read time, ahead of the async poller's STALE). It defaults to the
@@ -686,14 +708,20 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
 
     # ── bridges: ONE call, every catalog (source=None) ───────────────────────────────────────────
     bridge_views: list[dict] = []
+    capped = False
     try:
-        bridge_views = [v for v in list_bridge_proposals(
-            conn, source=None, limit=limit, roles=role_claims, actor=actor)
-            # NARROWING ONLY: the listing keeps a bridge whose endpoint has no graph_node row (a
-            # column with no row carries no sensitivity requirement to leak). Requiring both
-            # catalogs to be VISIBLE closes that, so the queue can never name a catalog
-            # `GET /catalogs` would withhold. It can only remove rows, never add one.
-            if {str(c).strip().lower() for c in (v.get("catalogs") or ())} <= visible]
+        raw_bridges = list_bridge_proposals(
+            conn, source=None, limit=_FETCH_LIMIT, roles=role_claims, actor=actor)
+        capped = capped or len(raw_bridges) >= _FETCH_LIMIT
+        bridge_views = [v for v in raw_bridges
+                        # NARROWING ONLY: the listing keeps a bridge whose endpoint has no
+                        # graph_node row (a column with no row carries no sensitivity requirement
+                        # to leak). Requiring both catalogs to be VISIBLE closes that, so the queue
+                        # can never name a catalog `GET /catalogs` would withhold. It can only
+                        # remove rows, never add one — which is exactly why it must run BEFORE the
+                        # merge truncates: narrowing after a cut spends the caller's budget on rows
+                        # they were never going to see.
+                        if {str(c).strip().lower() for c in (v.get("catalogs") or ())} <= visible]
     except Exception:  # noqa: BLE001
         counters.incr("overlay.governance_queue.bridges_unreadable")
         logger.warning("governance queue: the bridge listing is unreadable", exc_info=True)
@@ -713,7 +741,8 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
     seen: set[tuple[str, str]] = set()
     for source in catalogs:
         try:
-            joins = list_open_approved_join_proposals(conn, source, limit=limit)
+            joins = list_open_approved_join_proposals(conn, source, limit=_FETCH_LIMIT)
+            capped = capped or len(joins) >= _FETCH_LIMIT
         except Exception:  # noqa: BLE001 — one catalog's listing, not the whole queue
             counters.incr("overlay.governance_queue.joins_unreadable")
             logger.warning("governance queue: the join listing for %s is unreadable", source,
@@ -729,7 +758,8 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
             by_kind[APPROVED_JOIN].append(_join_item(view, source, actor))
 
         try:
-            facts = list_open_table_fact_proposals_governance(conn, source, limit=limit)
+            facts = list_open_table_fact_proposals_governance(conn, source, limit=_FETCH_LIMIT)
+            capped = capped or len(facts) >= _FETCH_LIMIT
         except Exception:  # noqa: BLE001
             counters.incr("overlay.governance_queue.table_facts_unreadable")
             logger.warning("governance queue: the table-fact listing for %s is unreadable", source,
@@ -758,4 +788,5 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
         items_visible_to_you_by_catalog=tuple(sorted(per_catalog.items())),
         items_visible_to_you_by_kind=tuple((k, per_kind[k]) for k in KIND_ORDER),
         unreadable=tuple(unreadable), complete=not unreadable,
-        truncated=len(ordered) > len(items))
+        # Cut HERE, or cut by a sub-listing that hit its own ceiling — both are "there is more".
+        truncated=len(ordered) > len(items) or capped)

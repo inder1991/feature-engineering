@@ -591,6 +591,80 @@ def test_limit_is_clamped_and_truncation_is_reported(all_three_kinds):
     assert governance_queue(conn, roles=(), limit=10_000).truncated is False
 
 
+def _bridge_everything(db, sources: tuple[str, ...]) -> None:
+    """One bridgeable `customer_id` column per catalog, so every pair derives a candidate."""
+    for source in sources:
+        _load(db, source, [
+            (CanonicalRow(source, "customers", "customer_id", "integer", is_grain=True),
+             "customer_id")])
+
+
+def test_a_sub_listing_that_cut_rows_is_reported_as_truncated(queue_db):
+    """`truncated` is the flag that renders "Show more", and it was blind to the cut that actually
+    happens. Each sub-listing used to be handed the CALLER's limit, so it cut before the merge could
+    observe the loss: six bridges at `limit=3` came back as three, `ordered == items`, `truncated`
+    was False, and the operator was shown half a queue with nothing saying so.
+
+    Four catalogs bridged pairwise are six proposals; three are asked for."""
+    _bridge_everything(queue_db, ("cat_a", "cat_b", "cat_c", "cat_d"))
+    keys = {propose_bridge(queue_db, cand, actor=SERVICE_ACTOR, now=_NOW)
+            for cand in derive_bridge_candidates(queue_db)}
+    assert len(keys) == 6, "four catalogs pairwise — the population the listing must not hide"
+
+    queue = governance_queue(queue_db, roles=(), limit=3)
+    assert len(queue.items) == 3
+    assert queue.truncated is True
+    # ...and this is a CUT, not an outage: the listings were all read.
+    assert queue.complete is True and queue.unreadable == ()
+
+
+def test_scope_narrowing_runs_BEFORE_truncation_so_a_visible_item_is_not_crowded_out(queue_db):
+    """`items == [] and complete` is this payload's own contract for "nothing is waiting", and it
+    was reachable while work WAS waiting.
+
+    The queue drops a bridge whose catalogs are not ALL visible — the KEEP-if-absent case the
+    listing deliberately does not drop (an endpoint with no `graph_node` row carries no sensitivity
+    requirement, so the listing keeps it) — but that narrowing ran AFTER the sub-listing had already
+    spent the caller's whole limit. Bridges the caller can never see crowded out the one they can.
+
+    The two `ghost` catalogs are ingested so a bridge derives, proposed FIRST so they are oldest and
+    the listing reaches them first, then their `graph_node` rows are removed. At `limit=1` the
+    listing used to return the ghost bridge alone, and the queue then narrowed it away to nothing.
+    """
+    _bridge_everything(queue_db, ("ghost_a", "ghost_b"))
+    ghost = propose_bridge(queue_db, derive_bridge_candidates(queue_db)[0],
+                           actor=SERVICE_ACTOR, now=_NOW)
+    _two_catalogs(queue_db)
+    pair = next(c for c in derive_bridge_candidates(queue_db)
+                if {c.left_ref.catalog_source, c.right_ref.catalog_source} == {"core", "crm"})
+    wanted = propose_bridge(queue_db, pair, actor=SERVICE_ACTOR, now=_NOW)
+    queue_db.execute("DELETE FROM graph_node WHERE catalog_source IN ('ghost_a', 'ghost_b')")
+
+    queue = governance_queue(queue_db, roles=(), limit=1)
+    assert set(queue.catalogs) == {"core", "crm"}       # the ghosts are genuinely invisible now
+    assert [i.fact_key for i in queue.items] == [wanted]
+    assert ghost not in _keys(queue)
+
+
+def test_a_listing_that_came_back_at_its_own_ceiling_is_reported_as_truncated(all_three_kinds,
+                                                                             monkeypatch):
+    """The residual cut the merge still cannot measure. Each sibling listing clamps at its own
+    `_LIMIT_MAX`, so past that ceiling the queue holds every row it was handed and no comparison of
+    `ordered` against `items` can reveal the loss.
+
+    A listing that comes back holding exactly what it was asked for MAY have cut, and the
+    conservative answer is the honest one: over-reporting costs a wasted "Show more", while
+    under-reporting tells an operator nothing is waiting when something is. Here nothing is cut at
+    the merge at all — every item fits inside `limit` — and `truncated` is still True."""
+    from featuregen.overlay.upload import governance_queue as mod
+    monkeypatch.setattr(mod, "_FETCH_LIMIT", 1)
+
+    queue = governance_queue(all_three_kinds.conn, roles=(), limit=100)
+    assert len(queue.items) == 3          # nothing was cut HERE — the merge fits inside the limit
+    assert queue.truncated is True        # ...but a listing came back at its ceiling
+    assert queue.complete is True and queue.unreadable == ()
+
+
 # ── Test-local recorders (the REAL stores' minimal legal rows) ─────────────────────────────────────
 
 def _record_candidate(conn, *, run: str, intent: str, plan: str, bridge_key: str | None,
