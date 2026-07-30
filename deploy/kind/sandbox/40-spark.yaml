@@ -1,0 +1,127 @@
+# Local Spark 3.5 + Hive metastore sandbox.
+#
+# WHY THIS SHAPE. The requirement was a metastore several sessions can share. That rules out the
+# usual local answer — an embedded Derby metastore holds an exclusive single-JVM lock, so a second
+# session simply cannot attach. Sharing therefore needs a real RDBMS behind the metastore, and the
+# cluster already runs one. Spark's built-in metastore client points straight at Postgres; no
+# separate Hive service is deployed, because nothing here needs the thrift hop.
+#
+# WAREHOUSE. A PersistentVolumeClaim, not emptyDir, so a pod restart does not silently take the
+# tables with it. kind is single-node, so ReadWriteOnce still lets several pods on that node share
+# it — which is what makes the sandbox usable from more than one session at a time.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT. It runs the generated Kedro project against a REAL
+# metastore: real table creation, partitioning, schema resolution, and the publication code path.
+# It does NOT prove HDFS atomicity — a local-path volume is an ordinary filesystem and HDFS rename
+# and visibility guarantees genuinely differ. The capability attestation is environment-scoped for
+# exactly this reason, so an attestation earned here refuses to authorize the real cluster. That is
+# the design working, not a gap to route around.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spark-warehouse
+  namespace: featuregen
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark
+  namespace: featuregen
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: spark }
+  template:
+    metadata:
+      labels: { app: spark }
+    spec:
+      containers:
+        - name: spark
+          image: featuregen-spark:local
+          imagePullPolicy: IfNotPresent
+          # A long-lived shell: sessions drive it with `kubectl exec`, so the warehouse and the
+          # metastore outlive any single spark-submit.
+          command: ["/bin/bash", "-c", "sleep infinity"]
+          env:
+            - { name: SPARK_LOCAL_IP, value: "127.0.0.1" }
+            # JAVA_HOME is deliberately NOT set. The image installs Debian's OpenJDK 17, which
+            # lands on PATH; a hardcoded path here (the `apache/spark` layout, /opt/java/openjdk)
+            # points at nothing and PySpark's launcher fails with the opaque
+            # "Java gateway process exited before sending its port number".
+            - { name: WAREHOUSE_DIR, value: "/warehouse" }
+            # REQUIRED. pip-installed PySpark reads its conf from inside site-packages, not from
+            # /opt/spark/conf (the `apache/spark` image layout). Without this the mounted
+            # spark-defaults.conf is never read, Spark silently falls back to an embedded DERBY
+            # metastore, and the sandbox looks like it works — a second SEQUENTIAL session even
+            # sees the tables. It only fails when two sessions connect at once, which is the whole
+            # reason this is backed by Postgres.
+            - { name: SPARK_CONF_DIR, value: "/opt/spark/conf" }
+          volumeMounts:
+            - { name: warehouse, mountPath: /warehouse }
+            - { name: sparkconf, mountPath: /opt/spark/conf/spark-defaults.conf, subPath: spark-defaults.conf }
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits:   { cpu: "2",    memory: "4Gi" }
+      volumes:
+        - name: warehouse
+          persistentVolumeClaim:
+            claimName: spark-warehouse
+        - name: sparkconf
+          configMap:
+            name: spark-defaults
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-defaults
+  namespace: featuregen
+data:
+  spark-defaults.conf: |
+    spark.sql.catalogImplementation           hive
+    spark.sql.warehouse.dir                   file:///warehouse
+
+    # The shared catalog: Spark's metastore client -> the cluster's Postgres. `metastore` is a
+    # separate database from `featuregen` so catalog metadata and application data cannot collide.
+    #
+    # THE `spark.hadoop.` PREFIX IS LOAD-BEARING. `javax.jdo.*` and `datanucleus.*` are HIVE
+    # properties, not Spark ones. Written bare in spark-defaults.conf they are parsed, accepted and
+    # then ignored — Spark only forwards `spark.hadoop.*` into the Hadoop/Hive conf. The symptom is
+    # a silent fall back to an embedded Derby metastore: tables persist, a sequential second session
+    # even sees them, and only concurrent access reveals it. Verified here by asserting the Hive
+    # tables exist in Postgres, not by asserting a write succeeded.
+    spark.hadoop.javax.jdo.option.ConnectionURL        jdbc:postgresql://postgres:5432/metastore
+    spark.hadoop.javax.jdo.option.ConnectionDriverName org.postgresql.Driver
+    spark.hadoop.javax.jdo.option.ConnectionUserName   postgres
+    spark.hadoop.javax.jdo.option.ConnectionPassword   postgres
+    # autoCreateAll is OFF, deliberately. Letting DataNucleus build the schema self-deadlocked
+    # partway (consistently at 28 of 46 tables, one connection left "idle in transaction" while an
+    # ALTER TABLE ... ADD CONSTRAINT waited on it) — even from a SINGLE session, and worse with
+    # several. The schema is initialised ONCE from Hive's own DDL
+    # (metastore/scripts/upgrade/postgres/hive-schema-2.3.0.postgres.sql, matching the Hive 2.3.9
+    # client pyspark 3.5 bundles), which applies in seconds. Application sessions must never race
+    # to create a shared schema; that is a bootstrap step, not a runtime one.
+    spark.hadoop.datanucleus.schema.autoCreateAll      false
+    spark.hadoop.datanucleus.autoCreateSchema          false
+    spark.hadoop.datanucleus.fixedDatastore            true
+    spark.hadoop.hive.metastore.schema.verification    false
+    spark.hadoop.hive.metastore.schema.verification.record.version false
+
+    # PINNED, NOT INHERITED. Spark 3 defaults this to false and Spark 4 to true, and it decides
+    # whether a decimal overflow and a divide-by-zero RAISE or return NULL. Leaving it to the
+    # engine's default would mean the same generated pipeline computes differently depending on
+    # which cluster ran it — the ungoverned-arithmetic hazard the pinned session timezone already
+    # closed for time. Set explicitly so the sandbox states its arithmetic rather than inheriting.
+    spark.sql.ansi.enabled                     false
+
+    # One clock, stated. §8's window boundaries each carry their own governed zone; a session zone
+    # inherited from whichever JVM the run landed on would be a second, ungoverned clock.
+    spark.sql.session.timeZone                 UTC
+
+    spark.driver.host                          127.0.0.1
+    spark.ui.enabled                           false

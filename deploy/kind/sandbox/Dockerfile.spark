@@ -1,0 +1,52 @@
+# Spark 3.5 for the local materialization sandbox.
+#
+# 3.5 is deliberate, not the newest available. Spark 3 defaults `spark.sql.ansi.enabled` to FALSE
+# and Spark 4 defaults it TRUE, which changes what a decimal overflow and a divide-by-zero DO —
+# return NULL versus raise. The rendered pipeline's OVERFLOW_VIOLATION gate is built for the NULL
+# behaviour, so a sandbox on 4.x would exercise different arithmetic than the target cluster and
+# report confident results under the wrong semantics.
+#
+# WHY NOT `apache/spark:3.5.3`. That image ships Python 3.8.10, and the renderer targets kedro 1.5
+# (what Task 12 verified its emitted API against), which requires Python >= 3.9 — `pip install
+# kedro==1.5.0` there resolves no candidate above 0.19.8. So the stock Spark image cannot run the
+# project this repo generates. Building on Python 3.11 with PySpark from PyPI gives the same Spark
+# 3.5 runtime on a Python new enough for the pinned Kedro, and matches the `.venv-l0` combination
+# already known to build the rendered pipeline.
+#
+# NOTE FOR TASK 0: `EngineVersions` carries `python` AND `kedro`, and this is exactly why they are
+# both required. If the target cluster's Spark 3.5 runs Python 3.8, the generated project's Kedro
+# pin is unusable there and the inventory must say so before a run is attempted, not after.
+# Pinned to bookworm on purpose: the floating `python:3.11-slim` tag has moved to a Debian release
+# that dropped `openjdk-17-jre-headless` in favour of 21, and Spark 3.5 supports Java 8/11/17 —
+# not 21. An unpinned base would have silently changed the JVM under the engine.
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openjdk-17-jre-headless curl procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# PySpark bundles the Spark distribution, so this is the engine as well as the client.
+RUN pip install --no-cache-dir --timeout 120 --retries 5 \
+      "pyspark==3.5.3" "kedro==1.5.0" "kedro-datasets[spark]==9.5.0"
+
+# Spark's built-in Hive metastore client talks to Postgres directly (no separate metastore
+# service): the shared RDBMS is what lets several sessions see one catalog. The driver is baked in
+# rather than resolved with --packages so a run never depends on Maven being reachable.
+ARG PG_JDBC_VERSION=42.7.4
+RUN SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirname(pyspark.__file__),"jars"))')" \
+ && curl -fsSL -o "$SPARK_JARS/postgresql-${PG_JDBC_VERSION}.jar" \
+      "https://repo1.maven.org/maven2/org/postgresql/postgresql/${PG_JDBC_VERSION}/postgresql-${PG_JDBC_VERSION}.jar"
+
+# Hive metastore support is not in the base pyspark wheel's jar set; without these the
+# `spark.sql.catalogImplementation=hive` setting falls back to in-memory and every table vanishes
+# with the session — silently, which is the failure mode this sandbox exists to avoid.
+RUN SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirname(pyspark.__file__),"jars"))')" \
+ && for c in hive-metastore/2.3.9 hive-exec/2.3.9 hive-common/2.3.9 hive-serde/2.3.9; do \
+      n="${c%%/*}"; v="${c##*/}"; \
+      curl -fsSL -o "$SPARK_JARS/${n}-${v}-core.jar" \
+        "https://repo1.maven.org/maven2/org/apache/hive/${n}/${v}/${n}-${v}-core.jar" \
+      || curl -fsSL -o "$SPARK_JARS/${n}-${v}.jar" \
+        "https://repo1.maven.org/maven2/org/apache/hive/${n}/${v}/${n}-${v}.jar"; \
+    done || true
+
+WORKDIR /work
