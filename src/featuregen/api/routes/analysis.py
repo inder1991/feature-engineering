@@ -36,6 +36,8 @@ from featuregen.analysis.grounding import ground_analysis_plan
 from featuregen.analysis.intent import IntentUnavailable, extract_intent
 from featuregen.analysis.preview import preview
 from featuregen.analysis.retrieval import RetrievalBudget, retrieve_candidates
+from featuregen.data_agent.binding_store import resolve_binding
+from featuregen.data_agent.connection import ConnectionError_
 from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
@@ -100,7 +102,7 @@ def plan(body: PlanIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """A question, planned and previewed. Never executed — see the module docstring."""
     retrieval, extraction, grounded = _plan_for(
         conn, body.question, identity, client, body.max_columns)
-    view = preview(grounded, _execution_inputs_or_none())
+    view = _previewed(conn, grounded)
     return {
         "preview": _serialize_preview(view),
         "clarifications": [
@@ -130,7 +132,7 @@ def clarify(body: AnswerIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     except ClarificationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     regrounded = ground_analysis_plan(conn, answered, roles=identity.role_claims)
-    view = preview(regrounded, _execution_inputs_or_none())
+    view = _previewed(conn, regrounded)
     return {
         "preview": _serialize_preview(view),
         "clarifications": [
@@ -142,12 +144,54 @@ def clarify(body: AnswerIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     }
 
 
-def _execution_inputs_or_none() -> ExecutionInputs | None:
-    """No deployment can build these yet.
+def _previewed(conn, grounded):
+    """Preview, with the blocked reason sharpened by what the registry actually knows."""
+    from dataclasses import replace as _replace
 
-    `PhysicalObjectIdentityV1` requires a database; the catalog records `schema_name` and no
-    database, and there is no connection or binding registry. Returning None is what makes the
-    preview report `EXECUTION_INPUTS_ABSENT` honestly, instead of this route inventing a binding to
-    look complete. When a registry exists, this is the one place that changes.
+    view = preview(grounded, _execution_inputs_or_none(conn, grounded.plan))
+    if view.blocked_by and view.blocked_by[0] == "EXECUTION_INPUTS_ABSENT":
+        return _replace(view, blocked_by=_binding_hint(conn, grounded.plan))
+    return view
+
+
+def _execution_inputs_or_none(conn, plan) -> ExecutionInputs | None:
+    """Assemble what CAN be assembled, and return None when something real is missing.
+
+    The binding registry (migration 1037) supplies the physical address the catalog cannot — a
+    database, and the connection authorized to read it. What it cannot supply is the rest of
+    `ExecutionInputs`: a population spine distinct from the event table, which `AnalysisPlanV1`
+    structurally cannot express, and an eligibility policy, which no store yet holds.
+
+    So this still returns None — but only after LOOKING, so `_blocked_reason` can say whether the
+    operator needs to bind a table or make a decision. Returning None without checking would leave
+    both cases reading as one, and "not configured" and "cannot be expressed" call for different
+    people.
     """
     return None
+
+
+def _binding_hint(conn, plan) -> tuple[str, str]:
+    """The precise reason a plan cannot execute, for the preview to report.
+
+    Resolution is attempted rather than assumed: an unbound table is an operator task, while a
+    revoked grant is a governance answer and must not read as "not configured".
+    """
+    _source, table = _source_and_table(plan.base_table_ref)
+    try:
+        resolved = resolve_binding(conn, catalog_source=_source, table=table)
+    except ConnectionError_ as exc:
+        # A binding exists and its connection refuses it — surfaced rather than swallowed, or a
+        # revoked allowlist would look identical to a table nobody has bound.
+        return (exc.code, f"{_source}::{table}")
+    if resolved is None:
+        return ("PHYSICAL_BINDING_ABSENT", f"{_source}::{table}")
+    # Bound and authorized: what remains is not configuration but contract — the plan carries one
+    # base table and cannot name a population spine, and no eligibility policy is stored anywhere.
+    return ("EXECUTION_INPUTS_ABSENT", f"{_source}::{table}")
+
+
+def _source_and_table(table_ref: str) -> tuple[str, str]:
+    """``source::[schema.]table`` -> (source, table), mirroring `grounding._parse`."""
+    source, _, rest = table_ref.partition("::")
+    parts = [p for p in rest.split(".") if p]
+    return source.strip().lower(), (parts[-1] if parts else "")

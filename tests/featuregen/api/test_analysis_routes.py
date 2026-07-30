@@ -87,15 +87,56 @@ def test_a_question_becomes_a_previewed_plan(make_client, catalog):
     assert view["comparison"] == "decrease"
 
 
-def test_the_plan_reports_that_it_cannot_execute_and_names_why(make_client, catalog):
-    """No deployment can build ExecutionInputs — the catalog records no physical database and there
-    is no connection registry. The honest preview says so rather than inventing a binding to look
-    complete."""
+def test_an_UNBOUND_table_reports_an_operator_task(make_client, catalog):
+    """With no binding, the catalog cannot supply a physical address at all — nothing to run against
+    and nothing to decide. Naming it as a binding gap points at the person who can fix it."""
     r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
     view = r.json()["preview"]
     assert view["runnable"] is False
-    assert view["blocked_by"]["code"] == "EXECUTION_INPUTS_ABSENT"
+    assert view["blocked_by"]["code"] == "PHYSICAL_BINDING_ABSENT"
+    assert view["blocked_by"]["subject"] == "ftr::tran_repos"
     assert view["sql"] == ""
+
+
+def test_a_BOUND_table_changes_the_reason_it_cannot_run(make_client, catalog):
+    """The registry has a real consumer, asserted. Once the address exists, what remains is not
+    configuration but contract — the plan carries one base table and cannot name a population spine,
+    and no eligibility policy is stored anywhere. A different gap, for a different person."""
+    from featuregen.data_agent.binding_store import record_binding, record_connection
+    from featuregen.data_agent.connection import DataSourceConnectionV1
+    from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+
+    record_connection(catalog, DataSourceConnectionV1(
+        connection_id="c1", environment_id="uat", kind="hive", host="h", port=10000,
+        auth_mechanism="kerberos", secret_ref="vault://x", execution_principal="svc_ro",
+        allowed_schemas=frozenset({"dpl_eib"}), active=True))
+    record_binding(catalog, PhysicalDatasetBindingV1(
+        binding_id="b1", catalog_logical_ref="ftr::dpl_eib.tran_repos", connection_id="c1",
+        identity=PhysicalObjectIdentityV1(catalog_source="ftr", database="wh", schema="dpl_eib",
+                                          table="tran_repos", object_kind="table")))
+
+    r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    assert r.json()["preview"]["blocked_by"]["code"] == "EXECUTION_INPUTS_ABSENT"
+
+
+def test_a_REVOKED_grant_does_not_read_as_unconfigured(make_client, catalog):
+    """"Nobody bound this" and "somebody revoked it" call for different people. Collapsing the second
+    into the first would hide a withdrawn permission behind a setup task."""
+    from featuregen.data_agent.binding_store import record_binding, record_connection
+    from featuregen.data_agent.connection import DataSourceConnectionV1
+    from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+
+    record_connection(catalog, DataSourceConnectionV1(
+        connection_id="c1", environment_id="uat", kind="hive", host="h", port=10000,
+        auth_mechanism="kerberos", secret_ref="vault://x", execution_principal="svc_ro",
+        allowed_schemas=frozenset({"nothing_here"}), active=True))
+    record_binding(catalog, PhysicalDatasetBindingV1(
+        binding_id="b1", catalog_logical_ref="ftr::dpl_eib.tran_repos", connection_id="c1",
+        identity=PhysicalObjectIdentityV1(catalog_source="ftr", database="wh", schema="dpl_eib",
+                                          table="tran_repos", object_kind="table")))
+
+    r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    assert r.json()["preview"]["blocked_by"]["code"] != "PHYSICAL_BINDING_ABSENT"
 
 
 def test_truncation_is_reported_to_the_caller(make_client, catalog):
