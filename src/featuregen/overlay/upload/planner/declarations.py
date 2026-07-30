@@ -316,6 +316,11 @@ def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
 # hop_physical_cardinality's `source` vocabulary (F4): where the fan-in evidence came from.
 CARDINALITY_SOURCE_REALIZATION = "realization"
 CARDINALITY_SOURCE_UNAVAILABLE = "unavailable"
+# A bridge the context RESOLVED but whose fan-in NOTHING attests. Distinct from `unavailable` (which
+# means the segment resolved to no bridge at all) because the two ask a human for different things:
+# one to establish a directional realization, the other to find out why the bridge is missing. Both
+# carry cardinality None — see `_hop_evidence` for why a bridge can no longer claim many_to_one.
+CARDINALITY_SOURCE_BRIDGE_UNATTESTED = "bridge_unattested"
 
 # Declared functions that are provably duplication/order-safe on ANY fan-in without extra inputs.
 _ORDER_SAFE_DECLARED = frozenset(
@@ -356,12 +361,37 @@ def _hop_evidence(
     """One hop segment's physical evidence: (cardinality, source, grouping_keys,
     execution_catalog, execution_table). Realized hop → the REALIZATION's declared_cardinality
     (F4/F8 — the physical authority; the segment's semantic cardinality string is never
-    consulted), its to-side key as the GROUP BY, its to-table as the execution site. A symmetric
-    bridge supplies NO directional cardinality: matching identifier namespaces does not prove
-    target uniqueness, fan-out, predicates or applicability scope. Task 9 will resolve those from
-    a deterministically validated directional realization. Until then every bridge hop and anything
-    else the context cannot resolve returns
-    ``(None, "unavailable", (), <segment catalog>, "")`` — fail closed, never a guessed fan-in."""
+    consulted), its to-side key as the GROUP BY, its to-table as the execution site. Anything the
+    context cannot resolve → ``(None, "unavailable", (), <segment catalog>, "")`` — fail closed,
+    never a guessed fan-in.
+
+    BRIDGE-ROLLUP hops have NO cardinality (fail-close correction). This branch used to return
+    ``many_to_one`` "BY CONSTRUCTION", on the argument that the bridge anchors an E2-key FK column
+    to an E2-grain far table. Nothing in a bridge attests either half of that: not the DIRECTION the
+    join runs, and not the far side's grain. If the far side is not in fact at that grain the hop is
+    1:N — rows multiply, and every SUM taken over it inflates into a plausible number that raises no
+    error anywhere. That is an ASSUMPTION presented as EVIDENCE, and it is the one class of defect
+    this compiler exists to refuse.
+
+    ``materialize/joins.py`` already writes the argument out for the identical case: "Unknown
+    cardinality is refused ... Refusing only the hops that SAY 1:N is a fail-open: an unattested edge
+    may BE 1:N. 'We do not know' is not 'it is safe'." Until DIRECTIONAL REALIZATIONS exist — which
+    direction is joined, at what cardinality, in what scope, with what fan-out — there is no evidence
+    to return, so a resolved bridge yields ``(None, "bridge_unattested", (), <far catalog>, "")`` and
+    ``compile_aggregation`` stages every measure on it as ``physical_cardinality_unavailable``.
+
+    This withholds a CARDINALITY CLAIM, nothing else. Link availability is decided elsewhere
+    entirely (``cross_catalog_links``' lifecycle allow-list, read through ``ctx.active_bridges``), so
+    the bridge remains fully visible to discovery, suggestions and bounded sandbox analysis. The two
+    are different axes and must not be collapsed: a link is not withdrawn because nobody has yet
+    measured its direction, and it is not execution-safe because somebody approved its semantics.
+
+    The far endpoint is still identified (the endpoint in the segment's catalog; endpoint storage
+    order is unordered) — it is what tells an unattested bridge apart from an absent one — but it is
+    NOT returned as a grouping key or an execution site. Emitting a GROUP BY for a hop whose fan-in
+    is unproven would be the same fabrication one step down, and it would break the invariant
+    ``_grouping_survives`` relies on ("a cardinality-unavailable hop has neither").
+    """
     if segment.realization_ref is not None:
         r = next((x for x in ctx.realizations_by_catalog.get(segment.catalog_source, ())
                   if x.realization_id == segment.realization_ref), None)
@@ -370,6 +400,16 @@ def _hop_evidence(
         return (r.declared_cardinality, CARDINALITY_SOURCE_REALIZATION, (r.to_key_ref,),
                 segment.catalog_source, r.to_object_ref)
     if segment.bridge_fact_key is not None:
+        br = next((x for x in ctx.active_bridges
+                   if x.fact_key == segment.bridge_fact_key), None)
+        if br is not None:
+            far = [(cat, ref)
+                   for cat, ref in ((br.left_catalog_source, br.left_object_ref),
+                                    (br.right_catalog_source, br.right_object_ref))
+                   if cat == segment.catalog_source]
+            if len(far) == 1:   # exactly one endpoint on the segment's (far) side, else fail closed
+                cat, _ref = far[0]
+                return None, CARDINALITY_SOURCE_BRIDGE_UNATTESTED, (), cat, ""
         return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
     return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
 

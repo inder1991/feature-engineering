@@ -34,6 +34,9 @@ from tests.featuregen.overlay.upload._bridge_fixtures import (
     seed_verified_bridge as _seed_verified_bridge_fact,
 )
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
+from tests.featuregen.overlay.upload.planner._unattested_bridge import (
+    needs_attested_bridge_cardinality,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
@@ -335,7 +338,7 @@ def test_compile_over_stale_union_is_unresolved_freshness_but_still_minted(stale
 
 
 # ── consistent plan -> resolved, with a deterministic contract_id across two runs ────────────────
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_consistent_plan_resolves_with_deterministic_contract_id(resolved_topology):
     conn, scope = resolved_topology
     operand = _operand(slot_id="op_0", catalog="core_banking")

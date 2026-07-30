@@ -66,6 +66,13 @@ from featuregen.overlay.upload.contract.invalidation import (
 _PROMOTED = ("design_checked", "DATA-CHECKED")
 _DOWNGRADED = ("needs_external_validation", "UNVERIFIED")
 
+#: The ``contract_metadata_dependency.item_hash`` a healthy VERIFIED, projected bridge produced
+#: BEFORE the lifecycle-first fold — captured from ``origin/main`` at 265ce4be. Pinned as a literal
+#: because that table is WORM (migration 1011 rejects UPDATE/DELETE): a signature change cannot be
+#: migrated, it can only condemn every governed contract already confirmed against it.
+_HEALTHY_VERIFIED_ITEM_HASH = (
+    "30ca22189daa8e95e577cb95376ad6ff3100aa34d6901490a40c8db1e4e664ce")
+
 
 @pytest.fixture
 def client(db, monkeypatch):
@@ -290,6 +297,105 @@ def test_an_unavailable_bridge_still_resolves_to_missing(db, status):
     a contract that crossed it while it was live drifts, exactly as before."""
     _draft_bridge(db, "bfk_gone", status=status)
     assert _bridge_fact_signature(db, bridge_fact_marker("bfk_gone")) == _MISSING
+
+
+# ══════════ the read gate folds the LIFECYCLE FIRST — a stale projection row cannot vouch ═════════
+#
+# `_bridge_fact_signature` read `entity_bridge_edge` and returned that row's state whenever a row
+# existed, consulting the authoritative lifecycle only when there was NO row. But the projection is a
+# cache and `demote_bridge_edges` is FAIL-SOFT, so the failure mode is exactly the one the gate exists
+# to catch:
+#
+#     the bridge is rejected / expires / drift-stales
+#       -> the edge demotion fails (or simply has not run)
+#       -> the old VERIFIED row survives
+#       -> the recomputed dependency hash still matches the one stored at confirm
+#       -> a contract resting on a withdrawn bridge stays PROMOTABLE.
+#
+# Lifecycle first, then. REJECTED / STALE / expired-to-REVERIFY / UNREADABLE => MISSING, whatever the
+# projection says. The healthy VERIFIED-with-a-row path is untouched byte for byte (controls below),
+# so no stored `item_hash` re-baselines and no promoted contract demotes on deploy.
+#
+# Test strength: none of the three below can pass against a signature that reads the row first.
+
+def _stale_row_behind(db, fact_key: str, *, status: str) -> None:
+    """Drive `fact_key`'s lifecycle to `status` and leave a VERIFIED `entity_bridge_edge` row behind
+    it — the shape a fail-soft demotion produces. The row's endpoints match the fixture's, so the two
+    sources disagree about the STATUS alone."""
+    _draft_bridge(db, fact_key, status=status)
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
+        " right_catalog_source, right_object_ref, status) "
+        "VALUES (%s,'account','ops','public.transactions.account_id','rev',"
+        " 'public.accounts.account_id','VERIFIED')", (fact_key,))
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "STALE", "REVERIFY"])
+def test_a_surviving_verified_row_cannot_vouch_for_a_withdrawn_bridge(db, status):
+    """THE fail-open. A VERIFIED projection row outliving its confirmation must not keep a contract
+    promotable — the lifecycle is the authority and it says the bridge is gone."""
+    _stale_row_behind(db, "bfk_soft", status=status)
+    assert db.execute("SELECT status FROM entity_bridge_edge WHERE fact_key = 'bfk_soft'"
+                      ).fetchone() == ("VERIFIED",), "the stale row really is there"
+
+    marker = bridge_fact_marker("bfk_soft")
+    assert _bridge_fact_signature(db, marker) == _MISSING
+    assert _catalog_state_signature(db, "rev", marker) == _MISSING   # and via the gate's entry point
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "STALE", "REVERIFY"])
+def test_a_contract_resting_on_a_withdrawn_bridge_drifts_even_if_the_row_survives(db, status):
+    """The same fact stated where it bites: the recomputed hash no longer matches the one stored
+    while the bridge was live, so the read gate downgrades."""
+    _draft_bridge(db, "bfk_soft", status="VERIFIED")
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
+        " right_catalog_source, right_object_ref, status) "
+        "VALUES ('bfk_soft','account','ops','public.transactions.account_id','rev',"
+        " 'public.accounts.account_id','VERIFIED')")
+    marker = bridge_fact_marker("bfk_soft")
+    dep_row = {"contract_id": "c1", "catalog_source": "rev", "graph_ref": marker,
+               "logical_ref": marker, "decision_id": None, "fact_id": None, "event_id": None}
+    at_confirm = confirm_dependency_hash(
+        db, contract_id="c1", catalog_source="rev", graph_ref=marker, logical_ref=marker,
+        decision_id=None, fact_id=None, event_id=None)
+    assert current_dependency_hash(db, dep_row) == at_confirm, "live and promotable to begin with"
+
+    _draft_bridge(db, "bfk_soft", status=status)       # the withdrawal; the demotion never lands
+    assert db.execute("SELECT count(*) FROM entity_bridge_edge WHERE fact_key = 'bfk_soft'"
+                      ).fetchone()[0] == 1
+    assert current_dependency_hash(db, dep_row) != at_confirm
+
+
+def test_an_unreadable_fact_stream_returns_missing_even_with_a_verified_row(db, monkeypatch):
+    """Fail CLOSED on an unreadable lifecycle. The gate cannot tell a sound bridge from a rejected
+    one behind a failing read, so it must not let the projection answer for it."""
+    from featuregen.overlay import store
+
+    _cross_seed(db)
+    marker = bridge_fact_marker("bfk_cap")
+    assert _bridge_fact_signature(db, marker) != _MISSING, "the control: readable before the fault"
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("fact stream unreadable")
+
+    monkeypatch.setattr(store, "load_fact", _boom)
+    assert _bridge_fact_signature(db, marker) == _MISSING
+
+
+def test_control_b_the_healthy_verified_dependency_hash_is_not_re_baselined(db):
+    """MUST-SURVIVE control, pinned to a LITERAL. `contract_metadata_dependency` is WORM (migration
+    1011 rejects UPDATE and DELETE), so a signature change silently condemns every stored governed
+    contract: the at-confirm hash can never be rewritten, and the recompute would stop matching it.
+
+    The literal is what a healthy VERIFIED, projected bridge hashed BEFORE the lifecycle-first fold
+    existed. If this fails, the change re-baselined history — which is a V2 dependency scheme plus
+    recompilation into new contract versions, not an edit to this resolver."""
+    _cross_seed(db)
+    marker = bridge_fact_marker("bfk_cap")
+    assert confirm_dependency_hash(
+        db, contract_id="c1", catalog_source="rev", graph_ref=marker, logical_ref=marker,
+        decision_id=None, fact_id=None, event_id=None) == _HEALTHY_VERIFIED_ITEM_HASH
 
 
 def test_confirming_an_unreviewed_bridge_a_contract_crosses_registers_as_drift(db):

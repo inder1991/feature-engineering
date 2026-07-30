@@ -86,10 +86,15 @@ def test_demote_removes_a_projected_bridge(db):
     assert demote_bridge_edges(db, fact_key(ref, "entity_bridge")) == 1
     # The EDGE is gone — that is what demote does, and what this test is named for.
     assert db.execute("SELECT count(*) FROM entity_bridge_edge").fetchone()[0] == 0
-    # The LINK is not un-derived by removing its projection: it drops back to proposed rather than
-    # vanishing. Only a human REJECTION or drift STALE suppresses a link outright (see
-    # test_catalog_drift_stales_a_verified_bridge, which still asserts the empty set).
-    assert [b.status for b in active_bridges(db)] == ["proposed"]
+    # The LINK is not un-derived by removing its projection, and — the fail-close correction — it is
+    # not un-REVIEWED either. Demoting the row here does not touch the stream, which still folds
+    # VERIFIED, so the confirmation still stands: this call deleted a CACHE of a decision, not the
+    # decision. Review status is folded, never inferred from the row's presence, precisely because
+    # `demote_bridge_edges` is fail-soft — a demotion that fails must not leave a bridge looking
+    # reviewed, and one that succeeds without a lifecycle exit must not un-review it.
+    # A link is suppressed outright only by its LIFECYCLE leaving the allow-list — a human REJECTION,
+    # a drift STALE (test_catalog_drift_stales_a_verified_bridge) or an expiry.
+    assert [b.status for b in active_bridges(db)] == ["confirmed"]
 
 
 def test_bridge_events_skip_the_single_source_read_models(db):

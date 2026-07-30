@@ -20,8 +20,8 @@ NEVER a direct concept/grain/bridge table insert. The suite proves:
 from __future__ import annotations
 
 import pytest
-from tests.featuregen.overlay.upload._bridge_fixtures import (
-    requires_directional_bridge_realization,
+from tests.featuregen.overlay.upload.planner._unattested_bridge import (
+    needs_attested_bridge_cardinality,
 )
 
 from featuregen.contracts import DbConn
@@ -60,7 +60,7 @@ def _adapter():
 
 
 # ── 1) the gate passes over the full gold ────────────────────────────────────────────────────────
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_gate_passes(db: DbConn, service_actor: IdentityEnvelope, human_actor: IdentityEnvelope,
                      monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FEATUREGEN_LLM_XCAT_SHADOW, "1")
@@ -81,7 +81,7 @@ def test_gate_passes(db: DbConn, service_actor: IdentityEnvelope, human_actor: I
 
 
 # ── 2) exact per-case dispositions through the REAL govern_llm_idea ───────────────────────────────
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_exact_dispositions_per_case(
         db: DbConn, service_actor: IdentityEnvelope, human_actor: IdentityEnvelope,
         monkeypatch: pytest.MonkeyPatch) -> None:

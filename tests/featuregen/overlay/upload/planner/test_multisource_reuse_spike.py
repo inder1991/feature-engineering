@@ -25,6 +25,9 @@ from tests.featuregen.overlay.upload._bridge_fixtures import (
     seed_verified_bridge as _seed_verified_bridge_fact,
 )
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
+from tests.featuregen.overlay.upload.planner._unattested_bridge import (
+    needs_attested_bridge_cardinality,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.commands import propose_fact
@@ -179,7 +182,7 @@ def two_catalog_take_latest_fixture(db, service_actor, human_actor):
 
 
 # ── the SPIKE ─────────────────────────────────────────────────────────────────────────────────
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_injected_operand_template_rolls_up_and_compiles(two_catalog_bridged_fixture):
     conn, scope, now = two_catalog_bridged_fixture
     tmpl = injected_operand_template(recipe_id="ms:op_0", need_role="measure_0",

@@ -29,6 +29,9 @@ from tests.featuregen.overlay.upload._bridge_fixtures import (
     seed_verified_bridge as _seed_verified_bridge_fact,
 )
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
+from tests.featuregen.overlay.upload.planner._unattested_bridge import (
+    needs_attested_bridge_cardinality,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
@@ -232,7 +235,7 @@ def ungoverned_endpoint_topology(db, service_actor, human_actor):
 
 
 # ── tests ──────────────────────────────────────────────────────────────────────────────────────
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_valid_ratio_resolves_one_selected_candidate(resolved_topology):
     conn, scope = resolved_topology
     result = plan_multi_source(conn, _adapter(), intent=_ratio_intent(), scope=scope,
@@ -299,7 +302,7 @@ def test_ungoverned_landing_endpoint_is_realization_endpoint_ungoverned(ungovern
     assert result.selected_plan_id is None
 
 
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_contract_axis_gate_stale_union_is_not_a_resolved_selection(stale_landing_topology):
     """THE TWO-AXIS RESOLVE GATE. The plan compiles to ``resolution_status=resolved`` (the assembly axis
     is sound) but ``contract_result_status=unresolved_freshness`` (the landing catalog is stale). The run
@@ -324,7 +327,7 @@ def test_contract_axis_gate_stale_union_is_not_a_resolved_selection(stale_landin
     assert result.selected_contract_plan_id is None
 
 
-@requires_directional_bridge_realization
+@needs_attested_bridge_cardinality
 def test_explicit_budget_is_decremented_per_compile(resolved_topology):
     conn, scope = resolved_topology
     budget = CompileBudget(remaining=5, deadline_monotonic=float("inf"), clock=time.monotonic)
