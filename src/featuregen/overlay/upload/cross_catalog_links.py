@@ -45,12 +45,15 @@ already stored, and a weak candidate is ranked down rather than hidden:
 """
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
-logger = logging.getLogger(__name__)
+from featuregen.overlay.upload.bridge_assessment import (
+    LinkAvailability,
+    LinkReviewStatus,
+    read_overlay_identifier_link_state,
+)
 
 
 class LinkStatus(StrEnum):
@@ -202,20 +205,10 @@ def bridge_lifecycle(conn, fact_key: str | None, *,
     del projected_verified
     if not fact_key:
         return BridgeLifecycleV1(UNGOVERNED, {})
-    from featuregen.overlay import store
-    from featuregen.overlay.state import fold_overlay_state
-    try:
-        folded = fold_overlay_state(store.load_fact(conn, fact_key))
-    except Exception:  # noqa: BLE001 — fail CLOSED: an unreadable lifecycle is not an available link
-        logger.warning("bridge lifecycle unreadable, treating as unavailable: %s", fact_key,
-                       exc_info=True)
+    state = read_overlay_identifier_link_state(conn, fact_key)
+    if state.folded_status is None:
         return BridgeLifecycleV1(UNREADABLE, {})
-    # Every UNAVAILABLE state moves the value to `prior_value`, so `value` is empty exactly where
-    # the caller is about to discard the reading anyway.
-    value = folded.value if isinstance(folded.value, Mapping) else {}
-    if folded.status:
-        return BridgeLifecycleV1(folded.status, value)
-    return BridgeLifecycleV1(UNGOVERNED, {})
+    return BridgeLifecycleV1(state.folded_status.value, state.governed_value)
 
 
 def bridge_lifecycle_status(conn, fact_key: str | None, *,
@@ -279,8 +272,8 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     out: list[CrossCatalogLink] = []
     for entity, l_src, l_ref, r_src, r_ref, key, family, ev in rows:
         # ONE fold answers both questions, and neither is answered by the projection row.
-        status = bridge_lifecycle_status(conn, key, projected_verified=key in verified)
-        if status not in AVAILABLE_STATUSES:
+        lifecycle = read_overlay_identifier_link_state(conn, key)
+        if lifecycle.availability is not LinkAvailability.AVAILABLE:
             continue
         if object_ref is not None:
             want = object_ref.strip().lower()
@@ -292,7 +285,7 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
         left_grain = (l_src, l_ref) in grain or bool(ev.get("left_is_grain"))
         right_grain = (r_src, r_ref) in grain or bool(ev.get("right_is_grain"))
         basis = str(ev.get("type_basis") or "")
-        confirmed = status == REVIEWED_STATUS
+        confirmed = lifecycle.review_status is LinkReviewStatus.HUMAN_VERIFIED
         out.append(CrossCatalogLink(
             entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
             right_catalog_source=r_src, right_object_ref=r_ref,
@@ -308,13 +301,13 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     for key, (entity, l_src, l_ref, r_src, r_ref) in verified.items():
         if key in seen:
             continue
-        status = bridge_lifecycle_status(conn, key, projected_verified=True)
-        if status not in AVAILABLE_STATUSES:
+        lifecycle = read_overlay_identifier_link_state(conn, key)
+        if lifecycle.availability is not LinkAvailability.AVAILABLE:
             continue
         if object_ref is not None and object_ref.strip().lower() not in (
                 str(l_ref).lower(), str(r_ref).lower()):
             continue
-        confirmed = status == REVIEWED_STATUS
+        confirmed = lifecycle.review_status is LinkReviewStatus.HUMAN_VERIFIED
         out.append(CrossCatalogLink(
             entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
             right_catalog_source=r_src, right_object_ref=r_ref,

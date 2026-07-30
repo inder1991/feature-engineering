@@ -9,7 +9,6 @@ import dataclasses
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 
 from featuregen.overlay.config import OverlayConfig
@@ -993,6 +992,10 @@ def _bridge_core_crm_snapshotted(db):
         (CanonicalRow("crm", "customers", "snapshot_dt", "date", is_grain=True), "as_of_date"),
         (CanonicalRow("crm", "customers", "spend", "numeric"), "monetary_flow"),
     ])
+    govern_bridge_fact(
+        db, "bridge:customer:c4", entity="customer",
+        left_source="core", left_ref="public.accounts.customer_id",
+        right_source="crm", right_ref="public.customers.customer_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
         " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",

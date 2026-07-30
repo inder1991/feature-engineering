@@ -6,13 +6,23 @@ registry (concept group='identifier' + entity_link), NEVER the free-text graph_n
 and deterministic; a candidate becomes a governed fact only when proposed + confirmed (later tasks)."""
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.identity import CatalogObjectRef
+from featuregen.overlay.upload.bridge_assessment import (
+    CANDIDATE_FAMILY_IDENTIFIER_LINK,
+    ConceptAuthority,
+    IdentifierColumnMemberV1,
+    IdentifierEndpointV1,
+    KeyMemberRole,
+    TupleKeyRole,
+    TypeBasis,
+    candidate_id_for,
+)
 from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 BRIDGE_DERIVATION_VERSION = "1.0.0"
@@ -58,6 +68,7 @@ class BridgeCandidateV1:
     #: schema — and deliberately OUTSIDE ``candidate_id``, so re-deriving the same pair after a
     #: structural source attests the type keeps the SAME candidate rather than forking a second one.
     type_basis: str = "attested"
+    candidate_family: str = CANDIDATE_FAMILY_IDENTIFIER_LINK
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,9 +129,28 @@ def _col_ref(col: _IdCol) -> CatalogObjectRef:
 
 def _candidate(entity: str, a: _IdCol, b: _IdCol) -> BridgeCandidateV1:
     left, right = sorted((a, b), key=lambda c: (c.catalog_source, c.table_name, c.column_name))
-    material = (f"{entity}|{left.catalog_source}.{left.table_name}.{left.column_name}"
-                f"|{right.catalog_source}.{right.table_name}.{right.column_name}|{BRIDGE_DERIVATION_VERSION}")
-    candidate_id = hashlib.sha256(material.encode()).hexdigest()[:16]
+
+    def endpoint(col: _IdCol) -> IdentifierEndpointV1:
+        member = IdentifierColumnMemberV1(
+            logical_column_ref=normalize_ref(
+                col.catalog_source, "public", col.table_name, col.column_name),
+            data_type_family=col.type_family,
+            type_basis=TypeBasis(col.type_basis),
+            key_member_role=KeyMemberRole.PRIMARY if col.is_grain else KeyMemberRole.UNKNOWN,
+        )
+        return IdentifierEndpointV1(
+            logical_table_ref=normalize_ref(col.catalog_source, "public", col.table_name),
+            members=(member,),
+            entity_id=entity,
+            concept=f"{entity}_id",
+            concept_authority=ConceptAuthority.DETERMINISTIC,
+            tuple_key_role=(
+                TupleKeyRole.COMPLETE_UNIQUE_KEY if col.is_grain
+                else TupleKeyRole.UNKNOWN),
+        )
+
+    candidate_id = candidate_id_for(
+        CANDIDATE_FAMILY_IDENTIFIER_LINK, endpoint(left), endpoint(right))
     basis = left.type_basis if left.type_basis == right.type_basis else "mixed"
     return BridgeCandidateV1(
         candidate_id=candidate_id, entity_id=entity, left_ref=_col_ref(left), right_ref=_col_ref(right),

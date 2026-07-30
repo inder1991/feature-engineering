@@ -10,9 +10,13 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from featuregen.overlay.identity import EntityBridgeRef, fact_key
-from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.bridge_assessment import (
+    LinkReviewStatus,
+    available_identifier_links,
+)
+from featuregen.overlay.upload.object_ref import parse_ref
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +67,13 @@ def demote_bridge_edges(conn, fact_key_value: str) -> int:
     return cur.rowcount
 
 
+def _flat_object_ref(logical_column_ref: str) -> str:
+    _source, schema, table, column = parse_ref(logical_column_ref)
+    if column is None:  # structurally impossible for IdentifierColumnMemberV1
+        raise ValueError(f"identifier member is not a column: {logical_column_ref!r}")
+    return f"{schema}.{table}.{column}"
+
+
 def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
     """The cross-catalog active set every planner surface consumes — CONFIRMED and PROPOSED alike.
 
@@ -81,7 +92,20 @@ def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
     """
     return tuple(
         ActiveBridgeV1(
-            link.fact_key, link.entity_id, link.left_catalog_source, link.left_object_ref,
-            link.right_catalog_source, link.right_object_ref, str(link.status), link.strength)
-        for link in cross_catalog_links(conn) if link.fact_key is not None
+            link.assessment.bridge_fact_key or "",
+            link.assessment.left_endpoint.entity_id or "",
+            parse_ref(link.assessment.left_endpoint.logical_table_ref)[0],
+            _flat_object_ref(
+                link.assessment.left_endpoint.members[0].logical_column_ref),
+            parse_ref(link.assessment.right_endpoint.logical_table_ref)[0],
+            _flat_object_ref(
+                link.assessment.right_endpoint.members[0].logical_column_ref),
+            (
+                "confirmed"
+                if link.availability.review_status is LinkReviewStatus.HUMAN_VERIFIED
+                else "proposed"
+            ),
+            link.ranking_strength,
+        )
+        for link in available_identifier_links(conn)
     )

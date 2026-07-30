@@ -36,6 +36,8 @@ from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.identity import fact_key
+from featuregen.overlay.state import fold_overlay_state
+from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -355,6 +357,9 @@ def test_governed_crossings_persisted_for_resolved_operand(
     BEFORE the fixture rollback) plus the declared intra-catalog realization — so crossing-governedness
     is FALSIFIABLE from persisted telemetry, not only from the endpoint grain-facts."""
     _seed_resolved_topology(planning_conn, service_actor, human_actor)
+    confirmed_bridge_event_id = fold_overlay_state(
+        load_fact(planning_conn, "bfk_acct")).confirmed_event_id
+    assert confirmed_bridge_event_id is not None
 
     run_multisource_assembly_shadow(
         planning_conn=planning_conn, telemetry_conn=db, adapter=_adapter(),
@@ -375,7 +380,8 @@ def test_governed_crossings_persisted_for_resolved_operand(
                         if c["kind"] == "governed_bridge"]
     assert bridge_crossings
     assert all(c["authority"] == "verified" for c in bridge_crossings)
-    assert any(c["confirmed_event_id"] == "evt-bfk_acct" for c in bridge_crossings)
+    assert any(
+        c["confirmed_event_id"] == confirmed_bridge_event_id for c in bridge_crossings)
 
 
 # ── CLI/admin entrypoint: the flag is read HERE (never in the harness) ──
