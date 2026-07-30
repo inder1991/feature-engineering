@@ -3610,7 +3610,20 @@ button.stat:hover {
    review are three independent facts about a row, so each gets its own labelled cell with its own
    tinted rule — never one shared badge, one shared colour or one shared sort key. The tones say
    "settled / open / needs care / off", NOT "approved / not approved": an `open` human-review cell
-   sits next to an `ok` execution cell all the time, and that pairing must read as ordinary. */
+   sits next to an `ok` execution cell all the time, and that pairing must read as ordinary.
+
+   KEYBOARD: every control on this screen is a native <button> or <input>, so the base
+   :focus-visible ring (2px --accent, 2px offset) is the whole story — no rule here removes it and
+   nothing here is a click-handling div. The ring clears 3:1 (WCAG 1.4.11) on all three fills the
+   queue renders it against: --surface 6.43:1, --surface-2 6.07:1 (filter bar, member rows),
+   --accent-soft 5.35:1 (decision panels). No ancestor clips it — nothing in this block sets
+   overflow.
+
+   MOTION: this block declares no transition and no animation of its own. The `.btn` / `.gj-chip`
+   colour transitions it inherits are already neutralised by the global
+   @media (prefers-reduced-motion: reduce) block at the top of this sheet, so a second media query
+   here would be dead weight. If a transition is ever added below, check that block still covers
+   it rather than adding another. */
 
 .gq > * + * {
   margin-top: 14px;
@@ -3744,14 +3757,20 @@ button.stat:hover {
 
 /* ---- the three axes ---- */
 
+/* min() on the track floor: a bare minmax(210px, 1fr) keeps a 210px column even when the row is
+   narrower than that, and the overflow lands on the page body as a sideways scroll. With
+   min(210px, 100%) the strip collapses to the container instead. */
 .gq-axes {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
   gap: 8px;
   margin: 0;
 }
 
+/* grid items floor at min-content: without this an unbroken code from the payload widens the
+   track past the row edge (.row already sets overflow-wrap: anywhere, which does the wrapping). */
 .gq-axis {
+  min-width: 0;
   padding: 7px 10px 8px;
   border: 1px solid var(--line);
   border-left-width: 3px;
@@ -3847,7 +3866,7 @@ button.stat:hover {
 
 .gq-usage-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
   gap: 8px;
   margin: 0;
 }
@@ -3906,6 +3925,13 @@ button.stat:hover {
   border: 1px solid var(--accent-line);
   border-radius: var(--radius);
   background: var(--accent-soft);
+}
+
+/* A note field is a grid item, so its intrinsic width becomes the column floor and a narrow row
+   would push the panel sideways. Stretch it instead. */
+.gq-panel > input {
+  min-width: 0;
+  width: 100%;
 }
 
 /* on --accent-soft: the head is --accent at 5.35:1, the note --ink-soft at 6.34:1, and a
