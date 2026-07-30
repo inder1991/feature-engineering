@@ -24,9 +24,6 @@ from tests.featuregen.overlay.upload._bridge_fixtures import (
     seed_verified_bridge as _seed_verified_bridge_fact,
 )
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
-from tests.featuregen.overlay.upload.planner._unattested_bridge import (
-    needs_attested_bridge_cardinality,
-)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.commands import propose_fact
@@ -123,7 +120,17 @@ def _binding_for(need_role, catalog, object_ref):
 def two_catalog_bridged_fixture(db, service_actor, human_actor):
     """core_banking.transactions (transaction grain, a monetary_flow measure) reaches entity
     ``customer`` ONLY by CROSSING to wealth via a VERIFIED ``entity_bridge`` at ``account``, then an
-    intra-wealth realization ``account -> customer``. Landing = wealth.customers (VERIFIED grain)."""
+    intra-wealth realization ``account -> customer``. Landing = wealth.customers (VERIFIED grain).
+
+    ``wealth.accounts`` — the bridge's FAR ENDPOINT — carries a VERIFIED grain fact too, because the
+    crossing here is a ROLL-UP hop whose fan-in is DERIVED from that grain (``declarations.
+    _hop_evidence``): nothing in a bridge attests the far side's grain, so without the fact the hop is
+    honestly unattested and every measure staged on it fails closed. That is the same "VERIFIED grain
+    on EVERY hop endpoint" the sibling bridged fixtures seed
+    (``test_multisource_plan._seed_all_hop_grains``). This fixture used to grain only the landing —
+    the one omission the old ``many_to_one`` "BY CONSTRUCTION" constant let it get away with. The
+    file-declared ``is_grain`` flag on the column is the uploader's claim about their own file and
+    attests nothing."""
     ensure_upload_catalog_adapter()
     _seed(db, "core_banking", [
         (CanonicalRow("core_banking", "transactions", "transaction_id", "integer", is_grain=True),
@@ -141,6 +148,8 @@ def two_catalog_bridged_fixture(db, service_actor, human_actor):
     _seed_verified_bridge(db, "bfk_acct", "account",
                           "core_banking", "public.transactions.account_id",
                           "wealth", "public.accounts.account_id")
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
     _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
                          service_actor=service_actor, human_actor=human_actor)
     return db, _scope("core_banking", "wealth"), _NOW
@@ -181,7 +190,6 @@ def two_catalog_take_latest_fixture(db, service_actor, human_actor):
 
 
 # ── the SPIKE ─────────────────────────────────────────────────────────────────────────────────
-@needs_attested_bridge_cardinality
 def test_injected_operand_template_rolls_up_and_compiles(two_catalog_bridged_fixture):
     conn, scope, now = two_catalog_bridged_fixture
     tmpl = injected_operand_template(recipe_id="ms:op_0", need_role="measure_0",

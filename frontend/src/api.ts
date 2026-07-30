@@ -663,6 +663,149 @@ export function rejectTableFact(
   })
 }
 
+// ---- entity-bridge governance (the CROSS-CATALOG confirm surface) ---------------------------
+// An entity bridge links the SAME business entity in two catalogs (the customer on a transaction
+// and the customer in the customer master). Confirming one records that a HUMAN AGREES WITH THE
+// SEMANTIC RELATIONSHIP — it is not permission to execute anything: a proposed bridge is already
+// consumed, and whether the crossing may run automatically is the separate production-eligibility
+// axis the queue reports on its own.
+//
+// Four-eyes is a SERVER decision, projected into `available_actions` on the queue item — never
+// recomputed here. A VERIFIED bridge carries NO actions at all (reject_fact denies it; re-verify
+// has its own flow), so the UI must not offer one.
+
+// Why a reviewer says no to a cross-catalog identifier link — mirrors the backend
+// EntityBridgeRejectCategory Literal exactly. `values_do_not_match` is the type-compatible pair
+// whose populations simply do not overlap, which `type_basis: 'declared'` cannot see.
+export const ENTITY_BRIDGE_REJECT_CATEGORIES = [
+  'not_the_same_entity', 'wrong_column', 'values_do_not_match', 'duplicate_bridge',
+  'needs_data_check',
+] as const
+export type EntityBridgeRejectCategory = (typeof ENTITY_BRIDGE_REJECT_CATEGORIES)[number]
+
+export function confirmEntityBridge(
+  factKey: string,
+  body: { note?: string },
+): Promise<{ governance_status: string; operational_projection: string }> {
+  return post(`/governance/entity-bridges/${encodeURIComponent(factKey)}/confirm`, {
+    note: body.note ?? null,
+  })
+}
+
+export function rejectEntityBridge(
+  factKey: string,
+  body: { category: EntityBridgeRejectCategory; note?: string },
+): Promise<{ governance_status: string; category: string; operational_projection: string }> {
+  return post(`/governance/entity-bridges/${encodeURIComponent(factKey)}/reject`, {
+    category: body.category,
+    note: body.note ?? null,
+  })
+}
+
+// One key's outcome in a group reject. The route fans out to ONE governed command per key, each
+// with its own audit row and its own savepoint, so PARTIAL success is the ordinary case and there
+// is no single status code for it: the call always resolves 200 and the caller renders the split.
+// `outcome` is rejected | already_rejected | denied | not_found | failed — kept an open string so
+// a newer backend outcome still renders.
+export interface BulkBridgeRejectResult {
+  fact_key: string
+  outcome: string
+  detail?: string
+  operational_projection?: string
+}
+
+export function bulkRejectEntityBridges(
+  factKeys: string[],
+  category: EntityBridgeRejectCategory,
+  note?: string,
+): Promise<{
+  category: string
+  counts: Record<string, number>
+  results: BulkBridgeRejectResult[]
+}> {
+  return post('/governance/entity-bridges/bulk-reject', {
+    fact_keys: factKeys,
+    category,
+    note: note ?? null,
+  })
+}
+
+// ---- the cross-catalog governance QUEUE (GET /governance/queue) ------------------------------
+// One request, no source argument: every pending decision the caller may see across every catalog
+// they may see. Every other governance listing is keyed by a slug the operator had to already know.
+//
+// THE TWO CODE FIELDS ARE TWO INDEPENDENT AXES AND MUST NEVER BE FUSED:
+//   * `state` / `state_code`   — the HUMAN axis (has someone endorsed the semantics?)
+//   * `production_eligibility` / `production_eligibility_code` — the AUTOMATIC axis (is the
+//     directional realization / cardinality resolved, so the crossing may run in production?)
+// Human review controls neither availability nor execution: a row can legitimately be unreviewed
+// AND production-eligible, or human-endorsed AND sandbox-only. Bind to the *_code fields — the
+// labels are display text the backend may reword; the codes are the contract.
+
+// One "already depended on by" category. `count` is null unless `state === 'counted'`, so the
+// wire itself makes "unmeasured" unrepresentable as a number: an empty store answers
+// `not_tracked_yet` and MUST render as "not tracked yet", never 0. `state` is
+// counted | not_tracked_yet | unreadable (open string for forward compatibility); `reason` says
+// WHY a category cannot be measured and `basis` says exactly what a count would mean.
+export interface GovernanceQueueUsage {
+  category: string
+  state: string
+  count: number | null
+  display: string
+  store: string
+  basis: string
+  reason: string
+}
+
+// One pending decision, whatever its kind. `kind` is entity_bridge | approved_join | grain |
+// availability_time (open string). `catalogs` holds BOTH catalogs for a bridge and the ONE
+// catalog for a join / table fact — the join listing filters on from_ref.catalog_source only and
+// is NOT endpoint-symmetric, so a join must never be presented as cross-catalog.
+// `available_actions` is the SERVER's sanctioned set for this caller (four-eyes already applied);
+// `already_depended_on_by` is bridges-only and is [] for kinds with no bridge anchor to count.
+export interface GovernanceQueueItem {
+  kind: string
+  fact_key: string
+  catalogs: string[]
+  subject: string
+  state: string
+  state_code: string
+  production_eligibility: string | null
+  production_eligibility_code: string
+  available_actions: string[]
+  detail: Record<string, unknown>
+  already_depended_on_by: GovernanceQueueUsage[]
+}
+
+// A listing or store that could not be READ. Reported so an empty queue and a broken one are
+// never the same answer: items [] with complete true means "nothing is waiting".
+export interface GovernanceQueueUnreadable {
+  listing: string
+  source: string | null
+  reason: string
+}
+
+export interface GovernanceQueue {
+  items: GovernanceQueueItem[]
+  // The catalogs this caller may see — the exact set the queue was built over, and the ONLY
+  // source of the catalog filter chips. There is NO display name anywhere in this system
+  // (graph_node carries no label): a UI may upper-case the slug, never invent prose.
+  catalogs: string[]
+  // SCOPE-RELATIVE by construction — two operators legitimately see different numbers for the
+  // same catalog, so neither map is ever a catalog total.
+  items_visible_to_you_by_catalog: Record<string, number>
+  items_visible_to_you_by_kind: Record<string, number>
+  unreadable: GovernanceQueueUnreadable[]
+  complete: boolean
+  truncated: boolean
+  counts_are_scope_relative: boolean
+  next_cursor: string | null
+}
+
+export function getGovernanceQueue(limit = 100): Promise<GovernanceQueue> {
+  return request(`/governance/queue?limit=${limit}`)
+}
+
 // ---- relationship readiness (read-only visibility over the governance outcomes) --------------
 // The per-table diagnostic behind the two queues above: one row per table with the precedence-
 // folded status (conflicting > confirmed > candidate_proposed > weak_candidates_only >

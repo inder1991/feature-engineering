@@ -253,9 +253,17 @@ def open_gaps(conn) -> tuple[GapDemand, ...]:
     distinct questions it blocks is what a later projector needs to turn repeated learning into
     prioritised ontology candidates.
     """
+    # The subjects come back as a `text[]`, read from any one row of the group — every row sharing a
+    # gap_key shares its subjects by construction, since the key is derived from them. They are
+    # deliberately NOT aggregated as text: `min(subject_refs::text)` then splitting on commas was
+    # wrong for any element PostgreSQL has to quote, so "customer segment" came back carrying its
+    # quotes and a subject containing a comma became two. Physical column refs never trip it, which
+    # is why it survived until the gaps were exposed over HTTP.
     rows = conn.execute(
         "SELECT g.gap_key, min(g.code), min(g.required_action), "
-        "       count(DISTINCT g.analysis_request_id), min(g.subject_refs::text) "
+        "       count(DISTINCT g.analysis_request_id), "
+        "       (SELECT s.subject_refs FROM analysis_learning_event s "
+        "          WHERE s.gap_key = g.gap_key AND s.kind = 'gap' LIMIT 1) "
         "FROM analysis_learning_event g "
         "WHERE g.kind = 'gap' AND NOT EXISTS ("
         "    SELECT 1 FROM analysis_learning_event r "
@@ -264,8 +272,7 @@ def open_gaps(conn) -> tuple[GapDemand, ...]:
     ).fetchall()
     out = []
     for gap_key, code, action, blocked, subjects in rows:
-        parsed = tuple(subjects.strip("{}").split(",")) if subjects else ()
-        out.append(GapDemand(gap_key=gap_key, code=code, subject_refs=parsed,
+        out.append(GapDemand(gap_key=gap_key, code=code, subject_refs=tuple(subjects or ()),
                              required_action=action, blocked_requests=int(blocked),
                              choices=CHOICE_VOCABULARIES.get(code, ())))
     return tuple(out)

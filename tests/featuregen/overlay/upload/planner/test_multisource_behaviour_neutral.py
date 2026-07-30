@@ -133,17 +133,34 @@ _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 # file, each with the reason. Per SYMBOL, never per file: everything else in the same file is still
 # held to behavioural identity, so this exception cannot grow silently into a blanket exemption.
 #
-# `declarations._hop_evidence` — the FAIL-CLOSE CORRECTION. Its bridge-rollup branch returned
-# `Cardinality.MANY_TO_ONE` "BY CONSTRUCTION": an assumption about the far side's grain presented as
-# evidence, which silently inflates every SUM taken across a bridge whose far side is not actually at
-# that grain. It now returns unknown, with the `bridge_unattested` source constant replacing the
-# `bridge_construction` one. This is a CORRECTNESS change the product owner directed, not a
-# shadow-engine perturbation: the branch it touches is reachable only from a cross-catalog plan,
-# which single-source `plan_bindings` never produces — and proof 2 (RUNTIME) measures that directly
-# and still passes. Escalate anything that appears here without a matching, owner-directed reason.
+# THE CARDINALITY CORRECTION, in two owner-directed steps. Step 1 (fail-close) removed the
+# `Cardinality.MANY_TO_ONE` a bridge-rollup hop returned "BY CONSTRUCTION" — an assumption about the
+# far side's grain presented as evidence, which silently inflates every SUM taken across a bridge
+# whose far side is not in fact at that grain. Step 2 (tier 2, these entries) restores the capability
+# by DERIVING the fan-in instead: a hop whose far endpoint IS the far table's complete, current,
+# VERIFIED, unique grain really is many_to_one, and anything short of that stays unknown.
+#
+#   `_hop_evidence`                        — the derivation itself, and the fail-closed default.
+#   `CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN`  — the new `source` vocabulary entry naming that evidence.
+#   `CompilerContext`                      — carries the batch-read `governed_grain_by_table` the
+#                                            derivation reads (the context stays conn-free and pure).
+#   `build_compiler_context`               — batch-reads it once per run for the tables the active
+#                                            bridges name.
+#
+# Both steps are CORRECTNESS changes, not shadow-engine perturbations: the branch they touch is
+# reachable only from a cross-catalog plan, which single-source `plan_bindings` never produces, and
+# proof 2 (RUNTIME) measures that directly and still passes.
+#
+# Step 1's own entries (`CARDINALITY_SOURCE_BRIDGE`, `CARDINALITY_SOURCE_BRIDGE_UNATTESTED`) are GONE
+# from this list, not because they stopped mattering but because they are now IN the baseline: the
+# correction landed on origin/main, so the merge-base this proof compares against already contains it.
+# That is the intended end state — the allow-list shrinks as each correction becomes the baseline
+# rather than accumulating forever. Escalate anything that appears here without a matching,
+# owner-directed reason.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
-        "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE", "CARDINALITY_SOURCE_BRIDGE_UNATTESTED",
+        "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
+        "build_compiler_context",
     }),
 }
 

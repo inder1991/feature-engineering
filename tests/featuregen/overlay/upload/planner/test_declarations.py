@@ -19,8 +19,10 @@ from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.catalog_realizations import (
     derive_catalog_realizations,
     realization_fingerprint,
+    table_of,
 )
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.governed_grain import load_governed_grains
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.need_metadata import RESOLVED_NEED_METADATA
 from featuregen.overlay.upload.planner import contracts as c
@@ -89,11 +91,24 @@ def _ctx(db, *catalogs: str, roles: tuple[str, ...] = (),
     """The C2 test constructor — batch-loads via the REAL loaders, then drops the connection.
     (The per-run production builder `build_compiler_context` is C8.) ``agg`` injects the declared
     aggregation-function registry (F5) — EMPTY in production, populated only by tests. ``roles``
-    feeds the READ-SCOPED column load (C6: a pii column is loaded only for a pii_reader)."""
+    feeds the READ-SCOPED column load (C6: a pii column is loaded only for a pii_reader).
+
+    ``governed_grain_by_table`` is loaded through the REAL reader over the REAL active bridges, the
+    same way `build_compiler_context` does it — never hand-written. A test that injected a grain map
+    directly would assert against its own claim about the catalog instead of the catalog's."""
+    bridges = active_bridges(db)
     return CompilerContext(
         realizations_by_catalog={
             s: derive_catalog_realizations(db, s).realizations for s in catalogs},
-        active_bridges=active_bridges(db),
+        active_bridges=bridges,
+        governed_grain_by_table=load_governed_grains(
+            db,
+            ((cat, table_of(ref))
+             for br in bridges
+             for cat, ref in ((br.left_catalog_source, br.left_object_ref),
+                              (br.right_catalog_source, br.right_object_ref))
+             if cat in catalogs),
+            now=_NOW),
         columns_by_catalog={
             s: {col.object_ref: col for col in _load_columns(db, s, roles)} for s in catalogs},
         catalog_fingerprint_at_start={s: realization_fingerprint(db, s) for s in catalogs},
@@ -268,7 +283,8 @@ def test_compile_budget_is_plain_mutable():
 
 def _empty_ctx() -> CompilerContext:
     return CompilerContext(
-        realizations_by_catalog={}, active_bridges=(), columns_by_catalog={},
+        realizations_by_catalog={}, active_bridges=(), governed_grain_by_table={},
+        columns_by_catalog={},
         catalog_fingerprint_at_start={}, bridge_fingerprint_at_start="", catalog_stamps={},
         config=_overlay_config(), roles=(), now=_NOW, agg_declarations={})
 
@@ -882,21 +898,288 @@ def _bridge_rollup_plan():
         ))
 
 
-def test_bridge_rollup_hop_cardinality_is_unknown_never_assumed(db):
-    """THE fail-close correction. This branch used to return `many_to_one` "BY CONSTRUCTION" — an
-    ASSUMPTION presented as evidence. Nothing in the bridge attests the DIRECTION of the join or the
-    grain of its far side; if that side is not actually at the claimed grain the hop is 1:N, rows
-    multiply, and every SUM over it inflates into a plausible number with no error anywhere.
+def _mirrored_bridge_segment():
+    """The SAME bridge, crossed the OTHER way: the hop lands in ``core``, so the far endpoint is
+    ``core.accounts.customer_id``. A bridge's identity is unordered — only the segment's catalog says
+    which direction is being asked about."""
+    return c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "core",
+                                  from_entity="customer", to_entity="account",
+                                  bridge_fact_key="bridge:customer:c4")
 
-    The codebase already refuses precisely this (`materialize/joins.py`): "Unknown cardinality is
-    refused ... 'We do not know' is not 'it is safe'." Until DIRECTIONAL REALIZATIONS exist there is
-    no evidence to return, so the hop resolves UNKNOWN and every stage on it fails closed.
 
-    Test strength: none of these assertions can pass against the `Cardinality.MANY_TO_ONE` constant.
-    """
+def _verified_grain(db, source, table, columns, *, service_actor, human_actor, unique=True):
+    """A VERIFIED grain fact through the REAL four-eyes flow (service propose -> platform-admin
+    confirm -> drain the projection). Never a hand-set row: the whole point of tier 2 is that the
+    cardinality is DERIVED from governed evidence, so a test that manufactured the evidence would be
+    asserting against its own claim."""
+    from tests.featuregen.overlay.upload.conftest import _drain, _open_grain_task
+
+    from featuregen.contracts.envelopes import Command
+    from featuregen.overlay.commands import confirm_fact, propose_fact
+    from featuregen.overlay.upload.upload_catalog import (
+        ensure_upload_catalog_adapter,
+        table_ref,
+    )
+
+    ensure_upload_catalog_adapter()
+    ref = table_ref(source, table)
+    value = {"columns": list(columns), "is_unique": unique}
+    res = propose_fact(db, Command(
+        "propose_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "grain", "proposed_value": value},
+        service_actor, f"propose-grain-{source}-{table}"))
+    assert res.accepted, res.denied_reason
+    _task, target, _ref = _open_grain_task(db, source, table, actor=human_actor)
+    res = confirm_fact(db, Command(
+        "confirm_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "grain", "target_event_id": target, "value": value},
+        human_actor, f"confirm-grain-{target}"))
+    assert res.accepted, res.denied_reason
+    _drain(db)
+
+
+def _grain_fact_row(db, source, table):
+    from featuregen.overlay.identity import fact_key as _fk
+    from featuregen.overlay.upload.upload_catalog import table_ref
+
+    return db.execute(
+        "SELECT status, expires_at FROM overlay_fact_state WHERE fact_key = %s",
+        (_fk(table_ref(source, table), "grain"),)).fetchone()
+
+
+# ── TIER 2: many_to_one DERIVED from the far table's governed grain ──────────────────────────────
+def test_bridge_rollup_hop_derives_many_to_one_from_the_far_governed_grain(
+        db, service_actor, human_actor):
+    """THE DERIVATION. The hop lands on ``crm.customers.customer_id``, and a VERIFIED grain fact says
+    that column — all of it, nothing else — identifies rows of ``crm.customers``. So at most one far
+    row exists per key value and the hop IS many_to_one. That is derived from evidence, not assumed:
+    the same plan over the same bridge resolves UNKNOWN in every neighbouring test where the evidence
+    is missing, partial, expired, non-unique or about the other direction.
+
+    The GROUP BY and the execution site come back too, because now they are proven: grouping at a
+    column that is the far table's whole grain is grouping at that table's own row identity."""
     _bridge_core_crm(db)
+    _verified_grain(db, "crm", "customers", ["customer_id"],
+                    service_actor=service_actor, human_actor=human_actor)
     ctx = _ctx(db, "core", "crm")
     plan = _bridge_rollup_plan()
+
+    assert ctx.governed_grain_by_table["crm"]["public.customers"] == ("customer_id",)
+    assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (
+        Cardinality.MANY_TO_ONE, "bridge_far_grain", ("public.customers.customer_id",))
+    (hop,) = _c4_compile(ctx, plan)
+    assert (hop.semantic_hop_index, hop.segment_index) == (0, 1)
+    assert hop.physical_cardinality is Cardinality.MANY_TO_ONE
+    assert hop.cardinality_source == "bridge_far_grain"
+    assert hop.grouping_keys == ("public.customers.customer_id",)
+    assert (hop.execution_catalog, hop.execution_table) == ("crm", "public.customers")
+    (stage,) = hop.ingredient_stages
+    assert stage.need_role == "balance"
+    assert stage.validation is c.AggregationValidation.sound   # semi_additive, single-PIT
+    assert stage.reason_codes == ()
+
+
+def _bridge_core_crm_snapshotted(db):
+    """The SAME bridge, but ``crm.customers`` is a SNAPSHOT table: its governed grain is the composite
+    ``(customer_id, snapshot_dt)``, so the bridge endpoint is only ONE MEMBER of it. Seeds ``crm``'s
+    whole graph itself (``build_graph`` replaces a catalog per call), so it is self-contained."""
+    _seed(db, "core", [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "customer_id", "integer"), "customer_id"),
+        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+    ])
+    _seed(db, "crm", [
+        (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow("crm", "customers", "snapshot_dt", "date", is_grain=True), "as_of_date"),
+        (CanonicalRow("crm", "customers", "spend", "numeric"), "monetary_flow"),
+    ])
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
+        " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
+        ("bridge:customer:c4", "customer", "core", "public.accounts.customer_id",
+         "crm", "public.customers.customer_id"))
+
+
+def test_one_member_of_a_composite_grain_derives_nothing(db, service_actor, human_actor):
+    """A COLUMN THAT IS MERELY PART OF THE GRAIN IS NOT THE GRAIN. ``crm.customers`` is a snapshot
+    table keyed by ``(customer_id, snapshot_dt)``; the bridge lands on ``customer_id`` alone, so the
+    far side holds one row per snapshot per customer. Joining on ``customer_id`` fans out over every
+    snapshot, and a SUM across the hop counts each customer once per snapshot — a plausible number,
+    silently multiplied.
+
+    This is ``spine._refuse_non_unique_keys``' both-directions rule with the one relaxation it allows
+    removed: grain columns the key does not contain mean many rows per key, legal there only because a
+    snapshot POLICY names the columns it collapses, and a bridge hop has no such policy. So the test
+    is set EQUALITY against the whole grain.
+
+    Test strength: the grain is VERIFIED, unique, unexpired and CONTAINS the endpoint column. An
+    implementation that asked "is the endpoint one of the grain columns" (or that derived from any
+    grain fact existing at all) passes everything else and fails here."""
+    _bridge_core_crm_snapshotted(db)
+    _verified_grain(db, "crm", "customers", ["customer_id", "snapshot_dt"],
+                    service_actor=service_actor, human_actor=human_actor)
+    ctx = _ctx(db, "core", "crm")
+
+    # the grain IS attested — and it is wider than the endpoint
+    assert ctx.governed_grain_by_table["crm"]["public.customers"] == (
+        "customer_id", "snapshot_dt")
+    assert hop_physical_cardinality(ctx, _bridge_rollup_plan().path_segments[1]) == (
+        None, "bridge_unattested", ())
+    (hop,) = _c4_compile(ctx, _bridge_rollup_plan())
+    assert hop.physical_cardinality is None
+    assert hop.grouping_keys == () and hop.execution_table == ""
+    (stage,) = hop.ingredient_stages
+    assert stage.reason_codes == (c.ReasonCode.physical_cardinality_unavailable,)
+
+
+def test_grain_evidence_is_direction_specific(db, service_actor, human_actor):
+    """DIRECTION COMES FROM THE HOP, NEVER FROM THE BRIDGE. One bridge, one grain fact, two hops.
+
+    ``crm.customers`` is at ``customer_id`` grain, so the hop that LANDS there is many_to_one.
+    ``core.accounts`` is governed too — at ``account_id`` — and the mirrored hop lands on its
+    ``customer_id`` column, which is not its grain: many accounts per customer, so that direction is
+    1:N and derives nothing. Evidence that A -> B is many_to_one says nothing whatever about B -> A.
+
+    Test strength: an implementation that read "either endpoint's table has a governed grain", or that
+    read the grain of the table the hop came FROM, passes the first assertion and fails the second."""
+    _bridge_core_crm(db)
+    _verified_grain(db, "crm", "customers", ["customer_id"],
+                    service_actor=service_actor, human_actor=human_actor)
+    _verified_grain(db, "core", "accounts", ["account_id"],
+                    service_actor=service_actor, human_actor=human_actor)
+    ctx = _ctx(db, "core", "crm")
+
+    # both tables carry attested grain — so neither verdict below can be "no evidence anywhere"
+    assert ctx.governed_grain_by_table["crm"]["public.customers"] == ("customer_id",)
+    assert ctx.governed_grain_by_table["core"]["public.accounts"] == ("account_id",)
+
+    into_crm = hop_physical_cardinality(ctx, _bridge_rollup_plan().path_segments[1])
+    assert into_crm == (Cardinality.MANY_TO_ONE, "bridge_far_grain",
+                        ("public.customers.customer_id",))
+    into_core = hop_physical_cardinality(ctx, _mirrored_bridge_segment())
+    assert into_core == (None, "bridge_unattested", ())
+
+
+def test_an_expired_grain_derives_nothing(db, service_actor, human_actor):
+    """A grain past ``expires_at`` is refused at READ time, before the async poller has moved it off
+    VERIFIED. The compiler reads the grain at its own ``ctx.now``, so the same catalog derives
+    many_to_one at one instant and nothing at another — which is the point: re-verification overdue is
+    not evidence.
+
+    Test strength: the fact is still VERIFIED in the read model and still names exactly the endpoint
+    column. Only the clock has moved."""
+    _bridge_core_crm(db)
+    _verified_grain(db, "crm", "customers", ["customer_id"],
+                    service_actor=service_actor, human_actor=human_actor)
+    status, expires_at = _grain_fact_row(db, "crm", "customers")
+    assert status == "VERIFIED" and expires_at is not None
+
+    fresh = _ctx(db, "core", "crm")
+    assert hop_physical_cardinality(fresh, _bridge_rollup_plan().path_segments[1])[0] \
+        is Cardinality.MANY_TO_ONE
+
+    expired = dataclasses.replace(
+        fresh, now=expires_at + timedelta(seconds=1),
+        governed_grain_by_table=load_governed_grains(
+            db, [("crm", "public.customers")], now=expires_at + timedelta(seconds=1)))
+    assert _grain_fact_row(db, "crm", "customers")[0] == "VERIFIED"   # the poller has NOT run
+    assert hop_physical_cardinality(expired, _bridge_rollup_plan().path_segments[1]) == (
+        None, "bridge_unattested", ())
+
+
+def test_a_grain_no_longer_verified_derives_nothing(db, service_actor, human_actor):
+    """The other half of staleness: once the expiry poller has run the fact sits in REVERIFY, still
+    carrying its last VERIFIED value as read-only context. VERIFIED is the only servable status, so
+    the derivation stops immediately rather than at the next re-upload."""
+    _bridge_core_crm(db)
+    _verified_grain(db, "crm", "customers", ["customer_id"],
+                    service_actor=service_actor, human_actor=human_actor)
+    assert hop_physical_cardinality(
+        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1])[0] \
+        is Cardinality.MANY_TO_ONE
+
+    from featuregen.overlay.identity import fact_key as _fk
+    from featuregen.overlay.upload.upload_catalog import table_ref
+    db.execute("UPDATE overlay_fact_state SET status = 'REVERIFY' WHERE fact_key = %s",
+               (_fk(table_ref("crm", "customers"), "grain"),))
+    ctx = _ctx(db, "core", "crm")
+    assert ctx.governed_grain_by_table == {}
+    assert hop_physical_cardinality(ctx, _bridge_rollup_plan().path_segments[1]) == (
+        None, "bridge_unattested", ())
+
+
+def test_a_grain_whose_uniqueness_is_only_scoped_derives_nothing(db, service_actor, human_actor):
+    """SCOPED UNIQUENESS WITHOUT THE PREDICATE. ``is_unique=False`` is what a VERIFIED grain looks
+    like when the columns are the grain but uniqueness is not attested unconditionally — a key that is
+    unique only among current rows of an SCD table, or within one partition. The safe join is
+    "... WHERE <predicate>", and the governed grain value is a closed schema with nowhere to record
+    the predicate, so it cannot be written. Grain confirmation validates PHYSICAL UNIQUENESS; without
+    that half there is nothing to derive from.
+
+    Test strength: the fact is VERIFIED, unexpired, complete, and names exactly the endpoint column.
+    Only ``is_unique`` differs from the positive case."""
+    _bridge_core_crm(db)
+    _verified_grain(db, "crm", "customers", ["customer_id"],
+                    service_actor=service_actor, human_actor=human_actor, unique=False)
+    from featuregen.overlay.identity import fact_key as _fk
+    from featuregen.overlay.upload.upload_catalog import table_ref
+    row = db.execute(
+        "SELECT status, value FROM overlay_fact_state WHERE fact_key = %s",
+        (_fk(table_ref("crm", "customers"), "grain"),)).fetchone()
+    assert row[0] == "VERIFIED" and row[1]["is_unique"] is False
+    ctx = _ctx(db, "core", "crm")
+    assert ctx.governed_grain_by_table == {}
+    assert hop_physical_cardinality(ctx, _bridge_rollup_plan().path_segments[1]) == (
+        None, "bridge_unattested", ())
+
+
+def test_deriving_a_cardinality_does_not_touch_bridge_availability(db, service_actor, human_actor):
+    """AVAILABILITY AND CARDINALITY-SAFETY ARE SEPARATE AXES, and tier 2 must not re-couple them from
+    the other side. The bridge is equally present in ``cross_catalog_links``, in ``active_bridges``
+    and in ``ctx.active_bridges`` whether its cardinality can be derived or not — nothing about
+    discovery, suggestions or bounded sandbox analysis moves when the grain fact appears."""
+    from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
+
+    _bridge_core_crm(db)
+    before_links = [(x.usable, x.left_object_ref, x.right_object_ref)
+                    for x in cross_catalog_links(db)]
+    before_bridges = [b.fact_key for b in active_bridges(db)]
+    before_ctx = [b.fact_key for b in _ctx(db, "core", "crm").active_bridges]
+    assert hop_physical_cardinality(
+        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1])[0] is None
+
+    _verified_grain(db, "crm", "customers", ["customer_id"],
+                    service_actor=service_actor, human_actor=human_actor)
+    assert hop_physical_cardinality(
+        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1])[0] \
+        is Cardinality.MANY_TO_ONE, "the derivation must actually have flipped"
+
+    assert [(x.usable, x.left_object_ref, x.right_object_ref)
+            for x in cross_catalog_links(db)] == before_links
+    assert [b.fact_key for b in active_bridges(db)] == before_bridges
+    assert [b.fact_key for b in _ctx(db, "core", "crm").active_bridges] == before_ctx
+
+
+def test_bridge_rollup_hop_cardinality_is_unknown_without_governed_grain(db):
+    """THE FAIL-CLOSE FLOOR, and the mutation control for the whole derivation. ``build_graph`` wrote
+    ``is_grain = true`` on ``crm.customers.customer_id`` straight from the upload, so an
+    implementation that enumerated grain from the flat flag — or that kept the old
+    ``many_to_one`` "BY CONSTRUCTION" constant — reports many_to_one here. Nobody has confirmed
+    anything, so the hop resolves UNKNOWN and every stage on it fails closed.
+
+    Nothing in a bridge attests the DIRECTION of the join or the grain of its far side; if that side
+    is not actually at that grain the hop is 1:N, rows multiply, and every SUM over it inflates into a
+    plausible number with no error anywhere. `materialize/joins.py` writes the same argument out:
+    "Unknown cardinality is refused ... 'We do not know' is not 'it is safe'."
+    """
+    _bridge_core_crm(db)
+    assert db.execute(
+        "SELECT is_grain, grain_fact_event_id FROM graph_node WHERE catalog_source = 'crm' "
+        "AND column_name = 'customer_id'").fetchone() == (True, None), \
+        "the file-declared flag must be present for this to be a real control"
+    ctx = _ctx(db, "core", "crm")
+    plan = _bridge_rollup_plan()
+    assert ctx.governed_grain_by_table == {}
 
     assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (
         None, "bridge_unattested", ())

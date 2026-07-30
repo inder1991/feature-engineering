@@ -25,9 +25,6 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
-from tests.featuregen.overlay.upload.planner._unattested_bridge import (
-    needs_attested_bridge_cardinality,
-)
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -141,7 +138,6 @@ class _BoomConn:
 
 
 # ── 1) happy path -> GovernedResult (two-axis governed; tri-state carried) ────────────────────────
-@needs_attested_bridge_cardinality
 def test_scenario1_happy_path_governs(
         db: DbConn, service_actor: IdentityEnvelope, human_actor: IdentityEnvelope,
         monkeypatch: pytest.MonkeyPatch) -> None:

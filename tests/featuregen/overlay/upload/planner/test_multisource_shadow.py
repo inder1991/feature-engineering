@@ -31,9 +31,6 @@ from tests.featuregen.overlay.upload._bridge_fixtures import (
     seed_verified_bridge as _seed_verified_bridge_fact,
 )
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
-from tests.featuregen.overlay.upload.planner._unattested_bridge import (
-    needs_attested_bridge_cardinality,
-)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
@@ -192,7 +189,6 @@ def _ratio_intent():
 
 
 # ── tests ──
-@needs_attested_bridge_cardinality
 def test_two_intent_run_manifest_first_persist_reconcile_clean(
         db, planning_conn, service_actor, human_actor):
     """The whole two-connection sequence over 2 gold intents: manifest on telemetry FIRST, plan on
@@ -250,7 +246,6 @@ def test_manifest_written_before_planning(db, planning_conn, service_actor, huma
     assert seen["dispatch_at_first_plan"] == 1   # manifest present before the plan ran
 
 
-@needs_attested_bridge_cardinality
 def test_injected_db_error_in_one_intent_is_isolated_technical_failure(
         db, planning_conn, service_actor, human_actor, monkeypatch):
     """A per-intent DB error is caught by the per-intent SAVEPOINT: it records ``technical_failure``
@@ -286,7 +281,6 @@ def test_injected_db_error_in_one_intent_is_isolated_technical_failure(
     assert rec.complete
 
 
-@needs_attested_bridge_cardinality
 def test_budget_exhausting_run_records_truncation(
         db, planning_conn, service_actor, human_actor, monkeypatch):
     """The harness owns ONE mutable ``CompileBudget`` across intents. With the per-run compile
@@ -336,7 +330,6 @@ def test_telemetry_persists_despite_fixture_rollback_two_connection_boundary(
     assert reconcile(db, "mrun_boundary").complete
 
 
-@needs_attested_bridge_cardinality
 def test_resolved_assembly_stale_union_lands_compile_incomplete(
         db, planning_conn, service_actor, human_actor):
     """M22: a governed plan whose ASSEMBLY axis resolves but whose compile-end UNION freshness is stale
@@ -355,7 +348,6 @@ def test_resolved_assembly_stale_union_lands_compile_incomplete(
     assert row["technical_status"] == "ok"              # not a technical/truncation failure
 
 
-@needs_attested_bridge_cardinality
 def test_governed_crossings_persisted_for_resolved_operand(
         db, planning_conn, service_actor, human_actor):
     """I-1 end-to-end: a resolved cross-catalog operand persists its governed crossings on the operand

@@ -19,15 +19,18 @@ from featuregen.api.routes import (
     assets,
     assist,
     auth,
+    catalogs,
     contract,
     entity,
     features,
     gate,
     governance,
     governance_dashboard,
+    governance_queue,
     graph,
     ingestion_runs,
     integrations,
+    learning,
     lineage,
     quarantine,
     readiness,
@@ -137,6 +140,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(ingestion_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
+    # `GET /catalogs` — the pick-list for every `{source}`-keyed surface below (read-scoped).
+    app.include_router(catalogs.router)
     app.include_router(assets.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
@@ -145,12 +150,15 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(lineage.router)
     app.include_router(features.router)
     app.include_router(governance.router)
+    # `GET /governance/queue` — the CROSS-catalog merge of the three source-keyed listings above.
+    app.include_router(governance_queue.router)
     app.include_router(governance_dashboard.router)
     app.include_router(gate.router)
     app.include_router(assist.router)
     app.include_router(contract.router)
     app.include_router(entity.router)
     app.include_router(suggestions.router)
+    app.include_router(learning.router)
 
     @app.get("/health")
     def health() -> dict:

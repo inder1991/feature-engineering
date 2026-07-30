@@ -208,3 +208,21 @@ def test_re_running_after_resolution_records_a_genuinely_DIFFERENT_remaining_gap
                         required_action=RequiredAction.PROFILE_DATA), now=_NOW)
     remaining = open_gaps(db)
     assert len(remaining) == 1 and remaining[0].code == "JOIN_CARDINALITY_UNKNOWN"
+
+
+# ── the subject list must survive the round trip ─────────────────────────────────────────────────
+
+def test_a_subject_containing_a_SPACE_round_trips_intact(db):
+    """`open_gaps` rebuilt the subject list by casting `text[]` to text and splitting on commas.
+    PostgreSQL quotes any element containing a space or comma, so the quotes came back as part of
+    the value.
+
+    This matters now that the gaps are exposed over HTTP: a business term is exactly the kind of
+    subject that has a space in it (`SEMANTIC_TERM_UNRESOLVED` on "customer segment"), and a
+    reviewer would be shown `"customer segment"` — or, with a comma, two subjects where there was
+    one. Physical column refs happened to be safe, which is why nothing caught it.
+    """
+    subjects = ("customer segment", "ftr::dpl_eib.tran_repos.cif_id")
+    record_gap(db, _gap(code="SEMANTIC_TERM_UNRESOLVED", subject_refs=subjects), now=_NOW)
+    (gap,) = open_gaps(db)
+    assert gap.subject_refs == subjects

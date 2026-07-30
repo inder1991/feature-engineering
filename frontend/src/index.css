@@ -3599,3 +3599,400 @@ button.stat:hover {
 .sug-reqs {
   font-size: 12.5px;
 }
+
+/* ---------------------------------------------------------------- governance decision queue
+   Appended for the rewritten GovernanceReviewScreen: one cross-catalog list of pending decisions.
+   Composes the existing .callout / .stats-.stat / .rows-.row-.q-item / .badge / .gj-chips /
+   .gj-actions / .gj-check / .empty / .hint vocabulary; the additions are the THREE-AXIS strip, the
+   usage grid, the decision panel and the candidate group. Nothing above this line is modified.
+
+   THE AXES ARE THE LOAD-BEARING PART. Link availability, automatic execution safety and human
+   review are three independent facts about a row, so each gets its own labelled cell with its own
+   tinted rule — never one shared badge, one shared colour or one shared sort key. The tones say
+   "settled / open / needs care / off", NOT "approved / not approved": an `open` human-review cell
+   sits next to an `ok` execution cell all the time, and that pairing must read as ordinary.
+
+   KEYBOARD: every control on this screen is a native <button> or <input>, so the base
+   :focus-visible ring (2px --accent, 2px offset) is the whole story — no rule here removes it and
+   nothing here is a click-handling div. The ring clears 3:1 (WCAG 1.4.11) on all three fills the
+   queue renders it against: --surface 6.43:1, --surface-2 6.07:1 (filter bar, member rows),
+   --accent-soft 5.35:1 (decision panels). No ancestor clips it — nothing in this block sets
+   overflow.
+
+   MOTION: this block declares no transition and no animation of its own. The `.btn` / `.gj-chip`
+   colour transitions it inherits are already neutralised by the global
+   @media (prefers-reduced-motion: reduce) block at the top of this sheet, so a second media query
+   here would be dead weight. If a transition is ever added below, check that block still covers
+   it rather than adding another. */
+
+.gq > * + * {
+  margin-top: 14px;
+}
+
+.gq-purpose {
+  margin-bottom: 4px;
+}
+
+.gq-notice {
+  margin: 0;
+}
+
+.gq-summary {
+  margin-block: 12px 6px;
+}
+
+.gq-filters {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+/* .gj-chip is a MONO face because a reject category is API vocabulary (`not_the_same_entity`) —
+   an identifier, near enough. These chips are not: they carry business prose ("All catalogs",
+   "Cross-catalog identifier links") plus a scope-relative count, so they take the sans face, with
+   tabular figures so a count does not jitter as the filter narrows. Scoped to .gq-filters, so the
+   reject chips in this screen's panels — and AssetDetailScreen's — keep the mono treatment. */
+.gq-filters .gj-chip {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* .gj-chip--on is a DANGER fill because its other use is picking a rejection reason, where red is
+   the truth. Here it made "All catalogs" — the default, selected on arrival — a danger chip, which
+   is a severity signal for an act that carries none. Narrowing a list is accent work.
+   --chip-ink on --accent is 6.25:1; the fill is 6.07:1 against the --surface-2 filter bar, and the
+   :focus-visible ring lands on that same fill-free 2px gap at 6.07:1. `aria-pressed` remains the
+   non-visual carrier of "selected", exactly as before. */
+.gq-filters .gj-chip--on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--chip-ink);
+}
+
+.gq-filters button.gj-chip--on:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* ---- per-kind section ---- */
+
+.gq-kind {
+  margin-top: 18px;
+}
+
+.gq-kind-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  font-size: 15px;
+}
+
+/* the per-kind count: a figure, not prose, so the mono face is right — and the markup adds
+   .tabular-nums so 1 and 11 occupy the same width as sections come and go. */
+.gq-kind-head span {
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.gq-kind-about {
+  margin: 4px 0 8px;
+}
+
+/* Settled is QUIET, not an error: a solid hairline and soft ink, no dashed alarm box. "We could
+   not look" is the one that gets the warn tint, because it is genuinely unknown. */
+.gq-settled {
+  border-style: solid;
+  border-color: var(--line);
+  padding: 14px 16px;
+  margin-block: 0;
+  font-size: 13.5px;
+}
+
+/* --ink on --warn-soft is 13.95:1; the --warn border is 5.34:1 against the ground it sits on. */
+.gq-broken {
+  border-style: solid;
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  padding: 14px 16px;
+  margin-block: 0;
+  color: var(--ink);
+  font-size: 13.5px;
+}
+
+/* ---- one row ---- */
+
+.gq-row > * + * {
+  margin-top: 8px;
+}
+
+.gq-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gq-row-kind {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* The catalog slug is an identifier, so it keeps the mono face. --accent on --accent-soft is
+   5.35:1, which clears 4.5:1 for this 11px uppercase label. */
+.badge.gq-catalog {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
+
+.gq-row-headline {
+  margin: 0;
+  font-size: 15.5px;
+  color: var(--ink);
+}
+
+.gq-row-subject {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+/* ---- the three axes ---- */
+
+/* min() on the track floor: a bare minmax(210px, 1fr) keeps a 210px column even when the row is
+   narrower than that, and the overflow lands on the page body as a sideways scroll. With
+   min(210px, 100%) the strip collapses to the container instead. */
+.gq-axes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+/* grid items floor at min-content: without this an unbroken code from the payload widens the
+   track past the row edge (.row already sets overflow-wrap: anywhere, which does the wrapping). */
+.gq-axis {
+  min-width: 0;
+  padding: 7px 10px 8px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.gq-axis-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.gq-axis-value {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+/* The left rule is the only colour: enough to separate the three cells at a glance, never enough
+   to read as a verdict badge.
+
+   A 3px rule that carries a state is a non-text indicator, so each SIGNALLING tone clears 3:1
+   (WCAG 1.4.11) against both fills it can sit between — the cell's own --surface and the
+   --surface-2 of a .gq-member row. Measured, in the same terms as --ln-join above:
+
+     tone   token       on --surface   on --surface-2   was
+     ok     --ok           5.53:1          5.22:1       (unchanged)
+     open   --accent       6.43:1          6.07:1       --accent-line 2.56 / 2.42 — BELOW 3:1
+     warn   --warn         5.34:1          5.05:1       (unchanged)
+     off    --ln-join      3.85:1          3.63:1       --line-strong 2.10 / 1.99 — BELOW 3:1
+     quiet  --line         1.50:1          1.42:1       (unchanged, and deliberate — see below)
+
+   `quiet` is the ONE tone deliberately left at hairline strength, because it is not an indicator:
+   it means "the payload has nothing to report on this axis" (not_observed / not_applicable / a code
+   this client cannot map), and it paints the rule the SAME colour as the rest of the cell's border,
+   so there is no state being signalled by colour for a reader to miss. What that axis says is
+   carried by its words and by `data-tone`, with the value dropped to --ink-soft (7.61:1 on surface,
+   7.19:1 on surface-2). Lifting it to 3:1 would manufacture a signal the data does not contain.
+
+   `off` (rejected / stale) stays achromatic on purpose — a red rule would read as a danger verdict
+   on a settled row — but at --ln-join it is now perceivable rather than a near-invisible hairline. */
+.gq-axis[data-tone='ok'] {
+  border-left-color: var(--ok);
+}
+
+.gq-axis[data-tone='open'] {
+  border-left-color: var(--accent);
+}
+
+.gq-axis[data-tone='warn'] {
+  border-left-color: var(--warn);
+}
+
+.gq-axis[data-tone='off'] {
+  border-left-color: var(--ln-join);
+}
+
+.gq-axis[data-tone='quiet'] {
+  border-left-color: var(--line);
+}
+
+.gq-axis[data-tone='quiet'] .gq-axis-value {
+  color: var(--ink-soft);
+}
+
+.gq-prov {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* ---- already depended on by ---- */
+
+.gq-usage {
+  padding: 8px 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.gq-usage-head {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.gq-usage-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.gq-usage-item {
+  min-width: 0;
+}
+
+.gq-usage-cat {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+  text-transform: capitalize;
+}
+
+.gq-usage-value {
+  margin: 1px 0 0;
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+/* An unmeasured category must not LOOK like a measurement: no tabular figures, no number weight.
+   It is words, in quieter ink, because "we cannot see this" is a different claim from "zero". */
+.gq-usage-not_tracked_yet,
+.gq-usage-unreadable {
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+.gq-usage-why {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+/* ---- actions + the withheld reason ---- */
+
+.gq-actions {
+  align-items: center;
+}
+
+.gq-why {
+  font-size: 12px;
+  color: var(--ink-soft);
+  max-width: 62ch;
+}
+
+.gq-panel {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+
+/* A note field is a grid item, so its intrinsic width becomes the column floor and a narrow row
+   would push the panel sideways. Stretch it instead. */
+.gq-panel > input {
+  min-width: 0;
+  width: 100%;
+}
+
+/* on --accent-soft: the head is --accent at 5.35:1, the note --ink-soft at 6.34:1, and a
+   :focus-visible ring inside the panel is --accent at 5.35:1 (>= 3:1, WCAG 1.4.11). */
+.gq-panel-head {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.gq-panel-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+/* "tick the statement you agree with" is a sentence, and .gj-gate-hint is mono. Sans here, scoped
+   to this screen's panels so the shared class keeps its face on AssetDetailScreen. */
+.gq-panel .gj-gate-hint {
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+/* ---- the candidate group ---- */
+
+.gq-group > * + * {
+  margin-top: 8px;
+}
+
+.gq-group-note {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.gq-members {
+  margin-top: 10px;
+  padding-left: 12px;
+  border-left: 2px solid var(--line);
+}
+
+.gq-member {
+  background: var(--surface-2);
+}

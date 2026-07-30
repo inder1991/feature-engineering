@@ -216,7 +216,9 @@ describe('SuggestedFeaturesScreen', () => {
     renderScreen()
     expect(await screen.findByText(/7 features are blocked/i)).toBeInTheDocument()
     expect(screen.getByText(/no confirmed as-of column/i)).toBeInTheDocument()
-    expect(screen.getByText(/grain & availability/i)).toBeInTheDocument()
+    // Governance review is one cross-catalog decision queue now, not three source-keyed tabs, so
+    // the pointer names where in that queue the fact is waiting.
+    expect(screen.getByText(/under as-of date/i)).toBeInTheDocument()
   })
 
   it('treats zero clean & ready with cards present as the honest normal state, not an error',

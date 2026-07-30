@@ -250,8 +250,8 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
               future leakage.
             </p>
             <p className="hint">
-              Confirm the table’s as-of column on Governance review → Grain &amp; availability, and
-              these come back on their own.
+              Confirm the table’s as-of column on Governance review — it waits there under As-of
+              date — and these come back on their own.
             </p>
           </div>
         </div>
