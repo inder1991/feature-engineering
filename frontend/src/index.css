@@ -3637,6 +3637,17 @@ button.stat:hover {
   background: var(--surface-2);
 }
 
+/* .gj-chip is a MONO face because a reject category is API vocabulary (`not_the_same_entity`) —
+   an identifier, near enough. These chips are not: they carry business prose ("All catalogs",
+   "Cross-catalog identifier links") plus a scope-relative count, so they take the sans face, with
+   tabular figures so a count does not jitter as the filter narrows. Scoped to .gq-filters, so the
+   reject chips in this screen's panels — and AssetDetailScreen's — keep the mono treatment. */
+.gq-filters .gj-chip {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- per-kind section ---- */
 
 .gq-kind {
@@ -3651,6 +3662,8 @@ button.stat:hover {
   font-size: 15px;
 }
 
+/* the per-kind count: a figure, not prose, so the mono face is right — and the markup adds
+   .tabular-nums so 1 and 11 occupy the same width as sections come and go. */
 .gq-kind-head span {
   padding: 1px 8px;
   border: 1px solid var(--line);
@@ -3910,6 +3923,13 @@ button.stat:hover {
   margin: 0;
   font-size: 12.5px;
   color: var(--ink-soft);
+}
+
+/* "tick the statement you agree with" is a sentence, and .gj-gate-hint is mono. Sans here, scoped
+   to this screen's panels so the shared class keeps its face on AssetDetailScreen. */
+.gq-panel .gj-gate-hint {
+  font-family: var(--font-sans);
+  font-size: 12px;
 }
 
 /* ---- the candidate group ---- */
