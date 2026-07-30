@@ -52,7 +52,9 @@ wait_ready() {                       # wait_ready <attempts>
 
 if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = "true" ]; then
   echo "$NAME is running on port $PORT; probing HiveServer2"
-  if wait_ready 12; then exit 0; fi   # ~1 min grace for a server still booting
+  # Only a SHORT grace: every failed probe costs the full 20s timeout against a hung server,
+  # so a generous loop here spends minutes proving what two attempts already showed.
+  if wait_ready 3; then exit 0; fi
   echo "$NAME is up but not answering — replacing it" >&2
 fi
 
