@@ -32,11 +32,27 @@ class ApprovedJoinRef:
 @dataclass(frozen=True, slots=True)
 class EntityBridgeRef:
     """A cross-catalog entity bridge: the SAME entity_id via an identifier column in two DISTINCT
-    catalogs. Bridge identity is UNORDERED — (left, right) and (right, left) denote the same bridge, so
-    fact_key canonicalizes the endpoints."""
+    catalogs. Bridge identity is UNORDERED — (left, right) and (right, left) denote the same bridge.
+
+    The endpoints are canonicalized ON CONSTRUCTION, so the ref itself carries one orientation and
+    every identity derived FROM it agrees: ``fact_key``, ``display_object_ref``, the ``asdict(ref)``
+    stored on ``OVERLAY_FACT_PROPOSED.payload``, and the value a caller builds out of ``left_ref`` /
+    ``right_ref``. It used to be canonicalized only inside ``fact_key``, which let the same bridge
+    hold ONE key and TWO of everything else — most damagingly two ``proposal_fingerprint``s, so a
+    human's REJECT (sticky by fingerprint) did not stop the swapped orientation from being proposed
+    onto the same fact and folding it back to an AVAILABLE state. A rejection is the one governance
+    decision that must be durable, and canonicalizing at the type is what makes it so.
+    """
     entity_id: str
     left_ref: CatalogObjectRef
     right_ref: CatalogObjectRef
+
+    def __post_init__(self) -> None:
+        left, right = canonical_bridge_endpoints(self.left_ref, self.right_ref)
+        if left is not self.left_ref:
+            # frozen dataclass: the same escape hatch dataclasses' own __init__ uses
+            object.__setattr__(self, "left_ref", left)
+            object.__setattr__(self, "right_ref", right)
 
 
 def _ref_from_payload(d):
@@ -76,6 +92,54 @@ def _digest(canonical: object) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+#: The fields of a catalog object ref, in the order they are compared. Same order as `_ref_tuple`,
+#: so the endpoint ordering below and the `fact_key` digest read the endpoints identically.
+_ENDPOINT_FIELDS = ("catalog_source", "object_kind", "schema", "table", "column")
+
+
+def _endpoint_order_key(parts) -> tuple[str, ...]:
+    """The ONE total order over bridge endpoints.
+
+    A missing part sorts as ``""`` rather than ``None``: a bare ``sorted`` raises comparing ``None``
+    against a string, which would make ordering an endpoint that names no column a crash rather than
+    a decision. In practice the FIRST part decides every legal bridge — the write gate requires two
+    DISTINCT catalog sources — but the rule is total anyway so nothing downstream has to rely on
+    that."""
+    return tuple("" if p is None else _norm(str(p)) or "" for p in parts)
+
+
+def canonical_bridge_endpoints(
+    left: CatalogObjectRef, right: CatalogObjectRef
+) -> tuple[CatalogObjectRef, CatalogObjectRef]:
+    """The two endpoints of a bridge in canonical order — the single ordering rule every derivation
+    of bridge identity uses (``EntityBridgeRef``, ``fact_key``, ``proposal_fingerprint``, the
+    candidate ledger, the verified-edge projection). Returns the arguments UNCHANGED (identity, not
+    a copy) when they are already canonical, so a caller can cheaply test whether a swap happened."""
+    if (_endpoint_order_key(_ref_tuple(left)) <= _endpoint_order_key(_ref_tuple(right))):
+        return left, right
+    return right, left
+
+
+def canonical_bridge_value(value: Mapping) -> Mapping:
+    """A bridge's ``proposed_value`` with its endpoints in canonical order; anything else unchanged.
+
+    Shape-detected on the exact ``entity_id`` + ``left_ref`` + ``right_ref`` triple — the same
+    sniff ``_ref_from_payload`` uses, and the only fact value with that shape (an ``approved_join``
+    is DIRECTIONAL and names ``from_ref`` / ``to_ref``, so it is never reordered). A value already
+    in canonical order is returned untouched, so every fingerprint recorded before this existed
+    still matches: only the orientation that was producing a SECOND identity is re-keyed."""
+    if not isinstance(value, Mapping) or "entity_id" not in value:
+        return value
+    left, right = value.get("left_ref"), value.get("right_ref")
+    if not (isinstance(left, Mapping) and isinstance(right, Mapping)):
+        return value
+    left_key = _endpoint_order_key(left.get(f) for f in _ENDPOINT_FIELDS)
+    right_key = _endpoint_order_key(right.get(f) for f in _ENDPOINT_FIELDS)
+    if left_key <= right_key:
+        return value
+    return dict(value) | {"left_ref": right, "right_ref": left}
+
+
 def fact_key(
     ref: CatalogObjectRef | ApprovedJoinRef | EntityBridgeRef,
     fact_type: str,
@@ -85,7 +149,8 @@ def fact_key(
     column pairs are sorted AS UNITS (never the two column lists independently) so distinct joins
     can never alias."""
     if isinstance(ref, EntityBridgeRef):
-        endpoints = sorted([_ref_tuple(ref.left_ref), _ref_tuple(ref.right_ref)])
+        left, right = canonical_bridge_endpoints(ref.left_ref, ref.right_ref)
+        endpoints = [_ref_tuple(left), _ref_tuple(right)]
         bridge_canonical = {"kind": "bridge", "entity_id": _norm(ref.entity_id),
                             "endpoints": endpoints, "fact_type": _norm(fact_type),
                             "use_case": _norm(use_case)}
@@ -235,9 +300,15 @@ def proposal_fingerprint(
 ) -> str:
     """Stable hash over (canonical proposed_value + profiler version + thresholds) — NOT the
     evidence id/timestamp (§3.4/§5). Drives REJECTED-stickiness dedup; only a materially different
-    value yields a new fingerprint."""
+    value yields a new fingerprint.
+
+    "Canonical" now means canonical for the FACT TYPE, not merely for JSON: a bridge's endpoints are
+    an unordered pair, so they are ordered here by the same rule ``fact_key`` orders them by. Naming
+    a rejected bridge the other way round is not a materially different value, and before this it
+    produced a second fingerprint under the same key — which is precisely what the sticky-reject
+    guard compares, so a human's NO could be undone by the next upload."""
     canonical = {
-        "value": dict(proposed_value),
+        "value": dict(canonical_bridge_value(proposed_value)),
         "profile_version": profile_version,
         "thresholds": dict(thresholds) if thresholds is not None else None,
     }
