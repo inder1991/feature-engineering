@@ -41,7 +41,9 @@ never a resolved contract.
 
 ``confirmed_event_ids_for_audit`` re-queries ``entity_bridge_edge`` for the durable
 ``confirmed_event_id`` of every crossed VERIFIED bridge — a PURE AUDIT helper (never widening
-``active_bridges`` (finding #8), never entering any hash). It deliberately does NOT drive
+``active_bridges`` (finding #8), never entering any hash) — and folds each row's LIFECYCLE before
+trusting it, because the edge table is a fail-soft projection that can outlive the decision it
+caches. It deliberately does NOT drive
 ``declaration_status``/``contract_id``: a bridge revoked/expired MID-compile is caught by
 ``revalidate_freshness``'s bridge fingerprint (the freshness OBSERVATION axis, excluded from identity) —
 the SOLE detector, so classification stays consistent with single-source.
@@ -56,6 +58,10 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from featuregen.overlay.upload.catalog_realizations import table_of
+from featuregen.overlay.upload.cross_catalog_links import (
+    REVIEWED_STATUS,
+    bridge_lifecycle_status,
+)
 from featuregen.overlay.upload.planner.contracts import (
     ADDITIVITY_RULE_VERSION,
     AGGREGATION_RULE_VERSION,
@@ -260,7 +266,20 @@ def confirmed_event_ids_for_audit(
     fields), so the store re-reads it here instead of widening ``ActiveBridgeV1``. Returns sorted
     ``(fact_key, confirmed_event_id)`` pairs; the event ids are audit metadata and NEVER enter any hash
     (a per-event id is excluded from the deterministic contract identity) and NEVER drive
-    ``declaration_status``/``contract_id`` — a mid-compile bridge mutation is the freshness axis' job."""
+    ``declaration_status``/``contract_id`` — a mid-compile bridge mutation is the freshness axis' job.
+
+    THE ROW IS NOT THE DECISION. ``entity_bridge_edge`` is a PROJECTION of the VERIFIED fold, and
+    ``expiry.demote_bridge_edges`` is FAIL-SOFT: a withdrawn / drift-STALEd / expired bridge whose
+    demotion did not run leaves its VERIFIED row behind, and reading the row alone would stamp that
+    crossing ``verified`` in the audit record. So each row is confirmed against
+    ``cross_catalog_links.bridge_lifecycle_status`` — the ONE fold every other reader in ``src``
+    already goes through — before it is trusted. ``projected_verified=True`` is passed because the
+    row we are holding IS that lookup: it saves the fold a per-key query and cannot widen the answer
+    (it is consulted ONLY for an ABSENT stream, the ``multisource_gold``/fixture shape, and a stream
+    that folds always wins).
+
+    SCOPE. This changes nothing about what "governed" MEANS to the gate — that is a separate,
+    deferred decision. It only stops a stale projection row being taken for a live sanction."""
     fact_keys = _referenced_bridge_keys(plan)
     if not fact_keys:
         return ()
@@ -268,7 +287,9 @@ def confirmed_event_ids_for_audit(
         "SELECT fact_key, confirmed_event_id FROM entity_bridge_edge "
         "WHERE fact_key = ANY(%s) AND status = 'VERIFIED' ORDER BY fact_key",
         (fact_keys,)).fetchall()
-    return tuple((row[0], row[1]) for row in rows)
+    return tuple(
+        (row[0], row[1]) for row in rows
+        if bridge_lifecycle_status(conn, row[0], projected_verified=True) == REVIEWED_STATUS)
 
 
 # The persisted authority marker for a governed VERIFIED bridge crossing (there is no RealizationAuthority
