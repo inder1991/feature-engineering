@@ -121,8 +121,8 @@ def test_route_governed_confirm_is_promotable_and_bridge_revocation_downgrades(c
     """Over the REAL route (considered-set → draft → confirm, the envelope→ordered_path rewrite): the
     governed cross-catalog contract's bridge segment is recorded as a ``bridgefact:`` TYPED marker (NOT a
     raw ``bfk_*`` graph_node), so at confirm the read gate RESOLVES it (no poison) — the contract is
-    PROMOTABLE. Deleting the bridge's ``entity_bridge_edge`` row (a revocation) drifts the marker → a
-    promoted stamp HARD-downgrades (I-3: bridge-revocation drift is now detectable)."""
+    PROMOTABLE. Rejecting the authoritative bridge lifecycle drifts the marker even when its stale
+    projection row survives → a promoted stamp HARD-downgrades."""
     _enable_live(db, monkeypatch)
     _cross_seed(db)                      # ops + rev + a VERIFIED bridge → a resolvable cross-catalog plan
     _fresh_now(db, "ops", "rev")
@@ -153,9 +153,10 @@ def test_route_governed_confirm_is_promotable_and_bridge_revocation_downgrades(c
     assert dependencies_drifted(db, cid) is False
     assert _apply_dependency_read_gate(db, cid, *_PROMOTED) == _PROMOTED
 
-    # REVOKE the bridge (its entity_bridge_edge row DELETEd, exactly as demote_bridge_edges does).
-    n = db.execute("DELETE FROM entity_bridge_edge WHERE fact_key = 'bfk_cap'").rowcount
-    assert n == 1
+    # REVOKE authoritatively while deliberately leaving the fail-soft projection behind.
+    _draft_bridge(db, "bfk_cap", status="REJECTED")
+    assert db.execute(
+        "SELECT count(*) FROM entity_bridge_edge WHERE fact_key='bfk_cap'").fetchone()[0] == 1
 
     # the marker now resolves MISSING → drift detected → the promoted stamp HARD-downgrades (I-3).
     assert dependencies_drifted(db, cid) is True
@@ -202,7 +203,7 @@ def test_govern_bridge_marker_resolves_at_confirm_then_drifts_on_revocation(db):
     """The govern layer applied to the SERVER route rewrite (``_envelope_join_path`` on the compiled
     ordered_path — the exact transform ``routes/contract.py`` applies): the confirmed governed contract's
     bridge segment lands as a ``bridgefact:`` dep, ``dependencies_drifted`` is False at confirm (RESOLVES,
-    no poison), and revoking the bridge flips it True."""
+    no poison), and authoritatively rejecting the bridge flips it True even if the projection remains."""
     _cross_seed(db)
     ideas, rej = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
@@ -214,15 +215,15 @@ def test_govern_bridge_marker_resolves_at_confirm_then_drifts_on_revocation(db):
                          plan_envelope=env, templates=(_txn_template(),))
     assert ("rev", "bridgefact:bfk_cap") in _deps(db, c.contract_id)   # TYPED marker recorded
     assert dependencies_drifted(db, c.contract_id) is False            # RESOLVES at confirm (no poison)
-    db.execute("DELETE FROM entity_bridge_edge WHERE fact_key = 'bfk_cap'")
+    _draft_bridge(db, "bfk_cap", status="REJECTED")
+    assert db.execute(
+        "SELECT count(*) FROM entity_bridge_edge WHERE fact_key='bfk_cap'").fetchone()[0] == 1
     assert dependencies_drifted(db, c.contract_id) is True             # revocation → drift
 
 
 # ══════════ resolver unit tests — the bridge/realization signatures hash the RIGHT state ══════════════
 def test_bridge_fact_signature_resolves_verified_and_missing_on_revoke(db):
-    """``_bridge_fact_signature`` returns a real dict (existence + VERIFIED status + endpoints) for a live
-    bridge and ``MISSING`` after its ``entity_bridge_edge`` row is deleted — so an at-confirm hash over the
-    live dict can never be reproduced post-revocation (the drift signal)."""
+    """Projection loss alone does not revoke a bridge; the authoritative lifecycle does."""
     _cross_seed(db)
     marker = bridge_fact_marker("bfk_cap")
     sig = _bridge_fact_signature(db, marker)
@@ -230,6 +231,8 @@ def test_bridge_fact_signature_resolves_verified_and_missing_on_revoke(db):
     # routed identically through the public entry point the read gate uses:
     assert _catalog_state_signature(db, "rev", marker) == sig
     db.execute("DELETE FROM entity_bridge_edge WHERE fact_key = 'bfk_cap'")
+    assert _bridge_fact_signature(db, marker) == sig
+    _draft_bridge(db, "bfk_cap", status="REJECTED")
     assert _bridge_fact_signature(db, marker) == _MISSING
 
 

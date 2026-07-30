@@ -30,7 +30,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from tests.featuregen.overlay.upload._bridge_fixtures import (
-    requires_directional_bridge_realization,
     seed_verified_bridge as _seed_verified_bridge_fact,
 )
 from tests.featuregen.overlay.upload.conftest import _confirm_grain

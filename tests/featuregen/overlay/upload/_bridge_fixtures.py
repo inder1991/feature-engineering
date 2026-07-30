@@ -11,24 +11,14 @@ So fixtures say which lifecycle state they mean, and get the events that state r
 """
 from __future__ import annotations
 
-import pytest
-
 from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.overlay import facts, store
+from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
+from featuregen.projections.runner import run_projection
 
 _ACTOR = mint_test_identity(subject="user:bridge-proposer", role_claims=("data_owner",))
-
-# Task 0B deliberately removes the fabricated cardinality that made legacy cross-catalog
-# compilation "happy paths" pass. Keep those future Task-9 acceptance tests visible as strict
-# expected failures: once a directional realization makes one pass again, XPASS fails the suite and
-# forces the marker to be removed rather than silently leaving a stale quarantine behind.
-requires_directional_bridge_realization = pytest.mark.xfail(
-    strict=True,
-    reason="Task 9: symmetric bridge has no executable directional realization/cardinality yet",
-)
-
 
 def _ref(source: str, object_ref: str) -> dict:
     """``schema.table.column`` -> the catalog object ref shape the entity_bridge value schema wants."""
@@ -99,6 +89,16 @@ def seed_verified_bridge(db, fact_key: str, *, entity: str, left_source: str, le
     govern_bridge_fact(
         db, fact_key, entity=entity, left_source=left_source, left_ref=left_ref,
         right_source=right_source, right_ref=right_ref, status="VERIFIED")
+    # The helper appends real governance events, so it must also advance the overlay projection
+    # checkpoint. Otherwise a planner fixture that was healthy before this correction becomes
+    # artificially LAGGED merely because its bridge is now seeded honestly.
+    while run_projection(db, OverlayProjection()) >= 500:
+        pass
+    degraded = db.execute(
+        "SELECT aggregate, aggregate_id, reason FROM projection_degraded "
+        "WHERE projection_name = 'overlay' ORDER BY poison_seq"
+    ).fetchall()
+    assert not degraded, f"verified bridge fixture degraded the overlay projection: {degraded!r}"
     confirmed_event_id = fold_overlay_state(store.load_fact(db, fact_key)).confirmed_event_id
     assert confirmed_event_id is not None
     db.execute(
