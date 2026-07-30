@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, cast
 
-from featuregen.overlay.identity import EntityBridgeRef, fact_key
+from featuregen.overlay.identity import EntityBridgeRef, canonical_bridge_value, fact_key
 from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
@@ -45,7 +45,12 @@ def project_verified_bridge(conn, ref: EntityBridgeRef, *, now) -> str:
     if state.status != "VERIFIED" or not state.value:
         conn.execute("DELETE FROM entity_bridge_edge WHERE fact_key = %s", (key,))
         return "pending"
-    v = cast("dict[str, Any]", state.value)  # shape enforced by the entity_bridge write gate (Task 2)
+    # Canonical endpoints on the way out. Values PROPOSED before bridge identity was canonicalized
+    # keep whatever orientation they were written with, and the projection is keyed by fact_key —
+    # which is orientation-free — so without this one bridge would describe itself one way in
+    # `entity_bridge_edge` and the other in the candidate ledger, leaving the read model to
+    # reconcile two shapes of the same link.
+    v = cast("dict[str, Any]", canonical_bridge_value(state.value))  # shape: entity_bridge write gate
     conn.execute("DELETE FROM entity_bridge_edge WHERE fact_key = %s", (key,))
     conn.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
