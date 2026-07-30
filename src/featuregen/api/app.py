@@ -19,6 +19,7 @@ from featuregen.api.routes import (
     assets,
     assist,
     auth,
+    catalogs,
     contract,
     entity,
     features,
@@ -137,6 +138,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(ingestion_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
+    # `GET /catalogs` — the pick-list for every `{source}`-keyed surface below (read-scoped).
+    app.include_router(catalogs.router)
     app.include_router(assets.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
