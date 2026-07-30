@@ -39,10 +39,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 from tests.featuregen.overlay.upload.passc.conftest import SERVICE_ACTOR
 from tests.featuregen.overlay.upload.test_bridge_candidates import _load
-from tests.featuregen.overlay.upload.test_join_governance import _seed_join_with_evidence
+from tests.featuregen.overlay.upload.test_join_governance import (
+    _confirm_once,
+    _seed_join_with_evidence,
+)
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.commands import propose_fact
@@ -384,6 +388,53 @@ def test_a_table_fact_has_no_production_eligibility_rather_than_a_guess(all_thre
                  if i.kind == "grain")
     assert grain.production_eligibility is None
     assert grain.production_eligibility_code == "not_applicable"
+
+
+# ── available_actions: four-eyes, PROJECTED from the write-side rule ──────────────────────────────
+
+def test_an_admin_who_already_endorsed_a_join_is_not_offered_confirm_again(queue_db):
+    """NEVER ADVERTISE AN ACTION THE WRITE SIDE DENIES — the invariant this surface exists to hold.
+
+    A dual discovered join needs TWO DISTINCT platform-admins:
+    `join_confirmation._confirm_approved_join` denies a repeat subject ("this owner already
+    confirmed; awaiting the other owner") and the route renders that denial as a 409 "You already
+    approved this — a different admin must confirm." So the admin who has already endorsed must be
+    offered `reject` only, while any OTHER admin is still offered both.
+
+    The defect was silent because the key was wrong, not the logic: `_approvals_from_stream` builds
+    each entry as `{"subject": payload["by_owner"], …}` — `by_owner` is the EVENT payload's field
+    and the approvals VIEW renames it — so reading `by_owner` off the view yielded a set of empty
+    strings, the membership test never matched, and every caller was offered `confirm`."""
+    _load(queue_db, "src", [
+        (CanonicalRow("src", "transactions", "cif_id", "text"), "customer_id"),
+        (CanonicalRow("src", "customers", "cif_id", "text", is_grain=True), "customer_id"),
+    ])
+    ref, key = _seed_join_with_evidence(queue_db)
+    admin1 = mint_test_identity(subject="user:admin1", role_claims=("platform-admin",))
+    admin2 = mint_test_identity(subject="user:admin2", role_claims=("platform-admin",))
+    _confirm_once(queue_db, ref, key, admin1, "looks right")
+
+    def _item(actor):
+        queue = governance_queue(queue_db, roles=(), actor=actor)
+        return next(i for i in queue.items if i.kind == "approved_join" and i.fact_key == key)
+
+    # the endorsement really is recorded, and under the key the view publishes
+    assert [a["subject"] for a in _item(admin1).detail["approvals"]] == ["user:admin1"]
+    assert _item(admin1).state_code == "partially_endorsed_available"
+
+    assert _item(admin1).available_actions == ("reject",)          # the write side would 409
+    assert _item(admin2).available_actions == ("confirm", "reject")  # the second, DISTINCT admin
+    assert _item(None).available_actions == ("confirm", "reject")    # unscoped internal read
+
+
+def test_a_join_nobody_has_endorsed_offers_both_actions_to_any_admin(all_three_kinds):
+    """The control for the test above: with an empty `approvals` list the projection must not
+    withhold `confirm` from anyone, or a caller who has done nothing would be told to reject."""
+    admin = mint_test_identity(subject="user:admin1", role_claims=("platform-admin",))
+    queue = governance_queue(all_three_kinds.conn, roles=(), actor=admin)
+    join = next(i for i in queue.items if i.kind == "approved_join")
+    assert join.detail["approvals"] == []
+    assert join.available_actions == ("confirm", "reject")
 
 
 # ── "Already depended on by": measurability is decided PER CATEGORY ───────────────────────────────

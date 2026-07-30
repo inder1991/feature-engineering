@@ -585,11 +585,20 @@ def _bridge_item(view: Mapping[str, Any], usage: tuple[Usage, ...],
 
 def _join_actions(view: Mapping[str, Any], actor: IdentityEnvelope | None) -> tuple[str, ...]:
     """The server-sanctioned actions for a discovered join. A dual join needs TWO DISTINCT
-    platform-admins (``join_confirmation`` denies a repeat subject), so a caller already recorded in
-    ``approvals`` is not offered ``confirm`` — a projection of the write-side rule, not a copy."""
+    platform-admins (``join_confirmation._confirm_approved_join`` denies a repeat subject with
+    *"this owner already confirmed; awaiting the other owner"*, which the route renders as *"You
+    already approved this — a different admin must confirm."*), so a caller already recorded in
+    ``approvals`` is not offered ``confirm`` — a projection of the write-side rule, not a copy.
+
+    THE KEY IS ``subject``. ``join_governance._approvals_from_stream`` builds each entry as
+    ``{"subject": payload.get("by_owner"), …}``: ``by_owner`` is the EVENT payload's field name and
+    the approvals VIEW renames it. Reading ``by_owner`` off the view made ``already`` a set of empty
+    strings, so the membership test never matched and this function always returned
+    ``("confirm", "reject")`` — advertising an action the write side answers with a 409, which is
+    the one thing this projection exists to prevent."""
     if actor is None:
         return ("confirm", "reject")
-    already = {str(a.get("by_owner") or "") for a in (view.get("approvals") or ())
+    already = {str(a.get("subject") or "") for a in (view.get("approvals") or ())
                if isinstance(a, Mapping)}
     return ("reject",) if actor.subject in already else ("confirm", "reject")
 
