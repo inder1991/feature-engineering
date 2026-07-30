@@ -422,6 +422,11 @@ describe('governance review — available_actions drives the buttons', () => {
     expect(endorsed.getByRole('button', { name: /^confirm/i })).toBeDisabled()
     expect(endorsed.getByTestId('gq-action-why')).toHaveTextContent(/nothing left to decide/i)
     expect(endorsed.queryByRole('button', { name: /^reject/i })).toBeNull()
+    // And it is NOT counted as work: the bridge listing carries VERIFIED facts too, so a summary
+    // built from the list length would claim a decision is waiting when none is.
+    const summary = screen.getByTestId('gq-summary')
+    expect(summary).toHaveTextContent(/0 waiting for a person/i)
+    expect(summary).toHaveTextContent(/1 already endorsed/i)
   })
 
   it('confirms a bridge behind an explicit agreement, then refetches the queue', async () => {

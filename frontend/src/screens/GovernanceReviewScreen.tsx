@@ -902,9 +902,14 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   // kind from a newer backend gets a chip, a section and a readable label.
   const kinds = Object.keys(queue.items_visible_to_you_by_kind)
   const shownKinds = kindFilter === null ? kinds : kinds.filter(kind => kind === kindFilter)
-  const actionable = items.filter(item => item.available_actions.length > 0).length
+  // WHAT ACTUALLY NEEDS A PERSON is not the list length: the bridge listing also carries VERIFIED
+  // facts, and those offer no action at all (`reject_fact` denies them). Counting them as waiting
+  // would overstate the work, so the headline counts only rows the server still offers an action on.
+  const waiting = items.filter(item => item.available_actions.length > 0).length
+  const yours = items.filter(item => item.available_actions.includes('confirm')).length
   const elsewhere = items.filter(item =>
-    !item.available_actions.includes('confirm') && item.state_code !== 'human_endorsed').length
+    item.available_actions.length > 0 && !item.available_actions.includes('confirm')).length
+  const endorsed = items.filter(item => item.available_actions.length === 0).length
 
   return (
     <section className="gq">
@@ -937,19 +942,24 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
 
       <div className="stats gq-summary" data-testid="gq-summary">
         <div className="stat">
-          <b>{items.length}</b> waiting for a person
+          <b>{waiting}</b> waiting for a person
         </div>
+        <div className="stat">
+          <b>{yours}</b> you can decide
+        </div>
+        <div className="stat">
+          <b>{elsewhere}</b> need a different reviewer
+        </div>
+        {endorsed > 0 && (
+          <div className="stat">
+            <b>{endorsed}</b> already endorsed
+          </div>
+        )}
         {shownKinds.map(kind => (
           <div className="stat" key={kind}>
             <b>{items.filter(item => item.kind === kind).length}</b> {kindLabel(kind).toLowerCase()}
           </div>
         ))}
-        <div className="stat">
-          <b>{actionable}</b> you can decide now
-        </div>
-        <div className="stat">
-          <b>{elsewhere}</b> need a different reviewer
-        </div>
       </div>
       <p className="hint" data-testid="gq-scope-note">
         Across {queue.catalogs.length} catalog{queue.catalogs.length === 1 ? '' : 's'} you can see
