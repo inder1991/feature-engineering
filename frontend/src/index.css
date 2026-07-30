@@ -3996,3 +3996,138 @@ button.stat:hover {
 .gq-member {
   background: var(--surface-2);
 }
+
+/* ---- how the match was established (bridges) ----
+
+   The three fields the read model already sent and the screen used to swallow. `type_basis` leads
+   because it changes WHAT a confirmation means: `declared` is two glossary spreadsheets agreeing,
+   not a read of the physical schema. It carries the same data-tone vocabulary as .gq-axis, and the
+   caution restates it inside the confirm panel, so neither the tone nor the placement is the
+   carrier — the words are. */
+
+.gq-basis {
+  padding: 8px 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.gq-basis-head {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.gq-basis-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.gq-basis-item {
+  min-width: 0;
+}
+
+/* The one field a reviewer must not scroll past gets the rule, in the tones .gq-axis already
+   measured against these fills (--warn 5.05:1, --ok 5.22:1 on --surface-2). */
+.gq-basis-item--lead {
+  padding-left: 8px;
+  border-left: 3px solid var(--line);
+}
+
+.gq-basis-item--lead[data-tone='ok'] {
+  border-left-color: var(--ok);
+}
+
+.gq-basis-item--lead[data-tone='warn'] {
+  border-left-color: var(--warn);
+}
+
+.gq-basis-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.gq-basis-value {
+  margin: 1px 0 0;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.gq-basis-why {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+/* The caution reads as a sentence in the panel, not as a badge: --warn on --accent-soft is text,
+   so it is held to the 4.5:1 body threshold rather than the 3:1 indicator one. */
+.gq-panel-caution {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink);
+  padding-left: 8px;
+  border-left: 3px solid var(--warn);
+}
+
+/* ---- join side-tasks / table-fact advisory ---- */
+
+.gq-side {
+  padding: 8px 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.gq-side-head {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.gq-side-list {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.gq-side-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12.5px;
+}
+
+.gq-side-key {
+  color: var(--ink-soft);
+  text-transform: capitalize;
+}
+
+.gq-side-val {
+  color: var(--ink);
+}
+
+.gq-side-id {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.gq-side-note {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}

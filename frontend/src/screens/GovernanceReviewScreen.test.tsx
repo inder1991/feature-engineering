@@ -383,6 +383,120 @@ describe('governance review — the two axes stay separate', () => {
     })
 })
 
+describe('governance review — the basis of the claim being endorsed', () => {
+  it('shows that a declared type match rests on two spreadsheets, not on the schema', async () => {
+    // Every bridge on the live catalogs is `declared`: bridge_candidates._resolve_family falls back
+    // to the glossary-declared type only when nothing was attested. Confirming that is a materially
+    // different act, so the basis is on screen.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${bridge().fact_key}`))
+    const basis = cells.getByTestId('gq-basis')
+    expect(basis).toHaveAttribute('data-type-basis', 'declared')
+    const type = within(basis).getByTestId('basis-type')
+    // The words, not just the code: a reviewer must be able to read what `declared` means.
+    expect(type).toHaveTextContent(/spreadsheets/i)
+    expect(type).toHaveTextContent(/nothing read the physical schema/i)
+    // The other two fields the payload carried and the screen used to swallow.
+    expect(within(basis).getByTestId('basis-family')).toHaveTextContent('string')
+    expect(within(basis).getByTestId('basis-strength')).toHaveTextContent('3')
+    // A ranking score is not a probability, and it is not a claim about the values.
+    expect(within(basis).getByTestId('basis-strength')).toHaveTextContent(/not a probability/i)
+  })
+
+  it('repeats the declared basis where the agreement is actually ticked', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${bridge().fact_key}`))
+    await userEvent.click(cells.getByRole('button', { name: /^confirm/i }))
+    const caution = cells.getByTestId('gq-confirm-basis')
+    expect(caution).toHaveTextContent(/two glossary spreadsheets/i)
+    expect(caution).toHaveTextContent(/nothing read the physical schema/i)
+    // Beside the statement being agreed to, not somewhere else on the page.
+    expect(cells.getByRole('checkbox').closest('.gq-panel')).toContainElement(caution)
+  })
+
+  it('reports an attested basis differently, and a missing one as missing', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [
+        bridge({ fact_key: 'fact:entity_bridge:attested',
+                 detail: bridgeDetail({ entity_id: 'account', type_basis: 'attested' }) }),
+        // W4: bridge_propose skipped the ledger row, so there is no derivation evidence at all.
+        bridge({ fact_key: 'fact:entity_bridge:blank',
+                 detail: bridgeDetail({ entity_id: 'product', type_basis: '', data_type_family: '',
+                                        strength: null, evidence_present: false }) }),
+      ],
+      items_visible_to_you_by_kind: { entity_bridge: 2, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const attested = within(await screen.findByTestId('row-fact:entity_bridge:attested'))
+    expect(attested.getByTestId('gq-basis')).toHaveAttribute('data-type-basis', 'attested')
+    expect(attested.getByTestId('basis-type')).toHaveTextContent(/read from the data/i)
+    expect(attested.getByTestId('basis-type')).not.toHaveTextContent(/spreadsheet/i)
+    // An attested basis carries no caveat, so nothing is manufactured next to the agreement.
+    await userEvent.click(attested.getByRole('button', { name: /^confirm/i }))
+    expect(attested.queryByTestId('gq-confirm-basis')).toBeNull()
+
+    const blank = within(screen.getByTestId('row-fact:entity_bridge:blank'))
+    const basis = blank.getByTestId('gq-basis')
+    expect(basis).toHaveAttribute('data-type-basis', 'not_recorded')
+    expect(within(basis).getByTestId('basis-type')).toHaveTextContent(/not recorded/i)
+    expect(within(basis).getByTestId('basis-family')).toHaveTextContent(/not recorded/i)
+    expect(within(basis).getByTestId('basis-strength')).toHaveTextContent(/not recorded/i)
+    // Never dressed up as a weak pass: the type cell claims no basis it does not have.
+    expect(within(basis).getByTestId('basis-type')).not.toHaveTextContent(/read from the data/i)
+    expect(within(basis).getByTestId('basis-type')).not.toHaveTextContent(/spreadsheet/i)
+  })
+
+  it('renders the join side-tasks and the table advisory, and neither on the wrong kind',
+    async () => {
+      getGovernanceQueue.mockResolvedValue(queue({
+        items: [bridge(), join(), grain({
+          detail: { ...grain().detail,
+                    advisory: { table_role: 'dimension', primary_entity: 'party',
+                                event_or_snapshot: 'snapshot' } },
+        })],
+        items_visible_to_you_by_kind: {
+          entity_bridge: 1, approved_join: 1, grain: 1, availability_time: 0,
+        },
+      }))
+      render(<GovernanceReviewScreen />)
+      const joinRow = within(await screen.findByTestId(`row-${join().fact_key}`))
+      const tasks = joinRow.getByTestId('gq-tasks')
+      expect(tasks).toHaveTextContent(/from side/i)
+      expect(tasks).toHaveTextContent(/open/i)
+      expect(tasks).toHaveTextContent('t1')
+
+      const grainRow = within(screen.getByTestId(`row-${grain().fact_key}`))
+      const advisory = grainRow.getByTestId('gq-advisory')
+      expect(advisory).toHaveTextContent('dimension')
+      expect(advisory).toHaveTextContent('party')
+      // Advisory is context, never part of the claim — and it says so.
+      expect(advisory).toHaveTextContent(/not part of what you are agreeing to/i)
+
+      // A kind whose payload carries none of these renders no empty shell.
+      const bridgeRow = within(screen.getByTestId(`row-${bridge().fact_key}`))
+      expect(bridgeRow.queryByTestId('gq-tasks')).toBeNull()
+      expect(bridgeRow.queryByTestId('gq-advisory')).toBeNull()
+      expect(joinRow.queryByTestId('gq-basis')).toBeNull()
+      // The grain fixture with an EMPTY advisory map must render nothing either.
+      expect(grainRow.queryByTestId('gq-tasks')).toBeNull()
+    })
+
+  it('renders no advisory block when the enrichment recorded nothing', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain()], items_visible_to_you_by_kind: { grain: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const grainRow = within(await screen.findByTestId(`row-${grain().fact_key}`))
+    expect(grainRow.queryByTestId('gq-advisory')).toBeNull()
+  })
+})
+
 describe('governance review — available_actions drives the buttons', () => {
   it('renders confirm disabled, with the server reason, when the action is withheld', async () => {
     const withheld = bridge({

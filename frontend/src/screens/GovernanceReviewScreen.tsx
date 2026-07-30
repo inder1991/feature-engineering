@@ -283,6 +283,54 @@ function withheldReason(item: GovernanceQueueItem): string {
     + `endorse it${by ? ` (proposed by ${by})` : ''}.`
 }
 
+// ── how the machine established the claim ────────────────────────────────────────────────────────
+//
+// `type_basis` changes WHAT a confirmation means, so it is rendered rather than carried silently.
+// On the live catalogs every bridge is `declared`: two glossary SPREADSHEETS each answered with a
+// type and the two answers agreed — nothing read the physical schema (bridge_candidates._resolve_
+// family consults the declared type only when nothing was attested, and records the weaker basis).
+// A reviewer ticking "these two columns identify the same customer" on that basis is endorsing two
+// files, which is a materially different claim, so they see it before they tick.
+const TYPE_BASIS: Record<string, { label: string; what: string; tone: string }> = {
+  attested: {
+    label: 'read from the data',
+    what: 'Both sides were classified from the physical column type the catalog carries.',
+    tone: 'ok',
+  },
+  declared: {
+    label: 'declared in two spreadsheets',
+    what: 'Nothing read the physical schema. The types matched because two glossary files each '
+      + 'declared one and those two declarations agreed, so this rests on the files being right.',
+    tone: 'warn',
+  },
+  mixed: {
+    label: 'one side read, one side declared',
+    what: 'One side was classified from the physical column type; the other only from what a '
+      + 'glossary file declared.',
+    tone: 'warn',
+  },
+}
+
+// The same fact, said once more where the agreement is actually ticked — the one place a reviewer
+// cannot be scrolled past it. Empty for a basis that carries no caveat.
+function basisCaution(item: GovernanceQueueItem): string {
+  if (item.kind !== 'entity_bridge') return ''
+  const code = asStr(item.detail.type_basis)
+  if (code === 'declared') {
+    return 'Before you tick: the types here match because two glossary spreadsheets each said so. '
+      + 'Nothing read the physical schema, so your agreement rests on those two files.'
+  }
+  if (code === 'mixed') {
+    return 'Before you tick: only one of the two types was read from the data — the other is what '
+      + 'a glossary file declared.'
+  }
+  if (!code) {
+    return 'Before you tick: no derivation evidence was recorded for this crossing, so there is '
+      + 'nothing on file about how the two types were matched.'
+  }
+  return ''
+}
+
 // A safe DOM id from a fact_key (which carries colons, dots and arrows).
 function domId(prefix: string, factKey: string): string {
   return `${prefix}-${factKey.replaceAll(/[^a-zA-Z0-9_-]/g, '-')}`
@@ -412,6 +460,109 @@ function Usage({ usages }: { usages: GovernanceQueueUsage[] }) {
   )
 }
 
+// The derivation the reviewer is being asked to endorse: how the type match was established, which
+// family matched, and where the link ranked. Bridges carry all three; every other kind carries none
+// of them, and the block is ABSENT rather than rendered with blanks.
+function Basis({ item }: { item: GovernanceQueueItem }) {
+  const d = item.detail
+  const code = asStr(d.type_basis)
+  const family = asStr(d.data_type_family)
+  const strength = typeof d.strength === 'number' ? d.strength : null
+  // W4: `bridge_propose` skipped the ledger row, so there is no derivation evidence to describe —
+  // said as an absence, never as a weak pass.
+  const noEvidence = d.evidence_present === false
+  if (!code && !family && strength === null && !noEvidence) return null
+  const note = TYPE_BASIS[code]
+  return (
+    <div className="gq-basis" data-testid="gq-basis" data-type-basis={code || 'not_recorded'}>
+      <p className="gq-basis-head">How this match was established</p>
+      <dl className="gq-basis-list">
+        <div
+          className="gq-basis-item gq-basis-item--lead"
+          data-testid="basis-type"
+          data-tone={note?.tone ?? 'quiet'}
+        >
+          <dt className="gq-basis-label">Type match</dt>
+          <dd className="gq-basis-value">
+            {note?.label ?? (code ? code.replaceAll('_', ' ') : 'not recorded')}
+          </dd>
+          <dd className="gq-basis-why">
+            {note?.what
+              ?? (noEvidence || !code
+                ? 'No derivation evidence was recorded for this crossing, so how the two types '
+                  + 'were matched is not on file.'
+                : 'This client cannot explain that basis, so it says nothing beyond the code.')}
+          </dd>
+        </div>
+        <div className="gq-basis-item" data-testid="basis-family">
+          <dt className="gq-basis-label">Matched type family</dt>
+          <dd className="gq-basis-value">{family || 'not recorded'}</dd>
+          <dd className="gq-basis-why">
+            The two columns were paired because their types fall in the same family. Nothing here
+            compared the values they hold.
+          </dd>
+        </div>
+        <div className="gq-basis-item" data-testid="basis-strength">
+          <dt className="gq-basis-label">Ranking strength</dt>
+          <dd className="gq-basis-value">{strength === null ? 'not recorded' : String(strength)}</dd>
+          <dd className="gq-basis-why">
+            Where this link ranked against the other candidates for the same entity — it rewards a
+            side that is its table key and a type read from the data. It is not a probability.
+          </dd>
+        </div>
+      </dl>
+    </div>
+  )
+}
+
+// A dual join opens TWO side-labelled platform-admin tasks (`join_governance`), and which sides are
+// still open is what tells a reviewer whether their endorsement finishes it. Joins only.
+function Tasks({ item }: { item: GovernanceQueueItem }) {
+  const tasks = (Array.isArray(item.detail.tasks) ? item.detail.tasks : []).map(asRec)
+  if (tasks.length === 0) return null
+  return (
+    <div className="gq-side" data-testid="gq-tasks">
+      <p className="gq-side-head">Approval tasks recorded for this join</p>
+      <ul className="gq-side-list">
+        {tasks.map((task, i) => (
+          <li className="gq-side-item" key={asStr(task.task_id) || String(i)}>
+            <span className="gq-side-key">{asStr(task.side) || 'unlabelled'} side</span>
+            <span className="gq-side-val">{asStr(task.status) || 'status not reported'}</span>
+            <span className="mono gq-side-id">{asStr(task.task_id)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+// The table-level fields Pass B recorded alongside a grain / as-of proposal. DISPLAY-ONLY context
+// (`table_fact_governance._ADVISORY_FIELDS`): it is not part of the claim being endorsed, and it
+// says so, because an advisory field rendered like a finding would be read as one.
+function Advisory({ item }: { item: GovernanceQueueItem }) {
+  const fields = Object.entries(asRec(item.detail.advisory))
+    .map(([key, value]): [string, string] => [key, asStr(value)])
+    .filter(([, value]) => value !== '')
+  if (fields.length === 0) return null
+  return (
+    <div className="gq-side" data-testid="gq-advisory">
+      <p className="gq-side-head">What the enrichment said about this table</p>
+      <ul className="gq-side-list">
+        {fields.map(([key, value]) => (
+          <li className="gq-side-item" key={key}>
+            <span className="gq-side-key">{categoryLabel(key)}</span>
+            <span className="gq-side-val">{value}</span>
+          </li>
+        ))}
+      </ul>
+      <p className="gq-side-note">
+        Advisory context the enrichment offered. It is not part of what you are agreeing to, and
+        nothing downstream reads it.
+      </p>
+    </div>
+  )
+}
+
 function CategoryChips({ kind, chosen, onPick, label }: {
   kind: string
   chosen: string | null
@@ -497,6 +648,7 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
   const canReject = item.available_actions.includes('reject')
   const whyId = domId('why', item.fact_key)
   const provenance = provenanceParts(item)
+  const caution = basisCaution(item)
 
   async function run(action: () => Promise<string>) {
     setBusy(true)
@@ -529,6 +681,9 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
       <p className="gq-row-headline">{headline(item)}</p>
       <p className="mono gq-row-subject">{item.subject}</p>
       <Axes item={item} />
+      <Basis item={item} />
+      <Tasks item={item} />
+      <Advisory item={item} />
       {provenance.length > 0 && <p className="gq-prov">{provenance.join(' · ')}</p>}
       <Usage usages={item.already_depended_on_by} />
 
@@ -562,6 +717,9 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
       {panel === 'confirm' && (
         <div className="gq-panel">
           <p className="gq-panel-head">What your confirmation records</p>
+          {caution && (
+            <p className="gq-panel-caution" data-testid="gq-confirm-basis">{caution}</p>
+          )}
           <label className="gj-check">
             <input type="checkbox" checked={agreed} onChange={() => setAgreed(a => !a)} />
             <span>{agreement(item)}</span>
