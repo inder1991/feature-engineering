@@ -3661,6 +3661,23 @@ button.stat:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* .gj-chip--on is a DANGER fill because its other use is picking a rejection reason, where red is
+   the truth. Here it made "All catalogs" — the default, selected on arrival — a danger chip, which
+   is a severity signal for an act that carries none. Narrowing a list is accent work.
+   --chip-ink on --accent is 6.25:1; the fill is 6.07:1 against the --surface-2 filter bar, and the
+   :focus-visible ring lands on that same fill-free 2px gap at 6.07:1. `aria-pressed` remains the
+   non-visual carrier of "selected", exactly as before. */
+.gq-filters .gj-chip--on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--chip-ink);
+}
+
+.gq-filters button.gj-chip--on:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
 /* ---- per-kind section ---- */
 
 .gq-kind {
