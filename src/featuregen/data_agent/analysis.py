@@ -17,7 +17,6 @@ a generated Kedro project later without the ontology or the audit trail noticing
 from __future__ import annotations
 
 import hashlib
-
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,12 +28,11 @@ from featuregen.data_agent.dimensions import (
     DimensionAttributionPolicyV1,
     MissingValueBehavior,
 )
-from featuregen.data_agent.eligibility import TransactionEligibilityPolicyV1
-from featuregen.data_agent.eligibility import EligibilityError
+from featuregen.data_agent.eligibility import EligibilityError, TransactionEligibilityPolicyV1
 from featuregen.data_agent.learning import record_refusal
 from featuregen.data_agent.observation import ObservationPlanError, require_identifier
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
-from featuregen.data_agent.relationship import RelationshipEvidenceV1, join_refusal
+from featuregen.data_agent.relationship import RelationshipEvidence, join_refusal
 
 
 class AnalysisIRError(ValueError):
@@ -121,7 +119,7 @@ class AnalysisExecutionIRV1:
     #: "verified joins". Not validated at construction: like `assert_no_dimension_overlap`, this is a
     #: statement about the state of the data rather than about the shape of the plan, so a plan can
     #: be built and previewed before a probe has run. :func:`run_analysis` is the gate.
-    join_evidence: RelationshipEvidenceV1 | None = None
+    join_evidence: RelationshipEvidence | None = None
 
     def __post_init__(self) -> None:
         # The identifier rule is genuinely shared with observation, so it is reused rather than

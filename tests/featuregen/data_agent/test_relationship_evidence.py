@@ -16,6 +16,8 @@ while a sample that finds none proves nothing.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from tests.featuregen.data_agent.pilot_fixture import (
     CUSTOMER_SCHEMA,
@@ -89,10 +91,10 @@ def test_referential_coverage_finds_the_unmatched_key(pilot):
 
 
 def test_the_observed_join_multiplier(pilot):
-    """How many left rows a single right row attracts. This is the fan-out fact, measured rather
-    than declared."""
+    """Source frequency is not join fan-out: six transactions still match one customer row each."""
     e = _run(pilot)
-    assert e.max_left_rows_per_right_key == EXPECTED["max_rows_per_customer"] == 6   # C1 and C3 both reach 6 raw rows
+    assert e.max_left_rows_per_tuple == EXPECTED["max_rows_per_customer"] == 6
+    assert e.max_right_matches_per_left_row == 1
     assert e.observed_cardinality == "many_to_one"
 
 
@@ -123,7 +125,12 @@ def test_a_sample_that_finds_a_duplicate_DISPROVES_uniqueness(pilot):
 def test_a_sample_that_finds_no_duplicate_proves_NOTHING(pilot):
     """The rule automatic attestation rests on. An approximate probe seeing no duplicate must return
     `unknown`, never `unique` — otherwise a cheap profile silently promotes a bad key."""
-    e = _run(pilot, _probe(policy=ProfilePolicyV1(exact_distinct=False)))
+    # PostgreSQL executes the V2 group probe exactly even when approximation was requested. Model
+    # a genuinely approximate engine result explicitly; the verdict is about evidence semantics.
+    e = replace(
+        _run(pilot, _probe(policy=ProfilePolicyV1(exact_distinct=False))),
+        method="approximate",
+    )
     assert e.method == "approximate"
     assert e.uniqueness_verdict("right") == "unknown"
 

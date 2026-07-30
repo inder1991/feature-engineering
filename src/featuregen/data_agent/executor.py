@@ -12,9 +12,17 @@ answer, and turn a failure into typed coverage rather than an exception.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Protocol
 
 from featuregen.data_agent.observation import ObservationPlanV1
+from featuregen.data_agent.relationship_observation import (
+    EndpointTupleObservationV2,
+    RelationshipObservationPlanV2,
+    RelationshipObservationV2,
+    failed_relationship_observation,
+    utc_now,
+)
 from featuregen.data_agent.results import ColumnObservationV1, DataObservationResultV1
 
 logger = logging.getLogger(__name__)
@@ -27,12 +35,18 @@ class Dialect(Protocol):
 
     def render_column_profile(self, plan: ObservationPlanV1) -> str: ...
 
-    def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+    def render_relationship_probe(self, plan: RelationshipObservationPlanV2) -> str: ...
+
+    def timeout_statements(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> tuple[str, ...]:
         """Statements bounding one query's runtime. Engine-specific: PostgreSQL is transaction
         milliseconds, Hive is session seconds. Empty for an engine with no reliable bound."""
         ...
 
-    def effective_method(self, plan: ObservationPlanV1) -> str:
+    def effective_method(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> str:
         """What this engine ACTUALLY does — `exact` or `approximate`. Not what the plan requested:
         an engine without an approximate function silently runs a census, and the result must say
         so."""
@@ -70,15 +84,52 @@ class DirectSqlExecutor:
 
         return self._shape(plan, row, physical_id, partitions)
 
+    def observe_relationship(
+        self,
+        plan: RelationshipObservationPlanV2,
+        *,
+        observed_at: datetime | None = None,
+    ) -> RelationshipObservationV2:
+        """Execute one tuple-aware pair probe through the same cursor, timeout and method seam."""
+        timestamp = observed_at or utc_now()
+        statement = self._dialect.render_relationship_probe(plan)
+        method = self._method(plan)
+        try:
+            row = self._run(plan, statement)
+        except Exception as exc:  # noqa: BLE001 — data-side failures are typed coverage
+            reason = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+            logger.info(
+                "relationship observation failed for %s -> %s: %s",
+                plan.left_binding.identity.table_id,
+                plan.right_binding.identity.table_id,
+                reason,
+            )
+            return failed_relationship_observation(
+                plan, method=method, observed_at=timestamp, reason=reason)
+        return self._shape_relationship(
+            plan, row, method=method, observed_at=timestamp)
+
     # ── internals ────────────────────────────────────────────────────────────────────────────────
 
-    def _method(self, plan: ObservationPlanV1) -> str:
+    def _method(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> str:
         """Prefer the dialect's answer; fall back to the plan for a dialect that predates the
         capability (the PostgresDialect's own fallback is documented in its docstring)."""
         effective = getattr(self._dialect, "effective_method", None)
-        return effective(plan) if callable(effective) else plan.method
+        if callable(effective):
+            return effective(plan)
+        return (
+            plan.method
+            if isinstance(plan, ObservationPlanV1)
+            else plan.requested_method
+        )
 
-    def _run(self, plan: ObservationPlanV1, statement: str):
+    def _run(
+        self,
+        plan: ObservationPlanV1 | RelationshipObservationPlanV2,
+        statement: str,
+    ):
         """Execute through a CURSOR — the DB-API 2.0 contract every driver implements.
 
         An earlier version called `conn.execute(...)`, which is a psycopg3 convenience the standard
@@ -97,7 +148,9 @@ class DirectSqlExecutor:
             if callable(close):
                 close()
 
-    def _timeouts(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+    def _timeouts(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> tuple[str, ...]:
         statements = getattr(self._dialect, "timeout_statements", None)
         return tuple(statements(plan)) if callable(statements) else ()
 
@@ -112,12 +165,16 @@ class DirectSqlExecutor:
         bounds = {c.strip().lower() for c in plan.bounds_columns}
         columns: list[ColumnObservationV1] = []
         for column in plan.columns:
-            non_null = int(values[cursor] or 0); cursor += 1
-            distinct = int(values[cursor] or 0); cursor += 1
+            non_null = int(values[cursor] or 0)
+            cursor += 1
+            distinct = int(values[cursor] or 0)
+            cursor += 1
             minimum = maximum = None
             if column.strip().lower() in bounds:
-                minimum = None if values[cursor] is None else str(values[cursor]); cursor += 1
-                maximum = None if values[cursor] is None else str(values[cursor]); cursor += 1
+                minimum = None if values[cursor] is None else str(values[cursor])
+                cursor += 1
+                maximum = None if values[cursor] is None else str(values[cursor])
+                cursor += 1
             columns.append(ColumnObservationV1(
                 column=column, non_null_count=non_null, distinct_count=distinct,
                 minimum=minimum, maximum=maximum, observed_rows=row_count))
@@ -126,3 +183,106 @@ class DirectSqlExecutor:
             physical_id=physical_id, row_count=row_count, columns=tuple(columns),
             partitions_read=partitions, method=self._method(plan), complete=True,
             failures=())
+
+    def _shape_relationship(
+        self,
+        plan: RelationshipObservationPlanV2,
+        row,
+        *,
+        method: str,
+        observed_at: datetime,
+    ) -> RelationshipObservationV2:
+        values = [int(value or 0) for value in row]
+        if len(values) != 18:
+            raise ValueError(
+                f"relationship probe returned {len(values)} metrics, expected 18")
+        (
+            left_rows,
+            left_non_null,
+            left_distinct,
+            left_duplicate_tuples,
+            left_duplicates,
+            left_max,
+            right_rows,
+            right_non_null,
+            right_distinct,
+            right_duplicate_tuples,
+            right_duplicates,
+            right_max,
+            matched,
+            left_orphan_rows,
+            right_orphan_rows,
+            joined_rows,
+            max_right_matches,
+            max_left_matches,
+        ) = values
+
+        def endpoint(binding, columns, selector, metrics):
+            rows, non_null, distinct, duplicate_tuples, duplicates, maximum = metrics
+            return EndpointTupleObservationV2(
+                physical_id=binding.identity.table_id,
+                binding_revision_id=binding.binding_revision_id,
+                binding_content_hash=binding.content_hash,
+                columns=columns,
+                row_count=rows,
+                non_null_row_count=non_null,
+                distinct_tuple_count=distinct,
+                duplicate_tuple_count=duplicate_tuples,
+                duplicate_row_count=duplicates,
+                max_rows_per_tuple=maximum,
+                partitions_read=tuple(selector.values) if selector else (),
+            )
+
+        left = endpoint(
+            plan.left_binding,
+            tuple(pair.left_column for pair in plan.column_pairs),
+            plan.scope.left_partitions,
+            (
+                left_rows,
+                left_non_null,
+                left_distinct,
+                left_duplicate_tuples,
+                left_duplicates,
+                left_max,
+            ),
+        )
+        right = endpoint(
+            plan.right_binding,
+            tuple(pair.right_column for pair in plan.column_pairs),
+            plan.scope.right_partitions,
+            (
+                right_rows,
+                right_non_null,
+                right_distinct,
+                right_duplicate_tuples,
+                right_duplicates,
+                right_max,
+            ),
+        )
+        return RelationshipObservationV2(
+            realization_revision_id=plan.realization_revision_id,
+            plan_hash=plan.plan_hash,
+            scope_id=plan.scope.scope_id,
+            left=left,
+            right=right,
+            matched_left_distinct=matched,
+            unmatched_left_distinct=max(0, left_distinct - matched),
+            matched_right_distinct=matched,
+            unmatched_right_distinct=max(0, right_distinct - matched),
+            left_orphan_rows=left_orphan_rows,
+            right_orphan_rows=right_orphan_rows,
+            joined_row_count=joined_rows,
+            max_right_matches_per_left_row=max_right_matches,
+            max_left_matches_per_right_row=max_left_matches,
+            normalization_ids=plan.scope.normalization_ids,
+            predicate_ids=tuple(
+                predicate.predicate_id for predicate in plan.scope.predicates),
+            left_source_snapshot_id=plan.left_source_snapshot_id,
+            right_source_snapshot_id=plan.right_source_snapshot_id,
+            snapshot_or_as_of=plan.scope.snapshot_or_as_of,
+            execution_principal=plan.scope.execution_principal,
+            method=method,
+            row_coverage=plan.scope.row_coverage,
+            complete=True,
+            observed_at=observed_at,
+        )

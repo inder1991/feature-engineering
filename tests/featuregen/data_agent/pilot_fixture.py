@@ -187,9 +187,11 @@ PILOT_JOIN_EVIDENCE = RelationshipEvidenceV1(
     left_nulls=EXPECTED["transaction_cif_nulls"],
     right_rows=EXPECTED["customer_rows"],
     right_distinct=EXPECTED["customer_cif_distinct"],
+    right_nulls=0,
     matched_distinct=EXPECTED["matched_ids"],
     unmatched_distinct=EXPECTED["unmatched_ids"],
-    max_left_rows_per_right_key=EXPECTED["max_rows_per_customer"],
+    max_left_rows_per_tuple=EXPECTED["max_rows_per_customer"],
+    max_right_matches_per_left_row=1,
     method="exact")
 
 

@@ -412,3 +412,14 @@ def demote_realizations_for_dependency(
         (dependency_kind, dependency_key),
     )
     return changed.rowcount
+
+
+def demote_realization_revision(conn, realization_revision_id: str) -> int:
+    """Withdraw one exact current revision after observed duplicate/fan-out evidence."""
+    changed = conn.execute(
+        "UPDATE bridge_join_realization_current "
+        "SET lifecycle='stale', pointer_version=pointer_version+1, updated_at=now() "
+        "WHERE realization_revision_id=%s AND lifecycle='active'",
+        (realization_revision_id,),
+    )
+    return changed.rowcount

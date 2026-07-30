@@ -11,6 +11,10 @@ already safe to render.
 from __future__ import annotations
 
 from featuregen.data_agent.observation import ObservationPlanError, ObservationPlanV1
+from featuregen.data_agent.relationship_observation import (
+    RelationshipObservationPlanV2,
+    render_relationship_probe_sql,
+)
 
 #: Which engines behind HiveServer2 offer a built-in approximate distinct.
 #:
@@ -52,7 +56,9 @@ class HiveDialect:
         to something else entirely rather than rejecting."""
         return _ident(name)
 
-    def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+    def timeout_statements(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> tuple[str, ...]:
         """Hive's query timeout is a SESSION setting measured in SECONDS — not PostgreSQL's
         transaction-scoped milliseconds.
 
@@ -67,7 +73,9 @@ class HiveDialect:
     def supports_approx_distinct(self) -> bool:
         return _APPROX_BY_FLAVOUR[self.flavour] is not None
 
-    def effective_method(self, plan: ObservationPlanV1) -> str:
+    def effective_method(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> str:
         """What this engine will ACTUALLY do — not what the plan asked for.
 
         A plan requesting `approximate` against an engine without an approximate function runs an
@@ -75,6 +83,11 @@ class HiveDialect:
         a consumer would believe it holds a sample when it holds a census, and would refuse a
         uniqueness proof it could legitimately make.
         """
+        # The relationship probe groups complete tuples to measure actual join multiplication.
+        # That operation is exact even on Spark; labelling it approximate because the request
+        # preferred a sketch would understate what the engine actually executed.
+        if isinstance(plan, RelationshipObservationPlanV2):
+            return "exact"
         if plan.policy.exact_distinct or not self.supports_approx_distinct:
             return "exact"
         return "approximate"
@@ -137,3 +150,6 @@ class HiveDialect:
         where = self.where(plan)
         stmt = f"SELECT COUNT(*) AS row_count\nFROM {self.table_ref(plan)}"
         return f"{stmt}\n{where}" if where else stmt
+
+    def render_relationship_probe(self, plan: RelationshipObservationPlanV2) -> str:
+        return render_relationship_probe_sql(plan, dialect=self)

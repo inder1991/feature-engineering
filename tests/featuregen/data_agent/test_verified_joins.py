@@ -22,18 +22,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
-from featuregen.data_agent.analysis import AnalysisIRError, compile_analysis, run_analysis
-from featuregen.data_agent.profile_policy import ProfilePolicyV1
-from featuregen.data_agent.relationship import (
-    JOIN_EVIDENCE_MISMATCHED,
-    JOIN_EVIDENCE_MISSING,
-    JOIN_KEY_NOT_UNIQUE,
-    JOIN_UNIQUENESS_UNKNOWN,
-    RelationshipProbeV1,
-    observe_relationship,
-)
-from featuregen.data_agent.sql_postgres import PostgresDialect
 from tests.featuregen.data_agent.pilot_fixture import (
     CUSTOMER_SCHEMA,
     CUSTOMER_TABLE,
@@ -44,6 +32,19 @@ from tests.featuregen.data_agent.pilot_fixture import (
     create_pilot_tables,
 )
 from tests.featuregen.data_agent.test_analysis_ir import _binding, _ir
+
+from featuregen.data_agent.analysis import AnalysisIRError, compile_analysis, run_analysis
+from featuregen.data_agent.executor import DirectSqlExecutor
+from featuregen.data_agent.profile_policy import ProfilePolicyV1
+from featuregen.data_agent.relationship import (
+    JOIN_EVIDENCE_MISMATCHED,
+    JOIN_EVIDENCE_MISSING,
+    JOIN_KEY_NOT_UNIQUE,
+    JOIN_UNIQUENESS_UNKNOWN,
+    RelationshipProbeV1,
+    observe_relationship,
+)
+from featuregen.data_agent.sql_postgres import PostgresDialect
 
 
 @pytest.fixture
@@ -123,7 +124,7 @@ def test_an_APPROXIMATE_probe_cannot_verify_the_join(pilot):
     because an approximate distinct count that happens to equal the row count proves nothing. The
     join check must inherit that asymmetry rather than reading `right_is_unique` directly — reading
     the raw property is precisely how a cheap profile silently promotes a bad key."""
-    evidence = _probe(pilot, exact=False)
+    evidence = replace(_probe(pilot, exact=False), method="approximate")
     assert evidence.right_is_unique                      # the raw property says yes...
     with pytest.raises(AnalysisIRError) as exc:          # ...and the verdict still refuses
         run_analysis(pilot, _ir(join_evidence=evidence), dialect=PostgresDialect())
@@ -161,7 +162,8 @@ def test_the_probe_reproduces_the_fixtures_hand_counted_numbers(pilot):
     assert evidence.left_nulls == EXPECTED["transaction_cif_nulls"]
     assert evidence.unmatched_distinct == EXPECTED["unmatched_ids"]     # C9
     assert evidence.matched_distinct == EXPECTED["matched_ids"]
-    assert evidence.max_left_rows_per_right_key == EXPECTED["max_rows_per_customer"]
+    assert evidence.max_left_rows_per_tuple == EXPECTED["max_rows_per_customer"]
+    assert evidence.max_right_matches_per_left_row == 1
     assert evidence.observed_cardinality == "many_to_one"
 
 
@@ -174,6 +176,22 @@ def test_the_verified_pilot_join_returns_the_SAME_answers(pilot):
     decreased = tuple(sorted(r.key for r in rows if r.decreased))
     assert decreased == EXPECTED["decreased_customers"]
     assert len(rows) == EXPECTED["customer_rows"]
+
+
+def test_analysis_consumes_the_tuple_aware_v2_observation_directly(pilot):
+    probe = RelationshipProbeV1(
+        left_binding=_binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE),
+        left_column="cif_id",
+        right_binding=_binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE),
+        right_column="cif_id",
+        policy=ProfilePolicyV1(exact_distinct=True),
+    )
+    evidence = DirectSqlExecutor(
+        pilot, PostgresDialect()).observe_relationship(probe.to_v2())
+    rows = run_analysis(
+        pilot, _ir(join_evidence=evidence), dialect=PostgresDialect())
+    assert tuple(sorted(row.key for row in rows if row.decreased)) == (
+        EXPECTED["decreased_customers"])
 
 
 def test_evidence_is_NOT_part_of_the_plan_hash(pilot):
