@@ -3675,6 +3675,7 @@ button.stat:hover {
   font-size: 13.5px;
 }
 
+/* --ink on --warn-soft is 13.95:1; the --warn border is 5.34:1 against the ground it sits on. */
 .gq-broken {
   border-style: solid;
   border-color: var(--warn);
@@ -3706,6 +3707,8 @@ button.stat:hover {
   color: var(--ink-faint);
 }
 
+/* The catalog slug is an identifier, so it keeps the mono face. --accent on --accent-soft is
+   5.35:1, which clears 4.5:1 for this 11px uppercase label. */
 .badge.gq-catalog {
   background: var(--accent-soft);
   border-color: var(--accent-line);
@@ -3759,13 +3762,34 @@ button.stat:hover {
 }
 
 /* The left rule is the only colour: enough to separate the three cells at a glance, never enough
-   to read as a verdict badge. */
+   to read as a verdict badge.
+
+   A 3px rule that carries a state is a non-text indicator, so each SIGNALLING tone clears 3:1
+   (WCAG 1.4.11) against both fills it can sit between — the cell's own --surface and the
+   --surface-2 of a .gq-member row. Measured, in the same terms as --ln-join above:
+
+     tone   token       on --surface   on --surface-2   was
+     ok     --ok           5.53:1          5.22:1       (unchanged)
+     open   --accent       6.43:1          6.07:1       --accent-line 2.56 / 2.42 — BELOW 3:1
+     warn   --warn         5.34:1          5.05:1       (unchanged)
+     off    --ln-join      3.85:1          3.63:1       --line-strong 2.10 / 1.99 — BELOW 3:1
+     quiet  --line         1.50:1          1.42:1       (unchanged, and deliberate — see below)
+
+   `quiet` is the ONE tone deliberately left at hairline strength, because it is not an indicator:
+   it means "the payload has nothing to report on this axis" (not_observed / not_applicable / a code
+   this client cannot map), and it paints the rule the SAME colour as the rest of the cell's border,
+   so there is no state being signalled by colour for a reader to miss. What that axis says is
+   carried by its words and by `data-tone`, with the value dropped to --ink-soft (7.61:1 on surface,
+   7.19:1 on surface-2). Lifting it to 3:1 would manufacture a signal the data does not contain.
+
+   `off` (rejected / stale) stays achromatic on purpose — a red rule would read as a danger verdict
+   on a settled row — but at --ln-join it is now perceivable rather than a near-invisible hairline. */
 .gq-axis[data-tone='ok'] {
   border-left-color: var(--ok);
 }
 
 .gq-axis[data-tone='open'] {
-  border-left-color: var(--accent-line);
+  border-left-color: var(--accent);
 }
 
 .gq-axis[data-tone='warn'] {
@@ -3773,7 +3797,7 @@ button.stat:hover {
 }
 
 .gq-axis[data-tone='off'] {
-  border-left-color: var(--line-strong);
+  border-left-color: var(--ln-join);
 }
 
 .gq-axis[data-tone='quiet'] {
@@ -3871,6 +3895,8 @@ button.stat:hover {
   background: var(--accent-soft);
 }
 
+/* on --accent-soft: the head is --accent at 5.35:1, the note --ink-soft at 6.34:1, and a
+   :focus-visible ring inside the panel is --accent at 5.35:1 (>= 3:1, WCAG 1.4.11). */
 .gq-panel-head {
   margin: 0;
   font-size: 12px;
