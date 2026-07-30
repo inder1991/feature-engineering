@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 
 from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.upload.search import SearchResult, search
 
 router = APIRouter()
@@ -51,5 +52,13 @@ def search_catalog(
         filters["grain"] = ["true"]
     if as_of:
         filters["as_of"] = ["true"]
+    # Freshness comes from the CONFIGURED drift SLA, the same one every other governed read uses
+    # (`resolve.py`'s watermark check, `declarations.py`'s `participating_catalog_stale`). Before
+    # this, the route passed nothing and `search()`'s own 24-hour default governed instead — a
+    # second, private, non-configurable freshness window nobody could see. On a deployment whose
+    # watermark only advances at ingest (there is no drift scanner), raising
+    # OVERLAY_DRIFT_FRESHNESS_SLA_MIN kept every governed read working while search silently went
+    # empty the moment a catalog crossed 24 hours. Two windows is the defect; this removes one.
     return search(conn, q, now=datetime.now(UTC), roles=identity.role_claims,
+                  fresh_within=current_overlay_config().drift_freshness_sla,
                   filters=filters, limit=limit, offset=offset)
