@@ -60,7 +60,7 @@ them together would be reporting one axis's evidence under another's name.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -241,3 +241,29 @@ def read_governed_grain(
             f"projection says {projected}: one of the two is stale, and a grain that is wider than "
             f"it looks is the exact shape of an unnoticed fan-out")
     return GovernedGrain(columns=columns, fact_event_id=confirmed_event_id)
+
+
+def load_governed_grains(
+    conn: DbConn, targets: Iterable[tuple[str, str]], *, now: datetime,
+) -> dict[str, dict[str, tuple[str, ...]]]:
+    """Batch the grain read for a KNOWN set of tables: ``{catalog -> {table_object_ref -> columns}}``.
+
+    ``targets`` is an iterable of ``(catalog_source, table_object_ref)`` — flattened
+    ``public.<table>`` refs, the form ``graph_node`` and every bridge endpoint use. The caller names
+    the tables; nothing here searches for one, so a batch cannot quietly widen into a scan.
+
+    Only ATTESTED grains land in the result. An absent key therefore means "no usable grain evidence"
+    for whatever reason :class:`GrainRefusal` recorded, which is the shape a consumer that must fail
+    closed wants: it cannot accidentally read a refusal as an answer. Deduplicated, so one table
+    reached by two bridges is read once — this is called once per run, and the per-column C1 reads
+    inside it are exactly what a per-plan re-read would multiply.
+    """
+    out: dict[str, dict[str, tuple[str, ...]]] = {}
+    for catalog_source, table_ref_str in sorted(set(targets)):
+        table = table_ref_str.rsplit(".", 1)[-1]
+        if not table:
+            continue
+        grain = read_governed_grain(conn, catalog_source, table, now=now)
+        if isinstance(grain, GovernedGrain):
+            out.setdefault(catalog_source, {})[table_ref_str] = grain.columns
+    return out

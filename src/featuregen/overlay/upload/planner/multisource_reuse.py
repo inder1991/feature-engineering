@@ -30,7 +30,9 @@ from featuregen.overlay.upload.bridge_projection import active_bridges
 from featuregen.overlay.upload.catalog_realizations import (
     derive_catalog_realizations,
     realization_fingerprint,
+    table_of,
 )
+from featuregen.overlay.upload.governed_grain import load_governed_grains
 from featuregen.overlay.upload.planner.assembly import (
     _Position,
     assemble_paths,
@@ -78,13 +80,28 @@ def build_operand_context(
     of resolving everything ``undeclared``. Every other field is batch-loaded the same way
     (realizations, active bridges, read-scoped columns, scope-start fingerprints). ``catalog_stamps``
     is empty (the freshness observation isn't part of the reuse chain); ``config`` comes from the
-    deployment env loader. Immutable + conn-free once built."""
+    deployment env loader. Immutable + conn-free once built.
+
+    ``governed_grain_by_table`` is loaded the same way the production builder loads it — the governed
+    grain of both endpoints of every in-scope active bridge — because A's whole premise is that the
+    REUSED ``compile_aggregation`` behaves here exactly as it does in production. Omitting it would
+    leave every bridge-rollup hop's cardinality unattested in A's context alone, which would not be
+    reuse."""
     roles = tuple(roles)
     catalogs = tuple(catalogs)
+    bridges = active_bridges(conn)
     return CompilerContext(
         realizations_by_catalog={
             src: derive_catalog_realizations(conn, src).realizations for src in catalogs},
-        active_bridges=active_bridges(conn),
+        active_bridges=bridges,
+        governed_grain_by_table=load_governed_grains(
+            conn,
+            ((cat, table_of(ref))
+             for br in bridges
+             for cat, ref in ((br.left_catalog_source, br.left_object_ref),
+                              (br.right_catalog_source, br.right_object_ref))
+             if cat in catalogs),
+            now=now),
         columns_by_catalog={
             src: {col.object_ref: col for col in _load_columns(conn, src, roles)}
             for src in catalogs},

@@ -98,6 +98,14 @@ class CompilerContext:
 
     realizations_by_catalog: Mapping[str, tuple[CatalogEntityRelationshipV1, ...]]
     active_bridges: tuple[ActiveBridgeV1, ...]
+    # ``{catalog -> {table_object_ref -> the table's COMPLETE, CURRENT, VERIFIED, UNIQUE grain}}``,
+    # batch-read once per run by ``governed_grain.load_governed_grains`` for the tables the active
+    # bridges name. ONLY attested grains are present, so an absent key means "no usable evidence" and
+    # can never be misread as an answer — which is what lets ``_hop_evidence`` derive a bridge-rollup
+    # hop's cardinality and fail closed without a second read. REQUIRED, with no default: an omitted
+    # grain map derives nothing, and a silent fail-closed is still a wrong answer nobody was told
+    # about, so every construction site has to say what evidence it holds.
+    governed_grain_by_table: Mapping[str, Mapping[str, tuple[str, ...]]]
     columns_by_catalog: Mapping[str, Mapping[str, _Col]]     # catalog -> object_ref -> _Col
     catalog_fingerprint_at_start: Mapping[str, str]
     bridge_fingerprint_at_start: str
@@ -123,6 +131,9 @@ class CompilerContext:
         object.__setattr__(self, "agg_declarations", MappingProxyType(dict(self.agg_declarations)))
         object.__setattr__(self, "agg_declaration_conflicts",
                            frozenset(self.agg_declaration_conflicts))
+        object.__setattr__(self, "governed_grain_by_table", MappingProxyType(
+            {cat: MappingProxyType({ref: tuple(cols) for ref, cols in tables.items()})
+             for cat, tables in self.governed_grain_by_table.items()}))
 
 
 @dataclass(slots=True)
@@ -318,9 +329,14 @@ CARDINALITY_SOURCE_REALIZATION = "realization"
 CARDINALITY_SOURCE_UNAVAILABLE = "unavailable"
 # A bridge the context RESOLVED but whose fan-in NOTHING attests. Distinct from `unavailable` (which
 # means the segment resolved to no bridge at all) because the two ask a human for different things:
-# one to establish a directional realization, the other to find out why the bridge is missing. Both
-# carry cardinality None — see `_hop_evidence` for why a bridge can no longer claim many_to_one.
+# one to establish the far side's grain, the other to find out why the bridge is missing. Both carry
+# cardinality None — see `_hop_evidence` for why a bridge alone can never claim many_to_one.
 CARDINALITY_SOURCE_BRIDGE_UNATTESTED = "bridge_unattested"
+# TIER 2: many_to_one DERIVED from the far table's governed grain — the hop lands on a column that is
+# that table's COMPLETE, CURRENT, VERIFIED, UNIQUE grain, so at most one row can be on the far side
+# of it. Named distinctly from `realization` because the EVIDENCE is different (a grain fact, not a
+# declared relationship) and a reader must be able to tell which one carried a verdict.
+CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN = "bridge_far_grain"
 
 # Declared functions that are provably duplication/order-safe on ANY fan-in without extra inputs.
 _ORDER_SAFE_DECLARED = frozenset(
@@ -365,32 +381,63 @@ def _hop_evidence(
     context cannot resolve → ``(None, "unavailable", (), <segment catalog>, "")`` — fail closed,
     never a guessed fan-in.
 
-    BRIDGE-ROLLUP hops have NO cardinality (fail-close correction). This branch used to return
-    ``many_to_one`` "BY CONSTRUCTION", on the argument that the bridge anchors an E2-key FK column
-    to an E2-grain far table. Nothing in a bridge attests either half of that: not the DIRECTION the
-    join runs, and not the far side's grain. If the far side is not in fact at that grain the hop is
-    1:N — rows multiply, and every SUM taken over it inflates into a plausible number that raises no
-    error anywhere. That is an ASSUMPTION presented as EVIDENCE, and it is the one class of defect
-    this compiler exists to refuse.
+    BRIDGE-ROLLUP hops get their cardinality from the FAR TABLE'S GOVERNED GRAIN, or not at all.
 
-    ``materialize/joins.py`` already writes the argument out for the identical case: "Unknown
-    cardinality is refused ... Refusing only the hops that SAY 1:N is a fail-open: an unattested edge
-    may BE 1:N. 'We do not know' is not 'it is safe'." Until DIRECTIONAL REALIZATIONS exist — which
-    direction is joined, at what cardinality, in what scope, with what fan-out — there is no evidence
-    to return, so a resolved bridge yields ``(None, "bridge_unattested", (), <far catalog>, "")`` and
-    ``compile_aggregation`` stages every measure on it as ``physical_cardinality_unavailable``.
+    The branch once returned ``many_to_one`` "BY CONSTRUCTION", on the argument that the bridge
+    anchors an E2-key FK column to an E2-grain far table. Nothing in a bridge attests either half of
+    that: not the DIRECTION the join runs, and not the far side's grain. If the far side is not in
+    fact at that grain the hop is 1:N — rows multiply, and every SUM taken over it inflates into a
+    plausible number that raises no error anywhere. ``materialize/joins.py`` writes the same argument
+    out for the identical case: "Refusing only the hops that SAY 1:N is a fail-open: an unattested
+    edge may BE 1:N. 'We do not know' is not 'it is safe'."
 
-    This withholds a CARDINALITY CLAIM, nothing else. Link availability is decided elsewhere
-    entirely (``cross_catalog_links``' lifecycle allow-list, read through ``ctx.active_bridges``), so
-    the bridge remains fully visible to discovery, suggestions and bounded sandbox analysis. The two
-    are different axes and must not be collapsed: a link is not withdrawn because nobody has yet
-    measured its direction, and it is not execution-safe because somebody approved its semantics.
+    TIER 2 replaces that assumption with a DERIVATION from evidence that was always there:
 
-    The far endpoint is still identified (the endpoint in the segment's catalog; endpoint storage
-    order is unordered) — it is what tells an unattested bridge apart from an absent one — but it is
-    NOT returned as a grouping key or an execution site. Emitting a GROUP BY for a hop whose fan-in
-    is unproven would be the same fabrication one step down, and it would break the invariant
+        if the far endpoint column IS the far table's complete, current, VERIFIED, unique grain,
+        then at most one far row exists per key value, and the hop into it really IS many_to_one.
+
+    Every word of that is load-bearing. ``ctx.governed_grain_by_table`` holds ONLY grains
+    ``governed_grain.read_governed_grain`` attested (VERIFIED, unexpired at ``ctx.now``, schema-clean,
+    ``is_unique`` true, agreeing with its column projection), so the test here is set EQUALITY against
+    the whole grain. That is ``spine._refuse_non_unique_keys``' both-directions discipline with the
+    only relaxation it allows removed: keys the grain does not contain are not attested to identify
+    anything, AND grain columns the key does not contain mean many rows per key — legal there only
+    because a snapshot policy names the columns it COLLAPSES, and a bridge hop has no such policy. So
+    one member of a composite grain ``(a, b)`` derives NOTHING: joining on ``a`` alone lands on every
+    ``b`` for that ``a``.
+
+    DIRECTION comes from the HOP, never from the bridge. A bridge's identity is unordered (left/right
+    is storage order), and evidence that A → B is many_to_one says nothing whatever about B → A: the
+    grain of the table being joined INTO is what bounds the fan-in, and the two tables have different
+    grains. The far endpoint is therefore the one in ``segment.catalog_source`` — the side this hop
+    lands on — and only THAT table's grain is consulted. A grain confirmed on the near side is
+    evidence for the opposite direction and is deliberately never read here.
+
+    THREE AXES, KEPT APART. A grain fact attests PHYSICAL UNIQUENESS and nothing else. It does not say
+    the two endpoint columns MEAN the same thing — that is the bridge's semantic axis, with its own
+    authority and lifecycle — and it does not make anything eligible to execute. Deriving fan-in from
+    grain therefore neither borrows nor confers semantic trust: an ungoverned-semantics bridge whose
+    far side is at grain still gets its honest cardinality, and a human-blessed bridge whose far side
+    is not still gets none.
+
+    Anything unproven yields ``(None, "bridge_unattested", (), <far catalog>, "")`` and
+    ``compile_aggregation`` stages every measure on it as ``physical_cardinality_unavailable``. The far
+    endpoint is still IDENTIFIED (it is what tells an unattested bridge from an absent one) but is NOT
+    returned as a grouping key or an execution site: emitting a GROUP BY for a hop whose fan-in is
+    unproven would be the same fabrication one step down, and it would break the invariant
     ``_grouping_survives`` relies on ("a cardinality-unavailable hop has neither").
+
+    AVAILABILITY IS NOT THIS FUNCTION'S BUSINESS, in either direction. Link availability is decided
+    entirely elsewhere (``cross_catalog_links``' lifecycle allow-list, read through
+    ``ctx.active_bridges``), so a bridge stays fully visible to discovery, suggestions and bounded
+    sandbox analysis whether or not its cardinality can be derived. The two must not be collapsed: a
+    link is not withdrawn because nobody governed the far side's grain, and it is not execution-safe
+    because somebody approved its semantics.
+
+    TIER 3 (a MEASURED fan-out probe) is future work, and it does not make grain evidence
+    unnecessary. A probe is bound to the scope it measured and to a validity window; it could
+    supersede a grain fact only under an explicit freshness / scope / revalidation policy, which does
+    not exist. Nothing here should be read as waiting for it.
     """
     if segment.realization_ref is not None:
         r = next((x for x in ctx.realizations_by_catalog.get(segment.catalog_source, ())
@@ -408,7 +455,13 @@ def _hop_evidence(
                                     (br.right_catalog_source, br.right_object_ref))
                    if cat == segment.catalog_source]
             if len(far) == 1:   # exactly one endpoint on the segment's (far) side, else fail closed
-                cat, _ref = far[0]
+                cat, ref = far[0]
+                table = table_of(ref)
+                grain = ctx.governed_grain_by_table.get(cat, {}).get(table)
+                column = ref.rsplit(".", 1)[-1].strip().lower()
+                if grain is not None and grain == (column,):
+                    return (Cardinality.MANY_TO_ONE, CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN, (ref,),
+                            cat, table)
                 return None, CARDINALITY_SOURCE_BRIDGE_UNATTESTED, (), cat, ""
         return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
     return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
@@ -1148,14 +1201,37 @@ def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
     seals, not a fresh READ COMMITTED query. The capture is produced by the IDENTICAL ``_load_columns``
     SELECT, so ``columns_by_catalog`` (and thus every ``physical_plan_id``) is byte-identical to the
     live read. With ``column_source=None`` (gold/shadow/direct callers) the live ``_load_columns`` read
-    is unchanged."""
+    is unchanged.
+
+    It also batch-reads the GOVERNED GRAIN of the tables the active bridges name — BOTH endpoints of
+    each, so a hop in either direction can be answered — which is what lets ``_hop_evidence`` DERIVE a
+    bridge-rollup hop's cardinality instead of assuming it. Endpoint-keyed, never a scan: the tables
+    come from the bridges themselves, and only catalogs inside the authorized scope are read.
+
+    ``load_governed_grains`` is imported inside this function deliberately. The neutrality proof holds
+    ``declarations.py`` to behavioural identity per TOP-LEVEL SYMBOL but compares every module-level
+    statement — imports included — as ONE blob, so a new module-level import could only be admitted by
+    allow-listing that whole blob, trading per-symbol precision for a blanket exemption on any future
+    module-level change here. Keeping the dependency inside the one impure builder that needs it costs
+    nothing and leaves the proof at full strength."""
+    from featuregen.overlay.upload.governed_grain import load_governed_grains
+
     roles = tuple(roles)
     catalogs = scope.authorized_catalog_sources
     agg_declarations, agg_conflicts = load_aggregation_declarations(conn, now)
+    bridges = active_bridges(conn)
     return CompilerContext(
         realizations_by_catalog={
             src: derive_catalog_realizations(conn, src).realizations for src in catalogs},
-        active_bridges=active_bridges(conn),
+        active_bridges=bridges,
+        governed_grain_by_table=load_governed_grains(
+            conn,
+            ((cat, table_of(ref))
+             for br in bridges
+             for cat, ref in ((br.left_catalog_source, br.left_object_ref),
+                              (br.right_catalog_source, br.right_object_ref))
+             if cat in catalogs),
+            now=now),
         columns_by_catalog={
             src: {col.object_ref: col
                   for col in (column_source.columns(src, roles) if column_source is not None
