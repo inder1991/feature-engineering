@@ -1667,19 +1667,29 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
                     for column, key in zip(hop.to_columns, hop.keys)
                 ),
              *(f"F.col({column!r}).alias({hop.prefix + column!r})" for column in hop.carried)]))
+        # Uniqueness is checked over NON-NULL keys only, exactly as the bridge precondition
+        # checks it (nodes_join_gate): a left equi-join never matches a NULL key, so NULL-key
+        # dimension rows cannot amplify anything, and refusing them would be a false diagnostic
+        # on a pipeline that would have run correctly.
+        non_null = " & ".join(f"F.col({key!r}).isNotNull()" for key in hop.keys)
         grouped_keys = ", ".join(f"F.col({key!r})" for key in hop.keys)
         lines.extend([
-            f"    duplicate_{hop.index} = {hop.frame}.groupBy({grouped_keys}).count().where(",
+            f"    {hop.frame}_joinable = {hop.frame}.where({non_null})",
+            f"    duplicate_{hop.index} = {hop.frame}_joinable.groupBy({grouped_keys})"
+            ".count().where(",
             "        F.col('count') > F.lit(1)).limit(1).count()",
             f"    if duplicate_{hop.index}:",
             "        raise RuntimeError(",
             f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} + ",
-            f"            ': join key is not unique on {hop.schema}.{hop.table} for hop {hop.index}'",
-            "        )",
+            f"            "
+            f"{f': join key is not unique on {hop.schema}.{hop.table} for hop {hop.index}'!r})",
         ])
         for key, left_name in zip(hop.keys, hop.left_names):
             lines.append(f"    rows = rows.withColumn({key!r}, F.col({left_name!r}))")
         if hop.directional:
+            # NOT redundant with the pre-join uniqueness gate above: the hop frame is lazy and
+            # scanned twice (once by the gate, once by the join), so this post-join recheck is
+            # what catches a target table that CHANGED between the two scans.
             lines.append(f"    rows_before_bridge_{hop.index} = rows.count()")
         rendered_keys = ", ".join(repr(key) for key in hop.keys)
         lines.append(

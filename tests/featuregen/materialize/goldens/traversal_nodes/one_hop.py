@@ -75,13 +75,13 @@ def project_total_debit_amount_30d__body_expr(
     # customers — authorized by approved_join fact ajf-txn-cust (VERIFIED).
     hop_1 = join_1_customers.select(
         F.col('cif_id').alias('__join_1__key'), F.col('cif_id').alias('__join_1__cif_id'))
-    duplicate_1 = hop_1.groupBy(F.col('__join_1__key')).count().where(
+    hop_1_joinable = hop_1.where(F.col('__join_1__key').isNotNull())
+    duplicate_1 = hop_1_joinable.groupBy(F.col('__join_1__key')).count().where(
         F.col('count') > F.lit(1)).limit(1).count()
     if duplicate_1:
         raise RuntimeError(
             'JOIN_AMPLIFICATION' + 
-            ': join key is not unique on banking.customers for hop 1'
-        )
+            ': join key is not unique on banking.customers for hop 1')
     rows = rows.withColumn('__join_1__key', F.col('cif_num'))
     rows = rows.join(hop_1, ['__join_1__key'], 'left').drop('__join_1__key')
 

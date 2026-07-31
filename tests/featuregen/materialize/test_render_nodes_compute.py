@@ -2525,6 +2525,21 @@ def test_a_duplicated_key_on_the_SECOND_hop_is_caught_at_THAT_hop_and_names_THAT
     assert "banking.customers" in str(caught.value) and "hop 2" in str(caught.value)
 
 
+def test_NULL_dimension_keys_do_not_trip_the_gate_because_a_left_join_never_matches_them(
+        compiled, expression):
+    """The gate mirrors the bridge precondition (`nodes_join_gate`): uniqueness is checked over
+    NON-NULL keys only. Two NULL-key dimension rows cannot amplify anything — a left equi-join
+    never matches NULL, itself included — so refusing them would be a false diagnostic ('key is
+    not unique' when every joinable key is) on a pipeline that would have run correctly. The
+    join's own semantics are unchanged: a null-key source row still annotates to NULL."""
+    node = _traversal(compiled, expression)
+    rows = _traverse(node, [_windowed(BEFORE, 10) | {"acct_num": "A1"},
+                            _windowed(BEFORE, 99) | {"acct_num": None}],
+                     accounts=[*ACCOUNTS, {"acct_id": None, "owner_id": "C7"},
+                               {"acct_id": None, "owner_id": "C8"}]).rows
+    assert [(row["txn_amt"], row["cif_id"]) for row in rows] == [(10, "C1"), (99, None)]
+
+
 def test_a_source_row_whose_DIMENSION_ROW_IS_MISSING_survives_with_a_NULL_key(
         compiled, expression):
     """The join type, made observable. An INNER traversal drops this row — which changes the rows
