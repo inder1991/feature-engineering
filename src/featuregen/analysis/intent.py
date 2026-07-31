@@ -32,13 +32,24 @@ from dataclasses import dataclass, field
 
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure, Window
 from featuregen.contracts import SchemaValidationError
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.intake.llm import (
     STATUS_OK,
     STATUS_REPAIRED,
     STATUS_RETRIED,
     LLMClient,
     LLMRequest,
+    compute_input_hash,
     drive_structured_call,
+    mint_id,
+    record_llm_call,
+)
+from featuregen.overlay.upload.enrich_llm import _generation_settings
+from featuregen.intake.redaction import (
+    assert_llm_safe,
+    build_llm_inputs,
+    redact_free_text,
 )
 
 TASK = "analysis.intent"
@@ -246,44 +257,74 @@ def _plan_from(output: dict, question: str) -> AnalysisPlanV1:
     )
 
 
-def extract_intent(client: LLMClient, question: str, candidates: IntentCandidates, *,
-                   model: str | None = None) -> IntentExtraction:
+def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCandidates, *,
+                   actor: IdentityEnvelope, model: str | None = None) -> IntentExtraction:
     """Turn a question into a candidate plan, or fail into clarification.
 
-    The plan is NOT grounded here. Grounding is a separate pass that reads the catalog's governed
-    facts, and keeping the two apart is what stops a model's confidence from being mistaken for
-    evidence.
+    `conn` and `actor` are REQUIRED, not optional conveniences: there must be no ungoverned way to
+    call this. The first version took neither and consequently did three things wrong — the user's
+    question egressed to the provider unscanned, the payload skipped the §9.4 egress backstop, and
+    no `llm_call` record was written, so a route docstring claiming the call was "attributed to the
+    human who asked" was simply false.
+
+    **The QUESTION is free text from a person.** "show me transactions for Ahmed Al-Mansouri" is a
+    perfectly natural thing to type, and it carries a customer name. It goes through
+    `redact_free_text`, which scans and classifies it honestly — a hit means the spans are scrubbed
+    and the payload is marked `contains_pii`, and no hit means `clean` BECAUSE IT WAS SCANNED.
+
+    The plan is NOT grounded here. Grounding is a separate pass over the catalog's governed facts,
+    and keeping the two apart is what stops a model's confidence being mistaken for evidence.
     """
-    inputs = {
-        "question": question,
-        # Metadata only — refs and labels, never a data value (§9.4). The catalog objects are what
-        # the model chooses among, so they must egress; no sample or profile does.
-        "catalog_metadata": {
+    # The question is the intent; the offered catalog objects are metadata. Same split the
+    # enrichment path uses, so the reserved-key contract `assert_llm_safe` checks is satisfied.
+    redaction = redact_free_text(question)
+    inputs = build_llm_inputs(
+        redaction,
+        catalog_metadata={
             "column_refs": sorted(candidates.column_refs),
             "table_refs": sorted(candidates.table_refs),
             "labels": dict(sorted(candidates.labels.items())),
+            "instruction":
+                "Choose, from the offered catalog objects only, which ones this question is about. "
+                "Never name a ref that is not offered. Express periods as whole calendar units. If "
+                "the question does not determine something, list it in `unresolved` and leave it "
+                "empty rather than guessing.",
         },
-        "instruction":
-            "Choose, from the offered catalog objects only, which ones this question is about. Never "
-            "name a ref that is not offered. Express periods as whole calendar units. If the "
-            "question does not determine something, list it in `unresolved` and leave it empty "
-            "rather than guessing.",
-    }
+        raw_input_classification=(
+            "contains_pii" if redaction.redacted_spans else "clean"))
+
     request = LLMRequest(
         task=TASK, prompt_id=PROMPT_ID, prompt_version=PROMPT_VERSION, inputs=inputs,
         output_schema_id=SCHEMA_ID, output_schema_version=SCHEMA_VERSION,
-        generation_settings={"model": model} if model else {},
+        # From the SAME env that configures the client, so the audit record says what the adapter
+        # actually applied — and `llm_call.provider` is NOT NULL, so an empty dict cannot be written
+        # at all. A per-call `model` override still wins.
+        generation_settings=({**_generation_settings(), "model": model}
+                             if model else _generation_settings()),
         output_schema=INTENT_SCHEMA,
         # The offered vocabulary is a large static prefix across questions against one catalog.
-        cacheable_metadata_keys=("column_refs", "table_refs", "labels"),
-    )
+        cacheable_metadata_keys=("column_refs", "table_refs", "labels"))
+
+    # §9.4 backstop, BEFORE dispatch. A hard failure: nothing is sent.
+    assert_llm_safe(request)
 
     outcome = drive_structured_call(
         client, request, lambda out: validate_intent(dict(out), candidates))
 
+    # Written whatever the disposition — a refused or malformed call still egressed, and the record
+    # is the evidence that it did.
+    record_llm_call(
+        conn, run_id=mint_id("arun"), request=request,
+        input_hash=compute_input_hash(inputs),
+        redaction_version=redaction.redaction_version,
+        input_redaction={"redacted_spans": [dict(s) for s in redaction.redacted_spans]},
+        raw_output={"output": outcome.output,
+                    "self_reported_scores": outcome.self_reported_scores},
+        validation_result=outcome.validation_result,
+        repair_attempts=list(outcome.repair_attempts), latency_ms=None,
+        cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
+
     if outcome.status not in (STATUS_OK, STATUS_REPAIRED, STATUS_RETRIED):
-        # Fail into clarification rather than returning a half-plan: the caller must be able to tell
-        # "the model could not express this" from "the model expressed it and the catalog disagreed".
         raise IntentUnavailable(outcome.status, outcome.validation_result.get("reason", ""))
 
     output = dict(outcome.output)
@@ -296,8 +337,7 @@ def extract_intent(client: LLMClient, question: str, candidates: IntentCandidate
         plan=_plan_from(output, question),
         unresolved=tuple(unresolved),
         status=outcome.status,
-        provider_calls=outcome.provider_calls,
-    )
+        provider_calls=outcome.provider_calls)
 
 
 class IntentUnavailable(RuntimeError):

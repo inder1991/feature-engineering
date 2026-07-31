@@ -14,7 +14,9 @@ const API = 'http://localhost:8000'
 // the browser's asset-detail request hits the Vite server itself and 404s instead of the backend.
 const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', '/features',
   '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs', '/governance',
-  '/gate', '/catalog', '/ingestion-runs']
+  '/gate', '/catalog', '/catalogs', '/ingestion-runs',
+  // The data agent's planning surface, and the learning-gap queue.
+  '/analysis', '/learning']
 
 export default defineConfig({
   plugins: [react()],

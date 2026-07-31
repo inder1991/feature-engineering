@@ -12,9 +12,11 @@ there is no connection registry — so a route that promised to run would be pro
 impossible. The preview reports exactly which piece is missing.
 
 **`feature:generate`, not `catalog:read`.** Planning dispatches an LLM call against catalog metadata
-on the caller's behalf. That is the same class of action as the feature-generation routes next door,
-and it is charged to the caller's identity so every `llm_call` is attributed to the human who asked
-rather than to a service actor.
+on the caller's behalf — the same class of action as the feature-generation routes next door. The
+caller's identity is threaded into `extract_intent`, which writes the `llm_call` record, so the
+dispatch is attributed to the human who asked rather than to a service actor. That sentence was
+here before the record was, and was false: the first version called the raw driver and audited
+nothing.
 
 **Read scope is the caller's.** Retrieval prunes candidates by `identity.role_claims`, so a column
 the caller may not see is never offered to a model on their behalf — and here that set becomes prompt
@@ -95,7 +97,8 @@ def _plan_for(conn, question: str, identity: IdentityEnvelope, client: LLMClient
     if retrieval.is_empty:
         raise HTTPException(status_code=422, detail=retrieval.empty_reason)
     try:
-        extraction = extract_intent(client, question, retrieval.candidates)
+        extraction = extract_intent(conn, client, question, retrieval.candidates,
+                                    actor=identity)
     except IntentUnavailable as exc:
         # 422, not 500: the question could not be expressed, which is about the request rather than
         # a fault in the service.

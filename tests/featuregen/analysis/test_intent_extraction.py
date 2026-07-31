@@ -23,6 +23,7 @@ from featuregen.analysis.intent import (
     validate_intent,
 )
 from featuregen.contracts import SchemaValidationError
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import (
     PROVIDER_REFUSAL,
     STATUS_OK,
@@ -69,6 +70,17 @@ def _output(**over) -> dict:
     return out
 
 
+_ACTOR = IdentityEnvelope(subject="analyst", actor_kind="human", authenticated=True,
+                         auth_method="oidc", role_claims=("feature_engineer",))
+
+
+def _extract(db, client, question=None, candidates=None, **kw):
+    """`extract_intent` now REQUIRES a connection and an actor — it writes the llm_call record and
+    runs the egress backstop, and there is deliberately no ungoverned way to call it."""
+    return extract_intent(db, client, question or _QUESTION,
+                          candidates or _candidates(), actor=_ACTOR, **kw)
+
+
 def _llm(*responses: FakeResponse) -> FakeLLM:
     from featuregen.analysis.intent import TASK
     return FakeLLM(script={TASK: list(responses) or [FakeResponse(output=_output())]})
@@ -76,8 +88,8 @@ def _llm(*responses: FakeResponse) -> FakeLLM:
 
 # ── the pilot question ───────────────────────────────────────────────────────────────────────────
 
-def test_the_pilot_question_becomes_a_candidate_plan():
-    got = extract_intent(_llm(), _QUESTION, _candidates())
+def test_the_pilot_question_becomes_a_candidate_plan(db):
+    got = _extract(db, _llm(), _QUESTION, _candidates())
     plan = got.plan
     assert plan.question == _QUESTION
     assert plan.entity == "customer"
@@ -92,10 +104,10 @@ def test_the_pilot_question_becomes_a_candidate_plan():
     assert got.unresolved == ("population",)
 
 
-def test_the_windows_arrive_as_whole_calendar_periods():
+def test_the_windows_arrive_as_whole_calendar_periods(db):
     """Day spans cannot express a calendar month, so the model is asked for units — and the offsets
     are what make "this month vs last" two distinct partitions."""
-    plan = extract_intent(_llm(), _QUESTION, _candidates()).plan
+    plan = _extract(db, _llm(), _QUESTION, _candidates()).plan
     current, previous = plan.windows
     assert (current.calendar_unit, current.calendar_offset) == ("month", 0)
     assert (previous.calendar_unit, previous.calendar_offset) == ("month", 1)
@@ -115,7 +127,7 @@ def test_the_extracted_plan_flows_through_grounding_and_execution(db):
     from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
-    plan = extract_intent(_llm(), _QUESTION, _candidates()).plan
+    plan = _extract(db, _llm(), _QUESTION, _candidates()).plan
     partitions = resolve_window_partitions(
         plan.windows, granularity=PartitionGranularity.MONTH,
         reference=datetime(2026, 6, 30, tzinfo=UTC))
@@ -146,11 +158,11 @@ def test_a_hallucinated_DIMENSION_is_rejected():
             _candidates())
 
 
-def test_the_repair_loop_recovers_from_one_bad_ref():
+def test_the_repair_loop_recovers_from_one_bad_ref(db):
     """Rejecting through the repair loop rather than refusing outright is what gives the model a
     named complaint and a second attempt — the bad ref is reported, not silently dropped."""
     bad = FakeResponse(output=_output(entity_ref="ftr::dpl_eib.tran_repos.nope"))
-    got = extract_intent(_llm(bad, FakeResponse(output=_output())), _QUESTION, _candidates())
+    got = _extract(db, _llm(bad, FakeResponse(output=_output())), _QUESTION, _candidates())
     assert got.status == STATUS_REPAIRED
     assert got.plan.entity_ref == "ftr::dpl_eib.tran_repos.cif_id"
     assert got.provider_calls == 2
@@ -189,11 +201,10 @@ def test_an_unactionable_abstention_code_is_rejected():
 
 # ── abstention ───────────────────────────────────────────────────────────────────────────────────
 
-def test_an_abstained_dimension_stays_EMPTY_rather_than_guessed():
+def test_an_abstained_dimension_stays_EMPTY_rather_than_guessed(db):
     """A model forced to fill every field invents a split, and the answer then looks like it was
     asked for. The abstention is carried instead."""
-    got = extract_intent(
-        _llm(FakeResponse(output=_output(
+    got = _extract(db, _llm(FakeResponse(output=_output(
             unresolved=["dimensions"],
             dimensions=[{"logical_ref": "ftr::dpl_eib.customer_segment_history.segment"}]))),
         _QUESTION, _candidates())
@@ -202,50 +213,52 @@ def test_an_abstained_dimension_stays_EMPTY_rather_than_guessed():
     assert set(got.unresolved) == {"dimensions", "population"}
 
 
-def test_the_population_is_raised_even_when_the_model_resolved_everything_else():
+def test_the_population_is_raised_even_when_the_model_resolved_everything_else(db):
     """Unconditional for a comparison, and NOT in the output schema — so a model cannot resolve it,
     omit it, or be blamed for it. A population chosen by a model is inference by something with less
     standing than the catalog."""
-    got = extract_intent(_llm(), _QUESTION, _candidates())
+    got = _extract(db, _llm(), _QUESTION, _candidates())
     assert "population" in got.unresolved
     assert "population" not in str(INTENT_SCHEMA["properties"].keys())
 
 
-def test_a_question_with_NO_comparison_needs_no_population():
+def test_a_question_with_NO_comparison_needs_no_population(db):
     """A single-period question has no spine to lose customers from."""
-    got = extract_intent(_llm(FakeResponse(output=_output(comparison=""))), _QUESTION,
+    got = _extract(db, _llm(FakeResponse(output=_output(comparison=""))), _QUESTION,
                          _candidates())
     assert "population" not in got.unresolved
 
 
-def test_an_abstained_comparison_is_not_silently_a_decrease():
-    got = extract_intent(
-        _llm(FakeResponse(output=_output(unresolved=["comparison"], comparison="decrease"))),
+def test_an_abstained_comparison_is_not_silently_a_decrease(db):
+    got = _extract(db, _llm(FakeResponse(output=_output(unresolved=["comparison"], comparison="decrease"))),
         _QUESTION, _candidates())
     assert got.plan.comparison == ""
 
 
-def test_an_abstained_window_leaves_no_windows():
-    got = extract_intent(
-        _llm(FakeResponse(output=_output(unresolved=["windows"]))), _QUESTION, _candidates())
+def test_an_abstained_window_leaves_no_windows(db):
+    got = _extract(db, _llm(FakeResponse(output=_output(unresolved=["windows"]))), _QUESTION, _candidates())
     assert got.plan.windows == ()
 
 
 # ── failure is not an empty plan ─────────────────────────────────────────────────────────────────
 
-def test_a_provider_refusal_fails_into_clarification_not_a_blank_plan():
+def test_a_provider_refusal_fails_into_clarification_not_a_blank_plan(db):
     """A caller handed an empty plan cannot tell a question the model could not read from a question
     whose answer is genuinely nothing."""
     with pytest.raises(IntentUnavailable):
-        extract_intent(_llm(FakeResponse(output={}, provider_status=PROVIDER_REFUSAL)),
+        _extract(db, _llm(FakeResponse(output={}, provider_status=PROVIDER_REFUSAL)),
                        _QUESTION, _candidates())
 
 
 # ── egress ───────────────────────────────────────────────────────────────────────────────────────
 
-def test_only_metadata_leaves_the_building():
-    """The offered refs and the question egress; no sample, profile or data value does. Asserted on
-    the request the client actually received, not on intent."""
+def test_the_payload_uses_the_GOVERNED_reserved_key_contract(db):
+    """The question is free text from a person — "show me transactions for Ahmed Al-Mansouri" is a
+    natural thing to type and carries a customer name. It must go through `redact_free_text` and
+    arrive under the reserved keys `assert_llm_safe` checks, not an ad-hoc `{"question": ...}` dict.
+
+    The first version of this module sent exactly that ad-hoc shape, which meant the egress backstop
+    could not inspect it and the question egressed unscanned."""
     captured: list = []
 
     class _Capture:
@@ -253,11 +266,58 @@ def test_only_metadata_leaves_the_building():
             captured.append(request)
             return FakeLLM(script={request.task: FakeResponse(output=_output())}).call(request)
 
-    extract_intent(_Capture(), _QUESTION, _candidates())
+    _extract(db, _Capture())
     (request,) = captured
-    assert set(request.inputs) == {"question", "catalog_metadata", "instruction"}
-    assert set(request.inputs["catalog_metadata"]) == {"column_refs", "table_refs", "labels"}
+    assert set(request.inputs) == {"redacted_intent", "catalog_metadata",
+                                   "raw_input_classification", "redaction_version",
+                                   "input_redaction"}
+    # The classification is what the scan ESTABLISHED, never a hardcoded "clean".
+    assert request.inputs["raw_input_classification"] in {"clean", "contains_pii"}
+    assert request.inputs["redaction_version"]
+    # Refs and labels only — no sample, profile or data value.
+    assert set(request.inputs["catalog_metadata"]) == {
+        "column_refs", "table_refs", "labels", "instruction"}
     assert request.output_schema is INTENT_SCHEMA
+
+
+def test_a_question_naming_a_person_is_SCANNED_before_it_egresses(db):
+    """Not "is redacted" — scanned and classified honestly. A hit scrubs the spans and marks the
+    payload; no hit means clean BECAUSE IT WAS SCANNED."""
+    captured: list = []
+
+    class _Capture:
+        def call(self, request):
+            captured.append(request)
+            return FakeLLM(script={request.task: FakeResponse(output=_output())}).call(request)
+
+    _extract(db, _Capture(), "transactions for card 4111111111111111")
+    (request,) = captured
+    assert "4111111111111111" not in str(request.inputs), "a card number reached the provider"
+
+
+def test_the_call_is_RECORDED_with_the_caller_as_its_author(db):
+    """A route docstring claimed every llm_call was attributed to the human who asked, while this
+    module called the raw driver and wrote no record at all. The claim is now true, and asserted."""
+    _extract(db, _llm())
+    row = db.execute(
+        "select task, provider, created_by->>'subject' from llm_call "
+        "where task = 'analysis.intent' order by created_at desc limit 1").fetchone()
+    assert row is not None, "no llm_call was written for a dispatched call"
+    assert row[0] == "analysis.intent"
+    assert row[1], "provider is NOT NULL and must say which provider ran it"
+    assert row[2] == "analyst"
+
+
+def test_a_REFUSED_call_is_still_recorded(db):
+    """It egressed. The record is the evidence that it did, and a disposition that erases its own
+    audit trail is the worst possible one."""
+    from featuregen.intake.llm import PROVIDER_REFUSAL
+
+    before = db.execute("select count(*) from llm_call where task='analysis.intent'").fetchone()[0]
+    with pytest.raises(IntentUnavailable):
+        _extract(db, _llm(FakeResponse(output={}, provider_status=PROVIDER_REFUSAL)))
+    after = db.execute("select count(*) from llm_call where task='analysis.intent'").fetchone()[0]
+    assert after == before + 1
 
 
 def test_every_wire_object_in_the_schema_is_CLOSED():
@@ -277,6 +337,6 @@ def test_every_wire_object_in_the_schema_is_CLOSED():
     _walk(INTENT_SCHEMA)
 
 
-def test_the_status_is_reported_so_a_repair_is_never_invisible():
-    got = extract_intent(_llm(), _QUESTION, _candidates())
+def test_the_status_is_reported_so_a_repair_is_never_invisible(db):
+    got = _extract(db, _llm(), _QUESTION, _candidates())
     assert got.status == STATUS_OK
