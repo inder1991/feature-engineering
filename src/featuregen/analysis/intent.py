@@ -28,6 +28,8 @@ is a refusal rather than a default. The model is never asked for them.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure, Window
@@ -43,14 +45,31 @@ from featuregen.intake.llm import (
     compute_input_hash,
     drive_structured_call,
     mint_id,
-    record_llm_call,
+    record_llm_call_durable,
 )
-from featuregen.overlay.upload.enrich_llm import _generation_settings
+from featuregen.intake.llm_claude import ClaudeConfig
 from featuregen.intake.redaction import (
     assert_llm_safe,
     build_llm_inputs,
     redact_free_text,
 )
+
+def _generation_settings() -> dict:
+    """Provider + model + the pinned knobs, from the SAME env that configures the client.
+
+    Deliberately NOT imported from `overlay.upload.enrich_llm`, which has an identical helper: this
+    package must not depend on the overlay enrichment STAGE for five lines. Importing it pulled that
+    module's whole graph — and its import-time registrations — into the analysis package, which
+    reordered a registry another test asserts on. Five duplicated lines beat a dependency that
+    reaches across two subsystems to fetch them.
+    """
+    provider = os.environ.get("FEATUREGEN_LLM_PROVIDER", "fake")
+    if provider == "anthropic":
+        cfg = ClaudeConfig.from_env()
+        return {"provider": "anthropic", "model": cfg.model, "max_tokens": cfg.max_tokens,
+                "thinking": cfg.thinking, "effort": cfg.effort}
+    return {"provider": "fake", "model": "test"}
+
 
 TASK = "analysis.intent"
 PROMPT_ID = "analysis_intent_v1"
@@ -88,16 +107,29 @@ INTENT_SCHEMA: dict = {
     "required": ["entity", "entity_ref", "base_table_ref", "measure", "windows", "dimensions",
                  "comparison", "unresolved"],
     "properties": {
-        "entity": {"type": "string"},
-        "entity_ref": {"type": "string"},
-        "base_table_ref": {"type": "string"},
+        "entity": {"type": "string",
+                   "description": "The thing the answer is per, in business words, e.g. 'customer'."},
+        "entity_ref": {
+            "type": "string",
+            "description": "The COLUMN that identifies that thing, chosen from the offered "
+                           "column_refs. A column, never a table: it is what rows are counted per.",
+        },
+        "base_table_ref": {
+            "type": "string",
+            "description": "The TABLE holding the events being counted, chosen from the offered "
+                           "table_refs.",
+        },
         "measure": {
             "type": "object",
             "additionalProperties": False,
             "required": ["op", "logical_ref"],
             "properties": {
-                "op": {"type": "string", "enum": sorted(MEASURE_OPS)},
-                "logical_ref": {"type": "string"},
+                "op": {"type": "string", "enum": sorted(MEASURE_OPS),
+                       "description": "Use 'count' to count rows; the others aggregate a column."},
+                "logical_ref": {
+                    "type": "string",
+                    "description": "The COLUMN aggregated. Leave empty for 'count'.",
+                },
             },
         },
         "windows": {
@@ -108,8 +140,12 @@ INTENT_SCHEMA: dict = {
                 "required": ["label", "anchor_ref", "calendar_unit", "calendar_length",
                              "calendar_offset"],
                 "properties": {
-                    "label": {"type": "string"},
-                    "anchor_ref": {"type": "string"},
+                    "label": {"type": "string",
+                              "description": "A short name for this period, e.g. 'current'."},
+                    "anchor_ref": {
+                        "type": "string",
+                        "description": "The COLUMN the period is measured on, from column_refs.",
+                    },
                     "calendar_unit": {"type": "string", "enum": sorted(CALENDAR_UNITS)},
                     "calendar_length": {"type": "integer"},
                     "calendar_offset": {"type": "integer"},
@@ -122,7 +158,10 @@ INTENT_SCHEMA: dict = {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["logical_ref"],
-                "properties": {"logical_ref": {"type": "string"}},
+                "properties": {"logical_ref": {
+                    "type": "string",
+                    "description": "A COLUMN to split the answer by, from column_refs.",
+                }},
             },
         },
         "comparison": {"type": "string", "enum": sorted(COMPARISONS)},
@@ -182,10 +221,21 @@ def validate_intent(output: dict, candidates: IntentCandidates) -> None:
     passing through — it would ground against nothing and read as a catalog gap rather than a model
     error.
     """
+    offered = sorted(candidates.column_refs)
+    # Bounded: enough to correct the answer, not so many that the complaint becomes another prompt.
+    sample = ", ".join(offered[:12]) + ("" if len(offered) <= 12 else ", ...")
+
     def _require_column(ref: str, what: str) -> None:
         if ref and ref not in candidates.column_refs:
+            hint = ""
+            if ref in candidates.table_refs:
+                # The observed failure: the customer TABLE was given where a column identifying the
+                # customer was required. Naming the confusion is what lets one repair fix it.
+                hint = (f" — that is a TABLE. {what} must be a COLUMN, one of the offered "
+                        f"column_refs")
             raise SchemaValidationError(
-                f"{what} {ref!r} is not one of the columns offered for this question")
+                f"{what} {ref!r} is not one of the columns offered for this question{hint}. "
+                f"Choose from: {sample}")
 
     _require_column(str(output.get("entity_ref", "")), "entity_ref")
     table = str(output.get("base_table_ref", ""))
@@ -301,9 +351,13 @@ def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCan
         # at all. A per-call `model` override still wins.
         generation_settings=({**_generation_settings(), "model": model}
                              if model else _generation_settings()),
-        output_schema=INTENT_SCHEMA,
-        # The offered vocabulary is a large static prefix across questions against one catalog.
-        cacheable_metadata_keys=("column_refs", "table_refs", "labels"))
+        output_schema=INTENT_SCHEMA)
+    # NO `cacheable_metadata_keys`. That option exists for the enrichment path's genuinely STATIC
+    # prefix — the ~276-concept vocabulary, identical across every item of every batch. The offered
+    # refs here are RETRIEVED PER QUESTION, so they can never cache-hit; all the flag did was pop
+    # them out of the user turn into a `system` block labelled "shared classification context",
+    # separating the refs from the instruction telling the model to choose only from them. The
+    # model then produced output that failed validation until the repair budget ran out.
 
     # §9.4 backstop, BEFORE dispatch. A hard failure: nothing is sent.
     assert_llm_safe(request)
@@ -313,7 +367,10 @@ def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCan
 
     # Written whatever the disposition — a refused or malformed call still egressed, and the record
     # is the evidence that it did.
-    record_llm_call(
+    # DURABLE: this route turns a refused extraction into a 422, which unwinds the request
+    # transaction. A record on that connection would vanish with it — erasing the only
+    # evidence that the question already egressed to the provider.
+    record_llm_call_durable(
         conn, run_id=mint_id("arun"), request=request,
         input_hash=compute_input_hash(inputs),
         redaction_version=redaction.redaction_version,

@@ -9,6 +9,8 @@ ships FakeLLM + the taxonomy + the store; the real Claude adapter lives in llm_c
 from __future__ import annotations
 
 import hashlib
+import psycopg
+import logging
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -17,6 +19,7 @@ from typing import Any, Protocol, runtime_checkable
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from featuregen.config import get_settings
 from featuregen.contracts import SchemaValidationError
 from featuregen.contracts.db import DbConn
 from featuregen.idgen import mint_id
@@ -85,6 +88,8 @@ _REUSABLE_STATUSES = frozenset({STATUS_OK, STATUS_REPAIRED, STATUS_RETRIED})
 # Default provider model for every LLM call, overridable per deployment via FEATUREGEN_LLM_MODEL and
 # per request via generation_settings["model"]. Single source of truth so the wired client and the
 # audit record can never disagree on which model the default resolves to.
+logger = logging.getLogger(__name__)
+
 DEFAULT_LLM_MODEL = "claude-sonnet-5"
 
 
@@ -451,3 +456,34 @@ def find_llm_call(
             if rec.validation_result.get("result") in _REUSABLE_STATUSES:
                 return rec
     return None
+
+
+def record_llm_call_durable(conn, **record_kwargs) -> str:
+    """Write the llm_call on its OWN connection, so a failing request cannot erase it.
+
+    By the time this runs the content has ALREADY egressed to the provider. If the record shares the
+    caller's transaction, any later failure in the same request — including the caller deciding the
+    outcome is a 422 — rolls back the only evidence that data left the system. That is precisely
+    what happened to the analysis route: a refused extraction returned 422, the request transaction
+    unwound, and the audit row went with it.
+
+    Gated on a configured DSN: unset means tests or a no-DB harness, where a separately-committing
+    connection would pollute a rolled-back test database. Uses `get_settings().dsn` — the FULL
+    configured DSN — never `conn.info.dsn`, which psycopg strips the password from.
+
+    Best-effort: if the separate connection cannot be opened, the record goes on the caller's
+    connection. Transactional evidence beats none.
+
+    (`overlay.upload.enrich_llm._record_llm_call_durable` is the same pattern with an
+    enrichment-specific degradation counter; this is the plain version for callers outside that
+    stage. Consolidating them is worth doing when someone next touches both.)
+    """
+    dsn = get_settings().dsn
+    if dsn:
+        try:
+            with psycopg.connect(dsn) as audit_conn:   # own tx, committed on `with` exit
+                return record_llm_call(audit_conn, **record_kwargs)
+        except Exception:  # noqa: BLE001 — a degraded audit must never fail the (completed) call
+            logger.exception(
+                "durable llm_call audit write failed; falling back to the caller's connection")
+    return record_llm_call(conn, **record_kwargs)

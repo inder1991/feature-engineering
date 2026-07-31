@@ -340,3 +340,81 @@ def test_every_wire_object_in_the_schema_is_CLOSED():
 def test_the_status_is_reported_so_a_repair_is_never_invisible(db):
     got = _extract(db, _llm(), _QUESTION, _candidates())
     assert got.status == STATUS_OK
+
+
+def test_the_offered_refs_ride_the_SAME_turn_as_the_instruction(db):
+    """The refs and the instruction to choose only from them must not be separated.
+
+    `cacheable_metadata_keys` moves a key out of the user turn into a cached `system` block. That is
+    right for the enrichment path's static concept vocabulary and wrong here: retrieval builds a
+    DIFFERENT candidate set per question, so it can never cache-hit — and displacing the refs left
+    the model producing output that failed validation until the repair budget ran out. Asserted on
+    the request, because the symptom appeared only against a real provider.
+    """
+    captured: list = []
+
+    class _Capture:
+        def call(self, request):
+            captured.append(request)
+            return FakeLLM(script={request.task: FakeResponse(output=_output())}).call(request)
+
+    _extract(db, _Capture())
+    (request,) = captured
+    assert request.cacheable_metadata_keys == ()
+    metadata = request.inputs["catalog_metadata"]
+    assert {"column_refs", "table_refs", "instruction"} <= set(metadata)
+
+
+def test_a_TABLE_given_where_a_column_belongs_says_so_explicitly():
+    """The failure observed against a real provider: asked which column identifies the customer, the
+    model answered with the customer TABLE — a reasonable reading of the field name, and wrong.
+
+    The old complaint said only "is not one of the columns offered", which names the violation and
+    not the requirement, so the identical answer came back twice and exhausted the repair budget. A
+    repair loop is only worth having if its complaint can be acted on."""
+    with pytest.raises(SchemaValidationError) as exc:
+        validate_intent(_output(entity_ref="ftr::dpl_eib.tran_repos"), _candidates())
+    message = str(exc.value)
+    assert "TABLE" in message and "must be a COLUMN" in message
+    assert "Choose from:" in message
+
+
+def test_the_complaint_lists_valid_choices_but_stays_bounded():
+    """Enough to correct the answer; not so many that the complaint becomes a second prompt."""
+    many = IntentCandidates(
+        column_refs=frozenset(f"ftr::t.c{i}" for i in range(40)),
+        table_refs=frozenset({"ftr::t"}))
+    with pytest.raises(SchemaValidationError) as exc:
+        validate_intent(_output(entity_ref="ftr::t.nope"), many)
+    assert str(exc.value).count("ftr::t.c") <= 12
+    assert "..." in str(exc.value)
+
+
+def test_every_ref_field_in_the_schema_says_whether_it_wants_a_column_or_a_table():
+    """The schema was property names and types only. Nothing told the model that `entity_ref` is a
+    column and `base_table_ref` is a table, which is exactly the distinction it got wrong."""
+    props = INTENT_SCHEMA["properties"]
+    assert "COLUMN" in props["entity_ref"]["description"]
+    assert "TABLE" in props["base_table_ref"]["description"]
+    assert "COLUMN" in props["windows"]["items"]["properties"]["anchor_ref"]["description"]
+    assert "COLUMN" in props["dimensions"]["items"]["properties"]["logical_ref"]["description"]
+
+
+def test_this_package_does_not_import_the_overlay_enrichment_stage():
+    """Importing `overlay.upload.enrich_llm` for a five-line helper dragged that module's whole
+    graph — and its import-time registrations — into this package, reordering a registry an
+    unrelated bridge test asserts on. The suite failed only in FULL runs, and passed in isolation
+    and beside its own neighbours, which is the hardest shape of failure to attribute.
+
+    Duplicating five lines beats a dependency that reaches across two subsystems to fetch them."""
+    import ast
+    import pathlib
+
+    offenders = []
+    for path in pathlib.Path("src/featuregen/analysis").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                module = getattr(node, "module", "") or ""
+                if "overlay.upload.enrich" in module:
+                    offenders.append((path.name, module))
+    assert not offenders, offenders
