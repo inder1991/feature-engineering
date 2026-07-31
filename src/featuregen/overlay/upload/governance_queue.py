@@ -90,7 +90,15 @@ from typing import Any
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.identity import IdentityEnvelope
-from featuregen.overlay.upload.bridge_governance import list_bridge_proposals
+from featuregen.overlay.upload.bridge_governance import (
+    list_bridge_proposals,
+    load_bridge_context,
+)
+from featuregen.overlay.upload.bridge_realization_governance import (
+    current_assessment_views_by_bridge,
+    link_authority_view,
+    list_bridge_realization_views,
+)
 from featuregen.overlay.upload.catalogs import list_visible_catalogs
 from featuregen.overlay.upload.contract.invalidation import bridge_fact_marker
 from featuregen.overlay.upload.join_governance import list_open_approved_join_proposals
@@ -345,6 +353,7 @@ def _probe(conn: DbConn, cat: _Category) -> bool | None:
     Runs inside a SAVEPOINT: a failing probe (a missing table in a partially-migrated database)
     poisons the transaction otherwise, and a usage probe must never break the queue it annotates.
     """
+    assert cat.probe_sql is not None
     try:
         with conn.transaction():
             row = conn.execute(cat.probe_sql).fetchone()
@@ -363,6 +372,7 @@ def _counts(conn: DbConn, cat: _Category, anchors: Sequence[str],
     ``anchors`` are the literal values stored in the anchor column (a raw fact_key for the crossing
     stores, a ``bridgefact:`` marker for the contract-lineage store) and ``by_anchor`` maps each back
     to its fact_key, so the caller never has to parse a marker apart."""
+    assert cat.count_sql is not None
     try:
         with conn.transaction():
             rows = conn.execute(cat.count_sql, (list(anchors),)).fetchall()
@@ -442,19 +452,19 @@ def _state(status: str) -> tuple[str, str]:
 def _bridge_eligibility(view: Mapping[str, Any]) -> tuple[str | None, str]:
     """The AUTOMATIC production axis for a bridge, independent of every human decision.
 
-    A crossing is production-eligible when its directional realization is resolved: one endpoint is
-    the far table's governed GRAIN, which is exactly what makes the hop many-to-one
-    (``declarations._segment_cardinality`` -> ``CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN``; the
-    alternative is ``CARDINALITY_SOURCE_BRIDGE_UNATTESTED``). Neither endpoint a grain means fan-out
-    is unbounded, which is a sandbox answer, not a withheld approval.
-
-    No derivation evidence at all (the W4 case: ``bridge_propose`` skipped the ledger row) -> None.
-    Absence of evidence is not evidence of unresolved cardinality."""
-    if not view.get("evidence_present"):
-        return None, "not_observed"
-    if view.get("left_is_grain") or view.get("right_is_grain"):
-        return _VALIDATED, "grain_resolved"
-    return _SANDBOX_ONLY, "cardinality_unresolved"
+    The legacy grain booleans are proposal evidence, not an executable directional contract. Only a
+    current, final-revalidated realization may report production eligibility.
+    """
+    realizations = view.get("realizations")
+    if not isinstance(realizations, list) or not realizations:
+        return "Not evaluated", "not_evaluated"
+    if any(bool(item.get("execution_eligible")) for item in realizations):
+        return _VALIDATED, "deterministically_validated"
+    if any(item.get("cardinality_label") == "N:N risk" for item in realizations):
+        return "N:N risk", "fanout_risk"
+    if any(item.get("cardinality") == "unknown" for item in realizations):
+        return "Unknown — profile required", "cardinality_unknown"
+    return _SANDBOX_ONLY, "realization_not_executable"
 
 
 def _join_eligibility(view: Mapping[str, Any]) -> tuple[str | None, str]:
@@ -493,6 +503,10 @@ def _bridge_item(view: Mapping[str, Any], usage: tuple[Usage, ...]) -> QueueItem
                 "right": view.get("right"), "data_type_family": view.get("data_type_family"),
                 "type_basis": view.get("type_basis"), "strength": view.get("strength"),
                 "evidence_present": view.get("evidence_present"),
+                "assessment": view.get("assessment"),
+                "realizations": view.get("realizations"),
+                "cardinality_label": view.get("cardinality_label"),
+                "authority": view.get("authority"),
                 "proposed_by": view.get("proposed_by"), "proposed_at": view.get("proposed_at"),
                 "target_event_id": view.get("target_event_id")},
         already_depended_on_by=usage)
@@ -598,6 +612,32 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
         counters.incr("overlay.governance_queue.bridges_unreadable")
         logger.warning("governance queue: the bridge listing is unreadable", exc_info=True)
         unreadable.append(Unreadable(ENTITY_BRIDGE, None, "the bridge listing could not be read"))
+
+    assessments: dict[str, dict[str, Any]] = {}
+    realizations_by_bridge: dict[str, list[dict[str, Any]]] = {}
+    try:
+        assessments = current_assessment_views_by_bridge(conn)
+        for realization in list_bridge_realization_views(conn, roles=role_claims):
+            realizations_by_bridge.setdefault(
+                str(realization["bridge_fact_key"]), []).append(realization)
+    except Exception:  # noqa: BLE001 — do not turn a review queue into a blank page
+        counters.incr("overlay.governance_queue.realizations_unreadable")
+        logger.warning("governance queue: bridge realization evidence is unreadable", exc_info=True)
+        unreadable.append(
+            Unreadable("bridge_realization", None,
+                       "the directional realization evidence could not be read"))
+    for view in bridge_views:
+        bridge_key = str(view["fact_key"])
+        context = load_bridge_context(conn, bridge_key, roles=role_claims)
+        view["authority"] = (
+            link_authority_view(conn, context["ref"]) if context is not None else None)
+        view["assessment"] = assessments.get(bridge_key)
+        view["realizations"] = realizations_by_bridge.get(bridge_key, [])
+        view["cardinality_label"] = (
+            view["realizations"][0]["cardinality_label"]
+            if view["realizations"]
+            else "Not evaluated"
+        )
 
     usage_by_key: dict[str, tuple[Usage, ...]] = {}
     if usage and bridge_views:

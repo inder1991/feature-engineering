@@ -242,14 +242,14 @@ def test_an_unreviewed_relationship_is_presented_as_available_for_use(seeded):
     assert bridge["state_code"] == "unreviewed_available"
 
 
-def test_production_eligibility_is_reported_independently_of_review(seeded):
-    """The seeded bridge is UNREVIEWED and automatically validated at the same time — which is the
-    product point: review does not gate production, automatic validation of the directional
-    realization does."""
+def test_production_eligibility_requires_a_directional_realization_not_a_grain_flag(seeded):
+    """The seeded bridge is unreviewed and has grain-shaped proposal evidence, but no typed
+    directional realization. Metadata alone must not be presented as production validation."""
     body = _get(seeded["client"]).json()
     bridge = next(i for i in body["items"] if i["kind"] == "entity_bridge")
     assert bridge["state_code"] == "unreviewed_available"
-    assert bridge["production_eligibility"] == "Automatically validated for production"
+    assert bridge["production_eligibility"] == "Not evaluated"
+    assert bridge["production_eligibility_code"] == "not_evaluated"
 
 
 # ── Usage: never zero when it cannot measure ──────────────────────────────────────────────────────

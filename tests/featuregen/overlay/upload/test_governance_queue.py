@@ -251,15 +251,13 @@ def test_an_unreviewed_relationship_is_labelled_available_for_use(all_three_kind
     assert bridge.state_code == "unreviewed_available"
 
 
-def test_production_eligibility_is_a_SEPARATE_axis_from_review(all_three_kinds):
-    """Human review does not decide production eligibility; automatic validation of the directional
-    realization does. The seeded bridge is UNREVIEWED and its cardinality IS resolved (both endpoints
-    are governed grains), so the two axes must disagree — which is only expressible if they are two
-    fields."""
+def test_production_eligibility_requires_a_typed_directional_realization(all_three_kinds):
+    """Human review and automatic execution remain separate. Grain-shaped proposal evidence is not
+    a directional execution contract, so this bridge is honestly not evaluated."""
     bridge = _bridge(governance_queue(all_three_kinds.conn, roles=()))
     assert bridge.state_code == "unreviewed_available"
-    assert bridge.production_eligibility == "Automatically validated for production"
-    assert bridge.production_eligibility_code == "grain_resolved"
+    assert bridge.production_eligibility == "Not evaluated"
+    assert bridge.production_eligibility_code == "not_evaluated"
 
 
 def test_a_table_fact_has_no_production_eligibility_rather_than_a_guess(all_three_kinds):

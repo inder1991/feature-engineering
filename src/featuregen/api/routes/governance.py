@@ -32,8 +32,7 @@ a stale drift watermark's correct refusal reports "pending".
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -42,17 +41,18 @@ from pydantic import BaseModel, Field
 
 from featuregen.api.deps import get_conn, get_identity, require_confirmer
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
+from featuregen.overlay.bridge_realization_commands import review_bridge_realization
 from featuregen.overlay.confirmation_commands import confirm_fact, reject_fact
-from featuregen.overlay.identity import EntityBridgeRef
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_governance import (
     list_bridge_proposals,
     load_bridge_context,
 )
-from featuregen.overlay.upload.bridge_projection import (
-    demote_bridge_edges,
-    project_verified_bridge,
+from featuregen.overlay.upload.bridge_realization_governance import (
+    current_assessment_views_by_bridge,
+    link_authority_view,
+    list_bridge_realization_views,
 )
 from featuregen.overlay.upload.join_drift import (
     acknowledge_governed_join_divergence,
@@ -130,6 +130,12 @@ class WithdrawSemanticBindingRequest(BaseModel):
 
 
 class ConfirmEntityBridgeRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ReviewBridgeRealizationRequest(BaseModel):
+    realization_revision_id: str = Field(min_length=1, max_length=256)
+    expected_pointer_version: int = Field(ge=1)
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -510,23 +516,10 @@ def correct_semantic_binding(fact_key: str, body: CorrectSemanticBindingRequest,
 
 
 # ══════════ Entity-bridge routes (governance-review redesign, Task 2 — cross-catalog links) ═══════
-# The governed `entity_bridge` facts the derivation proposes and `bridge_projection` makes
-# operational. Same shape as the siblings above (require_confirmer, the fact_type-VALIDATED +
-# read-scoped 404 bridge, idempotency key, target-event CAS, return-the-409), over the Task 1 read
-# model (`bridge_governance`). Two things differ, both forced by the projection:
-#
-#   * The route is the ONLY thing that projects. `confirm_fact` carries projection hooks for
-#     `approved_join` and the semantic bindings and NONE for `entity_bridge`; `reject_fact` likewise
-#     demotes joins and bindings and not bridges. So a bridge route that omits these calls reaches
-#     VERIFIED/REJECTED and returns a perfectly normal 200 over a link that is never operational —
-#     or, worse on reject, one that stays traversable after a human said no.
-#
-#   * Confirm and reject handle a projection fault in OPPOSITE directions, deliberately. On confirm
-#     the projection ADDS capability, so failing it is fail-closed and deferrable: the confirmation
-#     is the scarce thing (a human decided), the edge is rebuildable from the stream, and losing the
-#     decision to a projection fault is the W2 defect. On reject the demote REMOVES capability, so a
-#     "soft" failure would leave a REJECTED bridge live in the planner — a governance leak. That one
-#     stays all-or-nothing: it raises, `get_conn` rolls back, and nothing happened.
+# The entity-bridge link and directional realization routes are separate. Link review is optional
+# semantic endorsement; realization review is optional endorsement of one exact direction/scope.
+# Neither review is an execution gate. `confirm_fact`/`reject_fact` own the synchronous legacy
+# review projection; these routes report that outcome and never create a second projection path.
 #
 # A VERIFIED bridge is offered NO action. `_AWAITING_CONFIRMATION` excludes VERIFIED, so
 # `reject_fact` denies it; a real withdrawal needs the semantic-binding shape (the sanctioned
@@ -545,30 +538,12 @@ def _load_bridge_context_or_404(conn: psycopg.Connection, fact_key: str, roles) 
     return ctx
 
 
-def _project_bridge(conn: psycopg.Connection, ref: EntityBridgeRef) -> str:
-    """Make a just-VERIFIED bridge operational, honestly and WITHOUT risking the confirmation.
-
-    W1 — ``project_verified_bridge`` has no default for ``now`` (its semantic-binding twin does) and
-    feeds it straight into ``entity_bridge_edge.projected_at``, declared ``timestamptz NOT NULL
-    DEFAULT now()``. A column DEFAULT applies when the column is OMITTED, never when NULL is
-    explicitly supplied, so ``now=None`` would insert NULL into a NOT NULL column and error. The
-    projection wall-clock is passed explicitly, matching what the twin's default would have produced.
-
-    W2 — it also has neither a savepoint nor a never-raises guarantee, so a fault here would
-    propagate, roll back the whole request transaction and LOSE the confirmation: the reviewer sees
-    a 500 and the fact is not VERIFIED. ``conn.transaction()`` nests a SAVEPOINT, so a fault (even
-    one that poisons the transaction, which a database error does) is contained and reported as
-    "pending" — the honest answer, since a pending edge is simply not yet traversable and the next
-    projection rebuilds it from the stream. This wrapper lives here rather than in
-    ``bridge_projection`` because that module is owned by the parallel planner stream.
-    """
-    try:
-        with conn.transaction():
-            return project_verified_bridge(conn, ref, now=datetime.now(UTC))
-    except Exception:  # noqa: BLE001 — a projection fault must NEVER roll back the confirmation
-        logger.warning("entity-bridge projection failed after a successful confirm — the fact is "
-                       "VERIFIED and the edge is pending", exc_info=True)
-        return "pending"
+def _bridge_review_projection_exists(conn: psycopg.Connection, fact_key: str) -> bool:
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM entity_bridge_edge WHERE fact_key=%s)",
+        (fact_key,),
+    ).fetchone()
+    return bool(row and row[0])
 
 
 @router.get("/sources/{source}/governance/entity-bridges",
@@ -586,18 +561,35 @@ def list_entity_bridges(source: str, conn: _Conn, identity: _Identity,
     ensure_upload_catalog_adapter()
     proposals = list_bridge_proposals(conn, source=source, limit=limit,
                                       roles=identity.role_claims, actor=identity)
+    assessments = current_assessment_views_by_bridge(conn)
+    realizations = list_bridge_realization_views(
+        conn, source=source, roles=identity.role_claims)
+    realizations_by_link: dict[str, list[dict]] = {}
+    for realization in realizations:
+        realizations_by_link.setdefault(realization["bridge_fact_key"], []).append(realization)
+    for proposal in proposals:
+        ctx = load_bridge_context(conn, proposal["fact_key"], roles=identity.role_claims)
+        proposal["authority"] = (
+            link_authority_view(conn, ctx["ref"]) if ctx is not None else None)
+        proposal["assessment"] = assessments.get(proposal["fact_key"])
+        proposal["realizations"] = realizations_by_link.get(proposal["fact_key"], [])
+        proposal["cardinality_label"] = (
+            proposal["realizations"][0]["cardinality_label"]
+            if proposal["realizations"]
+            else "Not evaluated"
+        )
     return {"source": source.strip().lower(), "proposals": proposals, "next_cursor": None}
 
 
 @router.post("/governance/entity-bridges/{fact_key}/confirm",
              dependencies=[Depends(require_confirmer)])
 def confirm_entity_bridge(fact_key: str, body: ConfirmEntityBridgeRequest, conn: _Conn,
-                          identity: _Identity) -> dict:
-    """Confirm a PROPOSED (or re-affirm a REVERIFY/STALE) entity bridge → VERIFIED via the overlay's
-    own ``confirm_fact``, then project the operational ``entity_bridge_edge`` — the ONLY place that
-    projection happens, since ``confirm_fact`` has no bridge hook. Four-eyes is preserved (the
-    derivation's service actor proposes; a human disposes). ``operational_projection`` is honest:
-    "projected" only when the edge actually landed."""
+                          identity: _Identity) -> Any:
+    """Record optional human endorsement and synchronously refresh its review projection.
+
+    Confirmation does not make the link available and does not make any directional realization
+    executable. Those decisions are automatic and are reported on independent payload axes.
+    """
     ctx = _load_bridge_context_or_404(conn, fact_key, identity.role_claims)
     cmd = Command(
         action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key,
@@ -612,16 +604,145 @@ def confirm_entity_bridge(fact_key: str, body: ConfirmEntityBridgeRequest, conn:
         return JSONResponse(status_code=409,
                             content={"detail": _deny_to_detail(result.denied_reason)})
     status = fold_overlay_state(load_fact(conn, fact_key)).status
-    projection = "not_applicable"
-    if status == "VERIFIED":
-        projection = _project_bridge(conn, ctx["ref"])
-    return {"governance_status": status, "operational_projection": projection}
+    # `confirm_fact` owns the synchronous review projection. Re-running it here used to create a
+    # second projection path and could report "pending" even though the command had already written
+    # the row. Read the command's outcome instead.
+    projected = _bridge_review_projection_exists(conn, fact_key)
+    projection = "projected" if projected else "not_applicable"
+    return {
+        "governance_status": status,
+        "review_projection": projection,
+        "review_controls_availability": False,
+        "review_controls_execution": False,
+        "authority": link_authority_view(conn, ctx["ref"]),
+    }
+
+
+def _load_realization_view_or_404(
+    conn: psycopg.Connection,
+    realization_id: str,
+    revision_id: str,
+    roles,
+) -> dict:
+    views = list_bridge_realization_views(conn, roles=roles)
+    view = next(
+        (
+            item for item in views
+            if item["realization_id"] == realization_id
+            and item["realization_revision_id"] == revision_id
+        ),
+        None,
+    )
+    if view is None:
+        raise HTTPException(status_code=404, detail="No such current bridge realization.")
+    return view
+
+
+@router.get("/sources/{source}/governance/bridge-realizations",
+            dependencies=[Depends(require_confirmer)])
+def list_bridge_realizations(source: str, conn: _Conn, identity: _Identity,
+                             bridge_fact_key: str | None = Query(default=None)) -> dict:
+    """Directional join realizations touching this catalog, separate from symmetric links."""
+    ensure_upload_catalog_adapter()
+    return {
+        "source": source.strip().lower(),
+        "realizations": list_bridge_realization_views(
+            conn,
+            source=source,
+            bridge_fact_key=bridge_fact_key,
+            roles=identity.role_claims,
+        ),
+        "next_cursor": None,
+    }
+
+
+def _review_realization(
+    conn: psycopg.Connection,
+    identity: IdentityEnvelope,
+    realization_id: str,
+    body: ReviewBridgeRealizationRequest,
+    *,
+    approved: bool,
+) -> dict | JSONResponse:
+    before = _load_realization_view_or_404(
+        conn,
+        realization_id,
+        body.realization_revision_id,
+        identity.role_claims,
+    )
+    result = review_bridge_realization(
+        conn,
+        Command(
+            action="review_bridge_realization",
+            aggregate="bridge_realization",
+            aggregate_id=realization_id,
+            args={
+                "realization_revision_id": body.realization_revision_id,
+                "expected_pointer_version": body.expected_pointer_version,
+                "approved": approved,
+                "evidence": {"note": _clean(body.note), "source": "governance_api"},
+            },
+            actor=identity,
+            idempotency_key=(
+                f"review-realization:{realization_id}:{body.realization_revision_id}:"
+                f"{approved}:{identity.subject}"
+            ),
+            expected_version=None,
+        ),
+    )
+    if not result.accepted:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": _deny_to_detail(result.denied_reason)},
+        )
+    (after,) = [
+        item for item in list_bridge_realization_views(
+            conn,
+            bridge_fact_key=before["bridge_fact_key"],
+            roles=identity.role_claims,
+        )
+        if item["realization_id"] == realization_id
+    ]
+    return {
+        "review_status": after["review_status"],
+        "safety_status": after["safety_status"],
+        "execution_eligible": after["execution_eligible"],
+        "pointer_version": after["pointer_version"],
+        "review_projection": "current_pointer_updated",
+        "review_controls_execution": False,
+        "realization": after,
+        "authority": {
+            "role": "platform-admin",
+            "confirmation_count": 1,
+            "dual": False,
+        },
+    }
+
+
+@router.post("/governance/bridge-realizations/{realization_id}/confirm",
+             dependencies=[Depends(require_confirmer)])
+def confirm_bridge_realization(realization_id: str, body: ReviewBridgeRealizationRequest,
+                               conn: _Conn, identity: _Identity) -> Any:
+    """Optionally endorse an exact realization revision without changing safety."""
+    return _review_realization(
+        conn, identity, realization_id, body, approved=True)
+
+
+@router.post("/governance/bridge-realizations/{realization_id}/reject",
+             dependencies=[Depends(require_confirmer)])
+def reject_bridge_realization(realization_id: str, body: ReviewBridgeRealizationRequest,
+                              conn: _Conn, identity: _Identity) -> Any:
+    """Remove/withhold endorsement without changing deterministic safety."""
+    return _review_realization(
+        conn, identity, realization_id, body, approved=False)
 
 
 def _reject_one_bridge(conn: psycopg.Connection, ctx: dict, fact_key: str, *, category: str,
                        note: str | None, identity: IdentityEnvelope) -> tuple[str, str]:
-    """ONE governed bridge reject + its demote. Returns ``("rejected", projection)`` or
-    ``("denied", detail)``; a projection fault RAISES, and the caller decides what that costs.
+    """ONE governed bridge reject and verification of the command-owned demotion.
+
+    Returns ``("rejected", projection)`` or ``("denied", detail)``; a projection leak raises and
+    the caller decides what that costs.
 
     Shared verbatim by the single and the bulk route so a batch cannot become a second, laxer
     dialect of the same decision — same command, same ``category``/``reason`` split, and the SAME
@@ -629,6 +750,7 @@ def _reject_one_bridge(conn: psycopg.Connection, ctx: dict, fact_key: str, *, ca
     on its own. `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics
     key); `reason` carries ONLY the free-text note (or None), matching the sibling rejects.
     """
+    had_projection = _bridge_review_projection_exists(conn, fact_key)
     cmd = Command(
         action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
         args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
@@ -639,24 +761,17 @@ def _reject_one_bridge(conn: psycopg.Connection, ctx: dict, fact_key: str, *, ca
     result = reject_fact(conn, cmd)
     if not result.accepted:
         return "denied", _deny_to_detail(result.denied_reason)
-    removed = demote_bridge_edges(conn, result.aggregate_id or fact_key)
-    return "rejected", ("demoted" if removed else "not_applicable")
+    still_projected = _bridge_review_projection_exists(conn, fact_key)
+    if still_projected:
+        raise RuntimeError("rejected entity bridge remains in the review projection")
+    return "rejected", ("demoted" if had_projection else "not_applicable")
 
 
 @router.post("/governance/entity-bridges/{fact_key}/reject",
              dependencies=[Depends(require_confirmer)])
 def reject_entity_bridge(fact_key: str, body: RejectEntityBridgeRequest, conn: _Conn,
-                         identity: _Identity) -> dict:
-    """Reject a decidable entity bridge → REJECTED, then DEMOTE any projected edge.
-
-    The demote is load-bearing, not defensive: ``reject_fact`` demotes joins and semantic bindings
-    and has no ``entity_bridge`` branch, and nothing demotes a bridge on drift either — so a bridge
-    that was VERIFIED and has since gone STALE still has a live edge while remaining rejectable.
-    Without this call a human's NO would leave the link traversable.
-
-    Deliberately NOT savepoint-wrapped, unlike the confirm-side projection: this removes capability,
-    so a fault must fail the whole request (``get_conn`` rolls back, nothing happened) rather than
-    report a REJECTED bridge that is still operational."""
+                         identity: _Identity) -> Any:
+    """Reject a decidable link and prove the command removed its optional review projection."""
     ctx = _load_bridge_context_or_404(conn, fact_key, identity.role_claims)
     outcome, value = _reject_one_bridge(conn, ctx, fact_key, category=body.category,
                                         note=body.note, identity=identity)
@@ -664,8 +779,13 @@ def reject_entity_bridge(fact_key: str, body: RejectEntityBridgeRequest, conn: _
         # A VERIFIED bridge lands HERE ("fact not awaiting confirmation") — which is why the listing
         # offers it no action at all. RETURN, don't raise (audit I-3).
         return JSONResponse(status_code=409, content={"detail": value})
-    return {"governance_status": "REJECTED", "category": body.category,
-            "operational_projection": value}
+    return {
+        "governance_status": "REJECTED",
+        "category": body.category,
+        "review_projection": value,
+        "review_controls_availability": False,
+        "review_controls_execution": False,
+    }
 
 
 @router.post("/governance/entity-bridges/bulk-reject",
@@ -686,7 +806,7 @@ def bulk_reject_entity_bridges(body: BulkRejectEntityBridgesRequest, conn: _Conn
     a per-item ``results`` list in REQUEST order plus ``counts``; the UI shows which succeeded rather
     than one verdict for the batch. Five outcomes, all of them ordinary:
 
-      * ``rejected``         — settled now (``operational_projection`` reports any edge demoted)
+      * ``rejected``         — settled now (``review_projection`` reports any edge demoted)
       * ``already_rejected`` — REJECTED is terminal, so a replay/double-click is a no-op, not an
                                error; the fact is already in the state the reviewer asked for
       * ``denied``           — the server refused, with the reason (a VERIFIED bridge lands here:
@@ -746,7 +866,7 @@ def bulk_reject_entity_bridges(body: BulkRejectEntityBridgesRequest, conn: _Conn
             counts["denied"] += 1
             continue
         results.append({"fact_key": fact_key, "outcome": "rejected",
-                        "operational_projection": value})
+                        "review_projection": value})
         counts["rejected"] += 1
 
     return {"category": body.category, "counts": counts, "results": results}

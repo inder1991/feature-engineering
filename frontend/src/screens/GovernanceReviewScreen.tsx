@@ -1,6 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
+  type BridgeRealizationView,
   ENTITY_BRIDGE_REJECT_CATEGORIES,
   type EntityBridgeRejectCategory,
   type GovernanceQueue,
@@ -18,6 +19,7 @@ import {
   rejectEntityBridge,
   rejectJoin,
   rejectTableFact,
+  reviewBridgeRealization,
 } from '../api'
 
 // GOVERNANCE REVIEW — a decision queue, not a search box.
@@ -126,7 +128,12 @@ const REVIEW_TONE: Record<string, string> = {
 // AXIS 2 — the automatic axis, keyed by `production_eligibility_code`.
 const EXECUTION_TONE: Record<string, string> = {
   grain_resolved: 'ok',
+  deterministically_validated: 'ok',
   cardinality_unresolved: 'warn',
+  cardinality_unknown: 'warn',
+  fanout_risk: 'warn',
+  realization_not_executable: 'warn',
+  not_evaluated: 'quiet',
   not_observed: 'quiet',
   not_applicable: 'quiet',
 }
@@ -137,6 +144,7 @@ const EXECUTION_ABSENT: Record<string, string> = {
   not_applicable: 'Not applicable — this fact describes one table, so there is no directional join '
     + 'to validate',
   not_observed: 'Not observed — no derivation evidence was recorded for this crossing',
+  not_evaluated: 'Not evaluated — no directional realization has been assessed',
 }
 
 // AXIS 1 — DERIVED for display from `state_code`, because the read model folds the availability
@@ -412,6 +420,223 @@ function Usage({ usages }: { usages: GovernanceQueueUsage[] }) {
   )
 }
 
+function bridgeRealizations(item: GovernanceQueueItem): BridgeRealizationView[] {
+  const value = item.detail.realizations
+  if (!Array.isArray(value)) return []
+  return value.filter(
+    (entry): entry is BridgeRealizationView => (
+      entry !== null
+      && typeof entry === 'object'
+      && typeof (entry as Record<string, unknown>).realization_id === 'string'
+    ),
+  )
+}
+
+function MetricSummary({ metric }: { metric: Record<string, unknown> }) {
+  const fields: Array<[string, unknown]> = [
+    ['Left rows', metric.left_row_count],
+    ['Right rows', metric.right_row_count],
+    ['Matched left IDs', metric.matched_left_distinct],
+    ['Unmatched left IDs', metric.unmatched_left_distinct],
+    ['Target duplicate rows', metric.right_duplicate_row_count],
+    ['Maximum target matches per source row', metric.max_right_matches_per_left_row],
+    ['Joined rows', metric.joined_row_count],
+  ]
+  return (
+    <dl className="gq-usage-list" data-testid="realization-metrics">
+      {fields.map(([label, value]) => (
+        <div className="gq-usage-item" key={label}>
+          <dt className="gq-usage-cat">{label}</dt>
+          <dd className="gq-usage-value">{value === null || value === undefined
+            ? 'Not observed'
+            : String(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+function RealizationEvidence({
+  initial,
+  onDone,
+  onConflict,
+}: {
+  initial: BridgeRealizationView
+  onDone: (message: string) => void
+  onConflict: (detail: string) => void
+}) {
+  const [realization, setRealization] = useState(initial)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function review(approved: boolean) {
+    setBusy(true)
+    setError('')
+    try {
+      const result = await reviewBridgeRealization(realization, approved)
+      setRealization(result.realization)
+      onDone(
+        `${approved ? 'Endorsement recorded' : 'Endorsement removed'}. `
+        + 'Automatic execution safety was not changed.',
+      )
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        onConflict(e.detail)
+      } else {
+        setError(errorDetail(e))
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="gq-usage" data-testid="realization-evidence">
+      <p className="gq-usage-head">
+        Directional realization: {realization.direction.from} → {realization.direction.to}
+      </p>
+      <dl className="gq-axes">
+        <Axis
+          testid="realization-cardinality"
+          code={realization.cardinality}
+          tone={realization.execution_eligible ? 'ok' : 'warn'}
+          label="Join cardinality"
+          value={realization.cardinality_label}
+        />
+        <Axis
+          testid="realization-safety"
+          code={realization.safety_status}
+          tone={realization.execution_eligible ? 'ok' : 'warn'}
+          label="Automatic safety"
+          value={realization.execution_eligible
+            ? 'Executable for the declared scope'
+            : realization.execution_reason_codes.join(', ') || 'Not executable'}
+        />
+        <Axis
+          testid="realization-review"
+          code={realization.review_status}
+          tone={realization.review_status === 'human_verified' ? 'ok' : 'quiet'}
+          label="Optional human review"
+          value={realization.review_status.replaceAll('_', ' ')}
+        />
+      </dl>
+      <p className="gq-prov">
+        Basis: {realization.cardinality_basis} · Lifecycle: {realization.lifecycle} · Evidence:{' '}
+        {realization.evidence_fresh ? 'current' : 'not current'}
+      </p>
+      {realization.predicates.length > 0 && (
+        <p className="gq-prov">
+          Predicate scope: {realization.predicates
+            .map(predicate => asStr(predicate.predicate_id) || asStr(predicate.kind))
+            .join(', ')}
+        </p>
+      )}
+      {realization.missing_requirements.length > 0 && (
+        <p className="gq-error">
+          Missing: {realization.missing_requirements
+            .map(requirement => requirement.reason_code)
+            .join(', ')}
+        </p>
+      )}
+      {realization.metrics.map((metric, index) => (
+        <MetricSummary metric={metric} key={asStr(metric.observation_revision_id) || index} />
+      ))}
+      {realization.profile_action && (
+        <p className="gq-prov">
+          Next action: {realization.profile_action.label} ({realization.profile_action.state})
+        </p>
+      )}
+      <div className="gj-actions gq-actions">
+        <button type="button" className="btn" disabled={busy} onClick={() => void review(true)}>
+          Endorse realization
+        </button>
+        <button type="button" className="btn" disabled={busy} onClick={() => void review(false)}>
+          Remove endorsement
+        </button>
+      </div>
+      {error && <p className="gq-error" role="alert">{error}</p>}
+    </section>
+  )
+}
+
+function BridgeEvidence({
+  item,
+  onDone,
+  onConflict,
+}: {
+  item: GovernanceQueueItem
+  onDone: (message: string) => void
+  onConflict: (detail: string) => void
+}) {
+  if (item.kind !== 'entity_bridge') return null
+  const assessment = asRec(item.detail.assessment)
+  const left = asRec(assessment.left_endpoint)
+  const right = asRec(assessment.right_endpoint)
+  const authority = asRec(item.detail.authority)
+  const hypothesis = asStr(assessment.population_hypothesis)
+  const contradiction = asStr(assessment.strongest_contradiction)
+  const reasons = asStrArr(assessment.proposal_reasons)
+  const realizations = bridgeRealizations(item)
+  return (
+    <section className="gq-bridge-evidence" data-testid="bridge-evidence">
+      <dl className="gq-usage-list">
+        <div className="gq-usage-item">
+          <dt className="gq-usage-cat">Join cardinality</dt>
+          <dd className="gq-usage-value">
+            {asStr(item.detail.cardinality_label) || 'Not evaluated'}
+          </dd>
+        </div>
+        <div className="gq-usage-item">
+          <dt className="gq-usage-cat">Namespace verdict</dt>
+          <dd className="gq-usage-value">
+            {asStr(assessment.namespace_verdict) || 'Not evaluated'}
+          </dd>
+        </div>
+        <div className="gq-usage-item">
+          <dt className="gq-usage-cat">Governed population relation</dt>
+          <dd className="gq-usage-value">
+            {asStr(assessment.governed_population_relation) || 'Unknown'}
+          </dd>
+        </div>
+        <div className="gq-usage-item">
+          <dt className="gq-usage-cat">Concept authority</dt>
+          <dd className="gq-usage-value">
+            {[asStr(left.concept_authority), asStr(right.concept_authority)]
+              .filter(Boolean).join(' / ') || 'Unknown'}
+          </dd>
+        </div>
+        <div className="gq-usage-item">
+          <dt className="gq-usage-cat">Human review authority</dt>
+          <dd className="gq-usage-value">
+            {asStr(authority.role)
+              ? `${asStr(authority.role)} · ${String(authority.confirmation_count ?? 1)} confirmer`
+              : 'Not reported'}
+          </dd>
+        </div>
+      </dl>
+      {hypothesis && <p className="gq-prov">Advisory population hypothesis: {hypothesis}</p>}
+      {reasons.length > 0 && <p className="gq-prov">Proposed because: {reasons.join(', ')}</p>}
+      {contradiction && (
+        <p className="gq-error">Strongest contradiction: {contradiction}</p>
+      )}
+      {realizations.map(realization => (
+        <RealizationEvidence
+          initial={realization}
+          key={realization.realization_id}
+          onDone={onDone}
+          onConflict={onConflict}
+        />
+      ))}
+      {realizations.length === 0 && (
+        <p className="gq-prov">
+          No directional realization has been evaluated. Run a bounded profile in the data
+          environment; reviewing the identifier link will not run it.
+        </p>
+      )}
+    </section>
+  )
+}
+
 function CategoryChips({ kind, chosen, onPick, label }: {
   kind: string
   chosen: string | null
@@ -439,14 +664,28 @@ function CategoryChips({ kind, chosen, onPick, label }: {
 
 interface Outcome {
   governance_status: string
-  operational_projection: string
+  projection: string
+  projectionKind: 'review' | 'operational'
 }
 
 async function confirmItem(item: GovernanceQueueItem, note: string): Promise<Outcome> {
   const body = note ? { note } : {}
-  if (item.kind === 'entity_bridge') return confirmEntityBridge(item.fact_key, body)
-  if (item.kind === 'approved_join') return confirmJoin(item.fact_key, body)
-  return confirmTableFact(item.fact_key, body)
+  if (item.kind === 'entity_bridge') {
+    const result = await confirmEntityBridge(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.review_projection,
+      projectionKind: 'review',
+    }
+  }
+  const result = item.kind === 'approved_join'
+    ? await confirmJoin(item.fact_key, body)
+    : await confirmTableFact(item.fact_key, body)
+  return {
+    governance_status: result.governance_status,
+    projection: result.operational_projection,
+    projectionKind: 'operational',
+  }
 }
 
 async function rejectItem(
@@ -468,8 +707,14 @@ async function rejectItem(
   await rejectTableFact(item.fact_key, { category: category as TableFactRejectCategory, ...rest })
 }
 
-function projectionNote(projection: string): string {
-  if (projection === 'projected') return ' The operational link is live and stays revocable.'
+function projectionNote(projection: string, kind: Outcome['projectionKind']): string {
+  if (kind === 'review' && projection === 'projected') {
+    return ' The review projection was updated; availability and execution safety did not change.'
+  }
+  if (kind === 'review' && projection === 'pending') {
+    return ' The endorsement was recorded; its review projection is pending.'
+  }
+  if (projection === 'projected') return ' The operational projection is live and stays revocable.'
   if (projection === 'pending') {
     return ' The operational projection is deferred to the next caught-up ingest.'
   }
@@ -531,6 +776,7 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
       <Axes item={item} />
       {provenance.length > 0 && <p className="gq-prov">{provenance.join(' · ')}</p>}
       <Usage usages={item.already_depended_on_by} />
+      <BridgeEvidence item={item} onDone={onDone} onConflict={onConflict} />
 
       <div className="gj-actions gq-actions">
         <button
@@ -586,7 +832,7 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
                 const result = await confirmItem(item, note.trim())
                 return `Your agreement is recorded — ${headline(item)} is now `
                   + `${result.governance_status.toLowerCase().replaceAll('_', ' ')}.`
-                  + projectionNote(result.operational_projection)
+                  + projectionNote(result.projection, result.projectionKind)
               })}
             >
               {busy ? 'Recording…' : 'Record my confirmation'}

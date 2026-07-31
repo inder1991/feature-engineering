@@ -428,19 +428,25 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
     // to "shared", because graph_node.entity is null on every column — the same never-populated
     // column that kept this expansion from firing at all.
     //
-    // And `resolved` is honoured rather than hard-coding "declared": a confirmed bridge used to
-    // report itself as unconfirmed.
     const entity = e.entity_id ?? from?.entity ?? to?.entity ?? 'shared'
     const target = to
       ? `${to.catalog_source ?? idSource(e.to)}.${shortRef(to, e.to)}`
       : e.to
-    const state = e.resolved ? 'confirmed by a person' : 'proposed, not yet reviewed'
+    const review = e.link_review_status === 'human_verified'
+      ? 'endorsed by a person'
+      : e.link_review_status === 'not_governed'
+        ? 'advisory, not governed'
+        : 'not yet reviewed'
+    const safety = e.execution_eligible
+      ? 'automatically validated for execution'
+      : `execution ${e.realization_safety_status ?? 'not evaluated'}`
     // The VERDICT first, then the reason behind it. `why` explains the rank ("neither side is a
     // key — types match but this may not be a real join"); on the canvas that compresses to one
     // word, and here there is room for both.
     const rank = (e.strength ?? 0) >= 10 ? 'strong' : 'weak'
     const because = e.why ? ` · ${e.why}` : ''
-    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${rank} · ${state}${because}`
+    return `${shortRef(from, e.from)} links to ${target} on ${entity} · ${rank} · `
+      + `${review} · ${safety}${because}`
   }
   if (e.kind === 'derives') {
     return `${shortRef(from, e.from)} derives feature ${shortRef(to, e.to)} · registered`
@@ -868,7 +874,12 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         // unlabelled, so "no marker" had to be read as "good" — an absence is a poor way to state
         // a verdict, and it is invisible when only one link is on screen.
         const keyed = (e.strength ?? 0) >= 10
-        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'}`
+        const trust = e.execution_eligible
+          ? 'executable'
+          : e.trust_kind === 'governed_identifier_link'
+            ? 'governed'
+            : 'advisory'
+        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'} · ${trust}`
       } else {
         stroke = 'var(--proposal)'
         label = e.kind
@@ -1038,7 +1049,9 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
                 )}
                 {layersOn.entity && (
                   <p>
-                    No verified entity bridge yet. Entity assignments are confirmed on the{' '}
+                    No entity relationship is visible yet. Advisory mappings, governed identifier
+                    links, and executable realizations appear here as separate trust levels. Review
+                    is available on the{' '}
                     <a
                       href="#/governance"
                       onClick={e => {

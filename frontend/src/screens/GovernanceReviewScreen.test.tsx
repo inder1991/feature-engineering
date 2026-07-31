@@ -19,12 +19,14 @@ vi.mock('../api', async importOriginal => {
     rejectJoin: vi.fn(),
     confirmTableFact: vi.fn(),
     rejectTableFact: vi.fn(),
+    reviewBridgeRealization: vi.fn(),
   }
 })
 const getGovernanceQueue = vi.mocked(api.getGovernanceQueue)
 const confirmEntityBridge = vi.mocked(api.confirmEntityBridge)
 const rejectEntityBridge = vi.mocked(api.rejectEntityBridge)
 const bulkRejectEntityBridges = vi.mocked(api.bulkRejectEntityBridges)
+const reviewBridgeRealization = vi.mocked(api.reviewBridgeRealization)
 const confirmJoin = vi.mocked(api.confirmJoin)
 const confirmTableFact = vi.mocked(api.confirmTableFact)
 
@@ -97,6 +99,54 @@ function bridge(over: Partial<api.GovernanceQueueItem> = {}): api.GovernanceQueu
     detail: bridgeDetail(),
     already_depended_on_by: USAGE,
     ...over,
+  }
+}
+
+function realization(): api.BridgeRealizationView {
+  return {
+    realization_id: 'real-customer',
+    realization_revision_id: 'real-rev-2',
+    bridge_fact_key: 'fact:entity_bridge:customer',
+    direction: { from: 'cib::public.customer_master_dly', to: 'ftr::public.party_dly' },
+    from_endpoint: {},
+    to_endpoint: {},
+    column_pairs: [{
+      from_logical_column_ref: 'cib::public.customer_master_dly.cif_id',
+      to_logical_column_ref: 'ftr::public.party_dly.cif_id',
+    }],
+    cardinality: 'unknown',
+    cardinality_label: 'Unknown — profile required',
+    cardinality_basis: 'none',
+    predicates: [],
+    missing_requirements: [{
+      from_logical_column_ref: 'cib::public.customer_master_dly.business_dt',
+      to_logical_column_ref: 'ftr::public.party_dly.business_dt',
+      reason_code: 'composite_key_member_missing',
+    }],
+    applicability_scope: {
+      scope_id: 'customer-daily',
+      execution_tier: 'production',
+      purposes: ['feature_generation'],
+      environment: 'pilot',
+      partition_scope_ref: null,
+    },
+    dependency_snapshot_id: 'deps-1',
+    safety_status: 'unassessed',
+    review_status: 'unreviewed',
+    lifecycle: 'active',
+    pointer_version: 1,
+    execution_eligible: false,
+    execution_reason_codes: ['directional_cardinality_unknown'],
+    evidence_fresh: true,
+    evidence: [],
+    metrics: [],
+    assessment: null,
+    available_review_actions: ['confirm', 'reject'],
+    profile_action: {
+      state: 'external_run_required',
+      label: 'Run bounded profile in the data environment',
+    },
+    review_controls_execution: false,
   }
 }
 
@@ -194,13 +244,16 @@ beforeEach(() => {
   getGovernanceQueue.mockResolvedValue(queue())
   confirmEntityBridge.mockReset()
   confirmEntityBridge.mockResolvedValue({
-    governance_status: 'VERIFIED', operational_projection: 'projected',
+    governance_status: 'VERIFIED', review_projection: 'projected',
+    review_controls_availability: false, review_controls_execution: false,
   })
   rejectEntityBridge.mockReset()
   rejectEntityBridge.mockResolvedValue({
     governance_status: 'REJECTED', category: 'not_the_same_entity',
-    operational_projection: 'not_applicable',
+    review_projection: 'not_applicable',
+    review_controls_availability: false, review_controls_execution: false,
   })
+  reviewBridgeRealization.mockReset()
   bulkRejectEntityBridges.mockReset()
   bulkRejectEntityBridges.mockResolvedValue({
     category: 'not_the_same_entity',
@@ -237,6 +290,46 @@ describe('governance review — the decision queue', () => {
     expect(screen.queryByRole('textbox')).toBeNull()
     expect(screen.queryByLabelText(/^source$/i)).toBeNull()
     expect(screen.queryByRole('button', { name: /load proposals/i })).toBeNull()
+  })
+
+  it('shows assessment truth separately from the directional realization', async () => {
+    const exact = realization()
+    const item = bridge({
+      production_eligibility: 'Unknown — profile required',
+      production_eligibility_code: 'cardinality_unknown',
+      detail: bridgeDetail({
+        cardinality_label: exact.cardinality_label,
+        authority: { role: 'platform-admin', confirmation_count: 1, dual: false },
+        assessment: {
+          namespace_verdict: 'possible',
+          governed_population_relation: 'unknown',
+          population_hypothesis: 'CIB customer IDs likely overlap the FTR transaction population',
+          left_endpoint: { concept_authority: 'llm' },
+          right_endpoint: { concept_authority: 'source' },
+          proposal_reasons: ['same_customer_concept', 'compatible_type'],
+          strongest_contradiction: 'CIB key is (business_dt, cif_id), not cif_id alone',
+        },
+        realizations: [exact],
+      }),
+    })
+    getGovernanceQueue.mockResolvedValue(queue({ items: [item] }))
+    render(<GovernanceReviewScreen />)
+
+    const card = await screen.findByTestId(`row-${item.fact_key}`)
+    expect(within(card).getAllByText('Unknown — profile required')).toHaveLength(3)
+    expect(within(card).getByText('possible')).toBeInTheDocument()
+    expect(within(card).getByText('unknown')).toBeInTheDocument()
+    expect(within(card).getByText('llm / source')).toBeInTheDocument()
+    expect(within(card).getByText('platform-admin · 1 confirmer')).toBeInTheDocument()
+    expect(within(card).getByText(/Advisory population hypothesis/)).toHaveTextContent(
+      'CIB customer IDs likely overlap the FTR transaction population',
+    )
+    expect(within(card).getByText(/Strongest contradiction/)).toHaveTextContent(
+      'CIB key is (business_dt, cif_id), not cif_id alone',
+    )
+    expect(within(card).getByText(/Next action/)).toHaveTextContent(
+      'Run bounded profile in the data environment',
+    )
   })
 
   it('opens with the purpose line: the system proposes, a person disposes', async () => {

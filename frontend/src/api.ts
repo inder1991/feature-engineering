@@ -689,7 +689,12 @@ export type EntityBridgeRejectCategory = (typeof ENTITY_BRIDGE_REJECT_CATEGORIES
 export function confirmEntityBridge(
   factKey: string,
   body: { note?: string },
-): Promise<{ governance_status: string; operational_projection: string }> {
+): Promise<{
+  governance_status: string
+  review_projection: string
+  review_controls_availability: false
+  review_controls_execution: false
+}> {
   return post(`/governance/entity-bridges/${encodeURIComponent(factKey)}/confirm`, {
     note: body.note ?? null,
   })
@@ -698,7 +703,13 @@ export function confirmEntityBridge(
 export function rejectEntityBridge(
   factKey: string,
   body: { category: EntityBridgeRejectCategory; note?: string },
-): Promise<{ governance_status: string; category: string; operational_projection: string }> {
+): Promise<{
+  governance_status: string
+  category: string
+  review_projection: string
+  review_controls_availability: false
+  review_controls_execution: false
+}> {
   return post(`/governance/entity-bridges/${encodeURIComponent(factKey)}/reject`, {
     category: body.category,
     note: body.note ?? null,
@@ -714,7 +725,7 @@ export interface BulkBridgeRejectResult {
   fact_key: string
   outcome: string
   detail?: string
-  operational_projection?: string
+  review_projection?: string
 }
 
 export function bulkRejectEntityBridges(
@@ -731,6 +742,81 @@ export function bulkRejectEntityBridges(
     category,
     note: note ?? null,
   })
+}
+
+export interface BridgeRealizationView {
+  realization_id: string
+  realization_revision_id: string
+  bridge_fact_key: string
+  direction: { from: string; to: string }
+  from_endpoint: Record<string, unknown>
+  to_endpoint: Record<string, unknown>
+  column_pairs: Array<{
+    from_logical_column_ref: string
+    to_logical_column_ref: string
+  }>
+  cardinality: string
+  cardinality_label: string
+  cardinality_basis: string
+  predicates: Array<Record<string, unknown>>
+  missing_requirements: Array<Record<string, string>>
+  applicability_scope: {
+    scope_id: string
+    execution_tier: string
+    purposes: string[]
+    environment: string
+    partition_scope_ref: string | null
+  }
+  dependency_snapshot_id: string
+  safety_status: string
+  review_status: string
+  lifecycle: string
+  pointer_version: number
+  execution_eligible: boolean
+  execution_reason_codes: string[]
+  evidence_fresh: boolean
+  evidence: Array<Record<string, unknown>>
+  metrics: Array<Record<string, unknown>>
+  assessment: Record<string, unknown> | null
+  available_review_actions: string[]
+  profile_action: { state: string; label: string } | null
+  review_controls_execution: false
+}
+
+export function listBridgeRealizations(
+  source: string,
+  bridgeFactKey?: string,
+): Promise<{ source: string; realizations: BridgeRealizationView[]; next_cursor: null }> {
+  const query = bridgeFactKey
+    ? `?bridge_fact_key=${encodeURIComponent(bridgeFactKey)}`
+    : ''
+  return request(
+    `/sources/${encodeURIComponent(source)}/governance/bridge-realizations${query}`,
+  )
+}
+
+export function reviewBridgeRealization(
+  realization: BridgeRealizationView,
+  approved: boolean,
+  note?: string,
+): Promise<{
+  review_status: string
+  safety_status: string
+  execution_eligible: boolean
+  pointer_version: number
+  review_projection: string
+  review_controls_execution: false
+  realization: BridgeRealizationView
+}> {
+  const action = approved ? 'confirm' : 'reject'
+  return post(
+    `/governance/bridge-realizations/${encodeURIComponent(realization.realization_id)}/${action}`,
+    {
+      realization_revision_id: realization.realization_revision_id,
+      expected_pointer_version: realization.pointer_version,
+      note: note ?? null,
+    },
+  )
 }
 
 // ---- the cross-catalog governance QUEUE (GET /governance/queue) ------------------------------
@@ -955,7 +1041,8 @@ export interface LineageNode {
 }
 
 // Edge orientation for symmetric kinds (join, entity_bridge) points away from the anchor.
-// `cardinality` is omitted when the declared edge has none; entity bridges never carry one.
+// `cardinality` is omitted for advisory/link-only entity edges and populated from a current
+// directional realization when one has actually been evaluated.
 // kind 'contains' (table -> column) is structural and always emitted regardless of layers.
 export interface LineageEdge {
   from: string
@@ -963,7 +1050,15 @@ export interface LineageEdge {
   layer: LineageLayer
   kind: 'contains' | 'join' | 'entity_bridge' | 'derives' | 'consumes'
   cardinality?: string
-  resolved: boolean
+  // Non-bridge edges retain the original endpoint-resolution flag.
+  resolved?: boolean
+  // Entity bridges expose the independent truths explicitly. `trust_kind` is
+  // advisory_lineage | governed_identifier_link | executable_realization.
+  trust_kind?: string
+  endpoint_resolved?: boolean
+  link_review_status?: string
+  realization_safety_status?: string
+  execution_eligible?: boolean
   // entity_bridge only: WHICH entity the two columns share (customer, branch, …). Carried on the
   // edge because the node-level `entity` field is null on every column.
   entity_id?: string

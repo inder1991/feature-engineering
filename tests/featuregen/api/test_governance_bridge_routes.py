@@ -9,22 +9,9 @@ idempotency key, target-event CAS, the REAL overlay commands, and the deny-path 
 Four properties this suite exists to pin, all of which distinguish a real implementation from a
 plausible-looking one:
 
-* **The confirm actually PROJECTS.** ``confirm_fact`` has projection hooks for ``approved_join`` and
-  the semantic bindings and NONE for ``entity_bridge`` (``confirmation_commands.py``), so the route
-  is the ONLY thing that ever writes ``entity_bridge_edge``. A route that skips the projection still
-  reaches VERIFIED and still returns 200 — and the bridge is never operational. The decisive test
-  therefore asserts the ROW, with a non-null ``confirmed_event_id`` and ``status='VERIFIED'``.
-
-* **W1 — ``project_verified_bridge`` has NO default for ``now``**, unlike its semantic-binding twin,
-  and passes it straight into a ``timestamptz NOT NULL DEFAULT now()`` column. A column DEFAULT
-  applies when the column is OMITTED, never when NULL is explicitly supplied, so ``now=None`` errors.
-  The route must pass a real timestamp; the projection test would fail if it did not.
-
-* **W2 — it has neither a savepoint nor a never-raises guarantee**, unlike its twin (*"a projection
-  fault must not roll back the confirm"*). Unwrapped, a projection fault AFTER a successful
-  ``confirm_fact`` propagates, rolls back the request transaction, and LOSES the confirmation — the
-  reviewer sees a 500 and the fact is not VERIFIED. ``test_a_projection_fault_...`` injects exactly
-  the W1 fault and asserts the fact is VERIFIED with ``"pending"`` reported.
+* **The confirm command actually updates its review projection.** The route reports the command's
+  synchronous result and does not run a second projection path. The decisive test asserts the ROW,
+  with a non-null ``confirmed_event_id`` and ``status='VERIFIED'``.
 
 * **A denied command RETURNS 409, never raises** (audit I-3): raising rolls back the
   ``COMMAND_DENIED`` row and releases the advisory lock. Proven under ``prod_tx_client``, which
@@ -62,7 +49,6 @@ from featuregen.overlay.identity import EntityBridgeRef, fact_key
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
-from featuregen.overlay.upload.bridge_projection import project_verified_bridge
 from featuregen.overlay.upload.bridge_propose import propose_bridge
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
@@ -157,6 +143,11 @@ def test_get_lists_the_bridge_from_either_endpoint(client, seeded_bridge):
         assert p["available_actions"] == ["confirm", "reject"]
         assert p["target_event_id"] is not None
         assert sorted(p["catalogs"]) == ["core", "crm"]
+        assert p["cardinality_label"] == "Not evaluated"
+        assert p["realizations"] == []
+        assert p["authority"]["role"] == "platform-admin"
+        assert p["authority"]["confirmation_count"] == 1
+        assert p["authority"]["dual"] is False
 
 
 def test_get_excludes_a_source_that_is_neither_endpoint(client, seeded_bridge):
@@ -218,7 +209,13 @@ def test_confirm_verifies_and_writes_the_operational_edge(client, seeded_bridge,
     ref, key = seeded_bridge
     r = _confirm(client, key, note="same customer id both sides")
     assert r.status_code == 200, r.text
-    assert r.json() == {"governance_status": "VERIFIED", "operational_projection": "projected"}
+    body = r.json()
+    assert body["governance_status"] == "VERIFIED"
+    assert body["review_projection"] == "projected"
+    assert body["review_controls_availability"] is False
+    assert body["review_controls_execution"] is False
+    assert body["authority"]["role"] == "platform-admin"
+    assert body["authority"]["dual"] is False
     assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
 
     row = _edge(conn, key)
@@ -278,38 +275,6 @@ def test_confirm_404s_on_a_fact_of_another_type_without_writing_events(client, o
 
 def test_unknown_fact_key_404(client, overlay_env):
     assert _confirm(client, "no-such-fact").status_code == 404
-
-
-# ── (3) W2: a projection fault must NOT roll back the confirm ──────────────────────────────────────
-
-def test_a_projection_fault_leaves_the_fact_verified_and_reports_pending(
-        client, seeded_bridge, conn, monkeypatch):
-    """W2. `project_verified_bridge` has no savepoint and no never-raises guarantee, unlike its twin
-    (*"a projection fault must not roll back the confirm"*). Unwrapped, a fault AFTER a successful
-    `confirm_fact` propagates, the request transaction rolls back, and the CONFIRMATION IS LOST — the
-    reviewer sees a 500 and the fact is not VERIFIED.
-
-    The injected fault is the REAL W1 defect (`now=None` into a NOT NULL column), so this is a
-    genuine in-transaction database error that POISONS the transaction — nothing short of a savepoint
-    rollback can recover it. Passing requires: 200, `"pending"` reported honestly, and the fact
-    VERIFIED with its CONFIRMED event intact."""
-    import featuregen.api.routes.governance as gov
-
-    def _faulty(conn_, ref, *, now):          # noqa: ARG001 — the whole point is to ignore `now`
-        return project_verified_bridge(conn_, ref, now=None)
-
-    monkeypatch.setattr(gov, "project_verified_bridge", _faulty)
-
-    _ref, key = seeded_bridge
-    r = _confirm(client, key)
-    assert r.status_code == 200, r.text
-    assert r.json() == {"governance_status": "VERIFIED", "operational_projection": "pending"}
-    # the confirm SURVIVED the poisoned projection
-    assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
-    assert len([e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_CONFIRMED"]) == 1
-    assert _edge(conn, key) is None          # honest: "pending" means NOT operational
-    # and the connection is usable — the savepoint rollback un-poisoned the transaction
-    assert conn.execute("SELECT 1").fetchone()[0] == 1
 
 
 # ── (4) four-eyes: the proposer cannot confirm, and the denial is RETURNED ─────────────────────────
@@ -381,8 +346,13 @@ def test_reject_a_proposed_bridge_records_the_category(client, seeded_bridge, co
                     json={"category": "not_the_same_entity", "note": "crm ids are not core ids"},
                     headers=_h("priya"))
     assert r.status_code == 200, r.text
-    assert r.json() == {"governance_status": "REJECTED", "category": "not_the_same_entity",
-                        "operational_projection": "not_applicable"}
+    assert r.json() == {
+        "governance_status": "REJECTED",
+        "category": "not_the_same_entity",
+        "review_projection": "not_applicable",
+        "review_controls_availability": False,
+        "review_controls_execution": False,
+    }
     assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
     rejected = [e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_REJECTED"][-1]
     assert rejected.payload["category"] == "not_the_same_entity"
@@ -406,7 +376,7 @@ def test_rejecting_a_drifted_bridge_demotes_the_live_edge(client, seeded_bridge,
     r = client.post(f"/governance/entity-bridges/{key}/reject",
                     json={"category": "needs_data_check"}, headers=_h("dev"))
     assert r.status_code == 200, r.text
-    assert r.json()["operational_projection"] == "demoted"
+    assert r.json()["review_projection"] == "demoted"
     assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
     assert _edge(conn, key) is None, "a REJECTED bridge is still projected — planner can traverse it"
 
@@ -577,18 +547,18 @@ def test_a_fault_on_one_item_does_not_roll_back_the_others(
     REJECTED over a still-live bridge. Per item that means the faulting item's reject is UNDONE — it
     reports `failed` and its fact is left exactly as it was — while the other seven stand.
     """
-    import featuregen.api.routes.governance as gov
+    import featuregen.overlay.confirmation_commands as commands
 
     keys = eight_bridges
     poisoned = keys[3]
-    real = gov.demote_bridge_edges
+    real = commands.demote_projected_bridge_edges
 
-    def _faulty(conn_, fact_key_value):
+    def _faulty(conn_, fact_key_value, status):
         if fact_key_value == poisoned:
             conn_.execute("SELECT 1 FROM entity_bridge_edge WHERE fact_key = no_such_column")
-        return real(conn_, fact_key_value)
+        return real(conn_, fact_key_value, status)
 
-    monkeypatch.setattr(gov, "demote_bridge_edges", _faulty)
+    monkeypatch.setattr(commands, "demote_projected_bridge_edges", _faulty)
 
     r = _bulk_reject(prod_tx_client, keys)
     assert r.status_code == 200, r.text
@@ -638,7 +608,7 @@ def test_bulk_reject_demotes_a_live_edge_per_item(client, eight_bridges, conn):
     body = _bulk_reject(client, keys).json()
 
     assert body["counts"]["rejected"] == 8
-    projections = {x["fact_key"]: x["operational_projection"] for x in body["results"]}
+    projections = {x["fact_key"]: x["review_projection"] for x in body["results"]}
     assert projections[drifted] == "demoted"
     assert _edge(conn, drifted) is None, "a REJECTED bridge is still projected"
     assert all(v == "not_applicable" for k, v in projections.items() if k != drifted)

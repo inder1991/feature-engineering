@@ -257,10 +257,28 @@ export function IngestResultCallout({
               {result.tables ?? 0} table{result.tables === 1 ? '' : 's'} ·{' '}
               {result.columns ?? 0} column{result.columns === 1 ? '' : 's'}),{' '}
               <Count value={result.containment_edges ?? 0} tone="ok" /> containment edge
-              {result.containment_edges === 1 ? '' : 's'},{' '}
-              {result.join_candidates ?? 0} join candidate
-              {result.join_candidates === 1 ? '' : 's'} · Pass B:{' '}
+              {result.containment_edges === 1 ? '' : 's'} · Pass B:{' '}
               {result.passb_proposed ?? 0} proposed, {result.passb_abstained ?? 0} abstained
+            </p>
+          )}
+          {result.join_candidates !== undefined && (
+            <p className="tabular-nums" data-testid="pass-c-join-counts">
+              Intra-catalog Pass C: {result.join_candidates} join candidate
+              {result.join_candidates === 1 ? '' : 's'}
+            </p>
+          )}
+          {result.entity_bridge_candidates_considered !== undefined && (
+            <p className="tabular-nums" data-testid="cross-catalog-bridge-counts">
+              Cross-catalog identifier links: {result.entity_bridge_candidates_considered}{' '}
+              assessments completed, {result.entity_bridge_candidates_retained ?? 0} retained,{' '}
+              {result.entity_bridges_proposed ?? 0} proposed,{' '}
+              {result.entity_bridge_candidates_suppressed ?? 0} suppressed
+              {(result.entity_bridge_candidates_truncated ?? 0) > 0 && (
+                <strong style={{ color: 'var(--warn)' }}>
+                  {' '}· {result.entity_bridge_candidates_truncated} candidates not evaluated
+                  because the bounded shortlist was reached
+                </strong>
+              )}
             </p>
           )}
           {result.flagged && (
