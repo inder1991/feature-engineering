@@ -289,6 +289,57 @@ def test_reconciliation_supersedes_tasks_left_by_an_already_withdrawn_pointer(
     ).fetchone() == ("superseded",)
 
 
+def test_withdrawn_candidate_revision_cannot_cancel_its_active_semantic_replacement(
+    db, monkeypatch
+):
+    """Candidate identity is revision-local, but review belongs to the stable semantic fact.
+
+    A derivation-version change can replace a candidate id while retaining the same bridge
+    ``fact_key``.  The withdrawn historical id must not cancel the active replacement's review
+    task merely because both revisions name the same semantic link.
+    """
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    _trigger(db)
+    active_candidate_id = derive_bridge_candidates(db)[0].candidate_id
+    active_task_id = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO governed_candidate_identity "
+        "(candidate_id, candidate_family, logical_identity_json) "
+        "SELECT 'historical-candidate', candidate_family, logical_identity_json "
+        "FROM governed_candidate_identity WHERE candidate_id=%s",
+        (active_candidate_id,),
+    )
+    db.execute(
+        "INSERT INTO governed_candidate_revision "
+        "(candidate_revision_id, candidate_id, assessment_json, assessment_version) "
+        "SELECT 'historical-revision', 'historical-candidate', assessment_json, "
+        "       assessment_version "
+        "FROM governed_candidate_revision "
+        "WHERE candidate_revision_id=("
+        "  SELECT candidate_revision_id FROM governed_candidate_current WHERE candidate_id=%s"
+        ")",
+        (active_candidate_id,),
+    )
+    db.execute(
+        "INSERT INTO governed_candidate_current "
+        "(candidate_id, candidate_revision_id, pointer_version, lifecycle) "
+        "VALUES ('historical-candidate', 'historical-revision', 1, 'withdrawn')"
+    )
+
+    result = withdraw_missing_candidate_assessments(
+        db, frozenset({active_candidate_id})
+    )
+
+    assert result == (0, 0, 0)
+    assert db.execute(
+        "SELECT status FROM human_tasks WHERE task_id=%s",
+        (active_task_id,),
+    ).fetchone() == ("open",)
+
+
 # ── who proposes: the SYSTEM, never the uploading human ──────────────────────────────────────────
 #
 # A derived bridge proposed under the UPLOADER's own identity is permanently unconfirmable BY that

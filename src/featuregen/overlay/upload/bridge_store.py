@@ -438,12 +438,8 @@ def withdraw_missing_candidate_assessments(
     itself fails.
     """
     rows = conn.execute(
-        "SELECT c.candidate_id, c.pointer_version, "
-        "coalesce(r.assessment_json->>'bridge_fact_key', "
-        "         r.assessment_json->>'fact_key') AS bridge_fact_key "
+        "SELECT c.candidate_id, c.pointer_version "
         "FROM governed_candidate_current c "
-        "JOIN governed_candidate_revision r "
-        "  ON r.candidate_revision_id=c.candidate_revision_id "
         "JOIN governed_candidate_identity i ON i.candidate_id=c.candidate_id "
         "WHERE i.candidate_family='identifier_link' AND c.lifecycle='active' "
         "ORDER BY c.candidate_id"
@@ -451,9 +447,8 @@ def withdraw_missing_candidate_assessments(
     withdrawn = 0
     realizations = 0
     review_tasks = 0
-    from featuregen.gates.tasks import cancel_task
 
-    for candidate_id, pointer_version, bridge_fact_key in rows:
+    for candidate_id, pointer_version in rows:
         if candidate_id in retained_candidate_ids:
             continue
         changed = conn.execute(
@@ -465,36 +460,35 @@ def withdraw_missing_candidate_assessments(
         if changed != 1:
             raise BridgeStoreConflict(f"candidate {candidate_id} pointer advanced")
         withdrawn += 1
-        if bridge_fact_key:
-            realizations += demote_realizations_for_bridge(
-                conn, str(bridge_fact_key), lifecycle="stale")
-            tasks = conn.execute(
-                "SELECT task_id FROM human_tasks "
-                "WHERE fact_key=%s AND status='open' ORDER BY task_id",
-                (str(bridge_fact_key),),
-            ).fetchall()
-            for (task_id,) in tasks:
-                cancel_task(
-                    conn,
-                    task_id,
-                    reason="identifier-link candidate withdrawn",
-                    new_status="superseded",
-                )
-                review_tasks += 1
-    # Idempotent repair for pointers withdrawn by an earlier version that did not supersede their
-    # review tasks.  This also makes a deploy-time reconciliation sufficient; no catalog re-upload
-    # is needed to clean the queue.
-    withdrawn_fact_keys = conn.execute(
-        "SELECT DISTINCT coalesce(r.assessment_json->>'bridge_fact_key', "
-        "                        r.assessment_json->>'fact_key') "
-        "FROM governed_candidate_current c "
-        "JOIN governed_candidate_revision r "
-        "  ON r.candidate_revision_id=c.candidate_revision_id "
-        "WHERE c.lifecycle='withdrawn'"
+
+    # Candidate identity versions can change while the semantic link's fact_key remains stable.
+    # Demote execution and supersede review only when NO active current candidate names that fact.
+    # This query also repairs already-withdrawn pointers left by an earlier deployment, so no
+    # catalog re-upload is needed.
+    orphaned_fact_keys = conn.execute(
+        "WITH candidate_facts AS ("
+        "  SELECT c.lifecycle, "
+        "         coalesce(r.assessment_json->>'bridge_fact_key', "
+        "                  r.assessment_json->>'fact_key') AS fact_key "
+        "  FROM governed_candidate_current c "
+        "  JOIN governed_candidate_revision r "
+        "    ON r.candidate_revision_id=c.candidate_revision_id"
+        ") "
+        "SELECT DISTINCT withdrawn.fact_key "
+        "FROM candidate_facts withdrawn "
+        "WHERE withdrawn.lifecycle='withdrawn' AND withdrawn.fact_key IS NOT NULL "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM candidate_facts active "
+        "  WHERE active.fact_key=withdrawn.fact_key AND active.lifecycle='active'"
+        ") "
+        "ORDER BY withdrawn.fact_key"
     ).fetchall()
-    for (bridge_fact_key,) in withdrawn_fact_keys:
-        if not bridge_fact_key:
-            continue
+    from featuregen.gates.tasks import cancel_task
+
+    for (bridge_fact_key,) in orphaned_fact_keys:
+        realizations += demote_realizations_for_bridge(
+            conn, str(bridge_fact_key), lifecycle="stale"
+        )
         tasks = conn.execute(
             "SELECT task_id FROM human_tasks "
             "WHERE fact_key=%s AND status='open' ORDER BY task_id",
