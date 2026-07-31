@@ -127,3 +127,12 @@ migration head is re-recorded after deployment.
   (file-side payload, quality defect stands), restricted 37, concept cib 110/111, branch_id
   conflation 4 cols (sol_desc still misclassified), 4 stamp-drift rows, candidates 17 / tasks 11,
   bindings 126/0/0.
+
+### Allocation update (2026-07-31, post-Task-3)
+The 1040/1041 numeric prefixes were taken by parallel main work DESPITE the reservation
+(`1040_bridge_candidate_currentness.sql`, `1041_catalog_engine.sql`) — filename-keyed ledger
+coexistence holds, as with the 1036–1038 pairs. Richness plan actually used:
+`1040_graph_node_party_role.sql`, `1042_graph_node_sensitivity_display.sql`. Remaining richness
+reservation: 1043–1044. NOTE for every session: the numeric-prefix reservation is advisory only;
+uniqueness lives in the full FILENAME — re-scan `src/featuregen/db/migrations/` immediately
+before creating any file, and never reuse an existing full basename.
