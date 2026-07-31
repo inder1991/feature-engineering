@@ -133,22 +133,30 @@ def _set_policy(conn, *, confirmed_by=None):
             non_reversed_values=("N",), null_behavior=NullBehavior.EXCLUDE))
 
 
-def test_a_BOUND_table_with_no_policy_asks_for_a_DECISION_not_an_operator(make_client, catalog):
+def test_a_BOUND_table_next_needs_the_population_DECLARED(make_client, catalog):
     """The registry has a real consumer, asserted. Once the address exists the next gap is not
-    configuration: nobody has said which rows count, and the IR refuses without that because counting
-    pending and reversed activity as activity changes the answer."""
+    configuration at all: a person must say which table is the population, and no store may choose
+    for them — the clarification asking exactly that is on the same response."""
     _bind(catalog)
     r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
-    assert r.json()["preview"]["blocked_by"]["code"] == "ELIGIBILITY_ABSENT"
+    body = r.json()
+    assert body["preview"]["blocked_by"]["code"] == "POPULATION_UNDECLARED"
+    assert "population" in {c["code"] for c in body["clarifications"]}
 
 
-def test_bound_AND_defined_leaves_only_the_contract_gap(make_client, catalog):
-    """Both stores satisfied. What remains is neither an operator task nor a decision — AnalysisPlanV1
-    carries one base table and structurally cannot name a population spine distinct from the events."""
+def test_the_route_reports_gaps_it_does_not_know_about_itself(make_client, catalog):
+    """This route used to keep its own short list of gaps, and the list was WRONG — four codes, with
+    attribution and join evidence missing. POPULATION_UNDECLARED is a code the route never mentions;
+    surfacing it proves the enumeration comes from `analysis.assembly`, which is the only place that
+    can stay complete as stores land."""
+    from featuregen.api.routes import analysis as route_module
+
     _bind(catalog)
     _set_policy(catalog)
     r = _client(make_client).post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
-    assert r.json()["preview"]["blocked_by"]["code"] == "EXECUTION_INPUTS_ABSENT"
+    code = r.json()["preview"]["blocked_by"]["code"]
+    assert code == "POPULATION_UNDECLARED"
+    assert code not in route_module.BLOCKED_ROUTE_CODES
 
 
 def test_an_UNCONFIRMED_policy_is_disclosed_as_a_finding(make_client, catalog):
