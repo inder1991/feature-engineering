@@ -22,6 +22,7 @@ from featuregen.api.routes import (
     auth,
     catalogs,
     contract,
+    data_sources,
     entity,
     features,
     gate,
@@ -162,6 +163,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(learning.router)
     # `POST /analysis/plan` + `/analysis/clarify` — the data agent's planning surface.
     app.include_router(analysis.router)
+    # `/data-sources/...` — which engine each catalog lives on, and the routes to reach it.
+    app.include_router(data_sources.router)
 
     @app.get("/health")
     def health() -> dict:

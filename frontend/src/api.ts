@@ -2404,3 +2404,64 @@ export function clarifyAnalysis(
 ): Promise<AnalysisPlanResponse> {
   return post('/analysis/clarify', { question, code, chosen })
 }
+
+// ── data sources: where each catalog's DATA lives ───────────────────────────────────────────────
+// Distinct from the OpenMetadata integrations above, which are where the catalog DESCRIPTION comes
+// from. These grant read access to a warehouse, so writes need the platform-admin claim.
+
+export interface DataSourceConnection {
+  connection_id: string
+  environment: string
+  engine: string
+  tier: string
+  host: string
+  port: number
+  auth_mechanism: string
+  secret_ref: string
+  execution_principal: string
+  allowed_schemas: string[]
+  database_name: string
+  active: boolean
+  usable_here: boolean
+}
+
+export interface DataSourceConnections {
+  environment: string
+  engines: string[]
+  connections: DataSourceConnection[]
+}
+
+export interface CatalogEngine {
+  catalog_source: string
+  engine: string | null
+  tier: string | null
+  declared_by: string | null
+}
+
+export function getDataSourceConnections(): Promise<DataSourceConnections> {
+  return request('/data-sources/connections')
+}
+
+export function putDataSourceConnection(
+  body: Omit<DataSourceConnection, 'environment' | 'usable_here'>,
+): Promise<{ connection_id: string; environment: string }> {
+  return request(`/data-sources/connections/${encodeURIComponent(body.connection_id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function getCatalogEngines(): Promise<{ catalogs: CatalogEngine[] }> {
+  return request('/data-sources/catalogs')
+}
+
+export function putCatalogEngine(
+  source: string, engine: string, tier: string,
+): Promise<CatalogEngine> {
+  return request(`/data-sources/catalogs/${encodeURIComponent(source)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ engine, tier }),
+  })
+}

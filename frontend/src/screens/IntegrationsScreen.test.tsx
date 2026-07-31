@@ -199,7 +199,9 @@ describe('add integration', () => {
     await userEvent.type(within(form).getByLabelText('Name'), 'Corporate OpenMetadata')
     await userEvent.type(within(form).getByLabelText('OpenMetadata URL'), 'https://evil.example')
     await userEvent.click(within(form).getByRole('button', { name: 'Save integration' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent(
+    // Scoped to THIS form: the Data sources panel below is an independent region with its own
+    // alert, and an unscoped getByRole('alert') now matches both.
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
       'no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS')
   })
 })

@@ -4387,3 +4387,197 @@ button.stat:hover {
   font-size: 12.5px;
   line-height: 1.5;
 }
+
+/* ── data sources: where each catalog's data lives ──────────────────────────────────────────────
+   Every class the markup declares has a rule here. A declared class with no rule renders as
+   run-together text while the tests still pass on textContent — this codebase has shipped that. */
+
+.ds-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 28px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+
+.ds-panel h2 { margin: 0; }
+.ds-panel h3 { margin: 6px 0 0; font-size: 14px; color: var(--ink-soft); }
+
+.ds-lede {
+  margin: 0;
+  color: var(--ink-soft);
+  max-width: 68ch;
+}
+
+.ds-error {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  background: var(--surface);
+}
+
+.ds-catalogs,
+.ds-conns {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ds-empty {
+  color: var(--ink-faint);
+  padding: 10px 0;
+}
+
+.ds-catalog,
+.ds-conn {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+/* an unrouted catalog is the reason a question cannot run — it should read as the open item */
+.ds-catalog.unrouted { border-color: var(--warn); }
+
+.ds-catalog-head,
+.ds-conn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.ds-catalog-name,
+.ds-conn-route {
+  font-weight: 600;
+}
+
+.ds-catalog-state,
+.ds-conn-id {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.ds-catalog.unrouted .ds-catalog-state { color: var(--warn); }
+
+.ds-catalog-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+}
+
+.ds-catalog-form label,
+.ds-add label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ds-catalog-form input,
+.ds-catalog-form select,
+.ds-add input,
+.ds-add select {
+  padding: 7px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 400;
+  font-size: 13px;
+}
+
+.ds-catalog-form button,
+.ds-add button {
+  padding: 7px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.ds-catalog-form button:disabled,
+.ds-add button:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+}
+
+.ds-declared-by {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* a route from another environment is visible and INERT — it must not read as working */
+.ds-conn.inert {
+  border-style: dashed;
+  background: var(--surface-2);
+}
+
+.ds-conn-inert-tag {
+  font-size: 12px;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.ds-conn-fields {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 4px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.ds-conn-fields dt { color: var(--ink-soft); font-weight: 600; }
+.ds-conn-fields dd { margin: 0; }
+
+.ds-secret {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.ds-add {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+  padding: 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+}
+
+.ds-add h4 { margin: 0; font-size: 14px; }
+
+.ds-add-note {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  max-width: 62ch;
+}
+
+.ds-add-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px 14px;
+  width: 100%;
+}
+
+.ds-wide { grid-column: 1 / -1; }
+
+.ds-hint {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.ds-hint.bad { color: var(--danger); }

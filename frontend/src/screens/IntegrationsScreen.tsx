@@ -12,6 +12,7 @@
 // Discovery (the live list of services a token can see) is a convenience, not a dependency: the
 // sync-create path never needs it, so when OpenMetadata is unreachable the services section says
 // so and offers a retry, and the user can still add a sync by typing a service name.
+import { DataSourcesPanel } from './DataSourcesPanel'
 import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
@@ -158,6 +159,7 @@ export function IntegrationsScreen() {
           onRemoved={onRemoved}
         />
       ))}
+      <DataSourcesPanel />
     </section>
   )
 }
