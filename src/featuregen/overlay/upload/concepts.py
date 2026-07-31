@@ -34,6 +34,14 @@ class Concept:
     pit_role: str = "none"          # "as_of"|"effective"|"event"|"maturity"|"valid_time"|"system_time"|"none"
     sensitivity: str = "public"     # "public"|"pii"|"protected_attribute"|"special_category"|"proxy"
     entity_link: str | None = None  # identifiers only: the entity it links (e.g. "customer","account")
+    #: Identifier namespace — the ISSUER's value space this identifier draws from (three-axis
+    #: model). Two columns are join-candidates iff their concepts share a namespace: equal values
+    #: must denote the same thing. `customer_id` and `counterparty_id` BOTH declare "cif" (one
+    #: bank's CIF registry); a BIC is "swift_bic" whatever entity role carries it. Identifier
+    #: concepts MUST declare one; nothing else may (validated at import). Namespaces are
+    #: single-issuer names — issuer-scope them (e.g. "cif@<institution>") the moment a second
+    #: institution's catalogs arrive.
+    namespace: str | None = None
     is_a: str | None = None         # parent concept name (is-a edge), else None
     leakage_anchor: bool = False    # True for outcome_label + the target-defining flags (§3.10/§3.7)
     near_label: bool = False        # True for funnel-tail signals that BORDER the label (forbearance,
@@ -75,19 +83,70 @@ _ALL: tuple[Concept, ...] = (
                         "notional across snapshots."),
 
     # ── §3.2 Identifiers → entity links (join key + grain + entity) ───────────────────────────────
-    Concept("customer_id", "identifier", entity_link="customer", description="Links to the customer entity."),
-    Concept("account_id", "identifier", entity_link="account", description="Links to the account entity."),
-    Concept("card_id", "identifier", entity_link="card_account", description="Links to the card_account entity."),
-    Concept("transaction_id", "identifier", entity_link="transaction", description="Links to the transaction entity."),
-    Concept("application_id", "identifier", entity_link="application", description="Links to the application entity."),
-    Concept("product_id", "identifier", entity_link="product", description="Links to the product entity."),
-    Concept("facility_id", "identifier", entity_link="facility", description="Links to the facility entity."),
-    Concept("instrument_id", "identifier", entity_link="instrument", description="Links to the instrument entity."),
-    Concept("counterparty_id", "identifier", entity_link="counterparty", description="Links to the counterparty entity."),
-    Concept("merchant_id", "identifier", entity_link="merchant", description="Links to the merchant entity."),
-    Concept("lei", "identifier", entity_link="legal_entity",
+    Concept("customer_id", "identifier", namespace="cif", entity_link="customer", description="Links to the customer entity."),
+    Concept("account_id", "identifier", namespace="internal_account", entity_link="account",
+            description="Links to the account entity via THIS bank's internal account number. "
+                        "An external bank's account is external_account_ref; a virtual/shadow "
+                        "account is virtual_account_id."),
+    Concept("card_id", "identifier", namespace="card", entity_link="card_account", description="Links to the card_account entity."),
+    Concept("transaction_id", "identifier", namespace="core_serial", entity_link="transaction",
+            description="Links to the transaction entity via the core system's own id. UETR, "
+                        "end-to-end, clearing and channel references have their OWN concepts — "
+                        "each is a different value space, never this."),
+    Concept("application_id", "identifier", namespace="application", entity_link="application", description="Links to the application entity."),
+    Concept("product_id", "identifier", namespace="product_catalog", entity_link="product", description="Links to the product entity."),
+    Concept("facility_id", "identifier", namespace="facility", entity_link="facility", description="Links to the facility entity."),
+    Concept("instrument_id", "identifier", namespace="instrument", entity_link="instrument", description="Links to the instrument entity."),
+    Concept("counterparty_id", "identifier", namespace="cif", entity_link="counterparty",
+            description="Links to the counterparty entity via the counterparty's CIF at THIS bank "
+                        "(same cif namespace as customer_id — a counterparty may be our customer). "
+                        "A BIC is bank_bic, not this; a scheme code is clearing_member_code."),
+    Concept("merchant_id", "identifier", namespace="merchant_scheme", entity_link="merchant", description="Links to the merchant entity."),
+    Concept("lei", "identifier", namespace="lei", entity_link="legal_entity",
             description="Legal Entity Identifier — links to the LEI-identified legal_entity."),
-    Concept("branch_id", "identifier", entity_link="branch", description="Links to the branch entity."),
+    Concept("branch_id", "identifier", namespace="branch_sol", entity_link="branch",
+            description="Links to the branch entity via a branch/SOL CODE. A branch NAME or "
+                        "DESCRIPTION is branch_name, never this."),
+    # ── Three-axis namespace repair (ingestion-richness Task 1): atomic identifier namespaces.
+    # Descriptions state the NEGATIVE deliberately — they are the LLM's routing signal.
+    Concept("bank_bic", "identifier", namespace="swift_bic", entity_link="bank",
+            description="SWIFT BIC of a BANK (8/11 alphanumeric). Identifies the institution, "
+                        "never the counterparty person/company — a counterparty's CIF is "
+                        "counterparty_id; the bank's code is this."),
+    Concept("clearing_member_code", "identifier", namespace="correspondent_scheme_code",
+            entity_link="bank",
+            description="A clearing/correspondent scheme member code (national or scheme-local). "
+                        "Bank-level, scheme-scoped; not a BIC and not a counterparty. Split into "
+                        "per-scheme namespaces the moment a second scheme appears — equal values "
+                        "across schemes mean nothing."),
+    Concept("swift_uetr", "identifier", namespace="swift_uetr", entity_link="transaction",
+            description="SWIFT gpi UETR — a UUID tracing one payment end-to-end. Its own "
+                        "namespace; never equal to an internal transaction id."),
+    Concept("end_to_end_reference", "identifier", namespace="iso20022_end_to_end",
+            entity_link="transaction",
+            description="ISO 20022 EndToEndId assigned by the initiating party. Distinct from "
+                        "UETR, scheme references and internal serials."),
+    Concept("clearing_system_reference", "identifier", namespace="clearing_system_ref",
+            entity_link="transaction",
+            description="The clearing system's own reference for the instruction."),
+    Concept("channel_reference", "identifier", namespace="channel_ref", entity_link="transaction",
+            description="A channel-assigned reference (branch/mobile/host). Channel-scoped."),
+    Concept("internal_transaction_serial", "identifier", namespace="core_serial",
+            entity_link="transaction",
+            description="A core-banking internal serial/partition number. Meaningless outside "
+                        "its own system."),
+    Concept("external_account_ref", "identifier", namespace="external_account",
+            entity_link="account",
+            description="An account held AT ANOTHER INSTITUTION (e.g. a counterparty's account "
+                        "number). Never joinable to internal account_id."),
+    Concept("virtual_account_id", "identifier", namespace="virtual_account", entity_link="account",
+            description="A virtual/shadow account identifier issued for reconciliation."),
+    Concept("party_name", "sensitive", sensitivity="pii",
+            description="A person or organisation NAME. Names display and group; they are "
+                        "never identifiers and never join keys."),
+    Concept("module_id", "categorical",
+            description="A source-system module/product code (which subsystem produced the row). "
+                        "System-scoped categorical; not a business category and not a key."),
 
     # ── §3.3 Temporal (point-in-time critical) ────────────────────────────────────────────────────
     Concept("as_of_date", "temporal", pit_role="as_of",
@@ -199,7 +258,10 @@ _ALL: tuple[Concept, ...] = (
 
     # ── §3.8 Sensitive / regulatory ───────────────────────────────────────────────────────────────
     Concept("pii", "sensitive", sensitivity="pii",
-            description="email, phone, ssn, address, name, DOB. Read-scoped."),
+            description="LEGACY sensitivity-class catch-all, kept for compatibility. Prefer the "
+                        "SEMANTIC concept: a name is party_name, an address is postal_address, a "
+                        "phone is phone_number, an email is email_address — each carries the same "
+                        "pii sensitivity class, so the read-scope floor is identical. Read-scoped."),
     Concept("protected_attribute", "sensitive", sensitivity="protected_attribute",
             description="age, gender, race, ethnicity, marital status, national origin, religion. "
                         "REGULATORY-BLOCKED for credit/pricing (ECOA/fair-lending)."),
@@ -351,7 +413,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("lien_seniority", "categorical",
             description="Priority of the security interest (first / second lien, senior / subordinated) "
                         "— ordinal; drives recovery/LGD. Loan-level (contrast tranche)."),
-    Concept("netting_set_id", "identifier", entity_link="netting_set",
+    Concept("netting_set_id", "identifier", namespace="netting_set", entity_link="netting_set",
             description="Links to the ISDA netting_set — the grain at which MtM/exposure NETS. Summing "
                         "trade MtMs across netting sets without netting overstates exposure (§D)."),
     Concept("margin", "monetary", additivity="semi_additive", is_a="monetary_stock",
@@ -379,9 +441,9 @@ _ALL: tuple[Concept, ...] = (
                         "bucket (signed). Non-additive: nets within a snapshot; never sum across dates."),
     Concept("ftp_rate", "monetary", additivity="non_additive", is_a="monetary_rate",
             description="Funds-transfer-pricing rate — the internal cost/credit of funds. Non-additive."),
-    Concept("invoice_id", "identifier", entity_link="invoice",
+    Concept("invoice_id", "identifier", namespace="invoice", entity_link="invoice",
             description="Links to the invoice entity (trade finance / receivables / supply-chain)."),
-    Concept("pooling_structure_id", "identifier", entity_link="pooling_structure",
+    Concept("pooling_structure_id", "identifier", namespace="pooling_structure", entity_link="pooling_structure",
             description="Links to a cash-pooling structure (notional/zero-balancing) — the grain for "
                         "group cash management."),
     Concept("implied_volatility", "quantity_risk", additivity="non_additive",
@@ -404,7 +466,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("macro_variable", "quantity_risk", additivity="non_additive",
             description="Macro-economic driver (GDP, unemployment, HPI, rates) for IFRS9 forward-looking "
                         "ECL / CCAR scenarios. Non-additive (an economic level/rate)."),
-    Concept("scenario_id", "identifier", entity_link="scenario",
+    Concept("scenario_id", "identifier", namespace="scenario", entity_link="scenario",
             description="Links to a macro scenario (base / adverse / severely-adverse) — the grain for "
                         "scenario-conditioned features."),
     Concept("scenario_weight", "quantity_risk", additivity="non_additive",
@@ -517,9 +579,9 @@ _ALL: tuple[Concept, ...] = (
                         "accounts, latest over time."),
 
     # ── Specialist · asset & wealth management (gap-review §B) ──────────────────────────────────
-    Concept("fund", "identifier", entity_link="fund",
+    Concept("fund", "identifier", namespace="fund", entity_link="fund",
             description="Links to the fund entity (the pooled vehicle) — the grain above share_class."),
-    Concept("share_class", "identifier", entity_link="share_class",
+    Concept("share_class", "identifier", namespace="share_class", entity_link="share_class",
             description="Links to a fund share-class (fee/currency/accumulation variants of one fund) — "
                         "the sub-fund grain."),
     Concept("fund_flow", "monetary", additivity="additive", is_a="monetary_flow",
@@ -641,36 +703,36 @@ _ALL: tuple[Concept, ...] = (
             description="FCA Consumer-Duty vulnerable-customer indicator — highly sensitive (may derive "
                         "from health/capacity): read-scoped + eligibility-gated. MUST support fair "
                         "treatment, never disadvantage."),
-    Concept("household_id", "identifier", entity_link="household",
+    Concept("household_id", "identifier", namespace="household", entity_link="household",
             description="Links to the household entity (relationship/primacy aggregation grain)."),
-    Concept("portfolio_id", "identifier", entity_link="portfolio",
+    Concept("portfolio_id", "identifier", namespace="portfolio", entity_link="portfolio",
             description="Links to the portfolio entity — a markets/AM aggregation grain."),
-    Concept("book_id", "identifier", entity_link="book",
+    Concept("book_id", "identifier", namespace="book", entity_link="book",
             description="Links to the trading book entity — a markets grain (netting/PnL)."),
-    Concept("desk_id", "identifier", entity_link="desk",
+    Concept("desk_id", "identifier", namespace="desk", entity_link="desk",
             description="Links to the trading desk entity — a markets grain."),
     Concept("bureau_provenance", "flag",
             description="Provenance marker: EXTERNAL bureau/third-party data — FCRA-regulated and heavily "
                         "lagged/restated (use system_time to avoid restated-data leakage)."),
-    Concept("collateral_id", "identifier", entity_link="collateral",
+    Concept("collateral_id", "identifier", namespace="collateral", entity_link="collateral",
             description="Links to the collateral entity."),
-    Concept("policy_id", "identifier", entity_link="policy",
+    Concept("policy_id", "identifier", namespace="policy", entity_link="policy",
             description="Links to the insurance policy entity."),
-    Concept("claim_id", "identifier", entity_link="claim",
+    Concept("claim_id", "identifier", namespace="claim", entity_link="claim",
             description="Links to the insurance claim entity."),
-    Concept("case_id", "identifier", entity_link="case",
+    Concept("case_id", "identifier", namespace="case", entity_link="case",
             description="Links to an investigation/case entity (AML/fraud/complaint case management)."),
-    Concept("alert_id", "identifier", entity_link="alert",
+    Concept("alert_id", "identifier", namespace="alert", entity_link="alert",
             description="Links to a monitoring alert entity (transaction-monitoring / screening)."),
-    Concept("campaign_id", "identifier", entity_link="campaign",
+    Concept("campaign_id", "identifier", namespace="campaign", entity_link="campaign",
             description="Links to a marketing campaign entity."),
-    Concept("relationship_manager_id", "identifier", entity_link="relationship_manager",
+    Concept("relationship_manager_id", "identifier", namespace="rm", entity_link="relationship_manager",
             description="Links to the relationship-manager (banker) entity — book/advisor-attrition grain."),
-    Concept("gl_account", "identifier", entity_link="gl_account",
+    Concept("gl_account", "identifier", namespace="gl_account", entity_link="gl_account",
             description="Links to the general-ledger account entity (finance/reconciliation)."),
-    Concept("obligor_id", "identifier", entity_link="obligor",
+    Concept("obligor_id", "identifier", namespace="obligor", entity_link="obligor",
             description="Links to the obligor entity (the party obliged to repay — the credit grain)."),
-    Concept("guarantor_id", "identifier", entity_link="guarantor",
+    Concept("guarantor_id", "identifier", namespace="guarantor", entity_link="guarantor",
             description="Links to the guarantor entity (credit-risk mitigation / support)."),
 
     # ── Specialist near-labels (§3.10) — outcome states that ARE targets ─────────────────────────
@@ -706,7 +768,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("consent_token", "eligibility", sensitivity="pii",
             description="Open-Banking consent grant/token (PSD2/FDX) — scopes + expiry; the lawful-basis "
                         "anchor for AIS/PIS access. A credential — read-scoped."),
-    Concept("tpp_id", "identifier", entity_link="tpp",
+    Concept("tpp_id", "identifier", namespace="tpp", entity_link="tpp",
             description="Links to the third-party provider (AISP/PISP) entity."),
     Concept("aisp_pisp_flag", "categorical",
             description="Open-Banking access role (AIS account-information vs PIS payment-initiation). "
@@ -735,7 +797,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("tranche", "categorical",
             description="A securitization tranche (senior / mezzanine / equity) with attach/detach "
                         "points — ordinal loss priority. Structure-level (contrast lien_seniority)."),
-    Concept("spv_id", "identifier", entity_link="spv",
+    Concept("spv_id", "identifier", namespace="spv", entity_link="spv",
             description="Links to the bankruptcy-remote SPV/issuer entity (securitization)."),
     Concept("waterfall_position", "categorical",
             description="Position in the cashflow waterfall (payment priority) — ordinal."),
@@ -762,7 +824,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("loss_amount", "monetary", additivity="additive", is_a="monetary_flow",
             description="Operational-loss amount (gross / net of recovery). A flow — additive. The "
                         "op-risk loss target (leakage-risk)."),
-    Concept("risk_control_id", "identifier", entity_link="risk_control",
+    Concept("risk_control_id", "identifier", namespace="risk_control", entity_link="risk_control",
             description="Links to a risk/control entity (RCSA) — the op-risk taxonomy grain."),
     Concept("near_miss_flag", "flag",
             description="Operational near-miss (control failure, no/immaterial loss) — an early-warning "
@@ -772,7 +834,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("withholding_amount", "monetary", additivity="additive", is_a="monetary_flow",
             description="Withholding tax deducted at source. A flow — additive; treaty/relief affects "
                         "the rate."),
-    Concept("tax_lot", "identifier", entity_link="tax_lot",
+    Concept("tax_lot", "identifier", namespace="tax_lot", entity_link="tax_lot",
             description="Links to a cost-basis tax lot (acquisition date + basis) — the CGT realisation "
                         "grain (FIFO/LIFO/spec-id)."),
     Concept("taxable_flag", "flag",
@@ -833,10 +895,10 @@ _ALL: tuple[Concept, ...] = (
             description="Legacy alias — generic monetary amount; superseded by monetary_stock / "
                         "monetary_flow (which carry the correct additivity)."),
     # legacy alias — superseded by account_id
-    Concept("account_identifier", "identifier", entity_link="account",
+    Concept("account_identifier", "identifier", namespace="internal_account", entity_link="account",
             description="Legacy alias — superseded by account_id."),
     # legacy alias — superseded by customer_id
-    Concept("customer_identifier", "identifier", entity_link="customer",
+    Concept("customer_identifier", "identifier", namespace="cif", entity_link="customer",
             description="Legacy alias — superseded by customer_id."),
     # legacy alias — superseded by event_timestamp
     Concept("timestamp", "temporal", pit_role="event",
@@ -889,10 +951,10 @@ _ALL: tuple[Concept, ...] = (
             description="Whether the party holds in a nominee capacity — the named party is not the "
                         "beneficial owner. Material to AML beneficial-ownership treatment and to "
                         "whether party-level behaviour can be attributed to a real person."),
-    Concept("customer_group_id", "identifier", entity_link="customer_group",
+    Concept("customer_group_id", "identifier", namespace="customer_group", entity_link="customer_group",
             description="Identifier of the corporate GROUP a party belongs to (parent group / "
                         "conglomerate). The join key for group-level exposure and concentration."),
-    Concept("parent_customer_id", "identifier", entity_link="customer",
+    Concept("parent_customer_id", "identifier", namespace="cif", entity_link="customer",
             description="Reference to another PARTY that is this one's parent — a self-referencing "
                         "hierarchy. Shares the `customer` entity link with customer_id deliberately: "
                         "a different entity would make the hierarchy unbridgeable across catalogs."),
@@ -1009,6 +1071,12 @@ def _validate_registry() -> None:
         seen.add(c.name)
         if c.is_a is not None and c.is_a not in seen and c.is_a not in {x.name for x in _ALL}:
             raise ValueError(f"concept {c.name!r} has unresolved is_a {c.is_a!r}")
+        # Three-axis model: namespace <=> identifier. An identifier without a value space cannot
+        # participate in join candidacy; a namespace on a non-identifier is a modelling bug.
+        if c.group == "identifier" and not c.namespace:
+            raise ValueError(f"identifier concept {c.name!r} declares no namespace")
+        if c.group != "identifier" and c.namespace is not None:
+            raise ValueError(f"non-identifier concept {c.name!r} declares namespace {c.namespace!r}")
     if CONCEPTS != frozenset(CONCEPT_REGISTRY) or len(_ALL) != len(CONCEPT_REGISTRY):
         raise ValueError("CONCEPTS must mirror CONCEPT_REGISTRY keys (no dropped duplicates)")
 

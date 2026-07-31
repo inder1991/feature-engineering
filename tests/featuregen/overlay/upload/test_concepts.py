@@ -257,3 +257,85 @@ def test_all_is_a_edges_resolve():
     for c in CONCEPT_REGISTRY.values():
         if c.is_a is not None:
             assert c.is_a in CONCEPT_REGISTRY, (c.name, c.is_a)
+
+
+# ── Task 1 (ingestion-richness): the three-axis model's namespace + party semantics ──────────────
+
+def test_bank_identifiers_are_not_counterparty_ids():
+    for name in ("bank_bic", "clearing_member_code"):
+        c = concept(name)
+        assert c is not None, name
+        assert c.group == "identifier" and c.entity_link == "bank", name
+
+
+def test_payment_reference_namespaces_are_atomic():
+    for name in ("swift_uetr", "end_to_end_reference", "clearing_system_reference",
+                 "channel_reference", "internal_transaction_serial"):
+        c = concept(name)
+        assert c is not None, name
+        assert c.group == "identifier" and c.entity_link == "transaction", name
+
+
+def test_account_namespaces_are_split():
+    assert concept("external_account_ref").entity_link == "account"
+    assert concept("virtual_account_id").entity_link == "account"
+    assert concept("external_account_ref").namespace != concept("account_id").namespace
+    assert concept("virtual_account_id").namespace != concept("account_id").namespace
+
+
+def test_party_semantics_replace_pii_as_concept():
+    # CRITICAL (PII-floor survival): visible_requires derives partly from the concept-driven
+    # sensitivity floor. The party concepts MUST carry the pii sensitivity class, or re-deriving
+    # pii->party_name would weaken the floor on live columns.
+    for name in ("party_name", "postal_address", "phone_number", "email_address"):
+        c = concept(name)
+        assert c is not None, name
+        assert c.group != "identifier", name
+        assert c.sensitivity == "pii", name
+
+
+def test_every_identifier_concept_has_entity_link():
+    from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
+    for c in CONCEPT_REGISTRY.values():
+        if c.group == "identifier":
+            assert c.entity_link, c.name
+
+
+def test_namespace_axis_is_identifier_only_and_complete():
+    # THE PERMANENT FIX: every identifier concept declares its value space; nothing else may.
+    from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
+    for c in CONCEPT_REGISTRY.values():
+        if c.group == "identifier":
+            assert c.namespace, c.name
+        else:
+            assert c.namespace is None, c.name
+
+
+def test_cif_namespace_spans_customer_and_counterparty_concepts():
+    # counter_party_cif_id (concept counterparty_id) and cust_num (customer_id) hold the SAME
+    # bank's CIF values — same namespace, different entity/role. This surfaces the missed
+    # "counterparties who are our customers" link and kills the BIC<->CIF decoy.
+    assert concept("customer_id").namespace == concept("counterparty_id").namespace == "cif"
+    assert concept("bank_bic").namespace == "swift_bic"
+    assert concept("bank_bic").namespace != concept("clearing_member_code").namespace
+
+
+def test_vocabulary_fingerprint_changes_with_names():
+    # enrich.py folds a NAMES-ONLY vocabulary fingerprint into the concept cache key. Adding the
+    # Task-1 names must change it (=> full cache re-derivation). Pinned so a future
+    # description-only registry fix is KNOWN not to bump the cache by itself.
+    from featuregen.overlay.upload.concepts import CONCEPTS
+    from featuregen.overlay.upload.enrich import _vocab_fingerprint
+    assert "bank_bic" in CONCEPTS
+    assert _vocab_fingerprint() != "a426dc41262b"   # the pre-Task-1 fingerprint
+
+
+def test_party_role_vocabulary_is_closed_and_token_derived():
+    from featuregen.overlay.upload.party_vocab import PartyRole, normalize_party_role
+    assert normalize_party_role("sender_bic") is PartyRole.SENDER
+    assert normalize_party_role("corres_bank_receiver_code") is PartyRole.RECEIVER
+    assert normalize_party_role("corres_bank_intermediary_bic") is PartyRole.INTERMEDIARY
+    assert normalize_party_role("third_reimb_inst_code") is PartyRole.REIMBURSEMENT
+    assert normalize_party_role("counter_party_cif_id") is PartyRole.COUNTERPARTY
+    assert normalize_party_role("cust_swift_cd") is PartyRole.SUBJECT
+    assert normalize_party_role("tran_amt") is None          # ambiguous/off-vocab -> honest None
