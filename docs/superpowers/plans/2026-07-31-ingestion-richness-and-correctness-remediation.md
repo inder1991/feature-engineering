@@ -164,6 +164,18 @@ the gate).
 `posted_at/pstd_date`; `cib`: `ingested_at/business_dt` — basis questionable). **But both table
 nodes have NULL `grain_fact_event_id` / `availability_fact_event_id`** — stamps not projected.
 
+**Task 0 addendum (2026-07-31 late, script run against the redeployed cluster):** the merged
+build was deployed and CIB/FTR re-ingested after this baseline was written. Drift captured by
+`scripts/verify_catalog_richness.sql`: **all seven `1036`–`1039` migrations are APPLIED** (the
+interleave resolved empirically — Task 6's pre-flight item is satisfied early); `ai_summary` is
+now 237/237 but still drafted from the FILE-SIDE payload (the parrot defect stands — Step 6c's
+quality target unchanged); `visible_requires` now `{restricted}`×37 / `{confidential}`×18 /
+`{}`×182; `coverage_concept` cib 110/111; the `branch_id` conflation shrank to 4 columns (the
+registry's `branch_name` fix took effect for CIB name columns on re-ingest — but `sol_desc`
+is STILL `branch_id`, the exact desc-as-identifier case Task 2's critic exists to refute);
+4 stamp-drift rows (both tables × grain+availability) confirm Task 5 live. Candidates 17,
+tasks 11, bindings 126/0/0 — unchanged.
+
 **Pipelines:** semantic bindings **126 candidates → 0 proposals → 0 edges** — and BOTH
 `OVERLAY_SEMANTIC_BINDING_CANDIDATES`/`_PROPOSALS` are `"1"` in
 `deploy/kind/k8s/20-backend.yaml:42-43`, so this is a CODE defect, not configuration (Task 4).

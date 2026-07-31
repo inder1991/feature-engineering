@@ -106,3 +106,24 @@ invalidation.
 Task 0B may proceed against the selected code commit. Cluster acceptance may not: it remains gated
 on a replacement image whose immutable digest is linked to the exact source commit and whose
 migration head is re-recorded after deployment.
+
+---
+
+## Ingestion-richness plan — Task 0 record (2026-07-31)
+
+- **Implementation baseline:** `origin/main bfcafafa` (bridge merge `387165a6`/`fc6127da` at
+  `b5088f5d` + subsequent main work + the three program plan docs).
+- **Migrations:** ALL SEVEN `1036`–`1039` names applied on the kind cluster (both lines' sets;
+  filename-keyed ledger; interleave verified empirically by the deployed run — no conflicts).
+  Merged tree maximum: `1039_structured_result_store`.
+- **Allocation:** ingestion-richness plan reserves **1040–1044** (known need: `graph_node.party_role`;
+  spare for Task 7 type-observation storage if required). Catalog-profiles plan allocates **1045+**.
+  Re-scan this ledger before creating any file.
+- **Store pairing (never unify):** `data_source_binding` (+connection) = CONFIG — reviewed access
+  grant + address; `physical_dataset_binding_revision` = immutable content-addressed REVISION cited
+  by observations/realizations. Config feeds revision-minting (richness Task 7).
+- **Audit script:** `scripts/verify_catalog_richness.sql` (read-only; metric|value rows). First
+  run captured post-redeploy drift — recorded in the plan's Task 0 addendum: summaries 237/237
+  (file-side payload, quality defect stands), restricted 37, concept cib 110/111, branch_id
+  conflation 4 cols (sol_desc still misclassified), 4 stamp-drift rows, candidates 17 / tasks 11,
+  bindings 126/0/0.
