@@ -10,6 +10,7 @@ import { IntegrationsScreen } from './screens/IntegrationsScreen'
 import { OverviewScreen } from './screens/OverviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
+import { AnalysisWorkspaceScreen } from './screens/AnalysisWorkspaceScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
 import { SuggestedFeaturesScreen } from './screens/SuggestedFeaturesScreen'
@@ -96,6 +97,15 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M8 5.5v5M5.5 8h5" />
     </NavIcon>
   ),
+  analysis: (
+    // A question mark in a circle: this screen asks, it does not act. Deliberately not a play or
+    // run glyph — nothing here executes.
+    <NavIcon>
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M6.4 6.2a1.6 1.6 0 1 1 1.9 1.85V9.4" />
+      <path d="M8.3 11.3h.01" />
+    </NavIcon>
+  ),
   registry: (
     // Four cells: the registered-feature inventory.
     <NavIcon>
@@ -171,6 +181,15 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     description:
       'State a hypothesis and goal, generate a safe candidate set, then register drafts or govern the '
       + 'ones that matter into signed contracts.',
+  },
+  {
+    route: 'analysis',
+    label: 'Ask a question',
+    eyebrow: 'CATALOG · ANALYSE',
+    title: 'Analysis workspace',
+    description:
+      'Ask a question in plain words and see what it would compute, which periods it would read, and '
+      + 'what the answer would rest on — before anyone runs it.',
   },
   {
     route: 'registry',
@@ -383,6 +402,7 @@ export default function App() {
         )}
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
         {route === 'workbench' && <WorkbenchScreen />}
+        {route === 'analysis' && <AnalysisWorkspaceScreen />}
       </main>
     </div>
   )

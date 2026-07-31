@@ -5,6 +5,7 @@ import { useCallback, useMemo, useSyncExternalStore } from 'react'
 export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
   | 'integrations' | 'governance' | 'dashboard' | 'gate' | 'asset' | 'suggested'
+  | 'analysis'
 
 // 'asset' is the catalog asset-detail screen (Delivery G). It carries source + object_ref via the
 // existing params mechanism (a Details action on a search hit navigates('asset', {source,
@@ -13,7 +14,7 @@ export type Route =
 // destination reached with source + table in the hash, deliberately absent from the left rail.
 const ROUTES: readonly string[] =
   ['overview', 'upload', 'search', 'review', 'semantics', 'workbench', 'registry',
-    'integrations', 'governance', 'dashboard', 'asset', 'suggested']
+    'integrations', 'governance', 'dashboard', 'asset', 'suggested', 'analysis']
 
 // The internal gate console (Phase 3C.1) is an authority-only surface behind its own Vite flag.
 // Checked at CALL time (not module scope) so vi.stubEnv works per-test, mirroring the

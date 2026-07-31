@@ -4155,3 +4155,235 @@ button.stat:hover {
 .gq-not-yours .hint {
   margin-top: 10px;
 }
+
+/* ── analysis workspace ─────────────────────────────────────────────────────────────────────────
+   A question, planned and checked. Every rule here exists because the markup declares the class;
+   a class with no rule renders as run-together text while the tests still pass on textContent. */
+
+.adg-workspace {
+  display: grid;
+  gap: 20px;
+  max-width: 900px;
+}
+
+.adg-workspace-lede {
+  color: var(--ink-soft);
+  max-width: 62ch;
+  margin: -12px 0 0;
+}
+
+.adg-ask {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: 'label label' 'input button';
+  gap: 8px 12px;
+  align-items: center;
+}
+
+.adg-ask label {
+  grid-area: label;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.adg-ask input {
+  grid-area: input;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.adg-ask button { grid-area: button; }
+
+.adg-error {
+  color: var(--danger);
+  background: var(--surface);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0;
+}
+
+.adg-plan,
+.adg-rests-on,
+.adg-blocked,
+.adg-clarifications,
+.adg-sql {
+  display: grid;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.adg-plan h3,
+.adg-rests-on h3,
+.adg-blocked h3,
+.adg-clarifications h3,
+.adg-sql h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+/* label / value pairs: the label column is fixed so the values line up down the panel */
+.adg-plan-fields {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 6px 16px;
+  margin: 0;
+}
+
+.adg-plan-fields dt {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.adg-plan-fields dd {
+  margin: 0;
+  color: var(--ink);
+}
+
+/* a period is its own dt/dd pair inside the grid, so it must span both tracks itself */
+.adg-period {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+}
+
+.adg-period dd {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.adg-plan-hash {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.adg-finding-clean {
+  margin: 0;
+  color: var(--ok);
+}
+
+.adg-findings {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.adg-findings li {
+  display: grid;
+  gap: 2px;
+  border-left: 3px solid var(--warn);
+  padding-left: 10px;
+}
+
+.adg-finding-text { color: var(--ink); }
+
+.adg-finding-subject {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.adg-finding-clears {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.adg-blocked { border-color: var(--line-strong); }
+.adg-blocked p { margin: 0; }
+.adg-blocked-who { color: var(--ink-soft); }
+
+.adg-blocked-subject {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.adg-truncated {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.adg-clarifications ul {
+  display: grid;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.adg-clarification {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+
+.adg-clarification-q {
+  margin: 0;
+  font-weight: 600;
+}
+
+.adg-optional {
+  font-weight: 400;
+  color: var(--ink-faint);
+}
+
+.adg-clarification-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.adg-option {
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.adg-option.selected {
+  border-color: var(--accent);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.adg-answer {
+  padding: 6px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.adg-answer:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+}
+
+/* wide SQL scrolls inside its own box; the page must never scroll sideways */
+.adg-sql pre {
+  margin: 0;
+  overflow-x: auto;
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}

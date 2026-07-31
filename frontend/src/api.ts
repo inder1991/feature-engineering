@@ -2245,3 +2245,64 @@ export function postFieldDecision(
     },
   )
 }
+
+// ── the data agent: a question, planned and previewed ────────────────────────────────────────────
+// Nothing here executes. `/analysis/plan` retrieves, extracts, grounds and previews; the API has no
+// run endpoint, because execution needs inputs a deployment must configure first. The screen must
+// not offer a Run control it cannot honour.
+
+export interface AnalysisFinding {
+  code: string
+  subject: string
+  detail: string
+  clears_when: string
+}
+
+export interface AnalysisPeriod {
+  label: string
+  partitions: string[]
+}
+
+export interface AnalysisPreview {
+  question: string
+  entity: string
+  measure: string
+  comparison: string
+  dimensions: string[]
+  periods: AnalysisPeriod[]
+  findings: AnalysisFinding[]
+  sql: string
+  plan_hash: string
+  runnable: boolean
+  rests_on_unconfirmed_facts: boolean
+  blocked_by: { code: string; subject: string } | null
+}
+
+export interface ClarificationOption {
+  value: string
+  label: string
+}
+
+export interface AnalysisClarification {
+  code: string
+  question: string
+  optional: boolean
+  allows_multiple: boolean
+  options: ClarificationOption[]
+}
+
+export interface AnalysisPlanResponse {
+  preview: AnalysisPreview
+  clarifications: AnalysisClarification[]
+  retrieval?: { tables_considered: string[]; dropped_columns: number }
+}
+
+export function planAnalysis(question: string): Promise<AnalysisPlanResponse> {
+  return post('/analysis/plan', { question })
+}
+
+export function clarifyAnalysis(
+  question: string, code: string, chosen: string[],
+): Promise<AnalysisPlanResponse> {
+  return post('/analysis/clarify', { question, code, chosen })
+}
