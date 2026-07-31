@@ -224,15 +224,25 @@ def _entity_assignment_write_error(ref, value: Mapping) -> str | None:
 
 
 def _currency_binding_write_error(ref, value: Mapping) -> str | None:
-    """Write gate for currency_binding (Delivery E): the subject measure must be a COLUMN ref and the
-    target currency column must be a well-formed CatalogObjectRef referencing a concrete column in the
-    SAME source/schema/table as the measure — no cross-source / cross-schema / cross-table binding
-    through this path. The value must match the fact subject (same table). The JSON schema already
-    forbids any free value beyond `currency_column`."""
+    """Write gate for currency_binding (Delivery E; Task 4 adds the FIXED-CURRENCY shape): the
+    subject measure must be a COLUMN ref, and EITHER the target currency column is a well-formed
+    CatalogObjectRef referencing a concrete column in the SAME source/schema/table as the measure —
+    no cross-source / cross-schema / cross-table binding through this path — OR the value carries a
+    ``currency_code`` literal that is a member of the closed ``known_currency_codes()`` registry
+    (never free text). The JSON schema already forbids any value beyond the one shape key."""
     if not isinstance(ref, CatalogObjectRef):
         return "currency_binding requires a CatalogObjectRef"
     if not ref.column:
         return "currency_binding subject (measure) must be a column (ref carries no column)"
+    code = value.get("currency_code")
+    if code is not None and value.get("currency_column") is None:
+        # Lazy import: overlay.identity -> overlay.upload.taxonomy at module load would cycle
+        # (mirrors the known_entities import in _entity_assignment_write_error above).
+        from featuregen.overlay.upload.taxonomy.dimensions import known_currency_codes
+
+        if not isinstance(code, str) or code not in known_currency_codes():
+            return f"currency_binding currency_code {code!r} is not a known ISO-4217 code"
+        return None
     cc = value.get("currency_column")
     if not isinstance(cc, Mapping):
         return "currency_binding value.currency_column must be a CatalogObjectRef"

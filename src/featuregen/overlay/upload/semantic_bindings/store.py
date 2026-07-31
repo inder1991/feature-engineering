@@ -96,13 +96,17 @@ def to_candidate_input(
     schema_version: str = DEFAULT_SCHEMA_VERSION,
     config_version: str = DEFAULT_CONFIG_VERSION,
 ) -> CandidateInput:
-    """Map ONE D2 candidate onto D1's ``CandidateInput`` (the kind shape is exactly D1's: currency
-    carries a target column + no free value; entity carries a registry value + no target)."""
+    """Map ONE D2 candidate onto D1's ``CandidateInput`` (the kind shape is exactly D1's: a PAIRED
+    currency carries a target column + no free value; a FIXED-CURRENCY literal carries a
+    ``{"currency_code": ...}`` registry value + no target; entity carries a registry value + no
+    target)."""
     if candidate.binding_kind == CURRENCY_BINDING:
         target = candidate.target
         target_graph = target.graph_ref if target is not None else None
         target_logical = target.logical_ref if target is not None else None
-        proposed_value: object | None = None
+        proposed_value: object | None = (
+            {"currency_code": candidate.currency_code}
+            if candidate.currency_code is not None else None)
     else:  # entity_assignment
         target_graph = None
         target_logical = None

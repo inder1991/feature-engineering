@@ -76,15 +76,21 @@ def to_fact_command(
     without a value) — the same fail-closed shape D1's store enforces."""
     ref = _subject_ref(candidate)
     if candidate.binding_kind == CURRENCY_BINDING:
-        if candidate.target is None:
+        if candidate.currency_code is not None:
+            # FIXED-CURRENCY (Task 4): the closed-registry ISO literal — no target column.
+            value: dict[str, object] = {"currency_code": candidate.currency_code}
+            fact_type = CURRENCY_BINDING
+        elif candidate.target is None:
             raise ValueError("currency_binding candidate has no target currency column")
-        t = candidate.target
-        # C-1: the currency target is PUBLIC-FLATTENED too (same source/schema/table as the subject
-        # measure — the write gate requires it — so both sit in the drift-snapshot scope).
-        value: dict[str, object] = {"currency_column": {
-            "catalog_source": t.catalog_source, "object_kind": "column",
-            "schema": _PUBLIC_SCHEMA, "table": t.table, "column": t.column}}
-        fact_type = CURRENCY_BINDING
+        else:
+            t = candidate.target
+            # C-1: the currency target is PUBLIC-FLATTENED too (same source/schema/table as the
+            # subject measure — the write gate requires it — so both sit in the drift-snapshot
+            # scope).
+            value = {"currency_column": {
+                "catalog_source": t.catalog_source, "object_kind": "column",
+                "schema": _PUBLIC_SCHEMA, "table": t.table, "column": t.column}}
+            fact_type = CURRENCY_BINDING
     elif candidate.binding_kind == ENTITY_ASSIGNMENT:
         if not candidate.entity_id:
             raise ValueError("entity_assignment candidate has no entity_id")

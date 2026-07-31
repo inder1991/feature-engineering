@@ -66,7 +66,10 @@ CONTENT_HASH_ALGO_VERSION = "sbc-content-v2"
 # deterministic set stays the governed-proposal authority. This constant is the canonical home (store
 # imports store_projection, so putting it here avoids the reverse import cycle); ``store`` re-exports
 # it as ``DEFAULT_SHORTLIST_VERSION``.
-DETERMINISTIC_TASK_VERSION = "d2-shortlist-v1"
+# v2 (ingestion-richness Task 4): name-affinity disambiguation + fixed-currency literals. The bump
+# changes every table fingerprint, so the next ingest supersedes v1 current sets (whose all-weak
+# candidates starved the proposal stage) instead of replaying them as current.
+DETERMINISTIC_TASK_VERSION = "d2-shortlist-v2"
 
 _MAX_DEFINITION_LEN = 600
 
@@ -257,16 +260,21 @@ def _set_content_hash(
 # Persist (immutable set + candidates)
 # ==================================================================================================
 def _validate_candidate_shape(c: CandidateInput) -> None:
-    """Mirror the 1014 kind/registry CHECKs in code so the store fails closed with a clear message
-    (the DB CHECK is the real guard). ``currency_binding`` needs a target + no free value;
-    ``entity_assignment`` needs a value + no target ref."""
+    """Mirror the 1014/1043 kind/registry CHECKs in code so the store fails closed with a clear
+    message (the DB CHECK is the real guard). ``currency_binding`` needs a target column XOR a
+    fixed-currency ``{"currency_code": ...}`` registry value (Task 4); ``entity_assignment`` needs
+    a value + no target ref."""
     if c.binding_kind not in BINDING_KINDS:
         raise ValueError(f"unknown binding_kind: {c.binding_kind!r}")
     if c.disposition not in DISPOSITIONS:
         raise ValueError(f"unknown disposition: {c.disposition!r}")
     if c.binding_kind == "currency_binding":
-        if c.target_graph_ref is None or c.proposed_value is not None:
-            raise ValueError("currency_binding requires a target column and no free value")
+        paired = c.target_graph_ref is not None and c.proposed_value is None
+        fixed = (c.target_graph_ref is None and isinstance(c.proposed_value, Mapping)
+                 and set(c.proposed_value) == {"currency_code"})
+        if not (paired or fixed):
+            raise ValueError("currency_binding requires a target column XOR a "
+                             "{'currency_code': ...} value")
     else:  # entity_assignment
         if c.target_graph_ref is not None or c.proposed_value is None:
             raise ValueError("entity_assignment requires a registry value and no target ref")

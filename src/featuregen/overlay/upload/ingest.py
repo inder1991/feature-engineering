@@ -766,7 +766,8 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
     D3's audited LLM select as ADDITIONAL evidence (persisted as its own immutable set, never made
     current — the governed proposal path stays deterministic) only when a client is present. Returns
     ``(candidates_total, proposable, llm_failed, llm_partial)``: ``proposable`` is a list of
-    ``(candidate_set_id, strong_candidates)`` for the proposal stage; ``llm_failed`` counts tables
+    ``(candidate_set_id, candidates)`` — ALL of each set's candidates, so the proposal stage can
+    record a per-candidate denial reason for every non-proposed one (Task 4); ``llm_failed`` counts tables
     whose D3 stage hit a BLOCKING bound (byte/call/deadline) or provider fault; ``llm_partial`` counts
     tables whose D3 set was ``partial`` (candidate-cap overflow, still ranked). The caller marks the
     stage ``partial`` when either is non-zero, WITHOUT changing upload acceptance. NEVER promotes a
@@ -783,7 +784,6 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
     from featuregen.overlay.upload.semantic_bindings.store_projection import (
         stale_orphaned_proposals,
     )
-    from featuregen.overlay.upload.semantic_bindings.types import STRONG
     from featuregen.overlay.upload.semantic_bindings.validate import validate_candidates
 
     run_id = ingestion_run_id or mint_id("ing")
@@ -811,8 +811,10 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
         stale_orphaned_proposals(conn, catalog_source=catalog_source,
                                  table_graph_ref=table_graph_ref(view))
         candidates_total += len(deterministic)
-        strong = [c for c in deterministic if c.disposition == STRONG]
-        proposable.append((store_res.persist.candidate_set_id, strong))
+        # ALL candidates ride to the proposal stage (Task 4): only STRONG ones are proposed, but a
+        # weak/rejected candidate must surface as a RECORDED per-candidate denial reason there — a
+        # pre-filter here is exactly the silent-zero seam that starved the live stage.
+        proposable.append((store_res.persist.candidate_set_id, deterministic))
         if client is not None:
             # D3 audited LLM SELECT — its own separate fail-soft domain (never raises), persisted as a
             # distinct immutable set for audit. NOT projected current: the deterministic set remains
@@ -838,16 +840,23 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
     return candidates_total, proposable, llm_failed, llm_partial
 
 
-def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tuple[int, int]:
+def _run_semantic_binding_proposal_stage(conn, proposable: list,
+                                         *, actor) -> tuple[int, int, dict[str, int]]:
     """The PROPOSAL stage body (caller owns the savepoint + except). For each STRONG candidate in the
     persisted current set, map it to an E1 governed DRAFT fact (``propose``) + the candidate->proposal
     link — proposal ONLY after ``propose_fact`` succeeds. NEVER confirms: the fact stays DRAFT for
     E2's human four-eyes gate, so this can never create a VERIFIED fact. Returns
-    ``(proposed, abstained)`` — a not-accepted propose (a duplicate of an already-pending/verified
-    fact on re-upload) is ``abstained``, expected and counted, never an error."""
+    ``(proposed, abstained, denials)`` — ``abstained`` counts a not-accepted propose of a STRONG
+    candidate (a duplicate of an already-pending/verified fact on re-upload), expected and counted,
+    never an error; ``denials`` is the Task-4 honesty ledger: a ``reason -> count`` histogram
+    covering EVERY candidate that did not become a proposal (a weak/rejected candidate's disposition
+    + its first durable reason code / signal, or a denied strong's ``denied_reason``). The caller's
+    unexplained-zero guard keys off it: candidates with zero proposals and an EMPTY ``denials`` is
+    the banned silent-zero class."""
     from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
     from featuregen.overlay.upload.semantic_bindings.propose import propose as _sb_propose
     from featuregen.overlay.upload.semantic_bindings.store import candidate_id_for
+    from featuregen.overlay.upload.semantic_bindings.types import STRONG
 
     # Proposals ride the SERVICE proposer so four-eyes holds against a human confirmer — but the
     # VALUE is authored by the uploaded file, so the uploading HUMAN is recorded as provenance
@@ -856,10 +865,23 @@ def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tu
     # confirm it single-handedly — field_correction's M-7 SOURCE-provenance hole on this surface).
     uploader = actor.subject if getattr(actor, "actor_kind", None) == "human" else None
     proposed = abstained = 0
-    for candidate_set_id, strong in proposable:
+    denials: dict[str, int] = {}
+
+    def _deny(reason: str) -> None:
+        denials[reason] = denials.get(reason, 0) + 1
+
+    for candidate_set_id, candidates in proposable:
         if not candidate_set_id:
             continue
-        for cand in strong:
+        for cand in candidates:
+            if cand.disposition != STRONG:
+                # Not proposable — recorded, never silently dropped: the disposition plus the
+                # candidate's own durable reason code (rejected) or first evidence signal (weak).
+                basis = (cand.reason_codes[0] if cand.reason_codes
+                         else (cand.evidence.signals[0] if cand.evidence.signals
+                               else "unspecified"))
+                _deny(f"not_proposable:{cand.disposition}:{basis}")
+                continue
             cid = candidate_id_for(cand, candidate_set_id=candidate_set_id)
             outcome = _sb_propose(conn, cand, candidate_id=cid, actor=_ENRICH_ACTOR,
                                   idempotency_key=cid, source_uploader=uploader)
@@ -867,7 +889,8 @@ def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tu
                 proposed += 1
             else:
                 abstained += 1
-    return proposed, abstained
+                _deny(outcome.denied_reason or "propose_denied:unspecified")
+    return proposed, abstained, denials
 
 
 # ── Glossary ingest wiring (spec §6.3 / §U). GUARDED: only runs for a glossary upload (a `glossary`
@@ -2702,11 +2725,31 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():   # OWN savepoint + except — proposals are DRAFT-only, never VERIFIED
-                sembind_proposed, sembind_abstained = _run_semantic_binding_proposal_stage(
-                    conn, sembind_proposable, actor=actor)
-            record_stage(stage_recorder, "semantic_binding_proposals", "succeeded",
-                         detail={"proposed": sembind_proposed, "abstained": sembind_abstained},
-                         started_at=stage_started)
+                sembind_proposed, sembind_abstained, sembind_denials = (
+                    _run_semantic_binding_proposal_stage(
+                        conn, sembind_proposable, actor=actor))
+            if sembind_candidates > 0 and sembind_proposed == 0 and not sembind_denials:
+                # Task-4 class guard: candidates entered, ZERO proposals emerged, and NOT ONE
+                # candidate carries a recorded denial reason — the silent-zero contract violation
+                # that hid the live 126->0 starvation. A stage that cannot explain its zero is a
+                # FAILED stage; an explained zero (denials non-empty) stays a truthful success.
+                counters.incr("overlay.semantic_binding.proposals.unexplained_zero")
+                logger.warning("semantic-binding proposal stage for %r consumed %d candidates and "
+                               "emitted 0 proposals with NO recorded per-candidate denial reason — "
+                               "recording the stage as failed (unexplained_zero)",
+                               catalog_source, sembind_candidates)
+                sembind_failed += 1
+                record_stage(stage_recorder, "semantic_binding_proposals", "failed",
+                             reason_code="unexplained_zero",
+                             detail={"candidates": sembind_candidates, "proposed": 0,
+                                     "abstained": sembind_abstained},
+                             started_at=stage_started)
+            else:
+                record_stage(stage_recorder, "semantic_binding_proposals", "succeeded",
+                             detail={"proposed": sembind_proposed,
+                                     "abstained": sembind_abstained,
+                                     "denials": sembind_denials},
+                             started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: the proposal stage never fails an upload
             counters.incr("overlay.semantic_binding.proposals.error")
             logger.warning("advisory semantic-binding proposal stage failed for %r — facts + graph "

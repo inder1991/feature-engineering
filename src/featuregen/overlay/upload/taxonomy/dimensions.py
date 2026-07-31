@@ -107,3 +107,24 @@ def known_entities() -> frozenset[str]:
     """The closed target-entity vocabulary: every distinct non-``None`` ``Concept.entity_link`` in the
     concept registry. A recognised ``target_entity`` outside this set is unknown (cleared, non-fatally)."""
     return _KNOWN_ENTITIES
+
+
+# The closed ISO-4217 currency-code vocabulary (ingestion-richness Task 4) — the registry a
+# FIXED-CURRENCY semantic-binding candidate/fact validates its literal against (a measure column
+# whose name embeds its currency, e.g. ``counter_party_amt_aed`` -> ``AED``). Curated to the major
+# trading/reporting currencies rather than the full ISO table: a miss simply yields no candidate
+# (status quo), while every member is a genuine ISO-4217 code — free text never becomes a value.
+# NOT in ``DIMENSIONS``: it is a fact-value registry (like ``known_entities``), not a crosswalk
+# dimension.
+KNOWN_CURRENCY_CODES: frozenset[str] = frozenset({
+    "AED", "ARS", "AUD", "BDT", "BGN", "BHD", "BRL", "CAD", "CHF", "CLP", "CNY", "COP", "CZK",
+    "DKK", "EGP", "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "JOD", "JPY", "KES", "KRW",
+    "KWD", "LKR", "MAD", "MXN", "MYR", "NGN", "NOK", "NZD", "OMR", "PHP", "PKR", "PLN", "QAR",
+    "RON", "RUB", "SAR", "SEK", "SGD", "THB", "TRY", "TWD", "USD", "VND", "ZAR",
+})
+
+
+def known_currency_codes() -> frozenset[str]:
+    """The closed ISO-4217 vocabulary a fixed-currency binding literal must belong to. A code
+    outside this set is never proposed and never accepted by the E1 write gate (fail-closed)."""
+    return KNOWN_CURRENCY_CODES

@@ -1939,12 +1939,15 @@ export interface SemanticEntityEdge {
   available_actions: string[]
 }
 
-// A VERIFIED column-to-column semantic edge (e.g. a currency binding) touching the anchor.
+// A VERIFIED column semantic edge (e.g. a currency binding) touching the anchor. A FIXED-CURRENCY
+// binding has NO target column: `to_ref` is null and `currency_code` carries the governed ISO
+// literal (e.g. a `counter_party_amt_aed` measure bound to 'AED').
 export interface SemanticColumnEdge {
   kind: string   // the binding kind (never 'entity_assignment')
   status: string
   from_ref: string
-  to_ref: string
+  to_ref: string | null
+  currency_code: string | null
   fact_key: string
   confirmed_event_id: string | null
   available_actions: string[]

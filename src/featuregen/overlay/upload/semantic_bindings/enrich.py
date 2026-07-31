@@ -154,7 +154,7 @@ _MAX_TOKEN_LEN = 128  # per-value egress bound for the structural candidate toke
 # against): a server-minted id + bounded STRUCTURAL tokens only — never a logical_ref / sample value.
 _ITEM_ALLOWED_KEYS_PROBE = frozenset({
     "candidate_id", "binding_kind", "subject_column", "subject_concept",
-    "target_column", "target_concept", "entity_id", "disposition",
+    "target_column", "target_concept", "entity_id", "currency_code", "disposition",
 })
 
 
@@ -198,6 +198,8 @@ def _candidate_item(candidate: SemanticBindingCandidate, candidate_id: str) -> d
         item["target_column"] = _bounded(candidate.target.column)
         if candidate.evidence.target_concept:
             item["target_concept"] = _bounded(candidate.evidence.target_concept)
+    elif candidate.binding_kind == CURRENCY_BINDING and candidate.currency_code:
+        item["currency_code"] = _bounded(candidate.currency_code)   # closed ISO-4217 literal
     elif candidate.entity_id:
         item["entity_id"] = _bounded(candidate.entity_id)
     return item
@@ -356,7 +358,11 @@ def _to_candidate_input(candidate: SemanticBindingCandidate, *, disposition: str
         target = candidate.target
         target_graph = target.graph_ref if target is not None else None
         target_logical = target.logical_ref if target is not None else None
-        proposed_value: object | None = None
+        # A FIXED-CURRENCY candidate (Task 4) carries its closed-registry literal instead of a
+        # target column — mirror store.to_candidate_input so the D1 shape check holds.
+        proposed_value: object | None = (
+            {"currency_code": candidate.currency_code}
+            if candidate.currency_code is not None else None)
     else:
         target_graph = None
         target_logical = None

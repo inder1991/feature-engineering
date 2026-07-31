@@ -817,7 +817,9 @@ function SemanticVerifiedRow({ edge }: { edge: SemanticVerifiedEdge }) {
         <span className="mono gj-kind">
           {'object_ref' in edge
             ? `${shortRef(edge.object_ref)} — entity ${edge.entity}`
-            : `${shortRef(edge.from_ref)} → ${shortRef(edge.to_ref)} (${edge.kind})`}
+            : edge.to_ref === null
+              ? `${shortRef(edge.from_ref)} → ${edge.currency_code ?? '?'} (${edge.kind})`
+              : `${shortRef(edge.from_ref)} → ${shortRef(edge.to_ref)} (${edge.kind})`}
         </span>
         <span className={`badge ${verifiedBadgeTone(edge.status)}`}>{edge.status}</span>
       </div>
@@ -920,6 +922,10 @@ function NeighborhoodGraph({
     for (const edge of relationships.semantic.verified_edges) {
       if ('object_ref' in edge) {
         add(`entity:${edge.entity}`, `entity ${edge.entity}`, edge.status === 'VERIFIED', 'entity')
+      } else if (edge.to_ref === null) {
+        // A FIXED-CURRENCY binding has no target column — its neighbour is the governed literal.
+        const code = edge.currency_code ?? '?'
+        add(`sem:code:${code}`, code, edge.status === 'VERIFIED', edge.kind)
       } else {
         const neighborRef = otherEnd(edge.from_ref, edge.to_ref, anchorRef)
         add(`sem:${neighborRef}`, shortRef(neighborRef), edge.status === 'VERIFIED', edge.kind)

@@ -143,14 +143,25 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
         "additionalProperties": False,
     },
     CURRENCY_BINDING: {
-        # This measure's currency is that column (Delivery E). value = {currency_column:
-        # CatalogObjectRef}. The target currency column must live in the SAME source/schema/table as
-        # the subject measure and reference a concrete column — enforced in the WRITE GATE. NO free
-        # value (additionalProperties False); `use_case` is PROHIBITED (a data fact).
+        # This measure's currency (Delivery E; extended by ingestion-richness Task 4). TWO closed
+        # shapes: value = {currency_column: CatalogObjectRef} — the currency lives in a same-table
+        # column (same source/schema/table + concrete column, enforced in the WRITE GATE) — or
+        # value = {currency_code: "AED"} — the measure's currency is FIXED (the code must be a
+        # member of the closed `known_currency_codes()` registry, enforced in the WRITE GATE). NO
+        # free value beyond the one shape key; `use_case` is PROHIBITED (a data fact).
         "type": "object",
-        "required": ["currency_column"],
-        "properties": {"currency_column": _CATALOG_OBJECT_REF_SCHEMA},
-        "additionalProperties": False,
+        "oneOf": [
+            {
+                "required": ["currency_column"],
+                "properties": {"currency_column": _CATALOG_OBJECT_REF_SCHEMA},
+                "additionalProperties": False,
+            },
+            {
+                "required": ["currency_code"],
+                "properties": {"currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"}},
+                "additionalProperties": False,
+            },
+        ],
     },
     POLICY_TAG: {
         "type": "object",

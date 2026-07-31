@@ -55,7 +55,11 @@ def fact_dependencies(
         # under the fact's single catalog_source (the write gate forces same source/schema/table). A
         # drop/rename/retype of EITHER stales the binding (mirrors approved_join indexing endpoint
         # columns). The currency target lives in `value['currency_column']` (a CatalogObjectRef).
-        cc = value["currency_column"]
+        # A FIXED-CURRENCY literal (`{"currency_code": ...}`, Task 4) has no target column — its
+        # only catalog referent is the subject measure itself.
+        cc = value.get("currency_column")
+        if cc is None:
+            return {(catalog_source, object_ref)}
         return {
             (catalog_source, object_ref),
             (catalog_source, f"{table_obj(cc)}.{cc['column']}"),

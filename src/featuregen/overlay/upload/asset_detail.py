@@ -401,9 +401,12 @@ def _semantic_subsection(
                 })
 
     # VERIFIED currency edges touching the anchor (measure→currency), read-scoped on BOTH endpoints —
-    # a hidden currency/measure column omits the whole edge (mirrors approved_joins).
-    for fk, from_ref, to_ref, kind, status, conf_event in conn.execute(
-        "SELECT e.fact_key, e.from_ref, e.to_ref, e.kind, e.status, e.confirmed_event_id "
+    # a hidden currency/measure column omits the whole edge (mirrors approved_joins). A
+    # FIXED-CURRENCY literal edge (Task 4) has NO target column (to_ref NULL, currency_code set):
+    # only its measure endpoint is scoped — there is no second column to hide.
+    for fk, from_ref, to_ref, ccode, kind, status, conf_event in conn.execute(
+        "SELECT e.fact_key, e.from_ref, e.to_ref, e.currency_code, e.kind, e.status, "
+        "e.confirmed_event_id "
         "FROM semantic_binding_edge e "
         "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref "
         "  AND fn.catalog_source = e.catalog_source "
@@ -413,14 +416,17 @@ def _semantic_subsection(
         "AND (e.from_ref = %s OR e.to_ref = %s) "
         # M-5 fail-closed: a MISSING endpoint row must NOT read as visible (a LEFT JOIN leaves its
         # sensitivity NULL, which `IS NULL` would wrongly admit) — require BOTH endpoints to EXIST
-        # and pass scope, so an edge to an absent/hidden node is OMITTED (no leak).
+        # and pass scope, so an edge to an absent/hidden node is OMITTED (no leak). A literal edge
+        # has no target endpoint to require.
         "AND fn.object_ref IS NOT NULL AND COALESCE(fn.visible_requires, '{}') <@ %s "
-        "AND tn.object_ref IS NOT NULL AND COALESCE(tn.visible_requires, '{}') <@ %s "
+        "AND (e.to_ref IS NULL OR "
+        "     (tn.object_ref IS NOT NULL AND COALESCE(tn.visible_requires, '{}') <@ %s)) "
         "ORDER BY e.from_ref, e.to_ref",
         (source, object_ref, object_ref, allowed, allowed),
     ).fetchall():
         verified_edges.append({
             "kind": kind, "status": status, "from_ref": from_ref, "to_ref": to_ref,
+            "currency_code": ccode,
             "fact_key": fk, "confirmed_event_id": conf_event,
             "available_actions": caller_binding_actions(conn, fact_key=fk, actor=identity)["actions"],
         })

@@ -8,7 +8,11 @@ This module makes a CONFIRMED (VERIFIED) semantic fact operational and keeps it 
   (``entity_fact_key`` / ``entity_fact_event_id`` / ``entity_status='VERIFIED'``). The node's
   ``search_doc`` is rebuilt in the SAME transaction (the governed tag is full-text searchable).
 * ``currency_binding`` -> a ``semantic_binding_edge`` row (measure column -> currency column,
-  ``status='VERIFIED'``).
+  ``status='VERIFIED'``). A FIXED-CURRENCY literal (Task 4: ``{"currency_code": "AED"}``, no
+  target column) writes the edge with ``currency_code`` (``to_ref`` NULL) AND projects the code
+  onto the subject measure's ``graph_node.currency`` with fact provenance
+  (``currency_fact_key`` / ``currency_fact_event_id`` / ``currency_status='VERIFIED'``), the
+  file's declared value preserved in ``declared_currency`` (demotion restores it).
 
 The load-bearing truth is the fact stream; these are its operational projections. A VERIFIED value
 WINS: a conflicting re-upload records a DIVERGENCE signal (``declared_entity <> entity``), never an
@@ -216,30 +220,76 @@ def _demote_entity(conn: DbConn, key: str, *, emit_invalidation: bool = True,
 
 def _apply_verified_currency(conn: DbConn, source: str, ref, resolved, key: str,
                              now: datetime) -> None:
-    """Upsert the VERIFIED currency-binding edge (measure column -> currency column), keyed by
-    fact_key. The write gate forced the currency column into the SAME source/schema/table, so both
-    endpoints render in the source's public graph scope."""
-    cc = resolved.value["currency_column"]
+    """Upsert the VERIFIED currency-binding edge, keyed by fact_key. TWO value shapes (Task 4):
+
+    * ``{"currency_column": ...}`` — measure column -> currency column (``to_ref``); the write
+      gate forced the currency column into the SAME source/schema/table, so both endpoints render
+      in the source's public graph scope.
+    * ``{"currency_code": ...}`` — a FIXED-CURRENCY literal: the edge carries the closed-registry
+      code (``to_ref`` NULL) AND the code is projected onto the subject measure's
+      ``graph_node.currency`` (with fact provenance + ``currency_status='VERIFIED'``), the file's
+      declared display value PRESERVED in ``declared_currency`` (a demotion restores it — mirrors
+      the entity projection; never data loss)."""
+    value = resolved.value
     from_ref = _col_endpoint(ref.table, ref.column)
-    to_ref = _col_endpoint(cc["table"], cc["column"])
+    cc = value.get("currency_column")
+    code = None if cc is not None else value["currency_code"]
+    to_ref = _col_endpoint(cc["table"], cc["column"]) if cc is not None else None
     confirmed_event_id = (resolved.provenance or {}).get("confirmed_event_id")
     conn.execute(
         "INSERT INTO semantic_binding_edge (fact_key, catalog_source, kind, from_ref, to_ref, "
-        "confirmed_event_id, status, projected_at) "
-        "VALUES (%s, %s, 'currency_binding', %s, %s, %s, 'VERIFIED', %s) "
+        "currency_code, confirmed_event_id, status, projected_at) "
+        "VALUES (%s, %s, 'currency_binding', %s, %s, %s, %s, 'VERIFIED', %s) "
         "ON CONFLICT (fact_key) DO UPDATE SET "
         "catalog_source = EXCLUDED.catalog_source, from_ref = EXCLUDED.from_ref, "
-        "to_ref = EXCLUDED.to_ref, confirmed_event_id = EXCLUDED.confirmed_event_id, "
+        "to_ref = EXCLUDED.to_ref, currency_code = EXCLUDED.currency_code, "
+        "confirmed_event_id = EXCLUDED.confirmed_event_id, "
         "status = 'VERIFIED', projected_at = EXCLUDED.projected_at",
-        (key, source, from_ref, to_ref, confirmed_event_id, now))
+        (key, source, from_ref, to_ref, code, confirmed_event_id, now))
+    if code is None:
+        return
+    row = conn.execute(
+        "SELECT currency, declared_currency, currency_status FROM graph_node "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (source, from_ref)).fetchone()
+    if row is None:
+        # The subject column node isn't in the graph (not yet ingested / foreign scope). The edge
+        # stands; the display stamp defers to the next build_graph reproject. NEVER raise.
+        counters.incr("overlay.semantic_binding.currency_node_absent")
+        return
+    current_currency, declared_currency, currency_status = row
+    # Preserve the FILE's display currency (idempotent — mirrors _apply_verified_entity): on a
+    # FRESH projection the current flat value IS the file-declared one; on a RE-projection keep
+    # the STORED declared_currency.
+    declared = declared_currency if currency_status == "VERIFIED" else current_currency
+    conn.execute(
+        "UPDATE graph_node SET currency = %s, declared_currency = %s, currency_fact_key = %s, "
+        "currency_fact_event_id = %s, currency_status = 'VERIFIED' "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (code, declared, key, confirmed_event_id, source, from_ref))
+    if declared is not None and _norm(declared) != _norm(code):
+        # DIVERGENCE: the file declared a DIFFERENT currency than the governed literal. The
+        # governed value stands (VERIFIED wins); the file value stays in declared_currency — the
+        # two differing IS the durable divergence signal, never an overwrite.
+        counters.incr("overlay.semantic_binding.currency_divergence")
+        logger.warning("currency_binding divergence in %s on %s: file declared %r, governed %r "
+                       "(governed wins; file preserved as declared_currency)",
+                       source, from_ref, declared, code)
 
 
 def _demote_currency(conn: DbConn, key: str, status: str, now: datetime) -> None:
     """Demote the edge: stamp the non-VERIFIED folded status, KEEP the row (audit trail + the
-    status='VERIFIED' 2nd gate excludes it). A never-projected fact has no row — a harmless no-op."""
+    status='VERIFIED' 2nd gate excludes it). A fixed-currency literal ALSO restores the subject
+    node's file-declared display currency and clears the governed provenance (never data loss —
+    mirrors _demote_entity). A never-projected fact has no row — a harmless no-op."""
     conn.execute(
         "UPDATE semantic_binding_edge SET status = %s, projected_at = %s WHERE fact_key = %s",
         (status, now, key))
+    conn.execute(
+        "UPDATE graph_node SET currency = declared_currency, declared_currency = NULL, "
+        "currency_fact_key = NULL, currency_fact_event_id = NULL, currency_status = NULL "
+        "WHERE currency_fact_key = %s",
+        (key,))
 
 
 # ==================================================================================================
@@ -437,14 +487,19 @@ class SemanticBindingProjection:
                                       emit_invalidation=False)
 
     def reset(self, conn: DbConn) -> None:
-        """Restore EVERY governed entity node to its file display context + truncate the edge table so
-        a from-zero rebuild reproduces state identically. The event log (the authority) is untouched."""
+        """Restore EVERY governed entity node to its file display context + restore every governed
+        fixed-currency display (Task 4) + truncate the edge table so a from-zero rebuild reproduces
+        state identically. The event log (the authority) is untouched."""
         rows = conn.execute(
             "UPDATE graph_node SET entity = declared_entity, declared_entity = NULL, "
             "entity_fact_key = NULL, entity_fact_event_id = NULL, entity_status = NULL "
             "WHERE entity_fact_key IS NOT NULL RETURNING catalog_source, object_ref").fetchall()
         for src, obj_ref in rows:
             rebuild_search_doc(conn, src, obj_ref)
+        conn.execute(
+            "UPDATE graph_node SET currency = declared_currency, declared_currency = NULL, "
+            "currency_fact_key = NULL, currency_fact_event_id = NULL, currency_status = NULL "
+            "WHERE currency_fact_key IS NOT NULL")
         conn.execute("TRUNCATE semantic_binding_edge")
 
     def catch_up(self, conn: DbConn, *, batch: int = 500) -> int:

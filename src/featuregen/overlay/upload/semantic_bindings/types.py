@@ -34,12 +34,13 @@ RC_TARGET_ROLE_MISMATCH = "target_role_mismatch"
 RC_AMBIGUOUS_TARGET = "ambiguous_target"
 RC_ENTITY_NOT_KNOWN = "entity_not_known"
 RC_MISSING_ENTITY_VALUE = "missing_entity_value"
+RC_CURRENCY_NOT_KNOWN = "currency_not_known"
 RC_OVER_BOUND = "over_bound"
 RC_UNKNOWN_BINDING_KIND = "unknown_binding_kind"
 REASON_CODES = frozenset({
     RC_SUBJECT_NOT_IN_ROSTER, RC_TARGET_NOT_IN_ROSTER, RC_SUBJECT_ROLE_MISMATCH,
     RC_TARGET_ROLE_MISMATCH, RC_AMBIGUOUS_TARGET, RC_ENTITY_NOT_KNOWN, RC_MISSING_ENTITY_VALUE,
-    RC_OVER_BOUND, RC_UNKNOWN_BINDING_KIND,
+    RC_CURRENCY_NOT_KNOWN, RC_OVER_BOUND, RC_UNKNOWN_BINDING_KIND,
 })
 
 
@@ -87,8 +88,11 @@ class Evidence:
 @dataclass(frozen=True, slots=True)
 class SemanticBindingCandidate:
     """One proposed semantic binding. IMMUTABLE + HASHABLE. ``target`` is the currency column for
-    ``currency_binding`` and ``None`` for ``entity_assignment``; ``entity_id`` is the closed-vocabulary
-    entity for ``entity_assignment`` and ``None`` for ``currency_binding`` (mirrors the D1 kind shape).
+    a PAIRED ``currency_binding`` and ``None`` for ``entity_assignment``; ``entity_id`` is the
+    closed-vocabulary entity for ``entity_assignment`` and ``None`` for ``currency_binding``
+    (mirrors the D1 kind shape). ``currency_code`` is the closed ISO-4217 literal of a
+    FIXED-CURRENCY ``currency_binding`` (a measure whose name embeds its currency, e.g.
+    ``counter_party_amt_aed`` -> ``AED``) — such a candidate carries NO target column.
     ``input_hash`` is a deterministic hash of the candidate's identity — it backs D1's idempotent
     ``candidate_id`` minting, so the SAME candidate always mints the SAME id."""
 
@@ -100,12 +104,13 @@ class SemanticBindingCandidate:
     reason_codes: tuple[str, ...] = ()
     target: ColumnRef | None = None
     entity_id: str | None = None
+    currency_code: str | None = None
 
-    def sort_key(self) -> tuple[str, str, str, str, str]:
+    def sort_key(self) -> tuple[str, str, str, str, str, str]:
         """Total order for the deterministic candidate tuple — same inputs → identical ordering."""
         return (self.binding_kind, self.subject.graph_ref,
                 self.target.graph_ref if self.target is not None else "",
-                self.entity_id or "", self.disposition)
+                self.entity_id or "", self.currency_code or "", self.disposition)
 
     def rejected_with(self, reason_code: str) -> SemanticBindingCandidate:
         """Return a REJECTED copy carrying ``reason_code`` (deduped) — the fail-closed transform.
@@ -116,10 +121,16 @@ class SemanticBindingCandidate:
 
 
 def candidate_input_hash(*, binding_kind: str, subject_graph_ref: str,
-                         target_graph_ref: str | None, entity_id: str | None) -> str:
+                         target_graph_ref: str | None, entity_id: str | None,
+                         currency_code: str | None = None) -> str:
     """The deterministic per-candidate ``input_hash`` — a pure function of the candidate's identity
-    dims (never sample values / clocks / randomness)."""
-    return canonical_hash({
+    dims (never sample values / clocks / randomness). ``currency_code`` (the fixed-currency
+    literal) joins the hash ONLY when present, so every pre-existing candidate's hash — and with
+    it D1's idempotent id minting across re-uploads — is byte-identical."""
+    payload: dict[str, object] = {
         "binding_kind": binding_kind, "subject_graph_ref": subject_graph_ref,
         "target_graph_ref": target_graph_ref, "entity_id": entity_id,
-    })
+    }
+    if currency_code is not None:
+        payload["currency_code"] = currency_code
+    return canonical_hash(payload)

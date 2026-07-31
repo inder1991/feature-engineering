@@ -26,11 +26,13 @@ from featuregen.overlay.upload.semantic_bindings.shortlist import (
     PassCIdentifier,
     is_currency_column,
     is_measure_column,
+    preferred_currency_target,
 )
 from featuregen.overlay.upload.semantic_bindings.types import (
     CURRENCY_BINDING,
     ENTITY_ASSIGNMENT,
     RC_AMBIGUOUS_TARGET,
+    RC_CURRENCY_NOT_KNOWN,
     RC_ENTITY_NOT_KNOWN,
     RC_MISSING_ENTITY_VALUE,
     RC_OVER_BOUND,
@@ -43,7 +45,7 @@ from featuregen.overlay.upload.semantic_bindings.types import (
     STRONG,
     SemanticBindingCandidate,
 )
-from featuregen.overlay.upload.taxonomy.dimensions import known_entities
+from featuregen.overlay.upload.taxonomy.dimensions import known_currency_codes, known_entities
 
 # The per-table candidate cap (the bound check) — a fail-closed guard against an enumeration blowing
 # up a review queue for one table. Deterministic overflow ordering is the candidate sort order.
@@ -76,19 +78,32 @@ def validate(
         return ValidationOutcome(False, RC_SUBJECT_NOT_IN_ROSTER)
 
     if candidate.binding_kind == CURRENCY_BINDING:
+        pb = pass_b or {}
+        if candidate.currency_code is not None:
+            # FIXED-CURRENCY literal: no target column, a measure subject, and a closed-registry
+            # ISO-4217 code — the same gates the shortlist applied, re-checked fail-closed.
+            if candidate.target is not None:
+                return ValidationOutcome(False, RC_TARGET_ROLE_MISMATCH)
+            if not is_measure_column(subj_col, pb.get(subj_col.logical_ref)):
+                return ValidationOutcome(False, RC_SUBJECT_ROLE_MISMATCH)
+            if candidate.currency_code not in known_currency_codes():
+                return ValidationOutcome(False, RC_CURRENCY_NOT_KNOWN)
+            return ValidationOutcome(True, None)
         if candidate.target is None or candidate.target.logical_ref not in roster:
             return ValidationOutcome(False, RC_TARGET_NOT_IN_ROSTER)
         tgt_col = roster[candidate.target.logical_ref]
-        pb = pass_b or {}
         if not is_measure_column(subj_col, pb.get(subj_col.logical_ref)):
             return ValidationOutcome(False, RC_SUBJECT_ROLE_MISMATCH)
         if not is_currency_column(tgt_col, pb.get(tgt_col.logical_ref)):
             return ValidationOutcome(False, RC_TARGET_ROLE_MISMATCH)
         if candidate.disposition == STRONG:
-            targets = [c for c in table_view.columns
-                       if is_currency_column(c, pb.get(c.logical_ref))
-                       and c.logical_ref != subj_col.logical_ref]
-            if len(targets) > 1:
+            # Re-derive the ONE unambiguous target via the SAME shared rule the shortlist used
+            # (single target, or the unique name-affinity winner) — a STRONG claim on any other
+            # target is downgraded. Shortlist and validate can never drift apart on this.
+            currency_cols = [c for c in table_view.columns
+                             if is_currency_column(c, pb.get(c.logical_ref))]
+            preferred = preferred_currency_target(subj_col, currency_cols, pb)
+            if preferred is None or preferred.logical_ref != candidate.target.logical_ref:
                 return ValidationOutcome(False, RC_AMBIGUOUS_TARGET)
         return ValidationOutcome(True, None)
 

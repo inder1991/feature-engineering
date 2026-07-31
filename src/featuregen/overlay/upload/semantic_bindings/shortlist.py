@@ -10,9 +10,13 @@ LLM-invented FQN can never appear. The seven rules from the brief, as implemente
 2. No raw / LLM-generated FQN is accepted (there is no LLM here) — the roster is the only source.
 3. **Currency** candidates are shortlisted from structural column names, curated business
    concepts (the ``monetary`` / ``currency`` taxonomy groups), and declared semantic facets. A
-   measure with EXACTLY ONE currency-eligible target → ``strong``; a measure with several equally
-   plausible currency targets → each pairing is ``weak`` (never ``strong``) — the ambiguity is
-   preserved for a reviewer, never resolved by guessing.
+   measure whose own name embeds a closed ISO-4217 code (``counter_party_amt_aed``) is a
+   ``strong`` FIXED-CURRENCY literal candidate (no target column, never cross-paired). Otherwise:
+   ONE unambiguous currency target — a single currency column, or the unique NAME-AFFINITY winner
+   among several (``actual_tran_amt`` → ``actual_tran_crncy``) — → ``strong``; every other
+   pairing is ``weak`` (never ``strong``) — residual ambiguity is preserved for a reviewer, never
+   resolved by guessing. (Task 4: the old exactly-one-currency-column-per-TABLE rule starved the
+   proposal stage on every real multi-currency table — 126 candidates → 0 proposals live.)
 4. **Event-time is NOT a binding kind here** — it is owned by the Pass B availability fact
    path/lifecycle. This function NEVER emits an event-time candidate.
 5. **Entity** candidates target identifier-eligible columns (Pass C identifier metadata) whose
@@ -44,16 +48,17 @@ from featuregen.overlay.upload.semantic_bindings.types import (
     SemanticBindingCandidate,
     candidate_input_hash,
 )
-from featuregen.overlay.upload.taxonomy.dimensions import known_entities
+from featuregen.overlay.upload.taxonomy.dimensions import known_currency_codes, known_entities
 
 # Concepts that DENOTE a currency (the monetary UNIT itself) — a currency_binding TARGET. FX rates
 # (fx_conversion_rate / cross_rate) are rates, NOT currency codes, so they are deliberately excluded.
 _CURRENCY_CODE_CONCEPTS = frozenset({"currency_code", "base_currency", "local_currency"})
 
 # Structural currency column-name tokens (exact) + suffixes — the "structural column names" signal.
-_CURRENCY_NAME_EXACT = frozenset({"ccy", "curr", "currency", "currency_code", "ccy_code",
+# `crncy` is the standard core-banking abbreviation (live FTR: `tran_crncy`, `actual_tran_crncy`).
+_CURRENCY_NAME_EXACT = frozenset({"ccy", "curr", "crncy", "currency", "currency_code", "ccy_code",
                                   "iso_currency", "iso_ccy", "currency_iso"})
-_CURRENCY_NAME_SUFFIXES = ("_ccy", "_curr", "_currency", "_currency_code", "_ccy_code")
+_CURRENCY_NAME_SUFFIXES = ("_ccy", "_curr", "_crncy", "_currency", "_currency_code", "_ccy_code")
 
 # Declared semantic-facet values (view.semantic_type) that mark a currency column.
 _CURRENCY_FACETS = frozenset({"currency", "currency_code", "iso_currency_code"})
@@ -63,6 +68,12 @@ _MEASURE_NAME_TOKENS = frozenset({
     "amount", "amt", "balance", "bal", "notional", "price", "value", "val", "fee", "principal",
     "cost", "revenue", "charge", "premium", "exposure", "pnl", "proceeds",
 })
+
+# The ROLE tokens stripped when comparing a measure name against a currency-column name for the
+# NAME-AFFINITY disambiguation: what remains is each column's business STEM (`actual_tran_amt` ->
+# {actual, tran}; `actual_tran_crncy` -> {actual, tran}) — the tokens that actually identify which
+# measure a currency column qualifies.
+_CURRENCY_ROLE_TOKENS = frozenset({"ccy", "curr", "crncy", "currency", "code", "iso"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +139,58 @@ def is_measure_column(col: object, pass_b: PassBColumn | None = None) -> bool:
     return bool(_tokens(col.column) & _MEASURE_NAME_TOKENS)
 
 
+def fixed_currency_code(col: object, pass_b: PassBColumn | None = None) -> str | None:
+    """The closed ISO-4217 code a MEASURE column's own name fixes its currency to (Task 4:
+    ``counter_party_amt_aed`` -> ``AED``), or ``None``. Declared metadata only — the code must be
+    the FINAL name token, a member of :func:`known_currency_codes`, and not the whole name; a
+    non-measure column never fixes a currency. Such a measure needs no currency COLUMN — pairing
+    it with unrelated currency columns is exactly the decoy noise this rule removes."""
+    if not is_measure_column(col, pass_b):
+        return None
+    parts = [t for t in (col.column or "").lower().replace("-", "_").split("_") if t]
+    if len(parts) < 2:
+        return None
+    code = parts[-1].upper()
+    return code if code in known_currency_codes() else None
+
+
+def _stem(name: str) -> set[str]:
+    """A column's business STEM: its name tokens minus the measure/currency ROLE tokens."""
+    return _tokens(name) - _MEASURE_NAME_TOKENS - _CURRENCY_ROLE_TOKENS
+
+
+def preferred_currency_target(
+    col: object, currency_cols: list, pass_b: Mapping[str, PassBColumn] | None = None,
+) -> object | None:
+    """The ONE currency column ``col`` (a measure) unambiguously binds, or ``None`` when genuinely
+    ambiguous. PURE + deterministic — shared by the shortlist AND validate so the two can never
+    disagree on what STRONG means.
+
+    A single currency target in the table is preferred outright (the original rule). With several,
+    NAME AFFINITY disambiguates: score each target by stem-token overlap with the measure
+    (``actual_tran_amt`` -> ``actual_tran_crncy``), tie-broken toward the target with the FEWEST
+    unshared stem tokens (``tran_amt`` prefers ``tran_crncy`` over ``actual_tran_crncy``). Only a
+    UNIQUE best-scoring target with at least one shared stem token wins — a tie or a zero-overlap
+    field stays ambiguous (preserved for a reviewer, never guessed)."""
+    targets = [t for t in currency_cols if t.logical_ref != col.logical_ref]
+    if not targets:
+        return None
+    if len(targets) == 1:
+        return targets[0]
+    measure_stem = _stem(col.column)
+    scored: list[tuple[tuple[int, int], object]] = []
+    for tgt in targets:
+        target_stem = _stem(tgt.column)
+        overlap = len(measure_stem & target_stem)
+        if overlap >= 1:
+            scored.append(((overlap, -len(target_stem - measure_stem)), tgt))
+    if not scored:
+        return None
+    best = max(score for score, _t in scored)
+    winners = [t for score, t in scored if score == best]
+    return winners[0] if len(winners) == 1 else None
+
+
 def _currency_candidates(
     columns: tuple, pass_b: Mapping[str, PassBColumn] | None,
 ) -> list[SemanticBindingCandidate]:
@@ -137,16 +200,38 @@ def _currency_candidates(
     for col in columns:
         if not is_measure_column(col, pb.get(col.logical_ref)):
             continue
+        subject_ref = ColumnRef.from_view(col)
+        # FIXED CURRENCY: the measure's own name embeds its ISO code — ONE strong literal
+        # candidate, and NO cross-pairing with the table's currency columns (pure decoy noise).
+        code = fixed_currency_code(col, pb.get(col.logical_ref))
+        if code is not None:
+            out.append(SemanticBindingCandidate(
+                binding_kind=CURRENCY_BINDING, subject=subject_ref, currency_code=code,
+                disposition=STRONG,
+                input_hash=candidate_input_hash(
+                    binding_kind=CURRENCY_BINDING, subject_graph_ref=subject_ref.graph_ref,
+                    target_graph_ref=None, entity_id=None, currency_code=code),
+                evidence=Evidence(signals=("currency_fixed_in_name",),
+                                  subject_concept=(getattr(col, "concept", None) or None)),
+            ))
+            continue
         targets = [t for t in currency_cols if t.logical_ref != col.logical_ref]
         if not targets:
             continue
-        # EXACTLY ONE currency target → strong; several equally plausible → each pairing weak.
-        disposition = STRONG if len(targets) == 1 else WEAK
-        subject_ref = ColumnRef.from_view(col)
+        # ONE unambiguous target (single column, or the unique name-affinity winner) → strong;
+        # every other pairing stays weak — the ambiguity is preserved for a reviewer, never
+        # resolved by guessing.
+        preferred = preferred_currency_target(col, currency_cols, pb)
         for tgt in targets:
+            if len(targets) == 1:
+                disposition, signals = STRONG, ("currency_target_unique",)
+            elif preferred is not None and tgt.logical_ref == preferred.logical_ref:
+                disposition, signals = STRONG, ("currency_target_name_affinity",)
+            elif preferred is not None:
+                disposition, signals = WEAK, ("currency_target_not_preferred",)
+            else:
+                disposition, signals = WEAK, ("currency_target_ambiguous",)
             target_ref = ColumnRef.from_view(tgt)
-            signals = ["currency_target_unique"] if disposition == STRONG \
-                else ["currency_target_ambiguous"]
             out.append(SemanticBindingCandidate(
                 binding_kind=CURRENCY_BINDING, subject=subject_ref, target=target_ref,
                 disposition=disposition,
