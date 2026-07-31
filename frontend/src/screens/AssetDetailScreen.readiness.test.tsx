@@ -34,9 +34,11 @@ function detail(roles: api.RoleUsability[], rollup: Partial<api.TableRollup> = {
     column_capabilities: base.readiness?.column_capabilities ?? null,
     usability: {
       object_ref: 'public.accounts.balance', roles,
-      usable_roles: roles.filter(r => r.state !== 'not_set' && r.state !== 'unavailable').length,
+      usable_roles: roles.filter(r => !['not_set', 'not_considered', 'not_suitable', 'unavailable']
+        .includes(r.state)).length,
       total_roles: roles.length,
-      headline: `Usable for ${roles.filter(r => r.state !== 'not_set').length} of ${roles.length} roles`,
+      headline: `Usable for ${roles.filter(r => !['not_set', 'not_considered', 'not_suitable',
+        'unavailable'].includes(r.state)).length} of ${roles.length} roles`,
     },
     table_rollup: {
       table: 'accounts', headline: '109 columns are AI-proposed and not yet reviewed.',
@@ -97,6 +99,18 @@ it('shows a not-set role as needing a decision rather than as an error', async (
   })]))
   expect(screen.getByText('Not set')).toBeInTheDocument()
   expect(screen.getByText(/has proposed entity_assignment/i)).toBeInTheDocument()
+})
+
+it('does not present an unevaluated amount as a join-key candidate', async () => {
+  await openTab(detail([role({
+    role: 'as_join_key', label: 'Join key', state: 'not_considered',
+    headline: 'Not considered',
+    detail: 'No current join candidate or governed join uses this column.',
+    action: null, outstanding: ['join_candidate'], data_checks: [],
+  })]))
+  expect(screen.getByText('Not considered')).toBeInTheDocument()
+  expect(screen.getByText(/no current join candidate/i)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /run data check/i })).toBeNull()
 })
 
 // ── the parent table is one line, not 341 rows ───────────────────────────────────────────────────

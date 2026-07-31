@@ -226,6 +226,33 @@ def test_as_join_key_confirms_to_side_join_consistent_with_relationships(client,
     assert any(j["to_ref"] == "public.b.id" and j["status"] == "VERIFIED" for j in approved), approved
 
 
+def test_amount_without_candidate_is_not_labelled_as_join_key_proposal(client, conn):
+    """Live-regression shape: an amount may be a measure without being a join candidate."""
+    _seed_column(
+        conn,
+        "ftr_readiness",
+        "transactions",
+        "actual_counter_party_amt",
+        "numeric",
+        concept="monetary_flow",
+    )
+
+    body = _asset(
+        client,
+        "ftr_readiness",
+        "public.transactions.actual_counter_party_amt",
+    ).json()
+    join_role = next(
+        role
+        for role in body["readiness"]["usability"]["roles"]
+        if role["role"] == "as_join_key"
+    )
+
+    assert join_role["state"] == "not_considered"
+    assert join_role["headline"] == "Not considered"
+    assert join_role["data_checks"] == []
+
+
 # ── (2e) F2b: the route surfaces the VERIFIED semantic (currency) edge, read-scoped ──────────────
 
 

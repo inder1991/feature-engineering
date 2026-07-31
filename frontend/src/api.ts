@@ -2057,11 +2057,11 @@ export interface ReadinessRequirement {
 }
 
 // What a column can be USED for, in the language of someone deciding whether to build a feature
-// from it. `confirmed` / `ai_proposed` / `needs_data_check` / `not_set` replace one red BLOCKED
-// badge that stood for three unrelated situations. This product uses AI-proposed values whether or
-// not a human has reviewed them, so "blocked" is not a state it has.
+// from it. `not_considered` is distinct from `needs_data_check`: the former means no candidate
+// exists, while the latter means a real candidate exists and is waiting on evidence.
 export type Usability =
-  | 'confirmed' | 'ai_proposed' | 'needs_data_check' | 'not_set' | 'not_suitable' | 'unavailable'
+  | 'confirmed' | 'ai_proposed' | 'needs_data_check' | 'not_set' | 'not_considered'
+  | 'not_suitable' | 'unavailable'
 
 export interface RoleUsability {
   role: string

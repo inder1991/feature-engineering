@@ -25,8 +25,8 @@ from __future__ import annotations
 
 from featuregen.overlay.upload.column_readiness import (
     ColumnCapability,
-    ColumnRequirement,
     ColumnReadiness,
+    ColumnRequirement,
 )
 from featuregen.overlay.upload.column_usability import Usability, column_usability
 
@@ -94,6 +94,16 @@ def test_an_external_check_is_UNKNOWN_not_a_failure():
     role = _role(column_usability(_readiness(caps)), "as_grain_key")
     assert role.state is Usability.NEEDS_DATA_CHECK
     assert role.action == "run_data_check"
+
+
+def test_a_column_without_a_join_candidate_is_NOT_CONSIDERED():
+    caps = _cap("as_join_key", "blocked", (
+        _req("join_candidate", status="missing", blocking=True,
+             authority="candidate_scope", reason="not_considered_as_join_key"),))
+    role = _role(column_usability(_readiness(caps)), "as_join_key")
+    assert role.state is Usability.NOT_CONSIDERED
+    assert role.headline == "Not considered"
+    assert role.action is None
 
 
 def test_nothing_proposed_by_anyone_is_NO_CANDIDATE():

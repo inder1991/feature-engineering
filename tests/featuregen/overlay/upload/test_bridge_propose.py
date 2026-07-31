@@ -12,6 +12,7 @@ from featuregen.contracts.envelopes import Command
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.evidence import read_evidence
 from featuregen.overlay.identity import proposal_fingerprint
+from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_assessment import (
@@ -24,9 +25,11 @@ from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_propose import propose_bridge
 from featuregen.overlay.upload.bridge_store import load_current_candidate_assessments
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.column_readiness import column_readiness
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 from featuregen.overlay.upload.table_fact_governance import project_verified_table_fact
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter, table_ref
+from featuregen.projections.runner import run_projection
 
 _T0 = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -57,6 +60,24 @@ def test_propose_stamps_the_candidate_ledger(db):
         "WHERE left_catalog_source = 'core' AND right_catalog_source = 'crm'").fetchone()
     assert row is not None
     assert row[0] == "customer" and row[1] == key and row[2] is not None and row[3] == "integer"
+
+
+def test_available_cross_catalog_candidate_earns_join_connectivity_preview(db):
+    _propose(db)
+    run_projection(db, OverlayProjection())
+
+    readiness = column_readiness(
+        db,
+        source="core",
+        object_ref="public.customer_master.customer_id",
+    )
+
+    assert readiness.as_join_key.operational_status == "ready"
+    assert any(
+        requirement.requirement_id == "external:JOIN_CONNECTIVITY"
+        and requirement.external_preview
+        for requirement in readiness.as_join_key.requirements
+    )
 
 
 def test_propose_opens_one_governance_gate_task(db):
