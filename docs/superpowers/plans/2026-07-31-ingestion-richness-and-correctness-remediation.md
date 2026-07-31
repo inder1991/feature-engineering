@@ -790,20 +790,20 @@ Use superpowers:systematic-debugging.
   `repair_table_fact_stamps(conn, adapter, *, now)` re-running the existing projection (no
   fabricated event ids — it re-reads `resolve_fact`).
 
-- [ ] **Step 1: Reproduce.** Fixture: confirm a grain fact, then re-ingest the same catalog;
+- [x] **Step 1: Reproduce.** Fixture: confirm a grain fact, then re-ingest the same catalog;
   assert the table node's `grain_fact_event_id` — the kind evidence (VERIFIED facts, NULL stamps
   on both tables) says some path wipes or skips the stamp. Locate whether re-ingest node
   recreation drops stamps, or projection-lag skip (`table_fact_projection lagged`) never
   backfills.
-- [ ] **Step 2: Write the failing test** at the located seam: “after re-ingest + drain,
+- [x] **Step 2: Write the failing test** at the located seam: “after re-ingest + drain,
   VERIFIED grain/availability facts are re-stamped on the table node.”
-- [ ] **Step 3: Fix minimally** (expected shape: run `project_table_facts` for sources with
+- [x] **Step 3: Fix minimally** (expected shape: run `project_table_facts` for sources with
   VERIFIED facts even when the upload itself asserted none, after the drain catches up).
-- [ ] **Step 4: Reconciliation check:** `reconcile_table_fact_stamps` compares overlay VERIFIED
+- [x] **Step 4: Reconciliation check:** `reconcile_table_fact_stamps` compares overlay VERIFIED
   grain/availability facts against node stamps; wire as an ingest tail stage
   (`stamp_reconcile: {drift: n}`) and expose in the audit script (Task 0 script gains the
   reconcile query — update it).
-- [ ] **Step 4b: Gate the relocated bridge stage on projection agreement (live bug on main).**
+- [x] **Step 4b: Gate the relocated bridge stage on projection agreement (live bug on main).**
   The merged ingest runs `entity_bridges` AFTER `table_fact_projection` so it assesses against
   governed grain — but when `table_fact_projection` records `lagged` and skips, `entity_bridges`
   still runs (`ingest.py` ~2770 has no lag check), assessing exactly the stale flat grain flags
@@ -811,14 +811,35 @@ Use superpowers:systematic-debugging.
   the bridge stage records `skipped{reason: projection_lag}` and does not assess; the next
   caught-up ingest (or the Step-3 repair path) assesses. Test: a lagged projection yields a
   skipped bridge stage and zero new candidate revisions; a caught-up rerun assesses normally.
-- [ ] **Step 5: CIB availability basis review item:** the fact value
+- [x] **Step 5: CIB availability basis review item:** the fact value
   `{basis: ingested_at, column: business_dt}` is questionable (a business date labelled as
   ingestion). Do NOT rewrite. **Verify-or-add:** the re-verify task machinery is currently tied
   to expiry/stale events — check whether an "open a review task WITHOUT staling the fact"
   command exists in `_lifecycle`/task helpers; if not, add the minimal command (opens one
   `human_tasks` row bound to the fact's current confirmed event, reason `basis_review`, no
   status change). Test: the task exists, the fact stays VERIFIED and servable until decided.
-- [ ] **Step 6: Commit** `fix(projection): table-fact stamps survive re-ingest; drift is reconciled and visible`.
+- [x] **Step 6: Commit** `fix(projection): table-fact stamps survive re-ingest; drift is reconciled and visible`.
+
+> **Task 5 diagnosis (2026-07-31, executed):** the live 4 stamp-drift rows are NOT a wipe and
+> NOT the lagged skip — `project_table_facts_for_ref` (and the confirm-time bridge through it)
+> only ever stamped `kind='column'` rows; **no code path had EVER written
+> `grain_fact_event_id`/`availability_fact_event_id` on the `kind='table'` node** the audit
+> script and baseline hand-query read, so every VERIFIED table fact reported table-node drift
+> since migration 0986, healthy ingest or not (reproduced locally: healthy ingest + re-ingest →
+> column stamps correct, table stamps NULL, audit query emits drift). Fixed: the projection now
+> clear-then-sets the table-node stamp alongside the columns. The lagged-skip-with-no-backfill
+> path is REAL as a second defect (build_graph wipes nodes, a `lagged` stage skips, nothing
+> backfills until a next caught-up ingest that may never come) — closed by
+> `stamp_reconcile.repair_table_fact_stamps` (re-reads `resolve_fact`; an unservable VERIFIED
+> fact is left drifted-and-visible, never force-stamped, so the c715a16d declared-flag wipe
+> hazard cannot re-enter through the repair). Step 4b's gate also covers a FAILED projection
+> (`deferred{table_fact_projection_failed}`), not just `lagged{projection_lag}`. Step 5 verified
+> NO existing no-stale review command (all `open_reverify_task` callers are expiry/stale/drift
+> flows) → added `reverify_tasks.open_fact_review_task` (reason rides `required_inputs`;
+> CAS-bound to the current `confirmed_event_id`; idempotent; appends no overlay event). The
+> audit script's `stamp_drift` metric was itself measuring the never-written table stamp — now
+> mirrors the reconcile (IS DISTINCT FROM the fact's `confirmed_event_id`, wrong-stamp-aware,
+> source-labelled).
 
 ---
 
