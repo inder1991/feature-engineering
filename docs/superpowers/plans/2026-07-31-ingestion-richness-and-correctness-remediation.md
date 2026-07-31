@@ -728,7 +728,7 @@ Use superpowers:systematic-debugging — root cause before fix.
 - Consumes: existing `semantic_binding_candidate` rows and the existing confirm surface; produces
   no new contracts — this is a wiring repair.
 
-- [ ] **Step 1: Reproduce and localize — this is a CODE bug.** Both flags are `"1"` in
+- [x] **Step 1: Reproduce and localize — this is a CODE bug.** Both flags are `"1"` in
   `deploy/kind/k8s/20-backend.yaml:42-43` and the live `semantic_binding_candidate_proposal`
   table has zero rows against 126 candidates (verified 2026-07-31). Verify the running pod's env
   once (configmap drift is conceivable), then go straight to instrumenting the
@@ -737,20 +737,40 @@ Use superpowers:systematic-debugging — root cause before fix.
   per-candidate denial reasons. Prime suspect: the filter that assembles `sembind_proposable` —
   a stage that enters with 126 candidates and emits nothing without a recorded denial is the
   silent-zero class this plan bans.
-- [ ] **Step 2: Write the failing test at the located boundary** — e.g. “a monetary column with a
+  **FOUND (2026-07-31, local fixture repro — no cluster access needed):**
+  `shortlist._currency_candidates` marked a pairing STRONG only when the table had EXACTLY ONE
+  currency column; live FTR carries several (`tran_crncy` + `actual_tran_crncy`), so every
+  measure×currency pairing was WEAK, the `disposition == STRONG` filter starved
+  `sembind_proposable` into empty per-set lists, and the stage truthfully-looking recorded a
+  vacuous `succeeded {proposed: 0, abstained: 0}` with no per-candidate reason.
+- [x] **Step 2: Write the failing test at the located boundary** — e.g. “a monetary column with a
   same-table currency column yields ≥1 currency-binding proposal and stage
   `semantic_binding_proposals=succeeded{n>0}`”, or the config-shaped equivalent.
-- [ ] **Step 3: Fix minimally; PASS.**
-- [ ] **Step 4: Add the silent-no-op guard:** candidates>0 with proposals==0 and no recorded
+  (`tests/featuregen/overlay/upload/test_semantic_binding_pipeline.py` — red before the fix.)
+- [x] **Step 3: Fix minimally; PASS.** Name-affinity disambiguation
+  (`shortlist.preferred_currency_target`, shared by shortlist AND validate so STRONG can never
+  drift) + fixed-currency literal candidates (`counter_party_amt_aed` → closed
+  `known_currency_codes()` member `AED`); `crncy`/`_crncy` added to the structural currency
+  tokens; `DETERMINISTIC_TASK_VERSION` bumped to `d2-shortlist-v2` so the live v1 all-weak
+  current sets are superseded on the next ingest instead of replayed.
+- [x] **Step 4: Add the silent-no-op guard:** candidates>0 with proposals==0 and no recorded
   per-candidate denial reason forces stage state `failed{reason:"unexplained_zero"}` — this is
-  the class-level fix the Global Constraints demand.
-- [ ] **Step 5: End-to-end fixture:** candidate → proposal → confirm via the **existing
+  the class-level fix the Global Constraints demand. (The proposal stage now receives ALL
+  candidates and returns a `denials` reason→count histogram covering every non-proposed one;
+  an explained zero stays `succeeded {proposed: 0, denials: {...}}`.)
+- [x] **Step 5: End-to-end fixture:** candidate → proposal → confirm via the **existing
   `semantic_binding_governance` surface** (`api/routes/governance.py:68-77`:
   `list_semantic_binding_proposals`, `load_semantic_binding_confirmation_context`,
   `project_verified_semantic_binding`) → `semantic_binding_edge` row → `graph_node.currency`
   projected. The AED fixed-currency case (`counter_party_amt_aed` → literal `AED`) and the
   column-ref case (`actual_tran_amt` → `actual_tran_crncy`) both covered.
-- [ ] **Step 6: Commit** `fix(bindings): proposal stage fires; zero-without-reason is a failure`.
+  (Migration `1043_semantic_binding_fixed_currency.sql` — from the richness 1043–1044
+  reservation: the 1014 candidate kind-shape CHECK gains the literal variant,
+  `semantic_binding_edge.currency_code` + NULL-able `to_ref`, and the `graph_node` currency
+  quartet `declared_currency`/`currency_fact_key`/`currency_fact_event_id`/`currency_status`
+  mirroring the 1015 entity pattern; replay parity via `SemanticBindingProjection`
+  reset/rebuild proven in the e2e test.)
+- [x] **Step 6: Commit** `fix(bindings): proposal stage fires; zero-without-reason is a failure`.
 
 ---
 
