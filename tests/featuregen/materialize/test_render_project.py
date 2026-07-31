@@ -513,6 +513,15 @@ def test_the_hook_refuses_UNEXPECTED_parameters_as_well_as_missing_ones(
     assert "raise RuntimeError" in hooks
 
 
+def test_the_hook_reads_both_kedro_run_param_keys(project: SealedProject) -> None:
+    """kedro 0.19.x passes the dict as `extra_params`; kedro 1.x as `runtime_params`. The artifact
+    pins 0.19.9 (goldens/cif_daily/requirements.lock), so reading only the 1.x key means every run
+    refuses RUN_PARAMETERS_MISSING."""
+    hooks = project.files[f"{SOURCE_ROOT}/hooks.py"]
+    assert 'get("runtime_params")' in hooks
+    assert 'get("extra_params")' in hooks
+
+
 def test_the_readme_states_the_kedro_run_versus_spark_submit_distinction(
         project: SealedProject) -> None:
     """§7: `kedro run` inside a Spark session configured by a Kedro hook, with `spark-submit` used

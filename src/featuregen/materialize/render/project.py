@@ -772,7 +772,8 @@ def _render_hooks(package: str, required_parameters: tuple[str, ...]) -> str:
         "    @hook_impl\n"
         "    def before_pipeline_run(self, run_params: dict[str, Any], pipeline: Any,\n"
         "                            catalog: Any) -> None:\n"
-        '        supplied = set((run_params or {}).get("runtime_params") or {})\n'
+        '        params = run_params or {}\n'
+        '        supplied = set(params.get("runtime_params") or params.get("extra_params") or {})\n'
         "        expected = set(self.REQUIRED_RUN_PARAMETERS)\n"
         "        missing = sorted(expected - supplied)\n"
         "        unexpected = sorted(supplied - expected)\n"

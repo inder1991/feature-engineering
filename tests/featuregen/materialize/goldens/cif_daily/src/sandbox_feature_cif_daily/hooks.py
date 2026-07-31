@@ -53,7 +53,8 @@ class RunParametersHook:
     @hook_impl
     def before_pipeline_run(self, run_params: dict[str, Any], pipeline: Any,
                             catalog: Any) -> None:
-        supplied = set((run_params or {}).get("runtime_params") or {})
+        params = run_params or {}
+        supplied = set(params.get("runtime_params") or params.get("extra_params") or {})
         expected = set(self.REQUIRED_RUN_PARAMETERS)
         missing = sorted(expected - supplied)
         unexpected = sorted(supplied - expected)
