@@ -1,7 +1,7 @@
-.PHONY: help setup lint format format-check typecheck test ci api frontend-dev frontend-test clean
+.PHONY: help setup lint format format-check typecheck test l0-gate ci api frontend-dev frontend-test clean
 
 help:  ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 setup:  ## Install deps (dev) and git hooks
@@ -22,6 +22,22 @@ typecheck:  ## Mypy type check
 
 test:  ## Run the test suite (ephemeral Postgres, or set FEATUREGEN_TEST_DSN)
 	uv run pytest -q
+
+l0-gate:  ## Build-verify the golden Kedro project under BOTH supported kedro lines
+	test -x .venv-artifact/bin/python || (uv venv .venv-artifact --python 3.11 --seed && \
+		.venv-artifact/bin/python -m pip install --quiet \
+			-r tests/featuregen/materialize/goldens/cif_daily/requirements.lock)
+	test -x .venv-l0-modern/bin/python || (uv venv .venv-l0-modern --python 3.11 --seed && \
+		.venv-l0-modern/bin/python -m pip install --quiet \
+			"kedro==1.5.0" "kedro-datasets[spark]==9.5.0" "pyspark==4.2.0")
+	FEATUREGEN_L0_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
+	PYSPARK_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
+	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
+		uv run pytest tests/featuregen/materialize/l0_gate.py -q
+	FEATUREGEN_L0_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
+	PYSPARK_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
+	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
+		uv run pytest tests/featuregen/materialize/l0_gate.py -q
 
 ci: lint format-check typecheck test  ## Everything CI runs
 
