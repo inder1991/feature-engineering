@@ -1541,7 +1541,8 @@ def _projection_docstring(expression: ExpressionExecutionIR, feature_column: str
         traversal = ["", *(f"    {part}" for part in _wrap(
             f"Each surviving row then reaches the entity it belongs to over the governed path "
             f"{route} ({len(plan.hops)} hop(s), §3.1). Every hop fans IN, so the traversal ANNOTATES "
-            f"rows and never multiplies them.", 92))]
+            f"rows and never multiplies them — and each hop CHECKS that at run time, refusing on a "
+            f"duplicated join key instead of trusting the declared cardinality.", 92))]
     return [
         f'    """Point-in-time rows for {_safe_text(feature_column, "the feature column")} (§8).',
         "",
@@ -1597,7 +1598,10 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
     **Nothing is de-duplicated.** ``JoinPlan.fans_out`` is ``False`` by construction and every hop
     fans in, so one source row comes out as exactly one row. A ``dropDuplicates`` here would hide a
     fan-out that got through instead of reporting it, and a hidden fan-out is a SUM that is wrong by
-    a factor nobody can see.
+    a factor nobody can see. The declared cardinality is metadata about the catalog, though, not
+    about today's rows — so every hop additionally gates on OBSERVED key uniqueness before it
+    joins, and a duplicated dimension key refuses loudly with the offending table's name instead of
+    doubling every aggregate downstream.
     """
     if not plan.hops:
         return []
@@ -1663,6 +1667,16 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
                     for column, key in zip(hop.to_columns, hop.keys)
                 ),
              *(f"F.col({column!r}).alias({hop.prefix + column!r})" for column in hop.carried)]))
+        grouped_keys = ", ".join(f"F.col({key!r})" for key in hop.keys)
+        lines.extend([
+            f"    duplicate_{hop.index} = {hop.frame}.groupBy({grouped_keys}).count().where(",
+            "        F.col('count') > F.lit(1)).limit(1).count()",
+            f"    if duplicate_{hop.index}:",
+            "        raise RuntimeError(",
+            f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} + ",
+            f"            ': join key is not unique on {hop.schema}.{hop.table} for hop {hop.index}'",
+            "        )",
+        ])
         for key, left_name in zip(hop.keys, hop.left_names):
             lines.append(f"    rows = rows.withColumn({key!r}, F.col({left_name!r}))")
         if hop.directional:

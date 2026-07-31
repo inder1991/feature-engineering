@@ -55,6 +55,7 @@ from featuregen.formula.schema import (
     RoundingMode,
     ZeroDenominator,
 )
+from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     ContractGroup,
@@ -2493,6 +2494,35 @@ def test_the_traversal_produces_EXACTLY_ONE_ROW_PER_SOURCE_ROW(compiled, express
     txns = [_windowed(BEFORE, n) | {"acct_num": acct}
             for n, acct in ((10, "A1"), (20, "A2"), (30, "A1"), (40, "A1"))]
     assert _traverse(node, txns).count() == len(txns)
+    # The count above passed THROUGH every hop's uniqueness gate: unique keys raise nothing, and
+    # each gate sits BEFORE its join so a refusal names the offending table, not the grown rows.
+    assert node.source.index("duplicate_1") < node.source.index("rows.join(")
+    assert "duplicate_2" in node.source
+
+
+def test_a_DUPLICATED_DIMENSION_KEY_refuses_loudly_instead_of_doubling_every_SUM(
+        compiled, expression):
+    """A double-loaded dimension row is the classic silent SUM-doubler. The declared N:1 is
+    metadata about the catalog; this gate is the first check against the data itself — and it runs
+    BEFORE the join, so the refusal names the table that fanned, not the rows that grew."""
+    node = _traversal(compiled, expression)
+    with pytest.raises(RuntimeError) as caught:
+        _traverse(node, [_windowed(BEFORE, 10) | {"acct_num": "A1"}],
+                  accounts=[*ACCOUNTS, dict(ACCOUNTS[0])])          # the same acct_id, twice
+    assert str(caught.value).startswith(ValidationGateCode.JOIN_AMPLIFICATION.value)
+    assert "banking.accounts" in str(caught.value) and "hop 1" in str(caught.value)
+
+
+def test_a_duplicated_key_on_the_SECOND_hop_is_caught_at_THAT_hop_and_names_THAT_table(
+        compiled, expression):
+    """Every hop carries the gate, not just the first: a duplicate two tables away multiplies rows
+    exactly as silently, and a gate that only guarded hop 1 would let it through."""
+    node = _traversal(compiled, expression)
+    with pytest.raises(RuntimeError) as caught:
+        _traverse(node, [_windowed(BEFORE, 10) | {"acct_num": "A1"}],
+                  customers=[*CUSTOMERS_ROWS, dict(CUSTOMERS_ROWS[0])])   # the same cif_id, twice
+    assert str(caught.value).startswith(ValidationGateCode.JOIN_AMPLIFICATION.value)
+    assert "banking.customers" in str(caught.value) and "hop 2" in str(caught.value)
 
 
 def test_a_source_row_whose_DIMENSION_ROW_IS_MISSING_survives_with_a_NULL_key(

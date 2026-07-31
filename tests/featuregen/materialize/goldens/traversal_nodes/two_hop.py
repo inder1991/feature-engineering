@@ -11,7 +11,9 @@ def project_total_debit_amount_30d__body_expr(
 
     Each surviving row then reaches the entity it belongs to over the governed path
     banking.transactions -> banking.accounts -> banking.customers (2 hop(s), §3.1). Every hop
-    fans IN, so the traversal ANNOTATES rows and never multiplies them.
+    fans IN, so the traversal ANNOTATES rows and never multiplies them — and each hop CHECKS
+    that at run time, refusing on a duplicated join key instead of trusting the declared
+    cardinality.
     """
     business_date = str(business_dt)
 
@@ -75,6 +77,13 @@ def project_total_debit_amount_30d__body_expr(
     # accounts — authorized by approved_join fact ajf-txn-acct (VERIFIED).
     hop_1 = join_1_accounts.select(
         F.col('acct_id').alias('__join_1__key'), F.col('owner_id').alias('__join_1__owner_id'))
+    duplicate_1 = hop_1.groupBy(F.col('__join_1__key')).count().where(
+        F.col('count') > F.lit(1)).limit(1).count()
+    if duplicate_1:
+        raise RuntimeError(
+            'JOIN_AMPLIFICATION' + 
+            ': join key is not unique on banking.accounts for hop 1'
+        )
     rows = rows.withColumn('__join_1__key', F.col('acct_num'))
     rows = rows.join(hop_1, ['__join_1__key'], 'left').drop('__join_1__key')
 
@@ -82,6 +91,13 @@ def project_total_debit_amount_30d__body_expr(
     # customers — authorized by a FILE-DECLARED edge, backed by no approved_join fact.
     hop_2 = join_2_customers.select(
         F.col('cif_id').alias('__join_2__key'), F.col('cif_id').alias('__join_2__cif_id'))
+    duplicate_2 = hop_2.groupBy(F.col('__join_2__key')).count().where(
+        F.col('count') > F.lit(1)).limit(1).count()
+    if duplicate_2:
+        raise RuntimeError(
+            'JOIN_AMPLIFICATION' + 
+            ': join key is not unique on banking.customers for hop 2'
+        )
     rows = rows.withColumn('__join_2__key', F.col('__join_1__owner_id'))
     rows = rows.join(hop_2, ['__join_2__key'], 'left').drop('__join_2__key')
 
