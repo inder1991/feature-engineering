@@ -232,11 +232,13 @@ SELECT
 FROM entity_bridge_candidate_evidence
 JOIN governed_candidate_current USING (candidate_id)
 WHERE (
-    lower(left_object_ref) LIKE '%.cust_num'
-    AND lower(right_object_ref) LIKE '%.cif_id'
-) OR (
-    lower(left_object_ref) LIKE '%.cif_id'
-    AND lower(right_object_ref) LIKE '%.cust_num'
+    (
+        lower(left_object_ref) LIKE '%.cust_num'
+        AND lower(right_object_ref) LIKE '%.cif_id'
+    ) OR (
+        lower(left_object_ref) LIKE '%.cif_id'
+        AND lower(right_object_ref) LIKE '%.cust_num'
+    )
 )
 AND governed_candidate_current.lifecycle = 'active'
 ORDER BY candidate_id;
