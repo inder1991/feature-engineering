@@ -61,9 +61,10 @@ _HISTORY_RUN_LIMIT = 20
 
 # The F0 sections, in render order. ``identity`` is ALWAYS built (it is the anchor's core); the rest
 # are selectable via the route's ``include`` param. ``relationships.semantic`` is F1 (unavailable).
+# ``source_glossary`` (richness Task 3C) is the dossier's "what the source file itself said" section.
 _F0_SECTIONS: tuple[str, ...] = (
     "identity", "effective_metadata", "evidence", "relationships", "readiness", "history", "actions",
-    "audit",
+    "audit", "source_glossary",
 )
 
 # The subject-linked LLM-audit-summaries section returns at most this many newest dispatches.
@@ -85,14 +86,24 @@ _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("currency", "currency", "currency"),
     ("entity", "entity", "entity"),
     ("type", "data_type", "logical_representation"),
+    # Richness Task 3C: the two display axes the axis projection fills (migrations 1042 / 1040).
+    # ``sensitivity_display`` is the DISPLAY label, never the enforcement tag (``sensitivity`` /
+    # ``visible_requires`` stay the only read-scope authority); ``party_role`` is advisory.
+    ("sensitivity_display", "sensitivity_display", "sensitivity_display"),
+    ("party_role", "party_role", "party_role"),
 )
+
+# The display axes whose value, when present without any evidence row, was written by the
+# DETERMINISTIC axis projection (fill-only-NULL, provenance in the run manifest) — labelled so a
+# projected value never reads as "unattested" (which would frame a normal state as failure).
+_PROJECTED_AXES = frozenset({"sensitivity_display", "party_role"})
 
 # The anchor graph_node columns this read model surfaces (identity + display metadata + fact links).
 # entity_status / entity_fact_key / entity_fact_event_id back the F12 entity-authority gate below.
 _ANCHOR_COLUMNS = (
     "catalog_source, object_ref, kind, table_name, column_name, schema_name, data_type, "
     "declared_type, definition, ai_summary, is_grain, is_as_of, concept, domain, sensitivity, "
-    "additivity, "
+    "sensitivity_display, party_role, additivity, "
     "unit, currency, entity, entity_status, entity_fact_key, entity_fact_event_id, "
     "grain_fact_event_id, availability_fact_event_id"
 )
@@ -167,11 +178,14 @@ def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) ->
     field's authority/provenance is SOURCED from C1 :func:`read_operational_value` — never
     re-derived here."""
     fields: dict[str, dict] = {}
-    # Newest ACTIVE evidence per field — the honest author of a value that has no governed decision.
+    # Newest ACTIVE evidence per field — the honest author of a value that has no governed decision,
+    # AND (Task 3C) the value it proposed: a NULL display axis with a live AI proposal renders that
+    # proposal (labelled), never a blank — "nobody decided yet" must be distinguishable from
+    # "nothing was ever proposed".
     active_ev = {
-        r[0]: (r[1], r[2])
+        r[0]: (r[1], r[2], r[3])
         for r in conn.execute(
-            "SELECT DISTINCT ON (field_name) field_name, producer, strength "
+            "SELECT DISTINCT ON (field_name) field_name, producer, strength, proposed_value "
             "FROM field_evidence WHERE logical_ref = %s AND lifecycle = 'active' "
             "ORDER BY field_name, created_at DESC, evidence_id DESC",
             (logical_ref,),
@@ -191,6 +205,34 @@ def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) ->
         entry["evidence_provenance"] = (
             _evidence_provenance_label(ev[0], ev[1]) if ev else None
         )
+        # The newest ACTIVE proposal's value — what the screen renders (with the author chip) when
+        # the display column is NULL. Carried whether or not a display value exists; the display
+        # value always wins on screen.
+        entry["proposed_value"] = ev[2] if ev else None
+        # A projected display axis (sensitivity_display / party_role) has no evidence rows — its
+        # value came from the deterministic axis projection. Say so, rather than "unattested".
+        if label in _PROJECTED_AXES and display_value is not None \
+                and entry["evidence_provenance"] is None:
+            entry["evidence_provenance"] = "system projected"
+        # Type display policy (Task 3C): the flat data_type is the OPERATIONAL type; when it is
+        # unknown but the source DECLARED a SQL type, the declared type is the honest display —
+        # with its basis named — and bare "unknown" is reserved for genuinely holding nothing.
+        if label == "type":
+            operational = anchor.get("data_type")
+            known = operational is not None and str(operational).strip().lower() \
+                not in ("", "unknown")
+            if known:
+                entry["basis"] = "operational"
+            elif anchor.get("declared_type"):
+                entry["value"] = anchor["declared_type"]
+                entry["basis"] = "declared"
+                # A value IS displayed now, so the authority label must follow it (hint, not
+                # missing) — authority is about attestation, and the file did declare this.
+                entry["authority"] = _authority_label(ov, entry["value"])
+                if entry["evidence_provenance"] is None:
+                    entry["evidence_provenance"] = "source declared"
+            else:
+                entry["basis"] = None
         # [E1a T3] domain is TWO-LEVEL: a table's domain is the DEFAULT context its columns inherit,
         # and a column asserts its own only as an explicit OVERRIDE. So the column's own active
         # evidence IS the discriminator — with it the value is `direct` (authored at this column);
@@ -212,6 +254,39 @@ def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) ->
             entry["provenance"] = (anchor.get("entity_fact_event_id")
                                    or anchor.get("entity_fact_key"))
         fields[label] = entry
+    return {"fields": fields}
+
+
+# The dossier's "From the source glossary" fields (richness Task 3C) — everything the SOURCE FILE
+# itself asserted about this term, persisted as source field-evidence (Task 3 Step 6b added the four
+# previously-lost ones). Read back per-field from the ACTIVE source evidence; a field the file never
+# declared is simply absent (no fabricated empties), and every present value carries the source
+# producer/strength label ("source attested" / "source proposed") as its provenance chip.
+_SOURCE_GLOSSARY_FIELDS: tuple[str, ...] = (
+    "business_term", "term_type", "process_path", "related_terms",
+    "bian_path", "fibo_path", "physical_fqn",
+)
+
+
+def _source_glossary_section(conn: DbConn, logical_ref: str) -> dict:
+    """The anchor's ACTIVE source-glossary field evidence, one entry per declared field. Pure read
+    over ``field_evidence`` (producer='source'); the anchor already passed read-scope. ``fields``
+    is empty — not invented — for an asset whose upload declared none of them."""
+    rows = conn.execute(
+        "SELECT DISTINCT ON (field_name) field_name, proposed_value, strength "
+        "FROM field_evidence WHERE logical_ref = %s AND producer = 'source' "
+        "AND lifecycle = 'active' AND field_name = ANY(%s) "
+        "ORDER BY field_name, created_at DESC, evidence_id DESC",
+        (logical_ref, list(_SOURCE_GLOSSARY_FIELDS)),
+    ).fetchall()
+    fields = {
+        name: {
+            "value": value,
+            "provenance": _evidence_provenance_label("source", strength),
+        }
+        for name, value, strength in rows
+        if value is not None and str(value).strip() != ""
+    }
     return {"fields": fields}
 
 
@@ -641,6 +716,10 @@ def build_asset_detail(
     if "evidence" in requested:
         body["evidence"] = _evidence_section(conn, logical_ref)
         built.append("evidence")
+
+    if "source_glossary" in requested:
+        body["source_glossary"] = _source_glossary_section(conn, logical_ref)
+        built.append("source_glossary")
 
     if "relationships" in requested:
         relationships, rel_unavailable = _relationships_section(

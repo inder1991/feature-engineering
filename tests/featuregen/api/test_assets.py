@@ -74,7 +74,7 @@ def test_asset_detail_sections_built_from_real_ingest(client):
     # platform_admin (AUTH) holds audit:read, so the F2-audit LLM-audit-summaries section is built.
     assert set(body["included_sections"]) == {
         "identity", "effective_metadata", "evidence", "relationships", "readiness", "history",
-        "actions", "audit"}
+        "actions", "audit", "source_glossary"}
 
     # identity — from the REAL graph_node the ingest built (no hardcoded values).
     ident = body["identity"]
