@@ -8,7 +8,9 @@ a store lands, and this cannot.
 **Not every gap is configuration, and that distinction is the useful part.**
 
 * ``PHYSICAL_BINDING_ABSENT``, ``ELIGIBILITY_ABSENT``, ``ATTRIBUTION_ABSENT`` — someone records
-  something. An operator or a data owner closes them.
+  something. An operator or a data owner closes them. Addressing goes through ``resolve_table``, so
+  declaring a CATALOG's engine and tier once addresses every table in it; a per-table binding is the
+  exception, for the table pointed at a snapshot or caught mid-migration.
 * ``POPULATION_UNDECLARED`` — a person must CHOOSE, and no store may choose for them. See
   ``materialize/spine.py``: look-alike population tables are indistinguishable to the catalog, and a
   wrong choice silently shrinks every number that follows.
@@ -35,7 +37,7 @@ from featuregen.analysis.windows import (
     WindowResolutionError,
     resolve_window_partitions,
 )
-from featuregen.data_agent.binding_store import resolve_binding
+from featuregen.data_agent.binding_store import resolve_table
 from featuregen.data_agent.connection import ConnectionError_
 from featuregen.data_agent.eligibility_store import resolve_eligibility
 
@@ -87,7 +89,7 @@ def first_unmet_requirement(
     """
     event_source, event_table = _source_and_table(plan.base_table_ref)
     try:
-        if resolve_binding(conn, catalog_source=event_source, table=event_table) is None:
+        if resolve_table(conn, catalog_source=event_source, table=event_table) is None:
             return ("PHYSICAL_BINDING_ABSENT", f"{event_source}::{event_table}")
     except ConnectionError_ as exc:
         # A refused grant is a governance answer and must not read as "nobody set this up".
@@ -97,7 +99,7 @@ def first_unmet_requirement(
         return ("POPULATION_UNDECLARED", plan.base_table_ref)
     spine_source, spine_table = _source_and_table(plan.population_table_ref)
     try:
-        if resolve_binding(conn, catalog_source=spine_source, table=spine_table) is None:
+        if resolve_table(conn, catalog_source=spine_source, table=spine_table) is None:
             return ("PHYSICAL_BINDING_ABSENT", plan.population_table_ref)
     except ConnectionError_ as exc:
         return (exc.code, plan.population_table_ref)
@@ -121,7 +123,7 @@ def first_unmet_requirement(
         dim_source, dim_table = _source_and_table_of_column(
             plan.dimensions[0].logical_ref)
         try:
-            if resolve_binding(conn, catalog_source=dim_source, table=dim_table) is None:
+            if resolve_table(conn, catalog_source=dim_source, table=dim_table) is None:
                 return ("PHYSICAL_BINDING_ABSENT", plan.dimensions[0].logical_ref)
         except ConnectionError_ as exc:
             return (exc.code, plan.dimensions[0].logical_ref)

@@ -32,6 +32,10 @@ class Settings:
     # gate windows over). Set at deploy (e.g. the git SHA). Unset -> the sentinel "unset", which the
     # window selector treats as an uncertified cohort (fail-closed exclusion).
     producer_commit: str
+    #: WHICH environment this deployment IS. A connection is only usable by a deployment
+    #: whose environment matches it: a UAT deployment resolving a production connection is
+    #: the failure that ends badly and quietly, so it is a hard match rather than a label.
+    environment: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -41,6 +45,7 @@ class Settings:
             audit_hmac_key=os.environ.get("FEATUREGEN_AUDIT_HMAC_KEY"),
             intent_gate_public_key=os.environ.get("FEATUREGEN_INTENT_GATE_PUBLIC_KEY"),
             producer_commit=os.environ.get("FEATUREGEN_PRODUCER_COMMIT", "unset"),
+            environment=os.environ.get("FEATUREGEN_ENVIRONMENT", "dev"),
         )
 
 

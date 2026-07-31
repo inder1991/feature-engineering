@@ -192,3 +192,37 @@ def test_every_gap_this_can_report_is_declared_in_GAP_ORDER():
 @pytest.mark.parametrize("code", GAP_ORDER)
 def test_the_order_has_no_duplicates_and_each_code_is_reachable(code):
     assert GAP_ORDER.count(code) == 1
+
+
+# ── declaring the CATALOG's engine addresses every table in it ───────────────────────────────────
+
+def test_declaring_the_catalog_engine_removes_the_binding_gap_with_no_per_table_row(db):
+    """The shape the user asked for: one catalog is one engine. A real EDP has thousands of tables
+    and one connection; binding each individually is correct and unmaintainable.
+
+    The address has two halves from different places, and neither needs maintaining — the INSTANCE
+    comes from the connection, the NAMESPACE from the catalog row.
+    """
+    from featuregen.data_agent.binding_store import declare_catalog_engine
+
+    record_connection(db, _connection(connection_id="edp", environment_id="dev", kind="hive"),
+                      tier="edp", database_name="edp_cluster")
+    # BOTH tables: the event table and the declared population. Resolution needs each one's real
+    # schema, so a catalog row missing for the spine reports the same binding gap — which is what
+    # the first version of this test tripped over.
+    for table in ("tran_repos", "cust_master"):
+        db.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+            "  schema_name) VALUES ('ftr',%s,'column',%s,'cif_id','dpl_eib') "
+            "ON CONFLICT (catalog_source, object_ref) DO NOTHING",
+            (f"public.{table}.cif_id", table))
+    declare_catalog_engine(db, catalog_source="ftr", engine="hive", tier="edp", declared_by="priya")
+
+    # No physical_dataset_binding row exists, and the binding gap is nonetheless gone.
+    assert db.execute("select count(*) from physical_dataset_binding").fetchone()[0] == 0
+    assert _gap(db)[0] != "PHYSICAL_BINDING_ABSENT"
+
+
+def test_an_undeclared_catalog_still_reports_the_binding_gap(db):
+    """Declaring is required, not assumed: an undeclared catalog has no engine and must not guess."""
+    assert _gap(db)[0] == "PHYSICAL_BINDING_ABSENT"
