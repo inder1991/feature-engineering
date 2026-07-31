@@ -24,6 +24,7 @@ from featuregen.api.routes import (
     contract,
     data_sources,
     entity,
+    entity_map,
     features,
     gate,
     governance,
@@ -159,6 +160,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(assist.router)
     app.include_router(contract.router)
     app.include_router(entity.router)
+    app.include_router(entity_map.router)
     app.include_router(suggestions.router)
     app.include_router(learning.router)
     # `POST /analysis/plan` + `/analysis/clarify` — the data agent's planning surface.
