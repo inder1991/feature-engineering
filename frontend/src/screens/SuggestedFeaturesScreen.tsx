@@ -320,7 +320,9 @@ function EntityGroup({ group }: { group: SuggestionGroup }) {
   )
 }
 
-function SuggestionCard({ suggestion }: { suggestion: FeatureSuggestion }) {
+// Exported for the asset-detail column dossier (Task 3C), which renders the SAME card for the
+// suggestions that use the opened column — one visual vocabulary for a suggestion everywhere.
+export function SuggestionCard({ suggestion }: { suggestion: FeatureSuggestion }) {
   const status = suggestion.validation_status
   return (
     <li className="row q-item sug-card">

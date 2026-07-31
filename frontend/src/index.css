@@ -4581,3 +4581,39 @@ button.stat:hover {
 }
 
 .ds-hint.bad { color: var(--danger); }
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════════
+   Appended for the AssetDetail column dossier (richness Task 3C): the headline type + basis chip,
+   the Meaning section's definition/AI-summary two-up, and the inline type-basis chip. */
+.adg-type-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 15px;
+}
+
+/* Definition and AI summary SIDE BY SIDE — the summary sits beside the definition, never in its
+   place, and collapses under it on a narrow screen. */
+.adg-meaning {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.adg-meaning-col {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}
+
+.adg-meaning-text {
+  margin: 0;
+  max-width: 62ch;
+}
+
+/* The basis chip riding inside a field value (`varchar(50) · declared`). */
+.adg-basis {
+  margin-left: 8px;
+}

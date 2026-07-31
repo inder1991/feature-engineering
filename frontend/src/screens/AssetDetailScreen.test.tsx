@@ -3,14 +3,20 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { AssetDetailScreen } from './AssetDetailScreen'
-import { fixture } from './AssetDetailScreen.fixture'
+import { fixture, suggestionsFixture } from './AssetDetailScreen.fixture'
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, getAssetDetail: vi.fn(), postFieldDecision: vi.fn() }
+  return {
+    ...actual,
+    getAssetDetail: vi.fn(),
+    postFieldDecision: vi.fn(),
+    getTableSuggestions: vi.fn(),
+  }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
 const postFieldDecision = vi.mocked(api.postFieldDecision)
+const getTableSuggestions = vi.mocked(api.getTableSuggestions)
 
 beforeEach(() => {
   getAssetDetail.mockReset()
@@ -21,6 +27,8 @@ beforeEach(() => {
     projected: true, latest_decision_id: 'dec-2', evidence_set_hash: 'hash-2',
     policy_version: 'pol-1', actions: ['reject'],
   })
+  getTableSuggestions.mockReset()
+  getTableSuggestions.mockResolvedValue(suggestionsFixture())
 })
 
 function renderScreen() {
@@ -46,15 +54,31 @@ describe('asset detail — tabs + identity', () => {
     expect(getAssetDetail).toHaveBeenCalledWith('deposits', 'public.accounts.balance')
   })
 
-  it('overview shows the two-type honesty — declared vs operational, only a technical source attests', async () => {
+  it('type policy: a declared type backs the display — never a bare "unknown"', async () => {
     renderScreen()
-    // declared "double" but operational "unknown": the declared type is never evidence of numeric.
-    expect(await screen.findByText('double')).toBeInTheDocument()
-    expect(screen.getByText('unknown')).toBeInTheDocument()
+    // declared "double", operational unknown → the headline is `double · declared` (basis chip);
+    // the word "unknown" appears NOWHERE, because the platform HOLDS a type — the file declared it.
+    const typeLine = await screen.findByTestId('type-display')
+    expect(typeLine).toHaveTextContent('double')
+    expect(typeLine).toHaveTextContent('declared')
+    expect(screen.queryByText('unknown')).toBeNull()
+    // the operational slot states its honest gap without the bare word.
+    expect(screen.getByText('— not attested yet')).toBeInTheDocument()
     expect(screen.getByText(/only a technical source/i)).toBeInTheDocument()
     expect(
       screen.getByText(/never on its own evidence a column is operationally numeric/i),
     ).toBeInTheDocument()
+  })
+
+  it('renders bare "unknown" ONLY when nothing at all is held', async () => {
+    const detail = fixture()
+    detail.identity.declared_type = null
+    detail.identity.operational_type = 'unknown'
+    getAssetDetail.mockResolvedValue({ detail, etag: 'etag-1' })
+    renderScreen()
+    const typeLine = await screen.findByTestId('type-display')
+    expect(typeLine).toHaveTextContent('unknown')
+    expect(typeLine).not.toHaveTextContent('declared')
   })
 })
 

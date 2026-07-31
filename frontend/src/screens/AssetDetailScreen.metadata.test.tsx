@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { AssetDetailScreen } from './AssetDetailScreen'
-import { fixture } from './AssetDetailScreen.fixture'
+import { fixture, suggestionsFixture } from './AssetDetailScreen.fixture'
 
 // Metadata & evidence: one line per field, detail on demand.
 //
@@ -16,7 +16,12 @@ import { fixture } from './AssetDetailScreen.fixture'
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, getAssetDetail: vi.fn(), postFieldDecision: vi.fn() }
+  return {
+    ...actual,
+    getAssetDetail: vi.fn(),
+    postFieldDecision: vi.fn(),
+    getTableSuggestions: vi.fn(),
+  }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
 
@@ -28,6 +33,8 @@ function detail(over: (d: api.AssetDetail) => void = () => {}): api.AssetDetail 
 
 beforeEach(() => {
   getAssetDetail.mockReset()
+  vi.mocked(api.getTableSuggestions).mockReset()
+  vi.mocked(api.getTableSuggestions).mockResolvedValue(suggestionsFixture())
 })
 
 async function openTab(d: api.AssetDetail) {
@@ -153,10 +160,15 @@ it('the overview summary shows only fields that have a value', async () => {
   expect(within(panel).getByText('USD')).toBeInTheDocument()
 })
 
-it('the overview summary still accounts for the unset ones', async () => {
+it('the overview semantics panel states an empty axis explicitly — never hides it', async () => {
+  // Task 3C: a NULL axis must be DISTINGUISHABLE from a hidden one. The old "Not set: …" summary
+  // line is replaced by tri-state axis rows: an axis with no value and no proposal renders an
+  // explicit "nothing known yet" in its own row, not an omission and not "— not set".
   await openOverview(detail(d => {
     d.effective_metadata!.fields.unit = { ...d.effective_metadata!.fields.unit, value: null }
   }))
-  // The line sits beside the list, not inside it — it accounts for what the list omits.
-  expect(screen.getByText(/^Not set:/)).toBeInTheDocument()
+  const panel = screen.getByTestId('attested-metadata')
+  const unitRow = within(panel).getByTestId('axis-unit')
+  expect(unitRow).toHaveTextContent('nothing known yet')
+  expect(within(panel).queryByText(/^— not set$/)).toBeNull()
 })

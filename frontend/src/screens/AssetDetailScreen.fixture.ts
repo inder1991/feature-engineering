@@ -1,5 +1,22 @@
 import type * as api from '../api'
 
+// An EMPTY per-table suggestions payload (P4 shape): what the column dossier's usage section loads
+// by default in tests that are not about suggestions — table known, nothing suggested, no
+// neighbours. Tests about the section override it.
+export function suggestionsFixture(): api.TableSuggestions {
+  return {
+    catalog_source: 'deposits',
+    table: 'accounts',
+    table_known: true,
+    summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
+    groups: [],
+    rejections: [],
+    neighbourhood: {
+      tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1, limit_reason: null,
+    },
+  }
+}
+
 // A column asset covering the honesty properties: declared vs operational type; three metadata
 // fields whose AUTHORITY differs from whether a value is present (governed/hint/missing all carry a
 // non-empty value); verified relationships alongside a proposed candidate; a mixed readiness matrix;

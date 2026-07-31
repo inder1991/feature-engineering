@@ -1873,6 +1873,26 @@ export interface EffectiveMetadataField {
   provenance: string | null
   evidence_provenance: string | null
   selected_evidence_ids: string[]
+  // The newest ACTIVE evidence's value (Task 3C): what the screen renders — with the author chip
+  // and an "unconfirmed" marker — when `value` is null. The display value always wins when present.
+  // Optional: an older backend omits it.
+  proposed_value?: string | null
+  // Type field only: which basis the displayed type stands on — 'operational' (a technical/upload
+  // type) or 'declared' (the source file's SQL type, shown instead of a bare "unknown"), or null
+  // when nothing at all is held.
+  basis?: string | null
+}
+
+// One field the SOURCE FILE itself asserted (the "From the source glossary" dossier section):
+// the value plus its provenance label ("source attested" / "source proposed"). A field the upload
+// never declared is simply absent — the section is empty, never fabricated.
+export interface SourceGlossaryField {
+  value: string
+  provenance: string
+}
+
+export interface SourceGlossarySection {
+  fields: Record<string, SourceGlossaryField>
 }
 
 // A column asset carries a field per label (concept/definition/domain/additivity/unit/currency/
@@ -2164,6 +2184,8 @@ export interface AssetDetail {
   relationships?: Relationships
   readiness?: ReadinessSection
   history?: HistorySection
+  // What the source file itself said about this term (Task 3C's dossier section).
+  source_glossary?: SourceGlossarySection
   // Server-calculated commands the caller may run; F0 keeps this empty.
   actions?: unknown[]
   audit?: AuditSection
