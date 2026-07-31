@@ -30,6 +30,7 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from featuregen.analysis.assembly import first_unmet_requirement
 from featuregen.analysis.clarify import ClarificationError, apply_answer, clarifications_for
 from featuregen.analysis.execution import ExecutionInputs
 from featuregen.analysis.grounding import ground_analysis_plan
@@ -42,6 +43,11 @@ from featuregen.data_agent.connection import ConnectionError_
 from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
+
+#: Codes this MODULE names in its own fallback. Everything else a caller sees comes from
+#: `analysis.assembly`, and a test asserts the route surfaces codes absent from here — the
+#: evidence that the enumeration is not maintained in two places.
+BLOCKED_ROUTE_CODES: frozenset[str] = frozenset({"EXECUTION_INPUTS_ABSENT"})
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -191,28 +197,17 @@ def _execution_inputs_or_none(conn, plan) -> ExecutionInputs | None:
 
 
 def _binding_hint(conn, plan) -> tuple[str, str]:
-    """The precise reason a plan cannot execute, for the preview to report.
+    """The first unmet requirement, from the single enumeration in `analysis.assembly`.
 
-    Resolution is attempted rather than assumed: an unbound table is an operator task, while a
-    revoked grant is a governance answer and must not read as "not configured".
+    This route used to keep its own short list, and the list was WRONG — it stopped at four gaps and
+    omitted attribution and join evidence. A hand-maintained "what's still missing" drifts the moment
+    a store lands; asking the enumerator cannot.
+
+    `granularity` is deliberately not supplied: nothing records whether a partition column names
+    months or days, so the honest report is that the calendar is unknown rather than a month assumed.
     """
-    _source, table = _source_and_table(plan.base_table_ref)
-    try:
-        resolved = resolve_binding(conn, catalog_source=_source, table=table)
-    except ConnectionError_ as exc:
-        # A binding exists and its connection refuses it — surfaced rather than swallowed, or a
-        # revoked allowlist would look identical to a table nobody has bound.
-        return (exc.code, f"{_source}::{table}")
-    if resolved is None:
-        return ("PHYSICAL_BINDING_ABSENT", f"{_source}::{table}")
-    if resolve_eligibility(conn, catalog_source=_source, table=table) is None:
-        # Bound, but nobody has said which rows count. A DECISION, not an operator task — and the IR
-        # refuses without it because counting pending and reversed activity as activity changes the
-        # answer rather than widening it.
-        return ("ELIGIBILITY_ABSENT", f"{_source}::{table}")
-    # Bound, authorized and defined: what remains is contract, not configuration — AnalysisPlanV1
-    # carries one base table and cannot name a population spine distinct from the events.
-    return ("EXECUTION_INPUTS_ABSENT", f"{_source}::{table}")
+    return first_unmet_requirement(conn, plan, reference=datetime.now(UTC)) or (
+        "EXECUTION_INPUTS_ABSENT", plan.base_table_ref)
 
 
 def _source_and_table(table_ref: str) -> tuple[str, str]:
