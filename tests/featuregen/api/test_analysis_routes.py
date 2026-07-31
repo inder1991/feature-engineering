@@ -16,7 +16,10 @@ import pytest
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 
-_NOW = datetime(2026, 7, 30, tzinfo=UTC)
+#: REAL time, not a pinned date. These tests drive the HTTP route, and the route stamps its own
+#: `datetime.now(UTC)` — so a hardcoded watermark falls outside the freshness window the moment the
+#: clock passes it, and every column reads as stale. Pinning it broke this file at midnight.
+_NOW = datetime.now(UTC)
 _QUESTION = "which customers had fewer transactions this month than last"
 
 
