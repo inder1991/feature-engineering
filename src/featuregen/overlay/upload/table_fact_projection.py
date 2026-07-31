@@ -15,7 +15,8 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
                                 declared_grain: set[str] | None = None,
                                 declared_as_of: set[str] | None = None,
                                 only_fact_type: str | None = None,
-                                now: datetime | None = None) -> None:
+                                now: datetime | None = None,
+                                adapter=None) -> None:
     """Project the CURRENT verified grain/availability for ONE table onto graph_node — IDEMPOTENTLY.
 
     CRITICAL: clears every prior is_grain/is_as_of + fact-event-id on this table's columns FIRST,
@@ -24,6 +25,16 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
     on old columns — a silent correctness rot. Set-only projection is not rebuild-safe; clear-then-set
     is. This single-table entry point is also what a future confirm-time hook calls (there is no
     confirm API today; see the scope boundary).
+
+    THE TABLE NODE IS STAMPED TOO (richness Task 5): the fact is TABLE-scoped, so its
+    confirmed-event provenance lands on the `kind='table'` row alongside the member columns —
+    that row is what the stamp audit (`scripts/verify_catalog_richness.sql`) and the table-level
+    dossier read. Before this, only column nodes were ever stamped and every VERIFIED
+    grain/availability fact reported permanent stamp drift against its table node.
+
+    ``adapter`` (stamp-reconcile repair path) overrides the process-global catalog adapter so a
+    repair driver can thread the exact adapter it validated; ``None`` (every existing caller)
+    resolves ``current_catalog_adapter()`` as before.
 
     ``declared_grain`` / ``declared_as_of`` are the columns THIS upload declares as grain / as-of (a
     file/source attestation ``build_graph`` just wrote is_grain/is_as_of=true for). The clear SPARES
@@ -39,7 +50,7 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
     watermark resolve_fact refuses to re-serve the untouched fact, so an unscoped clear would wipe
     a file-declared grain/as-of until the next re-upload. ``None`` (the default — the ingest
     re-projection path) keeps the full both-types clear-then-set, byte-for-byte."""
-    adapter = current_catalog_adapter()
+    adapter = adapter or current_catalog_adapter()
     declared_grain = declared_grain or set()
     declared_as_of = declared_as_of or set()
     project_grain = only_fact_type in (None, "grain")
@@ -48,18 +59,28 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
     #    this upload declares (their file-declared flag is final and must not be wiped by a staled
     #    governed fact). Two scoped UPDATEs because is_grain and is_as_of are independent flags —
     #    each gated on `only_fact_type` so a single-fact confirm never clears the other flag.
+    #    The TABLE node's provenance stamp is cleared in the same pass: it is never file-declared
+    #    (no spare set applies), so clear-then-set keeps it rebuild-safe too.
     if project_grain:
         conn.execute(
             "UPDATE graph_node SET is_grain = false, grain_fact_event_id = NULL "
             "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
             "AND NOT (column_name = ANY(%s))",
             (source, table, list(declared_grain)))
+        conn.execute(
+            "UPDATE graph_node SET grain_fact_event_id = NULL "
+            "WHERE catalog_source = %s AND table_name = %s AND kind = 'table'",
+            (source, table))
     if project_as_of:
         conn.execute(
             "UPDATE graph_node SET is_as_of = false, availability_fact_event_id = NULL "
             "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
             "AND NOT (column_name = ANY(%s))",
             (source, table, list(declared_as_of)))
+        conn.execute(
+            "UPDATE graph_node SET availability_fact_event_id = NULL "
+            "WHERE catalog_source = %s AND table_name = %s AND kind = 'table'",
+            (source, table))
     ref = table_ref(source, table)
     # 2. Apply the CONFIRMED grain (VERIFIED only; PROPOSED/absent -> value None -> nothing set).
     # `now` MUST be forwarded: resolve_fact's expiry + drift-freshness guards compare against it,
@@ -73,27 +94,38 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
             # ResolvedFact has NO confirmed_event_id attribute; a VERIFIED overlay fact carries it
             # in .provenance['confirmed_event_id'] (resolve.py _overlay_verified). getattr(...)
             # would silently write NULL — read provenance so the audit-link column is populated.
+            grain_event_id = (grain.provenance or {}).get("confirmed_event_id")
             conn.execute(
                 "UPDATE graph_node SET is_grain = true, grain_fact_event_id = %s "
                 "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
                 "AND column_name = ANY(%s)",
-                ((grain.provenance or {}).get("confirmed_event_id"), source, table, list(cols)))
+                (grain_event_id, source, table, list(cols)))
+            # The fact is table-scoped: stamp the table node too (is_grain stays a column flag).
+            conn.execute(
+                "UPDATE graph_node SET grain_fact_event_id = %s "
+                "WHERE catalog_source = %s AND table_name = %s AND kind = 'table'",
+                (grain_event_id, source, table))
     # 3. Apply the CONFIRMED availability.
     if project_as_of:
         avail = resolve_fact(conn, adapter, ref, "availability_time", now=now)
         if avail and avail.value is not None:
             col = avail.value.get("column")
+            avail_event_id = (avail.provenance or {}).get("confirmed_event_id")
             conn.execute(
                 "UPDATE graph_node SET is_as_of = true, availability_fact_event_id = %s "
                 "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
                 "AND column_name = %s",
-                ((avail.provenance or {}).get("confirmed_event_id"), source, table, col))
+                (avail_event_id, source, table, col))
+            conn.execute(
+                "UPDATE graph_node SET availability_fact_event_id = %s "
+                "WHERE catalog_source = %s AND table_name = %s AND kind = 'table'",
+                (avail_event_id, source, table))
 
 
 def project_table_facts(conn, *, source: str, tables,
                         declared_grain: dict[str, set[str]] | None = None,
                         declared_as_of: dict[str, set[str]] | None = None,
-                        now: datetime | None = None) -> None:
+                        now: datetime | None = None, adapter=None) -> None:
     """Project every table's confirmed grain/availability. Idempotent per table (clear-then-set).
 
     ``declared_grain`` / ``declared_as_of`` map a table to the columns the current upload declares as
@@ -105,7 +137,7 @@ def project_table_facts(conn, *, source: str, tables,
         project_table_facts_for_ref(
             conn, source=source, table=table,
             declared_grain=declared_grain.get(table), declared_as_of=declared_as_of.get(table),
-            now=now)
+            now=now, adapter=adapter)
 
 
 _TABLE_FACT_TYPES = ("grain", "availability_time")

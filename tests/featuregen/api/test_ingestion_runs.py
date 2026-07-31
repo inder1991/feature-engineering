@@ -268,6 +268,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
         # stale flat grain flags and froze them into the candidate evidence (bridge 6B).
         "table_fact_projection", "entity_bridges",
         "join_projection", "semantic_binding_projection", "join_drift",
+        # richness Task 5: the stamp reconcile makes dropped table-fact stamps visible per run.
+        "stamp_reconcile",
         # the display-axis projection runs LAST among the graph writers (richness Task 3), so
         # its fill-only-NULL guards see every governed re-projection already applied.
         "axis_projection",
@@ -295,7 +297,8 @@ def test_successful_upload_stages_carry_started_at(client):
     run = _get_run(client, res.headers[RUN_HEADER]).json()
     stages = {s["stage"]: s for s in run["stages"]}
     for name in ("parse", "validation", "brake", "fact_assertion", "drift", "graph_persistence",
-                 "projection_drain", "table_fact_projection", "join_projection", "quarantine"):
+                 "projection_drain", "table_fact_projection", "join_projection",
+                 "stamp_reconcile", "quarantine"):
         assert stages[name]["started_at"] is not None, name
     for name in ("enrich_concept", "enrich_definition", "enrich_domain", "pass_b", "pass_c",
                  "glossary_classification", "glossary_evidence", "governed_joins", "join_drift"):

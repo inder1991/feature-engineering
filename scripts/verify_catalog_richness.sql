@@ -46,13 +46,19 @@ UNION ALL
 SELECT 'overlay_fact|' || fact_type || ':' || status || '|' || count(*)
 FROM overlay_fact_state GROUP BY fact_type, status
 UNION ALL
-SELECT 'stamp_drift|' || op.object_ref || '|' || fs.fact_type
+-- Mirrors `stamp_reconcile.reconcile_table_fact_stamps`: a VERIFIED grain/availability fact
+-- whose TABLE-node stamp differs from its confirmed_event_id (NULL *or wrong* both count;
+-- pre-Task-5 the projection never stamped the table node at all, so this fired always). The
+-- overlay's object_ref is display-only ('public.<table>', source-less), so the join matches the
+-- table node by object_ref — one row per (source, fact) pair.
+SELECT 'stamp_drift|' || t.catalog_source || ':' || fs.object_ref || '|' || fs.fact_type
 FROM overlay_fact_state fs
-JOIN overlay_proposal op USING (fact_key)
-LEFT JOIN graph_node t ON t.kind='table' AND op.object_ref = 'public.' || t.table_name
+JOIN graph_node t ON t.kind='table' AND t.object_ref = fs.object_ref
 WHERE fs.status='VERIFIED' AND fs.fact_type IN ('grain','availability_time')
-  AND ((fs.fact_type='grain' AND t.grain_fact_event_id IS NULL)
-    OR (fs.fact_type='availability_time' AND t.availability_fact_event_id IS NULL))
+  AND ((fs.fact_type='grain'
+        AND t.grain_fact_event_id IS DISTINCT FROM fs.confirmed_event_id)
+    OR (fs.fact_type='availability_time'
+        AND t.availability_fact_event_id IS DISTINCT FROM fs.confirmed_event_id))
 
 -- ── semantic-binding pipeline (Task 4) ──────────────────────────────────────────────────────
 UNION ALL

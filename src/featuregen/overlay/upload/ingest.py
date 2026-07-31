@@ -116,6 +116,7 @@ from featuregen.overlay.upload.stage_report import (
     record_skipped_downstream,
     record_stage,
 )
+from featuregen.overlay.upload.stamp_reconcile import reconcile_table_fact_stamps
 from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.taxonomy_evidence import derive_concept_evidence
 from featuregen.overlay.upload.upload_catalog import (
@@ -2824,6 +2825,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                  "lagged" if table_projection_lagged else "succeeded",
                  reason_code="projection_lag" if table_projection_lagged else None,
                  started_at=stage_started)
+    # Task 5 Step 4b: the bridge stage below is GATED on this outcome — it exists to assess
+    # against freshly projected governed grain, so a run whose projection did not reach
+    # "succeeded" must not assess at all (it would read exactly the stale flat flags the
+    # relocation escaped).
+    table_fact_projection_state = "lagged"
     if table_projection_lagged:
         # Under projection lag the overlay_fact_state read model resolve_fact reads is stale: the
         # clear-then-set could wipe a just-declared grain (a not-yet-projected confirm) or persist a
@@ -2844,10 +2850,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                                     tables=sorted({r.table for r in vr.good}),
                                     declared_grain=declared_grain, declared_as_of=declared_as_of,
                                     now=now)
+            table_fact_projection_state = "succeeded"
             record_stage(stage_recorder, "table_fact_projection", "succeeded",
                          started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
             counters.incr("overlay.table_fact_projection.error")
+            table_fact_projection_state = "failed"
             logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
                            catalog_source, exc_info=True)
             record_stage(stage_recorder, "table_fact_projection", "failed",
@@ -2856,7 +2864,23 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # Cross-catalog link assessment runs after the graph, overlay projection and governed table-fact
     # projection agree. The generic link lifecycle is folded directly, so the DRAFT emitted here
     # does not need a second projection drain to become available.
-    if entity_bridges_enabled():
+    if entity_bridges_enabled() and table_fact_projection_state != "succeeded":
+        # Step 4b (live bug): the stage used to run here UNCONDITIONALLY — a lagged/failed
+        # table-fact projection meant it assessed the stale flat grain flags build_graph just
+        # rewrote from the file, freezing them into candidate evidence. Skip and let the next
+        # caught-up ingest (or the stamp-repair path) assess; withdrawing/reconciling is skipped
+        # too — a stale graph must not withdraw candidates either.
+        counters.incr("overlay.entity_bridges.skipped_projection_not_succeeded")
+        logger.warning("entity-bridge assessment skipped for %r — table-fact projection state "
+                       "is %r, not succeeded (assesses on the next caught-up ingest)",
+                       catalog_source, table_fact_projection_state)
+        if table_fact_projection_state == "lagged":
+            record_stage(stage_recorder, "entity_bridges", "lagged",
+                         reason_code="projection_lag")
+        else:
+            record_stage(stage_recorder, "entity_bridges", "deferred",
+                         reason_code="table_fact_projection_failed")
+    elif entity_bridges_enabled():
         stage_started = datetime.now(UTC)
         try:
             # The proposal savepoints contain per-item DB faults; this outer savepoint makes the
@@ -2998,6 +3022,29 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                          started_at=stage_started)
     else:
         record_stage(stage_recorder, "join_drift", "disabled")
+
+    # ── Stamp reconciliation (richness Task 5): the honest account of whether every VERIFIED
+    # grain/availability fact of THIS source is actually stamped on its table node after the
+    # projections above ran (or lag-skipped). READ-ONLY detection — `{drift: n}` rides the stage
+    # detail; a lagged run therefore SHOWS its dropped stamps instead of hiding them until the
+    # next audit. Repair is the operator-driven `repair_table_fact_stamps` (never automatic here:
+    # under lag a repair would read the same stale model the projection just refused). ──
+    stage_started = datetime.now(UTC)
+    try:
+        stamp_drift = reconcile_table_fact_stamps(conn, source=catalog_source)
+        if stamp_drift:
+            counters.incr("overlay.stamp_reconcile.drift", len(stamp_drift))
+            logger.warning("table-fact stamp drift after ingest of %r: %s", catalog_source,
+                           [(d.object_ref, d.fact_type) for d in stamp_drift])
+        record_stage(stage_recorder, "stamp_reconcile", "succeeded",
+                     reason_code="stamp_drift" if stamp_drift else None,
+                     detail={"drift": len(stamp_drift)}, started_at=stage_started)
+    except Exception:  # noqa: BLE001 — advisory: a reconcile fault never fails an upload
+        counters.incr("overlay.stamp_reconcile.error")
+        logger.warning("advisory stamp reconciliation failed for %r — facts + graph intact",
+                       catalog_source, exc_info=True)
+        record_stage(stage_recorder, "stamp_reconcile", "failed", reason_code="exception",
+                     started_at=stage_started)
 
     # ── Display-axis projection (richness Task 3): the LAST graph writer of the ingest, after
     # every governed re-projection above, so its fill-only-NULL guards see the governed values

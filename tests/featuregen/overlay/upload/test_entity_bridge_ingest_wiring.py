@@ -192,6 +192,76 @@ def test_bridge_proposals_do_not_leave_the_governed_projection_lagged(db, monkey
     assert projection_lag(db, "overlay") == 0
 
 
+def test_a_lagged_projection_skips_the_bridge_stage_entirely(db, monkeypatch):
+    """Task 5 Step 4b (live bug): the bridge stage was RELOCATED after table_fact_projection so it
+    assesses against governed grain — but when that projection records ``lagged`` and skips, the
+    bridge ran anyway, assessing exactly the stale flat grain flags the relocation exists to
+    escape. When the projection stage does not reach ``succeeded``, the bridge stage must record
+    the skip and assess NOTHING: zero new candidates, zero new candidate revisions."""
+    from featuregen.overlay.upload import ingest as ingest_mod
+
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    monkeypatch.setattr(ingest_mod, "projection_lag", lambda conn, name: 1)
+    recorder = StageRecorder()
+    result = ingest_upload(db, "cat_c", _rows("cat_c", "other", "some_id"),
+                           actor=_actor(), now=_NOW, stage_recorder=recorder)
+    assert result.status == "ingested"
+    projection = next(r for r in recorder.reports if r.stage == "table_fact_projection")
+    assert projection.state == "lagged"                       # the precondition of the bug
+    stage = next(r for r in recorder.reports if r.stage == "entity_bridges")
+    assert stage.state == "lagged"
+    assert stage.reason_code == "projection_lag"
+    assert _ledger(db) == []                                  # zero new candidates
+    assert db.execute(
+        "SELECT count(*) FROM governed_candidate_revision").fetchone()[0] == 0
+    assert result.entity_bridges_proposed == 0
+
+
+def test_a_caught_up_rerun_after_a_lagged_skip_assesses_normally(db, monkeypatch):
+    """The deferral is temporary: the next caught-up ingest assesses and proposes as usual."""
+    from featuregen.overlay.upload import ingest as ingest_mod
+
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    lag = {"value": 1}
+    monkeypatch.setattr(ingest_mod, "projection_lag", lambda conn, name: lag["value"])
+    ingest_upload(db, "cat_c", _rows("cat_c", "other", "some_id"), actor=_actor(), now=_NOW)
+    assert _ledger(db) == []                                  # the lagged run skipped
+    lag["value"] = 0                                          # the projection caught up
+    recorder = StageRecorder()
+    _trigger(db)
+    ingest_upload(db, "cat_c", _rows("cat_c", "other", "some_id"),
+                  actor=_actor(), now=_NOW, stage_recorder=recorder)
+    stage = next(r for r in recorder.reports if r.stage == "entity_bridges")
+    assert stage.state == "succeeded"
+    assert len(_ledger(db)) == 1                              # assessed on the caught-up rerun
+
+
+def test_a_failed_projection_also_defers_the_bridge_stage(db, monkeypatch):
+    """`did not reach succeeded` includes a FAILED projection: assessing against a graph whose
+    governed grain re-projection just blew up is the same stale-flags hazard."""
+    from featuregen.overlay.upload import ingest as ingest_mod
+
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+
+    def boom(conn, **kwargs):
+        raise RuntimeError("projection exploded")
+
+    monkeypatch.setattr(ingest_mod, "project_table_facts", boom)
+    recorder = StageRecorder()
+    result = ingest_upload(db, "cat_c", _rows("cat_c", "other", "some_id"),
+                           actor=_actor(), now=_NOW, stage_recorder=recorder)
+    assert result.status == "ingested"
+    assert next(r for r in recorder.reports
+                if r.stage == "table_fact_projection").state == "failed"
+    stage = next(r for r in recorder.reports if r.stage == "entity_bridges")
+    assert stage.state == "deferred"
+    assert stage.reason_code == "table_fact_projection_failed"
+    assert _ledger(db) == []
+
+
 def test_reingest_withdraws_suppressed_candidates_and_reappearance_reactivates_them(
     db, monkeypatch
 ):

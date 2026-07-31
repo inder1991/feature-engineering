@@ -58,6 +58,10 @@ CANONICAL_STAGES: tuple[str, ...] = (
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "entity_bridges", "join_projection",
     "semantic_binding_projection", "join_drift",
+    # richness Task 5: after every stamp writer above ran (or lag-skipped), reconcile the
+    # VERIFIED grain/availability facts against the table-node stamps — `{drift: n}` in the
+    # detail makes a lagged run's dropped stamps visible on the run itself.
+    "stamp_reconcile",
     # The ingest TAIL (richness Task 3): the display-axis projection runs last among the graph
     # writers, then the ONE summary draft per ingest writes from the full enriched dossier
     # (Step 6c moved `enrich_summary` here from the Pass-A block — drafting mid-pipeline could
