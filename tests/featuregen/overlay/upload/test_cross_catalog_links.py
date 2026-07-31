@@ -35,8 +35,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 
 from featuregen.overlay import store
@@ -117,7 +115,10 @@ def test_both_kinds_come_back_together(db):
     _candidate(db, "customer", "cust_num", "cif_id", fact_key="fk-1")
     _verify(db, "fk-1", "customer", "cust_num", "cif_id")
     _candidate(db, "branch", "cust_prim_branch_nm", "sol_desc", fact_key="fk-2")
-    assert {l.status for l in cross_catalog_links(db)} == {LinkStatus.CONFIRMED, LinkStatus.PROPOSED}
+    assert {link.status for link in cross_catalog_links(db)} == {
+        LinkStatus.CONFIRMED,
+        LinkStatus.PROPOSED,
+    }
 
 
 # ── strength: rank, never bar ────────────────────────────────────────────────────────────────────
@@ -127,7 +128,7 @@ def test_a_grain_backed_link_outranks_one_with_no_key_on_either_side(db):
     a weak candidate is not hidden — but the caller can tell them apart."""
     _candidate(db, "customer", "cust_num", "cif_id", left_grain=True, fact_key="fk-1")
     _candidate(db, "branch", "cust_prim_branch_nm", "sol_desc", fact_key="fk-2")
-    by_entity = {l.entity_id: l for l in cross_catalog_links(db)}
+    by_entity = {link.entity_id: link for link in cross_catalog_links(db)}
     assert by_entity["customer"].strength > by_entity["branch"].strength
 
 
@@ -136,7 +137,7 @@ def test_an_attested_type_match_outranks_a_merely_declared_one(db):
     read them. Both link; they are not equally believable."""
     _candidate(db, "customer", "a", "b", basis="attested", fact_key="fk-1")
     _candidate(db, "branch", "c", "d", basis="declared", fact_key="fk-2")
-    by_entity = {l.entity_id: l for l in cross_catalog_links(db)}
+    by_entity = {link.entity_id: link for link in cross_catalog_links(db)}
     assert by_entity["customer"].strength > by_entity["branch"].strength
 
 
@@ -152,7 +153,7 @@ def test_a_confirmed_weak_link_does_not_outrank_an_unreviewed_safer_one(db):
                fact_key="fk-1")
     _candidate(db, "branch", "c", "d", fact_key="fk-2")
     _verify(db, "fk-2", "branch", "c", "d")
-    by_entity = {l.entity_id: l for l in cross_catalog_links(db)}
+    by_entity = {link.entity_id: link for link in cross_catalog_links(db)}
     assert by_entity["customer"].strength > by_entity["branch"].strength
     assert cross_catalog_links(db)[0].entity_id == "customer"
 
@@ -163,7 +164,7 @@ def test_confirmation_still_breaks_a_tie_between_two_equally_safe_links(db):
     _candidate(db, "customer", "a", "b", left_grain=True, basis="attested", fact_key="fk-1")
     _candidate(db, "account", "c", "d", left_grain=True, basis="attested", fact_key="fk-2")
     _verify(db, "fk-2", "account", "c", "d")
-    by_entity = {l.entity_id: l for l in cross_catalog_links(db)}
+    by_entity = {link.entity_id: link for link in cross_catalog_links(db)}
     assert by_entity["account"].strength > by_entity["customer"].strength
     assert cross_catalog_links(db)[0].entity_id == "account"
 
@@ -172,7 +173,10 @@ def test_no_amount_of_endorsement_reaches_the_next_safety_band(db):
     """The tie-breaker is bounded BY CONSTRUCTION, not by luck: a confirmed link's whole endorsement
     bonus is smaller than the smallest safety increment, so it can never cross a band."""
     from featuregen.overlay.upload.cross_catalog_links import (
-        _W_ATTESTED, _W_CONFIRMED, _W_GRAIN_SIDE)
+        _W_ATTESTED,
+        _W_CONFIRMED,
+        _W_GRAIN_SIDE,
+    )
     assert _W_CONFIRMED < min(_W_ATTESTED, _W_GRAIN_SIDE)
 
 
@@ -190,14 +194,14 @@ def test_links_can_be_narrowed_to_one_column(db):
     _candidate(db, "customer", "cust_num", "cif_id", fact_key="fk-1")
     _candidate(db, "branch", "cust_prim_branch_nm", "sol_desc", fact_key="fk-2")
     links = cross_catalog_links(db, object_ref="public.bo_cib_customer.cust_num")
-    assert [l.entity_id for l in links] == ["customer"]
+    assert [link.entity_id for link in links] == ["customer"]
 
 
 def test_a_column_matches_from_either_side_of_the_link(db):
     """A link is symmetric — opening the FTR side must find the same link the CIB side does."""
     _candidate(db, "customer", "cust_num", "cif_id", fact_key="fk-1")
     links = cross_catalog_links(db, object_ref="public.comp_financial_tran_repos_dly.cif_id")
-    assert [l.entity_id for l in links] == ["customer"]
+    assert [link.entity_id for link in links] == ["customer"]
 
 
 def test_no_links_is_an_empty_list_not_an_error(db):
@@ -212,7 +216,7 @@ def test_a_verified_edge_with_no_candidate_row_is_still_returned(db):
     "show unconfirmed too" change into a regression that loses confirmed links."""
     _verify(db, "fk-orphan", "customer", "cust_num", "cif_id")
     links = cross_catalog_links(db)
-    assert [l.status for l in links] == [LinkStatus.CONFIRMED]
+    assert [link.status for link in links] == [LinkStatus.CONFIRMED]
     assert links[0].entity_id == "customer"
 
 
@@ -265,7 +269,7 @@ def test_control_a_draft_link_is_available_and_nothing_here_blocks_it(db):
     """MUST-SURVIVE no-op control. An allow-list wired too tight — or a harness that governs the
     fixture into the wrong state — passes every suppression test below and fails this one."""
     _candidate(db, "customer", "cust_num", "cif_id", status="DRAFT")
-    assert [l.entity_id for l in cross_catalog_links(db)] == ["customer"]
+    assert [link.entity_id for link in cross_catalog_links(db)] == ["customer"]
 
 
 def test_a_draft_link_is_available_and_traversable_with_no_human_involved(db):
@@ -291,7 +295,7 @@ def test_a_partially_confirmed_link_is_available(db):
     """One approval of a two-approval gate. Half-reviewed is still unreviewed, and unreviewed is
     still available — the four-eyes gate governs the ENDORSEMENT, not the link."""
     _candidate(db, "customer", "cust_num", "cif_id", status="PARTIALLY_CONFIRMED")
-    assert [l.entity_id for l in cross_catalog_links(db)] == ["customer"]
+    assert [link.entity_id for link in cross_catalog_links(db)] == ["customer"]
 
 
 def test_an_expired_bridge_is_unavailable(db):
@@ -355,14 +359,11 @@ def test_a_ledger_row_with_no_governance_record_at_all_is_unavailable(db):
     assert cross_catalog_links(db) == ()
 
 
-def test_a_verified_projection_with_no_stream_is_still_available(db):
-    """The one place absence is allowed, and only because the ROW ITSELF is the positive reading:
-    `project_verified_bridge` writes an `entity_bridge_edge` row ONLY under a VERIFIED fold, and
-    `demote_bridge_edges` removes it on every exit from VERIFIED. `multisource_gold` and the planner
-    fixtures seed bridges this way, so treating a projected VERIFIED row as unreadable would blank
-    them."""
+def test_a_verified_projection_with_no_stream_is_unavailable(db):
+    """A projection is rebuildable and may be stale. It cannot replace the authoritative lifecycle:
+    an orphan VERIFIED row with no event stream is unverifiable and must fail closed."""
     _verify(db, "fk-gold", "customer", "cust_num", "cif_id", stream=False)
-    assert [l.status for l in cross_catalog_links(db)] == [LinkStatus.CONFIRMED]
+    assert cross_catalog_links(db) == ()
 
 
 # ── REVIEW STATUS comes from the folded lifecycle, never from the projection's LAG ───────────────

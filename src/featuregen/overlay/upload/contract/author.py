@@ -132,17 +132,28 @@ def _join_path(conn, grain_table: str | None, pairs: tuple[tuple[str, str], ...]
     return tuple(steps)
 
 
-def _envelope_join_path(ordered_path: tuple[str, ...]) -> tuple[dict, ...]:
+def _envelope_join_path(
+    ordered_path: tuple[str, ...],
+    bridge_realization_dependencies: tuple[dict[str, str], ...] = (),
+) -> tuple[dict, ...]:
     """3C.2a — a governed feature's drafted join path IS its compiled envelope's ``ordered_path`` (never
     a recomputed permissive path). Each pinned ``catalog:segment_kind:ref`` segment becomes one step dict
     carrying the raw segment, so ``tuple(s['segment'] for s in join_path)`` reconstructs ``ordered_path``
     EXACTLY — the invariant that a governed draft path equals the plan's, byte-for-byte."""
+    dependencies = {
+        item["realization_revision_id"]: item["dependency_snapshot_id"]
+        for item in bridge_realization_dependencies
+    }
     steps: list[dict] = []
     for seg in ordered_path:
         catalog_source, _, rest = seg.partition(":")
         segment_kind, _, ref = rest.partition(":")
-        steps.append({"kind": "governed_segment", "segment": seg, "catalog_source": catalog_source,
-                      "segment_kind": segment_kind, "ref": ref})
+        step = {"kind": "governed_segment", "segment": seg, "catalog_source": catalog_source,
+                "segment_kind": segment_kind, "ref": ref}
+        if ref in dependencies:
+            step["realization_revision_id"] = ref
+            step["dependency_snapshot_id"] = dependencies[ref]
+        steps.append(step)
     return tuple(steps)
 
 
@@ -165,7 +176,10 @@ def _draft_join_path(conn, feature: FeatureIdea, roles: tuple[str, ...],
         fresh = recheck_plan_freshness(conn, feature.plan_envelope, roles)
         if fresh is not ReplayFreshness.current:
             raise StalePlan(fresh, feature.plan_envelope.physical_plan_id)
-        return _envelope_join_path(feature.plan_envelope.ordered_path)
+        return _envelope_join_path(
+            feature.plan_envelope.ordered_path,
+            feature.plan_envelope.bridge_realization_dependencies,
+        )
     if len(catalogs) > 1:
         raise CrossCatalogPlanRequired(
             "cross-catalog feature has no governed plan envelope; regenerate under the governed planner")

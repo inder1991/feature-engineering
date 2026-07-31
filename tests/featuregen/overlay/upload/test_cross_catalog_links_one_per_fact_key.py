@@ -28,6 +28,7 @@ import json
 from datetime import UTC, datetime
 from itertools import permutations
 
+from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 from tests.featuregen.overlay.upload.test_bridge_orientation_identity import (
     bridge_candidate,
     reject,
@@ -171,9 +172,17 @@ def test_the_merge_is_order_independent_by_construction(db):
 
 
 def test_two_genuinely_different_bridges_are_not_merged(db):
-    """The merge is keyed by fact_key, so it can only ever collapse rows that ARE one bridge."""
+    """The merge is keyed by fact_key, so it can only ever collapse rows that ARE one bridge.
+
+    The second bridge carries a real VERIFIED overlay stream: under the lifecycle allow-list an
+    edge row with NO governed stream is correctly invisible (missing stream -> unavailable), so a
+    bare synthetic row would test the fail-closed rule, not the merge."""
     key = _seed_contradictory_pair(db, forward_first=True)
     other = "f" * 64
+    govern_bridge_fact(
+        db, other, entity="account", left_source="core",
+        left_ref="public.accounts.account_id", right_source="crm",
+        right_ref="public.acct.acct_id", status="VERIFIED")
     db.execute("INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, "
                "  left_object_ref, right_catalog_source, right_object_ref, status) "
                "VALUES (%s,'account','core','public.accounts.account_id','crm',"

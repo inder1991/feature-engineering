@@ -193,7 +193,7 @@ def _compiled_plan(*, declaration_status, contract_resolution_status, contract_r
 def test_version_split_keeps_physical_id_stable():
     # PHYSICAL_PLAN_VERSION freezes the physical material; PLAN_CONTRACT_VERSION may bump freely.
     assert c.PHYSICAL_PLAN_VERSION == "3b3b.1.0.0"
-    assert c.PLAN_CONTRACT_VERSION == "3b3c.1.0.0"
+    assert c.PLAN_CONTRACT_VERSION == "3b3c.2.0.0"
     seg = c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core")
     p = c.make_binding_plan(recipe_id="t", target_entity="cust", catalog_source="core",
         ingredient_bindings=(), path_segments=(seg,),

@@ -16,12 +16,9 @@ while a sample that finds none proves nothing.
 """
 from __future__ import annotations
 
-import pytest
+from dataclasses import replace
 
-from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
-from featuregen.data_agent.profile_policy import ProfilePolicyV1
-from featuregen.data_agent.relationship import RelationshipProbeV1, observe_relationship
-from featuregen.data_agent.sql_postgres import PostgresDialect
+import pytest
 from tests.featuregen.data_agent.pilot_fixture import (
     CUSTOMER_SCHEMA,
     CUSTOMER_TABLE,
@@ -30,6 +27,11 @@ from tests.featuregen.data_agent.pilot_fixture import (
     TRANSACTION_TABLE,
     create_pilot_tables,
 )
+
+from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+from featuregen.data_agent.profile_policy import ProfilePolicyV1
+from featuregen.data_agent.relationship import RelationshipProbeV1, observe_relationship
+from featuregen.data_agent.sql_postgres import PostgresDialect
 
 
 @pytest.fixture
@@ -89,11 +91,21 @@ def test_referential_coverage_finds_the_unmatched_key(pilot):
 
 
 def test_the_observed_join_multiplier(pilot):
-    """How many left rows a single right row attracts. This is the fan-out fact, measured rather
-    than declared."""
+    """Source frequency is not join fan-out: six transactions still match one customer row each."""
     e = _run(pilot)
-    assert e.max_left_rows_per_right_key == EXPECTED["max_rows_per_customer"] == 6   # C1 and C3 both reach 6 raw rows
+    assert e.max_left_rows_per_tuple == EXPECTED["max_rows_per_customer"] == 6
+    assert e.max_right_matches_per_left_row == 1
     assert e.observed_cardinality == "many_to_one"
+
+
+def test_relationship_evidence_is_pinned_to_both_binding_revisions(pilot):
+    probe = _probe()
+    evidence = _run(pilot, probe)
+
+    assert evidence.left_binding_revision_id == probe.left_binding.binding_revision_id
+    assert evidence.left_binding_content_hash == probe.left_binding.content_hash
+    assert evidence.right_binding_revision_id == probe.right_binding.binding_revision_id
+    assert evidence.right_binding_content_hash == probe.right_binding.content_hash
 
 
 # ── what the evidence may and may not support ────────────────────────────────────────────────────
@@ -113,7 +125,12 @@ def test_a_sample_that_finds_a_duplicate_DISPROVES_uniqueness(pilot):
 def test_a_sample_that_finds_no_duplicate_proves_NOTHING(pilot):
     """The rule automatic attestation rests on. An approximate probe seeing no duplicate must return
     `unknown`, never `unique` — otherwise a cheap profile silently promotes a bad key."""
-    e = _run(pilot, _probe(policy=ProfilePolicyV1(exact_distinct=False)))
+    # PostgreSQL executes the V2 group probe exactly even when approximation was requested. Model
+    # a genuinely approximate engine result explicitly; the verdict is about evidence semantics.
+    e = replace(
+        _run(pilot, _probe(policy=ProfilePolicyV1(exact_distinct=False))),
+        method="approximate",
+    )
     assert e.method == "approximate"
     assert e.uniqueness_verdict("right") == "unknown"
 

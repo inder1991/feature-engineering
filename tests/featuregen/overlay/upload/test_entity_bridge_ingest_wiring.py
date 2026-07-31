@@ -27,10 +27,14 @@ from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_propose import propose_bridge
+from featuregen.overlay.upload.bridge_store import withdraw_missing_candidate_assessments
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 from featuregen.overlay.upload.ingest import entity_bridges_enabled, ingest_upload
+from featuregen.overlay.upload.stage_report import StageRecorder
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+from featuregen.projections.runner import projection_lag
 
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
@@ -152,7 +156,10 @@ def test_a_failure_in_the_stage_does_not_fail_the_upload(db, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("derivation exploded")
 
-    monkeypatch.setattr("featuregen.overlay.upload.ingest.derive_bridge_candidates", boom)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.ingest.derive_bridge_candidates_with_report",
+        boom,
+    )
     result = _trigger(db)
     assert result.status == "ingested"
     assert _ledger(db) == []
@@ -165,6 +172,172 @@ def test_the_count_is_reported_on_the_result(db, monkeypatch):
     _seed_two_catalogs(db)
     result = _trigger(db)
     assert result.entity_bridges_proposed == 1
+    assert result.entity_bridge_candidates_considered == 1
+    assert result.entity_bridge_candidates_retained == 1
+    assert result.entity_bridge_candidates_suppressed == 0
+    assert result.entity_bridge_candidates_truncated == 0
+
+
+def test_bridge_proposals_do_not_leave_the_governed_projection_lagged(db, monkeypatch):
+    """The bridge stage runs after the ordinary ingest drain because it needs the freshly
+    re-projected grain facts.  Its DRAFT events must still be drained before the upload returns:
+    catalog readiness fails closed on *global* overlay lag, so leaving even one bridge event behind
+    makes every role on every uploaded column appear unavailable."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+
+    _trigger(db)
+
+    assert _ledger(db), "precondition: the trigger proposed a bridge"
+    assert projection_lag(db, "overlay") == 0
+
+
+def test_reingest_withdraws_suppressed_candidates_and_reappearance_reactivates_them(
+    db, monkeypatch
+):
+    """The current shortlist must follow the latest graph, not accumulate every historical
+    proposal forever.  Withdrawal changes only the current pointer: immutable assessment/event
+    history remains and the same candidate can become current again."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    _trigger(db)
+    candidate_id = derive_bridge_candidates(db)[0].candidate_id
+    assert len(cross_catalog_links(db)) == 1
+    original_task = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()
+    assert original_task is not None
+
+    db.execute(
+        "UPDATE graph_node SET concept='unrelated_identifier' "
+        "WHERE catalog_source='cat_b' AND column_name='cif_id'"
+    )
+    run_id = _open_run(db, "ingrun_withdraw_bridge", _actor())
+    recorder = StageRecorder()
+    ingest_upload(
+        db,
+        "cat_c",
+        _rows("cat_c", "other", "some_id"),
+        actor=_actor(),
+        now=_NOW,
+        ingestion_run_id=run_id,
+        stage_recorder=recorder,
+    )
+
+    assert cross_catalog_links(db) == ()
+    lifecycle = db.execute(
+        "SELECT lifecycle FROM governed_candidate_current WHERE candidate_id=%s",
+        (candidate_id,),
+    ).fetchone()
+    assert lifecycle == ("withdrawn",)
+    stage = next(item for item in recorder.reports if item.stage == "entity_bridges")
+    assert stage.detail is not None
+    assert stage.detail["withdrawn_count"] == 1
+    assert stage.detail["withdrawn_realization_count"] == 0
+    assert stage.detail["superseded_review_task_count"] == 1
+    assert db.execute(
+        "SELECT status FROM human_tasks WHERE task_id=%s",
+        (original_task[0],),
+    ).fetchone() == ("superseded",)
+    assert db.execute(
+        "SELECT count(*) FROM human_tasks WHERE status='open'"
+    ).fetchone()[0] == 0
+
+    db.execute(
+        "UPDATE graph_node SET concept='customer_id' "
+        "WHERE catalog_source='cat_b' AND column_name='cif_id'"
+    )
+    _trigger(db)
+
+    assert len(cross_catalog_links(db)) == 1
+    lifecycle = db.execute(
+        "SELECT lifecycle FROM governed_candidate_current WHERE candidate_id=%s",
+        (candidate_id,),
+    ).fetchone()
+    assert lifecycle == ("active",)
+    new_task = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()
+    assert new_task is not None
+    assert new_task[0] != original_task[0]
+
+
+def test_reconciliation_supersedes_tasks_left_by_an_already_withdrawn_pointer(
+    db, monkeypatch
+):
+    """Deploy-time repair: BUG 3 shipped before BUG 4, so a pointer can already be withdrawn while
+    its old task is still open. Reconciliation must repair that state without a catalog re-upload."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    _trigger(db)
+    candidate_id = derive_bridge_candidates(db)[0].candidate_id
+    task_id = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE governed_candidate_current SET lifecycle='withdrawn' "
+        "WHERE candidate_id=%s",
+        (candidate_id,),
+    )
+
+    result = withdraw_missing_candidate_assessments(db, frozenset())
+
+    assert result == (0, 0, 1)
+    assert db.execute(
+        "SELECT status FROM human_tasks WHERE task_id=%s",
+        (task_id,),
+    ).fetchone() == ("superseded",)
+
+
+def test_withdrawn_candidate_revision_cannot_cancel_its_active_semantic_replacement(
+    db, monkeypatch
+):
+    """Candidate identity is revision-local, but review belongs to the stable semantic fact.
+
+    A derivation-version change can replace a candidate id while retaining the same bridge
+    ``fact_key``.  The withdrawn historical id must not cancel the active replacement's review
+    task merely because both revisions name the same semantic link.
+    """
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    _trigger(db)
+    active_candidate_id = derive_bridge_candidates(db)[0].candidate_id
+    active_task_id = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO governed_candidate_identity "
+        "(candidate_id, candidate_family, logical_identity_json) "
+        "SELECT 'historical-candidate', candidate_family, logical_identity_json "
+        "FROM governed_candidate_identity WHERE candidate_id=%s",
+        (active_candidate_id,),
+    )
+    db.execute(
+        "INSERT INTO governed_candidate_revision "
+        "(candidate_revision_id, candidate_id, assessment_json, assessment_version) "
+        "SELECT 'historical-revision', 'historical-candidate', assessment_json, "
+        "       assessment_version "
+        "FROM governed_candidate_revision "
+        "WHERE candidate_revision_id=("
+        "  SELECT candidate_revision_id FROM governed_candidate_current WHERE candidate_id=%s"
+        ")",
+        (active_candidate_id,),
+    )
+    db.execute(
+        "INSERT INTO governed_candidate_current "
+        "(candidate_id, candidate_revision_id, pointer_version, lifecycle) "
+        "VALUES ('historical-candidate', 'historical-revision', 1, 'withdrawn')"
+    )
+
+    result = withdraw_missing_candidate_assessments(
+        db, frozenset({active_candidate_id})
+    )
+
+    assert result == (0, 0, 0)
+    assert db.execute(
+        "SELECT status FROM human_tasks WHERE task_id=%s",
+        (active_task_id,),
+    ).fetchone() == ("open",)
 
 
 # ── who proposes: the SYSTEM, never the uploading human ──────────────────────────────────────────
@@ -299,3 +472,7 @@ def test_flag_off_reports_zero(db, monkeypatch, flag):
     _seed_two_catalogs(db)
     result = _trigger(db)
     assert result.entity_bridges_proposed == 0
+    assert result.entity_bridge_candidates_considered == 0
+    assert result.entity_bridge_candidates_retained == 0
+    assert result.entity_bridge_candidates_suppressed == 0
+    assert result.entity_bridge_candidates_truncated == 0

@@ -253,29 +253,16 @@ def test_an_unreviewed_relationship_is_presented_as_available_for_use(seeded):
     assert bridge["state_code"] == "unreviewed_available"
 
 
-def test_production_eligibility_is_reported_independently_of_review(seeded):
-    """The seeded bridge is UNREVIEWED and automatically validated at the same time — which is the
-    product point: review does not gate production, automatic validation of the directional
-    realization does. What licenses the automatic half is the GOVERNED grain of `crm.customers`,
-    confirmed here through the real four-eyes flow: `crm`'s endpoint column is that whole grain, so
-    the compiler resolves the same crossing as `bridge_far_grain`."""
-    _verify_grain(seeded["conn"], "crm", "customers", ["customer_id"])
+def test_production_eligibility_requires_a_directional_realization_not_a_grain_flag(seeded):
+    """The seeded bridge is unreviewed and has grain-shaped proposal evidence — including a grain a
+    human could VERIFY — but no typed directional realization. Metadata alone must not be presented
+    as production validation: the realization model supersedes the interim grain-derived rule, so
+    the wire says "Not evaluated", never "Automatically validated"."""
     body = _get(seeded["client"]).json()
     bridge = next(i for i in body["items"] if i["kind"] == "entity_bridge")
     assert bridge["state_code"] == "unreviewed_available"
-    assert bridge["production_eligibility"] == "Automatically validated for production"
-    assert bridge["production_eligibility_code"] == "grain_resolved"
-
-
-def test_an_uploaders_own_is_grain_flag_is_never_production_validation_over_the_wire(seeded):
-    """The OVER-CLAIM, at the wire. Both endpoints are `is_grain` in their own uploads and no grain
-    fact is VERIFIED, so the screen must read "sandbox only" — the response used to say
-    "Automatically validated for production" while the compiler refused the identical crossing as
-    `bridge_unattested`."""
-    body = _get(seeded["client"]).json()
-    bridge = next(i for i in body["items"] if i["kind"] == "entity_bridge")
-    assert bridge["production_eligibility"] == "Cardinality unresolved — sandbox only"
-    assert bridge["production_eligibility_code"] == "cardinality_unresolved"
+    assert bridge["production_eligibility"] == "Not evaluated"
+    assert bridge["production_eligibility_code"] == "not_evaluated"
 
 
 # ── Usage: never zero when it cannot measure ──────────────────────────────────────────────────────

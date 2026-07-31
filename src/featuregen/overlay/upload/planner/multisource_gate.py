@@ -9,9 +9,10 @@ the CLEAN (correctness) population against the spec §10 criteria:
      shapes each RESOLVE (a reject-everything assembler FAILS: positives MUST resolve).
   2. ZERO operand substitution/loss — every intent operand (incl. ordered slots) survives on the
      resolved plan exactly once, its pin + per-slot ``path_strategy`` preserved verbatim.
-  3. ZERO non-governed crossings/endpoints in a resolve — every operand path carries governed
-     endpoints (each a VERIFIED grain fact), asserted on the persisted ``governed_endpoints`` evidence
-     (a VERIFIED-only frontier implies governed crossings; the endpoints are asserted directly).
+  3. ZERO hidden/unknown crossings or endpoints in a resolve — every operand path carries governed
+     endpoints and every crossing is classified as either a visible sandbox provisional bridge, an
+     exact deterministically-validated bridge realization, or an approved/declared intra-catalog
+     realization.
   4. ONE physical grain — every operand's landing endpoint IS the plan's single ``physical_landing``.
   5. Correct per-path aggregation/temporal — the persisted ``path_strategy`` matches the authored one
      (a ``take_latest`` slot carries its ordering anchor).
@@ -60,10 +61,16 @@ from featuregen.overlay.upload.planner.multisource_shadow_store import (
 _DEFAULT_RUN_IDS = ("mgate_run_a", "mgate_run_b")
 _DEFAULT_ROLES = ("feature_engineer",)
 
-# Criterion (3), I-1: the crossing authorities that count as GOVERNED — a VERIFIED entity_bridge or an
-# approved/declared intra-catalog realization. An ``inferred_join`` / ``unverified`` crossing is NOT
-# governed; a resolved plan carrying one fails the gate on the PERSISTED crossings evidence.
-_GOVERNED_CROSSING_AUTHORITIES = frozenset({"verified", "approved_join", "declared_join"})
+# Criterion (3), I-1 is for the SHADOW/SANDBOX assembly gate, not production execution. A visible
+# provisional bridge is admissible here because downstream execution must run the relationship
+# gate. Production authorization instead requires ``deterministically_validated``. Human review's
+# old ``verified`` label is intentionally absent: endorsement is neither one of those properties.
+_ADMISSIBLE_SHADOW_CROSSING_AUTHORITIES = frozenset({
+    "provisional",
+    "deterministically_validated",
+    "approved_join",
+    "declared_join",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +238,7 @@ def evaluate_gate_over_runs(telemetry_conn, *, run_ids: Sequence[str],
                 # of a resolved plan must be a governed authority (VERIFIED bridge / approved-or-declared
                 # realization). This is backed by persisted telemetry, not only the endpoint grain-facts.
                 for cr in (o.get("crossings") or []):
-                    if cr.get("authority") not in _GOVERNED_CROSSING_AUTHORITIES:
+                    if cr.get("authority") not in _ADMISSIBLE_SHADOW_CROSSING_AUTHORITIES:
                         endpoints_ok = False
                         failures.append(
                             f"non-governed crossing run={rid} case={case.case_id} "

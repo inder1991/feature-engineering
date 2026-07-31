@@ -233,7 +233,11 @@ def test_upload_response_body_unchanged_by_run_manifest(client):
                                  "passb_proposed", "passb_abstained",
                                  "semantic_binding_candidates", "semantic_binding_proposed",
                                  "semantic_binding_abstained", "semantic_binding_failed",
-                                 "entity_bridges_proposed"]
+                                 "entity_bridges_proposed",
+                                 "entity_bridge_candidates_considered",
+                                 "entity_bridge_candidates_retained",
+                                 "entity_bridge_candidates_suppressed",
+                                 "entity_bridge_candidates_truncated"]
     run_id = res.headers["X-Ingestion-Run-Id"]
     assert run_id.encode() not in res.content
 
@@ -255,7 +259,11 @@ def test_upload_response_body_byte_identical_with_stage_reports(client):
         "facts_asserted": 4, "join_candidates": 0, "passb_proposed": 0, "passb_abstained": 0,
         "semantic_binding_candidates": 0, "semantic_binding_proposed": 0,
         "semantic_binding_abstained": 0, "semantic_binding_failed": 0,
-        "entity_bridges_proposed": 0}
+        "entity_bridges_proposed": 0,
+        "entity_bridge_candidates_considered": 0,
+        "entity_bridge_candidates_retained": 0,
+        "entity_bridge_candidates_suppressed": 0,
+        "entity_bridge_candidates_truncated": 0}
     assert res.content == json.dumps(
         expected, separators=(",", ":"), ensure_ascii=False).encode()
 

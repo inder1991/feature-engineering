@@ -49,7 +49,7 @@ from featuregen.materialize.inventory import (
     TableLayout,
     VerifiedUnpartitioned,
 )
-from featuregen.materialize.ir import ir_hash
+from featuregen.materialize.ir import BridgeExecutionAuthorization, ir_hash
 from featuregen.materialize.render import nodes_compute
 from featuregen.materialize.render.project import REQUIRED_RUN_PARAMETERS
 from featuregen.materialize.runprep import (
@@ -557,15 +557,64 @@ def _rendered():
         group_plan_hash="plan-0001"), FILES).identity
 
 
+def _cross_rendered():
+    return seal_project(CompilationIdentity(
+        formula_content_hashes=("formula-sum",),
+        ir_hashes=("ir-sum",),
+        materialization_contract_hash="contract-0001",
+        group_plan_hash="plan-0001",
+        bridge_realization_dependencies=(("brr-0001", "brds-0001"),),
+    ), FILES).identity
+
+
 def _prepared(*, business_dt=BUSINESS_DT, generation_id="gen-0001", run_id="run-0001",
-              layout=None, staging_base="hdfs://nn/staging", requests=None):
+              layout=None, staging_base="hdfs://nn/staging", requests=None, rendered=None, **kwargs):
     layout = _layout(_event_mapping()) if layout is None else layout
     return prepare_run(
-        _rendered(), _inventory(layout), _Metastore(),
+        _rendered() if rendered is None else rendered, _inventory(layout), _Metastore(),
         generation_id=generation_id, run_id=run_id, business_dt=business_dt,
         requests=(_request(_requirement(layout), pit=_pit(length=30)),) if requests is None
         else requests,
-        staging_base=staging_base, capability_attestation_id="att-0001")
+        staging_base=staging_base, capability_attestation_id="att-0001", **kwargs)
+
+
+def test_cross_catalog_run_requires_exact_final_bridge_authorization() -> None:
+    rendered = _cross_rendered()
+    refused = _prepared(rendered=rendered)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+
+    mismatched = BridgeExecutionAuthorization(
+        ir_hashes=("ir-sum",),
+        environment_id="hdfc-local",
+        realization_dependencies=(("brr-other", "brds-0001"),),
+    )
+    refused = _prepared(rendered=rendered, bridge_authorization=mismatched)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+
+    exact = BridgeExecutionAuthorization(
+        ir_hashes=("ir-sum",),
+        environment_id="hdfc-local",
+        realization_dependencies=(("brr-0001", "brds-0001"),),
+    )
+    assert isinstance(
+        _prepared(rendered=rendered, bridge_authorization=exact),
+        runprep.RunPreparation,
+    )
+
+
+def test_additional_rendered_parameters_enter_the_execution_hash() -> None:
+    required = (*REQUIRED_RUN_PARAMETERS, "bridge_predicate_values")
+    first = _ok(_prepared(
+        additional_parameters={"bridge_predicate_values": {"tenant_id": "A"}},
+        required_parameters=required,
+    ))
+    second = _ok(_prepared(
+        additional_parameters={"bridge_predicate_values": {"tenant_id": "B"}},
+        required_parameters=required,
+    ))
+    assert first.sandbox_execution_hash != second.sandbox_execution_hash
 
 
 def test_execution_hash_DOES_change_with_business_dt() -> None:

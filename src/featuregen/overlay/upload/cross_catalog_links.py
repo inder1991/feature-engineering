@@ -1,8 +1,11 @@
-"""Cross-catalog links — the SAME business entity in two catalogs, confirmed or not.
+"""Discoverable cross-catalog links — the SAME business entity in two catalogs, confirmed or not.
 
-The one read model every consumer should use: the asset screen, feature generation, and the data
-agents. It returns candidates AND verified edges together, each carrying its own status, so a caller
-RANKS rather than being barred.
+The one AVAILABLE-LINK read model used by search, asset/lineage screens, review queues, feature
+suggestion and provisional data-agent planning. It returns candidates AND verified edges together,
+each carrying its own status, so a discovery caller RANKS rather than being barred. Production
+analysis and materialization must instead consume
+``bridge_store.executable_bridge_realizations``: availability says a relationship may be
+considered; an exact directional realization says a particular join is safe to execute.
 
 **Why this exists.** The platform gated hard on confirmation. ``entity_bridge_edge`` holds VERIFIED
 bridges only and is the only thing ``planner/multisource_compile``, ``analysis/grounding`` and
@@ -51,6 +54,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from featuregen.overlay.identity import CatalogObjectRef, canonical_bridge_endpoints
+from featuregen.overlay.upload.bridge_assessment import (
+    LinkAvailability,
+    LinkReviewStatus,
+    read_overlay_identifier_link_state,
+)
+from featuregen.overlay.upload.bridge_store import bridge_candidate_currentness
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +68,8 @@ class LinkStatus(StrEnum):
     #: A human has endorsed the semantic relationship. An annotation — never required, and never
     #: enough on its own to outrank a link the platform measured to be safer.
     CONFIRMED = "confirmed"
-    #: Derived and proposed, nobody has reviewed it. Fully usable.
+    #: Derived and proposed, nobody has reviewed it. Available to discovery; production execution
+    #: still requires a current deterministically-validated directional realization.
     PROPOSED = "proposed"
 
 
@@ -118,9 +128,11 @@ class CrossCatalogLink:
 
     @property
     def usable(self) -> bool:
-        """Always true for a link that is RETURNED — availability is decided before construction,
-        by the lifecycle allow-list, and never by ``status``. Present so a caller reads intent
-        rather than inferring it: confirmation annotates, it does not gate."""
+        """Always true for DISCOVERY after the lifecycle allow-list.
+
+        This compatibility property is not production execution authority. A production consumer
+        must resolve a current deterministically-validated directional realization.
+        """
         return True
 
     @property
@@ -292,7 +304,7 @@ def bridge_lifecycle(conn, fact_key: str | None, *,
     platform can consider a link, nor whether a review actually happened. A decision must take
     effect the moment it is made, not once a projector catches up.
 
-    Three resolutions that are NOT the fold, each deliberate:
+    Two resolutions that are NOT the fold, each deliberate:
 
     * **no fact_key** -> ``UNGOVERNED``. ``entity_bridge_candidate_evidence.fact_key`` is NULLable,
       so a ledger row can name no governed fact. Under an allow-list there is nothing to read and so
@@ -302,42 +314,18 @@ def bridge_lifecycle(conn, fact_key: str | None, *,
       here, i.e. served a link whose governance state it could not read — which also made a REJECTED
       bridge behind a failing read indistinguishable from a sound one. A blank list is a visible,
       diagnosable outage; silently serving ungoverned joins is not.
-    * **empty stream + a VERIFIED projection row** -> VERIFIED. The one place absence is allowed,
-      and only because the ROW ITSELF is a positive reading: ``project_verified_bridge`` writes it
-      ONLY under a VERIFIED fold and ``demote_bridge_edges`` removes it on every exit from VERIFIED.
-      ``multisource_gold`` and the planner fixtures seed bridges this way. An empty stream with no
-      such row is ``UNGOVERNED`` — absence of a governance record is not evidence of a benign one.
-      This is the ONLY use the projection has here, and it is a fallback for an ABSENT stream: a row
-      can never override a stream that folded.
 
-    ``projected_verified`` lets a caller that already knows the projection state pass it in rather
-    than provoke a per-link query; ``None`` means "look it up".
+    ``projected_verified`` remains only for source compatibility with baseline callers. It is
+    deliberately ignored. A rebuildable projection can lag or survive failed cleanup, so it may
+    carry audit detail but can never replace a missing authoritative event stream.
     """
+    del projected_verified
     if not fact_key:
         return BridgeLifecycleV1(UNGOVERNED, {})
-    from featuregen.overlay import store
-    from featuregen.overlay.state import fold_overlay_state
-    try:
-        folded = fold_overlay_state(store.load_fact(conn, fact_key))
-    except Exception:  # noqa: BLE001 — fail CLOSED: an unreadable lifecycle is not an available link
-        logger.warning("bridge lifecycle unreadable, treating as unavailable: %s", fact_key,
-                       exc_info=True)
+    state = read_overlay_identifier_link_state(conn, fact_key)
+    if state.folded_status is None:
         return BridgeLifecycleV1(UNREADABLE, {})
-    # Every UNAVAILABLE state moves the value to `prior_value`, so `value` is empty exactly where
-    # the caller is about to discard the reading anyway.
-    value = folded.value if isinstance(folded.value, Mapping) else {}
-    if folded.status:
-        return BridgeLifecycleV1(folded.status, value)
-    if projected_verified is None:
-        try:
-            projected_verified = conn.execute(
-                "SELECT 1 FROM entity_bridge_edge WHERE fact_key = %s AND status = 'VERIFIED'",
-                (fact_key,)).fetchone() is not None
-        except Exception:  # noqa: BLE001 — same fail-closed rule for the fallback read
-            logger.warning("bridge projection unreadable, treating as unavailable: %s", fact_key,
-                           exc_info=True)
-            return BridgeLifecycleV1(UNREADABLE, {})
-    return BridgeLifecycleV1(REVIEWED_STATUS if projected_verified else UNGOVERNED, value)
+    return BridgeLifecycleV1(state.folded_status.value, state.governed_value)
 
 
 def bridge_lifecycle_status(conn, fact_key: str | None, *,
@@ -401,9 +389,15 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     # one of them being picked. See `ledger_evidence_by_fact_key`.
     out: list[CrossCatalogLink] = []
     for key, ev in sorted(ledger_evidence_by_fact_key(conn).items()):
+        # Candidate currentness is a SECOND gate beside the overlay lifecycle: a withdrawn or
+        # superseded candidate revision stays out of the visible set even while its generic
+        # overlay fact is technically available (the branch's governed_candidate_current
+        # 'active'-only semantics, applied per key since the merged read cannot join it).
+        if bridge_candidate_currentness(conn, key) is False:
+            continue
         # ONE fold answers both questions, and neither is answered by the projection row.
-        status = bridge_lifecycle_status(conn, key, projected_verified=key in verified)
-        if status not in AVAILABLE_STATUSES:
+        lifecycle = read_overlay_identifier_link_state(conn, key)
+        if lifecycle.availability is not LinkAvailability.AVAILABLE:
             continue
         if object_ref is not None:
             want = object_ref.strip().lower()
@@ -413,7 +407,7 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
         # counts, and one recorded as grain then is not demoted by a read-scoped miss now.
         left_grain = (ev.left_catalog_source, ev.left_object_ref) in grain or ev.left_is_grain
         right_grain = (ev.right_catalog_source, ev.right_object_ref) in grain or ev.right_is_grain
-        confirmed = status == REVIEWED_STATUS
+        confirmed = lifecycle.review_status is LinkReviewStatus.HUMAN_VERIFIED
         out.append(CrossCatalogLink(
             entity_id=ev.entity_id, left_catalog_source=ev.left_catalog_source,
             left_object_ref=ev.left_object_ref, right_catalog_source=ev.right_catalog_source,
@@ -426,17 +420,19 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     # Edge rows with no candidate row — never derived here, or derived before the ledger existed.
     # They must not be lost. Their REVIEW status is folded like every other link's, not assumed from
     # the row: a row whose stream has since fallen back to DRAFT is an available, unreviewed link.
-    seen = {l.fact_key for l in out}
+    seen = {link.fact_key for link in out}
     for key, (entity, l_src, l_ref, r_src, r_ref) in verified.items():
         if key in seen:
             continue
-        status = bridge_lifecycle_status(conn, key, projected_verified=True)
-        if status not in AVAILABLE_STATUSES:
+        if bridge_candidate_currentness(conn, key) is False:
+            continue
+        lifecycle = read_overlay_identifier_link_state(conn, key)
+        if lifecycle.availability is not LinkAvailability.AVAILABLE:
             continue
         if object_ref is not None and object_ref.strip().lower() not in (
                 str(l_ref).lower(), str(r_ref).lower()):
             continue
-        confirmed = status == REVIEWED_STATUS
+        confirmed = lifecycle.review_status is LinkReviewStatus.HUMAN_VERIFIED
         out.append(CrossCatalogLink(
             entity_id=entity, left_catalog_source=l_src, left_object_ref=l_ref,
             right_catalog_source=r_src, right_object_ref=r_ref,

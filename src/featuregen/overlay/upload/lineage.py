@@ -9,9 +9,9 @@ features and consumers hang off its columns. Three layers, each independently to
              find_join_path). A declared target not loaded in this catalog renders as a
              resolved=false stub node plus a resolved=false edge: pending joins are data,
              not errors.
-  entity   — CROSS-catalog entity bridges (columns sharing graph_node.entity, the machinery
-             behind entity.py's cross-catalog paths). Bridges are declared/entity-resolved,
-             never value-verified, so bridge edges are always resolved=false.
+  entity   — CROSS-catalog entity relationships. Advisory entity matches, governed identifier
+             links and executable directional realizations are explicitly distinguished; human
+             review and automatic execution safety are separate fields.
   features — feature_derives_from (column -> feature) and feature_consumer (feature ->
              consumer). The only DIRECTED layer: `direction` gates it (down = toward features
              and consumers, up = from a feature back to its source columns). Joins and entity
@@ -159,6 +159,8 @@ class _Builder:
         self._wm: dict[str, datetime | None] = {}               # per-source drift watermark (cached)
         self._as_of: dict[tuple[str, str], tuple[str | None, str | None]] = {}  # (source, table) -> (as-of col, basis)
         self._table_cols: dict[tuple[str, str], list[str]] = {}  # (source, table) -> visible col refs
+        self.roles = tuple(roles)
+        self._realization_views: dict[str, list[dict]] | None = None
 
     # ---- traversal -------------------------------------------------------------------------
     def run(self, anchor_unit: _Unit, depth: int) -> None:
@@ -387,7 +389,12 @@ class _Builder:
                 (entity, source, self.allowed)).fetchall()
             for p_source, p_table, p_ref in partners:
                 edge = {"from": f"{source}:{key_ref}", "to": f"{p_source}:{p_ref}",
-                        "layer": "entity", "kind": "entity_bridge", "resolved": False}
+                        "layer": "entity", "kind": "entity_bridge",
+                        "trust_kind": "advisory_lineage",
+                        "endpoint_resolved": True,
+                        "link_review_status": "not_governed",
+                        "realization_safety_status": "not_evaluated",
+                        "execution_eligible": False}
                 out.append((("table", p_source, p_table), None, edge))
         out.extend(self._expand_derived_bridges(unit))
         return out
@@ -401,7 +408,8 @@ class _Builder:
         produced an edge here, and clicking Graph on a linked column drew nothing.
 
         The links are not in doubt; they are in the ledger. Read them. Shown whether or not a human
-        confirmed one — confirmation annotates, it does not gate — with ``resolved`` saying which.
+        confirmed one — confirmation annotates, it does not gate. The old ``resolved`` field fused
+        endpoint existence with review and execution; this path emits all three explicitly.
 
         READ-SCOPE is preserved exactly as the entity path preserves it: the partner column must be
         visible to THIS caller, or a bridge would become an existence oracle for a column the caller
@@ -445,10 +453,24 @@ class _Builder:
             if (near_ref, far_src, far_ref) in seen:
                 continue
             seen.add((near_ref, far_src, far_ref))
+            trust = self._bridge_trust(link.fact_key)
             out.append((("table", far_src, far[0]), None, {
                 "from": f"{source}:{near_ref}", "to": f"{far_src}:{far_ref}",
                 "layer": "entity", "kind": "entity_bridge",
-                "resolved": link.status is LinkStatus.CONFIRMED,
+                "trust_kind": (
+                    "executable_realization"
+                    if trust["execution_eligible"]
+                    else "governed_identifier_link"
+                ),
+                "endpoint_resolved": True,
+                "link_review_status": (
+                    "human_verified"
+                    if link.status is LinkStatus.CONFIRMED
+                    else "unreviewed"
+                ),
+                "realization_safety_status": trust["safety_status"],
+                "execution_eligible": trust["execution_eligible"],
+                "cardinality": trust["cardinality_label"],
                 "entity_id": link.entity_id,
                 # Ranking, carried onto the edge so the CANVAS can distinguish a grain-backed link
                 # from a type-only match. Without it `cust_num <-> cif_id` drew identically to
@@ -458,6 +480,32 @@ class _Builder:
                 "why": link.why,
             }))
         return out
+
+    def _bridge_trust(self, fact_key: str | None) -> dict[str, object]:
+        """Current realization truth for one governed link, loaded once for the whole graph."""
+        if self._realization_views is None:
+            from featuregen.overlay.upload.bridge_realization_governance import (
+                list_bridge_realization_views,
+            )
+
+            grouped: dict[str, list[dict]] = {}
+            for view in list_bridge_realization_views(self.conn, roles=self.roles):
+                grouped.setdefault(str(view["bridge_fact_key"]), []).append(view)
+            self._realization_views = grouped
+        views = self._realization_views.get(str(fact_key), [])
+        if not views:
+            return {
+                "safety_status": "not_evaluated",
+                "execution_eligible": False,
+                "cardinality_label": "Not evaluated",
+            }
+        eligible = [view for view in views if view["execution_eligible"]]
+        chosen = eligible[0] if eligible else views[0]
+        return {
+            "safety_status": chosen["safety_status"],
+            "execution_eligible": bool(eligible),
+            "cardinality_label": chosen["cardinality_label"],
+        }
 
     def _expand_derived_features(self, unit: _Unit) -> list[tuple[_Unit | None, dict | None, dict]]:
         """column -> feature over feature_derives_from, from VISIBLE columns only (a read-scoped

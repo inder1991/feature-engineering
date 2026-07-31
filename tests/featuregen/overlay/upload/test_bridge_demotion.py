@@ -42,23 +42,38 @@ load-bearing assertions are the read-gate signature (stale) and the planner cros
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from tests.featuregen._helpers import mint_test_identity
+from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+    _executable_pair,
+    _realization,
+)
 from tests.featuregen.overlay.upload.test_bridge_candidates import _load
 
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay._lifecycle import _cas_target
 from featuregen.overlay.catalog_changes import detect_catalog_changes
-from featuregen.overlay.commands import confirm_fact
+from featuregen.overlay.commands import confirm_fact, reject_fact
 from featuregen.overlay.expiry import fire_due_overlay_expiries
 from featuregen.overlay.identity import EntityBridgeRef, fact_key
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.bridge_assessment import LinkReviewStatus
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_projection import active_bridges, project_verified_bridge
 from featuregen.overlay.upload.bridge_propose import propose_bridge
+from featuregen.overlay.upload.bridge_realization import (
+    BridgeRealizationCurrentV1,
+    RealizationLifecycle,
+    SafetyStatus,
+)
+from featuregen.overlay.upload.bridge_store import (
+    BridgeDependencyRefV1,
+    record_realization_revision,
+)
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.invalidation import _MISSING, _bridge_fact_signature
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
@@ -111,6 +126,15 @@ def _verified_bridge(db) -> tuple[EntityBridgeRef, str]:
     return ref, key
 
 
+def _draft_bridge(db) -> tuple[EntityBridgeRef, str]:
+    ensure_upload_catalog_adapter()
+    _two_catalog_customer(db)
+    candidate = derive_bridge_candidates(db)[0]
+    key = propose_bridge(db, candidate, actor=_ENRICH_ACTOR, now=_NOW)
+    return EntityBridgeRef(
+        candidate.entity_id, candidate.left_ref, candidate.right_ref), key
+
+
 def _snapshot_crm(db, *, rows: list[CanonicalRow]) -> list:
     return detect_catalog_changes(db, UploadCatalog("crm", rows), actor=_actor(), now=_NOW,
                                   open_reverify=False)
@@ -157,6 +181,26 @@ def _edge_rows(db, key: str) -> int:
         "SELECT count(*) FROM entity_bridge_edge WHERE fact_key = %s", (key,)).fetchone()[0]
 
 
+def _store_realization(db, key: str) -> str:
+    left, right = _executable_pair()
+    revision = replace(_realization(left, right), bridge_fact_key=key)
+    current = BridgeRealizationCurrentV1(
+        revision.realization_id,
+        revision.realization_revision_id,
+        SafetyStatus.DETERMINISTICALLY_VALIDATED,
+        LinkReviewStatus.UNREVIEWED,
+        RealizationLifecycle.ACTIVE,
+        1,
+    )
+    record_realization_revision(
+        db,
+        revision,
+        current,
+        dependencies=(BridgeDependencyRefV1("bridge_fact", key, "head-1"),),
+    )
+    return revision.realization_id
+
+
 # ── MUST-SURVIVE control: none of this may fire while the bridge is still VERIFIED ───────────────
 
 def test_control_a_still_verified_bridge_keeps_its_edge_and_is_crossed_as_confirmed(db):
@@ -171,14 +215,48 @@ def test_control_a_still_verified_bridge_keeps_its_edge_and_is_crossed_as_confir
     assert _bridge_fact_signature(db, f"bridgefact:{key}") != _MISSING
 
 
+def test_rejecting_an_available_draft_withdraws_its_realization(db):
+    ref, key = _draft_bridge(db)
+    realization_id = _store_realization(db, key)
+    admin = mint_test_identity(
+        subject="user:admin-reject", role_claims=("platform-admin",))
+    target = _cas_target(fold_overlay_state(load_fact(db, key)))
+    result = reject_fact(
+        db,
+        Command(
+            "reject_fact",
+            "overlay_fact",
+            None,
+            {
+                "ref": ref,
+                "fact_type": "entity_bridge",
+                "target_event_id": target,
+                "reason": "wrong namespace",
+            },
+            admin,
+            f"reject-{target}",
+        ),
+    )
+    assert result.accepted, result.denied_reason
+    assert db.execute(
+        "SELECT lifecycle FROM bridge_join_realization_current WHERE realization_id=%s",
+        (realization_id,),
+    ).fetchone()[0] == "rejected"
+
+
 # ── drift -> STALE ───────────────────────────────────────────────────────────────────────────────
 
 def test_drift_stale_demotes_the_projected_bridge_edge(db):
     _, key = _verified_bridge(db)
+    realization_id = _store_realization(db, key)
     _drift_stale(db)
 
     assert fold_overlay_state(load_fact(db, key)).status == "STALE"
     assert _edge_rows(db, key) == 0
+    assert db.execute(
+        "SELECT lifecycle FROM bridge_join_realization_current WHERE realization_id=%s",
+        (realization_id,),
+    ).fetchone()[0] == "stale"
 
 
 def test_a_drift_staled_bridge_no_longer_reads_as_a_live_governed_sanction(db):
@@ -193,6 +271,27 @@ def test_a_drift_staled_bridge_no_longer_reads_as_a_live_governed_sanction(db):
 
     _drift_stale(db)
 
+    assert _bridge_fact_signature(db, marker) == _MISSING
+
+
+def test_authoritative_stale_state_wins_even_if_projection_cleanup_failed(db):
+    """The read-time gate is independent of the fail-soft projection cleanup. Recreate the exact
+    stale VERIFIED row a failed demotion would leave behind and require the lifecycle fold to win."""
+    _, key = _verified_bridge(db)
+    marker = f"bridgefact:{key}"
+    stale_row = db.execute(
+        "SELECT entity_id,left_catalog_source,left_object_ref,right_catalog_source,right_object_ref "
+        "FROM entity_bridge_edge WHERE fact_key=%s", (key,)).fetchone()
+
+    _drift_stale(db)
+    db.execute(
+        "INSERT INTO entity_bridge_edge "
+        "(fact_key,entity_id,left_catalog_source,left_object_ref,right_catalog_source,"
+        "right_object_ref,status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
+        (key, *stale_row))
+
+    assert fold_overlay_state(load_fact(db, key)).status == "STALE"
+    assert _edge_rows(db, key) == 1, "the fixture must preserve the stale projection leak"
     assert _bridge_fact_signature(db, marker) == _MISSING
 
 
@@ -213,10 +312,15 @@ def test_the_planner_does_not_cross_a_drift_staled_bridge(db):
 
 def test_expiry_demotes_the_projected_bridge_edge(db):
     _, key = _verified_bridge(db)
+    realization_id = _store_realization(db, key)
     _expire(db)
 
     assert fold_overlay_state(load_fact(db, key)).status == "REVERIFY"
     assert _edge_rows(db, key) == 0
+    assert db.execute(
+        "SELECT lifecycle FROM bridge_join_realization_current WHERE realization_id=%s",
+        (realization_id,),
+    ).fetchone()[0] == "stale"
 
 
 def test_the_planner_stops_crossing_an_expired_bridge(db):

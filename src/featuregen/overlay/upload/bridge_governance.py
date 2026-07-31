@@ -58,6 +58,7 @@ from featuregen.overlay.facts import ENTITY_BRIDGE
 from featuregen.overlay.identity import CatalogObjectRef, EntityBridgeRef, _norm, _ref_from_payload
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.bridge_store import bridge_candidate_currentness
 from featuregen.overlay.upload.cross_catalog_links import (
     LedgerEvidenceV1,
     cross_catalog_links,
@@ -299,6 +300,8 @@ def list_bridge_proposals(conn: DbConn, *, source: str | None = None, limit: int
     memo: dict = {}
     views: list[dict] = []
     for key in keys:
+        if bridge_candidate_currentness(conn, key) is False:
+            continue
         try:
             view = _view(conn, key, _evidence(links.get(key), ledger.get(key)), allowed, memo,
                          actor)

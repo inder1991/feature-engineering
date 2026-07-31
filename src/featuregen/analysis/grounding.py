@@ -28,9 +28,11 @@ from featuregen.analysis.plan import (
     GroundedPlan,
     Window,
 )
-from featuregen.overlay.upload.cross_catalog_links import (
-    AVAILABLE_STATUSES,
-    bridge_lifecycle_status,
+from featuregen.overlay.upload.bridge_assessment import (
+    LinkAvailability,
+    LinkReviewStatus,
+    LinkUnavailableReason,
+    read_overlay_identifier_link_state,
 )
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
@@ -223,20 +225,28 @@ def ground_analysis_plan(conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (
     # Availability is enforced where links are actually traversed (`cross_catalog_links`), so this
     # surface can report an unavailable link without becoming a second, divergent gate on it.
     for fact_key in plan.join_refs:
-        status = bridge_lifecycle_status(conn, fact_key)
-        if status == "VERIFIED":
+        lifecycle = read_overlay_identifier_link_state(conn, fact_key)
+        if (
+            lifecycle.availability is LinkAvailability.AVAILABLE
+            and lifecycle.review_status is LinkReviewStatus.HUMAN_VERIFIED
+        ):
             continue
-        if status in AVAILABLE_STATUSES:            # DRAFT / PARTIALLY_CONFIRMED — usable, unreviewed
+        if lifecycle.availability is LinkAvailability.AVAILABLE:
             findings.append(Finding(
                 code="JOIN_IDENTITY_UNCONFIRMED", subject=fact_key,
                 detail=("this answer joins two catalogs on an identifier link no human has "
                         "confirmed"),
                 clears_when="a human confirms the identifier link"))
         else:
+            state = (
+                lifecycle.folded_status.value.lower()
+                if lifecycle.folded_status is not None
+                else LinkUnavailableReason.UNREADABLE.value
+            )
             findings.append(Finding(
                 code="JOIN_IDENTITY_UNAVAILABLE", subject=fact_key,
                 detail=("this answer joins two catalogs on an identifier link the platform will not "
-                        f"consider (governance state: {status.lower()})"),
+                        f"consider (governance state: {state})"),
                 clears_when="the identifier link is re-derived and re-established"))
 
     # ── period-over-period coherence ──────────────────────────────────────────────────────────────

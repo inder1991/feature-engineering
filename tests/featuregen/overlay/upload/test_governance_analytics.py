@@ -161,11 +161,18 @@ def _seed_open_bridge_task(conn):
     """An OPEN entity_bridge gate task via the REAL 3B.2B propose path (propose_fact -> open_task).
     entity_bridge is NOT a dashboard-governed fact type and never lands in ``overlay_proposal``
     (projection.py early-returns it), so its open task sits OUTSIDE the dashboard's enumeration."""
+    # A real bridge proposal now re-checks both catalog endpoints. Seed the minimal identifier
+    # projection this queue test depends on instead of bypassing the production write gate.
+    conn.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name,"
+        " data_type, concept) VALUES "
+        "('src','public.customers.customer_id','column','customers','customer_id','text','customer_id'),"
+        "('src2','public.parties.customer_id','column','parties','customer_id','text','customer_id')")
     ref = EntityBridgeRef(
-        entity_id="party",
-        left_ref=CatalogObjectRef("src", "column", "public", "customers", "party_id"),
-        right_ref=CatalogObjectRef("src2", "column", "public", "parties", "party_id"))
-    value = {"entity_id": "party",
+        entity_id="customer",
+        left_ref=CatalogObjectRef("src", "column", "public", "customers", "customer_id"),
+        right_ref=CatalogObjectRef("src2", "column", "public", "parties", "customer_id"))
+    value = {"entity_id": "customer",
              "left_ref": asdict(ref.left_ref), "right_ref": asdict(ref.right_ref)}
     res = propose_fact(conn, Command(
         "propose_fact", "overlay_fact", None,

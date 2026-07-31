@@ -176,15 +176,18 @@ def _fresh_now(conn, *sources) -> None:
     planner-fixture seeds' hardcoded past date would read as stale) + the applied overlay projection
     checkpoint the compiler's CatalogStateStamp pins (mirrors test_plan._freshness at now)."""
     now = datetime.now(UTC)
+    event_head = conn.execute("SELECT COALESCE(max(global_seq), 0) FROM events").fetchone()[0]
+    applied_head = max(1, event_head)
     for src in sources:
         conn.execute(
             "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id,"
-            " head_seq) VALUES (%s,%s,'t7',1) ON CONFLICT (catalog_source) DO UPDATE SET"
+            " head_seq) VALUES (%s,%s,'t7',%s) ON CONFLICT (catalog_source) DO UPDATE SET"
             " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
-            (src, now))
+            (src, now, applied_head))
     conn.execute(
-        "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES ('overlay', 1)"
-        " ON CONFLICT (projection_name) DO UPDATE SET checkpoint_seq = EXCLUDED.checkpoint_seq")
+        "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES ('overlay', %s)"
+        " ON CONFLICT (projection_name) DO UPDATE SET checkpoint_seq = EXCLUDED.checkpoint_seq",
+        (applied_head,))
 
 
 def _governed_scoped_body() -> dict:

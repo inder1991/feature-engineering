@@ -147,11 +147,13 @@ def _code_string_literals(module: types.ModuleType) -> set[str]:
 # ══ §7 — the two phases are two objects ══════════════════════════════════════════════════════════
 
 
-def test_the_compilation_identity_has_EXACTLY_the_four_fields() -> None:
+def test_the_compilation_identity_has_only_static_compilation_fields() -> None:
     """Pinned with `==`, not `<=`: a superset assertion would let `generated_project_hash` be added
-    back tomorrow, which is precisely the circularity rev 3 shipped."""
+    back tomorrow, which is precisely the circularity rev 3 shipped.  Exact directional bridge
+    dependencies are static compilation inputs and are the final revalidation handle."""
     assert {field.name for field in dataclasses.fields(CompilationIdentity)} == {
-        "formula_content_hashes", "ir_hashes", "materialization_contract_hash", "group_plan_hash"}
+        "formula_content_hashes", "ir_hashes", "materialization_contract_hash", "group_plan_hash",
+        "bridge_realization_dependencies"}
 
 
 def test_the_rendered_identity_is_the_compilation_PLUS_the_project_hash() -> None:
@@ -249,6 +251,23 @@ def test_the_lock_round_trips_the_rendered_identity() -> None:
     second chance to disagree about which key holds the project hash."""
     sealed = _sealed()
     assert read_lock(sealed.files[GENERATED_LOCK_FILENAME]) == sealed.identity
+
+
+def test_cross_catalog_lock_round_trips_exact_bridge_dependencies() -> None:
+    compilation = _compilation(
+        bridge_realization_dependencies=(
+            ("brr-2", "brds-2"),
+            ("brr-1", "brds-1"),
+            ("brr-1", "brds-1"),
+        ),
+    )
+    sealed = seal_project(compilation, FILES)
+    restored = read_lock(sealed.files[GENERATED_LOCK_FILENAME])
+    assert restored == sealed.identity
+    assert restored.compilation.bridge_realization_dependencies == (
+        ("brr-1", "brds-1"),
+        ("brr-2", "brds-2"),
+    )
 
 
 def test_a_lock_missing_the_project_hash_is_refused() -> None:

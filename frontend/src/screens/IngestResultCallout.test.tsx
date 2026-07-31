@@ -213,8 +213,11 @@ describe('MF-5 truthful counts line', () => {
       facts_asserted: 4, join_candidates: 0, passb_proposed: 2, passb_abstained: 1,
     }))
     expect(screen.getByRole('status')).toHaveTextContent(
-      '5 objects stored (2 tables · 3 columns), 3 containment edges, ' +
-        '0 join candidates · Pass B: 2 proposed, 1 abstained',
+      '5 objects stored (2 tables · 3 columns), 3 containment edges · ' +
+        'Pass B: 2 proposed, 1 abstained',
+    )
+    expect(screen.getByTestId('pass-c-join-counts')).toHaveTextContent(
+      'Intra-catalog Pass C: 0 join candidates',
     )
   })
 
@@ -224,8 +227,36 @@ describe('MF-5 truthful counts line', () => {
       facts_asserted: 1, join_candidates: 1, passb_proposed: 0, passb_abstained: 0,
     }))
     expect(screen.getByRole('status')).toHaveTextContent(
-      '2 objects stored (1 table · 1 column), 1 containment edge, ' +
-        '1 join candidate · Pass B: 0 proposed, 0 abstained',
+      '2 objects stored (1 table · 1 column), 1 containment edge · ' +
+        'Pass B: 0 proposed, 0 abstained',
+    )
+    expect(screen.getByTestId('pass-c-join-counts')).toHaveTextContent(
+      'Intra-catalog Pass C: 1 join candidate',
+    )
+  })
+
+  it('separates cross-catalog links from Pass C and makes truncation visible', () => {
+    renderCallout(result({
+      objects_stored: 5,
+      tables: 2,
+      columns: 3,
+      containment_edges: 3,
+      join_candidates: 0,
+      entity_bridge_candidates_considered: 20,
+      entity_bridge_candidates_retained: 7,
+      entity_bridges_proposed: 5,
+      entity_bridge_candidates_suppressed: 2,
+      entity_bridge_candidates_truncated: 11,
+    }))
+    expect(screen.getByTestId('pass-c-join-counts')).toHaveTextContent(
+      'Intra-catalog Pass C: 0 join candidates',
+    )
+    expect(screen.getByTestId('cross-catalog-bridge-counts')).toHaveTextContent(
+      'Cross-catalog identifier links: 20 assessments completed, 7 retained, 5 proposed, '
+        + '2 suppressed',
+    )
+    expect(screen.getByTestId('cross-catalog-bridge-counts')).toHaveTextContent(
+      '11 candidates not evaluated because the bounded shortlist was reached',
     )
   })
 

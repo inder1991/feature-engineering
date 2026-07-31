@@ -200,10 +200,16 @@ def test_entity_bridge_reaches_cross_catalog_table(client):
     assert "cards:public.card_holders.holder_id" in _ids(body)
     assert "cards:public.card_holders.credit_limit" not in _ids(body)
     bridge = next(e for e in body["edges"] if e["kind"] == "entity_bridge")
-    assert bridge["layer"] == "entity" and bridge["resolved"] is False
+    assert bridge["layer"] == "entity"
+    assert "resolved" not in bridge
+    assert bridge["endpoint_resolved"] is True
+    assert bridge["link_review_status"] == "not_governed"
+    assert bridge["realization_safety_status"] == "not_evaluated"
+    assert bridge["execution_eligible"] is False
+    assert bridge["trust_kind"] == "advisory_lineage"
     assert bridge["from"] == "deposits:public.customers.cust_id"
     assert bridge["to"] == "cards:public.card_holders.holder_id"
-    assert "cardinality" not in bridge                             # a bridge declares no fan
+    assert "cardinality" not in bridge                 # an advisory bridge declares no fan-out
 
 
 # ---- pending declared joins ----------------------------------------------------------------

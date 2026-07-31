@@ -9,6 +9,16 @@ import dataclasses
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+    _binding as _physical_binding,
+)
+from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+    _endpoint as _identifier_endpoint,
+)
+from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+    _realization as _bridge_realization,
+)
 
 from featuregen.overlay.config import OverlayConfig
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
@@ -204,6 +214,10 @@ def test_bridge_endpoint_tables_count_as_path_tables(db):
         (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
         (CanonicalRow("crm", "customers", "churn_flag", "text"), "categorical"),
     ])
+    govern_bridge_fact(
+        db, "bridge:customer:c2", entity="customer",
+        left_source="core", left_ref="public.customer_master.customer_id",
+        right_source="crm", right_ref="public.customers.customer_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
         " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
@@ -862,6 +876,10 @@ def _bridge_core_crm(db):
         (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
         (CanonicalRow("crm", "customers", "spend", "numeric"), "monetary_flow"),
     ])
+    govern_bridge_fact(
+        db, "bridge:customer:c4", entity="customer",
+        left_source="core", left_ref="public.accounts.customer_id",
+        right_source="crm", right_ref="public.customers.customer_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
         " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
@@ -884,7 +902,11 @@ def _bridge_rollup_plan():
                                    cardinality="many_to_one"),
             c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
                                    from_entity="account", to_entity="customer",
-                                   bridge_fact_key="bridge:customer:c4"),
+                                   bridge_fact_key="bridge:customer:c4",
+                                   bridge_from_catalog_source="core",
+                                   bridge_from_object_ref="public.accounts.customer_id",
+                                   bridge_to_catalog_source="crm",
+                                   bridge_to_object_ref="public.customers.customer_id"),
         ))
 
 
@@ -937,17 +959,10 @@ def _grain_fact_row(db, source, table):
         (_fk(table_ref(source, table), "grain"),)).fetchone()
 
 
-# ── TIER 2: many_to_one DERIVED from the far table's governed grain ──────────────────────────────
-def test_bridge_rollup_hop_derives_many_to_one_from_the_far_governed_grain(
+# ── Task 9: only an exact directional realization may establish bridge cardinality ───────────────
+def test_far_governed_grain_alone_does_not_authorize_bridge_cardinality(
         db, service_actor, human_actor):
-    """THE DERIVATION. The hop lands on ``crm.customers.customer_id``, and a VERIFIED grain fact says
-    that column — all of it, nothing else — identifies rows of ``crm.customers``. So at most one far
-    row exists per key value and the hop IS many_to_one. That is derived from evidence, not assumed:
-    the same plan over the same bridge resolves UNKNOWN in every neighbouring test where the evidence
-    is missing, partial, expired, non-unique or about the other direction.
-
-    The GROUP BY and the execution site come back too, because now they are proven: grouping at a
-    column that is the far table's whole grain is grouping at that table's own row identity."""
+    """A grain is one input to admission, not the executable directional join contract."""
     _bridge_core_crm(db)
     _verified_grain(db, "crm", "customers", ["customer_id"],
                     service_actor=service_actor, human_actor=human_actor)
@@ -956,11 +971,50 @@ def test_bridge_rollup_hop_derives_many_to_one_from_the_far_governed_grain(
 
     assert ctx.governed_grain_by_table["crm"]["public.customers"] == ("customer_id",)
     assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (
-        Cardinality.MANY_TO_ONE, "bridge_far_grain", ("public.customers.customer_id",))
+        None, "bridge_unattested", ())
+
+
+def test_bridge_rollup_hop_uses_exact_directional_realization_revision(db):
+    _bridge_core_crm(db)
+    ctx = _ctx(db, "core", "crm")
+    left_binding = _physical_binding("core", "accounts")
+    right_binding = _physical_binding("crm", "customers")
+    left = _identifier_endpoint(
+        "core",
+        "accounts",
+        binding=left_binding,
+        binding_revision_id=left_binding.binding_revision_id,
+        entity="customer",
+    )
+    right = _identifier_endpoint(
+        "crm",
+        "customers",
+        binding=right_binding,
+        binding_revision_id=right_binding.binding_revision_id,
+        entity="customer",
+    )
+    revision = dataclasses.replace(
+        _bridge_realization(left, right),
+        bridge_fact_key="bridge:customer:c4",
+    )
+    plan = _bridge_rollup_plan()
+    segment = dataclasses.replace(
+        plan.path_segments[1],
+        bridge_realization_revision=revision,
+    )
+    plan = dataclasses.replace(
+        plan,
+        path_segments=(plan.path_segments[0], segment),
+    )
+    assert hop_physical_cardinality(ctx, segment) == (
+        Cardinality.MANY_TO_ONE,
+        "bridge_realization_revision",
+        ("public.customers.customer_id",),
+    )
     (hop,) = _c4_compile(ctx, plan)
     assert (hop.semantic_hop_index, hop.segment_index) == (0, 1)
     assert hop.physical_cardinality is Cardinality.MANY_TO_ONE
-    assert hop.cardinality_source == "bridge_far_grain"
+    assert hop.cardinality_source == "bridge_realization_revision"
     assert hop.grouping_keys == ("public.customers.customer_id",)
     assert (hop.execution_catalog, hop.execution_table) == ("crm", "public.customers")
     (stage,) = hop.ingredient_stages
@@ -983,6 +1037,10 @@ def _bridge_core_crm_snapshotted(db):
         (CanonicalRow("crm", "customers", "snapshot_dt", "date", is_grain=True), "as_of_date"),
         (CanonicalRow("crm", "customers", "spend", "numeric"), "monetary_flow"),
     ])
+    govern_bridge_fact(
+        db, "bridge:customer:c4", entity="customer",
+        left_source="core", left_ref="public.accounts.customer_id",
+        right_source="crm", right_ref="public.customers.customer_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
         " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
@@ -1022,16 +1080,9 @@ def test_one_member_of_a_composite_grain_derives_nothing(db, service_actor, huma
     assert stage.reason_codes == (c.ReasonCode.physical_cardinality_unavailable,)
 
 
-def test_grain_evidence_is_direction_specific(db, service_actor, human_actor):
-    """DIRECTION COMES FROM THE HOP, NEVER FROM THE BRIDGE. One bridge, one grain fact, two hops.
-
-    ``crm.customers`` is at ``customer_id`` grain, so the hop that LANDS there is many_to_one.
-    ``core.accounts`` is governed too — at ``account_id`` — and the mirrored hop lands on its
-    ``customer_id`` column, which is not its grain: many accounts per customer, so that direction is
-    1:N and derives nothing. Evidence that A -> B is many_to_one says nothing whatever about B -> A.
-
-    Test strength: an implementation that read "either endpoint's table has a governed grain", or that
-    read the grain of the table the hop came FROM, passes the first assertion and fails the second."""
+def test_grain_evidence_cannot_supply_either_bridge_direction(
+        db, service_actor, human_actor):
+    """Even complete grains cannot substitute for directional realization revisions."""
     _bridge_core_crm(db)
     _verified_grain(db, "crm", "customers", ["customer_id"],
                     service_actor=service_actor, human_actor=human_actor)
@@ -1044,8 +1095,7 @@ def test_grain_evidence_is_direction_specific(db, service_actor, human_actor):
     assert ctx.governed_grain_by_table["core"]["public.accounts"] == ("account_id",)
 
     into_crm = hop_physical_cardinality(ctx, _bridge_rollup_plan().path_segments[1])
-    assert into_crm == (Cardinality.MANY_TO_ONE, "bridge_far_grain",
-                        ("public.customers.customer_id",))
+    assert into_crm == (None, "bridge_unattested", ())
     into_core = hop_physical_cardinality(ctx, _mirrored_bridge_segment())
     assert into_core == (None, "bridge_unattested", ())
 
@@ -1065,8 +1115,8 @@ def test_an_expired_grain_derives_nothing(db, service_actor, human_actor):
     assert status == "VERIFIED" and expires_at is not None
 
     fresh = _ctx(db, "core", "crm")
-    assert hop_physical_cardinality(fresh, _bridge_rollup_plan().path_segments[1])[0] \
-        is Cardinality.MANY_TO_ONE
+    assert hop_physical_cardinality(fresh, _bridge_rollup_plan().path_segments[1]) == (
+        None, "bridge_unattested", ())
 
     expired = dataclasses.replace(
         fresh, now=expires_at + timedelta(seconds=1),
@@ -1085,8 +1135,8 @@ def test_a_grain_no_longer_verified_derives_nothing(db, service_actor, human_act
     _verified_grain(db, "crm", "customers", ["customer_id"],
                     service_actor=service_actor, human_actor=human_actor)
     assert hop_physical_cardinality(
-        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1])[0] \
-        is Cardinality.MANY_TO_ONE
+        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1]) == (
+            None, "bridge_unattested", ())
 
     from featuregen.overlay.identity import fact_key as _fk
     from featuregen.overlay.upload.upload_catalog import table_ref
@@ -1141,8 +1191,8 @@ def test_deriving_a_cardinality_does_not_touch_bridge_availability(db, service_a
     _verified_grain(db, "crm", "customers", ["customer_id"],
                     service_actor=service_actor, human_actor=human_actor)
     assert hop_physical_cardinality(
-        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1])[0] \
-        is Cardinality.MANY_TO_ONE, "the derivation must actually have flipped"
+        _ctx(db, "core", "crm"), _bridge_rollup_plan().path_segments[1]) == (
+            None, "bridge_unattested", ())
 
     assert [(x.usable, x.left_object_ref, x.right_object_ref)
             for x in cross_catalog_links(db)] == before_links
@@ -1751,6 +1801,10 @@ def test_bridge_fact_set_change_is_mutation_unverifiable(db):
     _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=2)
     _checkpoint(db, 2)
     ctx = _ctx(db, "core")
+    govern_bridge_fact(
+        db, "bridge:account:c7", entity="account",
+        left_source="core", left_ref="public.transactions.account_id",
+        right_source="crm", right_ref="public.accounts.account_id", status="VERIFIED")
     db.execute(
         "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source,"
         " left_object_ref, right_catalog_source, right_object_ref, status)"

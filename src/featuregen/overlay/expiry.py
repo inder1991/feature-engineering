@@ -178,6 +178,9 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
         # STALE but not REVERIFY, so until the edge row goes the planner keeps crossing an expired
         # bridge AS human-confirmed, ranked above every derived candidate.
         demote_projected_bridge_edges(conn, fact_key, "REVERIFY")
+        from featuregen.overlay.upload.bridge_store import demote_realizations_for_bridge
+
+        demote_realizations_for_bridge(conn, fact_key, lifecycle="stale")
     ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
     authority = resolve_authority(conn, adapter, ref, state.fact_type)
     open_reverify_task(

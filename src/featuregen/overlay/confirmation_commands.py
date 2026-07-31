@@ -32,6 +32,7 @@ from featuregen.overlay.authority import (
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import (
+    demote_projected_bridge_edges,
     demote_projected_join_edges,
     demote_projected_semantic_binding,
     schedule_expiry,
@@ -160,6 +161,12 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     join_err = join_write_error(ref, fact_type, value, use_case)
     if join_err is not None:
         return _deny_audited(conn, cmd, key, join_err)
+    if fact_type == "entity_bridge":
+        from featuregen.overlay.upload.bridge_candidates import bridge_catalog_write_error
+
+        bridge_err = bridge_catalog_write_error(conn, ref)
+        if bridge_err is not None:
+            return _deny_audited(conn, cmd, key, bridge_err)
     # SP-1.5 Task 7 (+ review #5b): re-confirming a drift-STALEd OR expiry-REVERIFY fact must not
     # re-affirm a value whose object/column the catalog no longer has. Config-gated: full SP-1.5
     # hardening is active only when a deployment has sealed an OverlayConfig.
@@ -221,6 +228,19 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
 
         project_verified_semantic_binding(conn, ref.catalog_source, ref, fact_type, now=None)
+    elif fact_type == "entity_bridge":
+        # Human review is optional provenance/ranking, never the availability or safety gate. Keep
+        # its legacy VERIFIED projection current synchronously so UI/audit readers do not lag the
+        # event stream; executable realizations remain governed by their separate safety axis.
+        from featuregen.overlay.upload.bridge_projection import project_verified_bridge
+
+        project_verified_bridge(conn, ref, now=datetime.now(UTC))
+    if fact_type == "grain":
+        from featuregen.overlay.upload.bridge_store import (
+            demote_realizations_for_dependency,
+        )
+
+        demote_realizations_for_dependency(conn, "grain_fact", key)
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 
 
@@ -294,6 +314,11 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         # E3: a pre-VERIFIED reject has no projection (no-op); a REVERIFY/STALE reject demotes the
         # governed semantic binding (restore the file entity / demote the currency edge).
         demote_projected_semantic_binding(conn, key, fact_type, "REJECTED")
+    elif fact_type == "entity_bridge":
+        demote_projected_bridge_edges(conn, key, "REJECTED")
+        from featuregen.overlay.upload.bridge_store import demote_realizations_for_bridge
+
+        demote_realizations_for_bridge(conn, key, lifecycle="rejected")
     _close_fact_tasks(conn, key, reason="fact rejected")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))
 
@@ -321,6 +346,13 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     join_err = join_write_error(ref, fact_type, proposed_value, use_case)  # SP-1.5 F4 + consistency
     if join_err is not None:
         return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
+    if fact_type == "entity_bridge":
+        from featuregen.overlay.upload.bridge_candidates import bridge_catalog_write_error
+
+        bridge_err = bridge_catalog_write_error(conn, ref)
+        if bridge_err is not None:
+            return CommandResult(
+                accepted=False, aggregate_id="", denied_reason=bridge_err)
     key = fact_key(ref, fact_type, use_case)
     # Delivery E four-eyes (E1): a governed semantic fact may NOT be single-party self-confirmed —
     # one principal must not both propose AND approve the same value. enter_fact is the audited

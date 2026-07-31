@@ -17,7 +17,6 @@ a generated Kedro project later without the ontology or the audit trail noticing
 from __future__ import annotations
 
 import hashlib
-
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,12 +28,11 @@ from featuregen.data_agent.dimensions import (
     DimensionAttributionPolicyV1,
     MissingValueBehavior,
 )
-from featuregen.data_agent.eligibility import TransactionEligibilityPolicyV1
-from featuregen.data_agent.eligibility import EligibilityError
+from featuregen.data_agent.eligibility import EligibilityError, TransactionEligibilityPolicyV1
 from featuregen.data_agent.learning import record_refusal
 from featuregen.data_agent.observation import ObservationPlanError, require_identifier
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
-from featuregen.data_agent.relationship import RelationshipEvidenceV1, join_refusal
+from featuregen.data_agent.relationship import RelationshipEvidence, join_refusal
 
 
 class AnalysisIRError(ValueError):
@@ -121,7 +119,10 @@ class AnalysisExecutionIRV1:
     #: "verified joins". Not validated at construction: like `assert_no_dimension_overlap`, this is a
     #: statement about the state of the data rather than about the shape of the plan, so a plan can
     #: be built and previewed before a probe has run. :func:`run_analysis` is the gate.
-    join_evidence: RelationshipEvidenceV1 | None = None
+    join_evidence: RelationshipEvidence | None = None
+    #: Exact directional safety decisions used by cross-catalog analysis. Human review is not an
+    #: execution predicate; revision and dependency snapshot are.
+    bridge_realization_dependencies: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         # The identifier rule is genuinely shared with observation, so it is reused rather than
@@ -169,6 +170,8 @@ class AnalysisExecutionIRV1:
         "counts" could be reused.
         """
         e = self.eligibility
+        if e is None:  # guarded by __post_init__; keeps the identity function total for type checkers
+            raise AssertionError("validated analysis IR has no eligibility policy")
         material = "|".join([
             self.spine.binding.identity.table_id, self.spine.key_column,
             self.event_binding.identity.table_id, self.event_key_column, self.period_column,
@@ -177,6 +180,9 @@ class AnalysisExecutionIRV1:
             ",".join(d.column for d in self.dimensions),
             e.status_column, ",".join(e.included_status_values), str(e.reversal_mode),
             e.reversal_column, ",".join(e.non_reversed_values), str(e.null_behavior),
+            ",".join(
+                f"{revision}:{snapshot}"
+                for revision, snapshot in self.bridge_realization_dependencies),
         ] + ([] if self.attribution is None else [
             str(self.attribution.attribution_basis), self.attribution.report_cutoff,
             self.attribution.effective_from_column, self.attribution.effective_to_column,
@@ -214,7 +220,10 @@ def compile_analysis(ir: AnalysisExecutionIRV1, *, dialect) -> str:
     # query, after the spine LEFT JOIN, a `WHERE tran_status = 'POSTED'` would drop every customer
     # whose joined columns are NULL — i.e. exactly the customers with no eligible transactions — and
     # silently destroy the population-spine guarantee the LEFT JOIN exists to provide.
-    eligibility = " AND ".join(ir.eligibility.predicates(_q))
+    eligibility_policy = ir.eligibility
+    if eligibility_policy is None:  # guarded by __post_init__
+        raise AssertionError("validated analysis IR has no eligibility policy")
+    eligibility = " AND ".join(eligibility_policy.predicates(_q))
 
     def _period_cte(name: str, values: tuple[str, ...]) -> str:
         return (f"{name} AS (SELECT {event_key} AS k, COUNT(*) AS n FROM {event_ref} "
@@ -227,17 +236,20 @@ def compile_analysis(ir: AnalysisExecutionIRV1, *, dialect) -> str:
     dimension_join = ""
 
     if ir.dimensions:
+        attribution = ir.attribution
+        if attribution is None:  # guarded by __post_init__
+            raise AssertionError("validated dimensional analysis has no attribution policy")
         # The dimension SNAPSHOT is built first, then LEFT JOINed — the same rule as the period
         # aggregates. Effective-date predicates in the outer WHERE would drop every customer with no
         # dimension history, repeating the population-spine mistake one layer up.
         dim_ref = dialect.table_ref(_Shim(ir.dimension_binding))
-        validity = ir.attribution.validity_predicate(_q)
+        validity = attribution.validity_predicate(_q)
         dim_cols = ", ".join(_q(d.column) for d in ir.dimensions)
         ctes.append(
             f"dim AS (SELECT {_q(ir.spine.key_column)} AS k, {dim_cols} "
             f"FROM {dim_ref} WHERE {validity})")
         dimension_join = f"LEFT JOIN dim ON dim.k = s.{key}\n"
-        if ir.attribution.missing_value_behavior is MissingValueBehavior.UNKNOWN_BUCKET:
+        if attribution.missing_value_behavior is MissingValueBehavior.UNKNOWN_BUCKET:
             # Totals still reconcile: an unclassified customer is a bucket, not a disappearance.
             dimension_select = "".join(
                 f", COALESCE(dim.{_q(d.column)}, '{UNKNOWN}') AS {_q(d.column)}"
@@ -268,13 +280,16 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
     """
     if not ir.dimensions:
         return
+    attribution = ir.attribution
+    if attribution is None:  # guarded by __post_init__
+        raise AssertionError("validated dimensional analysis has no attribution policy")
     class _Shim:
         def __init__(self, b): self.binding = b
     _q = dialect.ident
     dim_ref = dialect.table_ref(_Shim(ir.dimension_binding))
     key = _q(ir.spine.key_column)
     sql = (f"SELECT COUNT(*) FROM (SELECT {key} FROM {dim_ref} "
-           f"WHERE {ir.attribution.validity_predicate(_q)} "
+           f"WHERE {attribution.validity_predicate(_q)} "
            f"GROUP BY {key} HAVING COUNT(*) > 1) overlapping")
     cursor = conn.cursor()
     try:
@@ -288,7 +303,7 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
         raise AttributionError(
             "ATTRIBUTION_OVERLAPPING_RECORDS",
             f"{overlapping} entity(ies) have more than one dimension record valid at "
-            f"{ir.attribution.report_cutoff!r}; choosing one would hide a dimension-table defect")
+            f"{attribution.report_cutoff!r}; choosing one would hide a dimension-table defect")
 
 
 def assert_join_is_verified(ir: AnalysisExecutionIRV1) -> None:

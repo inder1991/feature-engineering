@@ -19,7 +19,10 @@ from featuregen.overlay.identity import fact_key
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
-from featuregen.overlay.upload.planner.multisource_contracts import GovernedEndpointV1
+from featuregen.overlay.upload.planner.multisource_contracts import (
+    GovernedEndpointV1,
+    GrainAuthorityProvenance,
+)
 from featuregen.overlay.upload.planner.multisource_endpoints import governed_endpoint
 from featuregen.overlay.upload.upload_catalog import (
     ensure_upload_catalog_adapter,
@@ -76,6 +79,10 @@ def test_verified_grain_fact_yields_qualified_validated_endpoint(
     assert endpoint.grain_key_refs == ("public.customers.customer_id",)
     # keyed on the DETERMINISTIC grain fact_key (ref+type), never a per-event id
     assert endpoint.grain_fact_key == fact_key(table_ref("wealth", "customers"), "grain")
+    assert endpoint.grain_is_unique is True
+    assert endpoint.grain_authority_provenance is GrainAuthorityProvenance.human_confirmed
+    assert endpoint.grain_fact_revision
+    assert endpoint.grain_dependency_identity
 
 
 def test_advisory_is_grain_without_verified_fact_yields_none(db, adapter):

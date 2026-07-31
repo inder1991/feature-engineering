@@ -131,21 +131,39 @@ def _build_replay_envelope(intent: MultiSourcePlannerIntentV1, *,
         bridge_fact_keys = tuple(sorted({
             seg.bridge_fact_key for p in plan.operand_paths
             for seg in p.binding_plan.path_segments if seg.bridge_fact_key is not None}))
+        bridge_revision_ids = tuple(sorted({
+            seg.bridge_realization_revision.realization_revision_id
+            for path in plan.operand_paths
+            for seg in path.binding_plan.path_segments
+            if seg.bridge_realization_revision is not None
+        }))
+        bridge_dependency_snapshot_ids = tuple(sorted({
+            seg.bridge_realization_revision.dependency_snapshot_id
+            for path in plan.operand_paths
+            for seg in path.binding_plan.path_segments
+            if seg.bridge_realization_revision is not None
+        }))
     else:
         endpoint_fact_keys = ()
         bridge_fact_keys = ()
+        bridge_revision_ids = ()
+        bridge_dependency_snapshot_ids = ()
     material = "|".join((
         intent.target_entity,
         ";".join(operand_pins),
         ";".join(source_grain_key_refs),
         ";".join(endpoint_fact_keys),
         ";".join(bridge_fact_keys),
+        ";".join(bridge_revision_ids),
+        ";".join(bridge_dependency_snapshot_ids),
         MULTISOURCE_ASSEMBLY_VERSION, OPERATION_POLICY_VERSION, intent.operation_policy_version))
     input_hash = "msr_" + hashlib.sha256(material.encode()).hexdigest()[:24]
     return MultiSourceReplayEnvelopeV1(
         target_entity=intent.target_entity, operand_pins=operand_pins,
         source_grain_key_refs=source_grain_key_refs, governed_endpoint_fact_keys=endpoint_fact_keys,
-        bridge_fact_keys=bridge_fact_keys, input_hash=input_hash)
+        bridge_fact_keys=bridge_fact_keys, input_hash=input_hash,
+        bridge_realization_revision_ids=bridge_revision_ids,
+        bridge_dependency_snapshot_ids=bridge_dependency_snapshot_ids)
 
 
 # ── assembly helpers ───────────────────────────────────────────────────────────────────────────

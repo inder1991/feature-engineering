@@ -179,11 +179,11 @@ def _seed_main(conn, service_actor, human_actor):
         (CanonicalRow("wl", "acc", "customer_id", "integer", joins_to="cust.customer_id",
                       cardinality="N:1"), "customer_id"),
         (CanonicalRow("wl", "cust", "customer_id", "integer", is_grain=True), "customer_id")])
-    conn.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES ('gbfk_main','account','cb','public.txn.account_id','wl','public.acc.account_id',"
-        "'evt-main','VERIFIED')")
+    from tests.featuregen.overlay.upload._bridge_fixtures import seed_verified_bridge
+    seed_verified_bridge(
+        conn, "gbfk_main", entity="account",
+        left_source="cb", left_ref="public.txn.account_id",
+        right_source="wl", right_ref="public.acc.account_id")
     _grain("cb", "txn", ["transaction_id"])
     _grain("wl", "acc", ["account_id"])
     _grain("wl", "cust", ["customer_id"])

@@ -8,8 +8,9 @@ resolving.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import cast
+from typing import Any, TypedDict, cast
 
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.contracts.gates import GateTaskSpec
@@ -19,7 +20,12 @@ from featuregen.overlay._lifecycle import _NON_TERMINAL, _latest_proposed
 from featuregen.overlay._types import FactType
 from featuregen.overlay.authority import resolve_authority
 from featuregen.overlay.catalog import current_catalog_adapter
-from featuregen.overlay.evidence import write_evidence
+from featuregen.overlay.evidence import (
+    AssertionStrength,
+    EvidenceLifecycle,
+    EvidenceProducer,
+    write_evidence,
+)
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
@@ -29,6 +35,92 @@ from featuregen.overlay.identity import (
 )
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+
+_RAW_EVIDENCE_REQUIRED = frozenset({
+    "table_snapshot_at",
+    "row_count",
+    "sample_size",
+    "profile_version",
+    "thresholds",
+    "metric_values",
+})
+_RAW_EVIDENCE_OPTIONAL = frozenset({
+    "producer",
+    "strength",
+    "lifecycle",
+    "producer_configuration_hash",
+    "producer_item_ref",
+    "evidence_spans",
+})
+
+
+class _RawEvidenceArgs(TypedDict):
+    table_snapshot_at: object
+    row_count: int
+    sample_size: int
+    profile_version: str
+    thresholds_used: Mapping[str, Any]
+    metric_values: Mapping[str, Any]
+    producer: EvidenceProducer
+    strength: AssertionStrength
+    lifecycle: EvidenceLifecycle
+    producer_configuration_hash: str | None
+    producer_item_ref: str | None
+    evidence_spans: tuple[str, ...]
+
+
+def _raw_evidence_args(payload: object) -> _RawEvidenceArgs:
+    """Validate the closed raw-evidence payload before minting an immutable record."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("raw evidence must be an object")
+    keys = set(payload)
+    missing = _RAW_EVIDENCE_REQUIRED - keys
+    unknown = keys - _RAW_EVIDENCE_REQUIRED - _RAW_EVIDENCE_OPTIONAL
+    if missing:
+        raise ValueError(f"raw evidence missing fields {sorted(missing)}")
+    if unknown:
+        raise ValueError(f"raw evidence has unknown fields {sorted(unknown)}")
+    thresholds = payload["thresholds"]
+    metrics = payload["metric_values"]
+    if not isinstance(thresholds, Mapping) or not isinstance(metrics, Mapping):
+        raise ValueError("raw evidence thresholds and metric_values must be objects")
+    spans = payload.get("evidence_spans", ())
+    if (
+        isinstance(spans, (str, bytes))
+        or not isinstance(spans, Sequence)
+        or not all(isinstance(span, str) and span.strip() for span in spans)
+    ):
+        raise ValueError("raw evidence evidence_spans must be a sequence of non-blank strings")
+    try:
+        producer = EvidenceProducer(
+            payload.get("producer", EvidenceProducer.PROFILER.value))
+        strength = AssertionStrength(
+            payload.get("strength", AssertionStrength.SUPPORTED.value))
+        lifecycle = EvidenceLifecycle(
+            payload.get("lifecycle", EvidenceLifecycle.ACTIVE.value))
+    except ValueError as exc:
+        raise ValueError(f"raw evidence has an invalid provenance axis: {exc}") from exc
+    for count_name in ("row_count", "sample_size"):
+        count = payload[count_name]
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"raw evidence {count_name} must be a non-negative integer")
+    profile_version = payload["profile_version"]
+    if not isinstance(profile_version, str) or not profile_version.strip():
+        raise ValueError("raw evidence profile_version must not be blank")
+    return _RawEvidenceArgs(
+        table_snapshot_at=payload["table_snapshot_at"],
+        row_count=payload["row_count"],
+        sample_size=payload["sample_size"],
+        profile_version=profile_version,
+        thresholds_used=thresholds,
+        metric_values=metrics,
+        producer=producer,
+        strength=strength,
+        lifecycle=lifecycle,
+        producer_configuration_hash=payload.get("producer_configuration_hash"),
+        producer_item_ref=payload.get("producer_item_ref"),
+        evidence_spans=tuple(spans),
+    )
 
 
 def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
@@ -62,6 +154,17 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     join_err = join_write_error(ref, fact_type, proposed_value, use_case)
     if join_err is not None:
         return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
+    if fact_type == "entity_bridge":
+        # The pure identity gate above proves ref/value consistency. Endpoint existence and current
+        # identifier classification require the catalog connection, so they live in this second,
+        # state-aware gate. LLM-classified identifiers remain admissible; human review is not a
+        # precondition.
+        from featuregen.overlay.upload.bridge_candidates import bridge_catalog_write_error
+
+        bridge_err = bridge_catalog_write_error(conn, ref)
+        if bridge_err is not None:
+            return CommandResult(
+                accepted=False, aggregate_id="", denied_reason=bridge_err)
     key = fact_key(ref, fact_type, use_case)
     fp = proposal_fingerprint(
         proposed_value,
@@ -105,16 +208,19 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # OCC raises ConcurrencyError and this INSERT rolls back with the rest of the transaction —
     # either way there is no orphan evidence.
     if evidence_ref is None and evidence_payload is not None:
+        try:
+            raw_evidence_args = _raw_evidence_args(evidence_payload)
+        except ValueError as exc:
+            return CommandResult(
+                accepted=False,
+                aggregate_id=key,
+                denied_reason=f"invalid raw evidence: {exc}",
+            )
         evidence_ref = write_evidence(
             conn,
             fact_key=key,
-            table_snapshot_at=evidence_payload["table_snapshot_at"],
-            row_count=evidence_payload["row_count"],
-            sample_size=evidence_payload["sample_size"],
-            profile_version=evidence_payload["profile_version"],
-            thresholds_used=evidence_payload["thresholds"],
-            metric_values=evidence_payload["metric_values"],
             created_by=identity_to_jsonb(cmd.actor),  # a dict, never a raw IdentityEnvelope
+            **raw_evidence_args,
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     payload: dict[str, object] = {

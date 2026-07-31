@@ -36,14 +36,19 @@ module never mints a privileged principal itself.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay.commands import confirm_fact, propose_fact
-from featuregen.overlay.identity import fact_key
+from featuregen.overlay.identity import (
+    CatalogObjectRef,
+    EntityBridgeRef,
+    fact_key,
+)
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.task_read import get_task_proposal
+from featuregen.overlay.upload.bridge_projection import project_verified_bridge
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -91,12 +96,71 @@ def _graph(conn, source: str, rows_concepts: list[tuple[CanonicalRow, str]]) -> 
     build_graph(conn, source, rows, concepts={content_hash(r): c for r, c in rows_concepts})
 
 
-def _bridge(conn, fk: str, entity: str, lc: str, lref: str, rc: str, rref: str) -> None:
-    conn.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fk, entity, lc, lref, rc, rref, f"evt-{fk}"))
+def _bridge(
+    conn,
+    _fixture_name: str,
+    entity: str,
+    left_source: str,
+    left_object_ref: str,
+    right_source: str,
+    right_object_ref: str,
+    *,
+    service_actor: IdentityEnvelope,
+    human_actor: IdentityEnvelope,
+    now: datetime,
+) -> None:
+    """Seed a bridge through the same authoritative lifecycle and projection production uses."""
+
+    def column_ref(source: str, object_ref: str) -> CatalogObjectRef:
+        schema, table, column = object_ref.split(".", 2)
+        return CatalogObjectRef(source, "column", schema, table, column)
+
+    ref = EntityBridgeRef(
+        entity,
+        column_ref(left_source, left_object_ref),
+        column_ref(right_source, right_object_ref),
+    )
+    value = {
+        "entity_id": entity,
+        "left_ref": asdict(ref.left_ref),
+        "right_ref": asdict(ref.right_ref),
+    }
+    proposed = propose_fact(conn, Command(
+        "propose_fact",
+        "overlay_fact",
+        None,
+        {"ref": ref, "fact_type": "entity_bridge", "proposed_value": value},
+        service_actor,
+        f"gold-propose-bridge-{fact_key(ref, 'entity_bridge')}",
+    ))
+    if not proposed.accepted:
+        raise RuntimeError(f"gold bridge propose denied: {proposed.denied_reason}")
+    key = fact_key(ref, "entity_bridge")
+    task = conn.execute(
+        "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (key,),
+    ).fetchone()
+    if task is None:
+        raise RuntimeError(f"gold bridge task missing for {key}")
+    proposal = get_task_proposal(conn, task[0], human_actor)
+    confirmed = confirm_fact(conn, Command(
+        "confirm_fact",
+        "overlay_fact",
+        None,
+        {
+            "ref": ref,
+            "fact_type": "entity_bridge",
+            "target_event_id": proposal["target_event_id"],
+            "value": value,
+        },
+        human_actor,
+        f"gold-confirm-bridge-{proposal['target_event_id']}",
+    ))
+    if not confirmed.accepted:
+        raise RuntimeError(f"gold bridge confirm denied: {confirmed.denied_reason}")
+    if project_verified_bridge(conn, ref, now=now) != "projected":
+        raise RuntimeError(f"gold bridge did not project after confirmation: {key}")
 
 
 def _drain(conn) -> None:
@@ -313,7 +377,8 @@ def seed_gold(conn, *, service_actor: IdentityEnvelope, human_actor: IdentityEnv
     _graph(conn, CB, cb_rows)
     _graph(conn, WL, wl_rows)
     for bridge in bridges:
-        _bridge(conn, *bridge)
+        _bridge(
+            conn, *bridge, service_actor=service_actor, human_actor=human_actor, now=now)
     for catalog, table, columns in grains:
         _grain(conn, catalog, table, columns, service_actor=service_actor, human_actor=human_actor)
     _watermark(conn, CB, fresh)

@@ -60,6 +60,23 @@ def _realization_tuple(r: object) -> list:
             str(getattr(r, "from_key_ref", "")), str(getattr(r, "to_key_ref", ""))]
 
 
+def _path_segment_tuple(segment: object) -> list:
+    bridge_revision = getattr(segment, "bridge_realization_revision", None)
+    bridge_revision_id = (
+        "" if bridge_revision is None else bridge_revision.realization_revision_id)
+    dependency_snapshot_id = (
+        "" if bridge_revision is None else bridge_revision.dependency_snapshot_id)
+    return [
+        str(getattr(segment, "segment_kind", "")),
+        str(getattr(segment, "catalog_source", "")),
+        bridge_revision_id
+        or str(getattr(segment, "realization_ref", None)
+               or getattr(segment, "bridge_fact_key", None)
+               or ""),
+        dependency_snapshot_id,
+    ]
+
+
 def _catalog_cols(ctx, catalog_source: str) -> list:
     cols = ctx.columns_by_catalog.get(catalog_source, {})
     return sorted((_col_tuple(c) for c in cols.values()), key=lambda t: t[0])
@@ -114,8 +131,7 @@ def contract_input_hash(ctx, plan: BindingPlanV1, template) -> str:
         read_cols.append([cat, ref] + (_col_tuple(col)[1:] if col is not None else ["__missing__"]))
     used_realizations = sorted({s.realization_ref for s in plan.path_segments if s.realization_ref})
     used_bridges = sorted({s.bridge_fact_key for s in plan.path_segments if s.bridge_fact_key})
-    path = [[str(s.segment_kind), s.catalog_source, s.realization_ref or s.bridge_fact_key or ""]
-            for s in plan.path_segments]
+    path = [_path_segment_tuple(segment) for segment in plan.path_segments]
     agg_decls = sorted(
         (nr, str(fn)) for nr, fn in (
             (b.need_role, ctx.agg_declarations.get((plan.recipe_id, b.need_role)))

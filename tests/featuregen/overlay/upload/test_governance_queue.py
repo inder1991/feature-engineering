@@ -273,121 +273,15 @@ def test_an_unreviewed_relationship_is_labelled_available_for_use(all_three_kind
     assert bridge.state_code == "unreviewed_available"
 
 
-def test_production_eligibility_is_a_SEPARATE_axis_from_review(all_three_kinds, human_actor):
-    """Human review does not decide production eligibility; automatic validation of the directional
-    realization does. The bridge is UNREVIEWED, and its cardinality IS resolved because `crm`'s
-    endpoint column is the WHOLE, VERIFIED, unique grain of `crm.customers` — the same evidence,
-    read through the same `governed_grain` reader, that makes `declarations._segment_cardinality`
-    answer `bridge_far_grain` instead of `bridge_unattested`. The two axes must disagree, which is
-    only expressible if they are two fields."""
-    conn = all_three_kinds.conn
-    _verify_grain(conn, "crm", "customers", ["customer_id"], human=human_actor)
-
-    bridge = _bridge(governance_queue(conn, roles=()))
+def test_production_eligibility_requires_a_typed_directional_realization(all_three_kinds):
+    """Human review and automatic execution remain separate. Grain-shaped proposal evidence is not
+    a directional execution contract, so this bridge is honestly not evaluated."""
+    bridge = _bridge(governance_queue(all_three_kinds.conn, roles=()))
     assert bridge.state_code == "unreviewed_available"
-    assert bridge.production_eligibility == "Automatically validated for production"
-    assert bridge.production_eligibility_code == "grain_resolved"
+    assert bridge.production_eligibility == "Not evaluated"
+    assert bridge.production_eligibility_code == "not_evaluated"
 
 
-def test_an_uploaders_own_is_grain_flag_is_never_production_validation(all_three_kinds):
-    """THE OVER-CLAIM THIS AXIS EXISTED TO MAKE. Both endpoint columns are declared `is_grain` by
-    their own upload and `core`'s grain fact is merely DRAFT — nobody has confirmed anything. The
-    screen used to answer "Automatically validated for production" off those flags while the
-    compiler resolved the identical crossing as `bridge_unattested` and refused to run it.
-
-    `governed_grain`: *"`is_grain = true` alone is a claim an uploader made about their own file.
-    That is why nothing here ever GRANTS grain from the flags."*"""
-    conn = all_three_kinds.conn
-    flags = conn.execute(
-        "SELECT count(*) FROM graph_node WHERE kind = 'column' AND is_grain "
-        "  AND (catalog_source, object_ref) IN "
-        "      (('core', 'public.customer_master.customer_id'), "
-        "       ('crm', 'public.customers.customer_id'))").fetchone()[0]
-    assert flags == 2, "both endpoints carry the file-declared flag — the defect's whole input"
-
-    bridge = _bridge(governance_queue(conn, roles=()))
-    assert bridge.production_eligibility == "Cardinality unresolved — sandbox only"
-    assert bridge.production_eligibility_code == "cardinality_unresolved"
-
-
-def test_one_member_of_a_COMPOSITE_grain_resolves_nothing(queue_db, human_actor):
-    """Set EQUALITY, exactly as `_segment_cardinality` has it (`grain == (column,)`). The bridge
-    lands on `customer_id`, but `core.customer_master`'s VERIFIED grain is `(customer_id, segment)`:
-    joining on `customer_id` alone lands on every `segment` for that customer, so the hop is as
-    unbounded as one onto no key at all. A `column in grain` membership test would call this
-    validated."""
-    _load(queue_db, "core", [
-        (CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True),
-         "customer_id"),
-        (CanonicalRow("core", "customer_master", "segment", "text", is_grain=True), "categorical"),
-    ])
-    _load(queue_db, "crm", [
-        (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
-    ])
-    _seed_bridge(queue_db)
-    _verify_grain(queue_db, "core", "customer_master", ["customer_id", "segment"],
-                  human=human_actor)
-    # the composite grain really IS attested — this is complete-equality failing, not a refusal
-    grain = read_governed_grain(queue_db, "core", "customer_master", now=_NOW)
-    assert isinstance(grain, GovernedGrain) and grain.columns == ("customer_id", "segment")
-
-    bridge = _bridge(governance_queue(queue_db, roles=(), now=_NOW))
-    assert bridge.production_eligibility_code == "cardinality_unresolved"
-
-
-def test_a_grain_governed_on_one_side_is_never_credited_to_the_other_endpoint(queue_db,
-                                                                              human_actor):
-    """DIRECTION. `_segment_cardinality` consults ONLY the table the hop lands on, because *"a grain
-    confirmed on the near side is evidence for the opposite direction"*. Here `core.customer_master`
-    has a complete VERIFIED grain on `customer_id` — but the bridge does not land on it: `core`'s
-    endpoint is `cust_ref`, and the column actually named `customer_id` is `crm`'s endpoint, whose
-    own table has no governed grain at all.
-
-    So the only evidence in the database is grain evidence about the NEAR side of every crossing
-    this bridge can realize, and the honest answer is sandbox-only. An implementation that pooled
-    both tables' grain columns and matched either endpoint by NAME would answer validated — and so
-    does the file-flag implementation this replaced (`crm.customers.customer_id` is flagged)."""
-    _load(queue_db, "core", [
-        # the governed grain of this table — and deliberately NOT a bridge endpoint (no entity)
-        (CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True),
-         "categorical"),
-        # the bridge endpoint on this side — not the grain, and not flagged as one
-        (CanonicalRow("core", "customer_master", "cust_ref", "integer"), "customer_id"),
-    ])
-    _load(queue_db, "crm", [
-        # the bridge endpoint on the other side, carrying the uploader's own is_grain claim
-        (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
-    ])
-    _seed_bridge(queue_db)
-    _verify_grain(queue_db, "core", "customer_master", ["customer_id"], human=human_actor)
-
-    bridge = _bridge(governance_queue(queue_db, roles=(), now=_NOW))
-    assert bridge.detail["left"]["column"] == "cust_ref"          # the crossing really is off-grain
-    assert bridge.detail["right"]["column"] == "customer_id"
-    assert bridge.production_eligibility == "Cardinality unresolved — sandbox only"
-    assert bridge.production_eligibility_code == "cardinality_unresolved"
-
-
-def test_no_derivation_evidence_at_all_is_not_observed_never_a_verdict(all_three_kinds):
-    """The W4 case: `bridge_propose`'s early return left no ledger row, so there is no derivation
-    record to reason from. Absence of evidence is not evidence of unresolved cardinality, so the
-    axis withholds a verdict entirely rather than reporting sandbox-only."""
-    conn = all_three_kinds.conn
-    conn.execute("DELETE FROM entity_bridge_candidate_evidence")
-
-    bridge = _bridge(governance_queue(conn, roles=()))
-    assert bridge.detail["evidence_present"] is False
-    assert bridge.production_eligibility is None
-    assert bridge.production_eligibility_code == "not_observed"
-
-
-def test_a_table_fact_has_no_production_eligibility_rather_than_a_guess(all_three_kinds):
-    """A table's grain is not a crossing — there is no directional realization to validate — so the
-    axis says nothing instead of inventing a verdict."""
-    grain = next(i for i in governance_queue(all_three_kinds.conn, roles=()).items
-                 if i.kind == "grain")
-    assert grain.production_eligibility is None
-    assert grain.production_eligibility_code == "not_applicable"
 
 
 # ── available_actions: four-eyes, PROJECTED from the write-side rule ──────────────────────────────

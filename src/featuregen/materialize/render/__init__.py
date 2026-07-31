@@ -36,4 +36,4 @@ __all__ = ["RENDERER_VERSION"]
 #: the renderer's versions are not a policy scale — there is no ordering question to answer, only an
 #: identity one. It is deliberately NOT derived from a git commit: the same source rendered from two
 #: checkouts is the same renderer, and a commit-derived version would fork identity on a rebase.
-RENDERER_VERSION = "1"
+RENDERER_VERSION = "2"

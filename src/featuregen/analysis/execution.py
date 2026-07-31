@@ -48,6 +48,8 @@ from featuregen.data_agent.eligibility import TransactionEligibilityPolicyV1
 from featuregen.data_agent.learning import RequiredAction
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.data_agent.relationship import RelationshipEvidenceV1
+from featuregen.overlay.upload.bridge_realization import eligible_for_production
+from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
 
 
 class BridgeRefusal(ValueError):
@@ -74,6 +76,8 @@ BRIDGE_REFUSAL_TO_GAP: dict[str, tuple[str, RequiredAction]] = {
                             RequiredAction.CONFIRM_BUSINESS_POLICY),
     "ATTRIBUTION_ABSENT": ("DIMENSION_ATTRIBUTION_AS_OF_UNRESOLVED",
                            RequiredAction.CONFIRM_BUSINESS_POLICY),
+    "JOIN_REALIZATION_ABSENT": ("JOIN_CARDINALITY_UNKNOWN",
+                                RequiredAction.PROFILE_DATA),
 }
 
 #: The plan's comparison words, in the executor's vocabulary. An unknown word is refused rather than
@@ -104,6 +108,7 @@ class ExecutionInputs:
     dimension_binding: PhysicalDatasetBindingV1 | None = None
     attribution: DimensionAttributionPolicyV1 | None = None
     join_evidence: RelationshipEvidenceV1 | None = None
+    bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] = ()
 
 
 def _column_of(logical_ref: str) -> str:
@@ -191,6 +196,27 @@ def plan_to_execution_ir(grounded: GroundedPlan,
             "failed and reversed activity as activity",
             subject=plan.base_table_ref)
 
+    realization_dependencies: list[tuple[str, str]] = []
+    for fact_key in plan.join_refs:
+        matches = tuple(
+            realization
+            for realization in inputs.bridge_realizations
+            if realization.revision.bridge_fact_key == fact_key
+            and eligible_for_production(realization.revision, realization.current)
+        )
+        if len(matches) != 1:
+            raise BridgeRefusal(
+                "JOIN_REALIZATION_ABSENT",
+                f"identifier link {fact_key!r} has {len(matches)} exact current deterministic "
+                "directional realizations; production analysis requires exactly one and never "
+                "infers direction or cardinality from the symmetric link",
+                subject=fact_key,
+            )
+        realization_dependencies.append((
+            matches[0].revision.realization_revision_id,
+            matches[0].revision.dependency_snapshot_id,
+        ))
+
     # The plan orders windows most-recent-last by convention only, so the CURRENT window is chosen by
     # the smallest offset rather than by position — a reordered plan must not swap the two periods and
     # invert the answer.
@@ -233,4 +259,5 @@ def plan_to_execution_ir(grounded: GroundedPlan,
         dimension_binding=inputs.dimension_binding,
         attribution=inputs.attribution,
         join_evidence=inputs.join_evidence,
+        bridge_realization_dependencies=tuple(realization_dependencies),
     )

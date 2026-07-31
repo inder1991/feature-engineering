@@ -71,6 +71,7 @@ from featuregen.materialize.render.project import (
     REQUIRED_RUN_PARAMETERS,
     ProjectDatasets,
     RenderedNode,
+    _check_wiring,
     materialize_to,
     project_datasets,
     render_project,
@@ -167,6 +168,32 @@ def _nodes(datasets: ProjectDatasets) -> tuple[RenderedNode, ...]:
     nodes.append(_stub("gate_and_publish", "gate_and_publish", [datasets.assembled],
                        [datasets.published], tags=["feature"]))
     return tuple(nodes)
+
+
+def test_cross_catalog_projection_cannot_bypass_the_precomputation_gate() -> None:
+    datasets = ProjectDatasets(
+        raw={"banking.dimension": "raw_dimension"},
+        join_gates={"brr-1": "validated_dimension"},
+        spine="spine",
+        projections={("feature", "body.expr"): "projection"},
+        staging={"feature": "staged"},
+        manifests={"feature": "manifest"},
+        assembled="assembled",
+        published="published",
+    )
+    common = [
+        _stub("bridge_gate", "bridge_gate", ["raw_dimension"], ["validated_dimension"]),
+        _stub("spine", "spine", ["raw_dimension"], ["spine"]),
+        _stub("calculation", "calculation", ["projection", "spine"], ["staged", "manifest"]),
+        _stub("assembly", "assembly", ["staged", "manifest"], ["assembled"]),
+        _stub("publish", "publish", ["assembled"], ["published"]),
+    ]
+    bypass = _stub("projection", "projection", ["raw_dimension"], ["projection"])
+    with pytest.raises(ValueError, match="gate output.*not consumed"):
+        _check_wiring(datasets, (*common, bypass))
+
+    downstream = _stub("projection", "projection", ["validated_dimension"], ["projection"])
+    _check_wiring(datasets, (*common, downstream))
 
 
 def _render(db, *names, engine_versions=None, environment_id=ENVIRONMENT,

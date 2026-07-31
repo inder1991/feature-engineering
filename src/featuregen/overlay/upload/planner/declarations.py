@@ -24,6 +24,11 @@ from featuregen.overlay.catalog_changes import drift_head_seq, drift_watermark
 from featuregen.overlay.config import OverlayConfig, overlay_config_from_env
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1, active_bridges
+from featuregen.overlay.upload.bridge_realization import (
+    AdditionalKeyRequirementV1,
+    AsOfIntervalRequirementV1,
+    FixedValueReferencePredicateV1,
+)
 from featuregen.overlay.upload.catalog_realizations import (
     derive_catalog_realizations,
     realization_fingerprint,
@@ -118,6 +123,11 @@ class CompilerContext:
     # a governance CONFLICT the compiler must fail (never a silent pick). Empty in production until
     # a conflict exists; empty-registry runs are byte-identical to the pre-H3a compiler.
     agg_declaration_conflicts: frozenset[tuple[str, str]] = frozenset()
+    # The legacy multi-source planner is explicitly shadow/sandbox-only. It may retain a
+    # far-side-governed-grain N:1 hypothesis so a runtime uniqueness probe can test the path.
+    # Production context builders leave this false: only an attached exact directional realization
+    # can authorize physical cardinality there.
+    allow_provisional_bridge_cardinality: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "realizations_by_catalog",
@@ -220,6 +230,25 @@ def check_connectivity(ctx: CompilerContext, plan: BindingPlanV1) -> Connectivit
             path_tables.add(to_table)
             hop_of.setdefault(to_table, idx)
         elif seg.bridge_fact_key is not None:
+            if (
+                seg.bridge_from_catalog_source is not None
+                and seg.bridge_from_object_ref is not None
+                and seg.bridge_to_catalog_source is not None
+                and seg.bridge_to_object_ref is not None
+            ):
+                for endpoint in (
+                    (
+                        seg.bridge_from_catalog_source,
+                        table_of(seg.bridge_from_object_ref),
+                    ),
+                    (
+                        seg.bridge_to_catalog_source,
+                        table_of(seg.bridge_to_object_ref),
+                    ),
+                ):
+                    path_tables.add(endpoint)
+                    hop_of.setdefault(endpoint, idx)
+                continue
             br = next((x for x in ctx.active_bridges if x.fact_key == seg.bridge_fact_key), None)
             if br is None:
                 continue    # not an active VERIFIED bridge — contributes no tables (fail closed)
@@ -327,16 +356,13 @@ def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
 # hop_physical_cardinality's `source` vocabulary (F4): where the fan-in evidence came from.
 CARDINALITY_SOURCE_REALIZATION = "realization"
 CARDINALITY_SOURCE_UNAVAILABLE = "unavailable"
-# A bridge the context RESOLVED but whose fan-in NOTHING attests. Distinct from `unavailable` (which
-# means the segment resolved to no bridge at all) because the two ask a human for different things:
-# one to establish the far side's grain, the other to find out why the bridge is missing. Both carry
-# cardinality None — see `_hop_evidence` for why a bridge alone can never claim many_to_one.
+# A symmetric link exists but no exact directional realization revision is attached.
 CARDINALITY_SOURCE_BRIDGE_UNATTESTED = "bridge_unattested"
-# TIER 2: many_to_one DERIVED from the far table's governed grain — the hop lands on a column that is
-# that table's COMPLETE, CURRENT, VERIFIED, UNIQUE grain, so at most one row can be on the far side
-# of it. Named distinctly from `realization` because the EVIDENCE is different (a grain fact, not a
-# declared relationship) and a reader must be able to tell which one carried a verdict.
-CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN = "bridge_far_grain"
+# Directional physical evidence from the exact immutable realization revision.
+CARDINALITY_SOURCE_BRIDGE_REALIZATION = "bridge_realization_revision"
+# Sandbox-only hypothesis. It is deliberately a distinct source so no consumer can mistake it for
+# deterministic execution evidence; production contexts never enable it.
+CARDINALITY_SOURCE_SANDBOX_PROVISIONAL = "sandbox_provisional_runtime_probe_required"
 
 # Declared functions that are provably duplication/order-safe on ANY fan-in without extra inputs.
 _ORDER_SAFE_DECLARED = frozenset(
@@ -381,63 +407,15 @@ def _hop_evidence(
     context cannot resolve → ``(None, "unavailable", (), <segment catalog>, "")`` — fail closed,
     never a guessed fan-in.
 
-    BRIDGE-ROLLUP hops get their cardinality from the FAR TABLE'S GOVERNED GRAIN, or not at all.
+    A production bridge hop gets cardinality only from the exact directional realization revision
+    attached to the path segment. The symmetric link, a far-side grain, human review, or a semantic
+    hop label cannot stand in for it.
 
-    The branch once returned ``many_to_one`` "BY CONSTRUCTION", on the argument that the bridge
-    anchors an E2-key FK column to an E2-grain far table. Nothing in a bridge attests either half of
-    that: not the DIRECTION the join runs, and not the far side's grain. If the far side is not in
-    fact at that grain the hop is 1:N — rows multiply, and every SUM taken over it inflates into a
-    plausible number that raises no error anywhere. ``materialize/joins.py`` writes the same argument
-    out for the identical case: "Refusing only the hops that SAY 1:N is a fail-open: an unattested
-    edge may BE 1:N. 'We do not know' is not 'it is safe'."
-
-    TIER 2 replaces that assumption with a DERIVATION from evidence that was always there:
-
-        if the far endpoint column IS the far table's complete, current, VERIFIED, unique grain,
-        then at most one far row exists per key value, and the hop into it really IS many_to_one.
-
-    Every word of that is load-bearing. ``ctx.governed_grain_by_table`` holds ONLY grains
-    ``governed_grain.read_governed_grain`` attested (VERIFIED, unexpired at ``ctx.now``, schema-clean,
-    ``is_unique`` true, agreeing with its column projection), so the test here is set EQUALITY against
-    the whole grain. That is ``spine._refuse_non_unique_keys``' both-directions discipline with the
-    only relaxation it allows removed: keys the grain does not contain are not attested to identify
-    anything, AND grain columns the key does not contain mean many rows per key — legal there only
-    because a snapshot policy names the columns it COLLAPSES, and a bridge hop has no such policy. So
-    one member of a composite grain ``(a, b)`` derives NOTHING: joining on ``a`` alone lands on every
-    ``b`` for that ``a``.
-
-    DIRECTION comes from the HOP, never from the bridge. A bridge's identity is unordered (left/right
-    is storage order), and evidence that A → B is many_to_one says nothing whatever about B → A: the
-    grain of the table being joined INTO is what bounds the fan-in, and the two tables have different
-    grains. The far endpoint is therefore the one in ``segment.catalog_source`` — the side this hop
-    lands on — and only THAT table's grain is consulted. A grain confirmed on the near side is
-    evidence for the opposite direction and is deliberately never read here.
-
-    THREE AXES, KEPT APART. A grain fact attests PHYSICAL UNIQUENESS and nothing else. It does not say
-    the two endpoint columns MEAN the same thing — that is the bridge's semantic axis, with its own
-    authority and lifecycle — and it does not make anything eligible to execute. Deriving fan-in from
-    grain therefore neither borrows nor confers semantic trust: an ungoverned-semantics bridge whose
-    far side is at grain still gets its honest cardinality, and a human-blessed bridge whose far side
-    is not still gets none.
-
-    Anything unproven yields ``(None, "bridge_unattested", (), <far catalog>, "")`` and
-    ``compile_aggregation`` stages every measure on it as ``physical_cardinality_unavailable``. The far
-    endpoint is still IDENTIFIED (it is what tells an unattested bridge from an absent one) but is NOT
-    returned as a grouping key or an execution site: emitting a GROUP BY for a hop whose fan-in is
-    unproven would be the same fabrication one step down, and it would break the invariant
-    ``_grouping_survives`` relies on ("a cardinality-unavailable hop has neither").
-
-    AVAILABILITY IS NOT THIS FUNCTION'S BUSINESS, in either direction. Link availability is decided
-    entirely elsewhere (``cross_catalog_links``' lifecycle allow-list, read through
-    ``ctx.active_bridges``), so a bridge stays fully visible to discovery, suggestions and bounded
-    sandbox analysis whether or not its cardinality can be derived. The two must not be collapsed: a
-    link is not withdrawn because nobody governed the far side's grain, and it is not execution-safe
-    because somebody approved its semantics.
-
-    TIER 3 (a MEASURED fan-out probe) is future work, and it does not make grain evidence
-    unnecessary. A probe is bound to the scope it measured and to a validity window; it could
-    supersede a grain fact only under an explicit freshness / scope / revalidation policy, which does
-    not exist. Nothing here should be read as waiting for it.
+    The explicitly shadow/sandbox-only multi-source context may carry a narrower hypothesis: if the
+    destination endpoint is exactly the destination table's complete governed grain, it can plan
+    N:1 under ``sandbox_provisional_runtime_probe_required``. That source is not deterministic
+    execution evidence and must be tested by the runtime join gate; production context builders
+    never enable it.
     """
     if segment.realization_ref is not None:
         r = next((x for x in ctx.realizations_by_catalog.get(segment.catalog_source, ())
@@ -447,23 +425,72 @@ def _hop_evidence(
         return (r.declared_cardinality, CARDINALITY_SOURCE_REALIZATION, (r.to_key_ref,),
                 segment.catalog_source, r.to_object_ref)
     if segment.bridge_fact_key is not None:
-        br = next((x for x in ctx.active_bridges
-                   if x.fact_key == segment.bridge_fact_key), None)
-        if br is not None:
-            far = [(cat, ref)
-                   for cat, ref in ((br.left_catalog_source, br.left_object_ref),
-                                    (br.right_catalog_source, br.right_object_ref))
-                   if cat == segment.catalog_source]
-            if len(far) == 1:   # exactly one endpoint on the segment's (far) side, else fail closed
-                cat, ref = far[0]
-                table = table_of(ref)
-                grain = ctx.governed_grain_by_table.get(cat, {}).get(table)
-                column = ref.rsplit(".", 1)[-1].strip().lower()
-                if grain is not None and grain == (column,):
-                    return (Cardinality.MANY_TO_ONE, CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN, (ref,),
-                            cat, table)
-                return None, CARDINALITY_SOURCE_BRIDGE_UNATTESTED, (), cat, ""
-        return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
+        revision = segment.bridge_realization_revision
+        if revision is None:
+            bridge = next(
+                (
+                    candidate
+                    for candidate in ctx.active_bridges
+                    if candidate.fact_key == segment.bridge_fact_key
+                ),
+                None,
+            )
+            if ctx.allow_provisional_bridge_cardinality and bridge is not None:
+                destination_catalog = (
+                    segment.bridge_to_catalog_source or segment.catalog_source)
+                destination_ref = segment.bridge_to_object_ref
+                if destination_ref is None:
+                    destinations = [
+                        ref
+                        for catalog, ref in (
+                            (bridge.left_catalog_source, bridge.left_object_ref),
+                            (bridge.right_catalog_source, bridge.right_object_ref),
+                        )
+                        if catalog == destination_catalog
+                    ]
+                    destination_ref = destinations[0] if len(destinations) == 1 else None
+                if destination_ref is not None:
+                    table = table_of(destination_ref)
+                    grain = ctx.governed_grain_by_table.get(
+                        destination_catalog, {}).get(table)
+                    column = destination_ref.rsplit(".", 1)[-1].strip().lower()
+                    if grain == (column,):
+                        return (
+                            Cardinality.MANY_TO_ONE,
+                            CARDINALITY_SOURCE_SANDBOX_PROVISIONAL,
+                            (destination_ref,),
+                            destination_catalog,
+                            table,
+                        )
+            source = (
+                CARDINALITY_SOURCE_BRIDGE_UNATTESTED
+                if bridge is not None
+                else CARDINALITY_SOURCE_UNAVAILABLE
+            )
+            return (
+                None,
+                source,
+                (),
+                segment.catalog_source,
+                "",
+            )
+        if (
+            revision.bridge_fact_key != segment.bridge_fact_key
+            or revision.cardinality.value is None
+        ):
+            return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
+        grouping_keys = tuple(
+            pair.to_logical_column_ref.split("::", 1)[-1]
+            for pair in revision.column_pairs
+        )
+        execution_table = revision.to_endpoint.logical_table_ref.split("::", 1)[-1]
+        return (
+            revision.cardinality.value,
+            CARDINALITY_SOURCE_BRIDGE_REALIZATION,
+            grouping_keys,
+            segment.catalog_source,
+            execution_table,
+        )
     return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
 
 
@@ -822,8 +849,10 @@ def build_physical_read_set(ctx: CompilerContext, plan: BindingPlanV1) -> Physic
     key (``join_key``), and each bridge segment's BOTH endpoint columns (``bridge_key``).
     Duplicate ``(catalog, object_ref)`` reads merge into ONE ``PhysicalColumnReadV1`` with the
     UNION of roles; per-column safety + reason from :func:`safety_of_ref`. A segment whose
-    realization/bridge ref the context cannot resolve contributes no reads — that plan already
-    fails C2 connectivity, fail-closed there. Deterministic: columns sorted by
+    realization ref the context cannot resolve contributes no reads. An available provisional
+    bridge still contributes both discovery endpoints even when it has no executable realization:
+    that is how the safety report describes the path it is refusing, and it does not confer
+    cardinality. Deterministic: columns sorted by
     ``(catalog_source, object_ref)``, roles value-sorted + deduped. Pure over ``ctx``."""
     none_temporal = str(TemporalRole.NONE)
     roles_of: dict[tuple[str, str], set[ColumnRole]] = {}
@@ -845,10 +874,67 @@ def build_physical_read_set(ctx: CompilerContext, plan: BindingPlanV1) -> Physic
                 _read(seg.catalog_source, r.from_key_ref, ColumnRole.join_key)
                 _read(seg.catalog_source, r.to_key_ref, ColumnRole.join_key)
         elif seg.bridge_fact_key is not None:
-            br = next((x for x in ctx.active_bridges if x.fact_key == seg.bridge_fact_key), None)
-            if br is not None:
-                _read(br.left_catalog_source, br.left_object_ref, ColumnRole.bridge_key)
-                _read(br.right_catalog_source, br.right_object_ref, ColumnRole.bridge_key)
+            revision = seg.bridge_realization_revision
+            if revision is not None:
+                for pair in revision.column_pairs:
+                    from_catalog, from_ref = pair.from_logical_column_ref.split("::", 1)
+                    to_catalog, to_ref = pair.to_logical_column_ref.split("::", 1)
+                    _read(from_catalog, from_ref, ColumnRole.bridge_key)
+                    _read(to_catalog, to_ref, ColumnRole.bridge_key)
+                for predicate in revision.predicates:
+                    if isinstance(predicate, FixedValueReferencePredicateV1):
+                        catalog, ref = predicate.logical_column_ref.split("::", 1)
+                        _read(catalog, ref, ColumnRole.filter)
+                    elif isinstance(predicate, AsOfIntervalRequirementV1):
+                        for logical_ref in (
+                            predicate.effective_from_ref,
+                            predicate.effective_to_ref,
+                        ):
+                            catalog, ref = logical_ref.split("::", 1)
+                            _read(catalog, ref, ColumnRole.filter)
+                    elif isinstance(predicate, AdditionalKeyRequirementV1):
+                        for logical_ref in (
+                            predicate.from_logical_column_ref,
+                            predicate.to_logical_column_ref,
+                        ):
+                            catalog, ref = logical_ref.split("::", 1)
+                            _read(catalog, ref, ColumnRole.bridge_key)
+            elif (
+                seg.bridge_from_catalog_source is not None
+                and seg.bridge_from_object_ref is not None
+                and seg.bridge_to_catalog_source is not None
+                and seg.bridge_to_object_ref is not None
+            ):
+                _read(
+                    seg.bridge_from_catalog_source,
+                    seg.bridge_from_object_ref,
+                    ColumnRole.bridge_key,
+                )
+                _read(
+                    seg.bridge_to_catalog_source,
+                    seg.bridge_to_object_ref,
+                    ColumnRole.bridge_key,
+                )
+            else:
+                bridge = next(
+                    (
+                        candidate
+                        for candidate in ctx.active_bridges
+                        if candidate.fact_key == seg.bridge_fact_key
+                    ),
+                    None,
+                )
+                if bridge is not None:
+                    _read(
+                        bridge.left_catalog_source,
+                        bridge.left_object_ref,
+                        ColumnRole.bridge_key,
+                    )
+                    _read(
+                        bridge.right_catalog_source,
+                        bridge.right_object_ref,
+                        ColumnRole.bridge_key,
+                    )
 
     columns: list[PhysicalColumnReadV1] = []
     for catalog, ref in sorted(roles_of):
@@ -900,8 +986,9 @@ class FreshnessResult:
 
 
 def bridge_fingerprint(conn) -> str:
-    """A deterministic hash of the CURRENT active-bridge fact-set (the VERIFIED projected
-    crossings). Taken once at scope-start by C8's context builder (``bridge_fingerprint_at_start``)
+    """A deterministic hash of the CURRENT AVAILABLE bridge fact-set (reviewed and unreviewed).
+
+    Taken once at scope-start by C8's context builder (``bridge_fingerprint_at_start``)
     and recomputed at compile-end by :func:`revalidate_freshness` — a bridge verified, rejected,
     or expired mid-compile changes the set and fails the consistency recheck. Impure (reads the
     projection); order-insensitive (sorted fact keys)."""

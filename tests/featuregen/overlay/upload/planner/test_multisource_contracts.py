@@ -160,17 +160,27 @@ def test_path_strategy_carries_anchor_and_external_type_flag():
 def test_governed_endpoint_shape():
     ep = m.GovernedEndpointV1(
         catalog="core", table_ref="core.positions",
-        grain_key_refs=("core.positions.account_id",), grain_fact_key="gf_core_positions")
+        grain_key_refs=("core.positions.account_id",), grain_fact_key="gf_core_positions",
+        grain_is_unique=True,
+        grain_authority_provenance=m.GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="event-1", grain_dependency_identity="dependency-1")
     assert ep.grain_fact_key == "gf_core_positions"
     names = {f.name for f in dataclasses.fields(m.GovernedEndpointV1)}
-    assert names == {"catalog", "table_ref", "grain_key_refs", "grain_fact_key"}
+    assert names == {
+        "catalog", "table_ref", "grain_key_refs", "grain_fact_key",
+        "grain_is_unique", "grain_authority_provenance", "grain_fact_revision",
+        "grain_dependency_identity",
+    }
 
 
 def test_operand_path_reuses_binding_plan_and_read_set_by_import():
     bp = _minimal_binding_plan()
     ep = m.GovernedEndpointV1(
         catalog="core", table_ref="core.balances",
-        grain_key_refs=("core.balances.account_id",), grain_fact_key="gf")
+        grain_key_refs=("core.balances.account_id",), grain_fact_key="gf",
+        grain_is_unique=True,
+        grain_authority_provenance=m.GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="event-1", grain_dependency_identity="dependency-1")
     strategy = m.PathStrategyV1(
         aggregation=m.PathAggregation.sum, output_type="numeric",
         output_additivity=AdditivityClass.additive, external_type_required=False,

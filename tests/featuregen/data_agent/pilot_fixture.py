@@ -174,17 +174,24 @@ def binding(schema: str, table: str) -> PhysicalDatasetBindingV1:
 #: hand-written attestation that no longer describes the data.
 PILOT_JOIN_EVIDENCE = RelationshipEvidenceV1(
     left_physical_id=binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).identity.table_id,
+    left_binding_revision_id=(
+        binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).binding_revision_id),
+    left_binding_content_hash=binding(TRANSACTION_SCHEMA, TRANSACTION_TABLE).content_hash,
     left_column="cif_id",
     right_physical_id=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).identity.table_id,
+    right_binding_revision_id=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).binding_revision_id,
+    right_binding_content_hash=binding(CUSTOMER_SCHEMA, CUSTOMER_TABLE).content_hash,
     right_column="cif_id",
     left_rows=EXPECTED["transaction_rows"],
     left_distinct=EXPECTED["transaction_cif_distinct"],
     left_nulls=EXPECTED["transaction_cif_nulls"],
     right_rows=EXPECTED["customer_rows"],
     right_distinct=EXPECTED["customer_cif_distinct"],
+    right_nulls=0,
     matched_distinct=EXPECTED["matched_ids"],
     unmatched_distinct=EXPECTED["unmatched_ids"],
-    max_left_rows_per_right_key=EXPECTED["max_rows_per_customer"],
+    max_left_rows_per_tuple=EXPECTED["max_rows_per_customer"],
+    max_right_matches_per_left_row=1,
     method="exact")
 
 

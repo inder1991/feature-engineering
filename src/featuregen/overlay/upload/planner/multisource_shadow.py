@@ -150,7 +150,11 @@ def _landing_dict(landing: PhysicalLandingV1) -> dict[str, Any]:
 
 def _endpoint_dict(e: GovernedEndpointV1) -> dict[str, Any]:
     return {"catalog": e.catalog, "table_ref": e.table_ref,
-            "grain_key_refs": list(e.grain_key_refs), "grain_fact_key": e.grain_fact_key}
+            "grain_key_refs": list(e.grain_key_refs), "grain_fact_key": e.grain_fact_key,
+            "grain_is_unique": e.grain_is_unique,
+            "grain_authority_provenance": e.grain_authority_provenance.value,
+            "grain_fact_revision": e.grain_fact_revision,
+            "grain_dependency_identity": e.grain_dependency_identity}
 
 
 def _evidence_dict(ev: MultiSourceDeclarationEvidenceV1) -> dict[str, Any]:

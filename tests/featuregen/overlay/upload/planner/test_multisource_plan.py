@@ -24,6 +24,9 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -69,11 +72,9 @@ def _seed(db, source, rows_concepts):
 
 
 def _seed_verified_bridge(db, fact_key, entity_id, lc, lref, rc, rref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, lc, lref, rc, rref, f"evt-{fact_key}"))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(db, source, table, columns, *, service_actor, human_actor):

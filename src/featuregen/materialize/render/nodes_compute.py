@@ -120,6 +120,7 @@ from featuregen.materialize.inventory import (
     StaticSnapshot,
 )
 from featuregen.materialize.ir import FormulaExecutionIRV1
+from featuregen.materialize.joins import CrossCatalogJoinStepV1
 from featuregen.materialize.physical_types import PhysicalType
 from featuregen.materialize.render.project import (
     RenderedNode,
@@ -133,6 +134,11 @@ from featuregen.materialize.spine import (
     PartitionMappedSnapshot,
     PopulationSemantics,
     SpineSpec,
+)
+from featuregen.overlay.upload.bridge_realization import (
+    AdditionalKeyRequirementV1,
+    AsOfIntervalRequirementV1,
+    FixedValueReferencePredicateV1,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
 
@@ -228,11 +234,13 @@ _FANS_IN: frozenset[str] = frozenset({"N:1", "1:1"})
 #: a plan built by hand — or a governance extension that mints a new outcome — cannot arrive here
 #: and be rendered as though it had been approved.
 _OPERATIONAL_OUTCOME = "OPERATIONAL"
+_DIRECTIONAL_REALIZATION_OUTCOME = "DIRECTIONAL_REALIZATION_OPERATIONAL"
 
 #: ``graph_edge.authority`` a hop must carry to be COMPUTED on. ``display_only`` is an ungoverned
 #: edge kept for lineage display; rendering one would compute the feature over a path nobody
 #: governed, and the number it produced would look exactly like a governed one.
 _OPERATIONAL_AUTHORITY = "operational"
+_DIRECTIONAL_REALIZATION_AUTHORITY = "directional_realization"
 
 #: The ``approved_join`` status an authority-bearing hop must hold. A hop with no fact key at all is
 #: a FILE-DECLARED edge — "a meaningful answer, not a missing one" — and is not covered by this.
@@ -927,6 +935,7 @@ def render_projection_node(
         *_projection_signature(projection_func_name(feature_column, expression.expr_path), plan),
         *_projection_docstring(expression, feature_column, plan),
         "    business_date = str(business_dt)",
+        *_bridge_value_gate(plan.predicate_value_refs),
         "",
         *_read_set_lines(plan.source_columns),
         "",
@@ -942,11 +951,34 @@ def render_projection_node(
         name=projection_node_name(feature_column, expression.expr_path),
         func_name=projection_func_name(feature_column, expression.expr_path),
         source=source,
-        inputs=(source_dataset, *wired, _BUSINESS_DT_PARAMETER),
+        inputs=(
+            source_dataset,
+            *wired,
+            *(("params:bridge_predicate_values",) if plan.predicate_value_refs else ()),
+            _BUSINESS_DT_PARAMETER,
+        ),
         outputs=(projection_dataset,),
         imports=(_DATAFRAME_IMPORT, _FUNCTIONS_IMPORT),
         tags=("intermediate", "projection"),
     )
+
+
+def _bridge_value_gate(value_refs: tuple[str, ...]) -> list[str]:
+    """Refuse before reading rows when a closed bridge predicate lacks its prepared value."""
+    if not value_refs:
+        return []
+    return [
+        f"    required_bridge_values = {value_refs!r}",
+        "    missing_bridge_values = sorted(",
+        "        name for name in required_bridge_values if name not in bridge_predicate_values)",
+        "    if missing_bridge_values:",
+        *_refuse(
+            ValidationGateCode.RUN_PARAMETERS_MISSING,
+            "the directional realization requires prepared bridge predicate value reference(s) "
+            "that were not supplied:",
+            tail="repr(missing_bridge_values)",
+            indent="        "),
+    ]
 
 
 def _hop_datasets(plan: _Traversal, joined_datasets: Mapping[str, str] | None) -> tuple[str, ...]:
@@ -964,16 +996,31 @@ def _hop_datasets(plan: _Traversal, joined_datasets: Mapping[str, str] | None) -
             f"joined_datasets must be a mapping from '<schema>.<table>' to a catalog dataset name, "
             f"got {type(joined_datasets).__name__}: a sequence would be matched to the hops by "
             f"position, and two dimension tables differ only by position")
-    needed = [f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}" for hop in plan.hops]
-    missing = [table for table in needed if table not in supplied]
-    extra = sorted(set(supplied) - set(needed))
+    needed: list[str] = []
+    selected_keys: list[str] = []
+    missing: list[str] = []
+    for hop in plan.hops:
+        full = (
+            f"{hop.catalog_source.strip().lower()}::"
+            f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}")
+        legacy = f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}"
+        needed.append(full)
+        if full in supplied:
+            selected_keys.append(full)
+        elif legacy in supplied:
+            selected_keys.append(legacy)
+        else:
+            missing.append(full)
+    extra = sorted(set(supplied) - set(selected_keys))
     if missing or extra:
         raise ValueError(
             f"the traversal reaches {needed} and joined_datasets declares {sorted(supplied)} "
             f"(missing {missing}, unexpected {extra}): a hop with no dataset has no table to read, "
             f"and a dataset for a table nothing joins is a governed source this node would claim "
             f"and never read")
-    return tuple(_dataset(supplied[table], f"the {table} hop dataset") for table in needed)
+    return tuple(
+        _dataset(supplied[key], f"the {needed[index]} hop dataset")
+        for index, key in enumerate(selected_keys))
 
 
 def _projection_signature(func_name: str, plan: _Traversal) -> list[str]:
@@ -985,8 +1032,10 @@ def _projection_signature(func_name: str, plan: _Traversal) -> list[str]:
     """
     if not plan.hops:
         return [f"def {func_name}(source: DataFrame, business_dt: str) -> DataFrame:"]
-    parameters = ["source: DataFrame", *(f"{hop.parameter}: DataFrame" for hop in plan.hops),
-                  "business_dt: str"]
+    parameters = ["source: DataFrame", *(f"{hop.parameter}: DataFrame" for hop in plan.hops)]
+    if plan.predicate_value_refs:
+        parameters.append("bridge_predicate_values: dict[str, object]")
+    parameters.append("business_dt: str")
     return [
         f"def {func_name}(",
         *(f"        {parameter}," for parameter in parameters[:-1]),
@@ -1009,22 +1058,34 @@ class _Hop:
     """
 
     index: int
+    catalog_source: str
     schema: str
     table: str
-    left_name: str
-    from_key: tuple[str, str]
+    left_names: tuple[str, ...]
+    from_key: tuple[str, str, str]
     from_table: str
-    from_column: str
-    to_column: str
+    from_columns: tuple[str, ...]
+    to_columns: tuple[str, ...]
     columns: tuple[str, ...]
     carried: tuple[str, ...]
     cardinality: str
     fact_key: str | None
     status: str | None
+    source_predicates: tuple[str, ...] = ()
+    target_predicates: tuple[str, ...] = ()
+    predicate_value_refs: tuple[str, ...] = ()
+    realization_revision_id: str | None = None
+    dependency_snapshot_id: str | None = None
+    evidence_revision_ids: tuple[str, ...] = ()
+    directional: bool = False
 
     @property
-    def key_of(self) -> tuple[str, str]:
-        return (self.schema.strip().lower(), self.table.strip().lower())
+    def key_of(self) -> tuple[str, str, str]:
+        return (
+            self.catalog_source.strip().lower(),
+            self.schema.strip().lower(),
+            self.table.strip().lower(),
+        )
 
     @property
     def prefix(self) -> str:
@@ -1038,9 +1099,11 @@ class _Hop:
         return f"__join_{self.index}__"
 
     @property
-    def key(self) -> str:
-        """The single name both sides of the join carry for the duration of this hop."""
-        return f"{self.prefix}key"
+    def keys(self) -> tuple[str, ...]:
+        """The temporary names both sides carry for this hop's composite equality."""
+        if len(self.left_names) == 1 and not self.directional:
+            return (f"{self.prefix}key",)
+        return tuple(f"{self.prefix}key_{index}" for index in range(1, len(self.left_names) + 1))
 
     @property
     def frame(self) -> str:
@@ -1066,10 +1129,19 @@ class _Traversal:
     source_columns: tuple[str, ...]
     hops: tuple[_Hop, ...]
     reached: tuple[tuple[str, str], ...]
+    predicate_value_refs: tuple[str, ...]
 
 
-def _physical(ref: Any) -> tuple[str, str]:
-    return (ref.schema.strip().lower(), ref.table.strip().lower())
+def _physical(ref: Any) -> tuple[str, str, str]:
+    return (
+        ref.catalog_source.strip().lower(),
+        ref.schema.strip().lower(),
+        ref.table.strip().lower(),
+    )
+
+
+def _physical_label(key: tuple[str, str, str]) -> str:
+    return f"{key[0]}::{key[1]}.{key[2]}"
 
 
 def _projection_columns(expression: ExpressionExecutionIR) -> tuple[str, ...]:
@@ -1100,7 +1172,7 @@ def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
             f"table's rows")
     source_table = _physical(relation[0])
 
-    authorized: dict[tuple[str, str], set[str]] = {}
+    authorized: dict[tuple[str, str, str], set[str]] = {}
     for ref in read:
         if ref.column is not None:
             authorized.setdefault(_physical(ref), set()).add(ref.column)
@@ -1112,12 +1184,12 @@ def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
             "only other thing it could select — reads whatever the table happens to hold today")
 
     hops = _hops(expression, relation[0], authorized)
-    reached = {source_table: None} | {(hop.schema, hop.table): None for hop in hops}
-    unreached = sorted(f"{schema}.{table}" for schema, table in authorized
-                       if (schema, table) not in reached)
+    reached = {source_table: None} | {hop.key_of: None for hop in hops}
+    unreached = sorted(_physical_label(key) for key in authorized if key not in reached)
     if unreached:
         raise ValueError(
-            f"the expression's read set spans {sorted(f'{s}.{t}' for s, t in authorized)} and its "
+            f"the expression's read set spans "
+            f"{sorted(_physical_label(key) for key in authorized)} and its "
             f"governed join plan reaches none of {unreached}: a projection reads the relations its "
             f"traversal arrives at, and a node handed no dataset for a table cannot name its "
             f"columns")
@@ -1150,9 +1222,9 @@ def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
     # it, and any grain key it holds. Everything else it was authorized to read stays where it is —
     # a column selected into the frame and never named again is a line a reviewer of the generated
     # project has to resolve before they can say the traversal is right.
-    needed: dict[tuple[str, str], set[str]] = {}
+    needed: dict[tuple[str, str, str], set[str]] = {}
     for hop in hops:
-        needed.setdefault(hop.from_key, set()).add(hop.from_column)
+        needed.setdefault(hop.from_key, set()).update(hop.from_columns)
     for ref in read:
         if RefRole.GRAIN_KEY in ref.roles and ref.column is not None:
             needed.setdefault(_physical(ref), set()).add(ref.column)
@@ -1163,19 +1235,21 @@ def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
         columns=tuple(sorted((*source_columns, *carried))),
         source_columns=source_columns,
         hops=hops,
-        reached=tuple(sorted(carried.items())))
+        reached=tuple(sorted(carried.items())),
+        predicate_value_refs=tuple(sorted({
+            value_ref for hop in hops for value_ref in hop.predicate_value_refs})))
 
 
-def _hop_reaching(hops: tuple[_Hop, ...], table: tuple[str, str]) -> _Hop:
+def _hop_reaching(hops: tuple[_Hop, ...], table: tuple[str, str, str]) -> _Hop:
     for hop in hops:
-        if (hop.schema, hop.table) == table:
+        if hop.key_of == table:
             return hop
     raise ValueError(  # pragma: no cover — `unreached` above refuses first
-        f"no hop reaches {table[0]}.{table[1]}")
+        f"no hop reaches {_physical_label(table)}")
 
 
 def _hops(expression: ExpressionExecutionIR, relation: Any,
-          authorized: Mapping[tuple[str, str], set[str]]) -> tuple[_Hop, ...]:
+          authorized: Mapping[tuple[str, str, str], set[str]]) -> tuple[_Hop, ...]:
     """The join plan's steps, checked and resolved into the direction of travel.
 
     ``fans_out`` and ``outcome_kind`` are READ rather than inferred. ``JoinPlan``'s own docstring
@@ -1188,10 +1262,14 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
     plan = expression.join_plan
     if not plan.steps:
         return ()
-    if plan.outcome_kind != _OPERATIONAL_OUTCOME:
+    if plan.outcome_kind not in {
+        _OPERATIONAL_OUTCOME,
+        _DIRECTIONAL_REALIZATION_OUTCOME,
+    }:
         raise ValueError(
             f"the governed join plan's outcome is {plan.outcome_kind!r} and only "
-            f"{_OPERATIONAL_OUTCOME!r} may be computed on: every other outcome is a path governance "
+            f"{_OPERATIONAL_OUTCOME!r} or {_DIRECTIONAL_REALIZATION_OUTCOME!r} may be computed on: "
+            "every other outcome is a path governance "
             f"did not approve, and a hop rendered from one produces rows that look exactly like "
             f"governed ones")
     if plan.fans_out:
@@ -1201,50 +1279,94 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
             "— allocating one row across many is a governed business decision (§3.2), so a plan "
             "that fans is a defect upstream rather than something to repair here")
 
-    catalog = relation.catalog_source
     by_ref = {ref.logical_ref: ref for ref in expression.physical_read_set}
     current: dict[str, str] = {}
     source_table = _physical(relation)
-    for column in sorted(authorized.get(source_table, ())):
-        current[f"{source_table[0]}.{source_table[1]}.{column}"] = column
-    reached: dict[tuple[str, str], None] = {source_table: None}
+    for ref in expression.physical_read_set:
+        if _physical(ref) == source_table and ref.column is not None:
+            current[ref.logical_ref] = ref.column
+    reached: dict[tuple[str, str, str], None] = {source_table: None}
 
     hops: list[_Hop] = []
     for index, step in enumerate(plan.steps, start=1):
         _check_authority(step, index)
-        origin = _endpoint(step.from_ref, catalog, by_ref, index, "from")
-        target = _endpoint(step.to_ref, catalog, by_ref, index, "to")
+        if isinstance(step, CrossCatalogJoinStepV1):
+            origins = tuple(
+                _full_endpoint(pair[0], by_ref, index, "from") for pair in step.column_pairs)
+            targets = tuple(
+                _full_endpoint(pair[1], by_ref, index, "to") for pair in step.column_pairs)
+        else:
+            origins = (_endpoint(
+                step.from_ref, relation.catalog_source, by_ref, index, "from"),)
+            targets = (_endpoint(
+                step.to_ref, relation.catalog_source, by_ref, index, "to"),)
+        origin, target = origins[0], targets[0]
+        if any(_physical(candidate) != _physical(origin) for candidate in origins):
+            raise ValueError(
+                f"hop {index}'s composite from tuple spans more than one physical table")
+        if any(_physical(candidate) != _physical(target) for candidate in targets):
+            raise ValueError(
+                f"hop {index}'s composite to tuple spans more than one physical table")
         if _physical(origin) not in reached:
             raise ValueError(
-                f"hop {index} travels from {origin.schema}.{origin.table} and the traversal has not "
+                f"hop {index} travels from {origin.catalog_source}::{origin.schema}.{origin.table} "
+                "and the traversal has not "
                 f"reached it: steps are ORIENTED to the direction of travel, so one whose `from` "
                 f"side is not in the frame yet is a plan being replayed in the wrong order — "
                 f"rendered anyway it would join backwards and land rows on the wrong entities")
         if _physical(target) in reached:
             raise ValueError(
-                f"hop {index} arrives at {target.schema}.{target.table}, which the traversal has "
+                f"hop {index} arrives at "
+                f"{target.catalog_source}::{target.schema}.{target.table}, which the traversal has "
                 f"already reached: a path that revisits a table joins it to itself, and every row "
                 f"count downstream is then a property of that join rather than of the data")
-        left = current.get(f"{origin.schema.strip().lower()}."
-                           f"{origin.table.strip().lower()}.{origin.column}")
-        if left is None:
+        left_names = tuple(current.get(candidate.logical_ref) for candidate in origins)
+        if any(left is None for left in left_names):
             raise ValueError(  # pragma: no cover — `reached` above refuses first
-                f"hop {index} joins from {origin.logical_ref}, which is not in the frame")
+                f"hop {index} joins from {[candidate.logical_ref for candidate in origins]}, "
+                "which is not in the frame")
         columns = tuple(sorted(authorized.get(_physical(target), ())))
-        if target.column not in columns:
+        if any(candidate.column not in columns for candidate in targets):
             raise ValueError(
-                f"hop {index} arrives on {target.logical_ref}, which is not in the authorized read "
-                f"set for {target.schema}.{target.table} ({list(columns)}): §1.3 authorized a SET "
+                f"hop {index} arrives on {[candidate.logical_ref for candidate in targets]}, which "
+                "is not in the authorized read set for "
+                f"{target.catalog_source}::{target.schema}.{target.table} ({list(columns)}): "
+                "§1.3 authorized a SET "
                 f"of columns, and joining on one outside it is a read this group was never granted")
+        source_predicates: tuple[str, ...] = ()
+        target_predicates: tuple[str, ...] = ()
+        predicate_value_refs: tuple[str, ...] = ()
+        if isinstance(step, CrossCatalogJoinStepV1):
+            source_predicates, target_predicates, predicate_value_refs = _bridge_predicates(
+                step, by_ref, current, _physical(target), index)
         hop = _Hop(
-            index=index, schema=target.schema, table=target.table, left_name=left,
-            from_key=_physical(origin), from_table=f"{origin.schema}.{origin.table}",
-            from_column=origin.column or "", to_column=target.column or "", columns=columns,
+            index=index, catalog_source=target.catalog_source, schema=target.schema,
+            table=target.table,
+            left_names=tuple(str(left) for left in left_names),
+            from_key=_physical(origin),
+            from_table=(
+                f"{origin.catalog_source}::{origin.schema}.{origin.table}"
+                if isinstance(step, CrossCatalogJoinStepV1)
+                else f"{origin.schema}.{origin.table}"
+            ),
+            from_columns=tuple(candidate.column or "" for candidate in origins),
+            to_columns=tuple(candidate.column or "" for candidate in targets), columns=columns,
             carried=(), cardinality=str(step.cardinality),
-            fact_key=step.approved_join_fact_key, status=step.approved_join_status)
-        for column in columns:
-            current[f"{hop.schema.strip().lower()}.{hop.table.strip().lower()}.{column}"] = (
-                f"{hop.prefix}{column}")
+            fact_key=(
+                step.bridge_fact_key
+                if isinstance(step, CrossCatalogJoinStepV1)
+                else step.approved_join_fact_key
+            ),
+            status=step.approved_join_status,
+            source_predicates=source_predicates, target_predicates=target_predicates,
+            predicate_value_refs=predicate_value_refs,
+            realization_revision_id=getattr(step, "realization_revision_id", None),
+            dependency_snapshot_id=getattr(step, "dependency_snapshot_id", None),
+            evidence_revision_ids=tuple(getattr(step, "evidence_revision_ids", ())),
+            directional=isinstance(step, CrossCatalogJoinStepV1))
+        for ref in expression.physical_read_set:
+            if _physical(ref) == hop.key_of and ref.column is not None:
+                current[ref.logical_ref] = f"{hop.prefix}{ref.column}"
         reached[_physical(target)] = None
         hops.append(hop)
     return tuple(hops)
@@ -1252,13 +1374,22 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
 
 def _check_authority(step: Any, index: int) -> None:
     """A hop's last three fields — why this edge was allowed to be traversed at all."""
-    if step.authority != _OPERATIONAL_AUTHORITY:
+    expected_authority = (
+        _DIRECTIONAL_REALIZATION_AUTHORITY
+        if isinstance(step, CrossCatalogJoinStepV1)
+        else _OPERATIONAL_AUTHORITY
+    )
+    if step.authority != expected_authority:
         raise ValueError(
             f"hop {index} ({step.from_ref} -> {step.to_ref}) carries authority "
-            f"{step.authority!r}: only {_OPERATIONAL_AUTHORITY!r} edges may be computed on, and a "
+            f"{step.authority!r}: only {expected_authority!r} edges may be computed on, and a "
             f"{step.authority!r} edge is kept for lineage DISPLAY — computing over one would "
             f"produce a number nobody governed the path of")
-    if step.approved_join_fact_key is not None and step.approved_join_status != _VERIFIED_STATUS:
+    if (
+        not isinstance(step, CrossCatalogJoinStepV1)
+        and step.approved_join_fact_key is not None
+        and step.approved_join_status != _VERIFIED_STATUS
+    ):
         raise ValueError(
             f"hop {index} ({step.from_ref} -> {step.to_ref}) is backed by approved_join fact "
             f"{step.approved_join_fact_key!r} whose status is {step.approved_join_status!r} rather "
@@ -1271,6 +1402,16 @@ def _check_authority(step: Any, index: int) -> None:
             f"{sorted(_FANS_IN)}: an unattested hop may BE 1:N — 'we do not know' is not 'it is "
             f"safe' — and a hop that fans multiplies rows, which inflates every aggregate over "
             f"them with nothing raised anywhere")
+    if isinstance(step, CrossCatalogJoinStepV1):
+        for name in (
+            "realization_revision_id",
+            "dependency_snapshot_id",
+            "bridge_fact_key",
+        ):
+            if not str(getattr(step, name, "")).strip():
+                raise ValueError(
+                    f"hop {index}'s directional realization has no {name}: generated execution "
+                    "must name the exact safety decision and dependencies it is reusing")
 
 
 def _endpoint(step_ref: str, catalog: str, by_ref: Mapping[str, Any], index: int,
@@ -1291,6 +1432,77 @@ def _endpoint(step_ref: str, catalog: str, by_ref: Mapping[str, Any], index: int
             f"so an endpoint missing from it is a column the group would join on and was never "
             f"granted")
     return found
+
+
+def _full_endpoint(
+    logical_ref: str,
+    by_ref: Mapping[str, Any],
+    index: int,
+    side: str,
+) -> Any:
+    """Resolve a cross-catalog endpoint by its full governed logical address."""
+    found = by_ref.get(logical_ref)
+    if found is None or found.column is None:
+        raise ValueError(
+            f"hop {index}'s {side} endpoint {logical_ref!r} is not in the expression's authorized "
+            "physical read set")
+    return found
+
+
+def _bridge_predicates(
+    step: CrossCatalogJoinStepV1,
+    by_ref: Mapping[str, Any],
+    current: Mapping[str, str],
+    target_key: tuple[str, str, str],
+    index: int,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Compile only the closed realization-predicate vocabulary into safe Spark expressions."""
+    source: list[str] = []
+    target: list[str] = []
+    values: list[str] = []
+
+    def location(logical_ref: str) -> tuple[str, str]:
+        endpoint = _full_endpoint(logical_ref, by_ref, index, "predicate")
+        if _physical(endpoint) == target_key:
+            return "target", endpoint.column
+        rendered = current.get(logical_ref)
+        if rendered is None:
+            raise ValueError(
+                f"hop {index}'s predicate column {logical_ref!r} is on neither the reached frame "
+                "nor this hop's target table")
+        return "source", rendered
+
+    def value(value_ref: str) -> str:
+        values.append(value_ref)
+        return f"F.lit(bridge_predicate_values[{value_ref!r}])"
+
+    for predicate in step.predicates:
+        if isinstance(predicate, FixedValueReferencePredicateV1):
+            side, column = location(predicate.logical_column_ref)
+            rendered = f"(F.col({column!r}) == {value(predicate.value_ref)})"
+        elif isinstance(predicate, AsOfIntervalRequirementV1):
+            from_side, effective_from = location(predicate.effective_from_ref)
+            to_side, effective_to = location(predicate.effective_to_ref)
+            if from_side != to_side:
+                raise ValueError(
+                    f"hop {index}'s as-of predicate {predicate.predicate_id!r} places its interval "
+                    "bounds on different physical frames")
+            side = from_side
+            as_of = value(predicate.as_of_value_ref)
+            rendered = (
+                f"((F.col({effective_from!r}) <= {as_of}) & "
+                f"(F.col({effective_to!r}).isNull() | "
+                f"(F.col({effective_to!r}) > {as_of})))")
+        elif isinstance(predicate, AdditionalKeyRequirementV1):
+            raise ValueError(
+                f"hop {index} carries unresolved additional-key requirement "
+                f"{predicate.reason_code!r}; it cannot be rendered")
+        else:  # pragma: no cover - the realization contract closes the union
+            raise TypeError(
+                f"hop {index} carries unsupported structured predicate "
+                f"{type(predicate).__name__}")
+        (source if side == "source" else target).append(rendered)
+    return tuple(source), tuple(target), tuple(sorted(set(values)))
 
 
 def _read_column(ref: str, read_set: tuple[str, ...], what: str) -> str:
@@ -1412,20 +1624,61 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
             "that is not there."),
     ]
     for hop in plan.hops:
-        backing = (f"approved_join fact {hop.fact_key} ({hop.status})" if hop.fact_key is not None
-                   else "a FILE-DECLARED edge, backed by no approved_join fact")
+        if hop.realization_revision_id is not None:
+            backing = (
+                f"entity_bridge fact {hop.fact_key}, directional realization "
+                f"{hop.realization_revision_id}, dependency snapshot "
+                f"{hop.dependency_snapshot_id}, evidence "
+                f"{', '.join(hop.evidence_revision_ids) or 'none'}")
+        else:
+            backing = (
+                f"approved_join fact {hop.fact_key} ({hop.status})"
+                if hop.fact_key is not None
+                else "a FILE-DECLARED edge, backed by no approved_join fact")
         lines.append("")
-        lines.extend(_comment(
-            f"Hop {hop.index}: {hop.from_table}.{hop.from_column} -> {hop.schema}.{hop.table}."
-            f"{hop.to_column}, cardinality {hop.cardinality} toward {hop.table} — authorized by "
-            f"{backing}."))
+        if hop.directional:
+            description = (
+                f"Hop {hop.index}: {hop.from_table}({', '.join(hop.from_columns)}) -> "
+                f"{hop.catalog_source}::{hop.schema}.{hop.table}"
+                f"({', '.join(hop.to_columns)}), cardinality {hop.cardinality} toward "
+                f"{hop.table} — authorized by {backing}.")
+        else:
+            description = (
+                f"Hop {hop.index}: {hop.from_table}.{hop.from_columns[0]} -> "
+                f"{hop.schema}.{hop.table}.{hop.to_columns[0]}, cardinality {hop.cardinality} "
+                f"toward {hop.table} — authorized by {backing}.")
+        lines.extend(_comment(description))
+        for predicate in hop.source_predicates:
+            lines.append(f"    rows = rows.where({predicate})")
+        target_frame = hop.parameter
+        for predicate in hop.target_predicates:
+            filtered = f"{hop.frame}_scoped"
+            lines.append(f"    {filtered} = {target_frame}.where({predicate})")
+            target_frame = filtered
         lines.extend(_select_lines(
-            f"    {hop.frame} = {hop.parameter}.select(",
-            [f"F.col({hop.to_column!r}).alias({hop.key!r})",
+            f"    {hop.frame} = {target_frame}.select(",
+            [
+                *(
+                    f"F.col({column!r}).alias({key!r})"
+                    for column, key in zip(hop.to_columns, hop.keys)
+                ),
              *(f"F.col({column!r}).alias({hop.prefix + column!r})" for column in hop.carried)]))
-        lines.append(f"    rows = rows.withColumn({hop.key!r}, F.col({hop.left_name!r}))")
-        lines.append(f"    rows = rows.join({hop.frame}, [{hop.key!r}], {_HOP_JOIN_HOW!r})"
-                     f".drop({hop.key!r})")
+        for key, left_name in zip(hop.keys, hop.left_names):
+            lines.append(f"    rows = rows.withColumn({key!r}, F.col({left_name!r}))")
+        if hop.directional:
+            lines.append(f"    rows_before_bridge_{hop.index} = rows.count()")
+        rendered_keys = ", ".join(repr(key) for key in hop.keys)
+        lines.append(
+            f"    rows = rows.join({hop.frame}, [{rendered_keys}], {_HOP_JOIN_HOW!r})"
+            f".drop({rendered_keys})")
+        if hop.directional:
+            lines.extend([
+                f"    if rows.count() > rows_before_bridge_{hop.index}:",
+                "        raise RuntimeError(",
+                f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} + ",
+                "            ': observed row amplification for directional realization ' +",
+                f"            {hop.realization_revision_id!r})",
+            ])
     lines.append("")
     lines.extend(_comment(
         "What the traversal hands on: the source relation's authorized columns, plus the grain "

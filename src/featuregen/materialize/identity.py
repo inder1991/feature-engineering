@@ -53,7 +53,11 @@ from featuregen.materialize import binding, compile, render
 from featuregen.materialize.admission import hive_identifier
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.group_plan import FeatureGroupPlanV1, group_plan_hash
-from featuregen.materialize.ir import FormulaExecutionIRV1, ir_hash
+from featuregen.materialize.ir import (
+    FormulaExecutionIRV1,
+    bridge_realization_dependencies,
+    ir_hash,
+)
 
 __all__ = [
     "GENERATED_LOCK_FILENAME",
@@ -134,6 +138,7 @@ class CompilationIdentity:
     ir_hashes: tuple[str, ...]
     materialization_contract_hash: str
     group_plan_hash: str
+    bridge_realization_dependencies: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         formulas = _hashes(self.formula_content_hashes, "formula_content_hashes")
@@ -150,6 +155,11 @@ class CompilationIdentity:
         object.__setattr__(self, "ir_hashes", irs)
         _required(self.materialization_contract_hash, "materialization_contract_hash")
         _required(self.group_plan_hash, "group_plan_hash")
+        dependencies = tuple(sorted(set(self.bridge_realization_dependencies)))
+        for revision_id, snapshot_id in dependencies:
+            _required(revision_id, "bridge realization revision")
+            _required(snapshot_id, "bridge dependency snapshot")
+        object.__setattr__(self, "bridge_realization_dependencies", dependencies)
 
     def identity_payload(self) -> dict[str, Any]:
         """Every field, because every field is identity — no provenance, no run-time value.
@@ -157,12 +167,19 @@ class CompilationIdentity:
         Deliberately TOTAL: no parsing, no catalog read, nothing that can raise. It is called while
         building a hash, where an exception would be indistinguishable from a governed refusal.
         """
-        return {
+        payload: dict[str, Any] = {
             "formula_content_hashes": list(self.formula_content_hashes),
             "ir_hashes": list(self.ir_hashes),
             "materialization_contract_hash": self.materialization_contract_hash,
             "group_plan_hash": self.group_plan_hash,
         }
+        # Preserve the existing identity bytes for the overwhelmingly common single-catalog case.
+        # A cross-catalog artifact adds the exact execution dependencies it must revalidate.
+        if self.bridge_realization_dependencies:
+            payload["bridge_realization_dependencies"] = [
+                list(dependency) for dependency in self.bridge_realization_dependencies
+            ]
+        return payload
 
 
 def build_compilation_identity(
@@ -231,7 +248,9 @@ def build_compilation_identity(
         formula_content_hashes=tuple(compiled.formula_content_hash for compiled in ordered),
         ir_hashes=tuple(ir_hash(compiled) for compiled in ordered),
         materialization_contract_hash=plan.materialization_contract_hash,
-        group_plan_hash=group_plan_hash(plan))
+        group_plan_hash=group_plan_hash(plan),
+        bridge_realization_dependencies=bridge_realization_dependencies(ordered),
+    )
 
 
 # ── phase 2: the rendered artifact ───────────────────────────────────────────────────────────────
@@ -391,12 +410,22 @@ def read_lock(document: str) -> RenderedArtifactIdentity:
             f"{GENERATED_LOCK_FILENAME} must hold exactly a rendered identity, got keys "
             f"{sorted(parsed) if isinstance(parsed, dict) else type(parsed).__name__}")
     compilation = parsed["compilation"]
-    expected = {"formula_content_hashes", "ir_hashes", "materialization_contract_hash",
+    required = {"formula_content_hashes", "ir_hashes", "materialization_contract_hash",
                 "group_plan_hash"}
-    if not isinstance(compilation, dict) or set(compilation) != expected:
+    optional = {"bridge_realization_dependencies"}
+    if (
+        not isinstance(compilation, dict)
+        or not required <= set(compilation)
+        or set(compilation) - required - optional
+    ):
         raise ValueError(
             f"{GENERATED_LOCK_FILENAME} must hold exactly a compilation identity, got keys "
             f"{sorted(compilation) if isinstance(compilation, dict) else type(compilation).__name__}")
+    if "bridge_realization_dependencies" in compilation:
+        compilation["bridge_realization_dependencies"] = tuple(
+            tuple(dependency)
+            for dependency in compilation["bridge_realization_dependencies"]
+        )
     return RenderedArtifactIdentity(
         compilation=CompilationIdentity(**compilation),
         generated_project_hash=parsed["generated_project_hash"])

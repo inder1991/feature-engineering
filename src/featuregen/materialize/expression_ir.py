@@ -78,9 +78,21 @@ from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.inputs import PhysicalInputRequirement, derive_requirement
 from featuregen.materialize.inventory import ClusterInventoryV1
-from featuregen.materialize.joins import JoinPlan, PhysicalIdentity, plan_join
+from featuregen.materialize.joins import (
+    CrossCatalogJoinStepV1,
+    JoinPlan,
+    PhysicalIdentity,
+    plan_cross_catalog_join,
+    plan_join,
+)
 from featuregen.overlay.facts import AVAILABILITY_TIME, FactValidationError, validate_fact_value
 from featuregen.overlay.identity import fact_key as _fact_key_of
+from featuregen.overlay.upload.bridge_realization import (
+    AdditionalKeyRequirementV1,
+    AsOfIntervalRequirementV1,
+    FixedValueReferencePredicateV1,
+)
+from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.upload_catalog import table_ref as _catalog_table_ref
@@ -340,8 +352,14 @@ class ExpressionExecutionIR:
         return {
             "expr_path": self.expr_path,
             "physical_read_set": [ref.identity_payload() for ref in self.physical_read_set],
-            "join_steps": [[step.from_ref, step.to_ref, step.cardinality]
-                           for step in self.join_plan.steps],
+            "join_steps": [
+                (
+                    step.identity_payload()
+                    if isinstance(step, CrossCatalogJoinStepV1)
+                    else [step.from_ref, step.to_ref, step.cardinality]
+                )
+                for step in self.join_plan.steps
+            ],
             "pit": self.pit.identity_payload(),
             "input_requirements": [req.identity_payload() for req in self.input_requirements],
             "aggregation": self.aggregation.value,
@@ -742,6 +760,7 @@ def compile_expression(
     grain_keys: Iterable[str],
     roles: Iterable[str] = (),
     inventory: ClusterInventoryV1,
+    bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] = (),
 ) -> ExpressionExecutionIR | MaterializationRefused:
     """Compile ONE ``AggregateExpression`` into its executable plan, or refuse it (§3).
 
@@ -826,7 +845,8 @@ def compile_expression(
     read_set.add(availability_ref, RefRole.AVAILABILITY, source_identity, availability.column)
 
     planned = _plan_to_grain(conn, tables, read_set, source_identity=source_identity,
-                             source_catalog=source_catalog, grain=grain, roles=roles_used)
+                             source_catalog=source_catalog, grain=grain, roles=roles_used,
+                             bridge_realizations=bridge_realizations)
     if isinstance(planned, MaterializationRefused):
         return planned
     join, joined_tables = planned
@@ -889,6 +909,7 @@ def _plan_to_grain(
     source_catalog: str,
     grain: tuple[str, ...],
     roles: tuple[str, ...],
+    bridge_realizations: tuple[CurrentBridgeRealizationV1, ...],
 ) -> tuple[JoinPlan, tuple[str, ...]] | MaterializationRefused:
     """The governed traversal from the source relation to the grain, and the reads it implies.
 
@@ -917,19 +938,35 @@ def _plan_to_grain(
         target_identity = source_identity
     else:
         parsed_source, _schema, _table, _column = parse_ref(target_table_ref)
-        if _fold(parsed_source) != _fold(source_catalog):
-            return _refuse(
-                CompilationRefusalCode.GRAIN_PATH_NOT_GOVERNED,
-                f"the grain key table {target_table_ref} is in catalog {parsed_source!r} while the "
-                f"source relation is in {source_catalog!r}: the governed join planner is "
-                f"single-catalog, so no governed path between them exists to plan")
         resolved = tables.resolve(target_table_ref)
         if isinstance(resolved, MaterializationRefused):
             return resolved
         target_identity = resolved
 
-    plan = plan_join(conn, catalog_source=source_catalog, from_identity=source_identity,
-                     to_identity=target_identity, roles=roles)
+    cross_catalog = _fold(target_identity.catalog_source) != _fold(source_catalog)
+    if cross_catalog:
+        matches = tuple(
+            realization
+            for realization in bridge_realizations
+            if _identity_matches_realization(
+                source_identity, target_identity, realization)
+        )
+        if len(matches) != 1:
+            return _refuse(
+                CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                f"the cross-catalog grain route {source_catalog} -> "
+                f"{target_identity.catalog_source} resolved to {len(matches)} current executable "
+                "directional realizations; production compilation requires exactly one",
+            )
+        plan = plan_cross_catalog_join(
+            matches[0],
+            from_identity=source_identity,
+            to_identity=target_identity,
+            roles=roles,
+        )
+    else:
+        plan = plan_join(conn, catalog_source=source_catalog, from_identity=source_identity,
+                         to_identity=target_identity, roles=roles)
     if isinstance(plan, MaterializationRefused):
         return plan
 
@@ -938,14 +975,50 @@ def _plan_to_grain(
     # the path is read too, including the intermediate hops the caller never named.
     read_order: dict[str, None] = {}
     for step in plan.steps:
-        for step_ref in (step.from_ref, step.to_ref):
-            key_ref = join_key_ref(source_catalog, step_ref)
+        step_refs = (
+            tuple(ref for pair in step.column_pairs for ref in pair)
+            if isinstance(step, CrossCatalogJoinStepV1)
+            else tuple(
+                join_key_ref(source_catalog, ref)
+                for ref in (step.from_ref, step.to_ref)
+            )
+        )
+        for key_ref in step_refs:
             key_table_ref = _table_ref_of(key_ref)
             identity = tables.resolve(key_table_ref)
             if isinstance(identity, MaterializationRefused):
                 return identity
             read_set.add(key_ref, RefRole.JOIN_KEY, identity, _column_of(key_ref))
             read_order.setdefault(key_table_ref, None)
+        if isinstance(step, CrossCatalogJoinStepV1):
+            for predicate in step.predicates:
+                predicate_refs: tuple[str, ...]
+                if isinstance(predicate, FixedValueReferencePredicateV1):
+                    predicate_refs = (predicate.logical_column_ref,)
+                elif isinstance(predicate, AsOfIntervalRequirementV1):
+                    predicate_refs = (
+                        predicate.effective_from_ref,
+                        predicate.effective_to_ref,
+                    )
+                elif isinstance(predicate, AdditionalKeyRequirementV1):
+                    predicate_refs = (
+                        predicate.from_logical_column_ref,
+                        predicate.to_logical_column_ref,
+                    )
+                else:  # pragma: no cover - the realization constructor closes the vocabulary
+                    raise AssertionError("unknown structured bridge predicate")
+                for predicate_ref in predicate_refs:
+                    predicate_table_ref = _table_ref_of(predicate_ref)
+                    identity = tables.resolve(predicate_table_ref)
+                    if isinstance(identity, MaterializationRefused):
+                        return identity
+                    read_set.add(
+                        predicate_ref,
+                        RefRole.FILTER_LEFT,
+                        identity,
+                        _column_of(predicate_ref),
+                    )
+                    read_order.setdefault(predicate_table_ref, None)
 
     for key in grain:
         key_table_ref = _table_ref_of(key)
@@ -955,6 +1028,40 @@ def _plan_to_grain(
         read_set.add(key, RefRole.GRAIN_KEY, identity, _column_of(key))
         read_order.setdefault(key_table_ref, None)
     return plan, tuple(read_order)
+
+
+def _identity_matches_realization(
+    source: PhysicalIdentity,
+    target: PhysicalIdentity,
+    realization: CurrentBridgeRealizationV1,
+) -> bool:
+    revision = realization.revision
+    left = revision.from_endpoint.physical_binding
+    right = revision.to_endpoint.physical_binding
+    return (
+        left is not None
+        and right is not None
+        and (
+            _fold(source.catalog_source),
+            _fold(source.schema),
+            _fold(source.table),
+        )
+        == (
+            _fold(left.identity.catalog_source),
+            _fold(left.identity.schema),
+            _fold(left.identity.table),
+        )
+        and (
+            _fold(target.catalog_source),
+            _fold(target.schema),
+            _fold(target.table),
+        )
+        == (
+            _fold(right.identity.catalog_source),
+            _fold(right.identity.schema),
+            _fold(right.identity.table),
+        )
+    )
 
 
 def _fold(value: str) -> str:

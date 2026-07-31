@@ -98,7 +98,7 @@ class Authority:
 def resolve_authority(
     conn: DbConn,
     adapter: CatalogAdapter,
-    ref: CatalogObjectRef | ApprovedJoinRef,
+    ref: CatalogObjectRef | ApprovedJoinRef | EntityBridgeRef,
     fact_type: FactType,
 ) -> Authority:
     # conn is part of the stable contract (owner overrides / governance config may be stored

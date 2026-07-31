@@ -1,5 +1,9 @@
 from datetime import UTC, datetime
 
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
+
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -113,10 +117,9 @@ def _seed(db, source, catalog):
 
 
 def _seed_bridge(db, fact_key, entity_id, left_cat, left_ref, right_cat, right_ref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, left_cat, left_ref, right_cat, right_ref))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=left_cat, left_ref=left_ref,
+        right_source=right_cat, right_ref=right_ref)
 
 
 def _txn_template(extra_needs: tuple = ()):
@@ -242,16 +245,18 @@ from featuregen.overlay.upload.planner.declarations import CompileBudget, build_
 
 
 def _freshness(db, *sources, head_seq=1):
+    event_head = db.execute("SELECT COALESCE(max(global_seq), 0) FROM events").fetchone()[0]
+    applied_head = max(head_seq, event_head)
     for src in sources:
         db.execute(
             "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id,"
             " head_seq) VALUES (%s,%s,'c8',%s) ON CONFLICT (catalog_source) DO UPDATE SET"
             " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
-            (src, _NOW, head_seq))
+            (src, _NOW, applied_head))
     db.execute(
         "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES"
         " ('overlay', %s) ON CONFLICT (projection_name) DO UPDATE SET"
-        " checkpoint_seq = EXCLUDED.checkpoint_seq", (head_seq,))
+        " checkpoint_seq = EXCLUDED.checkpoint_seq", (applied_head,))
 
 
 def _c8_fixture(db):

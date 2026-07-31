@@ -29,6 +29,9 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
 from tests.featuregen.overlay.upload.conftest import _confirm_grain
 
 from featuregen.contracts.envelopes import Command
@@ -73,6 +76,7 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
     FinalOperation,
     GovernedEndpointV1,
     GovernedSourceBindingV1,
+    GrainAuthorityProvenance,
     MultiSourceBindingPlanV1,
     MultiSourceDeclarationEvidenceV1,
     MultiSourceReason,
@@ -100,11 +104,9 @@ def _seed(db, source, rows_concepts):
 
 
 def _seed_verified_bridge(db, fact_key, entity_id, lc, lref, rc, rref):
-    db.execute(
-        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref, "
-        "right_catalog_source, right_object_ref, confirmed_event_id, status) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,'VERIFIED')",
-        (fact_key, entity_id, lc, lref, rc, rref, f"evt-{fact_key}"))
+    _seed_verified_bridge_fact(
+        db, fact_key, entity=entity_id, left_source=lc, left_ref=lref,
+        right_source=rc, right_ref=rref)
 
 
 def _seed_verified_grain(db, source, table, columns, *, service_actor, human_actor):
@@ -303,7 +305,11 @@ def test_path_fresh_on_its_own_catalogs_but_union_hits_stale_watermark(stale_uni
     ctx = _union_ctx(conn)
     landing_ep = GovernedEndpointV1(
         catalog="wealth", table_ref="public.customers",
-        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk")
+        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk",
+        grain_is_unique=True,
+        grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="test-revision",
+        grain_dependency_identity="test-dependency")
     plan = _stale_union_plan(landing_ep)
 
     # operand 0's OWN catalogs {core_banking, wealth} are both fresh -> individually fresh
@@ -321,7 +327,11 @@ def test_compile_over_stale_union_is_unresolved_freshness_but_still_minted(stale
     ctx = _union_ctx(conn)
     landing_ep = GovernedEndpointV1(
         catalog="wealth", table_ref="public.customers",
-        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk")
+        grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk",
+        grain_is_unique=True,
+        grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+        grain_fact_revision="test-revision",
+        grain_dependency_identity="test-dependency")
     plan = _stale_union_plan(landing_ep)
 
     out = compile_multi_source_contract(conn, ctx, plan, _stale_union_spec(), budget=_budget())
@@ -372,45 +382,19 @@ def test_confirmed_event_id_requeried_from_entity_bridge_edge_for_audit(resolved
     # the operand's governed path crosses via the VERIFIED bridge bfk_acct -> re-queried for audit,
     # carrying the durable confirmed_event_id (NEVER widening active_bridges)
     audit = confirmed_event_ids_for_audit(conn, plan)
-    assert ("bfk_acct", "evt-bfk_acct") in audit
+    expected = conn.execute(
+        "SELECT confirmed_event_id FROM entity_bridge_edge WHERE fact_key='bfk_acct'").fetchone()[0]
+    assert expected is not None
+    assert ("bfk_acct", expected) in audit
 
 
-def test_a_staled_bridge_whose_projection_row_survived_is_not_audited_as_verified(
-        resolved_topology, service_actor):
-    """THE ROW IS NOT THE DECISION. `entity_bridge_edge` is a projection of the VERIFIED fold and
-    `expiry.demote_bridge_edges` is FAIL-SOFT: when drift STALEs a bridge and the demotion does not
-    run, the VERIFIED row is left behind. Reading the row alone stamped that withdrawn crossing
-    `verified` in the persisted audit record — which is the telemetry the gate's "every crossing is
-    a governed authority" assertion is falsified from.
-
-    Here the STALE event lands on the stream and the row is deliberately left VERIFIED (the exact
-    fail-soft residue). The fold — the one every other `entity_bridge_edge` reader in `src` already
-    goes through — must win: no audit pair, and the crossing recorded as `unverified`."""
-    conn, scope = resolved_topology
-    operand = _operand(slot_id="op_0", catalog="core_banking")
-    ctx, plan = _assemble_identity(conn, scope, operand)
-    assert ("bfk_acct", "evt-bfk_acct") in confirmed_event_ids_for_audit(conn, plan)
-
-    append_overlay_event(
-        conn, fact_key="bfk_acct", type="OVERLAY_FACT_STALED",
-        payload={"catalog_change_ref": "drift:core_banking:account_id",
-                 "stales_confirmed_event_id": "evt-bfk_acct"},
-        actor=service_actor)
-    assert conn.execute(
-        "SELECT status FROM entity_bridge_edge WHERE fact_key = 'bfk_acct'"
-    ).fetchone()[0] == "VERIFIED", "the fail-soft residue the reader must not trust"
-
-    assert confirmed_event_ids_for_audit(conn, plan) == ()
-    bridge = next(c for c in crossing_audit_by_slot(conn, ctx, plan)["op_0"]
-                  if c["kind"] == "governed_bridge")
-    assert bridge["authority"] == "unverified"
-    assert bridge["confirmed_event_id"] is None
-
-
-def test_crossing_audit_by_slot_records_governed_crossings(resolved_topology):
-    # I-1: per-slot governed crossings — the VERIFIED bridge (authority=verified + audit
-    # confirmed_event_id, re-queried from entity_bridge_edge) and any declared realization — so
-    # crossing-governedness is falsifiable from persisted telemetry.
+def test_crossing_audit_by_slot_separates_provisional_bridge_from_governed_crossings(
+        resolved_topology):
+    # I-1: per-slot crossings keep review and execution authority separate. The reviewed bridge
+    # carries its audit confirmed_event_id, but remains provisional until an exact deterministic
+    # directional realization is attached. (Supersedes the staled-projection-residue test: under
+    # this model authority is NEVER derived from the edge row, so a fail-soft VERIFIED residue has
+    # no authority left to launder.)
     conn, scope = resolved_topology
     operand = _operand(slot_id="op_0", catalog="core_banking")
     ctx, plan = _assemble_identity(conn, scope, operand)
@@ -419,13 +403,25 @@ def test_crossing_audit_by_slot_records_governed_crossings(resolved_topology):
 
     assert set(by_slot) == {"op_0"}
     crossings = by_slot["op_0"]
-    assert crossings, "the cross-catalog operand crosses at least the VERIFIED bridge"
+    assert crossings, "the cross-catalog operand crosses at least the reviewed bridge"
     bridge = next(c for c in crossings if c["kind"] == "governed_bridge")
     assert bridge["bridge_fact_key"] == "bfk_acct"
-    assert bridge["authority"] == "verified"
-    assert bridge["confirmed_event_id"] == "evt-bfk_acct"   # AUDIT-only, re-queried from the edge
-    # every recorded crossing is a governed authority (VERIFIED bridge / approved-or-declared realization)
-    assert all(c["authority"] in {"verified", "declared_join", "approved_join"} for c in crossings)
+    assert bridge["authority"] == "provisional"
+    expected = conn.execute(
+        "SELECT confirmed_event_id FROM entity_bridge_edge WHERE fact_key='bfk_acct'").fetchone()[0]
+    assert expected is not None
+    assert bridge["confirmed_event_id"] == expected   # AUDIT-only, re-queried from the edge
+    # Review never launders the bridge into execution authority. Intra-catalog realizations retain
+    # their own governed authority while this un-realized crossing is visibly provisional.
+    assert all(
+        c["authority"] in {
+            "provisional",
+            "deterministically_validated",
+            "declared_join",
+            "approved_join",
+        }
+        for c in crossings
+    )
 
 
 # ── CompileBudget decremented by 1 per compile ──────────────────────────────────────────────────
@@ -503,7 +499,11 @@ def _bridge_endpoints(db, *, right_sensitivity=""):
 
 _LANDING_EP = GovernedEndpointV1(
     catalog="wealth", table_ref="public.customers",
-    grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk")
+    grain_key_refs=("public.customers.customer_id",), grain_fact_key="grain-fk",
+    grain_is_unique=True,
+    grain_authority_provenance=GrainAuthorityProvenance.source_declared,
+    grain_fact_revision="test-revision",
+    grain_dependency_identity="test-dependency")
 
 
 def test_not_evaluated_key_outside_read_scope_is_unresolved_safety_evaluation(db):

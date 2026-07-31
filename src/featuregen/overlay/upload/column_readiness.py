@@ -23,7 +23,10 @@ triggers no check, opens no task, and writes nothing:
 * the governed grain / availability facts are read through C1's ``is_grain`` / ``is_as_of`` axes
   (governed iff the flag is true AND the ``*_fact_event_id`` link is non-null).
 * the VERIFIED ``approved_join`` edge (queried directly, matched on EITHER endpoint — F4) backs join
-  connectivity, read-scoped on both endpoints like the relationships section.
+  connectivity, read-scoped on both endpoints like the relationships section;
+* a current Pass-C or cross-catalog identifier candidate earns a connectivity data-check preview.
+  A column with neither is explicitly ``not_considered_as_join_key``. Merely existing in the
+  catalog must not make every amount, description and timestamp look like a proposed join key.
 
 DIAGNOSTIC EXTERNAL-CHECK PREVIEWS vs BLOCKING REQUIREMENTS. A capability may advertise that a
 future feature build would require an EXTERNAL data check (``TYPE_IS_NUMERIC``, ``GRAIN_IS_UNIQUE``,
@@ -92,6 +95,7 @@ _R_TYPE_UNKNOWN = "operational_type_unknown"
 _R_TYPE_NOT_NUMERIC = "operational_type_not_numeric"
 _R_NO_IDENTITY = "column_absent_from_catalog"
 _R_EXTERNAL_PREVIEW = "external_check_preview"
+_R_JOIN_NOT_CONSIDERED = "not_considered_as_join_key"
 
 # A requirement's gate — which resolved statuses BLOCK the capability:
 #   "strict"   -> anything but a governed "confirmed" blocks (a fact that MUST be verified).
@@ -248,6 +252,9 @@ def _fact_requirement(
     flag with no verified fact is ``proposed`` and still BLOCKS (only VERIFIED governs); no flag is
     ``missing`` and blocks."""
     ov = read_operational_value(conn, logical_ref, field_name)
+    status: _Status
+    blocking: bool
+    reason: str
     if ov.status == "resolved":
         status, blocking, reason = "confirmed", False, _R_GOVERNED
     elif ov.value == "true":
@@ -294,7 +301,7 @@ def _type_requirement(conn: DbConn, logical_ref: str,
     if ov.status in _CONFLICT_STATUSES:
         status, reason = _status_and_reason(ov)
         return _mk_c1_requirement("operational_type", status, True, reason, ov)
-    base = (ov.value or "").strip().lower()
+    base = str(ov.value or "").strip().lower()
     if base in ("", UNKNOWN_TYPE):
         # A glossary upload leaves the OPERATIONAL type unknown by design (a business glossary is
         # not the physical-type authority), so reading only that made every glossary column claim a
@@ -358,9 +365,12 @@ def _freshness_requirement(conn: DbConn, source: str) -> ColumnRequirement:
 def _join_requirement(
     conn: DbConn, source: str, object_ref_flat: str, roles: Iterable[str]
 ) -> ColumnRequirement:
-    """Join connectivity — DIAGNOSTIC, never blocking (a join key is only REQUIRED when another
-    table participates). A VERIFIED ``approved_join`` touching this column confirms it; otherwise a
-    ``JOIN_CONNECTIVITY`` external-check PREVIEW. Read-scoped on join endpoints via ``roles``.
+    """Join connectivity with an honest candidate boundary.
+
+    A VERIFIED ``approved_join`` touching this column confirms it. A current Pass-C or
+    cross-catalog identifier-link candidate receives a ``JOIN_CONNECTIVITY`` external-check
+    preview. A column with neither is ``not_considered_as_join_key`` rather than a fabricated
+    candidate. All three paths are read-scoped on both endpoints via ``roles``.
 
     F4: matched in EITHER direction (``from_ref = %s OR to_ref = %s``), because a dimension key is
     typically the join TARGET (``to_ref``). The prior ``column_joins`` read matched ``from_ref`` only
@@ -389,9 +399,117 @@ def _join_requirement(
             authority=_R_GOVERNED, c1_status=None, evidence_ids=(), fact_event_id=None,
             decision_event_id=None, external_preview=False, reason="verified_approved_join",
         )
-    return _preview_requirement(
-        _PREVIEW_JOIN_CONNECTIVITY,
-        "no verified approved_join yet; connectivity is checked when another table is required",
+    if _has_visible_join_candidate(conn, source, object_ref_flat, roles):
+        return _preview_requirement(
+            _PREVIEW_JOIN_CONNECTIVITY,
+            "a join candidate exists; connectivity and directional cardinality still need evidence",
+        )
+    return ColumnRequirement(
+        requirement_id="join_candidate",
+        status="missing",
+        blocking=True,
+        authority="candidate_scope",
+        c1_status=None,
+        evidence_ids=(),
+        fact_event_id=None,
+        decision_event_id=None,
+        external_preview=False,
+        reason=_R_JOIN_NOT_CONSIDERED,
+    )
+
+
+def _visible_column(
+    conn: DbConn,
+    source: str,
+    object_ref_flat: str,
+    allowed: list[str],
+) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM graph_node "
+        "WHERE catalog_source=%s AND object_ref=%s AND kind='column' "
+        "AND visible_requires <@ %s LIMIT 1",
+        (source, object_ref_flat, allowed),
+    ).fetchone() is not None
+
+
+def _has_visible_pass_c_candidate(
+    conn: DbConn,
+    source: str,
+    object_ref_flat: str,
+    allowed: list[str],
+) -> bool:
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+
+    rows = conn.execute(
+        "SELECT from_ref, to_ref, fact_key "
+        "FROM pass_c_candidate_evidence "
+        "WHERE catalog_source=%s AND (from_ref=%s OR to_ref=%s)",
+        (source, object_ref_flat, object_ref_flat),
+    ).fetchall()
+    for from_ref, to_ref, fact_key in rows:
+        if not (
+            _visible_column(conn, source, from_ref, allowed)
+            and _visible_column(conn, source, to_ref, allowed)
+        ):
+            continue
+        if fact_key is None:
+            return True
+        try:
+            status = fold_overlay_state(load_fact(conn, fact_key)).status
+        except Exception:  # noqa: BLE001 - unreadable governance fails closed
+            continue
+        if status in {"DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED"}:
+            return True
+    return False
+
+
+def _has_visible_bridge_candidate(
+    conn: DbConn,
+    source: str,
+    object_ref_flat: str,
+    allowed: list[str],
+) -> bool:
+    from featuregen.overlay.upload.bridge_assessment import available_identifier_links
+
+    try:
+        links = available_identifier_links(conn, object_ref=object_ref_flat)
+    except Exception:  # noqa: BLE001 - unreadable governance fails closed
+        return False
+    for link in links:
+        members = (
+            *link.assessment.left_endpoint.members,
+            *link.assessment.right_endpoint.members,
+        )
+        parsed = [parse_ref(member.logical_column_ref) for member in members]
+        endpoint_refs = [
+            (member_source, f"public.{table}.{column}")
+            for member_source, _schema, table, column in parsed
+            if column is not None
+        ]
+        if (
+            (source, object_ref_flat) not in endpoint_refs
+            or len(endpoint_refs) != len(members)
+        ):
+            continue
+        if all(
+            _visible_column(conn, member_source, member_ref, allowed)
+            for member_source, member_ref in endpoint_refs
+        ):
+            return True
+    return False
+
+
+def _has_visible_join_candidate(
+    conn: DbConn,
+    source: str,
+    object_ref_flat: str,
+    roles: Iterable[str],
+) -> bool:
+    allowed = allowed_sensitivities(roles)
+    return (
+        _has_visible_pass_c_candidate(conn, source, object_ref_flat, allowed)
+        or _has_visible_bridge_candidate(conn, source, object_ref_flat, allowed)
     )
 
 

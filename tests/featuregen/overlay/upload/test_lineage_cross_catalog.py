@@ -18,7 +18,6 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -72,11 +71,16 @@ def test_the_other_catalogs_table_is_a_NODE_on_the_graph(two_catalogs):
     assert any(n["catalog_source"] == "ftr" for n in g["nodes"]), g["nodes"]
 
 
-def test_an_UNCONFIRMED_link_is_drawn_and_marked_unresolved(two_catalogs):
-    """Confirmation annotates, it does not gate — but the graph still says which it is."""
+def test_an_unreviewed_link_has_separate_review_and_execution_axes(two_catalogs):
+    """Confirmation annotates, it does not gate; endpoint, review and safety stay separate."""
     g = _graph(two_catalogs)
     bridge = next(e for e in g["edges"] if e.get("kind") == "entity_bridge")
-    assert bridge["resolved"] is False
+    assert "resolved" not in bridge
+    assert bridge["endpoint_resolved"] is True
+    assert bridge["link_review_status"] == "unreviewed"
+    assert bridge["realization_safety_status"] == "not_evaluated"
+    assert bridge["execution_eligible"] is False
+    assert bridge["trust_kind"] == "governed_identifier_link"
 
 
 def test_it_works_from_the_OTHER_side_too(two_catalogs):

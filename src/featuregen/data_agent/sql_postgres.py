@@ -14,6 +14,10 @@ The differences from Hive are confined to identifier quoting and the approximate
 from __future__ import annotations
 
 from featuregen.data_agent.observation import ObservationPlanV1
+from featuregen.data_agent.relationship_observation import (
+    RelationshipObservationPlanV2,
+    render_relationship_probe_sql,
+)
 
 
 def _ident(name: str) -> str:
@@ -34,12 +38,16 @@ class PostgresDialect:
         can render column names without knowing which engine it is targeting."""
         return _ident(name)
 
-    def timeout_statements(self, plan: ObservationPlanV1) -> tuple[str, ...]:
+    def timeout_statements(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> tuple[str, ...]:
         """`SET LOCAL` is transaction-scoped, so the bound dies with the caller's transaction rather
         than leaking onto a pooled connection."""
         return (f"SET LOCAL statement_timeout = {int(plan.policy.statement_timeout_ms)}",)
 
-    def effective_method(self, plan: ObservationPlanV1) -> str:
+    def effective_method(
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+    ) -> str:
         """Always `exact`. PostgreSQL has no built-in approximate distinct, so an approximate
         REQUEST runs a census here — and the result must report the census, not the request. An
         earlier version reported the plan's method and so overstated its own imprecision."""
@@ -79,3 +87,6 @@ class PostgresDialect:
         where = self.where(plan)
         stmt = f"SELECT {select}\nFROM {self.table_ref(plan)}"
         return f"{stmt}\n{where}" if where else stmt
+
+    def render_relationship_probe(self, plan: RelationshipObservationPlanV2) -> str:
+        return render_relationship_probe_sql(plan, dialect=self)

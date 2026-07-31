@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 
 from featuregen.overlay.upload.binding_roles import JoinRole
 from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1, active_bridges
+from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
 from featuregen.overlay.upload.catalog_realizations import (
     derive_catalog_realizations,
     key_entity,
@@ -212,11 +213,13 @@ def realize_in_place(conn, pos: _Position, hop: EntityRelationshipRefV1,
 
 def rollup_bridges(conn, pos: _Position, hop: EntityRelationshipRefV1,
                    scope: CatalogScopeV1) -> tuple[_Move, ...]:
-    """(B) Realize the semantic hop by CROSSING catalogs: the current table holds a
-    ``hop.to_entity``-keyed FK column, a VERIFIED in-scope bridge at that entity is anchored on
+    """(B) Enumerate a provisional semantic hop by CROSSING catalogs: the current table holds a
+    ``hop.to_entity``-keyed FK column, an AVAILABLE in-scope bridge at that entity is anchored on
     exactly that column, and the far endpoint's table is genuinely ``hop.to_entity``-grain.
     Emits ``semantic_rollup`` + ``governed_bridge`` (with the bridge's fact_key). Deterministic:
-    sorted by ``(far_catalog, far_column_ref, fact_key)``. ``()`` when nothing matches."""
+    sorted by ``(far_catalog, far_column_ref, fact_key)``. ``()`` when nothing matches. The
+    returned crossing is not production-executable until
+    :func:`attach_executable_bridge_realizations` binds an exact directional realization."""
     if pos.entity != hop.from_entity:
         return ()   # self-guard: the physics never realizes a hop from a mismatched position
     if pos.catalog not in scope.authorized_catalog_sources:
@@ -251,7 +254,11 @@ def rollup_bridges(conn, pos: _Position, hop: EntityRelationshipRefV1,
                         BindingPathSegmentV1(
                             segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
                             from_entity=hop.from_entity, to_entity=hop.to_entity,
-                            bridge_fact_key=b.fact_key),
+                            bridge_fact_key=b.fact_key,
+                            bridge_from_catalog_source=pos.catalog,
+                            bridge_from_object_ref=col_ref,
+                            bridge_to_catalog_source=cat2,
+                            bridge_to_object_ref=k2),
                     ),
                     bridge_fact_key=b.fact_key)))
     keyed.sort(key=lambda kv: kv[0])
@@ -290,7 +297,11 @@ def reposition_bridges(conn, pos: _Position, scope: CatalogScopeV1) -> tuple[_Mo
                         BindingPathSegmentV1(
                             segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
                             from_entity=pos.entity, to_entity=pos.entity,
-                            bridge_fact_key=b.fact_key),
+                            bridge_fact_key=b.fact_key,
+                            bridge_from_catalog_source=pos.catalog,
+                            bridge_from_object_ref=col_ref,
+                            bridge_to_catalog_source=cat2,
+                            bridge_to_object_ref=k2),
                     ),
                     bridge_fact_key=b.fact_key)))
     keyed.sort(key=lambda kv: kv[0])
@@ -336,6 +347,91 @@ class AssemblyV1:
     complete: tuple[BindingPlanV1, ...]
     rejected: tuple[BindingPlanV1, ...]
     bounding: BoundingMetricsV1
+
+
+def _realization_matches_segment(
+    realization: CurrentBridgeRealizationV1,
+    segment: BindingPathSegmentV1,
+) -> bool:
+    revision = realization.revision
+    if (
+        segment.bridge_fact_key != revision.bridge_fact_key
+        or segment.bridge_from_catalog_source is None
+        or segment.bridge_from_object_ref is None
+        or segment.bridge_to_catalog_source is None
+        or segment.bridge_to_object_ref is None
+    ):
+        return False
+    from_refs = {
+        member.logical_column_ref.split("::", 1)[-1]
+        for member in revision.from_endpoint.members
+    }
+    to_refs = {
+        member.logical_column_ref.split("::", 1)[-1]
+        for member in revision.to_endpoint.members
+    }
+    return (
+        revision.from_endpoint.logical_table_ref.split("::", 1)[0]
+        == segment.bridge_from_catalog_source
+        and revision.to_endpoint.logical_table_ref.split("::", 1)[0]
+        == segment.bridge_to_catalog_source
+        and segment.bridge_from_object_ref in from_refs
+        and segment.bridge_to_object_ref in to_refs
+    )
+
+
+def attach_executable_bridge_realizations(
+    plan: BindingPlanV1,
+    realizations: tuple[CurrentBridgeRealizationV1, ...],
+) -> BindingPlanV1 | None:
+    """Bind every provisional crossing to one exact directional realization.
+
+    Discovery plans intentionally remain useful with only a symmetric bridge fact.  Production
+    callers run this adapter with :func:`executable_bridge_realizations`; a missing or ambiguous
+    directional match returns ``None`` rather than restoring the historical N:1 guess.
+    """
+    segments: list[BindingPathSegmentV1] = []
+    for segment in plan.path_segments:
+        if segment.segment_kind is not SegmentKind.governed_bridge:
+            segments.append(segment)
+            continue
+        matches = tuple(
+            realization
+            for realization in realizations
+            if _realization_matches_segment(realization, segment)
+        )
+        if len(matches) != 1:
+            return None
+        segments.append(
+            replace(
+                segment,
+                bridge_realization_revision=matches[0].revision,
+            )
+        )
+    path_segments = tuple(segments)
+    reminted = make_binding_plan(
+        recipe_id=plan.recipe_id,
+        target_entity=plan.target_entity,
+        catalog_source=plan.catalog_source,
+        ingredient_bindings=plan.ingredient_bindings,
+        path_segments=path_segments,
+        resolution_status=plan.resolution_status,
+        path_resolution_status=plan.path_resolution_status,
+        primary_reason_code=plan.primary_reason_code,
+        reason_codes=plan.reason_codes,
+        safety=plan.safety,
+        preference_rank=plan.preference_rank,
+        preference_reasons=plan.preference_reasons,
+        candidate_role=plan.candidate_role,
+    )
+    return replace(
+        plan,
+        physical_plan_id=reminted.physical_plan_id,
+        path_segments=path_segments,
+        participating_catalogs=reminted.participating_catalogs,
+        bridge_count=reminted.bridge_count,
+        tier=reminted.tier,
+    )
 
 
 def _plan_safety(bindings: tuple[IngredientBindingV1, ...]) -> BindingSafety:

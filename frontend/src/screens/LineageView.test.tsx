@@ -313,7 +313,8 @@ describe('lineage view', () => {
       // hard-coding "declared".
       // The rank is stated in words. Marking only weak links left a strong one unlabelled, so
       // "no marker" had to be read as "good" — invisible when only one link is on screen.
-      'customers.cust_id links to cards.card_holders.holder_id on Customer · weak · proposed, not yet reviewed',
+      'customers.cust_id links to cards.card_holders.holder_id on Customer · weak · '
+        + 'not yet reviewed · execution not evaluated',
     ])
   })
 
@@ -554,7 +555,7 @@ describe('lineage view', () => {
       expect(
         screen.getByText(/Proposals appear here after uploads are enriched/),
       ).toBeInTheDocument()
-      expect(screen.getByText(/No verified entity bridge yet/)).toBeInTheDocument()
+      expect(screen.getByText(/No entity relationship is visible yet/)).toBeInTheDocument()
       expect(screen.getByText(/No features are derived from this column yet/)).toBeInTheDocument()
       expect(screen.getAllByRole('link', { name: 'Governance screen' }).length).toBe(2)
       expect(screen.getByRole('link', { name: 'Workbench' })).toBeInTheDocument()
@@ -562,7 +563,7 @@ describe('lineage view', () => {
       // the lines respect the layer toggles
       await userEvent.click(screen.getByLabelText('Joins'))
       expect(screen.queryByText(/No joins proposed or approved yet/)).not.toBeInTheDocument()
-      expect(screen.getByText(/No verified entity bridge yet/)).toBeInTheDocument()
+      expect(screen.getByText(/No entity relationship is visible yet/)).toBeInTheDocument()
       await userEvent.click(screen.getByLabelText('Joins'))
       expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
 

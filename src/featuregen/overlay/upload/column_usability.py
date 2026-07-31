@@ -61,6 +61,9 @@ class Usability(StrEnum):
     AI_PROPOSED = "ai_proposed"
     NEEDS_DATA_CHECK = "needs_data_check"
     NOT_SET = "not_set"
+    #: No current governed join or candidate names the column. This is not a proposal awaiting a
+    #: check and not an invitation to assign one manually.
+    NOT_CONSIDERED = "not_considered"
     #: A structural fact rules the role out — a declared varchar can never be a numeric measure.
     #: Distinct from NOT_SET, which is "nobody has decided": there is nothing here to decide.
     NOT_SUITABLE = "not_suitable"
@@ -163,6 +166,15 @@ def _describe(cap: ColumnCapability) -> tuple[Usability, str, str, str | None]:
     if refused:
         return (Usability.NOT_SUITABLE, "Not suitable",
                 "; ".join(r.reason for r in refused), None)
+    not_considered = [
+        r for r in outstanding if r.reason == "not_considered_as_join_key"]
+    if not_considered:
+        return (
+            Usability.NOT_CONSIDERED,
+            "Not considered",
+            "No current join candidate or governed join uses this column.",
+            None,
+        )
     check_text = ("Needs a data check first: "
                   + "; ".join(_check_phrase(c) for c in checks) + ".") if checks else ""
 

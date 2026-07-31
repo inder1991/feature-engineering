@@ -67,19 +67,29 @@ from featuregen.materialize.expression_ir import (
     join_key_ref,
 )
 from featuregen.materialize.inventory import ClusterInventoryV1
+from featuregen.materialize.joins import CrossCatalogJoinStepV1
 from featuregen.materialize.spine import (
     SpineSourceDeclarationV1,
     SpineSpec,
     validate_spine_declaration,
+)
+from featuregen.overlay.upload.bridge_store import (
+    CurrentBridgeRealizationV1,
+    executable_bridge_realizations,
+    load_current_bridge_realizations,
+    revalidate_bridge_realization,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 __all__ = [
     "AuthorizedCompilation",
+    "BridgeExecutionAuthorization",
     "FormulaExecutionIRV1",
     "ReadElementKind",
     "authorize_compilation",
+    "authorize_execution_realizations",
+    "bridge_realization_dependencies",
     "compile_ir",
     "ir_hash",
     "physical_read_set",
@@ -189,6 +199,22 @@ class AuthorizedCompilation:
     roles_used: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class BridgeExecutionAuthorization:
+    """Final control-plane check for the exact bridge revisions a run will execute.
+
+    Compilation and rendering may take long enough for a bridge, its exact observation or one of
+    its physical bindings to become stale.  This token is therefore minted separately, immediately
+    before run preparation.  It is bound to the compiled IR hashes, environment and exact
+    ``(realization_revision_id, dependency_snapshot_id)`` pairs.  Human review is deliberately not
+    represented: deterministic execution safety, rather than endorsement, is the gate.
+    """
+
+    ir_hashes: tuple[str, ...]
+    environment_id: str
+    realization_dependencies: tuple[tuple[str, str], ...]
+
+
 # ── compilation ──────────────────────────────────────────────────────────────────────────────────
 
 
@@ -207,6 +233,7 @@ def compile_ir(
     roles: Iterable[str] = (),
     spine_decl: SpineSourceDeclarationV1 | None,
     inventory: ClusterInventoryV1,
+    bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] | None = None,
 ) -> FormulaExecutionIRV1 | MaterializationRefused:
     """Compile ONE admitted feature into its complete executable plan, or refuse it (§2).
 
@@ -232,6 +259,16 @@ def compile_ir(
             for a cross-catalog identity.
     """
     roles_used = tuple(roles)
+    if bridge_realizations is None:
+        # This is the production compilation entry point.  Callers may inject a frozen set in
+        # deterministic unit tests, but omission must not mean "there are no bridges": that would
+        # make every cross-catalog formula fail even though a current executable realization
+        # exists, and would encourage callers to bypass the typed reader.
+        bridge_realizations = executable_bridge_realizations(
+            conn,
+            purpose="feature_generation",
+            environment=inventory.environment_id,
+        )
     spine = validate_spine_declaration(conn, spine_decl, roles=roles_used)
     if isinstance(spine, MaterializationRefused):
         return spine
@@ -249,7 +286,7 @@ def compile_ir(
     for expr_path, expr in body_expressions(formula.body):
         compiled = compile_expression(
             conn, expr_path=expr_path, expr=expr, grain_keys=formula.grain.keys, roles=roles_used,
-            inventory=inventory)
+            inventory=inventory, bridge_realizations=bridge_realizations)
         if isinstance(compiled, MaterializationRefused):
             return compiled
         expressions.append(compiled)
@@ -272,6 +309,75 @@ def compile_ir(
 
 
 # ── Gate 2 (§1.3) ────────────────────────────────────────────────────────────────────────────────
+
+
+def bridge_realization_dependencies(
+    irs: Sequence[FormulaExecutionIRV1],
+) -> tuple[tuple[str, str], ...]:
+    dependencies = {
+        (step.realization_revision_id, step.dependency_snapshot_id)
+        for ir in irs
+        for expression in ir.expressions
+        for step in expression.join_plan.steps
+        if isinstance(step, CrossCatalogJoinStepV1)
+    }
+    return tuple(sorted(dependencies))
+
+
+def authorize_execution_realizations(
+    conn: DbConn,
+    authorized: AuthorizedCompilation,
+    *,
+    environment_id: str,
+) -> BridgeExecutionAuthorization | MaterializationRefused:
+    """Revalidate every exact directional realization immediately before run preparation.
+
+    The check resolves by revision, not by symmetric bridge fact or endpoint names.  If a current
+    pointer advanced, a dependency changed, exact evidence expired, or the bridge lifecycle closed
+    after compilation, the old revision is refused rather than silently replaced with a newer
+    realization that was never rendered into this artifact.
+    """
+    if not isinstance(authorized, AuthorizedCompilation):
+        raise TypeError(
+            "authorize_execution_realizations requires Gate 2's AuthorizedCompilation")
+    if not isinstance(environment_id, str) or not environment_id.strip():
+        raise ValueError("environment_id must not be blank")
+
+    required = bridge_realization_dependencies(authorized.irs)
+    if required:
+        current_by_dependency = {
+            (
+                realization.revision.realization_revision_id,
+                realization.revision.dependency_snapshot_id,
+            ): realization
+            for realization in load_current_bridge_realizations(conn)
+        }
+        for dependency in required:
+            realization = current_by_dependency.get(dependency)
+            if realization is None:
+                return _refuse(
+                    CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                    "the compiled directional bridge realization is no longer the current "
+                    f"revision: {dependency[0]} / {dependency[1]}",
+                )
+            assessment = revalidate_bridge_realization(
+                conn,
+                realization,
+                purpose="feature_generation",
+                environment=environment_id,
+            )
+            if not assessment.executable:
+                return _refuse(
+                    CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                    f"directional bridge realization {dependency[0]} failed final execution "
+                    f"revalidation: {', '.join(assessment.reason_codes)}",
+                )
+
+    return BridgeExecutionAuthorization(
+        ir_hashes=tuple(sorted(ir_hash(ir) for ir in authorized.irs)),
+        environment_id=environment_id,
+        realization_dependencies=required,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,9 +454,17 @@ def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_R
                         f"assembled wrongly, and guessing a catalog would authorize nodes in one "
                         f"and read them in another")
                 for step in expression.join_plan.steps:
-                    for endpoint in (step.from_ref, step.to_ref):
-                        union.add(join_key_ref(catalog_source, endpoint),
-                                  ReadElementKind.JOIN_ENDPOINT)
+                    if isinstance(step, CrossCatalogJoinStepV1):
+                        for pair in step.column_pairs:
+                            for endpoint in pair:
+                                union.add(
+                                    endpoint,
+                                    ReadElementKind.JOIN_ENDPOINT,
+                                )
+                    else:
+                        for endpoint in (step.from_ref, step.to_ref):
+                            union.add(join_key_ref(catalog_source, endpoint),
+                                      ReadElementKind.JOIN_ENDPOINT)
 
             # Every row this expression aggregates is admitted or excluded by the availability
             # column (§8 rule 1), so it is read whether or not anything else names it.

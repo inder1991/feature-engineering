@@ -32,7 +32,10 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake, resolution_brake
-from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
+from featuregen.overlay.upload.bridge_candidates import (
+    BridgeCandidateDerivationV1,
+    derive_bridge_candidates_with_report,
+)
 from featuregen.overlay.upload.canonical import (
     CanonicalRow,
     RowError,
@@ -49,8 +52,8 @@ from featuregen.overlay.upload.enrich import (
     _summary_targets,
     _unit_targets,
     _write_definition_evidence,
-    _write_summary_evidence,
     _write_domain_evidence,
+    _write_summary_evidence,
     _write_synonym_evidence,
     _write_unit_evidence,
     classify_domains,
@@ -150,9 +153,9 @@ def entity_bridges_enabled() -> bool:
     0989. Nothing ever CALLED them, so a derivable bridge existed only for as long as something held
     it in memory. ON wires the derivation into ingest so it becomes durable.
 
-    NEVER promotes a fact to VERIFIED: a bridge stays a DRAFT proposal for the human confirm surface,
-    so the invariant that only a VERIFIED bridge is operational is untouched. Flag-off is
-    byte-identical (no ledger row, no fact, a truthful `disabled` stage entry)."""
+    NEVER fabricates review: a bridge stays DRAFT until a human confirms it. DRAFT and VERIFIED links
+    are both available; confirmation records accountability/ranking rather than gating exploration.
+    Flag-off is byte-identical (no ledger row, no fact, a truthful `disabled` stage entry)."""
     return os.environ.get("OVERLAY_ENTITY_BRIDGES", "0") == "1"
 
 
@@ -237,10 +240,13 @@ class IngestResult:
     semantic_binding_proposed: int = 0
     semantic_binding_abstained: int = 0
     semantic_binding_failed: int = 0
-    # Cross-catalog entity bridges PROPOSED this upload (0 when OVERLAY_ENTITY_BRIDGES is off).
-    # Proposed, never confirmed: a bridge is operational only once a human VERIFIES it, so this
-    # counts governance work created, not links made usable.
+    # Cross-catalog entity-bridge accounting (all 0 when OVERLAY_ENTITY_BRIDGES is off). Human
+    # confirmation records review but does not gate availability.
     entity_bridges_proposed: int = 0
+    entity_bridge_candidates_considered: int = 0
+    entity_bridge_candidates_retained: int = 0
+    entity_bridge_candidates_suppressed: int = 0
+    entity_bridge_candidates_truncated: int = 0
 
 
 def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
@@ -373,6 +379,12 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
             "value": value, "authority_basis": facts.AUTHORITY_SOURCE_DECLARED,
             "origin_type": origin_type, "role_claims": list(actor.role_claims),
             "expires_at": None, "confirms_event_id": draft.event_id})
+    if fact_type == "grain" and outcome == "changed":
+        from featuregen.overlay.upload.bridge_store import (
+            demote_realizations_for_dependency,
+        )
+
+        demote_realizations_for_dependency(conn, "grain_fact", fk)
     return outcome
 
 
@@ -441,9 +453,23 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
                         result.denied_reason)
 
 
-def _propose_entity_bridges(conn, *, ingestion_run_id: str | None = None) -> int:
-    """Derive cross-catalog entity bridges from the resolved graph and propose each one. Returns the
-    number proposed. Behind OVERLAY_ENTITY_BRIDGES (the caller gates on `entity_bridges_enabled()`).
+@dataclass(frozen=True, slots=True)
+class _BridgeProposalStageResult:
+    derivation: BridgeCandidateDerivationV1
+    proposed_count: int
+    proposal_error_count: int
+    withdrawn_count: int
+    withdrawn_realization_count: int
+    superseded_review_task_count: int
+
+
+def _propose_entity_bridges(
+    conn, *, ingestion_run_id: str | None = None
+) -> _BridgeProposalStageResult:
+    """Derive bounded cross-catalog links and propose only retained candidates.
+
+    Returns both proposal outcomes and the derivation account used by the run manifest.
+    Behind OVERLAY_ENTITY_BRIDGES (the caller gates on `entity_bridges_enabled()`).
 
     ADVISORY / fail-soft, mirroring `_propose_governed_joins`: the facts and graph are already stored
     by the time this runs, so a derivation or proposal fault is a warning, never a failed upload.
@@ -468,10 +494,17 @@ def _propose_entity_bridges(conn, *, ingestion_run_id: str | None = None) -> int
     originating upload stays in the audit trail via `ingestion_run_id` on the evidence row.
     """
     from featuregen.overlay.upload.bridge_propose import propose_bridge
+    from featuregen.overlay.upload.bridge_store import (
+        load_candidate_pointer_versions,
+        withdraw_missing_candidate_assessments,
+    )
     from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 
+    pointer_versions = load_candidate_pointer_versions(conn)
+    derivation = derive_bridge_candidates_with_report(conn)
     proposed = 0
-    for candidate in derive_bridge_candidates(conn):
+    errors = 0
+    for candidate in derivation.candidates:
         try:
             # Per-proposal savepoint (the audit I-2 pattern): a DB-class fault inside propose_fact
             # aborts the transaction it runs in, and the except below swallows the Python exception —
@@ -479,15 +512,31 @@ def _propose_entity_bridges(conn, *, ingestion_run_id: str | None = None) -> int
             # raise InFailedSqlTransaction, rolling back the already-stored Pass A facts.
             with conn.transaction():
                 propose_bridge(conn, candidate, actor=_ENRICH_ACTOR,
-                               ingestion_run_id=ingestion_run_id)
+                               ingestion_run_id=ingestion_run_id,
+                               expected_candidate_pointer_version=pointer_versions.get(
+                                   candidate.candidate_id, 0))
         except Exception:  # noqa: BLE001 — advisory: a proposal failure must never fail an upload
+            errors += 1
             counters.incr("overlay.entity_bridges.propose_error")
             logger.warning("advisory entity-bridge proposal raised for %s (%s <-> %s)",
                            candidate.entity_id, candidate.left_ref, candidate.right_ref,
                            exc_info=True)
             continue
         proposed += 1
-    return proposed
+    withdrawn, withdrawn_realizations, superseded_review_tasks = (
+        withdraw_missing_candidate_assessments(
+            conn,
+            frozenset(candidate.candidate_id for candidate in derivation.candidates),
+        )
+    )
+    return _BridgeProposalStageResult(
+        derivation=derivation,
+        proposed_count=proposed,
+        proposal_error_count=errors,
+        withdrawn_count=withdrawn,
+        withdrawn_realization_count=withdrawn_realizations,
+        superseded_review_task_count=superseded_review_tasks,
+    )
 
 
 # ── Pass C ingest wiring (Phase 3A Task 10, spec §7/§12): deterministic join candidates from
@@ -2485,25 +2534,16 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                            "intact", catalog_source, exc_info=True)
 
     entity_bridges_proposed = 0
-    # ── Cross-catalog entity bridges (Phase 3B.2B), behind OVERLAY_ENTITY_BRIDGES (default OFF).
-    # Placed HERE for one reason: the derivation's only input is `graph_node.concept`, which the
-    # evidence blocks above have just resolved and projected. It also sits BEFORE the projection
-    # drain below, so the DRAFT proposal events this emits are drained in the same request — the
-    # same placement reasoning as the Pass C / Pass B / semantic-binding seams. ──
-    if entity_bridges_enabled():
-        stage_started = datetime.now(UTC)
-        try:
-            entity_bridges_proposed = _propose_entity_bridges(
-                conn, ingestion_run_id=ingestion_run_id)
-            record_stage(stage_recorder, "entity_bridges", "succeeded",
-                         detail={"proposed": entity_bridges_proposed}, started_at=stage_started)
-        except Exception:  # noqa: BLE001 — advisory: never fail an upload whose facts are stored
-            logger.warning("advisory entity-bridge stage failed for %r — facts + graph intact",
-                           catalog_source, exc_info=True)
-            record_stage(stage_recorder, "entity_bridges", "failed", reason_code="exception",
-                         started_at=stage_started)
-    else:
-        record_stage(stage_recorder, "entity_bridges", "disabled")
+    entity_bridge_derivation = BridgeCandidateDerivationV1(
+        candidates=(),
+        block_matched_count=0,
+        considered_count=0,
+        retained_count=0,
+        suppressed_count=0,
+        truncated_pair_count=0,
+    )
+    # Entity bridges are assessed only after the projection drain and table-fact re-projection
+    # below. Running here used stale flat grain flags and froze them into the candidate evidence.
 
     # ── D4 semantic-binding stages (Delivery D): candidate -> proposal, savepointed fail-soft, behind
     # OVERLAY_SEMANTIC_BINDING_CANDIDATES / _PROPOSALS (default OFF). Placed AFTER glossary/Pass B and
@@ -2724,6 +2764,68 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "table_fact_projection", "failed",
                          reason_code="exception", started_at=stage_started)
 
+    # Cross-catalog link assessment runs after the graph, overlay projection and governed table-fact
+    # projection agree. The generic link lifecycle is folded directly, so the DRAFT emitted here
+    # does not need a second projection drain to become available.
+    if entity_bridges_enabled():
+        stage_started = datetime.now(UTC)
+        try:
+            # The proposal savepoints contain per-item DB faults; this outer savepoint makes the
+            # current-shortlist reconciliation atomic.  A CAS conflict cannot otherwise withdraw
+            # only half the obsolete candidates and then be swallowed by this advisory stage.
+            with conn.transaction():
+                bridge_stage = _propose_entity_bridges(
+                    conn, ingestion_run_id=ingestion_run_id)
+            entity_bridge_derivation = bridge_stage.derivation
+            entity_bridges_proposed = bridge_stage.proposed_count
+            partial = (
+                entity_bridge_derivation.truncated
+                or bridge_stage.proposal_error_count > 0
+            )
+            reason_code = (
+                "candidate_bound"
+                if entity_bridge_derivation.truncated
+                else "contained_failures"
+                if bridge_stage.proposal_error_count
+                else None
+            )
+            detail = entity_bridge_derivation.stage_detail(
+                proposed_count=entity_bridges_proposed,
+                proposal_error_count=bridge_stage.proposal_error_count,
+            )
+            detail.update({
+                "withdrawn_count": bridge_stage.withdrawn_count,
+                "withdrawn_realization_count":
+                    bridge_stage.withdrawn_realization_count,
+                "superseded_review_task_count":
+                    bridge_stage.superseded_review_task_count,
+            })
+            record_stage(
+                stage_recorder,
+                "entity_bridges",
+                "partial" if partial else "succeeded",
+                reason_code=reason_code,
+                detail=detail,
+                started_at=stage_started,
+            )
+        except Exception:  # noqa: BLE001 — advisory: never fail an upload whose facts are stored
+            logger.warning("advisory entity-bridge stage failed for %r — facts + graph intact",
+                           catalog_source, exc_info=True)
+            record_stage(stage_recorder, "entity_bridges", "failed", reason_code="exception",
+                         started_at=stage_started)
+    else:
+        record_stage(stage_recorder, "entity_bridges", "disabled")
+
+    # The bridge stage deliberately runs after the first drain + table-fact projection because its
+    # assessment needs the freshly projected grain.  It also appends DRAFT overlay events.  Although
+    # link availability folds those events directly, column readiness protects every load-bearing
+    # read with the GLOBAL overlay projection-lag gate.  Returning with bridge events still pending
+    # therefore makes every role on every column unavailable until an async worker happens to run.
+    # Drain once more before any lag-gated re-projection/readiness consumer.  This is normally only
+    # the handful of retained bridge proposals and stays bounded by the same ingest budget.
+    if entity_bridges_enabled() and entity_bridges_proposed:
+        _drain_projection(conn)
+
     # approved_join re-projection (Pass C Task 10, closing Task 8's loop): build_graph wiped EVERY
     # edge for this source, so a join VERIFIED in a PRIOR cycle must be re-projected from its FACT
     # (enumerated off the overlay substrate — NEVER the Pass-C ledger, which this cycle just
@@ -2832,7 +2934,15 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         semantic_binding_proposed=sembind_proposed,
                         semantic_binding_abstained=sembind_abstained,
                         semantic_binding_failed=sembind_failed,
-                        entity_bridges_proposed=entity_bridges_proposed)
+                        entity_bridges_proposed=entity_bridges_proposed,
+                        entity_bridge_candidates_considered=(
+                            entity_bridge_derivation.considered_count),
+                        entity_bridge_candidates_retained=(
+                            entity_bridge_derivation.retained_count),
+                        entity_bridge_candidates_suppressed=(
+                            entity_bridge_derivation.suppressed_count),
+                        entity_bridge_candidates_truncated=(
+                            entity_bridge_derivation.truncated_pair_count))
 
 
 def _bool(v) -> bool:

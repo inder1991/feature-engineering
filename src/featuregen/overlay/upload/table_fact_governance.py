@@ -304,6 +304,17 @@ def project_verified_table_fact(conn: DbConn, source: str, ref, fact_type: str, 
                 f"SELECT 1 FROM graph_node WHERE catalog_source = %s AND table_name = %s"
                 f" AND kind = 'column' AND {flag_col} = true AND {event_col} IS NOT NULL",
                 (source, ref.table)).fetchone()
+            if row is not None and fact_type == "grain":
+                # The candidate assessment reads the COMPLETE governed grain rather than the flat
+                # per-column flag. Refresh only links touching this table after that projection is
+                # visible; a failure rolls back this savepoint and reports pending, preserving the
+                # prior assessment history while keeping its realizations demoted by confirm_fact.
+                from featuregen.overlay.upload.bridge_propose import (
+                    reassess_bridge_candidates_for_table,
+                )
+
+                reassess_bridge_candidates_for_table(
+                    conn, catalog_source=source, table=ref.table, now=now)
         if row is None:
             # resolve_fact refused to serve the fact (stale drift watermark, demotion, expiry) or
             # the column nodes are absent: no flag landed, so the fact is NOT operational.

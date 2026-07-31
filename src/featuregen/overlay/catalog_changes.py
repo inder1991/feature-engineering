@@ -243,6 +243,15 @@ def _stale_one(
         # demote would keep a drift-invalidated contract PROMOTABLE (its docstring already states
         # the invariant this implements).
         demote_projected_bridge_edges(conn, fact_key, "STALE")
+        from featuregen.overlay.upload.bridge_store import demote_realizations_for_bridge
+
+        demote_realizations_for_bridge(conn, fact_key, lifecycle="stale")
+    elif state.fact_type == "grain":
+        from featuregen.overlay.upload.bridge_store import (
+            demote_realizations_for_dependency,
+        )
+
+        demote_realizations_for_dependency(conn, "grain_fact", fact_key)
     if open_reverify:
         # Governance path: route the stale to the data owner(s). The upload-catalog ingest
         # (no owners) passes open_reverify=False — the fact still STALEs via the append above,

@@ -237,3 +237,57 @@ def test_join_key_confirmed_on_to_side_verified_join(db):
     assert jr.status == "confirmed"
     assert jr.reason == "verified_approved_join"
     assert cr.as_join_key.operational_status == "ready"
+
+
+def test_non_candidate_amount_is_not_presented_as_a_join_key(db):
+    """A governed column's mere existence is not a join proposal.
+
+    This was the live FTR defect: ``actual_counter_party_amt`` had no Pass-C candidate, no bridge
+    candidate and no join edge, yet the generic connectivity preview made the UI say
+    "Join key — Needs a data check".
+    """
+    build_graph(db, _SOURCE, [
+        CanonicalRow(_SOURCE, "transactions", "actual_counter_party_amt", "numeric"),
+    ])
+
+    cr = column_readiness(
+        db,
+        source=_SOURCE,
+        object_ref="public.transactions.actual_counter_party_amt",
+    )
+
+    candidate = _req(cr.as_join_key, "join_candidate")
+    assert candidate.status == "missing"
+    assert candidate.blocking is True
+    assert candidate.reason == "not_considered_as_join_key"
+    assert not _has(cr.as_join_key, "external:JOIN_CONNECTIVITY")
+    assert cr.as_join_key.operational_status == "blocked"
+
+
+def test_real_pass_c_candidate_gets_connectivity_preview(db):
+    build_graph(db, _SOURCE, [
+        CanonicalRow(_SOURCE, "transactions", "customer_id", "text"),
+        CanonicalRow(_SOURCE, "customers", "customer_id", "text"),
+    ])
+    db.execute(
+        "INSERT INTO pass_c_candidate_evidence ("
+        "catalog_source,candidate_id,candidate_fingerprint,from_ref,to_ref,bucket,"
+        "namespace_compatibility,lifecycle,evidence_json,source_snapshot_id,config_version,"
+        "candidate_algorithm_version) "
+        "VALUES (%s,'candidate-1','fingerprint-1','public.customers.customer_id',"
+        "'public.transactions.customer_id','strong','compatible','weak','{}','snapshot-1',"
+        "'config-1','algorithm-1')",
+        (_SOURCE,),
+    )
+
+    cr = column_readiness(
+        db,
+        source=_SOURCE,
+        object_ref="public.transactions.customer_id",
+    )
+
+    preview = _req(cr.as_join_key, "external:JOIN_CONNECTIVITY")
+    assert preview.status == "review"
+    assert preview.external_preview is True
+    assert "candidate exists" in preview.reason
+    assert cr.as_join_key.operational_status == "ready"
