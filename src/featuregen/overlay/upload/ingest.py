@@ -2071,9 +2071,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     domain_overrides: dict[tuple[str, str], str] = {}
     if client is None:
         # No LLM provider configured: the enrichment stages honestly never ran (#22) — recorded as
-        # skipped, never as a failure, and ingestion continues normally.
-        for _stage in ("enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain",
-                       "enrich_synonyms", "enrich_unit"):
+        # skipped, never as a failure, and ingestion continues normally. The concept CRITIC is
+        # skipped with them: with no client there are no fresh LLM concept proposals this run to
+        # accept or refute (deterministic `shape_conflicts` refusal still guards every path that
+        # DOES propose — `critique_concept_batch` refutes without a client).
+        for _stage in ("enrich_concept", "enrich_concept_critic", "enrich_definition",
+                       "enrich_summary", "enrich_domain", "enrich_synonyms", "enrich_unit"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
@@ -2117,6 +2120,24 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             not_attempted=concept_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_concept", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
+        # Stage honesty for the Pass-A ACCEPTANCE critic (ingestion-richness Task 2 step 6): the
+        # critic runs INSIDE enrich_concepts (acceptance is part of accepting a concept, not a
+        # separate pipeline step), and its report rides out via `stats`. Zero identifier items ->
+        # `not_applicable`, NEVER silent; a concept stage that died before acceptance -> `not_run`;
+        # a contained critic fault -> `failed`.
+        critic_report = concept_stats.get("concept_critic")
+        if concepts is None or critic_report is None:
+            record_stage(stage_recorder, "enrich_concept_critic", "not_run",
+                         reason_code="enrich_concept_failed")
+        elif critic_report.get("failed"):
+            record_stage(stage_recorder, "enrich_concept_critic", "failed",
+                         reason_code="exception")
+        elif not critic_report.get("items"):
+            record_stage(stage_recorder, "enrich_concept_critic", "not_applicable",
+                         reason_code="no_identifier_assignments")
+        else:
+            record_stage(stage_recorder, "enrich_concept_critic", "succeeded",
+                         detail=dict(critic_report))
         stage_started = datetime.now(UTC)
         def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         def_evidence_failures = 0

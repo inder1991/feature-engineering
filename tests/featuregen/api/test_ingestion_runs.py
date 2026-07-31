@@ -258,7 +258,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
     stages = {s["stage"]: s for s in run["stages"]}
     assert [s["stage"] for s in run["stages"]] == [
         "parse", "validation", "brake", "fact_assertion", "drift", "glossary_classification",
-        "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain",
+        "enrich_concept", "enrich_concept_critic",
+        "enrich_definition", "enrich_summary", "enrich_domain",
         "enrich_synonyms", "enrich_unit",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",

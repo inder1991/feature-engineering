@@ -61,7 +61,8 @@ def test_successful_upload_records_all_stages_in_order(db):
     assert res.status == "ingested"
     assert [r.stage for r in rec.reports] == [
         "validation", "brake", "fact_assertion", "drift", "glossary_classification",
-        "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
+        "enrich_concept", "enrich_concept_critic",
+        "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
         "enrich_unit",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
@@ -74,6 +75,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "drift": "succeeded",
         "glossary_classification": "not_applicable",           # a technical, not glossary, upload
         "enrich_concept": "skipped_no_client",                 # no LLM provider configured
+        "enrich_concept_critic": "skipped_no_client",          # no proposals to accept or refute
         "enrich_definition": "skipped_no_client",
         # A no-LLM run now SAYS the summary stage was skipped. It used to be omitted entirely —
         # absent from the skip loop — so the report implied a stage that never existed.
@@ -125,7 +127,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 25
+    assert len(rec.reports) == 26
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
@@ -264,7 +266,8 @@ def test_durable_llm_audit_degradation_flags_the_enrich_stage(db, monkeypatch):
 # Every stage ingest_upload owns, in execution order — what a COMPLETE run account contains.
 _ALL_INGEST_STAGES = [
     "validation", "brake", "fact_assertion", "drift", "glossary_classification",
-    "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
+    "enrich_concept", "enrich_concept_critic",
+    "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",

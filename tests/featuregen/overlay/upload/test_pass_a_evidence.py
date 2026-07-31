@@ -65,7 +65,7 @@ def test_rich_glossary_context_reaches_the_llm(db, monkeypatch):
     h_name = content_hash(rows["CUST_NAME"])
     h_bal = content_hash(rows["ACCT_BAL"])
     client = _CapturingFake(script={_TASK: FakeResponse(output={"results": [
-        {"ref": h_name, "concept": "account_identifier"},
+        {"ref": h_name, "concept": "party_name"},
         {"ref": h_bal, "concept": "monetary_stock"}]})})
 
     enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
@@ -95,18 +95,18 @@ def test_batch_writes_item_level_concept_evidence(db, monkeypatch):
     h_name = content_hash(rows["CUST_NAME"])
     h_bal = content_hash(rows["ACCT_BAL"])
     client = FakeLLM(script={_TASK: FakeResponse(output={"results": [
-        {"ref": h_name, "concept": "account_identifier"},
+        {"ref": h_name, "concept": "party_name"},
         {"ref": h_bal, "concept": "monetary_stock"}]})})
 
     out = enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
                           source_snapshot_id="snap-1")
     # Return shape unchanged (content_hash -> concept), so build_graph is unaffected.
-    assert out == {h_name: "account_identifier", h_bal: "monetary_stock"}
+    assert out == {h_name: "party_name", h_bal: "monetary_stock"}
 
     ev = read_active_field_evidence(db, _NAME_REF, "concept")
     assert len(ev) == 1
     e = ev[0]
-    assert e.proposed_value == "account_identifier"
+    assert e.proposed_value == "party_name"
     assert e.producer == "llm" and e.strength == "proposed" and e.lifecycle == "active"
     assert e.producer_ref == "overlay-enrichment"
     assert e.producer_item_ref == h_name                       # the batch item ref (content hash)
@@ -203,7 +203,7 @@ def test_evidence_write_failure_is_fail_soft(db, monkeypatch):
     h_name = content_hash(rows["CUST_NAME"])
     h_bal = content_hash(rows["ACCT_BAL"])
     client = FakeLLM(script={_TASK: FakeResponse(output={"results": [
-        {"ref": h_name, "concept": "account_identifier"},
+        {"ref": h_name, "concept": "party_name"},
         {"ref": h_bal, "concept": "monetary_stock"}]})})
 
     def _boom(*a, **k):
@@ -212,7 +212,7 @@ def test_evidence_write_failure_is_fail_soft(db, monkeypatch):
     monkeypatch.setattr(enrich_mod, "record_field_evidence", _boom)
     out = enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
                           source_snapshot_id="snap-1")
-    assert out == {h_name: "account_identifier", h_bal: "monetary_stock"}   # enrichment survives
+    assert out == {h_name: "party_name", h_bal: "monetary_stock"}   # enrichment survives
     # the contained failure left no half-written evidence AND did not poison the txn
     assert read_active_field_evidence(db, _NAME_REF, "concept") == []
     assert db.execute("SELECT 1").fetchone()[0] == 1                        # txn still usable

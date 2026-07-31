@@ -705,6 +705,41 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             "population_reason_codes",
         ],
     },
+    # Enrichment concept critic (ingestion-richness Task 2). Refute-oriented: the model answers
+    # whether an ALREADY-PROPOSED concept assignment is supported by the supplied metadata evidence
+    # — a closed verdict, never a replacement concept (the revise pass below owns that), so an
+    # off-vocabulary answer cannot ride this channel.
+    ("concept_critique", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["supported", "refuted", "uncertain"],
+            },
+            "reason_codes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["verdict", "reason_codes"],
+    },
+    # The critic's one revise pass: a single concept name from the provided controlled vocabulary
+    # (or the literal 'unclassified'). Free-form on the wire by necessity — the vocabulary is data,
+    # not schema — so the code-side registry + shape gate is what makes an off-registry or
+    # shape-conflicted revision unemittable.
+    ("concept_revision", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "concept": {"type": "string", "maxLength": 64},
+            "reason_codes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["concept", "reason_codes"],
+    },
 }
 
 # Pass B v2 (Phase-2 Slice 1, Task 4): the OUTPUT contract is byte-for-byte v1 — v2 exists because

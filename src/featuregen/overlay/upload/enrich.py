@@ -8,7 +8,13 @@ from collections.abc import Callable
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_decision import (
+    FieldDecisionEventType,
+    read_field_decisions,
+    record_field_decision,
+)
 from featuregen.overlay.field_evidence import (
+    canonical_hash,
     field_input_hash,
     read_active_field_evidence,
     record_field_evidence,
@@ -16,6 +22,11 @@ from featuregen.overlay.field_evidence import (
 )
 from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.upload import enrich_config
+from featuregen.overlay.upload.attest.concept_critic import (
+    ConceptCriticItemV1,
+    ConceptDisposition,
+    critique_concept_batch,
+)
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import (
     UNCLASSIFIED,
@@ -1048,6 +1059,135 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
     return failures
 
 
+def _record_concept_critique_decision(conn, *, logical_ref: str, disposition: str,
+                                      conflict_codes: tuple[str, ...]) -> None:
+    """Append the critic's REPLACEMENT decision to the column's field-decision trail — the
+    machinery behind ``concept_decision_id`` — so the audit answers "why did this column's concept
+    change" from the COLUMN, not only from one run's stage detail.
+
+    A ``STALED`` event with the critic's closed reason codes (``concept_critic_<disposition>`` plus
+    the deterministic conflict codes), superseding the latest non-retired decision. STALED is the
+    honest lifecycle word: the critic retired the LLM's evidence, and a retired-latest decision is
+    exactly what keeps ``is_feature_eligible`` fail-closed for the field. A REVISED column's fresh
+    proposal then resolves normally on top (a later RESOLVED event); a REFUTED one stays retired —
+    the abstain supersedes the wrong identifier instead of protecting it."""
+    # Lazy import: ``field_resolution`` imports ``graph``, which imports THIS module for
+    # ``content_hash`` — a module-level import would cycle (the ``_concept_grounding`` pattern).
+    from featuregen.overlay.upload.field_resolution import (
+        FIELD_POLICY_VERSION,
+        RESOLVER_VERSION,
+    )
+    retired = {FieldDecisionEventType.REJECTED.value, FieldDecisionEventType.STALED.value,
+               FieldDecisionEventType.SUPERSEDED.value}
+    decisions = read_field_decisions(conn, logical_ref, "concept")   # oldest-first
+    supersedes = next(
+        (d.decision_event_id for d in reversed(decisions) if d.event_type not in retired),
+        None,
+    )
+    record_field_decision(
+        conn, logical_ref=logical_ref, field_name="concept",
+        event_type=FieldDecisionEventType.STALED,
+        selected_evidence_ids=[], evidence_set_hash=canonical_hash([]),
+        display_value_hash=None, load_bearing_value_hash=None,
+        conflict_status=f"concept_critic_{disposition}",
+        reason_codes=[f"concept_critic_{disposition}", *conflict_codes],
+        field_policy_version=FIELD_POLICY_VERSION, resolver_version=RESOLVER_VERSION,
+        actor_ref=None, supersedes_event_id=supersedes)
+
+
+def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, str],
+                          by_hash: dict[str, CanonicalRow], meta_by_hash: dict[str, dict],
+                          rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor) -> dict:
+    """The Pass-A ACCEPTANCE hook (ingestion-richness Task 2 step 5): run the refute-oriented
+    concept critic over this run's IDENTIFIER-group assignments and apply its dispositions to
+    ``result`` in place. Non-identifier assignments pass through byte-for-byte untouched.
+
+    The re-derivation rule, exactly as the plan states it — a ``refuted`` identifier assignment
+    never persists as the current suggestion; the column's concept resolves, in order:
+
+    1. the critic's revise-pass result if accepted (``result[h]`` becomes the revision, whose
+       fresh ``llm/proposed`` evidence is then written by ``_write_concept_evidence``);
+    2. else the non-identifier abstain — ``result[h]`` becomes the literal ``unclassified``
+       (a real classification the evidence writer deliberately never proposes);
+    3. NEVER silent retention of a previously-stored wrong identifier: for every evicted
+       assignment the LLM's ACTIVE ``concept`` evidence at the ref is staled (producer-scoped —
+       human/source rows are untouched), so a prior run's wrong value cannot re-resolve, and the
+       replacement decision (with the critic's conflict codes as its reason) is appended to the
+       column's field-decision trail.
+
+    DB-first, dict-after: all staling/decision writes happen inside the caller's savepoint BEFORE
+    ``result`` is mutated, so a rolled-back savepoint leaves the in-memory classification exactly
+    as the classifier produced it — never a half-applied correction.
+
+    The classifier CACHE is deliberately not touched: it stores the classifier's own answer, and
+    the critic's replay store (content-addressed on the same inputs) makes re-criticising a cache
+    HIT on the next upload free. Returns the stage-detail report
+    ``{items, accepted, revised, refuted, abstained, conflicts}``."""
+    items: dict[str, ConceptCriticItemV1] = {}
+    ref_to_hash: dict[str, str] = {}
+    for h, concept_name in result.items():
+        registered = concept_record(concept_name)
+        if registered is None or registered.group != "identifier":
+            continue                       # non-identifier fields pass through unchanged
+        row = by_hash.get(h)
+        if row is None:
+            continue
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        # Evidence and decisions key on the glossary's SCHEMA-PRESERVING ref; a technical column
+        # (no sidecar) falls back to its public-flattened identity. The DEFINITION handed to the
+        # critic is the already-sanitized, bounded glossary business definition — a technical
+        # upload's uploader-authored free text stays out of every prompt (the M4 rule), so those
+        # items carry None and are judged on name/type shape alone.
+        evidence_ref = (rec.logical_ref if rec is not None
+                        else normalize_ref(row.source, None, row.table, row.column))
+        meta = meta_by_hash.get(h, {})
+        items[evidence_ref] = ConceptCriticItemV1(
+            logical_ref=evidence_ref,
+            column_name=row.column,
+            declared_type=str(meta.get("type") or row.type or "") or None,
+            definition=meta.get("business_definition"),
+            proposed_concept=concept_name,
+        )
+        ref_to_hash[evidence_ref] = h
+    report: dict = {"items": len(items), "accepted": 0, "revised": 0, "refuted": 0,
+                    "abstained": 0, "conflicts": {}}
+    if not items:
+        return report
+    # The replay identity of THIS catalog's content: a byte-identical re-upload replays every
+    # stored critique for free, while any content change re-asks the affected questions.
+    catalog_revision = hashlib.sha256(
+        json.dumps(sorted(by_hash)).encode("utf-8")).hexdigest()[:16]
+    outcomes = critique_concept_batch(
+        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor)
+    corrections: list[tuple[str, str]] = []
+    for ref, outcome in outcomes.items():
+        h = ref_to_hash.get(ref)
+        if h is None:
+            continue
+        if outcome.disposition is ConceptDisposition.ACCEPTED:
+            report["accepted"] += 1
+            continue
+        if outcome.disposition is ConceptDisposition.ABSTAINED:
+            report["abstained"] += 1       # refute-oriented: no refutation -> proposal stands
+            continue
+        if outcome.conflict_codes:
+            report["conflicts"][ref] = list(outcome.conflict_codes)
+        stale_all_llm_field_evidence(conn, logical_ref=ref, field_name="concept")
+        _record_concept_critique_decision(
+            conn, logical_ref=ref, disposition=outcome.disposition.value,
+            conflict_codes=outcome.conflict_codes)
+        if (outcome.disposition is ConceptDisposition.REVISED
+                and outcome.resolved_concept is not None):
+            report["revised"] += 1
+            corrections.append((h, outcome.resolved_concept))
+        else:
+            report["refuted"] += 1
+            corrections.append((h, UNCLASSIFIED))
+    for h, corrected in corrections:       # in-memory only after every DB write succeeded
+        result[h] = corrected
+    return report
+
+
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
                     glossary: GlossaryUpload | None = None,
                     bindings: dict[str, ObjectBinding] | None = None,
@@ -1070,7 +1210,10 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     ``evidence_write_failures``, the count of per-item evidence-write failures the stage CONTAINED
     internally, plus ``not_attempted`` (batch mode), the count of items the budget/deadline cutoff
     skipped WITHOUT dispatch — so the caller's stage report can say ``partial`` (``items_failed`` or
-    the distinct ``truncated``) instead of a laundered success.
+    the distinct ``truncated``) instead of a laundered success. It also receives
+    ``concept_critic`` — the acceptance hook's report (``_apply_concept_critic``; ``{"failed":
+    True}`` when the contained critic faulted) — which ingest records as the
+    ``enrich_concept_critic`` stage.
 
     ``ingestion_run_id`` (C5-T5): the durable run this enrichment serves — with it, EVERY LLM
     dispatch this stage issues (batch chunks, retries, single fallbacks, single mode) is pre-audited
@@ -1144,13 +1287,33 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             result[h] = concept
             resolved[h] = concept
 
+    # ── Pass-A ACCEPTANCE (ingestion-richness Task 2): the refute-oriented concept critic runs
+    # over EVERY identifier-group assignment this run produced — fresh classifications AND cache
+    # HITS (a hit re-proposing yesterday's wrong identifier must be evicted, not grandfathered) —
+    # BEFORE any evidence is written, so a refuted assignment never persists as the current
+    # suggestion. Savepointed + advisory like every enrichment side-effect: a critic fault
+    # degrades to un-criticised concepts and an honest ``failed`` stage, never a lost upload.
+    critic_report: dict = {"failed": True}
+    try:
+        with conn.transaction():
+            critic_report = _apply_concept_critic(
+                conn, client, result=result, by_hash=by_hash, meta_by_hash=meta_by_hash,
+                rec_by_tc=rec_by_tc, actor=actor)
+    except Exception:  # noqa: BLE001 — advisory: the critic never aborts concept enrichment
+        logger.warning("advisory concept critic failed", exc_info=True)
+    if stats is not None:
+        stats["concept_critic"] = critic_report
+
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
     # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
     # on the very next upload instead of leaving graph_node.concept populated with no supporting
     # field_evidence forever. `_write_concept_evidence`'s input_hash reuse check makes this a safe
     # no-op when the evidence already exists and is unchanged — no duplicate/stale rows.
     if glossary is not None and source_snapshot_id is not None:
-        evidence_targets = {**resolved, **{h: result[h] for h in hit_hashes}}
+        # Values come from the corrected ``result`` (never the pre-critic ``resolved``): a REVISED
+        # column's evidence must carry the revision, a REFUTED one is ``unclassified`` and writes
+        # nothing (C3) — its old evidence was already staled by the acceptance hook.
+        evidence_targets = {h: result[h] for h in set(resolved) | hit_hashes}
         failures = _write_concept_evidence(
             conn, resolved=evidence_targets, by_hash=by_hash, meta_by_hash=meta_by_hash,
             rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id,

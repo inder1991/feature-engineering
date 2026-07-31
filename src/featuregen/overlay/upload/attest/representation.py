@@ -195,3 +195,108 @@ def representation_role(
     ):
         return RepresentationRole.HUMAN_LABEL
     return RepresentationRole.UNKNOWN
+
+
+# ── The NEW namespace-shape extension (ingestion-richness Task 2) ────────────────────────────────
+#
+# ``shape_conflicts`` answers ONE refute-oriented question deterministically: does this column's
+# own shape (name tokens, declared type, definition tokens) CONTRADICT the identifier concept it
+# was assigned? It exists because the live conflation defects were all shape-visible — a BIC-shaped
+# column classified into the CIF namespace, a description classified as a branch identifier, an
+# amount classified as a counterparty id — and a deterministic contradiction must be able to refute
+# without (and before) any LLM. Codes are CLOSED; exact word tokens only (the ``_tokens`` splitter
+# — never substrings, so "mandate" cannot fire "date" nor "grate" fire "rate").
+
+#: Closed conflict vocabulary — everything this module can ever emit. Consumers (the concept
+#: critic, stage details, decision-trail reasons) may rely on this set being exhaustive.
+SHAPE_CONFLICT_CODES = frozenset({
+    "identifier_namespace_mismatch",
+    "name_or_description_not_identifier",
+    "measure_not_identifier",
+})
+
+# Measure-name word tokens. Deliberately the four the remediation plan closes on — a wider net
+# (e.g. "balance", "pct") buys recall at precision's expense, and a deterministic refuter must
+# never wrongly kill a correct assignment.
+_MEASURE_NAME_TOKENS = frozenset({"amt", "amount", "rate", "bal"})
+
+# Declared SQL types that are inherently FRACTIONAL. A double/float/real column can never hold an
+# identifier. Integer/decimal/numeric types are deliberately EXCLUDED: customer and account numbers
+# are routinely declared integral (NUMBER/bigint), so treating them as measure evidence would refute
+# correct assignments — the false positive a deterministic refuter must not have.
+_FRACTIONAL_TYPES = frozenset({
+    "double", "double precision", "float", "float4", "float8", "real",
+})
+
+# Shape claims -> the registry namespace each claim identifies. A claim fires on exact word tokens
+# in the column NAME or DEFINITION: the token "bic" (or the glossary's own "8/11 alphanumeric"
+# shape wording) claims the SWIFT BIC namespace; "uuid"/"uetr" claim the SWIFT gpi UETR namespace.
+# These are the only shapes with an unambiguous single-namespace meaning today; scheme codes, CIFs
+# and serials are shape-anonymous and stay the critic's (LLM) question.
+_BIC_NAMESPACE = "swift_bic"
+_UETR_NAMESPACE = "swift_uetr"
+
+
+def _fractional_declared_type(declared_type: str | None) -> bool:
+    normalized = _TYPE_PARAMETER.sub("", (declared_type or "").strip().lower())
+    return normalized in _FRACTIONAL_TYPES
+
+
+def _claimed_namespaces(tokens: set[str]) -> set[str]:
+    """The identifier namespaces the column's own name/definition wording claims."""
+    claimed: set[str] = set()
+    if "bic" in tokens or ("alphanumeric" in tokens and tokens & {"8", "11"}):
+        claimed.add(_BIC_NAMESPACE)
+    if tokens & {"uuid", "uetr"}:
+        claimed.add(_UETR_NAMESPACE)
+    return claimed
+
+
+def shape_conflicts(
+    column_name: str,
+    declared_type: str | None,
+    definition: str | None,
+    concept: str | None,
+) -> tuple[str, ...]:
+    """Deterministic contradictions between a column's shape and its proposed IDENTIFIER concept.
+
+    Returns a sorted tuple of closed codes (subset of :data:`SHAPE_CONFLICT_CODES`); ``()`` for a
+    clean assignment AND for any non-identifier concept — this extension corroborates identifier
+    assignments only, so measures/labels/temporals pass through untouched.
+
+    * ``identifier_namespace_mismatch`` — the name/definition claims a specific namespace shape
+      (BIC / UUID-UETR) but the concept's registry namespace is a different value space.
+    * ``name_or_description_not_identifier`` — :func:`representation_role` reads the column as
+      description/label/free text. The role is computed WITHOUT the proposed concept: the concept
+      under refutation must not be allowed to vouch for itself (a registered identifier concept
+      would otherwise short-circuit the definition-token evidence).
+    * ``measure_not_identifier`` — a measure-name word token, or an inherently fractional declared
+      type, on a column claimed to be an identifier.
+    """
+    registered = lookup_concept((concept or "").strip().lower())
+    if registered is None or registered.group != "identifier":
+        return ()
+    tokens = _tokens(column_name) | _tokens(definition)
+    conflicts: set[str] = set()
+
+    claimed = _claimed_namespaces(tokens)
+    if claimed and registered.namespace not in claimed:
+        conflicts.add("identifier_namespace_mismatch")
+
+    role = representation_role(
+        column_name=column_name,
+        definition=definition,
+        concept_name=None,             # never let the disputed concept vouch for itself
+        observed_format=None,
+        data_type_family=type_family(declared_type),
+    )
+    if role in {
+        RepresentationRole.DESCRIPTION_TEXT,
+        RepresentationRole.HUMAN_LABEL,
+        RepresentationRole.FREE_TEXT,
+    }:
+        conflicts.add("name_or_description_not_identifier")
+
+    if _tokens(column_name) & _MEASURE_NAME_TOKENS or _fractional_declared_type(declared_type):
+        conflicts.add("measure_not_identifier")
+    return tuple(sorted(conflicts))
