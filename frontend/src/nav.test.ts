@@ -1,5 +1,5 @@
 import { act, renderHook } from '@testing-library/react'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useHashRoute } from './nav'
 
 beforeEach(() => {
@@ -110,5 +110,25 @@ describe('useHashRoute', () => {
     expect(result.current.route).toBe('search')
     expect(result.current.params.getAll('source')).toEqual(['deposits', 'cards'])
     expect(result.current.params.get('q')).toBe('balance')
+  })
+})
+
+// Entity map v0 is flag-gated (VITE_ENTITY_MAP), same call-time pattern as the gate console:
+// flag-off the hash parses like any unknown route — the screen is ABSENT, not broken.
+describe('entity-map flag gating', () => {
+  it('refuses #/entity-map when the flag is off', () => {
+    vi.stubEnv('VITE_ENTITY_MAP', '')
+    window.location.hash = '#/entity-map'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('overview')
+    vi.unstubAllEnvs()
+  })
+
+  it('resolves #/entity-map when the flag is on', () => {
+    vi.stubEnv('VITE_ENTITY_MAP', '1')
+    window.location.hash = '#/entity-map'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('entity-map')
+    vi.unstubAllEnvs()
   })
 })

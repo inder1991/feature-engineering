@@ -4617,3 +4617,64 @@ button.stat:hover {
 .adg-basis {
   margin-left: 8px;
 }
+
+/* ── Entity map v0 (Task 3D). Composes the existing .panel / .rows / .badge / .btn / .callout
+   vocabulary; only the node grid and edge alignment are new. Node SIZE is column count (set
+   inline as a font-size scale); the number is always printed beside it, so size is a glance aid,
+   never the datum. ── */
+.emap {
+  display: grid;
+  gap: 16px;
+}
+
+.emap-nodes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.emap-node {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  text-align: left;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.emap-node:hover {
+  border-color: var(--accent-line);
+}
+
+.emap-node-name {
+  font-weight: 600;
+}
+
+.emap-node-catalogs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.emap-edge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.emap-realizations {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}

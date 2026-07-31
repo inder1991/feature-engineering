@@ -2490,3 +2490,62 @@ export function putCatalogEngine(
     body: JSON.stringify({ engine, tier }),
   })
 }
+
+// ---- entity map v0 (ingestion-richness Task 3D) ----
+// The READ-ONLY face of the ontology: entities as nodes (read-scoped column counts per catalog),
+// available cross-catalog links as edges — the SAME availability truth governance and the planner
+// read, never a second interpretation.
+
+export interface EntityCatalogGroup {
+  catalog_source: string
+  column_count: number
+  sample_refs: string[]
+}
+
+export interface EntityMapNode {
+  entity_id: string
+  registered: boolean
+  column_count: number
+  catalogs: EntityCatalogGroup[]
+}
+
+export interface EntityMapEndpoint {
+  catalog_source: string
+  table_ref: string
+  column_refs: string[]
+  entity_id: string | null
+  concept: string | null
+  namespace: string | null
+}
+
+export interface EntityMapRealization {
+  from_catalog_source: string
+  from_table_ref: string
+  to_catalog_source: string
+  to_table_ref: string
+  lifecycle: string
+  safety_status: string
+  sandbox_eligible: boolean
+  production_eligible: boolean
+}
+
+export interface EntityMapLink {
+  candidate_id: string
+  candidate_revision_id: string
+  bridge_fact_key: string
+  status: 'proposed' | 'confirmed'
+  folded_status: string | null
+  strength: number
+  left: EntityMapEndpoint
+  right: EntityMapEndpoint
+  realizations: EntityMapRealization[]
+}
+
+export interface EntityMap {
+  entities: EntityMapNode[]
+  links: EntityMapLink[]
+}
+
+export function getEntityMap(): Promise<EntityMap> {
+  return request('/catalog/entity-map')
+}

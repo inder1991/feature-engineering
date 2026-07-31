@@ -5,7 +5,7 @@ import { useCallback, useMemo, useSyncExternalStore } from 'react'
 export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
   | 'integrations' | 'governance' | 'dashboard' | 'gate' | 'asset' | 'suggested'
-  | 'analysis'
+  | 'analysis' | 'entity-map'
 
 // 'asset' is the catalog asset-detail screen (Delivery G). It carries source + object_ref via the
 // existing params mechanism (a Details action on a search hit navigates('asset', {source,
@@ -24,12 +24,22 @@ export function gateConsoleEnabled(): boolean {
   return import.meta.env.VITE_INTENT_GATE_CONSOLE === '1'
 }
 
+// Entity map v0 (ingestion-richness Task 3D) rides its own Vite flag, same call-time pattern as the
+// gate console. The plan gates it with the profile read-model flag family; that family has no
+// frontend member yet (the profiles plan is unimplemented), so this flag is its first — fold it in
+// when the family lands. Flag-off, '#/entity-map' parses like any unknown hash: absent, not broken.
+export function entityMapEnabled(): boolean {
+  return import.meta.env.VITE_ENTITY_MAP === '1'
+}
+
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')
   const q = raw.indexOf('?')
   const path = q === -1 ? raw : raw.slice(0, q)
   const query = q === -1 ? '' : raw.slice(q + 1)
-  const known = ROUTES.includes(path) || (path === 'gate' && gateConsoleEnabled())
+  const known = ROUTES.includes(path)
+    || (path === 'gate' && gateConsoleEnabled())
+    || (path === 'entity-map' && entityMapEnabled())
   const route = known ? (path as Route) : 'overview'
   return { route, params: new URLSearchParams(query) }
 }

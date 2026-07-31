@@ -1,8 +1,9 @@
 import type { ReactElement } from 'react'
-import { gateConsoleEnabled, useHashRoute } from './nav'
+import { entityMapEnabled, gateConsoleEnabled, useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
 import { AssetDetailScreen } from './screens/AssetDetailScreen'
+import { EntityMapScreen } from './screens/EntityMapScreen'
 import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
@@ -75,6 +76,16 @@ const ICONS: Record<Route, ReactElement> = {
     <NavIcon>
       <circle cx="7" cy="7" r="4.25" />
       <path d="m10.25 10.25 3 3" />
+    </NavIcon>
+  ),
+  // Three entity nodes joined by edges: the ontology, drawn. Distinct from 'integrations'
+  // (a hub linking OUT to services) — this is a peer graph.
+  'entity-map': (
+    <NavIcon>
+      <circle cx="4" cy="4.5" r="1.75" />
+      <circle cx="12" cy="4.5" r="1.75" />
+      <circle cx="8" cy="12" r="1.75" />
+      <path d="M5.75 4.5h4.5M4.9 6.1l2.2 4.3M11.1 6.1l-2.2 4.3" />
     </NavIcon>
   ),
   review: (
@@ -206,6 +217,17 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     description: 'Find columns you can trust',
   },
   {
+    // Entity map v0, behind VITE_ENTITY_MAP — filtered out of the rendered nav in App() when the
+    // flag is off (parseHash also refuses the route then): absent, not broken.
+    route: 'entity-map',
+    label: 'Entity map',
+    eyebrow: 'CATALOG · ENTITY MAP',
+    title: 'Entity map',
+    description:
+      'The catalog’s ontology, drawn: every entity the columns carry, grouped by catalog, and '
+      + 'every available cross-catalog link — proposed or confirmed — as an edge. Read-only.',
+  },
+  {
     // The route stays 'upload' (#/upload unchanged — deep links keep working); only the words
     // change: the screen now holds two peer ingest paths (file upload + OpenMetadata connector).
     route: 'upload',
@@ -318,9 +340,11 @@ export default function App() {
   const openGovernanceReview = (source: string) => {
     navigate('governance', { source })
   }
-  // The gate console page exists only when its flag is on — checked per render (not module
-  // scope) so vi.stubEnv works in tests, same as the WorkbenchScreen intent flags.
-  const pages = gateConsoleEnabled() ? PAGES : PAGES.filter(p => p.route !== 'gate')
+  // Flag-gated pages exist only when their flag is on — checked per render (not module scope) so
+  // vi.stubEnv works in tests, same as the WorkbenchScreen intent flags.
+  const pages = PAGES.filter(p =>
+    (p.route !== 'gate' || gateConsoleEnabled())
+    && (p.route !== 'entity-map' || entityMapEnabled()))
   // 'asset' is a detail sheet, not a nav tab (absent from PAGES, so no rail item highlights) — but
   // it still needs an honest page-head, so it selects a dedicated entry instead of falling back to
   // Overview's copy.
@@ -401,6 +425,7 @@ export default function App() {
           />
         )}
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
+        {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}
         {route === 'workbench' && <WorkbenchScreen />}
         {route === 'analysis' && <AnalysisWorkspaceScreen />}
       </main>
