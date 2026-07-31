@@ -636,27 +636,46 @@ screen; this task owns the COLUMN-level dossier only. Same screen, disjoint sect
 
 **Steps:**
 
-- [ ] **"From the source glossary" section**, product names not CSV headers: Business term,
+- [x] **"From the source glossary" section**, product names not CSV headers: Business term,
   Term type, Business processes (L1 → L2 → L3 as one path), Related terms, BIAN / FIBO
   classification, Declared type, Physical path. Read from the source field-evidence Task 3
   Step 6b persists; every value carries its `source_attested` provenance chip.
-- [ ] **Type display policy:** when `operational_type` is unknown and `declared_type` exists,
+  (New `source_glossary` payload section — newest ACTIVE `producer='source'` evidence per field,
+  empty-not-fabricated; the screen's section renders product names + the source chip and is
+  absent when nothing was declared.)
+- [x] **Type display policy:** when `operational_type` is unknown and `declared_type` exists,
   render `varchar(50) · declared` (basis chip), never a bare "unknown"; an attested type (Task
   7) upgrades the chip. The bare word "unknown" appears only when we genuinely hold nothing.
-- [ ] **AI-proposed values instead of blanks** (standing product direction: AI-proposed is
+  (Policy lives in the READ MODEL — the `type` field gains `basis`
+  operational/declared/null and the declared value backs it — so every consumer gets it; the
+  identity Type section renders the headline + basis chip and the operational slot says
+  "— not attested yet", reserving bare "unknown" for a column holding nothing.)
+- [x] **AI-proposed values instead of blanks** (standing product direction: AI-proposed is
   usable, never framed as failure): for additivity/unit/currency/entity, render the governed
   value when present, else the LLM-proposed value with an "AI-proposed · unconfirmed" chip
   (E4a unit proposals included), else an explicit "nothing known yet" — a NULL axis must be
-  distinguishable from a hidden one.
-- [ ] **Suggested features on the column:** call the existing P4 route
+  distinguishable from a hidden one. (Every effective_metadata field now carries
+  `proposed_value` — the newest ACTIVE evidence's value — and the tri-state axis rows render
+  value/proposal/"nothing known yet"; `sensitivity_display` + `party_role` joined the axes,
+  labelled "system projected" when the deterministic projection filled them.)
+- [x] **Suggested features on the column:** call the existing P4 route
   (`/catalog/{source}/tables/{table}/suggestions`) from asset detail, filtered to suggestions
   that use the opened column; resolve the standing P4 access call (default data-owner session
   403s on `feature:read`) — either grant read on the session role or a column-scoped read
   route; never silently swallow the 403 into an empty section.
-- [ ] **AI summary placement:** show the (Task 3 Step 6c) enriched summary beside — never in
-  place of — the source definition, labelled as AI-drafted.
-- [ ] Cross-catalog links, readiness roles, and decision history remain; the dossier orders
-  sections: identity → meaning → semantics → governance → usage → history.
+  (ACCESS WAS ALREADY RESOLVED on the route: it gates on `catalog:read`, not `feature:read` —
+  the narrower change, pinned by `test_suggestions_route` ("data_owner PASSES"). The dossier's
+  usage section filters `uses` to the opened column, reuses `SuggestionCard`, and renders a
+  403 as the honest access message naming `catalog:read`; a non-403 failure is an error, and
+  an empty filter result names how many table suggestions exist that don't use this column.)
+- [x] **AI summary placement:** show the (Task 3 Step 6c) enriched summary beside — never in
+  place of — the source definition, labelled as AI-drafted. (Meaning section: two slots side by
+  side; a missing definition keeps its slot honest — the summary never occupies it.)
+- [x] Cross-catalog links, readiness roles, and decision history remain; the dossier orders
+  sections: identity → meaning → semantics → governance → usage → history. (Overview =
+  identity → Type → Meaning → source glossary → Semantics axes → Governance summary →
+  Suggested features; tabs reordered Overview → Relationships → Metadata & evidence →
+  Readiness → History so governance follows semantics and usage precedes history.)
 
 **Tests:**
 
