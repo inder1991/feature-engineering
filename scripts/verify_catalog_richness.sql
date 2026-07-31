@@ -15,7 +15,11 @@ SELECT 'coverage_domain|' || catalog_source || '|' || count(domain) FROM graph_n
 UNION ALL
 SELECT 'coverage_entity_display|' || catalog_source || '|' || count(NULLIF(entity,'')) FROM graph_node WHERE kind='column' GROUP BY catalog_source
 UNION ALL
-SELECT 'coverage_sensitivity_display|' || catalog_source || '|' || count(sensitivity) FROM graph_node WHERE kind='column' GROUP BY catalog_source
+-- The display axis is its OWN column (migration 1042): graph_node.sensitivity is the read-scope
+-- TAG (an input to the GENERATED visible_requires), so it could never carry the display labels.
+SELECT 'coverage_sensitivity_display|' || catalog_source || '|' || count(sensitivity_display) FROM graph_node WHERE kind='column' GROUP BY catalog_source
+UNION ALL
+SELECT 'coverage_sensitivity_tag|' || catalog_source || '|' || count(sensitivity) FROM graph_node WHERE kind='column' GROUP BY catalog_source
 UNION ALL
 SELECT 'coverage_attested_type|' || catalog_source || '|' || count(NULLIF(data_type,'unknown')) FROM graph_node WHERE kind='column' GROUP BY catalog_source
 UNION ALL
@@ -28,8 +32,9 @@ UNION ALL
 SELECT 'coverage_additivity|' || catalog_source || '|' || count(additivity) FROM graph_node WHERE kind='column' GROUP BY catalog_source
 UNION ALL
 SELECT 'coverage_ai_summary|' || catalog_source || '|' || count(ai_summary) FROM graph_node WHERE kind='column' GROUP BY catalog_source
--- (coverage_party_role joins this script when Task 3's migration adds the column —
---  a parse-time column reference cannot be guarded by an EXISTS subquery)
+UNION ALL
+-- Task 3's 1040 migration added the advisory party_role axis; count it like its neighbors.
+SELECT 'coverage_party_role|' || catalog_source || '|' || count(party_role) FROM graph_node WHERE kind='column' GROUP BY catalog_source
 
 -- ── read-scope enforcement distribution (display axis is separate; this is the ENFORCED one) ─
 UNION ALL

@@ -31,6 +31,7 @@ from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+from featuregen.overlay.upload.axis_projection import project_display_axes
 from featuregen.overlay.upload.brake import large_change_brake, resolution_brake
 from featuregen.overlay.upload.bridge_candidates import (
     BridgeCandidateDerivationV1,
@@ -2930,6 +2931,24 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                          started_at=stage_started)
     else:
         record_stage(stage_recorder, "join_drift", "disabled")
+
+    # ── Display-axis projection (richness Task 3): the LAST graph writer of the ingest, after
+    # every governed re-projection above, so its fill-only-NULL guards see the governed values
+    # already back on the fresh graph and can never race them. Idempotent + catalog-scoped;
+    # provenance rides the report -> stage detail (no decision-id stamps). OWN savepoint + except
+    # (the standard advisory pattern): a fault degrades to a warning, never fails the upload. ──
+    stage_started = datetime.now(UTC)
+    try:
+        with conn.transaction():
+            axis_report = project_display_axes(conn, catalog_source)
+        record_stage(stage_recorder, "axis_projection", "succeeded",
+                     detail=axis_report.stage_detail(), started_at=stage_started)
+    except Exception:  # noqa: BLE001 — advisory: a display fill never fails an upload
+        counters.incr("overlay.axis_projection.error")
+        logger.warning("advisory display-axis projection failed for %r — facts + graph intact",
+                       catalog_source, exc_info=True)
+        record_stage(stage_recorder, "axis_projection", "failed", reason_code="exception",
+                     started_at=stage_started)
 
     stage_started = datetime.now(UTC)
     persist_quarantine(conn, catalog_source, vr.quarantined)

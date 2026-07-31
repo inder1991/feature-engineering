@@ -257,6 +257,58 @@ def test_type_unknown_columns_are_listed_in_the_report(db):
     assert report.type_unknown == (gap,)
 
 
+def test_ingest_tail_runs_the_projection_and_records_the_stage(db):
+    """Step 4: `ingest_upload` runs the projection at the TAIL (after the governed re-projections,
+    so governed values are already back on the fresh graph and the fill-only-NULL guards see them)
+    and records stage `axis_projection` with the report counts."""
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.contracts.envelopes import IdentityEnvelope
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.stage_report import StageRecorder
+
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+        profiler_require_restricted_role=False))
+    actor = IdentityEnvelope(subject="u", actor_kind="human", authenticated=True,
+                             auth_method="oidc", role_claims=("data_owner",))
+    rec = StageRecorder()
+    rows = [CanonicalRow("axing", "txn", "sender_bic", "text"),
+            CanonicalRow("axing", "txn", "amt", "numeric", additivity="non_additive")]
+    res = ingest_upload(db, "axing", rows, actor=actor,
+                        now=datetime(2026, 7, 31, tzinfo=UTC), stage_recorder=rec)
+    assert res.status == "ingested"
+    stage = next(r for r in rec.reports if r.stage == "axis_projection")
+    assert stage.state == "succeeded"
+    assert stage.detail["party_role_set"] == 1                  # sender_bic -> sender
+    assert stage.started_at is not None
+    assert _col(db, "public.txn.sender_bic", "party_role", source="axing") == "sender"
+    assert _col(db, "public.txn.amt", "additivity", source="axing") == "non_additive"
+    # the stage sits at the ingest TAIL: after every re-projection, before quarantine.
+    order = [r.stage for r in rec.reports]
+    assert order.index("axis_projection") > order.index("semantic_binding_projection")
+    assert order.index("axis_projection") > order.index("join_drift")
+    assert order.index("axis_projection") < order.index("quarantine")
+
+
+def test_the_search_sensitivity_facet_is_untouched_by_the_projection(db):
+    """Verify-only (plan Task 3 files note): the search `sensitivity` facet reads the RAW tag
+    column — a HARD read-scope input — which this projection never writes, so facet behavior is
+    byte-identical across a run. (The display axis lives in `sensitivity_display`; surfacing it
+    on the search/dossier read side is Task 3C's work, gated on the frontend facet contract.)"""
+    from featuregen.overlay.upload.search import _COLUMN_FACETS
+
+    assert _COLUMN_FACETS["sensitivity"] == "sensitivity"       # the facet's source column
+    tagged = _node(db, "public.t.tagged", sensitivity="pii")
+    floored = _node(db, "public.t.floored", effective_restriction="confidential")
+    project_display_axes(db, _SRC)
+    assert _col(db, tagged, "sensitivity") == "pii"             # raw tag byte-identical
+    assert _col(db, floored, "sensitivity") is None
+
+
 def test_report_shape_and_stage_detail_are_bounded_counts(db):
     # a token-free column name: `cust_*` would legitimately earn party_role='subject'.
     _node(db, "public.t.client_no", concept="customer_id", effective_restriction="restricted")

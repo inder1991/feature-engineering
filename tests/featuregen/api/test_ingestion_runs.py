@@ -268,6 +268,9 @@ def test_successful_upload_records_ordered_stage_reports(client):
         # stale flat grain flags and froze them into the candidate evidence (bridge 6B).
         "table_fact_projection", "entity_bridges",
         "join_projection", "semantic_binding_projection", "join_drift",
+        # the display-axis projection runs LAST among the graph writers (richness Task 3), so
+        # its fill-only-NULL guards see every governed re-projection already applied.
+        "axis_projection",
         "quarantine", "manifest_finalization"]
     assert stages["parse"]["state"] == "succeeded"
     assert stages["manifest_finalization"]["state"] == "succeeded"   # #13 C: terminalize reported
