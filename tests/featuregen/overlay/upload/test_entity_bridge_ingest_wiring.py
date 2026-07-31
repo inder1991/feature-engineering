@@ -28,9 +28,12 @@ from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_propose import propose_bridge
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 from featuregen.overlay.upload.ingest import entity_bridges_enabled, ingest_upload
+from featuregen.overlay.upload.stage_report import StageRecorder
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+from featuregen.projections.runner import projection_lag
 
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 
@@ -172,6 +175,73 @@ def test_the_count_is_reported_on_the_result(db, monkeypatch):
     assert result.entity_bridge_candidates_retained == 1
     assert result.entity_bridge_candidates_suppressed == 0
     assert result.entity_bridge_candidates_truncated == 0
+
+
+def test_bridge_proposals_do_not_leave_the_governed_projection_lagged(db, monkeypatch):
+    """The bridge stage runs after the ordinary ingest drain because it needs the freshly
+    re-projected grain facts.  Its DRAFT events must still be drained before the upload returns:
+    catalog readiness fails closed on *global* overlay lag, so leaving even one bridge event behind
+    makes every role on every uploaded column appear unavailable."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+
+    _trigger(db)
+
+    assert _ledger(db), "precondition: the trigger proposed a bridge"
+    assert projection_lag(db, "overlay") == 0
+
+
+def test_reingest_withdraws_suppressed_candidates_and_reappearance_reactivates_them(
+    db, monkeypatch
+):
+    """The current shortlist must follow the latest graph, not accumulate every historical
+    proposal forever.  Withdrawal changes only the current pointer: immutable assessment/event
+    history remains and the same candidate can become current again."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    _trigger(db)
+    candidate_id = derive_bridge_candidates(db)[0].candidate_id
+    assert len(cross_catalog_links(db)) == 1
+
+    db.execute(
+        "UPDATE graph_node SET concept='unrelated_identifier' "
+        "WHERE catalog_source='cat_b' AND column_name='cif_id'"
+    )
+    run_id = _open_run(db, "ingrun_withdraw_bridge", _actor())
+    recorder = StageRecorder()
+    ingest_upload(
+        db,
+        "cat_c",
+        _rows("cat_c", "other", "some_id"),
+        actor=_actor(),
+        now=_NOW,
+        ingestion_run_id=run_id,
+        stage_recorder=recorder,
+    )
+
+    assert cross_catalog_links(db) == ()
+    lifecycle = db.execute(
+        "SELECT lifecycle FROM governed_candidate_current WHERE candidate_id=%s",
+        (candidate_id,),
+    ).fetchone()
+    assert lifecycle == ("withdrawn",)
+    stage = next(item for item in recorder.reports if item.stage == "entity_bridges")
+    assert stage.detail is not None
+    assert stage.detail["withdrawn_count"] == 1
+    assert stage.detail["withdrawn_realization_count"] == 0
+
+    db.execute(
+        "UPDATE graph_node SET concept='customer_id' "
+        "WHERE catalog_source='cat_b' AND column_name='cif_id'"
+    )
+    _trigger(db)
+
+    assert len(cross_catalog_links(db)) == 1
+    lifecycle = db.execute(
+        "SELECT lifecycle FROM governed_candidate_current WHERE candidate_id=%s",
+        (candidate_id,),
+    ).fetchone()
+    assert lifecycle == ("active",)
 
 
 # ── who proposes: the SYSTEM, never the uploading human ──────────────────────────────────────────

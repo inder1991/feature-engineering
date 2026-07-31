@@ -67,6 +67,7 @@ class CandidateCurrentPointerV1:
     candidate_id: str
     candidate_revision_id: str
     pointer_version: int
+    lifecycle: str = "active"
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,14 +285,14 @@ def realization_from_json(payload: dict[str, Any]) -> BridgeJoinRealizationRevis
 
 def _current_candidate(conn, candidate_id: str) -> CandidateCurrentPointerV1 | None:
     row = conn.execute(
-        "SELECT candidate_revision_id, pointer_version "
+        "SELECT candidate_revision_id, pointer_version, lifecycle "
         "FROM governed_candidate_current WHERE candidate_id = %s",
         (candidate_id,),
     ).fetchone()
     return (
         None
-        if row is None
-        else CandidateCurrentPointerV1(candidate_id, row[0], int(row[1]))
+        if row is None else CandidateCurrentPointerV1(
+            candidate_id, row[0], int(row[1]), str(row[2]))
     )
 
 
@@ -373,7 +374,28 @@ def record_candidate_assessment(
         ):
             raise BridgeStoreConflict(
                 f"candidate {assessment.candidate_id} pointer advanced")
-        return current
+        if current.lifecycle == "active":
+            return current
+        changed = conn.execute(
+            "UPDATE governed_candidate_current "
+            "SET lifecycle='active', pointer_version=pointer_version+1, updated_at=now() "
+            "WHERE candidate_id=%s AND candidate_revision_id=%s "
+            "AND pointer_version=%s AND lifecycle='withdrawn'",
+            (
+                assessment.candidate_id,
+                assessment.candidate_revision_id,
+                current.pointer_version,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise BridgeStoreConflict(
+                f"candidate {assessment.candidate_id} pointer advanced")
+        return CandidateCurrentPointerV1(
+            assessment.candidate_id,
+            assessment.candidate_revision_id,
+            current.pointer_version + 1,
+            "active",
+        )
     expected = (
         (0 if current is None else current.pointer_version)
         if expected_pointer_version is None
@@ -382,7 +404,8 @@ def record_candidate_assessment(
     if expected == 0:
         changed = conn.execute(
             "INSERT INTO governed_candidate_current "
-            "(candidate_id, candidate_revision_id, pointer_version) VALUES (%s,%s,1) "
+            "(candidate_id, candidate_revision_id, pointer_version, lifecycle) "
+            "VALUES (%s,%s,1,'active') "
             "ON CONFLICT (candidate_id) DO NOTHING",
             (assessment.candidate_id, assessment.candidate_revision_id),
         ).rowcount
@@ -391,7 +414,7 @@ def record_candidate_assessment(
         changed = conn.execute(
             "UPDATE governed_candidate_current "
             "SET candidate_revision_id = %s, pointer_version = pointer_version + 1, "
-            "updated_at = now() "
+            "lifecycle='active', updated_at = now() "
             "WHERE candidate_id = %s AND pointer_version = %s",
             (assessment.candidate_revision_id, assessment.candidate_id, expected),
         ).rowcount
@@ -400,18 +423,82 @@ def record_candidate_assessment(
         raise BridgeStoreConflict(
             f"candidate {assessment.candidate_id} pointer advanced")
     return CandidateCurrentPointerV1(
-        assessment.candidate_id, assessment.candidate_revision_id, version)
+        assessment.candidate_id, assessment.candidate_revision_id, version, "active")
+
+
+def withdraw_missing_candidate_assessments(
+    conn,
+    retained_candidate_ids: frozenset[str],
+) -> tuple[int, int]:
+    """Withdraw active identifier-link candidates absent from one complete global derivation.
+
+    The immutable identity/revision rows and generic overlay event stream stay as history.  Only the
+    mutable current pointer changes, and any active directional realization is demoted immediately.
+    This function must only be called after a complete derivation; callers skip it when derivation
+    itself fails.
+    """
+    rows = conn.execute(
+        "SELECT c.candidate_id, c.pointer_version, "
+        "coalesce(r.assessment_json->>'bridge_fact_key', "
+        "         r.assessment_json->>'fact_key') AS bridge_fact_key "
+        "FROM governed_candidate_current c "
+        "JOIN governed_candidate_revision r "
+        "  ON r.candidate_revision_id=c.candidate_revision_id "
+        "JOIN governed_candidate_identity i ON i.candidate_id=c.candidate_id "
+        "WHERE i.candidate_family='identifier_link' AND c.lifecycle='active' "
+        "ORDER BY c.candidate_id"
+    ).fetchall()
+    withdrawn = 0
+    realizations = 0
+    for candidate_id, pointer_version, bridge_fact_key in rows:
+        if candidate_id in retained_candidate_ids:
+            continue
+        changed = conn.execute(
+            "UPDATE governed_candidate_current "
+            "SET lifecycle='withdrawn', pointer_version=pointer_version+1, updated_at=now() "
+            "WHERE candidate_id=%s AND pointer_version=%s AND lifecycle='active'",
+            (candidate_id, pointer_version),
+        ).rowcount
+        if changed != 1:
+            raise BridgeStoreConflict(f"candidate {candidate_id} pointer advanced")
+        withdrawn += 1
+        if bridge_fact_key:
+            realizations += demote_realizations_for_bridge(
+                conn, str(bridge_fact_key), lifecycle="stale")
+    return withdrawn, realizations
+
+
+def bridge_candidate_currentness(conn, bridge_fact_key: str) -> bool | None:
+    """Whether a bridge backed by a governed candidate remains current.
+
+    ``None`` means the bridge has no candidate record (for example a directly governed legacy
+    bridge), so callers preserve its generic lifecycle behavior.  ``False`` is an explicit
+    automatic withdrawal and must fail closed for discovery and execution.
+    """
+    rows = conn.execute(
+        "SELECT c.lifecycle "
+        "FROM governed_candidate_current c "
+        "JOIN governed_candidate_revision r "
+        "  ON r.candidate_revision_id=c.candidate_revision_id "
+        "WHERE coalesce(r.assessment_json->>'bridge_fact_key', "
+        "               r.assessment_json->>'fact_key')=%s",
+        (bridge_fact_key,),
+    ).fetchall()
+    if not rows:
+        return None
+    return any(str(lifecycle) == "active" for (lifecycle,) in rows)
 
 
 def load_current_candidate_assessments(
     conn,
 ) -> tuple[IdentifierLinkAssessmentV1, ...]:
-    """Read modern current assessments; legacy synthetic revisions are skipped."""
+    """Read active modern current assessments; legacy and withdrawn revisions are history."""
     rows = conn.execute(
         "SELECT r.assessment_json "
         "FROM governed_candidate_current c "
         "JOIN governed_candidate_revision r "
         "  ON r.candidate_revision_id = c.candidate_revision_id "
+        "WHERE c.lifecycle='active' "
         "ORDER BY c.candidate_id"
     ).fetchall()
     out: list[IdentifierLinkAssessmentV1] = []
@@ -678,6 +765,8 @@ def revalidate_bridge_realization(
     link_state = read_overlay_identifier_link_state(conn, revision.bridge_fact_key)
     if link_state.availability is not LinkAvailability.AVAILABLE:
         reasons.append("identifier_link_not_available")
+    if bridge_candidate_currentness(conn, revision.bridge_fact_key) is False:
+        reasons.append("identifier_link_candidate_withdrawn")
 
     if not _binding_revision_is_stored(conn, revision.from_endpoint):
         reasons.append("from_binding_revision_not_stored")

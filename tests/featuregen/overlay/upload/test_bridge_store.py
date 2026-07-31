@@ -358,6 +358,26 @@ def test_stale_link_fails_final_realization_revalidation(db) -> None:
         db, purpose="feature_generation", environment="pilot") == ()
 
 
+def test_withdrawn_candidate_fails_final_realization_revalidation(db) -> None:
+    assessment = replace(_assessment(db), bridge_fact_key="bridge-fact-1")
+    record_candidate_assessment(db, assessment, expected_pointer_version=0)
+    _stored_production_realization(db)
+    db.execute(
+        "UPDATE governed_candidate_current SET lifecycle='withdrawn' "
+        "WHERE candidate_id=%s",
+        (assessment.candidate_id,),
+    )
+
+    loaded = load_current_bridge_realizations(db)[0]
+    result = revalidate_bridge_realization(
+        db, loaded, purpose="feature_generation", environment="pilot")
+
+    assert not result.executable
+    assert "identifier_link_candidate_withdrawn" in result.reason_codes
+    assert executable_bridge_realizations(
+        db, purpose="feature_generation", environment="pilot") == ()
+
+
 def test_stale_link_between_compilation_and_run_preparation_refuses(db) -> None:
     revision = _stored_production_realization(db)
     current = load_current_bridge_realizations(db)[0]

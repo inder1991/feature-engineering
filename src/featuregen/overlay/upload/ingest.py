@@ -458,6 +458,8 @@ class _BridgeProposalStageResult:
     derivation: BridgeCandidateDerivationV1
     proposed_count: int
     proposal_error_count: int
+    withdrawn_count: int
+    withdrawn_realization_count: int
 
 
 def _propose_entity_bridges(
@@ -491,7 +493,10 @@ def _propose_entity_bridges(
     originating upload stays in the audit trail via `ingestion_run_id` on the evidence row.
     """
     from featuregen.overlay.upload.bridge_propose import propose_bridge
-    from featuregen.overlay.upload.bridge_store import load_candidate_pointer_versions
+    from featuregen.overlay.upload.bridge_store import (
+        load_candidate_pointer_versions,
+        withdraw_missing_candidate_assessments,
+    )
     from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
 
     pointer_versions = load_candidate_pointer_versions(conn)
@@ -517,10 +522,16 @@ def _propose_entity_bridges(
                            exc_info=True)
             continue
         proposed += 1
+    withdrawn, withdrawn_realizations = withdraw_missing_candidate_assessments(
+        conn,
+        frozenset(candidate.candidate_id for candidate in derivation.candidates),
+    )
     return _BridgeProposalStageResult(
         derivation=derivation,
         proposed_count=proposed,
         proposal_error_count=errors,
+        withdrawn_count=withdrawn,
+        withdrawn_realization_count=withdrawn_realizations,
     )
 
 
@@ -2755,8 +2766,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if entity_bridges_enabled():
         stage_started = datetime.now(UTC)
         try:
-            bridge_stage = _propose_entity_bridges(
-                conn, ingestion_run_id=ingestion_run_id)
+            # The proposal savepoints contain per-item DB faults; this outer savepoint makes the
+            # current-shortlist reconciliation atomic.  A CAS conflict cannot otherwise withdraw
+            # only half the obsolete candidates and then be swallowed by this advisory stage.
+            with conn.transaction():
+                bridge_stage = _propose_entity_bridges(
+                    conn, ingestion_run_id=ingestion_run_id)
             entity_bridge_derivation = bridge_stage.derivation
             entity_bridges_proposed = bridge_stage.proposed_count
             partial = (
@@ -2770,15 +2785,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 if bridge_stage.proposal_error_count
                 else None
             )
+            detail = entity_bridge_derivation.stage_detail(
+                proposed_count=entity_bridges_proposed,
+                proposal_error_count=bridge_stage.proposal_error_count,
+            )
+            detail.update({
+                "withdrawn_count": bridge_stage.withdrawn_count,
+                "withdrawn_realization_count":
+                    bridge_stage.withdrawn_realization_count,
+            })
             record_stage(
                 stage_recorder,
                 "entity_bridges",
                 "partial" if partial else "succeeded",
                 reason_code=reason_code,
-                detail=entity_bridge_derivation.stage_detail(
-                    proposed_count=entity_bridges_proposed,
-                    proposal_error_count=bridge_stage.proposal_error_count,
-                ),
+                detail=detail,
                 started_at=stage_started,
             )
         except Exception:  # noqa: BLE001 — advisory: never fail an upload whose facts are stored
@@ -2788,6 +2809,16 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                          started_at=stage_started)
     else:
         record_stage(stage_recorder, "entity_bridges", "disabled")
+
+    # The bridge stage deliberately runs after the first drain + table-fact projection because its
+    # assessment needs the freshly projected grain.  It also appends DRAFT overlay events.  Although
+    # link availability folds those events directly, column readiness protects every load-bearing
+    # read with the GLOBAL overlay projection-lag gate.  Returning with bridge events still pending
+    # therefore makes every role on every column unavailable until an async worker happens to run.
+    # Drain once more before any lag-gated re-projection/readiness consumer.  This is normally only
+    # the handful of retained bridge proposals and stays bounded by the same ingest budget.
+    if entity_bridges_enabled() and entity_bridges_proposed:
+        _drain_projection(conn)
 
     # approved_join re-projection (Pass C Task 10, closing Task 8's loop): build_graph wiped EVERY
     # edge for this source, so a join VERIFIED in a PRIOR cycle must be re-projected from its FACT

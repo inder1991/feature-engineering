@@ -57,6 +57,7 @@ from featuregen.overlay.upload.bridge_assessment import (
     LinkReviewStatus,
     read_overlay_identifier_link_state,
 )
+from featuregen.overlay.upload.bridge_store import bridge_candidate_currentness
 
 
 class LinkStatus(StrEnum):
@@ -273,7 +274,10 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     rows = conn.execute(
         "SELECT entity_id, left_catalog_source, left_object_ref, right_catalog_source, "
         "       right_object_ref, fact_key, data_type_family, evidence_json "
-        "FROM entity_bridge_candidate_evidence ORDER BY entity_id, left_object_ref").fetchall()
+        "FROM entity_bridge_candidate_evidence e "
+        "LEFT JOIN governed_candidate_current c USING (candidate_id) "
+        "WHERE c.candidate_id IS NULL OR c.lifecycle='active' "
+        "ORDER BY entity_id, left_object_ref").fetchall()
 
     out: list[CrossCatalogLink] = []
     for entity, l_src, l_ref, r_src, r_ref, key, family, ev in rows:
@@ -306,6 +310,8 @@ def cross_catalog_links(conn, *, object_ref: str | None = None
     seen = {link.fact_key for link in out}
     for key, (entity, l_src, l_ref, r_src, r_ref) in verified.items():
         if key in seen:
+            continue
+        if bridge_candidate_currentness(conn, key) is False:
             continue
         lifecycle = read_overlay_identifier_link_state(conn, key)
         if lifecycle.availability is not LinkAvailability.AVAILABLE:
