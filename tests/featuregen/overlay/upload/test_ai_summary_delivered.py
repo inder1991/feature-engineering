@@ -31,12 +31,16 @@ def test_the_stage_is_canonical():
     assert "enrich_summary" in CANONICAL_STAGES
 
 
-def test_the_stage_sits_with_the_other_enrichment_stages():
+def test_the_stage_sits_at_the_ingest_tail():
     """Order matters: the report is read as a sequence, so a stage listed out of place implies it
-    ran at a different point than it did."""
+    ran at a different point than it did. Richness Task 3 Step 6c MOVED the draft to the ingest
+    TAIL — after the axis projection — so the ONE summary per ingest is written from the full
+    enriched dossier (concept, party_role, term_type, processes, grain/table roles), not the
+    file-side payload it used to paraphrase."""
     stages = list(CANONICAL_STAGES)
-    assert stages.index("enrich_definition") < stages.index("enrich_summary")
-    assert stages.index("enrich_summary") < stages.index("enrich_domain")
+    assert stages.index("axis_projection") < stages.index("enrich_summary")
+    assert stages.index("enrich_summary") < stages.index("quarantine")
+    assert stages.count("enrich_summary") == 1                  # exactly one draft per ingest
 
 
 # ── the feature-agent path ───────────────────────────────────────────────────────────────────────

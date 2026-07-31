@@ -167,6 +167,21 @@ def test_additivity_defaults_from_concept(db):
     assert sorted(report.additivity_set) == sorted([flow, stock])
 
 
+def test_a_decision_cleared_additivity_is_never_refilled(db):
+    """A NULL additivity whose `additivity_decision_id` is set is not 'blank' — the resolver
+    deliberately CLEARED it (a retired derivation / pending revalidation). The concept default
+    must not shadow that lifecycle; the abstention is recorded, never silent."""
+    ref = _node(db, "public.t.cleared", concept="monetary_stock")
+    db.execute(
+        "UPDATE graph_node SET additivity_decision_id = 'fde_x'"
+        " WHERE catalog_source = %s AND object_ref = %s", (_SRC, ref))
+    report = project_display_axes(db, _SRC)
+    assert _col(db, ref, "additivity") is None
+    assert report.additivity_set == ()
+    assert (ref, "additivity", "decision_cleared") in [
+        (s.object_ref, s.axis, s.reason) for s in report.skipped]
+
+
 # ── party_role: deterministic, advisory, honest abstention ───────────────────────────────────────
 
 

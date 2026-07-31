@@ -259,7 +259,7 @@ def test_successful_upload_records_ordered_stage_reports(client):
     assert [s["stage"] for s in run["stages"]] == [
         "parse", "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_concept_critic",
-        "enrich_definition", "enrich_summary", "enrich_domain",
+        "enrich_definition", "enrich_domain",
         "enrich_synonyms", "enrich_unit",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
@@ -271,6 +271,9 @@ def test_successful_upload_records_ordered_stage_reports(client):
         # the display-axis projection runs LAST among the graph writers (richness Task 3), so
         # its fill-only-NULL guards see every governed re-projection already applied.
         "axis_projection",
+        # Step 6c: the ONE summary draft per ingest happens at the tail, from the enriched
+        # dossier the axis projection just completed.
+        "enrich_summary",
         "quarantine", "manifest_finalization"]
     assert stages["parse"]["state"] == "succeeded"
     assert stages["manifest_finalization"]["state"] == "succeeded"   # #13 C: terminalize reported

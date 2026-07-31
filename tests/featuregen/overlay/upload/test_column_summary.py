@@ -159,14 +159,17 @@ def test_the_evidence_material_is_the_metadata_the_summary_WAS_DRAFTED_FROM(db):
     a term_name left the hash unchanged, and a redraft that failed transiently left the OLD summary
     active to be projected again as though it still described the column.
 
-    Same column, same type, DIFFERENT term: the material must differ."""
+    Since the Step-6c tail move, the ONE payload builder (`summary_payload`) is shared by the
+    drafter AND the evidence writer, so the material is the drafting input BY CONSTRUCTION —
+    including the ingest tail's enriched extras."""
     import inspect
 
     from featuregen.overlay.upload import enrich
 
-    src = inspect.getsource(enrich._write_summary_evidence)
-    assert "_concept_metadata(row, rec)" in src, "material is not the drafting input"
-    assert '"type": row.type}' not in src, "material is still the stub"
+    for fn in (enrich.draft_summaries, enrich._write_summary_evidence):
+        src = inspect.getsource(fn)
+        assert "summary_payload(" in src, f"{fn.__name__} does not use the shared payload builder"
+        assert '"type": row.type}' not in src, "material is still the stub"
 
 
 def test_a_changed_term_changes_the_material(db):
@@ -181,3 +184,77 @@ def test_a_changed_term_changes_the_material(db):
     after = GlossaryRecord(logical_ref="cib::s.t.c", term_name="Customer Previous 9Mnth NTB Flag",
                            definition="Status or indicator.", declared_type="varchar(5)")
     assert _concept_metadata(row, before) != _concept_metadata(row, after)
+
+
+# ── Step 6c: the TAIL re-draft writes from the FULL enriched dossier, not the file alone ─────────
+
+
+def test_an_enriched_payload_and_a_file_only_payload_produce_different_cache_keys():
+    """The auto-redraft property: `_summary_cache_key` hashes the payload, so the richer tail
+    payload re-drafts every column BY CONSTRUCTION — no cache surgery."""
+    from featuregen.overlay.upload.enrich import _summary_cache_key, summary_payload
+
+    row = _rows()[0]
+    rec = _glossary(_BOILERPLATE).records[0]
+    file_only = summary_payload(row, rec)
+    enriched = summary_payload(row, rec, extras={"concept": "flag", "party_role": "subject"})
+    assert _summary_cache_key("h", file_only) != _summary_cache_key("h", enriched)
+
+
+def test_summary_payload_carries_the_lost_glossary_fields_and_extras():
+    from featuregen.overlay.upload.enrich import summary_payload
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+
+    rec = GlossaryRecord(
+        logical_ref="cib::s.t.c", term_name="Term", definition="A definition.",
+        term_type="dimension", process_path="Onboarding > KYC",
+        related_terms=("NTB Segment",), declared_type="varchar(5)")
+    payload = summary_payload(
+        CanonicalRow(source="cib", table="t", column="c", type="text"), rec,
+        extras={"concept": "flag", "party_role": "subject", "grain_role": "grain",
+                "table_role": "dimension", "ai_synonyms": "new to bank, ntb"})
+    for key, val in (("term_type", "dimension"), ("process_path", "Onboarding > KYC"),
+                     ("related_terms", ["NTB Segment"]), ("concept", "flag"),
+                     ("party_role", "subject"), ("grain_role", "grain"),
+                     ("table_role", "dimension"), ("ai_synonyms", "new to bank, ntb")):
+        assert payload[key] == val, key
+    # an empty extra is never fabricated into the payload
+    assert "data_domain" not in summary_payload(
+        CanonicalRow(source="cib", table="t", column="c", type="text"), rec,
+        extras={"data_domain": ""})
+
+
+def test_the_ingest_tail_drafts_from_the_enriched_dossier(db):
+    """The full-loop property (the plan's must-die mutation: 'draft the summary from file-only
+    metadata again'). A real ingest's summary dispatch carries the enriched dossier fields —
+    party_role can ONLY come from the tail axis projection, term_type/process_path only from the
+    sidecar's lost fields — and exactly ONE summary draft happens per ingest."""
+    llm = _EchoLLM()
+    rows = [CanonicalRow(source="cib", table="bo_cib_customer", column="cust_swift_cd",
+                         type="text")]
+    records = [GlossaryRecord(
+        logical_ref="cib::bo_dpl_cib.bo_cib_customer.cust_swift_cd",
+        term_name="Customer SWIFT Code", definition="The customer's own bank BIC.",
+        domain="Customer", declared_type="varchar(11)", term_type="dimension",
+        process_path="Payments > Routing", related_terms=("Sender BIC",))]
+    ingest_upload(db, "cib", rows, actor=_ACTOR, now=_NOW, client=llm,
+                  glossary=GlossaryUpload(rows=rows, records=records))
+    sent = [i for batch in llm.seen for i in batch]
+    assert len(sent) == 1, "exactly one summary draft per ingest"
+    item = sent[0]
+    assert item["party_role"] == "subject"                  # tail-only: the axis projection wrote it
+    assert item["term_type"] == "dimension"
+    assert item["process_path"] == "Payments > Routing"
+    assert item["related_terms"] == ["Sender BIC"]
+
+
+def test_the_tail_draft_never_overwrites_the_definition(db):
+    llm = _EchoLLM()
+    rows = _rows()
+    glossary = _glossary(_BOILERPLATE)
+    glossary = GlossaryUpload(rows=rows, records=glossary.records)
+    ingest_upload(db, "cib", rows, actor=_ACTOR, now=_NOW, client=llm, glossary=glossary)
+    stored = dict(db.execute(
+        "SELECT object_ref, definition FROM graph_node"
+        " WHERE catalog_source = 'cib' AND kind = 'column'").fetchall())
+    assert set(stored.values()) == {_BOILERPLATE}, "the declared definition must survive the draft"

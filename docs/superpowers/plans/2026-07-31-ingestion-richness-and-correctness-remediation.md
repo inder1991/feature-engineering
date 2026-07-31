@@ -534,7 +534,7 @@ def test_clean_identifier_passes():
   called at the end of ingest and by the Task 6 repair run.
   `AxisProjectionReport(sensitivity_set, entity_set, additivity_set, skipped)`.
 
-- [ ] **Step 1: Write failing tests:**
+- [x] **Step 1: Write failing tests:**
 
 ```python
 def test_sensitivity_display_projected_from_enforcement():
@@ -554,7 +554,7 @@ def test_projection_is_idempotent_and_scoped():
     # running twice changes nothing; running for 'ftr' never touches 'cib'
 ```
 
-- [ ] **Step 2: Run; FAIL. Implement `axis_projection.py`:** three UPDATE passes, each guarded
+- [x] **Step 2: Run; FAIL. Implement `axis_projection.py`:** three UPDATE passes, each guarded
   `WHERE <axis> IS NULL` (display fill-in only), each stamping its provenance via the existing
   decision-id columns' conventions (`sensitivity_decision_id` etc. stay NULL — these are
   projections, not decisions; record provenance in the projection report + stage detail instead).
@@ -563,11 +563,19 @@ def test_projection_is_idempotent_and_scoped():
   → `restricted`; `"proxy"` → `confidential`) — do NOT build a new mapping table; the registry
   field already exists and `templates.py` `_BLOCKED_SENSITIVITIES` already consumes it; else
   leave NULL (unknown is honest).
-- [ ] **Step 3: Entity pass:** for identifier-group concepts with `entity_link`, fill
+  **Built as a NEW `graph_node.sensitivity_display` column (migration 1042), not
+  `graph_node.sensitivity`:** the existing column is the read-scope TAG — its 0993 CHECK forbids
+  `confidential`, materialize/classify fails closed on any tag outside `SENSITIVITY_ROLES`, and
+  1032 GENERATES `visible_requires` from it, so writing display labels there would have changed
+  enforcement (exactly what this task's own must-die mutation forbids). Tests pin
+  `visible_requires` + the raw tag byte-identical across a projection run; the audit script's
+  `coverage_sensitivity_display` now counts the new column (`coverage_sensitivity_tag` keeps the
+  raw-tag count).
+- [x] **Step 3: Entity pass:** for identifier-group concepts with `entity_link`, fill
   `graph_node.entity` when blank. This is display/planning context, NOT an `entity_assignment`
   fact — the governed fact path stays the Delivery-E command; the projection must skip any column
   with `entity_fact_key` set.
-- [ ] **Step 3b: Party-role pass (deterministic, advisory):** fill `graph_node.party_role` from
+- [x] **Step 3b: Party-role pass (deterministic, advisory):** fill `graph_node.party_role` from
   Task 1's `PartyRole` token normalizer over the column name — `sender_bic → sender`,
   `third_reimb_inst_code → reimbursement`, `counter_party_cif_id → counterparty`,
   `cust_swift_cd → subject` (the row-subject's own attribute) — abstaining (`NULL`) on
@@ -575,26 +583,26 @@ def test_projection_is_idempotent_and_scoped():
   every live role column; an LLM fallback for ambiguous names is deferred until a real column
   needs it. Tests: the five mappings above; an ambiguous name stays NULL; nothing anywhere
   consumes `party_role` in a join/candidacy/execution predicate (import-gate style assertion).
-- [ ] **Step 4: Wire into ingest tail** (post-merge layout — the bridge branch moved these
+- [x] **Step 4: Wire into ingest tail** (post-merge layout — the bridge branch moved these
   seams) + record stage `axis_projection` with the report counts. **Search-doc coherence:**
   `entity` is an input to the single `_SEARCH_DOC` expression (`graph.py` — insert-time and
   `rebuild_search_doc` render the same expression, invariant #20). Every node whose `entity`
   this projection changes gets `rebuild_search_doc(conn, catalog_source, object_ref)` called;
   the test asserts an entity-projected node's rebuilt doc equals a fresh-insert doc.
-- [ ] **Step 5: Declared-type gap honesty:** ingest result lists columns with NULL
+- [x] **Step 5: Declared-type gap honesty:** ingest result lists columns with NULL
   `declared_type` and NULL attested type (`cust_buy_rate`, `cust_sell_rate` today) as
   `type_unknown` items in the existing per-stage detail, so the uploader sees the fix list.
-- [ ] **Step 6: Pass-B re-synth check:** confirm `primary_entity` proposal for `bo_cib_customer`
+- [x] **Step 6: Pass-B re-synth check:** confirm `primary_entity` proposal for `bo_cib_customer`
   resolves (`customer` is in the entity registry); no code change expected — add the regression
   test that a dimension table with a customer grain proposes `primary_entity=customer`.
-- [ ] **Step 6b: Persist the four lost glossary fields as source evidence.** The A1 adapter
+- [x] **Step 6b: Persist the four lost glossary fields as source evidence.** The A1 adapter
   captures all 17 CSV headers, but `_SOURCE_FIELDS` (`ingest.py:895`) durably persists only
   definition/domain/business_term/bian_path/fibo_path — `term_type`,
   `process_path` (business processes L1–3), `related_terms`, and the physical FQN survive only
   inside `llm_call` payloads. Extend the source-evidence write (`ingest.py:1165` region) with
   those four as `source_attested` field evidence. Tests: each round-trips from a fixture upload
   to readable field evidence; absent-in-file stays absent (no fabricated empties).
-- [ ] **Step 6c: Re-draft the AI summary from the FULL enriched view at the ingest tail.**
+- [x] **Step 6c: Re-draft the AI summary from the FULL enriched view at the ingest tail.**
   `draft_summaries` currently runs mid-pipeline from `_concept_metadata` (file-side fields
   only), so it can only paraphrase the definition. Move (or second-pass) the summary draft to
   the ingest tail, fed by the assembled column dossier — concept, domain, synonyms, term type,
@@ -603,7 +611,7 @@ def test_projection_is_idempotent_and_scoped():
   hashes the metadata payload, so the richer payload re-drafts every column by construction.
   Tests: the summary prompt payload contains the enriched fields; a definition-only payload and
   the enriched payload produce different cache keys; `definition` is never overwritten.
-- [ ] **Step 7: Run suites; commit**
+- [x] **Step 7: Run suites; commit**
   `feat(ingest): sensitivity/entity/additivity display axes projected with provenance`.
 
 ---

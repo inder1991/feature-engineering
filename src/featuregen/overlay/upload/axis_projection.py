@@ -132,7 +132,8 @@ def project_display_axes(conn, catalog_source: str) -> AxisProjectionReport:
     human/uploaded value; every entity change rebuilds the node's search doc (#20)."""
     rows = conn.execute(
         "SELECT object_ref, column_name, concept, sensitivity_display, visible_requires, entity,"
-        " entity_fact_key, entity_status, additivity, party_role, data_type, declared_type"
+        " entity_fact_key, entity_status, additivity, additivity_decision_id, party_role,"
+        " data_type, declared_type"
         " FROM graph_node WHERE catalog_source = %s AND kind = 'column' ORDER BY object_ref",
         (catalog_source,)).fetchall()
 
@@ -144,8 +145,8 @@ def project_display_axes(conn, catalog_source: str) -> AxisProjectionReport:
     type_unknown: list[str] = []
 
     for (ref, column_name, concept_name, sensitivity_display, visible_requires, entity,
-         entity_fact_key, entity_status, additivity, party_role, data_type,
-         declared_type) in rows:
+         entity_fact_key, entity_status, additivity, additivity_decision_id, party_role,
+         data_type, declared_type) in rows:
         record = concept(concept_name) if concept_name else None
 
         # ── sensitivity display: enforcement first, else the concept class, else honest NULL ──
@@ -171,11 +172,17 @@ def project_display_axes(conn, catalog_source: str) -> AxisProjectionReport:
                 # entity feeds the search doc's domain slot — same expression, same tx (#20).
                 rebuild_search_doc(conn, catalog_source, ref)
 
-        # ── additivity: the registry default; 'n/a' is not a default ──
+        # ── additivity: the registry default; 'n/a' is not a default. A NULL display whose
+        # additivity_decision_id is SET is not blank — the resolver deliberately cleared it
+        # (a retired derivation / pending revalidation); the concept default must not shadow
+        # that lifecycle. Skipped-loud, never silent. ──
         if (record is not None and not additivity
-                and record.additivity in ("additive", "semi_additive", "non_additive")
-                and _fill(conn, catalog_source, ref, "additivity", record.additivity)):
-            additivity_set.append(ref)
+                and record.additivity in ("additive", "semi_additive", "non_additive")):
+            if additivity_decision_id is not None:
+                skipped.append(AxisSkip(ref, "additivity", "decision_cleared"))
+            elif _fill(conn, catalog_source, ref, "additivity", record.additivity,
+                       extra_guard=" AND additivity_decision_id IS NULL"):
+                additivity_set.append(ref)
 
         # ── party_role: deterministic tokens; ambiguity abstains ──
         if not party_role:

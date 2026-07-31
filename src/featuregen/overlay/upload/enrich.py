@@ -758,7 +758,8 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
 def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             summaries: dict[str, str], glossary: GlossaryUpload,
                             bindings: dict[str, ObjectBinding] | None,
-                            source_snapshot_id: str) -> int:
+                            source_snapshot_id: str,
+                            extras_by_hash: dict[str, dict] | None = None) -> int:
     """Promote drafted summaries into governed ``llm/proposed`` ``field_evidence`` under
     ``ai_summary``. Returns the CONTAINED per-item failure count for the caller's stage report.
 
@@ -770,6 +771,7 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     """
     by_hash = {content_hash(r): r for r in rows}
     rec_by_tc = _records_by_tc(glossary)
+    extras_by_hash = extras_by_hash or {}
 
     def ref_of(h: str) -> tuple[str, str, object] | None:
         row = by_hash.get(h)
@@ -778,13 +780,14 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
         if rec is None:
             return None   # not a glossary column term — no schema-preserving identity to key on
-        # The evidence material must be the SAME metadata the summary was drafted from
-        # (`_concept_metadata`), not a {table, column, type} stub. The input_hash is what decides
-        # whether existing evidence is still current: keyed on the stub, correcting a term_name or a
-        # definition leaves the hash unchanged, so a redraft that fails transiently leaves the OLD
-        # summary active and it is projected again as though it still described the column.
+        # The evidence material must be the SAME metadata the summary was drafted from — the ONE
+        # `summary_payload` builder, with the SAME extras the tail drafter passed — never a
+        # {table, column, type} stub. The input_hash is what decides whether existing evidence is
+        # still current: keyed on less than the drafting input, correcting a term_name (or the
+        # dossier getting richer) leaves the hash unchanged, so a redraft that fails transiently
+        # leaves the OLD summary active as though it still described the column.
         return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
-                _concept_metadata(row, rec))
+                summary_payload(row, rec, extras_by_hash.get(h)))
 
     failures = _write_llm_field_evidence(
         conn, field_name="ai_summary", items=summaries, ref_of=ref_of,
@@ -1382,11 +1385,40 @@ def _summary_cache_key(row_hash: str, metadata: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def summary_payload(row: CanonicalRow, rec: GlossaryRecord | None,
+                    extras: dict | None = None) -> dict:
+    """The summary drafting payload AND its evidence material — ONE builder (richness Task 3 Step
+    6c), so the ``input_hash`` always hashes exactly what was drafted from and the cache key
+    auto-redrafts whenever the payload gets richer.
+
+    Base = :func:`_concept_metadata` (deliberately UNTOUCHED — it is also the concept classifier's
+    input and cache key) plus the sidecar fields the classifier payload never carried
+    (``term_type`` / ``process_path`` / ``related_terms`` — the Step-6b lost fields). ``extras``
+    is the ingest tail's enriched dossier slice (concept, party_role, grain/table roles, AI
+    synonyms, a fallback domain) — short strings / lists of strings only, every value bounded to
+    the egress cap; an empty value is never fabricated into the payload. An extras key never
+    displaces a base (file-side) key: the file's curated metadata always wins."""
+    meta = _concept_metadata(row, rec)
+    if rec is not None:
+        for key, val in (("term_type", rec.term_type), ("process_path", rec.process_path)):
+            if val:
+                meta[key] = val[:_MAX_META_LEN]
+        if rec.related_terms:
+            meta["related_terms"] = [t[:_MAX_META_LEN] for t in rec.related_terms]
+    for key, val in sorted((extras or {}).items()):
+        if not val or key in meta:
+            continue
+        meta[key] = ([v[:_MAX_META_LEN] for v in val] if isinstance(val, (list, tuple))
+                     else str(val)[:_MAX_META_LEN])
+    return meta
+
+
 def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                     *, glossary: GlossaryUpload | None = None,
                     concepts: dict[str, str] | None = None,
                     ingestion_run_id: str | None = None,
-                    stats: dict | None = None) -> dict[str, str]:
+                    stats: dict | None = None,
+                    extras_by_hash: dict[str, dict] | None = None) -> dict[str, str]:
     """One plain-English summary per column, written from that column's full metadata.
     Returns ``{content_hash: summary}``.
 
@@ -1394,19 +1426,23 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     that overwrote it would both lose the specifics AND downgrade a source-attested fact to an
     llm-proposed one. The two coexist.
 
-    The payload is :func:`_concept_metadata` — the SAME full metadata the classifier receives
-    (term_name, the declared type, BIAN path, and every column of the uploader's file we have no
-    first-class slot for). The definition drafter sends only table/column/type/concept, which cannot
-    tell `cust_curr_ntb_flg` from `cust_prev_9mnth_ntb_flg`; `term_name` is the field that can.
-    """
+    The payload is :func:`summary_payload` — the classifier's full metadata plus the Step-6b
+    sidecar fields, plus ``extras_by_hash`` (Step 6c): the ingest tail's enriched dossier slice
+    per content hash (concept, party_role, grain/table roles, AI synonyms). The tail caller passes
+    it so the ONE summary per ingest is a synthesis of everything the platform resolved, not a
+    paraphrase of the file; the cache key hashes the payload, so a richer payload re-drafts by
+    construction. ``_write_summary_evidence`` takes the SAME extras so the evidence material is
+    exactly the drafting input."""
     rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+    extras_by_hash = extras_by_hash or {}
 
     def _rec_of(row: CanonicalRow) -> GlossaryRecord | None:
         return rec_by_tc.get((_norm(row.table), _norm(row.column)))
 
     targets = _summary_targets(rows, glossary)
     by_hash = {h: r for r in rows if (h := content_hash(r)) in targets}
-    meta_by_hash = {h: _concept_metadata(r, _rec_of(r)) for h, r in by_hash.items()}
+    meta_by_hash = {h: summary_payload(r, _rec_of(r), extras_by_hash.get(h))
+                    for h, r in by_hash.items()}
     key_of = {h: _summary_cache_key(h, meta_by_hash[h]) for h in by_hash}
     cached = _cache_get(conn, "enrichment_summary", list(key_of.values()), _SUMMARY_CACHE_VERSION)
     result = {h: cached[key_of[h]] for h in by_hash if key_of[h] in cached}

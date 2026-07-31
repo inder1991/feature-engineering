@@ -89,8 +89,15 @@ _DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition"})
 # PII-scanned per item and audited at an indexed path (`synonyms[0]`).
 # `source_attributes` joins `synonyms` here deliberately: these are uploader-authored values, so
 # they are never presumable-clean and each entry is PII-scanned at an indexed path.
-_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes"})
-_SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path"})
+# `related_terms` (richness Task 3 Step 6c) is the sidecar's uploader-authored term list — same
+# never-presumable-clean rule, per-item PII scan at an indexed path.
+_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_terms"})
+# `term_type`/`process_path` are sidecar (uploader-authored) scalars; `ai_synonyms` is the AI's
+# comma-joined synonym draft riding the tail summary payload — all PII-scanned as prose. The
+# remaining Step-6c summary keys (`concept`, `party_role`, `grain_role`, `table_role`) are
+# PLATFORM-derived closed-vocabulary tokens, allowlisted but deliberately not prose-scanned.
+_SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path",
+                                     "term_type", "process_path", "ai_synonyms"})
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
 _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 
@@ -1067,6 +1074,12 @@ _ITEM_META_ALLOWED = frozenset({
     # per-column signal that varies. Carried as list-of-prose so they ride the SAME per-item PII
     # scan and length cap as `synonyms`, rather than opening an unscanned channel.
     "source_attributes",
+    # Richness Task 3 Step 6c — the TAIL summary dossier. Sidecar fields (`term_type`,
+    # `process_path`, `related_terms`) and the AI's own synonym draft (`ai_synonyms`) are
+    # prose-classified above; `party_role`/`grain_role`/`table_role` are platform-derived
+    # closed-vocabulary tokens (party_vocab / table_vocab / the grain flags), never uploader text.
+    "term_type", "process_path", "related_terms", "ai_synonyms",
+    "party_role", "grain_role", "table_role",
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately

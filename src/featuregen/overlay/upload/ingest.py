@@ -50,6 +50,7 @@ from featuregen.overlay.upload.contract.invalidation import (
 )
 from featuregen.overlay.upload.enrich import (
     _definition_targets,
+    _records_by_tc,
     _summary_targets,
     _unit_targets,
     _write_definition_evidence,
@@ -1781,6 +1782,52 @@ def ingest_source_lock_key(catalog_source: str) -> int:
         "big", signed=True)
 
 
+def _summary_dossier_extras(conn, catalog_source: str, rows: list[CanonicalRow], *,
+                            glossary: GlossaryUpload,
+                            concepts: dict[str, str] | None,
+                            domains: dict[str, str] | None,
+                            domain_overrides: dict[tuple[str, str], str],
+                            synonyms: dict[str, str] | None) -> dict[str, dict]:
+    """The per-column ENRICHED slice of the summary dossier (Step 6c), keyed by content hash —
+    everything the tail draft knows that the file-side payload does not: the assigned concept,
+    the projected ``party_role`` (read from graph_node AFTER the axis projection), the grain/as-of
+    role and the table's advisory role (both post-re-projection graph truth), the AI's synonym
+    draft, and a classified-domain fallback ONLY where the sidecar declared none (curated always
+    wins). Values are short tokens/prose; ``summary_payload`` bounds them and drops empties, and
+    an extras key never displaces a file-side key."""
+    concepts = concepts or {}
+    domains = domains or {}
+    synonyms = synonyms or {}
+    rec_by_tc = _records_by_tc(glossary)
+    node_by_tc = {
+        (t, c): (party_role, is_grain, is_as_of)
+        for t, c, party_role, is_grain, is_as_of in conn.execute(
+            "SELECT lower(table_name), lower(column_name), party_role, is_grain, is_as_of"
+            " FROM graph_node WHERE catalog_source = %s AND kind = 'column'",
+            (catalog_source,)).fetchall()}
+    table_roles = dict(conn.execute(
+        "SELECT lower(table_name), table_role FROM graph_node"
+        " WHERE catalog_source = %s AND kind = 'table' AND table_role IS NOT NULL",
+        (catalog_source,)).fetchall())
+    out: dict[str, dict] = {}
+    for r in rows:
+        h = content_hash(r)
+        tc = (_lc(r.table), _lc(r.column))
+        party_role, is_grain, is_as_of = node_by_tc.get(tc, (None, False, False))
+        rec = rec_by_tc.get(tc)
+        extras: dict = {
+            "concept": concepts.get(h),
+            "party_role": party_role,
+            "grain_role": "grain" if is_grain else ("as_of" if is_as_of else None),
+            "table_role": table_roles.get(_lc(r.table)),
+            "ai_synonyms": synonyms.get(h),
+        }
+        if rec is None or not rec.domain:
+            extras["data_domain"] = domain_overrides.get(tc) or domains.get(r.table)
+        out[h] = {k: v for k, v in extras.items() if v}
+    return out
+
+
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None,
                   profile: SourceCapabilityProfile | None = None,
@@ -2087,9 +2134,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # skipped, never as a failure, and ingestion continues normally. The concept CRITIC is
         # skipped with them: with no client there are no fresh LLM concept proposals this run to
         # accept or refute (deterministic `shape_conflicts` refusal still guards every path that
-        # DOES propose — `critique_concept_batch` refutes without a client).
+        # DOES propose — `critique_concept_batch` refutes without a client). `enrich_summary` is
+        # NOT in this list: Step 6c moved it to the ingest tail, which records its own outcome
+        # (skipped_no_client there too when no client is configured).
         for _stage in ("enrich_concept", "enrich_concept_critic", "enrich_definition",
-                       "enrich_summary", "enrich_domain", "enrich_synonyms", "enrich_unit"):
+                       "enrich_domain", "enrich_synonyms", "enrich_unit"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
@@ -2192,47 +2241,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 
-        # A per-column SUMMARY for every column — the answer to a source whose description column is
-        # filled by BUCKET (CIB: 47 distinct descriptions over 111 columns). Distinct from
-        # enrich_definition in the one way that matters: that stage only fills a BLANK definition, so
-        # a boilerplate description occupies the field and it never runs. This one always runs and
-        # writes to its OWN field, so the source keeps its text at its own authority.
-        stage_started = datetime.now(UTC)
-        summaries: dict[str, str] = {}
-        summary_stats: dict = {}
-        summary_evidence_failures = 0
-        # GLOSSARY ONLY. `_write_summary_evidence` keys on the glossary record's schema-preserving
-        # logical_ref, so a technical upload has nowhere to put the result — it was paying for the
-        # provider calls, reporting `succeeded`, and storing nothing anyone could see. Skipping is
-        # the honest v1: a technical CSV carries no business terms to summarise from.
-        if glossary is None:
-            record_stage(stage_recorder, "enrich_summary", "not_applicable")
-        else:
-            try:
-                with conn.transaction():
-                    summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
-                                                concepts=concepts,
-                                                ingestion_run_id=ingestion_run_id,
-                                                stats=summary_stats)
-                    if snapshot_id is not None:
-                        try:
-                            summary_evidence_failures = _write_summary_evidence(
-                                conn, source=catalog_source, rows=vr.good, summaries=summaries,
-                                glossary=glossary, bindings=bindings,
-                                source_snapshot_id=snapshot_id)
-                        except Exception:  # noqa: BLE001 — an escape past the writer's per-item
-                            # guard would otherwise report `succeeded` for a run that wrote nothing.
-                            summary_evidence_failures = 1
-                            raise
-            except Exception:  # noqa: BLE001
-                logger.warning("advisory summary enrichment failed for %r", catalog_source,
-                               exc_info=True)
-            state, reason, detail = _enrichment_outcome(
-                summaries, len(_summary_targets(vr.good, glossary)),
-                internal_failures=summary_evidence_failures,
-                not_attempted=summary_stats.get("not_attempted", 0))
-            record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
-                         detail=_with_audit_degradations(detail), started_at=stage_started)
+        # The per-column SUMMARY stage no longer runs here: Step 6c moved the ONE draft per ingest
+        # to the INGEST TAIL (after the axis projection), where the full enriched dossier —
+        # concept, party_role, grain/table roles, the Step-6b sidecar fields — exists to write
+        # from. Drafting here could only paraphrase the file-side payload (the parrot defect).
 
         stage_started = datetime.now(UTC)
         domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
@@ -2961,6 +2973,65 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                        catalog_source, exc_info=True)
         record_stage(stage_recorder, "axis_projection", "failed", reason_code="exception",
                      started_at=stage_started)
+
+    # ── Step 6c: the ONE summary draft per ingest, at the TAIL, from the FULL enriched dossier —
+    # concept, party_role (projected just above), grain/as-of role, table role, the Step-6b
+    # sidecar fields and the AI's synonyms — assembled per column and passed as the drafting
+    # payload AND the evidence material (the single `summary_payload` builder). The mid-pipeline
+    # draft is GONE: it could only paraphrase the file-side payload (the parrot defect). GLOSSARY
+    # ONLY (`_write_summary_evidence` keys on the record's schema-preserving logical_ref — a
+    # technical upload has nowhere to put the result); no client -> honestly skipped.
+    # `_summary_cache_key` hashes the payload, so the richer payload re-drafts every column by
+    # construction while an unchanged re-upload still hits the cache.
+    stage_started = datetime.now(UTC)
+    summaries: dict[str, str] = {}
+    summary_stats: dict = {}
+    summary_evidence_failures = 0
+    if client is None:
+        record_stage(stage_recorder, "enrich_summary", "skipped_no_client")
+    elif glossary is None:
+        record_stage(stage_recorder, "enrich_summary", "not_applicable")
+    else:
+        try:
+            with conn.transaction():   # savepoint: the advisory tail draft never fails an upload
+                summary_extras = _summary_dossier_extras(
+                    conn, catalog_source, vr.good, glossary=glossary, concepts=concepts,
+                    domains=domains, domain_overrides=domain_overrides, synonyms=synonyms)
+                summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
+                                            concepts=concepts,
+                                            ingestion_run_id=ingestion_run_id,
+                                            stats=summary_stats,
+                                            extras_by_hash=summary_extras)
+                if snapshot_id is not None:
+                    try:
+                        summary_evidence_failures = _write_summary_evidence(
+                            conn, source=catalog_source, rows=vr.good, summaries=summaries,
+                            glossary=glossary, bindings=bindings,
+                            source_snapshot_id=snapshot_id,
+                            extras_by_hash=summary_extras)
+                    except Exception:  # noqa: BLE001 — an escape past the writer's per-item
+                        # guard would otherwise report `succeeded` for a run that wrote nothing.
+                        summary_evidence_failures = 1
+                        raise
+                    # The mid-pipeline resolve (_ingest_glossary_evidence) ran BEFORE this draft,
+                    # so project the fresh ai_summary display (+ its search doc, inside
+                    # _project_display) here — scoped to the ONE field so no sibling decision is
+                    # ever re-resolved at the tail.
+                    rec_by_tc = _records_by_tc(glossary)
+                    summary_refs = sorted({
+                        rec.logical_ref for r in vr.good
+                        if (rec := rec_by_tc.get((_lc(r.table), _lc(r.column)))) is not None})
+                    resolve_and_project(conn, source=catalog_source, logical_refs=summary_refs,
+                                        fields=["ai_summary"], now=now)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory summary enrichment failed for %r", catalog_source,
+                           exc_info=True)
+        state, reason, detail = _enrichment_outcome(
+            summaries, len(_summary_targets(vr.good, glossary)),
+            internal_failures=summary_evidence_failures,
+            not_attempted=summary_stats.get("not_attempted", 0))
+        record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
 
     stage_started = datetime.now(UTC)
     persist_quarantine(conn, catalog_source, vr.quarantined)

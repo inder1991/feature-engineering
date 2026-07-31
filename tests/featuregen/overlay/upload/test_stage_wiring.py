@@ -62,14 +62,14 @@ def test_successful_upload_records_all_stages_in_order(db):
     assert [r.stage for r in rec.reports] == [
         "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_concept_critic",
-        "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
+        "enrich_definition", "enrich_domain", "enrich_synonyms",
         "enrich_unit",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         "table_fact_projection", "entity_bridges", "join_projection",
         "semantic_binding_projection", "join_drift",
-        "axis_projection",
+        "axis_projection", "enrich_summary",
         "quarantine"]
     assert _states(rec) == {
         "validation": "succeeded", "brake": "succeeded", "fact_assertion": "succeeded",
@@ -269,14 +269,14 @@ def test_durable_llm_audit_degradation_flags_the_enrich_stage(db, monkeypatch):
 _ALL_INGEST_STAGES = [
     "validation", "brake", "fact_assertion", "drift", "glossary_classification",
     "enrich_concept", "enrich_concept_critic",
-    "enrich_definition", "enrich_summary", "enrich_domain", "enrich_synonyms",
+    "enrich_definition", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "entity_bridges", "join_projection",
     "semantic_binding_projection", "join_drift",
-    "axis_projection",
+    "axis_projection", "enrich_summary",
     "quarantine"]
 
 
