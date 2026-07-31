@@ -457,12 +457,12 @@ Concept("module_id", "categorical",
   catalog_revision) -> dict[ref, ConceptCriticResultV1]` mirroring `BridgeCriticResultV1`.
 - Consumed by: Pass-A acceptance (this task) and Task 6's re-derivation run.
 
-- [ ] **Step 1: Extraction first (behavior-identical move).** Move
+- [x] **Step 1: Extraction first (behavior-identical move).** Move
   `RepresentationRole`/`_representation_role`/`_observed_format`/`type_family` from
   `bridge_grounding.py` to `attest/representation.py`; `bridge_grounding` re-imports. Run the
   existing bridge-grounding suite unchanged — it is the proof the move changed nothing. Commit
   the move separately.
-- [ ] **Step 2: Write failing tests for the NEW `shape_conflicts` extension:**
+- [x] **Step 2: Write failing tests for the NEW `shape_conflicts` extension:**
 
 ```python
 def test_bic_shape_refutes_counterparty_id():
@@ -487,19 +487,19 @@ def test_clean_identifier_passes():
   Only the shapes are new (BIC 8/11 alphanumeric token, UUID/UETR, numeric-family-vs-identifier);
   the name/description/label detection is the moved token logic, not re-implemented. No regex
   over free SQL; no network.
-- [ ] **Step 2b: Run; FAIL on the new codes only. Implement the extension; PASS.**
-- [ ] **Step 3: Write failing critic tests** (mock LLM via the existing enrich client seam):
+- [x] **Step 2b: Run; FAIL on the new codes only. Implement the extension; PASS.**
+- [x] **Step 3: Write failing critic tests** (mock LLM via the existing enrich client seam):
   a batch where the critic must (a) refute `branch_id` on a description column citing the
   representation conflict, (b) uphold `customer_id` on `cif_id`, (c) abstain on genuinely
   ambiguous, (d) never emit a concept outside the registry, (e) be replay-deterministic via the
   `1039` store.
-- [ ] **Step 4: Implement `concept_critic.py`** following `bridge_critic.py`
+- [x] **Step 4: Implement `concept_critic.py`** following `bridge_critic.py`
   (`critique_identifier_link` → typed result + closed reason codes; replay through
   `structured_results.py`): deterministic `shape_conflicts` are computed FIRST and handed to the
   critic as evidence; the critic's question is refute-oriented ("given only this evidence, is
   the assignment supported?"); one revise pass for flagged items (the feature_assist loop
   shape); per-field disposition `accepted | revised | refuted | abstained`.
-- [ ] **Step 5: Hook Pass-A acceptance — with the re-derivation rule stated exactly.** An
+- [x] **Step 5: Hook Pass-A acceptance — with the re-derivation rule stated exactly.** An
   identifier-group assignment that ends `refuted` never persists; the column's concept resolves,
   in order: the critic's revise-pass result if accepted → a non-identifier abstain
   (`unclassified` disposition recorded) → **never silent retention of a previously-stored wrong
@@ -510,9 +510,9 @@ def test_clean_identifier_passes():
   machinery behind `concept_decision_id`) carries the critic's conflict codes as its reason, so
   the audit answers "why did this column's concept change" from the column, not only from one
   run's stage detail. Non-identifier fields pass through unchanged this slice.
-- [ ] **Step 6: Stage honesty:** record `enrich_concept_critic` with counts
+- [x] **Step 6: Stage honesty:** record `enrich_concept_critic` with counts
   accepted/revised/refuted/abstained; zero items → `not_applicable`, never silent.
-- [ ] **Step 7: Run enrichment suite; commit**
+- [x] **Step 7: Run enrichment suite; commit**
   `feat(enrich): refute-oriented concept critic + deterministic representation corroboration`.
 
 ---
