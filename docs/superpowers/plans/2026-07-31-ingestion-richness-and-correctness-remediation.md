@@ -708,20 +708,38 @@ ontology explorer (traversal, ER editing, multi-hop) stays deferred.
 
 **Steps:**
 
-- [ ] **Read model:** per entity present in the graph — column count per catalog (read-scoped,
+- [x] **Read model:** per entity present in the graph — column count per catalog (read-scoped,
   same `visible_requires` treatment as asset detail), sample column refs; per entity-pair —
   every AVAILABLE link with status (proposed/confirmed), strength, namespace (once Task 1
   lands), and direction-specific eligibility where a realization exists. Population comes from
   `available_identifier_links()` verbatim.
-- [ ] **Screen:** entities as nodes sized by column count, catalogs as groupings, links as edges
+  (`overlay/upload/entity_map.py`: links VERBATIM from the reader — statically guarded against
+  the banned second availability interpretation + byte-identity tested; namespace via each
+  endpoint's concept → `CONCEPT_REGISTRY[..].namespace`; eligibility via
+  `load_current_bridge_realizations` + the existing `eligible_for_sandbox/production`
+  predicates, never re-derived. Route `GET /catalog/entity-map` gated `require_catalog_read`,
+  RR read connection like asset detail; NO nginx/vite change needed — `/catalog` is already an
+  allowlisted proxy prefix.)
+- [x] **Screen:** entities as nodes sized by column count, catalogs as groupings, links as edges
   with status/strength chips; click a node → search filtered to that entity; click an edge →
   the governance queue item / asset detail relationships. Mermaid-simple rendering is fine for
   v0 — the value is truth, not layout.
-- [ ] **Honesty rules:** an empty map states "no governed links yet" (never a blank canvas); a
+  (`EntityMapScreen.tsx`: node size = font scale by sqrt share of the max count, the number
+  always printed beside it; endpoint click → asset detail, Review → governance queue filtered
+  to the link's source; namespace + realization-eligibility chips per edge.)
+- [x] **Honesty rules:** an empty map states "no governed links yet" (never a blank canvas); a
   proposed link renders as proposed, never dimmed as failure (standing product direction);
   counts the map shows must reconcile with the audit script's numbers.
-- [ ] Flag-gate the nav entry with the profile read-model flag family; flag-off is absent, not
+  (Reconciliation is a TEST: the audit script's own SQL runs against the same fixture and its
+  `coverage_entity_display` per-catalog numbers must equal the all-access map's sums — which is
+  why an entity OUTSIDE `known_entities()` is shown flagged `registered: false`, never dropped,
+  and why the map applies no private freshness window.)
+- [x] Flag-gate the nav entry with the profile read-model flag family; flag-off is absent, not
   broken.
+  (DEVIATION, recorded: the profile read-model flag family has no frontend member yet — the
+  profiles plan is unimplemented — so the nav entry + `#/entity-map` gate on `VITE_ENTITY_MAP`
+  following the gate-console call-time pattern, as this family's first member; fold it into the
+  profile read-model family when that lands. Flag-off the hash parses as unknown → overview.)
 
 **Tests:**
 
@@ -730,6 +748,19 @@ ontology explorer (traversal, ER editing, multi-hop) stays deferred.
 - A read-scoped caller sees neither restricted columns nor their counts.
 - Empty state renders the honest message; a proposed-only map renders proposed chips.
 - After a fixture re-derivation removes a decoy, the map loses the edge without a rebuild.
+
+> **Executed 2026-08-01:** all four test classes are in
+> `tests/featuregen/overlay/upload/test_entity_map.py` (13 tests: byte-identity incl. a rejected
+> decoy in neither set; read-scope count+sample hiding with role lift; audit-script
+> reconciliation running the script's own SQL; decoy rejection dropping the edge with no
+> rebuild; plus the static must-die guard and namespace/realization-eligibility reads) +
+> `tests/featuregen/api/test_entity_map_route.py` (3: RBAC 403/200, nodes+links shape,
+> session-role read-scoping) + `frontend/src/screens/EntityMapScreen.test.tsx` (11: honest
+> empty message, proposed-not-failure badge, click-throughs, eligibility rendering) +
+> 2 nav flag-gating tests. Suites: `tests/featuregen/overlay/upload/` 3309 passed / 11 skipped;
+> `tests/featuregen/api/` 586 passed / 2 failed = the KNOWN pre-existing `/data-sources`
+> proxy-parity pair (untouched — the new route rides the existing `/catalog` prefix);
+> `npx tsc -b` clean.
 
 ---
 
