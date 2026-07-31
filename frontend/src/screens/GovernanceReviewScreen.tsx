@@ -614,6 +614,10 @@ function Advisory({ item }: { item: GovernanceQueueItem }) {
         nothing downstream reads it.
       </p>
     </div>
+  )
+}
+
+
 function bridgeRealizations(item: GovernanceQueueItem): BridgeRealizationView[] {
   const value = item.detail.realizations
   if (!Array.isArray(value)) return []

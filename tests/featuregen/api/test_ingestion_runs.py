@@ -261,9 +261,12 @@ def test_successful_upload_records_ordered_stage_reports(client):
         "enrich_concept", "enrich_definition", "enrich_summary", "enrich_domain",
         "enrich_synonyms", "enrich_unit",
         "graph_persistence",
-        "governed_joins", "pass_c", "pass_b", "glossary_evidence", "entity_bridges",
+        "governed_joins", "pass_c", "pass_b", "glossary_evidence",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
-        "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
+        # entity_bridges runs AFTER the drain + table-fact projection: assessing earlier read
+        # stale flat grain flags and froze them into the candidate evidence (bridge 6B).
+        "table_fact_projection", "entity_bridges",
+        "join_projection", "semantic_binding_projection", "join_drift",
         "quarantine", "manifest_finalization"]
     assert stages["parse"]["state"] == "succeeded"
     assert stages["manifest_finalization"]["state"] == "succeeded"   # #13 C: terminalize reported
