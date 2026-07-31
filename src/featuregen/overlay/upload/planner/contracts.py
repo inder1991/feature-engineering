@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from featuregen.overlay.upload.bridge_realization import BridgeJoinRealizationRevisionV1
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 from featuregen.overlay.upload.taxonomy.versions import (
     APPLICABILITY_MAPPING_VERSION as APPLICABILITY_MAPPING_VERSION,
@@ -26,7 +27,7 @@ from featuregen.overlay.upload.taxonomy.versions import (
 PLANNER_VERSION = "3b3a.1.0.0"
 # The BindingPlanV1 SCHEMA version (contract shape). 3B.3c split it out of the physical-id
 # material: it may bump freely as fields are added without moving any physical_plan_id.
-PLAN_CONTRACT_VERSION = "3b3c.1.0.0"
+PLAN_CONTRACT_VERSION = "3b3c.2.0.0"
 # FROZEN (F1): the version hashed into every physical_plan_id. It pins the physical-path
 # derivation, NOT the dataclass shape — it must never track PLAN_CONTRACT_VERSION bumps, or every
 # stored physical id would silently move. Bump ONLY on a change to the physical-id material itself.
@@ -58,7 +59,7 @@ MAX_STATES_EXPANDED_PER_BINDING = 512
 
 # 3C.2b-i-A — governed multi-source operand assembly (shadow). Combine operands from DIFFERENT
 # catalogs into one governed computation at one physical grain; log-only, never surfaces.
-MULTISOURCE_ASSEMBLY_VERSION = "3c2bia.1.0.0"
+MULTISOURCE_ASSEMBLY_VERSION = "3c2bia.2.0.0"
 OPERATION_POLICY_VERSION = "3c2bia.op.1.0.0"
 MULTISOURCE_ASSEMBLY_SHADOW_FLAG = "FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW"
 MULTISOURCE_GOLD_MIN_SHAPES = 6
@@ -398,6 +399,14 @@ class BindingPathSegmentV1:
     # assembler at emission (a later 3B.3c task); None on pre-3B.3c and non-hop segments.
     relationship_id: str | None = None
     relationship_version: str | None = None
+    # Task 9 — exact directional crossing identity.  Discovery/sandbox plans may carry only the
+    # endpoint addresses and bridge fact.  Production compilation must attach the immutable
+    # realization revision; no consumer may infer cardinality from the symmetric link itself.
+    bridge_from_catalog_source: str | None = None
+    bridge_from_object_ref: str | None = None
+    bridge_to_catalog_source: str | None = None
+    bridge_to_object_ref: str | None = None
+    bridge_realization_revision: BridgeJoinRealizationRevisionV1 | None = None
 
 
 # ---- 3B.3c contract-compiler evidence (computed onto the plan; persisted only in 3B.4) ----
@@ -620,6 +629,12 @@ def tier_from_bridge_count(n: int) -> PlanTier:
     return PlanTier.tier_3_multi_bridge
 
 
+def _segment_physical_identity(segment: BindingPathSegmentV1) -> str:
+    if segment.bridge_realization_revision is not None:
+        return segment.bridge_realization_revision.realization_revision_id
+    return segment.realization_ref or segment.bridge_fact_key or ""
+
+
 def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_source: str,
                       ingredient_bindings: tuple[IngredientBindingV1, ...],
                       path_segments: tuple[BindingPathSegmentV1, ...],
@@ -653,7 +668,7 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
         raise ValueError("source_to_target_resolved plan cannot have resolution_status=unresolved")
     refs = tuple(sorted(b.bound_object_ref for b in ingredient_bindings))
     segments_material = ">".join(
-        f"{s.segment_kind}:{s.catalog_source}:{s.realization_ref or s.bridge_fact_key or ''}"
+        f"{s.segment_kind}:{s.catalog_source}:{_segment_physical_identity(s)}"
         for s in path_segments)
     # path_resolution_status is part of the hashed material: a tier-1 resolved plan and an
     # immediate-dead-end reject over the same refs/segments must NOT share a physical_plan_id

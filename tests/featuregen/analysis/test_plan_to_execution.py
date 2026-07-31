@@ -30,16 +30,6 @@ rather than vanishing into a stack trace.
 from __future__ import annotations
 
 import pytest
-
-from featuregen.analysis.execution import (
-    BRIDGE_REFUSAL_TO_GAP,
-    BridgeRefusal,
-    ExecutionInputs,
-    plan_to_execution_ir,
-)
-from featuregen.analysis.plan import AnalysisPlanV1, Dimension, GroundedPlan, Measure, Window
-from featuregen.data_agent.analysis import Comparison
-from featuregen.data_agent.learning import GAP_CODES
 from tests.featuregen.data_agent.pilot_fixture import (
     CURRENT_MONTH,
     CUSTOMER_SCHEMA,
@@ -52,6 +42,21 @@ from tests.featuregen.data_agent.pilot_fixture import (
     binding,
 )
 from tests.featuregen.data_agent.test_analysis_ir import _attribution, _policy
+from tests.featuregen.materialize.test_cross_catalog_ir import (
+    _inventory,
+    _realization_current,
+)
+from tests.featuregen.materialize.test_expression_ir import INVENTORY
+
+from featuregen.analysis.execution import (
+    BRIDGE_REFUSAL_TO_GAP,
+    BridgeRefusal,
+    ExecutionInputs,
+    plan_to_execution_ir,
+)
+from featuregen.analysis.plan import AnalysisPlanV1, Dimension, GroundedPlan, Measure, Window
+from featuregen.data_agent.analysis import Comparison
+from featuregen.data_agent.learning import GAP_CODES
 
 
 def _plan(**over) -> AnalysisPlanV1:
@@ -116,9 +121,10 @@ def test_the_dimensions_arrive_as_COLUMN_names_not_logical_refs():
 def test_the_resulting_ir_RUNS_and_reconciles_to_the_hand_counted_fixture(db):
     """End to end through the seam: a plan on one side, the fixture's hand-counted answer on the
     other. Without this the bridge could produce a well-typed IR that computes the wrong thing."""
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     ir = plan_to_execution_ir(_grounded(), _inputs())
@@ -203,6 +209,23 @@ def test_a_plan_carrying_FINDINGS_still_translates():
         Finding(code="JOIN_IDENTITY_UNCONFIRMED", subject="ftr::dpl_eib.tran_repos.cif_id")))
     ir = plan_to_execution_ir(grounded, _inputs())
     assert ir.comparison is Comparison.DECREASED
+
+
+def test_cross_catalog_production_analysis_requires_exact_directional_realization():
+    grounded = _grounded(plan=_plan(join_refs=("bridge-fact-1",)))
+    with pytest.raises(BridgeRefusal) as exc:
+        plan_to_execution_ir(grounded, _inputs())
+    assert exc.value.code == "JOIN_REALIZATION_ABSENT"
+
+    realization = _realization_current(_inventory(INVENTORY))
+    ir = plan_to_execution_ir(
+        grounded,
+        _inputs(bridge_realizations=(realization,)),
+    )
+    assert ir.bridge_realization_dependencies == ((
+        realization.revision.realization_revision_id,
+        realization.revision.dependency_snapshot_id,
+    ),)
 
 
 # ── every refusal is actionable ontology evidence ────────────────────────────────────────────────

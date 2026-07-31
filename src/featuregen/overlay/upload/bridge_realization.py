@@ -22,7 +22,7 @@ from featuregen.overlay.upload.bridge_assessment import (
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 
-REALIZATION_CONTRACT_VERSION = "1.0.0"
+REALIZATION_CONTRACT_VERSION = "2.0.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,18 +115,21 @@ class ColumnPairV1:
 class FixedValueReferencePredicateV1:
     """A partition/snapshot column must equal a named, externally resolved value reference."""
 
+    predicate_id: str
     logical_column_ref: str
     value_ref: str
     kind: str = field(default="fixed_value_reference", init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "logical_column_ref", _column_ref(self.logical_column_ref))
-        if not self.value_ref.strip():
-            raise BridgeContractError("fixed predicate value_ref must not be blank")
+        if not self.predicate_id.strip() or not self.value_ref.strip():
+            raise BridgeContractError(
+                "fixed predicate predicate_id and value_ref must not be blank")
 
     def identity_payload(self) -> dict[str, str]:
         return {
             "kind": self.kind,
+            "predicate_id": self.predicate_id,
             "logical_column_ref": self.logical_column_ref,
             "value_ref": self.value_ref,
         }
@@ -136,6 +139,7 @@ class FixedValueReferencePredicateV1:
 class AsOfIntervalRequirementV1:
     """Half-open ``[effective_from, effective_to)`` validity at a named as-of value."""
 
+    predicate_id: str
     effective_from_ref: str
     effective_to_ref: str
     as_of_value_ref: str
@@ -146,12 +150,14 @@ class AsOfIntervalRequirementV1:
         object.__setattr__(self, "effective_to_ref", _column_ref(self.effective_to_ref))
         if self.effective_from_ref == self.effective_to_ref:
             raise BridgeContractError("as-of interval bounds must be different columns")
-        if not self.as_of_value_ref.strip():
-            raise BridgeContractError("as_of_value_ref must not be blank")
+        if not self.predicate_id.strip() or not self.as_of_value_ref.strip():
+            raise BridgeContractError(
+                "as-of predicate predicate_id and as_of_value_ref must not be blank")
 
     def identity_payload(self) -> dict[str, str]:
         return {
             "kind": self.kind,
+            "predicate_id": self.predicate_id,
             "effective_from_ref": self.effective_from_ref,
             "effective_to_ref": self.effective_to_ref,
             "as_of_value_ref": self.as_of_value_ref,

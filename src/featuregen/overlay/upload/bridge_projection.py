@@ -75,15 +75,17 @@ def _flat_object_ref(logical_column_ref: str) -> str:
 
 
 def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
-    """The cross-catalog active set every planner surface consumes — CONFIRMED and PROPOSED alike.
+    """The provisional cross-catalog discovery set — CONFIRMED and PROPOSED alike.
 
     Owner's direction: a link is usable whether or not a human has confirmed it; confirmation marks
     it approved, it does not gate consumption. This used to select VERIFIED rows only, which is why
     nine derived candidates — `cib.cust_num <-> ftr.cif_id` among them — could never be traversed.
 
-    ACTIVE means AVAILABLE, not reviewed: `cross_catalog_links` has already applied the lifecycle
+    ACTIVE means AVAILABLE, not executable: ``available_identifier_links`` has already applied the lifecycle
     allow-list (DRAFT / PARTIALLY_CONFIRMED / VERIFIED), so a REJECTED, drift-STALEd, expired
-    (REVERIFY) or unreadable bridge is absent from this set and cannot be traversed by anything.
+    (REVERIFY) or unreadable bridge is absent. The legacy/shadow planner uses this set to enumerate
+    provisional paths; production analysis and materialization require a current exact directional
+    realization and never treat this projection as execution authority.
 
     Deterministic: SAFEST first — a grain-backed, attested link outranks a type-only match, and a
     human confirmation only breaks ties inside a safety band — so a consumer that takes the first

@@ -112,7 +112,13 @@ def build_operand_context(
         config=overlay_config_from_env(),
         roles=roles,
         now=now,
-        agg_declarations=dict(agg_declarations))
+        agg_declarations=dict(agg_declarations),
+        # This context is consumed only by the marked shadow/sandbox multi-source planner. A
+        # far-side governed grain can form an N:1 hypothesis here because every eventual execution
+        # must run the join gate; production compilation uses the default False and requires the
+        # exact directional realization revision.
+        allow_provisional_bridge_cardinality=True,
+    )
 
 
 def run_operand_rollup(

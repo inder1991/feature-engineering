@@ -1122,7 +1122,13 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
         # name/derives_pairs/aggregation but NOT join_path, so a replay carrying a FABRICATED path (which
         # the freshness recheck still passes) would otherwise be persisted as the "governed" bridge. Scoped
         # strictly to the envelope-present case (single-catalog / flag-off drafts keep their client path).
-        draft = replace(draft, join_path=tuple(_envelope_join_path(env.ordered_path)))
+        draft = replace(
+            draft,
+            join_path=tuple(_envelope_join_path(
+                env.ordered_path,
+                env.bridge_realization_dependencies,
+            )),
+        )
     elif cross_catalog:
         # H1c fail-closed — a cross-catalog candidate with NO governed plan envelope can NEVER be governed,
         # whatever the deployment state: it has no governed physical plan to author from, and the governing

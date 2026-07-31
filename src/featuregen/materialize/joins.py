@@ -47,6 +47,14 @@ from enum import StrEnum
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+from featuregen.overlay.upload.bridge_realization import (
+    BridgeJoinRealizationRevisionV1,
+    BridgeRealizationCurrentV1,
+    Cardinality,
+    StructuredPredicateV1,
+    eligible_for_production,
+)
+from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
 from featuregen.overlay.upload.join_path import (
     JoinOutcome,
     JoinStep,
@@ -54,7 +62,13 @@ from featuregen.overlay.upload.join_path import (
     table_of_ref,
 )
 
-__all__ = ["JoinPlan", "PhysicalIdentity", "plan_join"]
+__all__ = [
+    "CrossCatalogJoinStepV1",
+    "JoinPlan",
+    "PhysicalIdentity",
+    "plan_cross_catalog_join",
+    "plan_join",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +100,7 @@ class JoinPlan:
     them could not be re-checked.
     """
 
-    steps: tuple[JoinStep, ...]
+    steps: tuple[JoinStep | CrossCatalogJoinStepV1, ...]
     outcome_kind: str
     roles_used: tuple[str, ...]
     fans_out: bool
@@ -105,6 +119,52 @@ class _CardinalityVerdict(StrEnum):
 #: vocabulary must be given a direction here instead of silently degrading to UNKNOWN.
 _FANS_IN = frozenset({"N:1", "1:1"})
 _FANS_OUT = frozenset({"1:N"})
+
+
+_DIRECTIONAL_CARDINALITY = {
+    Cardinality.ONE_TO_ONE: "1:1",
+    Cardinality.MANY_TO_ONE: "N:1",
+    Cardinality.ONE_TO_MANY: "1:N",
+    Cardinality.MANY_TO_MANY: "N:N",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CrossCatalogJoinStepV1:
+    """One cross-catalog join, including every tuple member and closed predicate.
+
+    ``from_ref``/``to_ref`` expose the first pair for compatibility with generic diagnostics only;
+    execution must consume ``column_pairs`` as one composite equality, never render one table join
+    per member.
+    """
+
+    from_catalog_source: str
+    to_catalog_source: str
+    from_ref: str
+    to_ref: str
+    column_pairs: tuple[tuple[str, str], ...]
+    cardinality: str
+    predicates: tuple[StructuredPredicateV1, ...]
+    realization_id: str
+    realization_revision_id: str
+    bridge_fact_key: str
+    dependency_snapshot_id: str
+    evidence_revision_ids: tuple[str, ...]
+    approved_join_fact_key: str | None = None
+    approved_join_status: str | None = None
+    authority: str = "directional_realization"
+
+    def identity_payload(self) -> dict[str, object]:
+        return {
+            "from_catalog_source": self.from_catalog_source,
+            "to_catalog_source": self.to_catalog_source,
+            "column_pairs": [list(pair) for pair in self.column_pairs],
+            "cardinality": self.cardinality,
+            "predicates": [
+                predicate.identity_payload() for predicate in self.predicates],
+            "realization_revision_id": self.realization_revision_id,
+            "dependency_snapshot_id": self.dependency_snapshot_id,
+        }
 
 
 def _cardinality_verdict(cardinality: str | None) -> _CardinalityVerdict:
@@ -232,6 +292,107 @@ def plan_join(
 
     return JoinPlan(steps=outcome.steps, outcome_kind=outcome.kind, roles_used=roles_used,
                     fans_out=False)
+
+
+def _matches_physical_identity(
+    identity: PhysicalIdentity,
+    revision: BridgeJoinRealizationRevisionV1,
+    *,
+    from_side: bool,
+) -> bool:
+    endpoint = revision.from_endpoint if from_side else revision.to_endpoint
+    binding = endpoint.physical_binding
+    return (
+        binding is not None
+        and _fold(identity.catalog_source) == _fold(binding.identity.catalog_source)
+        and _fold(identity.schema) == _fold(binding.identity.schema)
+        and _fold(identity.table) == _fold(binding.identity.table)
+    )
+
+
+def plan_cross_catalog_join(
+    realization: CurrentBridgeRealizationV1,
+    *,
+    from_identity: PhysicalIdentity,
+    to_identity: PhysicalIdentity,
+    roles: Iterable[str] = (),
+) -> JoinPlan | MaterializationRefused:
+    """Adapt one current directional realization into an executable cross-catalog join.
+
+    The caller must obtain ``realization`` from ``executable_bridge_realizations`` and revalidate
+    it immediately before execution.  This pure adapter still repeats the structural safety checks
+    so a forged carrier, reversed direction, unknown cardinality or fan-out cannot reach the IR.
+    Human review is intentionally absent.
+    """
+    revision = realization.revision
+    current: BridgeRealizationCurrentV1 = realization.current
+    if not eligible_for_production(revision, current):
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"directional realization {revision.realization_revision_id} is not active and "
+            "deterministically validated",
+        )
+    if not _matches_physical_identity(from_identity, revision, from_side=True):
+        return _refuse(
+            CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED,
+            "the requested cross-catalog source does not match the realization's pinned "
+            f"from binding revision {revision.from_endpoint.binding_revision_id}",
+        )
+    if not _matches_physical_identity(to_identity, revision, from_side=False):
+        return _refuse(
+            CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED,
+            "the requested cross-catalog target does not match the realization's pinned "
+            f"to binding revision {revision.to_endpoint.binding_revision_id}",
+        )
+    if revision.cardinality.value is None:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"directional realization {revision.realization_revision_id} has unknown cardinality",
+        )
+    if revision.cardinality.value in {
+        Cardinality.ONE_TO_MANY,
+        Cardinality.MANY_TO_MANY,
+    }:
+        return _refuse(
+            CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED,
+            f"directional realization {revision.realization_revision_id} is "
+            f"{revision.cardinality.value.value} toward {to_identity.catalog_source}; this slice "
+            "has no governed row-allocation policy",
+        )
+    if revision.has_unresolved_requirements:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"directional realization {revision.realization_revision_id} has unresolved "
+            "additional-key requirements",
+        )
+
+    pairs = tuple(
+        (
+            pair.from_logical_column_ref,
+            pair.to_logical_column_ref,
+        )
+        for pair in revision.column_pairs
+    )
+    step = CrossCatalogJoinStepV1(
+        from_catalog_source=revision.from_endpoint.logical_table_ref.split("::", 1)[0],
+        to_catalog_source=revision.to_endpoint.logical_table_ref.split("::", 1)[0],
+        from_ref=pairs[0][0],
+        to_ref=pairs[0][1],
+        column_pairs=pairs,
+        cardinality=_DIRECTIONAL_CARDINALITY[revision.cardinality.value],
+        predicates=revision.predicates,
+        realization_id=revision.realization_id,
+        realization_revision_id=revision.realization_revision_id,
+        bridge_fact_key=revision.bridge_fact_key,
+        dependency_snapshot_id=revision.dependency_snapshot_id,
+        evidence_revision_ids=tuple(ref.evidence_id for ref in revision.evidence_refs),
+    )
+    return JoinPlan(
+        steps=(step,),
+        outcome_kind="DIRECTIONAL_REALIZATION_OPERATIONAL",
+        roles_used=tuple(roles),
+        fans_out=False,
+    )
 
 
 def _refuse_outcome(

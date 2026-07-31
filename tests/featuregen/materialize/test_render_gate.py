@@ -545,8 +545,14 @@ def rendered_corpus(full_project, compiled, db) -> str:
                                   availability_promise=AvailabilityPromiseV1(calendar_days=1))
     spines = [node.source for node in _render_all(
         (authorized, group_plan, group.contract, spine_input)).values()]
+    from tests.featuregen.materialize.test_render_join_gate import _step
+
+    from featuregen.materialize.render.nodes_join_gate import render_join_precondition_node
+
+    bridge_gate = render_join_precondition_node(
+        _step(), target_dataset="raw_customer", validated_dataset="validated_customer").source
     return "\n".join([*(text for path, text in full_project.files.items()
-                        if path.endswith(".py")), *spines])
+                        if path.endswith(".py")), *spines, bridge_gate])
 
 
 @pytest.mark.parametrize("code", list(ValidationGateCode), ids=lambda c: c.value)

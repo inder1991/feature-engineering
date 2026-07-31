@@ -238,6 +238,17 @@ def _rederive_hop_tables(ctx: CompilerContext, plan: BindingPlanV1, *, source_ca
             if r is not None:
                 hops.append((seg.catalog_source, r.to_object_ref))
         elif seg.bridge_fact_key is not None:
+            if (
+                seg.bridge_to_catalog_source is not None
+                and seg.bridge_to_object_ref is not None
+            ):
+                hops.append(
+                    (
+                        seg.bridge_to_catalog_source,
+                        table_of(seg.bridge_to_object_ref),
+                    )
+                )
+                continue
             br = next((x for x in ctx.active_bridges if x.fact_key == seg.bridge_fact_key), None)
             if br is None:
                 continue

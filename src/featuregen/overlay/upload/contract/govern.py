@@ -26,6 +26,7 @@ from featuregen.overlay.upload.contract.invalidation import (
     _MISSING,
     _catalog_state_signature,
     bridge_fact_marker,
+    bridge_realization_marker,
     confirm_dependency_hash,
     dependencies_drifted,
     has_dependency_rows,
@@ -237,6 +238,15 @@ def _contract_dependency_items(conn, draft: ContractDraft):
             segment_ref = step.get("ref")
             if not segment_ref:
                 continue                       # a ``direct_catalog`` source prefix — no bridge/realization
+            realization_revision_id = step.get("realization_revision_id")
+            dependency_snapshot_id = step.get("dependency_snapshot_id")
+            if realization_revision_id and dependency_snapshot_id:
+                marker = bridge_realization_marker(
+                    realization_revision_id,
+                    dependency_snapshot_id,
+                )
+                yield (step_catalog, marker, marker, None, None, None)
+                continue
             segment_kind = step.get("segment_kind")
             if segment_kind == str(SegmentKind.governed_bridge):
                 marker = bridge_fact_marker(segment_ref)

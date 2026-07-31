@@ -124,6 +124,9 @@ class ValidationGateCode(StrEnum):
     FORBIDDEN_NUMERIC = "FORBIDDEN_NUMERIC"
     OVERFLOW_VIOLATION = "OVERFLOW_VIOLATION"
 
+    # Directional cross-catalog join integrity.
+    JOIN_AMPLIFICATION = "JOIN_AMPLIFICATION"
+
     # Spine integrity — all three need the rows to be known.
     SPINE_INCOMPLETE = "SPINE_INCOMPLETE"
     SPINE_DUPLICATE_KEY = "SPINE_DUPLICATE_KEY"

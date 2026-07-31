@@ -352,10 +352,11 @@ def test_resolved_assembly_stale_union_lands_compile_incomplete(
 
 def test_governed_crossings_persisted_for_resolved_operand(
         db, planning_conn, service_actor, human_actor):
-    """I-1 end-to-end: a resolved cross-catalog operand persists its governed crossings on the operand
-    row — the VERIFIED bridge (authority=verified, carrying the audit ``confirmed_event_id`` re-queried
-    BEFORE the fixture rollback) plus the declared intra-catalog realization — so crossing-governedness
-    is FALSIFIABLE from persisted telemetry, not only from the endpoint grain-facts."""
+    """I-1 end-to-end: a resolved shadow operand persists review and execution trust separately.
+
+    The reviewed bridge is still ``provisional`` until an exact directional realization is
+    attached; its human ``confirmed_event_id`` remains audit evidence.
+    """
     _seed_resolved_topology(planning_conn, service_actor, human_actor)
     confirmed_bridge_event_id = fold_overlay_state(
         load_fact(planning_conn, "bfk_acct")).confirmed_event_id
@@ -381,15 +382,21 @@ def test_governed_crossings_persisted_for_resolved_operand(
             assert endpoint["grain_fact_revision"]
             assert endpoint["grain_dependency_identity"]
         crossings = list(o["crossings"])
-        assert crossings, f"expected governed crossings on slot {o['slot_id']}"
-        # every crossing is a governed authority (VERIFIED bridge / approved-or-declared realization)
-        assert all(c["authority"] in {"verified", "declared_join", "approved_join"}
-                   for c in crossings)
-    # the VERIFIED bridge crossing carries its audit confirmed_event_id (re-queried pre-rollback)
+        assert crossings, f"expected classified crossings on slot {o['slot_id']}"
+        assert all(
+            c["authority"] in {
+                "provisional",
+                "deterministically_validated",
+                "declared_join",
+                "approved_join",
+            }
+            for c in crossings
+        )
+    # Human confirmation remains audit-only on a provisional bridge crossing.
     bridge_crossings = [c for o in operands for c in o["crossings"]
                         if c["kind"] == "governed_bridge"]
     assert bridge_crossings
-    assert all(c["authority"] == "verified" for c in bridge_crossings)
+    assert all(c["authority"] == "provisional" for c in bridge_crossings)
     assert any(
         c["confirmed_event_id"] == confirmed_bridge_event_id for c in bridge_crossings)
 

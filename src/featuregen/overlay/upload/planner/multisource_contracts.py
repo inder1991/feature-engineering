@@ -285,6 +285,8 @@ class MultiSourceReplayEnvelopeV1:
     governed_endpoint_fact_keys: tuple[str, ...]
     bridge_fact_keys: tuple[str, ...]
     input_hash: str
+    bridge_realization_revision_ids: tuple[str, ...] = ()
+    bridge_dependency_snapshot_ids: tuple[str, ...] = ()
     multisource_assembly_version: str = MULTISOURCE_ASSEMBLY_VERSION
     operation_policy_version: str = OPERATION_POLICY_VERSION
     concept_registry_version: str = CONCEPT_REGISTRY_VERSION

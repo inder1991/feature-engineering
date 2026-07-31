@@ -74,7 +74,7 @@ from featuregen.materialize.inventory import (
     StaticSnapshot,
     VerifiedUnpartitioned,
 )
-from featuregen.materialize.ir import FormulaExecutionIRV1
+from featuregen.materialize.ir import BridgeExecutionAuthorization, FormulaExecutionIRV1
 from featuregen.materialize.render.project import REQUIRED_RUN_PARAMETERS
 from featuregen.materialize.spine import CurrentSnapshot, LatestAvailableAsOf, SpineSpec
 
@@ -740,6 +740,9 @@ def prepare_run(
     requests: tuple[RunInputRequest, ...],
     staging_base: str,
     capability_attestation_id: str,
+    bridge_authorization: BridgeExecutionAuthorization | None = None,
+    additional_parameters: Mapping[str, Any] | None = None,
+    required_parameters: Sequence[str] = REQUIRED_RUN_PARAMETERS,
 ) -> RunPreparation | MaterializationRefused:
     """Resolve a run's inputs and identify it — §11.1's ``prepare_run``.
 
@@ -754,6 +757,29 @@ def prepare_run(
     The compiler's and renderer's versions are not parameters here either: ``sandbox_execution_hash``
     reads both through their owning modules (§7), so there is nowhere on this call to freeze one.
     """
+    required_bridge_dependencies = rendered.compilation.bridge_realization_dependencies
+    if required_bridge_dependencies:
+        if bridge_authorization is None:
+            return MaterializationRefused(
+                CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                "the rendered cross-catalog project has no final bridge execution authorization",
+            )
+        expected_ir_hashes = tuple(sorted(rendered.compilation.ir_hashes))
+        if (
+            bridge_authorization.environment_id != inventory.environment_id
+            or bridge_authorization.ir_hashes != expected_ir_hashes
+            or bridge_authorization.realization_dependencies != required_bridge_dependencies
+        ):
+            return MaterializationRefused(
+                CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                "the final bridge execution authorization does not cover this artifact's exact "
+                "IRs, environment and realization dependency snapshots",
+            )
+    elif bridge_authorization is not None and bridge_authorization.realization_dependencies:
+        raise ValueError(
+            "a bridge execution authorization was supplied for an artifact that declares no "
+            "cross-catalog realization dependency")
+
     snapshots = resolve_snapshots(inventory, metastore, requests=requests,
                                   business_dt=business_dt)
     if isinstance(snapshots, MaterializationRefused):
@@ -766,16 +792,25 @@ def prepare_run(
         "run_id": run_id,
         "staging_root": staging_root_for(staging_base, generation_id=generation_id),
     }
+    extras = dict(additional_parameters or {})
+    overlap = set(extras) & set(covered | {"sandbox_execution_hash": ""})
+    if overlap:
+        raise ValueError(
+            f"additional run parameters overwrite owned parameters: {sorted(overlap)}")
     execution_hash = sandbox_execution_hash(
-        rendered, environment_id=inventory.environment_id, parameters=covered,
+        rendered, environment_id=inventory.environment_id, parameters={**covered, **extras},
         business_dt=business_dt, input_snapshot_ids=input_snapshot_ids(snapshots),
         capability_attestation_id=capability_attestation_id)
 
-    parameters = {**covered, "sandbox_execution_hash": execution_hash}
-    if set(parameters) != set(REQUIRED_RUN_PARAMETERS):
+    parameters = {**covered, **extras, "sandbox_execution_hash": execution_hash}
+    expected_parameters = set(required_parameters)
+    if not set(REQUIRED_RUN_PARAMETERS) <= expected_parameters:
+        raise ValueError(
+            "required_parameters omitted one or more base run parameters")
+    if set(parameters) != expected_parameters:
         raise ValueError(
             f"the prepared parameters are {sorted(parameters)} and the rendered project requires "
-            f"{sorted(REQUIRED_RUN_PARAMETERS)}: the rendered hook refuses a run that is missing "
+            f"{sorted(expected_parameters)}: the rendered hook refuses a run that is missing "
             f"one OR carries one nothing planned to read, so anything but equality cannot run")
     return RunPreparation(snapshots=snapshots, sandbox_execution_hash=execution_hash,
                           parameters=MappingProxyType(parameters))

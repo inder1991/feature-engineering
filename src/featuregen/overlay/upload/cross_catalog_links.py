@@ -1,8 +1,11 @@
-"""Cross-catalog links — the SAME business entity in two catalogs, confirmed or not.
+"""Discoverable cross-catalog links — the SAME business entity in two catalogs, confirmed or not.
 
-The one read model every consumer should use: the asset screen, feature generation, and the data
-agents. It returns candidates AND verified edges together, each carrying its own status, so a caller
-RANKS rather than being barred.
+The one AVAILABLE-LINK read model used by search, asset/lineage screens, review queues, feature
+suggestion and provisional data-agent planning. It returns candidates AND verified edges together,
+each carrying its own status, so a discovery caller RANKS rather than being barred. Production
+analysis and materialization must instead consume
+``bridge_store.executable_bridge_realizations``: availability says a relationship may be
+considered; an exact directional realization says a particular join is safe to execute.
 
 **Why this exists.** The platform gated hard on confirmation. ``entity_bridge_edge`` holds VERIFIED
 bridges only and is the only thing ``planner/multisource_compile``, ``analysis/grounding`` and
@@ -60,7 +63,8 @@ class LinkStatus(StrEnum):
     #: A human has endorsed the semantic relationship. An annotation — never required, and never
     #: enough on its own to outrank a link the platform measured to be safer.
     CONFIRMED = "confirmed"
-    #: Derived and proposed, nobody has reviewed it. Fully usable.
+    #: Derived and proposed, nobody has reviewed it. Available to discovery; production execution
+    #: still requires a current deterministically-validated directional realization.
     PROPOSED = "proposed"
 
 
@@ -119,9 +123,11 @@ class CrossCatalogLink:
 
     @property
     def usable(self) -> bool:
-        """Always true for a link that is RETURNED — availability is decided before construction,
-        by the lifecycle allow-list, and never by ``status``. Present so a caller reads intent
-        rather than inferring it: confirmation annotates, it does not gate."""
+        """Always true for DISCOVERY after the lifecycle allow-list.
+
+        This compatibility property is not production execution authority. A production consumer
+        must resolve a current deterministically-validated directional realization.
+        """
         return True
 
     @property

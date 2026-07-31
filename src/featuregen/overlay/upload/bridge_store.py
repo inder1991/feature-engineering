@@ -18,6 +18,7 @@ from featuregen.data_agent.physical import (
     PhysicalDatasetBindingV1,
     PhysicalObjectIdentityV1,
 )
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.bridge_assessment import (
     ConceptAuthority,
     EvidenceKind,
@@ -26,16 +27,31 @@ from featuregen.overlay.upload.bridge_assessment import (
     IdentifierEndpointV1,
     IdentifierLinkAssessmentV1,
     KeyMemberRole,
+    LinkAvailability,
+    LinkReviewStatus,
     NamespaceVerdict,
     PopulationRelation,
     TupleKeyRole,
     TypeBasis,
     candidate_identity_payload,
+    read_overlay_identifier_link_state,
 )
 from featuregen.overlay.upload.bridge_realization import (
+    AdditionalKeyRequirementV1,
+    AsOfIntervalRequirementV1,
     BridgeJoinRealizationRevisionV1,
     BridgeRealizationCurrentV1,
+    CardinalityBasis,
+    ColumnPairV1,
+    DirectionalCardinalityVerdictV1,
+    ExecutionTier,
+    FixedValueReferencePredicateV1,
+    RealizationApplicabilityScopeV1,
+    RealizationLifecycle,
+    SafetyStatus,
+    eligible_for_production,
 )
+from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 
 
 class BridgeStoreConflict(RuntimeError):
@@ -62,6 +78,52 @@ class BridgeDependencyRefV1:
     def __post_init__(self) -> None:
         if not self.kind.strip() or not self.key.strip() or not self.revision.strip():
             raise ValueError("bridge dependency kind, key and revision must not be blank")
+
+
+def bridge_dependency_snapshot_id(
+    dependencies: tuple[BridgeDependencyRefV1, ...],
+) -> str:
+    """Content identity of the exact dependency set a realization was admitted against."""
+    payload = [
+        {
+            "kind": dependency.kind,
+            "key": dependency.key,
+            "revision": dependency.revision,
+        }
+        for dependency in sorted(
+            dependencies,
+            key=lambda item: (item.kind, item.key, item.revision),
+        )
+    ]
+    return "brds_" + canonical_hash(payload)
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentBridgeRealizationV1:
+    """One typed realization revision joined to its mutable current pointer and dependencies."""
+
+    revision: BridgeJoinRealizationRevisionV1
+    current: BridgeRealizationCurrentV1
+    dependencies: tuple[BridgeDependencyRefV1, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeExecutionAssessmentV1:
+    """The result of re-reading every load-bearing execution dependency.
+
+    ``executable`` deliberately does not inspect human review.  Review is an accountability
+    annotation; execution is decided by deterministic safety, current evidence, lifecycle, scope
+    and physical binding revisions.
+    """
+
+    realization: CurrentBridgeRealizationV1
+    executable: bool
+    reason_codes: tuple[str, ...]
+
+
+_EXECUTION_BLOCKING_CARDINALITIES = frozenset(
+    {Cardinality.ONE_TO_MANY, Cardinality.MANY_TO_MANY}
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -148,6 +210,75 @@ def assessment_from_json(payload: dict[str, Any]) -> IdentifierLinkAssessmentV1:
         evidence_refs=tuple(_evidence_ref(item) for item in payload.get("evidence_refs") or ()),
         hard_conflicts=tuple(payload.get("hard_conflicts") or ()),
         explanation_codes=tuple(payload.get("explanation_codes") or ()),
+    )
+
+
+def _predicate_from_json(payload: dict[str, Any]):
+    kind = payload.get("kind")
+    if kind == "fixed_value_reference":
+        return FixedValueReferencePredicateV1(
+            predicate_id=payload["predicate_id"],
+            logical_column_ref=payload["logical_column_ref"],
+            value_ref=payload["value_ref"],
+        )
+    if kind == "as_of_interval":
+        return AsOfIntervalRequirementV1(
+            predicate_id=payload["predicate_id"],
+            effective_from_ref=payload["effective_from_ref"],
+            effective_to_ref=payload["effective_to_ref"],
+            as_of_value_ref=payload["as_of_value_ref"],
+        )
+    if kind == "unresolved_additional_key":
+        return AdditionalKeyRequirementV1(
+            from_logical_column_ref=payload["from_logical_column_ref"],
+            to_logical_column_ref=payload["to_logical_column_ref"],
+            reason_code=payload["reason_code"],
+        )
+    raise ValueError(f"unknown bridge realization predicate kind {kind!r}")
+
+
+def realization_from_json(payload: dict[str, Any]) -> BridgeJoinRealizationRevisionV1:
+    """Rebuild a typed revision and thereby re-check its content-addressed identities."""
+    cardinality_payload = payload.get("cardinality")
+    cardinality = (
+        cardinality_payload.get("value")
+        if isinstance(cardinality_payload, dict)
+        else cardinality_payload
+    )
+    return BridgeJoinRealizationRevisionV1(
+        bridge_fact_key=payload["bridge_fact_key"],
+        from_endpoint=_endpoint(payload["from_endpoint"]),
+        to_endpoint=_endpoint(payload["to_endpoint"]),
+        column_pairs=tuple(
+            ColumnPairV1(
+                pair["from_logical_column_ref"],
+                pair["to_logical_column_ref"],
+            )
+            for pair in payload["column_pairs"]
+        ),
+        predicates=tuple(
+            _predicate_from_json(predicate)
+            for predicate in payload.get("predicates") or ()
+        ),
+        applicability_scope=RealizationApplicabilityScopeV1(
+            scope_id=payload["applicability_scope"]["scope_id"],
+            execution_tier=ExecutionTier(
+                payload["applicability_scope"]["execution_tier"]),
+            purposes=tuple(payload["applicability_scope"]["purposes"]),
+            environment=payload["applicability_scope"]["environment"],
+            partition_scope_ref=payload["applicability_scope"].get(
+                "partition_scope_ref"),
+        ),
+        cardinality=DirectionalCardinalityVerdictV1(
+            None if cardinality in {None, "unknown"} else Cardinality(str(cardinality))
+        ),
+        cardinality_basis=CardinalityBasis(payload["cardinality_basis"]),
+        evidence_refs=tuple(
+            _evidence_ref(item) for item in payload.get("evidence_refs") or ()
+        ),
+        dependency_snapshot_id=payload["dependency_snapshot_id"],
+        derivation_version=payload["derivation_version"],
+        admission_policy_version=payload["admission_policy_version"],
     )
 
 
@@ -373,6 +504,283 @@ def record_realization_revision(
     if changed != 1:
         raise BridgeStoreConflict(
             f"realization {current.realization_id} pointer advanced")
+
+
+def load_current_bridge_realizations(
+    conn,
+    *,
+    bridge_fact_key: str | None = None,
+) -> tuple[CurrentBridgeRealizationV1, ...]:
+    """Load current realization pointers as typed, content-verified contracts.
+
+    Corrupt JSON or an identity mismatch is not skipped.  A supposedly current execution contract
+    that cannot reproduce the primary keys stored beside it is a store-integrity failure, and
+    silently omitting it would turn corruption into an unexplained missing join.
+    """
+    where = "" if bridge_fact_key is None else "WHERE r.bridge_fact_key = %s"
+    params: tuple[object, ...] = () if bridge_fact_key is None else (bridge_fact_key,)
+    rows = conn.execute(
+        "SELECT r.realization_revision_id, r.realization_id, r.realization_json, "
+        "c.safety_status, c.review_status, c.lifecycle, c.pointer_version "
+        "FROM bridge_join_realization_current c "
+        "JOIN bridge_join_realization_revision r "
+        "  ON r.realization_revision_id=c.realization_revision_id "
+        f"{where} ORDER BY r.realization_id",
+        params,
+    ).fetchall()
+    out: list[CurrentBridgeRealizationV1] = []
+    for (
+        stored_revision_id,
+        stored_realization_id,
+        payload,
+        safety_status,
+        review_status,
+        lifecycle,
+        pointer_version,
+    ) in rows:
+        revision = realization_from_json(payload)
+        if (
+            revision.realization_id != stored_realization_id
+            or revision.realization_revision_id != stored_revision_id
+        ):
+            raise BridgeStoreCorruption(
+                f"realization identity mismatch for {stored_revision_id}")
+        current = BridgeRealizationCurrentV1(
+            realization_id=stored_realization_id,
+            realization_revision_id=stored_revision_id,
+            safety_status=SafetyStatus(safety_status),
+            review_status=LinkReviewStatus(review_status),
+            lifecycle=RealizationLifecycle(lifecycle),
+            pointer_version=int(pointer_version),
+        )
+        dependencies = tuple(
+            BridgeDependencyRefV1(kind, key, dependency_revision)
+            for kind, key, dependency_revision in conn.execute(
+                "SELECT dependency_kind, dependency_key, dependency_revision "
+                "FROM bridge_realization_dependency "
+                "WHERE realization_revision_id=%s "
+                "ORDER BY dependency_kind, dependency_key, dependency_revision",
+                (stored_revision_id,),
+            ).fetchall()
+        )
+        out.append(CurrentBridgeRealizationV1(revision, current, dependencies))
+    return tuple(out)
+
+
+def _binding_revision_is_stored(conn, endpoint: IdentifierEndpointV1) -> bool:
+    binding = endpoint.physical_binding
+    revision_id = endpoint.binding_revision_id
+    if binding is None or revision_id is None:
+        return False
+    row = conn.execute(
+        "SELECT binding_id, content_hash, catalog_logical_ref, connection_id, physical_id "
+        "FROM physical_dataset_binding_revision WHERE binding_revision_id=%s",
+        (revision_id,),
+    ).fetchone()
+    return row == (
+        binding.binding_id,
+        binding.content_hash,
+        binding.catalog_logical_ref,
+        binding.connection_id,
+        binding.identity.table_id,
+    )
+
+
+def _current_exact_evidence_ids(
+    conn,
+    revision: BridgeJoinRealizationRevisionV1,
+    evidence_ids: frozenset[str],
+) -> frozenset[str]:
+    """Current exact observations that structurally attest this realization.
+
+    The observation necessarily names the *pre-admission* realization revision it tested.  Adding
+    that observation to ``evidence_refs`` creates the admitted revision ID, so requiring the
+    observation to name the admitted revision would be a content-addressing cycle.  We therefore
+    bind by immutable observation ID and re-check every execution-bearing field against the final
+    revision: ordered tuple, binding revisions, scope, predicates, completeness and fan-out.
+    """
+    if not evidence_ids:
+        return frozenset()
+    from featuregen.data_agent.relationship_observation import observation_from_json
+
+    from_columns = tuple(
+        pair.from_logical_column_ref.rsplit(".", 1)[-1]
+        for pair in revision.column_pairs
+    )
+    to_columns = tuple(
+        pair.to_logical_column_ref.rsplit(".", 1)[-1]
+        for pair in revision.column_pairs
+    )
+    expected_predicate_ids = tuple(
+        predicate.predicate_id
+        for predicate in revision.predicates
+        if isinstance(
+            predicate,
+            FixedValueReferencePredicateV1 | AsOfIntervalRequirementV1,
+        )
+    )
+    current: set[str] = set()
+    rows = conn.execute(
+        "SELECT r.observation_revision_id, r.observation_json "
+        "FROM relationship_observation_current c "
+        "JOIN relationship_observation_revision r "
+        "  ON r.observation_revision_id=c.observation_revision_id "
+        "WHERE r.observation_revision_id = ANY(%s) "
+        "  AND r.method='exact' AND r.complete=true AND r.row_coverage='full' "
+        "  AND r.conflict_observed=false",
+        (list(evidence_ids),),
+    ).fetchall()
+    for observation_id, payload in rows:
+        observation = observation_from_json(payload)
+        if (
+            observation.scope_id == revision.applicability_scope.scope_id
+            and observation.left.binding_revision_id
+            == revision.from_endpoint.binding_revision_id
+            and observation.right.binding_revision_id
+            == revision.to_endpoint.binding_revision_id
+            and observation.left.columns == from_columns
+            and observation.right.columns == to_columns
+            and observation.predicate_ids == expected_predicate_ids
+            and observation.right.duplicate_row_count == 0
+            and observation.right.null_row_count == 0
+            and observation.max_right_matches_per_left_row <= 1
+        ):
+            current.add(str(observation_id))
+    return frozenset(current)
+
+
+def revalidate_bridge_realization(
+    conn,
+    realization: CurrentBridgeRealizationV1,
+    *,
+    purpose: str,
+    environment: str,
+    execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
+) -> BridgeExecutionAssessmentV1:
+    """Re-read the mutable facts that may have changed since admission.
+
+    This is the compilation/execution boundary, not a review check.  The exact current pointer,
+    deterministic safety, backing link lifecycle, physical bindings, scope and current exact
+    relationship observation all have to agree.  Unknown and fan-out cardinalities fail closed.
+    """
+    revision = realization.revision
+    current = realization.current
+    reasons: list[str] = []
+    if not eligible_for_production(revision, current):
+        reasons.append("realization_not_deterministically_executable")
+    if revision.applicability_scope.execution_tier is not execution_tier:
+        reasons.append("realization_execution_tier_mismatch")
+    if environment != revision.applicability_scope.environment:
+        reasons.append("realization_environment_mismatch")
+    if purpose not in revision.applicability_scope.purposes:
+        reasons.append("realization_purpose_mismatch")
+
+    link_state = read_overlay_identifier_link_state(conn, revision.bridge_fact_key)
+    if link_state.availability is not LinkAvailability.AVAILABLE:
+        reasons.append("identifier_link_not_available")
+
+    if not _binding_revision_is_stored(conn, revision.from_endpoint):
+        reasons.append("from_binding_revision_not_stored")
+    if not _binding_revision_is_stored(conn, revision.to_endpoint):
+        reasons.append("to_binding_revision_not_stored")
+
+    if not revision.cardinality.known:
+        reasons.append("directional_cardinality_unknown")
+    elif revision.cardinality.value in _EXECUTION_BLOCKING_CARDINALITIES:
+        reasons.append("directional_cardinality_fans_out")
+    if revision.has_unresolved_requirements:
+        reasons.append("realization_has_unresolved_requirements")
+
+    if revision.dependency_snapshot_id != bridge_dependency_snapshot_id(
+        realization.dependencies
+    ):
+        reasons.append("dependency_snapshot_mismatch")
+
+    required_binding_dependencies = {
+        (
+            endpoint.physical_binding.binding_id,
+            endpoint.binding_revision_id,
+        )
+        for endpoint in (revision.from_endpoint, revision.to_endpoint)
+        if endpoint.physical_binding is not None
+    }
+    actual_binding_dependencies = {
+        (dependency.key, dependency.revision)
+        for dependency in realization.dependencies
+        if dependency.kind == "physical_binding"
+    }
+    if not required_binding_dependencies <= actual_binding_dependencies:
+        reasons.append("physical_binding_dependency_missing")
+
+    exact_evidence = {
+        ref.evidence_id
+        for ref in revision.evidence_refs
+        if ref.kind is EvidenceKind.EXACT_PROFILE
+    }
+    current_exact = _current_exact_evidence_ids(
+        conn, revision, frozenset(exact_evidence))
+    if not exact_evidence:
+        reasons.append("exact_relationship_evidence_missing")
+    elif not exact_evidence & current_exact:
+        reasons.append("exact_relationship_evidence_not_current")
+    evidence_dependencies = {
+        (dependency.key, dependency.revision)
+        for dependency in realization.dependencies
+        if dependency.kind == "relationship_observation"
+    }
+    required_evidence_dependencies = {
+        (ref.evidence_id, ref.content_hash or ref.evidence_id)
+        for ref in revision.evidence_refs
+        if ref.kind is EvidenceKind.EXACT_PROFILE
+    }
+    if not required_evidence_dependencies <= evidence_dependencies:
+        reasons.append("relationship_evidence_dependency_missing")
+
+    bridge_dependencies = {
+        dependency.revision
+        for dependency in realization.dependencies
+        if dependency.kind == "bridge_fact"
+        and dependency.key == revision.bridge_fact_key
+    }
+    if (
+        link_state.overlay_head_event_id is None
+        or not bridge_dependencies
+    ):
+        reasons.append("bridge_dependency_missing")
+    elif link_state.overlay_head_event_id not in bridge_dependencies:
+        reasons.append("bridge_dependency_revision_changed")
+
+    return BridgeExecutionAssessmentV1(
+        realization=realization,
+        executable=not reasons,
+        reason_codes=tuple(sorted(set(reasons))),
+    )
+
+
+def executable_bridge_realizations(
+    conn,
+    *,
+    purpose: str,
+    environment: str,
+    bridge_fact_key: str | None = None,
+) -> tuple[CurrentBridgeRealizationV1, ...]:
+    """Production reader: only current, deterministically safe directional realizations."""
+    assessments = (
+        revalidate_bridge_realization(
+            conn,
+            realization,
+            purpose=purpose,
+            environment=environment,
+            execution_tier=ExecutionTier.PRODUCTION,
+        )
+        for realization in load_current_bridge_realizations(
+            conn, bridge_fact_key=bridge_fact_key)
+    )
+    return tuple(
+        assessment.realization
+        for assessment in assessments
+        if assessment.executable
+    )
 
 
 def demote_realizations_for_bridge(

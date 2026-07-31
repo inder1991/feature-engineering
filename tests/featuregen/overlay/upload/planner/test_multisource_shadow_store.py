@@ -238,7 +238,7 @@ def test_crossings_persist_and_exclude_confirmed_event_id_from_hash(db) -> None:
     is a conflict."""
     ms.write_manifest(db, _manifest())
     crossing = {"kind": "governed_bridge", "catalog": "c2", "table": "public.acc",
-                "bridge_fact_key": "gbfk_1", "realization_ref": None, "authority": "verified",
+                "bridge_fact_key": "gbfk_1", "realization_ref": None, "authority": "provisional",
                 "confirmed_event_id": "evt-gbfk_1"}
     base = _operand()
     ms.write_intent_result(db, _intent(), [_candidate()], [replace(base, crossings=[crossing])])
@@ -256,7 +256,7 @@ def test_crossings_persist_and_exclude_confirmed_event_id_from_hash(db) -> None:
     with pytest.raises(DivergentDuplicateError):
         ms.write_intent_result(
             db, _intent(), [_candidate()],
-            [replace(base, crossings=[{**crossing, "authority": "unverified"}])])
+            [replace(base, crossings=[{**crossing, "authority": "unknown"}])])
 
 
 # ── two-phase capture (mirror 0999 write_run_and_plans) ──

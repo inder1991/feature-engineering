@@ -89,6 +89,7 @@ _EDGE_PREFIX = "joinedge:"
 # ``joinedge:`` pattern: RESOLVES at confirm (no poison, promotable) and CHANGES on revocation/drift.
 _BRIDGEFACT_PREFIX = "bridgefact:"
 _REALIZATION_PREFIX = "realization:"
+_BRIDGE_REALIZATION_PREFIX = "bridge-realization-v2:"
 
 
 def join_edge_marker(from_ref: str, to_ref: str) -> str:
@@ -126,6 +127,24 @@ def realization_marker(realization_id: str) -> str:
     changed / ``MISSING`` signature ⟶ drift. ``realization_id`` is ``{catalog}:{from_key}->{to_key}`` (the
     deriver's id); it is hashed verbatim as the item's identity and parsed for the state lookup."""
     return f"{_REALIZATION_PREFIX}{realization_id}"
+
+
+def bridge_realization_marker(
+    realization_revision_id: str,
+    dependency_snapshot_id: str,
+) -> str:
+    """Dependency marker for the exact directional execution-safety decision.
+
+    Existing ``bridgefact:`` rows remain readable and immutable. New contract versions use this
+    marker, so review-status changes cannot invalidate execution while lifecycle, deterministic
+    evidence, bindings, cardinality and the dependency snapshot remain load-bearing.
+    """
+    if not realization_revision_id.strip() or not dependency_snapshot_id.strip():
+        raise ValueError("bridge realization dependency requires revision and snapshot identities")
+    return (
+        f"{_BRIDGE_REALIZATION_PREFIX}"
+        f"{realization_revision_id}|{dependency_snapshot_id}"
+    )
 
 # The graph_node VALUE columns that make an item load-bearing. Deliberately EXCLUDES the volatile
 # ``*_decision_id`` link columns (a benign re-upload re-mints them, which would be false drift) — only
@@ -168,6 +187,8 @@ def _catalog_state_signature(conn: DbConn, catalog_source: str, object_ref: str 
         return _join_edge_signature(conn, catalog_source, object_ref)
     if object_ref.startswith(_BRIDGEFACT_PREFIX):
         return _bridge_fact_signature(conn, object_ref)
+    if object_ref.startswith(_BRIDGE_REALIZATION_PREFIX):
+        return _bridge_realization_signature(conn, object_ref)
     if object_ref.startswith(_REALIZATION_PREFIX):
         return _realization_signature(conn, catalog_source, object_ref)
     with conn.cursor(row_factory=dict_row) as cur:
@@ -276,6 +297,53 @@ def _unreviewed_bridge_signature(lifecycle):
     left, right = value.get("left_ref") or {}, value.get("right_ref") or {}
     return {"bridge": True, "status": lifecycle.status, "entity_id": value.get("entity_id"),
             "left": _endpoint_str(left), "right": _endpoint_str(right)}
+
+
+def _bridge_realization_signature(conn: DbConn, marker: str):
+    """Current deterministic execution state for one pinned directional revision, or ``MISSING``.
+
+    The typed executable reader is the authority. It rechecks generic-link availability, lifecycle,
+    current pointer, binding revisions, exact relationship evidence and the dependency snapshot.
+    Human review is deliberately absent from both the predicate and returned signature.
+    """
+    from featuregen.overlay.upload.bridge_store import (
+        load_current_bridge_realizations,
+        revalidate_bridge_realization,
+    )
+
+    body = marker[len(_BRIDGE_REALIZATION_PREFIX):]
+    revision_id, separator, dependency_snapshot_id = body.partition("|")
+    if not separator or not revision_id or not dependency_snapshot_id:
+        return _MISSING
+    matches = tuple(
+        realization
+        for realization in load_current_bridge_realizations(conn)
+        if realization.revision.realization_revision_id == revision_id
+    )
+    if len(matches) != 1:
+        return _MISSING
+    realization = matches[0]
+    revision = realization.revision
+    if revision.dependency_snapshot_id != dependency_snapshot_id:
+        return _MISSING
+    purpose = revision.applicability_scope.purposes[0]
+    assessment = revalidate_bridge_realization(
+        conn,
+        realization,
+        purpose=purpose,
+        environment=revision.applicability_scope.environment,
+        execution_tier=revision.applicability_scope.execution_tier,
+    )
+    if not assessment.executable:
+        return _MISSING
+    return {
+        "directional_realization": True,
+        "realization_revision_id": revision_id,
+        "dependency_snapshot_id": dependency_snapshot_id,
+        "cardinality": revision.cardinality.identity_payload(),
+        "safety_status": realization.current.safety_status.value,
+        "lifecycle": realization.current.lifecycle.value,
+    }
 
 
 def _endpoint_str(ref: Mapping) -> str:
@@ -420,10 +488,11 @@ def _already_invalidated(conn: DbConn, contract_id: str, ref: ChangedRef) -> boo
     last re-clearing (ASSESSED / EXTERNAL_PASSED) event. An all-time dedup would wrongly suppress a
     GENUINELY RECURRED drift: after INVALIDATED → re-clear (a new pass/assessment moves the epoch) →
     the SAME drift recurs, that recurrence must re-invalidate (defense-in-depth for the read gate)."""
-    epoch = conn.execute(
+    epoch_row = conn.execute(
         "SELECT coalesce(max(seq), 0) FROM feature_contract_validation_event "
         "WHERE contract_id = %s AND event_type IN ('ASSESSED', 'EXTERNAL_PASSED')",
-        (contract_id,)).fetchone()[0]
+        (contract_id,)).fetchone()
+    epoch = 0 if epoch_row is None else epoch_row[0]
     return conn.execute(
         "SELECT 1 FROM feature_contract_validation_event "
         "WHERE contract_id = %s AND event_type = 'INVALIDATED' AND seq > %s "

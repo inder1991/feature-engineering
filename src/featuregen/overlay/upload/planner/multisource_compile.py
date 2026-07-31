@@ -272,11 +272,10 @@ def confirmed_event_ids_for_audit(
     return tuple((row[0], row[1]) for row in rows)
 
 
-# The persisted authority marker for a governed VERIFIED bridge crossing (there is no RealizationAuthority
-# analogue for a bridge — it is a VERIFIED entity_bridge fact); a realization crossing carries its own
-# RealizationAuthority value (approved_join / declared_join / inferred_join).
-_VERIFIED_BRIDGE_AUTHORITY = "verified"
-_UNVERIFIED_BRIDGE_AUTHORITY = "unverified"
+# Human confirmation is audit metadata, never execution authority.  A bridge crossing is executable
+# only when the path carries the exact deterministic directional realization revision.
+_EXECUTABLE_BRIDGE_AUTHORITY = "deterministically_validated"
+_PROVISIONAL_BRIDGE_AUTHORITY = "provisional"
 
 
 def crossing_audit_by_slot(
@@ -290,10 +289,10 @@ def crossing_audit_by_slot(
     governed authority). ``semantic_rollup`` / ``direct_catalog`` segments are announcements, not physical
     crossings, and contribute no record.
 
-    ``authority`` is derived from the segment identity: a realization's ``RealizationAuthority`` (looked
-    up on ``ctx.realizations_by_catalog``), and — for a bridge — ``verified`` iff the fact_key is present
-    in the ``confirmed_event_ids_for_audit`` re-query (which returns only VERIFIED bridges), else
-    ``unverified`` (fail-closed, so a bridge revoked before the re-query reads as non-governed).
+    ``authority`` is derived from the segment identity: a realization's ``RealizationAuthority``
+    (looked up on ``ctx.realizations_by_catalog``), and — for a bridge — deterministic only when the
+    exact immutable directional realization revision is attached. Human confirmation remains in
+    ``confirmed_event_id`` for accountability and never changes this authority.
 
     ``confirmed_event_id`` is AUDIT-ONLY: it is re-queried here (never widening ``active_bridges``) and is
     a per-EVENT id, so the store EXCLUDES it from the divergent-duplicate ``payload_hash`` (which hashes
@@ -320,25 +319,39 @@ def crossing_audit_by_slot(
                 })
             elif seg.segment_kind is SegmentKind.governed_bridge:
                 bfk = seg.bridge_fact_key
-                bridge = next(
-                    (b for b in ctx.active_bridges if b.fact_key == bfk), None)
-                table = ""
-                if bridge is not None:
-                    for cat, col_ref in (
-                            (bridge.left_catalog_source, bridge.left_object_ref),
-                            (bridge.right_catalog_source, bridge.right_object_ref)):
-                        if cat == seg.catalog_source:
-                            table = table_of(col_ref)
-                            break
-                governed = bfk is not None and bfk in event_ids
+                revision = seg.bridge_realization_revision
+                table = (
+                    table_of(seg.bridge_to_object_ref)
+                    if seg.bridge_to_object_ref is not None
+                    else ""
+                )
                 records.append({
                     "kind": seg.segment_kind.value,
                     "catalog": seg.catalog_source,
                     "table": table,
                     "bridge_fact_key": bfk,
-                    "realization_ref": None,
-                    "authority": (_VERIFIED_BRIDGE_AUTHORITY if governed
-                                  else _UNVERIFIED_BRIDGE_AUTHORITY),
+                    "realization_ref": (
+                        revision.realization_id if revision is not None else None),
+                    "realization_revision_id": (
+                        revision.realization_revision_id
+                        if revision is not None
+                        else None
+                    ),
+                    "dependency_snapshot_id": (
+                        revision.dependency_snapshot_id
+                        if revision is not None
+                        else None
+                    ),
+                    "evidence_revision_ids": (
+                        [ref.evidence_id for ref in revision.evidence_refs]
+                        if revision is not None
+                        else []
+                    ),
+                    "authority": (
+                        _EXECUTABLE_BRIDGE_AUTHORITY
+                        if revision is not None
+                        else _PROVISIONAL_BRIDGE_AUTHORITY
+                    ),
                     "confirmed_event_id": event_ids.get(bfk) if bfk is not None else None,
                 })
         by_slot[path.slot_id] = tuple(records)

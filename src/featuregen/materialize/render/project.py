@@ -69,6 +69,7 @@ from featuregen.materialize.identity import (
 from featuregen.materialize.inputs import PhysicalInputRequirement
 from featuregen.materialize.inventory import EngineVersions
 from featuregen.materialize.ir import AuthorizedCompilation
+from featuregen.materialize.joins import CrossCatalogJoinStepV1
 from featuregen.materialize.publish import PublisherSelection
 from featuregen.materialize.render import RENDERER_VERSION
 from featuregen.materialize.render._yaml import yaml_scalar
@@ -151,6 +152,7 @@ class ProjectDatasets:
     """
 
     raw: Mapping[str, str]
+    join_gates: Mapping[str, str]
     spine: str
     projections: Mapping[tuple[str, str], str]
     staging: Mapping[str, str]
@@ -161,8 +163,9 @@ class ProjectDatasets:
     def names(self) -> tuple[str, ...]:
         """Every declared dataset name, sorted."""
         return tuple(sorted({
-            *self.raw.values(), self.spine, *self.projections.values(), *self.staging.values(),
-            *self.manifests.values(), self.assembled, self.published}))
+            *self.raw.values(), *self.join_gates.values(), self.spine,
+            *self.projections.values(), *self.staging.values(), *self.manifests.values(),
+            self.assembled, self.published}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,6 +330,7 @@ def project_datasets(
         raw.setdefault(key, f"raw_{slug(requirement.schema)}__{slug(requirement.table)}")
 
     projections: dict[tuple[str, str], str] = {}
+    join_gates: dict[str, str] = {}
     staging: dict[str, str] = {}
     manifests: dict[str, str] = {}
     for ir in sorted(authorized.irs, key=lambda compiled: compiled.feature_name):
@@ -336,9 +340,16 @@ def project_datasets(
         for expression in sorted(ir.expressions, key=lambda e: e.expr_path):
             projections[(column, expression.expr_path)] = (
                 f"intermediate_{column}__{slug(expression.expr_path)}")
+            for step in expression.join_plan.steps:
+                if isinstance(step, CrossCatalogJoinStepV1):
+                    join_gates.setdefault(
+                        step.realization_revision_id,
+                        f"intermediate_bridge_{slug(step.realization_revision_id[:16])}",
+                    )
 
     datasets = ProjectDatasets(
         raw=dict(sorted(raw.items())),
+        join_gates=dict(sorted(join_gates.items())),
         spine="primary_spine",
         projections=dict(sorted(projections.items())),
         staging=dict(sorted(staging.items())),
@@ -350,8 +361,9 @@ def project_datasets(
         published=published_dataset_name(plan))
 
     declared = [
-        *sorted(datasets.raw.values()), datasets.spine, *sorted(datasets.projections.values()),
-        *sorted(datasets.staging.values()), *sorted(datasets.manifests.values()),
+        *sorted(datasets.raw.values()), *sorted(datasets.join_gates.values()), datasets.spine,
+        *sorted(datasets.projections.values()), *sorted(datasets.staging.values()),
+        *sorted(datasets.manifests.values()),
         datasets.assembled, datasets.published]
     _unique(declared, "the generated catalog")
     return datasets
@@ -488,6 +500,15 @@ def _catalog_entries(
         entries.append(_hive_entry(
             name, DatasetLayer.RAW, database=schema, table=table,
             comment=f"governed source, read-only: {physical}"))
+    for revision_id, name in sorted(datasets.join_gates.items()):
+        entries.append(_parquet_entry(
+            name,
+            DatasetLayer.INTERMEDIATE,
+            path=f"intermediate/bridge/{revision_id}",
+            comment=(
+                "predicate-scoped target after the pre-computation fan-out gate for directional "
+                f"realization {revision_id}"),
+        ))
     for (column, expr_path), name in sorted(datasets.projections.items()):
         entries.append(_parquet_entry(
             name, DatasetLayer.INTERMEDIATE, path=f"intermediate/{column}/{slug(expr_path)}",
@@ -541,7 +562,9 @@ def _check_wiring(datasets: ProjectDatasets, nodes: Sequence[RenderedNode]) -> N
        a §9 gate failure discovered a run later;
     5. every raw dataset is read — a catalog entry nothing reads is a governed source the project
        claims and does not use, which is the same false statement in the other direction;
-    6. every input is a declared dataset or a parameter reference.
+    6. every input is a declared dataset or a parameter reference;
+    7. every bridge-gate output is consumed downstream. Merely running a sibling validation node
+       beside a projection leaves the computation free to read the unchecked raw target.
 
     Node names and function names are also required to be unique: Kedro rejects duplicate node
     names, and two functions of one name in ``nodes.py`` would mean the second silently replaced the
@@ -593,6 +616,12 @@ def _check_wiring(datasets: ProjectDatasets, nodes: Sequence[RenderedNode]) -> N
             f"{len(unread)} governed source table(s) are read by no node ({', '.join(unread)}): the "
             f"catalog would state a read this project does not perform, which is the same false "
             f"claim as a read it performs without declaring")
+    bypassed_bridge_gates = sorted(set(datasets.join_gates.values()) - read)
+    if bypassed_bridge_gates:
+        raise ValueError(
+            "bridge pre-computation gate output(s) are not consumed by a downstream node "
+            f"({', '.join(bypassed_bridge_gates)}): the projection would still read the unchecked "
+            "raw target, so the gate could fail beside—not before—the computation")
     if datasets.published not in written:
         raise ValueError(
             f"no node writes the publication target {datasets.published!r}: a project that computes "
@@ -693,8 +722,8 @@ def _render_pipeline_registry(package: str) -> str:
         f'    return {{"{PIPELINE_NAME}": {PIPELINE_NAME}, "__default__": {PIPELINE_NAME}}}\n')
 
 
-def _render_hooks(package: str) -> str:
-    required = "\n".join(f"        {name!r}," for name in REQUIRED_RUN_PARAMETERS)
+def _render_hooks(package: str, required_parameters: tuple[str, ...]) -> str:
+    required = "\n".join(f"        {name!r}," for name in required_parameters)
     return (
         _python_header("The two project hooks §7's launch story depends on.", package=package)
         + "from __future__ import annotations\n"
@@ -851,8 +880,8 @@ def _render_catalog(entries: Sequence[_CatalogEntry]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _render_parameters() -> str:
-    required = "\n".join(f"#   - {name}" for name in REQUIRED_RUN_PARAMETERS)
+def _render_parameters(required_parameters: tuple[str, ...]) -> str:
+    required = "\n".join(f"#   - {name}" for name in required_parameters)
     return (
         f"# {_DO_NOT_EDIT}\n"
         "#\n"
@@ -973,12 +1002,13 @@ def _render_readme(
     environment_id: str,
     engine_versions: EngineVersions,
     published_target: str,
+    required_parameters: tuple[str, ...],
 ) -> str:
     features = "\n".join(f"| `{feature.column_name}` | `{feature.physical_type.sql_type}` | "
                          f"`{feature.ir_hash}` |" for feature in plan.features)
     sources = "\n".join(f"| `{physical}` | `{name}` |"
                         for physical, name in sorted(datasets.raw.items()))
-    parameters = "\n".join(f"- `{name}`" for name in REQUIRED_RUN_PARAMETERS)
+    parameters = "\n".join(f"- `{name}`" for name in required_parameters)
     return (
         f"# `{published_target}`\n"
         "\n"
@@ -1168,6 +1198,16 @@ def render_project(
         raise ValueError(
             "render_project was given no nodes: a project with an empty pipeline builds, imports "
             "and runs, and publishes nothing — the one failure mode a parse check cannot see")
+    node_parameters = {
+        name.removeprefix("params:")
+        for node in supplied
+        for name in node.inputs
+        if name.startswith("params:")
+    }
+    required_parameters = tuple(sorted({
+        *REQUIRED_RUN_PARAMETERS,
+        *node_parameters,
+    }))
 
     compilation = build_compilation_identity(authorized.irs, plan)
     datasets = project_datasets(authorized, plan, spine_input=spine_input)
@@ -1184,15 +1224,16 @@ def render_project(
         "requirements.lock": _render_requirements(engine_versions),
         "README.md": _render_readme(
             plan, compilation, datasets, package=package, environment_id=environment_id,
-            engine_versions=engine_versions, published_target=published_target),
+            engine_versions=engine_versions, published_target=published_target,
+            required_parameters=required_parameters),
         "conf/base/catalog.yml": _render_catalog(entries),
-        "conf/base/parameters.yml": _render_parameters(),
+        "conf/base/parameters.yml": _render_parameters(required_parameters),
         "conf/base/logging.yml": _render_logging(),
         "conf/base/spark.yml": _render_spark(package),
         f"{source_root}/__init__.py": _render_package_init(compilation, package=package),
         f"{source_root}/settings.py": _render_settings(package),
         f"{source_root}/pipeline_registry.py": _render_pipeline_registry(package),
-        f"{source_root}/hooks.py": _render_hooks(package),
+        f"{source_root}/hooks.py": _render_hooks(package, required_parameters),
         f"{source_root}/pipelines/__init__.py": _render_pipelines_init(package),
         f"{source_root}/pipelines/{PIPELINE_NAME}/__init__.py": _render_materialize_init(package),
         f"{source_root}/pipelines/{PIPELINE_NAME}/nodes.py": _render_nodes(

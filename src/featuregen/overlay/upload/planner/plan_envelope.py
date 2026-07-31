@@ -40,6 +40,7 @@ class PlanEnvelopeV1:
     # physical_plan_id / declaration id. Additive (default None): it is NOT part of any id material,
     # so it never moves an id; pre-H3c snapshots deserialize to None (behaviour-neutral).
     target_entity: str | None = None
+    bridge_realization_dependencies: tuple[dict[str, str], ...] = ()
 
     def to_json(self) -> dict:
         return {
@@ -51,7 +52,10 @@ class PlanEnvelopeV1:
             "catalog_fingerprint": dict(self.catalog_fingerprint),
             "compiler_version": dict(self.compiler_version),
             "input_stamps": [dict(s) for s in self.input_stamps],
-            "target_entity": self.target_entity}
+            "target_entity": self.target_entity,
+            "bridge_realization_dependencies": [
+                dict(item) for item in self.bridge_realization_dependencies],
+        }
 
     @staticmethod
     def from_json(d: dict) -> PlanEnvelopeV1:
@@ -65,12 +69,22 @@ class PlanEnvelopeV1:
             catalog_fingerprint=dict(d.get("catalog_fingerprint", {})),
             compiler_version=dict(d.get("compiler_version", {})),
             input_stamps=tuple(dict(s) for s in d.get("input_stamps", [])),
-            target_entity=d.get("target_entity"))
+            target_entity=d.get("target_entity"),
+            bridge_realization_dependencies=tuple(
+                dict(item) for item in d.get("bridge_realization_dependencies", [])),
+        )
 
 
 def _ordered_path(plan: BindingPlanV1) -> tuple[str, ...]:
-    return tuple(f"{seg.catalog_source}:{seg.segment_kind}:{seg.realization_ref or seg.bridge_fact_key or ''}"
-                 for seg in plan.path_segments)
+    def identity(segment) -> str:
+        if segment.bridge_realization_revision is not None:
+            return segment.bridge_realization_revision.realization_revision_id
+        return segment.realization_ref or segment.bridge_fact_key or ""
+
+    return tuple(
+        f"{seg.catalog_source}:{seg.segment_kind}:{identity(seg)}"
+        for seg in plan.path_segments
+    )
 
 
 def plan_envelope_from_result(result: BindingPlanningResultV1) -> PlanEnvelopeV1 | None:
@@ -95,7 +109,18 @@ def plan_envelope_from_result(result: BindingPlanningResultV1) -> PlanEnvelopeV1
                             "compiler_input_fingerprint": s.compiler_input_fingerprint,
                             "head_seq": s.head_seq, "projection_checkpoint": s.projection_checkpoint}
                            for s in stamps),
-        target_entity=result.target_entity)   # H3c: the grain the confirm-time rebuild plans toward
+        target_entity=result.target_entity,   # H3c: the grain the confirm-time rebuild plans toward
+        bridge_realization_dependencies=tuple(
+            {
+                "realization_revision_id":
+                    segment.bridge_realization_revision.realization_revision_id,
+                "dependency_snapshot_id":
+                    segment.bridge_realization_revision.dependency_snapshot_id,
+            }
+            for segment in plan.path_segments
+            if segment.bridge_realization_revision is not None
+        ),
+    )
 
 
 def recheck_plan_freshness(conn, envelope: PlanEnvelopeV1,
