@@ -940,7 +940,13 @@ def _render_spark(package: str) -> str:
         "# decided HOW an overwrite behaves would be a policy for an operation this project may not\n"
         "# perform.\n"
         f"spark.app.name: {_quote(package)}\n"
-        'spark.sql.session.timeZone: "UTC"\n')
+        'spark.sql.session.timeZone: "UTC"\n'
+        "#\n"
+        "# ANSI mode changes what the emitted gates observe: the OVERFLOW_VIOLATION gate\n"
+        "# reads a NULL from an out-of-range cast (legacy semantics); under ANSI the cast\n"
+        "# raises a raw SparkArithmeticException outside the closed gate vocabulary. The\n"
+        "# governed semantics therefore must not depend on a cluster default.\n"
+        'spark.sql.ansi.enabled: "false"\n')
 
 
 def _render_pyproject(package: str, *, engine_versions: EngineVersions) -> str:

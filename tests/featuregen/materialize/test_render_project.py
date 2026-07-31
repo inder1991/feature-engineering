@@ -522,6 +522,15 @@ def test_the_hook_reads_both_kedro_run_param_keys(project: SealedProject) -> Non
     assert 'get("extra_params")' in hooks
 
 
+def test_spark_yml_pins_ansi_off(project: SealedProject) -> None:
+    """The emitted gates observe LEGACY cast semantics: the OVERFLOW_VIOLATION gate reads the NULL
+    an out-of-range cast produces, and under ANSI mode (pyspark 4.x's default) that cast raises a
+    raw SparkArithmeticException outside the closed gate vocabulary — so the artifact pins the
+    setting rather than inheriting whichever default the cluster runs."""
+    spark_yml = project.files["conf/base/spark.yml"]
+    assert 'spark.sql.ansi.enabled: "false"' in spark_yml
+
+
 def test_the_readme_states_the_kedro_run_versus_spark_submit_distinction(
         project: SealedProject) -> None:
     """§7: `kedro run` inside a Spark session configured by a Kedro hook, with `spark-submit` used
