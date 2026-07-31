@@ -26,7 +26,7 @@ from featuregen.overlay.upload._headers import _ALIASES
 # The capability-profile schema version evidence writers stamp on profile-derived evidence
 # (Delivery B): bump when a profile's field sets (or the strength they confer) change, so stored
 # evidence stays traceable to the capability rules that produced it.
-SOURCE_CAPABILITY_PROFILE_VERSION = "scp-v1"
+SOURCE_CAPABILITY_PROFILE_VERSION = "scp-v2"   # v2: glossary attests the four Task-3 Step-6b fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +65,11 @@ def strength_for(profile: SourceCapabilityProfile, field_name: str) -> Assertion
 
 FTR_GLOSSARY_PROFILE = SourceCapabilityProfile(
     source_type="ftr_glossary",
-    attested_fields=frozenset({"definition", "business_term", "bian_path", "fibo_path"}),
+    # scp-v2 (richness Task 3 Step 6b): term_type / process_path (business processes L1–L3,
+    # joined) / related_terms / physical_fqn are curated file facts the glossary VOUCHES for —
+    # previously captured by the reader but never durably persisted (prompt-only).
+    attested_fields=frozenset({"definition", "business_term", "bian_path", "fibo_path",
+                               "term_type", "process_path", "related_terms", "physical_fqn"}),
     proposed_fields=frozenset({"domain", "sample_profile", "sensitivity"}),
     structural_fields=frozenset(),
 )

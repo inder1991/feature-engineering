@@ -893,7 +893,13 @@ _TECHNICAL_MATERIAL_FIELDS = frozenset(
 # these against the fields the NEW upload actually provides: a field the new upload NO LONGER asserts
 # (present->absent) must have its prior ACTIVE rows STALED, else a dropped value stays load-bearing
 # (Task-10 Important-3). Kept in sync with `_write_glossary_source_evidence` / `_parser_evidence`.
-_SOURCE_FIELDS: tuple[str, ...] = ("definition", "domain", "business_term", "bian_path", "fibo_path")
+_SOURCE_FIELDS: tuple[str, ...] = (
+    "definition", "domain", "business_term", "bian_path", "fibo_path",
+    # Richness Task 3 Step 6b — the four previously-LOST glossary fields (captured by the A1
+    # reader, but persisted only inside llm_call payloads until now): the term's closed-vocab
+    # class, the joined business-process path (L1–L3), the related terms (tuple, joined for
+    # evidence) and the raw physical FQN as the file declared it.
+    "term_type", "process_path", "related_terms", "physical_fqn")
 # The SOURCE fields a TECHNICAL CSV declares per column (Delivery B item 8) — the technical mirror of
 # `_SOURCE_FIELDS`, reconciled present->absent the same way. Kept in sync with
 # `_write_technical_source_evidence` and TECHNICAL_CSV_PROFILE.attested_fields.
@@ -1164,7 +1170,13 @@ def _write_glossary_source_evidence(
     present: set[str] = set()
     for field_name, value in (("definition", rec.definition), ("domain", rec.domain),
                               ("business_term", rec.term_name), ("bian_path", rec.bian_path),
-                              ("fibo_path", rec.fibo_path)):
+                              ("fibo_path", rec.fibo_path),
+                              # Step 6b: the four lost fields, durably persisted. related_terms
+                              # is a tuple — joined for evidence (empty tuple -> "" -> absent).
+                              ("term_type", rec.term_type),
+                              ("process_path", rec.process_path),
+                              ("related_terms", ", ".join(rec.related_terms)),
+                              ("physical_fqn", rec.physical_fqn)):
         if not value:
             continue
         present.add(field_name)

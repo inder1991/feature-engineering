@@ -210,3 +210,19 @@ def test_off_vocab_as_of_basis_drops_availability_only_via_real_path(db):
     assert out["grain"] == {"columns": ["id"], "is_unique": True}
     assert out["availability_time"] is None
     assert _find(disp, "availability_time")["reason"] == "basis_not_allowed"
+
+
+def test_a_dimension_table_with_a_customer_grain_proposes_primary_entity_customer():
+    """Richness Task 3 Step 6 regression: `customer` IS in the entity registry, so a dimension
+    table's `primary_entity=customer` proposal RESOLVES (accepted), never `entity_not_registered`
+    — the exact live shape of `bo_cib_customer` (dimension, grain [business_dt, cust_num])."""
+    accept, disp = _accept(["business_dt", "cust_num"])
+    raw = json.dumps({"grain_columns": ["business_dt", "cust_num"], "as_of_column": None,
+                      "as_of_basis": None, "table_role": "dimension",
+                      "primary_entity": "customer", "event_or_snapshot": "snapshot"})
+    out, verdict = accept(raw, "t")
+    assert verdict == "valid"
+    parsed = json.loads(out)
+    assert parsed["primary_entity"] == "customer"
+    assert parsed["table_role"] == "dimension"
+    assert _find(disp, "primary_entity")["status"] == "accepted"

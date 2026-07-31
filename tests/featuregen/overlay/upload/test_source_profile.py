@@ -47,8 +47,12 @@ def test_attests_covers_attested_and_structural_but_not_proposed():
 
 def test_profile_shapes_match_spec_u1():
     assert FTR_GLOSSARY_PROFILE.source_type == "ftr_glossary"
+    # Richness Task 3 Step 6b: the four previously-lost glossary fields (term_type, the joined
+    # business-process path, related terms, the raw physical FQN) are curated file facts the
+    # glossary VOUCHES for — attested, exactly like business_term/bian_path.
     assert FTR_GLOSSARY_PROFILE.attested_fields == frozenset(
-        {"definition", "business_term", "bian_path", "fibo_path"})
+        {"definition", "business_term", "bian_path", "fibo_path",
+         "term_type", "process_path", "related_terms", "physical_fqn"})
     assert FTR_GLOSSARY_PROFILE.proposed_fields == frozenset(
         {"domain", "sample_profile", "sensitivity"})
     assert FTR_GLOSSARY_PROFILE.structural_fields == frozenset()
