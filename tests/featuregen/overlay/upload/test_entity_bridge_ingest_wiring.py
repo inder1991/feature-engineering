@@ -27,6 +27,7 @@ from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.bridge_propose import propose_bridge
+from featuregen.overlay.upload.bridge_store import withdraw_missing_candidate_assessments
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
@@ -202,6 +203,10 @@ def test_reingest_withdraws_suppressed_candidates_and_reappearance_reactivates_t
     _trigger(db)
     candidate_id = derive_bridge_candidates(db)[0].candidate_id
     assert len(cross_catalog_links(db)) == 1
+    original_task = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()
+    assert original_task is not None
 
     db.execute(
         "UPDATE graph_node SET concept='unrelated_identifier' "
@@ -229,6 +234,14 @@ def test_reingest_withdraws_suppressed_candidates_and_reappearance_reactivates_t
     assert stage.detail is not None
     assert stage.detail["withdrawn_count"] == 1
     assert stage.detail["withdrawn_realization_count"] == 0
+    assert stage.detail["superseded_review_task_count"] == 1
+    assert db.execute(
+        "SELECT status FROM human_tasks WHERE task_id=%s",
+        (original_task[0],),
+    ).fetchone() == ("superseded",)
+    assert db.execute(
+        "SELECT count(*) FROM human_tasks WHERE status='open'"
+    ).fetchone()[0] == 0
 
     db.execute(
         "UPDATE graph_node SET concept='customer_id' "
@@ -242,6 +255,38 @@ def test_reingest_withdraws_suppressed_candidates_and_reappearance_reactivates_t
         (candidate_id,),
     ).fetchone()
     assert lifecycle == ("active",)
+    new_task = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()
+    assert new_task is not None
+    assert new_task[0] != original_task[0]
+
+
+def test_reconciliation_supersedes_tasks_left_by_an_already_withdrawn_pointer(
+    db, monkeypatch
+):
+    """Deploy-time repair: BUG 3 shipped before BUG 4, so a pointer can already be withdrawn while
+    its old task is still open. Reconciliation must repair that state without a catalog re-upload."""
+    monkeypatch.setenv("OVERLAY_ENTITY_BRIDGES", "1")
+    _seed_two_catalogs(db)
+    _trigger(db)
+    candidate_id = derive_bridge_candidates(db)[0].candidate_id
+    task_id = db.execute(
+        "SELECT task_id FROM human_tasks WHERE status='open'"
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE governed_candidate_current SET lifecycle='withdrawn' "
+        "WHERE candidate_id=%s",
+        (candidate_id,),
+    )
+
+    result = withdraw_missing_candidate_assessments(db, frozenset())
+
+    assert result == (0, 0, 1)
+    assert db.execute(
+        "SELECT status FROM human_tasks WHERE task_id=%s",
+        (task_id,),
+    ).fetchone() == ("superseded",)
 
 
 # ── who proposes: the SYSTEM, never the uploading human ──────────────────────────────────────────

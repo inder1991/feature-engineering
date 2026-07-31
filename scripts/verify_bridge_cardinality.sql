@@ -264,7 +264,8 @@ SELECT
     s.detail->>'truncated_pair_count' AS truncated_pair_count,
     s.detail->>'proposed' AS proposed_count,
     s.detail->>'withdrawn_count' AS withdrawn_count,
-    s.detail->>'withdrawn_realization_count' AS withdrawn_realization_count
+    s.detail->>'withdrawn_realization_count' AS withdrawn_realization_count,
+    s.detail->>'superseded_review_task_count' AS superseded_review_task_count
 FROM latest_completed r
 LEFT JOIN ingestion_run_stage s
   ON s.ingestion_run_id = r.id

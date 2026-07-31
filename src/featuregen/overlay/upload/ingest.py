@@ -460,6 +460,7 @@ class _BridgeProposalStageResult:
     proposal_error_count: int
     withdrawn_count: int
     withdrawn_realization_count: int
+    superseded_review_task_count: int
 
 
 def _propose_entity_bridges(
@@ -522,9 +523,11 @@ def _propose_entity_bridges(
                            exc_info=True)
             continue
         proposed += 1
-    withdrawn, withdrawn_realizations = withdraw_missing_candidate_assessments(
-        conn,
-        frozenset(candidate.candidate_id for candidate in derivation.candidates),
+    withdrawn, withdrawn_realizations, superseded_review_tasks = (
+        withdraw_missing_candidate_assessments(
+            conn,
+            frozenset(candidate.candidate_id for candidate in derivation.candidates),
+        )
     )
     return _BridgeProposalStageResult(
         derivation=derivation,
@@ -532,6 +535,7 @@ def _propose_entity_bridges(
         proposal_error_count=errors,
         withdrawn_count=withdrawn,
         withdrawn_realization_count=withdrawn_realizations,
+        superseded_review_task_count=superseded_review_tasks,
     )
 
 
@@ -2793,6 +2797,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 "withdrawn_count": bridge_stage.withdrawn_count,
                 "withdrawn_realization_count":
                     bridge_stage.withdrawn_realization_count,
+                "superseded_review_task_count":
+                    bridge_stage.superseded_review_task_count,
             })
             record_stage(
                 stage_recorder,

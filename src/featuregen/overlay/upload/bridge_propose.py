@@ -9,8 +9,13 @@ import json
 import logging
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from typing import cast
 
 from featuregen.contracts.envelopes import Command
+from featuregen.contracts.gates import GateTaskSpec
+from featuregen.gates.tasks import open_task
+from featuregen.overlay.authority import resolve_authority
+from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.identity import (
@@ -40,6 +45,55 @@ logger = logging.getLogger(__name__)
 
 class BridgeProposalError(ValueError):
     """A caller supplied a candidate that no longer matches the governed catalog."""
+
+
+def _ensure_current_review_task(conn, ref: EntityBridgeRef, key: str, state, actor) -> None:
+    """Restore optional review when a withdrawn candidate becomes current again.
+
+    A first proposal already has an open task, making the common path an indexed no-op. Withdrawal
+    supersedes the obsolete task; a later re-derivation reopens accountability without creating a
+    second proposal event or making human review an availability/execution gate.
+    """
+    if state.status not in {"DRAFT", "STALE", "REVERIFY"}:
+        return
+    if conn.execute(
+        "SELECT 1 FROM human_tasks WHERE fact_key=%s AND status='open' LIMIT 1",
+        (key,),
+    ).fetchone() is not None:
+        return
+    authority = resolve_authority(conn, current_catalog_adapter(), ref, "entity_bridge")
+    if state.status in {"STALE", "REVERIFY"}:
+        if state.confirmed_event_id is None:
+            return
+        from featuregen.overlay.reverify_tasks import open_reverify_task
+
+        open_reverify_task(
+            conn,
+            fact_key=key,
+            fact_type="entity_bridge",
+            target_confirmed_event_id=state.confirmed_event_id,
+            authority=authority,
+            actor=actor,
+        )
+        return
+    if state.draft_event_id is None:
+        return
+    for eligible in authority.task_assignees:
+        assignees = cast("dict[str, str]", dict(eligible))
+        open_task(
+            conn,
+            GateTaskSpec(
+                gate=authority.gate,
+                required_inputs=("proposed_value",),
+                eligible_assignees=assignees,
+                allowed_responses=("confirm", "reject"),
+                fact_key=key,
+                draft_event_id=state.draft_event_id,
+                target_event_id=state.draft_event_id,
+                evidence_ref=state.evidence_ref,
+            ),
+            actor,
+        )
 
 
 def _object_ref_str(ref) -> str:
@@ -130,6 +184,7 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None,
     )
 
     state = fold_overlay_state(load_fact(conn, key))
+    _ensure_current_review_task(conn, ref, key, state, actor)
     proposed_event_id = state.draft_event_id
     conn.execute(
         "INSERT INTO entity_bridge_candidate_evidence ("

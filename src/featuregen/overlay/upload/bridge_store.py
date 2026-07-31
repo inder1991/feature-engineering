@@ -429,7 +429,7 @@ def record_candidate_assessment(
 def withdraw_missing_candidate_assessments(
     conn,
     retained_candidate_ids: frozenset[str],
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Withdraw active identifier-link candidates absent from one complete global derivation.
 
     The immutable identity/revision rows and generic overlay event stream stay as history.  Only the
@@ -450,6 +450,9 @@ def withdraw_missing_candidate_assessments(
     ).fetchall()
     withdrawn = 0
     realizations = 0
+    review_tasks = 0
+    from featuregen.gates.tasks import cancel_task
+
     for candidate_id, pointer_version, bridge_fact_key in rows:
         if candidate_id in retained_candidate_ids:
             continue
@@ -465,7 +468,47 @@ def withdraw_missing_candidate_assessments(
         if bridge_fact_key:
             realizations += demote_realizations_for_bridge(
                 conn, str(bridge_fact_key), lifecycle="stale")
-    return withdrawn, realizations
+            tasks = conn.execute(
+                "SELECT task_id FROM human_tasks "
+                "WHERE fact_key=%s AND status='open' ORDER BY task_id",
+                (str(bridge_fact_key),),
+            ).fetchall()
+            for (task_id,) in tasks:
+                cancel_task(
+                    conn,
+                    task_id,
+                    reason="identifier-link candidate withdrawn",
+                    new_status="superseded",
+                )
+                review_tasks += 1
+    # Idempotent repair for pointers withdrawn by an earlier version that did not supersede their
+    # review tasks.  This also makes a deploy-time reconciliation sufficient; no catalog re-upload
+    # is needed to clean the queue.
+    withdrawn_fact_keys = conn.execute(
+        "SELECT DISTINCT coalesce(r.assessment_json->>'bridge_fact_key', "
+        "                        r.assessment_json->>'fact_key') "
+        "FROM governed_candidate_current c "
+        "JOIN governed_candidate_revision r "
+        "  ON r.candidate_revision_id=c.candidate_revision_id "
+        "WHERE c.lifecycle='withdrawn'"
+    ).fetchall()
+    for (bridge_fact_key,) in withdrawn_fact_keys:
+        if not bridge_fact_key:
+            continue
+        tasks = conn.execute(
+            "SELECT task_id FROM human_tasks "
+            "WHERE fact_key=%s AND status='open' ORDER BY task_id",
+            (str(bridge_fact_key),),
+        ).fetchall()
+        for (task_id,) in tasks:
+            cancel_task(
+                conn,
+                task_id,
+                reason="identifier-link candidate withdrawn",
+                new_status="superseded",
+            )
+            review_tasks += 1
+    return withdrawn, realizations, review_tasks
 
 
 def bridge_candidate_currentness(conn, bridge_fact_key: str) -> bool | None:
