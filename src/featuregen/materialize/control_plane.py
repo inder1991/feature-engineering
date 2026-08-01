@@ -388,9 +388,21 @@ def append_run_event(conn: DbConn, event: MaterializationRunEvent) -> None:
     """Append one run event.
 
     The event's place in the run (``seq``) is the caller's, not this function's: computing
-    ``max(seq) + 1`` here would be a read-modify-write two appenders could both win. A duplicate
-    ``(run_id, seq)`` — or a second terminal event for the run — surfaces as the database's
-    ``UniqueViolation``, which is a refusal the caller must handle rather than a silent reordering.
+    ``max(seq) + 1`` here would be a read-modify-write two appenders could both win. The database
+    guarantees three things this function deliberately does not police:
+
+    * a duplicate ``(run_id, seq)`` is refused by the primary key (``UniqueViolation``);
+    * a second terminal event for the run is refused by the one-terminal partial unique index
+      (``UniqueViolation``);
+    * any event after a terminal one, and any ``seq`` that does not extend the run's max, is
+      refused by migration 1044's ``materialization_run_event_ordered`` BEFORE INSERT trigger
+      (``RaiseException``) — either write would brick ``run_status()`` forever on a table whose
+      append-only triggers leave no repair path.
+
+    Within one session the ordering trigger fires first, so those refusals surface as its
+    ``RaiseException``; the two unique constraints remain the arbiters of the concurrent race the
+    trigger's reads cannot see. Every one is a refusal the caller must handle rather than a silent
+    reordering.
     """
     conn.execute(
         "INSERT INTO materialization_run_event (run_id, seq, generation_id, event_kind, "

@@ -345,17 +345,21 @@ def test_run_status_refuses_a_run_nobody_recorded(conn) -> None:
 
 def test_a_second_event_at_the_same_seq_is_REFUSED_by_the_database(conn) -> None:
     """`append_run_event` does not compute seq — that read-modify-write is a race two appenders can
-    both win. The unique key turns the race into a refusal the caller must handle."""
+    both win. Since 1044 the ordering trigger refuses the non-extending seq BEFORE INSERT, so this
+    is the refusal a caller sees; the unique key remains the arbiter of the true concurrent race
+    the trigger's reads cannot see (proven in test_migration_1034)."""
     record_generation(conn, _generation())
     append_run_event(conn, _event(0, RunEventKind.RUN_PREPARED))
-    with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+    with pytest.raises(psycopg.errors.RaiseException, match="does not extend"), conn.transaction():
         append_run_event(conn, _event(0, RunEventKind.RUN_SUBMITTED))
 
 
 def test_a_second_terminal_event_is_REFUSED_by_the_database(conn) -> None:
+    """Since 1044 the ordering trigger refuses ANY event after a terminal one BEFORE INSERT; the
+    one-terminal partial index remains the concurrent-race backstop (test_migration_1034)."""
     record_generation(conn, _generation())
     append_run_event(conn, _event(0, RunEventKind.PUBLISHED))
-    with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+    with pytest.raises(psycopg.errors.RaiseException, match="terminal"), conn.transaction():
         append_run_event(conn, _event(1, RunEventKind.RUN_FAILED))
 
 
