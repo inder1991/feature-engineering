@@ -68,6 +68,29 @@ def visibility_predicate(alias: str = "") -> str:
     return f"{prefix}{VISIBILITY_PREDICATE}"
 
 
+def anchor_visibility_predicate(alias: str = "gn", param: str = "%s") -> str:
+    """The read-scope predicate for a ``graph_node`` row that may be a TABLE anchor (D11).
+
+    A COLUMN row carries its own requirement; a TABLE row's scope is DERIVED: visible iff the
+    caller can see AT LEAST ONE of its columns (the ``catalogs.py`` EXISTS-visible-column shape) —
+    because ``build_graph`` never writes sensitivity on table nodes (``visible_requires = {}``),
+    which would otherwise make every table node world-visible: an existence oracle — and, on the
+    correction command, a working blind-write path — over a fully-restricted table.
+
+    ``alias`` MUST qualify the outer ``graph_node`` (the call site aliases its table): the derived
+    branch correlates a subquery aliased ``c``, so an unqualified outer column would resolve to the
+    inner scope. ``param`` is the placeholder for ``allowed_classes(roles)``; it appears TWICE, so a
+    positional call site (``"%s"``, the default) binds the allowed list twice, while a named one
+    (e.g. ``"%(allowed)s"``) binds it once by name.
+    """
+    return (
+        f"(CASE WHEN {alias}.kind = 'table' THEN EXISTS("
+        f"SELECT 1 FROM graph_node c WHERE c.catalog_source = {alias}.catalog_source "
+        f"AND c.kind = 'column' AND c.table_name = {alias}.table_name "
+        f"AND COALESCE(c.visible_requires, '{{}}') <@ {param}) "
+        f"ELSE COALESCE({alias}.visible_requires, '{{}}') <@ {param} END)")
+
+
 def allowed_classes(roles: Iterable[str]) -> list[str]:
     """The visibility classes these roles may see — the union over BOTH vocabularies.
 

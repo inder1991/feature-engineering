@@ -47,7 +47,7 @@ from featuregen.overlay.upload.column_readiness import column_readiness
 from featuregen.overlay.upload.column_usability import column_usability, table_rollup
 from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.semantic_binding_governance import caller_binding_actions
 
@@ -112,14 +112,17 @@ _ANCHOR_COLUMNS = (
 def _load_anchor(conn: DbConn, source: str, object_ref: str, allowed: list[str]) -> dict | None:
     """The anchor ``graph_node`` row, loaded UNDER read-scope. Returns ``None`` when the ref does
     not exist OR carries a sensitivity the caller's roles can't see — the two are deliberately
-    indistinguishable so a hidden object never leaks its existence via a different status/shape."""
+    indistinguishable so a hidden object never leaks its existence via a different status/shape.
+    A TABLE anchor's scope is DERIVED from its columns (D11, the shared predicate): table nodes
+    carry ``visible_requires = {}``, so the raw clause alone would hand out the identity of a
+    fully-restricted table — an existence oracle."""
     row = conn.execute(
-        f"SELECT {_ANCHOR_COLUMNS} FROM graph_node "
+        f"SELECT {_ANCHOR_COLUMNS} FROM graph_node gn "
         # F7: object_ref is canonical lowercase, so equality against lower(%s) uses the (source,
         # object_ref) PK directly instead of forcing a functional scan over lower(object_ref).
-        "WHERE catalog_source = %s AND object_ref = lower(%s) "
-        "AND visible_requires <@ %s",
-        (source, object_ref, allowed),
+        "WHERE gn.catalog_source = %s AND gn.object_ref = lower(%s) "
+        f"AND {anchor_visibility_predicate()}",
+        (source, object_ref, allowed, allowed),
     ).fetchone()
     if row is None:
         return None

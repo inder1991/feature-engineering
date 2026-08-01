@@ -75,7 +75,7 @@ from featuregen.overlay.upload.ingest import (
     ingest_source_lock_key,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.security.audit import record_denial
 
 ACTIONS: frozenset[str] = frozenset(
@@ -256,17 +256,19 @@ def apply_field_correction(
                  "command")
 
     # 2. Resolve the schema-preserving logical_ref + confirm the asset exists AND is VISIBLE to this
-    #    caller (I-1 read-scope). The anchor is loaded under the actor's sensitivity scope (mirroring
-    #    asset_detail._load_anchor); a hidden column (e.g. pii) the caller can't read is
+    #    caller (I-1 read-scope). The anchor is loaded under the actor's sensitivity scope (the SAME
+    #    shared predicate as asset_detail._load_anchor and search — D11: a TABLE anchor's scope is
+    #    DERIVED from its columns, since table nodes carry visible_requires = {}); a hidden asset
+    #    (e.g. a pii column, or a table whose EVERY column is hidden) the caller can't read is
     #    INDISTINGUISHABLE from a missing one — the SAME 404, raised BEFORE the idempotency probe / CAS
     #    read / any write — so a platform-admin WITHOUT pii_reader gets no existence oracle and no blind
-    #    write path on a column that GET 404s for the same caller.
+    #    write path on an asset that GET 404s for the same caller.
     norm_source = source.strip().lower()
     allowed = allowed_sensitivities(actor.role_claims)
     anchor = conn.execute(
-        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = lower(%s) "
-        "AND visible_requires <@ %s",
-        (norm_source, object_ref, allowed)).fetchone()
+        "SELECT 1 FROM graph_node gn WHERE gn.catalog_source = %s AND gn.object_ref = lower(%s) "
+        f"AND {anchor_visibility_predicate()}",
+        (norm_source, object_ref, allowed, allowed)).fetchone()
     if anchor is None:
         raise FieldCorrectionError(404, "asset not found")
     logical_ref = logical_ref_of(conn, norm_source, object_ref.lower())

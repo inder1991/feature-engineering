@@ -7,7 +7,7 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 
 # Facet name -> graph_node column. AND across facet groups, OR (= ANY) within one group.
 # These are the ONLY facetable columns; read-scope (sensitivity gate) and freshness stay HARD
@@ -117,15 +117,12 @@ def _build_predicates(
         # later scan of the OTHER rows (round-3 #5). NULL attested_at = watermark, as before.
         "COALESCE(n.attested_at, w.last_completed_at) >= %(cutoff)s",
         # Read-scope hard filter. A COLUMN row carries its own requirement; a TABLE row's scope is
-        # DERIVED (D11): visible iff the caller can see AT LEAST ONE of its columns — the
-        # catalogs.py EXISTS-visible-column shape — because build_graph never writes sensitivity on
-        # table nodes (visible_requires = {}), which made every table name/text world-matchable: an
-        # existence oracle over fully-restricted tables.
-        "(CASE WHEN n.kind = 'table' THEN EXISTS("
-        "SELECT 1 FROM graph_node c WHERE c.catalog_source = n.catalog_source "
-        "AND c.kind = 'column' AND c.table_name = n.table_name "
-        "AND COALESCE(c.visible_requires, '{}') <@ %(allowed)s) "
-        "ELSE COALESCE(n.visible_requires, '{}') <@ %(allowed)s END)",
+        # DERIVED (D11): visible iff the caller can see AT LEAST ONE of its columns — the shared
+        # anchor predicate (read_scope.py), the same rule the asset-detail and field-correction
+        # anchor loads apply — because build_graph never writes sensitivity on table nodes
+        # (visible_requires = {}), which made every table name/text world-matchable: an existence
+        # oracle over fully-restricted tables.
+        anchor_visibility_predicate("n", "%(allowed)s"),
     ]
     if query:
         base_preds.append(f"n.search_doc @@ {_TSQUERY[match]}")
