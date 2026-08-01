@@ -433,6 +433,10 @@ def scd_customers(db):
         CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
         # Task 13: `effective_from` now carries `as_of=True` because `LatestAvailableAsOf` holds
         # its effective-time column to the SAME governed `is_as_of` standard as availability.
+        # NOTE: a TWO-as_of-column upload is QUARANTINED at ingest (`canonical.validate_rows`
+        # rejects ambiguous availability), and the projection governs exactly ONE as-of column per
+        # table — this fixture deliberately models the post-fact-model-growth state (DEFERRED-WORK
+        # A.30) so the read contract can be tested; it is not a realistic catalog today.
         CanonicalRow(_SRC, "customers", "effective_from", "date", is_grain=True, as_of=True),
         CanonicalRow(_SRC, "customers", "version_seq", "int", is_grain=True),
         CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
@@ -479,6 +483,30 @@ def test_an_UNGOVERNED_effective_time_ref_is_refused(scd_customers):
     assert isinstance(refused, MaterializationRefused)
     assert refused.code is CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED
     assert "effective_time_ref" in refused.detail
+
+
+def test_the_availability_column_ITSELF_may_be_the_effective_time(db):
+    """The ONLY production-reachable accept shape (DEFERRED-WORK A.30): ingest, projection and the
+    expression-side reader all enforce ONE governed as-of column per table, so a real catalog can
+    satisfy `LatestAvailableAsOf` only when `effective_time_ref == availability_ref` — one governed
+    column serving both PIT rule 1 roles (a load-versioned history, where a row is effective when
+    it arrives). Pinned so a future "effective must differ from availability" hardening cannot
+    silently kill the policy with a green suite."""
+    build_graph(db, _SRC, [
+        CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
+        CanonicalRow(_SRC, "customers", "load_ts", "timestamp", is_grain=True, as_of=True),
+    ])
+    _govern_grain(db, "cif_id", "load_ts")
+    _govern_availability(db, "load_ts")
+    _govern_entity(db, "cif_id")
+    _healthy_projection(db)
+    result = validate_spine_declaration(
+        db,
+        _declaration(population_semantics=PopulationSemantics.HISTORICAL_AS_OF,
+                     snapshot_policy=LatestAvailableAsOf(
+                         effective_time_ref=CUSTOMERS_ASOF, availability_ref=CUSTOMERS_ASOF)),
+        roles=_ROLES)
+    assert isinstance(result, SpineSpec)
 
 
 def test_when_BOTH_time_columns_are_ungoverned_AVAILABILITY_refuses_first(scd_customers):

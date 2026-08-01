@@ -521,3 +521,34 @@ of UTC is correct by luck).
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🔴 **`prepare_run` refuses (`PHYSICAL_TYPE_UNSUPPORTED`) any run whose `event_time_ref` or `availability_ref` resolves to a DATE-typed column under a non-UTC `window_timezone`** | The IR carries no physical type for the clock (`PitSpec.event_time_ref` is a bare ref), so neither compilation nor rendering can see the dtype; run preparation holds the `ClusterInventoryV1`, whose `TableLayout.columns` is ordered `(name, physical type)`, so the fail-closed gate lives there (`_date_typed_clock_refusal`, after snapshots resolve — layouts present and fingerprint-verified — and before the execution hash). UTC zones still prepare: the shift is zero there. | First feature over a DATE-typed event column in a non-UTC catalog; fix = carry the clock dtype in PitSpec and emit date-typed comparisons. |
+
+### A.30 🔴 SCD spines with DISTINCT time columns cannot validate — one governed as-of per table (2026-08-01)
+
+Recorded while remediating Task 13 of the codegen review (`LatestAvailableAsOf.effective_time_ref`
+now requires the governed `is_as_of` fact its docstring promised). The check is correct and
+fail-closed, but it collides with an invariant enforced independently at THREE layers — a table can
+carry at most ONE governed as-of column:
+
+1. **Ingest** — `src/featuregen/overlay/upload/canonical.py:286-311`: a file declaring 2+ `as_of`
+   columns for one table is QUARANTINED as an ambiguous availability basis; no basis is asserted
+   until a reviewer resolves exactly one.
+2. **Projection** — `src/featuregen/overlay/upload/table_fact_projection.py:76-81, 115-120`:
+   projecting the per-table `availability_time` fact CLEARS every prior `is_as_of` +
+   `availability_fact_event_id` on the table's columns, then sets exactly one — the fact's schema
+   names exactly ONE column.
+3. **Read** — `src/featuregen/materialize/expression_ir.py:521-525`: the expression-side PIT gate
+   refuses a table with 2+ governed as-of columns outright ("the gate a choice nobody made").
+
+Consequently `effective_time_ref == availability_ref` is the ONLY production-reachable accept shape
+for `LatestAvailableAsOf` (legal per `_reject_incoherent_policy` — only tie-break overlap is
+refused — and it passes all three layers: one column, governed once, serving both PIT rule 1
+roles). A declaration with DISTINCT columns now refuses `AVAILABILITY_TIME_NOT_GOVERNED`, and the
+refusal's apparent remedy has **NO FIXED POINT**: confirming `availability_time` for the effective
+column re-projects the per-table fact — clears-then-sets — which UN-GOVERNS the availability
+column, so the availability branch refuses; confirming it back for the availability column flips
+the refusal to the effective-time branch. No sequence of confirmations under the current fact
+model satisfies both checks for two distinct columns.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **A real SCD-2 spine (distinct `effective_time_ref` / `availability_ref`) cannot validate — no catalog state satisfies both governed time checks** | The previous behavior was worse: the effective column was trusted UNGOVERNED, letting an ETL load-timestamp silently decide which record version wins. Refusing is honest; the gap is in the fact model, not the check. Test fixtures model the post-growth state by writing the column-node flag+link directly (bypassing the projection). | First real SCD-2 spine declaration over a table whose effective and availability columns differ; fix = a second governed time fact type (e.g. `effective_time`) or a per-COLUMN availability fact, then the projection stops clearing sibling columns and `expression_ir`'s one-governed-column rule is scoped to availability alone. |

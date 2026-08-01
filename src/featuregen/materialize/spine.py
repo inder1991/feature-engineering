@@ -736,9 +736,9 @@ def _refuse_ungoverned_availability(
         if not (read.status == _RESOLVED and read.value == _GOVERNED_TRUE):
             return MaterializationRefused(
                 CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED,
-                f"effective_time_ref {policy.effective_time_ref} carries no governed is_as_of "
-                f"fact (C1 status {read.status!r}), so the column that decides which record "
-                f"version wins would be an unattested timestamp")
+                f"effective_time_ref {policy.effective_time_ref} carries no governed "
+                f"availability_time fact (C1 status {read.status!r}), so the column that decides "
+                f"which record version wins would be an unattested timestamp")
     return None
 
 
@@ -764,8 +764,8 @@ def validate_spine_declaration(
     4. governed `entity_assignment` agrees;
     5. governed `GRAIN` makes the keys unique under the policy;
     6. governed `availability_time` backs the declared availability column — and, for a
-       `LATEST_AVAILABLE_AS_OF` policy, a governed `is_as_of` fact backs the effective-time
-       column too — ``AVAILABILITY_TIME_NOT_GOVERNED``.
+       `LATEST_AVAILABLE_AS_OF` policy, the effective-time column too —
+       ``AVAILABILITY_TIME_NOT_GOVERNED``.
 
     Only the reported code depends on that order; every branch refuses.
     """
