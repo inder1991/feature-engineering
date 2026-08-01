@@ -67,6 +67,34 @@ def test_logical_ref_of_falls_back_to_public_when_no_graph_node_row_exists(db):
     assert logical_ref_of(db, _SRC, _OBJ) == _REF
 
 
+def _table_node(db, **cols):
+    keys = ["catalog_source", "object_ref", "kind", "table_name"]
+    vals = [_SRC, "public.accounts", "table", "accounts"]
+    for k, v in cols.items():
+        keys.append(k)
+        vals.append(v)
+    placeholders = ", ".join(["%s"] * len(vals))
+    db.execute(f"INSERT INTO graph_node ({', '.join(keys)}) VALUES ({placeholders})", vals)
+
+
+def test_logical_ref_of_maps_a_table_graph_ref_to_a_table_logical_ref(db):
+    """The bug: a 2-part graph ref (`public.accounts` — ALWAYS a TABLE node, graph refs are
+    public-flattened) used to parse as (table='public', column='accounts'), yielding the phantom
+    COLUMN ref 'bank::public.public.accounts' — so evidence/decisions landed where no reader or
+    projection ever looks. A table graph ref must map to the TABLE logical ref (column=None)."""
+    _table_node(db)
+    assert logical_ref_of(db, _SRC, "public.accounts") == normalize_ref(_SRC, "public", "accounts")
+
+
+def test_logical_ref_of_resolves_a_table_ref_through_its_stored_schema(db):
+    # A non-public-schema source's table node (schema_name set) resolves to the SCHEMA-PRESERVING
+    # table ref its evidence/decisions are actually keyed under.
+    _table_node(db, schema_name="DPL_EIB_COMPLIANCE")
+    expected = normalize_ref(_SRC, "DPL_EIB_COMPLIANCE", "accounts")
+    assert expected == "bank::dpl_eib_compliance.accounts"
+    assert logical_ref_of(db, _SRC, "public.accounts") == expected
+
+
 def test_additivity_hint_without_a_governing_decision(db):
     _col(db, additivity="non_additive", additivity_decision_id="fde_x")
     facts = read_column_facts(db, _REF, "additivity")

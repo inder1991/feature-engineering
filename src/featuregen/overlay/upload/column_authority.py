@@ -67,7 +67,10 @@ def logical_ref_of(conn: DbConn, catalog_source: str, object_ref: str) -> str:
     if len(parts) >= 3:
         table, column = parts[-2], parts[-1]
     elif len(parts) == 2:
-        table, column = parts[0], parts[1]
+        # Graph object_refs are public-flattened: 2 parts is ALWAYS a TABLE ref
+        # (``public.<table>``) — parts[0] is the flattened schema, never a table name. Treating it
+        # as (table, column) minted a phantom COLUMN ref that no evidence store or projection keys.
+        table, column = parts[1], ""
     else:
         table, column = object_ref, ""
     row = conn.execute(
