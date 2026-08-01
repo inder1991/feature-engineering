@@ -487,3 +487,13 @@ probe driver and `test_probe.py`) is 16b's.
 | ⚪ **`_quote` moved to `render/_yaml.py` as `yaml_scalar`** | `render.project` and `render.publish` both emit catalog entries and `project` imports `publish`, so a shared helper could not stay in `project`. A copy would have been a second chance to quote a storage location differently. `project._quote` is now an alias. | Recorded. |
 | ⚪ **Rendering a mechanism into a project built for another environment is refused twice** | `select_publisher` scopes by environment in the SQL, and `render_project` re-checks the selection's `environment_id` and `engine_versions` against its own. The second check is not redundant: a selection is a value that can be carried between calls, and the renderer is where the bytes get written. | Recorded. |
 | ⚪ **Mutation-tested, 7 controls, all caught** | A `passed=` back door on `record_attestation`; an `adds_feature=` parameter on `select_publisher`; a `mechanism=` parameter on `render_publish`; the attestation lookup unscoped from the environment; `matches()` ignoring the spark version; a probe passing having watched no swap; `published_schema=None` failing open. Each mutation failed 1–4 tests. | Recorded. |
+
+### A.27 Legacy fabricated-N:1 approved_join facts (2026-08-01)
+
+Recorded while remediating Task 5 of the codegen review (blank uploaded cardinality no longer
+fabricates `N:1` at the governed-join propose seam; the realization deriver no longer maps a NULL
+edge cardinality to `MANY_TO_ONE`).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **Legacy fabricated-N:1 approved_join facts persist under authority-persists** | Facts minted before the remediation carry a fabricated `N:1` that two admins confirmed; a stored `N:1` cannot be distinguished from a genuinely-uploaded one (the proposal value records no "defaulted" marker). Authority-persists is the platform's documented policy, so no data migration rewrites or demotes them; the propose-time pair dedupe also means a cardinality-blank re-upload cannot dislodge them (by design — the confirmed fact stands). | A governance decision to re-review cardinality-blank-origin joins, which requires re-proposal after a cardinality-bearing upload (reject the legacy fact via join governance, then upload with an explicit cardinality). |

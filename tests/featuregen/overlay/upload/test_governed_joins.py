@@ -16,10 +16,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from tests.featuregen.overlay.upload.passc.conftest import (  # noqa: F401 — pytest fixtures
+    _confirm_join,
+    human_admin_1,
+    human_admin_2,
+)
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.catalog import _clear_catalog_adapter
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import fact_key
+from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.graph import governed_join_proposal, parse_join_ref
@@ -166,7 +173,56 @@ def test_flag_on_blank_cardinality_still_proposes_with_cardinality_none(db, monk
     events = load_fact(db, fact_key(ref, "approved_join"))
     proposed = [e for e in events if e.type == "OVERLAY_FACT_PROPOSED"]
     assert proposed, "the blank-cardinality join must still be proposed, not schema-denied"
-    assert proposed[-1].payload["proposed_value"]["cardinality"] is None
+    stored = proposed[-1].payload["proposed_value"]["cardinality"]
+    assert stored is None
+    # M5: pin the REFUSAL in the same test that pins the proposal — the value this fact serves is
+    # exactly what plan_join's traversal gate sees, and None must land in the UNKNOWN branch
+    # (materialize.joins refuses an UNKNOWN-cardinality hop until a human supplies one).
+    from featuregen.materialize.joins import _cardinality_verdict, _CardinalityVerdict
+    assert _cardinality_verdict(stored) is _CardinalityVerdict.UNKNOWN
+
+
+def test_verified_pair_accepts_no_rival_draft_from_a_blank_cardinality_reupload(
+        db, monkeypatch, human_admin_1, human_admin_2):  # noqa: F811 — imported pytest fixtures
+    # Task 5 codegen-review remediation (F2): fact_key digests cardinality, so a blank re-upload
+    # of a pair already VERIFIED as N:1 hashes to a DIFFERENT fact_key — without the propose-time
+    # pair dedupe it would mint a rival DRAFT for the same unordered column pair (two VERIFIED
+    # refs on one pair is a state project_confirmed_joins treats as impossible). The VERIFIED
+    # fact STANDS (authority-persists); the new proposal is refused.
+    # Real clock (no now=): resolve_fact's 24h drift-freshness guard, as in test_join_drift.
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    res = ingest_upload(db, "deposits", _join_rows(), actor=_actor())   # declares N:1
+    assert res.status == "ingested"
+    ref_n1 = governed_join_proposal(_join_rows()[0])
+    _confirm_join(db, ref_n1, admin1=human_admin_1, admin2=human_admin_2)
+    key_n1 = fact_key(ref_n1, "approved_join")
+    assert fold_overlay_state(load_fact(db, key_n1)).status == "VERIFIED"
+
+    blank_rows = [
+        CanonicalRow("deposits", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id"),                   # cardinality omitted
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+    ]
+    res = ingest_upload(db, "deposits", blank_rows, actor=_actor())
+    assert res.status == "ingested"                                     # advisory: never aborts
+    ref_none = governed_join_proposal(blank_rows[0])
+    assert ref_none is not None and ref_none.cardinality is None
+    key_none = fact_key(ref_none, "approved_join")
+    assert key_none != key_n1                                           # the rival identity
+    assert load_fact(db, key_none) == []                                # NO rival DRAFT minted
+    # The human-confirmed claim on the pair STANDS. It folds STALE — the re-upload's blanked
+    # cardinality cell is a catalog change that PRE-EXISTING freshness governance marks for
+    # re-confirmation (and the end-of-ingest projection demotes the edge while it waits; that
+    # demotion is the STALE lifecycle, not this guard). The human decision is never erased.
+    stream = load_fact(db, key_n1)
+    assert any(e.type == "OVERLAY_FACT_CONFIRMED" for e in stream)      # the decision persists
+    assert fold_overlay_state(stream).status == "STALE"                 # awaiting re-confirm
+    edge = db.execute(
+        "SELECT authority, approved_join_fact_key FROM graph_edge WHERE catalog_source = %s "
+        "AND kind = 'joins' AND from_ref = %s AND to_ref = %s",
+        ("deposits", "public.transactions.acct_id", "public.accounts.account_id")).fetchone()
+    assert edge == ("display_only", None)   # demoted pending re-confirm — no rival ever ran
 
 
 def test_flag_on_ingest_reensures_adapter_and_proposes(db, monkeypatch):

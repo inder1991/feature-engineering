@@ -97,6 +97,7 @@ from featuregen.overlay.upload.ingestion_run import record_run_facts, record_run
 from featuregen.overlay.upload.join_drift import detect_governed_join_divergences
 from featuregen.overlay.upload.object_ref import _norm, normalize_ref, parse_ref
 from featuregen.overlay.upload.passc.projection import (
+    _pair_key,
     list_approved_join_refs,
     project_confirmed_joins,
 )
@@ -418,6 +419,25 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
                        "upload-context adapter). Display-only edges are still marked.")
         return
 
+    # Task 5 codegen-review remediation (F2): `fact_key` digests cardinality, so re-declaring an
+    # already-confirmed pair with a DIFFERENT cardinality (e.g. a blank re-upload of a pair
+    # verified as N:1) would mint a RIVAL DRAFT for the same unordered column pair — and two
+    # VERIFIED refs on one pair is a state `project_confirmed_joins` treats as impossible. Dedupe
+    # at proposal time: a pair whose approved_join fact was ever HUMAN-CONFIRMED and has not been
+    # humanly retired accepts no new proposal under another fact_key. The confirmed fact STANDS
+    # (authority-persists); correcting it goes through the join-governance reject/re-propose
+    # flow, never a silent upload rival.
+    #   * Folded VERIFIED is not enough: the SAME re-upload's changed cell (the blanked/altered
+    #     cardinality) STALEs the fact via catalog-change detection BEFORE this seam runs, so the
+    #     standing claim folds STALE (or REVERIFY after expiry) at guard time while it awaits
+    #     re-confirmation. Those states still hold the pair. A human REJECT retires the claim and
+    #     does NOT block — reject -> re-propose stays the correction path (mirrors Pass C
+    #     `decide_action`).
+    #   * Built lazily ONCE per ingest (not per row — the load-once lesson) from the same
+    #     enumeration + pair key the projector uses, so the seams cannot disagree about "the pair".
+    confirmed_pair_to_key: dict[tuple[str, str], str] | None = None
+    _PAIR_HOLDING = ("VERIFIED", "STALE", "REVERIFY")
+
     for r in rows:
         if not r.joins_to:
             continue
@@ -426,6 +446,23 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
             counters.incr("overlay.governed_joins.skipped_malformed")
             logger.warning("skipping governed join for %s.%s: %s", r.table, r.column,
                            parse_join_ref(r.joins_to).diagnostic)
+            continue
+        if confirmed_pair_to_key is None:
+            confirmed_pair_to_key = {}
+            for existing in list_approved_join_refs(conn, ref.from_ref.catalog_source):
+                k = fact_key(existing, "approved_join")
+                stream = load_fact(conn, k)
+                if (any(e.type == "OVERLAY_FACT_CONFIRMED" for e in stream)
+                        and fold_overlay_state(stream).status in _PAIR_HOLDING):
+                    confirmed_pair_to_key[_pair_key(existing)] = k
+        rival = confirmed_pair_to_key.get(_pair_key(ref))
+        if rival is not None and rival != fact_key(ref, "approved_join"):
+            counters.incr("overlay.governed_joins.skipped_verified_rival")
+            logger.info(
+                "governed join for %s.%s -> %s not proposed: the column pair is already held by "
+                "human-confirmed approved_join fact %s with a different identity (direction/"
+                "cardinality); the confirmed fact stands — correct it via join governance, not "
+                "a re-upload", r.table, r.column, r.joins_to, rival)
             continue
         value = {
             "from_ref": asdict(ref.from_ref),

@@ -240,9 +240,16 @@ function agreement(item: GovernanceQueueItem): string {
   if (item.kind === 'approved_join') {
     const from = asRec(d.from)
     const to = asRec(d.to)
-    const cardinality = asStr(d.cardinality) || 'the stated cardinality'
+    // Task 5 codegen-review remediation (M3): a blank uploaded cardinality is proposed as null
+    // now, and this sentence IS the agreement the confirmation records — it must never assert
+    // "the stated cardinality" when none was stated. Confirming the join is still meaningful
+    // (the pair and direction), but it stays unusable at runtime until a cardinality exists.
+    const cardinality = asStr(d.cardinality)
+    const atClause = cardinality
+      ? `, at ${cardinality}.`
+      : ', at an unstated cardinality — this join stays unusable until one is supplied.'
     return `I agree that ${asStr(from.table) || 'the from table'} joins into `
-      + `${asStr(to.table) || 'the to table'} in this direction, at ${cardinality}.`
+      + `${asStr(to.table) || 'the to table'} in this direction${atClause}`
   }
   if (item.kind === 'grain') {
     const columns = asStrArr(asRec(d.proposed_value).columns).join(' + ')

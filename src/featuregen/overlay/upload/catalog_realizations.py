@@ -25,8 +25,13 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
 
 REALIZATION_DERIVATION_VERSION = "1.0.0"
 
-# The upload cardinality tokens (canonical.py) -> the governed Cardinality. Unstated -> MANY_TO_ONE
-# (the overwhelmingly common FK direction). N:N is not a valid upload token.
+# The upload cardinality tokens (canonical.py) -> the governed Cardinality. Unstated -> None
+# (UNKNOWN). It used to default to MANY_TO_ONE ("the overwhelmingly common FK direction"), but
+# that fabricated fan-in evidence the planner then served with REALIZATION authority — the same
+# "we do not know" -> "it is safe" laundering the Task 5 codegen-review remediation removed from
+# the governed-join propose seam. An unknown-cardinality edge is UNRESOLVABLE, not N:1; the
+# deriver skips it and the hop fails closed as `physical_cardinality_unavailable`. N:N is not a
+# valid upload token.
 CARDINALITY_TOKENS: dict[str, Cardinality] = {
     "N:1": Cardinality.MANY_TO_ONE,
     "1:N": Cardinality.ONE_TO_MANY,
@@ -34,9 +39,10 @@ CARDINALITY_TOKENS: dict[str, Cardinality] = {
 }
 
 
-def cardinality_from_token(token: str | None) -> Cardinality:
+def cardinality_from_token(token: str | None) -> Cardinality | None:
+    """None/blank -> None (UNKNOWN — never a fabricated default); a bad token still raises."""
     if token is None or token == "":
-        return Cardinality.MANY_TO_ONE
+        return None
     try:
         return CARDINALITY_TOKENS[token]
     except KeyError:
@@ -187,6 +193,13 @@ def derive_catalog_realizations(conn, catalog_source: str) -> CatalogRealization
         if fg is None or tg is None or fke is None or tke is None:
             continue                                            # unresolvable grain/key -> not derivable
         declared = cardinality_from_token(card_token)
+        if declared is None:
+            # Unknown cardinality (a blank-cardinality upload, or a VERIFIED approved_join whose
+            # cardinality is None under the Task 5 remediation) is NOT physical evidence — skip,
+            # exactly like an unresolvable grain/key above. The planner's `_hop_evidence` then has
+            # no realization for the hop and fails closed (`physical_cardinality_unavailable`),
+            # never a guessed fan-in.
+            continue
         # try forward, then reverse orientation against the global model
         norm = normalize_realization(from_object_grain=fg, to_object_grain=tg,
                                      declared=declared, global_rel=global_relationship_for(fg, tg)) \
