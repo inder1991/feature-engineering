@@ -712,11 +712,15 @@ def _read_set(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec,
 
     The spine's refs are catalog-side (§3.5 flattens their schema segment), so only the column
     segment is taken from them; the physical table is the one its own resolved requirement names.
+
+    Keys are CASE-FOLDED, exactly as every column comparison already is: unquoted Hive identifiers
+    fold, so ``RISK.TXN`` and ``risk.txn`` are one table, and unfolded keys would ask the metastore
+    about it twice and report each answer as its own finding.
     """
     read: dict[tuple[str, str], list[str]] = {}
 
     def add(schema: str, table: str, column: str) -> None:
-        columns = read.setdefault((schema, table), [])
+        columns = read.setdefault((_fold(schema), _fold(table)), [])
         if column not in columns:
             columns.append(column)
 
@@ -859,14 +863,18 @@ def run_l1(
             if snapshot.partition_specs is None:
                 continue
             physical = (snapshot.requirement.schema, snapshot.requirement.table)
-            if physical in denied:
+            # `denied` and `live` are keyed by the FOLDED pair (the read-set loop's keys), so a
+            # requirement spelling the same table in another case still hits the denial and the
+            # cached partition listing; the finding below keeps the requirement's own spelling.
+            folded = (_fold(physical[0]), _fold(physical[1]))
+            if folded in denied:
                 continue
-            if physical not in live:
-                live[physical] = {
+            if folded not in live:
+                live[folded] = {
                     _canonical_partition(partition) for partition
                     in metastore.list_partitions(schema=physical[0], table=physical[1])}
             absent = [spec for spec in snapshot.partition_specs
-                      if _canonical_partition(spec.columns) not in live[physical]]
+                      if _canonical_partition(spec.columns) not in live[folded]]
             if absent:
                 findings.append(ValidationFinding(
                     code=ValidationFindingCode.PARTITION_ABSENT,

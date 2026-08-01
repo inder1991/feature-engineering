@@ -142,9 +142,10 @@ def _stub(name, func, inputs, outputs, *, imports=(), tags=()) -> RenderedNode:
         source=f'def {func}({body}):\n    """Task 13/14 renders this body."""\n    return {returns}\n')
 
 
-def _nodes(datasets: ProjectDatasets) -> tuple[RenderedNode, ...]:
+def _nodes(datasets: ProjectDatasets, *,
+           spine_table: str = "banking.customers") -> tuple[RenderedNode, ...]:
     """A complete, closed wiring over `datasets` — the shape Tasks 13 and 14 must produce."""
-    customers = datasets.raw["banking.customers"]
+    customers = datasets.raw[spine_table]
     transactions = datasets.raw["banking.transactions"]
     nodes = [_stub("spine", "build_spine", [customers], [datasets.spine], tags=["primary"],
                    imports=("from pyspark.sql import DataFrame",))]
@@ -756,13 +757,94 @@ def test_every_catalog_entry_declares_one_of_section_7s_LAYERS(project: SealedPr
 
 
 def test_each_feature_stages_INDEPENDENTLY(project: SealedProject) -> None:
-    """§7: no scan sharing in this slice. One staging output and one manifest per feature."""
+    """§7: no scan sharing in this slice. One staging output and one manifest per feature.
+
+    The three name FAMILIES are disjoint by prefix — `feature_staging_<column>`,
+    `feature_manifest__<column>`, `feature_group__assembled` — so no filter here has to carve one
+    family out of another, which is exactly the collision the old `feature_staging_manifest_`
+    prefix invited (a feature legitimately named `manifest_x` staged onto another feature's
+    manifest).
+    """
     entries = _yaml_of(project, "conf/base/catalog.yml")
-    staged = [name for name in entries if name.startswith("feature_staging_")
-              and not name.startswith("feature_staging_manifest_")
-              and name != "feature_staging_assembled"]
-    manifests = [name for name in entries if name.startswith("feature_staging_manifest_")]
+    staged = [name for name in entries if name.startswith("feature_staging_")]
+    manifests = [name for name in entries if name.startswith("feature_manifest__")]
     assert len(staged) == 3 and len(manifests) == 3
+
+
+def test_a_feature_named_manifest_x_RENDERS(catalog, db) -> None:  # noqa: F811
+    """`manifest_<x>` and `assembled` are legitimate hive column names, and the group also stages a
+    feature named `x`. Under the old prefixes, `x`'s manifest dataset was
+    `feature_staging_manifest_x` — the SAME name as `manifest_x`'s staging dataset — and `assembled`
+    staged onto the fixed assembled dataset, so `_unique` refused a group nobody misnamed. The
+    `feature_manifest__`/`feature_group__` families cannot collide with any
+    `feature_staging_<hive_identifier>`: they differ from it at the character after `feature_`.
+    """
+    authorized, plan, spine_input = _compiled(db, SUM_30D, COUNT_90D, RATIO_90D)
+    renames = {SUM_30D: "x", COUNT_90D: "manifest_x", RATIO_90D: "assembled"}
+    irs = tuple(dataclasses.replace(ir, feature_name=renames[ir.feature_name])
+                for ir in authorized.irs)
+    authorized = dataclasses.replace(authorized, irs=irs)
+    hashes = {ir.feature_name: ir_hash(ir) for ir in irs}
+    plan = dataclasses.replace(plan, features=tuple(
+        dataclasses.replace(feature, column_name=renames[feature.column_name],
+                            ir_hash=hashes[renames[feature.column_name]])
+        for feature in plan.features))
+
+    datasets = project_datasets(authorized, plan, spine_input=spine_input)
+    assert datasets.staging["manifest_x"] == "feature_staging_manifest_x"
+    assert datasets.manifests["x"] == "feature_manifest__x"
+    assert datasets.staging["assembled"] == "feature_staging_assembled"
+    assert datasets.assembled == "feature_group__assembled"
+
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=spine_input,
+                             nodes=_nodes(datasets))
+    entries = _yaml_of(project, "conf/base/catalog.yml")
+    assert {"feature_staging_manifest_x", "feature_manifest__x",
+            "feature_staging_assembled", "feature_group__assembled"} <= set(entries)
+
+
+def test_a_dotted_schema_addresses_the_right_table(catalog, db) -> None:  # noqa: F811
+    """`split(".", 1)` on `edp.raw.customers` yields table `raw.customers` — a table that does not
+    exist. The LAST dot separates schema from table: a dotted schema is real (a catalog-qualified
+    namespace), a dotted table is not."""
+    authorized, plan, spine_input = _compiled(db, SUM_30D)
+    dotted = dataclasses.replace(spine_input, schema="edp.raw")
+    datasets = project_datasets(authorized, plan, spine_input=dotted)
+    assert "edp.raw.customers" in datasets.raw
+
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=dotted,
+                             nodes=_nodes(datasets, spine_table="edp.raw.customers"))
+    entry = _yaml_of(project, "conf/base/catalog.yml")[datasets.raw["edp.raw.customers"]]
+    assert entry["database"] == "edp.raw"
+    assert entry["table"] == "customers"
+
+
+def test_a_dotted_publication_namespace_addresses_the_right_table(catalog, db, monkeypatch) -> None:  # noqa: F811
+    """The published target's split has the same defect in the other entry: a catalog-qualified
+    sandbox namespace must stay the database, whole."""
+    monkeypatch.setattr(binding, "SANDBOX_NAMESPACE", "lake.sandbox_feature")
+    published = _yaml_of(_render(db, SUM_30D), "conf/base/catalog.yml")[f"feature_{GROUP}"]
+    assert published["database"] == "lake.sandbox_feature"
+    assert published["table"] == GROUP
+
+
+def test_a_control_character_in_a_schema_cannot_change_the_rendered_location(catalog, db) -> None:  # noqa: F811
+    """Two defects at once, and both must be closed: the `database:` scalar must ESCAPE the
+    newline (or the value silently folds to a different name), and the `# comment` line above it
+    must not let the newline END the comment (or the remainder becomes YAML nobody wrote)."""
+    authorized, plan, spine_input = _compiled(db, SUM_30D)
+    hostile = dataclasses.replace(spine_input, schema="edp\nraw")
+    datasets = project_datasets(authorized, plan, spine_input=hostile)
+
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=hostile,
+                             nodes=_nodes(datasets, spine_table="edp\nraw.customers"))
+    entries = _yaml_of(project, "conf/base/catalog.yml")  # a raw newline fails the parse itself
+    entry = entries[datasets.raw["edp\nraw.customers"]]
+    assert entry["database"] == "edp\nraw"
+    assert entry["table"] == "customers"
 
 
 # ══ parameters — and what must never become one ══════════════════════════════════════════════════

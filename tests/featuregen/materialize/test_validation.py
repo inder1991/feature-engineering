@@ -739,6 +739,37 @@ def test_a_DENIED_table_is_READ_DENIED_and_its_columns_are_not_then_reported_abs
     assert may_regenerate(report) is False
 
 
+def test_two_casings_of_one_table_are_ONE_read_and_ONE_finding(prepared, compiled) -> None:
+    """BANKING.TRANSACTIONS and banking.transactions name the same Hive table (unquoted
+    identifiers fold), so L1 must ask about it ONCE and report it ONCE. Read-set keys that never
+    folded — while every column comparison did — would ask twice, and the unfolded ask, sailing
+    past the denial recorded under the folded spelling, would come back as a table that "does not
+    exist": a second, invented finding about the first one's table."""
+    shouted = dataclasses.replace(compiled[0], expressions=tuple(
+        dataclasses.replace(expression, physical_read_set=tuple(
+            dataclasses.replace(ref, schema=ref.schema.upper(), table=ref.table.upper())
+            for ref in expression.physical_read_set))
+        for expression in compiled[0].expressions))
+    _snapshots, environment = prepared
+    environment.deny("banking.transactions")
+    asked: list[tuple[str, str]] = []
+    inner = environment.can_read
+
+    def counting(*, schema: str, table: str, roles) -> bool:
+        asked.append((schema, table))
+        return inner(schema=schema, table=table, roles=roles)
+
+    environment.can_read = counting  # instance attribute shadows the method
+
+    report = _l1(prepared, irs=(shouted, compiled[1]))
+    assert {f.code for f in report.findings} == {ValidationFindingCode.READ_DENIED}
+    denied = [f for f in report.findings if f.code is ValidationFindingCode.READ_DENIED]
+    assert len(denied) == 1
+    assert denied[0].location == "banking.transactions"
+    assert asked.count(("banking", "transactions")) == 1
+    assert ("BANKING", "TRANSACTIONS") not in asked
+
+
 # ── L1 covers the SPINE, which no feature expression reads ───────────────────────────────────────
 
 
