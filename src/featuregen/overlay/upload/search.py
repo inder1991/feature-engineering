@@ -116,7 +116,16 @@ def _build_predicates(
         # that node is fresh for the SLA window after its resolution and never re-blessed by a
         # later scan of the OTHER rows (round-3 #5). NULL attested_at = watermark, as before.
         "COALESCE(n.attested_at, w.last_completed_at) >= %(cutoff)s",
-        "COALESCE(n.visible_requires, '{}') <@ %(allowed)s",   # read-scope hard filter
+        # Read-scope hard filter. A COLUMN row carries its own requirement; a TABLE row's scope is
+        # DERIVED (D11): visible iff the caller can see AT LEAST ONE of its columns — the
+        # catalogs.py EXISTS-visible-column shape — because build_graph never writes sensitivity on
+        # table nodes (visible_requires = {}), which made every table name/text world-matchable: an
+        # existence oracle over fully-restricted tables.
+        "(CASE WHEN n.kind = 'table' THEN EXISTS("
+        "SELECT 1 FROM graph_node c WHERE c.catalog_source = n.catalog_source "
+        "AND c.kind = 'column' AND c.table_name = n.table_name "
+        "AND COALESCE(c.visible_requires, '{}') <@ %(allowed)s) "
+        "ELSE COALESCE(n.visible_requires, '{}') <@ %(allowed)s END)",
     ]
     if query:
         base_preds.append(f"n.search_doc @@ {_TSQUERY[match]}")
