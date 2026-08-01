@@ -76,7 +76,7 @@ from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
 from featuregen.overlay.upload.governed_grain import governed_grain_columns
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import allowed_classes, visibility_predicate
 
 __all__ = [
     "SNAPSHOT_POLICY_TYPES",
@@ -565,9 +565,13 @@ def _resolve_nodes(
     """Existence, then read scope, then ``{ref: the catalog's OWN object_ref}``.
 
     Existence comes first because a denied read on a column that does not exist is a meaningless
-    answer that sends an operator to request a role they do not need. Read scope uses the SAME rule
-    the join planner applies: an untagged node is visible to everyone; a tagged one only to roles
-    that grant its tag.
+    answer that sends an operator to request a role they do not need. Read scope is the SHIPPED
+    predicate, inherited rather than re-implemented (``read_scope.py``, since migration 1032):
+    ``visible_requires`` folds BOTH the raw file tag and the governed ``effective_restriction``
+    floor into the classes a reader must hold, so a governed-``restricted`` key column whose file
+    attested nothing refuses here too. An untagged, unfloored node requires ``'{}'``, contained in
+    every allowed list, and stays visible to everyone. The TABLE node is part of the check: a
+    floored table node refuses the declaration.
 
     The stored `object_ref` is returned rather than the one built here because the two are not
     always the same string, and the shipped readers disagree about which one addresses a node:
@@ -579,11 +583,13 @@ def _resolve_nodes(
     object_refs = {_object_ref(located.table, column): ref
                    for ref, column in ((r, located.columns[r]) for r in located.read_refs)}
     table_node = _object_ref(located.table, None)
+    allowed = allowed_classes(roles)
     rows = conn.execute(
-        "SELECT lower(object_ref), object_ref, sensitivity FROM graph_node "
+        f"SELECT lower(object_ref), object_ref, (NOT ({visibility_predicate()})) AS hidden "
+        "FROM graph_node "
         "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s)",
-        (located.catalog_source, [*object_refs, table_node])).fetchall()
-    found = {folded: (stored, sensitivity) for folded, stored, sensitivity in rows}
+        (allowed, located.catalog_source, [*object_refs, table_node])).fetchall()
+    found = {folded: (stored, is_hidden) for folded, stored, is_hidden in rows}
 
     missing = sorted(ref for object_ref, ref in object_refs.items() if object_ref not in found)
     if missing:
@@ -595,10 +601,9 @@ def _resolve_nodes(
             f"the governed catalog has no table node for {located.table} on "
             f"{located.catalog_source}")
 
-    allowed = allowed_sensitivities(roles)
     hidden = sorted(object_refs.get(object_ref, object_ref)
-                    for object_ref, (_stored, sensitivity) in found.items()
-                    if sensitivity is not None and sensitivity not in allowed)
+                    for object_ref, (_stored, is_hidden) in found.items()
+                    if is_hidden)
     if hidden:
         return MaterializationRefused(
             CompilationRefusalCode.READ_SCOPE_INSUFFICIENT,

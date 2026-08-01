@@ -370,6 +370,28 @@ def test_a_denied_read_is_READ_SCOPE_INSUFFICIENT_not_a_fact_rejection(two_candi
     assert isinstance(granted, SpineSpec)          # same catalog, sufficient read scope
 
 
+@pytest.mark.parametrize(("floor", "granting_role"),
+                         [("restricted", "restricted_reader"),
+                          ("confidential", "confidential_reader")])
+def test_a_governed_floor_on_an_UNTAGGED_spine_column_needs_its_reader_role(
+        two_candidate_customer_tables, floor, granting_role):
+    """`sensitivity` stays NULL — the shipped FTR shape (migration 1032's header: 28/126 columns,
+    including an Emirates ID number, carried a governed floor and NO file tag). The spine's
+    read-scope check reads `visible_requires`, which folds BOTH axes, so the governed floor refuses
+    exactly like a tag — before this, a floored key column validated for a caller with no reader
+    role at all."""
+    two_candidate_customer_tables.execute(
+        "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
+        "AND object_ref = 'public.customers.cif_id'", (floor, _SRC))
+    denied = validate_spine_declaration(
+        two_candidate_customer_tables, _declaration(), roles=_ROLES)
+    granted = validate_spine_declaration(
+        two_candidate_customer_tables, _declaration(), roles=(*_ROLES, granting_role))
+    assert isinstance(denied, MaterializationRefused)
+    assert denied.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert isinstance(granted, SpineSpec)          # same catalog, sufficient read scope
+
+
 def test_the_roles_that_validated_the_spine_are_recorded(two_candidate_customer_tables):
     result = validate_spine_declaration(
         two_candidate_customer_tables, _declaration(), roles=["feature_engineer"])

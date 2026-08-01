@@ -36,11 +36,13 @@ produced**. There is no partial authorization and no per-feature bypass — whic
 value is a TOKEN (:class:`AuthorizedCompilation`) rather than a boolean: a downstream stage that
 takes the token cannot be entered by a caller who skipped the gate.
 
-**Two sensitivity axes, and this gate owns exactly one (interfaces §2).** ``graph_node.sensitivity``
-is the read-scope TAG (``pii``, ``restricted``) checked against ``allowed_sensitivities(roles)`` —
-that is Gate 2. ``graph_node.effective_restriction`` is the ordered restriction LEVEL, and a
-``prohibited`` input is refused during §5.2 classification with ``PROHIBITED_INPUT``. Conflating
-them would give the wrong code and make one of the two axes unreachable.
+**Read scope is the shipped predicate over BOTH sensitivity axes (migration 1032).** Gate 2 checks
+``graph_node.visible_requires`` — the GENERATED column folding the raw file tag AND the governed
+``effective_restriction`` floor into the classes a reader must hold — against
+``allowed_classes(roles)``, via ``read_scope.visibility_predicate``. So a governed-``restricted``
+column whose file attested nothing refuses here, and a ``prohibited`` floor is ungrantable at this
+gate. §5.2 classification still owns the contract-time answer: it re-reads the catalog and refuses a
+``prohibited`` input with ``PROHIBITED_INPUT`` even for a group authorized before the ruling.
 """
 from __future__ import annotations
 
@@ -80,7 +82,7 @@ from featuregen.overlay.upload.bridge_store import (
     revalidate_bridge_realization,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import allowed_classes, visibility_predicate
 
 __all__ = [
     "AuthorizedCompilation",
@@ -508,19 +510,23 @@ def _hidden(
 ) -> tuple[_ReadElement, ...]:
     """The elements the supplied read scope may not see.
 
-    The shipped read-scope rule, inherited rather than re-implemented (``read_scope.py``, and the
-    same shape ``spine._resolve_nodes`` applies): a node's ``sensitivity`` tag is visible only to a
-    caller whose roles grant it, and an UNTAGGED node is visible to everyone. The tag is compared
-    without folding, so a tag outside ``SENSITIVITY_ROLES`` — including one that differs only in
-    case — is granted by no role and fails CLOSED.
+    The shipped read-scope rule, genuinely INHERITED rather than re-implemented: one predicate
+    (``read_scope.visibility_predicate``) over one parameter (``read_scope.allowed_classes``),
+    exactly as ``read_scope.py``'s module contract prescribes and as every other read-scope call
+    site binds it since migration 1032. ``visible_requires`` is the GENERATED column folding BOTH
+    axes — the raw file tag AND the governed ``effective_restriction`` floor — so a
+    governed-``restricted`` column whose file attested nothing (``sensitivity = NULL``, the shipped
+    FTR shape) refuses here instead of compiling for a caller with no reader role. An untagged,
+    unfloored node has ``visible_requires = '{}'``, contained in every allowed list, and stays
+    visible to everyone; ``prohibited`` appears in no role map and fails CLOSED for every caller.
 
-    A ref with no ``graph_node`` row at all is treated as untagged, i.e. authorized. It carries no
-    tag to hide behind, so nothing sensitive is being let through; what it is, is a read of a column
-    the catalog does not describe, which §11's L1 validation reports as ``COLUMN_ABSENT`` against
-    the live metastore. Refusing it here would report a missing column as an insufficient role and
-    send an operator to request a privilege that would not help.
+    A ref with no ``graph_node`` row at all stays authorized here. It carries no visibility
+    requirement to hide behind, so nothing sensitive is being let through; what it is, is a read of
+    a column the catalog does not describe, which §11's L1 validation reports as ``COLUMN_ABSENT``
+    against the live metastore. Refusing it here would report a missing column as an insufficient
+    role and send an operator to request a privilege that would not help.
     """
-    allowed = allowed_sensitivities(roles)
+    allowed = allowed_classes(roles)
     by_source: dict[str, dict[str, _ReadElement]] = {}
     for element in elements:
         by_source.setdefault(element.catalog_source, {})[element.object_ref] = element
@@ -528,12 +534,11 @@ def _hidden(
     hidden: list[_ReadElement] = []
     for catalog_source, indexed in by_source.items():
         rows = conn.execute(
-            "SELECT lower(object_ref), sensitivity FROM graph_node "
-            "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s)",
-            (catalog_source, list(indexed))).fetchall()
-        for object_ref, sensitivity in rows:
-            if sensitivity is not None and sensitivity not in allowed:
-                hidden.append(indexed[object_ref])
+            "SELECT lower(object_ref) FROM graph_node "
+            "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s) "
+            f"AND NOT ({visibility_predicate()})",
+            (catalog_source, list(indexed), allowed)).fetchall()
+        hidden.extend(indexed[object_ref] for (object_ref,) in rows)
     return tuple(sorted(hidden, key=lambda element: element.logical_ref))
 
 

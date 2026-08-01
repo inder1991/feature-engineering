@@ -153,10 +153,15 @@ def test_contracts_are_derived_PER_FEATURE_never_from_the_union(catalog):
 
 
 def test_passing_two_features_together_cannot_promote_either(catalog):
-    """The attack §5.1 names: a caller hands both features to one call and hopes for one contract."""
+    """The attack §5.1 names: a caller hands both features to one call and hopes for one contract.
+
+    The caller holds `restricted_reader` so Gate 2 authorizes (since migration 1032 the governed
+    floor gates read scope too — test_ir.py's floor tests own that); what is being refused here is
+    the CONTRACT multiplicity, not the read."""
     _restrict(catalog, "transactions", "txn_amt", "restricted")
     group = tuple(_ok(_compile(catalog, name)) for name in (COUNT_90D, SUM_30D))
-    authorization = authorize_compilation(catalog, group, group[0].spine, roles=_ROLES)
+    authorization = authorize_compilation(catalog, group, group[0].spine,
+                                          roles=(*_ROLES, "restricted_reader"))
 
     refused = derive_group_contract(catalog, authorization, cadence=CADENCE,
                                     availability_promise=NEXT_DAY)
@@ -211,9 +216,14 @@ def test_the_group_contract_is_derived_over_the_authorized_IRS(catalog):
 
 
 def test_a_PROHIBITED_input_refuses_the_whole_group(catalog):
-    _restrict(catalog, "transactions", "txn_amt", "prohibited")
+    """The restriction lands AFTER Gate 2: since migration 1032 a `prohibited` floor is ungrantable
+    at the read-scope gate itself (test_ir.py owns that), so the only way a prohibited input still
+    reaches §5.2 is a catalog re-ruled between authorization and contract derivation. Classification
+    re-reads the catalog, so even an already-authorized group refuses — the token is not a licence
+    to publish what governance has since forbidden."""
     group = tuple(_ok(_compile(catalog, name)) for name in (SUM_30D, COUNT_90D))
     authorization = authorize_compilation(catalog, group, group[0].spine, roles=_ROLES)
+    _restrict(catalog, "transactions", "txn_amt", "prohibited")
     refused = derive_group_contract(catalog, authorization, cadence=CADENCE,
                                     availability_promise=NEXT_DAY)
     assert isinstance(refused, MaterializationRefused)
@@ -413,9 +423,12 @@ def test_the_contract_takes_BOTH_axes_from_the_classification(catalog):
 
 def test_the_SPINE_can_decide_the_class(catalog):
     """The read set the contract classifies is §1.3's union, so the population's own columns count
-    even though no expression mentions them."""
+    even though no expression mentions them. The caller holds `restricted_reader` because since
+    migration 1032 the governed floor also gates the spine's read scope at compile time — the claim
+    HERE is that the readable column still decides the contract's CLASS."""
     _restrict(catalog, "customers", "cif_id", "restricted")
-    assert _derived(_contract(catalog, SUM_30D)).sensitivity_class == "restricted"
+    assert _derived(_contract(catalog, SUM_30D, roles=(*_ROLES, "restricted_reader"))
+                    ).sensitivity_class == "restricted"
 
 
 def test_a_JOIN_ENDPOINT_can_decide_the_class(catalog):

@@ -204,6 +204,18 @@ def _tag(db, table, column, sensitivity):
         (sensitivity, _SRC, f"public.{table}.{column}"))
 
 
+def _floor(db, table, column, restriction):
+    """Set the GOVERNED floor (`graph_node.effective_restriction`) — axis two — leaving the tag
+    NULL. That pairing is the shipped FTR shape (migration 1032's header: a business glossary
+    attests no sensitivity, so all 126 columns carry `sensitivity = NULL` while the concept cascade
+    ruled 28 of them restricted/confidential). Migration 1032's GENERATED `visible_requires` column
+    derives from BOTH axes, so seeding the floor alone is enough to populate it."""
+    db.execute(
+        "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
+        "AND object_ref = %s",
+        (restriction, _SRC, f"public.{table}.{column}"))
+
+
 def seed_catalog(db):
     """`transactions` (the fact table), the two-hop path to `customers`, and the spine's facts.
 
@@ -682,22 +694,62 @@ def test_a_role_that_grants_the_TAG_authorizes_the_group(catalog):
         AuthorizedCompilation)
 
 
-def test_the_two_sensitivity_axes_are_NOT_conflated(catalog):
-    """`graph_node.sensitivity` is the read-scope tag; `effective_restriction` is the ordered
-    restriction level (interfaces §2). Gate 2 is the READ-SCOPE gate, so a `prohibited` restriction
-    with no read-scope tag does not belong to it — §5.2 refuses that with `PROHIBITED_INPUT` during
-    classification. Conflating them here would make the restriction axis unreachable and give the
-    wrong code."""
-    catalog.execute(
-        "UPDATE graph_node SET effective_restriction = 'prohibited' WHERE catalog_source = %s "
-        "AND object_ref = %s", (_SRC, "public.transactions.txn_amt"))
+@pytest.mark.parametrize(("floor", "granting_role"),
+                         [("restricted", "restricted_reader"),
+                          ("confidential", "confidential_reader")])
+def test_a_governed_floor_on_an_UNTAGGED_column_refuses_without_its_reader_role(
+        catalog, floor, granting_role):
+    """`sensitivity = NULL` + a governed floor is the shipped FTR shape (migration 1032's header:
+    28/126 columns, including an Emirates ID number, carried a floor and NO file tag). Gate 2 reads
+    `visible_requires`, which folds BOTH axes, so the governed floor gates compilation exactly like
+    a tag — before this, such a column compiled for a caller with no reader role at all."""
+    _floor(catalog, "transactions", "txn_amt", floor)
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=())
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert TXN_AMT in refused.detail
+
+
+@pytest.mark.parametrize(("floor", "granting_role"),
+                         [("restricted", "restricted_reader"),
+                          ("confidential", "confidential_reader")])
+def test_the_floors_own_reader_role_clears_the_governed_floor(catalog, floor, granting_role):
+    _floor(catalog, "transactions", "txn_amt", floor)
     ir = _ok(_compile(catalog, DENIED_FEATURE))
     assert isinstance(
-        authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES), AuthorizedCompilation)
+        authorize_compilation(catalog, (ir,), ir.spine, roles=(granting_role,)),
+        AuthorizedCompilation)
 
+
+def test_a_PROHIBITED_floor_is_ungrantable_at_Gate_2(catalog):
+    """`prohibited` always wins in `visible_requires` (migration 1032) and no role maps to it, so
+    no read scope — not even every reader role at once — can compile over it. Before 1032 Gate 2
+    read only the raw tag and AUTHORIZED this group, leaving §5.2 to refuse it later with
+    `PROHIBITED_INPUT`; that classification refusal still exists (it re-reads the catalog at
+    contract time), but the read-scope gate now fails closed first."""
+    _floor(catalog, "transactions", "txn_amt", "prohibited")
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    every_reader = ("pii_reader", "restricted_reader", "confidential_reader")
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=(*_ROLES, *every_reader))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+
+
+def test_a_TAGGED_column_keeps_its_own_gate_when_a_floor_is_also_present(catalog):
+    """The two axes are folded by PRECEDENCE, never required jointly (migration 1032): where a file
+    tag exists it keeps its own gate, so `pii_reader` — who can see this column today — does not
+    lose access when the governed floor independently resolves `restricted`, and the floor's role
+    alone does not unlock the tag."""
     _tag(catalog, "transactions", "txn_amt", "pii")
+    _floor(catalog, "transactions", "txn_amt", "restricted")
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
     assert isinstance(
-        authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES), MaterializationRefused)
+        authorize_compilation(catalog, (ir,), ir.spine, roles=("pii_reader",)),
+        AuthorizedCompilation)
+    assert isinstance(
+        authorize_compilation(catalog, (ir,), ir.spine, roles=("restricted_reader",)),
+        MaterializationRefused)
 
 
 @pytest.mark.parametrize(("tag", "granting_role"),
