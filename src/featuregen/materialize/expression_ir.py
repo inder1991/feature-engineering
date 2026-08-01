@@ -71,6 +71,8 @@ from featuregen.formula.canonical import filter_plain
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
+    FilterNode,
+    FilterPredicate,
     ParameterRef,
     TypedLiteral,
 )
@@ -700,6 +702,70 @@ def _table_ref_of(column_ref: str) -> str:
     return normalize_ref(source, schema, table)
 
 
+def _canonical_ref(ref: str) -> str:
+    """``ref`` in the ONE canonical spelling — the same fold :func:`_table_ref_of` applies.
+
+    ``parse_ref`` recovers the components and ``normalize_ref`` re-emits them stripped and
+    case-folded, so ``RETAIL::PUBLIC.TXN.AMT`` and ``retail::public.txn.amt`` become one string.
+    Idempotent by construction: a canonical ref parses back into already-folded components.
+
+    A string ``parse_ref`` rejects is returned UNTOUCHED: this helper normalizes spellings, it does
+    not validate refs, and the existing verdict for a malformed ref (a ``ValueError`` from
+    resolution, or an ``UNACCOUNTED_LOGICAL_REF`` refusal) must keep coming from where it comes
+    from today.
+    """
+    try:
+        source, schema, table, column = parse_ref(ref)
+    except ValueError:
+        return ref
+    return normalize_ref(source, schema, table, column)
+
+
+def _normalized_filter(node: FilterNode) -> FilterNode:
+    """The filter subtree with every predicate ``left`` folded — and NOTHING else touched.
+
+    ``left`` is a predicate's ONLY column reference (§6: ``FilterPredicate`` has no ``right_ref``).
+    A ``TypedLiteral.value`` is DATA and a ``ParameterRef.name`` is a declared parameter's name —
+    §2.1's non-physical slots — and folding either would silently change what the filter compares
+    against (``'D'`` and ``'d'`` are different values).
+    """
+    if isinstance(node, FilterPredicate):
+        return dataclasses.replace(node, left=_canonical_ref(node.left))
+    return dataclasses.replace(
+        node, children=tuple(_normalized_filter(child) for child in node.children))
+
+
+def _normalized_expression(expr: AggregateExpression) -> AggregateExpression:
+    """``expr`` with every AUTHORING-SIDE logical ref folded to its canonical spelling.
+
+    Applied ONCE, at the top of :func:`compile_expression` before the first ``tables.resolve``, so
+    a raw spelling can never become a ``_Tables`` cache key (deriving one table's requirement twice
+    into ``input_requirements``) or reach ``identity_payload()`` (forking ``ir_hash`` away from the
+    case-folded ``formula_content_hash``). Deliberately NOT inside ``_Tables.resolve``: folding the
+    cache key alone would leave the payload refs unfolded and only mask the fork.
+
+    NORMALIZED here — the refs that arrive in the author's own casing (``graph_node.object_ref``
+    keeps the upload's casing, and the formula tools hand raw refs to the authoring model):
+    ``source_relation.table_ref``, ``operand``, ``window.event_time_ref`` and every filter
+    predicate's ``left``. The grain keys arrive raw too, through the ``grain_keys`` parameter, and
+    are folded beside this call.
+
+    SKIPPED, because they are born canonical: ``availability_ref`` and every join-key ref are
+    DERIVED downstream through ``normalize_ref`` / :func:`join_key_ref`; a bridge realization's
+    predicate refs are canonicalized by its own constructors (``bridge_realization._column_ref``
+    runs ``normalize_ref`` in ``__post_init__``). SKIPPED, because they are not refs:
+    ``TypedLiteral.value`` and ``ParameterRef.name`` (see :func:`_normalized_filter`).
+    """
+    return dataclasses.replace(
+        expr,
+        operand=None if expr.operand is None else _canonical_ref(expr.operand),
+        source_relation=dataclasses.replace(
+            expr.source_relation, table_ref=_canonical_ref(expr.source_relation.table_ref)),
+        window=dataclasses.replace(
+            expr.window, event_time_ref=_canonical_ref(expr.window.event_time_ref)),
+        filter=None if expr.filter is None else _normalized_filter(expr.filter))
+
+
 class _Tables:
     """Per-table resolution and requirements, each derived at most once per compilation.
 
@@ -796,6 +862,12 @@ def compile_expression(
         raise ValueError(
             "grain_keys is empty: an aggregate with no grain has no key to reduce onto, and the "
             "spine it must land on is defined by those keys")
+
+    # One governed formula, one `ir_hash`: `formula_content_hash` folds ref case, so every
+    # authoring-side spelling is folded HERE, before the first `tables.resolve(...)` — a raw
+    # spelling must never become a `_Tables` cache key or reach `identity_payload()`.
+    expr = _normalized_expression(expr)
+    grain = tuple(_canonical_ref(key) for key in grain)
 
     roles_used = tuple(roles)
     tables = _Tables(conn, inventory)

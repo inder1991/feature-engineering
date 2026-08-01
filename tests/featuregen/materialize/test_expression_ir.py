@@ -466,6 +466,48 @@ def test_the_same_expression_compiles_to_the_same_hash_twice(catalog):
     assert expression_ir_hash(first) == expression_ir_hash(second)
 
 
+def test_ref_casing_does_not_fork_identity(catalog):
+    """`formula_content_hash` folds ref case, so `HDFC::PUBLIC.TRANSACTIONS.TXN_AMT` and its
+    lower-case spelling are ONE governed artifact — the IR must agree (remediation report §5).
+
+    Every other fixture in this file is lower-case, which is exactly how the fork stayed invisible:
+    `graph_node.object_ref` keeps the upload's own casing and the formula tools hand raw refs to
+    the authoring model, so a mixed-case spelling is reachable in production. The comparison
+    LITERALS are deliberately left alone — `'D'` and `'d'` really are two different filters."""
+    upper_filter = FilterBool(op=FilterBoolOp.AND, children=(
+        FilterPredicate(op=FilterPredicateOp.EQUAL, left=TXN_DR_CR.upper(),
+                        right_literal=TypedLiteral(type=LiteralType.STRING, value="D")),
+        FilterPredicate(op=FilterPredicateOp.EQUAL, left=TXN_STATUS.upper(),
+                        right_literal=TypedLiteral(type=LiteralType.STRING, value="posted")),
+    ))
+    lower = _compile(catalog, expr=_expr(filter_node=_posted_debit_filter()))
+    upper = _compile(
+        catalog,
+        expr=_expr(operand=TXN_AMT.upper(), table=TXN.upper(), filter_node=upper_filter,
+                   window=_window(event_time_ref=TXN_DT.upper())),
+        grain_keys=(TXN_CIF.upper(),))
+    assert isinstance(lower, ExpressionExecutionIR)
+    assert isinstance(upper, ExpressionExecutionIR), upper
+    assert expression_ir_hash(upper) == expression_ir_hash(lower)
+    assert _refs(upper) == _refs(lower)            # the payload carries only the folded spellings
+    assert upper.filter_tree == lower.filter_tree  # a mixed-case filter LEFT folds; its VALUE never
+    assert upper.pit == lower.pit
+    assert len(upper.input_requirements) == len(lower.input_requirements)
+
+
+def test_a_mixed_case_source_spelling_does_not_DUPLICATE_the_tables_requirement(catalog):
+    """The sharpest symptom of a raw ref used as a cache key: the source relation spelled with a
+    raw schema segment and the grain key's FOLDED table ref (`_table_ref_of` folds) would land on
+    two `_Tables` entries for ONE physical table, and
+    `identity_payload()["input_requirements"]` would carry the same requirement twice."""
+    lower = _compile(catalog)
+    mixed = _compile(catalog, expr=_expr(table=f"{_SRC}::PUBLIC.transactions"))
+    assert isinstance(lower, ExpressionExecutionIR)
+    assert isinstance(mixed, ExpressionExecutionIR), mixed
+    assert len(mixed.input_requirements) == 1
+    assert expression_ir_hash(mixed) == expression_ir_hash(lower)
+
+
 def test_the_body_path_is_part_of_identity(catalog):
     """A ratio of an expression with itself still stages two outputs; one hash for both would let
     the assembly step read one where it meant the other."""
