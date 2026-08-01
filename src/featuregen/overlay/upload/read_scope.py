@@ -91,6 +91,24 @@ def anchor_visibility_predicate(alias: str = "gn", param: str = "%s") -> str:
         f"ELSE COALESCE({alias}.visible_requires, '{{}}') <@ {param} END)")
 
 
+def visible_table_pairs(conn, allowed: list[str]) -> tuple[list[str], list[str]]:
+    """Every ``(catalog_source, table_name)`` with >= 1 column visible to ``allowed`` — the D11
+    derived table scope, MATERIALIZED once, as two parallel arrays ready to bind.
+
+    :func:`anchor_visibility_predicate` is the right shape for a SINGLE-ROW anchor lookup (one
+    indexed EXISTS probe). A caller issuing MANY queries over the same scope (search runs ~10
+    sharing one predicate) would instead re-plan that correlated EXISTS as a full-catalog hashed
+    subplan in EVERY query; it hoists the set here ONCE and binds the arrays into a plain
+    ``(catalog_source, table_name) IN (SELECT * FROM unnest(...))`` — identical semantics, one
+    scan. The empty result (a caller who can see no column anywhere) binds two empty arrays: every
+    table row is hidden and the SQL stays valid."""
+    rows = conn.execute(
+        "SELECT DISTINCT catalog_source, table_name FROM graph_node "
+        f"WHERE kind = 'column' AND COALESCE(visible_requires, '{{}}') <@ %s",
+        (allowed,)).fetchall()
+    return [r[0] for r in rows], [r[1] for r in rows]
+
+
 def allowed_classes(roles: Iterable[str]) -> list[str]:
     """The visibility classes these roles may see — the union over BOTH vocabularies.
 

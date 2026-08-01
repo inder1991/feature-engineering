@@ -256,6 +256,20 @@ def test_mixed_visibility_table_remains_visible(db):
     assert not any(h.column == "amount" for h in hits)
 
 
+def test_empty_visible_table_set_hides_all_tables_without_error(db):
+    """The visible-table set is computed ONCE per search call (perf hoist) and can be EMPTY — a
+    caller who can see no column anywhere. Every query of the fan-out (hits, total, each facet)
+    must still run — the empty bound array is a legal, all-hiding predicate, never a SQL edge."""
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_restricted_table(db, now)   # ONLY hr exists — roles=() sees no column at all
+
+    res = search(db, "", now=now, roles=())
+    assert res.hits == [] and res.total == 0
+    assert all(buckets == [] or all(b.count == 0 for b in buckets)
+               for buckets in res.facets.values())
+
+
 def test_facet_counts_respect_the_derived_table_scope(db):
     _seal()
     now = datetime(2026, 7, 5, tzinfo=UTC)
