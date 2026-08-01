@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AssetProfilePanel } from './AssetProfilePanel'
 import {
   ApiError,
   type AssetApprovedJoin,
@@ -490,6 +491,10 @@ function OverviewTab({
       </section>
 
       <GovernanceSummary detail={detail} />
+
+      {/* Release-A table profile: renders ONLY for table assets and ONLY while the server offers
+          the surface (flag-gated 404 ⟹ the panel renders nothing — flag-off looks like today). */}
+      <AssetProfilePanel source={source} objectRef={identity.object_ref} kind={identity.kind} />
 
       {identity.kind === 'column' && identity.table && (
         <ColumnSuggestions source={source} identity={identity} />

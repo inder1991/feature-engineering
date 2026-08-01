@@ -164,6 +164,10 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
   const [source, setSource] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState('')
+  // Optional catalog-narrative JSON (Release-A profiles). Attached as the multipart
+  // catalog_profile_json part; validated server-side before any write and committed atomically
+  // with a successful ingest. Empty = not sent; never required.
+  const [profileJson, setProfileJson] = useState('')
   // The result is stored with the source it was uploaded to, so the result panel and the
   // review-queue handoff never read the live input (which the user may already have edited
   // for the next upload).
@@ -187,7 +191,10 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
     setShowFailedRun(false)
     setUploaded(null)
     try {
-      setUploaded({ result: await uploadFile(file, submittedSource), source: submittedSource })
+      setUploaded({
+        result: await uploadFile(file, submittedSource, profileJson.trim() || undefined),
+        source: submittedSource,
+      })
     } catch (err) {
       setError(
         err instanceof ApiError
@@ -304,6 +311,30 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
               </div>
             )}
           </div>
+          <details>
+            <summary className="hint" style={{ cursor: 'pointer' }}>
+              Catalog narrative (optional)
+            </summary>
+            <div className="field" style={{ marginTop: 8 }}>
+              {/* "narrative", deliberately not "profile": getByLabelText(/file/i) must keep
+                  matching ONLY the file input (pro-FILE-…). */}
+              <label>
+                Catalog narrative JSON
+                <textarea
+                  value={profileJson}
+                  onChange={e => setProfileJson(e.target.value)}
+                  rows={4}
+                  placeholder={'{"display_name": "…", "description": "…", '
+                    + '"business_context": "…", "business_domains": ["…"]}'}
+                />
+              </label>
+              <p className="hint">
+                Describes the catalog itself (name, description, business context, domains). It is
+                validated before anything is written and saved atomically with a successful
+                ingest. Leaving it empty never blocks an upload.
+              </p>
+            </div>
+          </details>
           <button
             type="submit"
             className="btn btn--primary"

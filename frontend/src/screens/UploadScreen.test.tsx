@@ -130,6 +130,22 @@ describe('upload screen', () => {
     expect(onReviewQueue).toHaveBeenCalledWith('deposits')
   })
 
+  it('attaches the optional catalog narrative JSON to the upload, and omits it when blank', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    // Blank attach: uploadFile is called WITHOUT a profile part (a missing profile never blocks).
+    await submit()
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
+
+    // `{`/`}` are userEvent key-descriptor syntax, so paste the literal JSON instead of typing.
+    const json = '{"display_name": "Deposits"}'
+    const area = screen.getByLabelText(/catalog narrative json/i)
+    await userEvent.click(area)
+    await userEvent.paste(json)
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', json)
+  })
+
   it('rejects a dropped file with an unsupported extension before any request', async () => {
     renderUpload()
     const dropZone = screen.getByLabelText(/file/i).closest('label')

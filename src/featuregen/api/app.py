@@ -35,6 +35,7 @@ from featuregen.api.routes import (
     integrations,
     learning,
     lineage,
+    profiles,
     quarantine,
     readiness,
     search,
@@ -146,6 +147,10 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # `GET /catalogs` — the pick-list for every `{source}`-keyed surface below (read-scoped).
     app.include_router(catalogs.router)
     app.include_router(assets.router)
+    # Release-A table-asset profiles (flag-gated 404 while FEATUREGEN_DATASET_PROFILES is off).
+    # Distinct `/catalog/asset-profiles` prefix — the assets greedy `{object_ref:path}` route
+    # would swallow a nested literal (see profiles.py module docstring).
+    app.include_router(profiles.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
     app.include_router(readiness.router)

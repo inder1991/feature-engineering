@@ -87,6 +87,39 @@ def set_current_catalog_profile(
     return expected_pointer_version + 1
 
 
+def upsert_current_catalog_profile(conn: DbConn, *, catalog_source: str, revision_id: str) -> int:
+    """Serialized pointer advance for the INGEST path and return the new version.
+
+    The uploader has no pointer view to CAS against (the narrative rides the multipart upload),
+    and the ingest transaction must not fail an otherwise-good upload over a narrative race — so
+    this takes the pointer ROW lock (``FOR UPDATE``) and advances unconditionally under it. The
+    API PUT keeps the strict body-carried ``expected_pointer_version`` CAS
+    (:func:`set_current_catalog_profile`); this helper exists ONLY for the in-ingest write, which
+    already holds the source advisory lock against sibling ingests."""
+    row = conn.execute(
+        "SELECT pointer_version FROM catalog_profile_current WHERE catalog_source = %s "
+        "FOR UPDATE", (catalog_source,)).fetchone()
+    if row is None:
+        changed = conn.execute(
+            "INSERT INTO catalog_profile_current (catalog_source, revision_id, pointer_version) "
+            "VALUES (%s, %s, 1) ON CONFLICT (catalog_source) DO NOTHING",
+            (catalog_source, revision_id)).rowcount
+        if changed == 1:
+            return 1
+        # A concurrent first-write committed while we waited: lock the now-visible row.
+        row = conn.execute(
+            "SELECT pointer_version FROM catalog_profile_current WHERE catalog_source = %s "
+            "FOR UPDATE", (catalog_source,)).fetchone()
+        if row is None:   # unreachable outside a torn store
+            raise CatalogProfileConflict(
+                f"catalog profile pointer for {catalog_source!r} could not be initialized")
+    conn.execute(
+        "UPDATE catalog_profile_current SET revision_id = %s, "
+        "pointer_version = pointer_version + 1, updated_at = now() WHERE catalog_source = %s",
+        (revision_id, catalog_source))
+    return row[0] + 1
+
+
 def current_catalog_profile(
     conn: DbConn, catalog_source: str,
 ) -> tuple[CatalogProfileRevisionV1, CatalogProfileCurrentV1] | None:
