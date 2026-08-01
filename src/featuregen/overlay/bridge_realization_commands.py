@@ -58,10 +58,15 @@ def _update_axis(
             denied_reason="stale realization decision",
         )
     event_id = mint_id("brd")
+    # occurred_at is written explicitly with clock_timestamp(): the column's DEFAULT now() is
+    # TRANSACTION-start time, so two decisions in one transaction landed with identical
+    # timestamps and every `ORDER BY occurred_at, decision_event_id` read ordered them by the
+    # ULID's random tail — a coin flip within one millisecond. clock_timestamp() advances
+    # per statement, so decision order is the order the decisions were actually taken.
     conn.execute(
         "INSERT INTO bridge_realization_decision_event "
         "(decision_event_id, realization_revision_id, decision_axis, decision_value, "
-        " actor_json, evidence_json) VALUES (%s,%s,%s,%s,%s,%s)",
+        " actor_json, evidence_json, occurred_at) VALUES (%s,%s,%s,%s,%s,%s, clock_timestamp())",
         (
             event_id,
             revision_id,
