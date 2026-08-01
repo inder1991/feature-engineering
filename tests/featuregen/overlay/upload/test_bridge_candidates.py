@@ -46,7 +46,9 @@ def test_same_catalog_pair_is_not_a_bridge(db):
     assert derive_bridge_candidates(db) == ()
 
 
-def test_different_entities_do_not_bridge(db):
+def test_different_namespaces_do_not_bridge(db):
+    """The namespace pairing rule: customer_id draws from "cif", account_id from
+    "internal_account" — different issuer value spaces never pair, whatever their entities."""
     _load(db, "core", [
         (CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True), "customer_id"),
     ])
@@ -137,7 +139,9 @@ def test_an_unclassifiable_declared_type_still_does_not_bridge(db):
 
 
 def test_version_pinned():
-    assert BRIDGE_DERIVATION_VERSION == "2.0.0"
+    # 3.0.0 = the namespace pairing rule: candidacy groups by Concept.namespace, entity carried
+    # for corroboration/display with a deterministic pick. Fact identity is unchanged.
+    assert BRIDGE_DERIVATION_VERSION == "3.0.0"
 
 
 def test_a_parameterised_sql_type_classifies_by_its_base_type(db):

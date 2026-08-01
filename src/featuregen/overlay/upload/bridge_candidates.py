@@ -1,20 +1,25 @@
 """Phase-3B.2B — cross-catalog entity-bridge candidate discovery.
 
-A candidate nominates two catalog-local identifier columns for the same entity; it does not claim
-that their identifier namespaces or populations are equal. Bridge-specific grounding keeps those
-claims separate and suppresses hard representation/entity/namespace conflicts. Discovery is
-read-only and deterministic. A proposal becomes available without human confirmation; confirmation
-records review but is not a consumption gate.
+A candidate nominates two catalog-local identifier columns drawing from the same identifier
+NAMESPACE (the issuer's value space, ``Concept.namespace`` — three-axis model); it does not claim
+that their populations are equal. Namespace is the ONLY axis that gates candidacy: entity is
+carried on the candidate for corroboration and display, picked deterministically because
+``fact_key`` hashes ``entity_id``, and an in-namespace entity mismatch is a display note
+(``entity_disagreement``), never a suppression. Bridge-specific grounding keeps the remaining
+claims separate and suppresses hard representation/namespace conflicts. Discovery is read-only and
+deterministic. A proposal becomes available without human confirmation; confirmation records
+review but is not a consumption gate.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations, product
 
 from featuregen.overlay.identity import CatalogObjectRef
 from featuregen.overlay.upload.attest.bridge_grounding import (
+    ENTITY_DISAGREEMENT,
     BridgeEndpointGroundingV1,
     EvidencePresence,
     RepresentationRole,
@@ -30,9 +35,10 @@ from featuregen.overlay.upload.bridge_assessment import (
 )
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.party_vocab import PartyRole, normalize_party_role
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
-BRIDGE_DERIVATION_VERSION = "2.0.0"
+BRIDGE_DERIVATION_VERSION = "3.0.0"
 MAX_CANDIDATES_PER_ENDPOINT_PER_SOURCE_PAIR = 20
 MAX_PAIR_POOL_PER_ENDPOINT = 80
 MAX_BRIDGE_DERIVATION_EXAMPLES = 10
@@ -143,6 +149,9 @@ class _IdCol:
     table_name: str
     column_name: str
     entity: str
+    #: The concept's declared identifier namespace — the GROUPING KEY for candidacy. Entity above
+    #: is carried for corroboration/display and the deterministic candidate entity pick only.
+    namespace: str
     type_family: str
     is_grain: bool
     type_basis: str
@@ -183,13 +192,16 @@ def _identifier_columns(conn, *, roles: Iterable[str]) -> list[_IdCol]:
         grounding = ground_bridge_endpoint(conn, logical_ref)
         concept_name = grounding.concept.concept
         c = concept(concept_name) if concept_name is not None else None
-        if c is None or c.group != "identifier" or not c.entity_link:
+        # Identifier concepts all declare a namespace (validated at registry import) and an
+        # entity_link; a column whose concept is missing from the registry derives nothing.
+        if c is None or c.group != "identifier" or not c.namespace or not c.entity_link:
             continue
         out.append(_IdCol(
             catalog_source=catalog_source,
             table_name=table_name,
             column_name=column_name,
             entity=grounding.entity_id or c.entity_link,
+            namespace=c.namespace,
             type_family=grounding.data_type_family,
             is_grain=grounding.is_grain,
             type_basis=grounding.type_basis.value,
@@ -204,10 +216,34 @@ def _col_ref(col: _IdCol) -> CatalogObjectRef:
                             table=col.table_name, column=col.column_name)
 
 
-def _candidate(entity: str, a: _IdCol, b: _IdCol) -> BridgeCandidateV1:
+def _entity_pick(a: _IdCol, b: _IdCol) -> tuple[str, bool]:
+    """The candidate's carried entity, DETERMINISTICALLY — ``fact_key`` hashes ``entity_id``, so
+    an unstable pick would re-key the same link across re-derivations.
+
+    Agreeing endpoints keep their shared entity (the existing links' identity is preserved).
+    Disagreeing endpoints prefer the SUBJECT-role endpoint's entity where the party-role axis
+    distinguishes exactly one subject, else the lexicographic minimum. Symmetric in (a, b)."""
+    if a.entity == b.entity:
+        return a.entity, False
+    subjects = [
+        col for col in (a, b)
+        if normalize_party_role(col.column_name) is PartyRole.SUBJECT
+    ]
+    if len(subjects) == 1:
+        return subjects[0].entity, True
+    return min(a.entity, b.entity), True
+
+
+def _candidate(a: _IdCol, b: _IdCol) -> BridgeCandidateV1:
     left, right = sorted((a, b), key=lambda c: (c.catalog_source, c.table_name, c.column_name))
+    entity, entity_disagreement = _entity_pick(left, right)
     grounding = assess_grounded_identifier_link(left.grounding, right.grounding)
     assessment = grounding.to_assessment()
+    if entity_disagreement and ENTITY_DISAGREEMENT not in assessment.explanation_codes:
+        assessment = replace(
+            assessment,
+            explanation_codes=(*assessment.explanation_codes, ENTITY_DISAGREEMENT),
+        )
     basis = left.type_basis if left.type_basis == right.type_basis else "mixed"
     return BridgeCandidateV1(
         candidate_id=assessment.candidate_id,
@@ -420,7 +456,9 @@ def _derive_from_identifier_columns(
     for col in columns:
         if col.type_family == "other":
             continue
-        blocks[(col.entity, col.type_family)][col.catalog_source].append(col)
+        # The BLOCKING KEY is the identifier namespace: cross-namespace pairs are impossible by
+        # construction. Entity never gates — it rides on the candidate for corroboration/display.
+        blocks[(col.namespace, col.type_family)][col.catalog_source].append(col)
 
     candidates: dict[str, BridgeCandidateV1] = {}
     reason_counts: dict[str, int] = defaultdict(int)
@@ -429,7 +467,7 @@ def _derive_from_identifier_columns(
     considered_count = 0
     suppressed_count = 0
 
-    for (entity, _family), by_source in sorted(blocks.items()):
+    for (_namespace, _family), by_source in sorted(blocks.items()):
         normalized = {
             source: tuple(sorted(values, key=_col_key))
             for source, values in by_source.items()
@@ -450,7 +488,7 @@ def _derive_from_identifier_columns(
             scored: list[tuple[int, BridgeCandidateV1]] = []
             for left_key, right_key in sorted(pair_keys):
                 candidate = _candidate(
-                    entity, left_by_key[left_key], right_by_key[right_key])
+                    left_by_key[left_key], right_by_key[right_key])
                 assessment = candidate.assessment
                 assert assessment is not None
                 if assessment.hard_conflicts:
@@ -520,13 +558,19 @@ def _current_identifier_column(conn, ref: CatalogObjectRef) -> _IdCol | None:
         return None
     concept_name = grounding.concept.concept
     registered = concept(concept_name) if concept_name is not None else None
-    if registered is None or registered.group != "identifier" or not registered.entity_link:
+    if (
+        registered is None
+        or registered.group != "identifier"
+        or not registered.namespace
+        or not registered.entity_link
+    ):
         return None
     return _IdCol(
         catalog_source=ref.catalog_source.strip().lower(),
         table_name=ref.table.strip().lower(),
         column_name=ref.column.strip().lower(),
         entity=grounding.entity_id or registered.entity_link,
+        namespace=registered.namespace,
         type_family=grounding.data_type_family,
         is_grain=grounding.is_grain,
         type_basis=grounding.type_basis.value,
@@ -539,8 +583,10 @@ def bridge_catalog_write_error(conn, ref) -> str | None:
     """State-aware bridge write gate shared by propose, confirm and direct entry.
 
     The structural identity gate in :mod:`overlay.identity` proves ref/value consistency. This gate
-    proves that both claimed endpoints still exist as catalog columns and are still classified as
-    identifiers for the claimed entity. Human approval is deliberately not required.
+    proves that both claimed endpoints still exist as catalog columns, still draw from ONE
+    identifier namespace, and that the claimed entity is the deterministic pick over the two
+    endpoints — entity corroborates and displays, it never gates candidacy on its own. Human
+    approval is deliberately not required.
     """
     from featuregen.overlay.identity import EntityBridgeRef
 
@@ -554,12 +600,19 @@ def bridge_catalog_write_error(conn, ref) -> str | None:
                 f"entity_bridge {side} endpoint does not exist as a flat logical identifier column: "
                 f"{endpoint.catalog_source}::public.{endpoint.table}.{endpoint.column or ''}"
             )
-        if current.entity != ref.entity_id.strip().lower():
-            return (
-                f"entity_bridge {side} endpoint is classified for entity {current.entity!r}, "
-                f"not the claimed {ref.entity_id!r}"
-            )
         current_endpoints[side] = current
+    left, right = current_endpoints["left"], current_endpoints["right"]
+    if left.namespace != right.namespace:
+        return (
+            f"entity_bridge endpoints draw from different identifier namespaces "
+            f"({left.namespace!r} vs {right.namespace!r}); a cross-namespace link is impossible"
+        )
+    picked_entity, _entity_disagreement = _entity_pick(left, right)
+    if picked_entity != ref.entity_id.strip().lower():
+        return (
+            f"entity_bridge claimed entity {ref.entity_id!r} does not match the deterministic "
+            f"entity pick {picked_entity!r} for these endpoints"
+        )
     grounding = assess_grounded_identifier_link(
         current_endpoints["left"].grounding,
         current_endpoints["right"].grounding,
@@ -615,9 +668,10 @@ def bridge_candidate_write_error(conn, candidate: BridgeCandidateV1) -> str | No
 
 
 def derive_bridge_candidates(conn, *, roles: Iterable[str] = ()) -> tuple[BridgeCandidateV1, ...]:
-    """Candidate bridges from declared metadata: identifier concepts for the SAME entity_link, in DISTINCT
-    catalog sources, with a COMPATIBLE type family. Deterministic (canonical unordered pair + sorted
-    output). Read-only."""
+    """Candidate bridges from declared metadata: identifier concepts in the SAME identifier
+    namespace (``Concept.namespace``), in DISTINCT catalog sources, with a COMPATIBLE type family.
+    Entity is carried for corroboration/display, never as a gate. Deterministic (canonical
+    unordered pair + sorted output + deterministic entity pick). Read-only."""
     return derive_bridge_candidates_with_report(conn, roles=roles).candidates
 
 
@@ -638,12 +692,12 @@ def derive_bridge_candidate_for_refs(
         left is None
         or right is None
         or left.catalog_source == right.catalog_source
-        or left.entity != right.entity
+        or left.namespace != right.namespace
         or left.type_family == "other"
         or left.type_family != right.type_family
     ):
         return None
-    return _candidate(left.entity, left, right)
+    return _candidate(left, right)
 
 
 def derive_bridge_candidates_with_report(

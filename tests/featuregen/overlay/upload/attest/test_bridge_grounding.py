@@ -267,11 +267,36 @@ def test_explicit_different_namespaces_are_a_hard_conflict(db):
     assert derive_bridge_candidates(db) == ()
 
 
-def test_governed_entity_conflict_is_independent_of_the_display_concept(db):
+def test_governed_entity_disagreement_within_one_namespace_is_a_note_not_a_conflict(db):
+    """Namespace pairing rule: both concepts draw from "cif", so disagreeing GOVERNED entities
+    (still read from governed field evidence, never the display concept — the display concepts
+    AGREE here, so only the governed rows can disagree) become an ``entity_disagreement``
+    explanation and the pair still derives, with the deterministic entity pick."""
     _load(db, "core", [_column("core", "customers", "customer_id", "customer_id")])
     _load(db, "ftr", [_column("ftr", "transactions", "cif_id", "customer_id")])
     left_ref = "core::public.customers.customer_id"
     right_ref = "ftr::public.transactions.cif_id"
+    _record_governed_field(db, left_ref, "entity", "customer")
+    _record_governed_field(db, right_ref, "entity", "merchant")
+
+    grounding = ground_identifier_link(db, left_ref, right_ref)
+
+    assert "different_governed_entity" not in grounding.hard_conflicts
+    assert "entity_disagreement" in grounding.explanation_codes
+    candidates = derive_bridge_candidates(db)
+    assert len(candidates) == 1
+    # customer_id is the SUBJECT-role name; cif_id resolves no party role -> the subject's entity.
+    assert candidates[0].entity_id == "customer"
+
+
+def test_governed_entity_conflict_survives_across_namespaces(db):
+    """Outside a shared identifier namespace the governed-entity comparison still gates: the pair
+    could never derive anyway (different namespaces), and a direct proposal keeps hitting the
+    hard conflict."""
+    _load(db, "core", [_column("core", "customers", "customer_id", "customer_id")])
+    _load(db, "ftr", [_column("ftr", "transactions", "acct_ref", "account_id")])
+    left_ref = "core::public.customers.customer_id"
+    right_ref = "ftr::public.transactions.acct_ref"
     _record_governed_field(db, left_ref, "entity", "customer")
     _record_governed_field(db, right_ref, "entity", "merchant")
 

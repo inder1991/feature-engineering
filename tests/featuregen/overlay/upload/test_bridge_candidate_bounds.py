@@ -85,6 +85,7 @@ def _fake_col(
         table_name="customers",
         column_name=column,
         entity="customer",
+        namespace="cif",
         type_family="text",
         is_grain=False,
         type_basis="attested",

@@ -223,6 +223,11 @@ def test_party_role_is_never_consumed_by_join_candidacy_or_execution(db):
         "overlay/upload/enrich_llm.py",        # egress allowlist entry (structural token)
         "overlay/upload/asset_detail.py",      # the column dossier (Task 3C read surface)
         "overlay/upload/column_view.py",       # pure dossier assembler
+        # The namespace-pairing handoff's deterministic entity PICK: the role breaks the tie for
+        # which entity LABEL rides a disagreeing same-namespace candidate. WHICH pairs derive is
+        # decided by namespace alone — test_bridge_namespace_pairing pins that the candidate pair
+        # set is party-role-invariant, so the role still explains and never gates candidacy.
+        "overlay/upload/bridge_candidates.py",
     }
     offenders = sorted(
         str(p.relative_to(src_root))

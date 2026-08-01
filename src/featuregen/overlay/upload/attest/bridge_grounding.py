@@ -59,6 +59,12 @@ from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
 BRIDGE_GROUNDING_VERSION = "1.0.0"
 
+#: Explanation code for a SAME-NAMESPACE pair whose endpoints are classified for different
+#: entities (the cust_num(customer) x counter_party_cif_id(counterparty) case). Namespace is the
+#: only axis that gates join candidacy; entity corroborates and displays, so within one namespace
+#: this is a display note, never a suppression.
+ENTITY_DISAGREEMENT = "entity_disagreement"
+
 _METADATA_FIELDS = (
     "definition",
     "names",
@@ -624,7 +630,20 @@ def assess_grounded_identifier_link(
         and right.governed_entity_id
         and left.governed_entity_id != right.governed_entity_id
     ):
-        hard_conflicts.append("different_governed_entity")
+        # The three-axis model: within ONE identifier namespace, an entity mismatch is a display
+        # note (a counterparty may be our customer — same cif registry). Across namespaces, or
+        # where no namespace is declared, differing governed entities stay a hard conflict.
+        left_registered = lookup_concept(left.concept.concept) if left.concept.concept else None
+        right_registered = lookup_concept(right.concept.concept) if right.concept.concept else None
+        if (
+            left_registered is not None
+            and right_registered is not None
+            and left_registered.namespace is not None
+            and left_registered.namespace == right_registered.namespace
+        ):
+            explanations.append(ENTITY_DISAGREEMENT)
+        else:
+            hard_conflicts.append("different_governed_entity")
 
     if left.explicit_namespace and right.explicit_namespace:
         if left.explicit_namespace == right.explicit_namespace:
