@@ -76,7 +76,13 @@ from featuregen.materialize.inventory import (
 )
 from featuregen.materialize.ir import BridgeExecutionAuthorization, FormulaExecutionIRV1
 from featuregen.materialize.render.project import REQUIRED_RUN_PARAMETERS
-from featuregen.materialize.spine import CurrentSnapshot, LatestAvailableAsOf, SpineSpec
+from featuregen.materialize.spine import (
+    ActivePopulation,
+    CurrentSnapshot,
+    LatestAvailableAsOf,
+    SpineSourceDeclarationV1,
+    SpineSpec,
+)
 
 __all__ = [
     "DAYS_PER_UNIT",
@@ -608,6 +614,22 @@ def run_input_requests(
         for requirement in expression.input_requirements)
 
 
+def _recorded_vintage(declaration: SpineSourceDeclarationV1) -> str:
+    """The calendar date an ``ActivePopulation`` declaration was RECORDED — its only vintage.
+
+    The policy declares no vintage of its own (unlike ``CurrentSnapshot``), and its status column
+    is current-valued, so the one date on record that a human stood behind the table's current rows
+    is the date of ``recorded_at``. Returned as TEXT, with an unreadable ``recorded_at`` returned
+    raw, so it flows into the same "not a calendar date" refusal the ``CurrentSnapshot`` vintage
+    uses — *"this module cannot read the vintage"* is not *"the vintage is fine"*.
+    """
+    recorded = declaration.recorded_at.strip()
+    try:
+        return dt.datetime.fromisoformat(recorded).date().isoformat()
+    except ValueError:
+        return recorded
+
+
 def spine_input_request(
     spine: SpineSpec,
     spine_input: PhysicalInputRequirement,
@@ -623,14 +645,24 @@ def spine_input_request(
     ``PARTITION_MAPPED`` is the business date's own partition, exactly what the rendered spine node
     selects.
 
-    **This is where §4.2's `CurrentSnapshot` vintage condition becomes reachable.** A table that
-    holds no history was observed at one vintage; asked for any other business date it would answer
-    with the rows it has, and the run would publish one day's population under another day's date.
-    §4.2 says it refuses rather than pretending, so it does. The refusal is typed
-    ``SPINE_DECLARATION_REJECTED_BY_FACTS``: §14's vocabularies are closed and no member names a
-    run-preparation verdict, and of the members that exist this is the only one that says *this
-    spine declaration does not stand*. The strain is real and recorded — the refuting input is the
-    run's business date rather than a governed catalog fact.
+    **This is where §4.2's vintage condition becomes reachable — for BOTH present-tense
+    policies.** A table that holds no history was observed at one vintage; asked for any other
+    business date it would answer with the rows it has, and the run would publish one day's
+    population under another day's date. §4.2 says it refuses rather than pretending, so it does.
+    The refusal is typed ``SPINE_DECLARATION_REJECTED_BY_FACTS``: §14's vocabularies are closed and
+    no member names a run-preparation verdict, and of the members that exist this is the only one
+    that says *this spine declaration does not stand*. The strain is real and recorded — the
+    refuting input is the run's business date rather than a governed catalog fact.
+
+    ``CurrentSnapshot`` declares its vintage outright (``observed_snapshot_ref``).
+    ``ActivePopulation`` — the other history-free policy — declares none, and its status column is
+    CURRENT-valued, so the one date on record that anyone stood behind is the calendar date its
+    declaration was RECORDED: the moment a human looked at the table's current rows and called them
+    the population. It gets the SAME refusal for any other date (review §2.1's confirmed leak — a
+    January backfill run in July silently publishing July's actives). Requiring an
+    ``availability_ref`` instead would only half-close that leak: an entity CLOSED since a
+    historical business date has no row left for rule 6 to filter, so no availability cutoff can
+    recover that date's population.
 
     A vintage that is not a calendar date is refused too. It is an opaque declared identifier, a
     version and a date have no ordering between them, and *"this module cannot check the vintage"*
@@ -654,23 +686,30 @@ def spine_input_request(
     anchor = _business_date(business_dt)
     policy = spine.snapshot_policy
 
-    if isinstance(policy, CurrentSnapshot):
-        vintage = policy.observed_snapshot_ref.strip()
+    if isinstance(policy, CurrentSnapshot | ActivePopulation):
+        # ONE guard for the two present-tense policies; only WHERE the declared vintage lives
+        # differs. `label` puts the policy's name in the shared refusal, so the operator reading
+        # it knows which declaration to fix.
+        if isinstance(policy, CurrentSnapshot):
+            vintage, vintage_source = policy.observed_snapshot_ref.strip(), "observed at"
+        else:
+            vintage, vintage_source = _recorded_vintage(spine.declaration), "recorded at"
+        label = policy.kind.name
         try:
             observed = dt.date.fromisoformat(vintage)
         except ValueError:
             return _refuse(
                 CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
-                f"the population of {spine.source_table_ref} is declared CURRENT_SNAPSHOT observed "
-                f"at {vintage!r}, which is not a calendar date: the run's business date is "
+                f"the population of {spine.source_table_ref} is declared {label} {vintage_source} "
+                f"{vintage!r}, which is not a calendar date: the run's business date is "
                 f"{anchor.isoformat()}, and a version identifier and a date have no ordering "
                 f"between them — so whether this table can answer this date cannot be established, "
                 f"and an unestablished vintage is not a matching one")
         if observed != anchor:
             return _refuse(
                 CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
-                f"the population of {spine.source_table_ref} is declared CURRENT_SNAPSHOT observed "
-                f"at {observed.isoformat()}, and this run's business date is {anchor.isoformat()}: "
+                f"the population of {spine.source_table_ref} is declared {label} {vintage_source} "
+                f"{observed.isoformat()}, and this run's business date is {anchor.isoformat()}: "
                 f"a table that holds no history cannot answer another date, and answering with the "
                 f"rows it happens to hold would publish one day's population under another day's "
                 f"date")

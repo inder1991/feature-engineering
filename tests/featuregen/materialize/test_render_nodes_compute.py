@@ -405,6 +405,25 @@ def test_active_population_keeps_only_the_DECLARED_status_values(compiled):
     assert sorted(row["cif_id"] for row in rows) == ["c1", "c2"]
 
 
+def test_active_population_with_NO_availability_ref_renders_NO_cutoff_by_design(compiled):
+    """Documented shape, not an oversight (review §2.1): with no `availability_ref` there is no
+    rule-6 filter and no cutoff to compute, so the node is the status filter alone — a row that
+    ARRIVED after the cutoff is still kept. The point-in-time gate for this policy lives at RUN
+    PREPARATION: `runprep.spine_input_request` refuses any business date the declaration's
+    recorded vintage cannot answer, so a rendered no-cutoff spine only ever runs under the one
+    date its declaration stood behind."""
+    bare = _with_policy(compiled[0].spine, ACTIVE)
+    bare = dataclasses.replace(
+        bare, availability_ref=None,
+        declaration=dataclasses.replace(bare.declaration, availability_ref=None))
+    node = render_spine_node(
+        bare, compiled[1], compiled[2], spine_input=compiled[3],
+        source_dataset="raw_public__customers", spine_dataset="primary_spine")
+    assert "cutoff" not in node.source
+    rows = _run(node, [_customer("c1", load_ts=AFTER)]).rows
+    assert [row["cif_id"] for row in rows] == ["c1"]
+
+
 def test_current_snapshot_refuses_a_business_date_it_was_not_OBSERVED_at(compiled):
     """A present-day table cannot honestly answer an arbitrary historical business date, so a
     mismatch refuses rather than answering with today's rows."""

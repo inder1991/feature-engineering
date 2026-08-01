@@ -542,6 +542,27 @@ def test_an_ActivePopulation_declaration_is_accepted_when_it_is_coherent(
     assert CUSTOMERS_STATUS in result.read_set
 
 
+def test_an_ActivePopulation_with_NO_availability_ref_COMPILES_and_the_gate_is_at_run_prep(
+        two_candidate_customer_tables):
+    """Documented ACCEPTANCE, not an oversight (review §2.1). §4.2 places no availability
+    requirement on this policy, so the declaration compiles with `availability_ref=None` and the
+    rendered spine carries no cutoff at all (pinned in test_render_nodes_compute). The
+    point-in-time enforcement lives at RUN PREPARATION: `runprep.spine_input_request` refuses any
+    business date the declaration's recorded vintage cannot answer. Requiring an availability_ref
+    HERE would only half-close the leak — the status column is CURRENT-valued, so entities closed
+    since a historical business date would still vanish from that date's population even under a
+    rule-6 filter."""
+    result = validate_spine_declaration(
+        two_candidate_customer_tables,
+        _declaration(availability_ref=None,
+                     population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
+                     snapshot_policy=ActivePopulation(
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"))),
+        roles=_ROLES)
+    assert isinstance(result, SpineSpec)
+    assert result.availability_ref is None
+
+
 def test_a_refusal_never_echoes_the_declared_status_VALUES(two_candidate_customer_tables):
     """Refusal detail carries counts, types, hashes and locations — never data values."""
     result = validate_spine_declaration(
