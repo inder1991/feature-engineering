@@ -1112,6 +1112,35 @@ def concept(name: str) -> Concept | None:
     return CONCEPT_REGISTRY.get(name)
 
 
+def concept_path(name: str | None) -> tuple[str, ...]:
+    """The selected concept followed by every ``is_a`` ancestor (semantic plan Task 1).
+
+    ``unclassified`` is a SENTINEL, never a registry member — it (like ``None`` and any unknown
+    name) returns the EMPTY tuple; the semantic-context bundle carries the closed
+    ``concept_unclassified`` missing-context code beside it, so "no hierarchy" is honest output
+    rather than a lookup error. Registry validation (:func:`_validate_registry`) makes an ``is_a``
+    cycle impossible at import, but this READER still refuses a corrupt registry (a mutated entry
+    at runtime) rather than spinning forever: a revisited name raises ``ValueError``."""
+    if not name or name == UNCLASSIFIED:
+        return ()
+    record = CONCEPT_REGISTRY.get(name)
+    if record is None:
+        return ()
+    path: list[str] = [name]
+    cur = record.is_a
+    while cur is not None:
+        if cur in path:
+            raise ValueError(
+                f"concept registry is corrupt: is_a cycle {' -> '.join([*path, cur])}")
+        parent = CONCEPT_REGISTRY.get(cur)
+        if parent is None:
+            raise ValueError(
+                f"concept registry is corrupt: {path[-1]!r} names unknown parent {cur!r}")
+        path.append(cur)
+        cur = parent.is_a
+    return tuple(path)
+
+
 # The 5 legacy aliases are retained so already-enriched data + the pre-B1b classifier are never orphaned,
 # but they are NOT classification targets — the classifier should choose the richer §3 concept instead.
 _LEGACY_ALIASES: frozenset[str] = frozenset({

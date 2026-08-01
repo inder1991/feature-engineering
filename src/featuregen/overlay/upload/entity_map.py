@@ -40,14 +40,10 @@ from featuregen.overlay.upload.bridge_assessment import (
     LinkReviewStatus,
     available_identifier_links,
 )
-from featuregen.overlay.upload.bridge_realization import (
-    eligible_for_production,
-    eligible_for_sandbox,
-)
-from featuregen.overlay.upload.bridge_store import load_current_bridge_realizations
 from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.read_scope import allowed_classes
+from featuregen.overlay.upload.semantic_context import composed_link_realizations
 from featuregen.overlay.upload.taxonomy.dimensions import known_entities
 
 #: Sample column refs shown per (entity, catalog). A taste of what carries the entity, not a listing
@@ -150,9 +146,11 @@ def _endpoint_view(endpoint: IdentifierEndpointV1) -> EntityMapEndpointV1:
 
 
 def _realization_views(conn, bridge_fact_key: str) -> tuple[EntityMapRealizationV1, ...]:
+    # ONE shared composition (semantic_context.composed_link_realizations) renders here and in
+    # the semantic-context bundle — the map never re-loads or re-judges eligibility itself.
     views: list[EntityMapRealizationV1] = []
-    for stored in load_current_bridge_realizations(conn, bridge_fact_key=bridge_fact_key):
-        revision, current = stored.revision, stored.current
+    for composed in composed_link_realizations(conn, bridge_fact_key):
+        revision, current = composed.revision, composed.current
         f_source, f_schema, f_table, _ = parse_ref(revision.from_endpoint.logical_table_ref)
         t_source, t_schema, t_table, _ = parse_ref(revision.to_endpoint.logical_table_ref)
         views.append(EntityMapRealizationV1(
@@ -162,8 +160,8 @@ def _realization_views(conn, bridge_fact_key: str) -> tuple[EntityMapRealization
             to_table_ref=f"{t_schema}.{t_table}",
             lifecycle=current.lifecycle.value,
             safety_status=current.safety_status.value,
-            sandbox_eligible=eligible_for_sandbox(revision, current),
-            production_eligible=eligible_for_production(revision, current),
+            sandbox_eligible=composed.sandbox_eligible,
+            production_eligible=composed.production_eligible,
         ))
     return tuple(views)
 
