@@ -42,6 +42,15 @@ is derived from the formula's own policies (§8 rule 4) and never from the SQL t
   is a NULL on a NON-empty window. §6 lists only the two sources below; this third one is added
   deliberately, because declaring a column non-null that a propagating null can fill is the
   direction of that decision that produces a broken write rather than a refusal;
+* ``NullInput.IGNORE`` on ANY NON-COUNT expression (Task 20) — Spark's aggregates skip nulls, so a
+  NON-empty window whose every operand value is NULL aggregates to NULL, and the renderer
+  deliberately does not coalesce it: an all-null group is not an empty window, so the
+  ``empty_window`` fill must not touch it (the rendered §8 rule 4 comments say exactly this), and
+  a substituted zero would answer a policy question the formula never declared. The COUNT family
+  is exempt because every count answers that same group with 0, never NULL. Task 7's rendered
+  aggregate-overflow gate reads the same split from the other side — a NULL sum beside an operand
+  count ABOVE zero is OVERFLOW and aborts; beside a count of ZERO it is this policy's own answer,
+  and the type must admit it;
 * ``ZeroDenominator.NULL`` on a ratio.
 
 Everything else is non-null — including the ``ERROR`` members of those two enums, which abort the
@@ -120,7 +129,15 @@ __all__ = [
 #: under version 2 refuses under version 3, and the version-2 column it described carries a
 #: rounding claim the engine did not honour — the same accept→refuse non-interchangeability that
 #: separated 1 from 2 (DEFERRED-WORK A.28).
-PHYSICAL_TYPE_POLICY_VERSION = 3
+#:
+#: **4** (codegen-review Task 20): a NON-COUNT aggregate under ``null_input=IGNORE`` is now
+#: NULLABLE — Spark answers a non-empty, all-NULL window with NULL, the renderer deliberately does
+#: not coalesce it, and the COUNT family (which answers the same group with 0) keeps its version-3
+#: answer. Unlike 1→2 and 2→3 this is accept→ACCEPT-DIFFERENTLY: the same formula resolves under
+#: both versions with different nullability, so a version-3 plan typing a SUM+ignore column NOT
+#: NULL describes a constraint its own data can violate — §9's rendered ``WRONG_NULLABILITY`` gate
+#: would abort a correctly-authored feature the first time a group's operands were all NULL.
+PHYSICAL_TYPE_POLICY_VERSION = 4
 
 #: The maximum precision a Hive/Spark ``DECIMAL`` can hold. A policy above it is not representable.
 _MAX_DECIMAL_PRECISION = 38
@@ -326,11 +343,20 @@ def _check_operand_types(
 def _is_nullable(
     body: FormulaBody, expressions: tuple[tuple[str, AggregateExpression], ...]
 ) -> bool:
-    """Whether the published column can hold a NULL, from the formula's own policies (§8 rule 4)."""
+    """Whether the published column can hold a NULL, from the formula's own policies (§8 rule 4).
+
+    Four sources (module docstring): a NULL empty window, a propagating null input, an IGNORED
+    null input on a non-COUNT aggregate — a NON-empty, all-NULL window aggregates to NULL and the
+    renderer deliberately does not coalesce it (Task 20) — and a NULL zero-denominator policy.
+    Counts are exempt from the third source only: every COUNT answers an all-null group with 0.
+    """
     for _path, expr in expressions:
         if expr.window.empty_window is EmptyWindowResult.NULL:
             return True
         if expr.window.null_input is NullInput.PROPAGATE:
+            return True
+        if (expr.window.null_input is NullInput.IGNORE
+                and expr.aggregation not in _COUNT_FUNCTIONS):
             return True
     return isinstance(body, RatioBody) and body.zero_denominator is ZeroDenominator.NULL
 

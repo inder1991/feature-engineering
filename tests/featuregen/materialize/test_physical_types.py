@@ -137,10 +137,13 @@ def _count(aggregation: AggregateFunction = AggregateFunction.COUNT_DISTINCT, *,
 def _ratio(*, zero_denominator: ZeroDenominator = ZeroDenominator.ZERO,
            numerator_empty: EmptyWindowResult = EmptyWindowResult.ZERO,
            denominator_empty: EmptyWindowResult = EmptyWindowResult.ZERO,
+           null_input: NullInput = NullInput.IGNORE,
            decimal: DecimalPolicy = _POLICY) -> TypedFormulaV1:
     return _formula(
-        RatioBody(numerator=_expr(AggregateFunction.SUM, empty_window=numerator_empty),
-                  denominator=_expr(AggregateFunction.SUM, empty_window=denominator_empty),
+        RatioBody(numerator=_expr(AggregateFunction.SUM, empty_window=numerator_empty,
+                                  null_input=null_input),
+                  denominator=_expr(AggregateFunction.SUM, empty_window=denominator_empty,
+                                    null_input=null_input),
                   zero_denominator=zero_denominator),
         output_type="decimal", decimal=decimal)
 
@@ -222,8 +225,15 @@ def test_the_policy_version_is_a_declared_constant():
     explicit call — DEFERRED-WORK A.28). The same accept→refuse shape that separated 1 from 2: a
     version-2 ratio column claiming ``half_even`` carries a mode the engine never applied, so a
     contract keyed on 2 is not interchangeable with one keyed on 3.
+
+    **4**, not 3: a non-COUNT aggregate under ``null_input=ignore`` is now NULLABLE (Task 20 —
+    Spark answers a non-empty, all-NULL window with NULL and the renderer deliberately does not
+    coalesce it). Unlike the two shifts above this is accept→ACCEPT-DIFFERENTLY: the SAME formula
+    resolves under both versions with DIFFERENT nullability, so a version-3 plan typing a
+    SUM+ignore column NOT NULL describes a constraint its own data can violate — the strongest
+    form of the non-interchangeability the version exists to express.
     """
-    assert PHYSICAL_TYPE_POLICY_VERSION == 3
+    assert PHYSICAL_TYPE_POLICY_VERSION == 4
 
 
 # ── counts → BIGINT ──────────────────────────────────────────────────────────────────────────────
@@ -542,28 +552,38 @@ def test_operand_types_has_no_default():
 
 
 # ── nullability is part of the type decision ─────────────────────────────────────────────────────
+#
+# Every test isolating another axis pins ``null_input=ZERO``, because the default ``IGNORE`` is
+# itself a NULL source since Task 20 — under the default, these assertions would be answered by
+# the ignore rule whatever the axis under test declared.
 
 def test_a_zero_empty_window_yields_a_non_null_column():
-    assert _resolved(_sum(empty_window=EmptyWindowResult.ZERO)).nullable is False
+    assert _resolved(_sum(empty_window=EmptyWindowResult.ZERO,
+                          null_input=NullInput.ZERO)).nullable is False
 
 
 def test_a_null_empty_window_yields_a_nullable_column():
-    assert _resolved(_sum(empty_window=EmptyWindowResult.NULL)).nullable is True
+    assert _resolved(_sum(empty_window=EmptyWindowResult.NULL,
+                          null_input=NullInput.ZERO)).nullable is True
 
 
 def test_a_null_empty_window_on_EITHER_half_makes_the_column_nullable():
     """Each ``AggregateExpression`` owns its own window (interfaces §6), so a ratio has two
     empty-window policies and either one can put a NULL in the published column."""
-    assert _resolved(_ratio(denominator_empty=EmptyWindowResult.NULL)).nullable is True
-    assert _resolved(_ratio(numerator_empty=EmptyWindowResult.NULL)).nullable is True
+    assert _resolved(_ratio(denominator_empty=EmptyWindowResult.NULL,
+                            null_input=NullInput.ZERO)).nullable is True
+    assert _resolved(_ratio(numerator_empty=EmptyWindowResult.NULL,
+                            null_input=NullInput.ZERO)).nullable is True
 
 
 def test_zero_denominator_NULL_yields_a_nullable_column():
-    assert _resolved(_ratio(zero_denominator=ZeroDenominator.NULL)).nullable is True
+    assert _resolved(_ratio(zero_denominator=ZeroDenominator.NULL,
+                            null_input=NullInput.ZERO)).nullable is True
 
 
 def test_zero_denominator_ZERO_leaves_the_column_non_null():
-    assert _resolved(_ratio(zero_denominator=ZeroDenominator.ZERO)).nullable is False
+    assert _resolved(_ratio(zero_denominator=ZeroDenominator.ZERO,
+                            null_input=NullInput.ZERO)).nullable is False
 
 
 def test_a_count_is_nullable_when_its_empty_window_says_NULL():
@@ -577,8 +597,36 @@ def test_a_propagating_null_input_makes_the_column_nullable():
     """Beyond §6's two listed sources: ``NullInput.PROPAGATE`` says a null operand VALUE makes the
     aggregate null, which is a null in the published column on a NON-empty window."""
     assert _resolved(_sum(null_input=NullInput.PROPAGATE)).nullable is True
-    assert _resolved(_sum(null_input=NullInput.IGNORE)).nullable is False
     assert _resolved(_sum(null_input=NullInput.ZERO)).nullable is False
+
+
+def test_IGNORE_over_an_all_null_window_is_nullable():
+    """The FOURTH null source (Task 20 — this file previously PINNED ``is False`` here).
+
+    ``F.sum`` over a NON-empty group whose every operand is NULL returns NULL, and the renderer
+    deliberately does not coalesce it: the rendered §8 rule 4 comment in ``nodes_compute`` explains
+    that an all-null group is not an empty window, so filling it would answer this entity's policy
+    question with the empty-window declaration's answer. The TYPE must therefore admit the NULL —
+    ``empty_window`` stays ``ZERO`` here precisely because that policy cannot reach this value.
+    Task 7's aggregate-overflow gate reads the same split from the other side: a NULL sum beside
+    an operand count above zero is OVERFLOW; beside a count of ZERO it is this policy's own answer.
+    """
+    assert _resolved(_sum(null_input=NullInput.IGNORE)).nullable is True
+    # Either half of a two-expression body can hold the all-null group — the rule is per
+    # EXPRESSION, like the other window-policy sources.
+    assert _resolved(_difference()).nullable is True
+
+
+@pytest.mark.parametrize("aggregation", [
+    AggregateFunction.COUNT_ROWS,
+    AggregateFunction.COUNT_NON_NULL,
+    AggregateFunction.COUNT_DISTINCT,
+])
+def test_the_COUNT_family_stays_non_null_under_IGNORE(aggregation):
+    """The exemption inside the fourth source: every COUNT answers an all-null (or empty) group
+    with 0, never NULL — ``count(x)`` skips nulls and counts what remains — so ``ignore`` puts no
+    NULL in a BIGINT count column."""
+    assert _resolved(_count(aggregation)).nullable is False
 
 
 # ── the decimal policy is validated exactly where it governs ────────────────────────────────────
@@ -795,11 +843,15 @@ def test_a_body_outside_child1s_closed_union_is_a_schema_error_not_a_refusal():
 def test_the_identity_payload_hashes_and_distinguishes_nullability():
     """The resolved type enters ``group_plan_hash`` (§6), so a nullability difference must be a
     hash difference — otherwise two plans that write different columns share one identity."""
-    non_null = _resolved(_sum(empty_window=EmptyWindowResult.ZERO)).identity_payload()
+    # `null_input=ZERO` on the non-null side: under the default `ignore` the column is nullable
+    # for Task 20's reason and the two payloads would agree instead of differing.
+    non_null = _resolved(_sum(empty_window=EmptyWindowResult.ZERO,
+                              null_input=NullInput.ZERO)).identity_payload()
     nullable = _resolved(_sum(empty_window=EmptyWindowResult.NULL)).identity_payload()
     assert materialize_hash(non_null) != materialize_hash(nullable)
     assert materialize_hash(non_null) == materialize_hash(
-        _resolved(_sum(empty_window=EmptyWindowResult.ZERO)).identity_payload())
+        _resolved(_sum(empty_window=EmptyWindowResult.ZERO,
+                       null_input=NullInput.ZERO)).identity_payload())
 
 
 def test_the_identity_payload_distinguishes_the_sql_type_alone():

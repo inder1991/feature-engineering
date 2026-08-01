@@ -69,6 +69,7 @@ from featuregen.materialize.group_plan import (
     StagingManifestV1,
     StagingStatus,
     check_completeness,
+    expected_schema,
 )
 from featuregen.materialize.inventory import (
     EventTimePartition,
@@ -77,8 +78,10 @@ from featuregen.materialize.inventory import (
     StaticSnapshot,
 )
 from featuregen.materialize.ir import ir_hash
+from featuregen.materialize.physical_types import PhysicalType, resolve_physical_type
 from featuregen.materialize.render import nodes_compute
 from featuregen.materialize.render.nodes_compute import SPINE_FUNC_NAME, render_spine_node
+from featuregen.materialize.render.nodes_gate import GATE_FUNC_NAME, render_gate_node
 from featuregen.materialize.render.project import (
     RenderedNode,
     feature_staging_path,
@@ -1463,6 +1466,70 @@ def test_an_all_NULL_ignore_group_publishes_NULL_and_does_NOT_trip_the_aggregate
     values = {row["cif_id"]: row[SUM_30D] for row in frame.rows}
     assert values == {"c1": None}
     assert "__operand_count" not in frame.columns
+
+
+def test_a_SUM_under_IGNORE_is_typed_nullable_so_its_all_null_NULL_passes_the_nullability_gate(
+        compiled, feature, lock_tree):
+    """Task 20 end to end: the FOURTH null source, from the resolved TYPE to the EMITTED gate.
+
+    The worked formula re-declared ``empty_window=zero`` leaves ``null_input=ignore`` as the only
+    remaining NULL source. Before Task 20, ``resolve_physical_type`` typed this column NOT NULL,
+    and the rendered ``WRONG_NULLABILITY`` gate then aborted the first run whose data contained a
+    non-empty, all-NULL group — a correctly-authored feature refused over a correct value. The
+    all-null group is NOT an empty window (the entity HAS rows), so the ``zero`` fill must not
+    touch it; and Task 7's aggregate-overflow gate must not fire either, because the operand count
+    is 0 and a NULL sum is only overflow beside a count ABOVE zero — the run completing at all is
+    that proof."""
+    formula = fixtures.authored_formula(SUM_30D)
+    window = dataclasses.replace(formula.body.expr.window, empty_window=EmptyWindowResult.ZERO)
+    formula = dataclasses.replace(formula, body=dataclasses.replace(
+        formula.body, expr=dataclasses.replace(formula.body.expr, window=window)))
+    resolved = resolve_physical_type(formula, operand_types={
+        e.expr_path: e.operand_type for e in compiled[0].irs[0].expressions})
+    assert isinstance(resolved, PhysicalType), resolved
+    # The type half is the RESOLVER's answer, not this test's: the real formula, the compiled
+    # IR's own operand evidence, and §8 rule 4's fourth source.
+    assert resolved.nullable is True
+
+    planned = dataclasses.replace(feature, physical_type=resolved)
+    plan = dataclasses.replace(compiled[1], features=(planned,))
+    node = _calculate(compiled, planned, plan=plan,
+                      empty_window=EmptyWindowResult.ZERO, null_input=NullInput.IGNORE)
+    frame, _manifest = _run_calculation(
+        node, lock_tree,
+        projection=[_debit("c1", None), _debit("c1", None), _debit("c2", 5)],
+        spine=_spine_rows("c1", "c2", "c3"))
+    values = {row["cif_id"]: row[SUM_30D] for row in frame.rows}
+    assert values["c1"] is None      # rows EXIST; `ignore` sums nothing — not the empty-window fill
+    assert values["c2"] == 5
+    assert values["c3"] == 0         # no rows at all: THIS is the window `zero` answers
+
+    # The gate half, run against the EMITTED source: an assembled group carrying that NULL passes
+    # the nullability gate because the gate was rendered from the resolved (nullable) type.
+    gate = render_gate_node(plan, assembled_dataset="assembled_group",
+                            published_dataset="published_group")
+    columns = [column.name for column in expected_schema(plan)]
+    types = {name: "string" for name in columns}
+    types[plan.business_dt_column] = "date"
+    types[SUM_30D] = "decimal(38,6)"
+    assembled = fake_spark.DataFrame([{
+        plan.entity_key_columns[0]: "C1", plan.business_dt_column: BUSINESS_DT, SUM_30D: None,
+        "__generation_id": GENERATION, "__generated_project_hash": "p" * 64,
+        "__sandbox_execution_hash": "e" * 64,
+    }], columns, types)
+    passed = fake_spark.run_rendered(gate.source, GATE_FUNC_NAME)(assembled)
+    assert passed.columns == columns
+
+    # The discriminating control: a gate rendered from the PRE-Task-20 type (nullable=False)
+    # refuses the very same frame — so the pass above is the type's doing, not the gate never
+    # reaching the column.
+    strict = dataclasses.replace(planned, physical_type=dataclasses.replace(
+        resolved, nullable=False))
+    strict_gate = render_gate_node(
+        dataclasses.replace(compiled[1], features=(strict,)),
+        assembled_dataset="assembled_group", published_dataset="published_group")
+    with pytest.raises(RuntimeError, match="WRONG_NULLABILITY"):
+        fake_spark.run_rendered(strict_gate.source, GATE_FUNC_NAME)(assembled)
 
 
 def test_rounding_is_the_DECLARED_mode_and_the_two_modes_disagree_on_ties(compiled, feature,
