@@ -175,9 +175,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | Number | Reserved by |
 | --- | --- |
 | 1044 | codegen remediation (`1044_run_event_ordering.sql` — already claimed by that plan) |
-| 1045 | semantic Task 2 — catalog semantic scope (+ `graph_node.entity` backfill, D12) |
+| 1045 | semantic Task 2 — catalog semantic scope table ONLY (entity backfill removed per D12.1-revised) |
 | 1046 | semantic Task 5 — structured-result subject/current pointer |
-| 1047 | profile Task 2 — catalog narrative revision + current |
+| 1047 | profile Task 2 — catalog narrative revision + current, plus co-located `graph_node` `authority_role`/`temporal_storage_model` display+decision-link columns (recorded post-hoc; the stream had only this number) |
 | 1048 | profile Task 7 — serving policy store |
 | 1049 | profile Task 7 — temporal policy store |
 | 1050 | Release C Task 10 — crosswalk store |
@@ -250,15 +250,24 @@ New needs append 1051+ to this table FIRST (edit this doc in the same commit as 
 
 ## D12. Bound amendments to the plans
 
-1. **Counterparty (semantic Task 2):** `counterparty_id.entity_link` stays `counterparty` for
-   FACT-KEY DERIVATION (governed bridge fact keys hash `entity_id`; flipping it orphans
-   confirmation streams). The correction happens at projection: the alias seam maps the entity to
-   `customer` in `graph_node` backfill (migration 1045), Entity Map, bundles and NEW enrichment
-   evidence; `known_entities()` keeps `counterparty` as a readable legacy member; new
-   classification vocabulary excludes `counterparty_id`. `bridge_grounding.py` is IN Task 2's
-   scope (issuer folds into `assess_grounded_identifier_link`); the three pinned tests in
-   `test_bridge_namespace_pairing.py` are updated deliberately with a bridge-programme handoff
-   note, not silently.
+1. **Counterparty (semantic Task 2) — REVISED 2026-08-01 after review probes proved the original
+   instruction self-contradictory** (`graph_node.entity` is itself a fact-key input via
+   `bridge_grounding.advisory_entity_id`, so "backfill entity but don't re-key" was
+   unsatisfiable; a re-key resurrects human-REJECTED decoy links and orphans VERIFIED ones):
+   the entity stays `counterparty` EVERYWHERE it is persisted or feeds derivation —
+   `Concept.entity_link`, `graph_node.entity`, `axis_projection`, grounding (`concept_entity` =
+   raw `entity_link`), candidate enumeration and fact keys. NO `graph_node` entity backfill, NO
+   search-doc reproject hooks. The `customer` correction is READ-TIME ONLY via the alias seam
+   (`display_entity`) in Entity Map, asset detail, bundles and any UI render — the exact
+   `sensitivity` vs `sensitivity_display` precedent (migration 1042: never rewrite the value
+   that generates derived state). Migration 1045 carries ONLY the catalog semantic-scope table.
+   `known_entities()` keeps `counterparty` as a readable legacy member; new classification
+   vocabulary excludes `counterparty_id`; the concept critic's revise pass canonicalizes through
+   `canonical_concept_name` like Pass A. The three pinned pairing tests KEEP their original
+   entity literals; alias-seam tests assert display values only. Issuer folding into
+   `assess_grounded_identifier_link` unchanged. Gate-B approval text must state the
+   vocabulary-fingerprint change forces a full concept re-classification at next live ingest
+   (paid LLM spend).
 2. **Retrieval legs (semantic Task 9):** grain/time is leg 1 (as shipped, by design); lexical is
    leg 2; semantic expansion is leg 3; link neighbourhood leg 4. Plan renumbered.
 3. **Stage outcomes (semantic Task 5):** `selected/unchanged/...` live in the stage `detail`
