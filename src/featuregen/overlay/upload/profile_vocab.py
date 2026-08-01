@@ -151,6 +151,11 @@ class UnresolvedReason(str, Enum):
 
     NO_EVIDENCE = "no_evidence"                    # nobody said anything at all
     AUTHORITY_INSUFFICIENT = "authority_insufficient"  # said, but below the operational bar
+    # A top-strength tie among UNREVIEWED proposals (strength=proposed): competing candidates
+    # nobody with authority has adjudicated — honestly "nobody decided yet", never a
+    # failure-shaped conflict (F2). `conflict` below is reserved for contradictions at
+    # load-bearing-capable strengths.
+    PENDING_REVIEW = "pending_review"
     CONFLICT = "conflict"                          # active evidence disagrees
     PENDING_REVALIDATION = "pending_revalidation"  # material changed; awaiting re-confirmation
     # Reserved for the deterministic-contradiction path (Task 4: e.g. SCD2 claimed with no
@@ -163,6 +168,7 @@ class UnresolvedReason(str, Enum):
 UNRESOLVED_REASONS: dict[UnresolvedReason, UnresolvedReasonFamily] = {
     UnresolvedReason.NO_EVIDENCE: UnresolvedReasonFamily.UNDECIDED,
     UnresolvedReason.AUTHORITY_INSUFFICIENT: UnresolvedReasonFamily.UNDECIDED,
+    UnresolvedReason.PENDING_REVIEW: UnresolvedReasonFamily.UNDECIDED,
     UnresolvedReason.CONFLICT: UnresolvedReasonFamily.NEEDS_DATA_CHECK,
     UnresolvedReason.PENDING_REVALIDATION: UnresolvedReasonFamily.NEEDS_DATA_CHECK,
     UnresolvedReason.STRUCTURALLY_UNSUITABLE: UnresolvedReasonFamily.STRUCTURALLY_UNSUITABLE,

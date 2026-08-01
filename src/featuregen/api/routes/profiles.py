@@ -54,7 +54,10 @@ from featuregen.overlay.field_evidence import (
 )
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.dataset_profiles import build_dataset_profile
-from featuregen.overlay.upload.field_correction import _lock_key
+from featuregen.overlay.upload.field_correction import (
+    _lock_key,
+    _supersede_own_prior_proposal,
+)
 from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.ingest import ingest_source_lock_key
 from featuregen.overlay.upload.object_ref import normalize_source_name
@@ -197,8 +200,15 @@ def put_asset_profile(
             detail="the profile changed since you loaded it — refresh and retry")
 
     # 5. Ordinary bounded HUMAN/PROPOSED evidence + decisions, idempotent per identical value.
+    #    [F1] Re-proposing supersedes the SAME subject's prior ACTIVE proposal for the field FIRST
+    #    (same transaction, same lifecycle mechanic the decisions path uses) — a self-correction
+    #    must replace the author's own pending value, never tie with it; a DIFFERENT subject's
+    #    proposal is a legitimate competitor and is never touched.
     written: list[str] = []
     for field, value in writes.items():
+        superseded = _supersede_own_prior_proposal(
+            conn, logical_ref=logical_ref, field=field, subject=identity.subject,
+            keep_value_hash=canonical_hash(value))
         already = any(
             e.producer == EvidenceProducer.HUMAN.value
             and e.strength == AssertionStrength.PROPOSED.value
@@ -206,7 +216,12 @@ def put_asset_profile(
             and canonical_hash(e.proposed_value) == canonical_hash(value)
             for e in read_active_field_evidence(conn, logical_ref, field))
         if already:
-            continue   # replaying the same proposal must not stack duplicate evidence
+            # Replaying the same proposal must not stack duplicate evidence — but if the replay
+            # ALSO retired a prior different-valued row (legacy double-proposal state), the active
+            # set changed and the field must still re-resolve below.
+            if superseded:
+                written.append(field)
+            continue
         record_field_evidence(
             conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
             producer=EvidenceProducer.HUMAN, strength=AssertionStrength.PROPOSED,

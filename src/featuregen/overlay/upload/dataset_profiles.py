@@ -80,6 +80,10 @@ STATE_NEEDS_DATA_OBSERVATION = "needs_data_observation"
 STATE_STRUCTURALLY_UNSUITABLE = "structurally_unsuitable"
 STATE_CONFLICT = "conflict"
 STATE_PROJECTION_UNAVAILABLE = "projection_unavailable"
+# The honest "nobody decided yet" state (F2/F9): evidence exists but nothing clears the display
+# bar — competing unreviewed proposals, or evidence below every display rule. NEVER paired with a
+# display value; `display_only` is reserved for fields that actually display something.
+STATE_UNDECIDED = "undecided"
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,13 +214,26 @@ def _wrap_resolution(
     # A RECOMMENDATION field short-circuits at the influence ceiling BEFORE the resolver's own
     # conflict detection (resolution order step 4 < step 7), so a display-tie surfaces here only
     # as display=None. Detect it the way `_select`'s PREFER_CONFIRMED does — distinct values tied
-    # at the top strength — so disagreeing evidence reports the honest CONFLICT/needs_data_check,
-    # not a shapeless "undecided".
+    # at the top strength.
+    #
+    # [F2] HONESTY NOTE on what this wrapper can distinguish: the resolver reports only that the
+    # tie exists; THIS wrapper sees the evidence and can distinguish ties by the TIED STRENGTH
+    # (it does not adjudicate producer pairs). A tie at PROPOSED is a set of UNREVIEWED
+    # proposals — nobody with authority has decided anything, so the product family is
+    # `undecided` (undecided:pending_review), never a failure-shaped conflict. A tie at
+    # supported/attested/confirmed is a genuine contradiction between load-bearing-capable
+    # assertions (e.g. two source attestations disagreeing) — THAT is conflict/needs_data_check.
     if display is None:
         top = max(_STRENGTH_RANK.get(e.strength, -1) for e in evidence)
         top_values = {to_view(e).value for e in evidence
                       if _STRENGTH_RANK.get(e.strength, -1) == top}
         if len(top_values) > 1:
+            if top <= _STRENGTH_RANK[AssertionStrength.PROPOSED.value]:
+                return EffectiveProfileFieldV1(
+                    display=None, load_bearing=None, state=STATE_UNDECIDED,
+                    unresolved_reason=UnresolvedReason.PENDING_REVIEW.value,
+                    unresolved_family=unresolved_family(UnresolvedReason.PENDING_REVIEW).value,
+                    reason_codes=reason_codes)
             return EffectiveProfileFieldV1(
                 display=None, load_bearing=None, state=STATE_CONFLICT,
                 unresolved_reason=UnresolvedReason.CONFLICT.value,

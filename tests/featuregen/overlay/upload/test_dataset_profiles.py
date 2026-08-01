@@ -244,6 +244,57 @@ def test_off_vocabulary_values_are_refused_before_any_write(db):
                       "'temporal_storage_model'").fetchone()[0] == 0
 
 
+def test_same_subject_re_propose_supersedes_their_prior_proposal(db):
+    """F1 at the decisions path: the generic propose_override behaves exactly like the profile
+    PUT — re-proposing a different value retires the SAME subject's prior ACTIVE proposal to
+    `superseded` (same transaction), so a typo correction never ties with itself."""
+    _seed_graph(db)
+    _correct(db, "authority_role", "propose_override", ADMIN_A, "rp-1",
+             replacement_value="derived")
+    _correct(db, "authority_role", "propose_override", ADMIN_A, "rp-2",
+             replacement_value="system_of_record")
+    rows = db.execute(
+        "SELECT proposed_value, lifecycle FROM field_evidence WHERE field_name = "
+        "'authority_role' ORDER BY created_at, evidence_id").fetchall()
+    assert [r[0] for r in rows if r[1] == "active"] == ["system_of_record"]
+    assert ("derived", "superseded") in rows
+    f = _profile(db).authority_role
+    assert f.display is not None and f.display.value == "system_of_record"
+
+
+def test_competing_subjects_report_undecided_pending_review_not_conflict(db):
+    """F2: a top-strength tie among UNREVIEWED proposals is "nobody decided yet" — family
+    `undecided`, reason `pending_review` — never the needs_data_check conflict reserved for
+    contradictions at load-bearing-capable strengths. Neither subject's row is retired."""
+    _seed_graph(db)
+    _correct(db, "authority_role", "propose_override", ADMIN_A, "cp-1",
+             replacement_value="derived")
+    _correct(db, "authority_role", "propose_override", ADMIN_B, "cp-2",
+             replacement_value="system_of_record")
+    active = db.execute(
+        "SELECT count(*) FROM field_evidence WHERE field_name = 'authority_role' "
+        "AND lifecycle = 'active'").fetchone()[0]
+    assert active == 2
+    f = _profile(db).authority_role
+    assert f.display is None
+    assert f.state == "undecided"
+    assert f.unresolved_reason == UnresolvedReason.PENDING_REVIEW.value
+    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+
+
+def test_attested_tie_still_reports_the_needs_data_check_conflict(db):
+    """F2 boundary: a tie at a load-bearing-capable strength (two source attestations) IS a
+    genuine cross-authority contradiction — conflict/needs_data_check is reserved for it."""
+    _seed_graph(db)
+    _seed(db, "authority_role", "derived", EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    _seed(db, "authority_role", "system_of_record", EvidenceProducer.SOURCE,
+          AssertionStrength.ATTESTED)
+    f = _profile(db).authority_role
+    assert f.state == "conflict"
+    assert f.unresolved_reason == UnresolvedReason.CONFLICT.value
+    assert f.unresolved_family == UnresolvedReasonFamily.NEEDS_DATA_CHECK.value
+
+
 # ── effective profile assembly ───────────────────────────────────────────────────────────────────
 
 

@@ -501,14 +501,43 @@ def _set_advisory(
     return True
 
 
+def _supersede_own_prior_proposal(
+    conn: DbConn, *, logical_ref: str, field: str, subject: str, keep_value_hash: str
+) -> int:
+    """[F1] A subject RE-PROPOSING a different value for the same field retires their OWN prior
+    ACTIVE ``HUMAN/PROPOSED`` row(s) to the ``superseded`` lifecycle — the substrate's sanctioned
+    per-row lifecycle flip (the same scoped-UPDATE mechanic :func:`_reject` /
+    ``stale_source_evidence`` use; ``EvidenceLifecycle.SUPERSEDED`` is the existing "a newer record
+    replaces it" member, no new lifecycle). Without this, a typo correction ties with itself at the
+    top strength and the resolver maps the tie to a cleared display.
+
+    Scoped HARD to the proposer's OWN rows: a DIFFERENT subject's proposal is a legitimate
+    competing proposal and is never touched. Rows carrying the SAME value hash are kept ACTIVE
+    (an idempotent same-value replay reuses them). Returns the rows superseded."""
+    cur = conn.execute(
+        "UPDATE field_evidence SET lifecycle = 'superseded' "
+        "WHERE logical_ref = %s AND field_name = %s AND producer = %s AND strength = %s "
+        "AND producer_ref = %s AND lifecycle = 'active' AND proposed_value_hash <> %s",
+        (logical_ref, field, _HUMAN, AssertionStrength.PROPOSED.value, subject,
+         keep_value_hash))
+    return cur.rowcount
+
+
 def _propose_override(
     conn: DbConn, logical_ref: str, field: str, replacement_value: str | None,
     actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool:
     """Append a NON-load-bearing HUMAN/PROPOSED override + surface it for review; do NOT project (a
     later ``confirm_override`` by a DIFFERENT subject projects). HUMAN/PROPOSED is absent from every
-    display/operational rule, so this proposal is neither shown nor load-bearing until confirmed."""
+    display/operational rule, so this proposal is neither shown nor load-bearing until confirmed.
+
+    [F1] Re-proposing supersedes the SAME subject's prior ACTIVE proposal for this field first
+    (same transaction) — identical behavior to the asset-profile PUT path, so the two propose
+    surfaces can never diverge on self-correction."""
     _check_bounds(field, replacement_value)
+    _supersede_own_prior_proposal(
+        conn, logical_ref=logical_ref, field=field, subject=actor.subject,
+        keep_value_hash=canonical_hash(replacement_value))
     _append_human_evidence(
         conn, logical_ref=logical_ref, field=field, value=replacement_value,
         strength=AssertionStrength.PROPOSED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,

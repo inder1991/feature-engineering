@@ -265,6 +265,72 @@ def test_asset_profile_put_cas_and_validation(flag_on, client):
     assert read_only.status_code == 403
 
 
+OWNER2 = {"X-User": "dana", "X-Roles": "data_owner"}
+
+
+def _evidence_rows(conn, field):
+    return conn.execute(
+        "SELECT proposed_value, lifecycle, producer_ref FROM field_evidence "
+        "WHERE logical_ref = 'bank::public.orders' AND field_name = %s "
+        "ORDER BY created_at, evidence_id", (field,)).fetchall()
+
+
+def _graph_authority_role(conn):
+    return conn.execute(
+        "SELECT authority_role FROM graph_node WHERE catalog_source = 'bank' "
+        "AND object_ref = 'public.orders' AND kind = 'table'").fetchone()[0]
+
+
+def test_same_subject_re_put_supersedes_their_own_prior_proposal(flag_on, client, conn):
+    """F1 (review blocker): a data_owner correcting their OWN pending proposal must not tie with
+    it. The prior ACTIVE HUMAN/PROPOSED row is retired to `superseded` in the same transaction,
+    the NEW value displays, and the graph projection is never cleared by the correction."""
+    assert upload_csv(client, "bank", BANK_CSV).status_code == 200
+    current = client.get("/catalog/asset-profiles/bank/public.orders", headers=AUTH).json()
+    put1 = client.put("/catalog/asset-profiles/bank/public.orders", headers=OWNER,
+                      json={"expected_dataset_profile_hash": current["dataset_profile_hash"],
+                            "authority_role": "derived"})
+    assert put1.status_code == 200, put1.text
+    put2 = client.put("/catalog/asset-profiles/bank/public.orders", headers=OWNER,
+                      json={"expected_dataset_profile_hash":
+                            put1.json()["dataset_profile_hash"],
+                            "authority_role": "system_of_record"})
+    assert put2.status_code == 200, put2.text
+    f = put2.json()["profile"]["authority_role"]
+    assert f["display"] is not None and f["display"]["value"] == "system_of_record"
+    assert f["state"] == "display_only"
+    rows = _evidence_rows(conn, "authority_role")
+    assert [r[0] for r in rows if r[1] == "active"] == ["system_of_record"]
+    assert [r[1] for r in rows if r[0] == "derived"] == ["superseded"]
+    # The graph projection shows the corrected value — never cleared by the self-correction.
+    assert _graph_authority_role(conn) == "system_of_record"
+
+
+def test_different_subject_proposal_competes_without_retiring_anyone(flag_on, client, conn):
+    """A DIFFERENT subject proposing a different value is a legitimate competing proposal: both
+    rows stay ACTIVE, and the unreviewed tie reports the honest `undecided:pending_review`
+    (F2) — never a failure-shaped conflict, never anyone's row retired."""
+    assert upload_csv(client, "bank", BANK_CSV).status_code == 200
+    current = client.get("/catalog/asset-profiles/bank/public.orders", headers=AUTH).json()
+    put1 = client.put("/catalog/asset-profiles/bank/public.orders", headers=OWNER,
+                      json={"expected_dataset_profile_hash": current["dataset_profile_hash"],
+                            "authority_role": "derived"})
+    assert put1.status_code == 200, put1.text
+    put2 = client.put("/catalog/asset-profiles/bank/public.orders", headers=OWNER2,
+                      json={"expected_dataset_profile_hash":
+                            put1.json()["dataset_profile_hash"],
+                            "authority_role": "system_of_record"})
+    assert put2.status_code == 200, put2.text
+    rows = _evidence_rows(conn, "authority_role")
+    assert sorted((r[0], r[2]) for r in rows if r[1] == "active") == [
+        ("derived", "user:o"), ("system_of_record", "user:dana")]
+    f = put2.json()["profile"]["authority_role"]
+    assert f["display"] is None
+    assert f["state"] == "undecided"
+    assert f["unresolved_reason"] == "pending_review"
+    assert f["unresolved_family"] == "undecided"
+
+
 def test_set_advisory_flows_through_the_decision_route(flag_on, client):
     """A confirmer curates business_context in one step (advisory-only; RECOMMENDATION ceiling)."""
     assert upload_csv(client, "bank", BANK_CSV).status_code == 200
