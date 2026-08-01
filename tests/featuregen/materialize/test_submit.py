@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import signal
 import sys
+import time
 
 import pytest
 
@@ -37,6 +40,10 @@ PREPARED = {
     "sandbox_execution_hash": "c" * 64,
     "staging_root": "hdfs://nn/staging/gen-0001",
 }
+
+#: The two variables `submit()` refuses to run without — Spark otherwise launches its workers on
+#: whichever python is first on PATH and dies deep inside an executor.
+_PYSPARK_ENV = {"PYSPARK_PYTHON": "/bin/true", "PYSPARK_DRIVER_PYTHON": "/bin/true"}
 
 
 @pytest.fixture
@@ -103,7 +110,7 @@ def test_the_complete_prepared_set_is_accepted() -> None:
 def test_EXACTLY_the_prepared_parameters_reach_the_interpreter(echo_interpreter,
                                                                project_root) -> None:
     stub, received = echo_interpreter
-    outcome = LocalClusterSubmitter(python_executable=str(stub)).submit(
+    outcome = LocalClusterSubmitter(python_executable=str(stub), env=_PYSPARK_ENV).submit(
         project_root, run_parameters=PREPARED)
 
     assert outcome.completed is True
@@ -121,7 +128,7 @@ def test_the_nested_input_snapshots_survive_the_crossing_INTACT(echo_interpreter
     stringified version would have to invent a decoding nothing specified.
     """
     stub, received = echo_interpreter
-    LocalClusterSubmitter(python_executable=str(stub)).submit(
+    LocalClusterSubmitter(python_executable=str(stub), env=_PYSPARK_ENV).submit(
         project_root, run_parameters=PREPARED)
 
     _root, params_arg, _pipeline = received.read_text(encoding="utf-8").splitlines()
@@ -133,7 +140,7 @@ def test_a_value_carrying_shell_METACHARACTERS_is_not_interpreted(echo_interpret
     """argv is a list, so nothing between here and the child is a shell."""
     stub, received = echo_interpreter
     hostile = {**PREPARED, "staging_root": "hdfs://nn/staging/$(touch /tmp/pwned); rm -rf ."}
-    LocalClusterSubmitter(python_executable=str(stub)).submit(
+    LocalClusterSubmitter(python_executable=str(stub), env=_PYSPARK_ENV).submit(
         project_root, run_parameters=hostile)
 
     _root, params_arg, _pipeline = received.read_text(encoding="utf-8").splitlines()
@@ -165,7 +172,8 @@ def test_no_engine_is_imported_by_this_module() -> None:
 
 def test_an_interpreter_that_cannot_be_LAUNCHED_never_started(project_root, tmp_path) -> None:
     """`returncode is None` is the distinction §11.2 draws for a validation that could not run."""
-    outcome = LocalClusterSubmitter(python_executable=str(tmp_path / "no-such")).submit(
+    outcome = LocalClusterSubmitter(python_executable=str(tmp_path / "no-such"),
+                                    env=_PYSPARK_ENV).submit(
         project_root, run_parameters=PREPARED)
     assert (outcome.completed, outcome.returncode, outcome.started) == (False, None, False)
 
@@ -178,10 +186,11 @@ def test_a_pipeline_that_RAN_and_failed_is_distinguishable_from_one_that_never_r
                     encoding="utf-8")
     stub.chmod(0o755)
 
-    outcome = LocalClusterSubmitter(python_executable=str(stub)).submit(
+    outcome = LocalClusterSubmitter(python_executable=str(stub), env=_PYSPARK_ENV).submit(
         project_root, run_parameters=PREPARED)
     assert (outcome.completed, outcome.returncode, outcome.started) == (False, 4, True)
     assert "SPINE_DUPLICATE_KEY" in outcome.detail
+    assert outcome.detail.startswith("stderr: ")      # labeled, so an operator knows which stream
 
 
 def test_a_run_that_exceeds_its_timeout_never_STARTED_either(project_root, tmp_path) -> None:
@@ -189,10 +198,11 @@ def test_a_run_that_exceeds_its_timeout_never_STARTED_either(project_root, tmp_p
     stub.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
     stub.chmod(0o755)
 
-    outcome = LocalClusterSubmitter(python_executable=str(stub), timeout_seconds=0.4).submit(
+    outcome = LocalClusterSubmitter(python_executable=str(stub), timeout_seconds=0.4,
+                                    env=_PYSPARK_ENV).submit(
         project_root, run_parameters=PREPARED)
     assert (outcome.completed, outcome.returncode) == (False, None)
-    assert "verdict" in outcome.detail
+    assert "exceeded 0.4s" in outcome.detail and "process group was killed" in outcome.detail
 
 
 def test_the_environment_reaches_the_run(project_root, tmp_path) -> None:
@@ -204,9 +214,104 @@ def test_the_environment_reaches_the_run(project_root, tmp_path) -> None:
     stub.chmod(0o755)
 
     LocalClusterSubmitter(python_executable=str(stub),
-                          env={"PYSPARK_PYTHON": "/opt/py/bin/python"}).submit(
+                          env={"PYSPARK_PYTHON": "/opt/py/bin/python",
+                               "PYSPARK_DRIVER_PYTHON": "/opt/py/bin/python"}).submit(
         project_root, run_parameters=PREPARED)
     assert received.read_text(encoding="utf-8") == "/opt/py/bin/python"
+
+
+# ── the timeout is a real bound, and diagnostics survive it ──────────────────────────────────────
+
+
+def test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter(tmp_path) -> None:
+    """Killing only the DIRECT child leaves the spark-submit grandchild running (report §4).
+
+    On Windows and pre-bpo-37424 CPython, ``run(timeout=)`` then re-enters ``communicate()`` with
+    no timeout and blocks until the grandchild exits (~120s here); on this platform the drain is
+    bounded but the grandchild survives as an ORPHAN that keeps writing into ``staging_root``.
+    Both are the same missing property — the process GROUP dies — so this asserts both: the wall
+    clock stays bounded AND the grandchild is dead when ``submit()`` returns.
+    """
+    stub = tmp_path / "python"
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+    stub.write_text("#!/bin/sh\n"
+                    "( sleep 120 ) &\n"
+                    f'echo $! > "{grandchild_pid_file}"\n'
+                    "sleep 120\n", encoding="utf-8")
+    stub.chmod(0o755)
+    submitter = LocalClusterSubmitter(python_executable=str(stub), timeout_seconds=1.0,
+                                      env=_PYSPARK_ENV)
+    started = time.monotonic()
+    try:
+        outcome = submitter.submit(tmp_path, run_parameters=dict(PREPARED))
+
+        assert time.monotonic() - started < 40.0      # old code: ~120s pipe-drain hang (Windows)
+        assert outcome.completed is False and outcome.returncode is None
+        grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 10.0            # a killed orphan may be a zombie briefly
+        while True:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                break                                 # dead: the whole GROUP was killed
+            if time.monotonic() > deadline:
+                pytest.fail("the grandchild outlived submit(): only the direct child was killed, "
+                            "and the orphan would keep writing into staging_root")
+            time.sleep(0.05)
+    finally:
+        # Leave no 120s sleepers behind even if the assertions above (or a wedged submit) got here
+        # first. Guarded: under the OLD code the stub shares the test runner's process group, so
+        # only the recorded grandchild pid is safe to signal — never a pgid we did not create.
+        try:
+            os.kill(int(grandchild_pid_file.read_text(encoding="utf-8")), signal.SIGKILL)
+        except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+            pass
+
+
+def test_both_streams_survive_into_the_detail(tmp_path) -> None:
+    """`stderr or stdout` discards the cause on stdout whenever Spark's chatty stderr is not empty."""
+    stub = tmp_path / "python"
+    stub.write_text("#!/bin/sh\necho the-cause\necho noise 1>&2\nexit 3\n", encoding="utf-8")
+    stub.chmod(0o755)
+    outcome = LocalClusterSubmitter(python_executable=str(stub), env=_PYSPARK_ENV)\
+        .submit(tmp_path, run_parameters=dict(PREPARED))
+    assert "the-cause" in outcome.detail and "noise" in outcome.detail
+
+
+def test_missing_pyspark_python_is_refused_before_a_process_exists(tmp_path, monkeypatch) -> None:
+    """Documented-mandatory was never checked; now it is, on the MERGED environment."""
+    monkeypatch.delenv("PYSPARK_PYTHON", raising=False)
+    monkeypatch.delenv("PYSPARK_DRIVER_PYTHON", raising=False)
+    with pytest.raises(ValueError, match="PYSPARK_PYTHON"):
+        LocalClusterSubmitter(python_executable="/bin/true", env={})\
+            .submit(tmp_path, run_parameters=dict(PREPARED))
+
+
+def test_an_ambient_pyspark_python_satisfies_the_check_through_the_MERGE(tmp_path,
+                                                                         monkeypatch) -> None:
+    """The check reads self.env OVER os.environ — exactly what the child will receive."""
+    monkeypatch.setenv("PYSPARK_PYTHON", "/bin/true")
+    monkeypatch.setenv("PYSPARK_DRIVER_PYTHON", "/bin/true")
+    stub = tmp_path / "python"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    outcome = LocalClusterSubmitter(python_executable=str(stub))\
+        .submit(tmp_path, run_parameters=dict(PREPARED))
+    assert outcome.completed is True
+
+
+def test_the_run_script_speaks_both_kedro_majors() -> None:
+    """kedro >= 1.0 names the kwarg `runtime_params`; the 0.19.x line names it `extra_params`.
+
+    The script must ask the INSTALLED signature rather than remember either name, or the submitter
+    cannot start a run in a 0.19 artifact venv (2026-08-01 addendum: kedro 1.0+ is a supported
+    target by user directive).
+    """
+    from featuregen.materialize.submit import _RUN_SCRIPT
+
+    ast.parse(_RUN_SCRIPT)
+    assert "runtime_params" in _RUN_SCRIPT and "extra_params" in _RUN_SCRIPT
+    assert "inspect.signature(KedroSession.create).parameters" in _RUN_SCRIPT
 
 
 def test_the_local_submitter_satisfies_the_SEAM() -> None:
