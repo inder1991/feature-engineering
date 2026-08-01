@@ -412,13 +412,15 @@ def test_the_hash_is_stable_across_derivations(catalog):
 
 
 def test_the_contract_takes_BOTH_axes_from_the_classification(catalog):
+    """The requirements are the UNION over both axes: the `pii` tag's role AND the `confidential`
+    floor's role travel with the data, while the class comes from the floor alone."""
     catalog.execute(
         "UPDATE graph_node SET sensitivity = 'pii' WHERE catalog_source = %s AND object_ref = %s",
         (_SRC, "public.transactions.txn_amt"))
     _restrict(catalog, "transactions", "txn_amt", "confidential")
     derived = _derived(_contract(catalog, SUM_30D, roles=(*_ROLES, "pii_reader")))
     assert derived.sensitivity_class == "confidential"
-    assert derived.access_requirements == ("pii_reader",)
+    assert derived.access_requirements == ("confidential_reader", "pii_reader")
 
 
 def test_the_SPINE_can_decide_the_class(catalog):

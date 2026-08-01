@@ -41,7 +41,7 @@ from featuregen.materialize.classify import (
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.overlay.safety_floor import SENSITIVITY_ORDER
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
+from featuregen.overlay.upload.read_scope import RESTRICTION_ROLES, SENSITIVITY_ROLES
 
 _SRC = "hdfc"
 TXN = f"{_SRC}::public.transactions"
@@ -182,6 +182,43 @@ def test_an_untagged_read_set_requires_NOTHING(catalog):
     """Untagged nodes are visible to everyone (`read_scope`'s shipped rule), so an untagged read set
     carries no access requirement — a non-empty answer here would be a privilege nobody declared."""
     assert _ok(classify_read_set(catalog, READ_SET)).access_requirements == ()
+
+
+# ══ §5.2 — axis ONE also feeds the requirements: the governed floor's reader roles ═══════════════
+
+
+def test_access_requirements_carry_the_floor_not_only_the_tag(catalog):
+    """An untagged column whose governed floor is `restricted` must publish `restricted_reader` in
+    the contract. Gate 2 (since migration 1032) refuses this very read to a caller without the role,
+    so a tuple that stayed empty would let the artifact travel requirement-free while the platform
+    refuses the same read at compile time — the requirement is supposed to travel with the data."""
+    _set(catalog, AMT, restriction="restricted")
+    assert "restricted_reader" in _ok(classify_read_set(catalog, READ_SET)).access_requirements
+
+
+@pytest.mark.parametrize(("rank", "role"), sorted(RESTRICTION_ROLES.items()))
+def test_every_role_bearing_FLOOR_maps_through_RESTRICTION_ROLES(catalog, rank, role):
+    """The whole role-bearing half of the governed scale, taken from the mapping itself so a new
+    floor level cannot grow a role without this test noticing that classification never adds it.
+    The other ranks are covered elsewhere: `public`/`internal` add nothing (the fixture's all-public
+    baseline requires NOTHING, and the 2×2 holds requirements empty under `internal`), and
+    `prohibited` never reaches the requirements loop because it refused the compilation above."""
+    _set(catalog, AMT, restriction=rank)
+    assert _ok(classify_read_set(catalog, READ_SET)).access_requirements == (role,)
+
+
+def test_a_tagged_AND_floored_read_set_publishes_the_UNION(catalog):
+    _set(catalog, AMT, sensitivity="pii")
+    _set(catalog, DT, restriction="confidential")
+    requirements = _ok(classify_read_set(catalog, READ_SET)).access_requirements
+    assert requirements == ("confidential_reader", "pii_reader")
+
+
+def test_the_same_role_from_BOTH_axes_is_published_once(catalog):
+    """`restricted` lives in both vocabularies and both map it to `restricted_reader`: a column
+    tagged AND floored `restricted` names one requirement, not a duplicated pair."""
+    _set(catalog, AMT, sensitivity="restricted", restriction="restricted")
+    assert _ok(classify_read_set(catalog, READ_SET)).access_requirements == ("restricted_reader",)
 
 
 # ══ §5.2 — the two axes are INDEPENDENT ══════════════════════════════════════════════════════════
