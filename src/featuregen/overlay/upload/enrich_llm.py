@@ -104,11 +104,13 @@ _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 # Task 0.6 (D10): the single-call path has no ``_ITEM_META_ALLOWED`` gate, and the old
 # ``_FREE_TEXT_META_KEYS & out.keys()`` intersection silently egressed every OTHER top-level key
 # UNSCANNED. Every key a current producer sends is now classified explicitly — free-text (the sets
-# above, scanned) or STRUCTURAL/identifier (platform-derived tokens, refs, closed-vocabulary values
-# and nested payloads whose own adapters — ``sanitize_feature_context``, ``assert_llm_safe`` — own
-# their scanning); an UNKNOWN top-level key fails the whole payload CLOSED (audited by the caller as
-# an egress block), never a silent unscanned ride. A new metadata key must be classified here or in
-# the free-text sets before anything under it can egress. Inventoried from the live call sites:
+# above, scanned), STRUCTURAL/identifier (below), or ROUND-TRIP PROSE (further below, unscanned by
+# documented decision); an UNKNOWN top-level key fails the whole payload CLOSED (audited by the
+# caller as an egress block), never a silent unscanned ride. A new metadata key must be classified
+# in exactly one of the three before anything under it can egress. STRUCTURAL means genuinely
+# platform-derived: tokens, refs, closed-vocabulary values and nested payloads whose own adapters —
+# ``sanitize_feature_context``, ``assert_llm_safe`` — own their scanning. Inventoried from the live
+# call sites:
 _STRUCTURAL_META_KEYS = frozenset({
     # enrichment item identity + rosters (the _ITEM_META_ALLOWED structural half; the batch seam
     # feeds {**shared_metadata, **item.metadata} back through the single fallback)
@@ -123,13 +125,28 @@ _STRUCTURAL_META_KEYS = frozenset({
     "candidate_id", "candidate_revision_id", "left", "right",
     "deterministic_namespace_verdict", "governed_population_relation",
     "evidence", "explanation_codes",
-    # contract authoring/critique/refine (contract/author.py, contract/review.py)
-    "feature", "aggregation", "definition", "derives_from", "findings",
-    # feature assist (feature_assist.py) — `columns`/`table_context` are additionally routed
-    # through sanitize_feature_context after this scan
-    "target", "candidates", "avoid", "fix", "feedback", "objective", "sets", "table_context",
+    # contract authoring/critique/refine structural half (contract/author.py, contract/review.py)
+    "feature", "aggregation", "derives_from",
+    # feature assist structural half (feature_assist.py) — `columns`/`table_context` are
+    # additionally routed through sanitize_feature_context after this scan
+    "target", "candidates", "sets", "table_context",
     # formula authoring/critic (formula/author.py, formula/critic.py)
     "authoring_intent", "tool_trail", "recipe_authoring_context", "proposal", "operand_columns",
+})
+
+# ROUND-TRIP PROSE: free text that is DELIBERATELY egressed unscanned because it is the caller's
+# OWN text returning to the model — either the model's output from the immediately preceding call
+# of the same flow (the LLM's drafted `definition` and critique `findings`, contract/review.py) or
+# the operating human's instruction to the model (`objective`, `feedback`, `fix`, `avoid`,
+# feature_assist.py). Nothing here is uploader/source-file data, which is why it does not ride the
+# `_FREE_TEXT_META_KEYS` scrubbers; expanding the PII/data-marker scan over these round-trip fields
+# is the deferred B-2 egress hardening (docs/DEFERRED-WORK.md §B-2). These keys are NOT structural
+# — classifying them as such would misdocument the egress surface (the batch seam forbids plain
+# `definition` for exactly this reason) — but they ARE known: the fail-closed gate treats both
+# classes as classified.
+_ROUNDTRIP_PROSE_KEYS = frozenset({
+    "definition", "findings",            # model round-trip (contract critique/refine)
+    "objective", "feedback", "fix", "avoid",   # human round-trip (feature assist)
 })
 
 
@@ -175,8 +192,10 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     # below only visits the free-text keys, so an unclassified key would otherwise egress unscanned
     # through the single-call path (the batch path's _ITEM_META_ALLOWED never let one this far).
     # Same disposition as a redactor fail-closed: the caller blocks dispatch + audits EGRESS_BLOCKED.
+    # Round-trip prose is KNOWN (classified, documented unscanned), so it never trips this gate.
     unknown = sorted(k for k in out
-                     if k not in _FREE_TEXT_META_KEYS and k not in _STRUCTURAL_META_KEYS)
+                     if k not in _FREE_TEXT_META_KEYS and k not in _STRUCTURAL_META_KEYS
+                     and k not in _ROUNDTRIP_PROSE_KEYS)
     if unknown:
         logger.warning("metadata key(s) with no declared egress classification: %s — failing "
                        "closed (no egress kind)", unknown)

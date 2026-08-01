@@ -568,10 +568,36 @@ def test_item_meta_allowlist_is_fully_classified():
     from featuregen.overlay.upload.enrich_llm import (
         _FREE_TEXT_META_KEYS,
         _ITEM_META_ALLOWED,
+        _ROUNDTRIP_PROSE_KEYS,
         _STRUCTURAL_META_KEYS,
     )
-    unclassified = _ITEM_META_ALLOWED - _FREE_TEXT_META_KEYS - _STRUCTURAL_META_KEYS
+    unclassified = (_ITEM_META_ALLOWED - _FREE_TEXT_META_KEYS - _STRUCTURAL_META_KEYS
+                    - _ROUNDTRIP_PROSE_KEYS)
     assert unclassified == frozenset()
+
+
+# Free-text keys KNOWN to carry model/human prose at the current call sites: the LLM's own drafted
+# `definition` (contract/review.py) and critique `findings`, and the human's `objective`/`feedback`/
+# `fix`/`avoid` (feature_assist.py). Pinned so a refactor can never re-file one as "structural".
+_KNOWN_ROUNDTRIP_PROSE_KEYS = frozenset(
+    {"definition", "findings", "objective", "feedback", "fix", "avoid"})
+
+
+def test_structural_set_carries_no_roundtrip_prose():
+    """Egress honesty: `_STRUCTURAL_META_KEYS` documents what egresses UNSCANNED because it is
+    platform-derived (tokens/refs/closed vocab/adapter-owned nests). Round-trip prose — the
+    caller's own model/human text returning to the model — is deliberately egressed unscanned too,
+    but under its OWN explicitly-documented class, never laundered as 'structural'."""
+    from featuregen.overlay.upload.enrich_llm import (
+        _ROUNDTRIP_PROSE_KEYS,
+        _STRUCTURAL_META_KEYS,
+    )
+    assert _STRUCTURAL_META_KEYS & _KNOWN_ROUNDTRIP_PROSE_KEYS == frozenset()
+    assert _KNOWN_ROUNDTRIP_PROSE_KEYS <= _ROUNDTRIP_PROSE_KEYS
+    # The three classes are disjoint: one key, one classification, one documented disposition.
+    from featuregen.overlay.upload.enrich_llm import _FREE_TEXT_META_KEYS
+    assert _ROUNDTRIP_PROSE_KEYS & _STRUCTURAL_META_KEYS == frozenset()
+    assert _ROUNDTRIP_PROSE_KEYS & _FREE_TEXT_META_KEYS == frozenset()
 
 
 # One representative payload per CURRENT single-call producer (verified against the call sites) —
