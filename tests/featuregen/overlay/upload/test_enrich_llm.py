@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from featuregen.intake import redaction as redaction_module
 from featuregen.intake.llm import (
     PROVIDER_NON_RETRYABLE,
@@ -499,3 +501,125 @@ def test_flag_off_no_client_means_no_llm_egress_paths_at_all(db):
     assert db.execute("SELECT count(*) FROM llm_call").fetchone()[0] == 0
     assert db.execute("SELECT count(*) FROM security_audit "
                       "WHERE event_type = 'EGRESS_BLOCKED'").fetchone()[0] == 0
+
+
+# ── Task 0.6 Seam 3 (D10): schema registration + single-call metadata egress fail LOUD. ──────────
+
+
+def test_unregistered_schema_version_raises_at_dispatch(db):
+    """Requesting a version the registry does not hold must RAISE — never proceed with
+    output_schema=None (structured output unenforced, response failing repair downstream)."""
+    register_enrichment_schemas(db)
+    client = _Capture()
+    with pytest.raises(ValueError, match=r"overlay_concept.*99"):
+        audited_enrich_call(
+            db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_v99",
+            schema_id="overlay_concept", catalog_metadata=dict(_META), out_key="concept",
+            instruction="Classify the concept of this column.", schema_version=99)
+    assert client.requests == []                          # nothing egressed unenforced
+
+
+def test_unregistered_schema_version_raises_on_the_batch_path(db):
+    register_enrichment_schemas(db)
+    client = _Capture()
+    with pytest.raises(ValueError, match=r"overlay_concept_batch.*99"):
+        audited_batch_call(
+            db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_batch_v99",
+            schema_id="overlay_concept_batch", shared_metadata={},
+            items=[BatchItem("h1", dict(_META))], out_key="concept",
+            instruction="Classify.", accept=lambda raw: (raw, "ok"), schema_version=99)
+    assert client.requests == []
+
+
+def test_summary_single_fallback_schema_is_registered(db):
+    """The documented trap, live: the summary batch's single fallback requests
+    ('overlay_summary', 1) — that pair must resolve or the fallback dispatches unenforced
+    (pre-repair) / raises mid-ladder (post-repair)."""
+    register_enrichment_schemas(db)
+    from featuregen.documents.registry import DocumentSchemaRegistry
+    assert DocumentSchemaRegistry(db).schema_for("overlay_summary", 1) is not None
+
+
+def test_unknown_top_level_metadata_key_fails_closed_and_is_audited(db):
+    """The `_FREE_TEXT_META_KEYS & out.keys()` intersection let an UNKNOWN top-level key egress
+    unscanned through the single-call path. An unclassified key must now block the whole dispatch,
+    and the block is an audited security event — never a silent drop or a silent pass-through."""
+    client = _Capture()
+    out = _call(db, client, catalog_metadata={**_META, "wire_tap": "raw row payload"})
+    assert out is None
+    assert client.requests == []                          # no dispatch — fail closed
+    n = db.execute(
+        "SELECT count(*) FROM security_audit WHERE event_type = 'EGRESS_BLOCKED'").fetchone()[0]
+    assert n == 1
+
+
+def test_unclassified_key_takes_the_documented_valueerror_path():
+    from featuregen.overlay.upload.enrich_llm import _meta_field_kind, _redact_free_text_meta
+    with pytest.raises(ValueError, match="invented_key"):
+        _meta_field_kind("invented_key")
+    redacted, _spans, _audits, _version = _redact_free_text_meta({"invented_key": "x"})
+    assert redacted is None                               # fail closed, caller audits + blocks
+
+
+def test_item_meta_allowlist_is_fully_classified():
+    """Every batch-allowlisted top-level key must carry a single-call classification too — the
+    batch seam feeds `{**shared_metadata, **item.metadata}` into the single fallback, so a key
+    passing `_item_shape_ok` must never fail closed (or egress unscanned) one seam later."""
+    from featuregen.overlay.upload.enrich_llm import (
+        _FREE_TEXT_META_KEYS,
+        _ITEM_META_ALLOWED,
+        _STRUCTURAL_META_KEYS,
+    )
+    unclassified = _ITEM_META_ALLOWED - _FREE_TEXT_META_KEYS - _STRUCTURAL_META_KEYS
+    assert unclassified == frozenset()
+
+
+# One representative payload per CURRENT single-call producer (verified against the call sites) —
+# each must keep passing BYTE-IDENTICALLY: classification adds a fail-closed gate for unknown keys,
+# never a behavior change for the keys production already sends.
+_CALLER_PAYLOADS = {
+    "enrich.concept_single": {"table": "accounts", "column": "balance", "type": "numeric",
+                              "vocabulary": [{"name": "monetary_stock", "group": "monetary",
+                                              "hint": "Balance"}]},
+    "enrich.unit_single": {"table": "accounts", "column": "balance", "type": "numeric",
+                           "concept": "monetary_stock"},
+    "reclassify": {"column": "balance", "vocabulary": ["monetary_stock"],
+                   "sample_shape": "decimal", "sample_semantic_type": "amount"},
+    "concept_critic": {"logical_ref": "bank::public.accounts.balance", "column": "balance",
+                       "type": "numeric", "proposed_concept": "monetary_stock",
+                       "shape_conflicts": ["identifier_shape"],
+                       "proposed_concept_meaning": {"group": "monetary", "namespace": "",
+                                                    "entity_link": "", "hint": "Balance"}},
+    "bridge_critic": {"candidate_id": "c1", "candidate_revision_id": "r1",
+                      "left": {"entity_id": "customer"}, "right": {"entity_id": "customer"},
+                      "deterministic_namespace_verdict": "possible",
+                      "governed_population_relation": "unknown",
+                      "evidence": [{"kind": "governed_key"}], "explanation_codes": ["ns_possible"]},
+    "contract_critique": {"feature": "balance_avg", "definition": "Average posted balance.",
+                          "aggregation": "avg", "derives_from": ["public.accounts.balance"]},
+    "contract_refine": {"feature": "balance_avg", "definition": "Average posted balance.",
+                        "findings": ["states no grain"]},
+    "feature_leakage": {"derives_from": ["public.accounts.balance"],
+                        "target": "public.accounts.churned"},
+    "feature_critic": {"candidates": [{"name": "f1", "derives_from": ["public.accounts.balance"],
+                                       "aggregation": "sum", "grain_table": "accounts"}]},
+    "feature_set_rec": {"sets": [{"lens": "monetary", "signals": {"size": 1}, "features": []}]},
+    "formula_author_turn": {"authoring_intent": {"name": "i", "hypothesis": "h",
+                                                 "target_entity": "customer",
+                                                 "target_grain_keys": ["id"]},
+                            "tool_trail": [{"turn": 1, "tool_name": "search_columns",
+                                            "result": {"columns": []}}],
+                            "recipe_authoring_context": {"operation": "sum"}},
+    "formula_critic": {"authoring_intent": {"name": "i"}, "proposal": {"operation": "sum"},
+                       "operand_columns": [{"logical_ref": "bank::public.accounts.balance"}]},
+    "semantic_binding_select": {"table": "accounts", "candidates": [{"candidate_id": "c1"}]},
+}
+
+
+@pytest.mark.parametrize("caller", sorted(_CALLER_PAYLOADS))
+def test_existing_caller_payloads_pass_byte_identically(caller):
+    from featuregen.overlay.upload.enrich_llm import _redact_free_text_meta
+    payload = _CALLER_PAYLOADS[caller]
+    redacted, spans, audits, version = _redact_free_text_meta(dict(payload))
+    assert redacted == payload                            # byte-identical passthrough
+    assert (spans, audits, version) == ([], [], None)     # nothing scanned, nothing claimed

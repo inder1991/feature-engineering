@@ -101,6 +101,37 @@ _SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "f
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
 _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 
+# Task 0.6 (D10): the single-call path has no ``_ITEM_META_ALLOWED`` gate, and the old
+# ``_FREE_TEXT_META_KEYS & out.keys()`` intersection silently egressed every OTHER top-level key
+# UNSCANNED. Every key a current producer sends is now classified explicitly — free-text (the sets
+# above, scanned) or STRUCTURAL/identifier (platform-derived tokens, refs, closed-vocabulary values
+# and nested payloads whose own adapters — ``sanitize_feature_context``, ``assert_llm_safe`` — own
+# their scanning); an UNKNOWN top-level key fails the whole payload CLOSED (audited by the caller as
+# an egress block), never a silent unscanned ride. A new metadata key must be classified here or in
+# the free-text sets before anything under it can egress. Inventoried from the live call sites:
+_STRUCTURAL_META_KEYS = frozenset({
+    # enrichment item identity + rosters (the _ITEM_META_ALLOWED structural half; the batch seam
+    # feeds {**shared_metadata, **item.metadata} back through the single fallback)
+    "table", "column", "type", "columns", "concept",
+    "column_profiles", "chunk_summaries", "column_roster",
+    "party_role", "grain_role", "table_role",
+    # classification vocabulary + the reclassifier's shape hints (attest/reclassify.py)
+    "vocabulary", "sample_shape", "sample_semantic_type",
+    # concept critic (attest/concept_critic.py)
+    "logical_ref", "proposed_concept", "shape_conflicts", "proposed_concept_meaning",
+    # bridge identifier critic (attest/bridge_critic.py)
+    "candidate_id", "candidate_revision_id", "left", "right",
+    "deterministic_namespace_verdict", "governed_population_relation",
+    "evidence", "explanation_codes",
+    # contract authoring/critique/refine (contract/author.py, contract/review.py)
+    "feature", "aggregation", "definition", "derives_from", "findings",
+    # feature assist (feature_assist.py) — `columns`/`table_context` are additionally routed
+    # through sanitize_feature_context after this scan
+    "target", "candidates", "avoid", "fix", "feedback", "objective", "sets", "table_context",
+    # formula authoring/critic (formula/author.py, formula/critic.py)
+    "authoring_intent", "tool_trail", "recipe_authoring_context", "proposal", "operand_columns",
+})
+
 
 def _meta_field_kind(key: str) -> str:
     """The egress KIND of one free-text metadata key: ``definition`` (sample-strip + PII via
@@ -139,6 +170,17 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     pii_spans: list[dict] = []
     sample_audits: list[dict] = []
     version: str | None = None
+
+    # D10: fail CLOSED on any top-level key with NO declared classification — the intersection loop
+    # below only visits the free-text keys, so an unclassified key would otherwise egress unscanned
+    # through the single-call path (the batch path's _ITEM_META_ALLOWED never let one this far).
+    # Same disposition as a redactor fail-closed: the caller blocks dispatch + audits EGRESS_BLOCKED.
+    unknown = sorted(k for k in out
+                     if k not in _FREE_TEXT_META_KEYS and k not in _STRUCTURAL_META_KEYS)
+    if unknown:
+        logger.warning("metadata key(s) with no declared egress classification: %s — failing "
+                       "closed (no egress kind)", unknown)
+        return None, pii_spans, sample_audits, version
 
     def _definition(text: str, path: str) -> str | None:  # None ⟹ fail closed (blanked field)
         nonlocal version
@@ -450,6 +492,13 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     ("overlay_synonyms", 1): {"type": "object", "additionalProperties": False,
                               "properties": {"synonyms": {"type": "string"}},
                               "required": ["synonyms"]},
+    # The summary batch's per-item single FALLBACK shape (run_batched degrades non-ref-aware tasks
+    # to `schema_id=f"overlay_{task}"`). Until Task 0.6 this pair was UNREGISTERED, so the fallback
+    # dispatched with output_schema=None — structured output unenforced — exactly the trap the
+    # fail-loud registry gate now refuses.
+    ("overlay_summary", 1): {"type": "object", "additionalProperties": False,
+                             "properties": {"summary": {"type": "string"}},
+                             "required": ["summary"]},
     # E4a T2 — the MEASURE ANNOTATION a file did not declare. The flat (single / batch-fallback)
     # shape carries only the `unit`; `currency` rides the per-item batch schema below, exactly like
     # the domain task's two-level split. Both are EVIDENCE-only proposals: `_MEASURE_ANNOTATION`
@@ -782,6 +831,26 @@ _ENRICH_ACTOR = IdentityEnvelope(
     authenticated=False, auth_method="internal", role_claims=())
 
 
+def _require_schema(conn, reg: DocumentSchemaRegistry, schema_id: str, schema_version: int) -> dict:
+    """Resolve the REQUESTED output schema or RAISE (D10) — a call must never dispatch unenforced.
+
+    Self-registers the enrichment set on first use (idempotent) so a fresh database never fails a
+    real provider for lack of a schema; but a pair STILL unresolved after that is a caller bug (a
+    version bumped without registering its body — the ``schema_for(id, N+1) -> None`` trap), and
+    proceeding would send the request with ``output_schema=None``: structured output unenforced and
+    the response failing repair downstream. Fail loudly, naming the pair."""
+    schema = reg.schema_for(schema_id, schema_version)
+    if schema is None:
+        register_enrichment_schemas(conn)
+        schema = reg.schema_for(schema_id, schema_version)
+    if schema is None:
+        raise ValueError(
+            f"output schema ({schema_id!r}, v{schema_version}) is not registered — refusing to "
+            "dispatch an unenforced structured call; register the schema version before "
+            "requesting it")
+    return schema
+
+
 def register_enrichment_schemas(conn) -> None:
     """Register the enrichment output-schemas so the audited call can resolve/validate them.
     Idempotent (register_schema upserts). Called at overlay bootstrap.
@@ -918,10 +987,7 @@ def drive_audited_structured_call(
         return AuditedStructuredResult(output=None, llm_call_ref=ref, provider_calls=0, usage={})
 
     reg = DocumentSchemaRegistry(conn)
-    schema = reg.schema_for(schema_id, schema_version)
-    if schema is None:                      # self-register on first use (idempotent) so a real
-        register_enrichment_schemas(conn)   # provider never fails closed for lack of a schema.
-        schema = reg.schema_for(schema_id, schema_version)
+    schema = _require_schema(conn, reg, schema_id, schema_version)   # D10: raise, never unenforced
 
     # #19: glossary free-text in the metadata is scanned/scrubbed BEFORE the payload is built —
     # the classification below is what the scan established, never a hardcoded "clean".
@@ -1337,10 +1403,7 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
         return BatchCallResult(tuple(egress_outcomes), 0, 0, 0)
 
     reg = DocumentSchemaRegistry(conn)
-    schema = reg.schema_for(schema_id, schema_version)
-    if schema is None:
-        register_enrichment_schemas(conn)
-        schema = reg.schema_for(schema_id, schema_version)
+    schema = _require_schema(conn, reg, schema_id, schema_version)   # D10: raise, never unenforced
 
     catalog_metadata = {**shared_metadata,
                         "items": [{"ref": it.ref, **it.metadata} for it in included]}
