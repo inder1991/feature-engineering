@@ -63,6 +63,7 @@ disagreement blocking materialization. None exists today.
 """
 from __future__ import annotations
 
+import datetime as _dt
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -229,15 +230,26 @@ class ActivePopulation:
     that count as active are both declared, so a reviewer can see the population rule without
     reading SQL. A status filter REMOVES members, so it narrows the population — it never collapses
     versions, and it cannot support a completeness claim.
+
+    ``observed_on`` is REQUIRED — the ISO calendar date the current rows were observed valid. The
+    status column is CURRENT-valued, so the table can only answer "who is active NOW"; recording
+    when "now" was is what lets run preparation refuse any other business date instead of silently
+    publishing one day's actives under another day's date. Unlike
+    :attr:`CurrentSnapshot.observed_snapshot_ref` it is a DATE, never a version: it exists to be
+    compared against a run's business date, and a version has no ordering with a date. It enters
+    identity: two vintages are two populations, and re-declaring with a new vintage is a
+    hash-visible, reviewable act.
     """
 
     status_ref: str
     allowed_status_values: tuple[str, ...]
+    observed_on: str
     kind: ClassVar[SnapshotPolicyKind] = SnapshotPolicyKind.ACTIVE_POPULATION
 
     def identity_payload(self) -> dict[str, Any]:
         return {"kind": self.kind.value, "status_ref": self.status_ref,
-                "allowed_status_values": list(self.allowed_status_values)}
+                "allowed_status_values": list(self.allowed_status_values),
+                "observed_on": self.observed_on}
 
     def column_refs(self) -> tuple[str, ...]:
         return (self.status_ref,)
@@ -504,6 +516,18 @@ def _reject_incoherent_policy(
             return _reject(
                 f"allowed_status_values repeats a value ({len(policy.allowed_status_values)} "
                 f"values, {len(set(policy.allowed_status_values))} distinct)")
+        if not policy.observed_on.strip():
+            return _reject(
+                "observed_on is blank: the status column is current-valued, so a table of current "
+                "rows cannot honestly answer an arbitrary business date unless the date those rows "
+                "were observed valid is on the record")
+        try:
+            _dt.date.fromisoformat(policy.observed_on.strip())
+        except ValueError:
+            return _reject(
+                f"observed_on is {policy.observed_on!r}, which is not an ISO calendar date: the "
+                f"vintage exists to be compared against a run's business date, and only a date "
+                f"has an ordering with a date")
 
     if isinstance(policy, CurrentSnapshot) and not policy.observed_snapshot_ref.strip():
         return _reject(

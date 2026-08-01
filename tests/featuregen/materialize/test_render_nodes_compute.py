@@ -132,7 +132,8 @@ LATEST = LatestAvailableAsOf(
     deterministic_tie_break_refs=(f"{CUSTOMERS}.version_seq",))
 UNTIEBREAKABLE = LatestAvailableAsOf(
     effective_time_ref=f"{CUSTOMERS}.effective_from", availability_ref=CUSTOMERS_ASOF)
-ACTIVE = ActivePopulation(status_ref=CUSTOMERS_STATUS, allowed_status_values=("ACTIVE", "DORMANT"))
+ACTIVE = ActivePopulation(status_ref=CUSTOMERS_STATUS, allowed_status_values=("ACTIVE", "DORMANT"),
+                          observed_on=OBSERVED)
 PARTITIONED = PartitionMappedSnapshot(ordered_partition_refs=(f"{CUSTOMERS}.snapshot_dt",))
 SNAPSHOT = CurrentSnapshot(observed_snapshot_ref=OBSERVED)
 
@@ -409,9 +410,9 @@ def test_active_population_with_NO_availability_ref_renders_NO_cutoff_by_design(
     """Documented shape, not an oversight (review §2.1): with no `availability_ref` there is no
     rule-6 filter and no cutoff to compute, so the node is the status filter alone — a row that
     ARRIVED after the cutoff is still kept. The point-in-time gate for this policy lives at RUN
-    PREPARATION: `runprep.spine_input_request` refuses any business date the declaration's
-    recorded vintage cannot answer, so a rendered no-cutoff spine only ever runs under the one
-    date its declaration stood behind."""
+    PREPARATION: `runprep.spine_input_request` refuses any business date the policy's declared
+    `observed_on` vintage cannot answer, so a rendered no-cutoff spine only ever runs under the
+    one date its declaration stood behind."""
     bare = _with_policy(compiled[0].spine, ACTIVE)
     bare = dataclasses.replace(
         bare, availability_ref=None,
@@ -508,7 +509,8 @@ def test_it_refuses_an_ACTIVE_population_with_an_EMPTY_status_set(compiled):
     """An empty closed set selects nothing, so the spine would be empty and every landing key would
     disappear with no error — the shape of a population claim nobody could check."""
     with pytest.raises(ValueError, match="no allowed status"):
-        _render(compiled, ActivePopulation(status_ref=CUSTOMERS_STATUS, allowed_status_values=()))
+        _render(compiled, ActivePopulation(status_ref=CUSTOMERS_STATUS, allowed_status_values=(),
+                                           observed_on=OBSERVED))
 
 
 def test_it_refuses_when_the_contracts_keys_are_not_the_spines(compiled):

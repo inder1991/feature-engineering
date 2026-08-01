@@ -80,7 +80,6 @@ from featuregen.materialize.spine import (
     ActivePopulation,
     CurrentSnapshot,
     LatestAvailableAsOf,
-    SpineSourceDeclarationV1,
     SpineSpec,
 )
 
@@ -614,22 +613,6 @@ def run_input_requests(
         for requirement in expression.input_requirements)
 
 
-def _recorded_vintage(declaration: SpineSourceDeclarationV1) -> str:
-    """The calendar date an ``ActivePopulation`` declaration was RECORDED — its only vintage.
-
-    The policy declares no vintage of its own (unlike ``CurrentSnapshot``), and its status column
-    is current-valued, so the one date on record that a human stood behind the table's current rows
-    is the date of ``recorded_at``. Returned as TEXT, with an unreadable ``recorded_at`` returned
-    raw, so it flows into the same "not a calendar date" refusal the ``CurrentSnapshot`` vintage
-    uses — *"this module cannot read the vintage"* is not *"the vintage is fine"*.
-    """
-    recorded = declaration.recorded_at.strip()
-    try:
-        return dt.datetime.fromisoformat(recorded).date().isoformat()
-    except ValueError:
-        return recorded
-
-
 def spine_input_request(
     spine: SpineSpec,
     spine_input: PhysicalInputRequirement,
@@ -654,15 +637,14 @@ def spine_input_request(
     that says *this spine declaration does not stand*. The strain is real and recorded — the
     refuting input is the run's business date rather than a governed catalog fact.
 
-    ``CurrentSnapshot`` declares its vintage outright (``observed_snapshot_ref``).
-    ``ActivePopulation`` — the other history-free policy — declares none, and its status column is
-    CURRENT-valued, so the one date on record that anyone stood behind is the calendar date its
-    declaration was RECORDED: the moment a human looked at the table's current rows and called them
-    the population. It gets the SAME refusal for any other date (review §2.1's confirmed leak — a
-    January backfill run in July silently publishing July's actives). Requiring an
-    ``availability_ref`` instead would only half-close that leak: an entity CLOSED since a
-    historical business date has no row left for rule 6 to filter, so no availability cutoff can
-    recover that date's population.
+    ``CurrentSnapshot`` declares its vintage as ``observed_snapshot_ref`` — an opaque identifier,
+    a date or a version. ``ActivePopulation`` — the other history-free policy — declares
+    ``observed_on``, the calendar date its current rows were observed valid: its status column is
+    CURRENT-valued, so any other business date is review §2.1's confirmed leak (a January backfill
+    run in July silently publishing July's actives), and requiring an ``availability_ref`` instead
+    would only half-close it — an entity CLOSED since a historical business date has no row left
+    for rule 6 to filter. Both vintages enter identity, so the remedy the refusal points at — a
+    RE-DECLARATION with a new vintage — is a hash-visible, reviewable act.
 
     A vintage that is not a calendar date is refused too. It is an opaque declared identifier, a
     version and a date have no ordering between them, and *"this module cannot check the vintage"*
@@ -687,13 +669,13 @@ def spine_input_request(
     policy = spine.snapshot_policy
 
     if isinstance(policy, CurrentSnapshot | ActivePopulation):
-        # ONE guard for the two present-tense policies; only WHERE the declared vintage lives
-        # differs. `label` puts the policy's name in the shared refusal, so the operator reading
-        # it knows which declaration to fix.
+        # ONE guard for the two present-tense policies; only WHICH declared field holds the
+        # vintage differs. `label` puts the policy's name in the shared refusal, so the operator
+        # reading it knows which declaration to re-declare with a new vintage.
         if isinstance(policy, CurrentSnapshot):
             vintage, vintage_source = policy.observed_snapshot_ref.strip(), "observed at"
         else:
-            vintage, vintage_source = _recorded_vintage(spine.declaration), "recorded at"
+            vintage, vintage_source = policy.observed_on.strip(), "observed on"
         label = policy.kind.name
         try:
             observed = dt.date.fromisoformat(vintage)

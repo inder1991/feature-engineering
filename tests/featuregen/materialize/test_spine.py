@@ -173,7 +173,8 @@ def test_facts_validate_but_never_choose(two_candidate_customer_tables):
                      availability_ref=f"{KYC}.load_ts",
                      population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(status_ref=f"{KYC}.status_cd",
-                                                      allowed_status_values=("A",))),
+                                                      allowed_status_values=("A",),
+                                                      observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(master, SpineSpec)
     assert master.source_table_ref == CUSTOMERS
@@ -515,7 +516,8 @@ def test_an_ActivePopulation_policy_cannot_back_a_COMPLETE_claim(two_candidate_c
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(snapshot_policy=ActivePopulation(
-            status_ref=CUSTOMERS_STATUS, allowed_status_values=("A",))), roles=_ROLES)
+            status_ref=CUSTOMERS_STATUS, allowed_status_values=("A",),
+            observed_on="2026-07-27")), roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
@@ -525,7 +527,8 @@ def test_an_ActivePopulation_needs_a_NON_EMPTY_closed_status_set(two_candidate_c
         two_candidate_customer_tables,
         _declaration(population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(
-                         status_ref=CUSTOMERS_STATUS, allowed_status_values=())), roles=_ROLES)
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=(),
+                         observed_on="2026-07-27")), roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
@@ -536,7 +539,8 @@ def test_an_ActivePopulation_declaration_is_accepted_when_it_is_coherent(
         two_candidate_customer_tables,
         _declaration(population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(
-                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"))),
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"),
+                         observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(result, SpineSpec)
     assert CUSTOMERS_STATUS in result.read_set
@@ -548,16 +552,17 @@ def test_an_ActivePopulation_with_NO_availability_ref_COMPILES_and_the_gate_is_a
     requirement on this policy, so the declaration compiles with `availability_ref=None` and the
     rendered spine carries no cutoff at all (pinned in test_render_nodes_compute). The
     point-in-time enforcement lives at RUN PREPARATION: `runprep.spine_input_request` refuses any
-    business date the declaration's recorded vintage cannot answer. Requiring an availability_ref
-    HERE would only half-close the leak — the status column is CURRENT-valued, so entities closed
-    since a historical business date would still vanish from that date's population even under a
-    rule-6 filter."""
+    business date the policy's declared `observed_on` vintage cannot answer. Requiring an
+    availability_ref HERE would only half-close the leak — the status column is CURRENT-valued, so
+    entities closed since a historical business date would still vanish from that date's
+    population even under a rule-6 filter."""
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(availability_ref=None,
                      population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(
-                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"))),
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"),
+                         observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(result, SpineSpec)
     assert result.availability_ref is None
@@ -568,7 +573,8 @@ def test_a_refusal_never_echoes_the_declared_status_VALUES(two_candidate_custome
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(snapshot_policy=ActivePopulation(
-            status_ref=CUSTOMERS_STATUS, allowed_status_values=("SECRET_STATUS_TOKEN",))),
+            status_ref=CUSTOMERS_STATUS, allowed_status_values=("SECRET_STATUS_TOKEN",),
+            observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert "SECRET_STATUS_TOKEN" not in result.detail
@@ -581,6 +587,24 @@ def test_a_CurrentSnapshot_must_record_WHICH_snapshot_it_observed(two_candidate_
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(snapshot_policy=CurrentSnapshot(observed_snapshot_ref="  ")), roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+
+
+@pytest.mark.parametrize("observed_on", ["  ", "release-42"])
+def test_an_ActivePopulation_must_record_a_CALENDAR_DATE_it_was_observed_on(
+        two_candidate_customer_tables, observed_on):
+    """The `CurrentSnapshot` rule's analogue, one notch stricter: the status column is
+    current-valued, so the vintage exists ONLY to be compared against a run's business date — a
+    blank records nothing and a version identifier has no ordering with a date. Refusing the form
+    HERE is what lets run preparation compare without a fail-closed parse of its own."""
+    result = validate_spine_declaration(
+        two_candidate_customer_tables,
+        _declaration(population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
+                     snapshot_policy=ActivePopulation(
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A",),
+                         observed_on=observed_on)),
+        roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
@@ -691,6 +715,20 @@ def test_identity_covers_every_semantic_field():
 def test_every_semantic_change_moves_the_hash(changed):
     assert materialize_hash(_declaration().identity_payload()) != \
            materialize_hash(_declaration(**changed).identity_payload())
+
+
+def test_two_ActivePopulation_VINTAGES_are_two_populations():
+    """`CurrentSnapshot`'s rule, on the other present-tense policy: `observed_on` enters IDENTITY
+    (it is a declared population fact, not provenance), so re-declaring with a new vintage is a
+    hash-visible, reviewable act — never a silent slide of the population's as-of."""
+    def declared(observed_on):
+        return _declaration(
+            population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
+            snapshot_policy=ActivePopulation(status_ref=CUSTOMERS_STATUS,
+                                             allowed_status_values=("A",),
+                                             observed_on=observed_on))
+    assert materialize_hash(declared("2026-07-27").identity_payload()) != \
+           materialize_hash(declared("2026-07-28").identity_payload())
 
 
 def test_the_identity_payload_hashes_with_the_ONE_hasher():

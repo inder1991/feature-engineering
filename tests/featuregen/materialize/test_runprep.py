@@ -829,12 +829,11 @@ from featuregen.materialize.spine import (  # noqa: E402
 )
 
 
-def _spine(policy, **declaration_overrides):
+def _spine(policy):
     """A `SpineSpec` carrying one snapshot policy — every other field is beside the point here."""
     from tests.featuregen.materialize.test_ir import DECLARATION
 
-    declaration = dataclasses.replace(DECLARATION, snapshot_policy=policy,
-                                      **declaration_overrides)
+    declaration = dataclasses.replace(DECLARATION, snapshot_policy=policy)
     return SpineSpec(
         declaration=declaration, source_table_ref=declaration.source_table_ref,
         entity=declaration.entity, ordered_key_refs=declaration.ordered_key_refs,
@@ -927,20 +926,21 @@ def test_an_SCD_spine_over_an_UNPARTITIONED_table_is_fine() -> None:
                                           business_dt=BUSINESS_DT), RunInputRequest)
 
 
-def _active_population() -> ActivePopulation:
+def _active_population(observed_on: str) -> ActivePopulation:
+    """The vintage is stated by EVERY caller: which date the gate answers is the point under test."""
     return ActivePopulation(status_ref=f"{SOURCE}::public.customers.status_cd",
-                            allowed_status_values=("ACTIVE",))
+                            allowed_status_values=("ACTIVE",), observed_on=observed_on)
 
 
 def test_an_ACTIVE_POPULATION_spine_is_refused_for_a_date_its_vintage_cannot_answer() -> None:
-    """`status_cd` is CURRENT-valued: the table can only answer "who is active NOW", and the one
-    date on record for "now" is the calendar date the declaration was recorded — the moment a
-    human stood behind the table's current rows as the population. Any other business date is the
-    population-level as-of leak the review confirmed by execution (report §2.1): a January
+    """`status_cd` is CURRENT-valued: the table can only answer "who is active NOW", and the
+    declared `observed_on` is the one date on record for when "now" was. Any other business date
+    is the population-level as-of leak the review confirmed by execution (report §2.1): a January
     backfill run in July silently publishing July's actives. Rule 6's availability filter cannot
     close it — an entity CLOSED since the business date has no row left to filter."""
+    policy = _active_population(observed_on=BUSINESS_DT)
     for not_the_vintage in (NEXT_DT, "2026-01-15"):  # the next day, and the review's backfill
-        refused = spine_input_request(_spine(_active_population()), _requirement(_CUSTOMERS),
+        refused = spine_input_request(_spine(policy), _requirement(_CUSTOMERS),
                                       business_dt=not_the_vintage)
         assert isinstance(refused, MaterializationRefused), not_the_vintage
         assert refused.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
@@ -948,22 +948,14 @@ def test_an_ACTIVE_POPULATION_spine_is_refused_for_a_date_its_vintage_cannot_ans
         assert not_the_vintage in refused.detail and BUSINESS_DT in refused.detail
 
 
-def test_an_ACTIVE_POPULATION_spine_resolves_for_its_own_vintage() -> None:
-    """The vintage is the DECLARATION's own `recorded_at` date — the fixture declaration was
-    recorded at 2026-07-27T09:00:00+00:00, so 2026-07-27 is the one date it can answer."""
-    request = spine_input_request(_spine(_active_population()), _requirement(_CUSTOMERS),
-                                  business_dt=BUSINESS_DT)
+def test_an_ACTIVE_POPULATION_spine_resolves_for_its_own_DECLARED_vintage() -> None:
+    """The gate reads the policy's DECLARED `observed_on` — nothing else. `NEXT_DT` is chosen
+    because it differs from every other date the fixture declaration carries (its `recorded_at`
+    sits on `BUSINESS_DT`'s calendar day), so a pass here cannot come from a coincidence."""
+    request = spine_input_request(
+        _spine(_active_population(observed_on=NEXT_DT)), _requirement(_CUSTOMERS),
+        business_dt=NEXT_DT)
     assert isinstance(request, RunInputRequest)
-
-
-def test_an_ACTIVE_POPULATION_whose_recorded_at_is_unreadable_refuses_EVERY_date() -> None:
-    """Fail closed, exactly as a `CurrentSnapshot` vintage that is not a date does: "this module
-    cannot establish the vintage" is not "the vintage is fine"."""
-    refused = spine_input_request(
-        _spine(_active_population(), recorded_at="release-42"), _requirement(_CUSTOMERS),
-        business_dt=BUSINESS_DT)
-    assert isinstance(refused, MaterializationRefused)
-    assert refused.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
 
 def test_the_spine_request_key_cannot_COLLIDE_with_a_feature_expression() -> None:
