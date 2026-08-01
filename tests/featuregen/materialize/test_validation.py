@@ -19,7 +19,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 import inspect
+import subprocess
 import sys
+import time
 
 import pytest
 from tests.featuregen.materialize.test_group_plan import catalog  # noqa: F401 - a fixture
@@ -59,6 +61,8 @@ from featuregen.materialize.validation import (
     ValidationStatus,
     classify,
     may_regenerate,
+    may_regenerate_for,
+    read_validation_reports,
     record_validation_report,
     run_l0,
     run_l1,
@@ -837,6 +841,106 @@ def test_the_environment_given_to_L0_reaches_the_interpreter_that_imports_the_pr
     assert (with_env.status, with_env.findings) == (ValidationStatus.PASSED, ())
 
 
+# ── L0: the verdict channel cannot be forged ─────────────────────────────────────────────────────
+#
+# The marker's own docstring names the attack — a project that prints something shaped like a
+# verdict declares itself buildable — and these are the tests that attack never had. The defence is
+# a marker minted fresh per invocation: the probe reads it from argv, so an honest probe still
+# answers, while a FIXED string printed by the project (or by anything standing where the
+# interpreter should be) matches nothing.
+
+_FORGED_PASS = '@@L0-VERDICT@@ {"stage": "build", "ok": true, "observed": "2 nodes"}'
+
+
+def _stub_python(tmp_path, script_body: str) -> str:
+    """Something standing where the interpreter should be — it never runs the probe it was given."""
+    stub = tmp_path / "stub-python"
+    stub.write_text("#!/bin/sh\n" + script_body, encoding="utf-8")
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_a_project_printing_the_verdict_marker_cannot_bless_itself(tmp_path) -> None:
+    """The self-blessing project: it prints a verdict-shaped line with the well-known prefix during
+    import and exits before the probe can speak, so its line is the only candidate verdict. The
+    files are SEALED with that print in place — no hash mismatch — so the forged line is the only
+    signal, and the report must still not be a pass."""
+    files = _project_files(create_pipeline_body=_BUILDS)
+    files[f"src/{PACKAGE}/__init__.py"] = (
+        "import os, sys\n"
+        f"sys.stdout.write({_FORGED_PASS!r} + chr(10))\n"
+        "sys.stdout.flush()\n"
+        "os._exit(0)\n")
+    report = _l0(_on_disk(tmp_path, files))
+    assert report.status is not ValidationStatus.PASSED
+
+
+@pytest.mark.parametrize("forged", [
+    '@@L0-VERDICT@@ {"builds": true}',    # verdict-shaped only loosely — must still not pass
+    _FORGED_PASS,                          # byte-for-byte what a passing probe would print
+])
+def test_an_interpreter_that_prints_the_FIXED_marker_cannot_bless_the_project(tmp_path, forged):
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    stub = _stub_python(tmp_path, f"printf '%s\\n' '{forged}'\n")
+    assert _l0(root, python_executable=stub).status is not ValidationStatus.PASSED
+
+
+def test_the_verdict_marker_is_a_fresh_nonce_per_invocation(tmp_path) -> None:
+    """Two invocations, two markers — yesterday's log does not teach a forger today's marker.
+
+    The stub captures the marker the probe would have received (its argv, ``$3``), which is also
+    the only string the scan will match.
+    """
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    captured = tmp_path / "markers.txt"
+    stub = _stub_python(tmp_path, f'printf \'%s\\n\' "$3" >> "{captured}"\n')
+    _l0(root, python_executable=stub)
+    _l0(root, python_executable=stub)
+
+    first, second = captured.read_text(encoding="utf-8").splitlines()
+    assert first != second
+    assert first.startswith("@@L0-VERDICT@@") and second.startswith("@@L0-VERDICT@@")
+    assert first.endswith(" ") and second.endswith(" ")   # the delimiter the probe prepends
+    assert "@@L0-VERDICT@@ " not in (first, second)       # never the guessable fixed string
+
+
+# ── L0: the probe's timeout and the file that is not text ────────────────────────────────────────
+
+
+def test_a_probe_that_outlives_timeout_seconds_is_error_not_a_hang(tmp_path) -> None:
+    """§11.2: a probe killed by the timeout is *the validation did not run* — and it IS killed."""
+    files = _project_files(create_pipeline_body=_BUILDS)
+    files[f"src/{PACKAGE}/__init__.py"] = "import time\ntime.sleep(30)\n"
+    root = _on_disk(tmp_path, files)
+
+    began = time.monotonic()
+    report = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-timeout",
+                    python_executable=sys.executable, clock=_clock(), timeout_seconds=1.0)
+    elapsed = time.monotonic() - began
+
+    assert report.status is ValidationStatus.ERROR
+    assert report.findings == ()
+    assert elapsed < 20                                # returned at the timeout, not after the sleep
+    survivors = subprocess.run(["pgrep", "-f", str(root)], capture_output=True, text=True,
+                               check=False)
+    assert survivors.stdout.strip() == ""              # the timed-out probe was killed, not orphaned
+
+
+def test_a_non_utf8_file_is_PROJECT_HASH_MISMATCH_naming_the_utf8_problem(tmp_path) -> None:
+    """`_files_on_disk` answers None for a tree it cannot read as text; the verdict must be the
+    fail-closed drift finding with an HONEST observed — the hash of the readable files would claim
+    an observation of the whole tree that was never made."""
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    (root / "src" / PACKAGE / "junk.py").write_bytes(b"\xff\xfe")
+
+    report = _l0(root)
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.PROJECT_HASH_MISMATCH]
+    assert "UTF-8" in report.findings[0].observed
+    assert report.findings[0].expected == read_lock(
+        (root / GENERATED_LOCK_FILENAME).read_text(encoding="utf-8")).generated_project_hash
+
+
 # ── ingestion: the report the control plane deliberately did not invent ──────────────────────────
 
 
@@ -876,3 +980,105 @@ def test_an_L0_report_records_a_NULL_run_id(db) -> None:
     row = db.execute("SELECT run_id, findings FROM pipeline_validation_report "
                      "WHERE report_id = 'rep-l0-db'").fetchone()
     assert row == (None, [])
+
+
+# ── the reader the table never had ───────────────────────────────────────────────────────────────
+#
+# `record_validation_report` INSERTs and nothing in src ever SELECTed, so `may_regenerate`'s
+# blocking rule held only for the process that happened to hold the report object. These tests are
+# the cross-process form: what was RECORDED reads back EQUAL (frozen-dataclass `==`, every field),
+# and the recorded history — not an in-memory object — answers whether regeneration is legitimate.
+
+T2 = "2026-07-28T09:00:10+00:00"
+
+
+def _seed_generation(db, generation_id: str = GEN) -> None:
+    record_generation(db, MaterializationGeneration(
+        generation_id=generation_id, logical_group_name="cif_daily",
+        materialization_contract_hash="c" * 64, group_plan_hash=PLAN_HASH,
+        generated_project_hash=PROJECT_HASH, created_at=T0))
+
+
+def test_a_recorded_report_reads_back_EQUAL_and_gates_regeneration(db) -> None:
+    """FULL equality, not field sampling: one `==` over the frozen dataclass covers all eleven
+    columns and every finding field, including the None-valued expected/observed."""
+    _seed_generation(db)
+    report = _report(ValidationStatus.FAILED, (
+        _finding(ValidationFindingCode.COLUMN_TYPE_MISMATCH,
+                 location="banking.transactions.txn_amt", expected="decimal(18,2)",
+                 observed="string"),
+        _finding(ValidationFindingCode.PARTITION_ABSENT,
+                 location="txn_sum_30d/e0 banking.transactions",
+                 expected="3 partition(s)", observed="2 present", count=1),
+        _finding(ValidationFindingCode.UNKNOWN_FINDING),        # expected/observed both None
+    ))
+    record_validation_report(db, report)
+
+    (read,) = read_validation_reports(db, generation_id=GEN)
+    assert read == report
+    assert may_regenerate_for(db, generation_id=GEN) is False   # COLUMN_TYPE_MISMATCH blocks
+
+
+def test_reports_read_back_in_STARTED_order_with_an_L0_null_run_id_intact(db) -> None:
+    """Recorded newest-first on purpose: the order read back is `started_at`, not insertion."""
+    _seed_generation(db)
+    l1 = dataclasses.replace(
+        _report(ValidationStatus.FAILED,
+                (_finding(ValidationFindingCode.PARTITION_ABSENT, observed="0 present"),)),
+        report_id="rep-order-l1", started_at=T1, finished_at=T2)
+    l0 = ValidationReportV1(
+        report_id="rep-order-l0", generation_id=GEN, run_id=None,
+        generated_project_hash=PROJECT_HASH, group_plan_hash=PLAN_HASH,
+        level=ValidationLevel.L0, environment_id=ENVIRONMENT, status=ValidationStatus.PASSED,
+        started_at=T0, finished_at=T1, findings=())
+    record_validation_report(db, l1)
+    record_validation_report(db, l0)
+
+    assert read_validation_reports(db, generation_id=GEN) == (l0, l1)
+
+
+def test_no_recorded_reports_block_nothing_and_other_generations_do_not_bleed(db) -> None:
+    _seed_generation(db)
+    _seed_generation(db, "gen-15b-other")
+    record_validation_report(db, dataclasses.replace(
+        _report(ValidationStatus.FAILED,
+                (_finding(ValidationFindingCode.READ_DENIED, observed="denied"),)),
+        report_id="rep-other", generation_id="gen-15b-other"))
+
+    assert read_validation_reports(db, generation_id=GEN) == ()
+    assert may_regenerate_for(db, generation_id=GEN) is True
+
+
+def test_a_superseded_blocker_no_longer_blocks_and_a_fresh_one_blocks_again(db) -> None:
+    """`may_regenerate_for` judges the NEWEST report of each level. A re-validation re-checked the
+    findings of the report it supersedes, so a blocker followed by a clean re-run no longer blocks
+    — and a clean run followed by a fresh blocker blocks again. History's ORDER decides."""
+    _seed_generation(db)
+    record_validation_report(db, dataclasses.replace(
+        _report(ValidationStatus.FAILED,
+                (_finding(ValidationFindingCode.COLUMN_ABSENT, observed="absent"),)),
+        report_id="rep-seq-blocked", started_at=T0))
+    assert may_regenerate_for(db, generation_id=GEN) is False
+
+    record_validation_report(db, dataclasses.replace(
+        _report(ValidationStatus.PASSED), report_id="rep-seq-clean", started_at=T1))
+    assert may_regenerate_for(db, generation_id=GEN) is True
+
+    record_validation_report(db, dataclasses.replace(
+        _report(ValidationStatus.FAILED,
+                (_finding(ValidationFindingCode.COLUMN_ABSENT, observed="absent"),)),
+        report_id="rep-seq-blocked-again", started_at=T2))
+    assert may_regenerate_for(db, generation_id=GEN) is False
+
+
+def test_every_LEVELS_newest_report_must_permit_regeneration(db) -> None:
+    """The levels AND together: L1's clean re-run says nothing about L0's standing refusal —
+    here an `error` report, which never permits regeneration (nothing was looked at)."""
+    _seed_generation(db)
+    record_validation_report(db, dataclasses.replace(
+        _report(ValidationStatus.PASSED), report_id="rep-and-l1", started_at=T1))
+    record_validation_report(db, dataclasses.replace(
+        _report(ValidationStatus.ERROR, level=ValidationLevel.L0),
+        report_id="rep-and-l0", run_id=None, started_at=T0))
+
+    assert may_regenerate_for(db, generation_id=GEN) is False

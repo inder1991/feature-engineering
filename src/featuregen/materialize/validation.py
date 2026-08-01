@@ -41,6 +41,7 @@ import json
 import os
 import pathlib
 import subprocess
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -75,6 +76,8 @@ __all__ = [
     "ValidationStatus",
     "classify",
     "may_regenerate",
+    "may_regenerate_for",
+    "read_validation_reports",
     "record_validation_report",
     "run_l0",
     "run_l1",
@@ -331,6 +334,66 @@ def record_validation_report(conn: DbConn, report: ValidationReportV1) -> None:
          report.started_at, report.finished_at, json.dumps(report.findings_payload())))
 
 
+def _finding_from_payload(payload: Mapping[str, Any]) -> ValidationFinding:
+    """The exact inverse of :meth:`ValidationFinding.payload`.
+
+    ``classification`` is deliberately NOT read back: it was derived from ``code`` on the way out
+    and the constructor derives it again on the way in, so a stored row cannot smuggle in a routing
+    its own code contradicts.
+    """
+    return ValidationFinding(
+        code=ValidationFindingCode(payload["code"]),
+        location=payload["location"],
+        expected=payload["expected"],
+        observed=payload["observed"],
+        count=payload["count"],
+        severity=FindingSeverity(payload["severity"]))
+
+
+def read_validation_reports(conn: DbConn, *, generation_id: str
+                            ) -> tuple[ValidationReportV1, ...]:
+    """Every report recorded for one generation, oldest ``started_at`` first.
+
+    The exact inverse of :func:`record_validation_report`: the eleven columns it INSERTs come back
+    through the shapes they went in — the enums through their enums, the findings through the
+    inverse of :meth:`ValidationReportV1.findings_payload` — so a read-back report compares EQUAL
+    (``==`` over the frozen dataclass) to the one recorded, and every constructor invariant
+    (``error`` has no findings, ``failed`` has at least one) re-runs on the way out. ``started_at``
+    is ISO-8601 text, so its lexicographic order is its chronological order; ``recorded_at`` and
+    ``report_id`` only make a tie deterministic.
+    """
+    rows = conn.execute(
+        "SELECT report_id, generation_id, run_id, generated_project_hash, group_plan_hash, "
+        "level, environment_id, status, started_at, finished_at, findings "
+        "FROM pipeline_validation_report WHERE generation_id = %s "
+        "ORDER BY started_at, recorded_at, report_id",
+        (generation_id,)).fetchall()
+    return tuple(
+        ValidationReportV1(
+            report_id=row[0], generation_id=row[1], run_id=row[2],
+            generated_project_hash=row[3], group_plan_hash=row[4],
+            level=ValidationLevel(row[5]), environment_id=row[6],
+            status=ValidationStatus(row[7]), started_at=row[8], finished_at=row[9],
+            findings=tuple(_finding_from_payload(payload) for payload in row[10]))
+        for row in rows)
+
+
+def may_regenerate_for(conn: DbConn, *, generation_id: str) -> bool:
+    """The CROSS-PROCESS form of :func:`may_regenerate` — the recorded rule, not the in-memory one.
+
+    :func:`may_regenerate` judges the report object its caller happens to hold, which binds only
+    the process that ran the validation. This reads what was RECORDED and applies the same rule to
+    the NEWEST report of each level: a re-validation re-checked the findings of the report it
+    supersedes, so a superseded blocker no longer blocks — and every level's newest verdict must
+    permit regeneration, because L1's clean re-run says nothing about L0's standing refusal. No
+    recorded reports block nothing: ``True``.
+    """
+    newest: dict[ValidationLevel, ValidationReportV1] = {}
+    for report in read_validation_reports(conn, generation_id=generation_id):
+        newest[report.level] = report        # ordered oldest-first, so the last one seen is newest
+    return all(may_regenerate(report) for report in newest.values())
+
+
 class ClusterUnreachable(Exception):
     """The environment could not be asked — NOT a verdict about what it contains.
 
@@ -343,10 +406,21 @@ class ClusterUnreachable(Exception):
 
 # ── L0: the generated project itself ─────────────────────────────────────────────────────────────
 
-#: What the build probe prints, on its own line, so the project's own output cannot be mistaken for
-#: a verdict. A project that prints during import is legal; a project that prints something shaped
-#: like a verdict would otherwise be able to declare itself buildable.
-_VERDICT_MARKER = "@@L0-VERDICT@@ "
+#: The fixed PREFIX of the marker the build probe prints before its verdict, kept stable so a human
+#: can find the line in a log. The marker the probe is actually GIVEN — and the only string the
+#: scan matches — is minted fresh per invocation (:func:`_verdict_marker`): a project that prints
+#: during import is legal, but a project that printed a fixed, verdict-shaped line would otherwise
+#: be able to declare itself buildable, and the nonce did not exist until the probe was launched.
+_VERDICT_MARKER_PREFIX = "@@L0-VERDICT@@"
+
+
+def _verdict_marker() -> str:
+    """One probe invocation's marker. Fresh every call — yesterday's log teaches a forger nothing.
+
+    The trailing space is the delimiter between the marker and the verdict JSON, exactly as the
+    probe prints it (``MARKER + json.dumps(...)``).
+    """
+    return f"{_VERDICT_MARKER_PREFIX}{uuid.uuid4().hex} "
 
 #: The probe. Stdlib ONLY and run in ANOTHER interpreter, which is what lets the suite exercise it
 #: against ``sys.executable`` and hand-authored projects while the gate runs the identical code
@@ -398,18 +472,23 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
     line are all *the validation did not run*, which §11.2 records as ``status="error"`` with no
     findings. Turning any of them into ``PROJECT_DOES_NOT_BUILD`` would blame the artifact for the
     environment.
+
+    The verdict line is matched against a marker minted for THIS invocation and handed to the probe
+    through its argv, so output the project itself prints — including a verdict-shaped line carrying
+    the well-known prefix — can never be read as the probe's answer.
     """
+    marker = _verdict_marker()
     try:
         completed = subprocess.run(                                       # noqa: S603 - fixed argv
-            [python_executable, "-c", _BUILD_PROBE, _VERDICT_MARKER, str(root), package],
+            [python_executable, "-c", _BUILD_PROBE, marker, str(root), package],
             capture_output=True, text=True, timeout=timeout_seconds, check=False,
             cwd=str(root), env=None if env is None else {**os.environ, **env})
     except (OSError, subprocess.SubprocessError):
         return None
     for line in reversed(completed.stdout.splitlines()):
-        if line.startswith(_VERDICT_MARKER):
+        if line.startswith(marker):
             try:
-                verdict = json.loads(line[len(_VERDICT_MARKER):])
+                verdict = json.loads(line[len(marker):])
             except json.JSONDecodeError:
                 return None
             return verdict if isinstance(verdict, dict) else None
