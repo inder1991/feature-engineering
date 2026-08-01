@@ -104,10 +104,15 @@ def test_declared_join_builds_approved_join_ref():
     assert ref.from_ref.object_kind == "column" and ref.from_ref.column == "account_id"
 
 
-def test_governed_proposal_defaults_cardinality_to_n1():
+def test_a_blank_uploaded_cardinality_stays_unknown():
+    # Codegen-review remediation Task 5: this test used to pin the fabricated "N:1" default
+    # (test_governed_proposal_defaults_cardinality_to_n1). A fabricated N:1 would be admitted,
+    # confirmed by two admins, and trusted at runtime. Unknown must stay unknown so plan_join
+    # refuses until someone decides.
     ref = governed_join_proposal(CanonicalRow("deposits", "transactions", "account_id", "integer",
-                                              joins_to="accounts.id"))
-    assert ref is not None and ref.cardinality == "N:1"
+                                              joins_to="accounts.id", cardinality=""))
+    assert ref is not None
+    assert ref.cardinality is None
 
 
 def test_governed_proposal_none_for_absent_or_malformed_join():
@@ -140,6 +145,28 @@ def test_flag_on_with_adapter_marks_display_only_and_proposes(db, monkeypatch, c
     ref = governed_join_proposal(_join_rows()[0])
     events = load_fact(db, fact_key(ref, "approved_join"))
     assert any(e.type == "OVERLAY_FACT_PROPOSED" for e in events)   # governed proposal exists
+
+
+def test_flag_on_blank_cardinality_still_proposes_with_cardinality_none(db, monkeypatch, catalog):
+    # Codegen-review remediation Task 5: a blank uploaded cardinality no longer fabricates "N:1" —
+    # the declared join must STILL be proposed (the approved_join schema admits null) with
+    # cardinality None, so two admins can verify the join while plan_join refuses the hop as
+    # cardinality-unknown until a human supplies one.
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    rows = [
+        CanonicalRow("deposits", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id"),                    # cardinality omitted
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+    ]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=_NOW)
+    assert res.status == "ingested"
+    ref = governed_join_proposal(rows[0])
+    assert ref is not None and ref.cardinality is None
+    events = load_fact(db, fact_key(ref, "approved_join"))
+    proposed = [e for e in events if e.type == "OVERLAY_FACT_PROPOSED"]
+    assert proposed, "the blank-cardinality join must still be proposed, not schema-denied"
+    assert proposed[-1].payload["proposed_value"]["cardinality"] is None
 
 
 def test_flag_on_ingest_reensures_adapter_and_proposes(db, monkeypatch):

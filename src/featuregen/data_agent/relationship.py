@@ -12,7 +12,9 @@ It produces six things a declaration cannot:
   unmatched key is the strongest cheap signal that two identifier columns do NOT share a namespace;
 * **source tuple frequency** — how many source rows share one identifier;
 * **join multiplier** — how many target rows each source row actually matches;
-* **observed cardinality**, which is what `graph.py`'s propose-time `or "N:1"` currently guesses.
+* **observed cardinality** — measured, where a declaration-less upload has none (`graph.py`'s
+  propose-time seam used to guess `N:1` here; since the Task 5 codegen-review remediation a blank
+  uploaded cardinality stays None/UNKNOWN and `plan_join` refuses until a human supplies one).
 
 **It promotes nothing.** Release 1 produces evidence; Release 2 decides what it may support. The
 rule governing that decision lives here as :meth:`RelationshipEvidenceV1.uniqueness_verdict`, and it
