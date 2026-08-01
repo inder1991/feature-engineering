@@ -33,7 +33,7 @@ from featuregen.overlay.upload.bridge_assessment import (
     ConceptAuthority,
     IdentifierLinkAssessmentV1,
 )
-from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.concepts import concept, display_entity
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.party_vocab import PartyRole, normalize_party_role
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
@@ -200,7 +200,11 @@ def _identifier_columns(conn, *, roles: Iterable[str]) -> list[_IdCol]:
             catalog_source=catalog_source,
             table_name=table_name,
             column_name=column_name,
-            entity=grounding.entity_id or c.entity_link,
+            # The carried entity is corroboration/DISPLAY — it resolves through the alias seam
+            # (grounding already seams its concept-derived entity; the registry fallback must
+            # match). The registry's raw entity_link stays the byte-stable fact-key input only
+            # where a stored fact already carries it.
+            entity=grounding.entity_id or display_entity(concept_name, c.entity_link),
             namespace=c.namespace,
             type_family=grounding.data_type_family,
             is_grain=grounding.is_grain,
@@ -569,7 +573,7 @@ def _current_identifier_column(conn, ref: CatalogObjectRef) -> _IdCol | None:
         catalog_source=ref.catalog_source.strip().lower(),
         table_name=ref.table.strip().lower(),
         column_name=ref.column.strip().lower(),
-        entity=grounding.entity_id or registered.entity_link,
+        entity=grounding.entity_id or display_entity(concept_name, registered.entity_link),
         namespace=registered.namespace,
         type_family=grounding.data_type_family,
         is_grain=grounding.is_grain,

@@ -40,7 +40,7 @@ from featuregen.overlay.upload.bridge_assessment import (
     LinkReviewStatus,
     available_identifier_links,
 )
-from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
+from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, display_entity
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.read_scope import allowed_classes
 from featuregen.overlay.upload.semantic_context import composed_link_realizations
@@ -134,7 +134,11 @@ def _endpoint_view(endpoint: IdentifierEndpointV1) -> EntityMapEndpointV1:
     registered = CONCEPT_REGISTRY.get(concept) if concept else None
     # The assessment's own entity conclusion wins; a concept's registry entity_link fills in only
     # when the assessment concluded none. Namespace is registry-only: no concept, no namespace.
-    entity_id = endpoint.entity_id or (registered.entity_link if registered else None)
+    # The DISPLAY entity then resolves through the alias seam (semantic Task 2 / D12.1): a
+    # counterparty_id endpoint displays `customer` — counterparty is a party ROLE. Stored fact
+    # keys and the assessment's persisted entity_id are untouched; this is presentation.
+    entity_id = display_entity(
+        concept, endpoint.entity_id or (registered.entity_link if registered else None))
     return EntityMapEndpointV1(
         catalog_source=source,
         table_ref=f"{schema}.{table}",

@@ -71,9 +71,10 @@ from featuregen.overlay.upload.bridge_store import (
     load_current_bridge_realizations,
 )
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept_path
+from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept_path, display_entity
 from featuregen.overlay.upload.field_resolution import _RETIRED_EVENTS
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+from featuregen.overlay.upload.identifier_scope import resolve_identifier_issuer
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.party_vocab import normalize_party_role
 from featuregen.overlay.upload.read_scope import allowed_classes
@@ -1047,7 +1048,11 @@ def bundle_from_store(
     }
     operational = {
         "additivity": additivity, "currency": currency, "data_type": data_type,
-        "declared_type": declared_type, "entity": entity, "is_grain": bool(is_grain),
+        "declared_type": declared_type,
+        # Display entity resolves through the alias seam (Task 2 / D12.1): a counterparty_id
+        # column displays `customer`; stored facts and fact keys are untouched.
+        "entity": display_entity(concept_name, entity),
+        "is_grain": bool(is_grain),
         "is_as_of": bool(is_as_of), "unit": unit,
     }
     anchor_fields = sorted({
@@ -1117,7 +1122,13 @@ def bundle_from_store(
 
     relationship = _scoped_relationship_context(conn, flat_ref, allowed)
     path = concept_path(concept_name)
-    namespace = _identifier_namespace(concept_name)
+    # The ISSUER axis (Task 2): the same `identifier_scope` production the grounded bridge path
+    # consumes — one seam, no third namespace surface. Unresolved stays honest (basis
+    # "unresolved" + the closed missing-context code).
+    issuer_scope, issuer_basis = resolve_identifier_issuer(conn, source, concept_name)
+    namespace = _identifier_namespace(
+        concept_name, issuer_scope=issuer_scope,
+        basis=issuer_basis if issuer_scope is not None else None)
     resolved_map = {v.field_name: v for v in resolved_values}
     source_map = {v.field_name: v for v in source_values}
 

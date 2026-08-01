@@ -58,10 +58,18 @@ def _require_dsn(dsn: str | None) -> str:
 
 def _run_migrate(dsn: str) -> int:
     """Apply migrations inside one committing transaction (apply_migrations commits). Idempotent:
-    already-applied unchanged migrations are skipped, drift raises."""
+    already-applied unchanged migrations are skipped, drift raises.
+
+    After migrations, the migration-1045 companion rebuilds the search docs of entity-aliased
+    columns through graph.py's ONE weighted expression (a SQL migration cannot render it without
+    copying the weights). Idempotent + cheap, so it runs unconditionally."""
+    from featuregen.overlay.upload.graph import reproject_alias_entity_search_docs
+
     with psycopg.connect(dsn) as conn:
         apply_migrations(conn)
-    log("migrate.done", dsn=_safe_dsn(dsn))
+        rebuilt = reproject_alias_entity_search_docs(conn)
+        conn.commit()
+    log("migrate.done", dsn=_safe_dsn(dsn), alias_search_docs_rebuilt=rebuilt)
     return 0
 
 

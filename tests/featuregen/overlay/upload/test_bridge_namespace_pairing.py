@@ -183,29 +183,40 @@ def test_swift_bic_group_yields_bank_links_with_a_deterministic_entity(db):
     assert "entity_disagreement" not in bank_link.assessment.explanation_codes
 
 
-def test_entity_disagreement_prefers_the_single_subject_role_endpoint(db):
-    """cust_num (SUBJECT per party_vocab) x counter_party_cif_id (COUNTERPARTY): exactly one
-    subject -> the subject's entity, plus the explanation code. Same for beneficiary_cif, whose
-    name resolves NO party role at all."""
+def test_cif_pairs_resolve_one_display_entity_through_the_alias_seam(db):
+    """DELIBERATELY UPDATED (semantic Task 2 / D12.1 — bridge-programme handoff).
+
+    PREVIOUS PIN: cust_num x counter_party_cif_id disagreed on entity (customer vs counterparty),
+    so the subject-role endpoint's entity won and `entity_disagreement` was recorded. The alias
+    seam now resolves `counterparty_id`'s DISPLAY entity to `customer` (counterparty is a party
+    ROLE, not an entity), so the endpoints AGREE and the disagreement code disappears. The
+    registry's persisted `entity_link` — the fact-key input — is untouched; the party-role axis
+    still explains the relationship."""
     _cib_ftr_fixture(db)
     by_pair = _by_pair(derive_bridge_candidates(db))
     for other in ("counter_party_cif_id", "beneficiary_cif"):
         candidate = by_pair[frozenset({"cust_num", other})]
         assert candidate.entity_id == "customer", other
         assert candidate.assessment is not None
-        assert "entity_disagreement" in candidate.assessment.explanation_codes, other
+        assert "entity_disagreement" not in candidate.assessment.explanation_codes, other
 
 
-def test_entity_disagreement_without_a_single_subject_falls_to_lexicographic_minimum(db):
-    """client_no resolves no party role and counter_party_cif_id is COUNTERPARTY (not subject):
-    zero subjects -> min('counterparty', 'customer') = 'counterparty', plus the code."""
+def test_the_lexicographic_tie_break_no_longer_fires_for_the_cif_group(db):
+    """DELIBERATELY UPDATED (semantic Task 2 / D12.1 — bridge-programme handoff).
+
+    PREVIOUS PIN: client_no x counter_party_cif_id had zero subject roles, so the pick fell to
+    min('counterparty', 'customer') = 'counterparty'. Under the alias seam both endpoints resolve
+    the display entity `customer`, so the tie-break MECHANISM (still in `_entity_pick`, untouched)
+    has no disagreement to break here. NEW facts for these pairs therefore key under `customer`;
+    any EXISTING counterparty-keyed fact keeps its stored key and lifecycle untouched (the
+    sticky-rejection test below proves old keys never block the new candidate)."""
     _cib_ftr_fixture(db)
     by_pair = _by_pair(derive_bridge_candidates(db))
     for other in ("counter_party_cif_id", "beneficiary_cif"):
         candidate = by_pair[frozenset({"client_no", other})]
-        assert candidate.entity_id == "counterparty", other
+        assert candidate.entity_id == "customer", other
         assert candidate.assessment is not None
-        assert "entity_disagreement" in candidate.assessment.explanation_codes, other
+        assert "entity_disagreement" not in candidate.assessment.explanation_codes, other
 
 
 # ── (4) determinism across input orders ──────────────────────────────────────────────────────────
@@ -229,7 +240,13 @@ def test_entity_pick_and_candidate_ids_are_input_order_independent(db):
 
 def test_the_namespace_rule_candidate_set_on_the_cib_ftr_fixture(db):
     """The entity-era rule derived 5 candidates here, two of them cross-namespace decoys, and
-    missed every cross-entity cif pair. The namespace rule derives exactly these seven."""
+    missed every cross-entity cif pair. The namespace rule derives exactly these seven.
+
+    DELIBERATELY UPDATED (semantic Task 2 / D12.1 — bridge-programme handoff): the two client_no
+    tuples previously pinned entity 'counterparty' (the lexicographic tie-break). The alias seam
+    resolves `counterparty_id`'s display entity to `customer`, so all six cif pairs now carry
+    `customer`. `counterparty_id.entity_link` itself is byte-stable, so no EXISTING bridge fact
+    re-keys — the entity-era fact-key literal test above still passes untouched."""
     _cib_ftr_fixture(db)
     derived = {
         (c.left_ref.column, c.right_ref.column, c.entity_id)
@@ -239,8 +256,8 @@ def test_the_namespace_rule_candidate_set_on_the_cib_ftr_fixture(db):
         ("cust_num", "counter_party_cif_id", "customer"),
         ("cust_num", "beneficiary_cif", "customer"),
         ("client_no", "cif_id", "customer"),
-        ("client_no", "counter_party_cif_id", "counterparty"),
-        ("client_no", "beneficiary_cif", "counterparty"),
+        ("client_no", "counter_party_cif_id", "customer"),
+        ("client_no", "beneficiary_cif", "customer"),
         ("cust_swift_cd", "sender_bic", "bank"),
     }
 

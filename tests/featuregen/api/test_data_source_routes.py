@@ -150,3 +150,44 @@ def test_the_listing_says_which_routes_are_usable_HERE(client, catalog):
     catalog.execute("UPDATE data_source_connection SET environment_id = 'prod'")
     (row,) = client.get("/data-sources/connections", headers=_h("catalog_viewer")).json()["connections"]
     assert row["usable_here"] is False
+
+
+# ── the catalog semantic scope (identifier ISSUER axis — semantic Task 2) ────────────────────────
+
+def test_semantic_scope_round_trips_and_records_the_declarer(client, catalog):
+    r = client.put("/data-sources/catalogs/ftr/semantic-scope",
+                   json={"issuer_scope": "bank_one", "basis": "catalog_scope"}, headers=_h())
+    assert r.status_code == 200
+    body = client.get("/data-sources/catalogs/ftr/semantic-scope",
+                      headers=_h("catalog_viewer")).json()
+    assert (body["issuer_scope"], body["basis"]) == ("bank_one", "catalog_scope")
+    assert body["declared_by"] == "user:priya"
+
+
+def test_semantic_scope_of_an_undeclared_catalog_is_null_not_invented(client, catalog):
+    body = client.get("/data-sources/catalogs/ftr/semantic-scope",
+                      headers=_h("catalog_viewer")).json()
+    assert body["catalog_source"] == "ftr"
+    assert body["issuer_scope"] is None
+    assert body["basis"] is None
+
+
+def test_semantic_scope_404s_on_an_unknown_catalog(client, catalog):
+    assert client.get("/data-sources/catalogs/typo/semantic-scope",
+                      headers=_h("catalog_viewer")).status_code == 404
+    assert client.put("/data-sources/catalogs/typo/semantic-scope",
+                      json={"issuer_scope": "bank_one", "basis": "catalog_scope"},
+                      headers=_h()).status_code == 404
+
+
+@pytest.mark.parametrize("roles", ["catalog_viewer", "data_owner", "feature_engineer"])
+def test_declaring_a_semantic_scope_requires_the_platform_admin_claim(client, catalog, roles):
+    r = client.put("/data-sources/catalogs/ftr/semantic-scope",
+                   json={"issuer_scope": "bank_one", "basis": "catalog_scope"}, headers=_h(roles))
+    assert r.status_code == 403
+
+
+def test_an_unknown_semantic_scope_basis_is_refused(client, catalog):
+    r = client.put("/data-sources/catalogs/ftr/semantic-scope",
+                   json={"issuer_scope": "bank_one", "basis": "unresolved"}, headers=_h())
+    assert r.status_code == 422

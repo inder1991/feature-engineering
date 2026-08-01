@@ -1141,11 +1141,78 @@ def concept_path(name: str | None) -> tuple[str, ...]:
     return tuple(path)
 
 
-# The 5 legacy aliases are retained so already-enriched data + the pre-B1b classifier are never orphaned,
-# but they are NOT classification targets — the classifier should choose the richer §3 concept instead.
+# The legacy aliases are retained so already-enriched data + the pre-B1b classifier are never
+# orphaned, but they are NOT classification targets — the classifier should choose the richer §3
+# concept instead. `counterparty_id` joined the set under semantic Task 2 (D12.1): `counterparty`
+# is a PARTY ROLE (the third axis, `party_vocab`), not an entity — the identifier is a CIF that
+# links the CUSTOMER entity. The registry member itself is preserved byte-stable (its
+# `entity_link` feeds governed bridge fact keys), and only NEW classification stops targeting it.
 _LEGACY_ALIASES: frozenset[str] = frozenset({
     "monetary_amount", "account_identifier", "customer_identifier", "timestamp", "rate_or_ratio",
+    "counterparty_id",
 })
+
+# The canonicalization half of the ONE alias seam: a legacy alias with an unambiguous successor
+# maps to it; aliases whose successor is ambiguous (monetary_amount, rate_or_ratio, ...) have no
+# entry and stay themselves. Keys must be `_LEGACY_ALIASES` members; targets must be non-alias
+# registry members (validated below) — a parallel alias mechanism is forbidden.
+_CANONICAL_ALIAS_TARGETS: dict[str, str] = {
+    "counterparty_id": "customer_id",
+}
+
+
+def _validate_alias_seam() -> None:
+    for alias, target in _CANONICAL_ALIAS_TARGETS.items():
+        if alias not in _LEGACY_ALIASES or alias not in CONCEPT_REGISTRY:
+            raise ValueError(f"canonical alias source {alias!r} must be a legacy-alias registry member")
+        if target not in CONCEPT_REGISTRY or target in _LEGACY_ALIASES:
+            raise ValueError(f"canonical alias target {target!r} must be a non-alias registry member")
+
+
+_validate_alias_seam()
+
+
+def canonical_concept_name(name: str) -> str:
+    """The canonical registry name for a NEW selection attempt (semantic Task 2).
+
+    A legacy alias with an unambiguous successor canonicalizes (`counterparty_id` ->
+    `customer_id`); every other name — including aliases with no single successor — is returned
+    unchanged. STORED values are never rewritten through this seam: historical `counterparty_id`
+    evidence, decisions and bridge fact keys stay byte-stable (D12.1 fact-key preservation)."""
+    return _CANONICAL_ALIAS_TARGETS.get(name, name)
+
+
+def display_entity(concept_name: str | None, entity: str | None) -> str | None:
+    """The PROJECTION-LAYER display entity for a column, through the alias seam (D12.1).
+
+    When `concept_name` is an aliased concept and the stored/derived `entity` is that alias's own
+    `entity_link` (or absent), the DISPLAY entity is the canonical concept's `entity_link` —
+    `counterparty_id` therefore displays `customer` (a counterparty is our customer seen through a
+    party ROLE). An explicitly different stored entity is a decision, never an alias artifact, and
+    passes through untouched. Fact-key derivation must NOT route through this function: the
+    registry member's persisted `entity_link` stays the byte-stable key input."""
+    if not concept_name:
+        return entity
+    canonical = canonical_concept_name(concept_name)
+    if canonical == concept_name:
+        return entity
+    alias = CONCEPT_REGISTRY.get(concept_name)
+    target = CONCEPT_REGISTRY.get(canonical)
+    if alias is None or target is None or target.entity_link is None:
+        return entity
+    if entity is None or entity == alias.entity_link:
+        return target.entity_link
+    return entity
+
+
+def entity_aliased_concepts() -> frozenset[str]:
+    """The aliased concept names whose DISPLAY entity differs from their persisted `entity_link`
+    — the rows migration 1045's backfill (and its search-doc reprojection companion) targets."""
+    return frozenset(
+        alias for alias, target in _CANONICAL_ALIAS_TARGETS.items()
+        if CONCEPT_REGISTRY[alias].entity_link is not None
+        and CONCEPT_REGISTRY[alias].entity_link != CONCEPT_REGISTRY[target].entity_link
+    )
 
 
 def classification_vocabulary() -> tuple[dict, ...]:
