@@ -75,7 +75,7 @@ from featuregen.materialize.codes import CompilationRefusalCode, Materialization
 from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
 from featuregen.overlay.upload.governed_grain import governed_grain_columns
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
-from featuregen.overlay.upload.operational_facts import read_operational_value
+from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
 from featuregen.overlay.upload.read_scope import allowed_classes, visibility_predicate
 
 __all__ = [
@@ -701,26 +701,45 @@ def _refuse_non_unique_keys(
     return None
 
 
+def _read_is_as_of(conn: DbConn, located: _Located, ref: str) -> OperationalValue:
+    """The governed `is_as_of` verdict for one declared column, through the ONE C1 reader."""
+    return read_operational_value(
+        conn,
+        normalize_ref(located.catalog_source, located.schema, located.table,
+                      located.columns[ref]),
+        "is_as_of")
+
+
 def _refuse_ungoverned_availability(
     conn: DbConn, declaration: SpineSourceDeclarationV1, located: _Located
 ) -> MaterializationRefused | None:
     """The spine's availability column participates in PIT filtering exactly as an expression's
     does (§4.2 rule 6), so it must be a governed `AVAILABILITY_TIME` column — not merely a
-    timestamp someone believes is the arrival time."""
+    timestamp someone believes is the arrival time.
+
+    A `LATEST_AVAILABLE_AS_OF` policy filters on a SECOND time column: the effective time that
+    decides which record VERSION of a key wins (PIT rule 1's other half). It is held to the
+    IDENTICAL governed `is_as_of` standard, under the same refusal code — the vocabulary member
+    covers "a time column this policy depends on is not governed" — with a detail that names
+    `effective_time_ref`. Availability is checked (and refuses) first."""
     ref = declaration.availability_ref
-    if ref is None:
-        return None
-    read = read_operational_value(
-        conn,
-        normalize_ref(located.catalog_source, located.schema, located.table,
-                      located.columns[ref]),
-        "is_as_of")
-    if read.status == _RESOLVED and read.value == _GOVERNED_TRUE:
-        return None
-    return MaterializationRefused(
-        CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED,
-        f"{ref} carries no governed availability_time fact (C1 status {read.status!r}), so the "
-        f"spine's point-in-time filter would be applied on an unattested column")
+    if ref is not None:
+        read = _read_is_as_of(conn, located, ref)
+        if not (read.status == _RESOLVED and read.value == _GOVERNED_TRUE):
+            return MaterializationRefused(
+                CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED,
+                f"{ref} carries no governed availability_time fact (C1 status {read.status!r}), "
+                f"so the spine's point-in-time filter would be applied on an unattested column")
+    policy = declaration.snapshot_policy
+    if isinstance(policy, LatestAvailableAsOf):
+        read = _read_is_as_of(conn, located, policy.effective_time_ref)
+        if not (read.status == _RESOLVED and read.value == _GOVERNED_TRUE):
+            return MaterializationRefused(
+                CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED,
+                f"effective_time_ref {policy.effective_time_ref} carries no governed is_as_of "
+                f"fact (C1 status {read.status!r}), so the column that decides which record "
+                f"version wins would be an unattested timestamp")
+    return None
 
 
 def validate_spine_declaration(
@@ -744,8 +763,9 @@ def validate_spine_declaration(
     3. the columns exist, then the caller may read them — ``READ_SCOPE_INSUFFICIENT``;
     4. governed `entity_assignment` agrees;
     5. governed `GRAIN` makes the keys unique under the policy;
-    6. governed `availability_time` backs the declared availability column —
-       ``AVAILABILITY_TIME_NOT_GOVERNED``.
+    6. governed `availability_time` backs the declared availability column — and, for a
+       `LATEST_AVAILABLE_AS_OF` policy, a governed `is_as_of` fact backs the effective-time
+       column too — ``AVAILABILITY_TIME_NOT_GOVERNED``.
 
     Only the reported code depends on that order; every branch refuses.
     """

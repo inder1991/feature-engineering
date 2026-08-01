@@ -431,13 +431,17 @@ def scd_customers(db):
     table holds MANY rows per customer and only a collapsing policy can make a spine out of it."""
     build_graph(db, _SRC, [
         CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
-        CanonicalRow(_SRC, "customers", "effective_from", "date", is_grain=True),
+        # Task 13: `effective_from` now carries `as_of=True` because `LatestAvailableAsOf` holds
+        # its effective-time column to the SAME governed `is_as_of` standard as availability.
+        CanonicalRow(_SRC, "customers", "effective_from", "date", is_grain=True, as_of=True),
         CanonicalRow(_SRC, "customers", "version_seq", "int", is_grain=True),
         CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
         CanonicalRow(_SRC, "customers", "status_cd", "text"),
     ])
     _govern_grain(db, "cif_id", "effective_from", "version_seq")
     _govern_availability(db, "load_ts")
+    # Task 13: the effective-time column of an SCD policy must itself be governed `is_as_of`.
+    _govern_availability(db, "effective_from")
     _govern_entity(db, "cif_id")
     _healthy_projection(db)
     return db
@@ -457,6 +461,41 @@ def test_a_policy_that_collapses_the_history_columns_is_accepted(scd_customers):
                      snapshot_policy=_scd_policy()), roles=_ROLES)
     assert isinstance(result, SpineSpec)
     assert set(result.governed_grain_refs) == {CUSTOMERS_CIF, CUSTOMERS_EFF, CUSTOMERS_SEQ}
+
+
+def test_an_UNGOVERNED_effective_time_ref_is_refused(scd_customers):
+    """The effective-time column decides which record VERSION of a customer wins, so it
+    participates in PIT rule 1 exactly as availability does — the class docstring promises both
+    columns are governed. A file-declared `is_as_of` flag with no governed fact link is a HINT
+    (§3.2), and an ETL load-timestamp must never silently pick the winning version."""
+    scd_customers.execute(
+        "UPDATE graph_node SET availability_fact_event_id = NULL WHERE catalog_source = %s "
+        "AND table_name = 'customers' AND kind = 'column' AND column_name = 'effective_from'",
+        (_SRC,))
+    refused = validate_spine_declaration(
+        scd_customers,
+        _declaration(population_semantics=PopulationSemantics.HISTORICAL_AS_OF,
+                     snapshot_policy=_scd_policy()), roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED
+    assert "effective_time_ref" in refused.detail
+
+
+def test_when_BOTH_time_columns_are_ungoverned_AVAILABILITY_refuses_first(scd_customers):
+    """Ordering pin (Task 13): adding the effective-time check must not reorder the old case —
+    the availability verdict still decides the detail when both columns fail."""
+    scd_customers.execute(
+        "UPDATE graph_node SET availability_fact_event_id = NULL WHERE catalog_source = %s "
+        "AND table_name = 'customers' AND kind = 'column' AND column_name = ANY(%s)",
+        (_SRC, ["load_ts", "effective_from"]))
+    refused = validate_spine_declaration(
+        scd_customers,
+        _declaration(population_semantics=PopulationSemantics.HISTORICAL_AS_OF,
+                     snapshot_policy=_scd_policy()), roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED
+    assert CUSTOMERS_ASOF in refused.detail
+    assert "effective_time_ref" not in refused.detail
 
 
 def test_a_grain_column_NO_policy_collapses_gives_duplicate_spine_keys(scd_customers):

@@ -575,6 +575,14 @@ def test_the_union_covers_a_spine_column_that_is_NEITHER_a_key_nor_the_availabil
         snapshot_policy=LatestAvailableAsOf(
             effective_time_ref=f"{CUSTOMERS}.effective_from", availability_ref=CUSTOMERS_ASOF,
             deterministic_tie_break_refs=(f"{CUSTOMERS}.version_seq",)))
+    # Task 13: `LatestAvailableAsOf` now holds its effective-time column to the same governed
+    # `is_as_of` standard as availability. Flag + link on the COLUMN node only — deliberately not
+    # `_govern_availability`, whose per-table `overlay_fact_state` upsert would overwrite the
+    # `availability_time` fact that names `load_ts`.
+    catalog.execute(
+        "UPDATE graph_node SET is_as_of = true, availability_fact_event_id = 'ovf_evt_asof_eff' "
+        "WHERE catalog_source = %s AND table_name = 'customers' AND kind = 'column' "
+        "AND column_name = 'effective_from'", (_SRC,))
     ir = _ok(_compile(catalog, PUBLIC_FEATURE, spine_decl=declaration))
     assert f"{CUSTOMERS}.effective_from" in ir.spine.read_set
     assert f"{CUSTOMERS}.effective_from" not in ir.spine.ordered_key_refs
