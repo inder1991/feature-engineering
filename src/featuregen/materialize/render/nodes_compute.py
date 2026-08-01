@@ -222,6 +222,17 @@ _TRANSFORMS: dict[PartitionTransform, str] = {
 #: with a governed column, and dropped so it can never reach the published table.
 _SOURCE_ROWS = "__source_rows"
 
+#: The non-null-operand count the calculation aggregates NEXT TO a SUM whose published type carries
+#: an ``overflow: error`` obligation, and drops once §9's overflow gate has read it. It exists
+#: because Spark answers a sum that exceeds its own RESULT type with NULL **inside** the
+#: aggregation (``CheckOverflowInSum``, ANSI off) — before any publish cast — so the cast-based
+#: half of the gate structurally cannot see that overflow, and the published NULL would read
+#: exactly like an empty window. Within a group (≥1 source row by construction) a NULL sum beside
+#: a count above zero is that overflow and nothing else: every §8 rule 4 policy that answers NULL
+#: itself leaves the count at zero. Double-underscored so it cannot collide with a governed column,
+#: and dropped so it can never reach the published table.
+_OPERAND_COUNT = "__operand_count"
+
 #: The cardinality tokens that fan IN toward a hop's destination — one source row matches at most
 #: one destination row, so a rendered hop cannot multiply rows. ``joins._FANS_IN`` is the same set,
 #: and this is deliberately a SECOND statement of it rather than an import: the planner decides
@@ -2058,7 +2069,7 @@ def render_calculation_node(
         "",
         *body,
         *_rounding_lines(column, physical),
-        *_overflow_lines(column, physical),
+        *_overflow_lines(column, physical, slots),
         *_staging_shape_lines(column, keys, plan.business_dt_column),
         "",
         *_manifest_lines(column, feature),
@@ -2160,6 +2171,11 @@ class _Slot:
     def marker_column(self) -> str:
         """The ``__source_rows`` marker for THIS slot — see :data:`_SOURCE_ROWS`."""
         return _SOURCE_ROWS if not self.local else f"__{self.local}source_rows"
+
+    @property
+    def count_column(self) -> str:
+        """The ``__operand_count`` helper for THIS slot — see :data:`_OPERAND_COUNT`."""
+        return _OPERAND_COUNT if not self.local else f"__{self.local}operand_count"
 
     @property
     def subject(self) -> str:
@@ -2571,12 +2587,19 @@ def _grain_aggregate_lines(slot: _Slot, keys: tuple[str, ...],
     describes what — which is exactly how a comment ends up describing a line it is not about.
     """
     aggregated = [f"{slot.local}aggregate.alias({slot.value_column!r})"]
+    lines = [
+        *_comment(_null_input_note(slot)),
+        *_aggregate_expression(slot, physical),
+    ]
+    if _counts_operands(slot, physical):
+        lines.extend(["", *_comment(_operand_count_note(slot)),
+                      *_operand_count_expression(slot)])
+        aggregated.append(f"{slot.local}operand_count.alias({slot.count_column!r})")
     if slot.empty is not EmptyWindowResult.NULL:
         aggregated.append(f"F.count(F.lit(1)).alias({slot.marker_column!r})")
     grouping = ", ".join(f"F.col({key!r})" for key in keys)
     return [
-        *_comment(_null_input_note(slot)),
-        *_aggregate_expression(slot, physical),
+        *lines,
         "",
         *_comment(
             f"The grain-level aggregate. `{slot.expression.aggregation.value}` is the expression's "
@@ -2585,6 +2608,63 @@ def _grain_aggregate_lines(slot: _Slot, keys: tuple[str, ...],
         *_call_lines(f"    {slot.local}grouped = {slot.local}rows.groupBy({grouping}).agg(",
                      aggregated, ")"),
     ]
+
+
+def _counts_operands(slot: _Slot, physical: PhysicalType) -> bool:
+    """Whether this slot's grain aggregate ALSO carries its non-null-operand count — a SUM under
+    a declared ``overflow: error``, and nothing else.
+
+    Only a SUM can overflow INSIDE the aggregation: Spark's ``CheckOverflowInSum`` answers a sum
+    exceeding its own result type with NULL (ANSI off) before any publish cast, which the
+    cast-based check in :func:`_overflow_lines` structurally cannot see. The COUNT family is
+    exempt — ``count_rows``, ``count_non_null`` and ``count_distinct`` publish BIGINT and never
+    return NULL, so there is no NULL for a count to disambiguate — and no other member exists in
+    ``_AGGREGATE_CALLS``. Where the overflow obligation itself is absent (an integral published
+    type) no gate is rendered, so a count would be a column this node invented for nobody.
+    """
+    return (physical.overflow is OverflowBehavior.ERROR
+            and slot.expression.aggregation is AggregateFunction.SUM)
+
+
+def _operand_count_note(slot: _Slot) -> str:
+    """The rendered comment saying WHY the operand count rides along — one text per null policy,
+    because what makes "count > 0 and NULL means overflow" TRUE differs under each declaration."""
+    operand = slot.operand
+    if slot.nulls is NullInput.ZERO:
+        return (
+            f"The operand count rides along for §9's overflow gate below, taken over the "
+            f"PRE-coalesce {operand}: the coalesced value is never null, so it would count every "
+            f"row and document nothing, while the raw count records how many declared values "
+            f"actually arrived. Under `zero` no null ever reaches the sum, so a NULL sum can only "
+            f"be Spark overflowing INSIDE the aggregation (`CheckOverflowInSum` answers it with "
+            f"NULL before any cast). Dropped once the gate has read it.")
+    if slot.nulls is NullInput.PROPAGATE:
+        return (
+            f"The operand count rides along for §9's overflow gate below, and under `propagate` "
+            f"it is ZEROED for every group the policy itself answers: one null {operand} makes "
+            f"the aggregate NULL by declaration, and that NULL must never read as an overflow. "
+            f"What remains — a NULL sum beside a count above zero — can only be Spark overflowing "
+            f"INSIDE the aggregation (`CheckOverflowInSum` answers it with NULL before any cast). "
+            f"Dropped once the gate has read it.")
+    return (
+        "The operand count rides along for §9's overflow gate below: Spark answers a sum that "
+        "exceeds its own result type with NULL INSIDE the aggregation (`CheckOverflowInSum`, "
+        "before any cast), and under `ignore` the only NULL the policy itself produces is the "
+        "all-null group — which this count records as 0. A NULL sum beside a count above zero is "
+        "therefore overflow, never policy. Dropped once the gate has read it.")
+
+
+def _operand_count_expression(slot: _Slot) -> list[str]:
+    """``operand_count = …`` — a named binding, like the aggregate it rides beside."""
+    name = f"{slot.local}operand_count"
+    counted = f"F.count(F.col({slot.operand!r}))"
+    if slot.nulls is not NullInput.PROPAGATE:
+        return [f"    {name} = {counted}"]
+    single = f"    {name} = F.when({slot.local}any_null, F.lit(0)).otherwise({counted})"
+    if len(single) <= _RENDERED_WIDTH:
+        return [single]
+    return [f"    {name} = F.when({slot.local}any_null, F.lit(0)).otherwise(",
+            f"        {counted})"]
 
 
 def _when_lines(indent: str, condition: str, value: str, otherwise: str,
@@ -2795,6 +2875,7 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
     """
     if ir.final_operation is FinalOperation.IDENTITY:
         return []
+    prelude = _operand_overflow_section(slots, physical)
     values = [f"    {slot.local}value = F.col({slot.value_column!r})" for slot in slots]
     names = [f"{slot.local}value" for slot in slots]
     if ir.final_operation is FinalOperation.DIFFERENCE:
@@ -2810,7 +2891,7 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
             *_call_lines("    staged = staged.withColumn(",
                          [repr(column), f"{minuend} - {subtrahend}"], ")"),
         ]
-        return [*body, "", *_operand_drop_lines(slots)]
+        return [*prelude, *body, "", *_operand_drop_lines(slots)]
     numerator, denominator = names
     policy = _zero_denominator(ir)
     body = [
@@ -2831,7 +2912,7 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
         f"    denominator_is_zero = {denominator}.isNotNull() & ({denominator} == F.lit(0))",
         *_zero_denominator_lines(policy, column, numerator, denominator, physical),
     ]
-    return [*body, "", *_operand_drop_lines(slots)]
+    return [*prelude, *body, "", *_operand_drop_lines(slots)]
 
 
 def _zero_denominator_lines(policy: ZeroDenominator, column: str, numerator: str,
@@ -2953,8 +3034,76 @@ def _rounding_lines(column: str, physical: PhysicalType) -> list[str]:
     ]
 
 
-def _overflow_lines(column: str, physical: PhysicalType) -> list[str]:
-    """§9's ``OVERFLOW_VIOLATION`` — the check that turns Spark's silent NULL into a refusal."""
+def _aggregate_overflow_gate(slot: _Slot) -> list[str]:
+    """The ``count above zero AND value IS NULL`` refusal for ONE slot's grain aggregate.
+
+    ``isNotNull`` is stated even though SQL's three-valued logic would already keep a NULL count
+    out of the kept rows: an entity with NO source rows has no aggregate row at all after the LEFT
+    join, and the gate's claim — at least one non-null operand EXISTED — should be readable from
+    the predicate rather than inferred from comparison semantics.
+    """
+    gate = f"{slot.local}agg_overflowed"
+    count, value = slot.count_column, slot.value_column
+    return [
+        f"    {gate} = staged.where(",
+        f"        F.col({count!r}).isNotNull()",
+        f"        & (F.col({count!r}) > F.lit(0)) & F.col({value!r}).isNull())",
+        f"    if {gate}.limit(1).count() > 0:",
+        *_refuse(
+            ValidationGateCode.OVERFLOW_VIOLATION,
+            f"{_safe_text(slot.what, 'the feature column')} was aggregated to NULL over a group "
+            f"with at least one non-null operand: the sum overflowed INSIDE the aggregation, "
+            f"before any publish cast could see it. The formula declares overflow=error, so the "
+            f"run stops rather than publishing a NULL indistinguishable from an empty window. "
+            f"Rows affected: ",
+            tail=f"str({gate}.count())"),
+    ]
+
+
+def _operand_overflow_section(slots: tuple[_Slot, ...], physical: PhysicalType) -> list[str]:
+    """§9's aggregate-level overflow gates for a TWO-operand body — run BEFORE the operation.
+
+    The final operation consumes the operand columns, and afterwards a NULL operand is
+    indistinguishable from every policy answer that also leaves one — a `null` zero_denominator,
+    an empty numerator window, a propagated null. So each SUM operand is gated HERE, where its
+    value column still exists, and the helper counts are dropped the moment the gates have read
+    them. :func:`_overflow_lines` keeps the publish-cast half for the combined column.
+    """
+    counted = [slot for slot in slots if _counts_operands(slot, physical)]
+    if not counted:
+        return []
+    lines = [*_comment(
+        "§9 OVERFLOW_VIOLATION at the AGGREGATE level, per operand and BEFORE the final "
+        "operation consumes the two halves — afterwards a NULL operand is indistinguishable from "
+        "every policy answer that also leaves one. Spark answers a sum exceeding its own result "
+        "type with NULL before ANY cast (`CheckOverflowInSum`), and each operand count above is "
+        "zero for every NULL its own §8 rule 4 policies produce — so a NULL operand beside a "
+        "count above zero is that overflow, and nothing else.")]
+    for slot in counted:
+        lines.extend(_aggregate_overflow_gate(slot))
+    dropped = ", ".join(repr(slot.count_column) for slot in counted)
+    lines.extend([
+        *_comment(
+            "The operand counts are dropped the moment the gates have read them: they are this "
+            "node's own working state, and a column it invented must never reach the published "
+            "table."),
+        f"    staged = staged.drop({dropped})",
+        "",
+    ])
+    return lines
+
+
+def _overflow_lines(column: str, physical: PhysicalType,
+                    slots: tuple[_Slot, ...]) -> list[str]:
+    """§9's ``OVERFLOW_VIOLATION`` — the checks that turn Spark's silent NULLs into refusals.
+
+    Overflow surfaces as a silent NULL in TWO places, and each half of the gate lives where it is
+    decidable. A sum exceeding its own RESULT type is NULL inside the aggregation
+    (``CheckOverflowInSum``) — checked here for an identity body, whose aggregate column IS the
+    published column, and per operand before the final operation for a ratio or a difference
+    (:func:`_operand_overflow_section`). The publish cast's own NULL is checked here for every
+    body.
+    """
     if physical.overflow is None:
         # Nothing at all: `_rounding_lines` already said so for both obligations at once. A second
         # block here would state it twice, and the first draft's version pointed at "the check
@@ -2967,13 +3116,38 @@ def _overflow_lines(column: str, physical: PhysicalType) -> list[str]:
             f"the declared ones. `physical_types` refuses it at §6 and this renderer will not "
             f"quietly succeed where that refused")
     precision, scale = _decimal_scale(physical.sql_type)
-    return [
-        *_comment(
+    inline = len(slots) == 1 and _counts_operands(slots[0], physical)
+    lines: list[str] = []
+    if inline:
+        lines.extend([
+            *_comment(
+                f"§9 OVERFLOW_VIOLATION, in TWO checks — the formula declares `error` on "
+                f"overflow, `error` is not a mode Spark has, and Spark's silent NULL appears in "
+                f"two different places. FIRST, inside the aggregation: a sum exceeding its own "
+                f"RESULT type is already NULL before any cast (`CheckOverflowInSum`), so no cast "
+                f"comparison can see it. Every group has at least one source row by construction, "
+                f"and `{_OPERAND_COUNT}` above is zero for every NULL the §8 rule 4 policies "
+                f"produce themselves — so a NULL beside a count above zero is overflow inside the "
+                f"aggregation, and nothing else."),
+            *_aggregate_overflow_gate(slots[0]),
+            *_comment(
+                f"SECOND, the publish cast, whose default is to return NULL for a value that does "
+                f"not fit DECIMAL({precision},{scale}). The cast is compared against the value "
+                f"that went into it — a row that was NOT null and became null overflowed, and a "
+                f"NULL silently replacing a number is exactly what the declaration refuses."),
+        ])
+    else:
+        pointer = (
+            " The aggregate-level half of this obligation — a sum already NULL before any cast — "
+            "was checked per operand above, before the final operation combined them."
+            if any(_counts_operands(slot, physical) for slot in slots) else "")
+        lines.extend(_comment(
             f"§9 OVERFLOW_VIOLATION. The formula declares `error` on overflow, and `error` is not a "
             f"mode Spark has: its default is to return NULL for a value that does not fit "
             f"DECIMAL({precision},{scale}). So the cast is compared against the value that went "
             f"into it — a row that was NOT null and became null overflowed, and a NULL silently "
-            f"replacing a number is exactly what the declaration refuses."),
+            f"replacing a number is exactly what the declaration refuses.{pointer}"))
+    lines.extend([
         f"    typed = F.col({column!r}).cast('decimal({precision},{scale})')",
         *_comment(
             "A null that was ALREADY null passes: that is the empty-window or null-input policy's "
@@ -2989,8 +3163,16 @@ def _overflow_lines(column: str, physical: PhysicalType) -> list[str]:
             f"otherwise substitute. Rows affected: ",
             tail="str(overflowed.count())"),
         f"    staged = staged.withColumn({column!r}, typed)",
-        "",
-    ]
+    ])
+    if inline:
+        lines.extend([
+            *_comment(
+                "The operand count is dropped after BOTH checks: it is this node's own working "
+                "state, and a column it invented must never reach the published table."),
+            f"    staged = staged.drop({slots[0].count_column!r})",
+        ])
+    lines.append("")
+    return lines
 
 
 def _staging_shape_lines(column: str, keys: tuple[str, ...], business_dt_column: str) -> list[str]:

@@ -1,0 +1,140 @@
+"""The SPARK-SEMANTICS GATE — the aggregate-overflow refusal, proven on the real engine.
+
+**Not named ``test_*`` on purpose, so the main suite never collects it** — the same split as
+``l0_gate.py``, and for the same reason: ``pyspark`` is not a dependency of this platform, and a
+suite that pulled it in would trade ~4s for a JVM-capable interpreter. Run it explicitly::
+
+    FEATUREGEN_L0_PYTHON=$PWD/.venv-artifact/bin/python \\
+    PYTHONPATH=$PWD/src .venv/bin/python -m pytest \\
+        tests/featuregen/materialize/spark_semantics_gate.py -q
+
+**What the main suite proves and what only this can.** ``fake_spark`` sums exactly — arbitrary-
+precision decimals under a widened context — so a sum can NEVER overflow there, and the
+aggregate-level half of the OVERFLOW_VIOLATION gate can never fire. The suite therefore proves
+the gate does NOT fire where it must not (an all-null `ignore` group, an empty window). That the
+gate FIRES on a genuine in-aggregation overflow is a claim about Spark itself: with ANSI off (the
+setting the rendered ``spark.yml`` pins), ``CheckOverflowInSum`` answers a sum exceeding its own
+result type with NULL **before** any publish cast, so the cast-based check alone reports nothing
+and the NULL would publish as "no activity". Two rows of ``Decimal("9.99e+35")`` in a
+``DECIMAL(38,2)`` operand sum to 1.998e+36 — one integer digit more than DECIMAL(38,2) holds —
+which is the measured repro this file replays through the RENDERED node source on the real engine.
+
+The environment contract is ``l0_gate.py``'s: ``FEATUREGEN_L0_PYTHON`` names the interpreter that
+has pyspark (skipped, never faked, when absent), and ``PYSPARK_PYTHON``/``PYSPARK_DRIVER_PYTHON``
+are both exported so Spark's workers do not land on the system Python.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+
+from tests.featuregen.materialize.l0_gate import l0_env, l0_python  # noqa: F401 — fixtures
+from tests.featuregen.materialize.test_group_plan import (  # noqa: F401 — `catalog` is a fixture
+    BUSINESS_DT,
+    catalog,
+)
+from tests.featuregen.materialize.test_render_nodes_compute import (  # noqa: F401 — fixtures
+    _calculate,
+    compiled,
+    feature,
+)
+
+#: The measured repro: 9.99e+35 has 36 integer digits — the most DECIMAL(38,2) holds — so ONE row
+#: fits and the two-row sum (1.998e+36) exceeds the sum's own DECIMAL(38,2) result type.
+OVERFLOWING = '"9.99e+35"'
+
+#: The driver run under the L0 interpreter. `.format` placeholders only — no braces elsewhere.
+_DRIVER = '''\
+"""Replays the rendered calculation node against REAL Spark — see spark_semantics_gate.py."""
+import datetime as dt
+import importlib.util
+import sys
+from decimal import Decimal
+
+from pyspark.sql import SparkSession
+from pyspark.sql import types as T
+
+# The two settings the rendered spark.yml pins (Task 2): the governed gates are written against
+# ANSI-OFF semantics — under ANSI the overflow raises a raw SparkArithmeticException instead of
+# yielding the NULL the gate reads — and a session zone inherited from the JVM is a second clock.
+spark = (SparkSession.builder.master("local[1]").appName("spark-semantics-gate")
+         .config("spark.sql.ansi.enabled", "false")
+         .config("spark.sql.session.timeZone", "UTC")
+         .config("spark.ui.enabled", "false")
+         .getOrCreate())
+spark.sparkContext.setLogLevel("ERROR")
+
+spec = importlib.util.spec_from_file_location("gen_nodes", {nodes_path!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+calculate = getattr(module, {func_name!r})
+
+SCHEMA = T.StructType([
+    T.StructField("cif_id", T.StringType()),
+    T.StructField("dr_cr_flag", T.StringType()),
+    T.StructField("status_cd", T.StringType()),
+    T.StructField("txn_amt", T.DecimalType(38, 2)),
+])
+SPINE = spark.createDataFrame(
+    [("c1", dt.date.fromisoformat({business_dt!r}))],
+    T.StructType([
+        T.StructField("cif_id", T.StringType()),
+        T.StructField("business_dt", T.DateType()),
+    ]))
+
+
+def run(amount):
+    projection = spark.createDataFrame(
+        [("c1", "D", "posted", Decimal(amount)), ("c1", "D", "posted", Decimal(amount))], SCHEMA)
+    return calculate(projection, SPINE, {business_dt!r}, "gen-gate", "run-gate", "exec-gate",
+                     "hdfs://nn/staging/gen-gate")
+
+
+# The CONTROL first: two values that fit must publish, or a gate that always fired would also
+# "pass" the overflow half below.
+staged, manifest = run("100.50")
+if manifest["row_count"] != 1:
+    print("CONTROL FAILED: expected 1 staged row, got", manifest["row_count"])
+    sys.exit(2)
+
+try:
+    staged, manifest = run({overflowing})
+except RuntimeError as refused:
+    if "OVERFLOW_VIOLATION" in str(refused):
+        print("RAISED OVERFLOW_VIOLATION:", refused)
+        sys.exit(0)
+    print("RAISED THE WRONG REFUSAL:", refused)
+    sys.exit(3)
+print("PUBLISHED WITHOUT RAISING - the overflow NULL went through:",
+      [row.asDict() for row in staged.collect()])
+sys.exit(4)
+'''
+
+
+def test_a_sum_that_overflows_INSIDE_the_aggregation_raises_OVERFLOW_VIOLATION(
+        compiled, feature, tmp_path, l0_python, l0_env) -> None:  # noqa: F811 — pytest fixtures
+    """The claim `fake_spark` structurally cannot make, on the engine that decides it.
+
+    The rendered node is written where a generated ``nodes.py`` lives — ``GENERATED.lock`` is
+    resolved ``parents[4]`` up from ``__file__`` — and driven with the real ``SparkSession``.
+    A run whose sum overflows must REFUSE with OVERFLOW_VIOLATION, not publish a NULL.
+    """
+    node = _calculate(compiled, feature)
+    nodes_py = tmp_path / "src" / "pkg" / "pipelines" / "materialize" / "nodes.py"
+    nodes_py.parent.mkdir(parents=True)
+    nodes_py.write_text("\n".join(node.imports) + "\n\n\n" + node.source, encoding="utf-8")
+    (tmp_path / "GENERATED.lock").write_text(
+        json.dumps({"compilation": {}, "generated_project_hash": "spark-semantics-gate"}),
+        encoding="utf-8")
+    driver = tmp_path / "driver.py"
+    driver.write_text(_DRIVER.format(nodes_path=str(nodes_py), func_name=node.func_name,
+                                     business_dt=BUSINESS_DT, overflowing=OVERFLOWING),
+                      encoding="utf-8")
+
+    proved = subprocess.run(  # noqa: S603
+        [l0_python, str(driver)], capture_output=True, text=True, check=False, timeout=480,
+        env={**os.environ, **l0_env})
+    assert proved.returncode == 0, \
+        f"exit {proved.returncode}\nstdout:\n{proved.stdout}\nstderr:\n{proved.stderr}"
+    assert "RAISED OVERFLOW_VIOLATION" in proved.stdout

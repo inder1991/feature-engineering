@@ -1437,6 +1437,31 @@ def test_the_overflow_check_reads_the_DECLARED_precision_and_scale(compiled, fea
                          spine=_spine_rows("c1"))
 
 
+def test_the_overflow_gate_also_reads_the_operand_count(compiled, feature):
+    """sum() overflow yields NULL *before* the cast-based check can see it — Spark's
+    `CheckOverflowInSum` answers a sum exceeding its own result type with NULL, so the value the
+    cast comparison reads is already null and the gate reports nothing. A NULL sum over >0
+    non-null operands is overflow, not policy (a group has ≥1 source row by construction), so the
+    rendered gate must aggregate the operand count and read it."""
+    node = _calculate(compiled, feature)
+    assert "__operand_count" in node.source
+    assert "operand_count') > F.lit(0)" in node.source.replace('"', "'")
+
+
+def test_an_all_NULL_ignore_group_publishes_NULL_and_does_NOT_trip_the_aggregate_gate(
+        compiled, feature, lock_tree):
+    """The false positive the count column must not create. Under `ignore`, a group whose every
+    operand is NULL sums to NULL with an operand count of 0 — the policy's own declared answer,
+    not an overflow — and the helper column must be gone from the staged output."""
+    node = _calculate(compiled, feature, null_input=NullInput.IGNORE)
+    frame, _manifest = _run_calculation(
+        node, lock_tree, projection=[_debit("c1", None), _debit("c1", None)],
+        spine=_spine_rows("c1"))
+    values = {row["cif_id"]: row[SUM_30D] for row in frame.rows}
+    assert values == {"c1": None}
+    assert "__operand_count" not in frame.columns
+
+
 def test_rounding_is_the_DECLARED_mode_and_the_two_modes_disagree_on_ties(compiled, feature,
                                                                           lock_tree):
     """HALF_UP and HALF_EVEN differ on exactly the ties. A renderer that emitted one for both, or
@@ -2201,6 +2226,22 @@ def test_the_operand_columns_are_dropped_BEFORE_the_staging_select(ratio, ratio_
     source = _render_ratio(ratio, ratio_feature).source
     dropped = source.index("staged = staged.drop('__numerator', '__denominator')")
     assert dropped < source.index("staged = staged.select(")
+
+
+def test_the_ratio_gates_EACH_operands_aggregate_overflow_BEFORE_the_final_operation(
+        ratio, ratio_feature):
+    """A sum that overflows inside the aggregation is NULL before any cast, and once the division
+    has run a NULL operand is indistinguishable from a `null` zero_denominator or an empty window
+    — so each operand must be gated while its column still exists, and the helper counts must be
+    gone before the staging select."""
+    source = _render_ratio(ratio, ratio_feature).source
+    for operand in ("numerator", "denominator"):
+        assert f"__{operand}_operand_count') > F.lit(0)" in source.replace('"', "'")
+    gate = source.index("numerator_agg_overflowed = staged.where(")
+    assert gate < source.index("quotient = ")
+    dropped = source.index(
+        "staged = staged.drop('__numerator_operand_count', '__denominator_operand_count')")
+    assert gate < dropped < source.index("staged = staged.select(")
 
 
 def test_the_ratio_emits_no_row_collapsing_repair(ratio, ratio_feature, lock_tree):

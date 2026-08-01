@@ -34,10 +34,18 @@ l0-gate:  ## Build-verify the golden Kedro project under BOTH supported kedro li
 	PYSPARK_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
 	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
 		uv run pytest tests/featuregen/materialize/l0_gate.py -q
+	FEATUREGEN_L0_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
+	PYSPARK_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
+	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
+		uv run pytest tests/featuregen/materialize/spark_semantics_gate.py -q
 	FEATUREGEN_L0_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
 	PYSPARK_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
 	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
 		uv run pytest tests/featuregen/materialize/l0_gate.py -q
+	FEATUREGEN_L0_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
+	PYSPARK_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
+	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
+		uv run pytest tests/featuregen/materialize/spark_semantics_gate.py -q
 
 ci: lint format-check typecheck test  ## Everything CI runs
 

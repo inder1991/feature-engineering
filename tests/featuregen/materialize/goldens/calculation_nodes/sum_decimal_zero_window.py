@@ -28,11 +28,19 @@ def calculate_total_debit_amount_30d(
     # policy was READ rather than defaulted to.
     aggregate = F.sum(F.col('txn_amt'))
 
+    # The operand count rides along for §9's overflow gate below: Spark answers a sum that exceeds
+    # its own result type with NULL INSIDE the aggregation (`CheckOverflowInSum`, before any
+    # cast), and under `ignore` the only NULL the policy itself produces is the all-null group —
+    # which this count records as 0. A NULL sum beside a count above zero is therefore overflow,
+    # never policy. Dropped once the gate has read it.
+    operand_count = F.count(F.col('txn_amt'))
+
     # The grain-level aggregate. `sum` is the expression's own declared aggregate, and the
     # grouping is the DECLARED grain — one row per landing key, which is what the spine reduction
     # below can then join onto exactly once.
     grouped = rows.groupBy(F.col('cif_id')).agg(
         aggregate.alias('total_debit_amount_30d'),
+        operand_count.alias('__operand_count'),
         F.count(F.lit(1)).alias('__source_rows'),
     )
 
@@ -68,11 +76,27 @@ def calculate_total_debit_amount_30d(
         F.bround(F.col('total_debit_amount_30d'), 6),
     )
 
-    # §9 OVERFLOW_VIOLATION. The formula declares `error` on overflow, and `error` is not a mode
-    # Spark has: its default is to return NULL for a value that does not fit DECIMAL(38,6). So the
-    # cast is compared against the value that went into it — a row that was NOT null and became
-    # null overflowed, and a NULL silently replacing a number is exactly what the declaration
-    # refuses.
+    # §9 OVERFLOW_VIOLATION, in TWO checks — the formula declares `error` on overflow, `error` is
+    # not a mode Spark has, and Spark's silent NULL appears in two different places. FIRST, inside
+    # the aggregation: a sum exceeding its own RESULT type is already NULL before any cast
+    # (`CheckOverflowInSum`), so no cast comparison can see it. Every group has at least one
+    # source row by construction, and `__operand_count` above is zero for every NULL the §8 rule 4
+    # policies produce themselves — so a NULL beside a count above zero is overflow inside the
+    # aggregation, and nothing else.
+    agg_overflowed = staged.where(
+        F.col('__operand_count').isNotNull()
+        & (F.col('__operand_count') > F.lit(0)) & F.col('total_debit_amount_30d').isNull())
+    if agg_overflowed.limit(1).count() > 0:
+        raise RuntimeError(
+            "OVERFLOW_VIOLATION: total_debit_amount_30d was aggregated to NULL over a group with "
+            "at least one non-null operand: the sum overflowed INSIDE the aggregation, before any "
+            "publish cast could see it. The formula declares overflow=error, so the run stops "
+            "rather than publishing a NULL indistinguishable from an empty window. Rows affected: "
+            + str(agg_overflowed.count()))
+    # SECOND, the publish cast, whose default is to return NULL for a value that does not fit
+    # DECIMAL(38,6). The cast is compared against the value that went into it — a row that was NOT
+    # null and became null overflowed, and a NULL silently replacing a number is exactly what the
+    # declaration refuses.
     typed = F.col('total_debit_amount_30d').cast('decimal(38,6)')
     # A null that was ALREADY null passes: that is the empty-window or null-input policy's own
     # answer, not an overflow, and reporting it here would fire the wrong gate.
@@ -84,6 +108,9 @@ def calculate_total_debit_amount_30d(
             "stops rather than publishing the NULL Spark would otherwise substitute. Rows "
             "affected: " + str(overflowed.count()))
     staged = staged.withColumn('total_debit_amount_30d', typed)
+    # The operand count is dropped after BOTH checks: it is this node's own working state, and a
+    # column it invented must never reach the published table.
+    staged = staged.drop('__operand_count')
 
     # §10.2 — per-feature staging carries the landing keys, the business date and ONE feature
     # column, and nothing else. The three system columns are added ONCE, at assembly: one per

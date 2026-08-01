@@ -44,11 +44,19 @@ def calculate_cross_border_value_ratio_90d(
     # policy was READ rather than defaulted to.
     numerator_aggregate = F.sum(F.col('txn_amt'))
 
+    # The operand count rides along for §9's overflow gate below: Spark answers a sum that exceeds
+    # its own result type with NULL INSIDE the aggregation (`CheckOverflowInSum`, before any
+    # cast), and under `ignore` the only NULL the policy itself produces is the all-null group —
+    # which this count records as 0. A NULL sum beside a count above zero is therefore overflow,
+    # never policy. Dropped once the gate has read it.
+    numerator_operand_count = F.count(F.col('txn_amt'))
+
     # The grain-level aggregate. `sum` is the expression's own declared aggregate, and the
     # grouping is the DECLARED grain — one row per landing key, which is what the spine reduction
     # below can then join onto exactly once.
     numerator_grouped = numerator_rows.groupBy(F.col('cif_id')).agg(
         numerator_aggregate.alias('__numerator'),
+        numerator_operand_count.alias('__numerator_operand_count'),
     )
 
     # `body.denominator` — a FULL aggregate with its own governed filter, its own point-in-time
@@ -65,11 +73,19 @@ def calculate_cross_border_value_ratio_90d(
     # policy was READ rather than defaulted to.
     denominator_aggregate = F.sum(F.col('txn_amt'))
 
+    # The operand count rides along for §9's overflow gate below: Spark answers a sum that exceeds
+    # its own result type with NULL INSIDE the aggregation (`CheckOverflowInSum`, before any
+    # cast), and under `ignore` the only NULL the policy itself produces is the all-null group —
+    # which this count records as 0. A NULL sum beside a count above zero is therefore overflow,
+    # never policy. Dropped once the gate has read it.
+    denominator_operand_count = F.count(F.col('txn_amt'))
+
     # The grain-level aggregate. `sum` is the expression's own declared aggregate, and the
     # grouping is the DECLARED grain — one row per landing key, which is what the spine reduction
     # below can then join onto exactly once.
     denominator_grouped = denominator_rows.groupBy(F.col('cif_id')).agg(
         denominator_aggregate.alias('__denominator'),
+        denominator_operand_count.alias('__denominator_operand_count'),
     )
 
     # §8 rule 3 — the spine reduction. LEFT, and never INNER: an entity with no source rows in
@@ -86,6 +102,36 @@ def calculate_cross_border_value_ratio_90d(
     # is what the LEFT joins already leave for an entity with no rows. No marker column is
     # rendered for either because none is needed: a null from an empty window and a null from the
     # aggregate are the same declared answer here, so nothing has to tell them apart.
+
+    # §9 OVERFLOW_VIOLATION at the AGGREGATE level, per operand and BEFORE the final operation
+    # consumes the two halves — afterwards a NULL operand is indistinguishable from every policy
+    # answer that also leaves one. Spark answers a sum exceeding its own result type with NULL
+    # before ANY cast (`CheckOverflowInSum`), and each operand count above is zero for every NULL
+    # its own §8 rule 4 policies produce — so a NULL operand beside a count above zero is that
+    # overflow, and nothing else.
+    numerator_agg_overflowed = staged.where(
+        F.col('__numerator_operand_count').isNotNull()
+        & (F.col('__numerator_operand_count') > F.lit(0)) & F.col('__numerator').isNull())
+    if numerator_agg_overflowed.limit(1).count() > 0:
+        raise RuntimeError(
+            "OVERFLOW_VIOLATION: body.numerator of cross_border_value_ratio_90d was aggregated to "
+            "NULL over a group with at least one non-null operand: the sum overflowed INSIDE the "
+            "aggregation, before any publish cast could see it. The formula declares "
+            "overflow=error, so the run stops rather than publishing a NULL indistinguishable "
+            "from an empty window. Rows affected: " + str(numerator_agg_overflowed.count()))
+    denominator_agg_overflowed = staged.where(
+        F.col('__denominator_operand_count').isNotNull()
+        & (F.col('__denominator_operand_count') > F.lit(0)) & F.col('__denominator').isNull())
+    if denominator_agg_overflowed.limit(1).count() > 0:
+        raise RuntimeError(
+            "OVERFLOW_VIOLATION: body.denominator of cross_border_value_ratio_90d was aggregated "
+            "to NULL over a group with at least one non-null operand: the sum overflowed INSIDE "
+            "the aggregation, before any publish cast could see it. The formula declares "
+            "overflow=error, so the run stops rather than publishing a NULL indistinguishable "
+            "from an empty window. Rows affected: " + str(denominator_agg_overflowed.count()))
+    # The operand counts are dropped the moment the gates have read them: they are this node's own
+    # working state, and a column it invented must never reach the published table.
+    staged = staged.drop('__numerator_operand_count', '__denominator_operand_count')
 
     # §8 rule 4's ÷0 half — the declared zero_denominator is `zero`. It is tested on the
     # DENOMINATOR's value and never on the quotient. A denominator that is zero and one that is
@@ -129,7 +175,8 @@ def calculate_cross_border_value_ratio_90d(
     # Spark has: its default is to return NULL for a value that does not fit DECIMAL(38,6). So the
     # cast is compared against the value that went into it — a row that was NOT null and became
     # null overflowed, and a NULL silently replacing a number is exactly what the declaration
-    # refuses.
+    # refuses. The aggregate-level half of this obligation — a sum already NULL before any cast —
+    # was checked per operand above, before the final operation combined them.
     typed = F.col('cross_border_value_ratio_90d').cast('decimal(38,6)')
     # A null that was ALREADY null passes: that is the empty-window or null-input policy's own
     # answer, not an overflow, and reporting it here would fire the wrong gate.
