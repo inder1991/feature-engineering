@@ -36,7 +36,7 @@ def calculate_total_debit_amount_30d(
     # beside a count above zero — can only be Spark overflowing INSIDE the aggregation
     # (`CheckOverflowInSum` answers it with NULL before any cast). Dropped once the gate has read
     # it.
-    operand_count = F.when(any_null, F.lit(0)).otherwise(F.count(F.col('txn_amt')))
+    operand_count = F.when(any_null, F.lit(0).cast('bigint')).otherwise(F.count(F.col('txn_amt')))
 
     # The grain-level aggregate. `sum` is the expression's own declared aggregate, and the
     # grouping is the DECLARED grain — one row per landing key, which is what the spine reduction

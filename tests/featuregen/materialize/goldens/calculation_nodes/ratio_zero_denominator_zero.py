@@ -157,6 +157,23 @@ def calculate_cross_border_value_ratio_90d(
         'cross_border_value_ratio_90d',
         F.when(denominator_is_zero, zero_value).otherwise(quotient))
 
+    # §9 OVERFLOW_VIOLATION at the OPERATION level. The ratio's own arithmetic carries a Spark
+    # result type of its own, and a result that exceeds it is NULL under ANSI-off with BOTH
+    # operands present. No other check can see that: the cast comparison below needs a non-null
+    # value to compare, and each operand's own column is healthy — so both are read here, while
+    # they still exist. The `zero` zero_denominator policy answers a zero denominator with a
+    # literal 0 — never NULL — so it needs no exclusion here.
+    operation_overflowed = staged.where(
+        numerator_value.isNotNull() & denominator_value.isNotNull()
+        & F.col('cross_border_value_ratio_90d').isNull())
+    if operation_overflowed.limit(1).count() > 0:
+        raise RuntimeError(
+            "OVERFLOW_VIOLATION: the ratio producing cross_border_value_ratio_90d evaluated to "
+            "NULL although both operands were present: the operation's own arithmetic overflowed "
+            "its Spark result type, before the publish cast could see it. The formula declares "
+            "overflow=error, so the run stops rather than publishing a NULL indistinguishable "
+            "from an empty window. Rows affected: " + str(operation_overflowed.count()))
+
     # The operand columns are dropped: per-feature staging carries the keys, the business date and
     # ONE feature column. The two halves are this node's own working state, and either one
     # surviving is an extra column §9 reports against the whole group at assembly.
@@ -175,8 +192,10 @@ def calculate_cross_border_value_ratio_90d(
     # Spark has: its default is to return NULL for a value that does not fit DECIMAL(38,6). So the
     # cast is compared against the value that went into it — a row that was NOT null and became
     # null overflowed, and a NULL silently replacing a number is exactly what the declaration
-    # refuses. The aggregate-level half of this obligation — a sum already NULL before any cast —
-    # was checked per operand above, before the final operation combined them.
+    # refuses. The other two thirds of this obligation were checked above, while the operand
+    # columns still existed: each operand's own sum (already NULL before any cast —
+    # `CheckOverflowInSum`), and the final operation's own arithmetic (NULL with both operands
+    # present).
     typed = F.col('cross_border_value_ratio_90d').cast('decimal(38,6)')
     # A null that was ALREADY null passes: that is the empty-window or null-input policy's own
     # answer, not an overflow, and reporting it here would fire the wrong gate.

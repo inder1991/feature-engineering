@@ -2655,15 +2655,22 @@ def _operand_count_note(slot: _Slot) -> str:
 
 
 def _operand_count_expression(slot: _Slot) -> list[str]:
-    """``operand_count = …`` — a named binding, like the aggregate it rides beside."""
+    """``operand_count = …`` — a named binding, like the aggregate it rides beside.
+
+    The propagate form's zero is CAST, per :func:`_typed_literal`'s own doctrine: ``F.count``
+    returns a BIGINT and an untyped ``F.lit(0)`` is an INT beside it, leaving Spark to resolve
+    the branch type. It is typed to the COUNT's type and not the published one, because this
+    column is the gate's evidence and never a feature value.
+    """
     name = f"{slot.local}operand_count"
     counted = f"F.count(F.col({slot.operand!r}))"
     if slot.nulls is not NullInput.PROPAGATE:
         return [f"    {name} = {counted}"]
-    single = f"    {name} = F.when({slot.local}any_null, F.lit(0)).otherwise({counted})"
+    zero = "F.lit(0).cast('bigint')"
+    single = f"    {name} = F.when({slot.local}any_null, {zero}).otherwise({counted})"
     if len(single) <= _RENDERED_WIDTH:
         return [single]
-    return [f"    {name} = F.when({slot.local}any_null, F.lit(0)).otherwise(",
+    return [f"    {name} = F.when({slot.local}any_null, {zero}).otherwise(",
             f"        {counted})"]
 
 
@@ -2891,7 +2898,8 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
             *_call_lines("    staged = staged.withColumn(",
                          [repr(column), f"{minuend} - {subtrahend}"], ")"),
         ]
-        return [*prelude, *body, "", *_operand_drop_lines(slots)]
+        return [*prelude, *body, *_operation_overflow_lines(ir, column, names, physical), "",
+                *_operand_drop_lines(slots)]
     numerator, denominator = names
     policy = _zero_denominator(ir)
     body = [
@@ -2912,7 +2920,69 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
         f"    denominator_is_zero = {denominator}.isNotNull() & ({denominator} == F.lit(0))",
         *_zero_denominator_lines(policy, column, numerator, denominator, physical),
     ]
-    return [*prelude, *body, "", *_operand_drop_lines(slots)]
+    return [*prelude, *body, *_operation_overflow_lines(ir, column, names, physical), "",
+            *_operand_drop_lines(slots)]
+
+
+def _operation_overflow_lines(ir: FormulaExecutionIRV1, column: str, names: list[str],
+                              physical: PhysicalType) -> list[str]:
+    """§9's ``OVERFLOW_VIOLATION`` for the final operation's OWN arithmetic — the remaining NULL.
+
+    The subtraction and the division each carry a Spark result type of their OWN, and a result
+    exceeding it is NULL under ANSI-off with BOTH operands present. Neither neighbouring check can
+    see that: the per-operand gates read two healthy aggregates, and the publish cast's comparison
+    needs a non-null value to compare. So it is tested HERE, after the operation and before the
+    operand columns are dropped — that is what makes "both operands were present" decidable. The
+    one policy that legitimately answers NULL at this point, a `null` zero_denominator, is
+    excluded by its own test; `zero` answers with a literal 0 and `error` already proved no
+    denominator is zero, so neither needs an exclusion.
+    """
+    if physical.overflow is not OverflowBehavior.ERROR:
+        return []
+    left, right = names
+    operation = ir.final_operation.value
+    guards = f"{left}.isNotNull() & {right}.isNotNull()"
+    zero_message = ""
+    if ir.final_operation is FinalOperation.RATIO:
+        policy = _zero_denominator(ir)
+        if policy is ZeroDenominator.NULL:
+            guards += " & (~denominator_is_zero)"
+            zero_message = " and the denominator was not zero"
+            policy_note = (
+                "The `null` zero_denominator policy answers a zero denominator with this same "
+                "NULL, so its own test excludes those rows here.")
+        elif policy is ZeroDenominator.ZERO:
+            policy_note = (
+                "The `zero` zero_denominator policy answers a zero denominator with a literal 0 "
+                "— never NULL — so it needs no exclusion here.")
+        else:
+            policy_note = (
+                "The `error` zero_denominator policy proved above that no denominator reaching "
+                "the division is zero, so it needs no exclusion here.")
+    else:
+        policy_note = ("A NULL from an operand absent from its window is excluded by the "
+                       "isNotNull guards, and no policy of this body answers NULL here.")
+    return [
+        "",
+        *_comment(
+            f"§9 OVERFLOW_VIOLATION at the OPERATION level. The {operation}'s own arithmetic "
+            f"carries a Spark result type of its own, and a result that exceeds it is NULL under "
+            f"ANSI-off with BOTH operands present. No other check can see that: the cast "
+            f"comparison below needs a non-null value to compare, and each operand's own column "
+            f"is healthy — so both are read here, while they still exist. {policy_note}"),
+        "    operation_overflowed = staged.where(",
+        f"        {guards}",
+        f"        & F.col({column!r}).isNull())",
+        "    if operation_overflowed.limit(1).count() > 0:",
+        *_refuse(
+            ValidationGateCode.OVERFLOW_VIOLATION,
+            f"the {operation} producing {_safe_text(column, 'the feature column')} evaluated to "
+            f"NULL although both operands were present{zero_message}: the operation's own "
+            f"arithmetic overflowed its Spark result type, before the publish cast could see it. "
+            f"The formula declares overflow=error, so the run stops rather than publishing a NULL "
+            f"indistinguishable from an empty window. Rows affected: ",
+            tail="str(operation_overflowed.count())"),
+    ]
 
 
 def _zero_denominator_lines(policy: ZeroDenominator, column: str, numerator: str,
@@ -3137,10 +3207,20 @@ def _overflow_lines(column: str, physical: PhysicalType,
                 f"NULL silently replacing a number is exactly what the declaration refuses."),
         ])
     else:
-        pointer = (
-            " The aggregate-level half of this obligation — a sum already NULL before any cast — "
-            "was checked per operand above, before the final operation combined them."
-            if any(_counts_operands(slot, physical) for slot in slots) else "")
+        counted = any(_counts_operands(slot, physical) for slot in slots)
+        if len(slots) > 1 and counted:
+            pointer = (
+                " The other two thirds of this obligation were checked above, while the operand "
+                "columns still existed: each operand's own sum (already NULL before any cast — "
+                "`CheckOverflowInSum`), and the final operation's own arithmetic (NULL with both "
+                "operands present).")
+        elif len(slots) > 1:
+            pointer = (
+                " The operation-level half of this obligation — the final operation's own "
+                "arithmetic going NULL with both operands present — was checked above, while the "
+                "operand columns still existed.")
+        else:
+            pointer = ""
         lines.extend(_comment(
             f"§9 OVERFLOW_VIOLATION. The formula declares `error` on overflow, and `error` is not a "
             f"mode Spark has: its default is to return NULL for a value that does not fit "

@@ -2317,6 +2317,37 @@ def test_the_DIFFERENCE_answers_an_EMPTY_side_from_that_SIDES_own_policy(ratio, 
         "c1": decimal.Decimal("-40.000000")}
 
 
+def test_the_DIFFERENCE_gates_its_OWN_arithmetic_overflow_while_both_operands_exist(
+        ratio, ratio_feature):
+    """The subtraction has a Spark result type of its own, and a difference exceeding it is NULL
+    under ANSI-off with BOTH operands healthy — after the per-operand gates and before the cast
+    comparison (which needs a non-null value). Only a test reading both operand columns can see
+    it, so it must sit after the operation and before the operand drop."""
+    source = _render_difference(ratio, ratio_feature).source
+    assert "minuend_value.isNotNull() & subtrahend_value.isNotNull()" in source
+    gate = source.index("operation_overflowed = staged.where(")
+    assert source.index("minuend_value - subtrahend_value") < gate
+    assert gate < source.index("staged = staged.drop('__minuend', '__subtrahend')")
+
+
+def test_the_RATIO_gates_its_OWN_arithmetic_overflow_per_zero_denominator_policy(
+        ratio, ratio_feature):
+    """The division's own overflow is NULL too, and each ÷0 policy leaves a different legitimate
+    NULL to exclude: `null` answers a zero denominator with the SAME NULL (excluded by its own
+    test), `zero` answers with a literal 0 (nothing to exclude), and `error` already proved no
+    denominator is zero. A gate that ignored the policy would report the `null` policy's own
+    answer as an overflow."""
+    rendered = {policy: _render_ratio(ratio, ratio_feature, zero_denominator=policy).source
+                for policy in ZeroDenominator}
+    for source in rendered.values():
+        assert "numerator_value.isNotNull() & denominator_value.isNotNull()" in source
+        assert source.index("operation_overflowed = staged.where(") \
+            < source.index("staged = staged.drop('__numerator', '__denominator')")
+    assert "& (~denominator_is_zero)" in rendered[ZeroDenominator.NULL]
+    assert "~denominator_is_zero" not in rendered[ZeroDenominator.ZERO]
+    assert "~denominator_is_zero" not in rendered[ZeroDenominator.ERROR]
+
+
 def test_the_DIFFERENCE_does_not_COALESCE_either_side(ratio, ratio_feature):
     """The plausible shortcut, named. `F.coalesce` anywhere in the final operation would turn every
     `null` empty-window declaration into a `zero` one, silently and for both halves at once."""
