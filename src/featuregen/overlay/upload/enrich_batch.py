@@ -4,6 +4,7 @@ degradation ladder in run_batched (Task 6)."""
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from featuregen.overlay.upload import enrich_config
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.runtime.observability import counters
+
+logger = logging.getLogger(__name__)
 
 # NOTE: `audited_batch_call` / `audited_enrich_call` are imported LAZILY inside run_batched /
 # _single_fallback (not at module top) to break the enrich_batch <-> enrich_llm import cycle:
@@ -258,20 +261,36 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         # counter. (Task 4 carry-forward: the increments previously ran before the ref_aware skip.)
         if ref_aware:
             return
+        from featuregen.overlay.upload.enrich_llm import SchemaUnregisteredError  # lazy (cycle)
+        schema_unregistered = False
         for it in unresolved:
-            if fallback_used >= b.max_single_fallback or over_budget():
+            if schema_unregistered or fallback_used >= b.max_single_fallback or over_budget():
                 counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
                 continue
             fallback_used += 1
             calls += 1
             counters.incr(f"overlay.enrich.{short}.batch.single_fallback")
-            value, status = _single_fallback(conn, client, task=task, out_key=out_key,
-                                              instruction=instruction, item=it,
-                                              shared_metadata=shared_metadata, accept=accept,
-                                              actor=actor, ref_aware=ref_aware,
-                                              prompt_version=prompt_version,
-                                              schema_version=schema_version,
-                                              dispatch_audit=_ctx_for([it]))
+            try:
+                value, status = _single_fallback(conn, client, task=task, out_key=out_key,
+                                                  instruction=instruction, item=it,
+                                                  shared_metadata=shared_metadata, accept=accept,
+                                                  actor=actor, ref_aware=ref_aware,
+                                                  prompt_version=prompt_version,
+                                                  schema_version=schema_version,
+                                                  dispatch_audit=_ctx_for([it]))
+            except SchemaUnregisteredError:
+                # The FALLBACK's (schema_id, version) pair is unregistered (a version bumped
+                # without a body) — raised at dispatch, BEFORE any provider call, and
+                # deterministic for every remaining item this run. Contain exactly this
+                # registration bug: the affected items take the same terminal left-uncached
+                # outcome as a budget cutoff (retried next ingest), the batch-RESOLVED items
+                # survive, and nothing re-raises. Any other exception propagates unchanged.
+                logger.warning("single-fallback schema unregistered for task %r — leaving %r "
+                               "and the remaining fallback items uncached",
+                               task, it.ref, exc_info=True)
+                counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
+                schema_unregistered = True
+                continue
             if value is not None:
                 resolved[it.ref] = value
 

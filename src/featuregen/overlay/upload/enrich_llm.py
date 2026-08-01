@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -850,20 +851,29 @@ _ENRICH_ACTOR = IdentityEnvelope(
     authenticated=False, auth_method="internal", role_claims=())
 
 
-def _require_schema(conn, reg: DocumentSchemaRegistry, schema_id: str, schema_version: int) -> dict:
+class SchemaUnregisteredError(ValueError):
+    """A REQUESTED ``(schema_id, schema_version)`` pair does not resolve even after the owner's
+    registration hook ran (D10). A ``ValueError`` subclass so existing raise-at-dispatch contracts
+    hold, but TYPED so a containment site (the batch ladder's single fallback) can catch exactly
+    this registration bug without swallowing any other failure."""
+
+
+def _require_schema(conn, reg: DocumentSchemaRegistry, schema_id: str, schema_version: int,
+                    register: Callable[..., None] | None = None) -> dict:
     """Resolve the REQUESTED output schema or RAISE (D10) — a call must never dispatch unenforced.
 
-    Self-registers the enrichment set on first use (idempotent) so a fresh database never fails a
+    Self-registers the owner's schema set on first use (idempotent; ``register`` defaults to the
+    enrichment set, a non-enrichment owner passes its own hook) so a fresh database never fails a
     real provider for lack of a schema; but a pair STILL unresolved after that is a caller bug (a
     version bumped without registering its body — the ``schema_for(id, N+1) -> None`` trap), and
     proceeding would send the request with ``output_schema=None``: structured output unenforced and
     the response failing repair downstream. Fail loudly, naming the pair."""
     schema = reg.schema_for(schema_id, schema_version)
     if schema is None:
-        register_enrichment_schemas(conn)
+        (register or register_enrichment_schemas)(conn)
         schema = reg.schema_for(schema_id, schema_version)
     if schema is None:
-        raise ValueError(
+        raise SchemaUnregisteredError(
             f"output schema ({schema_id!r}, v{schema_version}) is not registered — refusing to "
             "dispatch an unenforced structured call; register the schema version before "
             "requesting it")

@@ -74,6 +74,7 @@ from featuregen.overlay.upload.enrich_llm import (
     _generation_settings,
     _record_llm_call_durable,
     _redact_free_text_meta,
+    _require_schema,
     sanitize_feature_context,
 )
 from featuregen.overlay.upload.semantic_bindings.store import (
@@ -256,10 +257,10 @@ def _audited_select_call(
     refusal returns ``(None, None, None, 'egress_blocked')`` with ``EGRESS_BLOCKED`` audited and NO
     dispatch."""
     reg = DocumentSchemaRegistry(conn)
-    schema = reg.schema_for(SELECTION_SCHEMA_ID, SELECTION_SCHEMA_VERSION)
-    if schema is None:
-        _register_selection_schema(conn)
-        schema = reg.schema_for(SELECTION_SCHEMA_ID, SELECTION_SCHEMA_VERSION)
+    # D10: raise, never unenforced — the shared require-or-raise seam, self-registering THIS
+    # module's schema set (not the enrichment set) before giving up.
+    schema = _require_schema(conn, reg, SELECTION_SCHEMA_ID, SELECTION_SCHEMA_VERSION,
+                             register=_register_selection_schema)
 
     # Field-aware egress policy (reused verbatim): glossary free-text scrub, then the nested
     # feature-menu adapter. Both are inert for D3's structural-only payload, but present so no path

@@ -268,6 +268,24 @@ def test_run_batched_does_not_fall_back_egress_excluded_item(db, monkeypatch):
     assert "h2" not in got
 
 
+def test_unregistered_fallback_schema_loses_only_the_fallback_items(db):
+    # The single fallback requests (f"overlay_{task-tail}", version); when THAT pair is
+    # unregistered, _require_schema raises SchemaUnregisteredError AT DISPATCH (no provider call).
+    # The ladder must contain exactly this registration bug: the fallback items end in the same
+    # terminal left-uncached outcome as a budget cutoff, the batch-RESOLVED items survive, and
+    # run_batched never raises.
+    items = [eb.BatchItem("h1", {"table": "t", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "t", "column": "bal2", "type": "numeric"})]
+    task = "overlay.enrich.mystery"   # tail 'mystery' -> fallback schema 'overlay_mystery' (absent)
+    client = FakeLLM(script={task: FakeResponse(output={"results": [
+        {"ref": "h1", "concept": "monetary_stock"}]})})    # batch resolves h1, omits h2
+    got = eb.run_batched(db, client, short="concept", task=task,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {"h1": "monetary_stock"}   # h2 lost to the broken fallback ONLY — no raise
+
+
 def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
     monkeypatch.setenv("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", "0")   # no fallback allowed

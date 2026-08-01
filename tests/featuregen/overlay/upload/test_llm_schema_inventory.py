@@ -57,6 +57,25 @@ def _module_constants(tree: ast.Module) -> dict[str, object]:
     return consts
 
 
+def _module_dict_names(tree: ast.Module, known: set[str]) -> set[str]:
+    """Names bound at module level to a dict LITERAL (a schema BODY, e.g. ``INTENT_SCHEMA``),
+    including plain-name aliases of one (``CRITIC_SCHEMA = CRITIC_FINDINGS_V1_SCHEMA``). Used to
+    recognize an ``LLMRequest``/contract construction that carries its schema body INLINE — such a
+    request never consults the registry, so it imposes no registration to gate on."""
+    names: set[str] = set(known)
+    for node in tree.body:
+        target = value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        if not isinstance(target, ast.Name):
+            continue
+        if isinstance(value, ast.Dict) or (isinstance(value, ast.Name) and value.id in names):
+            names.add(target.id)
+    return names
+
+
 def _resolve(node: ast.expr, consts: dict[str, object]) -> set | None:
     """The set of values this schema kwarg can take; ``None`` for a pure pass-through (a bare Name
     with no known constant binding — a wrapper parameter, whose ORIGINATING sites are scanned
@@ -79,11 +98,17 @@ def _resolve(node: ast.expr, consts: dict[str, object]) -> set | None:
         return {_DYNAMIC}
     if isinstance(node, ast.Attribute):
         return set()
+    if isinstance(node, ast.Subscript):
+        return set()   # a stored request being rehydrated (row["…"]) — its producer owns the pair
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in ("str", "int")):
+        return set()   # str()/int() over a stored value — same rehydration disposition
     raise AssertionError(f"unhandled schema kwarg shape: {ast.dump(node)}")
 
 
 def _requested_pairs() -> set[tuple[str, int]]:
     global_consts: dict[str, object] = {}
+    dict_names: set[str] = set()
     trees: list[ast.Module] = []
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -91,6 +116,7 @@ def _requested_pairs() -> set[tuple[str, int]]:
         # Name-resolution fallback for constants imported from a sibling module (first def wins).
         for name, value in _module_constants(tree).items():
             global_consts.setdefault(name, value)
+        dict_names |= _module_dict_names(tree, dict_names)
 
     pairs: set[tuple[str, int]] = set()
     for tree in trees:
@@ -100,11 +126,21 @@ def _requested_pairs() -> set[tuple[str, int]]:
                 continue
             kw = {k.arg: k.value for k in call.keywords if k.arg}
             sid_node: ast.expr | None = kw.get("schema_id")
+            vers_key = "schema_version"
             if (sid_node is None and isinstance(call.func, ast.Name)
                     and call.func.id in _POSITIONAL_WRAPPERS):
                 idx = _POSITIONAL_WRAPPERS[call.func.id]
                 if len(call.args) > idx:
                     sid_node = call.args[idx]
+            if sid_node is None and "output_schema_id" in kw:
+                # ``output_schema_id=`` sites (LLMRequest / provider-contract construction, e.g. the
+                # semantic-binding SELECT). A call whose ``output_schema=`` names a module-level
+                # schema BODY carries its schema inline — the registry is never consulted for it —
+                # so only registry-resolved requests gate here.
+                schema_node = kw.get("output_schema")
+                if not (isinstance(schema_node, ast.Name) and schema_node.id in dict_names):
+                    sid_node = kw["output_schema_id"]
+                    vers_key = "output_schema_version"
             if sid_node is None:
                 continue
             sids = _resolve(sid_node, consts)
@@ -116,7 +152,7 @@ def _requested_pairs() -> set[tuple[str, int]]:
                 sids = sids - {_DYNAMIC}
             if not sids:
                 continue
-            vers_node = kw.get("schema_version")
+            vers_node = kw.get(vers_key)
             vers = {1} if vers_node is None else _resolve(vers_node, consts)
             if vers is None:
                 continue   # version threaded from the caller — that caller is scanned directly
@@ -142,6 +178,9 @@ def test_the_scan_sees_the_known_call_sites():
         ("concept_critique", 1), ("concept_revision", 1),   # concept critic
         ("bridge_identifier_critique", 1),            # bridge critic
         ("use_case_recognition", 1),                  # recognizer
+        # the output_schema_id= widening: the semantic-binding SELECT resolves its schema from
+        # the registry (LLMRequest kwarg — the previously unscanned site).
+        ("overlay_semantic_bindings_select", 1),
     ]:
         assert expected in pairs, f"static scan no longer sees {expected}"
 
