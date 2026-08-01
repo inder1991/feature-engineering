@@ -263,6 +263,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
         "enrich_synonyms", "enrich_unit",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+        # Task 0.6 Seam 5a: the tail re-projection of evidence-bearing table refs now reports.
+        "table_display_reprojection",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         # entity_bridges runs AFTER the drain + table-fact projection: assessing earlier read
         # stale flat grain flags and froze them into the candidate evidence (bridge 6B).

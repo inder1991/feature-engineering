@@ -2636,9 +2636,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # projections (table_role / primary_entity / event_or_snapshot / domain ...) whose evidence and
     # decisions survive untouched. Re-project every schema-agreeing table ref that still carries
     # ACTIVE field evidence, UNCONDITIONALLY; refs a stage above already projected this round are
-    # skipped (no duplicate decision events). Savepointed fail-soft: never fails the upload.
+    # skipped (no duplicate decision events). Savepointed fail-soft PER REF (one bad ref never
+    # kills the remaining projections); never fails the upload. The honest outcome rides the run's
+    # stage account like every other tail stage.
+    stage_started = datetime.now(UTC)
     try:
-        with conn.transaction():
+        with conn.transaction():   # savepoint: even the pending-set read must not poison the tx
             _schema_of = _schema_by_table(glossary)
             _expected_table_refs = {
                 normalize_ref(catalog_source, _schema_of.get(t.strip().lower()), t)
@@ -2646,12 +2649,31 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             _pending_table_refs = sorted(
                 set(_evidence_bearing_table_refs(conn, sorted(_expected_table_refs)))
                 - projected_table_refs)
-            if _pending_table_refs:
-                resolve_and_project(conn, source=catalog_source,
-                                    logical_refs=_pending_table_refs, now=now)
+        _reprojected = _reproject_failed = 0
+        for _table_ref in _pending_table_refs:
+            try:
+                with conn.transaction():   # per-ref savepoint
+                    resolve_and_project(conn, source=catalog_source,
+                                        logical_refs=[_table_ref], now=now)
+                _reprojected += 1
+            except Exception:  # noqa: BLE001 — advisory: one ref's fault is contained
+                _reproject_failed += 1
+                logger.warning("advisory table display re-projection failed for %r ref %r — "
+                               "evidence intact, remaining refs still projected",
+                               catalog_source, _table_ref, exc_info=True)
+        _detail: dict = {"reprojected": _reprojected}
+        if _reproject_failed:
+            _detail["failed"] = _reproject_failed
+        record_stage(
+            stage_recorder, "table_display_reprojection",
+            ("failed" if _reprojected == 0 else "partial") if _reproject_failed else "succeeded",
+            reason_code="items_failed" if _reproject_failed else None,
+            detail=_detail, started_at=stage_started)
     except Exception:  # noqa: BLE001 — advisory: display re-projection never fails an upload
         logger.warning("advisory table display re-projection failed for %r — evidence intact",
                        catalog_source, exc_info=True)
+        record_stage(stage_recorder, "table_display_reprojection", "failed",
+                     reason_code="exception", started_at=stage_started)
 
     entity_bridges_proposed = 0
     entity_bridge_derivation = BridgeCandidateDerivationV1(

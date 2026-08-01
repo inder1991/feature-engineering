@@ -55,6 +55,11 @@ CANONICAL_STAGES: tuple[str, ...] = (
     "enrich_unit",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+    # Task 0.6 Seam 5a: the unconditional tail re-projection of evidence-bearing TABLE refs a
+    # re-upload's build_graph just wiped (Pass-B/glossary-scoped stages above only cover their
+    # own refs). Stage NAMES are unconstrained by the 0996 CHECK (only ``state`` is), so this
+    # registers like axis_projection/stamp_reconcile did — no migration.
+    "table_display_reprojection",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "entity_bridges", "join_projection",
     "semantic_binding_projection", "join_drift",

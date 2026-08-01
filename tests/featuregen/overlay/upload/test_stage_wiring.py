@@ -66,6 +66,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "enrich_unit",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+        "table_display_reprojection",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         "table_fact_projection", "entity_bridges", "join_projection",
         "semantic_binding_projection", "join_drift",
@@ -86,6 +87,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "graph_persistence": "succeeded",
         "governed_joins": "disabled", "pass_c": "disabled", "pass_b": "disabled",  # flags off
         "glossary_evidence": "not_applicable",
+        "table_display_reprojection": "succeeded",             # tail re-projection (Seam 5a)
         "entity_bridges": "disabled",                          # OVERLAY_ENTITY_BRIDGES off
         "semantic_binding_candidates": "disabled",             # OVERLAY_SEMANTIC_BINDING_* off
         "semantic_binding_proposals": "disabled",
@@ -110,8 +112,9 @@ def test_stages_that_ran_carry_started_at(db):
                         stage_recorder=rec)
     assert res.status == "ingested"
     ran = {"validation", "brake", "fact_assertion", "drift", "graph_persistence",
-           "projection_drain", "table_fact_projection", "join_projection",
-           "semantic_binding_projection", "stamp_reconcile", "axis_projection", "quarantine"}
+           "table_display_reprojection", "projection_drain", "table_fact_projection",
+           "join_projection", "semantic_binding_projection", "stamp_reconcile",
+           "axis_projection", "quarantine"}
     for r in rec.reports:
         if r.stage in ran:
             assert r.started_at is not None, r.stage
@@ -131,7 +134,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 28
+    assert len(rec.reports) == 29
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
@@ -275,6 +278,7 @@ _ALL_INGEST_STAGES = [
     "enrich_unit",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+    "table_display_reprojection",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "entity_bridges", "join_projection",
     "semantic_binding_projection", "join_drift",

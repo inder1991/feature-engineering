@@ -73,6 +73,59 @@ def test_confirmed_table_projection_survives_reupload_with_pass_b_off(db, monkey
     assert _projected_table_role(db) == "fact"
 
 
+def test_one_bad_ref_does_not_kill_the_remaining_reprojections(db, monkeypatch):
+    """FIX 8 (per-ref savepoint) + FIX 6 (stage record): with TWO evidence-bearing table refs, a
+    forced failure on the first ref's projection must leave the second ref projected — and the run's
+    stage account says so honestly (`partial`, one reprojected, one failed) instead of the whole
+    tail block dying on the first fault."""
+    from featuregen.overlay.upload import ingest as ingest_module
+    from featuregen.overlay.upload.stage_report import StageRecorder
+
+    monkeypatch.delenv("OVERLAY_TABLE_SYNTH", raising=False)
+    _seal()
+    t0 = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [CanonicalRow(_SRC, "alpha", "amount", "numeric"),
+            CanonicalRow(_SRC, "beta", "amount", "numeric")]
+    assert ingest_upload(db, _SRC, rows, actor=_actor(), now=t0).status == "ingested"
+
+    ref_alpha = normalize_ref(_SRC, None, "alpha")   # sorts FIRST in the pending set
+    ref_beta = normalize_ref(_SRC, None, "beta")
+    for ref in (ref_alpha, ref_beta):
+        record_field_evidence(
+            db, logical_ref=ref, field_name="table_role", proposed_value="fact",
+            producer=EvidenceProducer.HUMAN, strength=AssertionStrength.CONFIRMED,
+            producer_ref="user:reviewer", source_snapshot_id="human-confirm-1",
+            input_hash=field_input_hash(logical_ref=ref, field_name="table_role",
+                                        material="fact"))
+        resolve_and_project(db, source=_SRC, logical_refs=[ref])
+
+    real = ingest_module.resolve_and_project
+
+    def _boom(conn, *, source, logical_refs, now=None, **kw):
+        if list(logical_refs) == [ref_alpha]:
+            raise RuntimeError("forced projection failure (test)")
+        return real(conn, source=source, logical_refs=logical_refs, now=now, **kw)
+
+    monkeypatch.setattr(ingest_module, "resolve_and_project", _boom)
+    rec = StageRecorder()
+    assert ingest_upload(db, _SRC, rows, actor=_actor(), now=t0 + timedelta(minutes=5),
+                         stage_recorder=rec).status == "ingested"
+
+    def _table_role(table_obj):
+        row = db.execute(
+            "SELECT table_role FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+            (_SRC, table_obj)).fetchone()
+        return row[0] if row else None
+
+    assert _table_role("public.alpha") is None       # its projection failed (contained)
+    assert _table_role("public.beta") == "fact"      # the second ref still projected
+
+    report = next(r for r in rec.reports if r.stage == "table_display_reprojection")
+    assert report.state == "partial" and report.reason_code == "items_failed"
+    assert report.detail == {"reprojected": 1, "failed": 1}
+    assert report.started_at is not None
+
+
 def test_reprojection_records_one_decision_per_reupload_not_two(db, monkeypatch):
     # The repair must not fight the existing paths: with Pass B off and no glossary table term,
     # exactly ONE new RESOLVED decision lands per re-upload (the unconditional reprojection), not a
