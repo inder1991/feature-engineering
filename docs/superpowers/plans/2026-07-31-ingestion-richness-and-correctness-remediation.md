@@ -951,8 +951,8 @@ executing (standing rule: never upload/deploy without explicit approval).
 | `uetr`/`e2e_id`/`sw_srl_num`… | atomic reference concepts |
 | pii-as-concept | 0 columns (party_*/postal/phone/email semantics; sensitivity via axis) |
 | bridge candidates | Customer link present; 0 branch decoys; 0 counterparty decoys; open decoy tasks 0 |
-| cross-namespace candidates | 0 (requires the namespace pairing handoff landed; else record the gap explicitly) |
-| `cust_num ↔ counter_party_cif_id` | present as a `cif`-namespace candidate, population relation unknown (same conditionality) |
+| cross-namespace candidates | 0 (handoff LANDED 2026-08-01, `b35416f4` — the condition is satisfied) |
+| `cust_num ↔ counter_party_cif_id` | present as a `cif`-namespace candidate, population relation unknown (handoff landed — same) |
 | `party_role` | populated on every role-bearing column (`sender_bic`→sender, `third_reimb_inst_code`→reimbursement, `counter_party_*`→counterparty, `cust_swift_cd`→subject); NULL only on genuine ambiguity |
 | table stamps | 2/2 tables stamped; reconcile drift 0 |
 | VERIFIED human facts | byte-identical to pre-flight (grain ×2, availability ×2) |
@@ -1106,6 +1106,37 @@ supplies the data that slot has been waiting for.
 
 **Must-die mutation (owned by whichever suite lands with the change):** pair two identifier
 columns whose concepts declare different namespaces.
+
+> **EXECUTED HERE 2026-08-01 (bridge session, `worktree-bridge-main-merge`, commit
+> `b35416f4`):** `derive_bridge_candidates` + `derive_bridge_candidate_for_refs` now block on
+> `Concept.namespace`; the bounded-enumeration machinery is untouched (grouping key only). The
+> suite that owns the must-die is `tests/featuregen/overlay/upload/test_bridge_namespace_pairing.py`
+> (12 tests, TDD red-first on a CIB/FTR-shaped fixture). Acceptance evidence:
+>
+> - **zero cross-namespace candidates** — the entity-era rule derived 5 candidates on the fixture
+>   including two same-entity decoys (`cust_swift_cd ↔ counter_party_scheme_code` via entity
+>   `bank`, `cust_acct_no ↔ counter_party_acct_no` via entity `account`); the namespace rule
+>   derives 7, none cross-namespace, and the must-die asserts over ALL of them;
+> - **cif group** yields `cust_num ↔ cif_id` (fact key byte-identical to the entity-era key,
+>   golden-pinned literal `db794934…ed96248`) AND the new `cust_num ↔ counter_party_cif_id`
+>   subset candidate with `governed_population_relation` UNKNOWN + `entity_disagreement`;
+> - **swift_bic group** yields `cust_swift_cd ↔ sender_bic`, entity `bank`; the pick is proven
+>   input-order independent (candidate ids + entity ids + fact keys), subject-role preference
+>   and lexicographic fallback each pinned;
+> - **sticky rejection does not transfer**: a REJECTED decoy fact for the same column pair under
+>   entity `counterparty` does not block proposing the namespace-rule candidate (entity
+>   `customer`, different fact_key);
+> - entity mismatch WITHIN a namespace is demoted from `different_governed_entity` hard conflict
+>   to the `entity_disagreement` display note (across namespaces the hard conflict survives);
+>   the write gate (`bridge_catalog_write_error`) refuses cross-namespace endpoints and
+>   entity claims that are not the deterministic pick.
+>
+> Recorded deviations: `BRIDGE_DERIVATION_VERSION` bumped 2.0.0 → 3.0.0 (derivation semantics
+> changed; fact identity does not depend on it); the axis-projection `party_role` source guard's
+> allowlist gains `bridge_candidates.py` for the handoff-mandated entity pick, with a behavioral
+> must-die proving the candidate PAIR SET is party-role-invariant (roles label, never gate).
+> Suites: `tests/featuregen/overlay/upload/` 3322 passed / 11 skipped; `tests/featuregen/api/`
+> 586 passed + the 2 known pre-existing `/data-sources` proxy-parity failures.
 
 ## Execution Order
 
