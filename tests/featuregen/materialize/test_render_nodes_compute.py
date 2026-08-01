@@ -824,6 +824,90 @@ def test_the_stand_ins_subtraction_PROPAGATES_nulls_rather_than_treating_one_sid
     assert differences == [decimal.Decimal("3"), None, None]
 
 
+# ── the stand-in's Task 25 surface: NULL ordering, three-valued logic, DATE literals ─────────────
+
+
+def test_the_stand_ins_ordering_puts_NULLS_FIRST_ascending_and_NULLS_LAST_descending():
+    """Spark sorts NULLS FIRST ascending and NULLS LAST descending. The stand-in raised TypeError
+    on the first None it met, which made every null-timestamp scenario untestable — the whole
+    null-bearing half of banking data could not reach a window test at all."""
+    F = fake_spark.functions
+    rows = [{"t": dt.datetime(2026, 7, 2)}, {"t": None}, {"t": dt.datetime(2026, 7, 1)}]
+
+    def ordered_by(ordering):
+        frame = fake_spark.DataFrame(rows).withColumn(
+            "rn", F.row_number().over(fake_spark.Window.orderBy(ordering)))
+        return [row["t"] for row in frame.rows]
+
+    assert ordered_by(F.col("t").asc()) == [None, dt.datetime(2026, 7, 1),
+                                            dt.datetime(2026, 7, 2)]
+    assert ordered_by(F.col("t").desc()) == [dt.datetime(2026, 7, 2), dt.datetime(2026, 7, 1),
+                                             None]
+
+    # Two NULLs are ORDER-BY peers, exactly as Spark ranks them — an unresolved tie on a null
+    # ordering key must stay OBSERVABLE, because that is the whole reason RANK is modelled.
+    tied = fake_spark.DataFrame([{"t": None}, {"t": None}]).withColumn(
+        "rk", F.rank().over(fake_spark.Window.orderBy(F.col("t").asc())))
+    assert [row["rk"] for row in tied.rows] == [1, 1]
+
+
+def test_the_stand_ins_comparisons_are_THREE_VALUED_so_null_rows_DROP_in_where():
+    """Spark's comparisons answer NULL when either side is NULL, and `where` drops a NULL
+    predicate. The stand-in answered Python truthiness — `None != "cancelled"` is True — so it
+    KEPT exactly the rows the cluster drops, and every status filter over nullable data lied."""
+    F = fake_spark.functions
+    frame = fake_spark.DataFrame([{"s": None}, {"s": "ok"}])
+    assert [row["s"] for row in frame.where(F.col("s") != "cancelled").rows] == ["ok"]
+    assert [row["s"] for row in frame.where(~F.col("s").isin(["x"])).rows] == ["ok"]
+
+    # The comparison itself is NULL — not False. `~NULL` and `NULL.isin(...)` are NULL too.
+    null_row = {"s": None}
+    assert (F.col("s") == "ok")._eval(null_row) is None
+    assert (F.col("s") != "ok")._eval(null_row) is None
+    assert (F.col("s") < "ok")._eval(null_row) is None
+    assert (F.col("s") >= "ok")._eval(null_row) is None
+    assert (~F.col("s").isNull())._eval(null_row) is False   # isNull stays two-valued
+    assert F.col("s").isin(["x"])._eval(null_row) is None
+    assert (~F.col("s").isin(["x"]))._eval(null_row) is None
+    # A NULL MEMBER leaves a hit True and turns a miss UNKNOWN — SQL's IN, not Python's `in`.
+    assert F.col("s").isin(["ok", None])._eval({"s": "ok"}) is True
+    assert F.col("s").isin(["x", None])._eval({"s": "ok"}) is None
+
+
+def test_the_stand_ins_AND_and_OR_are_KLEENE_not_python_truthiness():
+    """NULL & False is FALSE (a false conjunct decides alone); NULL & True is NULL; dually for OR.
+    Inside `where` the difference is invisible — None and False both drop — but `~` composes on
+    top: `~(NULL & True)` must stay NULL and DROP, where Python truthiness answered False for the
+    conjunction and True for its negation, KEEPING the row. Child-1's NOT-over-AND filter trees
+    render exactly that shape."""
+    F = fake_spark.functions
+    null, true, false = F.col("n"), F.lit(True), F.lit(False)
+    row = {"n": None}
+    assert (null & false)._eval(row) is False
+    assert (false & null)._eval(row) is False
+    assert (null & true)._eval(row) is None
+    assert (true & null)._eval(row) is None
+    assert (null | true)._eval(row) is True
+    assert (true | null)._eval(row) is True
+    assert (null | false)._eval(row) is None
+    assert (null & null)._eval(row) is None
+    assert (null | null)._eval(row) is None
+    assert (~(null & true))._eval(row) is None
+    assert (~(null | false))._eval(row) is None
+
+
+def test_the_stand_ins_run_rendered_binds_DATE_so_date_literal_filters_execute():
+    """The renderer emits `date.fromisoformat('…')` for a DATE literal and declares `from datetime
+    import date` on the node — but `run_rendered` supplies the node's imports itself, and it never
+    supplied `date`. Every DATE-literal filter died with NameError before it filtered anything."""
+    node_source = ("def f(frame):\n"
+                   "    return frame.where(F.col('d') >= date.fromisoformat('2026-01-01'))\n")
+    run = fake_spark.run_rendered(node_source, "f")
+    frame = fake_spark.DataFrame(
+        [{"d": dt.date(2025, 12, 31)}, {"d": dt.date(2026, 1, 1)}, {"d": None}])
+    assert [row["d"] for row in run(frame).rows] == [dt.date(2026, 1, 1)]
+
+
 # ── the node's shape and its wiring ──────────────────────────────────────────────────────────────
 
 
