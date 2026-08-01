@@ -95,6 +95,18 @@ def test_logical_ref_of_resolves_a_table_ref_through_its_stored_schema(db):
     assert logical_ref_of(db, _SRC, "public.accounts") == expected
 
 
+def test_logical_ref_of_reads_the_row_not_the_segments_for_a_legacy_table_ref(db):
+    """The graph_node row is AUTHORITATIVE: 0997 permits legacy TABLE rows whose object_ref has
+    3+ segments (a dotted table name written before validation quarantined those), and the segment
+    heuristic parsed such a ref as (table, column) — dropping a segment and minting a phantom
+    COLUMN ref. When the row exists, kind/schema_name/table_name/column_name decide the logical
+    ref; the heuristic stays ONLY as the documented fallback for an absent row."""
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name) "
+        "VALUES (%s, %s, 'table', %s)", (_SRC, "ord.hist.arch", "ord.hist.arch"))
+    assert logical_ref_of(db, _SRC, "ord.hist.arch") == normalize_ref(_SRC, None, "ord.hist.arch")
+
+
 def test_additivity_hint_without_a_governing_decision(db):
     _col(db, additivity="non_additive", additivity_decision_id="fde_x")
     facts = read_column_facts(db, _REF, "additivity")

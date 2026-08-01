@@ -55,29 +55,38 @@ class OperationalColumnFacts:
 
 def logical_ref_of(conn: DbConn, catalog_source: str, object_ref: str) -> str:
     """Rebuild the SCHEMA-PRESERVING logical_ref for a graph_node ``(catalog_source, object_ref)``
-    so the same string keys the decision log / field_evidence (via is_feature_eligible). graph_node
-    object_refs are stored PUBLIC-FLATTENED (``public.table.column``), but the REAL (pre-flatten)
-    schema a non-``public`` source declared lives in ``graph_node.schema_name`` — read it here (a
-    single PK lookup) rather than assuming ``"public"``, so a real-schema upload's evidence/decisions
-    (keyed under their schema-preserving logical_ref, per ``field_resolution.py`` / ``object_ref.py``)
-    are actually reachable. ``normalize_ref`` (not string concatenation) so the case-folding EXACTLY
-    matches how the writers keyed the row. Falls back to ``"public"`` when ``schema_name`` is NULL or
-    the graph_node row is absent — public/technical uploads stay byte-identical."""
+    so the same string keys the decision log / field_evidence (via is_feature_eligible).
+
+    The graph_node ROW is AUTHORITATIVE: the same single PK lookup that reads the REAL
+    (pre-flatten) ``schema_name`` also reads ``kind``/``table_name``/``column_name``, and the
+    logical ref is derived from THOSE — never re-parsed out of the ref's dot segments. That covers
+    the legacy rows 0997 deliberately permits (a TABLE whose dotted name predates validation
+    quarantining dots, so its object_ref has 3+ segments): the segment heuristic parsed such a row
+    as (table, column), dropping a segment and minting a phantom COLUMN ref no store keys.
+    ``normalize_ref`` (not string concatenation) so the case-folding EXACTLY matches how the
+    writers keyed the row; ``schema_name`` NULL falls back to ``"public"``, so public/technical
+    uploads stay byte-identical.
+
+    The segment heuristic remains ONLY as the documented fallback for an ABSENT row (a stale or
+    derived object_ref): graph refs are public-flattened, so 2 parts is a TABLE ref
+    (``public.<table>`` — parts[0] is the flattened schema, never a table name) and 3+ parts is
+    read as ``…​.table.column``, under the default ``"public"`` schema."""
+    row = conn.execute(
+        "SELECT kind, schema_name, table_name, column_name FROM graph_node "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (catalog_source, object_ref)).fetchone()
+    if row is not None:
+        kind, schema, table_name, column_name = row
+        column = column_name if kind == "column" else None
+        return normalize_ref(catalog_source, schema or None, table_name, column or None)
     parts = object_ref.split(".")
     if len(parts) >= 3:
         table, column = parts[-2], parts[-1]
     elif len(parts) == 2:
-        # Graph object_refs are public-flattened: 2 parts is ALWAYS a TABLE ref
-        # (``public.<table>``) — parts[0] is the flattened schema, never a table name. Treating it
-        # as (table, column) minted a phantom COLUMN ref that no evidence store or projection keys.
         table, column = parts[1], ""
     else:
         table, column = object_ref, ""
-    row = conn.execute(
-        "SELECT schema_name FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
-        (catalog_source, object_ref)).fetchone()
-    schema = row[0] if row is not None and row[0] else "public"
-    return normalize_ref(catalog_source, schema, table, column or None)
+    return normalize_ref(catalog_source, None, table, column or None)
 
 
 def _render(raw: object) -> str | None:
