@@ -30,9 +30,10 @@ gate that could only see them through one path would stop seeing them the day th
 
 **A per-feature signature would be wrong in a way that matters.** A public feature genuinely *is*
 individually authorized, so a per-feature gate would authorize it and a test asserting "every IR is
-refused" would assert false semantics. What must fail is the GROUP OPERATION: one denied element
-anywhere returns a single ``READ_SCOPE_INSUFFICIENT``, and **no contract, group plan or project is
-produced**. There is no partial authorization and no per-feature bypass — which is why the success
+refused" would assert false semantics. What must fail is the GROUP OPERATION: one ref the governed
+catalog does not describe anywhere returns a single ``COLUMN_NOT_GOVERNED`` (existence is decided
+first — Task 12), one denied element anywhere returns a single ``READ_SCOPE_INSUFFICIENT``, and in
+either case **no contract, group plan or project is produced**. There is no partial authorization and no per-feature bypass — which is why the success
 value is a TOKEN (:class:`AuthorizedCompilation`) rather than a boolean: a downstream stage that
 takes the token cannot be entered by a caller who skipped the gate.
 
@@ -507,8 +508,8 @@ def physical_read_set(
 
 def _hidden(
     conn: DbConn, elements: Sequence[_ReadElement], roles: tuple[str, ...]
-) -> tuple[_ReadElement, ...]:
-    """The elements the supplied read scope may not see.
+) -> tuple[tuple[_ReadElement, ...], tuple[_ReadElement, ...]]:
+    """``(hidden, missing)`` — what the read scope may not see, and what the catalog does not have.
 
     The shipped read-scope rule, genuinely INHERITED rather than re-implemented: one predicate
     (``read_scope.visibility_predicate``) over one parameter (``read_scope.allowed_classes``),
@@ -520,11 +521,15 @@ def _hidden(
     unfloored node has ``visible_requires = '{}'``, contained in every allowed list, and stays
     visible to everyone; ``prohibited`` appears in no role map and fails CLOSED for every caller.
 
-    A ref with no ``graph_node`` row at all stays authorized here. It carries no visibility
-    requirement to hide behind, so nothing sensitive is being let through; what it is, is a read of
-    a column the catalog does not describe, which §11's L1 validation reports as ``COLUMN_ABSENT``
-    against the live metastore. Refusing it here would report a missing column as an insufficient
-    role and send an operator to request a privilege that would not help.
+    A ref with no ``graph_node`` row at all is returned as MISSING (Task 12). The doctrine used to
+    be the reverse — pass it through and let §11's L1 validation report ``COLUMN_ABSENT`` against
+    the live metastore — but L1 sits on no production path, so a hallucinated column rendered
+    cleanly and died on the cluster. The old objection (refusing here reported a missing column as
+    an insufficient role, sending an operator after a privilege that would not help) is answered by
+    a code of its own: the caller refuses missing refs as ``COLUMN_NOT_GOVERNED``, never as a role
+    problem. Both verdicts come from the SAME single fetch per catalog_source — every governed row
+    for the group's object refs, with its visibility — so hidden-ness and existence cannot be
+    answered against two different catalog states.
     """
     allowed = allowed_classes(roles)
     by_source: dict[str, dict[str, _ReadElement]] = {}
@@ -532,14 +537,24 @@ def _hidden(
         by_source.setdefault(element.catalog_source, {})[element.object_ref] = element
 
     hidden: list[_ReadElement] = []
+    missing: list[_ReadElement] = []
     for catalog_source, indexed in by_source.items():
         rows = conn.execute(
-            "SELECT lower(object_ref) FROM graph_node "
-            "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s) "
-            f"AND NOT ({visibility_predicate()})",
-            (catalog_source, list(indexed), allowed)).fetchall()
-        hidden.extend(indexed[object_ref] for (object_ref,) in rows)
-    return tuple(sorted(hidden, key=lambda element: element.logical_ref))
+            f"SELECT lower(object_ref), (NOT ({visibility_predicate()})) AS hidden "
+            "FROM graph_node "
+            "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s)",
+            (allowed, catalog_source, list(indexed))).fetchall()
+        # Fail CLOSED across duplicates: should the catalog ever hold two rows for one folded
+        # object_ref, one hidden row hides the node — mirroring the old shape, where the query
+        # returned hidden rows directly and any one of them sufficed.
+        found: dict[str, bool] = {}
+        for object_ref, is_hidden in rows:
+            found[object_ref] = found.get(object_ref, False) or bool(is_hidden)
+        hidden.extend(indexed[object_ref] for object_ref, is_hidden in found.items() if is_hidden)
+        missing.extend(element for object_ref, element in indexed.items()
+                       if object_ref not in found)
+    return (tuple(sorted(hidden, key=lambda element: element.logical_ref)),
+            tuple(sorted(missing, key=lambda element: element.logical_ref)))
 
 
 def authorize_compilation(
@@ -551,9 +566,15 @@ def authorize_compilation(
 ) -> AuthorizedCompilation | MaterializationRefused:
     """Gate 2 — authorize the GROUP's complete physical read set, or refuse the whole compilation.
 
-    One denied element anywhere returns a single ``READ_SCOPE_INSUFFICIENT``. Nothing partial is
-    returned, so no contract, group plan or project can be derived from a refused group: the
-    downstream chain takes an :class:`AuthorizedCompilation`, and a refusal is not one.
+    Two verdicts, decided from ONE fetch per catalog source, in a FIXED order. Existence first: a
+    ref the governed catalog does not describe returns ``COLUMN_NOT_GOVERNED`` naming every such
+    ref (Task 12 — L1's ``COLUMN_ABSENT`` sits on no production path, so compile must not emit a
+    read nobody governs). Then read scope: one denied element anywhere returns a single
+    ``READ_SCOPE_INSUFFICIENT``. When one group carries both, existence wins — no grantable role
+    can make an undescribed column readable, so a scope refusal would send the operator after a
+    privilege that cannot help. Nothing partial is returned either way, so no contract, group plan
+    or project can be derived from a refused group: the downstream chain takes an
+    :class:`AuthorizedCompilation`, and a refusal is not one.
 
     Raises:
         ValueError: the group is empty, an IR was compiled against a different population than the
@@ -582,7 +603,20 @@ def authorize_compilation(
 
     roles_used = tuple(roles)
     elements = _union_of(group, spine)
-    hidden = _hidden(conn, elements, roles_used)
+    hidden, missing = _hidden(conn, elements, roles_used)
+    if missing:
+        described = ", ".join(
+            f"{element.logical_ref} ({'+'.join(kind.value for kind in element.kinds)})"
+            for element in missing)
+        return _refuse(
+            CompilationRefusalCode.COLUMN_NOT_GOVERNED,
+            f"the governed catalog does not describe {len(missing)} of {len(elements)} elements "
+            f"of the group's complete physical read set across {len(group)} feature(s): "
+            f"{described}. §11's L1 would report each of them as COLUMN_ABSENT against the live "
+            f"metastore, but L1 sits on no production path, so compile refuses rather than emit a "
+            f"read nobody governs. Existence is decided before read scope: no grantable role can "
+            f"make an undescribed column readable, so when a group carries both an undescribed "
+            f"ref and a hidden one, this refusal wins")
     if hidden:
         described = ", ".join(
             f"{element.logical_ref} ({'+'.join(kind.value for kind in element.kinds)})"

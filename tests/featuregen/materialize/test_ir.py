@@ -774,6 +774,78 @@ def test_each_read_scope_TAG_needs_its_OWN_granting_role(catalog, tag, granting_
         AuthorizedCompilation)
 
 
+# ══ §1.3 — existence: compile must not emit a read nobody governs ════════════════════════════════
+
+
+_EVERY_READER_ROLE = (*_ROLES, "pii_reader", "restricted_reader", "confidential_reader")
+
+
+def _with_ref_renamed(ir: FormulaExecutionIRV1, old: str, new: str) -> FormulaExecutionIRV1:
+    """The same IR with one read-set ref RENAMED — the shape of a hallucinated column.
+
+    A typo'd operand keeps every other property of the read (its roles, its table) and changes only
+    which column the catalog is asked about, which is exactly what an LLM-authored formula naming a
+    plausible-but-absent column produces.
+    """
+    expressions = tuple(
+        dataclasses.replace(
+            expr,
+            physical_read_set=tuple(
+                dataclasses.replace(ref, logical_ref=new) if ref.logical_ref == old else ref
+                for ref in expr.physical_read_set))
+        for expr in ir.expressions)
+    doctored = dataclasses.replace(ir, expressions=expressions)
+    assert _refs_of(doctored) != _refs_of(ir)
+    return doctored
+
+
+def test_a_ref_the_catalog_does_not_govern_refuses_precisely(catalog):
+    # No graph_node row used to mean "authorized, L1 will catch it" — but L1 is not on any
+    # production path. A hallucinated column must die at compile, named as what it is (Task 12,
+    # report §3.3), not as a role problem and not on the cluster. EVERY reader role is supplied
+    # so the refusal cannot be about scope.
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    doctored = _with_ref_renamed(ir, TXN_AMT, f"{TXN}.txn_amt_typo")
+    refused = authorize_compilation(catalog, (doctored,), ir.spine, roles=_EVERY_READER_ROLE)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.COLUMN_NOT_GOVERNED
+    assert "public.transactions.txn_amt_typo" in refused.detail
+
+
+def test_the_refusal_names_EVERY_ungoverned_ref_not_just_the_first(catalog):
+    """One round trip, one verdict, the COMPLETE list — an operator fixing a refused group must not
+    discover the second typo only after fixing the first."""
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    doctored = _with_ref_renamed(
+        _with_ref_renamed(ir, TXN_AMT, f"{TXN}.txn_amt_typo"),
+        TXN_DR_CR, f"{TXN}.dr_cr_flag_typo")
+    refused = authorize_compilation(catalog, (doctored,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.COLUMN_NOT_GOVERNED
+    assert "public.transactions.txn_amt_typo" in refused.detail
+    assert "public.transactions.dr_cr_flag_typo" in refused.detail
+    assert "2 of" in refused.detail
+
+
+def test_existence_is_decided_BEFORE_read_scope(catalog):
+    """When one group carries both an undescribed ref and a hidden one, `COLUMN_NOT_GOVERNED` wins
+    (Task 12): no grantable role can make an undescribed column readable, so refusing on scope
+    first would send an operator to request a privilege that cannot help."""
+    _tag(catalog, "transactions", "dr_cr_flag", "pii")
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    doctored = _with_ref_renamed(ir, TXN_AMT, f"{TXN}.txn_amt_typo")
+
+    refused = authorize_compilation(catalog, (doctored,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.COLUMN_NOT_GOVERNED
+
+    # The control: with the typo alone repaired, the SAME group refuses on scope — the ordering
+    # above was a precedence between two live verdicts, not scope being unreachable.
+    scoped = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(scoped, MaterializationRefused)
+    assert scoped.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+
+
 # ══ §1.3 — calls the caller assembled wrongly ════════════════════════════════════════════════════
 
 
