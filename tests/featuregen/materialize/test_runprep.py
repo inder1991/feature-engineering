@@ -71,11 +71,14 @@ ZONE = "Asia/Kolkata"
 
 # ── the declared environment: one table, one mapping at a time ───────────────────────────────────
 
-def _layout(mapping, *, partition_columns=(("load_dt", "string"),), table="transactions"):
+def _layout(mapping, *, partition_columns=(("load_dt", "string"),), table="transactions",
+            columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "timestamp"))):
+    # `txn_dt` is TIMESTAMP-typed by default: the default `_pit()` zone is Asia/Kolkata, and a
+    # DATE-typed clock under a non-UTC zone now refuses at `prepare_run` (codegen-review Task 9) —
+    # the date-typed variant is built per test via `columns=_DATE_CLOCK_COLUMNS`.
     return TableLayout(
         schema="banking", table=table, partition_columns=partition_columns,
-        partition_mapping=mapping,
-        columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "date")),
+        partition_mapping=mapping, columns=columns,
         location=f"hdfs://nn/warehouse/banking.db/{table}", rewritten_in_place=False)
 
 
@@ -737,6 +740,62 @@ def test_the_prepared_parameters_are_read_only() -> None:
     prep = _ok(_prepared())
     with pytest.raises(TypeError):
         prep.parameters["business_dt"] = NEXT_DT  # type: ignore[index]
+
+
+# ══ codegen-review Task 9 — a DATE-typed clock outside UTC refuses at run preparation ════════════
+#
+# The emitted window comparison casts the boundary DATE to midnight and `to_utc_timestamp` re-reads
+# it as the window zone's wall clock, so west of UTC the whole window shifts by a day (report §2.3,
+# measured with America/New_York: the first day drops and an extra trailing day is admitted; east
+# of UTC is correct by luck). The IR carries no physical type for the clock, but the inventory's
+# `TableLayout.columns` does — so run preparation is where the refusal can live, fail-closed, until
+# `PitSpec` carries the clock dtype (DEFERRED-WORK A.29).
+
+_DATE_CLOCK_COLUMNS = (("txn_amt", "decimal(18,2)"), ("txn_dt", "date"))
+
+
+def test_a_DATE_typed_clock_with_a_non_utc_zone_is_refused() -> None:
+    layout = _layout(_event_mapping(), columns=_DATE_CLOCK_COLUMNS)
+    refused = _prepared(layout=layout, requests=(
+        _request(_requirement(layout), pit=_pit(length=30, timezone="America/New_York")),))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert "txn_dt" in refused.detail, "the refusal names the COLUMN"
+    assert "America/New_York" in refused.detail, "the refusal names the ZONE"
+    assert "to_utc_timestamp" in refused.detail, "the refusal names the MECHANISM"
+
+
+def test_a_DATE_typed_clock_under_utc_still_prepares() -> None:
+    """The shift is zero under UTC — refusing there would refuse every date-columned daily table."""
+    layout = _layout(_event_mapping(), columns=_DATE_CLOCK_COLUMNS)
+    prep = _prepared(layout=layout, requests=(
+        _request(_requirement(layout), pit=_pit(length=30, timezone="UTC")),))
+    assert isinstance(prep, runprep.RunPreparation)
+
+
+def test_a_TIMESTAMP_typed_clock_in_a_non_utc_zone_still_prepares() -> None:
+    """The no-over-refusal control: an instant-typed clock is what the emitted comparison is
+    correct for, in every zone."""
+    layout = _layout(_event_mapping(),
+                     columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "timestamp")))
+    prep = _prepared(layout=layout, requests=(
+        _request(_requirement(layout), pit=_pit(length=30, timezone="America/New_York")),))
+    assert isinstance(prep, runprep.RunPreparation)
+
+
+def test_the_availability_ref_is_checked_too() -> None:
+    """Rule 1's gate compares under the same zone arithmetic as rule 2's window, so a DATE-typed
+    availability column shifts the cutoff the same way a DATE-typed clock shifts the window."""
+    layout = _layout(_event_mapping(),
+                     columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "timestamp"),
+                              ("posted_dt", "date")))
+    pit = dataclasses.replace(
+        _pit(length=30, timezone="America/New_York"),
+        availability_ref=f"{SOURCE}::public.transactions.posted_dt")
+    refused = _prepared(layout=layout, requests=(_request(_requirement(layout), pit=pit),))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert "posted_dt" in refused.detail
 
 
 # ══ the inventory is CONSULTED, and a drifted one fails closed ═══════════════════════════════════

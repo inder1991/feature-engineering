@@ -509,3 +509,15 @@ published scale 6 the bround re-rounds an already-rounded value and is a no-op (
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🟡 **`half_even` on a RATIO refuses (`PHYSICAL_TYPE_UNSUPPORTED`) instead of being honoured** | Generated code alone cannot honour the declaration — the ties are gone before any explicit rounding call runs — and a governed mode the engine silently ignores must refuse rather than be recorded as applied. `resolve_physical_type` refuses the combination; non-ratio bodies keep both modes (post-aggregate rounding of a narrower-scale value has no engine pre-rounding to fight). The worked ratio fixture now declares `half_up` — the mode the engine actually applies. | A consumer needs banker's rounding on a ratio; requires computing the quotient at guaranteed extra scale or a post-division re-quantization proof. |
+
+### A.29 🔴 DATE clocks refused outside UTC — the IR carries no physical time type (2026-08-01)
+
+Recorded while remediating Task 9 of the codegen review. Empirically confirmed: the emitted window
+comparison `F.col(clock) >= F.to_utc_timestamp(boundary.cast('timestamp'), zone)` shifts the whole
+window by a day when the clock column is Hive `DATE` and the governed zone is west of UTC
+(measured with America/New_York: the first day drops and an extra trailing day is admitted; east
+of UTC is correct by luck).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`prepare_run` refuses (`PHYSICAL_TYPE_UNSUPPORTED`) any run whose `event_time_ref` or `availability_ref` resolves to a DATE-typed column under a non-UTC `window_timezone`** | The IR carries no physical type for the clock (`PitSpec.event_time_ref` is a bare ref), so neither compilation nor rendering can see the dtype; run preparation holds the `ClusterInventoryV1`, whose `TableLayout.columns` is ordered `(name, physical type)`, so the fail-closed gate lives there (`_date_typed_clock_refusal`, after snapshots resolve — layouts present and fingerprint-verified — and before the execution hash). UTC zones still prepare: the shift is zero there. | First feature over a DATE-typed event column in a non-UTC catalog; fix = carry the clock dtype in PitSpec and emit date-typed comparisons. |
