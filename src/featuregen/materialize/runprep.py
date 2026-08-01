@@ -80,6 +80,7 @@ from featuregen.materialize.spine import (
     ActivePopulation,
     CurrentSnapshot,
     LatestAvailableAsOf,
+    PartitionMappedSnapshot,
     SpineSpec,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
@@ -700,6 +701,23 @@ def spine_input_request(
                 f"a table that holds no history cannot answer another date, and answering with the "
                 f"rows it happens to hold would publish one day's population under another day's "
                 f"date")
+
+    if isinstance(policy, PartitionMappedSnapshot) and not isinstance(
+            spine_input.partition_mapping, EventTimePartition | StaticSnapshot):
+        # The supported set is the renderer's, read off `render.nodes_compute._partition_mapped`:
+        # only an EventTimePartition or a StaticSnapshot RESOLVES a business date to partition
+        # VALUES. Refusing here is the governed verdict; the renderer's own raise stays as
+        # defense-in-depth, because a bare ValueError mid-render is outside §14's vocabulary.
+        mapping = spine_input.partition_mapping
+        return _refuse(
+            CompilationRefusalCode.PARTITION_MAPPING_NOT_DECLARED,
+            f"the population of {spine.source_table_ref} is declared PARTITION_MAPPED, but "
+            f"{spine_input.schema}.{spine_input.table} declares the partition mapping "
+            f"{type(mapping).__name__ if mapping is not None else None}, which does not resolve a "
+            f"business date to partition VALUES: PARTITION_MAPPED says a business date selects the "
+            f"partitions, and rendering it over a mapping that reads every partition — or none, or "
+            f"a widened set for late arrivals — would read a population the declaration did not "
+            f"describe")
 
     if isinstance(policy, LatestAvailableAsOf) and isinstance(
             spine_input.partition_mapping, EventTimePartition | AvailabilityPartition):

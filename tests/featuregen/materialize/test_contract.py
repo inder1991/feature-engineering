@@ -215,6 +215,24 @@ def test_the_group_contract_is_derived_over_the_authorized_IRS(catalog):
     assert derived.feature_names == (COUNT_90D, SUM_30D)
 
 
+def test_two_irs_sharing_a_feature_name_cannot_silently_collapse(catalog):
+    """The dict keyed on `feature_name` must never overwrite: two IRs under one name would each
+    derive a contract and silently keep whichever came LAST — bypassing
+    `MULTIPLE_MATERIALIZATION_CONTRACTS` without any refusal at all. The two variants here differ
+    only in window, so their contracts are IDENTICAL (§5.3) and the collapse would succeed —
+    which is exactly why it must raise. Admission refuses a duplicate name within a batch, so a
+    group carrying one was assembled from artifacts that never co-admitted: a caller error, which
+    §14's closed vocabulary has no member for."""
+    original = _ok(_compile(catalog, SUM_30D))
+    rewindowed = _ok(_compile(catalog, SUM_30D, formula=_rewindowed(SUM_30D, 90)))
+    authorization = authorize_compilation(catalog, (original, rewindowed), original.spine,
+                                          roles=_ROLES)
+    assert not isinstance(authorization, MaterializationRefused)
+    with pytest.raises(ValueError, match="share feature_name"):
+        derive_group_contract(catalog, authorization, cadence=CADENCE,
+                              availability_promise=NEXT_DAY)
+
+
 def test_a_PROHIBITED_input_refuses_the_whole_group(catalog):
     """The restriction lands AFTER Gate 2: since migration 1032 a `prohibited` floor is ungrantable
     at the read-scope gate itself (test_ir.py owns that), so the only way a prohibited input still

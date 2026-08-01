@@ -750,6 +750,11 @@ def derive_group_contract(
     Raises:
         TypeError: ``authorization`` is not an ``AuthorizedCompilation``. Waving an unauthorized
             group past the gate is a call assembled wrongly, not a governed verdict.
+        ValueError: two IRs in the authorization share one ``feature_name``. The dict below is
+            keyed on the name, so the second contract would silently OVERWRITE the first and the
+            group would publish under whichever survived — bypassing
+            ``MULTIPLE_MATERIALIZATION_CONTRACTS`` without any refusal at all. A call assembled
+            wrongly, not a governed verdict, so it raises (§14).
     """
     if not isinstance(authorization, AuthorizedCompilation):
         raise TypeError(
@@ -760,6 +765,12 @@ def derive_group_contract(
 
     contracts: dict[str, MaterializationContractV1] = {}
     for ir in authorization.irs:
+        if ir.feature_name in contracts:
+            raise ValueError(
+                f"two IRs in one authorization share feature_name {ir.feature_name!r}: admission "
+                f"refuses this within a batch, so this call was assembled from artifacts that "
+                f"never co-admitted — and keying their contracts on the name would silently keep "
+                f"whichever came last")
         derived = derive_contract(conn, ir, cadence=cadence,
                                   availability_promise=availability_promise, overrides=overrides)
         if isinstance(derived, MaterializationRefused):

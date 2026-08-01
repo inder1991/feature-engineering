@@ -17,6 +17,7 @@ from featuregen.materialize.joins import (
 from featuregen.overlay.upload.bridge_assessment import LinkReviewStatus
 from featuregen.overlay.upload.bridge_realization import (
     BridgeRealizationCurrentV1,
+    CardinalityBasis,
     DirectionalCardinalityVerdictV1,
     ExecutionTier,
     RealizationApplicabilityScopeV1,
@@ -31,6 +32,7 @@ def _current(
     cardinality: Cardinality | None = Cardinality.MANY_TO_ONE,
     *,
     reviewed: bool = False,
+    basis: CardinalityBasis = CardinalityBasis.GOVERNED_KEY,
 ) -> CurrentBridgeRealizationV1:
     left, right = _executable_pair()
     revision = replace(
@@ -42,6 +44,7 @@ def _current(
             environment="pilot",
         ),
         cardinality=DirectionalCardinalityVerdictV1(cardinality),
+        cardinality_basis=basis,
     )
     current = BridgeRealizationCurrentV1(
         revision.realization_id,
@@ -113,6 +116,25 @@ def test_reverse_fanout_direction_refuses() -> None:
         realization, from_identity=left, to_identity=right)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
+
+
+def test_an_unattested_cardinality_basis_is_refused() -> None:
+    """"We do not know" is not "it is safe": the basis records how well the direction is known,
+    and the store rehydrates it independently of the cardinality claim — a rehydrated revision
+    claiming MANY_TO_ONE on a metadata-inference basis must not be admitted as fan-in-safe.
+    The `current` pointer is rebuilt from the replaced revision, so the refusal cannot be the
+    eligibility branch — the detail naming the basis pins which check fired."""
+    realization = _current(basis=CardinalityBasis.METADATA_INFERENCE)
+    left, right = _identities(realization)
+    result = plan_cross_catalog_join(
+        realization, from_identity=left, to_identity=right)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+    assert "metadata_inference" in result.detail
+    # The control: the OTHER attested basis — the deterministic exact profile — still plans.
+    profiled = _current(basis=CardinalityBasis.EXACT_PROFILE)
+    assert isinstance(plan_cross_catalog_join(
+        profiled, from_identity=left, to_identity=right), JoinPlan)
 
 
 def test_human_review_does_not_change_execution_eligibility() -> None:

@@ -938,6 +938,26 @@ def test_a_PARTITION_MAPPED_spine_resolves_the_business_dates_OWN_partition() ->
         [(("snapshot_dt", BUSINESS_DT),)]
 
 
+def test_a_PARTITION_MAPPED_spine_over_an_UNRESOLVABLE_mapping_refuses_at_prep() -> None:
+    """The renderer's `_partition_mapped` resolves a business date against an EventTimePartition
+    or a StaticSnapshot mapping and NOTHING else — a FullScan reads every partition, the opposite
+    of what the policy claims. Today that dies in the renderer as a bare ValueError, outside §14's
+    vocabulary; preparation must refuse instead, naming the mapping kind."""
+    scanned = _layout(FullScan(), table="customers")
+    refused = spine_input_request(
+        _spine(PartitionMappedSnapshot(
+            ordered_partition_refs=(f"{SOURCE}::public.customers.load_dt",))),
+        _requirement(scanned), business_dt=BUSINESS_DT)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PARTITION_MAPPING_NOT_DECLARED
+    assert "FullScan" in refused.detail
+    # The control: the refusal is about the POLICY-mapping PAIR, never about FullScan itself — a
+    # present-tense policy over the same scanned table still prepares.
+    assert isinstance(
+        spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref=BUSINESS_DT)),
+                            _requirement(scanned), business_dt=BUSINESS_DT), RunInputRequest)
+
+
 def test_a_CURRENT_SNAPSHOT_whose_vintage_IS_the_business_date_resolves() -> None:
     request = spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref=BUSINESS_DT)),
                                   _requirement(_CUSTOMERS), business_dt=BUSINESS_DT)
