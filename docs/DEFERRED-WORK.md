@@ -552,3 +552,16 @@ model satisfies both checks for two distinct columns.
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🔴 **A real SCD-2 spine (distinct `effective_time_ref` / `availability_ref`) cannot validate — no catalog state satisfies both governed time checks** | The previous behavior was worse: the effective column was trusted UNGOVERNED, letting an ETL load-timestamp silently decide which record version wins. Refusing is honest; the gap is in the fact model, not the check. Test fixtures model the post-growth state by writing the column-node flag+link directly (bypassing the projection). | First real SCD-2 spine declaration over a table whose effective and availability columns differ; fix = a second governed time fact type (e.g. `effective_time`) or a per-COLUMN availability fact, then the projection stops clearing sibling columns and `expression_ir`'s one-governed-column rule is scoped to availability alone. |
+
+### A.31 🟡 input_snapshots is prepared evidence, not an enforced read scope (2026-08-01)
+
+Recorded while remediating Task 21 of the codegen review (docstring corrected; no semantics
+change). `runprep.parameter_payload` builds the `input_snapshots` run parameter and its snapshot
+ids sit inside `sandbox_execution_hash` (§3.4 calls them *the exact ordered partition set read*),
+but no rendered node consumes the snapshot list: the rendered nodes filter raw sources by the
+window/availability predicates, and L1's `PARTITION_ABSENT` check proves only that the resolved
+partitions still exist at validation time — nothing proves the run read precisely (or only) them.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`input_snapshots` is carried and hashed but never enforced as the run's read scope** | The rendered predicates derive from the same window/availability facts that resolved the snapshots, so absent a metastore change between preparation and execution the two coincide; making the list load-bearing is a render-side semantics change (design-sensitive), out of scope for a docs-honesty remediation. | §3.4 identity is relied on for audit of what a run read; fix = render partition predicates onto raw sources, or record actually-read partitions post-run. |

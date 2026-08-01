@@ -22,3 +22,17 @@ def test_values_distinguished():
 def test_rejects_non_mapping():
     with pytest.raises(TypeError):
         materialize_hash([1])  # type: ignore[arg-type]
+
+
+def test_nested_mapping_views_hash_like_plain_dicts():
+    """The signature says ``Mapping`` — a nested read-only view is the same identity.
+
+    ``filter_tree`` payloads arrive as ``Mapping`` and a caller handing out
+    ``MappingProxyType`` views (the package's own read-only convention) must not
+    fork the hash or crash inside it.
+    """
+    from types import MappingProxyType
+    plain = {"filter": {"op": "and", "children": [{"left": "x"}]}}
+    proxied = {"filter": MappingProxyType({"op": "and",
+               "children": [MappingProxyType({"left": "x"})]})}
+    assert materialize_hash(plain) == materialize_hash(proxied)

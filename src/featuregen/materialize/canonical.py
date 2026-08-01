@@ -30,6 +30,19 @@ from featuregen.formula._jcs import dumps as _jcs_dumps
 __all__ = ["materialize_hash"]
 
 
+def _plain(value: Any) -> Any:
+    """Deep-convert Mappings to dicts and sequences to lists; everything else passes through.
+
+    Scalars are untouched, so a plain-dict payload canonicalizes to the exact
+    bytes it always did — this changes what is ACCEPTED, never what is hashed.
+    """
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
 def materialize_hash(payload: Mapping[str, Any]) -> str:
     """``sha256`` hex digest of ``payload``'s RFC 8785 canonical JSON bytes.
 
@@ -46,6 +59,9 @@ def materialize_hash(payload: Mapping[str, Any]) -> str:
         raise TypeError(
             f"materialize_hash requires a mapping, got {type(payload).__name__}"
         )
-    # `_jcs.dumps` dispatches on `isinstance(obj, dict)`, so a non-dict Mapping
-    # would otherwise fall through to its "unsupported type" branch.
-    return hashlib.sha256(_jcs_dumps(dict(payload))).hexdigest()
+    # `_jcs.dumps` dispatches on `isinstance(obj, dict)` / `isinstance(obj, list)`
+    # at EVERY level, so a non-dict Mapping (or a tuple) anywhere in the tree —
+    # not just at the top — would fall through to its "unsupported type" branch.
+    # `_plain` deep-converts the whole payload first; the vendored `_jcs` stays
+    # untouched.
+    return hashlib.sha256(_jcs_dumps(_plain(dict(payload)))).hexdigest()

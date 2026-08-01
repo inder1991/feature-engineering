@@ -658,6 +658,15 @@ def test_the_execution_hash_is_reproducible_for_one_prepared_run() -> None:
     assert _ok(_prepared()).sandbox_execution_hash == _ok(_prepared()).sandbox_execution_hash
 
 
+def test_business_dt_whitespace_does_not_fork_execution_identity() -> None:
+    """One day, one identity: `_business_date` canonicalizes the date everywhere ELSE (the covered
+    parameters, every snapshot id), so the raw caller spelling reaching the hash would make two
+    spellings of one run two execution identities while every covered value agrees they are one."""
+    a = _ok(_prepared(business_dt=BUSINESS_DT))
+    b = _ok(_prepared(business_dt=f" {BUSINESS_DT} "))
+    assert a.parameters["sandbox_execution_hash"] == b.parameters["sandbox_execution_hash"]
+
+
 def test_a_different_GENERATION_or_RUN_moves_the_execution_hash() -> None:
     baseline = _ok(_prepared()).sandbox_execution_hash
     assert _ok(_prepared(generation_id="gen-0002")).sandbox_execution_hash != baseline

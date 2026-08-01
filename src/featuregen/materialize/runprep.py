@@ -250,9 +250,13 @@ class PhysicalInputSnapshot:
         """One entry of the ``input_snapshots`` run parameter (§11.1).
 
         This is the shape Task 13a declined to invent (A.16): it names the read, the expression it
-        belongs to and the physical table, so the generated project can apply exactly these
-        predicates and prove afterwards that it read precisely them. It carries no data value and
-        no location — a location is a catalog entry, and a value is what the run computes.
+        belongs to and the physical table. It is prepared EVIDENCE, not an enforced read scope:
+        the set is resolved here at preparation and consumed by L1's ``PARTITION_ABSENT`` check
+        (the same resolved partitions must still exist at validation time); the rendered nodes
+        filter by the window/availability predicates and do not re-apply the snapshot list, so
+        nothing proves afterwards that the run read precisely these partitions (DEFERRED-WORK
+        A.31). It carries no data value and no location — a location is a catalog entry, and a
+        value is what the run computes.
         """
         return {
             "snapshot_id": self.snapshot_id(),
@@ -882,7 +886,7 @@ def prepare_run(
             f"additional run parameters overwrite owned parameters: {sorted(overlap)}")
     execution_hash = sandbox_execution_hash(
         rendered, environment_id=inventory.environment_id, parameters={**covered, **extras},
-        business_dt=business_dt, input_snapshot_ids=input_snapshot_ids(snapshots),
+        business_dt=covered["business_dt"], input_snapshot_ids=input_snapshot_ids(snapshots),
         capability_attestation_id=capability_attestation_id)
 
     parameters = {**covered, **extras, "sandbox_execution_hash": execution_hash}
