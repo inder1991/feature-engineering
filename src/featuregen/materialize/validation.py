@@ -819,6 +819,9 @@ def run_l1(
 
     findings: list[ValidationFinding] = []
     try:
+        # Finding locations spell schema.table FOLDED (Hive-canonical, the read-set key) for the
+        # read/column/type findings below, and in the snapshot requirement's OWN spelling for
+        # PARTITION_ABSENT — intentional: two observed casings have no single observed spelling.
         denied: set[tuple[str, str]] = set()
         for (schema, table), columns in _read_set(irs, spine, spine_table).items():
             if not metastore.can_read(schema=schema, table=table, roles=tuple(roles)):

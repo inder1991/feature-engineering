@@ -23,14 +23,18 @@ def yaml_scalar(value: str) -> str:
 
     Control characters are ESCAPED, never emitted raw: a raw newline inside a double-quoted YAML
     scalar folds to a space, so ``cust\\nomers`` would silently become the different table name
-    ``cust omers`` — a value that changed with nothing anywhere saying so. Anything else below
-    0x20 (and DEL) becomes ``\\xNN``, which double-quoted YAML reads back as the same character.
+    ``cust omers`` — a value that changed with nothing anywhere saying so. The C1 block is covered
+    too, and for both of its failure shapes: NEL (0x85) is a YAML 1.1 line break, so a raw one
+    FOLDS exactly like ``\\n``, while the rest of C1 makes the reader refuse the whole catalog.
+    Everything below 0x20, plus DEL through 0x9f, becomes ``\\xNN``, which double-quoted YAML
+    reads back as the same character. (U+2028/U+2029 round-trip unchanged — verified — so the
+    range stops at 0x9f.)
     """
     out: list[str] = []
     for ch in str(value):
         if ch in _ESCAPES:
             out.append(_ESCAPES[ch])
-        elif ord(ch) < 0x20 or ch == "\x7f":
+        elif ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f:
             out.append(f"\\x{ord(ch):02x}")
         else:
             out.append(ch)

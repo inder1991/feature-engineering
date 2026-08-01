@@ -13,14 +13,17 @@ import yaml
 from featuregen.materialize.render._yaml import yaml_scalar
 
 #: One hostile value per control-character family: newline (folds), tab (illegal in YAML),
-#: carriage return (folds), ESC (C0), DEL (0x7f), NUL (C0 floor).
-HOSTILE = ("cust\nomers", "a\tb", "c\rd", "e\x1bf", "del\x7fete", "nul\x00led")
+#: carriage return (folds), ESC (C0), DEL (0x7f), NUL (C0 floor) — and the C1 block: NEL (0x85)
+#: is a YAML 1.1 line break too, so a raw one FOLDS to a space exactly like ``\n``, while the
+#: rest of C1 (0x80-0x84, 0x86-0x9f) makes PyYAML's reader refuse the whole document.
+HOSTILE = ("cust\nomers", "a\tb", "c\rd", "e\x1bf", "del\x7fete", "nul\x00led",
+           "cust\x85omers", "\x80", "\x9f")
 
 
 def test_control_characters_cannot_change_the_value() -> None:
     for hostile in HOSTILE:
         scalar = yaml_scalar(hostile)
-        assert "\n" not in scalar and "\r" not in scalar and "\t" not in scalar, (
+        assert not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f for ch in scalar), (
             f"{hostile!r} rendered with a RAW control character: {scalar!r}")
         assert yaml.safe_load(scalar) == hostile, (
             f"{hostile!r} round-tripped to a DIFFERENT value through {scalar!r}")

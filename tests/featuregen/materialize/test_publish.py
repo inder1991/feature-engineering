@@ -42,6 +42,7 @@ from tests.featuregen.materialize.test_group_plan import (
     _plan,
 )
 
+from featuregen.materialize import binding
 from featuregen.materialize import publish as publish_module
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import (
@@ -579,6 +580,20 @@ def test_the_publication_target_is_DERIVED_from_the_plan_not_passed(
     assert "published_target" not in inspect.signature(render_publish).parameters
     rendered = render_publish(_plan(), selection=selection)
     assert f"sandbox_feature.{GROUP}" in rendered
+
+
+def test_a_dotted_namespace_keeps_the_filepath_tail_a_BARE_table(
+        selection: PublisherSelection, monkeypatch) -> None:
+    """`split(".", 1)` on `lake.sandbox_feature.cif_daily` yields the tail
+    `sandbox_feature.cif_daily` — a path segment carrying half the namespace. The LAST dot
+    separates namespace from table: the sandbox namespace may itself be catalog-qualified, and
+    the group name (a hive identifier) never carries a dot."""
+    monkeypatch.setattr(binding, "SANDBOX_NAMESPACE", "lake.sandbox_feature")
+    rendered = render_publish(_plan(), selection=selection)
+    filepath = next(line for line in rendered.splitlines()
+                    if line.lstrip().startswith("filepath:"))
+    assert filepath.rstrip().endswith(f'/{GROUP}"'), filepath
+    assert f"sandbox_feature.{GROUP}" not in filepath, filepath
 
 
 def test_a_mechanism_with_no_attested_rendering_is_refused(db) -> None:
