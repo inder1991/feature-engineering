@@ -1061,23 +1061,38 @@ CONCEPT_REGISTRY: dict[str, Concept] = {c.name: c for c in _ALL}
 CONCEPTS: frozenset[str] = frozenset(CONCEPT_REGISTRY)
 
 
-def _validate_registry() -> None:
+def _validate_registry(records: tuple[Concept, ...] = _ALL) -> None:
     """Fail fast at import if the registry drifts: no duplicate names, every ``is_a`` resolves to a
-    real concept, and the flat ``CONCEPTS`` set mirrors the registry keys."""
-    seen: set[str] = set()
-    for c in _ALL:
-        if c.name in seen:
+    real concept, the ``is_a`` graph is ACYCLIC, and the flat ``CONCEPTS`` set mirrors the registry
+    keys. ``records`` defaults to the live registry; tests validate synthetic tuples."""
+    by_name: dict[str, Concept] = {}
+    for c in records:
+        if c.name in by_name:
             raise ValueError(f"duplicate concept name {c.name!r}")
-        seen.add(c.name)
-        if c.is_a is not None and c.is_a not in seen and c.is_a not in {x.name for x in _ALL}:
-            raise ValueError(f"concept {c.name!r} has unresolved is_a {c.is_a!r}")
+        by_name[c.name] = c
         # Three-axis model: namespace <=> identifier. An identifier without a value space cannot
         # participate in join candidacy; a namespace on a non-identifier is a modelling bug.
         if c.group == "identifier" and not c.namespace:
             raise ValueError(f"identifier concept {c.name!r} declares no namespace")
         if c.group != "identifier" and c.namespace is not None:
             raise ValueError(f"non-identifier concept {c.name!r} declares namespace {c.namespace!r}")
-    if CONCEPTS != frozenset(CONCEPT_REGISTRY) or len(_ALL) != len(CONCEPT_REGISTRY):
+    for c in records:
+        if c.is_a is not None and c.is_a not in by_name:
+            raise ValueError(f"concept {c.name!r} has unresolved is_a {c.is_a!r}")
+    # Every is_a chain must terminate: the old check added each name to `seen` BEFORE testing it,
+    # so a self-loop (is_a = own name) and mutual loops validated — and a chain-walking consumer
+    # (concept_path, taxonomy derivation) would spin forever.
+    for c in records:
+        chain = [c.name]
+        cur = c.is_a
+        while cur is not None:
+            if cur in chain:
+                raise ValueError(
+                    f"concept {c.name!r} has an is_a cycle: {' -> '.join([*chain, cur])}")
+            chain.append(cur)
+            cur = by_name[cur].is_a
+    if records is _ALL and (
+            CONCEPTS != frozenset(CONCEPT_REGISTRY) or len(_ALL) != len(CONCEPT_REGISTRY)):
         raise ValueError("CONCEPTS must mirror CONCEPT_REGISTRY keys (no dropped duplicates)")
 
 

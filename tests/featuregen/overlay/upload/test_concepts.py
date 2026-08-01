@@ -339,3 +339,45 @@ def test_party_role_vocabulary_is_closed_and_token_derived():
     assert normalize_party_role("counter_party_cif_id") is PartyRole.COUNTERPARTY
     assert normalize_party_role("cust_swift_cd") is PartyRole.SUBJECT
     assert normalize_party_role("tran_amt") is None          # ambiguous/off-vocab -> honest None
+
+
+# ── Task 0.6 Seam 5b: the is_a graph must be ACYCLIC. `seen.add(c.name)` ran BEFORE the membership
+# test, so a self-loop (is_a = own name) and an A<->B mutual loop both validated at import. ──
+
+def test_registry_rejects_an_is_a_self_loop():
+    import pytest
+    from featuregen.overlay.upload.concepts import _validate_registry
+    with pytest.raises(ValueError, match="cycle"):
+        _validate_registry((Concept("loopy", "monetary", is_a="loopy"),))
+
+
+def test_registry_rejects_a_mutual_is_a_cycle():
+    import pytest
+    from featuregen.overlay.upload.concepts import _validate_registry
+    with pytest.raises(ValueError, match="cycle"):
+        _validate_registry((
+            Concept("alpha", "monetary", is_a="beta"),
+            Concept("beta", "monetary", is_a="alpha"),
+        ))
+
+
+def test_registry_accepts_a_valid_is_a_chain():
+    from featuregen.overlay.upload.concepts import _validate_registry
+    _validate_registry((
+        Concept("root", "monetary"),
+        Concept("mid", "monetary", is_a="root"),
+        Concept("leaf", "monetary", is_a="mid"),          # forward+backward refs both legal
+    ))
+
+
+def test_registry_still_rejects_an_unresolved_is_a():
+    import pytest
+    from featuregen.overlay.upload.concepts import _validate_registry
+    with pytest.raises(ValueError, match="unresolved"):
+        _validate_registry((Concept("orphan", "monetary", is_a="nowhere"),))
+
+
+def test_current_registry_validates():
+    # import-time regression: the SHIPPED registry must survive the stricter cycle check
+    from featuregen.overlay.upload.concepts import _validate_registry
+    _validate_registry()

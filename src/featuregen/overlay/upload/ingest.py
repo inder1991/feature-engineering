@@ -971,6 +971,22 @@ def _schema_by_table(glossary: GlossaryUpload | None) -> dict[str, str]:
     return out
 
 
+def _evidence_bearing_table_refs(conn, expected_refs: Sequence[str]) -> list[str]:
+    """The subset of ``expected_refs`` — this upload's schema-agreeing TABLE logical refs — that
+    still carry ACTIVE field evidence (Task 0.6 Seam 5a). These are the table display projections
+    ``build_graph``'s DELETE just wiped: their evidence/decisions survive, so they must re-project
+    on EVERY upload, not only under Pass B or a matching glossary table term. Keyed on the exact
+    refs (indexed ``= ANY``), which also honors the [F8] schema fence — evidence recorded under a
+    schema this upload's columns do not declare is left alone."""
+    expected = sorted(set(expected_refs))
+    if not expected:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT logical_ref FROM field_evidence "
+        "WHERE lifecycle = 'active' AND logical_ref = ANY(%s)", (expected,)).fetchall()
+    return sorted(r[0] for r in rows)
+
+
 def _source_is_schema_less(conn, catalog_source: str) -> bool:
     """True iff ``catalog_source`` already holds column nodes and NONE carry a ``schema_name`` — a
     schema-less TECHNICAL source (built by a plain technical CSV upload; build_graph writes
@@ -1521,7 +1537,8 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                               glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
                               concepts: dict[str, str] | None, snapshot_id: str,
                               now: datetime | None, stats: dict | None = None,
-                              changed_sink: list[ChangedRef] | None = None) -> int:
+                              changed_sink: list[ChangedRef] | None = None,
+                              projected_table_sink: set[str] | None = None) -> int:
     """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
     revalidation on a material change, project ``semantic_terms`` into search (Task 8), then
     resolve-and-project + a readiness diagnostic (spec §6.3).
@@ -1711,6 +1728,9 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     try:
         with conn.transaction():
             resolve_and_project(conn, source=source, logical_refs=attachable_refs, now=now)
+        if projected_table_sink is not None:   # Seam 5a: the projected TABLE-term refs, on success
+            projected_table_sink.update(
+                ref for ref in attachable_refs if parse_ref(ref)[3] is None)
     except Exception:  # noqa: BLE001 — resolver failure: continue with the raw graph (degraded)
         contained_failures += 1
         logger.warning("advisory resolve_and_project failed for %r — graph left with raw nodes "
@@ -2437,6 +2457,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # MF-5: the Pass B syntheses drive the truthful proposed/abstained split at the success return.
     # Initialised empty so it is ALWAYS in scope — Pass B off, no client, or an advisory failure
     # before it binds all leave `syntheses` at {} (proposed == abstained == 0).
+    # Task 0.6 Seam 5a: TABLE logical refs a stage this round already resolve_and_project-ed
+    # (Pass B below; the glossary table-term pass), so the unconditional table display
+    # re-projection at the tail skips them instead of appending duplicate decision events.
+    projected_table_refs: set[str] = set()
     syntheses: dict = {}
     if not table_synth_enabled():
         record_stage(stage_recorder, "pass_b", "disabled")
@@ -2528,6 +2552,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     for t in sorted({r.table for r in vr.good})]
                 resolve_and_project(conn, source=catalog_source, logical_refs=pass_b_table_refs,
                                     now=now)
+            # committed (savepoint released): the tail re-projection must not double these refs
+            projected_table_refs.update(pass_b_table_refs)
             # [F12] totality: a table that never RESOLVED (egress-excluded, provider-failed,
             # timed out, whole-rejected raw, or missing from the batch result — run_batched
             # returns resolved refs only) has no disposition records; give it the uniform five
@@ -2562,7 +2588,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             contained = _ingest_glossary_evidence(
                 conn, source=catalog_source, rows=vr.good, glossary=glossary,
                 bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now,
-                stats=glossary_stats, changed_sink=deferred_invalidations)
+                stats=glossary_stats, changed_sink=deferred_invalidations,
+                projected_table_sink=projected_table_refs)
             # The helper CONTAINS per-column failures (savepoint + warning); `partial` surfaces
             # them instead of laundering the outer no-raise as success (#22). A table-term schema
             # mismatch is NOT a failure (the upload still succeeds) but IS surfaced in the detail so
@@ -2602,6 +2629,29 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory technical evidence wiring failed for %r — facts + graph "
                            "intact", catalog_source, exc_info=True)
+
+    # Task 0.6 Seam 5a: build_graph recreated every table node with NULL display columns, and the
+    # only table-ref reprojections above are Pass-B-gated (table_synth_enabled, default OFF) or
+    # scoped to THIS glossary's table terms — so a plain re-upload wiped confirmed table display
+    # projections (table_role / primary_entity / event_or_snapshot / domain ...) whose evidence and
+    # decisions survive untouched. Re-project every schema-agreeing table ref that still carries
+    # ACTIVE field evidence, UNCONDITIONALLY; refs a stage above already projected this round are
+    # skipped (no duplicate decision events). Savepointed fail-soft: never fails the upload.
+    try:
+        with conn.transaction():
+            _schema_of = _schema_by_table(glossary)
+            _expected_table_refs = {
+                normalize_ref(catalog_source, _schema_of.get(t.strip().lower()), t)
+                for t in {r.table for r in vr.good}}
+            _pending_table_refs = sorted(
+                set(_evidence_bearing_table_refs(conn, sorted(_expected_table_refs)))
+                - projected_table_refs)
+            if _pending_table_refs:
+                resolve_and_project(conn, source=catalog_source,
+                                    logical_refs=_pending_table_refs, now=now)
+    except Exception:  # noqa: BLE001 — advisory: display re-projection never fails an upload
+        logger.warning("advisory table display re-projection failed for %r — evidence intact",
+                       catalog_source, exc_info=True)
 
     entity_bridges_proposed = 0
     entity_bridge_derivation = BridgeCandidateDerivationV1(
