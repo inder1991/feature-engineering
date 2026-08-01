@@ -564,9 +564,11 @@ def select_publisher(
       no probe demonstrated a failure on 3.5 either.
     * **a matching attestation exists and it FAILED** ⇒ ``PUBLISH_MECHANISM_UNSUPPORTED``. The probe
       ran and demonstrated this mechanism does not satisfy atomic visibility here; the design must
-      change rather than the claim. Scoped to the mechanism asked about — this function is asked
-      about one, and reporting on mechanisms nobody enquired after would be a verdict about
-      capability nobody probed for.
+      change rather than the claim. The NEWEST matching attestation carries the verdict: an older
+      pass does not outlive a later probe that demonstrated failure on identical versions (the
+      mirror of a later pass overriding an earlier failure). Scoped to the mechanism asked about —
+      this function is asked about one, and reporting on mechanisms nobody enquired after would be
+      a verdict about capability nobody probed for.
     * **the publication adds a column and the passing attestation does not cover schema
       evolution** ⇒ ``CAPABILITY_UNPROVEN``. A partition-location swap does not atomically change
       table schema, so what was proven is not what is about to happen.
@@ -617,6 +619,17 @@ def select_publisher(
             f"{len(attestations)} attestation(s) recorded for mechanism {mechanism.value} were "
             f"probed on {probed}: a mechanism proven on one engine version is not proven on "
             f"another, so the probe must be re-run on what the environment runs now")
+
+    # `read_attestations` returns rows ordered by `recorded_at` and `matching` preserves that
+    # order, so `matching[-1]` is the NEWEST evidence on exactly these versions. If it failed,
+    # an older pass is a claim the latest probe has already contradicted.
+    newest = matching[-1]
+    if not newest.passed:
+        return MaterializationRefused(
+            PublicationRefusalCode.PUBLISH_MECHANISM_UNSUPPORTED,
+            f"the most recent probe on these engine versions ({newest.attestation_id}) "
+            f"demonstrated the mechanism failing; earlier passing evidence is stale, re-run the "
+            f"probe")
 
     passing = [attestation for attestation in matching if attestation.passed]
     if not passing:

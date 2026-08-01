@@ -377,6 +377,34 @@ def test_a_later_PASSING_probe_overrides_an_earlier_failure(db) -> None:
     assert isinstance(_select(db), PublisherSelection)
 
 
+def test_a_later_FAILING_probe_defeats_an_earlier_pass(db) -> None:
+    """The mirror of the test above: the most recent evidence on IDENTICAL engine versions says
+    the mechanism is broken, so publication must not proceed on stale success. The earlier pass
+    here even covers schema evolution — the covering branch must not resurrect it either."""
+    _record(db, _schema_evolution_run(), probe_id="probe-passed")
+    torn = _clean_swap()
+    torn[1] = _observation("reader-2", "gen-A", columns=_NARROW, digest="digest-half-written")
+    _record(db, torn, probe_id="probe-failed")
+    refused = _select(db)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is PublicationRefusalCode.PUBLISH_MECHANISM_UNSUPPORTED
+    assert "probe-failed" in refused.detail
+
+
+def test_the_newest_failure_refuses_even_when_nothing_is_being_added(db) -> None:
+    """Same inversion on the no-schema-change branch (`adds_feature=False`): the stale pass would
+    be `passing[-1]` there, so the newest-evidence check must sit ahead of BOTH selection arms."""
+    plan = _plan()
+    _record(db, _clean_swap(), probe_id="probe-passed")
+    torn = _clean_swap()
+    torn[1] = _observation("reader-2", "gen-A", columns=_NARROW, digest="digest-half-written")
+    _record(db, torn, probe_id="probe-failed")
+    refused = _select(db, group_plan=plan, published_schema=_published_columns(plan))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is PublicationRefusalCode.PUBLISH_MECHANISM_UNSUPPORTED
+    assert "probe-failed" in refused.detail
+
+
 def test_one_probe_can_support_at_most_one_attestation(db) -> None:
     result = _result(_schema_evolution_run())
     record_attestation(db, result)
