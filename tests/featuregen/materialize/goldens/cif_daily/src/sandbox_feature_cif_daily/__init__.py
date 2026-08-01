@@ -16,11 +16,11 @@ COMPILATION_IDENTITY = {
         'e53124ea18b2fc274434f799a1ee2802c2d169d4c53896629d8dabc652c63a86',
         '82fda384fe8b0121521226572e35171db903f3a81739bf7bf22a4824c0ca051f',
     ],
-    'group_plan_hash': '26e02cc9dd958512ed13c5d4b6f4314866f4e17f31fb0249bde245b636bd94db',
+    'group_plan_hash': '047f7cede3dc15777f4eebbf6e8cb8608d183f89d862f7879ba95722da9825ea',
     'ir_hashes': [
         'a5b257ab3e2f42a21c4d007bb2f308d278b5a8f4fedfccb624eb89cc689cbd8a',
         '57306f2b2fd8eb6a2660d54ab6e7f564f67242172a9da4d788db2e51a6cc0e3d',
         '985525a5f1410a2031049fbe3aa64866b83e3c2ab0f23c0a4f39bbf4db2889dc',
     ],
-    'materialization_contract_hash': '2c9c4f8ab6236c0fcd6f04e21d81bf563178b4b829acb07a9c3673a874f2f803',
+    'materialization_contract_hash': '421f373b2c76fd2b37e9251cb6238d11c908f42589cabf12bb860e98d38d1327',
 }

@@ -217,8 +217,13 @@ def test_the_policy_version_is_a_declared_constant():
     to "EVERY arithmetic operand carries a GOVERNED exact-numeric type". A float denominator that
     resolved to ``DECIMAL`` under version 1 refuses under version 2, so a contract keyed on the old
     version describes a column decided by a rule that no longer applies.
+
+    **3**, not 2: ratio + ``half_even`` now refuses (Spark's division rounds HALF_UP before any
+    explicit call — DEFERRED-WORK A.28). The same accept→refuse shape that separated 1 from 2: a
+    version-2 ratio column claiming ``half_even`` carries a mode the engine never applied, so a
+    contract keyed on 2 is not interchangeable with one keyed on 3.
     """
-    assert PHYSICAL_TYPE_POLICY_VERSION == 2
+    assert PHYSICAL_TYPE_POLICY_VERSION == 3
 
 
 # ── counts → BIGINT ──────────────────────────────────────────────────────────────────────────────

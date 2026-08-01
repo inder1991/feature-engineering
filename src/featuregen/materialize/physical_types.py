@@ -113,7 +113,14 @@ __all__ = [
 #: ``DECIMAL`` under version 1 can refuse under version 2 — a float denominator was invisible to the
 #: word, and an ungoverned operand type was accepted — so the two versions are not interchangeable
 #: and a contract keyed on the old one describes a column decided by a rule that no longer applies.
-PHYSICAL_TYPE_POLICY_VERSION = 2
+#:
+#: **3** (codegen-review Task 8): a RATIO declaring ``HALF_EVEN`` rounding now REFUSES — Spark's
+#: decimal division rounds HALF_UP at the result scale before any explicit rounding call runs, so
+#: the declared mode was recorded but never applied. A ratio + half_even formula that resolved
+#: under version 2 refuses under version 3, and the version-2 column it described carries a
+#: rounding claim the engine did not honour — the same accept→refuse non-interchangeability that
+#: separated 1 from 2 (DEFERRED-WORK A.28).
+PHYSICAL_TYPE_POLICY_VERSION = 3
 
 #: The maximum precision a Hive/Spark ``DECIMAL`` can hold. A policy above it is not representable.
 _MAX_DECIMAL_PRECISION = 38
