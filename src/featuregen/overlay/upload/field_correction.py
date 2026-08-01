@@ -40,7 +40,7 @@ from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import Command
 from featuregen.contracts.identity import IdentityEnvelope
 from featuregen.overlay.evidence import AssertionStrength, EvidenceLifecycle, EvidenceProducer
-from featuregen.overlay.field_authority import InfluenceTier
+from featuregen.overlay.field_authority import InfluenceTier, evaluate
 from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
     read_field_decisions,
@@ -134,8 +134,12 @@ def _assert_set_advisory_allowlist(fields: frozenset[str] = SET_ADVISORY_FIELDS)
 _assert_set_advisory_allowlist()
 
 # [5] the PROJECTING actions — each re-projects (or clears) the field's governed display column, which
-# H2c hashes as contract-dependency state. ``propose_override`` is the sole non-projecting action (it
-# only surfaces a pending proposal), so it never invalidates a dependent contract.
+# H2c hashes as contract-dependency state. ``propose_override`` stays OUTSIDE this set deliberately:
+# for most fields it only surfaces a pending proposal (no projection at all), and for the three
+# proposal-DISPLAYING profile fields ([F3] — business_context / authority_role /
+# temporal_storage_model) the display it refreshes lives on TABLE nodes, which no ``column_field``
+# metadata snapshot hashes — so no dependent-contract state can change and no invalidation applies
+# (the Release-B ``dataset_profile`` snapshot kind revisits this when table-level pins exist).
 _PROJECTING_ACTIONS: frozenset[str] = frozenset({"confirm_existing", "confirm_override", "reject"})
 
 # [F11] the correctable fields whose INGESTION-STAGE counterpart the D2 semantic-binding shortlist
@@ -373,8 +377,8 @@ def apply_field_correction(
     # 7. Action-specific validation (bounds / selection / four-eyes) BEFORE any write, then effect. The
     #    reviewer ``note`` (M-9) is persisted on the appended human-action evidence row by each helper.
     if action == "propose_override":
-        projected = _propose_override(conn, logical_ref, field, replacement_value, actor,
-                                      idempotency_key, input_hash, note)
+        projected = _propose_override(conn, norm_source, logical_ref, field, replacement_value,
+                                      actor, idempotency_key, input_hash, note)
     elif action == "confirm_override":
         projected = _confirm_override(conn, norm_source, logical_ref, field, replacement_value,
                                       actor, idempotency_key, input_hash, note)
@@ -523,13 +527,27 @@ def _supersede_own_prior_proposal(
     return cur.rowcount
 
 
+#: [F3] The singleton (producer, strength) pair a bare human proposal contributes — evaluated
+#: against a field's display_rule to decide whether a pending proposal is DISPLAYABLE.
+_HUMAN_PROPOSED_PAIR = frozenset({(EvidenceProducer.HUMAN, AssertionStrength.PROPOSED)})
+
+
 def _propose_override(
-    conn: DbConn, logical_ref: str, field: str, replacement_value: str | None,
+    conn: DbConn, source: str, logical_ref: str, field: str, replacement_value: str | None,
     actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool:
-    """Append a NON-load-bearing HUMAN/PROPOSED override + surface it for review; do NOT project (a
-    later ``confirm_override`` by a DIFFERENT subject projects). HUMAN/PROPOSED is absent from every
-    display/operational rule, so this proposal is neither shown nor load-bearing until confirmed.
+    """Append a NON-load-bearing HUMAN/PROPOSED override + surface it for review. A later
+    ``confirm_override`` by a DIFFERENT subject is what makes it load-bearing.
+
+    [F3] Projection parity with the asset-profile PUT: for most fields HUMAN/PROPOSED is absent
+    from every display/operational rule, so a bare proposal is neither shown nor load-bearing and
+    this helper does NOT project. The three profile fields (``business_context`` /
+    ``authority_role`` / ``temporal_storage_model``) DO render proposals (their display_rule
+    admits human/proposed — the no-"blocked" rule), and the PUT path re-projects them — so this
+    path must too, or identical evidence leaves different graph state and the strict
+    ``profile_reconcile`` report flags every pending four-eyes proposal as drift. The gate is the
+    registered policy itself (does the display_rule pass on a lone human/proposed pair?), never a
+    hardcoded field list. Returns whether it projected.
 
     [F1] Re-proposing supersedes the SAME subject's prior ACTIVE proposal for this field first
     (same transaction) — identical behavior to the asset-profile PUT path, so the two propose
@@ -542,7 +560,12 @@ def _propose_override(
         conn, logical_ref=logical_ref, field=field, value=replacement_value,
         strength=AssertionStrength.PROPOSED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
         idempotency_key=idempotency_key, input_hash=input_hash, spans=[], note=note)
-    return False  # not projected — the pending proposal IS the review item
+    policy = policy_for(field)
+    assert policy is not None   # apply_field_correction validated the field before dispatch
+    if not evaluate(policy.display_rule, _HUMAN_PROPOSED_PAIR):
+        return False  # not displayable — the pending proposal IS the review item, nothing to show
+    resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field])
+    return True
 
 
 def _confirm_override(

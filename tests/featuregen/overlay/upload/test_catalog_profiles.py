@@ -273,6 +273,35 @@ def test_reconcile_is_clean_after_a_normal_confirm(db):
     assert _reconcile_module().reconcile(db) == []
 
 
+def test_reconcile_is_clean_while_a_four_eyes_proposal_is_pending(db):
+    """F3: propose via the decisions route now projects a proposal-DISPLAYING field exactly like
+    the profile PUT does — identical evidence leaves identical graph state, so the strict
+    reconcile report stays silent for a pending four-eyes proposal instead of printing three
+    divergence lines per proposal. The audit itself is unchanged (no special-casing)."""
+    _seed_graph(db)
+    _correct(db, "authority_role", "propose_override", ADMIN_A, "pp-1",
+             replacement_value="derived")
+    row = db.execute(
+        "SELECT authority_role FROM graph_node WHERE catalog_source = %s AND object_ref = %s "
+        "AND kind = 'table'", (_SRC, _TABLE_OBJECT_REF)).fetchone()
+    assert row is not None and row[0] == "derived"   # visible + labeled (no-blocked rule)
+    assert _reconcile_module().reconcile(db) == []
+
+
+def test_propose_on_a_non_proposal_displaying_field_still_does_not_project(db):
+    """The F3 parity rule is scoped to fields whose display rule renders HUMAN/PROPOSED: a
+    field like `domain` (display from llm/source-proposed or human-CONFIRMED only) keeps the
+    pre-existing behavior — no projection until confirmed — and reconcile stays silent in
+    BOTH directions (no new false positive either way)."""
+    _seed_graph(db)
+    _correct(db, "domain", "propose_override", ADMIN_A, "pd-1", replacement_value="lending")
+    row = db.execute(
+        "SELECT domain FROM graph_node WHERE catalog_source = %s AND object_ref = %s "
+        "AND kind = 'table'", (_SRC, _TABLE_OBJECT_REF)).fetchone()
+    assert row is not None and row[0] is None        # untouched by a bare proposal
+    assert _reconcile_module().reconcile(db) == []
+
+
 def test_reconcile_detects_a_tampered_graph_projection(db):
     _seed_graph(db)
     _confirm_authority(db)
