@@ -181,8 +181,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | 1048 | profile Task 7 — serving policy store |
 | 1049 | profile Task 7 — temporal policy store |
 | 1050 | Release C Task 10 — crosswalk store |
+| 1051 | D13 — `graph_node` display-projection columns `bian_path`, `process_path`, `sub_domain` (joint Task 4 / profile Task 5) |
 
-New needs append 1051+ to this table FIRST (edit this doc in the same commit as the migration).
+New needs append 1052+ to this table FIRST (edit this doc in the same commit as the migration).
 
 ## D8. Flag matrix
 
@@ -291,3 +292,42 @@ New needs append 1051+ to this table FIRST (edit this doc in the same commit as 
     narrative revision id — so narrative edits DO re-key dataset profiles (accepted: narrative is
     meaning-bearing) but do NOT invalidate feature snapshots, which pin the decision refs of D6,
     revalidated at execution.
+
+## D13. Product decisions 2026-08-01 — fine-grained classification axes
+
+Background: both live source files declare `data_domain` uniformly (FTR = Compliance × 127 rows,
+CIB = Customer × 111 rows), so `domain` is a two-value coarse axis by uploader authority — which
+source-over-LLM precedence rightly preserves. The fine-grained taxonomy already in the files is
+the per-column BIAN levels and business-process paths, captured today as source evidence
+(`bian_path`, `process_path`, `fibo_path`). User decision: adopt BOTH of the following; neither
+changes domain precedence.
+
+**D13.1 — BIAN/process as a first-class searchable axis (owner: profile Task 5 step).**
+- Migration 1051 adds rebuildable `graph_node` display-projection columns `bian_path`,
+  `process_path` (the facet mechanism requires literal columns; projections follow the existing
+  table display-column pattern and ride the `table_display_reprojection`/resolution path — never
+  authoritative, always rebuildable from evidence).
+- Search: facet + filter on both (facet values are the stored " > "-joined paths; a hierarchical
+  L1/L2 facet UI may segment on the delimiter client-side — no new server vocabulary). Read scope
+  identical to other column facets.
+- Data-agent retrieval (semantic Task 9): BIAN/process terms join the leg-2/leg-3 controlled
+  semantic expansion inputs.
+- Display: already shipped (dossier source-glossary section); no new UI surface required beyond
+  the facet controls.
+
+**D13.2 — LLM sub-domain proposals beside the source domain (owner: joint Task 4 step).**
+- NEW field `sub_domain`, recommendation/display tier exactly like `domain` (LLM visible,
+  human-editable via existing four-eyes, never load-bearing, never overwrites `domain`). Source
+  `domain` stays the coarse governed axis; `sub_domain` is a finer LLM-proposed axis rendered
+  with its `llm_proposed` authority label per the no-blocked rule.
+- Produced by the existing Pass-A domain task extended per D10 discipline: a REAL new schema
+  version body (per-column `sub_domain` beside the table-first `domain`/`column_domains` shape),
+  prompt version bump, registration before request, golden payload tests. No second LLM call.
+- `graph_node.sub_domain` display projection rides migration 1051; facet added in the same
+  profile-Task-5 step as D13.1 once populated.
+- Population requires the Gate-B re-enrichment run (live LLM spend — already governed by that
+  approval; witnesses: `counter_party_bic`, `pstd_date`-family temporal columns, and at least one
+  CIB flag column should receive sub-domains finer than Customer/Compliance).
+- Closed-vocabulary option deliberately deferred: sub_domain v1 is free-text-constrained-by-prompt
+  like `domain`; a curated sub-domain list becomes a `_KNOWN_VOCAB_VALIDATORS` entry later if the
+  bank supplies one (record as a deferred item at the joint step, not silently).
