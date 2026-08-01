@@ -977,19 +977,35 @@ executing (standing rule: never upload/deploy without explicit approval).
   (`DESCRIBE`/information_schema via the existing executor+dialects), recording the observation
   ref; `type_basis` derivations everywhere then see `attested`.
 
-- [ ] **Step 1: Failing tests:** an observation carrying engine-reported types upgrades
+- [x] **Step 1: Failing tests:** an observation carrying engine-reported types upgrades
   `data_type` and records provenance; a declared-only column is never upgraded; re-running with a
   CHANGED engine type does not silently overwrite — it records a conflict for drift handling.
-- [ ] **Step 2: Implement + dialect rendering tests** (Hive `DESCRIBE` vs Postgres
+  *(Executed 2026-08-01: `tests/featuregen/overlay/upload/test_type_attestation.py` — 9 tests,
+  written failing-first; also pins the downstream `type_basis` declared→attested flip on a real
+  candidate re-derivation, incomplete-observation refusal, physical-only reporting, and
+  input-hash-reuse idempotency.)*
+- [x] **Step 2: Implement + dialect rendering tests** (Hive `DESCRIBE` vs Postgres
   information_schema — rendering and transport tests run without a cluster, per the bridge
   plan's Task 7 precedent). This **extends the `executor.Dialect` Protocol** with one method
   (`render_schema_observation(plan) -> str`) — the Protocol currently has only
   `render_column_profile`/`timeout_statements`/`effective_method`; both dialects implement the
   new method, and the executor path reuses `effective_method` unchanged.
+  *(Executed 2026-08-01: `SchemaObservationPlanV1` (observation.py, narrower plan — no columns/
+  partitions/bounds, identifier-validated at construction) + `SchemaObservationResultV1`/
+  `ColumnTypeObservationV1` (results.py, no method axis — a schema read is a metadata census) +
+  `DirectSqlExecutor.observe_schema` (same cursor/timeout seam, fetchall, Hive partition-marker
+  skip + dedupe, failure→typed coverage) + both dialect renderers +
+  `overlay/upload/type_attestation.py` (`attest_types_from_observation` → `TypeAttestReport`;
+  provenance = `field_evidence` `data_type` rows, producer `structural_connector`, strength
+  `attested`, `producer_ref` = content-addressed `schema-obs:` ref). `effective_method` untouched;
+  no new migration. `tests/featuregen/data_agent/test_type_observation_render.py` — 13 tests,
+  cluster-free.)*
 - [ ] **Step 3 (gated):** with approval, run against the kind Spark/Hive sandbox for the two
   tables; targets: `data_type` real for every column physically present; columns absent from the
   physical table (glossary-only) stay `unknown` — that absence is itself recorded.
-- [ ] **Step 4: Commit** `feat(types): attested data types from engine observation — declared never silently upgraded`.
+  *(NOT run — awaits the gated live run per the no-cluster-mutation constraint; the code half
+  above is complete and the engine path is proven cluster-free.)*
+- [x] **Step 4: Commit** `feat(types): attested data types from engine observation — declared never silently upgraded`.
 
 ---
 
