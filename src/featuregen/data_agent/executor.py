@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from typing import Protocol
 
-from featuregen.data_agent.observation import ObservationPlanV1
+from featuregen.data_agent.observation import ObservationPlanV1, SchemaObservationPlanV1
 from featuregen.data_agent.relationship_observation import (
     EndpointTupleObservationV2,
     RelationshipObservationPlanV2,
@@ -23,7 +23,12 @@ from featuregen.data_agent.relationship_observation import (
     failed_relationship_observation,
     utc_now,
 )
-from featuregen.data_agent.results import ColumnObservationV1, DataObservationResultV1
+from featuregen.data_agent.results import (
+    ColumnObservationV1,
+    ColumnTypeObservationV1,
+    DataObservationResultV1,
+    SchemaObservationResultV1,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +42,14 @@ class Dialect(Protocol):
 
     def render_relationship_probe(self, plan: RelationshipObservationPlanV2) -> str: ...
 
+    def render_schema_observation(self, plan: SchemaObservationPlanV1) -> str:
+        """The engine's schema read — `DESCRIBE` on Hive, information_schema on PostgreSQL. A
+        metadata statement, never a scan: it is the ONLY statement `graph_node.data_type` may be
+        upgraded from (a glossary's declared type is not evidence of the physical schema)."""
+        ...
+
     def timeout_statements(
-        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2 | SchemaObservationPlanV1
     ) -> tuple[str, ...]:
         """Statements bounding one query's runtime. Engine-specific: PostgreSQL is transaction
         milliseconds, Hive is session seconds. Empty for an engine with no reliable bound."""
@@ -109,6 +120,26 @@ class DirectSqlExecutor:
         return self._shape_relationship(
             plan, row, method=method, observed_at=timestamp)
 
+    def observe_schema(self, plan: SchemaObservationPlanV1) -> SchemaObservationResultV1:
+        """Execute one schema read. Never raises for a data-side failure.
+
+        Same transport and timeout seam as :meth:`observe`; no method resolution, because a schema
+        read is a metadata census — exact by construction — so `effective_method` is untouched. A
+        failure is typed coverage: `complete=False` matters more here than for a profile, since a
+        consumer that read a failed result as "these columns are all the table has" would record
+        absences that are actually engine errors.
+        """
+        physical_id = plan.binding.identity.table_id
+        statement = self._dialect.render_schema_observation(plan)
+        try:
+            rows = self._run(plan, statement, fetch_all=True)
+        except Exception as exc:                      # noqa: BLE001 — any engine error is coverage
+            reason = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+            logger.info("schema observation failed for %s: %s", physical_id, reason)
+            return SchemaObservationResultV1(
+                physical_id=physical_id, columns=(), complete=False, failures=(reason,))
+        return self._shape_schema(rows, physical_id)
+
     # ── internals ────────────────────────────────────────────────────────────────────────────────
 
     def _method(
@@ -127,32 +158,59 @@ class DirectSqlExecutor:
 
     def _run(
         self,
-        plan: ObservationPlanV1 | RelationshipObservationPlanV2,
+        plan: ObservationPlanV1 | RelationshipObservationPlanV2 | SchemaObservationPlanV1,
         statement: str,
+        *,
+        fetch_all: bool = False,
     ):
         """Execute through a CURSOR — the DB-API 2.0 contract every driver implements.
 
         An earlier version called `conn.execute(...)`, which is a psycopg3 convenience the standard
         does not define, so a PyHive or impyla connection would have failed with AttributeError
         before running anything. The connection is BORROWED, so the cursor is closed and the
-        connection is not.
+        connection is not. `fetch_all` is for the statements whose ANSWER is rows (a schema read)
+        rather than one aggregate row.
         """
         cursor = self._conn.cursor()
         try:
             for bound in self._timeouts(plan):
                 cursor.execute(bound)
             cursor.execute(statement)
-            return cursor.fetchone()
+            return cursor.fetchall() if fetch_all else cursor.fetchone()
         finally:
             close = getattr(cursor, "close", None)
             if callable(close):
                 close()
 
     def _timeouts(
-        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2 | SchemaObservationPlanV1
     ) -> tuple[str, ...]:
         statements = getattr(self._dialect, "timeout_statements", None)
         return tuple(statements(plan)) if callable(statements) else ()
+
+    def _shape_schema(self, rows, physical_id: str) -> SchemaObservationResultV1:
+        """Positional again — `(name, type, ...)` is the first-two-columns shape of both engines'
+        schema statements, and reading by position keeps the executor engine-agnostic.
+
+        Hive's plain `DESCRIBE` on a partitioned table appends a marker section — a blank
+        separator row, `# Partition Information`, `# col_name` — and then REPEATS the partition
+        columns. Marker rows (blank or `#`-prefixed name) are not columns, and a repeated name is
+        one physical column, so the first occurrence wins. Harmless for information_schema, which
+        emits neither."""
+        columns: list[ColumnTypeObservationV1] = []
+        seen: set[str] = set()
+        for row in rows or ():
+            name = ("" if row[0] is None else str(row[0])).strip()
+            if not name or name.startswith("#"):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            engine_type = ("" if len(row) < 2 or row[1] is None else str(row[1])).strip()
+            columns.append(ColumnTypeObservationV1(column=name, engine_type=engine_type))
+        return SchemaObservationResultV1(
+            physical_id=physical_id, columns=tuple(columns), complete=True, failures=())
 
     def _shape(self, plan: ObservationPlanV1, row, physical_id: str,
                partitions: tuple[str, ...]) -> DataObservationResultV1:

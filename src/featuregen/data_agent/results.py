@@ -39,6 +39,38 @@ class ColumnObservationV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ColumnTypeObservationV1:
+    """One column's ENGINE-REPORTED type from one schema observation.
+
+    Deliberately not a :class:`ColumnObservationV1`: a schema read carries no counts and no values
+    — only what the engine says the column physically IS. That narrowness is the point; it is what
+    lets `graph_node.data_type` be upgraded from this and from nothing weaker (a glossary's
+    declared type never travels through this shape)."""
+
+    column: str
+    engine_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaObservationResultV1:
+    """One schema observation over one physical table — engine-reported column types only.
+
+    Carries no ``method``: a schema read is a metadata census (`DESCRIBE` / information_schema),
+    exact by construction, so there is no exact/approximate axis to report. ``complete`` still
+    matters — a failed read must never let "unread" masquerade as "absent from the table"."""
+
+    physical_id: str
+    columns: tuple[ColumnTypeObservationV1, ...] = ()
+    complete: bool = True
+    failures: tuple[str, ...] = field(default_factory=tuple)
+
+    def types_by_column(self) -> dict[str, str]:
+        """``{lower-cased column: engine type}`` — the lookup an attestation consumer needs.
+        Lower-cased because Hive identifiers are case-insensitive."""
+        return {c.column.strip().lower(): c.engine_type.strip() for c in self.columns}
+
+
+@dataclass(frozen=True, slots=True)
 class DataObservationResultV1:
     """One bounded observation over one physical table."""
 

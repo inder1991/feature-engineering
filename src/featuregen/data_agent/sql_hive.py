@@ -10,7 +10,11 @@ already safe to render.
 """
 from __future__ import annotations
 
-from featuregen.data_agent.observation import ObservationPlanError, ObservationPlanV1
+from featuregen.data_agent.observation import (
+    ObservationPlanError,
+    ObservationPlanV1,
+    SchemaObservationPlanV1,
+)
 from featuregen.data_agent.relationship_observation import (
     RelationshipObservationPlanV2,
     render_relationship_probe_sql,
@@ -57,7 +61,7 @@ class HiveDialect:
         return _ident(name)
 
     def timeout_statements(
-        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2 | SchemaObservationPlanV1
     ) -> tuple[str, ...]:
         """Hive's query timeout is a SESSION setting measured in SECONDS — not PostgreSQL's
         transaction-scoped milliseconds.
@@ -145,6 +149,20 @@ class HiveDialect:
         where = self.where(plan)
         statement = f"SELECT {select}\nFROM {self.table_ref(plan)}"
         return f"{statement}\n{where}" if where else statement
+
+    def render_schema_observation(self, plan: SchemaObservationPlanV1) -> str:
+        """`DESCRIBE` — the engine's own account of what the table physically holds.
+
+        Two-part backticked name, same as :meth:`table_ref`: a double-quoted identifier is a
+        STRING LITERAL in HiveQL, so a "safely quoted" statement would be accepted and evaluated
+        to something else entirely. The identity's `database` stays an address, never a name part
+        (a real HiveServer2 refuses three parts).
+
+        Plain `DESCRIBE`, not `FORMATTED`/`EXTENDED`: the extended forms interleave table metadata
+        prose with the column list, and the executor's shaping should skip a known marker section,
+        not parse a report."""
+        identity = plan.binding.identity
+        return f"DESCRIBE {_ident(identity.schema)}.{_ident(identity.table)}"
 
     def render_row_count(self, plan: ObservationPlanV1) -> str:
         where = self.where(plan)

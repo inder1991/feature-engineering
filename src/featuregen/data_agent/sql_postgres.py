@@ -13,7 +13,7 @@ The differences from Hive are confined to identifier quoting and the approximate
 """
 from __future__ import annotations
 
-from featuregen.data_agent.observation import ObservationPlanV1
+from featuregen.data_agent.observation import ObservationPlanV1, SchemaObservationPlanV1
 from featuregen.data_agent.relationship_observation import (
     RelationshipObservationPlanV2,
     render_relationship_probe_sql,
@@ -39,7 +39,7 @@ class PostgresDialect:
         return _ident(name)
 
     def timeout_statements(
-        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2
+        self, plan: ObservationPlanV1 | RelationshipObservationPlanV2 | SchemaObservationPlanV1
     ) -> tuple[str, ...]:
         """`SET LOCAL` is transaction-scoped, so the bound dies with the caller's transaction rather
         than leaking onto a pooled connection."""
@@ -87,6 +87,23 @@ class PostgresDialect:
         where = self.where(plan)
         stmt = f"SELECT {select}\nFROM {self.table_ref(plan)}"
         return f"{stmt}\n{where}" if where else stmt
+
+    def render_schema_observation(self, plan: SchemaObservationPlanV1) -> str:
+        """information_schema — the standard's answer to Hive's `DESCRIBE`.
+
+        The schema and table are DATA here (predicate literals), not identifiers, so they render
+        through `_literal`; the plan has already refused any name that is not a plain identifier,
+        making the escaping belt-and-braces rather than the defence. Projects exactly `(name,
+        type)` so the executor's positional shaping reads both engines' first two columns the
+        same way."""
+        identity = plan.binding.identity
+        return (
+            "SELECT column_name, data_type\n"
+            "FROM information_schema.columns\n"
+            f"WHERE table_schema = {_literal(identity.schema)} "
+            f"AND table_name = {_literal(identity.table)}\n"
+            "ORDER BY ordinal_position"
+        )
 
     def render_relationship_probe(self, plan: RelationshipObservationPlanV2) -> str:
         return render_relationship_probe_sql(plan, dialect=self)

@@ -114,3 +114,25 @@ class ObservationPlanV1:
         """`exact` or `approximate` — carried on the RESULT so a later consumer knows what the
         evidence can support. Sampled uniqueness never proves uniqueness."""
         return "exact" if self.policy.exact_distinct else "approximate"
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaObservationPlanV1:
+    """One schema read over one physical table — engine-reported column types, no data.
+
+    Deliberately NARROWER than :class:`ObservationPlanV1`: a schema observation is a metadata read
+    (Hive ``DESCRIBE`` / information_schema), so it names no columns (the engine reports what
+    physically exists — an expected column's ABSENCE is itself the finding), selects no partitions
+    (nothing scans, so the partitioned-table refusal above does not apply), and can never carry
+    bounds (no value crosses the boundary). The policy rides along for the statement timeout only.
+
+    The identity's schema/table are validated as plain identifiers HERE, per the module rule:
+    validation at plan construction, refusal over quoting — a dialect must never be the last line
+    of defence for a name it renders."""
+
+    binding: PhysicalDatasetBindingV1
+    policy: ProfilePolicyV1
+
+    def __post_init__(self) -> None:
+        require_identifier(self.binding.identity.schema, what="schema")
+        require_identifier(self.binding.identity.table, what="table")
