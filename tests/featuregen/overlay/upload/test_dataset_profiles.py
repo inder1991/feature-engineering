@@ -28,7 +28,10 @@ from featuregen.overlay.upload.field_correction import (
     apply_field_correction,
     read_field_cas,
 )
-from featuregen.overlay.upload.field_resolution import is_feature_eligible
+from featuregen.overlay.upload.field_resolution import (
+    is_feature_eligible,
+    resolve_and_project,
+)
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.profile_vocab import (
@@ -232,6 +235,21 @@ def test_four_eyes_is_not_weakened_for_operational_profile_fields(db):
                    replacement_value="system_of_record")
     assert res["accepted"] is False and res["status_code"] == 403
     assert is_feature_eligible(db, _TABLE_REF, "authority_role") is False
+
+
+def test_profiler_attested_is_not_load_bearing_for_profile_classifications(db):
+    """F8: the plan's bar for this release is source-attested / human-confirmed ONLY — the
+    profiler/attested leaf was removed from the operational rules (no producer emits PROFILER
+    field evidence for these fields today; the Hive/ODS deterministic slice re-proposes it
+    through policy review)."""
+    _seed_graph(db)
+    _seed(db, "authority_role", "system_of_record", EvidenceProducer.PROFILER,
+          AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=_SRC, logical_refs=[_TABLE_REF], fields=["authority_role"])
+    assert is_feature_eligible(db, _TABLE_REF, "authority_role") is False
+    f = _profile(db).authority_role
+    assert f.load_bearing is None
+    assert f.display is None       # profiler/attested clears no display rule either
 
 
 def test_off_vocabulary_values_are_refused_before_any_write(db):

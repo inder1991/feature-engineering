@@ -49,7 +49,6 @@ _SOURCE_ATTESTED = HasEvidence(EvidenceProducer.SOURCE, AssertionStrength.ATTEST
 _HUMAN_PROPOSED = HasEvidence(EvidenceProducer.HUMAN, AssertionStrength.PROPOSED)
 _HUMAN_CONFIRMED = HasEvidence(EvidenceProducer.HUMAN, AssertionStrength.CONFIRMED)
 _PARSER_SUPPORTED = HasEvidence(EvidenceProducer.PARSER, AssertionStrength.SUPPORTED)
-_PROFILER_ATTESTED = HasEvidence(EvidenceProducer.PROFILER, AssertionStrength.ATTESTED)
 _TAXONOMY_PROPOSED = HasEvidence(EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED)
 _TAXONOMY_CONFIRMED = HasEvidence(EvidenceProducer.TAXONOMY, AssertionStrength.CONFIRMED)
 
@@ -221,12 +220,10 @@ _BUSINESS_CONTEXT = _recommendation(
 #
 # * DISPLAY is lenient: an LLM or uploader (HUMAN/PROPOSED via the profile PUT) proposal is shown
 #   for exploration — visible, labeled, usable in sandbox ranking later — never hidden.
-# * LOAD-BEARING is strict and NEVER from the LLM: only source-attested, human-confirmed, or
-#   deterministic-profiler (profiler/ATTESTED) evidence clears the operational rule. The profiler
-#   leaf is FORWARD PERMISSION per the interface doc — no producer emits profiler/attested for
-#   these fields today (the deterministic Hive/ODS classification slice is deferred); including the
-#   leaf claims nothing exists, it only avoids a policy edit when that slice lands. The ordinary
-#   profiler default (profiler/SUPPORTED) deliberately does NOT clear it.
+# * LOAD-BEARING is strict and NEVER from the LLM: only source-attested or human-confirmed
+#   evidence clears the operational rule THIS release (the plan's explicit bar; no producer emits
+#   PROFILER field evidence for these fields today). The deferred Hive/ODS deterministic-
+#   classification slice re-proposes a profiler/attested leaf through policy review when it lands.
 # * human_editable=True wires the EXISTING four-eyes flow (D12.7): propose_override writes
 #   HUMAN/PROPOSED (displayed, not load-bearing); confirm_override by a DISTINCT subject writes
 #   HUMAN/CONFIRMED (load-bearing). `set_advisory` is hard-excluded (field_correction allowlist).
@@ -234,7 +231,7 @@ _OPERATIONAL_PROFILE_CLASSIFICATION = FieldPolicy(
     influence_max=InfluenceTier.OPERATIONAL,
     display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_PROPOSED,
                         _HUMAN_CONFIRMED)),
-    operational_rule=AnyOf((_SOURCE_ATTESTED, _HUMAN_CONFIRMED, _PROFILER_ATTESTED)),
+    operational_rule=_SOURCE_OR_HUMAN,
     disqualifiers=_OPERATIONAL_DISQUALIFIERS,
     resolution_mode=ResolutionMode.GENERIC_FIELD,
     conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
