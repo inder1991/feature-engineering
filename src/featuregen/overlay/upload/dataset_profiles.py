@@ -268,6 +268,12 @@ def _wrap_resolution(
         # this field — visible as projection_unavailable, family undecided (nobody decided HERE).
         reason = UnresolvedReason.AUTHORITY_INSUFFICIENT
         state = STATE_PROJECTION_UNAVAILABLE
+    if state == STATE_DISPLAY_ONLY and display is None:
+        # [F9] `display_only` with nothing to display is a lying state. When no active evidence
+        # clears the display bar, report the honest family-shaped state the reason maps to
+        # (`undecided` for authority_insufficient) — `display_only` is reserved for fields that
+        # actually display something.
+        state = unresolved_family(reason).value
     return EffectiveProfileFieldV1(
         display=display, load_bearing=None, state=state,
         unresolved_reason=reason.value, unresolved_family=unresolved_family(reason).value,

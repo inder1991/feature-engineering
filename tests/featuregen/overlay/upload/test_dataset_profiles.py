@@ -378,6 +378,34 @@ def test_technical_catalog_business_context_is_the_only_table_text(db):
     assert profile.business_context.display.value == "Branch-booked retail orders."
 
 
+def test_no_displayable_evidence_is_undecided_not_display_only(db):
+    """F9: `state="display_only"` with `display=null` was a lying state. Evidence below every
+    display rule (the ordinary profiler default) now reports the honest family-shaped
+    `undecided` — display_only is reserved for fields that actually display something."""
+    _seed_graph(db)
+    _seed(db, "authority_role", "derived", EvidenceProducer.PROFILER,
+          AssertionStrength.SUPPORTED)
+    f = _profile(db).authority_role
+    assert f.display is None
+    assert f.state == "undecided"
+    assert f.unresolved_reason == UnresolvedReason.AUTHORITY_INSUFFICIENT.value
+    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+
+
+def test_pending_proposal_below_the_display_bar_is_undecided(db):
+    """F9 on a RECOMMENDATION field: a lone HUMAN/PROPOSED definition is below `description`'s
+    display rule (human evidence renders only at CONFIRMED there), so nothing displays — the
+    state is honestly `undecided`, never display_only-with-nothing."""
+    _seed_graph(db)
+    _seed(db, "definition", "A pending def.", EvidenceProducer.HUMAN,
+          AssertionStrength.PROPOSED)
+    f = _profile(db).description
+    assert f.display is None
+    assert f.state == "undecided"
+    assert f.unresolved_reason == UnresolvedReason.AUTHORITY_INSUFFICIENT.value
+    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+
+
 def test_profile_returns_none_for_an_unknown_table(db):
     assert build_dataset_profile(db, source=_SRC,
                                  dataset_logical_ref=normalize_ref(_SRC, None, "ghost")) is None
