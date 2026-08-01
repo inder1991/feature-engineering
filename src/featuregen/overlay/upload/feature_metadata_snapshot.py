@@ -43,9 +43,9 @@ from featuregen.projections.runner import _checkpoint_seq, _head_seq
 # ``column_authority`` actually MODELS (its ``_VALUE_COLUMN`` keys). NOTE: the field key for the
 # numeric-usable operational type is ``logical_representation`` (whose value is read from the flat
 # ``data_type`` column); ``declared_type`` is the separate raw-declared hint. A caller may pass a
-# custom ``fields`` list; any field NOT in :data:`_KNOWN_FIELDS` is SKIPPED (``read_column_facts``
-# would fall back to a bare ``None``/hint for it — snapshotting that would fabricate an item for a
-# field the adapter does not resolve).
+# custom ``fields`` list; any field NOT in :data:`_KNOWN_FIELDS` RAISES (D6 — ``read_column_facts``
+# would fall back to a bare ``None``/hint for it, and silently dropping it handed the caller a
+# snapshot that quietly lacked a field they asked to pin).
 _DEFAULT_FIELDS: tuple[str, ...] = (
     "additivity",
     "logical_representation",
@@ -68,6 +68,33 @@ _FACT_FIELDS: frozenset[str] = frozenset({"is_grain", "is_as_of"})
 _C1_GOVERNED_FIELDS: frozenset[str] = _DECISION_FIELDS | _FACT_FIELDS
 
 _ISOLATION_LEVEL = "repeatable read"
+
+# ── Task 0.6 Seam 4 (D6): the six snapshot pin KINDS. ``column_field`` is the only kind with a
+# builder/comparator today; the other five are RESERVED vocabulary whose builders arrive with the
+# profile/serving/temporal deliveries. No DB change: ``item_kind`` is an existing text column.
+ITEM_KIND_COLUMN_FIELD = "column_field"
+ITEM_KINDS: frozenset[str] = frozenset({
+    ITEM_KIND_COLUMN_FIELD, "dataset_profile", "serving_policy", "source_selection",
+    "physical_binding", "temporal_policy", "row_selection",
+})
+
+# Freshness reason (D6): a stored item whose kind has no comparator registered in THIS build — a
+# typed refusal ("this build cannot verify that pin"), never generic drift and never a crash.
+SNAPSHOT_KIND_UNSUPPORTED = "SNAPSHOT_KIND_UNSUPPORTED"
+
+
+def snapshot_item_hash(item_kind: str, material: Mapping[str, object]) -> str:
+    """The hash-compat rule (D6): ``column_field`` keeps the EXACT legacy computation — ``item_kind``
+    EXCLUDED — so every already-stored snapshot's item/content hashes stay valid; every NEW kind
+    hashes ``item_kind`` INTO its material, so two kinds with identical payloads can never collide.
+    Cross-kind collision is thereby impossible without touching a single legacy row."""
+    if item_kind not in ITEM_KINDS:
+        raise ValueError(f"unknown snapshot item kind {item_kind!r}; register it in ITEM_KINDS")
+    if item_kind == ITEM_KIND_COLUMN_FIELD:
+        return canonical_hash(dict(material))
+    if "item_kind" in material:
+        raise ValueError("item material must not carry its own 'item_kind' key")
+    return canonical_hash({**material, "item_kind": item_kind})
 
 # The version constants captured into the snapshot HEADER, and their column mapping:
 #   policy_version   ← FIELD_POLICY_VERSION              (the field-policy the reads obeyed)
@@ -369,7 +396,8 @@ def _build_item(
         provenance = facts.provenance
     decision_event_id = provenance if field in _DECISION_FIELDS else None
     fact_event_id = provenance if field in _FACT_FIELDS else None
-    item_hash = canonical_hash(
+    item_hash = snapshot_item_hash(
+        ITEM_KIND_COLUMN_FIELD,
         {
             "catalog_source": catalog_source,
             "graph_ref": object_ref,
@@ -378,14 +406,14 @@ def _build_item(
             "authority": authority,
             "provenance": provenance,
             "status": status,
-        }
+        },
     )
     return SnapshotItem(
         catalog_source=catalog_source,
         graph_ref=object_ref,
         logical_ref=logical_ref,
         physical_ref=_physical_ref(conn, catalog_source, logical_ref),
-        item_kind="column_field",
+        item_kind=ITEM_KIND_COLUMN_FIELD,
         field_or_fact_type=field,
         value=value,
         authority=authority,
@@ -395,6 +423,12 @@ def _build_item(
         fact_event_id=fact_event_id,
         item_hash=item_hash,
     )
+
+
+# item_kind -> the CURRENT-state item rebuilder ``compare_snapshot_to_current`` dispatches on (D6).
+# Only ``column_field`` has one today; the five reserved kinds gain theirs with their builders — a
+# stored kind absent here is the typed :data:`SNAPSHOT_KIND_UNSUPPORTED` refusal.
+_KIND_COMPARATORS = {ITEM_KIND_COLUMN_FIELD: _build_item}
 
 
 def build_metadata_snapshot(
@@ -411,9 +445,15 @@ def build_metadata_snapshot(
     :class:`SnapshotContext` (see module docstring).
 
     ``refs`` is a sequence of ``(catalog_source, object_ref)``; ``fields`` defaults to the standard
-    governed+hint set (:data:`_DEFAULT_FIELDS`). A field ``read_column_facts`` does not MODEL is
-    skipped (never fabricated). MUST be given a REPEATABLE READ connection (raises
-    :class:`SnapshotIsolationError` otherwise)."""
+    governed+hint set (:data:`_DEFAULT_FIELDS`). Requesting a field ``read_column_facts`` does not
+    MODEL RAISES ``ValueError`` naming it (D6 — never silently dropped, never fabricated). MUST be
+    given a REPEATABLE READ connection (raises :class:`SnapshotIsolationError` otherwise)."""
+    requested = tuple(fields) if fields is not None else _DEFAULT_FIELDS
+    unknown_fields = [f for f in requested if f not in _KNOWN_FIELDS]
+    if unknown_fields:   # pure input validation — refuse BEFORE any read or write
+        raise ValueError(
+            f"unknown snapshot field(s) {unknown_fields!r}: read_column_facts does not model them "
+            f"(known: {sorted(_KNOWN_FIELDS)})")
     isolation_level = _assert_repeatable_read(conn)   # before the first catalog read
     # Readiness gate (C0-T4): a load-bearing projection that is LAGGED or DEGRADED would make the
     # authority adapter read STALE projected truth. Refuse BEFORE writing anything (no run manifest,
@@ -422,8 +462,7 @@ def build_metadata_snapshot(
     projection_watermarks = check_projection_readiness(conn)
     ensure_generation_run(conn, generation_run_id, actor or {}, flags or {})
 
-    requested = tuple(fields) if fields is not None else _DEFAULT_FIELDS
-    selected = [f for f in requested if f in _KNOWN_FIELDS]
+    selected = list(requested)
 
     items: list[SnapshotItem] = []
     seen_hashes: set[str] = set()
@@ -517,7 +556,7 @@ def compare_snapshot_to_current(conn: DbConn, snapshot_id: str) -> SnapshotFresh
     ):
         return SnapshotFreshness("drifted", "SNAPSHOT_VERSION_DRIFT", None)
     rows = conn.execute(
-        "SELECT catalog_source,graph_ref,field_or_fact_type,item_hash "
+        "SELECT catalog_source,graph_ref,field_or_fact_type,item_kind,item_hash "
         "FROM catalog_metadata_snapshot_item WHERE snapshot_id=%s "
         "ORDER BY catalog_source,graph_ref,field_or_fact_type,item_hash",
         (snapshot_id,),
@@ -525,9 +564,14 @@ def compare_snapshot_to_current(conn: DbConn, snapshot_id: str) -> SnapshotFresh
     if len(rows) != item_count:
         return SnapshotFreshness("unverifiable", "SNAPSHOT_ITEM_COUNT_MISMATCH", None)
     current_hashes: list[str] = []
-    for catalog_source, graph_ref, field, stored_item_hash in rows:
+    for catalog_source, graph_ref, field, item_kind, stored_item_hash in rows:
+        # D6 kind dispatch: a stored kind THIS build has no comparator for is a typed refusal —
+        # "cannot verify that pin" — never reported as drift and never allowed to crash.
+        comparator = _KIND_COMPARATORS.get(item_kind)
+        if comparator is None:
+            return SnapshotFreshness("unverifiable", SNAPSHOT_KIND_UNSUPPORTED, None)
         try:
-            current = _build_item(conn, catalog_source, graph_ref, field)
+            current = comparator(conn, catalog_source, graph_ref, field)
         except Exception:
             return SnapshotFreshness("unverifiable", "CURRENT_CATALOG_READ_FAILED", None)
         current_hashes.append(current.item_hash)
