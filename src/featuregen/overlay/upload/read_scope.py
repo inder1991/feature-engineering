@@ -104,7 +104,7 @@ def visible_table_pairs(conn, allowed: list[str]) -> tuple[list[str], list[str]]
     table row is hidden and the SQL stays valid."""
     rows = conn.execute(
         "SELECT DISTINCT catalog_source, table_name FROM graph_node "
-        f"WHERE kind = 'column' AND COALESCE(visible_requires, '{{}}') <@ %s",
+        "WHERE kind = 'column' AND COALESCE(visible_requires, '{}') <@ %s",
         (allowed,)).fetchall()
     return [r[0] for r in rows], [r[1] for r in rows]
 

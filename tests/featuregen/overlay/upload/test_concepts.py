@@ -346,6 +346,7 @@ def test_party_role_vocabulary_is_closed_and_token_derived():
 
 def test_registry_rejects_an_is_a_self_loop():
     import pytest
+
     from featuregen.overlay.upload.concepts import _validate_registry
     with pytest.raises(ValueError, match="cycle"):
         _validate_registry((Concept("loopy", "monetary", is_a="loopy"),))
@@ -353,6 +354,7 @@ def test_registry_rejects_an_is_a_self_loop():
 
 def test_registry_rejects_a_mutual_is_a_cycle():
     import pytest
+
     from featuregen.overlay.upload.concepts import _validate_registry
     with pytest.raises(ValueError, match="cycle"):
         _validate_registry((
@@ -372,6 +374,7 @@ def test_registry_accepts_a_valid_is_a_chain():
 
 def test_registry_still_rejects_an_unresolved_is_a():
     import pytest
+
     from featuregen.overlay.upload.concepts import _validate_registry
     with pytest.raises(ValueError, match="unresolved"):
         _validate_registry((Concept("orphan", "monetary", is_a="nowhere"),))

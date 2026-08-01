@@ -65,4 +65,11 @@ an output pipe; the recorded run above used `pipefail` and a verified `EXIT=0`.)
 **Test-count gate rule (per D9):** the literal-count gate for this program is scoped to the file
 list above (238 at baseline), never the whole repo (DEFERRED-WORK §C contamination).
 
+**Repo-wide suite status at baseline (recorded 2026-08-01, Task 0.6 review):** 2 pre-existing
+failures in `tests/featuregen/api/test_nginx_proxy_covers_frontend_calls.py` — the nginx proxy
+location list is missing `/data-sources`; both failures are present at `fa9a20b0` and unrelated to
+this branch. Overlay-tree precision (correcting an earlier imprecise citation): **3371** tests is
+the `tests/featuregen/overlay/upload` subtree; the full `tests/featuregen/overlay` tree is
+**3660**.
+
 **No deploy, no upload, no live LLM call, no Hive/ODS connection was made.**

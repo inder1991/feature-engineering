@@ -15,8 +15,8 @@ from datetime import UTC, datetime, timedelta
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.object_ref import normalize_ref
