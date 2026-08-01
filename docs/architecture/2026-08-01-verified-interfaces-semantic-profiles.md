@@ -1,0 +1,293 @@
+# Verified Interfaces — Semantic Context + Catalog Profiles Release Train (2026-08-01)
+
+**Status: CONTROLLING.** This document freezes the shared interfaces for the three-plan program
+(semantic enrichment, catalog profiles, codegen remediation). Where this document and a plan
+disagree, this document wins; the plan is amended, not reinterpreted. Every decision below was
+verified against `origin/main @ fa9a20b0` — citations refer to that tree. The adversarial review
+that motivated each decision is `docs/architecture/2026-08-01-plan-review-semantic-context-and-catalog-profiles.md`.
+
+**Program sequence (supersedes the execution-order diagrams inside both 2026-08-01 plans, which
+show codegen as a later sequential step — codegen remediation is an active PARALLEL predecessor):**
+
+```text
+Track 1:  Task 0 (baseline) -> Task 0.5 (this doc) -> Task 0.6 (seam repairs)
+          -> Release A:  Sem 1-2 ∥ Prof 1-3  ->  Sem 3-4 + Prof 4  ->  Sem 5-6
+                         ->  Sem 7-9 + Prof 5  ->  Sem 10 + Prof 6
+          -> deploy gate (approval) -> live-LLM/re-upload gate (separate approval)
+          -> Release B:  Prof 7-9 incl. wiring the API to existing run_analysis
+          -> fixture validation -> bounded Hive/ODS profiling (approval)
+Track 2:  codegen remediation Tasks 1-26 (parallel, own worktree)
+Sync:     Release B + remediated codegen -> Phase-G wiring plan (design + approval)
+          -> Release C Tasks 10-13 (crosswalk execution)
+```
+
+Generated-project acceptance (semantic Task 8's end-to-end item) waits for Track 2. Everything
+else in Releases A/B does not.
+
+---
+
+## D1. Canonical hash scheme
+
+All NEW content hashes in this program — `SemanticContextBundleV1.content_hash`,
+`dataset_profile_hash`, `CatalogProfileRevisionV1.content_hash`, policy revision hashes,
+`DatasetSourceSelectionV1`/`DatasetRowSelectionV1.content_hash`, analysis-plan identity v2 —
+use **RFC 8785 JCS via `materialize/canonical.py:33 materialize_hash`** (the scheme behind the
+CHECK-pinned `pbr_` binding revision ids, `physical.py:238-244`).
+
+- The `field_evidence.py:38-46` `json.dumps(sort_keys=True)` scheme remains for the stores that
+  already use it; no stored hash is rewritten.
+- No new inline hash implementation may be written; import `materialize_hash`.
+- Excluded from every content hash: wall-clock, job state, environment, physical bindings (which
+  live in `DatasetSourceSelectionV1`), projection timestamps.
+- The two bundle builders must byte-match on shared fields; the property test serializes both
+  through the same canonicalizer.
+
+## D2. Evidence authority — typed triple, not a flat vocabulary
+
+`SemanticValueV1` carries the REAL authority model verbatim:
+
+```python
+producer: str      # EvidenceProducer value (overlay/evidence.py:15-30) — 8 members
+strength: str      # AssertionStrength value (:33-41)
+lifecycle: str     # EvidenceLifecycle value (:44-48)
+```
+
+The plans' flat 5-value `authority` becomes a DERIVED display label with this fixed projection
+(display only, never persisted, never hashed as the authority):
+
+| producer × strength | display label |
+| --- | --- |
+| source × attested/confirmed | `source_attested` |
+| source × proposed/supported | `source_proposed` |
+| human × confirmed | `human` |
+| llm × any | `llm_proposed` |
+| profiler/structural_connector × attested | `deterministic` |
+| parser/taxonomy/legacy × any | `system` |
+| (from specialized governed facts / `OperationalColumnFacts.authority="governed"`) | `governed` |
+
+`CatalogProfileRevisionV1.authority` and `PolicyProvenanceV1.authority` reference the same triple
+(profile plan §6.2/§6.4 amended accordingly). No consumer branches on the display label.
+
+## D3. Relationship context — mirror the real shape
+
+`RelationshipContextV1` is REPLACED by a two-level shape matching `entity_map.py:96-122` and the
+two real readers (`available_identifier_links`, `bridge_assessment.py:648`;
+`load_current_bridge_realizations`, `bridge_store.py:633`):
+
+```python
+@dataclass(frozen=True, slots=True)
+class DirectionalRealizationContextV1:
+    realization_revision_id: str
+    from_ref: str
+    to_ref: str
+    lifecycle: str
+    safety_status: str
+    cardinality: str | None
+    scope_id: str | None            # RealizationApplicabilityScopeV1.scope_id — no invented hash
+    sandbox_eligible: bool
+    production_eligible: bool       # pure predicate; see display rule below
+
+@dataclass(frozen=True, slots=True)
+class RelationshipContextV1:
+    relationship_ref: str           # bridge fact_key today; crosswalk definition_id in Release C
+    kind: str                       # RelationshipKind — owned per D5
+    left_ref: str
+    right_ref: str
+    availability: str               # LinkAvailability: available | unavailable — nothing else
+    review_status: str | None
+    assessment_revision_id: str | None   # = candidate_revision_id (bridge_assessment.py:424)
+    realizations: tuple[DirectionalRealizationContextV1, ...]
+    producer: str; strength: str; lifecycle: str
+    current: bool
+    evidence_ids: tuple[str, ...]
+```
+
+- **Dropped until Release C defines them:** `definition_revision_id`, `execution_revision_id`,
+  `mapping_dataset_ref`, `leg_plan_hashes`, `leg_realization_revision_ids`,
+  `applicability_scope_hash` (none exists on main). Release C extends this contract additively
+  with `crosswalk: CrosswalkContextV1 | None` carrying `JoinLegPinV1` tuples (D5).
+- **Availability never encodes safety.** The four-way `discoverable|sandbox_only|executable|
+  unavailable` is deleted. UI derives "executable" ONLY from a reader that revalidates live
+  dependencies (`bridge_store.executable_bridge_realizations`, `:886-909`); the pure predicate
+  (`eligible_for_production`) may label history, never a live capability.
+- Builders compose the two existing readers exactly as `entity_map._link_view` does; that
+  composition moves into ONE shared function both entity_map and the bundle call (no duplication,
+  no third reader).
+
+## D4. Observation context — faithful projection of the V2 store
+
+`ObservationContextV1` mirrors `RelationshipObservationV2` (`relationship_observation.py:313-341`,
+migration 1038) field-for-field. Binding decisions:
+
+- Keep BOTH directional maxima (`max_right_matches_per_left_row`, `max_left_matches_per_right_row`)
+  — no single `direction` field.
+- Keep `method ∈ {exact, approximate}` × `row_coverage ∈ {full, sampled, partial}` as two axes.
+  The plans' `evidence_basis` merger is deleted; `governed_key`/`source_constraint` are not
+  observation values (they are realization-evidence kinds and stay there).
+- Identity fields: `scope_id`, `left_binding_revision_id`, `right_binding_revision_id`,
+  `realization_revision_id` — exact store names, sides preserved.
+- No `lifecycle_status`/`expires_at`/`observation_kind`/`supports` inventions. Currentness comes
+  from the `relationship_observation_current` pointer; strength/conflict from `strength`/
+  `conflict_observed`.
+- The asymmetry rule ("a sample may disprove uniqueness but never establish it") is already
+  enforced (`:417-430`, `store.py:251-253`); consumers read it, they do not re-derive it.
+- Semantic Task 12 is now a one-paragraph pointer to this section; it freezes nothing new.
+
+## D5. Contract ownership
+
+| Contract | Canonical owner | Consumers import |
+| --- | --- | --- |
+| `SemanticValueV1`, `SemanticContextBundleV1`, `IdentifierNamespaceV1`, `NeighbourColumnV1`, `RelationshipContextV1`, `ObservationContextV1`, `RelationshipKind` | semantic Task 1, `overlay/upload/semantic_context.py` | profile plan, Context Graph, feature/agent adapters |
+| `MISSING_CONTEXT_CODES`, `REASON_CODES`, `UNRESOLVED_REASONS` (closed vocabularies) | semantic Task 1, same module — defined BEFORE first emission, hash-load-bearing from day one | both plans |
+| `DataRole`, `AuthorityRole`, `TemporalStorageModel`, `EffectiveProfileFieldV1`, `DatasetSemanticProfileV1`, `CatalogProfileRevisionV1` | profile Task 1/2 | semantic Task 7/8 |
+| `DatasetNeedV1`, `DatasetSourceSelectionV1`, `DatasetTemporalPolicyRevisionV1`, `DatasetRowSelectionV1`, `PolicyProvenanceV1` | profile Task 7 | semantic Task 8 (Release-B acceptance) |
+| `JoinLegPinV1` (five-field form, profile §6.6), `CrosswalkDefinitionRevisionV1`, `CrosswalkExecutionRevisionV1` | Release C Task 10 | semantic context via the additive `crosswalk` extension (D3) |
+
+- **Naming:** the dataset profile hash is `dataset_profile_hash` in EVERY contract (the
+  `profile_hash`/`selected_profile_hash` variants in the profile plan are renamed).
+- `unresolved_reason` is a closed enum honoring the product rule — every member maps to exactly
+  one of `{undecided, needs_data_check, structurally_unsuitable}` and the UI renders that family,
+  never a failure-shaped free string. "No evidence at all" is `undecided:no_evidence`, distinct
+  from `influence_not_operational` (which display fields report as their NORMAL state, not as
+  unresolved — profile §6.3 amended).
+- `DatasetNeedV1.execution_tier` reuses `bridge_realization.ExecutionTier`; semantic Task 8's
+  feature path constructs needs with `SANDBOX` until a production feature flow exists.
+
+## D6. Snapshot pins — six kinds, compat-safe hashing
+
+- Item kinds: `column_field` (existing) + `dataset_profile`, `serving_policy`, `source_selection`,
+  `physical_binding`, `temporal_policy`, `row_selection` — the six-pin list wins.
+- `build_metadata_snapshot` RAISES on an unknown requested field (today it silently drops,
+  `feature_metadata_snapshot.py:426`).
+- **Hash compat rule (no migration needed):** `item_hash` for `item_kind="column_field"` keeps the
+  legacy computation (kind excluded) so existing stored snapshots stay valid; every NEW kind
+  includes `item_kind` in its hash. Cross-kind collision is thereby impossible without touching
+  legacy rows.
+- `compare_snapshot_to_current` dispatches by `item_kind`; an unknown stored kind returns a typed
+  `SNAPSHOT_KIND_UNSUPPORTED` refusal, never generic drift.
+
+## D7. Migration reservations
+
+Allocation rule: uniqueness is the FULL FILENAME; ledger state is recorded as the applied
+name-set, never a head number (duplicate prefixes exist at 0973/0974/1034/1036/1037/1038/1040
+and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
+
+| Number | Reserved by |
+| --- | --- |
+| 1044 | codegen remediation (`1044_run_event_ordering.sql` — already claimed by that plan) |
+| 1045 | semantic Task 2 — catalog semantic scope (+ `graph_node.entity` backfill, D12) |
+| 1046 | semantic Task 5 — structured-result subject/current pointer |
+| 1047 | profile Task 2 — catalog narrative revision + current |
+| 1048 | profile Task 7 — serving policy store |
+| 1049 | profile Task 7 — temporal policy store |
+| 1050 | Release C Task 10 — crosswalk store |
+
+New needs append 1051+ to this table FIRST (edit this doc in the same commit as the migration).
+
+## D8. Flag matrix
+
+| Flag | Enabled by | Depends on |
+| --- | --- | --- |
+| `FEATUREGEN_FEATURE_CONTEXT` | Release-A deploy gate | — |
+| `FEATUREGEN_DATASET_PROFILES` | Release-A deploy gate (same approval, both flags presented) | — |
+| `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` | Release-B gate | `FEATUREGEN_DATASET_PROFILES=1` |
+| `FEATUREGEN_CROSSWALK_EXECUTION` | Release-C gate | `FEATUREGEN_SOURCE_TEMPORAL_SELECTION=1` — enforced fail-closed at startup, not by convention |
+
+- All four use the widened truthy set `{"1","true","yes","on"}` (`feature_assist.py:193` pattern)
+  and are added to `deploy/kind/k8s/20-backend.yaml` + `.env.example` (defaults off).
+- Feature-context versions: v4 ships REGISTERED alongside v2/v3 (D10). Rollback ladder:
+  flag off → v1 menu (unchanged); flag on + `FEATUREGEN_FEATURE_CONTEXT_VERSION=3` → today's
+  shipped behavior; flag on (default) → v4. The env override exists precisely so v3 remains
+  reachable after Task 8.
+- Profile-in-feature-context is governed by `FEATUREGEN_DATASET_PROFILES` AND
+  `FEATUREGEN_FEATURE_CONTEXT`; with either off, feature payloads are byte-identical to that
+  flag's off-state today. Profile Task 6's flag-off check must assert the COMBINATION states.
+
+## D9. Gates between the plans
+
+- Profile Tasks 1–3 may run in parallel with semantic Tasks 1–2 (the program sequence above)
+  BECAUSE this document, not task completion, freezes their shared contracts. The shared-file
+  rule stands: `concepts.py`, `party_vocab.py`, `bridge_candidates.py`, `entity_map.py` belong to
+  semantic Tasks 1–2; `field_policies.py`, `field_resolution.py`, `field_correction.py` belong to
+  profile Task 1 — no cross-edits.
+- `table_synth.py`/`enrich_llm.py` are single-owner during the joint step (semantic 3–4 +
+  profile 4): one implementation stream, both plans' checkboxes.
+- Semantic Task 10's live-LLM comparison is EXPLICITLY part of Gate B (separate approval), not a
+  pre-gate deliverable. The pre-gate deliverable is the replay/fixture half only. (Amends
+  semantic Task 10/Execution Order; matches profile Task 6's rule.)
+- Test-count gates are scoped to NAMED focused suites (the Task-0 lists), never the whole repo
+  (DEFERRED-WORK §C contamination). The mutation harness is a NEW deliverable of the joint
+  eval step (Sem 10 + Prof 6) — it does not exist on main; nobody may cite it as existing.
+
+## D10. Egress and schema-registry rules (repaired in Task 0.6)
+
+- `schema_for(id, version)` returning None for a REQUESTED version is a raised error at dispatch,
+  never a silent unenforced call (fixes the trap documented at `enrich_llm.py:769-773`).
+- Unknown TOP-LEVEL metadata keys in the single-call path fail closed (today they egress
+  unscanned — `enrich_llm.py:168` intersection bug).
+- Every new context key ships with an explicit classification in the relevant allowlist
+  (`_FEATURE_COLUMN_*`, `_ITEM_META_ALLOWED`, `_COLUMN_PROFILE_KEYS`, `_ROSTER_ENTRY_KEYS`) plus
+  a golden egress test. Unclassified = blocked stays the law; the change is that blocked is LOUD.
+- The fact wrapper accepts the D2 typed triple; `llm_proposed` display never appears on the wire —
+  the wire carries `(producer, strength)`.
+- Pass-B extension (profile Task 4) requires a REAL schema v3 body + prompt version bump
+  (`overlay_table_synth_batch` v2 is a byte-alias of v1 with `additionalProperties: false`).
+- Feature-context v4 requires registration in `_SCHEMAS` before `_feature_schema_version()` may
+  return 4.
+
+## D11. Read scope
+
+- Table anchors get DERIVED visibility: a table node is visible iff the caller can see ≥1 of its
+  columns (the `overlay/upload/catalogs.py:50-59` shape). Search predicates, profile-text
+  matching, catalog narrative reads, and the Context Graph all use it. (Repaired for search in
+  Task 0.6; new surfaces adopt it from birth.)
+- Both bundle builders take `roles` and filter every neighbour/link/table read through
+  `visible_requires <@ allowed` — the bundle inherits NOTHING from the un-scoped
+  `read_operational_value`/`read_column_facts` paths without a scope check at the boundary
+  (closes DEFERRED-WORK B-1 #8 for this surface instead of widening it).
+- Entity Map's documented un-scoped links (`entity_map.py:20-27`) remain as-is; the semantic
+  Task 6 "same value everywhere" claim is amended to name that exception.
+
+## D12. Bound amendments to the plans
+
+1. **Counterparty (semantic Task 2):** `counterparty_id.entity_link` stays `counterparty` for
+   FACT-KEY DERIVATION (governed bridge fact keys hash `entity_id`; flipping it orphans
+   confirmation streams). The correction happens at projection: the alias seam maps the entity to
+   `customer` in `graph_node` backfill (migration 1045), Entity Map, bundles and NEW enrichment
+   evidence; `known_entities()` keeps `counterparty` as a readable legacy member; new
+   classification vocabulary excludes `counterparty_id`. `bridge_grounding.py` is IN Task 2's
+   scope (issuer folds into `assess_grounded_identifier_link`); the three pinned tests in
+   `test_bridge_namespace_pairing.py` are updated deliberately with a bridge-programme handoff
+   note, not silently.
+2. **Retrieval legs (semantic Task 9):** grain/time is leg 1 (as shipped, by design); lexical is
+   leg 2; semantic expansion is leg 3; link neighbourhood leg 4. Plan renumbered.
+3. **Stage outcomes (semantic Task 5):** `selected/unchanged/...` live in the stage `detail`
+   payload; stage state stays within the 0996 CHECK vocabulary; `stage_report.py` added to the
+   task's file list.
+4. **Supersession (semantic Task 6):** `_write_llm_field_evidence`'s unconditional rewrite is in
+   scope — same-value reruns must reuse the prior evidence ID (value-diff like the concept
+   writer), or "same value AND evidence ID" is unachievable for five of six fields.
+5. **Concept cache identity (semantic Task 4):** sibling-roster context enters the PROMPT but not
+   the per-column `input_hash`/cache key; roster changes re-enrich only on the vocabulary/pipeline
+   fingerprint, not per-sibling-edit. (Prevents per-table identity cascades; accepted trade-off:
+   a sibling change does not auto-invalidate neighbours until the next fingerprint bump.)
+6. **`AttributionPolicyV1` → `DimensionAttributionPolicyV1`** everywhere in the profile plan; and
+   Release B Task 8 explicitly budgets NEW work for `CURRENT_RECORD` (basis today declared and
+   refused) and `LATEST_SNAPSHOT_AS_OF` (no analysis-path implementation) — only
+   `VALID_AT_REPORT_CUTOFF` is reuse.
+7. **Load-bearing path (profile Tasks 1/3):** `authority_role` and `temporal_storage_model` get
+   `human_editable=True` with the existing four-eyes propose/confirm flow (`propose_override` →
+   `confirm_override`, distinct subjects) — platform-admin confirmer, `data_owner` may propose via
+   a new scoped route. `set_advisory` is whitelisted to `business_context` ONLY. The Release-B
+   serving/temporal policy remains the alternative operational declaration.
+8. **Release C predecessor:** the codegen-remediation plan + Phase-G wiring plan are named hard
+   predecessors of Release C Task 12 and of semantic Task 8's generated-project acceptance.
+9. **Superseded-plan drops** (OPERATIONAL/AUDIT serving purposes, owner/steward, OpenMetadata
+   description import, `table_role` facet, typed `dependency_kind`, sandbox observation
+   persistence, `open_gaps` demand surface) are recorded in `docs/DEFERRED-WORK.md` with triggers
+   as part of Release-A Task 6 exit — reinstated only by explicit decision.
+10. **`catalog_profile_revision_id` semantics:** authoring-context provenance on evidence;
+    effective reads resolve the CURRENT pointer; `dataset_profile_hash` includes the current
+    narrative revision id — so narrative edits DO re-key dataset profiles (accepted: narrative is
+    meaning-bearing) but do NOT invalidate feature snapshots, which pin the decision refs of D6,
+    revalidated at execution.
