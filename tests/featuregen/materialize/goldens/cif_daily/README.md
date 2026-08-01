@@ -9,7 +9,7 @@ one whose hash was recorded, with no record that it changed.
   write anywhere else.
 - **Renderer version** `2` · **physical type policy** `2`
 - **Materialization contract** `2c9c4f8ab6236c0fcd6f04e21d81bf563178b4b829acb07a9c3673a874f2f803`
-- **Group plan** `11f9eae66a2d2837ebf8f45957076786032f592e7627dc8f2b0658959ec7d8ad`
+- **Group plan** `26e02cc9dd958512ed13c5d4b6f4314866f4e17f31fb0249bde245b636bd94db`
 
 ## How this is launched
 
@@ -65,7 +65,7 @@ shared filter or window produces a wrong number, and this slice does not share s
 
 | Column | Type | `ir_hash` |
 | --- | --- | --- |
-| `cross_border_value_ratio_90d` | `DECIMAL(38,6)` | `927aaa403ef961367ea6a5c069f7c8410d0cf10f8d4518ba4872a705ae786787` |
+| `cross_border_value_ratio_90d` | `DECIMAL(38,6)` | `a5b257ab3e2f42a21c4d007bb2f308d278b5a8f4fedfccb624eb89cc689cbd8a` |
 | `distinct_merchant_count_90d` | `BIGINT` | `57306f2b2fd8eb6a2660d54ab6e7f564f67242172a9da4d788db2e51a6cc0e3d` |
 | `total_debit_amount_30d` | `DECIMAL(38,6)` | `985525a5f1410a2031049fbe3aa64866b83e3c2ab0f23c0a4f39bbf4db2889dc` |
 

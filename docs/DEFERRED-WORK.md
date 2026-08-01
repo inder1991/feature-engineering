@@ -497,3 +497,15 @@ edge cardinality to `MANY_TO_ONE`).
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🟡 **Legacy fabricated-N:1 approved_join facts persist under authority-persists** | Facts minted before the remediation carry a fabricated `N:1` that two admins confirmed; a stored `N:1` cannot be distinguished from a genuinely-uploaded one (the proposal value records no "defaulted" marker). Authority-persists is the platform's documented policy, so no data migration rewrites or demotes them; the propose-time pair dedupe also means a cardinality-blank re-upload cannot dislodge them (by design — the confirmed fact stands). | A governance decision to re-review cardinality-blank-origin joins, which requires re-proposal after a cardinality-bearing upload (reject the legacy fact via join governance, then upload with an explicit cardinality). |
+
+### A.28 🟡 half_even ratios refused — engine rounds first (2026-07-31)
+
+Recorded while remediating Task 8 of the codegen review. Empirically confirmed on real Spark:
+decimal `Divide` wraps its result in `CheckOverflow` with hard-coded HALF_UP at the division
+result scale (clamped to `MINIMUM_ADJUSTED_SCALE=6`) BEFORE the emitted `F.bround` runs — at
+published scale 6 the bround re-rounds an already-rounded value and is a no-op (1/2000000 →
+0.000001, not the HALF_EVEN 0.000000).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`half_even` on a RATIO refuses (`PHYSICAL_TYPE_UNSUPPORTED`) instead of being honoured** | Generated code alone cannot honour the declaration — the ties are gone before any explicit rounding call runs — and a governed mode the engine silently ignores must refuse rather than be recorded as applied. `resolve_physical_type` refuses the combination; non-ratio bodies keep both modes (post-aggregate rounding of a narrower-scale value has no engine pre-rounding to fight). The worked ratio fixture now declares `half_up` — the mode the engine actually applies. | A consumer needs banker's rounding on a ratio; requires computing the quotient at guaranteed extra scale or a post-division re-quantization proof. |

@@ -163,13 +163,13 @@ def calculate_cross_border_value_ratio_90d(
     # surviving is an extra column §9 reports against the whole group at assembly.
     staged = staged.drop('__minuend', '__subtrahend')
 
-    # §6 — rounding is applied EXPLICITLY, from the formula's own declared `half_even` mode, and
-    # never inherited from an engine default. `F.bround` is Spark's function for exactly that mode
-    # — a tie rounds to the EVEN neighbour, so 2.5 becomes 2 and 3.5 becomes 4. A different mode
-    # would move every tie in this column, and an engine default states no mode at all.
+    # §6 — rounding is applied EXPLICITLY, from the formula's own declared `half_up` mode, and
+    # never inherited from an engine default. `F.round` is Spark's function for exactly that mode
+    # — a tie rounds AWAY from zero, so 2.5 becomes 3. A different mode would move every tie in
+    # this column, and an engine default states no mode at all.
     staged = staged.withColumn(
         'cross_border_value_ratio_90d',
-        F.bround(F.col('cross_border_value_ratio_90d'), 6),
+        F.round(F.col('cross_border_value_ratio_90d'), 6),
     )
 
     # §9 OVERFLOW_VIOLATION. The formula declares `error` on overflow, and `error` is not a mode
@@ -232,7 +232,7 @@ def calculate_cross_border_value_ratio_90d(
     # publish stale output past every other check (§9).
     manifest = {
         'intent_feature_name': 'cross_border_value_ratio_90d',
-        'ir_hash': '927aaa403ef961367ea6a5c069f7c8410d0cf10f8d4518ba4872a705ae786787',
+        'ir_hash': 'a5b257ab3e2f42a21c4d007bb2f308d278b5a8f4fedfccb624eb89cc689cbd8a',
         'generation_id': str(generation_id),
         'run_id': str(run_id),
         'business_dt': business_date,

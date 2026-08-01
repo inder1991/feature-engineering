@@ -624,6 +624,30 @@ def test_SATURATE_is_refused():
         CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED)
 
 
+def test_half_even_on_a_ratio_is_refused_not_silently_half_up():
+    """Spark's decimal ``Divide`` applies ``CheckOverflow`` with hard-coded HALF_UP at the division
+    result scale (clamped to MINIMUM_ADJUSTED_SCALE=6) BEFORE any explicit rounding call in the
+    generated code runs — at published scale 6 the emitted ``bround`` is a no-op (verified
+    empirically: 1/2000000 → 0.000001, not the HALF_EVEN 0.000000). A governed declaration the
+    engine silently ignores must refuse instead of publishing a column whose recorded mode is
+    false."""
+    policy = DecimalPolicy(precision=18, scale=2, rounding=RoundingMode.HALF_EVEN,
+                           overflow=OverflowBehavior.ERROR)
+    refusal = _refusal(_ratio(decimal=policy))
+    assert refusal.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert "half_up" in refusal.detail
+
+
+def test_half_even_on_a_plain_aggregate_is_still_allowed():
+    """Post-aggregate rounding of a narrower-scale value has no engine pre-rounding to fight: a SUM
+    (and a DIFFERENCE — the refusal is about DIVISION, not about the two-expression shape) keeps
+    both modes."""
+    policy = DecimalPolicy(precision=18, scale=2, rounding=RoundingMode.HALF_EVEN,
+                           overflow=OverflowBehavior.ERROR)
+    assert _resolved(_sum(decimal=policy)).rounding is RoundingMode.HALF_EVEN
+    assert _resolved(_difference(decimal=policy)).rounding is RoundingMode.HALF_EVEN
+
+
 def test_a_counts_decimal_policy_governs_nothing_and_is_therefore_not_validated():
     """PINS A DECISION §6 does not make. A count publishes BIGINT, so its ``DecimalPolicy``
     reaches no rendered expression: neither an unrepresentable precision nor an unimplemented
@@ -816,4 +840,6 @@ def test_the_worked_features_resolve_to_their_published_types():
     ratio_type = _resolved(fixtures.authored_formula("cross_border_value_ratio_90d"))
     assert (ratio_type.sql_type, ratio_type.nullable) == ("DECIMAL(38,6)", True)
     assert ratio_type.overflow is OverflowBehavior.ERROR
-    assert ratio_type.rounding is RoundingMode.HALF_EVEN
+    # HALF_UP, deliberately: the engine's own division pre-rounds HALF_UP, so a worked ratio
+    # declaring half_even would refuse above — the fixture declares the mode Spark applies.
+    assert ratio_type.rounding is RoundingMode.HALF_UP

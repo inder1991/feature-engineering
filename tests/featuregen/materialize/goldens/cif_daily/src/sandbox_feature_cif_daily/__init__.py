@@ -12,13 +12,13 @@ __version__ = "1.0"
 #: What the compilation chain decided, before a single file existed (§7).
 COMPILATION_IDENTITY = {
     'formula_content_hashes': [
-        'd107527da1c3f6ab7e6511344d183b12fe046018ee202c3a151e2e513721a5b0',
+        '9a162dcf3f62d0c4fe0694542c9619393d033dd8560b4b690883ac69c9182c2b',
         'e53124ea18b2fc274434f799a1ee2802c2d169d4c53896629d8dabc652c63a86',
         '82fda384fe8b0121521226572e35171db903f3a81739bf7bf22a4824c0ca051f',
     ],
-    'group_plan_hash': '11f9eae66a2d2837ebf8f45957076786032f592e7627dc8f2b0658959ec7d8ad',
+    'group_plan_hash': '26e02cc9dd958512ed13c5d4b6f4314866f4e17f31fb0249bde245b636bd94db',
     'ir_hashes': [
-        '927aaa403ef961367ea6a5c069f7c8410d0cf10f8d4518ba4872a705ae786787',
+        'a5b257ab3e2f42a21c4d007bb2f308d278b5a8f4fedfccb624eb89cc689cbd8a',
         '57306f2b2fd8eb6a2660d54ab6e7f564f67242172a9da4d788db2e51a6cc0e3d',
         '985525a5f1410a2031049fbe3aa64866b83e3c2ab0f23c0a4f39bbf4db2889dc',
     ],

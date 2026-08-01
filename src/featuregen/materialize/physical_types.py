@@ -50,7 +50,12 @@ run instead of producing a value, so a column that exists at all was written wit
 **Two obligations this module RESOLVES but cannot itself enforce**, carried on :class:`PhysicalType`
 so the renderer receives them rather than re-deriving them:
 
-* ``RoundingMode`` — §6 requires it be implemented explicitly, never left to an engine default;
+* ``RoundingMode`` — §6 requires it be implemented explicitly, never left to an engine default.
+  For a RATIO, ``HALF_EVEN`` therefore REFUSES: Spark's decimal division rounds HALF_UP at the
+  result scale before any explicit rounding call in generated code runs, so the emitted call
+  re-rounds an already-rounded value and the declared mode is recorded but never applied
+  (DEFERRED-WORK A.28). Non-ratio bodies keep both modes — post-aggregate rounding of a
+  narrower-scale value has no engine pre-rounding to fight;
 * ``OverflowBehavior.ERROR`` — Spark's default on decimal overflow is to return NULL, so honouring
   ERROR is deliberate configuration plus an explicit check in generated code (§9's
   ``OVERFLOW_VIOLATION`` gate is the last line, not the first). ``SATURATE`` is a deferred NFR and
@@ -370,8 +375,9 @@ def resolve_physical_type(
     Returns:
         The resolved :class:`PhysicalType`, or a :class:`MaterializationRefused` carrying
         ``PHYSICAL_TYPE_UNSUPPORTED`` — an arithmetic operand that is not a governed exact numeric,
-        a decimal policy outside what a Hive/Spark ``DECIMAL`` can represent, or an overflow
-        behaviour this slice does not implement.
+        a decimal policy outside what a Hive/Spark ``DECIMAL`` can represent, an overflow
+        behaviour this slice does not implement, or ``HALF_EVEN`` rounding on a ratio, which the
+        engine's own division pre-rounds out of existence.
 
     Raises:
         ValueError: ``operand_types`` does not describe exactly this formula's expressions. A call
@@ -404,6 +410,20 @@ def resolve_physical_type(
     sql_type = _decimal_type(formula.decimal)
     if isinstance(sql_type, MaterializationRefused):
         return sql_type
+    if isinstance(body, RatioBody) and formula.decimal.rounding is RoundingMode.HALF_EVEN:
+        # Spark's decimal `Divide` wraps its result in `CheckOverflow`, which rounds HALF_UP at
+        # the division result scale (clamped to MINIMUM_ADJUSTED_SCALE=6) BEFORE any explicit
+        # rounding call in the generated code runs — at the published scale the emitted `bround`
+        # re-rounds an already-rounded value and is a no-op (verified empirically: 1/2000000 →
+        # 0.000001, not the HALF_EVEN 0.000000). §6 requires the mode to be implemented
+        # explicitly, and generated code alone cannot: the ties are gone before it runs. A
+        # declaration the engine silently ignores refuses instead of being recorded as applied.
+        # Non-ratio bodies keep both modes — post-aggregate rounding of a narrower-scale value
+        # has no engine pre-rounding to fight. DEFERRED-WORK A.28 holds the lifting conditions.
+        return _refuse(
+            "the formula declares half_even rounding on a ratio, which generated code cannot "
+            "honour: Spark decimal division rounds HALF_UP at the result scale before any "
+            "explicit rounding call; declare half_up, or wait for engine-side support")
     return PhysicalType(
         sql_type=sql_type,
         nullable=nullable,

@@ -1987,7 +1987,8 @@ def ratio(catalog, db):  # noqa: F811 — `catalog` seeds the governed facts `db
 
 @pytest.fixture
 def ratio_feature(ratio):
-    """The real PlannedFeature for `cross_border_value_ratio_90d` — DECIMAL(38,6), HALF_EVEN."""
+    """The real PlannedFeature for `cross_border_value_ratio_90d` — DECIMAL(38,6), HALF_UP (a
+    declared half_even on a ratio now refuses at `resolve_physical_type`; DEFERRED-WORK A.28)."""
     return next(planned for planned in ratio[1].features if planned.column_name == RATIO_90D)
 
 
