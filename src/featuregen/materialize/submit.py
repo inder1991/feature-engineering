@@ -145,9 +145,16 @@ class LocalClusterSubmitter:
     start a process without them, because Spark would launch its workers on whichever Python is
     first on the path and die deep inside an executor.
 
-    The run is its own session (``start_new_session=True``), so a timeout kills the ENTIRE process
+    The run is its own session (``start_new_session=True``), so a timeout kills the whole process
     group: killing only the direct child would leave a ``spark-submit`` grandchild orphaned,
     holding the inherited pipes and writing into ``staging_root`` after the submitter gave up.
+
+    Known residual limitation: ``os.killpg`` reaches only descendants that STAYED in the submitted
+    session's process group. A descendant that itself calls ``setsid()`` acquires a different pgid
+    and escapes this kill entirely — the orphan-writes-into-``staging_root`` defect recurring one
+    level deeper. That is inherent to the process-group mechanism; a cluster-mode application must
+    be bounded by cluster-side controls (the resource manager killing the application), not by
+    this local kill.
     """
 
     python_executable: str
@@ -187,6 +194,10 @@ class LocalClusterSubmitter:
                 stdout, stderr = process.communicate(timeout=30.0)
             except subprocess.TimeoutExpired:            # a pipe survived even SIGKILL
                 stdout, stderr = "", ""
+                try:
+                    process.wait(timeout=0)              # explicit reap of the SIGKILLed leader —
+                except subprocess.TimeoutExpired:        # not left to a GC finalizer; if it is not
+                    pass                                 # reapable yet, still return, never hang
             return SubmissionOutcome(
                 completed=False, returncode=None,
                 detail=f"the run exceeded {self.timeout_seconds}s; its process group was "
