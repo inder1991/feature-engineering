@@ -304,7 +304,12 @@ def compile_ir(
         # is never a defaulted policy.
         zero_denominator=body.zero_denominator if isinstance(body, RatioBody) else None,
         grain_entity=formula.grain.entity,
-        grain_keys=tuple(formula.grain.keys),
+        # Folded for the same reason `compile_expression` folds its refs: `formula_content_hash`
+        # folds case, so a raw spelling here would fork one governed formula into two `ir_hash`es —
+        # and the renderer's `_grain_key_columns` compares these against the (folded) expression
+        # read set and the `hive_identifier`-lowered landing keys, which a raw spelling can match
+        # neither of.
+        grain_keys=tuple(_fold(key) for key in formula.grain.keys),
         expressions=tuple(expressions),
         spine=spine,
         output_policy=formula.output,

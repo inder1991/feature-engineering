@@ -1010,6 +1010,20 @@ def test_the_same_feature_compiles_to_the_same_hash_twice(catalog):
            ir_hash(_ok(_compile(catalog, RATIO_FEATURE)))
 
 
+def test_grain_key_CASING_does_not_fork_the_formula_level_ir_hash(catalog):
+    """`formula_content_hash` folds ref case and Task 19 folded the per-EXPRESSION payloads — but
+    `grain_keys` enters THIS module's `identity_payload` directly, so a raw spelling here was the
+    last place one governed formula could still compile to two `ir_hash`es. Folded at the same
+    boundary (`compile_ir`), with `_fold` — the fold the sibling grain-entity check already uses."""
+    formula = fixtures.authored_formula(PUBLIC_FEATURE)
+    lower = dataclasses.replace(formula, grain=Grain(entity="customer", keys=(TXN_CIF,)))
+    upper = dataclasses.replace(formula, grain=Grain(entity="customer", keys=(TXN_CIF.upper(),)))
+    one = _ok(_compile(catalog, PUBLIC_FEATURE, formula=lower))
+    two = _ok(_compile(catalog, PUBLIC_FEATURE, formula=upper))
+    assert two.grain_keys == one.grain_keys == (TXN_CIF,)
+    assert ir_hash(two) == ir_hash(one)
+
+
 def test_two_different_features_hash_differently(catalog):
     assert ir_hash(_ok(_compile(catalog, PUBLIC_FEATURE))) != \
            ir_hash(_ok(_compile(catalog, DENIED_FEATURE)))

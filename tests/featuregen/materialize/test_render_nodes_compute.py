@@ -43,6 +43,8 @@ from tests.featuregen.materialize.test_ir import (
     CUSTOMERS,
     CUSTOMERS_ASOF,
     CUSTOMERS_STATUS,
+    _compile,
+    _ok,
 )
 from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compiled
 
@@ -50,6 +52,7 @@ from featuregen.formula.schema import (
     AggregateFunction,
     EmptyWindowResult,
     FinalOperation,
+    Grain,
     NullInput,
     OverflowBehavior,
     RoundingMode,
@@ -1811,6 +1814,22 @@ def test_it_refuses_when_the_GRAIN_columns_are_not_the_LANDING_key_columns(compi
     plan = dataclasses.replace(compiled[1], entity_key_columns=("customer_number",))
     with pytest.raises(ValueError, match="nothing states how one spelling maps"):
         _calculate(compiled, feature, plan=plan)
+
+
+def test_a_mixed_case_grain_key_spelling_renders_on_the_FOLDED_landing_column(compiled, feature,
+                                                                              db):
+    """`compile_ir` folds grain-key spellings, so this renderer never sees a raw one. Before that
+    fold, a mixed-case spelling was refused HERE with a spurious "not in authorized read set" —
+    the read-set side folds at expression compile — and `_column` would otherwise render a
+    `groupBy` on a casing Hive folds away. The landing side (`hive_identifier` lowers) and the
+    read set now agree, so the rendered aggregate groups by the FOLDED column."""
+    formula = dataclasses.replace(
+        fixtures.authored_formula(SUM_30D),
+        grain=Grain(entity="customer", keys=(fixtures.REF_CIF.upper(),)))
+    ir = _ok(_compile(db, SUM_30D, formula=formula))
+    node = _calculate(compiled, feature, ir=ir)   # pre-fold: "not in ... authorized read set"
+    assert ir.grain_keys == (fixtures.REF_CIF,)
+    assert "groupBy(F.col('cif_id'))" in node.source
 
 
 def test_it_refuses_when_the_PLAN_and_the_IR_describe_different_columns(compiled, feature):
