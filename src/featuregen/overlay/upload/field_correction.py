@@ -40,6 +40,7 @@ from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import Command
 from featuregen.contracts.identity import IdentityEnvelope
 from featuregen.overlay.evidence import AssertionStrength, EvidenceLifecycle, EvidenceProducer
+from featuregen.overlay.field_authority import InfluenceTier
 from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
     read_field_decisions,
@@ -75,12 +76,62 @@ from featuregen.overlay.upload.ingest import (
     ingest_source_lock_key,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
+from featuregen.overlay.upload.profile_vocab import (
+    normalize_authority_role,
+    normalize_temporal_storage_model,
+)
 from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.security.audit import record_denial
 
 ACTIONS: frozenset[str] = frozenset(
-    {"confirm_existing", "propose_override", "confirm_override", "reject"}
+    {"confirm_existing", "propose_override", "confirm_override", "reject", "set_advisory"}
 )
+
+# ── set_advisory (profile Task 1, interface doc D12.7) ────────────────────────────────────────────
+# The HARD allowlist for the single-actor advisory write: `set_advisory` appends HUMAN/CONFIRMED
+# and projects immediately WITHOUT a second reviewer, so it may cover ONLY a field whose value can
+# never be load-bearing from that write AND that never had (nor deserves) the four-eyes flow.
+# Exactly one field qualifies: `business_context` (RECOMMENDATION ceiling — the confirm changes
+# display, never authority). Every OTHER field — including every pre-existing human_editable
+# scalar (definition / concept / domain / …) — keeps propose_override -> confirm_override with
+# DISTINCT subjects. Extending this constant is guarded by `_assert_set_advisory_allowlist`
+# (import-time + tested): adding `definition`/`concept` (or any operational field) raises.
+SET_ADVISORY_FIELDS: frozenset[str] = frozenset({"business_context"})
+
+# Fields that must NEVER become single-actor writable: every field registered BEFORE the profile
+# program (each already carries four-eyes via the generic command or a dedicated one) plus the two
+# OPERATIONAL profile classifications (their confirm path IS four-eyes, D12.7). A hard, explicit
+# list — not derived — so a future registry addition cannot silently widen set_advisory.
+_SET_ADVISORY_BARRED: frozenset[str] = frozenset({
+    "concept", "definition", "ai_summary", "domain", "feature_role", "logical_representation",
+    "semantic_type", "sensitivity", "additivity", "temporal_role", "leakage_anchor", "table_role",
+    "primary_entity", "event_or_snapshot", "business_term", "term_type", "declared_type",
+    "data_type", "unit", "currency", "entity", "authority_role", "temporal_storage_model",
+})
+
+
+def _assert_set_advisory_allowlist(fields: frozenset[str] = SET_ADVISORY_FIELDS) -> None:
+    """Fail LOUDLY if the set_advisory allowlist ever names a field that four-eyes protects (or
+    should): barred fields, unregistered fields, non-RECOMMENDATION fields, and non-human_editable
+    fields all raise. Runs at import time over the live constant; the test suite additionally
+    proves that adding ``definition``/``concept`` to a candidate list raises."""
+    for f in sorted(fields):
+        if f in _SET_ADVISORY_BARRED:
+            raise ValueError(
+                f"set_advisory may never cover {f!r}: it is four-eyes-protected (propose/confirm "
+                "with distinct subjects); the single-actor advisory write is business_context only")
+        policy = policy_for(f)
+        if policy is None:
+            raise ValueError(f"set_advisory names an unregistered field {f!r}")
+        if policy.influence_max is not InfluenceTier.RECOMMENDATION:
+            raise ValueError(
+                f"set_advisory may never cover {f!r}: only a RECOMMENDATION-ceiling field (whose "
+                "value can never be load-bearing) may be single-actor confirmed")
+        if not policy.human_editable:
+            raise ValueError(f"set_advisory field {f!r} must be human_editable")
+
+
+_assert_set_advisory_allowlist()
 
 # [5] the PROJECTING actions — each re-projects (or clears) the field's governed display column, which
 # H2c hashes as contract-dependency state. ``propose_override`` is the sole non-projecting action (it
@@ -95,14 +146,22 @@ _PROJECTING_ACTIONS: frozenset[str] = frozenset({"confirm_existing", "confirm_ov
 # so the correction command itself must retire the current set.
 _SHORTLIST_INPUT_FIELDS: frozenset[str] = frozenset({"concept", "business_term", "term_type"})
 
-# Per-field value bound (chars); ``definition`` gets a longer prose ceiling, everything else a short
-# scalar bound. A value outside the bound (or empty/whitespace-only) is REFUSED before any write.
-_MAX_LEN: dict[str, int] = {"definition": 4000}
+# Per-field value bound (chars); ``definition``/``business_context`` get a longer prose ceiling,
+# everything else a short scalar bound. A value outside the bound (or empty/whitespace-only) is
+# REFUSED before any write.
+_MAX_LEN: dict[str, int] = {"definition": 4000, "business_context": 4000}
 _DEFAULT_MAX_LEN = 512
 
 # Fields whose value is drawn from a CLOSED, known vocabulary — a correction must land a real registry
 # term, not free text (M-8). ``definition`` / ``domain`` / ``business_term`` stay genuinely free-text.
-_KNOWN_VOCAB_VALIDATORS = {"concept": is_known_concept}
+# The two profile classifications accept only their EXACT canonical members (already-lowercased; the
+# profile PUT surface normalizes input before it reaches here) so case-variant duplicates can never
+# enter the evidence stream.
+_KNOWN_VOCAB_VALIDATORS = {
+    "concept": is_known_concept,
+    "authority_role": lambda v: normalize_authority_role(v) == v,
+    "temporal_storage_model": lambda v: normalize_temporal_storage_model(v) == v,
+}
 
 _HUMAN = EvidenceProducer.HUMAN.value
 
@@ -170,6 +229,8 @@ def _callable_actions(
     never confirm their OWN proposal)."""
     active = read_active_field_evidence(conn, logical_ref, field)
     actions = ["propose_override", "reject"]
+    if field in SET_ADVISORY_FIELDS:
+        actions.append("set_advisory")   # allowlisted advisory field: single-actor write available
     if any(not _proposed_by_actor(e, actor) for e in active):
         actions.append("confirm_existing")
     if any(_human_proposal(e) and e.producer_ref != actor.subject for e in active):
@@ -320,6 +381,9 @@ def apply_field_correction(
     elif action == "confirm_existing":
         projected = _confirm_existing(conn, norm_source, logical_ref, field, selected_evidence_ids,
                                       actor, idempotency_key, input_hash, note)
+    elif action == "set_advisory":
+        projected = _set_advisory(conn, norm_source, logical_ref, field, replacement_value, actor,
+                                  idempotency_key, input_hash, note)
     else:  # reject
         projected = _reject(conn, norm_source, logical_ref, field, selected_evidence_ids, actor,
                             idempotency_key, input_hash, note)
@@ -397,7 +461,8 @@ def _success_body(
 ) -> dict:
     latest, set_hash, policy_version = _current_cas(conn, logical_ref, field)
     outcome = {"confirm_existing": "confirmed", "confirm_override": "confirmed",
-               "propose_override": "proposed", "reject": "rejected"}[action]
+               "propose_override": "proposed", "reject": "rejected",
+               "set_advisory": "confirmed"}[action]
     return {"accepted": True, "body": {
         "field": field, "action": action,
         "outcome": "replayed" if replayed else outcome, "replayed": replayed,
@@ -407,6 +472,33 @@ def _success_body(
         "policy_version": policy_version,
         "actions": _callable_actions(conn, logical_ref, field, actor),
     }}
+
+
+def _set_advisory(
+    conn: DbConn, source: str, logical_ref: str, field: str, replacement_value: str | None,
+    actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
+) -> bool:
+    """Single-actor ADVISORY write (profile Task 1, D12.7): append a bounded HUMAN/CONFIRMED row
+    and re-resolve/project immediately — for the :data:`SET_ADVISORY_FIELDS` allowlist ONLY
+    (``business_context``; anything else 403s here, whatever its ``human_editable`` flag says).
+
+    Why no four-eyes: the allowlisted field is RECOMMENDATION-ceilinged, so this confirm changes
+    what is DISPLAYED and nothing operational — the influence ceiling (enforced in the resolver,
+    re-asserted by ``_assert_set_advisory_allowlist``) is the guarantee, not reviewer count. It is
+    deliberately NOT in ``_PROJECTING_ACTIONS``: ``business_context`` has no ``graph_node`` display
+    column (decision-only), so no H2c-hashed contract-dependency state changes and no contract
+    invalidation applies. Four-eyes for every other field is untouched."""
+    if field not in SET_ADVISORY_FIELDS:
+        raise FieldCorrectionError(
+            403, f"field {field!r} is not set_advisory-eligible; use propose_override/"
+                 "confirm_override (four-eyes) or the field's dedicated command")
+    _check_bounds(field, replacement_value)
+    _append_human_evidence(
+        conn, logical_ref=logical_ref, field=field, value=replacement_value,
+        strength=AssertionStrength.CONFIRMED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
+        idempotency_key=idempotency_key, input_hash=input_hash, spans=[], note=note)
+    resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field])
+    return True
 
 
 def _propose_override(

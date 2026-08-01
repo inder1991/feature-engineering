@@ -46,8 +46,10 @@ _OPERATIONAL_DISQUALIFIERS: tuple[Disqualifier, ...] = (
 _LLM_PROPOSED = HasEvidence(EvidenceProducer.LLM, AssertionStrength.PROPOSED)
 _SOURCE_PROPOSED = HasEvidence(EvidenceProducer.SOURCE, AssertionStrength.PROPOSED)
 _SOURCE_ATTESTED = HasEvidence(EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+_HUMAN_PROPOSED = HasEvidence(EvidenceProducer.HUMAN, AssertionStrength.PROPOSED)
 _HUMAN_CONFIRMED = HasEvidence(EvidenceProducer.HUMAN, AssertionStrength.CONFIRMED)
 _PARSER_SUPPORTED = HasEvidence(EvidenceProducer.PARSER, AssertionStrength.SUPPORTED)
+_PROFILER_ATTESTED = HasEvidence(EvidenceProducer.PROFILER, AssertionStrength.ATTESTED)
 _TAXONOMY_PROPOSED = HasEvidence(EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED)
 _TAXONOMY_CONFIRMED = HasEvidence(EvidenceProducer.TAXONOMY, AssertionStrength.CONFIRMED)
 
@@ -199,6 +201,47 @@ _MEASURE_ANNOTATION = FieldPolicy(
 )
 
 
+# ── Release-A profile fields (profile plan Task 1, interface doc D12.7) ───────────────────────────
+
+# business_context — the NEW advisory table-narrative field: the business meaning of a table in the
+# uploader's / curator's words. RECOMMENDATION ceiling (advisory forever: the ceiling, not the
+# operational rule, is the guarantee). Display admits llm/source/human-proposed AND human-proposed
+# (the no-"blocked" rule: a pending proposal is usable, labeled — never failure-styled) and it is
+# the ONE field the single-actor `set_advisory` command may write (field_correction's hard
+# allowlist). For a TECHNICAL catalog this is the only table prose there is — technical ingestion
+# writes no source-attested table narrative — so hiding a proposal here would blank the product.
+_BUSINESS_CONTEXT = _recommendation(
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_PROPOSED,
+                        _HUMAN_CONFIRMED)),
+    operational_rule=_SOURCE_OR_HUMAN,
+    human_editable=True,
+)
+
+# authority_role / temporal_storage_model — the NEW OPERATIONAL profile classifications (D12.7).
+#
+# * DISPLAY is lenient: an LLM or uploader (HUMAN/PROPOSED via the profile PUT) proposal is shown
+#   for exploration — visible, labeled, usable in sandbox ranking later — never hidden.
+# * LOAD-BEARING is strict and NEVER from the LLM: only source-attested, human-confirmed, or
+#   deterministic-profiler (profiler/ATTESTED) evidence clears the operational rule. The profiler
+#   leaf is FORWARD PERMISSION per the interface doc — no producer emits profiler/attested for
+#   these fields today (the deterministic Hive/ODS classification slice is deferred); including the
+#   leaf claims nothing exists, it only avoids a policy edit when that slice lands. The ordinary
+#   profiler default (profiler/SUPPORTED) deliberately does NOT clear it.
+# * human_editable=True wires the EXISTING four-eyes flow (D12.7): propose_override writes
+#   HUMAN/PROPOSED (displayed, not load-bearing); confirm_override by a DISTINCT subject writes
+#   HUMAN/CONFIRMED (load-bearing). `set_advisory` is hard-excluded (field_correction allowlist).
+_OPERATIONAL_PROFILE_CLASSIFICATION = FieldPolicy(
+    influence_max=InfluenceTier.OPERATIONAL,
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_PROPOSED,
+                        _HUMAN_CONFIRMED)),
+    operational_rule=AnyOf((_SOURCE_ATTESTED, _HUMAN_CONFIRMED, _PROFILER_ATTESTED)),
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
+    resolution_mode=ResolutionMode.GENERIC_FIELD,
+    conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
+    human_editable=True,
+)
+
+
 # The registry: object-field name -> its policy. Keyed by the field_name written to field_evidence.
 _POLICIES: dict[str, FieldPolicy] = {
     "concept": _CONCEPT,
@@ -230,6 +273,12 @@ _POLICIES: dict[str, FieldPolicy] = {
     "unit": _MEASURE_ANNOTATION,
     "currency": _MEASURE_ANNOTATION,
     "entity": _ENTITY_ADVISORY,             # operational path = VERIFIED entity_assignment (Del. E)
+    # Release-A profile fields (TABLE-level; profile plan Task 1). business_context is advisory
+    # forever (RECOMMENDATION ceiling + the set_advisory allowlist); the two classifications are
+    # OPERATIONAL with the strict source/human/deterministic bar documented above.
+    "business_context": _BUSINESS_CONTEXT,
+    "authority_role": _OPERATIONAL_PROFILE_CLASSIFICATION,
+    "temporal_storage_model": _OPERATIONAL_PROFILE_CLASSIFICATION,
 }
 
 
