@@ -175,14 +175,15 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | Number | Reserved by |
 | --- | --- |
 | 1044 | codegen remediation (`1044_run_event_ordering.sql` — already claimed by that plan) |
-| 1045 | semantic Task 2 — catalog semantic scope (+ `graph_node.entity` backfill, D12) |
+| 1045 | semantic Task 2 — catalog semantic scope table ONLY (entity backfill removed per D12.1-revised) |
 | 1046 | semantic Task 5 — structured-result subject/current pointer |
-| 1047 | profile Task 2 — catalog narrative revision + current |
+| 1047 | profile Task 2 — catalog narrative revision + current, plus co-located `graph_node` `authority_role`/`temporal_storage_model` display+decision-link columns (recorded post-hoc; the stream had only this number) |
 | 1048 | profile Task 7 — serving policy store |
 | 1049 | profile Task 7 — temporal policy store |
 | 1050 | Release C Task 10 — crosswalk store |
+| 1051 | D13 — `graph_node` display-projection columns `bian_path`, `process_path`, `sub_domain` (joint Task 4 / profile Task 5) |
 
-New needs append 1051+ to this table FIRST (edit this doc in the same commit as the migration).
+New needs append 1052+ to this table FIRST (edit this doc in the same commit as the migration).
 
 ## D8. Flag matrix
 
@@ -250,15 +251,24 @@ New needs append 1051+ to this table FIRST (edit this doc in the same commit as 
 
 ## D12. Bound amendments to the plans
 
-1. **Counterparty (semantic Task 2):** `counterparty_id.entity_link` stays `counterparty` for
-   FACT-KEY DERIVATION (governed bridge fact keys hash `entity_id`; flipping it orphans
-   confirmation streams). The correction happens at projection: the alias seam maps the entity to
-   `customer` in `graph_node` backfill (migration 1045), Entity Map, bundles and NEW enrichment
-   evidence; `known_entities()` keeps `counterparty` as a readable legacy member; new
-   classification vocabulary excludes `counterparty_id`. `bridge_grounding.py` is IN Task 2's
-   scope (issuer folds into `assess_grounded_identifier_link`); the three pinned tests in
-   `test_bridge_namespace_pairing.py` are updated deliberately with a bridge-programme handoff
-   note, not silently.
+1. **Counterparty (semantic Task 2) — REVISED 2026-08-01 after review probes proved the original
+   instruction self-contradictory** (`graph_node.entity` is itself a fact-key input via
+   `bridge_grounding.advisory_entity_id`, so "backfill entity but don't re-key" was
+   unsatisfiable; a re-key resurrects human-REJECTED decoy links and orphans VERIFIED ones):
+   the entity stays `counterparty` EVERYWHERE it is persisted or feeds derivation —
+   `Concept.entity_link`, `graph_node.entity`, `axis_projection`, grounding (`concept_entity` =
+   raw `entity_link`), candidate enumeration and fact keys. NO `graph_node` entity backfill, NO
+   search-doc reproject hooks. The `customer` correction is READ-TIME ONLY via the alias seam
+   (`display_entity`) in Entity Map, asset detail, bundles and any UI render — the exact
+   `sensitivity` vs `sensitivity_display` precedent (migration 1042: never rewrite the value
+   that generates derived state). Migration 1045 carries ONLY the catalog semantic-scope table.
+   `known_entities()` keeps `counterparty` as a readable legacy member; new classification
+   vocabulary excludes `counterparty_id`; the concept critic's revise pass canonicalizes through
+   `canonical_concept_name` like Pass A. The three pinned pairing tests KEEP their original
+   entity literals; alias-seam tests assert display values only. Issuer folding into
+   `assess_grounded_identifier_link` unchanged. Gate-B approval text must state the
+   vocabulary-fingerprint change forces a full concept re-classification at next live ingest
+   (paid LLM spend).
 2. **Retrieval legs (semantic Task 9):** grain/time is leg 1 (as shipped, by design); lexical is
    leg 2; semantic expansion is leg 3; link neighbourhood leg 4. Plan renumbered.
 3. **Stage outcomes (semantic Task 5):** `selected/unchanged/...` live in the stage `detail`
@@ -291,3 +301,42 @@ New needs append 1051+ to this table FIRST (edit this doc in the same commit as 
     narrative revision id — so narrative edits DO re-key dataset profiles (accepted: narrative is
     meaning-bearing) but do NOT invalidate feature snapshots, which pin the decision refs of D6,
     revalidated at execution.
+
+## D13. Product decisions 2026-08-01 — fine-grained classification axes
+
+Background: both live source files declare `data_domain` uniformly (FTR = Compliance × 127 rows,
+CIB = Customer × 111 rows), so `domain` is a two-value coarse axis by uploader authority — which
+source-over-LLM precedence rightly preserves. The fine-grained taxonomy already in the files is
+the per-column BIAN levels and business-process paths, captured today as source evidence
+(`bian_path`, `process_path`, `fibo_path`). User decision: adopt BOTH of the following; neither
+changes domain precedence.
+
+**D13.1 — BIAN/process as a first-class searchable axis (owner: profile Task 5 step).**
+- Migration 1051 adds rebuildable `graph_node` display-projection columns `bian_path`,
+  `process_path` (the facet mechanism requires literal columns; projections follow the existing
+  table display-column pattern and ride the `table_display_reprojection`/resolution path — never
+  authoritative, always rebuildable from evidence).
+- Search: facet + filter on both (facet values are the stored " > "-joined paths; a hierarchical
+  L1/L2 facet UI may segment on the delimiter client-side — no new server vocabulary). Read scope
+  identical to other column facets.
+- Data-agent retrieval (semantic Task 9): BIAN/process terms join the leg-2/leg-3 controlled
+  semantic expansion inputs.
+- Display: already shipped (dossier source-glossary section); no new UI surface required beyond
+  the facet controls.
+
+**D13.2 — LLM sub-domain proposals beside the source domain (owner: joint Task 4 step).**
+- NEW field `sub_domain`, recommendation/display tier exactly like `domain` (LLM visible,
+  human-editable via existing four-eyes, never load-bearing, never overwrites `domain`). Source
+  `domain` stays the coarse governed axis; `sub_domain` is a finer LLM-proposed axis rendered
+  with its `llm_proposed` authority label per the no-blocked rule.
+- Produced by the existing Pass-A domain task extended per D10 discipline: a REAL new schema
+  version body (per-column `sub_domain` beside the table-first `domain`/`column_domains` shape),
+  prompt version bump, registration before request, golden payload tests. No second LLM call.
+- `graph_node.sub_domain` display projection rides migration 1051; facet added in the same
+  profile-Task-5 step as D13.1 once populated.
+- Population requires the Gate-B re-enrichment run (live LLM spend — already governed by that
+  approval; witnesses: `counter_party_bic`, `pstd_date`-family temporal columns, and at least one
+  CIB flag column should receive sub-domains finer than Customer/Compliance).
+- Closed-vocabulary option deliberately deferred: sub_domain v1 is free-text-constrained-by-prompt
+  like `domain`; a curated sub-domain list becomes a `_KNOWN_VOCAB_VALIDATORS` entry later if the
+  bank supplies one (record as a deferred item at the joint step, not silently).

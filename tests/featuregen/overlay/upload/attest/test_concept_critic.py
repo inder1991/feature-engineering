@@ -143,6 +143,49 @@ def test_genuinely_ambiguous_assignment_abstains(db) -> None:
     assert result.resolved_concept == "category_code"
 
 
+def test_a_legacy_alias_revision_canonicalizes_and_is_never_stored_raw(db) -> None:
+    # The revise pass routes through canonical_concept_name exactly like Pass A's _accept_concept:
+    # a revise answer of counterparty_id (a legacy alias, still a registry member) lands as
+    # customer_id — in the typed result AND in the replay store, never raw.
+    client = FakeLLM(script={
+        CONCEPT_CRITIC_TASK: FakeResponse(output={
+            "verdict": "refuted",
+            "reason_codes": ["a category code does not identify the counterparty CIF"]}),
+        CONCEPT_REVISION_TASK: FakeResponse(output={"concept": "counterparty_id",
+                                                    "reason_codes": []}),
+    })
+    item = _item(
+        ref="ftr::real.comp_financial_tran_repos_dly.counter_party_cif_id",
+        column="counter_party_cif_id",
+        declared="varchar(20)",
+        definition="Counterparty CIF",
+        concept="category_code",
+    )
+    result = critique_concept_batch(db, client, [item], catalog_revision="r1")[item.logical_ref]
+    assert result.disposition is ConceptDisposition.REVISED
+    assert result.resolved_concept == "customer_id"
+    assert "revision_accepted" in result.reason_codes
+    stored = load_structured_result(db, result.structured_result_id)
+    assert stored is not None
+    assert stored.output["resolved_concept"] == "customer_id"
+
+
+def test_an_alias_revision_never_resurrects_its_own_refuted_successor(db) -> None:
+    # MUTATION (difference gate compares CANONICAL forms): customer_id was refuted; answering its
+    # legacy alias counterparty_id is the SAME selection restated, never a "different" revision.
+    client = FakeLLM(script={
+        CONCEPT_CRITIC_TASK: FakeResponse(output={
+            "verdict": "refuted", "reason_codes": ["not supported"]}),
+        CONCEPT_REVISION_TASK: FakeResponse(output={"concept": "counterparty_id",
+                                                    "reason_codes": []}),
+    })
+    item = _item(concept="customer_id")
+    result = critique_concept_batch(db, client, [item], catalog_revision="r1")[item.logical_ref]
+    assert result.disposition is ConceptDisposition.REFUTED
+    assert result.resolved_concept is None
+    assert "revision_rejected" in result.reason_codes
+
+
 def test_an_off_registry_revision_is_never_emitted(db) -> None:
     # (d) — the model names a concept outside CONCEPT_REGISTRY; the item falls to refuted, and the
     # fabricated name appears nowhere in the result.
