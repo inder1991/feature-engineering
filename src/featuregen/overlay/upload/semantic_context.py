@@ -40,6 +40,19 @@ Its query count is column-count- and field-count-independent (pinned by test).
 NOT wired into `enrich_llm` dispatch here (that is Task 4); every key they emit must be classified
 in the relevant egress allowlist before it may egress (D10) — key names reuse the existing
 allowlist names wherever a matching key exists.
+
+**DELIBERATE DEFERRALS (declared so nobody reads them as oversights).** Task 1 freezes the
+contract; three of its surfaces are intentionally unconsumed at this commit:
+
+* `structured_results` — the bundle carries no adjudication/critic result projection. Task 5 owns
+  the structured-result subject/current pointer (migration 1046) and wires it in.
+* Observation-store READS — this module never queries an observation store. `ObservationContextV1`
+  is projected only from observations the CALLER supplies, together with the caller-supplied
+  currentness pointer (see `bundle_from_store`); the store itself, and therefore
+  `relationship_observation_current`, arrives with the Hive/ODS slice. Until then
+  `observation_context` is empty and `observation_context_absent` is the honest code.
+* `REASON_CODES` — frozen NOW because D5 makes it hash-load-bearing from day one, but it has no
+  emitter in this module. Its consumers (adjudication + the critic surfacing) land in Task 5.
 """
 from __future__ import annotations
 
@@ -100,6 +113,17 @@ class SemanticContextError(ValueError):
 
 #: Why a piece of context is ABSENT from a bundle. Closed: arbitrary free-text reasons are
 #: forbidden; both the semantic and the profile plan consume these codes.
+#:
+#: READ `*_absent` AS "NOT IN THIS BUNDLE", NEVER AS A DATA-QUALITY VERDICT. Both builders are
+#: read-scoped (D11): a table, link or neighbour the CALLER may not see is filtered out before
+#: `_missing_codes` runs, so the same column yields `relationship_context_absent` for a narrowly
+#: scoped reader and no code at all for a broadly scoped one. The bundle is fail-closed by
+#: design — it must not leak "something exists here that you cannot see" — so absence under
+#: scope and absence in the platform are DELIBERATELY indistinguishable at this surface.
+#: Consequently no consumer may present these codes as a gap in the data, raise them as a
+#: quality finding, or use them to compute coverage/completeness across callers.
+#: `*_unresolved` / `*_missing` are different: those describe the anchor column itself, which the
+#: caller can see by construction (the builder raises `KeyError` otherwise).
 MISSING_CONTEXT_CODES: frozenset[str] = frozenset({
     "concept_unclassified",          # no registry concept selected -> concept_path == ()
     "definition_missing",
@@ -978,6 +1002,7 @@ def bundle_from_store(
     catalog_profile_revision_id: str | None = None,
     dataset_profile_hash: str | None = None,
     observations: Sequence[RelationshipObservationV2] = (),
+    current_observation_revision_ids: Iterable[str] | None = None,
 ) -> SemanticContextBundleV1:
     """Build the bundle from the persisted stores through read-scoped, BATCHED reads.
 
@@ -986,7 +1011,17 @@ def bundle_from_store(
     `logical_ref_of` rule, without its per-call query). Fails closed: an anchor that does not
     exist OR is not visible to `roles` raises `KeyError` (no existence oracle), and a degraded /
     lagged load-bearing projection raises `CatalogProjectionUnavailable` before any read is
-    trusted (checked ONCE for the whole bundle, never per field)."""
+    trusted (checked ONCE for the whole bundle, never per field).
+
+    CURRENTNESS IS SUPPLIED, NEVER ASSUMED. `ObservationContextV1.current` mirrors the
+    `relationship_observation_current` pointer (D4), and this module cannot read that pointer yet
+    (the observation store arrives with the Hive/ODS slice). So a caller passing `observations`
+    MUST also pass `current_observation_revision_ids` — the pointer rows' revision ids — and each
+    observation's `current` is membership in that set. Supplying observations WITHOUT the pointer
+    set raises: defaulting to `current=True` would let a superseded observation (measured against
+    an older binding revision) present itself to feature generation as the live measurement, which
+    is exactly the stale-evidence class the realization/scope guards exist to refuse. An EMPTY set
+    is a legitimate answer (every supplied observation is superseded)."""
     from featuregen.overlay.upload.feature_metadata_snapshot import check_projection_readiness
 
     check_projection_readiness(conn)
@@ -1133,6 +1168,12 @@ def bundle_from_store(
     source_map = {v.field_name: v for v in source_values}
 
     observation_context: list[ObservationContextV1] = []
+    if observations and current_observation_revision_ids is None:
+        raise SemanticContextError(
+            "observations supplied without `current_observation_revision_ids`: currentness "
+            "mirrors the `relationship_observation_current` pointer and is never assumed — pass "
+            "the pointer rows' revision ids (an empty set means every observation is superseded)")
+    current_ids = frozenset(current_observation_revision_ids or ())
     realized_by_revision = {
         realized.realization_revision_id: realized
         for link in relationship for realized in link.realizations
@@ -1143,8 +1184,9 @@ def bundle_from_store(
             raise SemanticContextError(
                 "observation supplied for a realization outside this bundle's relationship "
                 f"context: {observation.realization_revision_id!r}")
-        observation_context.append(
-            observation_context_from(observation, realization=realized, current=True))
+        observation_context.append(observation_context_from(
+            observation, realization=realized,
+            current=observation.observation_revision_id in current_ids))
 
     missing = _missing_codes(
         concept_name=concept_name,

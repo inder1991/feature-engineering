@@ -383,7 +383,9 @@ def test_a_lying_production_eligibility_dies() -> None:
         dataclasses.replace(_relationship(), availability="executable")
 
 
-def test_relationship_context_from_the_store_composes_the_shipped_readers(db) -> None:
+def _stored_link_with_realization(db):
+    """Seed ONE governed link with one current realization, visible to any caller, and return the
+    realization revision (shared by the D3 composition test and the D4 currentness tests)."""
     left, right = _executable_pair()
     assessment = IdentifierLinkAssessmentV1(
         left_endpoint=left, right_endpoint=right,
@@ -409,6 +411,11 @@ def test_relationship_context_from_the_store_composes_the_shipped_readers(db) ->
     _graph(db, [CanonicalRow("cib", "customers", "customer_id", "text", is_grain=True)])
     build_graph(db, "ftr", [CanonicalRow("ftr", "transactions", "customer_id", "text")])
     run_projection(db, OverlayProjection())     # catch the overlay checkpoint up to the head
+    return assessment, revision
+
+
+def test_relationship_context_from_the_store_composes_the_shipped_readers(db) -> None:
+    assessment, revision = _stored_link_with_realization(db)
 
     bundle = sc.bundle_from_store(db, "cib", "public.customers.customer_id", roles=())
     (link,) = bundle.relationship_context
@@ -542,6 +549,48 @@ def test_observation_reused_across_realizations_or_scopes_dies() -> None:
         sc.observation_context_from(
             _observation(), realization=_realization_context(scope_id=None),
             current=True)
+
+
+def _bundle_observation(revision) -> RelationshipObservationV2:
+    return _observation(realization_revision_id=revision.realization_revision_id,
+                        scope_id=revision.applicability_scope.scope_id)
+
+
+def test_bundle_observations_without_a_currentness_pointer_die(db) -> None:
+    """`ObservationContextV1.current` mirrors the `relationship_observation_current` pointer (D4),
+    which this module cannot read yet — so it is SUPPLIED, never assumed. Observations without the
+    pointer set are refused rather than stamped current."""
+    _, revision = _stored_link_with_realization(db)
+    with pytest.raises(sc.SemanticContextError):
+        sc.bundle_from_store(db, "cib", "public.customers.customer_id", roles=(),
+                             observations=(_bundle_observation(revision),))
+
+
+def test_bundle_observation_currentness_comes_from_the_supplied_pointer(db) -> None:
+    """MUTATION (currentness defaulted to True): the SAME observation projects `current` from the
+    caller's pointer set alone. An EMPTY set is a legitimate answer — every supplied observation is
+    superseded — and must NOT be confused with "no pointer supplied", which raises above.
+
+    Without this, a superseded observation (measured against an older binding revision) would
+    present itself to feature generation as the live measurement."""
+    _, revision = _stored_link_with_realization(db)
+    observation = _bundle_observation(revision)
+
+    superseded = sc.bundle_from_store(
+        db, "cib", "public.customers.customer_id", roles=(),
+        observations=(observation,), current_observation_revision_ids=())
+    (stale_ctx,) = superseded.observation_context
+    assert stale_ctx.current is False
+
+    live = sc.bundle_from_store(
+        db, "cib", "public.customers.customer_id", roles=(),
+        observations=(observation,),
+        current_observation_revision_ids=(observation.observation_revision_id,))
+    (live_ctx,) = live.observation_context
+    assert live_ctx.current is True
+
+    # Currentness is bundle CONTENT (D1): it re-keys the identity hash.
+    assert superseded.content_hash != live.content_hash
 
 
 # ── bundle_from_store: batching, scope, scalar-reader agreement ──────────────────────────────────
