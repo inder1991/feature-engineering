@@ -85,16 +85,21 @@ def test_off_vocab_role_and_unregistered_entity_dropped():
     assert _find(disp2, "primary_entity")["reason"] == "entity_not_registered"
 
 
-def test_dispositions_are_total_five_fields():
+def test_dispositions_are_total_over_every_field():
+    from featuregen.overlay.upload.table_synth import (
+        DISPOSITION_FIELDS,
+        DISPOSITION_STATUSES,
+    )
     accept, disp = _accept(["a"])
     accept(json.dumps({"grain_columns": []}), "t")
     fields = {d["field"] for d in disp}
-    assert fields == {"grain", "availability_time", "table_role", "primary_entity",
-                      "event_or_snapshot"}
+    # TOTAL over the one constant — five structural fields plus the four profile suggestions.
+    assert fields == set(DISPOSITION_FIELDS)
     assert _find(disp, "table_role")["status"] == "abstained"   # absent advisory == abstained
+    assert _find(disp, "authority_role")["status"] == "abstained"
     # [F12] record shape: prior_value_staled defaults False; status vocabulary is closed
     assert all(d["prior_value_staled"] is False for d in disp)
-    assert all(d["status"] in {"accepted", "abstained", "dropped_invalid"} for d in disp)
+    assert all(d["status"] in DISPOSITION_STATUSES for d in disp)
 
 
 # ── [F13] availability + event normalization ────────────────────────────────────────────────────

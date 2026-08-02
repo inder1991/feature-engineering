@@ -147,13 +147,15 @@ def test_wide_phase2_item_carries_structured_roster_and_table_definition(db):
     assert meta["column_roster"][0] == {"column": "c0", "operational_type": "integer",
                                         "declared_type": ""}  # structured, not "c0:integer"
     # both phases ship the Slice-2 contract via the Task-1 seam: prompt v3, canonical schema
-    # STAYS v2 ([F1] — the role vocab is code-side + prompt-side, never a schema enum)
-    assert synth_req.prompt_version == 3 and synth_req.output_schema_version == 2
+    # Profile Task 4 moved the contract to prompt v4 / schema v3 — a REAL v3 body, because v2 is a
+    # byte-alias of v1 with `additionalProperties: false` and would REJECT the profile suggestions.
+    # ONE generation across the whole run: the chunk-summary call stamps the same pair.
+    assert synth_req.prompt_version == 4 and synth_req.output_schema_version == 3
     summary_req = [r for r in client.requests if r.task == "table_synth_summary"][0]
-    assert summary_req.prompt_version == 3 and summary_req.output_schema_version == 2
+    assert summary_req.prompt_version == 4 and summary_req.output_schema_version == 3
 
 
-def test_narrow_fast_path_ships_v3_prompt_v2_schema(db):
+def test_narrow_fast_path_ships_the_v4_prompt_and_v3_schema(db):
     rows = [_row("narrow", "c0")]
     items = assemble_table_items(_views(rows))
     client = _RecordingLLM({"table_synth": FakeResponse(output={"results": [
@@ -161,7 +163,7 @@ def test_narrow_fast_path_ships_v3_prompt_v2_schema(db):
     out = synthesize_tables(db, client, items, columns_by_table={"narrow": {"c0"}}, actor=None)
     assert out["narrow"]["grain"] == {"columns": ["c0"], "is_unique": True}
     req = [r for r in client.requests if r.task == "table_synth"][0]
-    assert req.prompt_version == 3 and req.output_schema_version == 2
+    assert req.prompt_version == 4 and req.output_schema_version == 3
 
 
 # ── v2 schemas + instructions describe the dual-type contract ───────────────────────────────────
@@ -174,9 +176,10 @@ def test_v2_synth_schemas_are_registered(db):
     )
     register_enrichment_schemas(db)
     reg = DocumentSchemaRegistry(db)
-    assert reg.schema_for("overlay_table_synth_batch", 2) is not None
-    assert reg.schema_for("overlay_table_synth", 2) is not None
-    assert reg.schema_for("overlay_table_synth_summary_batch", 2) is not None
+    for version in (2, 3):     # v2 stays registered (the rollback rung); v3 is what ships
+        assert reg.schema_for("overlay_table_synth_batch", version) is not None, version
+        assert reg.schema_for("overlay_table_synth", version) is not None, version
+        assert reg.schema_for("overlay_table_synth_summary_batch", version) is not None, version
 
 
 def test_instructions_describe_operational_vs_declared():

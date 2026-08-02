@@ -73,7 +73,10 @@ def test_slice1_view_flows_into_pass_b_and_egress_audit_persists(db, synthetic_f
     # the structured roster in the same item is dual-typed for every column too
     assert len(table_item["column_roster"]) == 126
     for entry in table_item["column_roster"]:
-        assert entry.keys() == {"column", "operational_type", "declared_type"}
+        # The three identity keys are always present; profile Task 4 additionally carries the
+        # resolved `concept` where Pass A produced one (the crosswalk contradiction's only signal).
+        assert {"column", "operational_type", "declared_type"} <= entry.keys()
+        assert entry.keys() <= {"column", "operational_type", "declared_type", "concept"}
         assert entry["operational_type"] == UNKNOWN_TYPE and entry["declared_type"]
 
     # ── 3. reconciled-away parser facets are WITHHELD from the captured profiles ──

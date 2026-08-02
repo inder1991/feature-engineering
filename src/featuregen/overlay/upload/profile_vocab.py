@@ -122,3 +122,19 @@ def normalize_authority_role(raw: object) -> str | None:
 def normalize_temporal_storage_model(raw: object) -> str | None:
     """Normalize a raw temporal-storage-model into :class:`TemporalStorageModel`."""
     return _normalize_member(raw, TemporalStorageModel)
+
+
+def profile_vocabulary_fingerprint() -> str:
+    """Canonical, ORDER-INSENSITIVE fingerprint of the three closed profile vocabularies.
+
+    Folded into the Pass-B profile-synthesis replay identity (joint Task 4 item e) for the same
+    reason the concept vocabulary is folded into the classifier's: a verdict reached against a
+    DIFFERENT set of admissible answers must not replay as if nothing changed. Sorted member lists
+    through the one ``canonical_hash``, so neither declaration order nor dict key order can churn
+    identity."""
+    from featuregen.overlay.field_evidence import canonical_hash
+    return canonical_hash({
+        "data_role": sorted(m.value for m in DataRole),
+        "authority_role": sorted(m.value for m in AuthorityRole),
+        "temporal_storage_model": sorted(m.value for m in TemporalStorageModel),
+    })[:12]
