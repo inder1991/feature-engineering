@@ -26,7 +26,6 @@ whole-graph DELETE+rebuild), not an oversight.
 """
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Annotated
 
 import psycopg
@@ -42,7 +41,7 @@ from featuregen.api.deps import (
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.column_authority import logical_ref_of
-from featuregen.overlay.upload.dataset_profiles import build_dataset_profile
+from featuregen.overlay.upload.dataset_profiles import build_dataset_profile, profile_payload
 from featuregen.overlay.upload.field_correction import (
     FieldCorrectionError,
     _lock_key,
@@ -120,7 +119,7 @@ def get_asset_profile(source: str, object_ref: str, conn: _RRConn, identity: _Id
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _visible_table_anchor(conn, src, object_ref, identity.role_claims)
     logical_ref = logical_ref_of(conn, src, object_ref.lower())
-    return asdict(_assemble(conn, src, logical_ref))
+    return profile_payload(_assemble(conn, src, logical_ref))
 
 
 class AssetProfilePutRequest(BaseModel):
@@ -227,5 +226,5 @@ def put_asset_profile(
     return {
         "written": sorted(written),
         "dataset_profile_hash": updated.dataset_profile_hash,
-        "profile": asdict(updated),
+        "profile": profile_payload(updated),
     }

@@ -162,19 +162,46 @@ REASON_CODES: frozenset[str] = frozenset({
 UNRESOLVED_REASON_FAMILIES: frozenset[str] = frozenset(
     {"undecided", "needs_data_check", "structurally_unsuitable"})
 
+#: The closed unresolved-reason members — ONE spelling each, no aliases. Named here so consumers
+#: reference a symbol rather than re-typing a string; the family-free suffix is WIRE-VISIBLE
+#: through :func:`unresolved_label` (the Release-A profile surface publishes reason and family as
+#: two columns), so a suffix rename is a wire change, not a refactor.
+UNRESOLVED_NO_EVIDENCE = "undecided:no_evidence"
+UNRESOLVED_PENDING_REVIEW = "undecided:pending_review"
+UNRESOLVED_AUTHORITY_INSUFFICIENT = "undecided:authority_insufficient"
+UNRESOLVED_CONFLICT = "needs_data_check:conflict"
+UNRESOLVED_HASH_MISMATCH = "needs_data_check:hash_mismatch"
+UNRESOLVED_PROJECTION_UNAVAILABLE = "needs_data_check:projection_unavailable"
+UNRESOLVED_FORKED_DECISION_HEAD = "needs_data_check:forked_decision_head"
+UNRESOLVED_PENDING_REVALIDATION = "needs_data_check:pending_revalidation"
+UNRESOLVED_FIELD_NOT_APPLICABLE = "structurally_unsuitable:field_not_applicable"
+UNRESOLVED_RETIRED = "structurally_unsuitable:retired"
+
 #: Closed unresolved reasons. Every member is family-prefixed and maps to exactly one family
 #: (validated at import). "No evidence at all" is `undecided:no_evidence`, DISTINCT from
 #: `influence_not_operational` — which display fields report as their NORMAL state, never as
 #: unresolved (D5).
+#:
+#: The family is written out rather than derived from the prefix ON PURPOSE: the import-time
+#: validator then actually checks something (a member whose prefix and declared family disagree
+#: trips it), instead of restating a split.
 UNRESOLVED_REASONS: dict[str, str] = {
-    "undecided:no_evidence": "undecided",
-    "undecided:proposal_pending": "undecided",
-    "needs_data_check:conflict": "needs_data_check",
-    "needs_data_check:hash_mismatch": "needs_data_check",
-    "needs_data_check:projection_unavailable": "needs_data_check",
-    "needs_data_check:forked_decision_head": "needs_data_check",
-    "structurally_unsuitable:field_not_applicable": "structurally_unsuitable",
-    "structurally_unsuitable:retired": "structurally_unsuitable",
+    UNRESOLVED_NO_EVIDENCE: "undecided",
+    # An UNREVIEWED top-strength tie, or evidence below every display rule: nobody with authority
+    # has decided anything yet. Never a failure-shaped conflict — that word is reserved for
+    # contradictions between load-bearing-capable assertions.
+    UNRESOLVED_PENDING_REVIEW: "undecided",
+    # Said, but below the operational bar. Still `undecided`: an unmet authority bar is a decision
+    # nobody has taken, not a defect in the data.
+    UNRESOLVED_AUTHORITY_INSUFFICIENT: "undecided",
+    UNRESOLVED_CONFLICT: "needs_data_check",
+    UNRESOLVED_HASH_MISMATCH: "needs_data_check",
+    UNRESOLVED_PROJECTION_UNAVAILABLE: "needs_data_check",
+    UNRESOLVED_FORKED_DECISION_HEAD: "needs_data_check",
+    # Material changed under a human confirmation; awaiting a re-check.
+    UNRESOLVED_PENDING_REVALIDATION: "needs_data_check",
+    UNRESOLVED_FIELD_NOT_APPLICABLE: "structurally_unsuitable",
+    UNRESOLVED_RETIRED: "structurally_unsuitable",
 }
 
 #: The closed `SemanticValueV1.resolution_status` vocabulary: a source-declared value, a current
@@ -197,6 +224,24 @@ def _validate_vocabularies() -> None:
 
 
 _validate_vocabularies()
+
+
+def unresolved_family(reason: str) -> str:
+    """The product family of one closed unresolved reason.
+
+    Raises ``KeyError`` on an unknown member: the vocabulary is CLOSED, so an unmapped reason is a
+    programming error, not a display case the UI should be asked to render."""
+    return UNRESOLVED_REASONS[reason]
+
+
+def unresolved_label(reason: str) -> str:
+    """The member's family-free label — ``undecided:no_evidence`` -> ``no_evidence``.
+
+    For consumers that publish the family in its own column (the Release-A dataset-profile
+    surface): the pair ``(unresolved_label, unresolved_family)`` IS the member, split in two. It is
+    a projection of the one canonical spelling, never a second vocabulary."""
+    unresolved_family(reason)   # closed-vocabulary check before we hand out a substring
+    return reason.split(":", 1)[1]
 
 
 # ── D2: the derived display label (display only — never persisted, never authority) ─────────────
@@ -1116,7 +1161,7 @@ def bundle_from_store(
             field_name=field_name,
             value=value,
             evidence=entries,
-            resolution_status="current" if value is not None else "undecided:proposal_pending",
+            resolution_status="current" if value is not None else UNRESOLVED_PENDING_REVIEW,
         ))
     for field_name in _OPERATIONAL_FIELDS:
         value = _render(operational.get(field_name))
@@ -1136,7 +1181,7 @@ def bundle_from_store(
             field_name=field_name,
             value=value,
             evidence=entries,
-            resolution_status="current" if value is not None else "undecided:proposal_pending",
+            resolution_status="current" if value is not None else UNRESOLVED_PENDING_REVIEW,
             operational_influence=influence,
         ))
     resolved_values.sort(key=lambda v: v.field_name)
@@ -1153,7 +1198,7 @@ def bundle_from_store(
             table_values.append(SemanticValueV1(
                 field_name=field_name, value=value, evidence=entries,
                 resolution_status="current" if value is not None else
-                "undecided:proposal_pending"))
+                UNRESOLVED_PENDING_REVIEW))
 
     relationship = _scoped_relationship_context(conn, flat_ref, allowed)
     path = concept_path(concept_name)

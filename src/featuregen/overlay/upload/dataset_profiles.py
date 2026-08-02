@@ -36,10 +36,13 @@ and the CURRENT catalog narrative revision id (D12.10 — narrative edits re-key
 byte-identical re-authoring resolves to the same deterministic revision id and does NOT). It
 excludes physical bindings, environment, wall-clock, job state and projection timestamps.
 
-TODO(semantic-merge): ``SemanticValueV1`` is owned by the parallel semantic stream's
-``overlay/upload/semantic_context.py`` (D5). The module-local dataclass below is shaped to the D2
-contract (value + producer/strength/lifecycle triple + evidence ids); when that module lands,
-replace this definition with the import — this is the single adapter point.
+**Values (D2/D5):** display/load_bearing values are the canonical
+``semantic_context.SemanticValueV1`` — the value plus the FULL authority triple of every backing
+evidence record, leading with the strongest. The wire and the hash publish the FLAT projection of
+that (value + the leading triple + every backing evidence id) through the one
+:func:`_value_payload` boundary; ``profile_payload`` — not ``dataclasses.asdict`` — is what the
+routes serialize, because the canonical value nests its authority per record and this surface's
+payload shape (and therefore ``dataset_profile_hash``) is defined on the flat one.
 """
 from __future__ import annotations
 
@@ -62,10 +65,17 @@ from featuregen.overlay.field_evidence import (
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_revalidation import active_disqualifiers_for
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.profile_vocab import (
-    UnresolvedReason,
-    data_role_from_table_role,
+from featuregen.overlay.upload.profile_vocab import data_role_from_table_role
+from featuregen.overlay.upload.semantic_context import (
+    UNRESOLVED_AUTHORITY_INSUFFICIENT,
+    UNRESOLVED_CONFLICT,
+    UNRESOLVED_NO_EVIDENCE,
+    UNRESOLVED_PENDING_REVALIDATION,
+    UNRESOLVED_PENDING_REVIEW,
+    EvidenceAuthorityV1,
+    SemanticValueV1,
     unresolved_family,
+    unresolved_label,
 )
 from featuregen.projections.runner import projection_lag
 
@@ -96,6 +106,9 @@ STATE_DISPLAY_ONLY = "display_only"
 STATE_LOAD_BEARING = "load_bearing"
 STATE_NO_EVIDENCE = "no_evidence"
 STATE_NEEDS_DATA_OBSERVATION = "needs_data_observation"
+# No Release-A producer emits this yet; it lands with the deterministic-contradiction path (Task 4:
+# e.g. SCD2 claimed with no candidate boundary columns). Its REASON comes from the canonical
+# vocabulary's `structurally_unsuitable:*` members — this module holds no reason of its own.
 STATE_STRUCTURALLY_UNSUITABLE = "structurally_unsuitable"
 STATE_CONFLICT = "conflict"
 STATE_PROJECTION_UNAVAILABLE = "projection_unavailable"
@@ -103,20 +116,6 @@ STATE_PROJECTION_UNAVAILABLE = "projection_unavailable"
 # bar — competing unreviewed proposals, or evidence below every display rule. NEVER paired with a
 # display value; `display_only` is reserved for fields that actually display something.
 STATE_UNDECIDED = "undecided"
-
-
-@dataclass(frozen=True, slots=True)
-class SemanticValueV1:
-    """One resolved value + the D2 authority triple VERBATIM (producer × strength × lifecycle —
-    never the flat 5-label projection) + the evidence ids backing exactly this value.
-
-    Module-local stand-in shaped to the D2 contract; see the module TODO(semantic-merge)."""
-
-    value: str
-    producer: str
-    strength: str
-    lifecycle: str
-    evidence_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,14 +128,18 @@ class EffectiveProfileFieldV1:
 
     CRITICAL display semantics (§6.3 as amended): for a RECOMMENDATION-ceiling field,
     ``state=display_only`` is the NORMAL state — ``unresolved_reason`` is ``None`` there, and is
-    populated ONLY from the three-family :class:`profile_vocab.UnresolvedReason` vocabulary.
-    "No evidence at all" is ``no_evidence`` + ``undecided:no_evidence`` — honestly undecided,
-    never failure-styled."""
+    populated ONLY from the three-family ``semantic_context.UNRESOLVED_REASONS`` vocabulary.
+    "No evidence at all" is ``no_evidence`` + ``undecided`` — honestly undecided, never
+    failure-styled.
+
+    ``unresolved_reason``/``unresolved_family`` are the canonical member SPLIT IN TWO (the
+    ``unresolved_label``/``unresolved_family`` pair of one ``undecided:no_evidence``-style member),
+    because this surface has always published the family in its own column."""
 
     display: SemanticValueV1 | None
     load_bearing: SemanticValueV1 | None
     state: str
-    unresolved_reason: str | None      # an UnresolvedReason value, or None
+    unresolved_reason: str | None      # a canonical member's family-free label, or None
     unresolved_family: str | None      # its family (undecided | needs_data_check | structurally_unsuitable)
     reason_codes: tuple[str, ...]
 
@@ -187,23 +190,36 @@ _STRENGTH_RANK: dict[str, int] = {
 
 
 def _semantic_value(
-    evidence: list[FieldEvidence], value: str | None, *, mapped: str | None = None
+    evidence: list[FieldEvidence], value: str | None, *, field_name: str,
+    mapped: str | None = None,
 ) -> SemanticValueV1 | None:
-    """Type ``value`` with the D2 triple of its strongest backing evidence + ALL backing evidence
-    ids (sorted). ``mapped`` substitutes a display-mapped value (data_role) while the backing is
-    still matched on the resolver's raw ``value``. ``None`` value -> ``None``."""
+    """Type ``value`` as a canonical :class:`SemanticValueV1` carrying the D2 authority triple of
+    EVERY record backing exactly this value, LEADING with the strongest (the record whose triple
+    the flat wire projection publishes, and the one ``display_label()`` derives from). ``mapped``
+    substitutes a display-mapped value (data_role) while the backing is still matched on the
+    resolver's raw ``value``. ``None`` value -> ``None``.
+
+    ``resolution_status="current"``: a profile field is always the CURRENTLY resolved value, never
+    a source-declared one. ``operational_influence`` stays ``None`` — that axis is the operational
+    facts surface, which this read model does not consult and must not guess at."""
     if value is None:
         return None
     backing = [e for e in evidence if to_view(e).value == value]
     if not backing:   # defensive: a resolver value always has backing among its inputs
         return None
+    # Lead with the strongest exactly as before (`max` keeps the first of a tie in read order);
+    # the rest follow by evidence id so the value is deterministic for the hash.
     best = max(backing, key=lambda e: _STRENGTH_RANK.get(e.strength, -1))
+    rest = sorted((e for e in backing if e.evidence_id != best.evidence_id),
+                  key=lambda e: e.evidence_id)
     return SemanticValueV1(
+        field_name=field_name,
         value=mapped if mapped is not None else value,
-        producer=best.producer,
-        strength=best.strength,
-        lifecycle=best.lifecycle,
-        evidence_ids=tuple(sorted(e.evidence_id for e in backing)),
+        evidence=tuple(
+            EvidenceAuthorityV1(producer=e.producer, strength=e.strength, lifecycle=e.lifecycle,
+                                producer_ref=e.producer_ref, evidence_id=e.evidence_id)
+            for e in (best, *rest)),
+        resolution_status="current",
     )
 
 
@@ -212,17 +228,20 @@ def _wrap_resolution(
     evidence: list[FieldEvidence],
     policy: FieldPolicy,
     *,
+    field_name: str,
     map_value=None,
 ) -> EffectiveProfileFieldV1:
     """Re-wrap one :class:`FieldResolution` into the §6.3 shape (see the class docstring).
 
-    ``map_value`` (data_role) maps a resolver value into its DISPLAY vocabulary member without
-    touching the underlying evidence."""
+    ``field_name`` is the PROFILE field name (``data_role``, not the ``table_role`` evidence it
+    derives from) — it names the value on the canonical :class:`SemanticValueV1`. ``map_value``
+    (data_role) maps a resolver value into its DISPLAY vocabulary member without touching the
+    underlying evidence."""
     mapper = map_value if map_value is not None else (lambda v: v)
-    display = _semantic_value(evidence, resolution.display_value,
+    display = _semantic_value(evidence, resolution.display_value, field_name=field_name,
                               mapped=mapper(resolution.display_value)
                               if resolution.display_value is not None else None)
-    load_bearing = _semantic_value(evidence, resolution.load_bearing_value,
+    load_bearing = _semantic_value(evidence, resolution.load_bearing_value, field_name=field_name,
                                    mapped=mapper(resolution.load_bearing_value)
                                    if resolution.load_bearing_value is not None else None)
     reason_codes = (resolution.unresolved_reason,) if resolution.unresolved_reason else ()
@@ -230,8 +249,8 @@ def _wrap_resolution(
     if not evidence:
         return EffectiveProfileFieldV1(
             display=None, load_bearing=None, state=STATE_NO_EVIDENCE,
-            unresolved_reason=UnresolvedReason.NO_EVIDENCE.value,
-            unresolved_family=unresolved_family(UnresolvedReason.NO_EVIDENCE).value,
+            unresolved_reason=unresolved_label(UNRESOLVED_NO_EVIDENCE),
+            unresolved_family=unresolved_family(UNRESOLVED_NO_EVIDENCE),
             reason_codes=reason_codes)
     if load_bearing is not None:
         return EffectiveProfileFieldV1(
@@ -258,13 +277,13 @@ def _wrap_resolution(
             if top <= _STRENGTH_RANK[AssertionStrength.PROPOSED.value]:
                 return EffectiveProfileFieldV1(
                     display=None, load_bearing=None, state=STATE_UNDECIDED,
-                    unresolved_reason=UnresolvedReason.PENDING_REVIEW.value,
-                    unresolved_family=unresolved_family(UnresolvedReason.PENDING_REVIEW).value,
+                    unresolved_reason=unresolved_label(UNRESOLVED_PENDING_REVIEW),
+                    unresolved_family=unresolved_family(UNRESOLVED_PENDING_REVIEW),
                     reason_codes=reason_codes)
             return EffectiveProfileFieldV1(
                 display=None, load_bearing=None, state=STATE_CONFLICT,
-                unresolved_reason=UnresolvedReason.CONFLICT.value,
-                unresolved_family=unresolved_family(UnresolvedReason.CONFLICT).value,
+                unresolved_reason=unresolved_label(UNRESOLVED_CONFLICT),
+                unresolved_family=unresolved_family(UNRESOLVED_CONFLICT),
                 reason_codes=reason_codes)
 
     raw = resolution.unresolved_reason or ""
@@ -277,33 +296,36 @@ def _wrap_resolution(
             return EffectiveProfileFieldV1(
                 display=display, load_bearing=None, state=STATE_DISPLAY_ONLY,
                 unresolved_reason=None, unresolved_family=None, reason_codes=reason_codes)
-        reason = UnresolvedReason.AUTHORITY_INSUFFICIENT
+        reason = UNRESOLVED_AUTHORITY_INSUFFICIENT
         state = STATE_DISPLAY_ONLY
     elif raw == "authority_insufficient":
-        reason = UnresolvedReason.AUTHORITY_INSUFFICIENT
+        reason = UNRESOLVED_AUTHORITY_INSUFFICIENT
         state = STATE_DISPLAY_ONLY
     elif raw == "conflict":
-        reason = UnresolvedReason.CONFLICT
+        reason = UNRESOLVED_CONFLICT
         state = STATE_CONFLICT
     elif raw.startswith("disqualified:"):
         # The only honoured disqualifier today is CONFIRMATION_PENDING_REVALIDATION — a material
         # change awaiting a human re-check: squarely the "needs a data check" family.
-        reason = UnresolvedReason.PENDING_REVALIDATION
+        reason = UNRESOLVED_PENDING_REVALIDATION
         state = STATE_NEEDS_DATA_OBSERVATION
     else:
         # "specialized_fact" and any future resolver reason: the generic projection cannot serve
         # this field — visible as projection_unavailable, family undecided (nobody decided HERE).
-        reason = UnresolvedReason.AUTHORITY_INSUFFICIENT
+        # Deliberately NOT the canonical `needs_data_check:projection_unavailable` member: that one
+        # says "go check the data", and nothing here is wrong with the data — the STATE names the
+        # degraded read, while the reason stays honestly "nobody decided at this surface".
+        reason = UNRESOLVED_AUTHORITY_INSUFFICIENT
         state = STATE_PROJECTION_UNAVAILABLE
     if state == STATE_DISPLAY_ONLY and display is None:
         # [F9] `display_only` with nothing to display is a lying state. When no active evidence
         # clears the display bar, report the honest family-shaped state the reason maps to
         # (`undecided` for authority_insufficient) — `display_only` is reserved for fields that
         # actually display something.
-        state = unresolved_family(reason).value
+        state = unresolved_family(reason)
     return EffectiveProfileFieldV1(
         display=display, load_bearing=None, state=state,
-        unresolved_reason=reason.value, unresolved_family=unresolved_family(reason).value,
+        unresolved_reason=unresolved_label(reason), unresolved_family=unresolved_family(reason),
         reason_codes=reason_codes)
 
 
@@ -337,16 +359,59 @@ def _fact_head(conn: DbConn, stamp_event_id: str | None) -> GovernedFactHeadV1 |
                               confirmed_event_id=stamp_event_id)
 
 
-def _field_hash_payload(field: EffectiveProfileFieldV1) -> dict:
-    """The hash projection of one field: both resolutions, D2 triples, state, reasons, evidence
-    ids — no timestamps, no provenance."""
+def _value_payload(value: SemanticValueV1 | None) -> dict | None:
+    """The FLAT projection of one canonical semantic value — the value, the D2 triple of its
+    LEADING (strongest) evidence, and every backing evidence id.
+
+    This is the single adapter between the canonical value (which nests authority per evidence
+    record) and this surface's published shape. Both the API payload and ``dataset_profile_hash``
+    are defined on it, so a change here moves the wire AND re-keys every profile."""
+    if value is None:
+        return None
+    lead = value.evidence[0]
     return {
-        "display": asdict(field.display) if field.display is not None else None,
-        "load_bearing": asdict(field.load_bearing) if field.load_bearing is not None else None,
+        "value": value.value,
+        "producer": lead.producer,
+        "strength": lead.strength,
+        "lifecycle": lead.lifecycle,
+        "evidence_ids": tuple(sorted(e.evidence_id for e in value.evidence)),
+    }
+
+
+def _field_payload(field: EffectiveProfileFieldV1) -> dict:
+    """The projection of one field: both resolutions, D2 triples, state, reasons, evidence ids —
+    no timestamps, no provenance. The hash and the API response share it BY DESIGN: what a
+    consumer CAS-anchors on is exactly what it was shown."""
+    return {
+        "display": _value_payload(field.display),
+        "load_bearing": _value_payload(field.load_bearing),
         "state": field.state,
         "unresolved_reason": field.unresolved_reason,
         "unresolved_family": field.unresolved_family,
         "reason_codes": list(field.reason_codes),
+    }
+
+
+#: The §6.3 field order — the hash payload's key order and the response's field order.
+_EFFECTIVE_FIELDS = ("description", "business_context", "domains", "data_role", "primary_entity",
+                     "authority_role", "temporal_storage_model", "event_or_snapshot")
+
+
+def profile_payload(profile: DatasetSemanticProfileV1) -> dict:
+    """The API projection of an assembled profile — what the routes serialize.
+
+    NOT ``dataclasses.asdict``: the canonical :class:`SemanticValueV1` nests its authority per
+    evidence record, and this surface publishes the flat triple (:func:`_value_payload`). Key order
+    follows the dataclass, so the rendered body is byte-identical to the ``asdict`` it replaced."""
+    return {
+        "dataset_logical_ref": profile.dataset_logical_ref,
+        "catalog_profile_revision_id": profile.catalog_profile_revision_id,
+        **{name: _field_payload(getattr(profile, name)) for name in _EFFECTIVE_FIELDS},
+        "grain_fact": asdict(profile.grain_fact) if profile.grain_fact is not None else None,
+        "availability_fact": (asdict(profile.availability_fact)
+                              if profile.availability_fact is not None else None),
+        "missing_context": list(profile.missing_context),
+        "dataset_profile_hash": profile.dataset_profile_hash,
     }
 
 
@@ -382,7 +447,7 @@ def build_dataset_profile(
     fields: dict[str, EffectiveProfileFieldV1] = {}
     for name, evidence_field in _PROFILE_FIELD_SOURCES.items():
         resolution, evidence, policy = _resolve_field(conn, dataset_logical_ref, evidence_field)
-        fields[name] = _wrap_resolution(resolution, evidence, policy)
+        fields[name] = _wrap_resolution(resolution, evidence, policy, field_name=name)
 
     # data_role — DERIVED from the existing canonical table_role resolution (correction 4): the
     # SAME resolver output, values mapped through the ONE adapter (legacy `bridge` displays as
@@ -391,7 +456,7 @@ def build_dataset_profile(
     eos_display = (fields["event_or_snapshot"].display.value
                    if fields["event_or_snapshot"].display is not None else None)
     fields["data_role"] = _wrap_resolution(
-        tr_resolution, tr_evidence, tr_policy,
+        tr_resolution, tr_evidence, tr_policy, field_name="data_role",
         map_value=lambda v: data_role_from_table_role(v, event_or_snapshot=eos_display).value)
 
     grain_fact = _fact_head(conn, node[0])
@@ -400,8 +465,7 @@ def build_dataset_profile(
     missing: list[str] = []
     if catalog_profile_revision_id is None:
         missing.append("catalog_narrative:absent")
-    field_order = ("description", "business_context", "domains", "data_role", "primary_entity",
-                   "authority_role", "temporal_storage_model", "event_or_snapshot")
+    field_order = _EFFECTIVE_FIELDS
     for name in field_order:
         f = fields[name]
         if f.unresolved_reason is not None:
@@ -419,7 +483,7 @@ def build_dataset_profile(
         "contract": _PROFILE_CONTRACT,
         "dataset_logical_ref": dataset_logical_ref,
         "catalog_profile_revision_id": catalog_profile_revision_id,
-        "fields": {name: _field_hash_payload(fields[name]) for name in field_order},
+        "fields": {name: _field_payload(fields[name]) for name in field_order},
         "grain_fact": asdict(grain_fact) if grain_fact is not None else None,
         "availability_fact": asdict(availability_fact) if availability_fact is not None else None,
         "missing_context": missing,

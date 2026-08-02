@@ -1,7 +1,7 @@
 """Release-A profile vocabularies (profile plan §6.1, interface doc D5/D8).
 
 Three closed classification vocabularies for the effective dataset semantic profile, plus the
-module-local ``UNRESOLVED_REASONS`` vocabulary and the ``FEATUREGEN_DATASET_PROFILES`` flag reader.
+``FEATUREGEN_DATASET_PROFILES`` flag reader.
 
 ONE normalizer per vocabulary (§6.1): :func:`data_role_from_table_role` ADAPTS the existing
 ``table_vocab.normalize_table_role`` — it never re-normalizes a raw role itself, so there is no
@@ -10,16 +10,13 @@ competing table-role normalization path. Legacy canonical ``table_role='bridge'`
 ``table_vocab._ROLE_ALIASES`` (NOT in ``TABLE_ROLE_ENUM`` — that list is interpolated into the
 Pass-B prompt, and extending it would re-version the prompt; review D Release A).
 
-``UNRESOLVED_REASONS`` (D5): a closed enum in which EVERY member maps to exactly one of the three
-product families ``{undecided, needs_data_check, structurally_unsuitable}`` — the UI renders the
-family, never a failure-shaped free string. "No evidence at all" is ``undecided:no_evidence``,
-which is DISTINCT from ``influence_not_operational``: a RECOMMENDATION-ceiling field showing a
-display value is in its NORMAL state and carries NO unresolved reason at all.
-
-TODO(semantic-merge): ``UNRESOLVED_REASONS`` is owned by the parallel semantic stream's
-``overlay/upload/semantic_context.py`` (D5). When that module lands, replace the enum + family map
-below with ``from featuregen.overlay.upload.semantic_context import UNRESOLVED_REASONS`` — this
-module is the single adapter point; no other module may define these values.
+``UNRESOLVED_REASONS`` is NOT here. It is owned by ``overlay/upload/semantic_context.py`` (D5 —
+the canonical home), and consumers import it from there directly: one closed vocabulary, one
+spelling per member, no re-export layer to drift against. Every member maps to exactly one of the
+three product families ``{undecided, needs_data_check, structurally_unsuitable}`` — the UI renders
+the family, never a failure-shaped free string. "No evidence at all" is ``undecided:no_evidence``,
+DISTINCT from ``influence_not_operational``: a RECOMMENDATION-ceiling field showing a display value
+is in its NORMAL state and carries NO unresolved reason at all.
 """
 from __future__ import annotations
 
@@ -125,57 +122,3 @@ def normalize_authority_role(raw: object) -> str | None:
 def normalize_temporal_storage_model(raw: object) -> str | None:
     """Normalize a raw temporal-storage-model into :class:`TemporalStorageModel`."""
     return _normalize_member(raw, TemporalStorageModel)
-
-
-# ---------------------------------------------------------------------------------------------
-# UNRESOLVED_REASONS (D5) — module-local closed vocabulary, three families, no fourth.
-# ---------------------------------------------------------------------------------------------
-
-
-class UnresolvedReasonFamily(str, Enum):
-    """The three product families (D5; the no-"blocked" rule). The UI renders THESE — "nobody
-    decided yet" / "needs a data check" / "structurally unsuitable" — never a raw resolver string,
-    and never a fourth family."""
-
-    UNDECIDED = "undecided"
-    NEEDS_DATA_CHECK = "needs_data_check"
-    STRUCTURALLY_UNSUITABLE = "structurally_unsuitable"
-
-
-class UnresolvedReason(str, Enum):
-    """WHY a profile field has no load-bearing value (D5). Closed; every member maps to exactly
-    one :class:`UnresolvedReasonFamily` in :data:`UNRESOLVED_REASONS`.
-
-    ``influence_not_operational`` is deliberately NOT a member: a RECOMMENDATION-ceiling field in
-    its display state is NORMAL, not unresolved (§6.3 as amended)."""
-
-    NO_EVIDENCE = "no_evidence"                    # nobody said anything at all
-    AUTHORITY_INSUFFICIENT = "authority_insufficient"  # said, but below the operational bar
-    # A top-strength tie among UNREVIEWED proposals (strength=proposed): competing candidates
-    # nobody with authority has adjudicated — honestly "nobody decided yet", never a
-    # failure-shaped conflict (F2). `conflict` below is reserved for contradictions at
-    # load-bearing-capable strengths.
-    PENDING_REVIEW = "pending_review"
-    CONFLICT = "conflict"                          # active evidence disagrees
-    PENDING_REVALIDATION = "pending_revalidation"  # material changed; awaiting re-confirmation
-    # Reserved for the deterministic-contradiction path (Task 4: e.g. SCD2 claimed with no
-    # candidate boundary columns). No Release-A Task-1/2/3 producer emits it yet; the member
-    # exists so the family is representable from day one and the vocabulary stays closed.
-    STRUCTURALLY_UNSUITABLE = "structurally_unsuitable"
-
-
-#: member -> family (the D5 three-family rule). Every member appears exactly once.
-UNRESOLVED_REASONS: dict[UnresolvedReason, UnresolvedReasonFamily] = {
-    UnresolvedReason.NO_EVIDENCE: UnresolvedReasonFamily.UNDECIDED,
-    UnresolvedReason.AUTHORITY_INSUFFICIENT: UnresolvedReasonFamily.UNDECIDED,
-    UnresolvedReason.PENDING_REVIEW: UnresolvedReasonFamily.UNDECIDED,
-    UnresolvedReason.CONFLICT: UnresolvedReasonFamily.NEEDS_DATA_CHECK,
-    UnresolvedReason.PENDING_REVALIDATION: UnresolvedReasonFamily.NEEDS_DATA_CHECK,
-    UnresolvedReason.STRUCTURALLY_UNSUITABLE: UnresolvedReasonFamily.STRUCTURALLY_UNSUITABLE,
-}
-
-
-def unresolved_family(reason: UnresolvedReason | str) -> UnresolvedReasonFamily:
-    """The family for ``reason`` (raising ``KeyError``/``ValueError`` on an unknown member — the
-    vocabulary is closed; an unmapped reason is a programming error, not a display case)."""
-    return UNRESOLVED_REASONS[UnresolvedReason(reason)]

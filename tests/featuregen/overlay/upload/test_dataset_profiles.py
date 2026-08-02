@@ -35,14 +35,22 @@ from featuregen.overlay.upload.field_resolution import (
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.profile_vocab import (
-    UNRESOLVED_REASONS,
     DataRole,
-    UnresolvedReason,
-    UnresolvedReasonFamily,
     data_role_from_table_role,
     dataset_profiles_enabled,
     normalize_authority_role,
     normalize_temporal_storage_model,
+)
+from featuregen.overlay.upload.semantic_context import (
+    UNRESOLVED_AUTHORITY_INSUFFICIENT,
+    UNRESOLVED_CONFLICT,
+    UNRESOLVED_NO_EVIDENCE,
+    UNRESOLVED_PENDING_REVALIDATION,
+    UNRESOLVED_PENDING_REVIEW,
+    UNRESOLVED_REASON_FAMILIES,
+    UNRESOLVED_REASONS,
+    unresolved_family,
+    unresolved_label,
 )
 from featuregen.overlay.upload.table_vocab import TABLE_ROLE_ENUM, normalize_table_role
 
@@ -115,9 +123,34 @@ def test_authority_and_temporal_normalizers_are_closed():
 
 
 def test_unresolved_reasons_map_every_member_to_exactly_one_of_three_families():
-    assert set(UNRESOLVED_REASONS) == set(UnresolvedReason)
-    assert set(UNRESOLVED_REASONS.values()) <= set(UnresolvedReasonFamily)
-    assert len(UnresolvedReasonFamily) == 3   # no fourth family, ever
+    """The vocabulary is the CANONICAL one (`semantic_context`, D5) — this module owns no copy."""
+    assert set(UNRESOLVED_REASONS.values()) <= UNRESOLVED_REASON_FAMILIES
+    assert len(UNRESOLVED_REASON_FAMILIES) == 3   # no fourth family, ever
+    # Every member the profile read model can emit is IN that closed vocabulary.
+    for member in (UNRESOLVED_NO_EVIDENCE, UNRESOLVED_PENDING_REVIEW,
+                   UNRESOLVED_AUTHORITY_INSUFFICIENT, UNRESOLVED_CONFLICT,
+                   UNRESOLVED_PENDING_REVALIDATION):
+        assert member in UNRESOLVED_REASONS
+
+
+def test_profile_wire_labels_are_the_canonical_members_split_in_two():
+    """The `unresolved_reason`/`unresolved_family` pair on the wire IS one canonical member: the
+    family-free label plus its family. Pinned as LITERALS because both are published — renaming a
+    canonical member's suffix is a wire change, and this test is where that surfaces."""
+    assert (unresolved_label(UNRESOLVED_NO_EVIDENCE),
+            unresolved_family(UNRESOLVED_NO_EVIDENCE)) == ("no_evidence", "undecided")
+    assert (unresolved_label(UNRESOLVED_PENDING_REVIEW),
+            unresolved_family(UNRESOLVED_PENDING_REVIEW)) == ("pending_review", "undecided")
+    assert (unresolved_label(UNRESOLVED_AUTHORITY_INSUFFICIENT),
+            unresolved_family(UNRESOLVED_AUTHORITY_INSUFFICIENT)) == (
+                "authority_insufficient", "undecided")
+    assert (unresolved_label(UNRESOLVED_CONFLICT),
+            unresolved_family(UNRESOLVED_CONFLICT)) == ("conflict", "needs_data_check")
+    assert (unresolved_label(UNRESOLVED_PENDING_REVALIDATION),
+            unresolved_family(UNRESOLVED_PENDING_REVALIDATION)) == (
+                "pending_revalidation", "needs_data_check")
+    with pytest.raises(KeyError):
+        unresolved_label("undecided:invented_by_a_caller")
 
 
 def test_dataset_profiles_flag_uses_widened_truthy_set(monkeypatch):
@@ -189,11 +222,11 @@ def test_llm_proposal_is_displayed_but_never_load_bearing(db):
     profile = _profile(db)
     f = profile.authority_role
     assert f.display is not None and f.display.value == "derived"
-    assert f.display.producer == "llm" and f.display.strength == "proposed"
+    assert f.display.evidence[0].producer == "llm" and f.display.evidence[0].strength == "proposed"
     assert f.load_bearing is None
     assert f.state == "display_only"
-    assert f.unresolved_reason == UnresolvedReason.AUTHORITY_INSUFFICIENT.value
-    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+    assert f.unresolved_reason == "authority_insufficient"
+    assert f.unresolved_family == "undecided"
     assert is_feature_eligible(db, _TABLE_REF, "authority_role") is False
 
 
@@ -205,7 +238,7 @@ def test_human_proposed_is_displayed_but_not_load_bearing(db):
     profile = _profile(db)
     f = profile.temporal_storage_model
     assert f.display is not None and f.display.value == "scd2"
-    assert f.display.producer == "human" and f.display.strength == "proposed"
+    assert f.display.evidence[0].producer == "human" and f.display.evidence[0].strength == "proposed"
     assert f.load_bearing is None
     assert is_feature_eligible(db, _TABLE_REF, "temporal_storage_model") is False
 
@@ -222,7 +255,7 @@ def test_four_eyes_confirm_makes_the_value_load_bearing(db):
     f = profile.authority_role
     assert f.state == "load_bearing"
     assert f.load_bearing.value == "system_of_record"
-    assert f.load_bearing.producer == "human" and f.load_bearing.strength == "confirmed"
+    assert f.load_bearing.evidence[0].producer == "human" and f.load_bearing.evidence[0].strength == "confirmed"
     assert f.unresolved_reason is None
 
 
@@ -296,8 +329,8 @@ def test_competing_subjects_report_undecided_pending_review_not_conflict(db):
     f = _profile(db).authority_role
     assert f.display is None
     assert f.state == "undecided"
-    assert f.unresolved_reason == UnresolvedReason.PENDING_REVIEW.value
-    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+    assert f.unresolved_reason == "pending_review"
+    assert f.unresolved_family == "undecided"
 
 
 def test_attested_tie_still_reports_the_needs_data_check_conflict(db):
@@ -309,8 +342,8 @@ def test_attested_tie_still_reports_the_needs_data_check_conflict(db):
           AssertionStrength.ATTESTED)
     f = _profile(db).authority_role
     assert f.state == "conflict"
-    assert f.unresolved_reason == UnresolvedReason.CONFLICT.value
-    assert f.unresolved_family == UnresolvedReasonFamily.NEEDS_DATA_CHECK.value
+    assert f.unresolved_reason == "conflict"
+    assert f.unresolved_family == "needs_data_check"
 
 
 # ── effective profile assembly ───────────────────────────────────────────────────────────────────
@@ -324,8 +357,8 @@ def test_empty_table_profile_is_honestly_undecided_everywhere(db):
               profile.primary_entity, profile.authority_role, profile.temporal_storage_model,
               profile.event_or_snapshot):
         assert f.state == "no_evidence"
-        assert f.unresolved_reason == UnresolvedReason.NO_EVIDENCE.value
-        assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+        assert f.unresolved_reason == "no_evidence"
+        assert f.unresolved_family == "undecided"
     assert profile.grain_fact is None and profile.availability_fact is None
     assert "catalog_narrative:absent" in profile.missing_context
     assert "description:no_evidence" in profile.missing_context
@@ -339,7 +372,7 @@ def test_recommendation_display_is_the_normal_state_not_unresolved(db):
     f = _profile(db).description
     assert f.state == "display_only"
     assert f.display.value == "Orders booked."
-    assert f.display.producer == "source" and f.display.strength == "attested"
+    assert f.display.evidence[0].producer == "source" and f.display.evidence[0].strength == "attested"
     assert f.unresolved_reason is None and f.unresolved_family is None
 
 
@@ -349,8 +382,8 @@ def test_conflicting_evidence_reports_the_needs_data_check_family(db):
     _seed(db, "definition", "Order events.", EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
     f = _profile(db).description
     assert f.state == "conflict"
-    assert f.unresolved_reason == UnresolvedReason.CONFLICT.value
-    assert f.unresolved_family == UnresolvedReasonFamily.NEEDS_DATA_CHECK.value
+    assert f.unresolved_reason == "conflict"
+    assert f.unresolved_family == "needs_data_check"
 
 
 def test_data_role_is_derived_and_legacy_bridge_displays_as_crosswalk(db):
@@ -374,7 +407,7 @@ def test_technical_catalog_business_context_is_the_only_table_text(db):
              replacement_value="Branch-booked retail orders.")
     profile = _profile(db)
     assert profile.description.state == "no_evidence"
-    assert profile.description.unresolved_reason == UnresolvedReason.NO_EVIDENCE.value
+    assert profile.description.unresolved_reason == "no_evidence"
     assert profile.business_context.display.value == "Branch-booked retail orders."
 
 
@@ -388,8 +421,8 @@ def test_no_displayable_evidence_is_undecided_not_display_only(db):
     f = _profile(db).authority_role
     assert f.display is None
     assert f.state == "undecided"
-    assert f.unresolved_reason == UnresolvedReason.AUTHORITY_INSUFFICIENT.value
-    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+    assert f.unresolved_reason == "authority_insufficient"
+    assert f.unresolved_family == "undecided"
 
 
 def test_pending_proposal_below_the_display_bar_is_undecided(db):
@@ -402,8 +435,8 @@ def test_pending_proposal_below_the_display_bar_is_undecided(db):
     f = _profile(db).description
     assert f.display is None
     assert f.state == "undecided"
-    assert f.unresolved_reason == UnresolvedReason.AUTHORITY_INSUFFICIENT.value
-    assert f.unresolved_family == UnresolvedReasonFamily.UNDECIDED.value
+    assert f.unresolved_reason == "authority_insufficient"
+    assert f.unresolved_family == "undecided"
 
 
 def test_profile_returns_none_for_an_unknown_table(db):
