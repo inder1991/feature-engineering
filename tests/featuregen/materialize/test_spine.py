@@ -327,6 +327,60 @@ def test_a_column_the_catalog_does_not_have_is_rejected(two_candidate_customer_t
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
 
+@pytest.fixture
+def composite_key_customers(db):
+    """A branch-sharded master file: the governed grain is (cif_id, branch_cd) — TWO columns.
+
+    Every other fixture in this file declares a 1-tuple key, so `_refuse_wrong_entity`'s loop over
+    `ordered_key_refs` never iterated twice. Here `cif_id` carries the governed `customer`
+    entity_assignment and `branch_cd` legitimately carries none — the composite-key shape the
+    docstring of `_refuse_wrong_entity` promises to accept."""
+    build_graph(db, _SRC, [
+        CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
+        CanonicalRow(_SRC, "customers", "branch_cd", "text", is_grain=True),
+        CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
+    ])
+    _govern_grain(db, "cif_id", "branch_cd")
+    _govern_availability(db, "load_ts")
+    _govern_entity(db, "cif_id")            # branch_cd stays UNTAGGED — allowed, not contradictory
+    _healthy_projection(db)
+    return db
+
+
+def test_a_COMPOSITE_key_with_one_governed_entity_and_one_untagged_key_validates(
+        composite_key_customers):
+    """The multi-key loop's accepting path: the untagged key is SKIPPED (not treated as a
+    contradiction, not counted as confirmation), and the one governed `customer` tag is enough."""
+    declaration = _declaration(
+        ordered_key_refs=(CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd"))
+    result = validate_spine_declaration(composite_key_customers, declaration, roles=_ROLES)
+    assert isinstance(result, SpineSpec), result
+    assert result.ordered_key_refs == (CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd")
+    assert set(result.governed_grain_refs) == {CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd"}
+
+
+def test_a_COMPOSITE_key_whose_SECOND_key_names_another_entity_is_rejected(db):
+    """The loop's refusing path, on the key a first-element-only check never reads: `branch_cd`
+    carries a governed entity_assignment for `branch`, which contradicts the declared `customer`
+    even though `cif_id` confirms it."""
+    build_graph(db, _SRC, [
+        CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
+        CanonicalRow(_SRC, "customers", "branch_cd", "text", is_grain=True, entity="branch"),
+        CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
+    ])
+    _govern_grain(db, "cif_id", "branch_cd")
+    _govern_availability(db, "load_ts")
+    _govern_entity(db, "cif_id")
+    _govern_entity(db, "branch_cd")         # governed, and it says BRANCH
+    _healthy_projection(db)
+    declaration = _declaration(
+        ordered_key_refs=(CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd"))
+    result = validate_spine_declaration(db, declaration, roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+    assert "branch_cd" in result.detail and "different entity" in result.detail
+
+
 def test_a_MIXED_CASE_catalog_is_the_same_catalog(db):
     """`build_graph` writes `object_ref`/`table_name` with the UPLOAD's casing, while a canonical
     `logical_ref` is case-folded — and the governed readers match on `lower(object_ref)`. If this

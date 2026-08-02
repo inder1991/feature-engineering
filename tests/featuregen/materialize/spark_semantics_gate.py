@@ -105,17 +105,23 @@ if manifest["row_count"] != 1:
     print("CONTROL FAILED: expected 1 staged row, got", manifest["row_count"])
     sys.exit(2)
 
-try:
-    staged, manifest = run({overflowing})
-except RuntimeError as refused:
-    if "OVERFLOW_VIOLATION" in str(refused):
-        print("RAISED OVERFLOW_VIOLATION:", refused)
-        sys.exit(0)
-    print("RAISED THE WRONG REFUSAL:", refused)
-    sys.exit(3)
-print("PUBLISHED WITHOUT RAISING - the overflow NULL went through:",
-      [row.asDict() for row in staged.collect()])
-sys.exit(4)
+# BOTH signs: `CheckOverflowInSum` answers NULL for a sum past either end of DECIMAL(38,2), and
+# a gate that read only the positive boundary would publish a cancelled-out liability. Task 26's
+# fake-side test can only reach the publish-cast clause (the stand-in sums exactly), so the
+# aggregate-level negative boundary is proven here or nowhere.
+for sign in ("", "-"):
+    try:
+        staged, manifest = run(sign + {overflowing})
+    except RuntimeError as refused:
+        if "OVERFLOW_VIOLATION" in str(refused):
+            print("RAISED OVERFLOW_VIOLATION (sign=" + (sign or "+") + "):", refused)
+            continue
+        print("RAISED THE WRONG REFUSAL:", refused)
+        sys.exit(3)
+    print("PUBLISHED WITHOUT RAISING - the overflow NULL went through:",
+          [row.asDict() for row in staged.collect()])
+    sys.exit(4)
+sys.exit(0)
 '''
 
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import inspect
+import os
 import pathlib
 import re
 
@@ -1006,11 +1007,18 @@ def test_the_rendered_project_matches_its_GOLDENS(project: SealedProject) -> Non
     `GENERATED.lock` is deliberately NOT a golden: it holds the hash of the other files, so it would
     have to be regenerated for any change at all and would never be read.
     """
-    assert GOLDENS.is_dir(), f"regenerate with {__file__}::_write_goldens"
-    expected = {str(path.relative_to(GOLDENS)): path.read_text(encoding="utf-8")
-                for path in GOLDENS.rglob("*") if path.is_file()}
     actual = {path: text for path, text in project.files.items()
               if path != GENERATED_LOCK_FILENAME}
+    if not GOLDENS.is_dir():
+        if os.environ.get("UPDATE_GOLDENS") != "1":
+            pytest.fail(f"golden dir {GOLDENS} is missing — if this is an intended renderer "
+                        f"change, regenerate with UPDATE_GOLDENS=1 and REVIEW the diff")
+        for path, text in actual.items():
+            target = GOLDENS / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+    expected = {str(path.relative_to(GOLDENS)): path.read_text(encoding="utf-8")
+                for path in GOLDENS.rglob("*") if path.is_file()}
     assert set(actual) == set(expected)
     for path in sorted(expected):
         assert actual[path] == expected[path], path

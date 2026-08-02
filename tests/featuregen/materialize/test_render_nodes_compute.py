@@ -27,6 +27,7 @@ import datetime as dt
 import decimal
 import inspect
 import json
+import os
 import pathlib
 
 import pytest
@@ -99,6 +100,22 @@ from featuregen.materialize.spine import (
 from featuregen.overlay.upload.join_path import JoinStep
 
 GOLDENS = pathlib.Path(__file__).parent / "goldens" / "spine_nodes"
+
+
+def _assert_golden(golden: pathlib.Path, rendered: str) -> None:
+    """Compare against the committed golden — a MISSING golden is a failure, never a self-bless.
+
+    The old shape (`if not golden.exists(): write_text(...)`) let `delete → rerun` bless whatever
+    the renderer currently emits, which turns the change detector off exactly when it is needed.
+    Regeneration is now an explicit act: run with ``UPDATE_GOLDENS=1`` and REVIEW the diff.
+    """
+    if not golden.exists():
+        if os.environ.get("UPDATE_GOLDENS") != "1":
+            pytest.fail(f"golden {golden} is missing — if this is an intended renderer "
+                        f"change, regenerate with UPDATE_GOLDENS=1 and REVIEW the diff")
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(rendered, encoding="utf-8")
+    assert rendered == golden.read_text(encoding="utf-8")
 
 #: The worked declaration's own vintage — `test_ir._declaration` observes the customer file here.
 OBSERVED = "2026-07-27"
@@ -583,10 +600,7 @@ def test_the_rendered_spine_matches_its_golden(compiled, kind):
     these sit on top so an unintended byte cannot move silently."""
     golden = GOLDENS / f"{kind}.py"
     rendered = _render_all(compiled)[kind].source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 # ══ Task 13b — the PIT projection (§8 rules 1 and 2) ═════════════════════════════════════════════
@@ -1200,10 +1214,7 @@ def test_the_rendered_projection_matches_its_golden(compiled, expression, varian
     """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
     golden = PROJECTION_GOLDENS / f"{variant}.py"
     rendered = _projection(compiled, expression, **PROJECTION_VARIANTS[variant]).source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 # ══ Task 13c — the per-feature calculation (§8 rules 3 and 4, §6, §9) ════════════════════════════
@@ -2096,10 +2107,7 @@ def test_the_rendered_calculation_matches_its_golden(compiled, feature, variant)
     """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
     golden = CALCULATION_GOLDENS / f"{variant}.py"
     rendered = _calculate(compiled, feature, **CALCULATION_VARIANTS[variant]).source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 def test_the_count_variant_renders_its_own_golden(compiled, feature):
@@ -2113,10 +2121,7 @@ def test_the_count_variant_renders_its_own_golden(compiled, feature):
     golden = CALCULATION_GOLDENS / "count_distinct_bigint.py"
     rendered = _calculate(compiled, counted, ir=ir,
                           plan=dataclasses.replace(compiled[1], features=(counted,))).source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 def test_every_rendered_calculation_line_fits_the_width_it_states(compiled, feature):
@@ -2618,19 +2623,13 @@ def test_the_rendered_ratio_matches_its_golden(ratio, ratio_feature, variant):
     """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
     golden = CALCULATION_GOLDENS / f"{variant}.py"
     rendered = _render_ratio(ratio, ratio_feature, **RATIO_VARIANTS[variant]).source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 def test_the_rendered_difference_matches_its_golden(ratio, ratio_feature):
     golden = CALCULATION_GOLDENS / "difference_decimal.py"
     rendered = _render_difference(ratio, ratio_feature).source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 def test_every_rendered_FINAL_OPERATION_line_fits_the_width_it_states(ratio, ratio_feature):
@@ -3155,10 +3154,7 @@ def test_the_rendered_traversal_matches_its_golden(compiled, expression, variant
     """Goldens prove STABILITY, never correctness — every property above is asserted on its own."""
     golden = TRAVERSAL_GOLDENS / f"{variant}.py"
     rendered = TRAVERSAL_VARIANTS[variant](compiled, expression).source
-    if not golden.exists():  # pragma: no cover — first run only
-        golden.parent.mkdir(parents=True, exist_ok=True)
-        golden.write_text(rendered, encoding="utf-8")
-    assert rendered == golden.read_text(encoding="utf-8")
+    _assert_golden(golden, rendered)
 
 
 def test_a_row_that_reaches_a_DANGLING_DIMENSION_lands_on_no_entity_not_on_the_dangling_id(
@@ -3190,3 +3186,190 @@ def test_the_rendered_traversal_states_the_ROLES_the_path_was_planned_under(comp
         source_dataset="raw_banking__transactions", joined_datasets=TRAVERSAL_DATASETS,
         projection_dataset="intermediate").source
     assert "an EMPTY read scope" in rendered
+
+
+# ══ Task 26 — dirty data: the shapes the fixture monoculture never fed the rendered nodes ════════
+#
+# Every fixture above is clean in the same four ways — all-positive amounts, single-column keys,
+# unique dimension rows, no NULL temporals — and that monoculture is exactly what let the branch's
+# headline defects hide. Task 25 taught the stand-in NULL ordering, three-valued logic and date
+# literals, which makes the null-bearing half of banking data TESTABLE; this section feeds it to
+# the rendered nodes and asserts VALUES, never just the absence of an exception.
+
+#: An event time inside each PROJECTION_VARIANTS window for `BUSINESS_DT`. The windows are
+#: disjoint (the 3-calendar-month window ends where July begins; the trailing window ends at the
+#: business date), so no single datetime sits inside every variant.
+_IN_WINDOW = {
+    "trailing_days_posted_at": BEFORE,
+    "calendar_months": dt.datetime(2026, 5, 15, 12, 0),
+    "event_time_plus_lag": BEFORE,
+}
+
+
+@pytest.mark.parametrize("variant", sorted(PROJECTION_VARIANTS))
+def test_a_NULL_event_time_row_is_excluded_from_EVERY_window_shape(compiled, expression, variant):
+    """Spark's window predicate answers NULL for a NULL event time and `where` drops the row —
+    under every window basis, unit and inclusivity. The stand-in used to raise TypeError on the
+    first None instead (report §6), so no test could ever hold a renderer to this."""
+    node = _projection(compiled, expression, **PROJECTION_VARIANTS[variant])
+    dated = _windowed(_IN_WINDOW[variant], 10)
+    undated = _windowed(None, 99)
+    assert _kept(node, [dated, undated]) == [10], variant
+
+
+def test_a_NULL_availability_timestamp_row_is_dropped_by_rule_1_not_crashed_on(compiled,
+                                                                              expression):
+    """The OTHER nullable temporal: a row whose availability column is NULL was never knowably
+    readable, so rule 1's `<= cutoff` answers NULL and the row drops — silently, exactly as the
+    cluster would, and never by raising."""
+    node = _projection(compiled, expression)
+    unposted = _txn(txn_dt=BEFORE, posted_ts=None, txn_amt=55)
+    assert _kept(node, [_windowed(BEFORE, 10), unposted]) == [10]
+
+
+def test_the_aggregate_counts_EXACTLY_the_dated_rows_when_null_temporals_ride_along(
+        compiled, expression, feature, lock_tree):
+    """Projection to calculation, end to end: two dated rows, one NULL event time, one NULL
+    availability. The published SUM is the two dated amounts and nothing else — a chain that
+    coerced either NULL to an epoch (or kept the row) would move the number, not raise."""
+    node = _projection(compiled, expression)
+    rows = [_windowed(BEFORE, 10), _windowed(ALSO_BEFORE, 7), _windowed(None, 99),
+            _txn(txn_dt=BEFORE, posted_ts=None, txn_amt=55)]
+    projected = _project(node, rows)
+    assert sorted(row["txn_amt"] for row in projected.rows) == [7, 10]
+    values = _staged(_calculate(compiled, feature), lock_tree,
+                     projection=projected.rows, spine=_spine_rows("c1"))
+    assert values == {"c1": 17}
+
+
+def test_CANCELLING_debits_reach_the_zero_denominator_policy_and_publish_its_NULL(
+        ratio, ratio_feature, lock_tree):
+    """The realistic road to a zero denominator is CANCELLATION (+50.00 and −50.00), not a
+    literal zero anybody typed. The declared `null` policy answers it — published NULL, run
+    completes, and no overflow or operand gate mistakes the cancelled sum for its own case. The
+    healthy sibling in the same run proves the NULL is c1's policy answer, not a stalled gate."""
+    node = _render_ratio(ratio, ratio_feature, zero_denominator=ZeroDenominator.NULL)
+    frame, manifest = _run_ratio(
+        node, lock_tree, spine=_spine_rows("c1", "c2"),
+        numerator=[_ratio_txn("c1", 30), _ratio_txn("c2", 25)],
+        denominator=[_ratio_txn("c1", decimal.Decimal("50.00")),
+                     _ratio_txn("c1", decimal.Decimal("-50.00")),
+                     _ratio_txn("c2", 50)])
+    values = {row["cif_id"]: row[RATIO_90D] for row in frame.rows}
+    assert values == {"c1": None, "c2": decimal.Decimal("0.500000")}
+    assert manifest["row_count"] == 2
+    assert manifest["status"] == "completed"
+
+
+def test_a_sum_of_large_NEGATIVE_decimals_trips_the_overflow_gate_symmetrically(
+        compiled, feature, lock_tree):
+    """Task 7's gate, on the sign every fixture avoided: each refund row fits DECIMAL(38,6) on
+    its own and their SUM does not, so publishing would substitute Spark's silent NULL for a
+    liability. Under the stand-in the sum is computed exactly and the PUBLISH-CAST clause is what
+    sees it; on the real engine the sum is already NULL inside the aggregation and the
+    operand-count clause fires instead — that half lives in `spark_semantics_gate.py`."""
+    node = _calculate(compiled, feature)
+    refund = decimal.Decimal(-6) * 10 ** 31          # 32 integer digits: fits alone, 2x does not
+    with pytest.raises(RuntimeError, match="OVERFLOW_VIOLATION"):
+        _run_calculation(node, lock_tree, projection=[_debit("c1", refund), _debit("c1", refund)],
+                         spine=_spine_rows("c1"))
+    # The pair: the same SIGN at a magnitude that fits publishes — the gate reads magnitude.
+    fits = decimal.Decimal(-1) * 10 ** 30
+    values = _staged(node, lock_tree, projection=[_debit("c1", fits)], spine=_spine_rows("c1"))
+    assert values["c1"] == fits
+
+
+def test_an_EMPTY_spine_produces_an_empty_publish_and_no_gate_noise(compiled, feature, lock_tree):
+    """Zero rows after the status filter is a legal population, not a failure. The spine's own
+    gates stay quiet, the calculation stages zero rows under the LOUDEST policy (`error`), the
+    manifest reports an honest zero, and the assembled group passes every publish gate."""
+    node = _render(compiled, ACTIVE)
+    population = _run(node, [_customer("c1", status_cd="CLOSED"),
+                             _customer("c2", status_cd="SUSPENDED")])
+    assert population.rows == []
+    assert population.columns == ["cif_id", "business_dt"]   # empty, but still the landing shape
+
+    calc = _calculate(compiled, feature, empty_window=EmptyWindowResult.ERROR)
+    staged, manifest = _run_calculation(calc, lock_tree, projection=[_debit("c1", 10)],
+                                        spine=population.rows)
+    assert staged.rows == []                                 # the ghost row landed on nobody
+    assert manifest["row_count"] == 0
+    assert manifest["status"] == "completed"
+
+    gate = render_gate_node(compiled[1], assembled_dataset="assembled_group",
+                            published_dataset="published_group")
+    columns = [column.name for column in expected_schema(compiled[1])]
+    types = dict.fromkeys(columns, "string")
+    types[compiled[1].business_dt_column] = "date"
+    types[SUM_30D] = "decimal(38,6)"
+    published = fake_spark.run_rendered(gate.source, GATE_FUNC_NAME)(
+        fake_spark.DataFrame([], columns, types))
+    assert published.columns == columns
+    assert published.rows == []
+
+
+def test_a_COMPOSITE_key_spine_renders_and_EXECUTES_a_two_column_select(compiled):
+    """Every fixture in this file keys the spine on a 1-tuple, so the positional zip in
+    `_key_columns` and the composite duplicate gate were unexercised. Two governed keys must come
+    out as TWO selected columns, and uniqueness must hold on the PAIR — a spine that gated on
+    `cif_id` alone would refuse a branch-sharded population that is perfectly well keyed."""
+    authorized, plan, contract, spine_input = compiled
+    branch_ref = f"{CUSTOMERS}.branch_cd"
+    keys = (*authorized.spine.ordered_key_refs, branch_ref)
+    spine = _with_policy(authorized.spine, SNAPSHOT)
+    spine = dataclasses.replace(
+        spine, ordered_key_refs=keys,
+        declaration=dataclasses.replace(spine.declaration, ordered_key_refs=keys))
+    plan = dataclasses.replace(plan, entity_key_columns=(*plan.entity_key_columns, "branch_cd"))
+    contract = dataclasses.replace(contract, ordered_keys=keys)
+    node = render_spine_node(spine, plan, contract, spine_input=spine_input,
+                             source_dataset="raw_public__customers",
+                             spine_dataset="primary_spine")
+    assert "F.col('branch_cd').alias('branch_cd')" in node.source
+
+    rows = _run(node, [_customer("c1", branch_cd="B1"), _customer("c1", branch_cd="B2"),
+                       _customer("c2", branch_cd="B1")]).rows
+    assert sorted((row["cif_id"], row["branch_cd"]) for row in rows) == [
+        ("c1", "B1"), ("c1", "B2"), ("c2", "B1")]            # same cif, two branches: NOT a dupe
+    with pytest.raises(RuntimeError, match="SPINE_DUPLICATE_KEY"):
+        _run(node, [_customer("c1", branch_cd="B1"), _customer("c1", branch_cd="B1")])
+
+
+# ── the NOT-over-AND filter tree, under the now-Kleene stand-in (Task 25's review bonus) ─────────
+
+
+def _negated_ir(compiled):
+    """The worked SUM's compiled IR with its governed filter wrapped in ONE `not` node — the
+    Child-1 shape `~(a & b)` renders from, built on the REAL compiled tree rather than a parallel
+    fixture."""
+    ir = compiled[0].irs[0]
+    expression = ir.expressions[0]
+    negated = dataclasses.replace(
+        expression,
+        filter_tree={"kind": "bool", "op": "not", "children": [expression.filter_tree]})
+    return dataclasses.replace(ir, expressions=(negated,))
+
+
+def test_a_NOT_over_AND_filter_is_KLEENE_a_null_conjunct_row_drops_under_the_negation(
+        compiled, feature, lock_tree):
+    """`~(status = 'posted' & flag = 'D')` over a NULL status: the conjunction is NULL (not
+    False), its negation is NULL (not True), and the row DROPS. Python truthiness answered False
+    for the conjunction and True for the negation — keeping exactly the rows the cluster drops —
+    so before Task 25 this shape could only be asserted on rendered text."""
+    node = _calculate(compiled, feature, ir=_negated_ir(compiled))
+    values = _staged(node, lock_tree, projection=[
+        _debit("c1", 10),                                    # posted D: negation FALSE — excluded
+        _debit("c1", 7, status_cd="cancelled"),              # inner false: negation TRUE — counted
+        _debit("c1", 30, dr_cr_flag="C"),                    # inner false: negation TRUE — counted
+        _debit("c1", 5, status_cd=None),                     # inner NULL: negation NULL — DROPS
+    ], spine=_spine_rows("c1"))
+    assert values == {"c1": 37}
+
+
+def test_the_NOT_over_AND_calculation_matches_its_golden(compiled, feature):
+    """Change detection for the one rendered negation in the suite: the `~(...)` grouping is
+    load-bearing (`~a & b` is a different filter), so its bytes are pinned like every other
+    calculation variant's."""
+    node = _calculate(compiled, feature, ir=_negated_ir(compiled))
+    assert ".where(~(" in node.source
+    _assert_golden(CALCULATION_GOLDENS / "sum_decimal_not_over_and_filter.py", node.source)
