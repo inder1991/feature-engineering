@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from featuregen.overlay.safety_floor import SENSITIVITY_ORDER
-from featuregen.overlay.upload.concepts import concept, display_entity
+from featuregen.overlay.upload.concepts import concept
 
 # The ONE concept-class -> restriction-level mapping (plan Step 2: do NOT build a new table).
 from featuregen.overlay.upload.field_resolution import _CONCEPT_SENSITIVITY_TO_RESTRICTION
@@ -167,9 +167,10 @@ def project_display_axes(conn, catalog_source: str) -> AxisProjectionReport:
                     skipped.append(AxisSkip(ref, "entity", "entity_fact_present"))
             elif not entity and _fill(
                     conn, catalog_source, ref, "entity",
-                    # NEW enrichment projections resolve the DISPLAY entity through the alias
-                    # seam (semantic Task 2 / D12.1): counterparty_id fills `customer`.
-                    display_entity(concept_name, record.entity_link),
+                    # The RAW registry entity_link (D12.1-revised): this fill writes the very
+                    # `graph_node.entity` column grounding reads into fact keys, so it must
+                    # never route through the display seam. `customer` is read-time only.
+                    record.entity_link,
                     extra_guard=(" AND entity_fact_key IS NULL"
                                  " AND entity_status IS DISTINCT FROM 'VERIFIED'")):
                 entity_set.append(ref)

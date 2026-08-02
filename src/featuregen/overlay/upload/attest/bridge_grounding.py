@@ -54,9 +54,6 @@ from featuregen.overlay.upload.bridge_assessment import (
     TypeBasis,
 )
 from featuregen.overlay.upload.concepts import concept as lookup_concept
-
-# Aliased: `display_entity` is also a row-unpack local inside ground_bridge_endpoint.
-from featuregen.overlay.upload.concepts import display_entity as alias_display_entity
 from featuregen.overlay.upload.governed_grain import GovernedGrain, read_governed_grain
 from featuregen.overlay.upload.identifier_scope import resolve_identifier_issuer
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
@@ -481,12 +478,11 @@ def ground_bridge_endpoint(
         else None
     )
     explicit_entity, entity_evidence = _governed_scalar(conn, canonical_ref, "entity")
-    # The DISPLAY entity resolves through the alias seam (semantic Task 2 / D12.1):
-    # `counterparty_id` grounds the CUSTOMER entity — counterparty is a party ROLE. Fact keys are
-    # untouched: candidate/link identity never hashes this derived entity through the registry.
-    concept_entity = (
-        alias_display_entity(concept_grounding.concept, registered.entity_link)
-        if registered is not None else None)
+    # The RAW registry entity_link, deliberately NOT the display seam (D12.1-revised): this value
+    # flows into advisory_entity_id -> _entity_pick -> fact_key, so routing it through
+    # `display_entity` would re-key governed bridge facts (resurrecting REJECTED decoys under
+    # fresh keys and duplicating VERIFIED links). The `customer` correction is read-time only.
+    concept_entity = registered.entity_link if registered is not None else None
     governed_entity = explicit_entity
     if (
         governed_entity is None

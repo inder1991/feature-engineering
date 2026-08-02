@@ -74,13 +74,6 @@ def _startup_migration_check(app: FastAPI) -> None:
                 return
             if os.environ.get("FEATUREGEN_AUTO_MIGRATE") == "1":
                 apply_migrations(conn)
-                # Migration-1045 companion: rebuild entity-aliased columns' search docs through
-                # graph.py's one weighted expression (idempotent; a SQL migration cannot render
-                # it without copying the weights). Mirrors `python -m featuregen migrate`.
-                from featuregen.overlay.upload.graph import reproject_alias_entity_search_docs
-
-                reproject_alias_entity_search_docs(conn)
-                conn.commit()
                 logger.warning("auto-applied %d pending migration(s): %s",
                                len(pending), ", ".join(pending))
             else:

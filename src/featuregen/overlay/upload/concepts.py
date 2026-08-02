@@ -1183,14 +1183,21 @@ def canonical_concept_name(name: str) -> str:
 
 
 def display_entity(concept_name: str | None, entity: str | None) -> str | None:
-    """The PROJECTION-LAYER display entity for a column, through the alias seam (D12.1).
+    """The READ-TIME display entity for a column, through the alias seam (D12.1-revised).
 
     When `concept_name` is an aliased concept and the stored/derived `entity` is that alias's own
     `entity_link` (or absent), the DISPLAY entity is the canonical concept's `entity_link` —
     `counterparty_id` therefore displays `customer` (a counterparty is our customer seen through a
     party ROLE). An explicitly different stored entity is a decision, never an alias artifact, and
-    passes through untouched. Fact-key derivation must NOT route through this function: the
-    registry member's persisted `entity_link` stays the byte-stable key input."""
+    passes through untouched.
+
+    READ SURFACES ONLY (`entity_map._endpoint_view`, semantic-bundle display values, asset-detail
+    renders). NOTHING stored or derivation-feeding may route through this function — not
+    `graph_node.entity`, not axis-projection fills, not grounding's `concept_entity`: that value
+    flows into `advisory_entity_id` -> `_entity_pick` -> `fact_key`, and seaming it would re-key
+    governed bridge facts (a REJECTED decoy would resurrect under a fresh key; a VERIFIED link
+    would duplicate). The registry member's persisted `entity_link` stays the byte-stable key
+    input everywhere."""
     if not concept_name:
         return entity
     canonical = canonical_concept_name(concept_name)
@@ -1203,16 +1210,6 @@ def display_entity(concept_name: str | None, entity: str | None) -> str | None:
     if entity is None or entity == alias.entity_link:
         return target.entity_link
     return entity
-
-
-def entity_aliased_concepts() -> frozenset[str]:
-    """The aliased concept names whose DISPLAY entity differs from their persisted `entity_link`
-    — the rows migration 1045's backfill (and its search-doc reprojection companion) targets."""
-    return frozenset(
-        alias for alias, target in _CANONICAL_ALIAS_TARGETS.items()
-        if CONCEPT_REGISTRY[alias].entity_link is not None
-        and CONCEPT_REGISTRY[alias].entity_link != CONCEPT_REGISTRY[target].entity_link
-    )
 
 
 def classification_vocabulary() -> tuple[dict, ...]:

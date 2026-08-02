@@ -1,10 +1,12 @@
-"""Entity/role/alias/issuer semantics (semantic plan Task 2, amended by D12.1).
+"""Entity/role/alias/issuer semantics (semantic plan Task 2, amended by D12.1-REVISED).
 
 * `counterparty` is a PARTY ROLE. The registry member `counterparty_id` KEEPS its persisted
-  `entity_link="counterparty"` (governed bridge fact keys hash `entity_id` — fact-key
-  preservation), while the correction happens at PROJECTION: the alias seam
-  (`canonical_concept_name` / `display_entity`) maps the display entity to `customer` in the
-  Entity Map, the semantic bundle, new enrichment projections and the migration-1045 backfill.
+  `entity_link="counterparty"` EVERYWHERE it feeds derivation — `graph_node.entity`, grounding,
+  candidate enumeration and fact keys (governed bridge fact keys hash `entity_id`, so rewriting
+  the derived entity would resurrect REJECTED decoy links under fresh keys and duplicate
+  VERIFIED ones). The `customer` correction is READ-TIME ONLY via the alias seam
+  (`canonical_concept_name` / `display_entity`): Entity Map endpoint views and semantic-bundle
+  display values — the `sensitivity` vs `sensitivity_display` precedent.
 * New SELECTION attempts canonicalize (`counterparty_id` -> `customer_id`); the classification
   vocabulary excludes `counterparty_id`; `bank_bic` is untouched.
 * `Concept.namespace` stays the identifier SCHEME; the ISSUER comes from the new per-catalog
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from featuregen.overlay.identity import EntityBridgeRef, fact_key
 from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import (
@@ -28,10 +31,7 @@ from featuregen.overlay.upload.concepts import (
     display_entity,
 )
 from featuregen.overlay.upload.enrich import _accept_concept, content_hash
-from featuregen.overlay.upload.graph import (
-    build_graph,
-    reproject_alias_entity_search_docs,
-)
+from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.identifier_scope import (
     GLOBAL_SCHEME_ISSUERS,
     declare_catalog_semantic_scope,
@@ -158,7 +158,9 @@ def _grounding(ref: str, *, concept_name: str, issuer: str | None, basis: str = 
         concept=BridgeConceptGroundingV1(
             concept_name, ConceptAuthority.SOURCE, "source", (), True),
         governed_entity_id=None,
-        advisory_entity_id=display_entity(concept_name, registered.entity_link),
+        # The RAW registry entity_link, exactly like the reverted production grounding — the
+        # derivation layer never routes through the display seam (D12.1-revised).
+        advisory_entity_id=registered.entity_link,
         explicit_namespace=None,
         governed_population=None,
         representation_role=RepresentationRole.IDENTIFIER_VALUE,
@@ -300,15 +302,59 @@ def test_undeclared_issuers_keep_advisory_candidates_flagged(db) -> None:
         assert "issuer_unresolved" in candidate.assessment.explanation_codes
 
 
-def test_entity_display_resolves_customer_but_keys_are_untouched(db) -> None:
-    """The alias seam corrects the DISPLAY entity of counterparty-classified endpoints to
-    `customer`; the registry's persisted `entity_link` (the fact-key input) is untouched."""
+#: The 9e36d4c6-era fact keys of the two counterparty_id-classified pairs on this exact fixture,
+#: computed by RUNNING the pre-alias derivation at that commit — not restated from the current
+#: code. BOTH `_entity_pick` branches are pinned, because the withdrawn seam moved both:
+#:   * client_no x counter_party_cif_id — zero subject roles, so the lexicographic tie-break
+#:     picks min('counterparty','customer') = 'counterparty';
+#:   * cust_num x counter_party_cif_id — exactly one SUBJECT role, whose entity ('customer') wins.
+#: Byte-for-byte identity is the load-bearing claim (D12.1-revised): if either literal ever
+#: fails, a human-REJECTED decoy pair resurrects as a consumable link under a fresh key and every
+#: VERIFIED counterparty-keyed link duplicates with stranded realizations.
+_PRE_ALIAS_ERA_FACT_KEYS = {
+    ("client_no", "counter_party_cif_id"):
+        "a214367bfd10d2c1b82208f271c8d7bb3796c8dd742cee425dddfdb60cdcd4e0",
+    ("cust_num", "counter_party_cif_id"):
+        "9533ccc4b69a6eb6269949eb795b9bb291e2471e752feb2c34faf374c805762b",
+}
+
+
+def test_counterparty_pair_fact_key_is_byte_identical_while_display_reads_customer(db) -> None:
+    """THE definitive regression pin ("candidate/fact identities byte-for-byte before and after"):
+    the derived candidate for a counterparty_id-classified pair still carries the RAW entity
+    ('counterparty') and mints the exact pre-alias-era fact key, while every READ surface — the
+    Entity Map endpoint view and the semantic bundle — displays `customer` for the same pair."""
+    from featuregen.overlay.upload import semantic_context as sc
+    from featuregen.overlay.upload.entity_map import _endpoint_view
+
     _fixture(db)
     candidates = derive_bridge_candidates(db)
     by_pair = {frozenset({c.left_ref.column, c.right_ref.column}): c for c in candidates}
-    subset = by_pair[frozenset({"client_no", "counter_party_cif_id"})]
-    assert subset.entity_id == "customer"
+
+    # Derivation: raw entity, byte-identical fact keys on BOTH `_entity_pick` branches.
     assert concept("counterparty_id").entity_link == "counterparty"
+    for (left_col, right_col), expected in _PRE_ALIAS_ERA_FACT_KEYS.items():
+        candidate = by_pair[frozenset({left_col, right_col})]
+        minted = fact_key(
+            EntityBridgeRef(entity_id=candidate.entity_id, left_ref=candidate.left_ref,
+                            right_ref=candidate.right_ref),
+            "entity_bridge")
+        assert minted == expected, f"{left_col} x {right_col} re-keyed"
+
+    subset = by_pair[frozenset({"client_no", "counter_party_cif_id"})]
+    assert subset.entity_id == "counterparty"       # the tie-break branch, unseamed
+
+    # Display: the SAME pair reads `customer` on both read surfaces.
+    assert subset.assessment is not None
+    (cp_endpoint,) = [
+        endpoint
+        for endpoint in (subset.assessment.left_endpoint, subset.assessment.right_endpoint)
+        if endpoint.concept == "counterparty_id"]
+    assert cp_endpoint.entity_id == "counterparty"          # the stored/derived value
+    assert _endpoint_view(cp_endpoint).entity_id == "customer"   # the display value
+    bundle = sc.bundle_from_store(db, "ftr", "public.tran_repos.counter_party_cif_id", roles=())
+    by_field = {v.field_name: v for v in bundle.resolved_semantics}
+    assert by_field["entity"].value == "customer"
 
 
 # ── Entity Map + semantic bundle display through the seam ────────────────────────────────────────
@@ -353,45 +399,37 @@ def test_bundle_carries_issuer_aware_namespace_and_display_entity(db) -> None:
     assert by_field["entity"].value == "customer"
 
 
-# ── migration 1045: backfill + search-doc reprojection ───────────────────────────────────────────
+# ── migration 1045: the catalog semantic-scope table ONLY (D12.1-revised) ────────────────────────
 
-_MIGRATION = "src/featuregen/db/migrations/1045_catalog_semantic_scope_and_entity_alias.sql"
+_MIGRATION = "src/featuregen/db/migrations/1045_catalog_semantic_scope.sql"
 
 
-def test_migration_1045_backfills_display_entity_and_spares_governed_rows(db) -> None:
-    """The migration's UPDATE against a SEEDED legacy shape (migration audits are blind to legacy
-    data otherwise): counterparty display entities flip to customer; a governed VERIFIED entity
-    and an explicitly different entity survive byte-for-byte. Idempotent by construction."""
+def test_migration_1045_never_touches_stored_entities(db) -> None:
+    """D12.1-revised: migration 1045 carries ONLY the scope table. Run against a SEEDED legacy
+    shape (migration audits are blind to legacy data otherwise), every stored entity — including
+    the counterparty rows the withdrawn backfill would have rewritten — survives byte-for-byte,
+    because `graph_node.entity` is a fact-key input via grounding's advisory_entity_id."""
     db.execute(
         "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
         "concept, entity) VALUES "
         "('legacy','public.t.cp_cif','column','t','cp_cif','counterparty_id','counterparty'),"
         "('legacy','public.t.other','column','t','other','counterparty_id','legal_entity'),"
         "('legacy','public.t.cust','column','t','cust','customer_id','customer')")
-    db.execute(
-        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
-        "concept, entity, entity_status) VALUES "
-        "('legacy','public.t.governed','column','t','governed','counterparty_id','counterparty',"
-        "'VERIFIED')")
     sql = (_ROOT / _MIGRATION).read_text()
+    # The EXECUTABLE body (comments stripped — the header prose explains *why* graph_node is
+    # off-limits, and must stay readable) may not name graph_node at all.
+    statements = "\n".join(
+        line for line in sql.splitlines() if not line.lstrip().startswith("--"))
+    assert "graph_node" not in statements, (
+        "migration 1045 must not touch graph_node (D12.1-revised)")
     db.execute(sql)
     rows = dict(db.execute(
         "SELECT column_name, entity FROM graph_node WHERE catalog_source='legacy'").fetchall())
-    assert rows["cp_cif"] == "customer"
-    assert rows["other"] == "legal_entity"      # an explicit different entity is a decision
-    assert rows["cust"] == "customer"
-    assert rows["governed"] == "counterparty"   # governed VERIFIED rows are never backfilled
-    # The companion reprojection rebuilds the affected search docs via graph.py's ONE expression.
-    rebuilt = reproject_alias_entity_search_docs(db)
-    assert rebuilt >= 3
-    (doc_matches,) = db.execute(
-        "SELECT search_doc @@ plainto_tsquery('english', 'customer') FROM graph_node "
-        "WHERE catalog_source='legacy' AND column_name='cp_cif'").fetchone()
-    assert doc_matches is True
+    assert rows == {"cp_cif": "counterparty", "other": "legal_entity", "cust": "customer"}
 
 
 def test_migration_1045_is_reserved_and_unique() -> None:
     migrations = sorted(p.name for p in (_ROOT / "src/featuregen/db/migrations").glob("1045_*"))
-    assert migrations == ["1045_catalog_semantic_scope_and_entity_alias.sql"], (
+    assert migrations == ["1045_catalog_semantic_scope.sql"], (
         "migration prefix 1045 is reserved for semantic Task 2 (interface doc D7) and must stay "
         "a single full filename")

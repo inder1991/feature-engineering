@@ -152,29 +152,6 @@ def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
              catalog_source, ref))
 
 
-def reproject_alias_entity_search_docs(conn) -> int:
-    """Migration-1045 companion (semantic Task 2): rebuild ``search_doc`` for every column whose
-    concept is an ENTITY-ALIASED registry member (``concepts.entity_aliased_concepts`` — today
-    ``counterparty_id``), so the backfilled display entity ('customer') reaches the doc's domain
-    slot through the ONE weighted expression above — never a SQL copy of it.
-
-    Idempotent and cheap (an indexed concept scan + per-row rebuild of unchanged-or-corrected
-    docs), so the migrate entrypoints run it unconditionally after ``apply_migrations``. Returns
-    the number of rows rebuilt."""
-    from featuregen.overlay.upload.concepts import entity_aliased_concepts
-
-    aliased = sorted(entity_aliased_concepts())
-    if not aliased:
-        return 0
-    rows = conn.execute(
-        "SELECT catalog_source, object_ref FROM graph_node "
-        "WHERE kind = 'column' AND concept = ANY(%s) ORDER BY catalog_source, object_ref",
-        (aliased,)).fetchall()
-    for catalog_source, object_ref in rows:
-        rebuild_search_doc(conn, catalog_source, object_ref)
-    return len(rows)
-
-
 def _table_ref(table: str) -> str:
     return f"{_SCHEMA}.{table}"
 
