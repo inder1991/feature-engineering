@@ -169,6 +169,28 @@ _KNOWN_VOCAB_VALIDATORS = {
 
 _HUMAN = EvidenceProducer.HUMAN.value
 
+# ── [F10] HUMAN evidence key discipline — ONE owner ───────────────────────────────────────────────
+# EVERY HUMAN `field_evidence` row is written by this module: the generic correction command
+# (`_append_human_evidence`, keyed by the CALLER'S `idempotency_key`) and the narrow
+# `propose_profile_field` seam the asset-profile PUT calls. The command's replay probe (step 5)
+# assumed it owned the whole HUMAN key space; the PUT broke that by stamping
+# `producer_item_ref="asset-profile-put:{field}"` — a string a user could plausibly send as their
+# own idempotency_key, which then 409'd as "reused with different parameters" for a command they
+# never issued (and, since every PUT reused it, stacked rows under one key).
+#
+# The two spaces are now disjoint by construction, twice over:
+#   * `source_snapshot_id` NAMESPACE — command rows are "human-correction:{key}", surface rows are
+#     "asset-profile-put:{subject}". The replay probe matches on its own namespace, so a surface row
+#     can never be read as a command replay whatever a user sends.
+#   * `producer_item_ref` DERIVATION — a surface key embeds the field AND the value hash, so it is
+#     unique per (producer_ref, field, value) and is never the bare "surface:field" string.
+_PROFILE_PUT_NS = "asset-profile-put"
+
+
+def _command_snapshot_id(idempotency_key: str) -> str:
+    """The `source_snapshot_id` namespace of a row written by the CORRECTION COMMAND."""
+    return f"human-correction:{idempotency_key}"
+
 
 class FieldCorrectionError(Exception):
     """A benign, PRE-WRITE refusal (unregistered field / not human-editable / asset not found /
@@ -289,7 +311,7 @@ def _append_human_evidence(
         conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
         producer=EvidenceProducer.HUMAN, strength=strength, lifecycle=lifecycle,
         producer_ref=actor.subject, producer_item_ref=idempotency_key,
-        source_snapshot_id=f"human-correction:{idempotency_key}", input_hash=input_hash,
+        source_snapshot_id=_command_snapshot_id(idempotency_key), input_hash=input_hash,
         evidence_spans=list(spans), note=note)
 
 
@@ -355,12 +377,17 @@ def apply_field_correction(
                   "subject": actor.subject, "idempotency_key": idempotency_key})
 
     # 5. Idempotency — BEFORE the CAS, so a replay carrying the (now-stale) original CAS view still
-    #    replays success rather than 409ing. HUMAN field_evidence is written ONLY by this command, so
-    #    (producer=human, producer_item_ref=idempotency_key) is a clean key.
+    #    replays success rather than 409ing. [F10] The probe is scoped to rows THIS COMMAND wrote:
+    #    (producer=human, producer_item_ref=idempotency_key) alone was only a clean key while the
+    #    command owned every HUMAN row, which the asset-profile PUT surface ended. Matching the
+    #    command's own `source_snapshot_id` namespace as well (every command row goes through
+    #    `_append_human_evidence`) makes the probe exact: a surface row can never be mistaken for a
+    #    replay, so a user whose idempotency_key happens to look like a surface key is never 409'd.
     prior = conn.execute(
         "SELECT input_hash FROM field_evidence WHERE logical_ref = %s AND field_name = %s "
-        "AND producer = %s AND producer_item_ref = %s",
-        (logical_ref, field, _HUMAN, idempotency_key)).fetchall()
+        "AND producer = %s AND producer_item_ref = %s AND source_snapshot_id = %s",
+        (logical_ref, field, _HUMAN, idempotency_key,
+         _command_snapshot_id(idempotency_key))).fetchall()
     if prior:
         if all(row[0] != input_hash for row in prior):
             raise FieldCorrectionError(409, "idempotency_key reused with different parameters")
@@ -525,6 +552,60 @@ def _supersede_own_prior_proposal(
         (logical_ref, field, _HUMAN, AssertionStrength.PROPOSED.value, subject,
          keep_value_hash))
     return cur.rowcount
+
+
+def propose_profile_field(
+    conn: DbConn, *, logical_ref: str, field: str, value: str, actor: IdentityEnvelope,
+    note: str | None = None,
+) -> bool:
+    """[F10] The ONE seam a NON-command surface (the asset-profile PUT) writes HUMAN
+    ``field_evidence`` through, so this module stays the single owner of HUMAN evidence and of both
+    idempotency key spaces (see the ``_PROFILE_PUT_NS`` note). Appends a bounded, ordinary
+    ``HUMAN/PROPOSED`` row — displayable, labeled, never load-bearing; promotion stays with the
+    four-eyes ``confirm_override``. Returns whether the ACTIVE evidence set CHANGED, so the caller
+    re-projects exactly the fields that moved. Does NOT project and does NOT lock: the caller owns
+    the transaction, the source+ref locks, and the batched :func:`resolve_and_project`.
+
+    Key discipline, in this order:
+
+    1. [F1] retire the author's OWN prior ACTIVE proposal for the field (a self-correction replaces
+       their pending value; a DIFFERENT subject's proposal is a legitimate competitor, untouched);
+    2. the row's key is ``asset-profile-put:{field}:{value_hash}`` under ``producer_ref=subject``,
+       i.e. unique per (subject, field, value) — repeat PUTs cannot stack under one key;
+    3. that key already ACTIVE -> nothing to write (an idempotent replay, exactly like the command's
+       replay: no second row, and the replayed ``note`` is not persisted);
+    4. that key present but ``superseded`` -> the author is re-asserting a value THEY retired, so
+       revive that exact row rather than stack a duplicate under its key. Scoped hard to
+       ``superseded`` (this module's own supersession): a ``rejected`` row is a governance decision
+       and is NEVER revived — re-proposing a rejected value appends fresh, which is honest, and is
+       the one case where a key can carry two rows.
+    """
+    _check_bounds(field, value)
+    value_hash = canonical_hash(value)
+    changed = bool(_supersede_own_prior_proposal(
+        conn, logical_ref=logical_ref, field=field, subject=actor.subject,
+        keep_value_hash=value_hash))
+    key = f"{_PROFILE_PUT_NS}:{field}:{value_hash}"
+    prior = conn.execute(
+        "SELECT evidence_id, lifecycle FROM field_evidence WHERE logical_ref = %s "
+        "AND field_name = %s AND producer = %s AND producer_ref = %s AND producer_item_ref = %s",
+        (logical_ref, field, _HUMAN, actor.subject, key)).fetchall()
+    if any(row[1] == EvidenceLifecycle.ACTIVE.value for row in prior):
+        return changed
+    revivable = [row[0] for row in prior if row[1] == EvidenceLifecycle.SUPERSEDED.value]
+    if revivable:
+        conn.execute("UPDATE field_evidence SET lifecycle = 'active' WHERE evidence_id = ANY(%s)",
+                     (revivable,))
+        return True
+    record_field_evidence(
+        conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
+        producer=EvidenceProducer.HUMAN, strength=AssertionStrength.PROPOSED,
+        lifecycle=EvidenceLifecycle.ACTIVE, producer_ref=actor.subject, producer_item_ref=key,
+        source_snapshot_id=f"{_PROFILE_PUT_NS}:{actor.subject}",
+        input_hash=field_input_hash(logical_ref=logical_ref, field_name=field,
+                                    material={"value": value, "subject": actor.subject}),
+        note=note)
+    return True
 
 
 #: [F3] The singleton (producer, strength) pair a bare human proposal contributes — evaluated

@@ -41,22 +41,12 @@ from featuregen.api.deps import (
     require_catalog_write,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
-from featuregen.overlay.evidence import (
-    AssertionStrength,
-    EvidenceLifecycle,
-    EvidenceProducer,
-)
-from featuregen.overlay.field_evidence import (
-    canonical_hash,
-    field_input_hash,
-    read_active_field_evidence,
-    record_field_evidence,
-)
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.dataset_profiles import build_dataset_profile
 from featuregen.overlay.upload.field_correction import (
+    FieldCorrectionError,
     _lock_key,
-    _supersede_own_prior_proposal,
+    propose_profile_field,
 )
 from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.ingest import ingest_source_lock_key
@@ -199,39 +189,19 @@ def put_asset_profile(
             status_code=409,
             detail="the profile changed since you loaded it — refresh and retry")
 
-    # 5. Ordinary bounded HUMAN/PROPOSED evidence + decisions, idempotent per identical value.
-    #    [F1] Re-proposing supersedes the SAME subject's prior ACTIVE proposal for the field FIRST
-    #    (same transaction, same lifecycle mechanic the decisions path uses) — a self-correction
-    #    must replace the author's own pending value, never tie with it; a DIFFERENT subject's
-    #    proposal is a legitimate competitor and is never touched.
+    # 5. Ordinary bounded HUMAN/PROPOSED evidence, through the ONE seam that owns HUMAN evidence
+    #    writes and idempotency-key discipline ([F10] — this route must never key evidence itself;
+    #    it collided with the correction command's private replay namespace when it did). The seam
+    #    carries the [F1] self-supersession and same-value idempotency, and reports whether the
+    #    ACTIVE set changed so exactly the moved fields re-project.
     written: list[str] = []
     for field, value in writes.items():
-        superseded = _supersede_own_prior_proposal(
-            conn, logical_ref=logical_ref, field=field, subject=identity.subject,
-            keep_value_hash=canonical_hash(value))
-        already = any(
-            e.producer == EvidenceProducer.HUMAN.value
-            and e.strength == AssertionStrength.PROPOSED.value
-            and e.producer_ref == identity.subject
-            and canonical_hash(e.proposed_value) == canonical_hash(value)
-            for e in read_active_field_evidence(conn, logical_ref, field))
-        if already:
-            # Replaying the same proposal must not stack duplicate evidence — but if the replay
-            # ALSO retired a prior different-valued row (legacy double-proposal state), the active
-            # set changed and the field must still re-resolve below.
-            if superseded:
+        try:
+            if propose_profile_field(conn, logical_ref=logical_ref, field=field, value=value,
+                                     actor=identity, note=body.note):
                 written.append(field)
-            continue
-        record_field_evidence(
-            conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
-            producer=EvidenceProducer.HUMAN, strength=AssertionStrength.PROPOSED,
-            lifecycle=EvidenceLifecycle.ACTIVE, producer_ref=identity.subject,
-            producer_item_ref=f"asset-profile-put:{field}",
-            source_snapshot_id=f"asset-profile-put:{identity.subject}",
-            input_hash=field_input_hash(logical_ref=logical_ref, field_name=field,
-                                        material={"value": value, "subject": identity.subject}),
-            note=body.note)
-        written.append(field)
+        except FieldCorrectionError as exc:   # defense in depth: step 1 already bounded every field
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     if written:
         resolve_and_project(conn, source=src, logical_refs=[logical_ref], fields=written)
 

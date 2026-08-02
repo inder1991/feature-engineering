@@ -331,6 +331,59 @@ def test_different_subject_proposal_competes_without_retiring_anyone(flag_on, cl
     assert f["unresolved_family"] == "undecided"
 
 
+def _put(client, headers, expected_hash, **fields):
+    return client.put("/catalog/asset-profiles/bank/public.orders", headers=headers,
+                      json={"expected_dataset_profile_hash": expected_hash, **fields})
+
+
+def test_a_user_idempotency_key_can_never_collide_with_a_profile_put(flag_on, client, conn):
+    """F10: the PUT used to stamp HUMAN evidence with ``producer_item_ref="asset-profile-put:
+    {field}"`` — inside the idempotency namespace ``field_correction``'s replay probe owns. A user
+    who happened to send that exact ``idempotency_key`` got a 409 ("reused with different
+    parameters") for a command they had never issued. The two key spaces are now disjoint, so the
+    reviewer's collision probe is an ordinary successful proposal."""
+    assert upload_csv(client, "bank", BANK_CSV).status_code == 200
+    current = client.get("/catalog/asset-profiles/bank/public.orders", headers=AUTH).json()
+    assert _put(client, OWNER, current["dataset_profile_hash"],
+                authority_role="derived").status_code == 200
+    command = {"action": "propose_override", "replacement_value": "mastered_view",
+               "idempotency_key": "asset-profile-put:authority_role",
+               **_field_cas(conn, "bank::public.orders", "authority_role")}
+    collide = client.post(
+        "/catalog/assets/bank/public.orders/fields/authority_role/decisions", headers=CONFIRMER,
+        json=command)
+    assert collide.status_code == 200, collide.text
+    assert collide.json()["outcome"] == "proposed"
+    # Narrowing the probe must not have DISABLED it: the command's own replay still replays.
+    replay = client.post(
+        "/catalog/assets/bank/public.orders/fields/authority_role/decisions", headers=CONFIRMER,
+        json=command)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["outcome"] == "replayed" and replay.json()["replayed"] is True
+
+
+def test_repeat_puts_never_stack_rows_under_one_key(flag_on, client, conn):
+    """F10: every PUT appended under the SAME ``asset-profile-put:{field}`` key, so "one key, one
+    write" — the discipline the replay probe depends on — did not hold on this surface. The key is
+    now derived per (subject, field, VALUE): distinct values get distinct keys, and re-asserting a
+    value the author themselves superseded revives that exact row instead of stacking a second."""
+    assert upload_csv(client, "bank", BANK_CSV).status_code == 200
+    h = client.get("/catalog/asset-profiles/bank/public.orders", headers=AUTH
+                   ).json()["dataset_profile_hash"]
+    for value in ("derived", "system_of_record", "derived"):
+        res = _put(client, OWNER, h, authority_role=value)
+        assert res.status_code == 200, res.text
+        h = res.json()["dataset_profile_hash"]
+    keys = conn.execute(
+        "SELECT producer_item_ref FROM field_evidence WHERE logical_ref = 'bank::public.orders' "
+        "AND field_name = 'authority_role' AND producer = 'human'").fetchall()
+    assert len(keys) == len({k[0] for k in keys}), f"rows stacked under one key: {keys}"
+    assert all(k[0] != "asset-profile-put:authority_role" for k in keys)
+    # ...and the surface still behaves: exactly the last value is live and displayed.
+    assert [r[0] for r in _evidence_rows(conn, "authority_role") if r[1] == "active"] == ["derived"]
+    assert _graph_authority_role(conn) == "derived"
+
+
 def test_set_advisory_flows_through_the_decision_route(flag_on, client):
     """A confirmer curates business_context in one step (advisory-only; RECOMMENDATION ceiling)."""
     assert upload_csv(client, "bank", BANK_CSV).status_code == 200
