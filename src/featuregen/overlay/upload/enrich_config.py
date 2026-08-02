@@ -26,7 +26,51 @@ _DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
 # one column's summary borrowing another's facts — to the same bound the siblings hold.
 _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8, "unit": 8,
                       "summary": 8, "table_synth": 4}
-_DEFAULT_MAX_INPUT_TOKENS = {"concept": 14000, "definition": 8000, "domain": 8000,
+
+# ── RE-BUDGET, joint Task 4 (measured, not guessed) ──────────────────────────────────────────────
+#
+# The Pass-A payloads became the `semantic_context` purpose adapters, so every item carries more
+# bytes. "Preserve the batch bounds" and "triple the item bytes" cannot both be true: with a fixed
+# token cap a bigger item means fewer items per chunk, which means MORE provider calls against an
+# unchanged 32-call / 240s ceiling — i.e. SILENT truncation, reported as a normal partial run.
+#
+# Measured on the 126-column FTR fixture (`fixtures/ftr_sample_synthetic.csv`, one wide table),
+# `estimate_tokens` per item, old payload -> new payload:
+#
+#   task                       median      max      chunk cost at its max_items
+#   concept                    85 -> 373   194 -> 538   20 x 538  =  10,760   (was 20 x 194 = 3,880)
+#   definition/synonyms/unit    23 ->  93    25 -> 270    8 x 270  =   2,160   (was  8 x  25 =   200)
+#   summary                    92 -> 108   201 -> 272    8 x 272  =   2,176   (was  8 x 201 = 1,608)
+#   domain (per TABLE item)   428 -> 2993  428 -> 2993   8 x 2993 =  23,944   (was  8 x 428 = 3,424)
+#
+# Two bounds actually moved; the rest are recorded as MEASURED-SUFFICIENT rather than churned:
+#
+# * `concept` 14000 -> 24000. The measured max chunk (10,760) still fits 14000, but only because
+#   this fixture's roster entries are mostly bare names: on a RE-upload every sibling carries a
+#   resolved concept + party role, which the same measurement puts at ~750 tokens/item — 20 x 750 =
+#   15,000, i.e. just over the old cap. 24000 keeps 20 items/chunk (the same 7 chunks, the same call
+#   count, the same deadline accounting) with ~60% headroom for a wider glossary.
+# * `domain` 8000 -> 26000. This one is not marginal: a domain ITEM is a whole TABLE, and it now
+#   carries that table's complete column roster (name + resolved concept + party role) because the
+#   D13.2 per-column sub-domain question is unanswerable from a bare name list. 8 x 2,993 = 23,944
+#   against an 8000 cap would have cut chunks from 8 tables to 2 — a 4x call-count increase on the
+#   domain stage, which on a 100-table catalog crosses the 32-call ceiling and truncates.
+# * definition/synonyms/unit (2,160 = 27% of 8000) and summary (2,176 = 16% of 14000) keep their
+#   bounds: the margin is measured, not assumed.
+#
+# `_DEFAULT_MAX_ITEMS` is deliberately UNCHANGED everywhere. Those are cross-item CONTAMINATION
+# isolation boundaries (MF-8a above), not size limits; shrinking them to pay for bigger payloads
+# would trade an accuracy control for a byte budget and multiply the call count at the same time.
+#
+# NOTE on `estimate_tokens` and `shared_metadata` (the honest accounting): the estimator measures
+# ITEM metadata only. That is CORRECT for the one shared block that exists — the ~276-concept
+# classification vocabulary — because it is dispatched as a `cache_control` shared prefix
+# (`cacheable_metadata_keys`), sent once and reused by chunks 2..N rather than re-billed per chunk;
+# folding it into a per-chunk INPUT budget would make every chunk look ~23K tokens over and collapse
+# every batch to one item. The sibling roster and table context therefore ride PER-ITEM metadata by
+# design, where the estimator sees them honestly — pinned by a test, so nobody can "optimize" the
+# roster into `shared_metadata` and make the budget blind to it again.
+_DEFAULT_MAX_INPUT_TOKENS = {"concept": 24000, "definition": 8000, "domain": 26000,
                              "synonyms": 8000, "unit": 8000, "summary": 14000,
                              "table_synth": 6000}
 

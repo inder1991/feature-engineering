@@ -55,9 +55,11 @@ from featuregen.overlay.upload.enrich import (
     _unit_targets,
     _write_definition_evidence,
     _write_domain_evidence,
+    _write_sub_domain_evidence,
     _write_summary_evidence,
     _write_synonym_evidence,
     _write_unit_evidence,
+    build_enrichment_context,
     classify_domains,
     content_hash,
     draft_definitions,
@@ -2173,6 +2175,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # E1a T3: {(table, column): domain} for the columns whose domain OVERRIDES their table's default
     # (the classifier's out-param). Stays empty with no client / no overrides -> every column inherits.
     domain_overrides: dict[tuple[str, str], str] = {}
+    # D13.2: {(table, column): sub_domain} — the FINER LLM-proposed axis beside the coarse source
+    # `domain`, produced by the SAME domain call (no second LLM request). Empty with no client.
+    column_sub_domains: dict[tuple[str, str], str] = {}
+    # Joint Task 4: the run's semantic context, assembled once inside the concept stage's savepoint
+    # and threaded into every later Pass-A stage. `{}` when that stage never ran (no client, or a
+    # contained failure) — every stage then falls back to building its own.
+    enrichment_context: dict = {}
     if client is None:
         # No LLM provider configured: the enrichment stages honestly never ran (#22) — recorded as
         # skipped, never as a failure, and ingestion continues normally. The concept CRITIC is
@@ -2210,13 +2219,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # pre-audited + attributed to THIS run and the object subjects it enriches. `None`
             # (a direct caller with no run) dispatches unattributed — byte-for-byte as before.
             with conn.transaction():
+                # Joint Task 4: ONE semantic-context assembly for the whole run, threaded into
+                # every Pass-A stage below (each would otherwise repeat the same batched
+                # table-context read and the same pure per-column build).
+                enrichment_context = build_enrichment_context(conn, vr.good, glossary)
                 concepts = (
                     enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
                                     bindings=bindings, source_snapshot_id=snapshot_id,
-                                    stats=concept_stats, ingestion_run_id=ingestion_run_id)
+                                    stats=concept_stats, ingestion_run_id=ingestion_run_id,
+                                    bundles=enrichment_context)
                     if is_glossary
                     else enrich_concepts(conn, vr.good, client, actor, stats=concept_stats,
-                                         ingestion_run_id=ingestion_run_id)
+                                         ingestion_run_id=ingestion_run_id,
+                                         bundles=enrichment_context)
                 )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
@@ -2253,7 +2268,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # blanks (suppressed ≠ missing — never silently LLM-drafted); None for technical.
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
                                                 glossary=glossary,
-                                                ingestion_run_id=ingestion_run_id, stats=def_stats)
+                                                ingestion_run_id=ingestion_run_id, stats=def_stats,
+                                                bundles=enrichment_context or None)
                 # E1a: the drafted definition is not display-only — promote it to governed
                 # `llm/proposed` evidence so asset-detail shows the AI as its author, and RECONCILE
                 # the columns that dropped out of this run (a suppressed / no-longer-blank column
@@ -2297,7 +2313,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             with conn.transaction():
                 domains = classify_domains(conn, vr.good, client, actor,
                                            ingestion_run_id=ingestion_run_id, stats=domain_stats,
-                                           column_domains=domain_overrides)
+                                           column_domains=domain_overrides,
+                                           column_sub_domains=column_sub_domains,
+                                           glossary=glossary,
+                                           bundles=enrichment_context or None)
                 # E1a T3: the classified domain is not display-only either — promote it to governed
                 # `llm/proposed` evidence at BOTH levels (the table's default on the TABLE node; a
                 # column's only where it OVERRIDES that default — inheritance is never fabricated as
@@ -2310,6 +2329,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                             conn, source=catalog_source, rows=vr.good, domains=domains,
                             column_domains=domain_overrides, glossary=glossary, bindings=bindings,
                             source_snapshot_id=snapshot_id)
+                        # D13.2 — the finer axis rides the SAME stage/savepoint/report as the
+                        # coarse one it refines: one call produced both, so one failure domain.
+                        domain_evidence_failures += _write_sub_domain_evidence(
+                            conn, source=catalog_source, rows=vr.good,
+                            column_sub_domains=column_sub_domains, glossary=glossary,
+                            bindings=bindings, source_snapshot_id=snapshot_id)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
@@ -2337,7 +2362,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # the definition/domain evidence (glossary + snapshot); its CONTAINED failures ride
                 # into the stage report.
                 synonyms = draft_synonyms(conn, vr.good, client, actor, concepts=concepts,
-                                          ingestion_run_id=ingestion_run_id, stats=syn_stats)
+                                          ingestion_run_id=ingestion_run_id, stats=syn_stats,
+                                          glossary=glossary,
+                                          bundles=enrichment_context or None)
                 if glossary is not None and snapshot_id is not None:
                     try:
                         syn_evidence_failures = _write_synonym_evidence(
@@ -2374,7 +2401,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # evidence (glossary + snapshot); its CONTAINED failures ride into the stage report.
                 units = draft_units(conn, vr.good, client, actor, concepts=concepts,
                                     currencies=unit_currencies,
-                                    ingestion_run_id=ingestion_run_id, stats=unit_stats)
+                                    ingestion_run_id=ingestion_run_id, stats=unit_stats,
+                                    glossary=glossary,
+                                    bundles=enrichment_context or None)
                 if glossary is not None and snapshot_id is not None:
                     try:
                         unit_evidence_failures = _write_unit_evidence(
@@ -2515,13 +2544,30 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # Computed HERE (pure — no DB) so the C5-T5 dispatch subjects key each table under
                 # the SAME schema its fact proposals use below; reused by the propose block.
                 schema_by_table = _schema_by_table(glossary)
+                # Profile Task 4: does this catalog HAVE authored narrative to judge an
+                # authority claim against? The deterministic `authority_claim_without_source_context`
+                # rule fires only when it does — with no narrative anywhere, "unsupported" and
+                # "unknown" are indistinguishable and the rule abstains rather than refuting every
+                # claim in the catalog. Read fail-soft: an unavailable narrative store degrades to
+                # abstention, never to a wrong refutation.
+                try:
+                    from featuregen.overlay.upload.profile_store import (
+                        current_catalog_profile_revision_id,
+                    )
+                    _catalog_context = current_catalog_profile_revision_id(
+                        conn, catalog_source) is not None
+                except Exception:  # noqa: BLE001 — advisory: abstain rather than misfire
+                    logger.warning("advisory catalog-narrative probe failed for %r",
+                                   catalog_source, exc_info=True)
+                    _catalog_context = False
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor,     # LLM-call attribution only
                                               dispositions=dispositions,
                                               # C5-T5: run + table-subject dispatch attribution
                                               ingestion_run_id=ingestion_run_id,
                                               catalog_source=catalog_source,
-                                              schema_by_table=schema_by_table, stats=passb_stats)
+                                              schema_by_table=schema_by_table, stats=passb_stats,
+                                              catalog_context_available=_catalog_context)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
@@ -3159,18 +3205,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 summary_extras = _summary_dossier_extras(
                     conn, catalog_source, vr.good, glossary=glossary, concepts=concepts,
                     domains=domains, domain_overrides=domain_overrides, synonyms=synonyms)
+                # ONE bundle set for the drafter AND the evidence writer: the summary's
+                # `input_hash` must hash exactly what it was drafted from, so both sides must see
+                # the SAME context (`summary_payload` folds the adapter output into the material).
+                summary_context = enrichment_context or build_enrichment_context(
+                    conn, vr.good, glossary)
                 summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
                                             concepts=concepts,
                                             ingestion_run_id=ingestion_run_id,
                                             stats=summary_stats,
-                                            extras_by_hash=summary_extras)
+                                            extras_by_hash=summary_extras,
+                                            bundles=summary_context)
                 if snapshot_id is not None:
                     try:
                         summary_evidence_failures = _write_summary_evidence(
                             conn, source=catalog_source, rows=vr.good, summaries=summaries,
                             glossary=glossary, bindings=bindings,
                             source_snapshot_id=snapshot_id,
-                            extras_by_hash=summary_extras)
+                            extras_by_hash=summary_extras,
+                            bundles=summary_context)
                     except Exception:  # noqa: BLE001 — an escape past the writer's per-item
                         # guard would otherwise report `succeeded` for a run that wrote nothing.
                         summary_evidence_failures = 1

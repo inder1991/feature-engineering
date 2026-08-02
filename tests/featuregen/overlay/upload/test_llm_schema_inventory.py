@@ -37,10 +37,13 @@ _POSITIONAL_WRAPPERS = {
 
 # The one dynamic schema_id construction: enrich_batch._single_fallback's
 # f"overlay_{single_prompt}" — the per-item fallback of every NON-ref-aware run_batched task.
-# Expanded to the flat single schemas those tasks resolve to, at the default version 1 (the only
-# version a fallback-capable caller threads today; ref-aware tasks never reach the fallback).
+# Expanded to the flat single schemas those tasks resolve to, at EVERY version a fallback-capable
+# caller can thread (`_single_fallback` passes the batch call's own `schema_version` straight
+# through). `overlay_domain` reaches v2 from the D13.2 sub-domain batch; ref-aware tasks (Pass B)
+# never reach the fallback at all.
 _DYNAMIC_FALLBACK_PAIRS = {
-    ("overlay_concept", 1), ("overlay_definition", 1), ("overlay_domain", 1),
+    ("overlay_concept", 1), ("overlay_definition", 1),
+    ("overlay_domain", 1), ("overlay_domain", 2),
     ("overlay_synonyms", 1), ("overlay_unit", 1), ("overlay_summary", 1),
 }
 _DYNAMIC = "__DYNAMIC__"
@@ -171,7 +174,10 @@ def test_the_scan_sees_the_known_call_sites():
         ("overlay_concept", 1),                       # enrich.py single mode (positional _call)
         ("overlay_concept_batch", 1),                 # enrich.py batch mode
         ("overlay_summary", 1),                       # the dynamic single-fallback expansion
-        ("overlay_table_synth_batch", 2),             # table_synth v2 literal
+        # Pass B ships the profile-synthesis contract at schema v3 (a REAL body — v2 is a
+        # byte-alias of v1 and would reject every profile field). The version arrives as the
+        # module constant `_SYNTH_SCHEMA_VERSION`, which the scan resolves.
+        ("overlay_table_synth_batch", 3),
         ("feature_ideas", 1),                         # feature_assist flag-off
         ("feature_ideas", feature_assist._FEATURE_CONTEXT_SCHEMA_VERSION),   # flag-on
         ("overlay_contract", 1),                      # contract author/refine

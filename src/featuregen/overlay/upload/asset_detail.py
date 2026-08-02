@@ -81,6 +81,11 @@ _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
     # humanises underscores for display already.
     ("ai_summary", "ai_summary", "ai_summary"),
     ("domain", "domain", "domain"),
+    # D13.2 — the FINER LLM-proposed axis beside the coarse source `domain`. Rendered exactly like
+    # every other recommendation field, which is the point: it arrives with its `llm_proposed`
+    # authority label from `_authority_label`, never as a governed value and never in place of
+    # `domain`. A column with no proposal simply has no entry (no fabricated empty).
+    ("sub_domain", "sub_domain", "sub_domain"),
     ("additivity", "additivity", "additivity"),
     ("unit", "unit", "unit"),
     ("currency", "currency", "currency"),
@@ -102,7 +107,8 @@ _PROJECTED_AXES = frozenset({"sensitivity_display", "party_role"})
 # entity_status / entity_fact_key / entity_fact_event_id back the F12 entity-authority gate below.
 _ANCHOR_COLUMNS = (
     "catalog_source, object_ref, kind, table_name, column_name, schema_name, data_type, "
-    "declared_type, definition, ai_summary, is_grain, is_as_of, concept, domain, sensitivity, "
+    "declared_type, definition, ai_summary, is_grain, is_as_of, concept, domain, sub_domain, "
+    "sensitivity, "
     "sensitivity_display, party_role, additivity, "
     "unit, currency, entity, entity_status, entity_fact_key, entity_fact_event_id, "
     "grain_fact_event_id, availability_fact_event_id"

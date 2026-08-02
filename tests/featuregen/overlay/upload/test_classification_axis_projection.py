@@ -15,9 +15,9 @@ from __future__ import annotations
 import pytest
 
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_authority import InfluenceTier
 from featuregen.overlay.field_evidence import record_field_evidence
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.field_authority import InfluenceTier
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord

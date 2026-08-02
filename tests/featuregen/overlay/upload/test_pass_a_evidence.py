@@ -44,11 +44,36 @@ _BAL_REF = normalize_ref("ftr", "DPL_EIB_COMPLIANCE", "COMP_REPOS_DLY", "ACCT_BA
 
 
 class _CapturingFake(FakeLLM):
-    """FakeLLM that records the last request so a test can assert the outbound payload."""
+    """FakeLLM that records every request so a test can assert the outbound payload.
+
+    `last` is kept for the callers that only ever issue one call; `batch_items` names the CONCEPT
+    classifier's batch payload explicitly, because a monetary/temporal/label assignment now also
+    reaches the concept CRITIC (joint Task 4 item d) and "the last request" is no longer the
+    classifier's."""
 
     def call(self, request):
         self.last = request
+        self.requests = [*getattr(self, "requests", []), request]
         return super().call(request)
+
+    def batch_items(self) -> dict:
+        for request in self.requests:
+            if request.task != _TASK:
+                continue
+            items = request.inputs[INPUT_KEY_CATALOG].get("items")
+            if items:
+                return {it["ref"]: it for it in items}
+        raise AssertionError("the concept classifier never dispatched a batch")
+
+    def concept_payloads(self) -> list[dict]:
+        """Every CLASSIFIER payload this run egressed, item-flattened."""
+        out: list[dict] = []
+        for request in self.requests:
+            if request.task != _TASK:
+                continue
+            catalog = request.inputs[INPUT_KEY_CATALOG]
+            out.extend(catalog.get("items") or [catalog])
+        return out
 
 
 def _rows_by_col(upload):
@@ -71,10 +96,13 @@ def test_rich_glossary_context_reaches_the_llm(db, monkeypatch):
     enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
                     source_snapshot_id="snap-1")
 
-    items = {it["ref"]: it for it in client.last.inputs[INPUT_KEY_CATALOG]["items"]}
+    items = client.batch_items()
     name = items[h_name]
-    # Structural metadata is still present...
-    assert name["table"] == "COMP_REPOS_DLY" and name["column"] == "CUST_NAME"
+    # Structural metadata is still present. The identity now arrives NORMALIZED (joint Task 4: the
+    # payload is projected from the bundle's schema-preserving `object_ref`, the same case-folded
+    # identity every evidence/decision store keys on) rather than in the file's own casing — the
+    # cache key and the evidence material still carry the raw row values, so nothing re-keys.
+    assert name["table"] == "comp_repos_dly" and name["column"] == "cust_name"
     # ...AND the full business sidecar rides along (under `business_definition`, not the plain
     # `definition` key which stays egress-forbidden for technical uploads).
     assert name["business_definition"].startswith("The legal name of the customer")
@@ -147,9 +175,14 @@ def test_non_glossary_upload_is_unchanged(db, monkeypatch):
 
     out = enrich_concepts(db, rows, client)                    # no glossary / bindings / snapshot
     assert out == {h: "monetary_stock"}
-    item = client.last.inputs[INPUT_KEY_CATALOG]["items"][0]
-    assert set(item) == {"ref", "table", "column", "type"}     # no glossary keys, no free-text definition
-    assert "123-45-6789" not in str(client.last.inputs)        # PII never egresses (M4)
+    item = client.batch_items()[h]
+    # No glossary keys and no free-text definition. `column_roster` is the joint-Task-4 sibling
+    # roster — present but EMPTY here (a one-column table has no siblings), so a bare upload still
+    # egresses nothing beyond its own structural identity.
+    assert set(item) == {"ref", "table", "column", "type", "column_roster"}
+    assert item["column_roster"] == []
+    for request in client.requests:
+        assert "123-45-6789" not in str(request.inputs)        # PII never egresses (M4)
     n = db.execute("SELECT count(*) FROM field_evidence WHERE producer = 'llm'").fetchone()[0]
     assert n == 0                                              # no evidence for a non-glossary upload
 
@@ -184,10 +217,11 @@ def test_concept_enrichment_does_not_egress_raw_sample_values(db, monkeypatch):
     enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
                     source_snapshot_id="snap-1")
 
-    payload = str(client.last.inputs)
-    for value in ("84848368", "1250.00", "15:07:08"):
-        assert value not in payload            # raw customer sample values never egress
-    item = {it["ref"]: it for it in client.last.inputs[INPUT_KEY_CATALOG]["items"]}[h_amt]
+    for request in client.requests:            # EVERY call, classifier and critic alike
+        payload = str(request.inputs)
+        for value in ("84848368", "1250.00", "15:07:08"):
+            assert value not in payload        # raw customer sample values never egress
+    item = client.batch_items()[h_amt]
     bd = item["business_definition"]
     assert "financial transaction record" in bd.lower()   # business meaning survives...
     assert "customer" in bd.lower()
