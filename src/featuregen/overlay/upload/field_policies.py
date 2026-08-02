@@ -265,6 +265,18 @@ _POLICIES: dict[str, FieldPolicy] = {
     # Source-authority fields (Delivery B item 8) — technical-CSV / glossary declared values.
     "business_term": _GLOSSARY_TERM,        # advisory scalar — generically human-editable
     "term_type": _GLOSSARY_TERM,            # advisory scalar — generically human-editable
+    # D13.1 — the source's own FINE-GRAINED taxonomy axes. Both already land as SOURCE evidence
+    # (`ingest._SOURCE_FIELDS`, ATTESTED under FTR_GLOSSARY_PROFILE); without a policy they were
+    # unresolvable, so they could never reach a decision, a flat column or a facet. Same advisory
+    # shape as every other curated glossary scalar: shown, human-correctable, never load-bearing.
+    "bian_path": _GLOSSARY_TERM,
+    "process_path": _GLOSSARY_TERM,
+    # D13.2 — the LLM-proposed FINER classification axis beside the coarse source `domain`. The
+    # SAME `_MEANING` policy `domain` carries, deliberately: recommendation tier (never load-
+    # bearing however strong the evidence), lenient display so an `llm/proposed` value is visible
+    # and labeled rather than hidden, and human_editable so the existing four-eyes propose/confirm
+    # flow can correct it. It never overwrites `domain` — they are two separate fields.
+    "sub_domain": _MEANING,
     "declared_type": _DECLARED_TYPE_HINT,   # glossary-declared SQL type: a HINT, never authority
     "data_type": _DATA_TYPE,
     "unit": _MEASURE_ANNOTATION,
