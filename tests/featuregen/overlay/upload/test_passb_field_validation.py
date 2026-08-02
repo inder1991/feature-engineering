@@ -14,6 +14,7 @@ from featuregen.overlay.upload.table_synth import make_ref_accept
 from featuregen.overlay.upload.table_vocab import (
     CANONICAL_TABLE_ROLES,
     MAX_GRAIN_COLS,
+    TABLE_ROLE_ENUM,
     normalize_event_or_snapshot,
     normalize_table_role,
 )
@@ -210,6 +211,26 @@ def test_off_vocab_as_of_basis_drops_availability_only_via_real_path(db):
     assert out["grain"] == {"columns": ["id"], "is_unique": True}
     assert out["availability_time"] is None
     assert _find(disp, "availability_time")["reason"] == "basis_not_allowed"
+
+
+def test_hallucinated_crosswalk_role_is_salvaged_as_bridge_not_dropped(db):
+    """[F5] A DELIBERATE pin on a Pass-B behaviour change nobody asked Pass B for.
+
+    The profile program added ``crosswalk`` to ``table_vocab._ROLE_ALIASES`` so a human profile edit
+    could SAY "crosswalk" while the stored evidence vocabulary stayed the legacy ``bridge``. Pass B
+    shares that ONE normalizer, so the salvage path changed silently with it: the PROMPT does not
+    offer the word (it is absent from the prompt-interpolated ``TABLE_ROLE_ENUM`` — a Pass-B
+    ``crosswalk`` is therefore a HALLUCINATION), yet what used to drop with ``role_off_vocab`` is now
+    ACCEPTED and written as ``bridge`` table_role evidence.
+
+    Judged acceptable — ``bridge`` IS what a model means by "crosswalk", and an input alias can never
+    widen ``CANONICAL_TABLE_ROLES`` — but it must be a visible, pinned decision rather than a
+    side effect of a shared constant. Change this test deliberately or not at all."""
+    assert "crosswalk" not in TABLE_ROLE_ENUM       # the prompt never offers the word
+    out, disp = _real_path(db, {"grain_columns": ["id"], "table_role": " Crosswalk "}, {"id"})
+    assert out["table_role"] == "bridge"            # accepted + canonicalized, NOT role_off_vocab
+    assert _find(disp, "table_role")["status"] == "accepted"
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}   # salvage intact either way
 
 
 def test_a_dimension_table_with_a_customer_grain_proposes_primary_entity_customer():
