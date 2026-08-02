@@ -329,6 +329,10 @@ def test_different_subject_proposal_competes_without_retiring_anyone(flag_on, cl
     assert f["state"] == "undecided"
     assert f["unresolved_reason"] == "pending_review"
     assert f["unresolved_family"] == "undecided"
+    # The graph projection tracks the resolution EXACTLY (the strict reconcile invariant F3 keeps):
+    # with nothing displayable it is CLEARED rather than serving one proposer's value as if it had
+    # won. Only the F1 self-correction case must never clear — pinned in the test above.
+    assert _graph_authority_role(conn) is None
 
 
 def _put(client, headers, expected_hash, **fields):
