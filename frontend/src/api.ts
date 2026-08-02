@@ -369,10 +369,20 @@ export interface FeatureSpecIn {
   derives_from: { catalog_source: string; object_ref: string }[]
 }
 
-export async function uploadFile(file: File, source: string): Promise<IngestResult> {
+export async function uploadFile(
+  file: File,
+  source: string,
+  // Optional catalog-narrative JSON (Release-A profiles): validated server-side BEFORE any write
+  // and committed atomically with a successful ingest; ignored (with a server warning) while
+  // FEATUREGEN_DATASET_PROFILES is off. Never required — a missing profile never blocks a catalog.
+  catalogProfileJson?: string,
+): Promise<IngestResult> {
   const form = new FormData()
   form.append('file', file)
   form.append('source', source)
+  if (catalogProfileJson !== undefined && catalogProfileJson.trim() !== '') {
+    form.append('catalog_profile_json', catalogProfileJson)
+  }
   const { body, response } = await requestWithResponse<IngestResult>('/uploads', {
     method: 'POST',
     body: form,
@@ -2548,4 +2558,143 @@ export interface EntityMap {
 
 export function getEntityMap(): Promise<EntityMap> {
   return request('/catalog/entity-map')
+}
+
+// ── Release-A dataset/catalog profiles ──────────────────────────────────────────────────────────
+// Every route here is flag-gated server-side (FEATUREGEN_DATASET_PROFILES): while the flag is off
+// the routes 404, and the UI treats that as "surface absent" (render nothing), never as an error.
+
+// One resolved profile value + its authority triple VERBATIM (producer × strength × lifecycle).
+// A proposed value is USABLE and labeled — the UI must never frame it as failure (no-blocked rule).
+export interface ProfileSemanticValue {
+  value: string
+  producer: string
+  strength: string
+  lifecycle: string
+  evidence_ids: string[]
+}
+
+// unresolved_family ∈ {undecided, needs_data_check, structurally_unsuitable} — the UI renders the
+// FAMILY, never a raw failure string; null when the field is in a normal display/load state.
+export interface EffectiveProfileField {
+  display: ProfileSemanticValue | null
+  load_bearing: ProfileSemanticValue | null
+  state: string
+  unresolved_reason: string | null
+  unresolved_family: string | null
+  reason_codes: string[]
+}
+
+export interface GovernedFactHead {
+  fact_key: string
+  folded_status: string
+  confirmed_event_id: string | null
+}
+
+export interface AssetProfile {
+  dataset_logical_ref: string
+  catalog_profile_revision_id: string | null
+  description: EffectiveProfileField
+  business_context: EffectiveProfileField
+  domains: EffectiveProfileField
+  data_role: EffectiveProfileField
+  primary_entity: EffectiveProfileField
+  authority_role: EffectiveProfileField
+  temporal_storage_model: EffectiveProfileField
+  event_or_snapshot: EffectiveProfileField
+  grain_fact: GovernedFactHead | null
+  availability_fact: GovernedFactHead | null
+  missing_context: string[]
+  dataset_profile_hash: string
+}
+
+export function getAssetProfile(source: string, objectRef: string): Promise<AssetProfile> {
+  return request(
+    `/catalog/asset-profiles/${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`)
+}
+
+// The data_owner proposal surface: writes HUMAN/PROPOSED evidence for the three new profile
+// fields. expectedDatasetProfileHash is the aggregate CAS anchor — any drift 409s server-side.
+export interface AssetProfilePut {
+  expectedDatasetProfileHash: string
+  businessContext?: string
+  authorityRole?: string
+  temporalStorageModel?: string
+  note?: string
+}
+
+export interface AssetProfilePutResult {
+  written: string[]
+  dataset_profile_hash: string
+  profile: AssetProfile
+}
+
+export function putAssetProfile(
+  source: string,
+  objectRef: string,
+  req: AssetProfilePut,
+): Promise<AssetProfilePutResult> {
+  return request(
+    `/catalog/asset-profiles/${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        expected_dataset_profile_hash: req.expectedDatasetProfileHash,
+        business_context: req.businessContext ?? null,
+        authority_role: req.authorityRole ?? null,
+        temporal_storage_model: req.temporalStorageModel ?? null,
+        note: req.note ?? null,
+      }),
+    },
+  )
+}
+
+export interface CatalogProfileRevision {
+  catalog_source: string
+  display_name: string | null
+  description: string | null
+  business_context: string | null
+  business_domains: string[]
+  producer: string
+  strength: string
+  lifecycle: string
+  producer_ref: string
+  ingestion_run_id: string | null
+  content_hash: string
+  revision_id: string
+}
+
+export interface CatalogProfile {
+  source: string
+  pointer_version: number   // 0 == no narrative yet; the version a first PUT must carry
+  profile: CatalogProfileRevision | null
+}
+
+export function getCatalogProfile(source: string): Promise<CatalogProfile> {
+  return request(`/catalogs/${encodeURIComponent(source)}/profile`)
+}
+
+// expectedPointerVersion rides IN THE BODY (the repo's CAS convention); a miss 409s.
+export function putCatalogProfile(
+  source: string,
+  req: {
+    expectedPointerVersion: number
+    displayName?: string
+    description?: string
+    businessContext?: string
+    businessDomains?: string[]
+  },
+): Promise<{ source: string; revision_id: string; pointer_version: number }> {
+  return request(`/catalogs/${encodeURIComponent(source)}/profile`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_pointer_version: req.expectedPointerVersion,
+      display_name: req.displayName ?? null,
+      description: req.description ?? null,
+      business_context: req.businessContext ?? null,
+      business_domains: req.businessDomains ?? [],
+    }),
+  })
 }

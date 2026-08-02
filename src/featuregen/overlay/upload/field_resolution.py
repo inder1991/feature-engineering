@@ -99,6 +99,12 @@ _DISPLAY_COLUMN: dict[str, str] = {
     # See _SOURCE_AUTHORED_DISPLAY_COLUMNS: these two columns are SHARED with `build_graph`.
     "unit": "unit",
     "currency": "currency",
+    # Release-A profile Task 2 (migration 1047): TABLE-node compat projections for the two new
+    # operational profile classifications. Rebuildable display, never authoritative — operational
+    # reads go through the decision log (is_feature_eligible) / the assembled profile, and the
+    # Task-0.6 unconditional table_display_reprojection stage restores them on every re-upload.
+    "authority_role": "authority_role",
+    "temporal_storage_model": "temporal_storage_model",
 }
 
 # The projected columns ``graph.build_graph`` ALSO populates, straight from the uploaded file — so
@@ -143,6 +149,10 @@ _DECISION_LINK_COLUMN: dict[str, str] = {
     # E4a T3 (migration 1031). Doubles as the AUTHORSHIP marker for the wipe guard above.
     "unit": "unit_decision_id",
     "currency": "currency_decision_id",
+    # Release-A profile Task 2 (migration 1047) — display ≠ authority links for the table-node
+    # profile projections above.
+    "authority_role": "authority_role_decision_id",
+    "temporal_storage_model": "temporal_storage_model_decision_id",
 }
 
 

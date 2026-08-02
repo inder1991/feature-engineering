@@ -53,6 +53,13 @@ data:
   # per-source lock while it runs, so a slow provider can now block re-uploads of the SAME source
   # for longer — acceptable here, worth revisiting for concurrent ingestion.
   OVERLAY_ENRICH_STAGE_DEADLINE_S: "1800"
+  # Release-A flags (verified-interfaces D8; both DEFAULT OFF until the Release-A deploy gate
+  # presents them together for approval). Truthy set: 1/true/yes/on.
+  # Richer feature-generation context (v2+ payload shape) — off ⟹ the thin v1 menu, byte-for-byte.
+  FEATUREGEN_FEATURE_CONTEXT: "0"
+  # Dataset/catalog semantic profiles: profile API surfaces, upload narrative part, listing
+  # display names — off ⟹ every new surface 404s and existing payloads stay byte-identical.
+  FEATUREGEN_DATASET_PROFILES: "0"
 ---
 apiVersion: apps/v1
 kind: Deployment
