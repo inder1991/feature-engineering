@@ -459,6 +459,41 @@ def test_hash_moves_on_every_meaning_bearing_input(db):
     assert _profile(db, revision_id="cpr_a").dataset_profile_hash == h_rev_a
 
 
+def test_projection_lag_explains_the_fact_head_hash_movement(db, monkeypatch):
+    """F4: the fact heads read the TABLE-node graph stamps, and a lagged ingest REBUILDS the graph
+    but SKIPS restoring them (`ingest.py` table_fact_projection "lagged" branch) — so a governed
+    fact silently vanishes from the profile and `dataset_profile_hash` moves with no explanation.
+    The identity is NOT re-keyed (still the graph stamp); the builder names the lag as its own
+    missing-context code so the movement is explained."""
+    from featuregen.overlay.upload import dataset_profiles as dp
+
+    _seed_graph(db)
+    db.execute("UPDATE graph_node SET grain_fact_event_id = 'evt-grain-1' "
+               "WHERE catalog_source = %s AND object_ref = %s AND kind = 'table'",
+               (_SRC, _TABLE_OBJECT_REF))
+    steady = _profile(db)
+    assert steady.grain_fact.confirmed_event_id == "evt-grain-1"   # identity: the graph stamp
+    assert "fact_heads:projection_lagged" not in steady.missing_context
+
+    # A lagged ingest: build_graph wiped the stamp and project_table_facts was skipped.
+    monkeypatch.setattr(dp, "projection_lag", lambda conn, name: 1)
+    db.execute("UPDATE graph_node SET grain_fact_event_id = NULL "
+               "WHERE catalog_source = %s AND object_ref = %s AND kind = 'table'",
+               (_SRC, _TABLE_OBJECT_REF))
+    lagged = _profile(db)
+    assert lagged.grain_fact is None
+    assert "grain_fact:absent" in lagged.missing_context
+    assert "fact_heads:projection_lagged" in lagged.missing_context
+    assert lagged.dataset_profile_hash != steady.dataset_profile_hash
+
+
+def test_projection_lag_code_is_absent_when_the_projection_is_caught_up(db):
+    """F4 boundary: the code is emitted ONLY under real lag — an ordinary caught-up build never
+    carries it (so it cannot churn the hash of every profile)."""
+    _seed_graph(db)
+    assert "fact_heads:projection_lagged" not in _profile(db).missing_context
+
+
 def test_hash_ignores_wall_clock_and_row_identity_noise(db):
     """Two builds straddling unrelated writes (a different table's evidence) do not move."""
     _seed_graph(db)

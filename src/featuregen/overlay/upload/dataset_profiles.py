@@ -13,6 +13,18 @@ stamp audit reads). ``overlay_fact_state`` is consulted only to ENRICH the head 
 whose state row cannot be found is store drift (owned by ``scripts/profile_reconcile.py``) and is
 carried honestly with ``folded_status="unknown"`` rather than silently dropped from the hash.
 
+**[F4] Projection sensitivity of that identity (documented, not re-keyed):** those stamps are a
+PROJECTION. ``build_graph`` wipes ``graph_node`` on every ingest and the end-of-ingest
+``project_table_facts`` that restores the stamps is SKIPPED under overlay projection lag
+(``ingest.py``, the ``table_fact_projection`` "lagged" branch). So an ingest that lands while the
+projection trails leaves a genuinely CONFIRMED grain/availability fact temporarily unstamped —
+the profile then reports ``grain_fact=None`` and ``dataset_profile_hash`` MOVES, purely from lag.
+The identity stays the stamp (re-keying onto ``overlay_fact_state`` would trade this for a
+divergence between the profile and every other stamp reader); instead the builder reads the SAME
+readiness gate ingest uses and emits ``fact_heads:projection_lagged`` into ``missing_context``, so
+the movement is explained at the point a consumer sees it. The code clears itself when the
+projection catches up and the next ingest re-stamps.
+
 **Isolation:** callers run the builder inside ONE ``REPEATABLE READ`` transaction so every field,
 fact head and narrative pointer describe a single torn-free snapshot — the API reads use the
 existing ``get_feature_gen_conn`` dependency (the asset-detail precedent); write surfaces assemble
@@ -55,10 +67,17 @@ from featuregen.overlay.upload.profile_vocab import (
     data_role_from_table_role,
     unresolved_family,
 )
+from featuregen.projections.runner import projection_lag
 
 #: The contract token inside every ``dataset_profile_hash`` payload — bump ONLY on a meaning-bearing
 #: contract change (a new hashed field, a state-vocabulary change), never for provenance.
 _PROFILE_CONTRACT = "dataset_semantic_profile_v1"
+
+#: [F4] The missing-context code that EXPLAINS a fact-head movement caused by projection lag rather
+#: than by a governance decision (module docstring). It rides ``missing_context`` — and therefore the
+#: hash — deliberately: a consumer that CAS-anchored on a stamped profile must SEE that the head it
+#: is now missing is a lagged read, not a retraction.
+MISSING_FACT_HEADS_LAGGED = "fact_heads:projection_lagged"
 
 #: profile field name -> the ``field_evidence`` field_name it reads (all at the TABLE logical ref).
 #: ``data_role`` is DERIVED from ``table_role`` (correction 4) and is handled specially.
@@ -133,7 +152,15 @@ class GovernedFactHeadV1:
 
 @dataclass(frozen=True, slots=True)
 class DatasetSemanticProfileV1:
-    """The assembled effective semantic profile for ONE table (§6.3, D5 naming)."""
+    """The assembled effective semantic profile for ONE table (§6.3, D5 naming).
+
+    **[F4] ``grain_fact``/``availability_fact`` are PROJECTION-SENSITIVE.** They read the TABLE
+    node's graph stamps, which an ingest wipes and only re-writes when the overlay projection is
+    caught up — so both heads (and therefore ``dataset_profile_hash``) can move under projection
+    lag with no governance decision behind it. When that gate reports lag, ``missing_context``
+    carries :data:`MISSING_FACT_HEADS_LAGGED` and the absence must be read as "not yet re-stamped",
+    never as "the fact was retracted". See the module docstring for why the identity is not
+    re-keyed."""
 
     dataset_logical_ref: str
     catalog_profile_revision_id: str | None
@@ -383,6 +410,10 @@ def build_dataset_profile(
         missing.append("grain_fact:absent")
     if availability_fact is None:
         missing.append("availability_fact:absent")
+    # [F4] The SAME readiness gate ingest consults before it re-stamps the fact heads. Under lag the
+    # two heads above are a lagged read of a projection, not a statement about governance — say so.
+    if projection_lag(conn, "overlay") > 0:
+        missing.append(MISSING_FACT_HEADS_LAGGED)
 
     payload = {
         "contract": _PROFILE_CONTRACT,
