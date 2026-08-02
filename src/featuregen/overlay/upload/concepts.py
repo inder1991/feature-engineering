@@ -1112,11 +1112,104 @@ def concept(name: str) -> Concept | None:
     return CONCEPT_REGISTRY.get(name)
 
 
-# The 5 legacy aliases are retained so already-enriched data + the pre-B1b classifier are never orphaned,
-# but they are NOT classification targets — the classifier should choose the richer §3 concept instead.
+def concept_path(name: str | None) -> tuple[str, ...]:
+    """The selected concept followed by every ``is_a`` ancestor (semantic plan Task 1).
+
+    ``unclassified`` is a SENTINEL, never a registry member — it (like ``None`` and any unknown
+    name) returns the EMPTY tuple; the semantic-context bundle carries the closed
+    ``concept_unclassified`` missing-context code beside it, so "no hierarchy" is honest output
+    rather than a lookup error. Registry validation (:func:`_validate_registry`) makes an ``is_a``
+    cycle impossible at import, but this READER still refuses a corrupt registry (a mutated entry
+    at runtime) rather than spinning forever: a revisited name raises ``ValueError``."""
+    if not name or name == UNCLASSIFIED:
+        return ()
+    record = CONCEPT_REGISTRY.get(name)
+    if record is None:
+        return ()
+    path: list[str] = [name]
+    cur = record.is_a
+    while cur is not None:
+        if cur in path:
+            raise ValueError(
+                f"concept registry is corrupt: is_a cycle {' -> '.join([*path, cur])}")
+        parent = CONCEPT_REGISTRY.get(cur)
+        if parent is None:
+            raise ValueError(
+                f"concept registry is corrupt: {path[-1]!r} names unknown parent {cur!r}")
+        path.append(cur)
+        cur = parent.is_a
+    return tuple(path)
+
+
+# The legacy aliases are retained so already-enriched data + the pre-B1b classifier are never
+# orphaned, but they are NOT classification targets — the classifier should choose the richer §3
+# concept instead. `counterparty_id` joined the set under semantic Task 2 (D12.1): `counterparty`
+# is a PARTY ROLE (the third axis, `party_vocab`), not an entity — the identifier is a CIF that
+# links the CUSTOMER entity. The registry member itself is preserved byte-stable (its
+# `entity_link` feeds governed bridge fact keys), and only NEW classification stops targeting it.
 _LEGACY_ALIASES: frozenset[str] = frozenset({
     "monetary_amount", "account_identifier", "customer_identifier", "timestamp", "rate_or_ratio",
+    "counterparty_id",
 })
+
+# The canonicalization half of the ONE alias seam: a legacy alias with an unambiguous successor
+# maps to it; aliases whose successor is ambiguous (monetary_amount, rate_or_ratio, ...) have no
+# entry and stay themselves. Keys must be `_LEGACY_ALIASES` members; targets must be non-alias
+# registry members (validated below) — a parallel alias mechanism is forbidden.
+_CANONICAL_ALIAS_TARGETS: dict[str, str] = {
+    "counterparty_id": "customer_id",
+}
+
+
+def _validate_alias_seam() -> None:
+    for alias, target in _CANONICAL_ALIAS_TARGETS.items():
+        if alias not in _LEGACY_ALIASES or alias not in CONCEPT_REGISTRY:
+            raise ValueError(f"canonical alias source {alias!r} must be a legacy-alias registry member")
+        if target not in CONCEPT_REGISTRY or target in _LEGACY_ALIASES:
+            raise ValueError(f"canonical alias target {target!r} must be a non-alias registry member")
+
+
+_validate_alias_seam()
+
+
+def canonical_concept_name(name: str) -> str:
+    """The canonical registry name for a NEW selection attempt (semantic Task 2).
+
+    A legacy alias with an unambiguous successor canonicalizes (`counterparty_id` ->
+    `customer_id`); every other name — including aliases with no single successor — is returned
+    unchanged. STORED values are never rewritten through this seam: historical `counterparty_id`
+    evidence, decisions and bridge fact keys stay byte-stable (D12.1 fact-key preservation)."""
+    return _CANONICAL_ALIAS_TARGETS.get(name, name)
+
+
+def display_entity(concept_name: str | None, entity: str | None) -> str | None:
+    """The READ-TIME display entity for a column, through the alias seam (D12.1-revised).
+
+    When `concept_name` is an aliased concept and the stored/derived `entity` is that alias's own
+    `entity_link` (or absent), the DISPLAY entity is the canonical concept's `entity_link` —
+    `counterparty_id` therefore displays `customer` (a counterparty is our customer seen through a
+    party ROLE). An explicitly different stored entity is a decision, never an alias artifact, and
+    passes through untouched.
+
+    READ SURFACES ONLY (`entity_map._endpoint_view`, semantic-bundle display values, asset-detail
+    renders). NOTHING stored or derivation-feeding may route through this function — not
+    `graph_node.entity`, not axis-projection fills, not grounding's `concept_entity`: that value
+    flows into `advisory_entity_id` -> `_entity_pick` -> `fact_key`, and seaming it would re-key
+    governed bridge facts (a REJECTED decoy would resurrect under a fresh key; a VERIFIED link
+    would duplicate). The registry member's persisted `entity_link` stays the byte-stable key
+    input everywhere."""
+    if not concept_name:
+        return entity
+    canonical = canonical_concept_name(concept_name)
+    if canonical == concept_name:
+        return entity
+    alias = CONCEPT_REGISTRY.get(concept_name)
+    target = CONCEPT_REGISTRY.get(canonical)
+    if alias is None or target is None or target.entity_link is None:
+        return entity
+    if entity is None or entity == alias.entity_link:
+        return target.entity_link
+    return entity
 
 
 def classification_vocabulary() -> tuple[dict, ...]:

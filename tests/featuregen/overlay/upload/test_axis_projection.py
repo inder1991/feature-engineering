@@ -223,6 +223,11 @@ def test_party_role_is_never_consumed_by_join_candidacy_or_execution(db):
         "overlay/upload/enrich_llm.py",        # egress allowlist entry (structural token)
         "overlay/upload/asset_detail.py",      # the column dossier (Task 3C read surface)
         "overlay/upload/column_view.py",       # pure dossier assembler
+        # Semantic Task 1's read-model bundle + purpose adapters: party_role rides as ADVISORY
+        # display/context (NeighbourColumnV1, resolved semantics) exactly like the dossier; the
+        # bundle never feeds it to candidacy or execution — pairing invariance stays pinned in
+        # test_bridge_namespace_pairing.
+        "overlay/upload/semantic_context.py",
         # The namespace-pairing handoff's deterministic entity PICK: the role breaks the tie for
         # which entity LABEL rides a disagreeing same-namespace candidate. WHICH pairs derive is
         # decided by namespace alone — test_bridge_namespace_pairing pins that the candidate pair

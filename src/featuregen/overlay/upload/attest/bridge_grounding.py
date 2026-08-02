@@ -55,6 +55,7 @@ from featuregen.overlay.upload.bridge_assessment import (
 )
 from featuregen.overlay.upload.concepts import concept as lookup_concept
 from featuregen.overlay.upload.governed_grain import GovernedGrain, read_governed_grain
+from featuregen.overlay.upload.identifier_scope import resolve_identifier_issuer
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
 BRIDGE_GROUNDING_VERSION = "1.0.0"
@@ -139,6 +140,13 @@ class BridgeEndpointGroundingV1:
     observed_format: str | None
     metadata_facets: tuple[MetadataFacetV1, ...]
     evidence_refs: tuple[EvidenceRefV1, ...]
+    #: The identifier ISSUER axis (semantic Task 2): the endpoint's issuing scope resolved
+    #: through `identifier_scope.resolve_identifier_issuer` (global scheme registry, else the
+    #: catalog's declared semantic scope). `(None, "unresolved")` is the honest default — a
+    #: missing issuer never looks configured. Defaulted so pre-existing positional constructor
+    #: sites stay byte-identical.
+    issuer_scope: str | None = None
+    issuer_basis: str = "unresolved"
 
     @property
     def entity_id(self) -> str | None:
@@ -470,6 +478,10 @@ def ground_bridge_endpoint(
         else None
     )
     explicit_entity, entity_evidence = _governed_scalar(conn, canonical_ref, "entity")
+    # The RAW registry entity_link, deliberately NOT the display seam (D12.1-revised): this value
+    # flows into advisory_entity_id -> _entity_pick -> fact_key, so routing it through
+    # `display_entity` would re-key governed bridge facts (resurrecting REJECTED decoys under
+    # fresh keys and duplicating VERIFIED links). The `customer` correction is read-time only.
     concept_entity = registered.entity_link if registered is not None else None
     governed_entity = explicit_entity
     if (
@@ -526,6 +538,8 @@ def ground_bridge_endpoint(
         tuple_key_role = TupleKeyRole.UNKNOWN
         key_member_role = KeyMemberRole.UNKNOWN
         grain_evidence = ()
+    issuer_scope, issuer_basis = resolve_identifier_issuer(
+        conn, source, concept_grounding.concept)
     refs = _dedupe_evidence(
         [
             *concept_grounding.evidence_refs,
@@ -565,6 +579,8 @@ def ground_bridge_endpoint(
         observed_format=observed_format,
         metadata_facets=facets,
         evidence_refs=refs,
+        issuer_scope=issuer_scope,
+        issuer_basis=issuer_basis,
     )
 
 
@@ -657,6 +673,40 @@ def assess_grounded_identifier_link(
         explanations.append("same_entity_namespace_unproven")
     else:
         namespace = NamespaceVerdict.UNKNOWN
+
+    # ── the ISSUER fold (semantic Task 2): a scheme names a value space only WITHIN an issuer.
+    # Applied to SAME-SCHEME pairs (governed namespace facts equal, or both registry concepts
+    # declaring one scheme). The truth table (plan Task 2): same known issuer -> normal candidate;
+    # different known issuers -> refuse (two banks' registries are disjoint worlds — equal values
+    # mean nothing); either unresolved -> ADVISORY candidate, flagged, never an equality proof
+    # (rule 5) — and never a hard conflict, so AI-proposed stays usable. This lives HERE so no
+    # grounded path can bypass it; `identifier_scope` only produces the axis. Party role is not
+    # consulted anywhere in this function — roles explain links, they never gate pairing.
+    left_scheme_concept = lookup_concept(left.concept.concept) if left.concept.concept else None
+    right_scheme_concept = (
+        lookup_concept(right.concept.concept) if right.concept.concept else None)
+    same_scheme = bool(
+        (left.explicit_namespace and left.explicit_namespace == right.explicit_namespace)
+        or (
+            left_scheme_concept is not None
+            and right_scheme_concept is not None
+            and left_scheme_concept.namespace is not None
+            and left_scheme_concept.namespace == right_scheme_concept.namespace
+        )
+    )
+    if same_scheme:
+        if left.issuer_scope and right.issuer_scope:
+            if left.issuer_scope == right.issuer_scope:
+                explanations.append("same_identifier_issuer_scope")
+            else:
+                namespace = NamespaceVerdict.DIFFERENT
+                hard_conflicts.append("different_identifier_issuer_scope")
+        else:
+            explanations.append("issuer_unresolved")
+            if namespace is NamespaceVerdict.SAME:
+                # A governed same-scheme FACT pair without issuer context is still unproven
+                # equality: demote to POSSIBLE — a missing issuer never appears as verified.
+                namespace = NamespaceVerdict.POSSIBLE
 
     non_identifier_roles = {
         RepresentationRole.HUMAN_LABEL,

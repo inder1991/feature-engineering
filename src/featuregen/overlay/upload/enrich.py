@@ -30,6 +30,7 @@ from featuregen.overlay.upload.attest.concept_critic import (
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import (
     UNCLASSIFIED,
+    canonical_concept_name,
     classification_vocabulary,
     is_known_concept,
 )
@@ -231,12 +232,16 @@ def _accept_concept(raw: str) -> tuple[str | None, str]:
     """The concept response contract (spec C3), shared by BOTH batch and single mode (#5 — a single
     off-vocabulary response must not be coerced/counted resolved just because it took the un-batched
     path): the literal 'unclassified' is a real classification and IS cached; a known concept is
-    cached; anything else is invalid -> NOT cached, NOT counted resolved (retried next ingest)."""
+    cached; anything else is invalid -> NOT cached, NOT counted resolved (retried next ingest).
+
+    NEW selections canonicalize through the ONE alias seam (semantic Task 2): a legacy alias with
+    an unambiguous successor is stored under the successor (`counterparty_id` -> `customer_id`).
+    Stored historical values are untouched — only what a fresh classification writes changes."""
     v = raw.strip()
     if v == UNCLASSIFIED:
         return UNCLASSIFIED, "valid"
     if is_known_concept(v):
-        return v, "valid"
+        return canonical_concept_name(v), "valid"
     return None, "invalid_value"
 
 

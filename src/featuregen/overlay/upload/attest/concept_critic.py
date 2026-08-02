@@ -36,6 +36,7 @@ from featuregen.overlay.upload.attest.representation import shape_conflicts
 from featuregen.overlay.upload.concepts import (
     CONCEPT_REGISTRY,
     UNCLASSIFIED,
+    canonical_concept_name,
     classification_vocabulary,
 )
 from featuregen.overlay.upload.concepts import concept as lookup_concept
@@ -232,7 +233,13 @@ def _revise(conn, client: LLMClient, item: ConceptCriticItemV1,
     llm_call_ref)``. An acceptable revision is IN the registry, is not the literal
     ``unclassified`` withdrawal, differs from the refuted proposal, and itself survives
     :func:`shape_conflicts` — the ruleset that refuted the original applies undiminished to the
-    replacement, so the critic can never trade one conflation for another."""
+    replacement, so the critic can never trade one conflation for another.
+
+    The answer canonicalizes through the ONE alias seam BEFORE any gate, exactly like Pass A's
+    ``_accept_concept``: a revise answer of ``counterparty_id`` (a legacy alias, still a registry
+    member) lands as ``customer_id`` and is never stored raw. The difference gate compares
+    CANONICAL forms, so an alias can never resurrect its own refuted successor (or vice versa) as
+    a "different" concept."""
     output, llm_call_ref = _drive(
         conn, client, task=CONCEPT_REVISION_TASK, prompt_id=CONCEPT_REVISION_PROMPT_ID,
         schema_id=CONCEPT_REVISION_SCHEMA_ID,
@@ -240,11 +247,11 @@ def _revise(conn, client: LLMClient, item: ConceptCriticItemV1,
         instruction=_REVISION_INSTRUCTION, actor=actor, cacheable=("vocabulary",))
     if output is None:
         return None, "llm_critic_unavailable", llm_call_ref
-    revised = str(output.get("concept") or "").strip().lower()
+    revised = canonical_concept_name(str(output.get("concept") or "").strip().lower())
     if (
         not revised
         or revised == UNCLASSIFIED
-        or revised == item.proposed_concept
+        or revised == canonical_concept_name(item.proposed_concept)
         or revised not in CONCEPT_REGISTRY
         or shape_conflicts(item.column_name, item.declared_type, item.definition, revised)
     ):
