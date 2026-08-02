@@ -243,6 +243,11 @@ def test_a_dropped_cardinality_correction_is_VISIBLE_not_a_silent_log_line(
     assert res.status == "ingested"
     assert res.governed_join_corrections_dropped == 0                  # nothing dropped yet
     assert res.governed_join_correction_warnings == ()
+    # SPARSE at the serialization seam: an ordinary upload's outward payload carries NEITHER
+    # field, which is what keeps POST /uploads' body byte-identical to the pre-I3 contract
+    # (test_upload_response_body_byte_identical_with_stage_reports pins the bytes).
+    assert "governed_join_corrections_dropped" not in res.response_payload()
+    assert "governed_join_correction_warnings" not in res.response_payload()
     ref_n1 = governed_join_proposal(_join_rows()[0])
     _confirm_join(db, ref_n1, admin1=human_admin_1, admin2=human_admin_2)
 
@@ -261,6 +266,11 @@ def test_a_dropped_cardinality_correction_is_VISIBLE_not_a_silent_log_line(
     (warning,) = res.governed_join_correction_warnings
     assert "transactions.acct_id" in warning and "accounts.account_id" in warning
     assert "join governance" in warning                                # the correction route
+    # ...and the sparse serialization EMITS both fields exactly when a drop happened — the
+    # other half of the omission the no-drop upload above pins.
+    payload = res.response_payload()
+    assert payload["governed_join_corrections_dropped"] == 1
+    assert payload["governed_join_correction_warnings"] == (warning,)
     # 2. the counter.
     assert counters.snapshot()["counters"][
         "overlay.governed_joins.skipped_verified_rival"] == before + 1

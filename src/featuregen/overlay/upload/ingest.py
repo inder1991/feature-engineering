@@ -261,6 +261,25 @@ class IngestResult:
     entity_bridge_candidates_suppressed: int = 0
     entity_bridge_candidates_truncated: int = 0
 
+    def response_payload(self) -> dict:
+        """The OUTWARD shape of this result (HTTP bodies, stored import records): ``asdict``,
+        with the I3 correction fields SPARSE — both are omitted when no correction was dropped.
+
+        Sparse deliberately, unlike every other counter above (which emits its 0): those fields
+        predate the byte-identical upload-response contract that
+        ``test_upload_response_body_byte_identical_with_stage_reports`` pins, and adding two
+        always-present fields would break it for every ordinary upload. Omission-when-empty keeps
+        the ordinary body byte-for-byte what it was, and makes the surfacing appear exactly when
+        a drop happened — which is also the honest shape: an absent account and "nothing was
+        dropped" are the same claim here, where a 0 next to a () would just restate the default.
+        """
+        payload = asdict(self)
+        if not (self.governed_join_corrections_dropped
+                or self.governed_join_correction_warnings):
+            del payload["governed_join_corrections_dropped"]
+            del payload["governed_join_correction_warnings"]
+        return payload
+
 
 def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
                         not_attempted: int = 0) -> tuple[str, str | None, dict]:
