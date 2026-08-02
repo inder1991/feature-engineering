@@ -36,4 +36,12 @@ __all__ = ["RENDERER_VERSION"]
 #: the renderer's versions are not a policy scale — there is no ordering question to answer, only an
 #: identity one. It is deliberately NOT derived from a git commit: the same source rendered from two
 #: checkouts is the same renderer, and a commit-derived version would fork identity on a rebase.
-RENDERER_VERSION = "2"
+#:
+#: **"3"** (codegen-review remediation branch): the rendered bytes changed for an unchanged
+#: compilation across the branch — ``spark.yml`` (session configuration), ``hooks.py`` (the
+#: run-parameters gate), ``catalog.yml`` (dataset shapes/names), ``pipeline.py`` (node wiring), the
+#: README, and the compute nodes' traversal join gates (including the final wave's removal of the
+#: trailing whitespace ``nodes_compute`` emitted after ``'JOIN_AMPLIFICATION' +``). A project
+#: rendered by "2" and one rendered by "3" from the same compilation hash differently, which is
+#: exactly the question ``sandbox_execution_hash`` answers.
+RENDERER_VERSION = "3"

@@ -474,8 +474,12 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
     environment.
 
     The verdict line is matched against a marker minted for THIS invocation and handed to the probe
-    through its argv, so output the project itself prints — including a verdict-shaped line carrying
-    the well-known prefix — can never be read as the probe's answer.
+    through its argv. That defeats fixed-string forgery and log replay — a project that prints a
+    verdict-shaped line carrying the well-known prefix, or one copied from an earlier run's log,
+    matches nothing. It does NOT defeat an in-interpreter echo: the probe imports the project in its
+    own interpreter, so module code that reads ``sys.argv[1]`` at import time can print the live
+    marker and forge a verdict. Closing that would mean not importing the artifact in the process
+    that holds the marker, which is out of scope at this seam.
     """
     marker = _verdict_marker()
     try:

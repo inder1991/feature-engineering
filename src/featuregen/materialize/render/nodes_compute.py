@@ -1691,7 +1691,7 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
             "        F.col('count') > F.lit(1)).limit(1).count()",
             f"    if duplicate_{hop.index}:",
             "        raise RuntimeError(",
-            f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} + ",
+            f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} +",
             f"            "
             f"{f': join key is not unique on {hop.schema}.{hop.table} for hop {hop.index}'!r})",
         ])
@@ -1710,7 +1710,7 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
             lines.extend([
                 f"    if rows.count() > rows_before_bridge_{hop.index}:",
                 "        raise RuntimeError(",
-                f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} + ",
+                f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} +",
                 "            ': observed row amplification for directional realization ' +",
                 f"            {hop.realization_revision_id!r})",
             ])

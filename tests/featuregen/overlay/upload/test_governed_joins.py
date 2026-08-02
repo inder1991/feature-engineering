@@ -14,6 +14,7 @@ Two layers under test:
 """
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 from tests.featuregen.overlay.upload.passc.conftest import (  # noqa: F401 — pytest fixtures
@@ -31,6 +32,7 @@ from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.graph import governed_join_proposal, parse_join_ref
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.runtime.observability import counters
 
 _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 
@@ -223,6 +225,49 @@ def test_verified_pair_accepts_no_rival_draft_from_a_blank_cardinality_reupload(
         "AND kind = 'joins' AND from_ref = %s AND to_ref = %s",
         ("deposits", "public.transactions.acct_id", "public.accounts.account_id")).fetchone()
     assert edge == ("display_only", None)   # demoted pending re-confirm — no rival ever ran
+
+
+def test_a_dropped_cardinality_correction_is_VISIBLE_not_a_silent_log_line(
+        db, monkeypatch, caplog, human_admin_1, human_admin_2):  # noqa: F811 — imported fixtures
+    """Final-review I3: the pair-guard above is correct to refuse the rival proposal, but the
+    changed/blanked cardinality was an OPERATOR'S correction attempt, and dropping it at
+    logger.info left no trace a human would meet. The drop must be visible three ways: a WARNING
+    log line, the `skipped_verified_rival` counter, and `IngestResult` itself (count + the
+    human-readable warnings). `governed_join_divergence` deliberately does NOT carry it: its
+    `kind` CHECK admits only retargeted/dropped (a new kind needs a migration), and its
+    re-affirmation branch DELETES any same-pair row in this very ingest — a row written there
+    would be erased before anyone saw it."""
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    res = ingest_upload(db, "deposits", _join_rows(), actor=_actor())   # declares N:1
+    assert res.status == "ingested"
+    assert res.governed_join_corrections_dropped == 0                  # nothing dropped yet
+    assert res.governed_join_correction_warnings == ()
+    ref_n1 = governed_join_proposal(_join_rows()[0])
+    _confirm_join(db, ref_n1, admin1=human_admin_1, admin2=human_admin_2)
+
+    blank_rows = [
+        CanonicalRow("deposits", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id"),                  # cardinality omitted
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+    ]
+    before = counters.snapshot()["counters"].get(
+        "overlay.governed_joins.skipped_verified_rival", 0)
+    with caplog.at_level(logging.WARNING, logger="featuregen.overlay.upload.ingest"):
+        res = ingest_upload(db, "deposits", blank_rows, actor=_actor())
+    assert res.status == "ingested"                                    # advisory: never aborts
+    # 1. the result: the operator's client can render the account without reading server logs.
+    assert res.governed_join_corrections_dropped == 1
+    (warning,) = res.governed_join_correction_warnings
+    assert "transactions.acct_id" in warning and "accounts.account_id" in warning
+    assert "join governance" in warning                                # the correction route
+    # 2. the counter.
+    assert counters.snapshot()["counters"][
+        "overlay.governed_joins.skipped_verified_rival"] == before + 1
+    # 3. the log, at WARNING — not the info level the drop used to hide at.
+    assert any(record.levelno == logging.WARNING
+               and "governed-join correction dropped" in record.getMessage()
+               for record in caplog.records)
 
 
 def test_flag_on_ingest_reensures_adapter_and_proposes(db, monkeypatch):

@@ -244,6 +244,15 @@ class IngestResult:
     semantic_binding_proposed: int = 0
     semantic_binding_abstained: int = 0
     semantic_binding_failed: int = 0
+    # Final-review I3: corrections the governed-join pair-guard DROPPED, surfaced where a human
+    # sees them. A re-upload declaring a different cardinality/direction for a humanly-confirmed
+    # pair is not proposed (the confirmed fact stands; the correction path is join governance),
+    # and the operator who authored the correction must learn it went nowhere without reading
+    # server logs. `governed_join_divergence` cannot carry this without a migration (its `kind`
+    # CHECK is closed to retargeted/dropped, and its re-affirmation path deletes a same-pair row
+    # in the same ingest), so the account rides here: one human-readable warning per drop.
+    governed_join_corrections_dropped: int = 0
+    governed_join_correction_warnings: tuple[str, ...] = ()
     # Cross-catalog entity-bridge accounting (all 0 when OVERLAY_ENTITY_BRIDGES is off). Human
     # confirmation records review but does not gate availability.
     entity_bridges_proposed: int = 0
@@ -392,9 +401,14 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
     return outcome
 
 
-def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
+def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> list[str]:
     """Route each declared `joins_to` into the governed approved_join path via `propose_fact`, behind
     OVERLAY_GOVERNED_JOINS=1 (the caller gates on `governed_joins_enabled()`).
+
+    Returns the human-readable account of every CORRECTION the pair-guard dropped (final-review I3):
+    a re-upload declaring a different cardinality/direction for a humanly-confirmed pair is not
+    proposed, and the operator who authored that correction must learn it went nowhere. The caller
+    threads these onto `IngestResult`; an empty list is the normal case.
 
     ADVISORY / fail-soft (spec §12.1): this NEVER aborts the upload. A malformed `joins_to` is
     skipped-loud with its parse diagnostic; a `propose_fact` failure is logged and counted.
@@ -417,7 +431,7 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
         logger.warning("OVERLAY_GOVERNED_JOINS is on but no catalog adapter is registered in the "
                        "upload flow — skipping approved_join proposals (Phase-1: wire the "
                        "upload-context adapter). Display-only edges are still marked.")
-        return
+        return []
 
     # Task 5 codegen-review remediation (F2): `fact_key` digests cardinality, so re-declaring an
     # already-confirmed pair with a DIFFERENT cardinality (e.g. a blank re-upload of a pair
@@ -437,6 +451,7 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
     #     enumeration + pair key the projector uses, so the seams cannot disagree about "the pair".
     confirmed_pair_to_key: dict[tuple[str, str], str] | None = None
     _PAIR_HOLDING = ("VERIFIED", "STALE", "REVERIFY")
+    dropped_corrections: list[str] = []
 
     for r in rows:
         if not r.joins_to:
@@ -457,12 +472,19 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
                     confirmed_pair_to_key[_pair_key(existing)] = k
         rival = confirmed_pair_to_key.get(_pair_key(ref))
         if rival is not None and rival != fact_key(ref, "approved_join"):
+            # Final-review I3: this drop is an operator's CORRECTION going nowhere, so it must be
+            # VISIBLE, not an info-level log line. `governed_join_divergence` cannot honestly carry
+            # it without a migration — its `kind` CHECK is closed to ('retargeted', 'dropped'), and
+            # the drift detector's re-affirmation branch DELETES any row for a same-pair
+            # re-declaration in this very ingest — so the account rides `IngestResult` (warnings +
+            # count) alongside the WARNING and the counter.
             counters.incr("overlay.governed_joins.skipped_verified_rival")
-            logger.info(
-                "governed join for %s.%s -> %s not proposed: the column pair is already held by "
-                "human-confirmed approved_join fact %s with a different identity (direction/"
-                "cardinality); the confirmed fact stands — correct it via join governance, not "
-                "a re-upload", r.table, r.column, r.joins_to, rival)
+            dropped_corrections.append(
+                f"governed-join correction dropped: {r.table}.{r.column} -> {r.joins_to} declares "
+                f"a different identity (direction/cardinality) for a column pair already held by "
+                f"human-confirmed approved_join fact {rival}; the confirmed fact stands — correct "
+                f"it via join governance (reject, then re-propose), not a re-upload")
+            logger.warning("%s", dropped_corrections[-1])
             continue
         value = {
             "from_ref": asdict(ref.from_ref),
@@ -491,6 +513,7 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
             counters.incr("overlay.governed_joins.propose_denied")
             logger.info("governed-join proposal for %s.%s not accepted: %s", r.table, r.column,
                         result.denied_reason)
+    return dropped_corrections
 
 
 @dataclass(frozen=True, slots=True)
@@ -2423,6 +2446,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 column_domains=domain_overrides,
                 schemas=schema_by_ref(glossary), declared_types=declared_type_by_ref(glossary))
     record_stage(stage_recorder, "graph_persistence", "succeeded", started_at=stage_started)
+    governed_join_correction_warnings: tuple[str, ...] = ()   # I3: () when the seam is off/failed
     if governed_joins_enabled() or pass_c_enabled():
         # Governed seam (Task 7 / §12.1) — Pass C (Task 10) implies it: the raw 'joins' edges just
         # written are display-only; route each declared join into the governed approved_join path so
@@ -2434,8 +2458,14 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
-                _propose_governed_joins(conn, vr.good, actor=actor)
+                governed_join_correction_warnings = tuple(
+                    _propose_governed_joins(conn, vr.good, actor=actor))
             record_stage(stage_recorder, "governed_joins", "succeeded",
+                         reason_code=("corrections_dropped"
+                                      if governed_join_correction_warnings else None),
+                         detail=({"corrections_dropped":
+                                  len(governed_join_correction_warnings)}
+                                 if governed_join_correction_warnings else None),
                          started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: the governed-join seam never fails an upload
             counters.incr("overlay.governed_joins.error")
@@ -3184,6 +3214,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         semantic_binding_proposed=sembind_proposed,
                         semantic_binding_abstained=sembind_abstained,
                         semantic_binding_failed=sembind_failed,
+                        governed_join_corrections_dropped=len(
+                            governed_join_correction_warnings),
+                        governed_join_correction_warnings=governed_join_correction_warnings,
                         entity_bridges_proposed=entity_bridges_proposed,
                         entity_bridge_candidates_considered=(
                             entity_bridge_derivation.considered_count),

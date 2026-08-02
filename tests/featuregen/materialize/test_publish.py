@@ -369,13 +369,48 @@ def test_a_probe_that_RAN_and_failed_is_PUBLISH_MECHANISM_UNSUPPORTED(db) -> Non
     assert refusal.code is not PublicationRefusalCode.CAPABILITY_UNPROVEN
 
 
-def test_a_later_PASSING_probe_overrides_an_earlier_failure(db) -> None:
-    """The cluster was fixed. A refusal that outlived the evidence would be a stored verdict."""
-    torn = _clean_swap()
-    torn[1] = _observation("reader-2", "gen-A", columns=_NARROW, digest="digest-half-written")
-    _record(db, torn, probe_id="probe-failed")
+def test_a_later_PASSING_probe_overrides_a_STRICTLY_older_failure(db) -> None:
+    """The cluster was fixed. A refusal that outlived the evidence would be a stored verdict.
+
+    "Later" means a strictly newer `recorded_at`. Two probes recorded in production land in two
+    transactions with two `now()` stamps; the suite's single rolled-back transaction would tie
+    them at one, which is the ambiguity the tie guard refuses. The plane is append-only (its
+    trigger forbids UPDATE), so the strictly-older failure is INSERTed with the explicit
+    `recorded_at` an earlier transaction would have stamped — same table, same columns, one
+    minute older."""
+    db.execute(
+        "INSERT INTO publication_capability_attestation (attestation_id, environment_id, "
+        "hive_version, spark_version, metastore_version, mechanism, passed, "
+        "covers_schema_evolution, evidence_hash, attested_at, recorded_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, false, false, %s, %s, now() - interval '1 minute')",
+        ("probe-failed", ENV, VERSIONS.hive, VERSIONS.spark, VERSIONS.metastore,
+         PublishMechanism.VERSIONED_POINTER.value, "digest-half-written", T0))
     _record(db, _schema_evolution_run(), probe_id="probe-passed")
     assert isinstance(_select(db), PublisherSelection)
+
+
+@pytest.mark.parametrize("order", ["fail_then_pass", "pass_then_fail"])
+def test_a_pass_and_fail_that_TIE_on_recorded_at_refuse_in_both_orders(db, order: str) -> None:
+    """I4 (final review): `now()` is fixed at the TRANSACTION in Postgres, so a pass and a fail
+    ingested in one transaction share one `recorded_at` — and `ORDER BY recorded_at` over a tie
+    returns whichever physical order the heap happens to hold. "The newest evidence" is then a
+    claim the ordering cannot support, in EITHER insertion order, so the tie fails closed: a pass
+    supersedes a failure only when it is STRICTLY newer."""
+    torn = _clean_swap()
+    torn[1] = _observation("reader-2", "gen-A", columns=_NARROW, digest="digest-half-written")
+    if order == "fail_then_pass":
+        _record(db, torn, probe_id="probe-failed")
+        _record(db, _schema_evolution_run(), probe_id="probe-passed")
+    else:
+        _record(db, _schema_evolution_run(), probe_id="probe-passed")
+        _record(db, torn, probe_id="probe-failed")
+    first, second = read_attestations(
+        db, environment_id=ENV, mechanism=PublishMechanism.VERSIONED_POINTER)
+    assert first.recorded_at == second.recorded_at   # the tie is a fact, not an assumption
+    refused = _select(db)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is PublicationRefusalCode.PUBLISH_MECHANISM_UNSUPPORTED
+    assert "probe-failed" in refused.detail
 
 
 def test_a_later_FAILING_probe_defeats_an_earlier_pass(db) -> None:
@@ -642,7 +677,8 @@ def test_an_observation_carries_no_field_a_data_VALUE_could_occupy() -> None:
 def test_an_attestation_carries_exactly_migration_1034s_columns() -> None:
     assert [f.name for f in dataclasses.fields(PublicationCapabilityAttestation)] == [
         "attestation_id", "environment_id", "hive_version", "spark_version", "metastore_version",
-        "mechanism", "passed", "covers_schema_evolution", "evidence_hash", "attested_at"]
+        "mechanism", "passed", "covers_schema_evolution", "evidence_hash", "attested_at",
+        "recorded_at"]
 
 
 def test_an_attestation_read_back_is_the_one_that_was_written(db) -> None:

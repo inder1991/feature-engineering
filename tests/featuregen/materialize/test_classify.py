@@ -350,7 +350,7 @@ def test_the_most_restrictive_rank_is_the_one_that_refuses():
 def test_the_policy_version_is_PINNED():
     """It enters the contract hash and is derived from nothing, so a test that names the value is
     the only thing between an accidental edit and a silent change of artifact identity."""
-    assert CLASSIFICATION_POLICY_VERSION == 1
+    assert CLASSIFICATION_POLICY_VERSION == 2
 
 
 def test_missing_classification_uses_the_STATED_policy_not_an_implicit_default(catalog):

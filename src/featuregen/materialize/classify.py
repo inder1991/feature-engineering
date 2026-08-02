@@ -66,7 +66,15 @@ __all__ = [
 #: The version of the RULES below — which column feeds which answer, how the maximum is taken, and
 #: what an absent classification means. It enters the materialization contract hash (§5.5): a group
 #: classified under different rules is a different artifact even when the words coincide.
-CLASSIFICATION_POLICY_VERSION = 1
+#:
+#: **2** (codegen-review Task 11): ``effective_restriction`` now feeds ``access_requirements`` too —
+#: each element's governed floor maps through ``RESTRICTION_ROLES`` and the resulting reader role
+#: joins the requirements alongside the tag-derived ones. Under version 1 only the raw
+#: ``sensitivity`` tag fed that axis, so a governed-``restricted`` column whose file attested
+#: nothing published with an EMPTY requirements tuple — the requirement Gate 2 enforced at compile
+#: time was dropped at the artifact boundary. "Which column feeds which answer" changed, so a group
+#: classified under version 1 is not interchangeable with the same words under version 2.
+CLASSIFICATION_POLICY_VERSION = 2
 
 #: The stated policy for a node with no recorded ``effective_restriction`` (module docstring). It is
 #: the ONE rank this module names as a literal; every other rank is reached through the shipped
@@ -204,9 +212,12 @@ def _read_axes(
     """``ref -> (sensitivity tag, effective_restriction)`` for every ref the catalog describes.
 
     Both axes come from ONE row per node, read in one statement per catalog source (the shape
-    ``ir._hidden`` uses). A ref with no row is simply absent from the result: what it is, is a read
-    of a column the catalog does not describe, which §11's L1 validation reports against the live
-    metastore as ``COLUMN_ABSENT``. Here it falls to the stated missing-classification policy.
+    ``ir._hidden`` uses). A ref with no row is simply absent from the result. On §2's chain that
+    ref never arrives: since Task 12, Gate 2 (``ir.authorize_compilation``) refuses a read of a
+    column the catalog does not govern as ``COLUMN_NOT_GOVERNED`` — the old doctrine of passing it
+    through for §11's L1 to report ``COLUMN_ABSENT`` put the catch on a path no production run
+    takes. So an absent row reaching THIS module through the public seam falls to the stated
+    missing-classification policy, exactly as a present row with a blank classification does.
     """
     indexed: dict[str, dict[str, list[str]]] = {}
     for ref in refs:

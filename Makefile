@@ -24,12 +24,19 @@ test:  ## Run the test suite (ephemeral Postgres, or set FEATUREGEN_TEST_DSN)
 	uv run pytest -q
 
 l0-gate:  ## Build-verify the golden Kedro project under BOTH supported kedro lines
+	# hdfs + s3fs are GATE-environment dependencies (like Temurin 17), not artifact pins:
+	# kedro-datasets 4.x's spark module hard-imports both at catalog construction, the lock
+	# cannot carry them (DEFERRED-WORK A.32 — the [spark] extra conflicts with pyspark 3.5),
+	# and without them the run-parameters hook proof would die before the hook fires.
 	test -x .venv-artifact/bin/python || (uv venv .venv-artifact --python 3.11 --seed && \
 		.venv-artifact/bin/python -m pip install --quiet \
-			-r tests/featuregen/materialize/goldens/cif_daily/requirements.lock)
+			-r tests/featuregen/materialize/goldens/cif_daily/requirements.lock \
+			hdfs s3fs)
+	# hdfs again: kedro-datasets 9.5.0's spark_dataset.py hard-imports it, but the 9.x [spark]
+	# extra (spark-local + spark-s3) does not install it — an upstream packaging gap (A.32).
 	test -x .venv-l0-modern/bin/python || (uv venv .venv-l0-modern --python 3.11 --seed && \
 		.venv-l0-modern/bin/python -m pip install --quiet \
-			"kedro==1.5.0" "kedro-datasets[spark]==9.5.0" "pyspark==4.2.0")
+			"kedro==1.5.0" "kedro-datasets[spark]==9.5.0" "pyspark==4.2.0" hdfs)
 	FEATUREGEN_L0_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
 	PYSPARK_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
 	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-artifact/bin/python \
@@ -47,7 +54,7 @@ l0-gate:  ## Build-verify the golden Kedro project under BOTH supported kedro li
 	PYSPARK_DRIVER_PYTHON=$(CURDIR)/.venv-l0-modern/bin/python \
 		uv run pytest tests/featuregen/materialize/spark_semantics_gate.py -q
 
-ci: lint format-check typecheck test  ## Everything CI runs
+ci: lint format-check typecheck test  ## The fast CI jobs (l0-gate is separate: slow, needs JVM + artifact venvs)
 
 api:  ## Serve the HTTP API on :8000 (needs FEATUREGEN_DSN)
 	uv run uvicorn --factory featuregen.api.app:create_app_from_env --reload --port 8000

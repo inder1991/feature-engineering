@@ -7,9 +7,9 @@ one whose hash was recorded, with no record that it changed.
 - **Publishes to** `sandbox_feature.cif_daily` — derived from the group's sandbox binding
   (§10.1). It is not a parameter and not a template variable: there is no way to make a run
   write anywhere else.
-- **Renderer version** `2` · **physical type policy** `4`
-- **Materialization contract** `ec5a405e4dea47a7dadbaefb7f7b546d71931ac4fe7017af62ef0ec56158a54e`
-- **Group plan** `9d6b9d986a2a1e76b29c42a3197b7d055cc96ae49d3a314c702d2fe46b327c98`
+- **Renderer version** `3` · **physical type policy** `4`
+- **Materialization contract** `1f2ff12968846108c02ee11343b9a8e7ad8b37da4f5042fdf398c926aa8730d8`
+- **Group plan** `4df4b1b83b20130e87522c66007f4dd084ac314e6ae18b9447a85be4c3ee62e2`
 
 ## How this is launched
 

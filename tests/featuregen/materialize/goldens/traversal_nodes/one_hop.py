@@ -80,7 +80,7 @@ def project_total_debit_amount_30d__body_expr(
         F.col('count') > F.lit(1)).limit(1).count()
     if duplicate_1:
         raise RuntimeError(
-            'JOIN_AMPLIFICATION' + 
+            'JOIN_AMPLIFICATION' +
             ': join key is not unique on banking.customers for hop 1')
     rows = rows.withColumn('__join_1__key', F.col('cif_num'))
     rows = rows.join(hop_1, ['__join_1__key'], 'left').drop('__join_1__key')

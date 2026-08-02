@@ -492,7 +492,10 @@ probe driver and `test_probe.py`) is 16b's.
 
 Recorded while remediating Task 5 of the codegen review (blank uploaded cardinality no longer
 fabricates `N:1` at the governed-join propose seam; the realization deriver no longer maps a NULL
-edge cardinality to `MANY_TO_ONE`).
+edge cardinality to `MANY_TO_ONE`). Because the pair-guard keys on the UNORDERED column pair, it
+also blocks a re-upload that corrects the join's DIRECTION (a reversed `joins_to` on the same two
+columns), not only its cardinality — the same reject-then-re-propose governance path is the
+correction route for both.
 
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
@@ -565,3 +568,23 @@ partitions still exist at validation time — nothing proves the run read precis
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🟡 **`input_snapshots` is carried and hashed but never enforced as the run's read scope** | The rendered predicates derive from the same window/availability facts that resolved the snapshots, so absent a metastore change between preparation and execution the two coincide; making the list load-bearing is a render-side semantics change (design-sensitive), out of scope for a docs-honesty remediation. | §3.4 identity is relied on for audit of what a run read; fix = render partition predicates onto raw sources, or record actually-read partitions post-run. |
+
+### A.32 🔴 requirements.lock installs an environment that cannot construct the rendered catalog (2026-08-02)
+
+Recorded while adding the final-review wave's execution-level hook proof (l0_gate's
+`test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session`). An environment
+installed from the artifact's own `requirements.lock` (`kedro==0.19.9`, `kedro-datasets==4.1.0`,
+`pyspark==3.5.1`) dies at CATALOG CONSTRUCTION — before any hook fires — because kedro-datasets
+4.x's `spark_dataset.py` hard-imports `hdfs` (line 18) and `s3fs` (line 30) at module import, and
+neither is in the lock. The obvious fix is WRONG: pinning `kedro-datasets[spark]==4.1.0` is
+uninstallable against the captured cluster — the extra requires `delta-spark>=1.0,<3.0`, and every
+`delta-spark<3.0` pins `pyspark<3.5`, conflicting with the captured `pyspark==3.5.1` (empirically:
+uv resolution fails; pip backtracks into ancient `arrow` sdists and dies). The modern line has the
+same hole one layer up: kedro-datasets **9.5.0**'s `spark_dataset.py` still hard-imports `hdfs`,
+but the 9.x `[spark]` extra (= spark-local + spark-s3) does not install it — an upstream packaging
+gap. The L0 gate installs `hdfs` (+`s3fs` on the 4.x line) explicitly into both venvs (Makefile)
+as gate-environment dependencies, the same way it supplies Temurin 17.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |

@@ -63,7 +63,8 @@ be in a control plane: a value would make the observation a sample of the publis
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -366,6 +367,13 @@ class PublicationCapabilityAttestation:
     because they are what the attestation is KEYED on (migration ``1034``) and a nested object
     cannot be indexed. The other five engine versions describe the generated project's pins (§7),
     not the cluster's publish capability, so they are not part of the key.
+
+    ``recorded_at`` is the DATABASE's stamp (``DEFAULT now()``), not the probe's: ``attested_at``
+    says when the probe finished, ``recorded_at`` says when this plane learned of it, and the
+    newest-evidence ordering in :func:`select_publisher` runs on the latter — evidence supersedes
+    in the order it was recorded, not the order probes claim to have completed. It carries the
+    value read back from the row (``record_attestation`` RETURNINGs it), so an attestation read
+    from the table compares equal to the one recorded.
     """
 
     attestation_id: str
@@ -378,6 +386,7 @@ class PublicationCapabilityAttestation:
     covers_schema_evolution: bool
     evidence_hash: str
     attested_at: str
+    recorded_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mechanism, PublishMechanism):
@@ -441,16 +450,19 @@ def record_attestation(
         covers_schema_evolution=probe_result.covers_schema_evolution,
         evidence_hash=probe_result.evidence_hash,
         attested_at=probe_result.completed_at)
-    conn.execute(
+    # RETURNING the database's own `recorded_at` stamp (DEFAULT now()), so the value returned here
+    # is the one `read_attestations` will read back — never a second clock's opinion.
+    inserted = conn.execute(
         "INSERT INTO publication_capability_attestation (attestation_id, environment_id, "
         "hive_version, spark_version, metastore_version, mechanism, passed, "
         "covers_schema_evolution, evidence_hash, attested_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING recorded_at",
         (attestation.attestation_id, attestation.environment_id, attestation.hive_version,
          attestation.spark_version, attestation.metastore_version, attestation.mechanism.value,
          attestation.passed, attestation.covers_schema_evolution, attestation.evidence_hash,
-         attestation.attested_at))
-    return attestation
+         attestation.attested_at)).fetchone()
+    return replace(attestation,
+                   recorded_at=inserted[0] if inserted is not None else None)
 
 
 def read_attestations(
@@ -466,7 +478,7 @@ def read_attestations(
     """
     rows = conn.execute(
         "SELECT attestation_id, environment_id, hive_version, spark_version, metastore_version, "
-        "mechanism, passed, covers_schema_evolution, evidence_hash, attested_at "
+        "mechanism, passed, covers_schema_evolution, evidence_hash, attested_at, recorded_at "
         "FROM publication_capability_attestation WHERE environment_id = %s AND mechanism = %s "
         "ORDER BY recorded_at",
         (environment_id, mechanism.value)).fetchall()
@@ -566,7 +578,9 @@ def select_publisher(
       ran and demonstrated this mechanism does not satisfy atomic visibility here; the design must
       change rather than the claim. The NEWEST matching attestation carries the verdict: an older
       pass does not outlive a later probe that demonstrated failure on identical versions (the
-      mirror of a later pass overriding an earlier failure). Scoped to the mechanism asked about —
+      mirror of a later pass overriding an earlier failure). A TIE on ``recorded_at`` between a
+      pass and a failure — two probe results ingested in one transaction — refuses too: a pass
+      supersedes a failure only when it is STRICTLY newer. Scoped to the mechanism asked about —
       this function is asked about one, and reporting on mechanisms nobody enquired after would be
       a verdict about capability nobody probed for.
     * **the publication adds a column and the passing attestation does not cover schema
@@ -620,17 +634,6 @@ def select_publisher(
             f"probed on {probed}: a mechanism proven on one engine version is not proven on "
             f"another, so the probe must be re-run on what the environment runs now")
 
-    # `read_attestations` returns rows ordered by `recorded_at` and `matching` preserves that
-    # order, so `matching[-1]` is the NEWEST evidence on exactly these versions. If it failed,
-    # an older pass is a claim the latest probe has already contradicted.
-    newest = matching[-1]
-    if not newest.passed:
-        return MaterializationRefused(
-            PublicationRefusalCode.PUBLISH_MECHANISM_UNSUPPORTED,
-            f"the most recent probe on these engine versions ({newest.attestation_id}) "
-            f"demonstrated the mechanism failing; earlier passing evidence is stale, re-run the "
-            f"probe")
-
     passing = [attestation for attestation in matching if attestation.passed]
     if not passing:
         return MaterializationRefused(
@@ -640,6 +643,26 @@ def select_publisher(
             f"{engine_versions.metastore} and mechanism {mechanism.value} did not give atomic "
             f"visibility there ({len(matching)} failing attestation(s)): this is a demonstrated "
             f"absence rather than a missing probe, so re-running it will not change the answer")
+
+    # The newest-evidence guard, with its TIE failing closed. `read_attestations` returns rows
+    # ordered by `recorded_at` and `matching` preserves that order, so `matching[-1]` carries the
+    # newest `recorded_at` on exactly these versions — but "newest" is only a verdict when the
+    # ordering can actually support it. A FAILED attestation sharing that maximum (two probes
+    # ingested in one transaction share `now()`, so neither is strictly older) means no pass is
+    # strictly newer than the failure, and reading the pass as superseding it would be a
+    # tiebreak nobody demonstrated. Ambiguous evidence refuses, exactly as a strictly-newest
+    # failure does (the same recorded_at-tie discipline `read_validation_reports` states).
+    newest_recorded_at = matching[-1].recorded_at
+    undefeated_failures = [attestation for attestation in matching
+                           if not attestation.passed
+                           and attestation.recorded_at == newest_recorded_at]
+    if undefeated_failures:
+        return MaterializationRefused(
+            PublicationRefusalCode.PUBLISH_MECHANISM_UNSUPPORTED,
+            f"the most recent evidence on these engine versions includes a FAILED probe "
+            f"({', '.join(a.attestation_id for a in undefeated_failures)}) that no passing "
+            f"attestation strictly supersedes: passing evidence that is not strictly newer than "
+            f"a demonstrated failure is stale or ambiguous either way, re-run the probe")
 
     if adds_feature:
         covering = [attestation for attestation in passing if attestation.covers_schema_evolution]
