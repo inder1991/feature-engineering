@@ -384,6 +384,53 @@ def test_repeat_puts_never_stack_rows_under_one_key(flag_on, client, conn):
     assert _graph_authority_role(conn) == "derived"
 
 
+def test_a_zero_row_display_projection_is_a_500_never_a_silent_200(flag_on, client, monkeypatch):
+    """[F12] The route's last guard, previously untested: the PUT re-reads the table node and
+    compares it against the re-assembled display. If the projection wrote NO row (a graph ref the
+    projection cannot key, a dropped node), the profile would still return 200 with a display the
+    catalog does not actually carry. Simulate the zero-row write by neutering the projection."""
+    import featuregen.api.routes.profiles as profiles_mod
+
+    assert upload_csv(client, "bank", BANK_CSV).status_code == 200
+    current = client.get("/catalog/asset-profiles/bank/public.orders", headers=AUTH).json()
+    monkeypatch.setattr(profiles_mod, "resolve_and_project",
+                        lambda *a, **kw: None)   # the projection lands zero rows
+    res = _put(client, OWNER, current["dataset_profile_hash"], authority_role="derived")
+    assert res.status_code == 500
+    assert "did not project onto the table node" in res.json()["detail"]
+
+
+def _set_schema(conn, schema):
+    """Re-declare the ingested catalog under a REAL (non-public) schema. NB: no ``conn.commit()`` —
+    the suite's connection is the app's, and committing here would escape the per-test rollback and
+    leak this catalog into every later suite."""
+    conn.execute("UPDATE graph_node SET schema_name = %s WHERE catalog_source = 'bank'", (schema,))
+
+
+def test_asset_profile_round_trip_on_a_non_public_schema(flag_on, client, conn):
+    """[F12] The non-public-schema path, previously untested end-to-end. Graph refs are
+    PUBLIC-FLATTENED (`public.orders`) while every evidence/decision store keys the
+    SCHEMA-PRESERVING logical ref — so the routes must address the asset by its flattened ref and
+    resolve the real one through `logical_ref_of`. Get it wrong and the evidence lands where no
+    reader looks, exactly the class of bug `logical_ref_of` was rewritten to kill."""
+    assert upload_csv(client, "bank", BANK_CSV).status_code == 200
+    _set_schema(conn, "DPL_EIB_COMPLIANCE")
+    got = client.get("/catalog/asset-profiles/bank/public.orders", headers=AUTH)
+    assert got.status_code == 200, got.text
+    assert got.json()["dataset_logical_ref"] == "bank::dpl_eib_compliance.orders"
+
+    put = _put(client, OWNER, got.json()["dataset_profile_hash"], authority_role="derived")
+    assert put.status_code == 200, put.text
+    assert put.json()["profile"]["authority_role"]["display"]["value"] == "derived"
+    # The evidence is keyed on the SCHEMA-PRESERVING ref (not the flattened one)...
+    refs = conn.execute(
+        "SELECT DISTINCT logical_ref FROM field_evidence WHERE field_name = 'authority_role'"
+    ).fetchall()
+    assert refs == [("bank::dpl_eib_compliance.orders",)]
+    # ...and the display still projected onto the PUBLIC-FLATTENED graph node.
+    assert _graph_authority_role(conn) == "derived"
+
+
 def test_set_advisory_flows_through_the_decision_route(flag_on, client):
     """A confirmer curates business_context in one step (advisory-only; RECOMMENDATION ceiling)."""
     assert upload_csv(client, "bank", BANK_CSV).status_code == 200
