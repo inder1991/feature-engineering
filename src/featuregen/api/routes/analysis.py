@@ -26,12 +26,12 @@ text, which is the case the governed read-scope fix exists for.
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from featuregen.analysis.assembly import first_unmet_requirement
@@ -47,8 +47,10 @@ from featuregen.analysis.preview import preview
 from featuregen.analysis.retrieval import (
     Retrieval,
     RetrievalBudget,
+    catalog_snapshot_id,
     record_retrieval_gap,
     retrieve_candidates,
+    stable_analysis_request_id,
 )
 from featuregen.data_agent.binding_store import resolve_binding
 from featuregen.data_agent.eligibility_store import resolve_eligibility
@@ -65,6 +67,25 @@ BLOCKED_ROUTE_CODES: frozenset[str] = frozenset({"EXECUTION_INPUTS_ABSENT"})
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+class RetrievalRefused(Exception):
+    """The question matched no readable catalog column — the ONE refusal that WRITES on its way out.
+
+    Not an `HTTPException`, and deliberately so. `get_conn` rolls the request transaction back on any
+    exception that leaves the handler, so raising the 422 discarded the learning gap recorded a line
+    earlier — the store's only production producer, reverted by the very refusal that produced it.
+    Both routes convert this to the same `JSONResponse` FastAPI's own handler would have built, so
+    the wire format is unchanged and the transaction commits."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _refusal_response(exc: RetrievalRefused) -> JSONResponse:
+    """Byte-identical to what `HTTPException(422, detail=...)` produces — same status, same body."""
+    return JSONResponse(status_code=422, content={"detail": exc.detail})
 
 
 def _missing_context_of(retrieval: Retrieval) -> tuple[str, ...]:
@@ -125,12 +146,27 @@ def _plan_for(conn, question: str, identity: IdentityEnvelope, client: LLMClient
         # `GET /learning/gaps` read a table nothing populated. A question the catalog has no word
         # for is the canonical actionable gap, and this path is reached on every planning request.
         # Fail-soft: a learning write must never turn a clear 422 into a 500.
+        #
+        # The request id is DERIVED, never minted. `record_gap` dedupes on (request, gap, snapshot)
+        # and an `areq-{uuid4}` per call made every row unique by construction, so three identical
+        # unanswered questions wrote three identical gaps and demand read 3 for one thing to decide.
+        # The snapshot is computed ONCE and threaded into both the id and the event, so the two can
+        # never disagree about which catalog state this refusal was reached under.
         try:
-            record_retrieval_gap(conn, question, roles=identity.role_claims,
-                                 analysis_request_id=f"areq-{uuid.uuid4().hex[:16]}", now=now)
+            snapshot = catalog_snapshot_id(conn, roles=identity.role_claims)
+            record_retrieval_gap(
+                conn, question, roles=identity.role_claims,
+                analysis_request_id=stable_analysis_request_id(
+                    question, dependency_snapshot_id=snapshot),
+                now=now, dependency_snapshot_id=snapshot)
         except Exception:   # noqa: BLE001
             logger.warning("could not record a retrieval learning gap", exc_info=True)
-        raise HTTPException(status_code=422, detail=retrieval.empty_reason)
+        # RAISED, this 422 would take the learning write with it: `get_conn` rolls the request
+        # transaction back on ANY exception leaving the handler, so the row written one line above
+        # would never commit and the store would go on having no production producer. Returned, the
+        # response is byte-identical (FastAPI's own `HTTPException` handler emits exactly this
+        # body) and the transaction reaches its commit.
+        raise RetrievalRefused(retrieval.empty_reason)
     try:
         extraction = extract_intent(
             conn, client, question,
@@ -152,8 +188,11 @@ def _plan_for(conn, question: str, identity: IdentityEnvelope, client: LLMClient
 @router.post("/analysis/plan", dependencies=[Depends(require_feature_generate)])
 def plan(body: PlanIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """A question, planned and previewed. Never executed — see the module docstring."""
-    retrieval, extraction, grounded = _plan_for(
-        conn, body.question, identity, client, body.max_columns)
+    try:
+        retrieval, extraction, grounded = _plan_for(
+            conn, body.question, identity, client, body.max_columns)
+    except RetrievalRefused as exc:
+        return _refusal_response(exc)
     view = _previewed(conn, grounded)
     return {
         "preview": _serialize_preview(view),
@@ -183,8 +222,11 @@ def clarify(body: AnswerIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     The answer is re-validated against the candidates rather than trusted: a client is the layer
     least able to guarantee that what came back is what it offered.
     """
-    retrieval, extraction, grounded = _plan_for(
-        conn, body.question, identity, client, body.max_columns)
+    try:
+        retrieval, extraction, grounded = _plan_for(
+            conn, body.question, identity, client, body.max_columns)
+    except RetrievalRefused as exc:
+        return _refusal_response(exc)
     try:
         answered = apply_answer(grounded.plan, body.code, tuple(body.chosen),
                                 retrieval.candidates)

@@ -206,8 +206,36 @@ def _structural_columns(conn, pairs: Iterable[tuple[str, str]], *,
 _MAX_GAP_TERMS = 8
 
 
+def stable_analysis_request_id(question: str, *, dependency_snapshot_id: str) -> str:
+    """A DETERMINISTIC request id for one question against one catalog state.
+
+    `record_gap` dedupes on (request, gap, snapshot), so the request id decides whether the dedupe
+    does anything at all. A per-call ``areq-{uuid4}`` made every row unique by construction: the
+    same unanswered question asked three times wrote three identical gaps and `GET /learning/gaps`
+    reported demand 3 for ONE thing to decide.
+
+    Derived from the REDACTED, normalized question plus the dependency snapshot, so:
+
+    * the same question under the same catalog state is one request, however it was typed, and
+      whoever typed it — the id carries no session, principal or clock, because two analysts blocked
+      by one missing term are one gap and demand is counted by DISTINCT request id;
+    * the same question after an upload is a DIFFERENT request, because the gap may have been
+      resolved and re-recording it is the point of keeping the snapshot in the key;
+    * nothing derived from raw user text is stored — the material is redacted before hashing and
+      the hash is one-way, so the id cannot carry a customer name into a durable row.
+    """
+    from featuregen.intake.redaction import redact_free_text
+    from featuregen.materialize.canonical import materialize_hash
+
+    redaction = redact_free_text(question)
+    normalized = " ".join((redaction.text or "").lower().split())
+    return "areq-" + materialize_hash(
+        {"question": normalized, "dependency_snapshot_id": dependency_snapshot_id})[:16]
+
+
 def record_retrieval_gap(conn, question: str, *, roles: Iterable[str] = (),
-                         analysis_request_id: str, now: datetime) -> str | None:
+                         analysis_request_id: str, now: datetime,
+                         dependency_snapshot_id: str | None = None) -> str | None:
     """Record a retrieval refusal as the ONE actionable ontology gap it is: nobody has a term for
     what was asked (``SEMANTIC_TERM_UNRESOLVED`` / ``DEFINE_SEMANTIC_TERM``).
 
@@ -244,11 +272,15 @@ def record_retrieval_gap(conn, question: str, *, roles: Iterable[str] = (),
         code="SEMANTIC_TERM_UNRESOLVED",
         subject_refs=tuple(terms[:_MAX_GAP_TERMS]),
         required_action=RequiredAction.DEFINE_SEMANTIC_TERM,
-        dependency_snapshot_id=_catalog_snapshot_id(conn, roles=roles),
+        # The caller may already have computed it to derive `analysis_request_id`; recomputing it
+        # here would be a second query AND a second chance for the two to disagree, which would
+        # silently defeat the dedupe the id exists for.
+        dependency_snapshot_id=(dependency_snapshot_id if dependency_snapshot_id is not None
+                                else catalog_snapshot_id(conn, roles=roles)),
     ), now=now)
 
 
-def _catalog_snapshot_id(conn, *, roles: Iterable[str]) -> str:
+def catalog_snapshot_id(conn, *, roles: Iterable[str]) -> str:
     """A deterministic id for the catalog state this refusal was reached under.
 
     Re-asking an unanswerable question against the SAME catalog is not new information (the gap
