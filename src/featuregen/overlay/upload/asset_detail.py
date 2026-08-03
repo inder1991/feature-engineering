@@ -46,6 +46,7 @@ from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.column_readiness import column_readiness
 from featuregen.overlay.upload.column_usability import column_usability, table_rollup
 from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
+from featuregen.overlay.upload.feature_metadata_snapshot import projection_lag_marker
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
 from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
@@ -805,5 +806,10 @@ def build_asset_detail(
 
     body["included_sections"] = built
     body["unavailable_sections"] = unavailable
+    # Semantic Task 6 — projection lag is DETECTED and REPORTED, never silently absorbed. It is set
+    # BEFORE the token is computed on purpose: the token then fingerprints "this snapshot, taken
+    # under a lagged projection", so a lagged read and a ready read of the same values are not
+    # interchangeable to any client that caches on it. Not a refusal: the dossier still serves.
+    body["projection"] = projection_lag_marker(conn).as_dict()
     body["consistency_token"] = _consistency_token(body)
     return body

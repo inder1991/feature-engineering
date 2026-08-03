@@ -933,6 +933,26 @@ def stale_all_llm_field_evidence(conn, *, logical_ref: str, field_name: str) -> 
                                  producer=EvidenceProducer.LLM, keep_input_hash=_STALE_ALL)
 
 
+def _reusable_llm_evidence(conn, *, logical_ref: str, field_name: str, value: object):
+    """The LLM's OWN active evidence row already asserting exactly ``value``, or ``None``.
+
+    VALUE-diff, not input-diff (semantic Task 6 / D12.4): the question a consumer asks is "does the
+    platform still say the same thing?", and it must answer yes for a re-derivation that reached the
+    same answer from a slightly different prompt. Compared on ``proposed_value_hash`` — the store's
+    own order-independent digest — so a jsonb round-trip cannot make an identical value look
+    different.
+
+    Deterministic pick: ``read_active_field_evidence`` is ordered ``(created_at, evidence_id)``, so
+    the OLDEST matching row wins. That is what makes the evidence ID STABLE across reruns — picking
+    the newest would churn the very identity this function exists to preserve."""
+    target = canonical_hash(value)
+    for evidence in read_active_field_evidence(conn, logical_ref, field_name):
+        if (evidence.producer == EvidenceProducer.LLM.value
+                and evidence.proposed_value_hash == target):
+            return evidence
+    return None
+
+
 def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
                               ref_of: Callable[[str], tuple[str, str, object] | None],
                               source_snapshot_id: str,
@@ -942,10 +962,26 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
     """Write one ``llm/proposed`` ``field_evidence`` row per item of ``items`` (E1a); return the
     number of CONTAINED per-item failures so the caller's stage report can say ``partial``.
 
-    SUPERSEDE-AND-REWRITE, unconditionally: prior ACTIVE LLM evidence for the field is staled and a
-    fresh row written. No unchanged-detection and no result cache — that reuse is a DEFERRED
-    optimization (and is why this is a separate, simpler writer than ``_write_concept_evidence``,
-    which keeps its own).
+    VALUE-DIFF SUPERSESSION (semantic Task 6, amending the original unconditional
+    supersede-and-rewrite):
+
+    * a re-derivation landing on the SAME value REUSES the prior active LLM row — same current
+      value AND same ``evidence_id``. Without this, five of the six LLM fields minted a fresh
+      evidence ID on every ingest, so "every consumer returns the same current value and evidence
+      ID" was unachievable and every re-upload manufactured a supersession event that represented
+      no change. The reused row keeps its original ``input_hash``/``source_snapshot_id``: identity
+      belongs to the ASSERTION, not to the prompt that reproduced it, and rewriting them would
+      re-introduce the churn under a different name;
+    * a re-derivation landing on a DIFFERENT value stales the prior row and writes a fresh one,
+      through the SAME producer-scoped mechanics as before
+      (:func:`stale_all_llm_field_evidence` / :func:`stale_source_evidence`);
+    * either way the staling is PRODUCER-SCOPED — source-attested and human evidence is never
+      touched, so an LLM rerun leaves them byte-for-byte, and no system correction can mint a
+      human-rejection event (this writer records no decision events at all).
+
+    A same-value reuse still RETIRES the LLM's other active rows for the field (keeping the reused
+    row's input hash), so a run can never leave two live LLM proposals for one field — the state
+    that makes the resolver NULL a field on conflict.
 
     TWO IDENTITIES, never collapsed: ``ref_of(key)`` returns ``(evidence_ref, binding_ref,
     material)`` — attachability is checked against ``bindings[binding_ref]`` (the PUBLIC-flattened
@@ -973,6 +1009,15 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
             input_hash = field_input_hash(logical_ref=evidence_ref, field_name=field_name,
                                           material=material)
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
+                reusable = _reusable_llm_evidence(
+                    conn, logical_ref=evidence_ref, field_name=field_name, value=value)
+                if reusable is not None:
+                    # Unchanged: keep THIS row (and its evidence_id) live, retire the LLM's other
+                    # active rows for the field. Producer-scoped — human/source rows untouched.
+                    stale_source_evidence(
+                        conn, logical_ref=evidence_ref, field_name=field_name,
+                        producer=EvidenceProducer.LLM, keep_input_hash=reusable.input_hash)
+                    continue
                 stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
                 record_field_evidence(
                     conn, logical_ref=evidence_ref, field_name=field_name, proposed_value=value,
@@ -2271,8 +2316,9 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
     """Draft business synonyms for EVERY column; returns {content_hash: "term, term, term"} (E1a T4).
 
     Every column is a target — synonyms are ADDITIVE (they merge with the glossary's own terms), so
-    unlike a definition there is no "only fill a blank" rule to apply. NO CACHE: E1a defers reuse, and
-    the evidence writer supersedes-and-rewrites unconditionally.
+    unlike a definition there is no "only fill a blank" rule to apply. NO PROMPT CACHE: E1a defers
+    call reuse. That is now the only reuse missing — the evidence writer VALUE-DIFFS (Task 6), so a
+    redraft landing on the same terms reuses the same evidence row rather than churning its id.
 
     ``stats`` (optional out-param): in batch mode receives ``not_attempted``, the count the
     budget/deadline cutoff skipped WITHOUT dispatch, so the caller labels a truncated run
@@ -2351,8 +2397,9 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
     requirement. A human confirms it (Task 3); the AI only ever drafts the answer.
 
     Targets are ``_unit_targets`` — the ONE definition the writer and ingest's expected count share.
-    NO CACHE (like ``draft_synonyms``): the evidence writer supersedes-and-rewrites unconditionally,
-    and reuse is a deferred optimization.
+    NO PROMPT CACHE (like ``draft_synonyms``): call reuse is a deferred optimization. Evidence
+    reuse is NOT deferred — the writer value-diffs (Task 6), so an unchanged annotation keeps its
+    evidence id.
 
     ``currencies`` (optional out-param; the RETURN shape stays ``{hash: unit}`` so the stage report
     reads exactly like every other Pass A stage) receives ``{content_hash: ISO-4217 code}`` for the

@@ -194,6 +194,52 @@ def check_projection_readiness(
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectionLagV1:
+    """A typed, honest marker that a READ was served while a load-bearing projection was behind.
+
+    Semantic Task 6, scoped deliberately narrow: DETECTION AND DISCLOSURE, not a new refusal. The
+    feature path aborts on lag because it SEALS a snapshot that must be re-executable; a catalog
+    READ has no such contract — refusing to show a column because a projection is three events
+    behind would be a worse answer than showing it with the lag named. What must never happen is
+    the silent version: serving a newer semantic value under an older context hash as though the
+    two agreed.
+
+    ``code`` is the existing :data:`CATALOG_PROJECTION_UNAVAILABLE`; ``detail`` is the gate's own
+    sentence, naming which projection and why. Nothing here is re-derived — the marker is exactly
+    what :func:`check_projection_readiness` already computes."""
+
+    status: str
+    code: str
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "code": self.code, "detail": self.detail}
+
+
+#: The marker a READY read carries. Present ALWAYS (never omitted on the happy path): an absent key
+#: is indistinguishable from an older client that never had one, so "we checked and it was fine"
+#: has to be said out loud for "we checked and it was not" to mean anything.
+PROJECTION_READY = ProjectionLagV1(status="ready", code="", detail="")
+
+
+def projection_lag_marker(
+    conn: DbConn, *, projections: Sequence[str] = _LOAD_BEARING_PROJECTIONS
+) -> ProjectionLagV1:
+    """The DETECTION-ONLY sibling of :func:`check_projection_readiness`: same gate, same verdict,
+    reported instead of raised.
+
+    Reuses the readiness gate verbatim (never re-implements projection health) so a read surface
+    and the feature path can never disagree about whether the catalog is caught up. Returns
+    :data:`PROJECTION_READY` when it is, and a ``lagged`` marker carrying the gate's own code and
+    detail when it is not."""
+    try:
+        check_projection_readiness(conn, projections=projections)
+    except CatalogProjectionUnavailable as exc:
+        return ProjectionLagV1(status="lagged", code=exc.code, detail=exc.detail)
+    return PROJECTION_READY
+
+
+@dataclass(frozen=True, slots=True)
 class SnapshotItem:
     """One persisted snapshot row, held in memory so the context serves facts WITHOUT a re-query.
 

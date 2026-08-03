@@ -25,7 +25,10 @@ def test_search_returns_context_rich_hits(client):
     res = client.get("/search", params={"q": "balance"}, headers=AUTH)
     assert res.status_code == 200
     body = res.json()
-    assert set(body) == {"hits", "facets", "total"}       # the new wire shape
+    # The wire shape + the semantic-Task-6 projection marker: a search read now SAYS whether a
+    # load-bearing projection was behind when it ran, instead of serving rows as though it knew.
+    assert set(body) == {"hits", "facets", "total", "projection"}
+    assert body["projection"]["status"] == "ready"
     hit = next(h for h in body["hits"] if h["object_ref"] == "public.accounts.balance")
     assert hit["table"] == "accounts"
     assert hit["definition"] == "end-of-day ledger balance"
