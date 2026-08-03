@@ -479,7 +479,7 @@ class CandidateDecisionV1:
         object.__setattr__(self, "dataset_profile_hash", self.dataset_profile_hash.strip())
         if self.binding_revision_id is not None:
             object.__setattr__(self, "binding_revision_id",
-                               _binding_revision_id(self.binding_revision_id))
+                               normalize_binding_revision_id(self.binding_revision_id))
         object.__setattr__(self, "disposition", CandidateDisposition(
             _member(self.disposition, CandidateDisposition, what="disposition")))
         object.__setattr__(self, "reason_codes",
@@ -495,7 +495,7 @@ class CandidateDecisionV1:
         }
 
 
-def _binding_revision_id(raw: object) -> str:
+def normalize_binding_revision_id(raw: object) -> str:
     """A binding revision id is the CHECK-pinned ``pbr_<64 hex>`` shape (migration 1036).
 
     Validated structurally HERE so a typo cannot reach a decision; whether the revision is actually
@@ -618,7 +618,7 @@ class DatasetSourceSelectionV1:
         object.__setattr__(self, "selected_dataset_profile_hash",
                            self.selected_dataset_profile_hash.strip())
         object.__setattr__(self, "selected_binding_revision_id",
-                           _binding_revision_id(self.selected_binding_revision_id))
+                           normalize_binding_revision_id(self.selected_binding_revision_id))
         if self.serving_policy_revision_id is not None:
             policy_id = str(self.serving_policy_revision_id).strip()
             if not policy_id.startswith(SERVING_POLICY_ID_PREFIX):
