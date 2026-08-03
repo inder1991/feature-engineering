@@ -19,6 +19,7 @@ from datetime import timedelta
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.field_evidence import canonical_hash
+from featuregen.overlay.upload import grounding_trace
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
@@ -45,6 +46,11 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     capture_column_snapshot,
     ensure_generation_run,
 )
+from featuregen.overlay.upload.grounding_trace import (
+    SuggestionDependencyClass,
+    build_trace,
+    dependency_pin,
+)
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -56,10 +62,14 @@ from featuregen.overlay.upload.planner.declarations import CompileBudget, build_
 from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.plan_envelope import (
     PlanEnvelopeV1,
+    plan_dependency_pins,
     plan_envelope_from_result,
+    plan_operand_roles,
+    plan_relationship_dependencies,
 )
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
+from featuregen.overlay.upload.read_scope import allowed_classes, read_scope_rule_content_hash
 from featuregen.overlay.upload.recipe_grounding_context import (
     RecipeGroundingContextV1,
     build_recipe_grounding_context,
@@ -437,8 +447,40 @@ def _governed_rejection_reason(result: BindingPlanningResultV1) -> str:
     return result.contract_result_status.value
 
 
+def _governed_plan_trace(plan: BindingPlanV1, *, roles, pairs: tuple[tuple[str, str], ...],
+                         validation_status: str):
+    """The cross-catalog candidate's decision trace (Task 2A).
+
+    The governed planner IS this candidate's decision, so its trace is minted here, from the plan
+    the compiler already produced: the ordered crossings it selected (never re-planned), one pin per
+    crossing carrying the exact realization revision, the contract resolution that admitted it, the
+    read scope the compile ran under and the read set it resolved. No gauntlet rule runs on this
+    path, so ``validation_rule_content_hashes`` is honestly empty — this candidate's authority is
+    the governed contract, not the tri-state gauntlet.
+    """
+    pins = [
+        dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=grounding_trace.READ_SCOPE, dependency_key="read-scope",
+            content={"allowed_classes": allowed_classes(roles)}),
+        dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=grounding_trace.GROUNDING_CANDIDATE_SET,
+            dependency_key="physical_read_set",
+            content={"resolved_object_refs": [ref for _cs, ref in pairs]}),
+        *plan_dependency_pins(plan),
+    ]
+    return build_trace(
+        candidate_key=plan.physical_plan_id,
+        ordered_operand_roles=plan_operand_roles(plan),
+        ordered_relationship_path=plan_relationship_dependencies(plan),
+        validation_status=validation_status, requirements=(), dependency_pins=pins,
+        validation_rule_content_hashes=(),
+        read_scope_rule_content_hashes=(read_scope_rule_content_hash(),))
+
+
 def _governed_idea_from_result(result: BindingPlanningResultV1, template: Template,
-                               target_entity: str) -> FeatureIdea | None:
+                               target_entity: str, *, roles=()) -> FeatureIdea | None:
     """A SELECTED RESOLVED governed contract plan → a Gate-#1 :class:`FeatureIdea` carrying the exact
     compiled plan envelope (so drafting reconstructs the governed path, never a permissive one) and the
     STRUCTURED provenance (``origin`` / ``path_authority``). None when the run has no resolved contract
@@ -465,7 +507,11 @@ def _governed_idea_from_result(result: BindingPlanningResultV1, template: Templa
         # H1a metadata from the SERVER's envelope — planner_applicability is "applicable_cross_catalog"
         # BECAUSE a governed plan_envelope is present (the path_authority↔planner_applicability mapping).
         generation_source="recipe", recipe_id=envelope.recipe_id,
-        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id)
+        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id,
+        # The governed path's own decision trace — the crossings the compiler SELECTED, retained so
+        # nothing downstream has to re-plan to explain this option (freeze 0F-7 / rule 15).
+        grounding_trace=_governed_plan_trace(plan, roles=roles, pairs=pairs,
+                                             validation_status="DESIGN_CHECKED"))
 
 
 def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
@@ -506,7 +552,7 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
             rejections.append({"lens": "governed", "reason": ReasonCode.planner_internal_error.value,
                                "recipe_id": rid})
             continue
-        idea = _governed_idea_from_result(result, tmpl, target_entity)
+        idea = _governed_idea_from_result(result, tmpl, target_entity, roles=roles)
         if idea is not None:
             ideas.append(idea)
         else:
