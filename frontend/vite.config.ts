@@ -16,7 +16,10 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs', '/governance',
   '/gate', '/catalog', '/catalogs', '/ingestion-runs',
   // The data agent's planning surface, and the learning-gap queue.
-  '/analysis', '/learning']
+  '/analysis', '/learning',
+  // Physical connections/bindings + the catalog semantic scope (nginx has proxied this since the
+  // catalog-engine work; the dev proxy fell behind — the pre-existing two-test failure pair).
+  '/data-sources']
 
 export default defineConfig({
   plugins: [react()],
