@@ -25,6 +25,16 @@ BANK_CSV = _HEADER + (
 VAULT_CSV = _HEADER + (
     "vault,identities,eida_num,text,,,national id number,pii,,,,,,Customer\n"
 )
+# A MIXED-VISIBILITY table: one public column (so the table ANCHOR is visible to every catalog
+# reader under the D11 derived scope) and two `pii` columns a plain caller may not see. This is the
+# probe shape for the temporal GET — the caller can reach the route, and the question is what the
+# POLICY BODY is allowed to tell them.
+MIXED_CSV = _HEADER + (
+    "mixed,segment_history,cif_id,text,y,,customer key,,,,,,,Customer\n"
+    "mixed,segment_history,valid_from,timestamp,,,valid from,pii,,,,,,\n"
+    "mixed,segment_history,valid_to,timestamp,,,valid to,pii,,,,,,\n"
+    "mixed,segment_history,is_current,text,,,current row flag,,,,,,,\n"
+)
 
 ADMIN = {"X-User": "priya", "X-Roles": "platform-admin,platform_admin"}
 ADMIN2 = {"X-User": "sam", "X-Roles": "platform-admin,platform_admin"}
@@ -34,8 +44,11 @@ _CUST = "bank::public.customer_master"
 _ODS = "bank::public.customer_ods"
 _SEG = "bank::public.customer_segment"
 
+_MIXED = "mixed::public.segment_history"
+
 _SERVING = "/catalog/dataset-policies/serving/customer/population/analytical"
 _TEMPORAL = "/catalog/dataset-policies/temporal/bank/public.customer_segment"
+_MIXED_TEMPORAL = "/catalog/dataset-policies/temporal/mixed/public.segment_history"
 
 
 @pytest.fixture
@@ -281,6 +294,57 @@ def test_a_hidden_or_absent_dataset_is_a_404_not_an_oracle(seeded, flag_on):
                       headers=AUTH).status_code == 404
     assert seeded.get("/catalog/dataset-policies/temporal/vault/public.identities",
                       headers=PII_ADMIN).status_code == 200
+
+
+def test_a_temporal_policy_naming_a_hidden_column_is_withheld_WHOLE(seeded, flag_on):
+    """The probe: an unprivileged caller who can see the table anchor must not read the NAMES of
+    columns they may not see. A policy body is a list of column refs, so a partial redaction would
+    still confirm "a column exists here that you may not see" — an existence oracle over the exact
+    thing the sensitivity tag hides. The whole policy is withheld, in the serving GET's words."""
+    assert upload_csv(seeded, "mixed", MIXED_CSV).status_code == 200
+    # The anchor IS visible to a plain caller (cif_id is public) — the route is reachable, and with
+    # no policy declared it answers normally. That is what makes the leak below reachable at all.
+    before = seeded.get(_MIXED_TEMPORAL, headers=AUTH)
+    assert before.status_code == 200, before.text
+    assert before.json()["policy"] is None
+
+    declared = seeded.put(_MIXED_TEMPORAL, headers=PII_ADMIN, json={
+        "expected_pointer_version": 0,
+        "temporal_storage_model": "scd2",
+        "current_selection": "current_record",
+        "historical_selection": "valid_at_report_cutoff",
+        "effective_from_ref": f"{_MIXED}.valid_from",
+        "effective_to_ref": f"{_MIXED}.valid_to",
+        "current_flag_ref": f"{_MIXED}.is_current"})
+    assert declared.status_code == 200, declared.text
+
+    withheld = seeded.get(_MIXED_TEMPORAL, headers=AUTH)
+    assert withheld.status_code == 404, withheld.text
+    # The SAME words the serving GET uses for a policy it may not show, and the same words a
+    # caller gets for a policy that was never declared: hidden and missing read alike.
+    assert withheld.json() == {"detail": "policy not found"}
+    assert "valid_from" not in withheld.text and "valid_to" not in withheld.text
+
+    granted = seeded.get(_MIXED_TEMPORAL, headers=PII_ADMIN)
+    assert granted.status_code == 200, granted.text
+    assert granted.json()["policy"]["effective_from_ref"] == f"{_MIXED}.valid_from"
+
+
+def test_a_temporal_policy_naming_only_visible_columns_is_shown_to_everyone(seeded, flag_on):
+    """The control. Withholding is driven by what the policy NAMES, not by the table carrying a
+    sensitive column somewhere: a policy over public columns of a mixed table stays readable."""
+    assert upload_csv(seeded, "mixed", MIXED_CSV).status_code == 200
+    assert seeded.put(_MIXED_TEMPORAL, headers=PII_ADMIN, json={
+        "expected_pointer_version": 0,
+        "temporal_storage_model": "scd2",
+        "current_selection": "current_record",
+        "historical_selection": "explicit_only",
+        "current_flag_ref": f"{_MIXED}.is_current"}).status_code == 200
+
+    for headers in (AUTH, PII_ADMIN):
+        got = seeded.get(_MIXED_TEMPORAL, headers=headers)
+        assert got.status_code == 200, got.text
+        assert got.json()["policy"]["current_flag_ref"] == f"{_MIXED}.is_current"
 
 
 def test_a_column_ref_is_not_a_dataset(seeded, flag_on):

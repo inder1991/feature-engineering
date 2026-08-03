@@ -35,6 +35,14 @@ CLAIMS first-write and is refused if a policy appeared meanwhile.
 caller can see EVERY dataset it names — a partial policy would hide an eligible candidate and read
 as a narrower declaration than the one that governs, and revealing a hidden ref would be an
 existence oracle. Same words for hidden and missing, always.
+
+The TEMPORAL GET follows the identical whole-policy rule over the COLUMN refs its policy names. It
+has to be decided here rather than upstream: the table anchor is visible under the D11 DERIVED scope
+(a table is visible when >= 1 of its columns is), so a caller who may see one public column of a
+mixed-visibility table reaches the route legitimately — and the policy body, which is nothing but a
+list of column refs, would hand them the NAMES of the restricted columns. Withholding the offending
+field alone would still answer "a column exists here that you may not see", one field at a time. So
+the whole policy is withheld, in the same words as one that was never declared.
 """
 from __future__ import annotations
 
@@ -65,6 +73,7 @@ from featuregen.overlay.upload.source_selection import (
     PolicyStoreConflict,
     SelectionError,
     ServingPurpose,
+    assert_column_refs_readable,
     assert_dataset_refs_readable,
     human_declaration_provenance,
     source_temporal_selection_enabled,
@@ -208,7 +217,7 @@ def _resolve_dataset(conn, source: str, object_ref: str, roles) -> tuple[str, st
     return src, logical_ref_of(conn, src, object_ref.lower())
 
 
-def _temporal_payload(conn, *, source: str, dataset_logical_ref: str) -> dict:
+def _temporal_payload(conn, *, source: str, dataset_logical_ref: str, roles) -> dict:
     current = current_temporal_policy(conn, dataset_logical_ref)
     load_bearing, displayed = load_bearing_temporal_model(
         conn, source=source, dataset_logical_ref=dataset_logical_ref)
@@ -222,6 +231,17 @@ def _temporal_payload(conn, *, source: str, dataset_logical_ref: str) -> dict:
     if current is None:
         return {**base, "pointer_version": 0, "policy": None}
     revision, pointer = current
+    try:
+        assert_column_refs_readable(conn, revision.column_refs(), roles=roles)
+    except SelectionError as exc:
+        # THE WHOLE POLICY, not the offending field. A temporal policy IS a list of column refs, so
+        # redacting one and serving the rest would still confirm "there is a column here you may not
+        # see" — the existence oracle the sensitivity tag exists to prevent, and one a caller can
+        # probe field by field. The table anchor is visible under the D11 DERIVED scope (>= 1
+        # visible column), which is exactly why the anchor check upstream cannot decide this: the
+        # anchor says "you may look at this table", the refs say "these particular columns". Same
+        # rule and the same words as the serving GET (module docstring).
+        raise HTTPException(status_code=404, detail="policy not found") from exc
     return {
         **base,
         "pointer_version": pointer.pointer_version,
@@ -251,7 +271,8 @@ def get_temporal_policy(source: str, object_ref: str, conn: _RRConn,
     """The CURRENT temporal policy for one dataset + its CAS pointer version, alongside the
     profile's load-bearing/displayed temporal model."""
     src, logical_ref = _resolve_dataset(conn, source, object_ref, identity.role_claims)
-    return _temporal_payload(conn, source=src, dataset_logical_ref=logical_ref)
+    return _temporal_payload(conn, source=src, dataset_logical_ref=logical_ref,
+                             roles=identity.role_claims)
 
 
 class TemporalPolicyPutRequest(BaseModel):
