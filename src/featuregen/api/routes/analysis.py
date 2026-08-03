@@ -76,7 +76,9 @@ class RetrievalRefused(Exception):
     exception that leaves the handler, so raising the 422 discarded the learning gap recorded a line
     earlier — the store's only production producer, reverted by the very refusal that produced it.
     Both routes convert this to the same `JSONResponse` FastAPI's own handler would have built, so
-    the wire format is unchanged and the transaction commits."""
+    the wire format is unchanged and the transaction commits. Same idiom, same reason, as
+    `routes/assets.py`'s field-correction denial, which returns rather than raises so its
+    `COMMAND_DENIED` audit row commits."""
 
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
