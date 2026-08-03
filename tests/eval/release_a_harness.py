@@ -480,6 +480,39 @@ def _offered_refs(result) -> list[str]:
 # ── measurement 5: unsafe-feature acceptance ─────────────────────────────────────────────────────
 
 
+def run_feature_generation(conn, *, now) -> dict:
+    """Put every gold feature in front of the REAL generator and record its dispositions.
+
+    The provider here is a plain scripted `FakeLLM`: the question is not what a model proposes but
+    what the platform ACCEPTS once a proposal exists, so a scripted proposal is exactly right.
+    """
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.upload.feature_assist import recommend_features_report
+
+    def _flat(ref: str) -> str:
+        return "public." + ref.split(".", 1)[1]
+
+    proposals = [{"name": c["name"],
+                  "derives_from": [_flat(r) for r in c["derives_from"]],
+                  "aggregation": "latest"}
+                 for c in sg.unsafe_feature_cases()]
+    client = FakeLLM(script={
+        "overlay.feature.recommend": FakeResponse(output={"features": proposals})})
+    report = recommend_features_report(
+        conn, "predict which transactions will be reported", client,
+        catalog_source=sg.load()["catalog_source"],
+        target_ref=_flat("ftr.comp_fin_tran.sar_filed_flag"),
+        roles=("platform_admin", "pii_reader", "restricted_reader"),
+        now=now, budget=3, critic=False)
+    return {
+        "accepted": sorted(i.name for i in report.ideas),
+        "dispositions": {i.name: {"validation_status": i.validation_status,
+                                  "requirements": len(i.requirements)}
+                         for i in report.ideas},
+        "rejections": list(report.rejections),
+    }
+
+
 def unsafe_feature_acceptance(accepted_names: set[str]) -> dict:
     """Grade a set of ACCEPTED feature names against the gold safety labels.
 

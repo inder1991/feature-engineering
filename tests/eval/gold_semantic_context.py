@@ -61,6 +61,7 @@ class SemanticGoldCase:
     discriminator_keys: tuple[str, ...]
     forbidden_concepts: frozenset[str]
     witness: bool
+    sensitivity: str
 
     @property
     def logical_ref(self) -> str:
@@ -86,6 +87,7 @@ def _case(raw: dict, *, family: str, source: str, table: str) -> SemanticGoldCas
         discriminator_keys=tuple(disc.get("keys", ())),
         forbidden_concepts=frozenset(raw.get("forbidden_concepts", ())),
         witness=bool(raw.get("witness", False)),
+        sensitivity=raw.get("sensitivity", ""),
     )
 
 
@@ -144,6 +146,7 @@ def catalog_row_of(case: SemanticGoldCase) -> CanonicalRow:
     return CanonicalRow(
         case.catalog_source, case.table, case.column, physical_type(case.glossary),
         definition=(case.glossary or {}).get("definition", ""),
+        sensitivity=case.sensitivity,
     )
 
 

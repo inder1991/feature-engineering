@@ -478,6 +478,7 @@
             "synonyms": ["DOB"],
             "related_terms": ["Natural Person"]
           },
+          "sensitivity": "pii",
           "expected_concept": "pii",
           "acceptable_concepts": ["pii", "protected_attribute", "special_category"],
           "confusable_concept": "record_date",
@@ -505,6 +506,7 @@
             "synonyms": ["Citizenship"],
             "related_terms": ["Nationality"]
           },
+          "sensitivity": "restricted",
           "expected_concept": "protected_attribute",
           "acceptable_concepts": ["protected_attribute", "special_category", "residency_status"],
           "confusable_concept": "country_code",

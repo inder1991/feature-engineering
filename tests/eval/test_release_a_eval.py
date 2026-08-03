@@ -77,6 +77,9 @@ def report(hermetic, db, monkeypatch) -> dict:
         profiles_on=True, visible=h.visible_table_fields(db, source=source))
     monkeypatch.delenv("FEATUREGEN_DATASET_PROFILES", raising=False)
 
+    # ── 7: what the REAL generator accepts when every gold feature is proposed to it ─────────────
+    featuregen = h.run_feature_generation(db, now=now)
+
     out = {
         "generated_at": now.isoformat(),
         "mode": "replay",
@@ -102,7 +105,8 @@ def report(hermetic, db, monkeypatch) -> dict:
         "grounded_retrieval": {"thin": retrieval_thin, "rich": retrieval_rich},
         "passb_replay": passb,
         "table_selection": {"thin": selection_thin, "rich": selection_rich},
-        "unsafe_features": h.unsafe_feature_acceptance(set()),
+        "feature_generation": featuregen,
+        "unsafe_features": h.unsafe_feature_acceptance(set(featuregen["accepted"])),
     }
 
     REPORT_DIR.mkdir(exist_ok=True)
