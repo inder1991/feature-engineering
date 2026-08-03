@@ -17,12 +17,15 @@ import itertools
 
 import pytest
 
+import featuregen.materialize.request_store as request_store
 from featuregen.materialize.request_store import (
-    # The column list the reads are positional against.
+    # The column list the reads are positional against, and the identity/non-identity split.
     _COLUMNS,
     # The EXACT statement the reconciler issues — EXPLAINed below rather than re-typed, because a
     # look-alike query would prove nothing about the one that actually runs.
     _EXPIRED_REQUESTS_SQL,
+    _NON_IDENTITY_FIELDS,
+    IDEMPOTENT_IDENTITY_FIELDS,
     LEGAL_LIFECYCLE_TRANSITIONS,
     MaterializationRequestV1,
     RequestLifecycle,
@@ -102,6 +105,16 @@ def test_the_record_mirrors_the_selected_columns_field_for_field(conn) -> None:
     fourteen columns are text."""
     assert [field.name for field in dataclasses.fields(MaterializationRequestV1)] == \
         [column.strip() for column in _COLUMNS.split(",")]
+
+
+def test_the_idempotency_identity_split_partitions_the_record_exactly(conn) -> None:
+    """Which fields make a retry "the same request" is a decision per field, so the two sets must
+    PARTITION the record: add a column and this fails until somebody classifies it. Compared as sets
+    rather than as a subset, because a subset assertion is what would let a new identity-bearing
+    column be silently omitted from the comparison and quietly widen what one key can name."""
+    fields = {field.name for field in dataclasses.fields(MaterializationRequestV1)}
+    assert set(IDEMPOTENT_IDENTITY_FIELDS) | _NON_IDENTITY_FIELDS == fields
+    assert not set(IDEMPOTENT_IDENTITY_FIELDS) & _NON_IDENTITY_FIELDS
 
 
 def test_a_request_exists_before_any_generation_run_or_event(conn) -> None:
@@ -225,25 +238,66 @@ def test_the_legal_transition_set_is_exactly_what_the_plan_ships(conn) -> None:
 def test_every_transition_is_allowed_or_refused_exactly_as_the_table_says(
         conn, source: RequestLifecycle, target: RequestLifecycle) -> None:
     """All 25 pairs, including the self-transitions: re-advancing to the state a request is already
-    in is a caller who lost track of the run, and letting it through would hide that."""
+    in is a caller who lost track of the run, and letting it through would hide that.
+
+    ``accepted`` is the one target this function refuses from EVERY source, including the source the
+    lifecycle table calls legal — it carries no lease to grant, and the next test says what that
+    would cost.
+    """
     suffix = f"{source.value}-{target.value}"
     request = _in_state(conn, source, suffix=suffix)
-    legal = target in LEGAL_LIFECYCLE_TRANSITIONS[source]
     run_id = f"{RUN}-{suffix}" if target is RequestLifecycle.RUNNING else None
+    legal = (target in LEGAL_LIFECYCLE_TRANSITIONS[source]
+             and target is not RequestLifecycle.ACCEPTED)
+    expected = ("Use accept_request" if target is RequestLifecycle.ACCEPTED else source.value)
     if legal:
         moved = advance_lifecycle(conn, request_id=request.request_id, to_state=target,
                                   run_id=run_id)
         assert moved.lifecycle_state is target
         assert read_request(conn, request_id=request.request_id) == moved
     else:
-        with pytest.raises(ValueError, match=source.value):
+        with pytest.raises(ValueError, match=expected):
             advance_lifecycle(conn, request_id=request.request_id, to_state=target, run_id=run_id)
         assert read_request(conn, request_id=request.request_id).lifecycle_state is source
 
 
+def test_advance_lifecycle_will_not_open_a_SECOND_lease_less_door_into_accepted(conn) -> None:
+    """``requested → accepted`` is a legal lifecycle edge, and ``advance_lifecycle`` still refuses to
+    walk it: it takes no ``lease_seconds``, so all it could produce is an ``accepted`` row with no
+    ``accepted_at`` and no lease — non-terminal, and invisible to ``expired_requests``, which
+    requires ``lease_expires_at IS NOT NULL``. That row is a run nobody works and nobody ever looks
+    at again, i.e. exactly the loss this table exists to prevent; it would also undercut the
+    ``accepted → failed`` edge, whose whole justification is that an accepted row carries a lease.
+    """
+    request = _record(conn, "door")
+    with pytest.raises(ValueError, match="Use accept_request"):
+        advance_lifecycle(conn, request_id=request.request_id,
+                          to_state=RequestLifecycle.ACCEPTED)
+    assert read_request(conn, request_id=request.request_id).lifecycle_state \
+        is RequestLifecycle.REQUESTED
+    # And the door that IS legal leaves the row visible to the reconciler.
+    accepted = accept_request(conn, request_id=request.request_id, lease_seconds=1)
+    assert accepted.accepted_at is not None and accepted.lease_expires_at is not None
+    assert [found.request_id for found in expired_requests(conn, now=_later(3_600))] \
+        == [request.request_id]
+
+
+@pytest.mark.parametrize(
+    ("missing", "refusal"),
+    [("lease_expires_at", "claimed-and-leased"), ("accepted_at", "lease with no acceptance")])
+def test_an_accepted_record_without_a_lease_cannot_be_constructed(
+        conn, missing: str, refusal: str) -> None:
+    """The same invariant one layer up, so a row assembled in Python (a hand-written read, a future
+    writer) cannot express what the database refuses to store."""
+    stored = accept_request(conn, request_id=_record(conn, "inv").request_id, lease_seconds=300)
+    with pytest.raises(ValueError, match=refusal):
+        dataclasses.replace(stored, **{missing: None})
+
+
 def test_advancing_an_unknown_request_is_refused(conn) -> None:
     with pytest.raises(ValueError, match="no materialization request"):
-        advance_lifecycle(conn, request_id="never-asked", to_state=RequestLifecycle.ACCEPTED)
+        advance_lifecycle(conn, request_id="never-asked", to_state=RequestLifecycle.RUNNING,
+                          run_id=RUN)
 
 
 def test_running_requires_the_run_it_claims_to_be(conn) -> None:
@@ -252,6 +306,40 @@ def test_running_requires_the_run_it_claims_to_be(conn) -> None:
     request = _in_state(conn, RequestLifecycle.ACCEPTED, suffix="norun")
     with pytest.raises(ValueError, match="run_id"):
         advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.RUNNING)
+
+
+def test_the_conditional_UPDATE_is_the_arbiter_not_the_python_precheck(conn, monkeypatch) -> None:
+    """``advance_lifecycle`` reads the row, checks the edge in Python, and then UPDATEs ``WHERE
+    lifecycle_state = ANY(<legal sources>)``. That WHERE is the only thing standing between two
+    workers and a double transition — and because the Python check refuses every illegal move
+    first, deleting the WHERE leaves the rest of this file green. So the read is stubbed to report
+    a STALE state (what a racing worker's read really returns) while the row holds another: the
+    pre-check passes, and only the WHERE can refuse.
+
+    Single-session and deterministic — no second connection, no sleep, no thread. The stub is stale
+    for exactly one call, which is what a real race looks like: the pre-check reads the old state,
+    and the error path's re-read sees the truth.
+    """
+    request = _in_state(conn, RequestLifecycle.ACCEPTED, suffix="race")
+    stale = read_request(conn, request_id=request.request_id)
+    # The other worker gets there first.
+    advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.RUNNING,
+                      run_id=f"{RUN}-race")
+
+    real_current = request_store._current
+    reads = itertools.count()
+
+    def _stale_once(conn_, request_id):
+        return stale if next(reads) == 0 else real_current(conn_, request_id)
+
+    monkeypatch.setattr(request_store, "_current", _stale_once)
+    with pytest.raises(ValueError, match="moved to 'running'"):
+        advance_lifecycle(conn, request_id=request.request_id,
+                          to_state=RequestLifecycle.RUNNING, run_id=f"{RUN}-race")
+    monkeypatch.undo()
+    # Refused means "never applied twice", not "applied and then complained".
+    assert read_request(conn, request_id=request.request_id).lifecycle_state \
+        is RequestLifecycle.RUNNING
 
 
 def test_the_generation_and_run_links_are_stamped_once(conn) -> None:
@@ -305,14 +393,30 @@ def test_expired_requests_returns_only_expired_non_terminal_rows(conn) -> None:
     assert [request.request_id for request in expired] == [stale.request_id]
 
 
-def test_expired_requests_is_deterministically_ordered(conn) -> None:
-    """Two workers reconciling the same backlog must see the same order, so the ordering is by
-    lease expiry with the request id as the tie-break — never the table's physical order."""
-    for suffix, lease in (("z", 1), ("m", 1), ("a", 2)):
+def test_expired_requests_is_ordered_by_lease_expiry_not_by_insertion(conn) -> None:
+    """Two workers reconciling the same backlog must see the same order, so the ordering is the
+    lease expiry — never the table's physical order. Inserted newest-lease-first so insertion order
+    and expiry order disagree: an ORDER BY dropped from the query fails here."""
+    for suffix, lease in (("z", 300), ("m", 100), ("a", 200)):
         _record(conn, suffix)
         accept_request(conn, request_id=f"req-{suffix}", lease_seconds=lease)
     expired = expired_requests(conn, now=_later(3_600))
-    assert [request.request_id for request in expired] == ["req-m", "req-z", "req-a"]
+    assert [request.request_id for request in expired] == ["req-m", "req-a", "req-z"]
+
+
+def test_expired_requests_breaks_a_lease_TIE_by_request_id(conn) -> None:
+    """The tie-break, which the store cannot produce on its own: leases are stamped from
+    ``statement_timestamp()``, so two acceptances in one transaction are microseconds apart and
+    never tie. Two rows are therefore given one identical expiry directly — test setup, not store
+    behaviour — because a tie is exactly what two workers accepted in the same instant would look
+    like, and without the tie-break their backlogs would be ordered differently."""
+    for suffix in ("z", "a"):
+        _record(conn, suffix)
+        accept_request(conn, request_id=f"req-{suffix}", lease_seconds=60)
+    conn.execute("UPDATE materialization_request "
+                 "SET lease_expires_at = timestamptz '2026-08-03T10:00:00+00:00'")
+    expired = expired_requests(conn, now=_later(3_600))
+    assert [request.request_id for request in expired] == ["req-a", "req-z"]
 
 
 def test_the_reconcilers_query_can_use_the_partial_index_under_a_GENERIC_plan(conn) -> None:

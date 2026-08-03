@@ -256,9 +256,33 @@ def test_the_lifecycle_CHECK_matches_the_python_enum_EXACTLY(conn) -> None:
 
 @pytest.mark.parametrize("state", [state.value for state in RequestLifecycle])
 def test_every_lifecycle_state_is_accepted(conn, state: str) -> None:
+    """The must-survive control for the vocabulary: every member stores. ``accepted`` is seeded WITH
+    its lease because the state means claimed-and-leased (see below); the rest keep whatever the
+    lifecycle left them."""
     _generation(conn)
     _request(conn, lifecycle_state=state, run_id=RUN, generation_id=GEN,
-             accepted_at=NOW if state != "requested" else None)
+             accepted_at=None if state == "requested" else NOW,
+             lease_expires_at=NOW if state == "accepted" else None)
+
+
+def test_an_accepted_row_MUST_carry_its_acceptance_and_its_lease(conn) -> None:
+    """The converse of the lease-follows-acceptance rule, and the one that matters more: an
+    ``accepted`` row with no lease is non-terminal AND invisible to the reconciler's query (which
+    requires ``lease_expires_at IS NOT NULL``) — a run nobody works and nobody looks at again. The
+    store routes acceptance through the one call that carries a lease duration; this CHECK is what
+    stops any other writer opening a second, lease-less door into the state.
+
+    The properly-leased row goes in FIRST for two reasons: it is the must-survive control (a CHECK
+    that refused a real acceptance would make the refusals below meaningless), and it opens the
+    test's transaction, so the ``conn.transaction()`` blocks are SAVEPOINTs. Outermost, they commit
+    on clean exit — which is invisible while the CHECK works, and leaks a row into the session's
+    database for every later test the moment it stops working."""
+    _request(conn, request_id="req-1053-leased", idempotency_key="idem-1053-leased",
+             lifecycle_state="accepted", accepted_at=NOW, lease_expires_at=NOW)
+    for missing in ({"accepted_at": NOW, "lease_expires_at": None},
+                    {"accepted_at": None, "lease_expires_at": None}):
+        with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+            _request(conn, lifecycle_state="accepted", **missing)
 
 
 # ── 3. identity, uniqueness and the two references ───────────────────────────────────────────────
@@ -344,8 +368,17 @@ def test_the_reconcilers_query_has_a_partial_index(conn) -> None:
         "SELECT indexdef FROM pg_indexes WHERE indexname = "
         "'materialization_request_expired_lease_idx'").fetchone()
     assert definition is not None, "the reconciler's partial index is missing"
-    assert "lease_expires_at" in definition[0]
-    assert "WHERE" in definition[0].upper(), "a non-partial index would scan terminal requests too"
+    indexed, _, predicate = definition[0].partition(" WHERE ")
+    assert "(lease_expires_at, request_id)" in indexed, \
+        "the index must lead with lease_expires_at and carry the tie-break, as the query orders"
+    # The predicate itself, not merely "a WHERE exists": an index excluding the WRONG states would
+    # hide live requests from the reconciler, which is worse than the full scan a missing predicate
+    # costs. Read against the enum, so promoting a state to terminal in one place and not the other
+    # fails here.
+    assert predicate, "a non-partial index would scan terminal requests too"
+    for state in RequestLifecycle:
+        assert (f"'{state.value}'" in predicate) is state.is_terminal(), \
+            f"{state.value!r} is on the wrong side of the reconciler index predicate: {predicate}"
 
 
 def test_the_request_table_is_NOT_append_only_and_that_is_the_point(conn) -> None:
@@ -355,7 +388,8 @@ def test_the_request_table_is_NOT_append_only_and_that_is_the_point(conn) -> Non
     avoid."""
     _request(conn)
     conn.execute("UPDATE materialization_request SET lifecycle_state = 'accepted', "
-                 "accepted_at = now() WHERE request_id = 'req-1053'")
+                 "accepted_at = now(), lease_expires_at = now() + interval '5 minutes' "
+                 "WHERE request_id = 'req-1053'")
     assert conn.execute("SELECT lifecycle_state FROM materialization_request "
                         "WHERE request_id = 'req-1053'").fetchone()[0] == "accepted"
     conn.execute("DELETE FROM materialization_request WHERE request_id = 'req-1053'")
@@ -369,7 +403,8 @@ def test_updated_at_is_stamped_by_the_DATABASE_on_every_update(conn) -> None:
     conn.execute("UPDATE materialization_request SET updated_at = '2020-01-01T00:00:00+00:00' "
                  "WHERE request_id = 'req-1053'")
     conn.execute("UPDATE materialization_request SET lifecycle_state = 'accepted', "
-                 "accepted_at = now() WHERE request_id = 'req-1053'")
+                 "accepted_at = now(), lease_expires_at = now() + interval '5 minutes' "
+                 "WHERE request_id = 'req-1053'")
     stale, updated = conn.execute(
         "SELECT updated_at = '2020-01-01T00:00:00+00:00', updated_at >= requested_at "
         "FROM materialization_request WHERE request_id = 'req-1053'").fetchone()
@@ -388,9 +423,12 @@ def test_1053_applies_cleanly_over_a_POPULATED_control_plane(conn) -> None:
 
     The request row inserted first is what makes the DROP load-bearing: if the table survived (a
     renamed table, a drop that quietly matched nothing), the empty-table assertion below would see
-    it and this test would stop measuring a pre-migration database."""
+    it and this test would stop measuring a pre-migration database. The touch FUNCTION is dropped
+    too — dropping a table takes its triggers but leaves the function behind, and a "pre-migration"
+    database that still held half of 1053 would let a broken function definition pass unnoticed."""
     _request(conn)
     conn.execute("DROP TABLE IF EXISTS materialization_request CASCADE")
+    conn.execute("DROP FUNCTION IF EXISTS materialization_request_touch_updated_at() CASCADE")
     conn.execute(_migration_sql(PLANE_MIGRATION))
     conn.execute(_migration_sql(ORDERING_MIGRATION))
     _seed_legacy_plane(conn)

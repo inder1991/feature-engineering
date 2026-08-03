@@ -75,7 +75,16 @@ CREATE TABLE IF NOT EXISTS materialization_request (
     lease_expires_at      timestamptz NULL,
     updated_at            timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT materialization_request_lease_follows_acceptance
-        CHECK (lease_expires_at IS NULL OR accepted_at IS NOT NULL)
+        CHECK (lease_expires_at IS NULL OR accepted_at IS NOT NULL),
+    -- ...and the converse, which matters more. 'accepted' MEANS claimed-and-leased. A row that
+    -- reached 'accepted' with no lease would be non-terminal AND invisible to the reconciler (whose
+    -- query requires `lease_expires_at IS NOT NULL`) — a run nobody is working and nobody will ever
+    -- look at again, which is the exact loss this table exists to prevent. The store routes every
+    -- acceptance through `accept_request` (the only call that carries a lease duration); this CHECK
+    -- is what stops any OTHER writer from opening a second, lease-less door into the state.
+    CONSTRAINT materialization_request_acceptance_is_leased
+        CHECK (lifecycle_state <> 'accepted'
+               OR (accepted_at IS NOT NULL AND lease_expires_at IS NOT NULL))
 );
 
 -- The reconciler's ONLY real query: an expired lease on a request that has not reached a terminal
@@ -94,13 +103,15 @@ CREATE INDEX IF NOT EXISTS materialization_request_group_idx
 
 -- `updated_at` answers "was anything done to this row, and when?", so it must not depend on each
 -- writer remembering to set it — a store method that forgot would make the lease a lie without
--- failing anything. Stamped by the database instead. now() is the transaction's instant, matching
--- the DEFAULT above and the lease arithmetic (`now() + make_interval(...)`) the store issues, so a
--- request's timestamps are all read from the same clock.
+-- failing anything. Stamped by the database instead, from statement_timestamp(): the question is
+-- when THIS write happened, and now() would answer with the transaction's start, so two writes
+-- minutes apart inside one transaction would claim the same instant. The store's lease arithmetic
+-- reads the same clock. now() stays as the `requested_at`/`updated_at` DEFAULT, where the
+-- transaction's own instant is exactly what "when this row was created" means.
 CREATE OR REPLACE FUNCTION materialization_request_touch_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    NEW.updated_at := now();
+    NEW.updated_at := statement_timestamp();
     RETURN NEW;
 END $$;
 

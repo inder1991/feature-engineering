@@ -242,6 +242,35 @@ class MaterializationRequestV1:
                 "materialization request holds a lease with no acceptance: the lease is granted BY "
                 "acceptance, and one without it would let the reconciler adopt a request nobody "
                 "claimed")
+        if self.lifecycle_state is RequestLifecycle.ACCEPTED and (
+                self.accepted_at is None or self.lease_expires_at is None):
+            raise ValueError(
+                "materialization request is 'accepted' without an acceptance instant and a lease: "
+                "'accepted' MEANS claimed-and-leased, and a lease-less accepted row is invisible to "
+                "expired_requests while still non-terminal — the exact loss this table exists to "
+                "prevent. Migration 1053 carries the same rule as a CHECK")
+
+
+#: The fields that make a request THE request its idempotency key names. A retry that matches on all
+#: of them is the same request and gets the stored row back; one that differs is a key reused for
+#: different work, and answering it with the stored row would report the wrong request as queued.
+IDEMPOTENT_IDENTITY_FIELDS: tuple[str, ...] = (
+    "logical_group_name", "requested_by", "resolved_input_digest")
+
+#: The complement, with the reason each field is NOT compared. Named rather than left implicit so
+#: that a column added to the record forces a decision: the test suite asserts these two sets
+#: partition the record's fields exactly, so a new identity-bearing column cannot be silently
+#: omitted from the comparison above.
+_NON_IDENTITY_FIELDS: frozenset[str] = frozenset({
+    # The retry's own identifiers and mutable coordination state — never what makes it the same
+    # request. `request_id` in particular is re-minted by a client that lost its first response,
+    # which is the ordinary retry this table is built to absorb.
+    "request_id", "idempotency_key", "lifecycle_state", "generation_id", "run_id",
+    "requested_at", "accepted_at", "lease_expires_at", "updated_at",
+    # Observed at the moment of asking, not part of what was asked: a flag flipped between the
+    # first call and its retry must not turn one request into two runs.
+    "authorized_roles", "activation_state",
+})
 
 
 def _row(row: Sequence[Any] | None) -> MaterializationRequestV1 | None:
@@ -321,9 +350,18 @@ def record_request(
     existing = _row(conn.execute(
         f"SELECT {_COLUMNS} FROM materialization_request WHERE idempotency_key = %s",
         (candidate.idempotency_key,)).fetchone())
-    assert existing is not None, "ON CONFLICT fired but the conflicting row is unreadable"
+    if existing is None:
+        # Not an impossibility, and not an `assert` (which `python -O` strips, turning this into an
+        # AttributeError on the next line): under an isolation level stricter than READ COMMITTED
+        # the INSERT can see a concurrent inserter's conflict while this transaction's snapshot
+        # cannot yet see the row. Nothing is wrong with the CALL, so this is not the module's
+        # ValueError — it is a transient state the caller retries out of.
+        raise RuntimeError(
+            f"idempotency key {candidate.idempotency_key!r} conflicted with a row this "
+            f"transaction's snapshot cannot see: another writer holds it uncommitted, so the "
+            f"request is neither recorded nor readable here — retry in a fresh transaction")
     mismatched = [
-        name for name in ("logical_group_name", "requested_by", "resolved_input_digest")
+        name for name in IDEMPOTENT_IDENTITY_FIELDS
         if getattr(existing, name) != getattr(candidate, name)]
     if mismatched:
         raise ValueError(
@@ -344,8 +382,15 @@ def accept_request(conn: DbConn, *, request_id: str,
     """
     seconds = _lease_seconds(lease_seconds)
     accepted = _row(conn.execute(
-        "UPDATE materialization_request SET lifecycle_state = %s, accepted_at = now(), "
-        "lease_expires_at = now() + make_interval(secs => %s) "
+        # statement_timestamp(), not now(): now() is the TRANSACTION's start, so a worker that has
+        # already spent minutes inside its transaction would be granted a lease that is already part
+        # spent — and could be adopted by the reconciler while alive. statement_timestamp() is the
+        # current statement's clock, and it is STABLE within the statement (clock_timestamp() is
+        # not: two calls in one statement return different instants, which would make the granted
+        # lease differ from the duration asked for by whatever the two readings drifted).
+        "UPDATE materialization_request SET lifecycle_state = %s, "
+        "accepted_at = statement_timestamp(), "
+        "lease_expires_at = statement_timestamp() + make_interval(secs => %s) "
         f"WHERE request_id = %s AND lifecycle_state = %s RETURNING {_COLUMNS}",
         (RequestLifecycle.ACCEPTED.value, seconds, request_id,
          RequestLifecycle.REQUESTED.value)).fetchone())
@@ -365,10 +410,15 @@ def renew_lease(conn: DbConn, *, request_id: str,
     Nothing is being worked in ``requested`` (nobody has claimed it) or in a terminal state (the
     work is over), and renewing there would keep a dead request out of the reconciler's reach for
     as long as the renewals kept coming.
+
+    The new expiry runs from ``statement_timestamp()`` — this renewal's own clock. Measured from
+    ``now()`` it would run from the transaction's start, so the renewal a long-running worker issues
+    precisely because it is still alive would be the one that buys it the least time.
     """
     seconds = _lease_seconds(lease_seconds)
     renewed = _row(conn.execute(
-        "UPDATE materialization_request SET lease_expires_at = now() + make_interval(secs => %s) "
+        "UPDATE materialization_request "
+        "SET lease_expires_at = statement_timestamp() + make_interval(secs => %s) "
         f"WHERE request_id = %s AND lifecycle_state = ANY(%s) RETURNING {_COLUMNS}",
         (seconds, request_id,
          sorted(state.value for state in _LEASED_STATES))).fetchone())
@@ -391,6 +441,13 @@ def advance_lifecycle(
 ) -> MaterializationRequestV1:
     """Move the request along a LEGAL edge of :data:`LEGAL_LIFECYCLE_TRANSITIONS`, and link it.
 
+    ``accepted`` is NOT a target this function will move to, even though ``requested → accepted`` is
+    a legal edge: acceptance *is* the granting of a lease, and this function takes no
+    ``lease_seconds``, so it could only produce an ``accepted`` row with no ``accepted_at`` and no
+    lease — non-terminal, and invisible to :func:`expired_requests`, which is precisely the losable
+    run this table exists to prevent. :func:`accept_request` is the only door into ``accepted``, and
+    migration ``1053`` carries the same rule as a CHECK so no other writer can open a second one.
+
     ``generation_id`` and ``run_id`` are stamped once and never overwritten: which compilation a
     request became, and which run carried it, are answers to questions that have one — and the plane
     those ids point into cannot be rewritten to match a second answer. Supplying a value that
@@ -404,6 +461,11 @@ def advance_lifecycle(
     target = RequestLifecycle(to_state)
     generation = _optional_text(generation_id, field="generation_id")
     run = _optional_text(run_id, field="run_id")
+    if target is RequestLifecycle.ACCEPTED:
+        raise ValueError(
+            f"materialization request {request_id!r} cannot be advanced to 'accepted': acceptance "
+            f"grants the lease, and this call carries no lease to grant — an accepted row without "
+            f"one is non-terminal and invisible to the reconciler. Use accept_request()")
     existing = _must_exist(conn, request_id)
 
     if target not in LEGAL_LIFECYCLE_TRANSITIONS[existing.lifecycle_state]:
