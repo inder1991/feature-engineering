@@ -64,6 +64,13 @@ ODS = normalize_ref(_SRC, _SCHEMA, "customer_ods")
 KYC = normalize_ref(_SRC, _SCHEMA, "kyc_customers")
 TRAN = normalize_ref(_SRC, _SCHEMA, "tran_repos")
 TRAN_ARCHIVE = normalize_ref(_SRC, _SCHEMA, "tran_archive")
+#: An SCD2-shaped table with the columns a temporal policy has to name. It exists for the
+#: population-SHAPE tests below: a dataset can be perfectly authoritative and still be several rows
+#: per customer, which is the one thing a population may not be.
+SEG = normalize_ref(_SRC, _SCHEMA, "customer_segment")
+SEG_FROM = normalize_ref(_SRC, _SCHEMA, "customer_segment", "effective_from")
+SEG_TO = normalize_ref(_SRC, _SCHEMA, "customer_segment", "effective_to")
+SEG_FLAG = normalize_ref(_SRC, _SCHEMA, "customer_segment", "is_current")
 
 
 @pytest.fixture
@@ -72,6 +79,11 @@ def catalog(db):
     build_graph(db, _SRC, [
         CanonicalRow(_SRC, table, "cif_id", "text", is_grain=True, entity="Customer")
         for table in _TABLES
+    ] + [
+        CanonicalRow(_SRC, "customer_segment", "cif_id", "text", is_grain=True, entity="Customer"),
+        CanonicalRow(_SRC, "customer_segment", "effective_from", "timestamp"),
+        CanonicalRow(_SRC, "customer_segment", "effective_to", "timestamp"),
+        CanonicalRow(_SRC, "customer_segment", "is_current", "boolean"),
     ])
     # `build_graph` leaves `schema_name` NULL without a schema-bearing glossary, and the schema is
     # the one component of the physical address the catalog exists to supply.
@@ -202,6 +214,103 @@ def test_a_policy_with_no_preference_and_one_eligible_dataset_still_decides(cata
     outcome = select_dataset_source(catalog, need=_need(need_role=DatasetNeedRole.POPULATION))
     assert outcome.resolved
     assert outcome.selection.selected_dataset_ref == CUST
+
+
+# ── POPULATION: one row per member, or it is not a population ───────────────────────────────────
+#
+# The spine is read RAW by `compile_analysis` — every row is a member — so a history-keeping table
+# used as the population does not fail, it MULTIPLIES every count. The fixture comments have named
+# that hazard since Release 3 with nothing enforcing it.
+
+
+def _confirm_temporal_model(db, table: str, value: str) -> None:
+    """Drive the EXISTING four-eyes flow to a LOAD-BEARING temporal_storage_model."""
+    for action, actor, idem in (("propose_override", ADMIN_A, f"tsm-p-{table}-{value}"),
+                                ("confirm_override", ADMIN_B, f"tsm-c-{table}-{value}")):
+        cas = read_field_cas(db, source=_SRC, object_ref=f"public.{table}",
+                             field="temporal_storage_model")
+        result = apply_field_correction(
+            db, source=_SRC, object_ref=f"public.{table}", field="temporal_storage_model",
+            action=action, actor=actor, idempotency_key=idem, replacement_value=value,
+            expected_latest_decision_id=cas["latest_decision_id"],
+            expected_evidence_set_hash=cas["evidence_set_hash"],
+            expected_policy_version=cas["policy_version"])
+        assert result["accepted"] is True, result
+
+
+@pytest.mark.parametrize("model", ["scd2", "snapshot", "event_log"])
+def test_a_population_that_KEEPS_HISTORY_is_refused_however_it_was_chosen(catalog, model):
+    """A declared SCD2 population is still several rows per customer. The refusal is
+    SELECTION_POPULATION_UNDECLARED with a population-specific detail — see
+    `_population_history_refusal` for why that is the honest member of the closed eight."""
+    _confirm_temporal_model(catalog, "customer_master", model)
+    explicit = select_dataset_source(catalog, need=_need(
+        need_role=DatasetNeedRole.POPULATION, explicit_dataset_ref=CUST))
+    assert not explicit.resolved
+    assert explicit.refusal.code == SELECTION_POPULATION_UNDECLARED
+    assert explicit.refusal.subject_refs == (CUST,)
+    assert "row per" in explicit.refusal.detail
+
+    # The same table reached through a SERVING POLICY is the same refusal: the hazard is the
+    # dataset's shape, not the route that named it.
+    _publish(catalog, need_role=DatasetNeedRole.POPULATION,
+             eligible_dataset_refs=(CUST,), preferred_dataset_refs=(CUST,))
+    by_policy = select_dataset_source(catalog, need=_need(need_role=DatasetNeedRole.POPULATION))
+    assert not by_policy.resolved
+    assert by_policy.refusal.code == SELECTION_POPULATION_UNDECLARED
+
+
+def test_a_refused_population_leaves_NO_pinned_binding(catalog):
+    """The check runs before `_finish`, which persists the winner's binding: a dataset that is
+    about to be refused must not leave a `pbr_` revision behind naming it as a selected source."""
+    _confirm_temporal_model(catalog, "customer_master", "scd2")
+    before = catalog.execute(
+        "SELECT count(*) FROM physical_dataset_binding_revision").fetchone()[0]
+    select_dataset_source(catalog, need=_need(
+        need_role=DatasetNeedRole.POPULATION, explicit_dataset_ref=CUST))
+    assert catalog.execute(
+        "SELECT count(*) FROM physical_dataset_binding_revision").fetchone()[0] == before
+
+
+def test_a_CURRENT_ONLY_population_passes(catalog):
+    """The worked acceptance's shape: a master table that holds one row per customer, full stop."""
+    _confirm_temporal_model(catalog, "customer_master", "current_only")
+    outcome = select_dataset_source(catalog, need=_need(
+        need_role=DatasetNeedRole.POPULATION, explicit_dataset_ref=CUST))
+    assert outcome.resolved
+    assert outcome.selection.selected_dataset_ref == CUST
+
+
+def test_a_population_with_NO_declared_temporal_model_is_not_second_guessed(catalog):
+    """Nothing says this table keeps history, so nothing here claims it does. The doctrine is that
+    the population is DECLARED; refusing every population that has no temporal policy would refuse
+    the declaration itself."""
+    outcome = select_dataset_source(catalog, need=_need(
+        need_role=DatasetNeedRole.POPULATION, explicit_dataset_ref=CUST))
+    assert outcome.resolved
+
+
+def test_a_history_keeping_population_with_a_DECLARED_current_row_rule_passes(catalog):
+    """The dimension-with-a-current-flag shape. `current_record` is a declared one-row-per-entity
+    rule rather than an inference — and `analysis.assert_spine_is_unique` is what refuses it at
+    execution if the declaration does not hold of the data."""
+    from featuregen.overlay.upload.temporal_policy import (
+        DatasetTemporalPolicyRevisionV1,
+        TemporalSelectionKind,
+    )
+    from featuregen.overlay.upload.temporal_policy_store import publish_temporal_policy
+
+    _confirm_temporal_model(catalog, "customer_segment", "scd2")
+    publish_temporal_policy(catalog, DatasetTemporalPolicyRevisionV1(
+        dataset_logical_ref=SEG, temporal_storage_model="scd2",
+        current_selection=TemporalSelectionKind.CURRENT_RECORD,
+        historical_selection=TemporalSelectionKind.VALID_AT_REPORT_CUTOFF,
+        effective_from_ref=SEG_FROM, effective_to_ref=SEG_TO, current_flag_ref=SEG_FLAG,
+        provenance=human_declaration_provenance(producer_ref="user:priya")),
+        expected_pointer_version=0, actor="user:priya")
+    outcome = select_dataset_source(catalog, need=_need(
+        need_role=DatasetNeedRole.POPULATION, explicit_dataset_ref=SEG))
+    assert outcome.resolved
 
 
 # ── every other need: explicit -> policy -> single unambiguous candidate ────────────────────────

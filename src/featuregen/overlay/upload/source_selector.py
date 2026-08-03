@@ -13,6 +13,13 @@ the absence of a declaration is :data:`~...source_selection.SELECTION_POPULATION
 the caller's candidate list is not even READ for that need role. ``test_source_selector`` pins that
 by handing the population need a candidate set that would obviously "win" any ranking.
 
+**And a population is ONE ROW PER MEMBER.** A declared dataset whose own temporal model says it
+keeps history (scd2 / snapshot / event_log) is refused for that role — see
+:func:`_population_history_refusal`, which also records why that refusal is spelled with the
+population code rather than a temporal one. The spine carries no row rule at execution, so a
+history-keeping population does not fail; it multiplies every count while looking entirely
+reasonable.
+
 **Precedence for every other need (§8 Task 8):** explicit request -> current serving policy -> a
 single unambiguous eligible candidate. Two candidates that a rule cannot separate are
 :data:`SELECTION_SOURCE_AMBIGUOUS`, never broken by upload time, lexical order or catalog recency
@@ -291,17 +298,88 @@ def select_dataset_source(
                               candidate_dataset_refs=candidate_dataset_refs)
 
 
+#: Temporal storage models that keep MORE THAN ONE ROW PER ENTITY. A dataset in one of these is a
+#: history, not a population: used as the spine it multiplies every count by however many versions
+#: each customer happens to have, and the answer stays plausible while being wrong for exactly the
+#: customers who changed the most.
+_HISTORY_KEEPING_MODELS: frozenset[str] = frozenset({"scd2", "snapshot", "event_log"})
+
+
+def _population_history_refusal(conn: DbConn, *, need: DatasetNeedV1,
+                                chosen: str) -> SelectionRefusalV1 | None:
+    """Refuse a POPULATION whose own temporal model says it keeps several rows per entity.
+
+    THE SPINE HAS NO ROW RULE. ``compile_analysis`` reads the population table RAW — every row is a
+    population member — because that is what a population IS. So an SCD2 or snapshot table used as
+    the spine does not fail: it silently multiplies every count, and the fixture comments have named
+    that hazard since Release 3 without anything enforcing it.
+
+    VOCABULARY ADJUDICATION (the closed eight). This is spelled ``SELECTION_POPULATION_UNDECLARED``
+    with a population-specific detail, NOT a new code and not one of the temporal ones:
+
+    * ``TEMPORAL_HISTORICAL_CURRENT_ONLY`` and ``TEMPORAL_MODEL_UNKNOWN`` are statements about a
+      dataset's ability to answer a ROW question; here the temporal model is perfectly well known
+      and the dataset answers its own question fine. It is the POPULATION role it cannot fill.
+    * ``SELECTION_AUTHORITY_INSUFFICIENT`` would say the copy is not authoritative enough, which is
+      false — it may be the system of record and still be the wrong SHAPE for a spine.
+    * What is genuinely missing is the declaration of WHICH ROWS of it are the population — the
+      same decision ``SELECTION_POPULATION_UNDECLARED`` already names, reached from one step
+      further in. Its gap (``POPULATION_UNRESOLVED``) and its action (``CONFIRM_POPULATION``) are
+      already exactly right, and its clarification asks the one question that resolves this: which
+      table holds the population, every member, once.
+
+    A CURRENT-ONLY dataset passes. So does a history-keeping dataset whose current temporal policy
+    declares ``current_record`` — that is a declared one-row-per-entity rule rather than an
+    inference, and the runtime spine assertion (``analysis.assert_spine_is_unique``) is what stops
+    it if the declaration turns out not to hold of the data.
+    """
+    from featuregen.overlay.upload.temporal_policy import TemporalSelectionKind
+    from featuregen.overlay.upload.temporal_policy_store import (
+        current_temporal_policy,
+        load_bearing_temporal_model,
+    )
+
+    source, _table = _split(chosen)
+    load_bearing, _displayed = load_bearing_temporal_model(
+        conn, source=source, dataset_logical_ref=chosen)
+    found = current_temporal_policy(conn, chosen)
+    policy = None if found is None else found[0]
+    model = (load_bearing or "").strip().lower() or (
+        policy.temporal_storage_model.value if policy is not None else "")
+    if model not in _HISTORY_KEEPING_MODELS:
+        return None
+    if policy is not None and policy.current_selection is TemporalSelectionKind.CURRENT_RECORD:
+        return None                     # a DECLARED "which row is the current one" rule
+    return SelectionRefusalV1(
+        code=SELECTION_POPULATION_UNDECLARED,
+        subject_refs=(chosen,),
+        detail=(f"{chosen!r} keeps history ({model}), so it holds several rows per "
+                f"{need.entity_id}, and a population is one row per member. Used as the spine it "
+                "does not fail — it multiplies every count by however many versions a customer "
+                "happens to have, and the answer stays plausible. Declare a row rule for it (a "
+                "temporal policy naming which row is the current one), or name a dataset that is "
+                "already one row per member"))
+
+
 def _select_population(conn: DbConn, *, need: DatasetNeedV1, roles: Sequence[str],
                        recorded_by: str | None) -> SourceSelectionOutcomeV1:
     """Explicit declaration or a serving policy. THERE IS NO THIRD RULE, and that is the feature."""
     policy = _current_policy(conn, need)
     if need.explicit_dataset_ref:
+        # Checked BEFORE `_finish`, which persists the winner's binding: a dataset this need is
+        # about to refuse must not leave a pinned binding behind.
+        refusal = _population_history_refusal(conn, need=need, chosen=need.explicit_dataset_ref)
+        if refusal is not None:
+            return SourceSelectionOutcomeV1(need=need, refusal=refusal)
         return _finish(conn, need=need, chosen=need.explicit_dataset_ref,
                        basis=SelectionBasis.EXPLICIT_REQUEST, policy=policy, others=(),
                        roles=roles, recorded_by=recorded_by)
     if policy is not None:
         chosen, tied = _policy_choice(policy)
         if chosen is not None:
+            refusal = _population_history_refusal(conn, need=need, chosen=chosen)
+            if refusal is not None:
+                return SourceSelectionOutcomeV1(need=need, refusal=refusal)
             return _finish(conn, need=need, chosen=chosen, basis=SelectionBasis.SERVING_POLICY,
                            policy=policy,
                            others=tuple(r for r in policy.eligible_dataset_refs if r != chosen),

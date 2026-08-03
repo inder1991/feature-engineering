@@ -11,6 +11,11 @@ every entity that has no events in one period — and for "whose transactions de
 that fell to zero is the most affected one in the answer. So the spine is the left side of the query
 and both period aggregates hang off it, with missing counts coalesced to zero.
 
+The spine is also read RAW — every row of a population IS a member, so there is no row rule to
+apply. That makes "is this table one row per member?" a question about the DATA that nothing in the
+plan can answer, which is what :func:`assert_spine_is_unique` exists for: a history-keeping spine
+does not fail, it multiplies every count by however many versions each member happens to have.
+
 This compiles to SQL for the sandbox slice. The IR remains the artifact of record and can compile to
 a generated Kedro project later without the ontology or the audit trail noticing.
 """
@@ -365,6 +370,65 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
             f"{attribution.report_cutoff!r}; choosing one would hide a dimension-table defect")
 
 
+def assert_spine_is_unique(conn, ir: AnalysisExecutionIRV1, *, dialect) -> None:
+    """Refuse when the POPULATION SPINE is not one row per member. The mirror of
+    :func:`assert_no_dimension_overlap`, one join to the left.
+
+    The spine is read RAW — `FROM {spine} s`, no predicate — because every row of a population IS a
+    member. That is the design, and it is also the hole: a spine table that keeps history (SCD2, a
+    snapshot republished per day, an event log) does not fail here, it MULTIPLIES. Every count is
+    scaled by however many versions a customer happens to have, group totals inflate, and the
+    result is plausible for exactly the customers who changed the most.
+
+    Selection refuses a history-keeping population before it ever gets here
+    (`source_selector._population_history_refusal`), but that is a check on the DECLARED temporal
+    model, and this is a check on the DATA — the same split as attribution overlap and the snapshot
+    tie, both of which run at execution for the same reason. A population that slipped through
+    undeclared, or whose declared current-row rule does not actually hold, still cannot silently
+    multiply.
+
+    Both failure shapes carry ONE code, because both mean the same thing to the reader — this table
+    is not one row per member: a DUPLICATED key, and a row carrying NO key at all (which can never
+    match an event, so it contributes a permanent zero to every answer while counting as a member).
+
+    Deliberately NOT in `REFUSAL_TO_GAP`: a duplicated population row is a defect in the source or
+    the wrong table, not a decision anybody is waiting to make — the same judgement
+    `ATTRIBUTION_OVERLAPPING_RECORDS` gets, and for the same reason.
+    """
+    class _Shim:
+        def __init__(self, b): self.binding = b
+
+    _q = dialect.ident
+    spine_ref = dialect.table_ref(_Shim(ir.spine.binding))
+    key = _q(ir.spine.key_column)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT COUNT(*), COUNT({key}), COUNT(DISTINCT {key}) FROM {spine_ref}")
+        rows, keyed, distinct = (int(value) for value in cursor.fetchone()[:3])
+    finally:
+        close = getattr(cursor, "close", None)
+        if callable(close):
+            close()
+    spine_id = ir.spine.binding.identity.table_id
+    if keyed < rows:
+        raise AnalysisIRError(
+            "POPULATION_SPINE_NOT_UNIQUE",
+            f"the population {spine_id!r} has {rows - keyed} row(s) with no "
+            f"{ir.spine.key_column!r}: a member with no identity can never match an event, so it "
+            "contributes a permanent zero to the answer while still counting as a member",
+            subjects=(f"{spine_id}.{ir.spine.key_column}",))
+    if distinct < keyed:
+        raise AnalysisIRError(
+            "POPULATION_SPINE_NOT_UNIQUE",
+            f"the population {spine_id!r} has {rows} rows for {distinct} distinct "
+            f"{ir.spine.key_column!r} values, so it is not one row per member. Every count in this "
+            "answer would be multiplied by the number of rows each member happens to have — the "
+            "answer would not fail, it would be plausible and wrong. Use a current-only population, "
+            "or declare the row rule that reduces this table to one row per member",
+            subjects=(f"{spine_id}.{ir.spine.key_column}",))
+
+
 def assert_join_is_verified(ir: AnalysisExecutionIRV1) -> None:
     """Refuse to execute a join whose relationship has not been observed to hold.
 
@@ -405,6 +469,10 @@ def assert_snapshot_selection_is_unique(conn, ir: AnalysisExecutionIRV1, *, dial
 def run_analysis(conn, ir: AnalysisExecutionIRV1, *, dialect) -> tuple[AnalysisRow, ...]:
     """Compile and execute, returning one row per entity in the population."""
     assert_join_is_verified(ir)
+    # The spine gate runs FIRST of the data gates: a population that is not one row per member
+    # multiplies everything downstream, so reporting a dimension overlap on top of it would send
+    # the reader to fix the smaller of two problems.
+    assert_spine_is_unique(conn, ir, dialect=dialect)
     assert_no_dimension_overlap(conn, ir, dialect=dialect)
     assert_snapshot_selection_is_unique(conn, ir, dialect=dialect)
     cursor = conn.cursor()
