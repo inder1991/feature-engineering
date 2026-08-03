@@ -432,6 +432,12 @@ def test_the_entity_facet_is_the_engines_own_controlled_entity_link(overlay_conn
     for suggestion in labelled:
         assert suggestion.entity.display_name == suggestion.entity.id
         assert all(isinstance(t, AttributedTextV1) for t in suggestion.contextual_entity_terms)
+        # ...and it is visibly a DERIVATION: the authored need concept, through the governed
+        # concept registry. A citation naming only the recipe would read as an SME attestation of
+        # the entity itself.
+        refs = [e.producer_ref or "" for e in suggestion.entity.evidence]
+        assert any(r.startswith("concept-registry:") and "#concept=" in r for r in refs), refs
+        assert any(r.startswith("recipe-revision:") for r in refs), refs
 
 
 def test_every_profile_field_is_explicitly_unavailable_not_guessed(overlay_conn, ftr_catalog):

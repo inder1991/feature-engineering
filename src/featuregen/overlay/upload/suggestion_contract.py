@@ -76,6 +76,7 @@ from featuregen.overlay.upload.suggestion_taxonomy import (
     RECIPE_FAMILY_REGISTRY,
 )
 from featuregen.overlay.upload.taxonomy.use_cases import USE_CASE_REGISTRY
+from featuregen.overlay.upload.taxonomy.versions import CONCEPT_REGISTRY_VERSION
 from featuregen.overlay.upload.template_discovery import (
     DISCOVERY_METADATA,
     FAMILY_MAPPING_CITATION_PREFIX,
@@ -157,6 +158,11 @@ PROJECTION_STATES = frozenset({"current", "stale", "pending", "partial", "failed
 
 #: The explicit "the profile plan has not landed" marker for a source dataset (D9).
 PROFILE_STATUS_UNAVAILABLE = "unavailable"
+
+#: Citation prefix for a value DERIVED through the governed concept registry (the
+#: entity facet). Task 1 established the pattern: a derivation names the table that
+#: produced it, never only the artifact it started from.
+CONCEPT_REGISTRY_CITATION_PREFIX = "concept-registry:"
 
 #: Which typed requirement raises which warning. Derived from the CODE — never from the detail
 #: prose, which is a rendering.
@@ -699,8 +705,13 @@ def _warnings(idea, template, trace: GroundingDecisionTraceV1 | None,
     unproven = tuple((leg.from_ref, leg.to_ref) for leg in legs
                      if leg.safety_status != SAFETY_CLEARING)
     if unproven or join_needed:
+        # When the gauntlet raised JOIN_CONNECTIVITY but retained no non-clearing leg, the
+        # requirement's own operand is what the warning is ABOUT — an empty ref list would leave a
+        # reader with a warning that names nothing.
         warnings.append(SuggestionWarningV1(
-            code="RELATIONSHIP_SAFETY_UNPROVEN", operand_refs=unproven,
+            code="RELATIONSHIP_SAFETY_UNPROVEN",
+            operand_refs=unproven or tuple(r.operand for r in idea.requirements
+                                           if r.code == "JOIN_CONNECTIVITY"),
             detail="a traversed relationship has no governed-verified safety evidence"))
     unknown_cardinality = tuple((leg.from_ref, leg.to_ref) for leg in legs
                                 if leg.cardinality == CARDINALITY_UNKNOWN)
@@ -760,13 +771,31 @@ def _domain_and_entity_context(operands: Sequence[SuggestionOperandV1],
                      "contextual_entity_terms"))
 
 
-def _entity_label(entity_id: str, recipe_revision: str | None) -> AttributedLabelV1:
-    """The entity facet — the CONTROLLED ``Concept.entity_link`` vocabulary the grounding engine
-    itself bound (0F-6). ``display_name`` is the id until the semantic plan lands a controlled
-    entity registry with display names; inventing a prettier one here would be a second ontology."""
+def _entity_label(entity_id: str, recipe_revision: str | None,
+                  expected_concept: str | None) -> AttributedLabelV1:
+    """The entity facet — the CONTROLLED ``Concept.entity_link`` vocabulary (0F-6).
+
+    It is a DERIVATION, and the citation says so: the recipe declares a need concept, the governed
+    concept registry says which entity that concept links to, and the grounding engine bound a
+    column to it. So the value cites the concept registry AND the recipe revision, exactly as Task
+    1's family-derived categories cite their mapping — a reader must be able to tell a derived
+    entity from one somebody attested. ``basis`` is ``template_authored`` because the derivation
+    starts at the authored need, not at catalog wording (which stays in
+    ``contextual_entity_terms``).
+
+    ``display_name`` is the id until the semantic plan lands a controlled entity registry with
+    display names; inventing a prettier one here would be a second ontology.
+    """
+    citations = (EvidenceAuthorityV1(
+        producer=EvidenceProducer.TAXONOMY, strength=AssertionStrength.ATTESTED,
+        lifecycle=EvidenceLifecycle.ACTIVE,
+        producer_ref=f"{CONCEPT_REGISTRY_CITATION_PREFIX}{CONCEPT_REGISTRY_VERSION}"
+                     f"#concept={expected_concept or ''}",
+        evidence_id=None),) + _recipe_evidence(recipe_revision)
     return AttributedLabelV1(
-        id=entity_id, display_name=entity_id, basis="catalog_resolved",
-        evidence=_recipe_evidence(recipe_revision), operational_influence=None, source_refs=())
+        id=entity_id, display_name=entity_id, basis="template_authored",
+        evidence=citations, operational_influence=None,
+        source_refs=(f"{CONCEPT_REGISTRY_CITATION_PREFIX}{CONCEPT_REGISTRY_VERSION}",))
 
 
 def _source_datasets(operands: Sequence[SuggestionOperandV1]
@@ -799,6 +828,13 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
 
     bindings_by_ref = {} if context is None else {
         binding.graph_object_ref: binding for binding in context.need_bindings}
+    # The AUTHORED need concept the entity label was derived from — read off the engine's own
+    # source-entity role, never re-resolved here.
+    entity_concept = None
+    if context is not None and context.source_entity_need_role:
+        source_binding = next((b for b in context.need_bindings
+                               if b.role == context.source_entity_need_role), None)
+        entity_concept = None if source_binding is None else source_binding.expected_concept
     operand_refs = _operand_refs(idea)
     operands = []
     for catalog_source, object_ref in _bounded(operand_refs, MAX_OPERANDS, omitted, "operands"):
@@ -901,7 +937,8 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
         feature_category=feature_category, discovery_disposition=disposition,
         recipe_family=family, business_domains=business_domains,
         contextual_domain_terms=domain_terms, use_cases=use_cases, keywords=keywords,
-        entity=_entity_label(entity_label_id, recipe_revision) if entity_label_id else None,
+        entity=(_entity_label(entity_label_id, recipe_revision, entity_concept)
+                if entity_label_id else None),
         contextual_entity_terms=entity_terms, grain_refs=grain_refs,
         operation_kind=idea.operation_kind, window=idea.window, time_ref=idea.time_ref,
         recipe=render_recipe(idea, entity_ref), recipe_parts=recipe_parts(idea, entity_ref),
