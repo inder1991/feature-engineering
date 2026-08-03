@@ -29,6 +29,14 @@ Those decisions ride the plan as a :class:`SelectionPreviewV1` and their refusal
 plan could not be EXPRESSED against the catalog, and "nobody has declared which copy serves this"
 is a question for a person, not an inexpressible plan. The HARD gate is the execution bridge —
 which is exactly where the review found the hole, and where Task 8 closes it.
+
+**ONE WRITE, and it is deliberate.** "No data is touched" still holds — this module reads no
+warehouse row. But a SELECTION persists the physical binding it pinned
+(``binding_store.select_table_binding``), because selecting a source is the moment a derived
+binding becomes a thing decisions, observations and snapshots reference, and a decision naming a
+revision that was never recorded is unreplayable. It is idempotent, it happens only for the
+SELECTED dataset, and only with the flag on — a flag-off ground writes nothing at all, pinned by
+test.
 """
 from __future__ import annotations
 
