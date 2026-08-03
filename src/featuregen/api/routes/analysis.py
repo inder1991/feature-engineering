@@ -5,19 +5,25 @@ Seven read models existed with no surface — `retrieve_candidates`, `extract_in
 a read model nobody can call is the same inert mechanism this programme has found six times already.
 These are the routes.
 
-**Nothing here executes, and one thing here WRITES.** `POST /analysis/plan` retrieves, extracts,
-grounds and previews; it never runs the statement. That split is deliberate and not merely cautious:
-execution needs an `ExecutionInputs` this deployment cannot yet build — the catalog records no
-physical database and there is no connection registry — so a route that promised to run would be
-promising something impossible. The preview reports exactly which piece is missing.
+**PLANNING NEVER EXECUTES, AND EXECUTION NEVER PLANS.** `POST /analysis/plan` retrieves, extracts,
+grounds, previews and — behind `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` — SEALS; it never runs the
+statement. `POST /analysis/execute` runs one SEALED plan by its identity and never re-plans one.
+That split is the whole design: a caller who handed a question to an execute route would be running
+decisions nobody previewed, made by a model dispatched a second time under state that may have
+moved. (Until Release-B Task 9 this module said "nothing here executes" and gave the reason that
+execution inputs could not be built — no physical database, no connection registry. Both are now
+built: the binding registry supplies the address, the Release-B declaration supplies the
+population, and the eligibility store supplies which rows count.)
 
-No WAREHOUSE data is touched. The CATALOG is written twice, and both are disclosed rather than
-implied: a refusal records a learning gap (below), and — with
-`FEATUREGEN_SOURCE_TEMPORAL_SELECTION` on — a SELECTION persists the winner's physical binding
-revision. That second write is a content-addressed catalog ADDRESS, not a decision: it is the row a
-later decision, observation or snapshot points at when it names `pbr_...`, it is idempotent, it
-happens only for the dataset that was selected, and re-deriving it produces the same id. With the
-flag off nothing is written at all.
+WAREHOUSE data is touched by ONE route, `/analysis/execute`, and only through the governed engine
+provider — whose shipped default REFUSES, because running against the bank's warehouse is a
+separate approval gate. The CATALOG is written by planning in three disclosed ways: a refusal
+records a learning gap (below); with the selection flag on a SELECTION persists the winner's
+physical binding revision; and a resolved, executable plan is SEALED into `structured_result`. The
+binding write is a content-addressed catalog ADDRESS, not a decision — the row a later decision,
+observation or snapshot points at when it names `pbr_...`, idempotent, winner only. The seal is
+content-addressed on the plan's own identity, so re-planning the same thing writes nothing new.
+With the flag off none of the three happens.
 
 **`feature:generate`, not `catalog:read`.** Planning dispatches an LLM call against catalog metadata
 on the caller's behalf — the same class of action as the feature-generation routes next door. The

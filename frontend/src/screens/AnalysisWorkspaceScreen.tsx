@@ -12,10 +12,11 @@ import {
 // The analysis workspace: ask a question, see what WOULD run, and answer what the system could not
 // decide. Four honesty rules the design does not get to override:
 //
-//   * THERE IS NO RUN BUTTON. The API has no execute endpoint — execution needs bindings and an
-//     eligibility policy a deployment must configure first. A disabled "Run" would imply the button
-//     appears once you tick something; the screen instead says which of the four gaps is open and
-//     who closes it.
+//   * THERE IS NO RUN BUTTON, and the reason has changed. `POST /analysis/execute` now exists
+//     (Release-B Task 9) and runs a sealed plan — but only where the deployment has an APPROVED
+//     analysis engine, which is a separate gate this screen cannot open. A "Run" that 409'd on the
+//     approval would teach people to click through a governance decision. The screen still says
+//     which gap is open and who closes it; when the engine is approved, the button belongs here.
 //   * FINDINGS ARE NOT BEHIND A TOGGLE. They are what the answer would rest on — a currency that
 //     varies, an unconfirmed join identity, a definition of "counts" nobody agreed to. Collapsing
 //     them by default is how a disclosure becomes decorative.

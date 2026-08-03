@@ -1,12 +1,13 @@
-"""`POST /analysis/plan` and `/analysis/clarify` — the data agent's only surface.
+"""`POST /analysis/plan` and `/analysis/clarify` — the data agent's PLANNING surface.
 
 Seven read models existed with no route. A read model nobody can call is the same inert mechanism
 this programme has found six times, so these tests care most about the seams between the pieces:
 that the caller's read scope reaches retrieval, that a hallucinated ref cannot survive the round
 trip, and that a plan which cannot execute says so rather than pretending.
 
-Nothing here executes a statement — see the route module for why that is a design decision and not
-caution.
+Nothing in THESE routes executes a statement. That is still true of `/analysis/plan` and
+`/analysis/clarify` by design — running a sealed plan is `/analysis/execute`, which has its own
+suite (`test_analysis_execute_route.py`) and its own approval gate.
 """
 from __future__ import annotations
 
