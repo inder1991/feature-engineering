@@ -22,10 +22,12 @@ from datetime import datetime, timedelta
 import psycopg
 
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.evidence_axes import EvidenceAuthorityV1
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.evidence import EvidenceProducer
 from featuregen.overlay.field_evidence import read_active_field_evidence
+from featuregen.overlay.upload import grounding_trace as _gt
 from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
     read_column_facts,
@@ -35,16 +37,27 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     CATALOG_PROJECTION_UNAVAILABLE,
     CatalogProjectionUnavailable,
 )
+from featuregen.overlay.upload.grounding_trace import (
+    GroundingDecisionTraceV1,
+    GroundingTraceRecorder,
+    SuggestionDependencyClass,
+)
 from featuregen.overlay.upload.join_path import (
     JoinOutcome,
     JoinStep,
     classify_join_path,
     find_join_path,
+    join_outcome_relationship_path,
 )
 from featuregen.overlay.upload.need_metadata import is_measure_need_role
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import (
+    allowed_sensitivities,
+)
+from featuregen.overlay.upload.read_scope import (
+    read_scope_rule_content_hash as _read_scope_rule_content_hash,
+)
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
 logger = logging.getLogger(__name__)
@@ -100,6 +113,11 @@ class RejectCode:
 class Rejection:
     code: str
     message: str
+    # Task 2A: WHY this candidate was refused, in the same shape a survivor carries — the pins the
+    # gauntlet had already collected when it refused. Defaulted last, so every existing
+    # `Rejection(code, message)` construction and every two-field comparison is unchanged, and it is
+    # None on the paths that thread no candidate identity (see `_validate_idea`).
+    trace: GroundingDecisionTraceV1 | None = None
 
     def __str__(self) -> str:
         return self.message
@@ -562,6 +580,14 @@ class FeatureIdea:
     #
     #    Purely carried here — nothing reads it yet; no disposition, requirement or status depends on it.
     operand_roles: tuple[tuple[str, str], ...] = ()
+    # ── Task 2A: the DECISION TRACE this candidate's validation produced (freeze 0F-7 P1) ──
+    #    Defaulted last and never serialized: it is TRANSIENT CARRY from the gauntlet to the
+    #    projection built in the same call. A persisted-and-reloaded idea has None here, which is
+    #    correct — V2 assembly always consumes FRESH grounding output, never a reloaded snapshot,
+    #    so a trace that survived a round trip could only ever describe a decision made elsewhere.
+    #    None also on every path that threads no candidate identity (LLM / planner / confirm-time
+    #    revalidation). Nothing in the V1 payload reads it.
+    grounding_trace: GroundingDecisionTraceV1 | None = None
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
@@ -645,6 +671,25 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
 _MAX_SUGGESTION_LEN = 64
 
 
+def _ai_suggestion_with_evidence(conn, logical_ref: str, field_name: str):
+    """:func:`_ai_suggestion`'s value PLUS the evidence axes of the records it read, from the ONE
+    read both need (Task 2A). The trace pins what this read saw; the gauntlet uses only the value.
+
+    The records are real ``field_evidence`` rows, so every axis — producer, strength, lifecycle
+    (``active`` by the reader's own filter) — and the occurrence ids are the store's, not inferred.
+    """
+    records = [e for e in read_active_field_evidence(conn, logical_ref, field_name)
+               if e.producer == EvidenceProducer.LLM.value and e.proposed_value is not None]
+    values = {str(e.proposed_value).strip() for e in records}
+    values.discard("")
+    evidence = tuple(EvidenceAuthorityV1(e.producer, e.strength, e.lifecycle, e.producer_ref,
+                                         e.evidence_id)
+                     for e in records)
+    if len(values) != 1:
+        return None, evidence
+    return next(iter(values))[:_MAX_SUGGESTION_LEN], evidence
+
+
 def _ai_suggestion(conn, logical_ref: str, field_name: str) -> str | None:
     """The AI's ACTIVE ``llm/proposed`` value for ``field_name`` at this column, for SURFACING on a
     requirement (E4a T3) — or ``None`` when the AI proposed nothing.
@@ -656,21 +701,33 @@ def _ai_suggestion(conn, logical_ref: str, field_name: str) -> str | None:
     action. Producer-scoped to ``llm`` (a source/human value would have projected and there would be
     no requirement to decorate), and a self-contradicting AI (two active values) suggests NOTHING
     rather than picking one arbitrarily."""
-    values = {
-        str(e.proposed_value).strip()
-        for e in read_active_field_evidence(conn, logical_ref, field_name)
-        if e.producer == EvidenceProducer.LLM.value and e.proposed_value is not None
-    }
-    values.discard("")
-    if len(values) != 1:
-        return None
-    return next(iter(values))[:_MAX_SUGGESTION_LEN]
+    return _ai_suggestion_with_evidence(conn, logical_ref, field_name)[0]
+
+
+def _pin_governed(trace: GroundingTraceRecorder, catalog_source: str, object_ref: str,
+                  field_name: str, dependency_kind: str, ov) -> None:
+    """Pin ONE C1 governed read from the value it already returned (Task 2A; no second read).
+
+    The CONTENT is what decides — the value and the C1 status, because only ``resolved`` may clear a
+    check; the exact decision / fact event is the REVISION pin, which is provenance for currentness
+    and is excluded from every content identity. The evidence axes are the read's own selected
+    evidence, so a value that weakens from ``confirmed`` to ``proposed`` moves the trace hash while
+    a replayed identical occurrence does not.
+    """
+    trace.pin(SuggestionDependencyClass.VALIDATION, dependency_kind,
+              _gt.column_dependency_key(catalog_source, object_ref),
+              {"field_name": field_name,
+               "value": None if ov.value is None else str(ov.value),
+               "status": ov.status},
+              current_revision_id=ov.decision_event_id or ov.fact_event_id,
+              evidence=_gt.governed_read_evidence(ov))
 
 
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
                    target_ref: str | None, now: datetime | None, fresh_within: timedelta,
                    *, roles: Iterable[str] = (),
-                   operand_roles: tuple[tuple[str, str], ...] = ()):
+                   operand_roles: tuple[tuple[str, str], ...] = (),
+                   candidate_key: str | None = None, template_id: str | None = None):
     """The deterministic TRI-STATE gauntlet (spec §2). Returns (FeatureIdea, None) for DESIGN_CHECKED
     or NEEDS_EXTERNAL_VALIDATION — the returned idea carries validation_status + typed requirements +
     resolved operands — or (None, Rejection) for REJECTED (deterministically invalid / unauthorized).
@@ -680,34 +737,94 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     `operand_roles` is the `(object_ref, role)` map the TEMPLATE declared for this candidate's bound
     operands (empty for an LLM-proposed candidate, which declares none). It narrows ONE thing — which
     operands the unit/currency needs-check may ask about — and an EMPTY map means "nothing declared",
-    never "no measures": the E4a structural rule then runs exactly as before."""
-    derives = _ground_refs(raw.get("derives_from", []), known)
-    if not derives:
-        return None, Rejection(RejectCode.UNGROUNDED, "ungrounded")
-    pairs: list[tuple[str, str]] = []
-    for d in derives:
-        srcs = src_of.get(d, set())
-        if len(srcs) != 1:
-            return None, Rejection(RejectCode.AMBIGUOUS_CATALOG, f"ambiguous catalog for {d}")
-        pairs.append((next(iter(srcs)), d))
-    meta = _column_meta(conn, pairs)
-    for src, d in pairs:
-        if d not in meta or meta[d]["catalog_source"] != src:
-            return None, Rejection(RejectCode.UNKNOWN_COLUMN, f"unknown column {d} in catalog {src}")
-    if target_ref and target_ref in derives:
-        return None, Rejection(RejectCode.LEAKAGE, "leaks target")
-    if now is not None:
-        for src in {p[0] for p in pairs}:
-            wm = drift_watermark(conn, src)
-            if wm is None or wm < now - fresh_within:
-                return None, Rejection(RejectCode.STALE, f"stale source: {src}")
+    never "no measures": the E4a structural rule then runs exactly as before.
 
+    TASK 2A — THE DECISION TRACE (freeze 0F-7 P1). `candidate_key` / `template_id` let a caller
+    thread this candidate's identity in; when it does, the gauntlet records a
+    `GroundingDependencyPinV1` AT each read it already performs and returns the assembled
+    `GroundingDecisionTraceV1` on the object it was already returning — `FeatureIdea.grounding_trace`
+    for a survivor, `Rejection.trace` for a refusal. THE RETURN ARITY IS UNCHANGED, so not one of the
+    six production unpack sites moves. Threading nothing (the LLM / planner / confirm-time paths)
+    disables the recorder entirely: no pins, no hashing, no trace, byte-identical behaviour.
+
+    Nothing here reads the trace, and nothing here decides differently because of it: every pin is
+    written from a value the check had already read, and no pin adds a query."""
     # C2-C3: every requirement below is minted through the SANCTIONED, registry-validated factory
     # (validation_requirements.build_requirement) — the deterministic code picks code + typed params
     # from server-known refs; a bad code/param is a PROGRAMMER error (raises), never swallowed. Imported
     # here (function-local) because validation_requirements imports REQUIREMENT_CODES/Requirement from
     # this module — a module-top import would be a circular import at load time.
-    from featuregen.overlay.upload.validation_requirements import build_requirement
+    from featuregen.overlay.upload.validation_requirements import (
+        build_requirement,
+        evaluated_rule_content_hashes,
+    )
+
+    trace = GroundingTraceRecorder(
+        candidate_key=candidate_key, template_id=template_id,
+        read_scope_rule_content_hashes=(_read_scope_rule_content_hash(),) if candidate_key else ())
+
+    def _reject(code: str, message: str):
+        """A refusal carrying the trace of what had been read WHEN it refused — the pins collected
+        so far, the rules evaluated so far, no requirements (a rejection mints none)."""
+        return None, Rejection(code, message, trace=trace.build(
+            validation_status="REJECTED", requirements=(),
+            validation_rule_content_hashes=evaluated_rule_content_hashes(
+                trace.evaluated_rule_codes)))
+
+    # The VISIBILITY dependency: which classes this run could see. It gates the candidate universe
+    # (`known` / `src_of`, both read-scoped by the caller) and every join hop below, so it is pinned
+    # once, up front, for survivors and refusals alike.
+    trace.pin(SuggestionDependencyClass.HARD_AVAILABILITY, _gt.READ_SCOPE, "read-scope",
+              {"allowed_classes": allowed_sensitivities(roles)})
+
+    derives = _ground_refs(raw.get("derives_from", []), known)
+    trace.pin(SuggestionDependencyClass.HARD_AVAILABILITY, _gt.GROUNDING_CANDIDATE_SET,
+              "derives_from", {"resolved_object_refs": list(derives)})
+    if not derives:
+        return _reject(RejectCode.UNGROUNDED, "ungrounded")
+    pairs: list[tuple[str, str]] = []
+    for d in derives:
+        srcs = src_of.get(d, set())
+        if len(srcs) != 1:
+            return _reject(RejectCode.AMBIGUOUS_CATALOG, f"ambiguous catalog for {d}")
+        pairs.append((next(iter(srcs)), d))
+    # The TEMPLATE's own declaration of what each operand IS — a template-authored input to the
+    # unit/currency narrowing below, pinned where that narrowing will read it.
+    trace.pin(SuggestionDependencyClass.VALIDATION, _gt.TEMPLATE_OPERAND_ROLES, template_id or "",
+              {"operand_roles": [[ref, role] for ref, role in operand_roles]})
+    declared_role_of: dict[str, str] = {}
+    for ref, role in operand_roles:
+        declared_role_of.setdefault(ref, role)
+    # ORDERED by the gauntlet's own operand order, which is the template's binding order (`derives`
+    # preserves it). An operand the template declared nothing for carries an EMPTY role: an absent
+    # declaration is never a licence to guess one.
+    trace.record_operand_roles(
+        tuple((src, d, declared_role_of.get(d, "")) for src, d in pairs))
+
+    meta = _column_meta(conn, pairs)
+    for src, d in pairs:
+        if d not in meta or meta[d]["catalog_source"] != src:
+            trace.pin(SuggestionDependencyClass.HARD_AVAILABILITY, _gt.COLUMN_EXISTENCE,
+                      _gt.column_dependency_key(src, d),
+                      {"catalog_source": src, "object_ref": d, "exists": False})
+            return _reject(RejectCode.UNKNOWN_COLUMN, f"unknown column {d} in catalog {src}")
+        # ONE read (`_column_meta`) feeding three checks: the M4 existence check here, and the
+        # unit / currency hints the hard rejects and the needs-checks both consume below. Pinned
+        # where the read happened, not where each consumer sits.
+        trace.pin(SuggestionDependencyClass.HARD_AVAILABILITY, _gt.COLUMN_EXISTENCE,
+                  _gt.column_dependency_key(src, d),
+                  {"catalog_source": src, "object_ref": d, "exists": True})
+        trace.pin(SuggestionDependencyClass.VALIDATION, _gt.COLUMN_UNIT_HINT,
+                  _gt.column_dependency_key(src, d), {"unit": meta[d]["unit"]})
+        trace.pin(SuggestionDependencyClass.VALIDATION, _gt.COLUMN_CURRENCY_HINT,
+                  _gt.column_dependency_key(src, d), {"currency": meta[d]["currency"]})
+    if target_ref and target_ref in derives:
+        return _reject(RejectCode.LEAKAGE, "leaks target")
+    if now is not None:
+        for src in {p[0] for p in pairs}:
+            wm = drift_watermark(conn, src)
+            if wm is None or wm < now - fresh_within:
+                return _reject(RejectCode.STALE, f"stale source: {src}")
 
     aggregation = raw.get("aggregation")
     operation = _norm_agg(aggregation)   # the normalized operation string (server-known, not the LLM's)
@@ -727,15 +844,22 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    path — consistent-state behavior is preserved; only the drifted case is newly fail-closed).
     #    projection_unavailable ABORTS (never serve a stale type). ──
     if _needs_numeric(aggregation):
+        trace.record_rule("TYPE_IS_NUMERIC")
         for src, d in pairs:
             lref = logical_ref_of(conn, src, d)
             ov = _governed_read(conn, lref, "logical_representation")
+            _pin_governed(trace, src, d, "logical_representation", _gt.GOVERNED_LOGICAL_REPRESENTATION, ov)
             if _is_numeric(ov.value):   # value is None on the C1 drift/fork fail-closed → won't clear
                 continue
-            declared = read_column_facts(conn, lref, "declared_type").value
+            facts = read_column_facts(conn, lref, "declared_type")
+            declared = facts.value
+            trace.pin(SuggestionDependencyClass.VALIDATION, _gt.DECLARED_TYPE_HINT,
+                      _gt.column_dependency_key(src, d),
+                      {"declared_type": declared, "authority": facts.authority},
+                      current_revision_id=facts.provenance)
             if declared and not _is_numeric(declared):
-                return None, Rejection(RejectCode.NON_NUMERIC,
-                                       f"declared type {declared!r} of {d} is not numeric")
+                return _reject(RejectCode.NON_NUMERIC,
+                               f"declared type {declared!r} of {d} is not numeric")
             requirements.append(build_requirement(
                 code="TYPE_IS_NUMERIC", operand=(src, d),
                 detail="operational type unknown; numeric declared hint", params=None))
@@ -747,12 +871,13 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    != "resolved" → does NOT clear (emits ADDITIVITY_SUPPORTS_OPERATION), where the old permissive
     #    read_column_facts served it as governed-additive and wrongly cleared. ──
     if _is_additive_unsafe(aggregation):
+        trace.record_rule("ADDITIVITY_SUPPORTS_OPERATION")
         for src, d in pairs:
             ov = _governed_read(conn, logical_ref_of(conn, src, d), "additivity")
+            _pin_governed(trace, src, d, "additivity", _gt.GOVERNED_ADDITIVITY, ov)
             if ov.status == "resolved":
                 if ov.value in ("semi_additive", "non_additive"):
-                    return None, Rejection(RejectCode.ADDITIVITY,
-                                           f"unsafe additive aggregation of {d}")
+                    return _reject(RejectCode.ADDITIVITY, f"unsafe additive aggregation of {d}")
             else:
                 requirements.append(build_requirement(
                     code="ADDITIVITY_SUPPORTS_OPERATION", operand=(src, d),
@@ -764,27 +889,35 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
     currencies = {meta[d]["currency"] for d in derives if meta.get(d, {}).get("currency")}
     if len(units) > 1:
-        return None, Rejection(RejectCode.MIXED_UNITS,
-                               f"mixed units {sorted(units)}; aggregation would be silently wrong")
+        return _reject(RejectCode.MIXED_UNITS,
+                       f"mixed units {sorted(units)}; aggregation would be silently wrong")
     if len(currencies) > 1:
-        return None, Rejection(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
+        return _reject(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
     # (the "unit unknown" NEEDS-CHECK is minted further down, after the temporal + grain
     #  dispositions resolve which operands are the GROUP BY key and the window boundary)
 
     # ── disposition: temporal — a windowed feature needs a governed-VERIFIED as-of column; a table
     #    with NO as-of column at all is still a hard reject (future-leakage risk) ──
     if _is_windowed(aggregation):
+        trace.record_rule("TEMPORAL_IS_POPULATED")
         checked_tables: set[tuple[str, str]] = set()
         for src, d in pairs:
             if d.count(".") < 2 or (src, d.split(".")[-2]) in checked_tables:
                 continue
             checked_tables.add((src, d.split(".")[-2]))
-            aref = _as_of_column_ref(conn, src, d.split(".")[-2])
+            table = d.split(".")[-2]
+            aref = _as_of_column_ref(conn, src, table)
+            # The STRUCTURAL question — does this table have a point-in-time basis at all — pinned
+            # with the answer it got, including the honest "there is none" that rejects below.
+            trace.pin(SuggestionDependencyClass.HARD_AVAILABILITY, _gt.AS_OF_COLUMN_LOOKUP,
+                      _gt.table_dependency_key(src, table),
+                      {"table": table, "as_of_object_ref": aref})
             if aref is None:
-                return None, Rejection(RejectCode.NO_POINT_IN_TIME,
-                                       f"no point-in-time basis for {d} (future-leakage risk)")
+                return _reject(RejectCode.NO_POINT_IN_TIME,
+                               f"no point-in-time basis for {d} (future-leakage risk)")
             time_operand = (src, aref)
             ov = _governed_read(conn, logical_ref_of(conn, src, aref), "is_as_of")
+            _pin_governed(trace, src, aref, "is_as_of", _gt.GOVERNED_IS_AS_OF, ov)
             if ov.status != "resolved":
                 requirements.append(build_requirement(
                     code="TEMPORAL_IS_POPULATED", operand=(src, aref),
@@ -792,11 +925,16 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
 
     # ── disposition: grain — a grain feature needs a governed-VERIFIED grain column ──
     if grain_table and len(catalogs) == 1:
+        trace.record_rule("GRAIN_IS_UNIQUE")
         gcat = next(iter(catalogs))
         gref = _grain_column_ref(conn, gcat, grain_table)
+        trace.pin(SuggestionDependencyClass.HARD_AVAILABILITY, _gt.GRAIN_COLUMN_LOOKUP,
+                  _gt.table_dependency_key(gcat, grain_table),
+                  {"table": grain_table, "grain_object_ref": gref})
         if gref is not None:
             grain_operand = (gcat, gref)
             ov = _governed_read(conn, logical_ref_of(conn, gcat, gref), "is_grain")
+            _pin_governed(trace, gcat, gref, "is_grain", _gt.GOVERNED_IS_GRAIN, ov)
             if ov.status != "resolved":
                 requirements.append(build_requirement(
                     code="GRAIN_IS_UNIQUE", operand=(gcat, gref),
@@ -853,9 +991,18 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     measures = [p for p in pairs
                 if p not in structural and p[1] not in declared_non_measures]
     if len(measures) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
+        trace.record_rule("UNIT_CONSISTENT")
+        trace.record_rule("CURRENCY_CONSISTENT")
         for src, d in measures:
             if not meta[d]["unit"]:
-                suggested = _ai_suggestion(conn, logical_ref_of(conn, src, d), "unit")
+                suggested, suggestion_evidence = _ai_suggestion_with_evidence(
+                    conn, logical_ref_of(conn, src, d), "unit")
+                # SEMANTIC, not VALIDATION: this decorates the question, it never answers it. A
+                # later reader must not suppress a readiness claim because an advisory hint moved.
+                trace.pin(SuggestionDependencyClass.SEMANTIC, _gt.AI_UNIT_SUGGESTION,
+                          _gt.column_dependency_key(src, d),
+                          {"field_name": "unit", "suggested": suggested},
+                          evidence=suggestion_evidence)
                 requirements.append(build_requirement(
                     code="UNIT_CONSISTENT", operand=(src, d),
                     detail=("unit unknown across a combining op"
@@ -865,7 +1012,12 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             if not meta[d]["currency"]:
                 # currency is UNKNOWN here (that is the mint condition), so no bound currency_ref is
                 # available — pass none; currency_ref is OPTIONAL in the registry (C2C3-T1 tweak).
-                suggested = _ai_suggestion(conn, logical_ref_of(conn, src, d), "currency")
+                suggested, suggestion_evidence = _ai_suggestion_with_evidence(
+                    conn, logical_ref_of(conn, src, d), "currency")
+                trace.pin(SuggestionDependencyClass.SEMANTIC, _gt.AI_CURRENCY_SUGGESTION,
+                          _gt.column_dependency_key(src, d),
+                          {"field_name": "currency", "suggested": suggested},
+                          evidence=suggestion_evidence)
                 requirements.append(build_requirement(
                     code="CURRENCY_CONSISTENT", operand=(src, d),
                     detail=("currency unknown across a combining op"
@@ -879,13 +1031,23 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         jcat = next(iter(catalogs))
         for src, d in pairs:
             if d.count(".") >= 2 and d.split(".")[-2] != grain_table:
-                outcome = classify_join_path(conn, jcat, grain_table, d.split(".")[-2], roles=roles)
+                trace.record_rule("JOIN_CONNECTIVITY")
+                to_table = d.split(".")[-2]
+                outcome = classify_join_path(conn, jcat, grain_table, to_table, roles=roles)
+                # The path the planner SELECTED, converted at its own seam and RETAINED here — the
+                # legs, in order, in the direction travelled. Nothing downstream may search again.
+                legs = join_outcome_relationship_path(outcome, catalog_source=jcat)
+                trace.record_path(legs)
+                trace.pin(SuggestionDependencyClass.VALIDATION, _gt.JOIN_PATH,
+                          _gt.column_dependency_key(src, d),
+                          {"from_table": grain_table, "to_table": to_table,
+                           "outcome": outcome.kind,
+                           "legs": [leg.realization_content_hash for leg in legs]})
                 if outcome.kind == JoinOutcome.NO_PATH:
-                    return None, Rejection(RejectCode.NO_JOIN_PATH,
-                                           f"no join path {grain_table} -> {d}")
+                    return _reject(RejectCode.NO_JOIN_PATH, f"no join path {grain_table} -> {d}")
                 if outcome.kind == JoinOutcome.DENIED:
-                    return None, Rejection(RejectCode.JOIN_DENIED,
-                                           f"join {grain_table} -> {d} crosses a read-scope-denied hop")
+                    return _reject(RejectCode.JOIN_DENIED,
+                                   f"join {grain_table} -> {d} crosses a read-scope-denied hop")
                 if outcome.kind == JoinOutcome.UNVERIFIED:
                     requirements.append(build_requirement(
                         code="JOIN_CONNECTIVITY", operand=(src, d),
@@ -899,7 +1061,11 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         derives_pairs=tuple(pairs), rationale=str(raw.get("rationale", "")),
         operation_kind=_norm_agg(aggregation), measure_refs=tuple(pairs),
         grain_ref=grain_operand, time_ref=time_operand, window=_window_of(aggregation),
-        grouping_refs=(), validation_status=status, requirements=tuple(requirements)), None
+        grouping_refs=(), validation_status=status, requirements=tuple(requirements),
+        grounding_trace=trace.build(
+            validation_status=status, requirements=tuple(requirements),
+            validation_rule_content_hashes=evaluated_rule_content_hashes(
+                trace.evaluated_rule_codes))), None
 
 
 def _governed_read(conn, logical_ref: str, field_name: str):
