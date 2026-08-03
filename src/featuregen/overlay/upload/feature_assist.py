@@ -45,6 +45,10 @@ from featuregen.overlay.upload.need_metadata import is_measure_need_role
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.semantic_context import (
+    bundle_from_store,
+    for_feature_generation,
+)
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
 logger = logging.getLogger(__name__)
@@ -200,16 +204,48 @@ def feature_context_enabled() -> bool:
 #:   1 — the base menu.
 #:   2 — the widened feature-context menu (definition + semantic_terms prose).
 #:   3 — v2 plus `ai_summary`.
+#:   4 — the shared `SemanticContextBundleV1` contract (semantic Task 8): v3 plus concept ancestry,
+#:       identifier namespace/issuer, party role, the D2 (producer, strength) axes per semantic
+#:       field, current cross-catalog links and the closed missing-context codes.
 #: Bumped because the record must identify WHICH contract egressed. Adding a field to the payload
 #: while leaving the version at 2 makes a v2 record ambiguous — with or without summaries — which
 #: defeats the reason the version is stamped at all.
-_FEATURE_CONTEXT_SCHEMA_VERSION = 3
+_FEATURE_CONTEXT_SCHEMA_VERSION = 4
+
+#: The D8 ROLLBACK LADDER, in one place:
+#:   flag off                              -> v1, the thin pre-Slice-3 menu, byte-for-byte;
+#:   flag on + FEATUREGEN_FEATURE_CONTEXT_VERSION=3 -> today's SHIPPED v3 behaviour;
+#:   flag on (default)                     -> v4.
+#: The env override exists precisely so v3 stays REACHABLE after Task 8 — a rollback that dropped
+#: to the v1 thin menu would be a functional regression dressed as a safety valve. Only versions
+#: this module can actually render are honoured; anything else falls back to the default and warns,
+#: because a typo in a deploy manifest must not silently downgrade the contract.
+FEATURE_CONTEXT_VERSION_ENV = "FEATUREGEN_FEATURE_CONTEXT_VERSION"
+_SELECTABLE_CONTEXT_VERSIONS = (3, 4)
 
 
 def _feature_schema_version() -> int:
-    """The widened contract's version when the feature-context flag is on, else 1 — so the immutable
-    llm_call stamps the real numeric version, not a hardcoded 1 masked by a `…_v1` prompt_id."""
-    return _FEATURE_CONTEXT_SCHEMA_VERSION if feature_context_enabled() else 1
+    """The contract version this process will stamp AND render (the D8 ladder above).
+
+    D10 makes registration a precondition: `enrich_llm._SCHEMAS` carries every version this can
+    return, and `_require_schema` refuses to dispatch a pair it cannot resolve — so a version
+    returned here without a registered body is a loud failure at dispatch, not an unenforced call
+    whose response fails repair with the flag on."""
+    if not feature_context_enabled():
+        return 1
+    raw = os.environ.get(FEATURE_CONTEXT_VERSION_ENV, "").strip()
+    if not raw:
+        return _FEATURE_CONTEXT_SCHEMA_VERSION
+    try:
+        requested = int(raw)
+    except ValueError:
+        requested = -1
+    if requested not in _SELECTABLE_CONTEXT_VERSIONS:
+        logger.warning("%s=%r is not one of %s — using v%d",
+                       FEATURE_CONTEXT_VERSION_ENV, raw, list(_SELECTABLE_CONTEXT_VERSIONS),
+                       _FEATURE_CONTEXT_SCHEMA_VERSION)
+        return _FEATURE_CONTEXT_SCHEMA_VERSION
+    return requested
 
 
 # Menu fact key -> read_column_facts field_name. `data_type` reads the OPERATIONAL structural type
@@ -266,10 +302,89 @@ def _enriched_column(conn, c: dict) -> dict:
     return out
 
 
-def _enriched_menu(conn, cols: list[dict]) -> list[dict]:
+def _enriched_menu(conn, cols: list[dict], *, roles: Iterable[str] = ()) -> list[dict]:
     """The flag-ON menu (feature_context_enabled()). When the flag is OFF, callers keep serving
     the thin `_menu` projection unchanged — flag-off byte-identity is a Slice-3 invariant."""
-    return [_enriched_column(conn, c) for c in cols]
+    return [_context_column(conn, c, roles=roles) for c in cols]
+
+
+# ── feature-context v4: the shared semantic bundle (semantic Task 8) ───────────────────────────────
+
+#: Per-column keys the v4 payload may SHED, in order, when the mandatory set does not fit the byte
+#: budget. Prose goes first (it is the largest and the least load-bearing), then the discovery
+#: extras. `missing_context`, the governed|hint fact wrappers and `semantic_authority` are NOT
+#: trimmable: they are what stop the model treating an AI proposal as a governed fact, and a
+#: context that dropped them to fit would be smaller and less safe.
+_V4_TRIM_ORDER: tuple[str, ...] = ("semantic_terms", "ai_summary", "definition", "relationships",
+                                   "concept_path")
+
+
+def _semantic_authority(bundle) -> dict[str, str]:
+    """``{field: "producer/strength"}`` for every semantic value that has evidence — the D2 axes ON
+    THE WIRE (D10: the wire carries the triple, never the derived `llm_proposed` display label).
+
+    This is what makes an AI-proposed concept legible AS a proposal without corrupting the
+    `governed|hint` wrapper, which means something else entirely (operational influence). Lifecycle
+    is omitted because the bundle only carries ACTIVE evidence — a constant on this surface is
+    bytes, not information."""
+    out: dict[str, str] = {}
+    for value in bundle.resolved_semantics:
+        if not value.evidence:
+            continue
+        lead = value.evidence[0]
+        out[value.field_name] = f"{lead.producer}/{lead.strength}"
+    return out
+
+
+def _context_v4_column(conn, c: dict, *, roles: Iterable[str]) -> dict:
+    """One v4 column payload: `SemanticContextBundleV1.for_feature_generation` plus the D2 axes.
+
+    The bundle is the ONE assembly (semantic Task 1) — read-scoped and batched at that seam — so
+    this path cannot drift from the Context tab or from data-agent retrieval, which read the same
+    contract. Everything the adapter emits is already egress-classified (D10); the two keys added
+    here (`semantic_authority`, and `party_role` promoted out of the adapter's identity block) are
+    classified alongside them.
+
+    A column whose bundle cannot be assembled (it vanished between the candidate read and here, or
+    read scope narrowed) falls back to the v3 shape rather than dropping the column: a MISSING
+    column is a worse answer than a thinner one, and the fallback is visible in the payload as the
+    absence of the v4 keys."""
+    try:
+        bundle = bundle_from_store(conn, c["catalog_source"], c["object_ref"], roles=roles)
+    except KeyError:
+        return _enriched_column(conn, c)
+    out = for_feature_generation(bundle)
+    # THE MENU'S REF IS THE PUBLIC-FLATTENED GRAPH REF, NOT THE BUNDLE'S LOGICAL REF. The bundle
+    # deliberately re-keys everything by the SCHEMA-PRESERVING logical ref, but grounding matches
+    # an LLM-named ref against the CANDIDATE set (`known = {c["object_ref"] ...}`) and the
+    # validator rebuilds the decision-log key through `logical_ref_of`. Emitting the logical form
+    # here would make every ref the model faithfully copied back UNGROUNDED — the whole menu would
+    # generate nothing, silently and with the flag on. The bundle's own ref rides nowhere: one
+    # spelling per identity on this surface.
+    out["object_ref"] = c["object_ref"]
+    out["table"], out["column"] = c["table"], c["column"]
+    # `missing_context` is read-scoped ABSENCE, not a data-quality verdict — it tells the model
+    # what this view does not carry so it stops inferring from silence.
+    out["semantic_authority"] = _semantic_authority(bundle)
+    # The adapter emits `null` for anything the bundle does not hold; a null in a prompt is noise
+    # the egress scanner still has to walk. Drop the empties — absence IS the honest signal.
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
+
+
+def _context_column(conn, c: dict, *, roles: Iterable[str] = ()) -> dict:
+    """ONE column of the flag-on menu, at whatever version the D8 ladder selected."""
+    if _feature_schema_version() >= 4:
+        return _context_v4_column(conn, c, roles=roles)
+    return _enriched_column(conn, c)
+
+
+def _trimmed(column: dict, level: int) -> dict:
+    """The column payload with the first ``level`` trimmable keys removed (the explicit trim policy
+    — never a silent truncation: the caller reports what it shed, per kind)."""
+    if level <= 0:
+        return column
+    shed = set(_V4_TRIM_ORDER[:level])
+    return {k: v for k, v in column.items() if k not in shed}
 
 
 def _table_context(cols: list[dict]) -> list[dict]:
@@ -305,7 +420,24 @@ def _table_context(cols: list[dict]) -> list[dict]:
 
 # One hard byte budget on the assembled feature-context batch (spec §6). Referenced at call time so
 # tests can monkeypatch it; select_relevant_context reads this module global when byte_budget is None.
-FEATURE_CONTEXT_BYTE_BUDGET = 60_000
+#
+# RE-BUDGETED for feature-context v4 (semantic Task 8). MEASURED, not guessed, against the real
+# catalog shapes the review named — the committed 126-column FTR glossary export routed through the
+# real reader, plus a 111-column CIB-shaped technical table, with EVERY column entity-matched so
+# all 237 are mandatory (`test_feature_context_budget.py` builds both and records the numbers):
+#
+#   v3 mandatory bytes, 237 columns:  175_520   (~740 bytes/column)
+#   v4 mandatory bytes, 237 columns:  248_601   (~1_048 bytes/column)
+#   v4 with every trimmable field shed: 203_629
+#
+# The finding that matters: at 60_000 the SHIPPED v3 payload ALREADY raised ContextTooLarge on
+# these catalogs — nearly 3x over. v4 did not create that cliff; it would have deepened it. So the
+# budget is set above the measured v4 worst case with ~20% headroom for prose variance, AND the
+# cliff itself is removed: an over-budget MANDATORY set is TRIMMED by the explicit `_V4_TRIM_ORDER`
+# policy (prose first) and refuses only when even the fully trimmed set does not fit. A mandatory
+# column is never silently dropped — a missing grain or time column produces a confidently wrong
+# feature rather than a smaller one.
+FEATURE_CONTEXT_BYTE_BUDGET = 300_000
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -376,22 +508,40 @@ def _assembled_bytes(columns: list[dict], table_context: list[dict]) -> int:
 
 def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
                             entity: str | None, scope=None,
-                            byte_budget: int | None = None) -> tuple[list[dict], list[dict], int]:
+                            byte_budget: int | None = None,
+                            roles: Iterable[str] = ()) -> tuple[list[dict], list[dict], int]:
     """Deterministic relevance selection ([F13], spec §6). Returns
     (selected_enriched_columns, table_context, dropped_count). Mandatory columns (confirmed grain,
     as-of, entity-match) are ALWAYS included; the rest are added by descending shared-token score,
     stable (-score, object_ref asc), until the ONE hard byte budget on the assembled batch is
-    reached. Raises ContextTooLarge when the mandatory set alone exceeds the budget (do NOT chunk).
-    Logs the dropped count."""
+    reached. Logs the dropped count.
+
+    ENRICHMENT IS LAZY (semantic Task 8). It used to build the enriched payload for EVERY candidate
+    before scoring — hundreds of per-column reads whose results the budget then discarded. Scoring
+    needs only the already-loaded candidate row, so enrichment now happens per column, memoized,
+    as the budget admits it: the same output, bounded by what actually fits rather than by catalog
+    size. This matters more at v4, where a column costs a semantic bundle rather than a few
+    scalar reads.
+
+    OVER-BUDGET MANDATORY SET: trimmed, not refused (the explicit `_V4_TRIM_ORDER` policy). Prose
+    is shed first, level by level, and the level that fits is used; `ContextTooLarge` is raised only
+    when even the fully trimmed mandatory set exceeds the budget. Dropping a mandatory column
+    instead would silently remove the grain or the time anchor and produce a confidently wrong
+    feature."""
     if byte_budget is None:
         byte_budget = FEATURE_CONTEXT_BYTE_BUDGET
     obj_tokens = _objective_tokens(objective, entity, scope)
     obj_entity = _objective_entity(entity, scope)
-    enriched_by_ref = {(c["catalog_source"], c["object_ref"]): _enriched_column(conn, c)
-                       for c in cols}
+    enriched_by_ref: dict[tuple[str, str], dict] = {}
 
-    def _enriched(rows: list[dict]) -> list[dict]:
-        return [enriched_by_ref[(c["catalog_source"], c["object_ref"])] for c in rows]
+    def _enriched(rows: list[dict], *, trim: int = 0) -> list[dict]:
+        out: list[dict] = []
+        for c in rows:
+            key = (c["catalog_source"], c["object_ref"])
+            if key not in enriched_by_ref:
+                enriched_by_ref[key] = _context_column(conn, c, roles=roles)
+            out.append(_trimmed(enriched_by_ref[key], trim))
+        return out
 
     mandatory = [c for c in cols if _is_mandatory(c, obj_entity)]
     optional = [c for c in cols if not _is_mandatory(c, obj_entity)]
@@ -399,32 +549,45 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
                     key=lambda c: (-len(_column_tokens(c) & obj_tokens), c["object_ref"]))
 
     selected = list(mandatory)
-    if _assembled_bytes(_enriched(selected), _table_context(selected)) > byte_budget:
-        raise ContextTooLarge(
-            f"mandatory feature context ({len(mandatory)} columns) exceeds byte budget "
-            f"{byte_budget}; not chunking")
+    trim = 0
+    while (_assembled_bytes(_enriched(selected, trim=trim), _table_context(selected))
+           > byte_budget):
+        if trim >= len(_V4_TRIM_ORDER):
+            raise ContextTooLarge(
+                f"mandatory feature context ({len(mandatory)} columns) exceeds byte budget "
+                f"{byte_budget} even with every trimmable field removed "
+                f"({', '.join(_V4_TRIM_ORDER)}); not chunking")
+        trim += 1
+    if trim:
+        logger.info("feature-context trimmed %s from %d mandatory columns to fit byte budget %d",
+                    ", ".join(_V4_TRIM_ORDER[:trim]), len(mandatory), byte_budget)
     dropped = 0
     for i, c in enumerate(scored):
         trial = selected + [c]
-        if _assembled_bytes(_enriched(trial), _table_context(trial)) > byte_budget:
+        if _assembled_bytes(_enriched(trial, trim=trim), _table_context(trial)) > byte_budget:
             dropped = len(scored) - i
             break
         selected = trial
     if dropped:
         logger.info("feature-context relevance dropped %d of %d optional columns (byte budget %d)",
                     dropped, len(optional), byte_budget)
-    return _enriched(selected), _table_context(selected), dropped
+    return _enriched(selected, trim=trim), _table_context(selected), dropped
 
 
 def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
-                entity: str | None = None, scope=None) -> tuple[list[dict], list[dict]]:
+                entity: str | None = None, scope=None,
+                roles: Iterable[str] = ()) -> tuple[list[dict], list[dict]]:
     """The menu + per-table context for one generation call. Flag-OFF ⟹ the thin pre-Slice-3 menu
     and NO context (byte-identical). Flag-ON ⟹ the enriched, relevance-selected menu + context
-    (may raise ContextTooLarge)."""
+    (may raise ContextTooLarge).
+
+    `roles` is the CALLER's scope, threaded down to the v4 bundle build (D11). The candidate rows
+    were already read-scoped; the bundle re-applies the same scope at its own boundary rather than
+    inheriting a clearance from a row that passed it earlier."""
     if not feature_context_enabled():
         return _menu(cols), []
     columns, table_context, _dropped = select_relevant_context(
-        conn, cols, objective=objective, entity=entity, scope=scope)
+        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles)
     return columns, table_context
 
 
@@ -1077,7 +1240,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
     registered = _registered_signatures(conn)
     try:
         menu, table_context = _build_menu(
-            conn, cols, objective=objective, entity=entity, scope=scope)
+            conn, cols, objective=objective, entity=entity, scope=scope, roles=roles)
     except ContextTooLarge as exc:
         logger.warning("feature context too large for %r: %s", objective, exc)
         return [], [{"name": "", "reason": str(exc), "code": RejectCode.CONTEXT_TOO_LARGE}]
@@ -1249,7 +1412,8 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
     fix = [{"name": idea.get("name", ""), "derives_from": idea.get("derives_from", []),
             "aggregation": idea.get("aggregation"), "issue": instruction}]
     try:
-        menu, table_context = _build_menu(conn, cols, objective=objective, entity=entity)
+        menu, table_context = _build_menu(conn, cols, objective=objective, entity=entity,
+                                          roles=roles)
     except ContextTooLarge as exc:
         return None, {"name": str(idea.get("name", "")), "reason": str(exc),
                       "code": RejectCode.CONTEXT_TOO_LARGE}
@@ -1294,7 +1458,7 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
     try:
-        menu, table_context = _build_menu(conn, cols, objective=nl_query)
+        menu, table_context = _build_menu(conn, cols, objective=nl_query, roles=roles)
     except ContextTooLarge as exc:
         logger.warning("feature-recipe context too large for %r: %s", nl_query, exc)
         return Recipe(intent=nl_query, grain_table=None, derives_from=[], aggregation=None,

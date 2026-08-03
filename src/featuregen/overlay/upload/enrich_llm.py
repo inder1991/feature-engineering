@@ -316,15 +316,80 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
 _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semantic_terms"})
 # Identity strings: `catalog_source` is deliberately NOT emitted by the enriched menu (RF-I7
 # handoff) and `concept`/`domain` may be None — absence/None is structural-optional, never a block.
-_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain"})
+# `party_role` (feature-context v4) is a closed-vocabulary token from `party_vocab`, the same grade
+# of structural identity as `concept`.
+_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain",
+                                           "party_role"})
 _FEATURE_COLUMN_FACT_KEYS = frozenset({
     "data_type", "declared_type", "entity", "additivity", "unit", "currency",
     "is_grain", "is_as_of"})
 _FEATURE_FACT_SUBKEYS = frozenset({"value", "authority"})
+# ── feature-context v4 (semantic Task 8, D10) ────────────────────────────────────────────────────
+# Every NEW key ships with an explicit classification here plus a golden egress test; unclassified
+# stays BLOCKED, and now loudly. All four groups carry closed-vocabulary tokens or platform-minted
+# ids — never uploader prose, so none of them is sample-bearing and none routes through the
+# definition sanitizer.
+#
+#   * `concept_path` / `missing_context` — lists of closed-vocabulary tokens (registry concept
+#     names; `semantic_context.MISSING_CONTEXT_CODES`).
+#   * `identifier_namespace` — {scheme, issuer_scope, basis}: the value space an identifier lives
+#     in. `scheme` is a registry namespace, `basis` is the closed NAMESPACE_BASES vocabulary and
+#     `issuer_scope` is a catalog-scope token.
+#   * `semantic_authority` — {field: "producer/strength"}. The D2 triple ON THE WIRE, per D10: the
+#     wire carries (producer, strength), never the derived `llm_proposed` display label. This is
+#     what lets the model see that a concept is an AI PROPOSAL while the governed|hint fact wrapper
+#     keeps meaning what it always meant.
+#   * `relationships` — the current cross-catalog links: platform-minted refs plus the closed
+#     availability/review vocabularies. NEVER a claim of executability (that answer needs a
+#     revalidating reader and does not belong in a prompt).
+_FEATURE_COLUMN_TOKEN_LIST_KEYS = frozenset({"concept_path", "missing_context"})
+_FEATURE_COLUMN_OBJECT_KEYS: dict[str, frozenset[str]] = {
+    "identifier_namespace": frozenset({"scheme", "issuer_scope", "basis"}),
+}
+_FEATURE_COLUMN_MAPPING_KEYS = frozenset({"semantic_authority"})
+_FEATURE_COLUMN_DICT_LIST_KEYS: dict[str, frozenset[str]] = {
+    "relationships": frozenset({"relationship_ref", "kind", "availability", "review_status"}),
+}
 _TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition"})
 _TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity"})
 _TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns"})
 _FEATURE_STRUCTURAL_MAX_LEN = 200
+#: Bound on a v4 list/mapping so one column cannot carry an unbounded payload past the byte budget
+#: into the egress scanner.
+_FEATURE_COLLECTION_MAX_ITEMS = 40
+
+
+def _token(v: object) -> bool:
+    """A bounded, non-prose token: a short string with no room for a sample value."""
+    return isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN
+
+
+def _token_list_ok(v: object) -> bool:
+    return (isinstance(v, list) and len(v) <= _FEATURE_COLLECTION_MAX_ITEMS
+            and all(_token(x) for x in v))
+
+
+def _token_object_ok(v: object, allowed: frozenset[str]) -> bool:
+    """A flat object whose keys are exactly allowlisted and whose values are tokens or None."""
+    if v is None:
+        return True
+    if not isinstance(v, dict) or any(k not in allowed for k in v):
+        return False
+    return all(x is None or _token(x) for x in v.values())
+
+
+def _mapping_ok(v: object) -> bool:
+    """A ``{field_name: token}`` mapping — bounded in both directions. Keys are field names the
+    platform minted, values are short closed-vocabulary tokens (``producer/strength``)."""
+    if not isinstance(v, dict) or len(v) > _FEATURE_COLLECTION_MAX_ITEMS:
+        return False
+    return all(_token(k) and _token(x) for k, x in v.items())
+
+
+def _dict_list_ok(v: object, allowed: frozenset[str]) -> bool:
+    if not isinstance(v, list) or len(v) > _FEATURE_COLLECTION_MAX_ITEMS:
+        return False
+    return all(_token_object_ok(entry, allowed) and isinstance(entry, dict) for entry in v)
 
 
 def _fact_wrapper_ok(v: object) -> bool:
@@ -404,6 +469,22 @@ def sanitize_feature_context(
                     out[k] = v
                 elif k in _FEATURE_COLUMN_FACT_KEYS:
                     if not _fact_wrapper_ok(v):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                elif k in _FEATURE_COLUMN_TOKEN_LIST_KEYS:
+                    if not _token_list_ok(v):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                elif k in _FEATURE_COLUMN_OBJECT_KEYS:
+                    if not _token_object_ok(v, _FEATURE_COLUMN_OBJECT_KEYS[k]):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                elif k in _FEATURE_COLUMN_MAPPING_KEYS:
+                    if not _mapping_ok(v):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                elif k in _FEATURE_COLUMN_DICT_LIST_KEYS:
+                    if not _dict_list_ok(v, _FEATURE_COLUMN_DICT_LIST_KEYS[k]):
                         return None, pii_spans, sample_audits, version
                     out[k] = v
                 else:
@@ -1030,9 +1111,16 @@ for _synth_alias_id in ("overlay_table_synth", "overlay_table_synth_summary_batc
 # identifies the INPUT contract — so the alias must extend to every version the request may stamp.
 # Registering 2 but requesting 3 makes `schema_for(id, 3)` return None, structured output
 # unenforced, and the response fail repair: feature generation returns NOTHING with the flag on.
+# v4 = the SemanticContextBundleV1 feature-generation contract (semantic Task 8): concept ancestry,
+# identifier namespace/issuer, party role, the D2 (producer, strength) axes, current links and the
+# closed missing-context codes beside the v3 material. The OUTPUT schema is still unchanged — the
+# version identifies the INPUT contract — but D10 makes registration a PRECONDITION, not a
+# follow-up: `_feature_schema_version()` may not return 4 until this loop has run, or
+# `_require_schema` refuses the dispatch and feature generation returns nothing with the flag on.
 for _feature_schema_id in ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec"):
     _SCHEMAS[(_feature_schema_id, 2)] = _SCHEMAS[(_feature_schema_id, 1)]
     _SCHEMAS[(_feature_schema_id, 3)] = _SCHEMAS[(_feature_schema_id, 1)]
+    _SCHEMAS[(_feature_schema_id, 4)] = _SCHEMAS[(_feature_schema_id, 1)]
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads
