@@ -182,8 +182,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | 1049 | profile Task 7 — temporal policy store |
 | 1050 | Release C Task 10 — crosswalk store |
 | 1051 | D13 — `graph_node` display-projection columns `bian_path`, `process_path`, `sub_domain` (joint Task 4 / profile Task 5) |
+| 1052 | consumption step — `graph_node.data_role` display projection (derived from the normalized `table_role` at projection time; the facet mechanism requires a literal column; a rebuildable projection is NOT the duplicate store §4-correction-4 forbids) + table-node search-doc slots for `definition`/`business_context` (insert-time + rebuild parity — the read-time join cannot reach FTS matching) |
 
-New needs append 1052+ to this table FIRST (edit this doc in the same commit as the migration).
+New needs append 1053+ to this table FIRST (edit this doc in the same commit as the migration).
 
 ## D8. Flag matrix
 
