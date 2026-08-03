@@ -176,7 +176,7 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | --- | --- |
 | 1044 | codegen remediation (`1044_run_event_ordering.sql` — already claimed by that plan) |
 | 1045 | semantic Task 2 — catalog semantic scope table ONLY (entity backfill removed per D12.1-revised) |
-| 1046 | semantic Task 5 — structured-result subject/current pointer |
+| 1046 | semantic Task 5 — `structured_result_current` (GENERIC subject/current pointer: subject_kind × subject_ref × result_type, CAS pointer_version; deliberately not gap-specific) |
 | 1047 | profile Task 2 — catalog narrative revision + current, plus co-located `graph_node` `authority_role`/`temporal_storage_model` display+decision-link columns (recorded post-hoc; the stream had only this number) |
 | 1048 | profile Task 7 — serving policy store |
 | 1049 | profile Task 7 — temporal policy store |
@@ -274,9 +274,12 @@ New needs append 1052+ to this table FIRST (edit this doc in the same commit as 
 3. **Stage outcomes (semantic Task 5):** `selected/unchanged/...` live in the stage `detail`
    payload; stage state stays within the 0996 CHECK vocabulary; `stage_report.py` added to the
    task's file list.
-4. **Supersession (semantic Task 6):** `_write_llm_field_evidence`'s unconditional rewrite is in
-   scope — same-value reruns must reuse the prior evidence ID (value-diff like the concept
-   writer), or "same value AND evidence ID" is unachievable for five of six fields.
+4. **Supersession (semantic Task 6) — implemented, wording corrected:** `_write_llm_field_evidence`
+   reuses on `proposed_value_hash` (oldest matching row wins — that stability IS the point);
+   `_write_concept_evidence` reuses on `input_hash`. Two reuse keys, two paths, DELIBERATE — the
+   earlier parenthetical "like the concept writer" was wrong. Known trade: a same-value reuse
+   keeps the original `input_hash`/`source_snapshot_id`, so re-derivation recency is not recorded;
+   a compensating decision-log record is DEFERRED (recorded in the writer docstring).
 5. **Concept cache identity (semantic Task 4):** sibling-roster context enters the PROMPT but not
    the per-column `input_hash`/cache key; roster changes re-enrich only on the vocabulary/pipeline
    fingerprint, not per-sibling-edit. (Prevents per-table identity cascades; accepted trade-off:
