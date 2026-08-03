@@ -9,8 +9,18 @@ Runs are seeded through the REAL authoring path (``run_authoring`` over the real
 with scripted ``FakeLLM`` providers) wherever that can produce the state under test — a hand-built
 trace row would let a defect in the real writer hide behind a fixture that agrees with the reader.
 Only two states cannot be reached that way, and both are forgeries by construction: a payload whose
-``payload_hash`` does not match it (``append_event`` computes the hash, and 1020 forbids UPDATE), and
+``payload_hash`` does not match it (``append_event`` computes the hash, and 1022 forbids UPDATE), and
 an in-memory result that disagrees with its run.
+
+⚠️ **THE LANE MOVED (Phase G).** These runs are authored through
+``formula.replay_authoring.run_authoring`` — migration **1022**'s
+``formula_authoring_run`` / ``formula_authoring_trace_event`` — because that is the lane the LIVE
+worker writes (``overlay/upload/recipe_formula_worker.py:35``) and therefore the only lane in which
+a real governed feature exists. Admission used to prove against migration 1020's store, which
+**nothing in ``src/`` has ever written**; see ``docs/DEFERRED-WORK.md`` A.33. Two consequences are
+visible in this file and are deliberate: the terminal kinds are lower-case ``completed``/``failed``,
+and check 6 now covers ``recipe_authoring_context`` (the 1022 manifest hashes five intent fields
+where 1020 hashed four).
 """
 from __future__ import annotations
 
@@ -28,15 +38,20 @@ from tests.featuregen.materialize.fixtures import (
 )
 
 from featuregen.formula.author import AUTHOR_TASK
-from featuregen.formula.authoring import authoring_intent_hash, run_authoring
 from featuregen.formula.critic import CRITIC_TASK
-from featuregen.formula.trace import TraceEventKind, append_event, open_authoring_run
+from featuregen.formula.replay_authoring import run_authoring
+from featuregen.formula.replay_trace import append_event, open_authoring_run
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.materialize.admission import (
     AdmittedFeature,
     FeatureNamePlanError,
     ResolvedFeatureInput,
     admit_artifacts,
+)
+from featuregen.materialize.authoring_trace import (
+    authoring_intent_hash,
+    payload_digest,
+    read_terminal_event,
 )
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 
@@ -79,22 +94,49 @@ def resolved_run(catalog):
 
 @pytest.fixture
 def rejected_run(catalog):
-    """A REAL run that was REJECTED — and therefore still wrote a ``COMPLETED`` terminal event."""
+    """A REAL run that was REJECTED — a proposal the shape gate refuses."""
     return run_authoring(catalog, intent_for(_FEATURE), _author(rejected_raw_proposal()),
                          _critic(), roles=(), actor=_ACTOR)
 
 
 @pytest.fixture
+def needs_review_run(catalog):
+    """A REAL NEEDS_REVIEW run — and therefore one that still wrote a ``completed`` terminal event.
+
+    THE check-3 trap in the 1022 lane. A blocking critic finding folds to NEEDS_REVIEW with the
+    output still resolved, so the run closes through the orchestrator's normal terminal append,
+    which writes ``completed``. A gate that admitted on "a completed event exists" would admit a
+    feature whose human review is outstanding."""
+    return run_authoring(
+        catalog, intent_for(_FEATURE), _author(raw_proposal(_FEATURE)),
+        _critic([{"code": "WINDOW_INTENT_MISMATCH", "operand": None,
+                  "detail": "30d asked, 90d proposed"}]),
+        roles=(), actor=_ACTOR)
+
+
+@pytest.fixture
 def run_without_terminal(catalog):
-    """A run opened and STARTED through the real trace API, then abandoned — the honest shape of a
+    """A run opened and started through the real trace API, then abandoned — the honest shape of a
     process that died mid-authoring. ``run_authoring`` always closes a run, so the only way to
     produce this state is to stop before the terminal, which is exactly what a crash does."""
     run_id = open_authoring_run(
         catalog, intent_hash=authoring_intent_hash(intent_for(_FEATURE)),
-        versions={"disposition_policy_version": 1}, actor=_ACTOR)
-    append_event(catalog, run_id, TraceEventKind.STARTED, seq=0,
-                 idempotency_key=f"{run_id}:0", payload={"intent_name": _FEATURE})
+        versions={"disposition": 1}, actor=None)
+    append_event(catalog, run_id, "author_turn", seq=0, idempotency_key=f"{run_id}:0",
+                 payload={"index": 0, "kind": "final_proposal"}, stage="AUTHOR_TURN_0")
     return run_id
+
+
+def _write_terminal_directly(conn, run_id: str, payload: str, payload_hash: str | None) -> None:
+    """Insert a terminal event whose ``payload_hash`` does not cover its payload.
+
+    1022 forbids UPDATE and DELETE, so the ONLY way to produce a payload its hash does not cover is
+    to write the row directly — which is exactly what an out-of-band tamper is."""
+    conn.execute(
+        "INSERT INTO formula_authoring_trace_event "
+        "(authoring_run_id, seq, kind, idempotency_key, payload, payload_hash, stage) "
+        "VALUES (%s, 0, 'completed', %s, %s::jsonb, %s, 'TERMINAL')",
+        (run_id, f"{run_id}:terminal", payload, payload_hash))
 
 
 @pytest.fixture
@@ -140,23 +182,20 @@ def test_a_run_that_does_not_exist_is_refused_as_incomplete(catalog, result_for)
     """Absence is derived, so an invented run id and a crashed run are indistinguishable — and both
     mean the same thing: no authoring verdict exists to admit."""
     with pytest.raises(MaterializationRefused) as e:
-        admit_artifacts(catalog, [_input(result_for("arun_invented"))])
+        admit_artifacts(catalog, [_input(result_for("far_invented"))])
     assert e.value.code is CompilationRefusalCode.AUTHORING_RUN_INCOMPLETE
 
 
 # ── check 2: the payload must validate against its hash ──────────────────────────────────────────
 
 def test_tampered_terminal_payload_is_refused(catalog, result_for) -> None:
-    """Migration 1020 forbids UPDATE/DELETE, so tampering means writing the row directly — which is
+    """Migration 1022 forbids UPDATE/DELETE, so tampering means writing the row directly — which is
     the only way to produce a payload its ``payload_hash`` does not cover. Gate 1 recomputes."""
     run_id = open_authoring_run(
         catalog, intent_hash=authoring_intent_hash(intent_for(_FEATURE)),
-        versions={"disposition_policy_version": 1}, actor=_ACTOR)
-    catalog.execute(
-        "INSERT INTO authoring_trace_event (authoring_trace_event_id, authoring_run_id, seq, kind, "
-        "idempotency_key, payload, payload_hash) VALUES (%s, %s, 0, 'COMPLETED', %s, %s, %s)",
-        (f"atev_tampered_{run_id}", run_id, f"{run_id}:0",
-         '{"authoring_disposition": "RESOLVED"}', "0" * 64))
+        versions={"disposition": 1}, actor=None)
+    _write_terminal_directly(
+        catalog, run_id, '{"authoring_disposition": "RESOLVED"}', "0" * 64)
 
     with pytest.raises(MaterializationRefused) as e:
         admit_artifacts(catalog, [_input(result_for(run_id))])
@@ -168,53 +207,109 @@ def test_the_tamper_check_runs_before_the_disposition_is_believed(catalog, resul
     Here the doctored payload claims RESOLVED — and is still refused as TAMPERED, not admitted."""
     run_id = open_authoring_run(
         catalog, intent_hash=authoring_intent_hash(intent_for(_FEATURE)),
-        versions={"disposition_policy_version": 1}, actor=_ACTOR)
-    catalog.execute(
-        "INSERT INTO authoring_trace_event (authoring_trace_event_id, authoring_run_id, seq, kind, "
-        "idempotency_key, payload, payload_hash) VALUES (%s, %s, 0, 'COMPLETED', %s, %s, %s)",
-        (f"atev_claims_resolved_{run_id}", run_id, f"{run_id}:0",
-         '{"authoring_disposition": "RESOLVED", "candidate_formula_hash": "deadbeef"}', "0" * 64))
+        versions={"disposition": 1}, actor=None)
+    _write_terminal_directly(
+        catalog, run_id,
+        '{"authoring_disposition": "RESOLVED", "candidate_formula_hash": "deadbeef"}', "0" * 64)
 
     with pytest.raises(MaterializationRefused) as e:
         admit_artifacts(catalog, [_input(result_for(run_id))])
     assert e.value.code is CompilationRefusalCode.TERMINAL_PAYLOAD_TAMPERED
 
 
-# ── check 3: THE TRAP — a REJECTED run also writes COMPLETED ─────────────────────────────────────
+def test_a_null_payload_hash_is_refused_rather_than_skipped(catalog, result_for) -> None:
+    """1022's ``payload_hash`` is NULLable (migration 1026 added it to an existing table), so a row
+    can carry no tamper evidence at all. An unverifiable payload must FAIL CLOSED — treating a
+    missing hash as "nothing to compare, therefore fine" would make check 2 opt-out."""
+    run_id = open_authoring_run(
+        catalog, intent_hash=authoring_intent_hash(intent_for(_FEATURE)),
+        versions={"disposition": 1}, actor=None)
+    _write_terminal_directly(catalog, run_id, '{"authoring_disposition": "RESOLVED"}', None)
 
-def test_a_REJECTED_run_also_writes_COMPLETED_so_check_the_PAYLOAD(
-        catalog, rejected_run, result_for) -> None:
-    """VERIFIED: ``_TERMINAL_FOR_DISPOSITION`` maps only ``TECHNICAL_FAILURE`` to ``FAILED``.
+    with pytest.raises(MaterializationRefused) as e:
+        admit_artifacts(catalog, [_input(result_for(run_id))])
+    assert e.value.code is CompilationRefusalCode.TERMINAL_PAYLOAD_TAMPERED
+    # The DETAIL is asserted because the code alone is not load-bearing here: a digest compared
+    # against NULL also happens to differ, so this test would pass against an implementation with
+    # no NULL guard at all — and would then be silently accepting the wrong reason.
+    assert "no payload_hash" in e.value.detail
 
-    A gate that admitted on "a COMPLETED event exists" would admit this rejected formula."""
+
+def test_a_payload_that_is_not_an_object_at_all_is_refused(catalog, result_for) -> None:
+    """1022's ``payload`` has no ``jsonb_typeof = 'object'`` CHECK (1020's did), so a directly
+    written row may hold an array. Its ``payload_hash`` here is GENUINE, so check 2 passes and
+    check 3 is the one that must cope: an unreadable verdict is not a permissive one, and it must
+    not surface as an ``AttributeError`` out of a governed gate either."""
+    run_id = open_authoring_run(
+        catalog, intent_hash=authoring_intent_hash(intent_for(_FEATURE)),
+        versions={"disposition": 1}, actor=None)
+    _write_terminal_directly(
+        catalog, run_id, '["authoring_disposition", "RESOLVED"]',
+        payload_digest(["authoring_disposition", "RESOLVED"]))
+
+    with pytest.raises(MaterializationRefused) as e:
+        admit_artifacts(catalog, [_input(result_for(run_id))])
+    assert e.value.code is CompilationRefusalCode.NOT_RESOLVED
+
+
+def test_the_payload_digest_is_the_one_append_event_computed(catalog, resolved_run) -> None:
+    """PINS the two sides of check 2 against each other against a REAL, unaltered run.
+
+    1022 hashes with ``json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`` —
+    NOT the RFC 8785 (JCS) bytes ``materialize.canonical.materialize_hash`` produces, and not the
+    ASCII-escaping ``overlay.field_evidence.canonical_hash`` produces either. Admission therefore
+    borrows the writer's own hasher rather than keeping a second copy; this asserts the borrow is
+    still the right one, THROUGH the jsonb round-trip that reorders keys."""
+    event = read_terminal_event(catalog, resolved_run.authoring_run_id)
+
+    assert payload_digest(event.payload) == event.payload_hash
+
+
+# ── check 3: THE TRAP — a non-RESOLVED run also writes `completed` ───────────────────────────────
+
+def test_a_NEEDS_REVIEW_run_also_writes_completed_so_check_the_PAYLOAD(
+        catalog, needs_review_run, result_for) -> None:
+    """VERIFIED against the 1022 lane: the orchestrator's normal terminal append writes
+    ``completed`` for every disposition that reaches the fold — RESOLVED, NEEDS_REVIEW and an
+    ``invalid_output`` REJECTED alike (``replay_authoring.py:674-683``).
+
+    A gate that admitted on "a completed event exists" would admit this feature while its human
+    review is still outstanding."""
+    assert needs_review_run.authoring_disposition == "NEEDS_REVIEW"
+
+    with pytest.raises(MaterializationRefused) as e:
+        admit_artifacts(catalog, [_input(result_for(needs_review_run))])
+    assert e.value.code is CompilationRefusalCode.NOT_RESOLVED
+
+
+def test_the_needs_review_runs_terminal_event_really_is_completed(
+        catalog, needs_review_run) -> None:
+    """The premise of the test above, asserted rather than assumed — if this ever stops holding,
+    the trap has closed and the check-3 test would be passing for the wrong reason."""
+    event = read_terminal_event(catalog, needs_review_run.authoring_run_id)
+    assert event is not None
+    assert event.kind == "completed"
+    assert event.payload["authoring_disposition"] == "NEEDS_REVIEW"
+
+
+def test_a_rejected_run_is_refused(catalog, rejected_run, result_for) -> None:
+    """RE-POINTED from the 1020 lane. There, a REJECTED run wrote ``COMPLETED`` and this was the
+    trap test. In the 1022 lane a proposal the shape gate refuses is terminated by the parse arm,
+    which writes ``failed`` (``replay_authoring.py:426-431``) — so the trap now lives on the
+    NEEDS_REVIEW run above, and this test keeps proving the verdict itself is honoured."""
+    assert rejected_run.authoring_disposition == "REJECTED"
+    assert read_terminal_event(catalog, rejected_run.authoring_run_id).kind == "failed"
+
     with pytest.raises(MaterializationRefused) as e:
         admit_artifacts(catalog, [_input(result_for(rejected_run))])
     assert e.value.code is CompilationRefusalCode.NOT_RESOLVED
 
 
-def test_the_rejected_runs_terminal_event_really_is_COMPLETED(catalog, rejected_run) -> None:
-    """The premise of the test above, asserted rather than assumed — if this ever stops holding,
-    the trap has closed and the check-3 test would be passing for the wrong reason."""
-    from featuregen.formula.trace import read_terminal_event
-
-    event = read_terminal_event(catalog, rejected_run.authoring_run_id)
-    assert event is not None
-    assert event.kind is TraceEventKind.COMPLETED
-    assert event.payload["authoring_disposition"] == "REJECTED"
-
-
-def test_a_needs_review_run_is_refused(catalog, result_for) -> None:
+def test_a_needs_review_run_is_refused(catalog, needs_review_run) -> None:
     """NEEDS_REVIEW is not a near-miss: a blocking critic finding means a human verdict is
     outstanding, and materializing would decide that review by default."""
-    blocked = run_authoring(
-        catalog, intent_for(_FEATURE), _author(raw_proposal(_FEATURE)),
-        _critic([{"code": "WINDOW_INTENT_MISMATCH", "operand": None,
-                  "detail": "30d asked, 90d proposed"}]),
-        roles=(), actor=_ACTOR)
-    assert blocked.authoring_disposition == "NEEDS_REVIEW"
-
     with pytest.raises(MaterializationRefused) as e:
-        admit_artifacts(catalog, [_input(blocked)])
+        admit_artifacts(catalog, [_input(needs_review_run)])
     assert e.value.code is CompilationRefusalCode.NOT_RESOLVED
 
 
@@ -306,18 +401,36 @@ def test_an_intent_for_a_different_feature_is_refused(catalog, resolved_run) -> 
     assert e.value.code is CompilationRefusalCode.INTENT_HASH_MISMATCH
 
 
-def test_check_6_cannot_see_recipe_authoring_context(catalog, resolved_run) -> None:
-    """VERIFIED, and recorded because it is a LIMIT of this gate, not a feature of it.
+def test_check_6_now_covers_recipe_authoring_context(catalog, resolved_run) -> None:
+    """INVERTED by Phase G, and the single reason the lane move STRENGTHENS this gate.
 
-    ``authoring_intent_hash`` (``authoring.py:253``) hashes ``name`` / ``hypothesis`` /
-    ``target_entity`` / ``target_grain_keys`` ONLY — ``recipe_authoring_context`` is outside the
-    digest. So an intent carrying a context the run did not have still admits. Widening the digest
-    is a change to ``authoring``'s identity contract; this test pins today's real behaviour so that
-    change cannot happen silently."""
-    admitted = admit_artifacts(catalog, [
-        _input(resolved_run, recipe_authoring_context={"recipe_id": "never-authored"})])
+    Against migration 1020 this was a recorded LIMIT: ``authoring.authoring_intent_hash`` digests
+    ``name`` / ``hypothesis`` / ``target_entity`` / ``target_grain_keys`` ONLY, so an intent
+    carrying a ``recipe_authoring_context`` the run never had still admitted. The 1022 manifest is
+    stamped with ``canonical_hash(replay_authoring._intent_material(intent))``, which digests all
+    FIVE fields — so the context is now inside the proof and a fabricated one is refused.
 
-    assert admitted[0].intent.recipe_authoring_context == {"recipe_id": "never-authored"}
+    That field is the whole authoring prompt's catalog context (``author.py:98-99``): an intent
+    claiming a context the author never saw is a different authoring request."""
+    with pytest.raises(MaterializationRefused) as e:
+        admit_artifacts(catalog, [
+            _input(resolved_run, recipe_authoring_context={"recipe_id": "never-authored"})])
+    assert e.value.code is CompilationRefusalCode.INTENT_HASH_MISMATCH
+
+
+def test_the_intent_hash_recipe_is_the_one_the_manifest_was_stamped_with(
+        catalog, resolved_run) -> None:
+    """PINS the two sides of check 6 against each other against a REAL run.
+
+    ``authoring_trace.authoring_intent_hash`` re-derives; ``formula_authoring_run.intent_hash`` is
+    what ``replay_authoring.run_authoring`` actually wrote before any provider call. A second copy
+    of the recipe that drifted from the writer's would make check 6 unsatisfiable for every genuine
+    feature — a gate that refuses everything is as broken as one that admits everything."""
+    stored = catalog.execute(
+        "SELECT intent_hash FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (resolved_run.authoring_run_id,)).fetchone()[0]
+
+    assert authoring_intent_hash(intent_for(_FEATURE)) == stored
 
 
 # ── admission ────────────────────────────────────────────────────────────────────────────────────

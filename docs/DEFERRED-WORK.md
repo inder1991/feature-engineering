@@ -588,3 +588,38 @@ as gate-environment dependencies, the same way it supplies Temurin 17.
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |
+
+### A.33 🔴 The migration-1020 authoring lane is orphaned: nothing writes it, and nothing reads it any more (2026-08-03)
+
+Found by Phase G T2, which was the first caller ever to try to reach `admit_artifacts` from a
+durable identity. Two complete authoring lanes exist side by side and describe DISJOINT sets of
+runs — a given run is in exactly one of them, never both:
+
+| | 1020 lane | 1022 lane |
+|---|---|---|
+| orchestrator | `formula/authoring.py::run_authoring` | `formula/replay_authoring.py::run_authoring` |
+| trace module | `formula/trace.py` | `formula/replay_trace.py` |
+| tables | `authoring_run`, `authoring_trace_event` | `formula_authoring_run`, `formula_authoring_trace_event` |
+| run ids | `arun_…` (minted internally) | `far_…` (caller may supply) |
+| terminal kinds | `COMPLETED` / `FAILED` | `completed` / `failed` |
+| payload hash | sha256 over RFC 8785 (JCS) bytes | sha256 over `json.dumps(sort_keys, separators, ensure_ascii=False)` |
+| intent hash | `authoring.authoring_intent_hash` — 4 fields | `canonical_hash(replay_authoring._intent_material(…))` — 5 fields |
+| terminal payload | dispositions/axes/hashes only | the same, **plus** `result: _plain(result)` |
+
+The live worker imports `run_authoring` from `formula.replay_authoring`
+(`overlay/upload/recipe_formula_worker.py:35`), so **the 1020 store has never been written by
+anything in `src/`**: its only writer is `formula/trace.py::open_authoring_run`, whose only caller
+is `formula/authoring.py::run_authoring`, whose only callers are tests. `materialize/admission.py`
+proved against 1020 until 2026-08-03 and therefore refused every real governed feature at check 1
+with `AUTHORING_RUN_INCOMPLETE`; it now proves against 1022
+(`materialize/authoring_trace.py`). The consequence of the move is recorded there and in
+`admission.py`: check 6 went from a 4-field to a 5-field digest, so
+`AuthoringIntent.recipe_authoring_context` is now inside the proof.
+
+The 1020 lane is consequently unreferenced from `src/` in both directions. It is not deleted here:
+`formula/**` is not Phase G's to change, and which way to close this is a design decision about
+which orchestrator is the real one — not a wiring detail.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`formula/authoring.py` + `formula/trace.py` + migration 1020 have no writer and no reader** | Ownership: `formula/**` was explicitly out of scope for the session that found this, and the fix is a choice between two whole orchestrators rather than a repair. Both lanes remain individually correct and tested; the defect is that only one of them is connected to anything. | Any decision by whoever owns `formula/` about which authoring orchestrator is authoritative. The two closures are: DELETE the 1020 lane (and mark 1020 obsolete), or REPOINT `recipe_formula_worker` at `formula/authoring.py` — in which case `materialize/authoring_trace.py` must move back to the 1020 store and check 6 narrows to four fields again. Note the 1020 terminal payload carries no `result` material, so the second option also needs a durable authoring result before anything can be resolved. |
