@@ -30,6 +30,9 @@ from featuregen.overlay.upload.template_discovery import (
     DISCOVERY_BASIS_VALUES,
     DISCOVERY_DISPOSITIONS,
     DISCOVERY_METADATA,
+    FAMILY_FEATURE_CATEGORY_MAPPING,
+    FAMILY_MAPPING_CITATION_PREFIX,
+    RECIPE_REVISION_CITATION_PREFIX,
     TEMPLATE_DISCOVERY_OWNER,
     UNRESOLVED_MAPPING,
     DiscoveryControlledAssignmentV1,
@@ -39,6 +42,8 @@ from featuregen.overlay.upload.template_discovery import (
     discovery_metadata_revision_id,
     discovery_registry_content_hash,
     expected_legacy_audit_rows,
+    family_feature_category_mapping_content_hash,
+    is_derived_from_family_mapping,
     legacy_audit_manifest_content_hash,
     recipe_revision_id,
     validate_discovery_entries,
@@ -113,6 +118,84 @@ def test_feature_category_assignments_are_deterministic_and_controlled():
         cat = entry.feature_category.controlled_id if entry.feature_category else None
         by_family.setdefault(_BY_ID[entry.template_id].family, set()).add(cat)
     assert all(len(cats) == 1 for cats in by_family.values())
+
+
+# ── review finding 1: a family-DERIVED category must cite the mapping that produced it ─────────
+
+def test_family_derived_category_cites_the_family_mapping_not_only_the_recipe():
+    """A ``feature_category`` is not read out of the template — it is DERIVED by the
+    family→category table in this module. Its evidence must cite that mapping's content hash,
+    so a derived assignment can never be mistaken for a value the recipe itself authored."""
+    citation = f"{FAMILY_MAPPING_CITATION_PREFIX}{family_feature_category_mapping_content_hash()}"
+    categorized = [e for e in DISCOVERY_METADATA.values() if e.feature_category]
+    assert len(categorized) > 100
+    for entry in categorized:
+        assignment = entry.feature_category
+        assert is_derived_from_family_mapping(assignment)
+        refs = [e.producer_ref for e in assignment.evidence]
+        # the mapping citation names the CURRENT mapping content and the family rule applied
+        assert any(ref.startswith(citation) for ref in refs), refs
+        assert any(_BY_ID[entry.template_id].family in ref for ref in refs
+                   if ref.startswith(FAMILY_MAPPING_CITATION_PREFIX))
+
+
+def test_a_derived_category_is_distinguishable_from_an_authored_use_case():
+    """The defect this replaces: one ``_authored_evidence`` value was attached identically to
+    both, so a taxonomy-derived category rendered as "the recipe attests this"."""
+    for entry in DISCOVERY_METADATA.values():
+        for assignment in entry.canonical_use_cases:
+            # canonical use cases ARE read straight out of Template.primary_objective
+            assert not is_derived_from_family_mapping(assignment)
+            assert all(e.producer_ref.startswith(RECIPE_REVISION_CITATION_PREFIX)
+                       for e in assignment.evidence)
+    both = [e for e in DISCOVERY_METADATA.values() if e.feature_category and e.canonical_use_cases]
+    assert both  # …and where a template carries both, the two provenances differ
+    for entry in both:
+        assert (is_derived_from_family_mapping(entry.feature_category)
+                is not is_derived_from_family_mapping(entry.canonical_use_cases[0]))
+
+
+def test_family_mapping_content_hash_survives_reordering_and_moves_on_content():
+    mapping = dict(FAMILY_FEATURE_CATEGORY_MAPPING)
+    baseline = family_feature_category_mapping_content_hash(mapping)
+    assert baseline == family_feature_category_mapping_content_hash()
+    reordered = dict(reversed(list(mapping.items())))
+    assert family_feature_category_mapping_content_hash(reordered) == baseline
+    changed = {**mapping, "data_quality": "deviation"}   # a real re-derivation decision
+    assert family_feature_category_mapping_content_hash(changed) != baseline
+
+
+def test_family_mapping_contract_is_registered_to_the_owner_module():
+    assert contract_owner("family-feature-category-mapping", "1") == TEMPLATE_DISCOVERY_OWNER
+
+
+def test_validator_dies_when_a_derived_category_cites_only_the_recipe_revision():
+    """Mutation for finding 1: strip the mapping citation back to a bare recipe attestation —
+    exactly the shape that made a derived category indistinguishable — and the gate must die."""
+    entries = _entries()
+    idx = next(i for i, e in enumerate(entries) if e.feature_category)
+    bare = dataclasses.replace(
+        entries[idx],
+        feature_category=dataclasses.replace(
+            entries[idx].feature_category, evidence=(_evidence(),)))
+    with pytest.raises(TaxonomyValidationError, match="family-feature-category-mapping"):
+        validate_discovery_entries([*entries[:idx], bare, *entries[idx + 1:]])
+
+
+def test_the_mapping_citation_is_occurrence_provenance_and_never_churns_identity():
+    """Must-survive: the citation is a ``producer_ref``, so re-citing a re-revisioned mapping
+    (the same assignment, same axes) moves no discovery revision (0F-4 rule 3)."""
+    entry = next(e for e in DISCOVERY_METADATA.values() if e.feature_category)
+    baseline = discovery_metadata_revision_id(entry)
+    recited = dataclasses.replace(
+        entry,
+        feature_category=dataclasses.replace(
+            entry.feature_category,
+            evidence=tuple(
+                dataclasses.replace(e, producer_ref=f"{FAMILY_MAPPING_CITATION_PREFIX}deadbeef")
+                if e.producer_ref.startswith(FAMILY_MAPPING_CITATION_PREFIX) else e
+                for e in entry.feature_category.evidence)))
+    assert discovery_metadata_revision_id(recited) == baseline
 
 
 def test_dispositions_match_the_computed_summary():

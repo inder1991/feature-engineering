@@ -394,6 +394,10 @@ TAXONOMY_CHANGE_LOG: tuple[TaxonomyChangeRecord, ...] = (
                          "Authored canonical use-case assignments for the 14 templates with "
                          "authored objectives; recorded the 107 legacy use-case tags as an "
                          "unresolved audit manifest (no silent conversion)."),
+    TaxonomyChangeRecord(5, "authored", "family-feature-category-mapping",
+                         "Review fix: a family-derived feature_category now cites the mapping "
+                         "content hash and family rule that produced it, not the recipe "
+                         "revision alone, so it never reads as an SME-authored objective."),
 )
 
 

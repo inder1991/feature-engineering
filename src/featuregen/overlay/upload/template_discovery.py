@@ -17,6 +17,12 @@ Frozen identity rules (0F-5 / 0F-10 / D5):
   text values, per-value basis and canonicalized evidence axes (0F-4 rule 3: occurrence
   provenance excluded), sorted — so display order never moves identity and replayed evidence
   changes no revision.
+Citation rule (per-value, never one template-level authority): a value cites what actually
+produced it. A canonical use case is read straight out of ``Template.primary_objective`` and
+cites the recipe revision; a ``feature_category`` is DERIVED here by
+:data:`FAMILY_FEATURE_CATEGORY_MAPPING` and cites that mapping's content hash (alongside the
+recipe revision its ``family`` was read from), so a taxonomy-derived category is never
+presented as a value the recipe itself attested.
 
 Legacy migration rule: the 107 legacy ``Template.use_cases`` tags are NEVER silently converted
 into canonical use-case IDs. They are consumed only through the reviewed
@@ -68,6 +74,11 @@ __all__ = [
     "DISCOVERY_BASIS_VALUES",
     "DISCOVERY_DISPOSITIONS",
     "DISCOVERY_METADATA",
+    "FAMILY_FEATURE_CATEGORY_MAPPING",
+    "FAMILY_MAPPING_CITATION_PREFIX",
+    "RECIPE_REVISION_CITATION_PREFIX",
+    "family_feature_category_mapping_content_hash",
+    "is_derived_from_family_mapping",
     "DISCOVERY_PROPOSAL_ABSTAIN",
     "DISCOVERY_PROPOSAL_EGRESS_FIELDS",
     "DISCOVERY_PROPOSAL_PROMPT_ID",
@@ -287,7 +298,12 @@ def compute_discovery_disposition(
 # (e.g. balance_stock = trend + days-below + volatility) are deliberately ABSENT and their
 # templates stay explicit ``unclassified`` (rule 12: coverage targets never force invented
 # metadata).
-_FAMILY_FEATURE_CATEGORY: dict[str, str] = {
+#
+# This table — NOT the recipe — is what produces a ``feature_category``. It is authored in this
+# module by the taxonomy owner, so every category assignment cites its content hash
+# (:func:`family_feature_category_mapping_content_hash`) and stays distinguishable from a value
+# an SME wrote into the recipe.
+FAMILY_FEATURE_CATEGORY_MAPPING: dict[str, str] = {
     # ratio & share
     "cashflow_ratio": "ratio", "charge_off": "ratio", "collateral": "ratio",
     "corridor_mix": "ratio", "cost_to_collect": "ratio", "data_quality": "ratio",
@@ -345,7 +361,7 @@ _FAMILY_FEATURE_CATEGORY: dict[str, str] = {
 
 def _validate_family_mapping() -> None:
     authored = {t.family for t in ALL_TEMPLATES}
-    for family, category in _FAMILY_FEATURE_CATEGORY.items():
+    for family, category in FAMILY_FEATURE_CATEGORY_MAPPING.items():
         if family not in authored:
             raise TaxonomyValidationError(
                 f"family mapping names unauthored family {family!r}")
@@ -354,27 +370,80 @@ def _validate_family_mapping() -> None:
                 f"family {family!r} maps to unknown feature category {category!r}")
 
 
+def family_feature_category_mapping_content_hash(
+        mapping: Mapping[str, str] = FAMILY_FEATURE_CATEGORY_MAPPING) -> str:
+    """Content hash of the family→feature-category derivation table: the thing a derived
+    category assignment cites, because the table (not the recipe) is what produced it.
+
+    Order-independent (sorted pairs), so authoring order never moves the citation, while any
+    real re-derivation decision — adding, removing or re-pointing a family — does."""
+    payload = {"mapping": sorted([family, category] for family, category in mapping.items())}
+    return contract_hash_v1("family-feature-category-mapping", "1", payload)
+
+
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 # Entry construction (template_authored only; nothing invented)
 # ──────────────────────────────────────────────────────────────────────────────────────────────
+#: Citation prefixes. A ``producer_ref`` names WHAT produced the value: the recipe the value was
+#: read out of, or the taxonomy-owned mapping that derived it. Consumers (Task 2's provenance
+#: badge) read these through :func:`is_derived_from_family_mapping` rather than guessing.
+RECIPE_REVISION_CITATION_PREFIX = "recipe-revision:"
+FAMILY_MAPPING_CITATION_PREFIX = "family-feature-category-mapping:"
+
+
 def _authored_evidence(template: Template) -> EvidenceAuthorityV1:
-    """Template-authored values cite the recipe revision (plan: "Template-authored labels cite
-    recipe_revision_id"). The citation is occurrence provenance — excluded from semantic
-    hashes — so re-citing a re-revisioned recipe never churns the discovery revision."""
+    """Values READ OUT OF the recipe (canonical use cases, from ``Template.primary_objective``)
+    cite the recipe revision (plan: "Template-authored labels cite recipe_revision_id"). The
+    citation is occurrence provenance — excluded from semantic hashes — so re-citing a
+    re-revisioned recipe never churns the discovery revision."""
     return EvidenceAuthorityV1(
         producer=EvidenceProducer.TAXONOMY,
         strength=AssertionStrength.ATTESTED,
         lifecycle=EvidenceLifecycle.ACTIVE,
-        producer_ref=f"recipe-revision:{recipe_revision_id(template)}",
+        producer_ref=f"{RECIPE_REVISION_CITATION_PREFIX}{recipe_revision_id(template)}",
         evidence_id=None,
     )
 
 
-def _authored_entry(template: Template) -> TemplateDiscoveryMetadataV1:
+def _derived_category_evidence(template: Template, mapping_hash: str
+                               ) -> tuple[EvidenceAuthorityV1, ...]:
+    """A ``feature_category`` is DERIVED by :data:`FAMILY_FEATURE_CATEGORY_MAPPING`, not authored
+    in the recipe, so it cites that mapping's content hash and the family rule applied — first,
+    because that is the producer — and only then the recipe revision its ``family`` was read
+    from. ``basis`` stays ``template_authored`` (the derivation is deterministic and
+    controller-sanctioned); the CITATION is what keeps it distinguishable from an SME-authored
+    objective, so no one can read ``data_quality → ratio`` as "the recipe attests this".
+
+    Both citations carry the same ``(producer, strength, lifecycle)`` axes, so
+    :func:`canonical_evidence_axes` dedupes them and the discovery revision is unmoved."""
+    return (
+        EvidenceAuthorityV1(
+            producer=EvidenceProducer.TAXONOMY,
+            strength=AssertionStrength.ATTESTED,
+            lifecycle=EvidenceLifecycle.ACTIVE,
+            producer_ref=(f"{FAMILY_MAPPING_CITATION_PREFIX}{mapping_hash}"
+                          f"#family={template.family}"),
+            evidence_id=None,
+        ),
+        _authored_evidence(template),
+    )
+
+
+def is_derived_from_family_mapping(assignment: DiscoveryControlledAssignmentV1) -> bool:
+    """True when the assignment was produced by the family→category mapping rather than read
+    out of the recipe. The positive signal a provenance badge needs: a derived category and an
+    SME-authored objective must never render the same."""
+    return any((e.producer_ref or "").startswith(FAMILY_MAPPING_CITATION_PREFIX)
+               for e in assignment.evidence)
+
+
+def _authored_entry(template: Template, *, family_mapping_hash: str
+                    ) -> TemplateDiscoveryMetadataV1:
     evidence = (_authored_evidence(template),)
-    category_id = _FAMILY_FEATURE_CATEGORY.get(template.family)
+    category_id = FAMILY_FEATURE_CATEGORY_MAPPING.get(template.family)
     feature_category = (DiscoveryControlledAssignmentV1(
-        controlled_id=category_id, basis="template_authored", evidence=evidence,
+        controlled_id=category_id, basis="template_authored",
+        evidence=_derived_category_evidence(template, family_mapping_hash),
         operational_influence=None) if category_id else None)
     # Canonical use cases come ONLY from the template's own authored objectives — the 107
     # legacy tags are migration evidence in the audit manifest, never converted here.
@@ -410,9 +479,10 @@ def validate_discovery_entries(entries: Sequence[TemplateDiscoveryMetadataV1],
     """The 0F-5 import gate. Proves: exact one-entry-per-template coverage (no orphan, no
     duplicate, no missing template); every controlled ID resolves in its OWN registry (a
     plausible legacy string dies here); canonical use cases are selectable leaves with no
-    duplicates; keyword/prose bounds; basis/influence/evidence rules; and the disposition is
-    the honest computed summary (``needs_sme`` allowed only as an authored escalation of a
-    non-complete entry)."""
+    duplicates; keyword/prose bounds; basis/influence/evidence rules; a ``template_authored``
+    category cites the mapping that derived it, never a bare recipe attestation; and the
+    disposition is the honest computed summary (``needs_sme`` allowed only as an authored
+    escalation of a non-complete entry)."""
     known = {t.id for t in templates}
     leaves = set(selectable_leaves())
     seen: set[str] = set()
@@ -432,6 +502,16 @@ def validate_discovery_entries(entries: Sequence[TemplateDiscoveryMetadataV1],
                 raise TaxonomyValidationError(
                     f"template {tid!r} feature_category {cid!r} is not a registered "
                     f"feature-category ID")
+            # No template authors a category: a template_authored category can only come from
+            # the family→category derivation, so it must cite that mapping. A bare
+            # recipe-revision citation would present a taxonomy-derived value as one the recipe
+            # attested — indistinguishable from an SME-authored objective.
+            if (entry.feature_category.basis == "template_authored"
+                    and not is_derived_from_family_mapping(entry.feature_category)):
+                raise TaxonomyValidationError(
+                    f"template {tid!r} feature_category {cid!r} is template_authored but cites "
+                    f"no {FAMILY_MAPPING_CITATION_PREFIX} evidence — a derived category must "
+                    f"cite the mapping that produced it, never only the recipe revision")
         if entry.business_domains:
             # D9: the shared controlled business-domain registry does not exist in code; no
             # ID can validate, so none can be assigned. A local look-alike registry is
@@ -931,11 +1011,15 @@ register_contract_version("template-discovery-metadata", "1", owner=TEMPLATE_DIS
 register_contract_version("template-discovery-registry", "1", owner=TEMPLATE_DISCOVERY_OWNER)
 register_contract_version("legacy-use-case-audit-manifest", "1",
                           owner=TEMPLATE_DISCOVERY_OWNER)
+register_contract_version("family-feature-category-mapping", "1",
+                          owner=TEMPLATE_DISCOVERY_OWNER)
 
 # ── build + import-time validation: a malformed registry dies at import ────────────────────────
 _validate_family_mapping()
+_FAMILY_MAPPING_CONTENT_HASH = family_feature_category_mapping_content_hash()
 _ENTRIES: tuple[TemplateDiscoveryMetadataV1, ...] = tuple(
-    _authored_entry(t) for t in ALL_TEMPLATES)
+    _authored_entry(t, family_mapping_hash=_FAMILY_MAPPING_CONTENT_HASH)
+    for t in ALL_TEMPLATES)
 validate_discovery_entries(_ENTRIES)
 
 #: The discovery-metadata registry: exact template-ID coverage, per-value provenance,
