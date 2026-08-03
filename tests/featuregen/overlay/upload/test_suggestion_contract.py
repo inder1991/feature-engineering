@@ -873,6 +873,138 @@ def test_the_page_serializes_to_plain_json(overlay_conn, ftr_catalog):
     assert suggestion["grounding_trace_content_hash"]
 
 
+def test_one_template_index_is_built_once_not_scanned_per_suggestion(overlay_conn, ftr_catalog):
+    """The registry is 157 templates and a page renders ten cards; a per-card linear scan is 1,570
+    comparisons for an answer one dict already holds. The index is built at import, and this pins
+    that the assembly never walks ``ALL_TEMPLATES`` again."""
+    from featuregen.overlay.upload import templates as templates_module
+
+    assert set(contract_module._TEMPLATES_BY_ID) == {t.id for t in templates_module.ALL_TEMPLATES}
+    scans: list[int] = []
+    real = templates_module.ALL_TEMPLATES
+
+    class _CountingRegistry(tuple):
+        def __iter__(self):
+            scans.append(1)
+            return super().__iter__()
+
+    monkey = _CountingRegistry(real)
+    original = contract_module.ALL_TEMPLATES
+    contract_module.ALL_TEMPLATES = monkey
+    try:
+        page = _page(overlay_conn)
+        assert page.hits
+    finally:
+        contract_module.ALL_TEMPLATES = original
+    assert scans == []
+
+
+# ── the mutation set: every one of these must die ───────────────────────────────────────────────
+def test_collapsing_an_evidence_tuple_would_lose_the_derivation_citation(overlay_conn,
+                                                                        ftr_catalog):
+    """MUTATION: keep only the "best" evidence occurrence. A derived ``feature_category`` cites BOTH
+    the mapping that produced it AND the recipe its family was read from; collapsing to one drops
+    the mapping citation, and the provenance badge silently starts calling a taxonomy derivation an
+    SME-authored objective."""
+    from featuregen.overlay.upload.template_discovery import (
+        FAMILY_MAPPING_CITATION_PREFIX,
+        RECIPE_REVISION_CITATION_PREFIX,
+    )
+
+    categorised = [h.suggestion.feature_category for h in _page(overlay_conn).hits
+                   if h.suggestion.feature_category is not None]
+    assert categorised
+    for category in categorised:
+        refs = [e.producer_ref or "" for e in category.evidence]
+        assert len(refs) >= 2
+        assert any(r.startswith(FAMILY_MAPPING_CITATION_PREFIX) for r in refs)
+        assert any(r.startswith(RECIPE_REVISION_CITATION_PREFIX) for r in refs)
+        # the mutation: keep the first only
+        collapsed = replace(category, evidence=category.evidence[1:])
+        assert not is_family_derived_category(collapsed)
+
+
+def test_choosing_the_first_domain_would_drop_the_others(overlay_conn, ftr_catalog):
+    """MUTATION: pick one domain as the feature's one true domain (rule 3). A multi-source feature
+    genuinely has several, and every one keeps its own provenance."""
+    before = _suggestions(_page(overlay_conn))["balance_trend_90d"]
+    original = {t.value for t in before.contextual_domain_terms}
+    assert len(original) == 1, original          # one domain today — the mutation adds a second
+    overlay_conn.execute(
+        "UPDATE graph_node SET domain = 'treasury' WHERE catalog_source = %s AND object_ref = %s",
+        (SOURCE, f"public.{TABLE}.bal_amt"))
+    card = _suggestions(_page(overlay_conn))["balance_trend_90d"]
+    values = {t.value for t in card.contextual_domain_terms}
+    assert values == original | {"treasury"}, values
+    assert all(t.source_refs for t in card.contextual_domain_terms)
+    # ...and each term names the operands it came from, so neither is an unattributed string
+    by_value = {t.value: t for t in card.contextual_domain_terms}
+    assert by_value["treasury"].source_refs == (f"public.{TABLE}.bal_amt",)
+
+
+def test_dropping_the_relationship_path_from_identity_would_fuse_two_candidates(overlay_conn,
+                                                                                join_catalog):
+    """MUTATION: exclude the logical relationship path (rule 23). Rebuilt WITHOUT the per-operand
+    ``JOIN_PATH`` assignment, the cross-table candidate's id collides with the id of the same
+    columns reached over no path at all."""
+    from featuregen.overlay.upload.suggestion_identity import suggestion_id
+
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    card = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                              source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert card.relationship_dependencies, "no path traversed — the mutation proof would be vacuous"
+    inputs = dict(
+        template_id=card.template_id,
+        bound_params=(),
+        operands=tuple((o.catalog_source, o.logical_ref, o.recipe_role) for o in card.operands),
+        entity_id=card.entity.id if card.entity else None,
+        grain_refs=card.grain_refs, time_ref=card.time_ref)
+    pathless = suggestion_id(**inputs, relationship_path_assignment=())
+    assert card.suggestion_id != pathless
+
+
+def test_the_rendered_name_is_never_the_identity(overlay_conn, ftr_catalog, monkeypatch):
+    """MUTATION: use the rendered name as the id — today's V1 gap, where React keys on ``s.name``.
+    Renaming every candidate must move NO identity: the name is a rendering, not a key."""
+    before = {h.suggestion.template_id: h.suggestion for h in _page(overlay_conn).hits}
+    _patch_engine(monkeypatch, lambda r: replace(
+        r, ideas=[replace(idea, name=f"{idea.name}__renamed") for idea in r.ideas]))
+    after = {h.suggestion.template_id: h.suggestion for h in _page(overlay_conn).hits}
+    assert set(before) == set(after)
+    for template_id, suggestion in after.items():
+        assert suggestion.name.endswith("__renamed")
+        assert suggestion.suggestion_id == before[template_id].suggestion_id
+        assert suggestion.suggestion_revision_id == before[template_id].suggestion_revision_id
+
+
+def test_a_build_observation_never_reaches_the_revision(overlay_conn, ftr_catalog, monkeypatch):
+    """MUTATION: put a snapshot id (or a producer commit, or a refresh id) into the semantic hash.
+    A byte-identical re-upload mints new snapshot ids, so a revision that hashed one would churn
+    every suggestion in the catalog for no semantic change at all (rule 24)."""
+    before = {h.suggestion.template_id: h.suggestion.suggestion_revision_id
+              for h in _page(overlay_conn).hits}
+    _patch_engine(monkeypatch, lambda r: replace(
+        r, ideas=[replace(idea, metadata_snapshot_id="snap-9999") for idea in r.ideas]))
+    page = _page(overlay_conn)
+    after = {h.suggestion.template_id: h.suggestion.suggestion_revision_id for h in page.hits}
+    assert after == before
+    # ...and the new id IS carried, as build provenance where a reader can compare currentness
+    assert {p for hit in page.hits for p in hit.provenance.metadata_snapshot_ids} == {"snap-9999"}
+
+
+def test_every_engine_rejection_reaches_the_collection(overlay_conn, ftr_catalog):
+    """MUTATION: drop a collection rejection. The rejections are the table's catalog-readiness
+    to-dos; a page that quietly shortened them would report a cleaner catalog than it read."""
+    from featuregen.overlay.upload.contract.gate1 import _template_candidates
+
+    engine = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(), target_ref=None,
+                                  now=None, table=TABLE)
+    collection = _page(overlay_conn).collection
+    assert len(collection.rejections) == len(engine.rejection_records) > 0
+    assert {r.candidate_name for r in collection.rejections} == {
+        r["name"] for r in engine.rejections}
+
+
 def test_the_wire_keeps_every_evidence_axis_on_an_attributed_value(overlay_conn, ftr_catalog):
     """Rule 4: authority travels. A card that dropped the producer/strength/lifecycle axes would
     render an LLM proposal and a human attestation identically."""
