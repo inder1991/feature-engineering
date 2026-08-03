@@ -41,6 +41,8 @@ function page(offset: number, size: number, total: number): api.SearchResult {
     hits: Array.from({ length: size }, (_, i) => hit(offset + i)),
     facets: FACETS,
     total,
+    // Task 6: every search read carries the projection marker; `ready` is the normal value.
+    projection: { status: 'ready', code: '', detail: '' },
   }
 }
 

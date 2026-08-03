@@ -261,6 +261,9 @@ def test_successful_upload_records_ordered_stage_reports(client):
         "enrich_concept", "enrich_concept_critic",
         "enrich_definition", "enrich_domain",
         "enrich_synonyms", "enrich_unit",
+        # semantic Task 5: adjudication of the columns Pass A left unclear, between the stages it
+        # reasons over and the graph persistence that must carry its corrections.
+        "semantic_adjudication",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
         # Task 0.6 Seam 5a: the tail re-projection of evidence-bearing table refs now reports.

@@ -231,10 +231,24 @@ export type SearchFilters = {
 // GET /search response. `facets` is keyed by group name (the six above plus grain/as_of, which
 // always emit a single "true" bucket that may be count 0); each list is capped 50, count desc.
 // `total` counts tables AND columns (kind is a facet), so render honest "N result(s)" copy.
+/**
+ * Whether a load-bearing catalog projection was BEHIND when a read was served (semantic Task 6).
+ * `ready` on the happy path — ALWAYS present, because an omitted field cannot distinguish
+ * "checked and fine" from "never checked". A `lagged` marker is a disclosure, never a refusal:
+ * the rows are still served, and the UI should say the view may not yet reflect the newest
+ * resolved semantics rather than hide it.
+ */
+export interface ProjectionStatus {
+  status: 'ready' | 'lagged'
+  code: string
+  detail: string
+}
+
 export interface SearchResult {
   hits: SearchHit[]
   facets: Record<string, FacetBucket[]>
   total: number
+  projection: ProjectionStatus
 }
 
 export interface QuarantineItem {
@@ -2182,6 +2196,31 @@ export interface AuditSection {
   truncated: boolean
 }
 
+/** One suggested addition to the concept vocabulary — for human review, never auto-applied. */
+export interface OntologyGapSuggestion {
+  proposed_label: string
+  parent_concept: string | null
+  definition: string
+  aliases: string[]
+}
+
+/**
+ * The current semantic adjudication of one column. `confidence_band` is EXPLANATION for the
+ * reader, never authority: the adjudicated concept is llm/proposed evidence like any other, and
+ * its authority is shown by the evidence/effective_metadata sections.
+ */
+export interface SemanticAdjudicationSection {
+  status: 'available' | 'absent'
+  note?: string
+  structured_result_id?: string
+  selected_concept?: string
+  alternatives?: string[]
+  confidence_band?: 'high' | 'medium' | 'low'
+  reason_codes?: string[]
+  missing_context?: string[]
+  ontology_gap?: OntologyGapSuggestion | null
+}
+
 export interface AssetDetail {
   version: string
   source: string
@@ -2199,8 +2238,15 @@ export interface AssetDetail {
   // Server-calculated commands the caller may run; F0 keeps this empty.
   actions?: unknown[]
   audit?: AuditSection
+  // The adjudicator's reviewable second opinion for a column Pass A could not settle (Task 5).
+  // `absent` is the NORMAL state — adjudication is the exception path, not a gap in the data.
+  semantic_adjudication?: SemanticAdjudicationSection
   included_sections: string[]
   unavailable_sections: string[]
+  // Whether a load-bearing projection was behind when this dossier was assembled (Task 6). It is
+  // INSIDE the fingerprinted body, so a lagged snapshot never shares a consistency_token with a
+  // ready one.
+  projection?: ProjectionStatus
   // The snapshot fingerprint, echoed as the ETag header (the OCC token).
   consistency_token: string
 }
