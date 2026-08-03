@@ -24,7 +24,12 @@ from tests.featuregen.analysis.release_b_bank import (
     pilot_plan,
     publish_temporal_policy_for,
 )
-from tests.featuregen.data_agent.pilot_fixture import EXPECTED, TRANSACTION_TABLE
+from tests.featuregen.data_agent.pilot_fixture import (
+    CUSTOMER_TABLE,
+    DIMENSION_TABLE,
+    EXPECTED,
+    TRANSACTION_TABLE,
+)
 from tests.featuregen.data_agent.test_analysis_ir import _policy as _eligibility
 
 from featuregen.analysis.engine import EXECUTION_ENGINE_NOT_APPROVED, AnalysisEngineV1
@@ -282,6 +287,110 @@ def test_a_PRIVILEGED_caller_keeps_every_one_of_the_409s(make_client, bank, seal
     stale = client.post("/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
     assert stale.status_code == 409
     assert stale.json()["refusal"]["code"] == SEALED_PLAN_STALE_TEMPORAL_POLICY
+
+
+# ── the planning surface hands out an identity that REPLAYS ──────────────────────────────────────
+#
+# Every other test here seals through the SERVICE, so nothing proved the HTTP planning route ever
+# produced a `sealed_plan_hash` at all. It did not: retrieval offers the flattened
+# `source::table.column` ref and the selection contracts require `source::schema.table`, so every
+# LLM-planned question refused SELECTION_BINDING_MISSING at every need and the hash was always
+# `None`. This is that chain, over HTTP, end to end.
+
+
+def _intent_output(**over) -> dict:
+    """What the model returns, in the refs RETRIEVAL offers — flattened, exactly as the real one
+    would, because it may only name refs from the offered set."""
+    out = {
+        "entity": "customer",
+        # The column that IDENTIFIES a customer, chosen from the offered set — the transaction
+        # table's `cif_id` is not offered (it carries no governed grain and matches no lexeme in
+        # this question), and the model may only name what it was given.
+        "entity_ref": f"{SRC}::{CUSTOMER_TABLE}.cif_id",
+        "base_table_ref": f"{SRC}::{TRANSACTION_TABLE}",
+        "measure": {"op": "count", "logical_ref": ""},
+        "windows": [
+            {"label": "current", "anchor_ref": f"{SRC}::{TRANSACTION_TABLE}.tran_month",
+             "calendar_unit": "month", "calendar_length": 1, "calendar_offset": 0},
+            {"label": "previous", "anchor_ref": f"{SRC}::{TRANSACTION_TABLE}.tran_month",
+             "calendar_unit": "month", "calendar_length": 1, "calendar_offset": 1}],
+        "dimensions": [{"logical_ref": f"{SRC}::{DIMENSION_TABLE}.segment"}],
+        "comparison": "decrease", "unresolved": [],
+    }
+    out.update(over)
+    return out
+
+
+@pytest.fixture
+def planning_bank(bank):
+    """The pilot bank plus the freshness watermark retrieval reads. Without it every column reads
+    as stale and the question matches nothing."""
+    bank.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id) "
+        "VALUES (%s, %s, 'r1') ON CONFLICT (catalog_source) DO UPDATE "
+        "  SET last_completed_at = EXCLUDED.last_completed_at", (SRC, datetime.now(UTC)))
+    return bank
+
+
+def _planning_client(make_client, bank):
+    from featuregen.analysis.intent import TASK
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+
+    client = make_client(llm_client=FakeLLM(script={TASK: FakeResponse(output=_intent_output())}))
+    client.app.dependency_overrides[get_analysis_engine] = lambda: (
+        lambda _connection: AnalysisEngineV1(conn=bank, dialect=PostgresDialect(),
+                                             engine="postgres"))
+    return client
+
+
+def test_the_PLANNING_route_returns_a_sealed_plan_hash_and_it_replays(make_client, planning_bank):
+    """Plan -> the population clarification -> answer it -> a sealed hash that REPLAYS and RUNS.
+
+    The population is asked for rather than supplied, and that is the doctrine working, not a
+    detour: `extract_intent` raises `population` on every comparison question because choosing among
+    look-alike population tables is inference, so `/analysis/plan` can only seal once a PERSON has
+    named one. The route asserts the hash is offered at both steps and is `None` until then.
+    """
+    from featuregen.analysis.sealed_plan_store import replay_sealed_plan
+
+    client = _planning_client(make_client, planning_bank)
+    planned = client.post("/analysis/plan", json={"question": QUESTION}, headers=_h())
+    assert planned.status_code == 200, planned.text
+    # The KEY is always offered; it is `None` while nobody has declared the population.
+    assert planned.json()["sealed_plan_hash"] is None
+    assert "population" in {c["code"] for c in planned.json()["clarifications"]}
+
+    answered = client.post("/analysis/clarify", headers=_h(), json={
+        "question": QUESTION, "code": "population",
+        "chosen": [f"{SRC}::{CUSTOMER_TABLE}.cif_id"]})
+    assert answered.status_code == 200, answered.text
+    plan_hash = answered.json()["sealed_plan_hash"]
+    assert plan_hash, answered.json()["preview"]["blocked_by"]
+
+    # IT REPLAYS: the identity the caller was handed addresses the one canonical sealed plan.
+    replayed = replay_sealed_plan(planning_bank, plan_hash)
+    assert replayed is not None
+    assert replayed.plan_hash == plan_hash
+    assert {s.need_role for s in replayed.sources} == {"population", "event_source",
+                                                       "dimension_source"}
+    # …and the seventh pin is on it, sealed by the route rather than by a test helper.
+    assert replayed.eligibility is not None
+
+
+def test_the_hash_the_PLANNING_route_returns_is_the_one_execute_accepts(make_client,
+                                                                        planning_bank):
+    """The two surfaces meet. A hash that planned but could not execute would be a governance
+    handle nobody can use."""
+    client = _planning_client(make_client, planning_bank)
+    client.post("/analysis/plan", json={"question": QUESTION}, headers=_h())
+    plan_hash = client.post("/analysis/clarify", headers=_h(), json={
+        "question": QUESTION, "code": "population",
+        "chosen": [f"{SRC}::{CUSTOMER_TABLE}.cif_id"]}).json()["sealed_plan_hash"]
+
+    run = client.post("/analysis/execute", json={"plan_hash": plan_hash}, headers=_h())
+    assert run.status_code == 200, run.text
+    assert run.json()["plan_hash"] == plan_hash
+    assert run.json()["provenance"]["contract_version"] == 2
 
 
 def test_execution_requires_the_feature_generate_permission(make_client, bank, sealed):
