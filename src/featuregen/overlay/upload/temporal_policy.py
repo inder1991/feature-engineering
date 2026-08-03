@@ -330,10 +330,15 @@ def temporal_policy_agreement(
 
     Three cases, deliberately distinguished:
 
-    * a current LOAD-BEARING profile model exists and CONTRADICTS the policy — refuse
-      (:data:`TEMPORAL_MODEL_UNKNOWN` is not it; a contradiction is not an absence, so the caller
-      gets ``TEMPORAL_MODEL_UNKNOWN`` only when nothing is known). A policy may not overrule a
-      governed classification, because the classification is what the execution gates read.
+    * a current LOAD-BEARING profile model exists and CONTRADICTS the policy — refuse. The code
+      returned is :data:`TEMPORAL_MODEL_UNKNOWN`, the same one an absence gets: the eight-member
+      closed vocabulary has NO separate contradiction code, and inventing a ninth spelling here
+      would fork a vocabulary three consumers derive their enums, questions and learning gaps from.
+      So the code says only "the temporal model is not settled", which is true of both. WHICH of the
+      two it was is not lost — :func:`contradicts_load_bearing_model` answers exactly that, and
+      ``temporal_policy_store`` calls it to raise the specific message ("you declared scd2 and the
+      governed classification says snapshot") instead of the generic one. A policy may not overrule
+      a governed classification, because the classification is what the execution gates read.
     * a load-bearing model exists and AGREES — the policy operates on the governed value.
     * NO load-bearing model (absent, or only a PROPOSED/display value) — the POLICY is the
       operational declaration (D12.7). This is the case that keeps upload-only catalogs working:
@@ -342,7 +347,9 @@ def temporal_policy_agreement(
       make that distinction explicit at the call site; it never gates the answer.
 
     A policy declaring ``unknown`` declares nothing, and is refused with
-    :data:`TEMPORAL_MODEL_UNKNOWN` regardless of the profile."""
+    :data:`TEMPORAL_MODEL_UNKNOWN` regardless of the profile — which is why
+    ``temporal_policy_store.publish_temporal_policy`` refuses to publish one at all: a policy this
+    function can only ever answer a refusal for has no operational meaning to record."""
     declared = _enum_value(policy_model, TemporalStorageModel, what="policy_model")
     if declared == TemporalStorageModel.UNKNOWN.value:
         return TEMPORAL_MODEL_UNKNOWN
