@@ -272,6 +272,12 @@ def _fold(value: str) -> str:
     return value.strip().lower()
 
 
+def _comment(text: str) -> str:
+    """A catalog comment stays ON its comment line: a linebreak inside an interpolated value would
+    end the comment early and turn the remainder into YAML nobody wrote."""
+    return str(text).replace("\r", " ").replace("\n", " ")
+
+
 # ── the datasets ─────────────────────────────────────────────────────────────────────────────────
 
 
@@ -336,7 +342,12 @@ def project_datasets(
     for ir in sorted(authorized.irs, key=lambda compiled: compiled.feature_name):
         column = _column_of(plan, ir.feature_name)
         staging[column] = f"feature_staging_{column}"
-        manifests[column] = f"feature_staging_manifest_{column}"
+        # `feature_manifest__` (and `feature_group__` below), NOT `feature_staging_manifest_`:
+        # a feature legitimately named `manifest_<x>` stages as `feature_staging_manifest_<x>`,
+        # which is exactly the name the old prefix gave feature `<x>`'s manifest. The
+        # double-underscore families cannot collide with any `feature_staging_<hive_identifier>`
+        # name — they differ from it at the character after `feature_`.
+        manifests[column] = f"feature_manifest__{column}"
         for expression in sorted(ir.expressions, key=lambda e: e.expr_path):
             projections[(column, expression.expr_path)] = (
                 f"intermediate_{column}__{slug(expression.expr_path)}")
@@ -357,7 +368,9 @@ def project_datasets(
         # §9's gates run AFTER assembly and BEFORE publication, so the assembled group needs a
         # declared home: an undeclared output is an in-memory dataset, and a gate that failed over
         # one would leave nothing an operator could inspect to see what it judged.
-        assembled="feature_staging_assembled",
+        # `feature_group__`, not `feature_staging_`: a feature named `assembled` stages as
+        # `feature_staging_assembled`, which is the name this dataset used to claim.
+        assembled="feature_group__assembled",
         published=published_dataset_name(plan))
 
     declared = [
@@ -422,7 +435,7 @@ def _hive_entry(name: str, layer: DatasetLayer, *, database: str, table: str,
     at all. Task 16 replaces this entry with the mechanism its probe attested.
     """
     return _CatalogEntry(name=name, layer=layer, body=(
-        f"  # {comment}",
+        f"  # {_comment(comment)}",
         "  type: spark.SparkHiveDataset",
         f"  database: {_quote(database)}",
         f"  table: {_quote(table)}",
@@ -441,7 +454,7 @@ def _parquet_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -
     and a re-run would land on top of the previous run's evidence.
     """
     return _CatalogEntry(name=name, layer=layer, body=(
-        f"  # {comment}",
+        f"  # {_comment(comment)}",
         "  type: spark.SparkDataset",
         f"  filepath: {_quote('${runtime_params:staging_root}/' + path)}",
         '  file_format: "parquet"',
@@ -455,7 +468,7 @@ def _parquet_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -
 
 def _json_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -> _CatalogEntry:
     return _CatalogEntry(name=name, layer=layer, body=(
-        f"  # {comment}",
+        f"  # {_comment(comment)}",
         "  type: json.JSONDataset",
         f"  filepath: {_quote('${runtime_params:staging_root}/' + path)}",
         "  metadata:",
@@ -496,7 +509,9 @@ def _catalog_entries(
     """
     entries: list[_CatalogEntry] = []
     for physical, name in sorted(datasets.raw.items()):
-        schema, table = physical.split(".", 1)
+        # The LAST dot separates schema from table: a dotted schema is real (a catalog-qualified
+        # namespace like `edp.raw`), a dotted table is not.
+        schema, table = physical.rsplit(".", 1)
         entries.append(_hive_entry(
             name, DatasetLayer.RAW, database=schema, table=table,
             comment=f"governed source, read-only: {physical}"))
@@ -529,7 +544,9 @@ def _catalog_entries(
         comment="the assembled group — §9's gates run on THIS, and only a group that passes"
                 " every one of them reaches the publication target"))
     if selection is None:
-        database, table = published_target.split(".", 1)
+        # The LAST dot separates schema from table; the sandbox namespace may itself be
+        # catalog-qualified, and the group name (a hive identifier) never carries a dot.
+        database, table = published_target.rsplit(".", 1)
         entries.append(_hive_entry(
             datasets.published, DatasetLayer.FEATURE, database=database, table=table,
             comment=f"the publication target, derived from the sandbox binding: {published_target}"))
@@ -772,7 +789,8 @@ def _render_hooks(package: str, required_parameters: tuple[str, ...]) -> str:
         "    @hook_impl\n"
         "    def before_pipeline_run(self, run_params: dict[str, Any], pipeline: Any,\n"
         "                            catalog: Any) -> None:\n"
-        '        supplied = set((run_params or {}).get("runtime_params") or {})\n'
+        '        params = run_params or {}\n'
+        '        supplied = set(params.get("runtime_params") or params.get("extra_params") or {})\n'
         "        expected = set(self.REQUIRED_RUN_PARAMETERS)\n"
         "        missing = sorted(expected - supplied)\n"
         "        unexpected = sorted(supplied - expected)\n"
@@ -939,7 +957,13 @@ def _render_spark(package: str) -> str:
         "# decided HOW an overwrite behaves would be a policy for an operation this project may not\n"
         "# perform.\n"
         f"spark.app.name: {_quote(package)}\n"
-        'spark.sql.session.timeZone: "UTC"\n')
+        'spark.sql.session.timeZone: "UTC"\n'
+        "#\n"
+        "# ANSI mode changes what the emitted gates observe: the OVERFLOW_VIOLATION gate\n"
+        "# reads a NULL from an out-of-range cast (legacy semantics); under ANSI the cast\n"
+        "# raises a raw SparkArithmeticException outside the closed gate vocabulary. The\n"
+        "# governed semantics therefore must not depend on a cluster default.\n"
+        'spark.sql.ansi.enabled: "false"\n')
 
 
 def _render_pyproject(package: str, *, engine_versions: EngineVersions) -> str:

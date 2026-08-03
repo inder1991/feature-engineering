@@ -173,7 +173,8 @@ def test_facts_validate_but_never_choose(two_candidate_customer_tables):
                      availability_ref=f"{KYC}.load_ts",
                      population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(status_ref=f"{KYC}.status_cd",
-                                                      allowed_status_values=("A",))),
+                                                      allowed_status_values=("A",),
+                                                      observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(master, SpineSpec)
     assert master.source_table_ref == CUSTOMERS
@@ -326,6 +327,60 @@ def test_a_column_the_catalog_does_not_have_is_rejected(two_candidate_customer_t
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
 
+@pytest.fixture
+def composite_key_customers(db):
+    """A branch-sharded master file: the governed grain is (cif_id, branch_cd) — TWO columns.
+
+    Every other fixture in this file declares a 1-tuple key, so `_refuse_wrong_entity`'s loop over
+    `ordered_key_refs` never iterated twice. Here `cif_id` carries the governed `customer`
+    entity_assignment and `branch_cd` legitimately carries none — the composite-key shape the
+    docstring of `_refuse_wrong_entity` promises to accept."""
+    build_graph(db, _SRC, [
+        CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
+        CanonicalRow(_SRC, "customers", "branch_cd", "text", is_grain=True),
+        CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
+    ])
+    _govern_grain(db, "cif_id", "branch_cd")
+    _govern_availability(db, "load_ts")
+    _govern_entity(db, "cif_id")            # branch_cd stays UNTAGGED — allowed, not contradictory
+    _healthy_projection(db)
+    return db
+
+
+def test_a_COMPOSITE_key_with_one_governed_entity_and_one_untagged_key_validates(
+        composite_key_customers):
+    """The multi-key loop's accepting path: the untagged key is SKIPPED (not treated as a
+    contradiction, not counted as confirmation), and the one governed `customer` tag is enough."""
+    declaration = _declaration(
+        ordered_key_refs=(CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd"))
+    result = validate_spine_declaration(composite_key_customers, declaration, roles=_ROLES)
+    assert isinstance(result, SpineSpec), result
+    assert result.ordered_key_refs == (CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd")
+    assert set(result.governed_grain_refs) == {CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd"}
+
+
+def test_a_COMPOSITE_key_whose_SECOND_key_names_another_entity_is_rejected(db):
+    """The loop's refusing path, on the key a first-element-only check never reads: `branch_cd`
+    carries a governed entity_assignment for `branch`, which contradicts the declared `customer`
+    even though `cif_id` confirms it."""
+    build_graph(db, _SRC, [
+        CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
+        CanonicalRow(_SRC, "customers", "branch_cd", "text", is_grain=True, entity="branch"),
+        CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
+    ])
+    _govern_grain(db, "cif_id", "branch_cd")
+    _govern_availability(db, "load_ts")
+    _govern_entity(db, "cif_id")
+    _govern_entity(db, "branch_cd")         # governed, and it says BRANCH
+    _healthy_projection(db)
+    declaration = _declaration(
+        ordered_key_refs=(CUSTOMERS_CIF, f"{CUSTOMERS}.branch_cd"))
+    result = validate_spine_declaration(db, declaration, roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+    assert "branch_cd" in result.detail and "different entity" in result.detail
+
+
 def test_a_MIXED_CASE_catalog_is_the_same_catalog(db):
     """`build_graph` writes `object_ref`/`table_name` with the UPLOAD's casing, while a canonical
     `logical_ref` is case-folded — and the governed readers match on `lower(object_ref)`. If this
@@ -364,6 +419,28 @@ def test_a_denied_read_is_READ_SCOPE_INSUFFICIENT_not_a_fact_rejection(two_candi
         two_candidate_customer_tables, _declaration(), roles=_ROLES)
     granted = validate_spine_declaration(
         two_candidate_customer_tables, _declaration(), roles=(*_ROLES, "pii_reader"))
+    assert isinstance(denied, MaterializationRefused)
+    assert denied.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert isinstance(granted, SpineSpec)          # same catalog, sufficient read scope
+
+
+@pytest.mark.parametrize(("floor", "granting_role"),
+                         [("restricted", "restricted_reader"),
+                          ("confidential", "confidential_reader")])
+def test_a_governed_floor_on_an_UNTAGGED_spine_column_needs_its_reader_role(
+        two_candidate_customer_tables, floor, granting_role):
+    """`sensitivity` stays NULL — the shipped FTR shape (migration 1032's header: 28/126 columns,
+    including an Emirates ID number, carried a governed floor and NO file tag). The spine's
+    read-scope check reads `visible_requires`, which folds BOTH axes, so the governed floor refuses
+    exactly like a tag — before this, a floored key column validated for a caller with no reader
+    role at all."""
+    two_candidate_customer_tables.execute(
+        "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
+        "AND object_ref = 'public.customers.cif_id'", (floor, _SRC))
+    denied = validate_spine_declaration(
+        two_candidate_customer_tables, _declaration(), roles=_ROLES)
+    granted = validate_spine_declaration(
+        two_candidate_customer_tables, _declaration(), roles=(*_ROLES, granting_role))
     assert isinstance(denied, MaterializationRefused)
     assert denied.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
     assert isinstance(granted, SpineSpec)          # same catalog, sufficient read scope
@@ -408,13 +485,21 @@ def scd_customers(db):
     table holds MANY rows per customer and only a collapsing policy can make a spine out of it."""
     build_graph(db, _SRC, [
         CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
-        CanonicalRow(_SRC, "customers", "effective_from", "date", is_grain=True),
+        # Task 13: `effective_from` now carries `as_of=True` because `LatestAvailableAsOf` holds
+        # its effective-time column to the SAME governed `is_as_of` standard as availability.
+        # NOTE: a TWO-as_of-column upload is QUARANTINED at ingest (`canonical.validate_rows`
+        # rejects ambiguous availability), and the projection governs exactly ONE as-of column per
+        # table — this fixture deliberately models the post-fact-model-growth state (DEFERRED-WORK
+        # A.30) so the read contract can be tested; it is not a realistic catalog today.
+        CanonicalRow(_SRC, "customers", "effective_from", "date", is_grain=True, as_of=True),
         CanonicalRow(_SRC, "customers", "version_seq", "int", is_grain=True),
         CanonicalRow(_SRC, "customers", "load_ts", "timestamp", as_of=True),
         CanonicalRow(_SRC, "customers", "status_cd", "text"),
     ])
     _govern_grain(db, "cif_id", "effective_from", "version_seq")
     _govern_availability(db, "load_ts")
+    # Task 13: the effective-time column of an SCD policy must itself be governed `is_as_of`.
+    _govern_availability(db, "effective_from")
     _govern_entity(db, "cif_id")
     _healthy_projection(db)
     return db
@@ -434,6 +519,65 @@ def test_a_policy_that_collapses_the_history_columns_is_accepted(scd_customers):
                      snapshot_policy=_scd_policy()), roles=_ROLES)
     assert isinstance(result, SpineSpec)
     assert set(result.governed_grain_refs) == {CUSTOMERS_CIF, CUSTOMERS_EFF, CUSTOMERS_SEQ}
+
+
+def test_an_UNGOVERNED_effective_time_ref_is_refused(scd_customers):
+    """The effective-time column decides which record VERSION of a customer wins, so it
+    participates in PIT rule 1 exactly as availability does — the class docstring promises both
+    columns are governed. A file-declared `is_as_of` flag with no governed fact link is a HINT
+    (§3.2), and an ETL load-timestamp must never silently pick the winning version."""
+    scd_customers.execute(
+        "UPDATE graph_node SET availability_fact_event_id = NULL WHERE catalog_source = %s "
+        "AND table_name = 'customers' AND kind = 'column' AND column_name = 'effective_from'",
+        (_SRC,))
+    refused = validate_spine_declaration(
+        scd_customers,
+        _declaration(population_semantics=PopulationSemantics.HISTORICAL_AS_OF,
+                     snapshot_policy=_scd_policy()), roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED
+    assert "effective_time_ref" in refused.detail
+
+
+def test_the_availability_column_ITSELF_may_be_the_effective_time(db):
+    """The ONLY production-reachable accept shape (DEFERRED-WORK A.30): ingest, projection and the
+    expression-side reader all enforce ONE governed as-of column per table, so a real catalog can
+    satisfy `LatestAvailableAsOf` only when `effective_time_ref == availability_ref` — one governed
+    column serving both PIT rule 1 roles (a load-versioned history, where a row is effective when
+    it arrives). Pinned so a future "effective must differ from availability" hardening cannot
+    silently kill the policy with a green suite."""
+    build_graph(db, _SRC, [
+        CanonicalRow(_SRC, "customers", "cif_id", "text", is_grain=True, entity="customer"),
+        CanonicalRow(_SRC, "customers", "load_ts", "timestamp", is_grain=True, as_of=True),
+    ])
+    _govern_grain(db, "cif_id", "load_ts")
+    _govern_availability(db, "load_ts")
+    _govern_entity(db, "cif_id")
+    _healthy_projection(db)
+    result = validate_spine_declaration(
+        db,
+        _declaration(population_semantics=PopulationSemantics.HISTORICAL_AS_OF,
+                     snapshot_policy=LatestAvailableAsOf(
+                         effective_time_ref=CUSTOMERS_ASOF, availability_ref=CUSTOMERS_ASOF)),
+        roles=_ROLES)
+    assert isinstance(result, SpineSpec)
+
+
+def test_when_BOTH_time_columns_are_ungoverned_AVAILABILITY_refuses_first(scd_customers):
+    """Ordering pin (Task 13): adding the effective-time check must not reorder the old case —
+    the availability verdict still decides the detail when both columns fail."""
+    scd_customers.execute(
+        "UPDATE graph_node SET availability_fact_event_id = NULL WHERE catalog_source = %s "
+        "AND table_name = 'customers' AND kind = 'column' AND column_name = ANY(%s)",
+        (_SRC, ["load_ts", "effective_from"]))
+    refused = validate_spine_declaration(
+        scd_customers,
+        _declaration(population_semantics=PopulationSemantics.HISTORICAL_AS_OF,
+                     snapshot_policy=_scd_policy()), roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.AVAILABILITY_TIME_NOT_GOVERNED
+    assert CUSTOMERS_ASOF in refused.detail
+    assert "effective_time_ref" not in refused.detail
 
 
 def test_a_grain_column_NO_policy_collapses_gives_duplicate_spine_keys(scd_customers):
@@ -515,7 +659,8 @@ def test_an_ActivePopulation_policy_cannot_back_a_COMPLETE_claim(two_candidate_c
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(snapshot_policy=ActivePopulation(
-            status_ref=CUSTOMERS_STATUS, allowed_status_values=("A",))), roles=_ROLES)
+            status_ref=CUSTOMERS_STATUS, allowed_status_values=("A",),
+            observed_on="2026-07-27")), roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
@@ -525,7 +670,8 @@ def test_an_ActivePopulation_needs_a_NON_EMPTY_closed_status_set(two_candidate_c
         two_candidate_customer_tables,
         _declaration(population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(
-                         status_ref=CUSTOMERS_STATUS, allowed_status_values=())), roles=_ROLES)
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=(),
+                         observed_on="2026-07-27")), roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
@@ -536,10 +682,33 @@ def test_an_ActivePopulation_declaration_is_accepted_when_it_is_coherent(
         two_candidate_customer_tables,
         _declaration(population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
                      snapshot_policy=ActivePopulation(
-                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"))),
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"),
+                         observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(result, SpineSpec)
     assert CUSTOMERS_STATUS in result.read_set
+
+
+def test_an_ActivePopulation_with_NO_availability_ref_COMPILES_and_the_gate_is_at_run_prep(
+        two_candidate_customer_tables):
+    """Documented ACCEPTANCE, not an oversight (review §2.1). §4.2 places no availability
+    requirement on this policy, so the declaration compiles with `availability_ref=None` and the
+    rendered spine carries no cutoff at all (pinned in test_render_nodes_compute). The
+    point-in-time enforcement lives at RUN PREPARATION: `runprep.spine_input_request` refuses any
+    business date the policy's declared `observed_on` vintage cannot answer. Requiring an
+    availability_ref HERE would only half-close the leak — the status column is CURRENT-valued, so
+    entities closed since a historical business date would still vanish from that date's
+    population even under a rule-6 filter."""
+    result = validate_spine_declaration(
+        two_candidate_customer_tables,
+        _declaration(availability_ref=None,
+                     population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
+                     snapshot_policy=ActivePopulation(
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A", "N"),
+                         observed_on="2026-07-27")),
+        roles=_ROLES)
+    assert isinstance(result, SpineSpec)
+    assert result.availability_ref is None
 
 
 def test_a_refusal_never_echoes_the_declared_status_VALUES(two_candidate_customer_tables):
@@ -547,7 +716,8 @@ def test_a_refusal_never_echoes_the_declared_status_VALUES(two_candidate_custome
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(snapshot_policy=ActivePopulation(
-            status_ref=CUSTOMERS_STATUS, allowed_status_values=("SECRET_STATUS_TOKEN",))),
+            status_ref=CUSTOMERS_STATUS, allowed_status_values=("SECRET_STATUS_TOKEN",),
+            observed_on="2026-07-27")),
         roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert "SECRET_STATUS_TOKEN" not in result.detail
@@ -560,6 +730,24 @@ def test_a_CurrentSnapshot_must_record_WHICH_snapshot_it_observed(two_candidate_
     result = validate_spine_declaration(
         two_candidate_customer_tables,
         _declaration(snapshot_policy=CurrentSnapshot(observed_snapshot_ref="  ")), roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+
+
+@pytest.mark.parametrize("observed_on", ["  ", "release-42"])
+def test_an_ActivePopulation_must_record_a_CALENDAR_DATE_it_was_observed_on(
+        two_candidate_customer_tables, observed_on):
+    """The `CurrentSnapshot` rule's analogue, one notch stricter: the status column is
+    current-valued, so the vintage exists ONLY to be compared against a run's business date — a
+    blank records nothing and a version identifier has no ordering with a date. Refusing the form
+    HERE is what lets run preparation compare without a fail-closed parse of its own."""
+    result = validate_spine_declaration(
+        two_candidate_customer_tables,
+        _declaration(population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
+                     snapshot_policy=ActivePopulation(
+                         status_ref=CUSTOMERS_STATUS, allowed_status_values=("A",),
+                         observed_on=observed_on)),
+        roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
 
@@ -670,6 +858,20 @@ def test_identity_covers_every_semantic_field():
 def test_every_semantic_change_moves_the_hash(changed):
     assert materialize_hash(_declaration().identity_payload()) != \
            materialize_hash(_declaration(**changed).identity_payload())
+
+
+def test_two_ActivePopulation_VINTAGES_are_two_populations():
+    """`CurrentSnapshot`'s rule, on the other present-tense policy: `observed_on` enters IDENTITY
+    (it is a declared population fact, not provenance), so re-declaring with a new vintage is a
+    hash-visible, reviewable act — never a silent slide of the population's as-of."""
+    def declared(observed_on):
+        return _declaration(
+            population_semantics=PopulationSemantics.CURRENT_ACTIVE_ONLY,
+            snapshot_policy=ActivePopulation(status_ref=CUSTOMERS_STATUS,
+                                             allowed_status_values=("A",),
+                                             observed_on=observed_on))
+    assert materialize_hash(declared("2026-07-27").identity_payload()) != \
+           materialize_hash(declared("2026-07-28").identity_payload())
 
 
 def test_the_identity_payload_hashes_with_the_ONE_hasher():

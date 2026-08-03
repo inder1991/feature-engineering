@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -630,7 +629,8 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
                                ingestion_run_id=run_id)
         import_id = store.record_import(
             conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
-            approved_by=identity.subject, result=asdict(result), ingestion_run_id=run_id)
+            approved_by=identity.subject, result=result.response_payload(),
+            ingestion_run_id=run_id)
         pending = 0
         if result.status == "ingested":
             # Only a real ingest lands rows, so only 'ingested' advances last_import_at: stamping a
@@ -657,7 +657,9 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
         # so the JSON body below stays byte-for-byte unchanged).
         recorder.flush(conn, run_id, now=datetime.now(UTC))
         return {
-            "result": asdict(result),
+            # The same sparse serialization POST /uploads returns: the I3 correction fields
+            # appear only when a correction was actually dropped (IngestResult.response_payload).
+            "result": result.response_payload(),
             "import_id": import_id,
             # Informational COUNT, not a queue (#25): landed OM columns await a data owner's
             # semantics confirmation, but the import creates NO review records for them —

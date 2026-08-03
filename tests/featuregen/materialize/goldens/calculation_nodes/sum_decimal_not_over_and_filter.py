@@ -6,7 +6,7 @@ def calculate_total_debit_amount_30d(
 
     Exactly one row per (cif_id, business_dt), carrying total_debit_amount_30d and nothing else.
     The aggregate is reduced onto the SPINE with a LEFT join (§8 rule 3), so an entity with no
-    source rows is still present and carries this formula's declared empty-window value (zero).
+    source rows is still present and carries this formula's declared empty-window value (null).
     An inner join here would shrink the population and the feature would still look plausible.
 
     Returns the staged frame and its StagingManifestV1 (§9) — both, or neither. A gate below
@@ -21,7 +21,7 @@ def calculate_total_debit_amount_30d(
     # §6's governed filter, read from the compiled filter tree — never assembled from text. It
     # runs BEFORE the aggregate: the projection decided which rows this expression may SEE, and
     # this decides which of those it counts.
-    rows = projection.where((F.col('status_cd') == 'posted') & (F.col('dr_cr_flag') == 'D'))
+    rows = projection.where(~((F.col('status_cd') == 'posted') & (F.col('dr_cr_flag') == 'D')))
 
     # §8 rule 4 — the declared null_input is `ignore`, which is what Spark's aggregates do: a NULL
     # txn_amt is skipped. Nothing is rendered for it, so this comment is the evidence that the
@@ -41,7 +41,6 @@ def calculate_total_debit_amount_30d(
     grouped = rows.groupBy(F.col('cif_id')).agg(
         aggregate.alias('total_debit_amount_30d'),
         operand_count.alias('__operand_count'),
-        F.count(F.lit(1)).alias('__source_rows'),
     )
 
     # §8 rule 3 — the spine reduction. LEFT, and never INNER: an entity with no source rows in
@@ -53,19 +52,10 @@ def calculate_total_debit_amount_30d(
     # row-collapsing repair in the renderer is how row inflation becomes invisible.
     staged = spine.join(grouped, on=['cif_id'], how='left')
 
-    # §8 rule 4 — the declared empty_window is `zero`. The marker is what distinguishes an entity
-    # with NO rows from one whose aggregate evaluated to NULL: both are null after the join, and
-    # only the first is an empty window. Coalescing instead would answer the second one's policy
-    # question with this one's answer.
-    no_source_rows = F.col('__source_rows').isNull()
-    empty_value = F.lit(0).cast('decimal(38,6)')
-    staged = staged.withColumn(
-        'total_debit_amount_30d',
-        F.when(no_source_rows, empty_value).otherwise(F.col('total_debit_amount_30d')))
-
-    # The marker is dropped here: per-feature staging carries the keys, the business date and ONE
-    # feature column, and a column this node invented would collide at assembly.
-    staged = staged.drop('__source_rows')
+    # §8 rule 4 — the declared empty_window is `null`, which is what the LEFT join already leaves
+    # for an entity with no rows. No marker column is rendered because none is needed: a null from
+    # an empty window and a null from the aggregate are the same declared answer here, so nothing
+    # has to tell them apart.
 
     # §6 — rounding is applied EXPLICITLY, from the formula's own declared `half_even` mode, and
     # never inherited from an engine default. `F.bround` is Spark's function for exactly that mode

@@ -487,3 +487,104 @@ probe driver and `test_probe.py`) is 16b's.
 | ⚪ **`_quote` moved to `render/_yaml.py` as `yaml_scalar`** | `render.project` and `render.publish` both emit catalog entries and `project` imports `publish`, so a shared helper could not stay in `project`. A copy would have been a second chance to quote a storage location differently. `project._quote` is now an alias. | Recorded. |
 | ⚪ **Rendering a mechanism into a project built for another environment is refused twice** | `select_publisher` scopes by environment in the SQL, and `render_project` re-checks the selection's `environment_id` and `engine_versions` against its own. The second check is not redundant: a selection is a value that can be carried between calls, and the renderer is where the bytes get written. | Recorded. |
 | ⚪ **Mutation-tested, 7 controls, all caught** | A `passed=` back door on `record_attestation`; an `adds_feature=` parameter on `select_publisher`; a `mechanism=` parameter on `render_publish`; the attestation lookup unscoped from the environment; `matches()` ignoring the spark version; a probe passing having watched no swap; `published_schema=None` failing open. Each mutation failed 1–4 tests. | Recorded. |
+
+### A.27 Legacy fabricated-N:1 approved_join facts (2026-08-01)
+
+Recorded while remediating Task 5 of the codegen review (blank uploaded cardinality no longer
+fabricates `N:1` at the governed-join propose seam; the realization deriver no longer maps a NULL
+edge cardinality to `MANY_TO_ONE`). Because the pair-guard keys on the UNORDERED column pair, it
+also blocks a re-upload that corrects the join's DIRECTION (a reversed `joins_to` on the same two
+columns), not only its cardinality — the same reject-then-re-propose governance path is the
+correction route for both.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **Legacy fabricated-N:1 approved_join facts persist under authority-persists** | Facts minted before the remediation carry a fabricated `N:1` that two admins confirmed; a stored `N:1` cannot be distinguished from a genuinely-uploaded one (the proposal value records no "defaulted" marker). Authority-persists is the platform's documented policy, so no data migration rewrites or demotes them; the propose-time pair dedupe also means a cardinality-blank re-upload cannot dislodge them (by design — the confirmed fact stands). | A governance decision to re-review cardinality-blank-origin joins, which requires re-proposal after a cardinality-bearing upload (reject the legacy fact via join governance, then upload with an explicit cardinality). |
+
+### A.28 🟡 half_even ratios refused — engine rounds first (2026-07-31)
+
+Recorded while remediating Task 8 of the codegen review. Empirically confirmed on real Spark:
+decimal `Divide` wraps its result in `CheckOverflow` with hard-coded HALF_UP at the division
+result scale (clamped to `MINIMUM_ADJUSTED_SCALE=6`) BEFORE the emitted `F.bround` runs — at
+published scale 6 the bround re-rounds an already-rounded value and is a no-op (1/2000000 →
+0.000001, not the HALF_EVEN 0.000000).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`half_even` on a RATIO refuses (`PHYSICAL_TYPE_UNSUPPORTED`) instead of being honoured** | Generated code alone cannot honour the declaration — the ties are gone before any explicit rounding call runs — and a governed mode the engine silently ignores must refuse rather than be recorded as applied. `resolve_physical_type` refuses the combination; non-ratio bodies keep both modes (post-aggregate rounding of a narrower-scale value has no engine pre-rounding to fight). The worked ratio fixture now declares `half_up` — the mode the engine actually applies. | A consumer needs banker's rounding on a ratio; requires computing the quotient at guaranteed extra scale or a post-division re-quantization proof. |
+
+### A.29 🔴 DATE clocks refused outside UTC — the IR carries no physical time type (2026-08-01)
+
+Recorded while remediating Task 9 of the codegen review. Empirically confirmed: the emitted window
+comparison `F.col(clock) >= F.to_utc_timestamp(boundary.cast('timestamp'), zone)` shifts the whole
+window by a day when the clock column is Hive `DATE` and the governed zone is west of UTC
+(measured with America/New_York: the first day drops and an extra trailing day is admitted; east
+of UTC is correct by luck).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`prepare_run` refuses (`PHYSICAL_TYPE_UNSUPPORTED`) any run whose `event_time_ref` or `availability_ref` resolves to a DATE-typed column under a non-UTC `window_timezone`** | The IR carries no physical type for the clock (`PitSpec.event_time_ref` is a bare ref), so neither compilation nor rendering can see the dtype; run preparation holds the `ClusterInventoryV1`, whose `TableLayout.columns` is ordered `(name, physical type)`, so the fail-closed gate lives there (`_date_typed_clock_refusal`, after snapshots resolve — layouts present and fingerprint-verified — and before the execution hash). UTC zones still prepare: the shift is zero there. | First feature over a DATE-typed event column in a non-UTC catalog; fix = carry the clock dtype in PitSpec and emit date-typed comparisons. |
+
+### A.30 🔴 SCD spines with DISTINCT time columns cannot validate — one governed as-of per table (2026-08-01)
+
+Recorded while remediating Task 13 of the codegen review (`LatestAvailableAsOf.effective_time_ref`
+now requires the governed `is_as_of` fact its docstring promised). The check is correct and
+fail-closed, but it collides with an invariant enforced independently at THREE layers — a table can
+carry at most ONE governed as-of column:
+
+1. **Ingest** — `src/featuregen/overlay/upload/canonical.py:286-311`: a file declaring 2+ `as_of`
+   columns for one table is QUARANTINED as an ambiguous availability basis; no basis is asserted
+   until a reviewer resolves exactly one.
+2. **Projection** — `src/featuregen/overlay/upload/table_fact_projection.py:76-81, 115-120`:
+   projecting the per-table `availability_time` fact CLEARS every prior `is_as_of` +
+   `availability_fact_event_id` on the table's columns, then sets exactly one — the fact's schema
+   names exactly ONE column.
+3. **Read** — `src/featuregen/materialize/expression_ir.py:521-525`: the expression-side PIT gate
+   refuses a table with 2+ governed as-of columns outright ("the gate a choice nobody made").
+
+Consequently `effective_time_ref == availability_ref` is the ONLY production-reachable accept shape
+for `LatestAvailableAsOf` (legal per `_reject_incoherent_policy` — only tie-break overlap is
+refused — and it passes all three layers: one column, governed once, serving both PIT rule 1
+roles). A declaration with DISTINCT columns now refuses `AVAILABILITY_TIME_NOT_GOVERNED`, and the
+refusal's apparent remedy has **NO FIXED POINT**: confirming `availability_time` for the effective
+column re-projects the per-table fact — clears-then-sets — which UN-GOVERNS the availability
+column, so the availability branch refuses; confirming it back for the availability column flips
+the refusal to the effective-time branch. No sequence of confirmations under the current fact
+model satisfies both checks for two distinct columns.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **A real SCD-2 spine (distinct `effective_time_ref` / `availability_ref`) cannot validate — no catalog state satisfies both governed time checks** | The previous behavior was worse: the effective column was trusted UNGOVERNED, letting an ETL load-timestamp silently decide which record version wins. Refusing is honest; the gap is in the fact model, not the check. Test fixtures model the post-growth state by writing the column-node flag+link directly (bypassing the projection). | First real SCD-2 spine declaration over a table whose effective and availability columns differ; fix = a second governed time fact type (e.g. `effective_time`) or a per-COLUMN availability fact, then the projection stops clearing sibling columns and `expression_ir`'s one-governed-column rule is scoped to availability alone. |
+
+### A.31 🟡 input_snapshots is prepared evidence, not an enforced read scope (2026-08-01)
+
+Recorded while remediating Task 21 of the codegen review (docstring corrected; no semantics
+change). `runprep.parameter_payload` builds the `input_snapshots` run parameter and its snapshot
+ids sit inside `sandbox_execution_hash` (§3.4 calls them *the exact ordered partition set read*),
+but no rendered node consumes the snapshot list: the rendered nodes filter raw sources by the
+window/availability predicates, and L1's `PARTITION_ABSENT` check proves only that the resolved
+partitions still exist at validation time — nothing proves the run read precisely (or only) them.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`input_snapshots` is carried and hashed but never enforced as the run's read scope** | The rendered predicates derive from the same window/availability facts that resolved the snapshots, so absent a metastore change between preparation and execution the two coincide; making the list load-bearing is a render-side semantics change (design-sensitive), out of scope for a docs-honesty remediation. | §3.4 identity is relied on for audit of what a run read; fix = render partition predicates onto raw sources, or record actually-read partitions post-run. |
+
+### A.32 🔴 requirements.lock installs an environment that cannot construct the rendered catalog (2026-08-02)
+
+Recorded while adding the final-review wave's execution-level hook proof (l0_gate's
+`test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session`). An environment
+installed from the artifact's own `requirements.lock` (`kedro==0.19.9`, `kedro-datasets==4.1.0`,
+`pyspark==3.5.1`) dies at CATALOG CONSTRUCTION — before any hook fires — because kedro-datasets
+4.x's `spark_dataset.py` hard-imports `hdfs` (line 18) and `s3fs` (line 30) at module import, and
+neither is in the lock. The obvious fix is WRONG: pinning `kedro-datasets[spark]==4.1.0` is
+uninstallable against the captured cluster — the extra requires `delta-spark>=1.0,<3.0`, and every
+`delta-spark<3.0` pins `pyspark<3.5`, conflicting with the captured `pyspark==3.5.1` (empirically:
+uv resolution fails; pip backtracks into ancient `arrow` sdists and dies). The modern line has the
+same hole one layer up: kedro-datasets **9.5.0**'s `spark_dataset.py` still hard-imports `hdfs`,
+but the 9.x `[spark]` extra (= spark-local + spark-s3) does not install it — an upstream packaging
+gap. The L0 gate installs `hdfs` (+`s3fs` on the 4.x line) explicitly into both venvs (Makefile)
+as gate-environment dependencies, the same way it supplies Temurin 17.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |

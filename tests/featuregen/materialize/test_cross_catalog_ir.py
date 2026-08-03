@@ -354,6 +354,12 @@ def test_projection_rechecks_observed_amplification_even_after_precondition(cata
         joined_datasets={"crm::crm_banking.customer_master": "validated_crm_customer"},
         projection_dataset="projected",
     )
+    # The duplicate key below now trips the PRE-join uniqueness gate, so the post-join recheck
+    # is pinned on the emitted source: it is NOT redundant — the hop frame is lazy and scanned
+    # twice (once by the gate, once by the join), so the recheck is what catches a target table
+    # that CHANGED between the two scans, and deleting it must fail this test.
+    assert "rows_before_bridge_1 = rows.count()" in node.source
+    assert "if rows.count() > rows_before_bridge_1:" in node.source
     execute = fake_spark.run_rendered(node.source, node.func_name)
     with pytest.raises(RuntimeError, match="JOIN_AMPLIFICATION"):
         execute(
