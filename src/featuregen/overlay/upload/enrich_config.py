@@ -47,14 +47,38 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 #
 # * `concept` 14000 -> 24000. The measured max chunk (10,760) still fits 14000, but only because
 #   this fixture's roster entries are mostly bare names: on a RE-upload every sibling carries a
-#   resolved concept + party role, which the same measurement puts at ~750 tokens/item — 20 x 750 =
-#   15,000, i.e. just over the old cap. 24000 keeps 20 items/chunk (the same 7 chunks, the same call
-#   count, the same deadline accounting) with ~60% headroom for a wider glossary.
+#   resolved concept + party role. RE-MEASURED (review correction — the original "~750 tok/item,
+#   ~60% headroom" here was wrong): a golden classifier payload carrying a FULL 40-entry roster of
+#   resolved {column, concept, party_role} entries is 971 tok/item on the fixture's own column names
+#   (mean 9.3 chars) and 1,105-1,144 tok/item on longer bank-style names — 20 x that is
+#   19,420-22,880 against the 24000 cap, i.e. 81-95% of it USED and ~5-19% headroom, not 60%. The
+#   bound is kept: crossing it is not a cliff (see the chunking note below), and the headroom that
+#   remains is real.
 # * `domain` 8000 -> 26000. This one is not marginal: a domain ITEM is a whole TABLE, and it now
 #   carries that table's complete column roster (name + resolved concept + party role) because the
 #   D13.2 per-column sub-domain question is unanswerable from a bare name list. 8 x 2,993 = 23,944
 #   against an 8000 cap would have cut chunks from 8 tables to 2 — a 4x call-count increase on the
 #   domain stage, which on a 100-table catalog crosses the 32-call ceiling and truncates.
+#   RE-MEASURED at the same resolved-roster fill: the 127-column fixture table is 3,019 tok/item
+#   (3,146 on the review's run), against a break-even of 26000/8 = 3,250 tok/item — 8 x 3,019 =
+#   24,152, i.e. ~7% headroom (~3% on the review's number). This bound is genuinely tight, and it is
+#   still kept deliberately: `_DEFAULT_MAX_ITEMS` is a CONTAMINATION boundary (MF-8a) that must not
+#   be traded for bytes, and a wider table simply chunks smaller (below).
+#
+# WHAT CROSSING A TOKEN BOUND ACTUALLY COSTS (why none of these is "unsafe"): `chunk_items` packs by
+# BOTH item count and estimated tokens, and an item that alone exceeds the token budget still forms
+# its own chunk — nothing is ever dropped for size. So an under-budgeted bound degrades
+# PROPORTIONALLY (fewer items per chunk -> more provider calls), never into a lost item. The real
+# backstop is `budget(short).max_provider_calls` (32), which — since the Pass-B critic fix — counts
+# every PHYSICAL call of the run, nested seams included.
+#
+# NOT BOUNDED, and deliberately recorded here: the domain item's `columns` list has NO COUNT CAP in
+# `enrich_llm._item_shape_ok` (it falls to the generic list-of-strings branch; only `column_profiles`
+# / `chunk_summaries` / `column_roster` / `source_attributes` carry count caps). Per-VALUE length is
+# capped at 200, so a pathological table bounds each name but not how many ride: a 5,000-column
+# table would egress as one ~150K-token item in its own chunk. No such table exists in any catalog
+# on this platform today; capping it is a deliberate egress-shape change (an over-count item would
+# be EXCLUDED + audited), not a comment fix, so it is documented rather than silently done here.
 # * definition/synonyms/unit (2,160 = 27% of 8000) and summary (2,176 = 16% of 14000) keep their
 #   bounds: the margin is measured, not assumed.
 #

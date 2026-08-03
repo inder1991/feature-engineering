@@ -713,6 +713,9 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 _SYNTH_PROMPT_ID = "overlay_table_synth_v4"
 _SYNTH_PROMPT_VERSION = 4
 _SYNTH_SCHEMA_VERSION = 3
+#: The phase-1 (wide-table) summary prompt id. Its VERSIONS are `_SYNTH_PROMPT_VERSION` /
+#: `_SYNTH_SCHEMA_VERSION` — one Pass B run stamps ONE contract generation across both phases.
+_SUMMARY_PROMPT_ID = f"overlay_table_synth_summary_v{_SYNTH_PROMPT_VERSION}"
 PASS_B_RESULT_TYPE = "table_profile_synthesis"
 PASS_B_RESULT_VERSION = 1
 
@@ -759,9 +762,11 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
 
-    Ships the Pass B Slice-2 contract via the Task-1 version seam: **prompt v3** (the code-side
-    `table_role` vocab is enumerated in the instruction) over the **unchanged canonical v2
-    schema**. [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
+    Ships the Pass B contract via the Task-1 version seam, read from `_SYNTH_PROMPT_VERSION` /
+    `_SYNTH_SCHEMA_VERSION` (never re-typed): **prompt v4** (the code-side `table_role` vocab is
+    enumerated in the instruction) over the **canonical v3 schema** — a REAL v3 body, because v2 is
+    a byte-alias of v1 with `additionalProperties: false` and would reject the profile suggestions.
+    [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
     WHOLE synthesis on one schema violation, so a strict role enum would lose a valid grain to one
     off-vocab role; the vocab is enforced per-field in `make_ref_accept` instead.
 
@@ -880,12 +885,16 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
 
     summaries = run_batched(
         conn, client, short="table_synth", task="table_synth_summary",
-        # Slice-2 stamp: prompt v3 / canonical schema v2, matching the synthesis call so one Pass B
-        # run never egresses under two contract generations. The summary TEXT is unchanged at v3
-        # (it emits no table_role, so there is no vocab to enumerate) — the bump identifies the
-        # Slice-2 contract, mirroring the Slice-1 v2-aliases-v1 schema precedent.
-        prompt_id="overlay_table_synth_summary_v4", schema_id="overlay_table_synth_summary_batch",
-        prompt_version=4, schema_version=3,
+        # The phase-1 summary is stamped with the SAME contract generation as the phase-2 synthesis
+        # it feeds (`_SYNTH_PROMPT_VERSION` / `_SYNTH_SCHEMA_VERSION` — prompt v4 over the canonical
+        # v3 schema), so one Pass B run never egresses under two generations. Read from the
+        # constants rather than re-typed: the previous literal 4/3 pair carried a comment still
+        # claiming "prompt v3 / canonical schema v2", which is exactly how a drifted copy hides. The
+        # summary TEXT itself is unchanged by the bump (it emits no table_role, so there is no vocab
+        # to enumerate) — the version identifies the contract, mirroring the Slice-1 v2-aliases-v1
+        # schema precedent.
+        prompt_id=_SUMMARY_PROMPT_ID, schema_id="overlay_table_synth_summary_batch",
+        prompt_version=_SYNTH_PROMPT_VERSION, schema_version=_SYNTH_SCHEMA_VERSION,
         shared_metadata={}, items=chunk_items, out_key="summary",
         instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
         extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,

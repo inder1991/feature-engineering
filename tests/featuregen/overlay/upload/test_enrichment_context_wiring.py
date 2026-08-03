@@ -296,10 +296,13 @@ def test_the_evidence_material_is_the_identity_payload_not_the_prompt() -> None:
 
 
 def test_the_rebudgeted_bounds_hold_the_measured_payloads() -> None:
-    """The measured FTR maxima recorded in `enrich_config` (concept 538 tok/item, domain 2993
-    tok/table) must fit their chunks with headroom — the whole point of re-budgeting."""
-    assert enrich_config.max_items("concept") * 750 <= enrich_config.max_input_tokens("concept")
-    assert enrich_config.max_items("domain") * 2993 <= enrich_config.max_input_tokens("domain")
+    """The measured FTR maxima recorded in `enrich_config` must fit their chunks — the whole point
+    of re-budgeting. The per-item figures are the RESOLVED ones (every sibling carrying a concept +
+    party role), re-measured in the review: 1,144 tok for a classifier item with a full 40-entry
+    roster, 3,146 tok for a whole-table domain item. The old 750 here understated the classifier by
+    ~50% and made the headroom look like 60% when it is ~5%."""
+    assert enrich_config.max_items("concept") * 1144 <= enrich_config.max_input_tokens("concept")
+    assert enrich_config.max_items("domain") * 3146 <= enrich_config.max_input_tokens("domain")
     # The isolation boundaries themselves are UNCHANGED: payload size never buys itself a wider
     # contamination surface.
     assert enrich_config.max_items("concept") == 20
