@@ -160,14 +160,16 @@ Merge any trees (Track 1 owns that). Touch `analysis/**`, `data_agent/**`, `over
 
 ---
 
-## 7. Open questions for the user — answers change the plan
+## 7. Decisions taken (user, 2026-08-03)
 
-**Q1. Baseline.** Rebase `feature/phase-g` onto `main` (now carrying Track 2 + 12 Track-1 commits), or keep it on `3b0b7b01` as chartered? Recommendation: **rebase onto `main`**, because the divergence only grows and Phase G's collision surface with Track 1 is empirically zero under `materialize/`. This is your call because of the Gate A tag and your ownership of the integration↔codegen merge.
+**Q1. Baseline — REBASE ONTO `main`. Done.** `feature/phase-g` replayed onto `f3424c36`; now 0 behind / 1 ahead. The charter's "branch from the codegen branch, not main" is superseded: main already carries Track 2.
 
-**Q2. Sequencing.** The controlling doc's D12.8 puts Phase G *after* Release B as a Release-C predecessor. Is this handoff the amendment that supersedes it? If so it should be recorded in the controlling doc by you, not asserted by me.
+**Q3. Scope — G-1 ONLY, approved for implementation.** G-2 (execution) and G-3 (publication) stay designed-but-unapproved; each needs its own approval, and G-2's first cluster contact — including a local-Spark smoke — is a separate per-action approval.
 
-**Q3. Scope.** Do you accept the G-1/G-2/G-3 staging (§4), with G-1 the only implementation scope approved now?
+**Q4. Authorization — PLATFORM-ADMIN.** Release 1 gates on `require_confirmer` (the raw platform-admin claim, `deps.py:81-91`), not `feature:generate`. Relaxation is a later, deliberate act.
 
-**Q4. Authorization.** Release 1 on `require_confirmer` (platform-admin) as recommended, or straight to `feature:generate`?
+### Still open — not blocking G-1, but owed
 
-**Q5. T2's resolution seam.** The choice between restoring the authoring result from the 1022 replay lane versus persisting it at authoring time touches `formula/` — which the charter's ownership list does not assign. Whose is it, and do you want that decision argued in the task brief before implementation?
+**Q2. Sequencing (D12.8).** Unanswered. The controlling doc still sequences Phase G after Release B; this handoff plausibly amends that, but the amendment is the Track-1 session's to record. Phase G proceeds on the handoff's authority and does not edit the controlling doc.
+
+**Q5. Ownership of the resolution seam (`formula/`).** Unanswered, so **T2 takes the ownership-safe route by default**: the new `materialize/resolve.py` *reads* the existing replay-lane restorer (`replay_authoring._restore_terminal_result`, `replay_authoring.py:179`) and the 1022 trace store; it does **not** modify anything under `formula/`. If the implementer finds that route cannot preserve admission's "THE intent, not a look-alike rebuilt from its parts" invariant (`admission.py:115-117`) without a `formula/`-side change, the task stops as BLOCKED and returns here rather than reaching across an unassigned ownership line.
