@@ -23,7 +23,9 @@ at once is how a clarification step becomes a form nobody fills in.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from featuregen.analysis.intent import (
     COMPARISONS,
@@ -43,7 +45,11 @@ from featuregen.overlay.upload.source_selection import (
     TEMPORAL_MODEL_UNKNOWN,
     TEMPORAL_SCD_OVERLAP,
     TEMPORAL_SNAPSHOT_TIE,
+    CandidateDisposition,
 )
+
+if TYPE_CHECKING:                       # import weight — the `source_selection` precedent
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1
 
 
 class ClarificationError(ValueError):
@@ -85,9 +91,43 @@ def clarifications_for(extraction: IntentExtraction,
 
     Ordering is not cosmetic: the entity decides which table the rest of the question is about, so it
     is asked first. A user who picks dimensions before an entity can be asked to pick again.
+
+    The MODEL's half only. ``/analysis/plan`` calls :func:`clarifications_for_codes` directly
+    because it has a second source of questions — the selector's refusals — and merging them into
+    ONE sorted call is what keeps the population outranking every row question. This stays the
+    entry point for a caller holding an extraction and nothing else.
     """
-    raised = {code for code in extraction.unresolved if code in UNRESOLVED_CODES}
-    return tuple(_build(code, candidates) for code in sorted(raised, key=_clarification_rank))
+    return clarifications_for_codes(extraction.unresolved, candidates)
+
+
+def clarifications_for_codes(codes: tuple[str, ...] | frozenset[str],
+                             candidates: IntentCandidates,
+                             *, refusals: Iterable[SelectionRefusalV1] = ()
+                             ) -> tuple[Clarification, ...]:
+    """The SAME rendering, driven by codes rather than by a model extraction (Release-B Task 8).
+
+    A selection refusal is raised by the SELECTOR, not by the model, so it never appears in an
+    ``IntentExtraction`` — and the wire schema's enum deliberately cannot carry it (the D5 wire-enum
+    split: a model must not be able to assert an overlap or a binding refusal). Routing it through
+    this function rather than through a second renderer is what keeps ONE set of question wordings
+    and ONE total order: the population still outranks every row question, whichever half of the
+    system noticed the gap.
+
+    ``refusals`` are the REFUSAL PAYLOADS behind those codes, when the caller has them. One closed
+    code can describe two situations a person must be told apart — ``SELECTION_SOURCE_AMBIGUOUS``
+    covers both "several datasets are equally eligible" and "none is eligible at all" — and the
+    payload's own candidate dispositions are what say which. Optional, because the vocabulary is
+    the contract: a caller with only codes still gets a question, and it is the one the code's
+    common case describes.
+    """
+    raised = {code for code in codes if code in UNRESOLVED_CODES}
+    # First refusal per code: two refusals sharing a code are two instances of one question here,
+    # and the question is about the code, not about one subject.
+    by_code: dict[str, SelectionRefusalV1] = {}
+    for refusal in refusals:
+        by_code.setdefault(refusal.code, refusal)
+    return tuple(_build(code, candidates, refusal=by_code.get(code))
+                 for code in sorted(raised, key=_clarification_rank))
 
 
 # Asked in the order they must be answered. The Release-B SELECTION refusals sit at the FRONT,
@@ -128,9 +168,10 @@ def _clarification_rank(code: str) -> tuple[int, str]:
     return (_ORDER.get(code, 99), code)
 
 
-def _build(code: str, candidates: IntentCandidates) -> Clarification:
+def _build(code: str, candidates: IntentCandidates,
+           refusal: SelectionRefusalV1 | None = None) -> Clarification:
     if code in SELECTION_REFUSAL_CODES:
-        return _selection_clarification(code, candidates)
+        return _selection_clarification(code, candidates, refusal)
     if code == "population":
         # Asked FIRST and never optional. `spine.py`: the declaration chooses the source, governed
         # facts may only validate it — because look-alike population tables are indistinguishable to
@@ -256,7 +297,21 @@ _STORAGE_MODEL_OPTIONS: tuple[Option, ...] = tuple(
     for m in TemporalStorageModel if m is not TemporalStorageModel.UNKNOWN)
 
 
-def _selection_clarification(code: str, candidates: IntentCandidates) -> Clarification:
+def _eligible_candidates(refusal: SelectionRefusalV1 | None) -> int:
+    """How many considered candidates COULD have served — tied, eligible or selected.
+
+    A REJECTED candidate is one the selector looked at and ruled out (no binding, no profile, not
+    in the policy). Counting those as choices is what made the zero-eligible refusal offer a list
+    of datasets that had each already failed."""
+    if refusal is None:
+        return -1                       # unknown: the caller passed codes only
+    usable = {CandidateDisposition.TIED, CandidateDisposition.ELIGIBLE,
+              CandidateDisposition.SELECTED}
+    return sum(1 for c in refusal.considered_candidates if c.disposition in usable)
+
+
+def _selection_clarification(code: str, candidates: IntentCandidates,
+                             refusal: SelectionRefusalV1 | None = None) -> Clarification:
     tables = _options(candidates.table_refs, candidates)
     if code == SELECTION_POPULATION_UNDECLARED:
         # The same decision the `population` abstention asks for, reached from the selector instead
@@ -265,6 +320,22 @@ def _selection_clarification(code: str, candidates: IntentCandidates) -> Clarifi
         # `apply_answer` folds this one through the `population` branch.
         return replace(_build("population", candidates), code=code)
     if code == SELECTION_SOURCE_AMBIGUOUS:
+        # ONE code, TWO situations — `source_selector` reuses this spelling for "nothing is
+        # eligible" because the vocabulary is closed at eight and the GAP and ACTION
+        # (DATASET_SOURCE_UNRESOLVED / DECLARE_SERVING_POLICY) are right for both. The QUESTION is
+        # not: asking "which of these equally eligible datasets?" when none is eligible offers a
+        # list of candidates that each already failed, and tells the reader something untrue about
+        # what the system found. The payload's own dispositions say which situation this is.
+        if _eligible_candidates(refusal) == 0:
+            return Clarification(
+                code=code,
+                question="No dataset is eligible to serve this need — nothing considered has both "
+                         "an assembled profile and a current physical address. Declare a serving "
+                         "policy naming the dataset that should serve it, or name the dataset in "
+                         "the request.",
+                # No options, deliberately: every candidate here was REJECTED, and offering a
+                # rejected dataset as a choice invites an answer the selector will refuse again.
+                options=())
         return Clarification(
             code=code,
             question="More than one dataset is equally eligible to serve this. Which one should "
@@ -283,6 +354,24 @@ def _selection_clarification(code: str, candidates: IntentCandidates) -> Clarifi
                      "but not read. Which dataset should be used instead?",
             options=tables)
     if code == TEMPORAL_MODEL_UNKNOWN:
+        # ONE code, THREE situations (the closed eight cannot grow); the refusal's `missing`
+        # payload says which — the same move the SELECTION_SOURCE_AMBIGUOUS branch above makes
+        # with candidate dispositions. Asking the storage-model question when the model IS
+        # recorded would state a falsehood and offer five options none of which fixes anything.
+        missing = getattr(refusal, "missing", None) if refusal is not None else None
+        if missing == "report_cutoff":
+            return Clarification(
+                code=code,
+                question="This dataset's history rule reads rows as of an instant, but the "
+                         "question names no report date. What date should the answer be as of?",
+                options=())
+        if missing == "current_row_rule":
+            return Clarification(
+                code=code,
+                question="This dataset keeps history, and its temporal policy declares no rule "
+                         "for a current-values question. Declare which row counts as current "
+                         "(a current flag, or open-ended validity) in the dataset's policy.",
+                options=())
         return Clarification(
             code=code,
             question="Nobody has recorded how this dataset stores history. How does it?",

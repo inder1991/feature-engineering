@@ -50,6 +50,10 @@ from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.data_agent.relationship import RelationshipEvidenceV1
 from featuregen.overlay.upload.bridge_realization import eligible_for_production
 from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
+from featuregen.overlay.upload.source_selection import (
+    SELECTION_POPULATION_UNDECLARED,
+    source_temporal_selection_enabled,
+)
 
 
 class BridgeRefusal(ValueError):
@@ -78,6 +82,11 @@ BRIDGE_REFUSAL_TO_GAP: dict[str, tuple[str, RequiredAction]] = {
                            RequiredAction.CONFIRM_BUSINESS_POLICY),
     "JOIN_REALIZATION_ABSENT": ("JOIN_CARDINALITY_UNKNOWN",
                                 RequiredAction.PROFILE_DATA),
+    # Release-B Task 8. The SAME gap the selector's own refusal maps to in
+    # `learning.REFUSAL_TO_GAP` — reaching it from the execution bridge instead of from the
+    # selector does not make it a different thing to decide.
+    SELECTION_POPULATION_UNDECLARED: ("POPULATION_UNRESOLVED",
+                                      RequiredAction.CONFIRM_POPULATION),
 }
 
 #: The plan's comparison words, in the executor's vocabulary. An unknown word is refused rather than
@@ -181,6 +190,27 @@ def plan_to_execution_ir(grounded: GroundedPlan,
                 f"binding is {spine_id!r}; a population that was declared and then substituted is "
                 "worse than one never declared, because the audit trail says a person chose it",
                 subject=plan.population_table_ref)
+    elif source_temporal_selection_enabled():
+        # THE POPULATION HOLE, CLOSED (Release-B Task 8). The guard above used to be the whole
+        # check, so an UNDECLARED population accepted any caller-supplied spine — the plan's DoD
+        # item ("enforce the declaration again at the plan-to-execution bridge") was simply not
+        # true here, and the review found it pinned as intended behaviour by
+        # `test_an_UNDECLARED_population_still_works_for_a_caller_that_supplies_its_own_spine`.
+        #
+        # The fail-open was defensible while nothing could RESOLVE a population: refusing would
+        # have left the executor's own tests and batch callers with no way to run at all. Release B
+        # supplies the resolution — an explicit declaration or a serving policy — so the fallback
+        # now has an alternative, and the honest behaviour is to refuse.
+        #
+        # Behind the flag, so a flag-off tree behaves byte-identically and the old pin still holds
+        # in its flag-off form.
+        raise BridgeRefusal(
+            SELECTION_POPULATION_UNDECLARED,
+            "no population is declared for this plan, so the supplied spine is whatever the caller "
+            f"chose — here {spine_id!r}. Look-alike population tables are indistinguishable to the "
+            "catalog, and picking the wrong one does not fail: it silently shrinks every number "
+            "built on it. Declare the population in the request, or publish a serving policy",
+            subject=plan.entity_ref or plan.base_table_ref)
     if spine_id == inputs.event_binding.identity.table_id:
         raise BridgeRefusal(
             "SPINE_SAME_AS_EVENTS",

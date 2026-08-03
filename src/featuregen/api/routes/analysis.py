@@ -5,11 +5,19 @@ Seven read models existed with no surface — `retrieve_candidates`, `extract_in
 a read model nobody can call is the same inert mechanism this programme has found six times already.
 These are the routes.
 
-**Nothing here executes.** `POST /analysis/plan` retrieves, extracts, grounds and previews; it never
-runs the statement. That split is deliberate and not merely cautious: execution needs an
-`ExecutionInputs` this deployment cannot yet build — the catalog records no physical database and
-there is no connection registry — so a route that promised to run would be promising something
-impossible. The preview reports exactly which piece is missing.
+**Nothing here executes, and one thing here WRITES.** `POST /analysis/plan` retrieves, extracts,
+grounds and previews; it never runs the statement. That split is deliberate and not merely cautious:
+execution needs an `ExecutionInputs` this deployment cannot yet build — the catalog records no
+physical database and there is no connection registry — so a route that promised to run would be
+promising something impossible. The preview reports exactly which piece is missing.
+
+No WAREHOUSE data is touched. The CATALOG is written twice, and both are disclosed rather than
+implied: a refusal records a learning gap (below), and — with
+`FEATUREGEN_SOURCE_TEMPORAL_SELECTION` on — a SELECTION persists the winner's physical binding
+revision. That second write is a content-addressed catalog ADDRESS, not a decision: it is the row a
+later decision, observation or snapshot points at when it names `pbr_...`, it is idempotent, it
+happens only for the dataset that was selected, and re-deriving it produces the same id. With the
+flag off nothing is written at all.
 
 **`feature:generate`, not `catalog:read`.** Planning dispatches an LLM call against catalog metadata
 on the caller's behalf — the same class of action as the feature-generation routes next door. The
@@ -35,9 +43,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from featuregen.analysis.assembly import first_unmet_requirement
-from featuregen.analysis.clarify import ClarificationError, apply_answer, clarifications_for
+from featuregen.analysis.clarify import (
+    ClarificationError,
+    apply_answer,
+    clarifications_for_codes,
+)
 from featuregen.analysis.execution import ExecutionInputs
-from featuregen.analysis.grounding import ground_analysis_plan
+from featuregen.analysis.grounding import (
+    PRODUCTION_TIER,
+    ground_analysis_plan,
+    plan_cutoff_value_ref,
+    record_selection_gaps,
+)
 from featuregen.analysis.intent import (
     AnalysisIntentInputV2,
     IntentUnavailable,
@@ -58,6 +75,7 @@ from featuregen.data_agent.connection import ConnectionError_
 from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.upload.source_selection import SELECTION_POPULATION_UNDECLARED
 
 #: Codes this MODULE names in its own fallback. Everything else a caller sees comes from
 #: `analysis.assembly`, and a test asserts the route surfaces codes absent from here — the
@@ -117,6 +135,109 @@ class AnswerIn(BaseModel):
     code: str
     chosen: list[str] = Field(default_factory=list)
     max_columns: int = Field(default=60, ge=1, le=200)
+
+
+def _ground(conn, plan, identity: IdentityEnvelope, question: str):
+    """Ground one plan with this route's OWN context, and record what it refuses.
+
+    **The tier is PRODUCTION, and it is passed explicitly.** This surface plans questions people
+    ask about the bank's real data; nothing here is a sandbox experiment. Saying it rather than
+    relying on a default is the point of the default having moved: a route that names its tier
+    cannot have the governance posture changed underneath it by a signature edit.
+
+    **The cutoff ref comes from the PLAN**, through `plan_cutoff_value_ref` — the instant its
+    windows are measured back from is the report cutoff the dimension row rule reads. A plan that
+    expresses no time context has none to give, and a row rule that needs one then refuses
+    VISIBLY rather than resolving to "whatever is there now".
+    """
+    grounded = ground_analysis_plan(
+        conn, plan, roles=identity.role_claims, execution_tier=PRODUCTION_TIER,
+        cutoff_value_ref=plan_cutoff_value_ref(plan), recorded_by=identity.subject)
+    _record_selection_gaps(conn, grounded, question=question, roles=identity.role_claims)
+    return grounded
+
+
+def _record_selection_gaps(conn, grounded, *, question: str, roles) -> None:
+    """The ONE production caller of `record_selection_gaps`, at the surface refusals reach a person.
+
+    The request id is DERIVED from the question and the catalog snapshot (`record_selection_gaps`
+    does that itself), so asking a blocked question three times is ONE thing to decide — the same
+    property the retrieval gap above has, and for the same reason.
+
+    Fail-soft, exactly like the retrieval gap: a learning write must never turn a planned question
+    into a 500. Unlike that one it does NOT need a returned-rather-than-raised dance, because this
+    path answers 200 and the transaction reaches its commit on its own.
+    """
+    selections = grounded.selections
+    if selections is None or not selections.refusals:
+        return
+    try:
+        record_selection_gaps(
+            conn, selections, question=question,
+            dependency_snapshot_id=catalog_snapshot_id(conn, roles=roles),
+            now=datetime.now(UTC))
+    except Exception:   # noqa: BLE001
+        logger.warning("could not record a selection learning gap", exc_info=True)
+
+
+def _serialize_selection(selections) -> dict | None:
+    """The Release-B source/row decisions, as the caller sees them. `None` while the flag is off.
+
+    Shown even when it refuses — especially then. "Which copy served this, and which of its rows"
+    is half of what makes an answer explainable (§5.7), and a preview that showed only the
+    resolved half would report the absence of a row rule as silence.
+    """
+    if selections is None:
+        return None
+    return {
+        "resolved": selections.resolved,
+        "sources": [{"need_role": s.need.need_role.value,
+                     "dataset_ref": s.selected_dataset_ref,
+                     "selection_basis": s.selection_basis.value,
+                     "authority_basis": s.authority_basis.value,
+                     "considered": [{"dataset_ref": c.dataset_ref,
+                                     "disposition": c.disposition.value,
+                                     "reason_codes": list(c.reason_codes)}
+                                    for c in s.considered_candidates]}
+                    for s in selections.source_selections],
+        "rows": [{"dataset_ref": r.dataset_logical_ref,
+                  "selection_kind": r.selection_kind.value,
+                  "cutoff_value_ref": r.cutoff_value_ref}
+                 for r in selections.row_selections],
+        "refusals": [{"code": r.code, "subjects": list(r.subject_refs), "detail": r.detail}
+                     for r in selections.refusals],
+        "warnings": list(selections.warnings),
+    }
+
+
+def _clarification_codes(extraction, selections) -> tuple[str, ...]:
+    """The model's own abstentions PLUS the selector's refusals, as one set of questions.
+
+    Rendered through the single `clarifications_for_codes` ordering rather than appended after it,
+    or the population would stop outranking the row questions the moment a refusal joined the list.
+
+    `SELECTION_POPULATION_UNDECLARED` is dropped when the model already raised `population`: they
+    are the same decision in the same words (`clarify` builds one from the other), and asking it
+    twice under two codes is two questions for one thing to decide.
+    """
+    codes = list(extraction.unresolved)
+    for code in (selections.refusal_codes if selections is not None else ()):
+        if code == SELECTION_POPULATION_UNDECLARED and "population" in codes:
+            continue
+        codes.append(code)
+    return tuple(codes)
+
+
+def _serialize_clarifications(extraction, retrieval, grounded, *, answered: str = "") -> list[dict]:
+    selections = grounded.selections
+    return [
+        {"code": c.code, "question": c.question, "optional": c.optional,
+         "allows_multiple": c.allows_multiple,
+         "options": [{"value": o.value, "label": o.label} for o in c.options]}
+        for c in clarifications_for_codes(
+            _clarification_codes(extraction, selections), retrieval.candidates,
+            refusals=(selections.refusals if selections is not None else ()))
+        if c.code != answered]
 
 
 def _serialize_preview(view) -> dict:
@@ -183,13 +304,19 @@ def _plan_for(conn, question: str, identity: IdentityEnvelope, client: LLMClient
         # 422, not 500: the question could not be expressed, which is about the request rather than
         # a fault in the service.
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    grounded = ground_analysis_plan(conn, extraction.plan, roles=identity.role_claims)
+    grounded = _ground(conn, extraction.plan, identity, question)
     return retrieval, extraction, grounded
 
 
 @router.post("/analysis/plan", dependencies=[Depends(require_feature_generate)])
 def plan(body: PlanIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
-    """A question, planned and previewed. Never executed — see the module docstring."""
+    """A question, planned and previewed. Never executed — see the module docstring.
+
+    With the selection flag ON this also PINS the binding revision of each dataset it selects
+    (`grounding`'s one write) and records each selection refusal as a learning gap. The pin is a
+    catalog address rather than a decision — content-addressed, idempotent, winner only — so a
+    planning request that is never acted on leaves nothing that needs revoking.
+    """
     try:
         retrieval, extraction, grounded = _plan_for(
             conn, body.question, identity, client, body.max_columns)
@@ -198,11 +325,10 @@ def plan(body: PlanIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     view = _previewed(conn, grounded)
     return {
         "preview": _serialize_preview(view),
-        "clarifications": [
-            {"code": c.code, "question": c.question, "optional": c.optional,
-             "allows_multiple": c.allows_multiple,
-             "options": [{"value": o.value, "label": o.label} for o in c.options]}
-            for c in clarifications_for(extraction, retrieval.candidates)],
+        # WHICH COPY served each need, and WHICH of its rows — or the typed refusal saying nobody
+        # has decided yet. `None` while the selection flag is off.
+        "selection": _serialize_selection(grounded.selections),
+        "clarifications": _serialize_clarifications(extraction, retrieval, grounded),
         # Truncation is reported, never silent: a non-zero count means the plan rests on a narrower
         # view of the catalog than exists. PER LEG (D12.2) as well as in aggregate — one number
         # cannot say whether relevance narrowed the answer or a link budget did, and the two call
@@ -234,16 +360,13 @@ def clarify(body: AnswerIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
                                 retrieval.candidates)
     except ClarificationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    regrounded = ground_analysis_plan(conn, answered, roles=identity.role_claims)
+    regrounded = _ground(conn, answered, identity, body.question)
     view = _previewed(conn, regrounded)
     return {
         "preview": _serialize_preview(view),
-        "clarifications": [
-            {"code": c.code, "question": c.question, "optional": c.optional,
-             "allows_multiple": c.allows_multiple,
-             "options": [{"value": o.value, "label": o.label} for o in c.options]}
-            for c in clarifications_for(extraction, retrieval.candidates)
-            if c.code != body.code],
+        "selection": _serialize_selection(regrounded.selections),
+        "clarifications": _serialize_clarifications(
+            extraction, retrieval, regrounded, answered=body.code),
     }
 
 

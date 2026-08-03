@@ -37,6 +37,12 @@ CUSTOMER_TABLE = "customer_master"
 #: SCD2 dimension history, SEPARATE from the spine. It cannot be the spine: several history rows per
 #: customer would duplicate the population, and the population must be one row per customer.
 DIMENSION_TABLE = "customer_segment_history"
+#: The SNAPSHOT-shaped dimension source (Release-B Task 8, ENGINE B). The SAME classification, kept
+#: the other way a bank keeps it: one row per customer per publication instant rather than an
+#: interval. It exists beside the SCD2 table, not instead of it, because the two row rules give
+#: DIFFERENT answers and the point of declaring a temporal policy is that nobody has to guess which
+#: shape a table is.
+SNAPSHOT_TABLE = "customer_segment_snapshot"
 
 #: The instant the customer is classified AT. A business decision, not a rendering detail — see
 #: `dimensions.DIMENSION_ATTRIBUTION_AS_OF_UNRESOLVED`.
@@ -55,7 +61,7 @@ CUSTOMERS: tuple[tuple[str], ...] = (
     ("C1",), ("C2",), ("C3",), ("C4",), ("C5",), ("C6",),
 )
 
-#: cif_id, segment, sector, effective_from, effective_to  (half-open: [from, to))
+#: cif_id, segment, sector, effective_from, effective_to, is_current  (half-open: [from, to))
 #
 # Each row exists for a specific rule, at cutoff 2026-06-30:
 #   C1  changed BEFORE the cutoff              -> SME        (not the old RETAIL)
@@ -65,18 +71,49 @@ CUSTOMERS: tuple[tuple[str], ...] = (
 #       so the two boundary rules must AGREE and select exactly one row -> CORPORATE
 #   C5  only a FUTURE-dated row                -> no valid row -> Unknown
 #   C6  no dimension row at all                -> Unknown
-DIMENSION_HISTORY: tuple[tuple[str, str, str, str, str | None], ...] = (
-    ("C1", "RETAIL", "TRADING", "2020-01-01", "2026-06-15"),
-    ("C1", "SME", "TRADING", "2026-06-15", None),
-    ("C2", "RETAIL", "MANUFACTURING", "2020-01-01", "2026-07-15"),
-    ("C2", "SME", "MANUFACTURING", "2026-07-15", None),
-    ("C3", "CORPORATE", "TRADING", "2020-01-01", None),
-    ("C4", "RETAIL", "REAL_ESTATE", "2020-01-01", "2026-06-30"),
-    ("C4", "CORPORATE", "REAL_ESTATE", "2026-06-30", None),
-    ("C5", "RETAIL", "TRADING", "2026-08-01", None),
+#
+# `is_current` (Release-B Task 8, ENGINE A) is the SOURCE's own declaration of which row is today's
+# — the thing whose absence is why `current_value` attribution was refused until now. C7 is the
+# customer that makes the declaration MATTER: its only row is CLOSED on a scheduled future date, so
+# the table has no open-ended row for it at all and the two conventions disagree. A loader that
+# closes every row on a rollover date is a real shape, and an engine inferring "current = the row
+# with no end date" answers a different question there.
+DIMENSION_HISTORY: tuple[tuple[str, str, str, str, str | None, bool], ...] = (
+    ("C1", "RETAIL", "TRADING", "2020-01-01", "2026-06-15", False),
+    ("C1", "SME", "TRADING", "2026-06-15", None, True),
+    ("C2", "RETAIL", "MANUFACTURING", "2020-01-01", "2026-07-15", False),
+    ("C2", "SME", "MANUFACTURING", "2026-07-15", None, True),
+    ("C3", "CORPORATE", "TRADING", "2020-01-01", None, True),
+    ("C4", "RETAIL", "REAL_ESTATE", "2020-01-01", "2026-06-30", False),
+    ("C4", "CORPORATE", "REAL_ESTATE", "2026-06-30", None, True),
+    ("C5", "RETAIL", "TRADING", "2026-08-01", None, True),
     # C6: deliberately absent
+    # C7: CLOSED on a scheduled date — flagged current, but no open-ended row exists for it
+    ("C7", "CORPORATE", "SHIPPING", "2020-01-01", "2027-01-01", True),
     # an unknown customer's history must not invent a population member
-    ("C9", "CORPORATE", "TRADING", "2020-01-01", None),
+    ("C9", "CORPORATE", "TRADING", "2020-01-01", None, True),
+)
+
+#: cif_id, segment, sector, snapshot_date, load_seq — the SNAPSHOT shape (ENGINE B).
+#
+# At cutoff 2026-06-30:
+#   C1  two snapshots, the later one before the cutoff        -> SME
+#   C2  a pre-cutoff snapshot and a POST-cutoff one           -> RETAIL (the later is unknowable)
+#   C3  one snapshot                                          -> CORPORATE
+#   C4  TWO rows stamped on the SAME snapshot date            -> a TIE: refused, unless the policy
+#       declares a tie-breaker. `load_seq` separates them (2 wins); `sector` does NOT, which is what
+#       makes "the tie_break_refs resolve it deterministically" a testable claim.
+#   C5  only a POST-cutoff snapshot                           -> absent at the cutoff
+#   C6  no snapshot at all                                    -> Unknown bucket, never dropped
+SEGMENT_SNAPSHOTS: tuple[tuple[str, str, str, str, int], ...] = (
+    ("C1", "RETAIL", "TRADING", "2026-05-31", 1),
+    ("C1", "SME", "TRADING", "2026-06-30", 1),
+    ("C2", "RETAIL", "MANUFACTURING", "2026-06-30", 1),
+    ("C2", "SME", "MANUFACTURING", "2026-07-31", 1),
+    ("C3", "CORPORATE", "TRADING", "2026-06-30", 1),
+    ("C4", "RETAIL", "REAL_ESTATE", "2026-06-30", 1),
+    ("C4", "CORPORATE", "REAL_ESTATE", "2026-06-30", 2),
+    ("C5", "RETAIL", "TRADING", "2026-07-31", 1),
 )
 
 #: cif_id, tran_amt, tran_type, tran_month, tran_status, reversal_flag
@@ -201,12 +238,16 @@ def create_pilot_tables(conn) -> None:
     conn.execute(f"DROP TABLE IF EXISTS {TRANSACTION_SCHEMA}.{TRANSACTION_TABLE}")
     conn.execute(f"DROP TABLE IF EXISTS {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE}")
     conn.execute(f"DROP TABLE IF EXISTS {CUSTOMER_SCHEMA}.{DIMENSION_TABLE}")
+    conn.execute(f"DROP TABLE IF EXISTS {CUSTOMER_SCHEMA}.{SNAPSHOT_TABLE}")
     conn.execute(
         f"CREATE TABLE {CUSTOMER_SCHEMA}.{CUSTOMER_TABLE} (cif_id text)")
     conn.execute(
         f"CREATE TABLE {CUSTOMER_SCHEMA}.{DIMENSION_TABLE} ("
         "  cif_id text, segment text, sector text,"
-        "  effective_from text, effective_to text)")
+        "  effective_from text, effective_to text, is_current boolean)")
+    conn.execute(
+        f"CREATE TABLE {CUSTOMER_SCHEMA}.{SNAPSHOT_TABLE} ("
+        "  cif_id text, segment text, sector text, snapshot_date text, load_seq int)")
     conn.execute(
         f"CREATE TABLE {TRANSACTION_SCHEMA}.{TRANSACTION_TABLE} ("
         "  cif_id text, tran_amt numeric, tran_type text, tran_month text,"
@@ -216,6 +257,10 @@ def create_pilot_tables(conn) -> None:
     for row in DIMENSION_HISTORY:
         conn.execute(
             f"INSERT INTO {CUSTOMER_SCHEMA}.{DIMENSION_TABLE} "
+            "VALUES (%s, %s, %s, %s, %s, %s)", row)
+    for row in SEGMENT_SNAPSHOTS:
+        conn.execute(
+            f"INSERT INTO {CUSTOMER_SCHEMA}.{SNAPSHOT_TABLE} "
             "VALUES (%s, %s, %s, %s, %s)", row)
     for row in TRANSACTIONS:
         conn.execute(

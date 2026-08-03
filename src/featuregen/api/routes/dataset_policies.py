@@ -95,6 +95,14 @@ _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 
 _MAX_REFS = 64
 
+#: The selection kinds the temporal editor may offer, served ON the GET so a caller does not have
+#: to know which module owns the vocabulary. It was declared at the bottom of this file with no
+#: reader at all until Task 8 wired it here — a re-export nothing imports is not an API, it is a
+#: constant nobody can find. Every member is now IMPLEMENTED: `valid_at_report_cutoff` was reuse,
+#: `current_record` and `latest_snapshot_as_of` are Task 8's two new engines, and `explicit_only`
+#: is the honest terminal state for a dataset that cannot answer the shape of question asked.
+SELECTION_KINDS: tuple[str, ...] = tuple(k.value for k in TemporalSelectionKind)
+
 
 def require_source_temporal_selection() -> None:
     """404 (not 403) while the flag is off or its dependency is unmet: the surface does not exist,
@@ -229,6 +237,8 @@ def _temporal_payload(conn, *, source: str, dataset_logical_ref: str, roles) -> 
         # load-bearing value) or free (nobody has decided, so the policy is the declaration).
         "load_bearing_temporal_storage_model": load_bearing,
         "displayed_temporal_storage_model": displayed,
+        # The editor's select options, from the module that OWNS the vocabulary.
+        "selection_kinds": list(SELECTION_KINDS),
     }
     if current is None:
         return {**base, "pointer_version": 0, "policy": None}
@@ -330,8 +340,6 @@ def put_temporal_policy(source: str, object_ref: str, body: TemporalPolicyPutReq
                                 "historical": revision.historical_selection.value}}
 
 
-# Re-exported so a caller does not have to know which module owns which vocabulary when rendering
-# the editor's selects.
-SELECTION_KINDS: tuple[str, ...] = tuple(k.value for k in TemporalSelectionKind)
-
+# `SELECTION_KINDS` is declared at the top of this module, beside the other constants, and is READ
+# by the temporal GET — it was a bottom-of-file re-export with no reader in `src/` or `tests/`.
 __all__ = ["SELECTION_KINDS", "require_source_temporal_selection", "router"]
