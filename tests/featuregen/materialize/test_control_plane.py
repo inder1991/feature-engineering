@@ -165,7 +165,10 @@ def test_the_module_issues_no_UPDATE_DELETE_or_TRUNCATE() -> None:
 
 def test_the_module_reads_no_table_outside_the_control_plane() -> None:
     """"The control plane never reads feature data" is only true if it never reads anything else.
-    Every table it touches is one migration 1034 created."""
+    Every table it touches is one this plane owns: 1034's six, plus 1054's
+    ``materialization_compiled_artifact`` (Phase G §3.6), which is evidence about a compilation and
+    carries no data value either — a packing list names columns, types and refs, and a contract
+    names keys, classes and policies."""
     plane = {"materialization_generation", "materialization_run_event",
              "materialization_run_manifest", "materialization_compiled_artifact",
              "group_binding", "group_plan_revision"}
@@ -548,6 +551,31 @@ def test_the_writer_accepts_no_caller_supplied_hash(conn) -> None:
     nothing could correct it afterwards."""
     parameters = set(inspect.signature(record_compiled_artifact).parameters)
     assert parameters == {"conn", "generation_id", "group_plan", "contract"}
+
+
+def test_a_plan_and_a_contract_that_do_not_belong_together_are_REFUSED(conn) -> None:
+    """The two arguments are not independent, and only one of them is checked by anything else.
+
+    ``build_group_plan`` guarantees the plan carries **its own group's** contract hash — it does not
+    and cannot guarantee that the contract handed to this writer is that group's contract. Nothing
+    downstream would catch the difference either: each body would re-derive to the digest stored
+    beside it, so the row would look internally consistent while describing two different
+    compilations, and ``contract_hash`` would disagree with the ``materialization_contract_hash``
+    the plane already holds for the generation. On a table where nothing can be corrected
+    afterwards, that is the one mistake worth refusing at the door.
+
+    A ``ValueError``, not a §14 code: this is a call assembled wrongly, not a governed verdict about
+    a feature.
+    """
+    plan, contract = _compiled(conn)
+    someone_elses = dataclasses.replace(contract, sensitivity_class="confidential")
+    assert contract_hash(someone_elses) != plan.materialization_contract_hash
+
+    with pytest.raises(ValueError, match="materialization_contract_hash"):
+        record_compiled_artifact(conn, generation_id=GEN, group_plan=plan,
+                                 contract=someone_elses)
+    assert read_compiled_artifact(conn, generation_id=GEN) is None, \
+        "the mismatched pair was refused only AFTER it was written"
 
 
 def test_a_second_artifact_for_one_generation_is_REFUSED(conn) -> None:

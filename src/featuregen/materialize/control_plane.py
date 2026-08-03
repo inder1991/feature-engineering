@@ -27,6 +27,14 @@ that read-modify-write is a race: two appenders would both read the same maximum
 silently overwrite the other's place in the order. Supplied ``seq`` turns that race into a
 ``UniqueViolation`` the caller must handle.
 
+*One carve-out, added by Phase G §3.6:* :func:`record_compiled_artifact` DERIVES the two hashes it
+stores, from the very payloads it stores, and accepts neither from a caller. That is the same rule
+seen from the other side rather than an exception to it — everything supplied above is a fact about
+the world (when a thing happened, where it sits in an order) that this module could only invent,
+while a hash is a pure function of a body this module is already holding. A hash a caller could
+supply is a hash that could describe some other object, and on an append-only table nothing could
+ever correct it.
+
 **The one record here that carries a BODY, and why it still holds no data.** Phase G §3.6 added
 ``materialization_compiled_artifact`` (migration ``1054``): the group plan and the materialization
 contract, stored as the very canonical payloads their hashes were derived from. It is the same kind
@@ -591,19 +599,35 @@ def record_compiled_artifact(
     means a normalization that perturbed the payload aborts the compile that produced it, rather
     than surfacing months later in a reconciler holding a row nothing can repair or delete.
 
+    **The two arguments must belong together, and that is checked.** ``build_group_plan`` guarantees
+    the plan carries *its own group's* contract hash; nothing guarantees that the ``contract`` passed
+    here is that group's contract. Without the check, a mismatched pair would store two bodies that
+    each re-derive to the digest beside them — internally consistent, describing two different
+    compilations — and the stored ``contract_hash`` would disagree with the
+    ``materialization_contract_hash`` the plane holds for this generation. It is a ``ValueError``,
+    not a §14 code: a call assembled wrongly is not a governed verdict about a feature.
+
     This function does NOT open a transaction: it is called from inside ``compile/chain.py``'s
     commit block, whose whole point is that the generation row, the §10.1 records, this artifact,
     the terminal event and the tree land together or not at all.
     """
     plan_payload = group_plan.identity_payload()
     contract_payload = contract.identity_payload()
+    contract_digest = materialize_hash(contract_payload)
+    if contract_digest != group_plan.materialization_contract_hash:
+        raise ValueError(
+            f"the compiled artifact for generation {generation_id!r} was given a contract hashing "
+            f"to {contract_digest!r} and a plan whose materialization_contract_hash is "
+            f"{group_plan.materialization_contract_hash!r}: the plan is the packing list for the "
+            f"group THIS contract governs, and storing the pair would record two different "
+            f"compilations as one — on a table where nothing can be corrected afterwards")
     row = conn.execute(
         "INSERT INTO materialization_compiled_artifact (generation_id, group_plan, "
         "group_plan_hash, materialization_contract, contract_hash) VALUES (%s, %s, %s, %s, %s) "
         "RETURNING generation_id, group_plan, group_plan_hash, materialization_contract, "
         "contract_hash",
         (generation_id, Jsonb(plan_payload), materialize_hash(plan_payload),
-         Jsonb(contract_payload), materialize_hash(contract_payload))).fetchone()
+         Jsonb(contract_payload), contract_digest)).fetchone()
     if row is None:
         # Unreachable: an `INSERT … RETURNING` with no `ON CONFLICT` either returns the row it
         # inserted or raises. It is a narrow rather than an `assert` (which `python -O` strips,
