@@ -154,13 +154,20 @@ def _executable_realization_ids(conn: DbConn, relationship_ref: str) -> frozense
     label history and NEVER a live capability: it cannot see a dependency that has since been
     withdrawn. So "executable now" is asked of ``bridge_store.executable_bridge_realizations``,
     which revalidates, and of nothing else. A reader failure is NOT swallowed into a false
-    ``True`` — it degrades to "nothing is executable", the honest fail-closed answer."""
+    ``True`` — it degrades to "nothing is executable", the honest fail-closed answer.
+
+    Inside a SAVEPOINT, because failing closed is only half the guard: catching the exception does
+    not un-abort the transaction a DATABASE fault aborted, and the next statement in the dossier's
+    one repeatable-read transaction would then raise ``InFailedSqlTransaction``. Scoping the
+    rollback (the ``runtime.dispatch`` idiom) is what makes "nothing is executable" a degraded
+    answer rather than the first casualty of a dossier-wide failure."""
     from featuregen.overlay.upload.bridge_store import executable_bridge_realizations
 
     try:
-        realizations = executable_bridge_realizations(
-            conn, purpose="analysis", environment="production",
-            bridge_fact_key=relationship_ref)
+        with conn.transaction():
+            realizations = executable_bridge_realizations(
+                conn, purpose="analysis", environment="production",
+                bridge_fact_key=relationship_ref)
     except Exception:   # noqa: BLE001 — a revalidation fault must never READ AS executable
         return frozenset()
     return frozenset(r.revision.realization_revision_id for r in realizations)

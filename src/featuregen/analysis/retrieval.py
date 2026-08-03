@@ -430,13 +430,17 @@ def _context_bundles(conn, refs: Sequence[tuple[str, str, str]], *, roles: Itera
 
     A ref whose bundle cannot be assembled (it vanished, or read scope narrowed) is SKIPPED — the
     offered set is unaffected, because context is explanation and its absence must never silently
-    change what may be named."""
+    change what may be named. Each assembly runs inside a SAVEPOINT to make that true of a DATABASE
+    fault as well: catching the exception does not un-abort the transaction, so without the scoped
+    rollback the caller's very next statement raised ``InFailedSqlTransaction`` and the planning
+    request died anyway — on a fault the offered set was defined to survive."""
     from featuregen.overlay.upload.semantic_context import bundle_from_store, for_analysis_planning
 
     out: list[dict] = []
     for source, table, column in refs[:limit]:
         try:
-            bundle = bundle_from_store(conn, source, f"public.{table}.{column}", roles=roles)
+            with conn.transaction():
+                bundle = bundle_from_store(conn, source, f"public.{table}.{column}", roles=roles)
         except Exception:   # noqa: BLE001 — context is explanation; never a retrieval failure
             continue
         payload = for_analysis_planning(bundle)

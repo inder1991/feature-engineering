@@ -396,6 +396,24 @@ def test_bundles_carry_authority_axes_and_missing_context_codes(catalog):
             assert producer and strength
 
 
+def test_a_bundle_FAULT_does_not_abort_the_CALLER_transaction(catalog, monkeypatch):
+    """"Context is explanation; its absence must never change what may be named" is right, and the
+    bare `except Exception` did not achieve it: a DATABASE fault leaves PostgreSQL's transaction
+    ABORTED, so the caller's very next statement raises `InFailedSqlTransaction` and the planning
+    request dies anyway — on a fault the offered set was defined to survive. The guarded read runs
+    inside a SAVEPOINT."""
+    from featuregen.overlay.upload import semantic_context
+
+    def _bad_read(conn, *_args, **_kwargs):
+        conn.execute("SELECT no_such_column_zz FROM graph_node")
+
+    monkeypatch.setattr(semantic_context, "bundle_from_store", _bad_read)
+    got = retrieve_candidates(catalog, "transaction value by customer", now=_NOW)
+    assert got.context_bundles == ()
+    assert got.candidates.column_refs, "the offered set must be untouched by a context fault"
+    assert catalog.execute("SELECT 1").fetchone() == (1,)
+
+
 def test_bundles_are_bounded_far_below_the_offered_set(catalog):
     got = retrieve_candidates(catalog, "transaction value by customer", now=_NOW,
                               budget=RetrievalBudget(max_context_bundles=2))

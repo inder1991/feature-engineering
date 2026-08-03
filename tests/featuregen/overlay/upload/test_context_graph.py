@@ -230,6 +230,45 @@ def test_a_revalidation_fault_never_reads_as_executable(overlay_conn, monkeypatc
     assert cg._executable_realization_ids(overlay_conn, "bfk_1") == frozenset()
 
 
+def test_a_revalidation_DB_fault_leaves_the_TRANSACTION_usable(overlay_conn, monkeypatch):
+    """Failing closed is only half the guard. A `RuntimeError` degrades cleanly, but a DATABASE
+    fault leaves PostgreSQL's transaction ABORTED — every later statement then raises
+    `InFailedSqlTransaction`, so the honest "nothing is executable" is immediately followed by the
+    whole dossier dying. The guarded read runs inside a SAVEPOINT so the rollback is scoped to it."""
+    from featuregen.overlay.upload import bridge_store
+    from featuregen.overlay.upload import context_graph as cg
+
+    def _bad_read(conn, **_kwargs):
+        conn.execute("SELECT no_such_column_zz FROM graph_node")
+
+    monkeypatch.setattr(bridge_store, "executable_bridge_realizations", _bad_read)
+    assert cg._executable_realization_ids(overlay_conn, "bfk_1") == frozenset()
+    assert overlay_conn.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_a_context_FAULT_degrades_the_SECTION_not_the_dossier(overlay_conn, monkeypatch):
+    """The F0 contract says a section fault degrades to `unavailable`. It did — and then took the
+    dossier down anyway, because catching the exception does not un-abort the transaction the fault
+    aborted. `relationships` and `readiness` are assembled AFTER `context` in the same
+    repeatable-read transaction, so they died with `InFailedSqlTransaction` on a fault they had
+    nothing to do with."""
+    from featuregen.overlay.upload import context_graph as cg
+
+    def _bad_read(conn, **_kwargs):
+        conn.execute("SELECT no_such_column_zz FROM graph_node")
+
+    _seed(overlay_conn)
+    monkeypatch.setattr(cg, "build_context_section", _bad_read)
+    body = build_asset_detail(overlay_conn, source=_SRC, object_ref=_ANCHOR,
+                              roles=list(ADMIN.role_claims), identity=ADMIN)
+    assert body is not None
+    assert body["context"] == {"status": "unavailable"}
+    # The sections that come AFTER it still answer.
+    assert {"relationships", "readiness"} <= set(body["included_sections"])
+    assert body["relationships"] is not None
+    assert body["readiness"] is not None
+
+
 def test_availability_never_encodes_safety(overlay_conn, monkeypatch):
     """D3 deleted the four-way `discoverable|sandbox_only|executable|unavailable` merge: a link's
     `availability` carries only the two LinkAvailability words, with review and deterministic

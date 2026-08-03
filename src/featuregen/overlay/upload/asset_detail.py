@@ -721,7 +721,14 @@ def _context_section(
     missing-context codes rather than fabricating a blank node.
 
     Never raises into the dossier: an assembly fault degrades to an explicit ``unavailable`` status
-    (the F0 contract), because a context tab that 500s takes the whole asset page with it."""
+    (the F0 contract), because a context tab that 500s takes the whole asset page with it.
+
+    THE GUARD IS A SAVEPOINT, not just an ``except``. Catching the exception does not un-abort the
+    transaction a DATABASE fault aborted: PostgreSQL then refuses every later statement with
+    ``InFailedSqlTransaction``, so this section degraded politely to ``unavailable`` and
+    ``relationships`` — assembled next, in the SAME repeatable-read transaction — died on a fault it
+    had nothing to do with, taking the whole dossier with it. ``with conn.transaction():`` scopes the
+    rollback to this read (the ``runtime.dispatch`` idiom), so the sections after it still answer."""
     from featuregen.overlay.upload.context_graph import build_context_section
     from featuregen.overlay.upload.dataset_profiles import build_dataset_profile, profile_payload
     from featuregen.overlay.upload.profile_store import current_catalog_profile_revision_id
@@ -730,18 +737,19 @@ def _context_section(
     dataset_profile: dict | None = None
     revision_id: str | None = None
     try:
-        if dataset_profiles_enabled():
-            revision_id = current_catalog_profile_revision_id(conn, source)
-            table_logical_ref = logical_ref if anchor["kind"] == "table" else _table_logical_ref(
-                logical_ref)
-            assembled = build_dataset_profile(
-                conn, source=source, dataset_logical_ref=table_logical_ref,
-                catalog_profile_revision_id=revision_id)
-            dataset_profile = None if assembled is None else profile_payload(assembled)
-        return build_context_section(
-            conn, source=source, object_ref=anchor["object_ref"], kind=anchor["kind"],
-            logical_ref=logical_ref, roles=roles, now=datetime.now(UTC),
-            dataset_profile=dataset_profile, catalog_profile_revision_id=revision_id)
+        with conn.transaction():
+            if dataset_profiles_enabled():
+                revision_id = current_catalog_profile_revision_id(conn, source)
+                table_logical_ref = logical_ref if anchor["kind"] == "table" else (
+                    _table_logical_ref(logical_ref))
+                assembled = build_dataset_profile(
+                    conn, source=source, dataset_logical_ref=table_logical_ref,
+                    catalog_profile_revision_id=revision_id)
+                dataset_profile = None if assembled is None else profile_payload(assembled)
+            return build_context_section(
+                conn, source=source, object_ref=anchor["object_ref"], kind=anchor["kind"],
+                logical_ref=logical_ref, roles=roles, now=datetime.now(UTC),
+                dataset_profile=dataset_profile, catalog_profile_revision_id=revision_id)
     except Exception:  # noqa: BLE001 — one section must never take the dossier down
         logger.warning("context section unavailable for %r %r", source, anchor["object_ref"],
                        exc_info=True)
