@@ -5,8 +5,10 @@ durable identity: a ``recipe_formula_shadow_work_item`` whose authoring run was 
 1022 orchestrator. Only the two PROVIDER calls inside authoring are scripted, for the reason
 ``test_resolve.py`` states (the audited ``llm_call`` rows ``load_verified_checkpoint`` reconciles
 exist only under a durable DSN, which this suite deliberately does not have). Nothing in
-``chain.py`` itself is stubbed by any test below except the ONE seam Task 4 owns — the Kedro node
-assembly — which is injected because it does not exist yet.
+``chain.py`` itself is stubbed by any test below. The ONE seam Task 4 owns — the Kedro node
+assembly — is now the REAL ``compile/wiring.assemble_nodes``; it stays a parameter rather than a
+call so the chain does not become the second place the wiring is described, and
+``test_the_chain_takes_the_assembly_it_is_GIVEN`` drives a different assembler to show that.
 
 **The catalog is the UNION of two shipped seeds, not a third one.** ``fixtures.seed_materialize_catalog``
 is the only seed whose ``build_graph`` route makes ``logical_representation`` a GOVERNED decision,
@@ -62,6 +64,7 @@ from featuregen.materialize.compile.chain import (
     CompiledGroup,
     compile_feature_group,
 )
+from featuregen.materialize.compile.wiring import assemble_nodes
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     CadenceDecl,
@@ -151,12 +154,17 @@ def ready(catalog, monkeypatch, tmp_path):
 
 
 def _assemble(inputs) -> tuple:
-    """The Task-4 seam, standing in with ``test_render_project``'s stub-bodied wiring.
+    """The Task-4 seam — now the REAL assembler, so nothing in this file is stubbed at all.
 
-    The WIRING is real (``render_project._check_wiring`` refuses anything that does not close); only
-    the node BODIES are placeholders, which is exactly the split `test_render_project` documents.
-    Nothing else in the chain is stubbed anywhere in this file."""
-    return _nodes(inputs.datasets)
+    It stood in with ``test_render_project``'s stub-bodied wiring while
+    ``compile/wiring.assemble_nodes`` did not exist. Passing the real one keeps the chain's own
+    tests honest about what a run produces: the node BODIES are the renderers' and the wiring is the
+    assembly's, and ``_check_wiring`` refuses either if they do not close.
+
+    ``_nodes`` is still imported and exercised below, in
+    ``test_the_chain_takes_the_assembly_it_is_GIVEN``: the seam is a parameter, and a test that only
+    ever passed one assembler would not show that."""
+    return assemble_nodes(inputs)
 
 
 def _clock():
@@ -164,12 +172,12 @@ def _clock():
 
 
 def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schema=None,
-         spine=DECLARATION, inventory=INVENTORY) -> CompiledGroup:
+         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble) -> CompiledGroup:
     return compile_feature_group(
         db, request_id=request_id, work_item_ids=work_item_ids, inventory=inventory,
         spine_declaration=spine, cadence=_CADENCE, availability_promise=_PROMISE,
         contract_overrides=overrides, mechanism=PublishMechanism.VERSIONED_POINTER,
-        published_schema=published_schema, assemble_nodes=_assemble, project_root=root,
+        published_schema=published_schema, assemble_nodes=assemble, project_root=root,
         clock=_clock)
 
 
@@ -196,6 +204,36 @@ def test_a_governed_feature_becomes_a_sealed_project_on_disk(ready, catalog) -> 
     assert identity.compilation.group_plan_hash == outcome.group_plan_hash
     assert identity.compilation.materialization_contract_hash == \
         outcome.materialization_contract_hash
+
+
+def test_the_chain_renders_the_REAL_node_bodies_the_assembly_produced(ready, catalog) -> None:
+    """The Task-4 seam, closed. The project on disk carries the renderers' own compute — the §4.2
+    spine, the §8 projection, the §9 calculation and gates — and not a placeholder."""
+    request_id, work_items, root = ready
+
+    outcome = _run(catalog, request_id, work_items, root)
+
+    nodes_py = (pathlib.Path(outcome.project_root) / "src" / f"sandbox_feature_{_GROUP}" /
+                "pipelines" / "materialize" / "nodes.py").read_text()
+    assert "def build_spine(" in nodes_py
+    assert f"def calculate_{_FEATURE}(" in nodes_py
+    assert "def gate_and_publish(" in nodes_py
+    assert "renders this body" not in nodes_py
+
+
+def test_the_chain_takes_the_assembly_it_is_GIVEN(ready, catalog) -> None:
+    """`assemble_nodes` is a PARAMETER, not a call: the chain must not become the second place the
+    wiring is described. Driving one run through `test_render_project`'s stub wiring is what shows
+    the seam is still open — a chain that had quietly hard-coded `compile.wiring` would render the
+    real bodies here too."""
+    request_id, work_items, root = ready
+
+    outcome = _run(catalog, request_id, work_items, root,
+                   assemble=lambda inputs: _nodes(inputs.datasets))
+
+    nodes_py = (pathlib.Path(outcome.project_root) / "src" / f"sandbox_feature_{_GROUP}" /
+                "pipelines" / "materialize" / "nodes.py").read_text()
+    assert "Task 13/14 renders this body" in nodes_py
 
 
 def test_an_unproven_capability_renders_the_FAIL_CLOSED_publication_entry(ready, catalog) -> None:
