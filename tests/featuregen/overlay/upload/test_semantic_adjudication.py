@@ -466,6 +466,49 @@ def test_an_upheld_concept_is_unchanged_and_a_gap_answer_is_gap_suggested(db):
     assert [p.subject_ref for p in pointers] == ["src::s.t.ssi"]
 
 
+def test_a_gap_suggestion_never_suppresses_a_selected_correction(db):
+    """The display RANKING is display-only, which is only true if nothing about persistence reads
+    it. It did: `_OUTCOME_ORDER` puts `gap_suggested` above `selected` and `corrected_concept`
+    returned non-None only for a `selected` HEADLINE, so an answer that both named a better concept
+    AND flagged a vocabulary gap wrote ZERO concept evidence — the correction was silently
+    swallowed by the label. The two verdicts are now independent: one headline for the reader, one
+    concept verdict for the writer."""
+    results = adj.adjudicate_targets(
+        db, _client(_answer(selected_concept="branch_id", alternatives=[], ontology_gap={
+            "proposed_label": "branch_description", "parent_concept": "branch_id",
+            "definition": "A human-readable name for a branch."})),
+        [_target(_candidate(logical_ref="src::s.t.both", concept=None))],
+        catalog_revision="rev1", actor=_actor())
+    result = results[0]
+    assert result.outcome is adj.AdjudicationOutcome.GAP_SUGGESTED     # headline: the rarer event
+    assert result.concept_verdict is adj.AdjudicationOutcome.SELECTED  # what the WRITER reads
+    assert result.corrected_concept == "branch_id"
+    # Both are true of this one item, so the detail says both. The counts OVERLAP by design.
+    counts = adj.outcome_counts(results)
+    assert counts["selected"] == 1 and counts["gap_suggested"] == 1
+    # ...and the gap is still recorded and pointed at, not traded away for the correction.
+    assert [p.subject_ref for p in list_current_structured_results(
+        db, subject_kind=adj.SUBJECT_ONTOLOGY_GAP,
+        result_type=adj.SEMANTIC_ADJUDICATION_RESULT_TYPE)] == ["src::s.t.both"]
+
+
+def test_a_gap_only_answer_still_corrects_nothing(db):
+    """The other side of the decoupling: a gap beside an `unclassified` (or upheld) verdict must
+    STILL write no concept evidence. Decoupling the write path from the ranking must not turn every
+    gap into a correction."""
+    results = adj.adjudicate_targets(
+        db, _client(_answer(selected_concept="unclassified", alternatives=[], ontology_gap={
+            "proposed_label": "settlement_instruction", "definition": "A standing instruction."})),
+        [_target(_candidate(logical_ref="src::s.t.gaponly", concept=None))],
+        catalog_revision="rev1", actor=_actor())
+    assert results[0].outcome is adj.AdjudicationOutcome.GAP_SUGGESTED
+    assert results[0].concept_verdict is adj.AdjudicationOutcome.UNCLASSIFIED
+    assert results[0].corrected_concept is None
+    counts = adj.outcome_counts(results)
+    assert counts["unclassified"] == 1 and counts["gap_suggested"] == 1
+    assert counts["selected"] == 0
+
+
 def test_a_rederivation_without_a_gap_withdraws_the_previous_suggestion(db):
     target = _target(_candidate(logical_ref="src::s.t.ssi", concept=None))
     adj.adjudicate_targets(
@@ -640,6 +683,51 @@ def _ingest_one(db, client, monkeypatch, *, column: str = "sol_desc"):
     return result, rec
 
 
+# ── the GLOSSARY ingest: the only path that can write field evidence ────────────────────────────
+# A technical upload has no `source_snapshot_id` (`ingest.py`: `snapshot_id = mint_id("ing") if
+# is_glossary else None`), so its corrections reach `graph_node` with no evidence rows at all —
+# Pass A's pre-existing behaviour, documented at that seam. Proving "graph_node AND field_evidence
+# together" therefore REQUIRES a glossary upload.
+_GLOSSARY_SOURCE = "cibgloss"
+_GLOSSARY_CSV = (
+    "physical_name,business_term,description_business_definition,data_domain\n"
+    "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.SOL_DESC,Sol Desc,"
+    "The description of the branch that owns the relationship.,Party\n"
+)
+
+
+def _glossary_ref():
+    from featuregen.overlay.upload.object_ref import normalize_ref
+
+    return normalize_ref(_GLOSSARY_SOURCE, "DPL_EIB_COMPLIANCE", "BO_CIB_CUSTOMER", "SOL_DESC")
+
+
+def _ingest_glossary(db, client, monkeypatch):
+    from datetime import UTC, datetime
+
+    from featuregen.overlay.upload.glossary_reader import read_glossary
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.stage_report import StageRecorder
+
+    for var in ("CONCEPT", "DEFINITION", "DOMAIN", "SYNONYMS", "UNIT", "SUMMARY"):
+        monkeypatch.setenv(f"OVERLAY_ENRICH_{var}_MODE", "single")
+    _seal_overlay_config()
+    upload = read_glossary(_GLOSSARY_CSV, source=_GLOSSARY_SOURCE)
+    rec = StageRecorder()
+    result = ingest_upload(
+        db, _GLOSSARY_SOURCE, upload.rows, actor=_ingest_actor(),
+        now=datetime(2026, 7, 16, tzinfo=UTC), client=client, glossary=upload,
+        stage_recorder=rec)
+    return result, rec
+
+
+def _concept_evidence(db):
+    from featuregen.overlay.field_evidence import read_active_field_evidence
+
+    return [e for e in read_active_field_evidence(db, _glossary_ref(), "concept")
+            if e.producer == "llm"]
+
+
 def _stage(rec, name):
     return next(r for r in rec.reports if r.stage == name)
 
@@ -658,12 +746,62 @@ def test_the_ingest_stage_reports_outcomes_in_its_detail_and_a_state_from_the_09
 
 def test_a_selected_correction_reaches_graph_node_and_field_evidence_together(db, monkeypatch):
     """The correction is applied BEFORE `build_graph`, so the display value and the evidence that
-    justifies it can never disagree by a run."""
-    _ingest_one(db, _UnclassifiedThenAdjudicated(selected="branch_id"), monkeypatch)
+    justifies it can never disagree by a run — and the evidence row is ASSERTED here, not implied
+    by the test's name (the earlier version checked only `graph_node`, on a technical upload that
+    writes no evidence at all)."""
+    _ingest_glossary(db, _UnclassifiedThenAdjudicated(selected="branch_id"), monkeypatch)
     node = db.execute(
-        "SELECT concept FROM graph_node WHERE catalog_source='deposits' "
-        "AND object_ref='public.accounts.sol_desc'").fetchone()
+        "SELECT concept FROM graph_node WHERE catalog_source=%s "
+        "AND object_ref='public.bo_cib_customer.sol_desc'",
+        (_GLOSSARY_SOURCE,)).fetchone()
     assert node == ("branch_id",)
+    evidence = _concept_evidence(db)
+    assert [(e.proposed_value, e.strength) for e in evidence] == [("branch_id", "proposed")]
+
+
+def test_a_gap_beside_a_correction_writes_the_evidence_and_keeps_the_gap(db, monkeypatch):
+    """Wired end to end: the answer names a better concept AND a missing word. Both land — the
+    correction as `llm/proposed` concept evidence on `graph_node`'s column, the gap as a current
+    pointer — and the stage detail counts BOTH rather than letting the headline hide one."""
+    _result, rec = _ingest_glossary(
+        db, _UnclassifiedThenAdjudicated(
+            selected="branch_id",
+            gap={"proposed_label": "branch_description", "parent_concept": "branch_id",
+                 "definition": "A human-readable name for a branch."}),
+        monkeypatch)
+    assert [(e.proposed_value, e.strength) for e in _concept_evidence(db)] == \
+        [("branch_id", "proposed")]
+    node = db.execute(
+        "SELECT concept FROM graph_node WHERE catalog_source=%s "
+        "AND object_ref='public.bo_cib_customer.sol_desc'",
+        (_GLOSSARY_SOURCE,)).fetchone()
+    assert node == ("branch_id",)
+    assert [p.subject_ref for p in list_current_structured_results(
+        db, subject_kind=adj.SUBJECT_ONTOLOGY_GAP,
+        result_type=adj.SEMANTIC_ADJUDICATION_RESULT_TYPE)] == [_glossary_ref()]
+    detail = _stage(rec, "semantic_adjudication").detail
+    assert detail["selected"] == 1
+    assert detail["gap_suggested"] == 1
+    assert detail["gaps"] == 1
+    assert detail["evidence_written"] == 1
+
+
+def test_a_gap_without_a_correction_writes_no_concept_evidence(db, monkeypatch):
+    """Unchanged by the decoupling: an honest abstention plus a gap proposes no concept, so there
+    is nothing to write (C3) — and the stage still says so out loud."""
+    _result, rec = _ingest_glossary(
+        db, _UnclassifiedThenAdjudicated(answer={
+            "selected_concept": "unclassified", "alternatives": [], "confidence_band": "low",
+            "reason_codes": ["name_only_signal"], "missing_context": ["definition_missing"],
+            "ontology_gap": {"proposed_label": "branch_description", "parent_concept": "branch_id",
+                             "definition": "A human-readable name for a branch."}}),
+        monkeypatch)
+    assert _concept_evidence(db) == []
+    detail = _stage(rec, "semantic_adjudication").detail
+    assert detail["selected"] == 0
+    assert detail["unclassified"] == 1
+    assert detail["gap_suggested"] == 1
+    assert detail["evidence_written"] == 0
 
 
 def test_an_unclear_column_with_no_client_is_skipped_not_guessed(db, monkeypatch):

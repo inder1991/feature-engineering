@@ -22,8 +22,11 @@ hard. This module adds exactly that, for a DETERMINISTICALLY SELECTED few:
 * **`confidence_band` is explanation, never authority.** It rides the stored result and the read
   surface for a human to weigh; nothing in this module or downstream branches on it, and it cannot
   turn an LLM proposal into a stronger assertion. Evidence authority stays `llm/proposed`.
-* **A gap suggestion writes NO concept evidence and never touches the registry** — see
-  :mod:`semantic_gap`. It becomes discoverable through the migration-1046 subject/current pointer.
+* **A gap suggestion is ORTHOGONAL to the concept verdict.** It never grows the registry and is
+  never itself a classification (see :mod:`semantic_gap`); it becomes discoverable through the
+  migration-1046 subject/current pointer. It also neither creates nor cancels a concept correction
+  sitting in the same answer: "your vocabulary is missing a word" and "this column's concept is
+  wrong" are two claims, and a run that hears both must act on both.
 
 **Why a bounded single path rather than `run_batched`.** `run_batched` returns
 ``dict[ref, str]`` — one accepted STRING per item — and its degradation ladder (salvage, split,
@@ -133,9 +136,14 @@ class AdjudicationOutcome(StrEnum):
     NOT_ATTEMPTED = "not_attempted"  # no client, call cap reached, or a contained dispatch fault
 
 
-#: Outcome PRECEDENCE for the headline label, strongest first. A gap outranks the concept verdict
-#: because it is the rarer, reviewable event; the independent `evidence_written` / `gaps` counters
-#: in the stage detail mean nothing is hidden by the ranking.
+#: Outcome PRECEDENCE for the HEADLINE LABEL ONLY, strongest first. A gap outranks the concept
+#: verdict because it is the rarer, reviewable event.
+#:
+#: NOTHING ABOUT PERSISTENCE READS THIS. It used to: `corrected_concept` keyed off the headline, so
+#: an answer that both named a better concept AND flagged a vocabulary gap wrote no concept evidence
+#: at all — the ranking silently ate the correction. The concept verdict
+#: (:meth:`AdjudicationResultV1.concept_verdict`) is computed independently of any gap, the writer
+#: reads only that, and :func:`outcome_counts` reports BOTH facts about the same item.
 _OUTCOME_ORDER = (AdjudicationOutcome.INVALID, AdjudicationOutcome.NOT_ATTEMPTED,
                   AdjudicationOutcome.GAP_SUGGESTED, AdjudicationOutcome.SELECTED,
                   AdjudicationOutcome.UNCHANGED, AdjudicationOutcome.UNCLASSIFIED)
@@ -236,17 +244,37 @@ class AdjudicationResultV1:
     structured_result_id: str | None = None
     llm_call_ref: str | None = None
     skipped_reason: str | None = None
+    #: The CONCEPT verdict, computed with no gap precedence applied. ``None`` for the failure
+    #: outcomes (`invalid` / `not_attempted`), where the headline IS the concept verdict — there is
+    #: no validated answer to have a second opinion about.
+    concept_outcome: AdjudicationOutcome | None = None
+
+    @property
+    def concept_verdict(self) -> AdjudicationOutcome:
+        """What this result says about the column's CONCEPT — the only thing the write path reads.
+
+        Deliberately not `outcome`: the headline applies the display ranking, under which a gap
+        suggestion outranks (and, before this was split, erased) a valid correction sitting in the
+        very same answer."""
+        return self.concept_outcome or self.outcome
 
     @property
     def corrected_concept(self) -> str | None:
         """The registry concept this result asserts as a CORRECTION, or ``None``.
 
-        Only a `selected` outcome corrects. `unchanged` asserts nothing new, `unclassified` is the
-        deliberate non-proposal (C3: `unclassified` is never field evidence), and the failure
-        outcomes assert nothing at all."""
-        if self.outcome is not AdjudicationOutcome.SELECTED or self.adjudication is None:
+        Only a `selected` CONCEPT VERDICT corrects. `unchanged` asserts nothing new, `unclassified`
+        is the deliberate non-proposal (C3: `unclassified` is never field evidence), and the failure
+        outcomes assert nothing at all. A gap suggestion is orthogonal: it is a claim about the
+        VOCABULARY, and it neither creates nor cancels a claim about this column."""
+        if self.concept_verdict is not AdjudicationOutcome.SELECTED or self.adjudication is None:
             return None
         return self.adjudication.selected_concept
+
+    @property
+    def suggests_gap(self) -> bool:
+        """This result carries a validated ontology-gap suggestion — independent of the concept
+        verdict, which is why the two are counted separately."""
+        return self.adjudication is not None and self.adjudication.ontology_gap is not None
 
 
 # ── selection: a pure function over computed facts ──────────────────────────────────────────────
@@ -455,16 +483,26 @@ def adjudication_from_output(raw: Mapping | None) -> SemanticAdjudicationV2 | No
     )
 
 
-def _outcome_for(target: AdjudicationTargetV1,
-                 adjudication: SemanticAdjudicationV2) -> AdjudicationOutcome:
-    if adjudication.ontology_gap is not None:
-        return AdjudicationOutcome.GAP_SUGGESTED
+def _concept_outcome(target: AdjudicationTargetV1,
+                     adjudication: SemanticAdjudicationV2) -> AdjudicationOutcome:
+    """The CONCEPT verdict — what this answer says about the column's concept, computed WITHOUT any
+    reference to an ontology gap. This is what the evidence writer reads."""
     if adjudication.selected_concept == UNCLASSIFIED:
         return AdjudicationOutcome.UNCLASSIFIED
     current = canonical_concept_name((target.candidate.concept or "").strip().lower())
     if current == adjudication.selected_concept:
         return AdjudicationOutcome.UNCHANGED
     return AdjudicationOutcome.SELECTED
+
+
+def _outcome_for(target: AdjudicationTargetV1,
+                 adjudication: SemanticAdjudicationV2) -> AdjudicationOutcome:
+    """The HEADLINE label for one item — the concept verdict unless this answer also names a
+    vocabulary gap, which is the rarer, reviewable event and so leads the display. A pure
+    presentation choice: :func:`_concept_outcome` is unaffected by it, and so is every write."""
+    if adjudication.ontology_gap is not None:
+        return AdjudicationOutcome.GAP_SUGGESTED
+    return _concept_outcome(target, adjudication)
 
 
 # ── persistence ─────────────────────────────────────────────────────────────────────────────────
@@ -611,7 +649,9 @@ def adjudicate_targets(
     Per item and fail-soft: a replay HIT is served from the 1039 store WITHOUT a call (and without
     spending the cap), a cap-exhausted or client-less item is `not_attempted`, a contained dispatch
     fault is `not_attempted`, and an output that fails the code-side gate is `invalid`. Every item
-    in ``targets`` gets exactly one result — the caller's counts always sum to the target count."""
+    in ``targets`` gets exactly one RESULT (so ``len(results) == len(targets)``, always); the
+    stage-detail COUNTS deliberately do not partition that set — see :func:`outcome_counts`, where
+    one item can be both a correction and a gap suggestion."""
     limits = bounds or adjudication_bounds()
     results: list[AdjudicationResultV1] = []
     calls = 0
@@ -635,7 +675,8 @@ def adjudicate_targets(
             results.append(AdjudicationResultV1(
                 target.logical_ref, _outcome_for(target, adjudication), adjudication,
                 target.selection_reasons, stored.structured_result_id,
-                _stored_llm_call_ref(conn, stored.structured_result_id)))
+                _stored_llm_call_ref(conn, stored.structured_result_id),
+                concept_outcome=_concept_outcome(target, adjudication)))
             continue
         if client is None or calls >= limits.max_provider_calls:
             results.append(AdjudicationResultV1(
@@ -662,14 +703,27 @@ def adjudicate_targets(
         _point(conn, target=target, structured_result_id=result_id, adjudication=adjudication)
         results.append(AdjudicationResultV1(
             target.logical_ref, _outcome_for(target, adjudication), adjudication,
-            target.selection_reasons, result_id, llm_call_ref))
+            target.selection_reasons, result_id, llm_call_ref,
+            concept_outcome=_concept_outcome(target, adjudication)))
     return tuple(results)
 
 
 def outcome_counts(results: Sequence[AdjudicationResultV1]) -> dict[str, int]:
     """The six outcome counts, ALWAYS all six present (a zero is information — "nothing was
-    invalid" is an answer, a missing key is a question). Ordered by :data:`_OUTCOME_ORDER`."""
+    invalid" is an answer, a missing key is a question). Ordered by :data:`_OUTCOME_ORDER`.
+
+    THE COUNTS MAY OVERLAP, AND THEY DO NOT SUM TO THE ITEM COUNT. `selected` and `gap_suggested`
+    are not mutually exclusive facts: one answer can both name a better concept and report that the
+    vocabulary is missing a word, and the writer acts on the first regardless of the second. Each
+    item therefore contributes its CONCEPT VERDICT (`selected`/`unchanged`/`unclassified`, or
+    `invalid`/`not_attempted` when there is no validated answer) and, independently, a
+    `gap_suggested` tally when it carries a gap. Counting only the headline is what let a
+    ranking decide what got written; reporting `selected + gap_suggested = 2` for one item is the
+    honest shape, and the reader is told so here rather than left to infer a partition that is not
+    one."""
     counts = {outcome.value: 0 for outcome in _OUTCOME_ORDER}
     for result in results:
-        counts[result.outcome.value] += 1
+        counts[result.concept_verdict.value] += 1
+        if result.suggests_gap:
+            counts[AdjudicationOutcome.GAP_SUGGESTED.value] += 1
     return counts

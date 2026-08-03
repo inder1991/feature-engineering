@@ -1731,8 +1731,12 @@ def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow
       ``unclassified`` is never a proposal. It also does NOT clear a standing concept — the
       adjudicator failing to name a better word is not evidence the current word is wrong; the
       critic owns eviction, and doing it here too would make two components fight over one field;
-    * a gap suggestion writes NO concept evidence and never touches the registry (see
-      :mod:`semantic_gap`); its discovery pointer is written inside ``adjudicate_targets``.
+    * a gap suggestion never touches the registry and is never itself a classification (see
+      :mod:`semantic_gap`); its discovery pointer is written inside ``adjudicate_targets``. It is
+      ORTHOGONAL to the concept verdict: an answer carrying both a gap AND a better concept writes
+      the concept evidence AND records the gap. The display ranking that puts `gap_suggested` at
+      the head of such an item is a LABEL — the write path reads ``corrected_concept``, which is
+      computed from the concept verdict alone.
 
     DB-first, dict-after (the critic's rule): the evidence write happens before ``concepts`` is
     mutated, so a rolled-back savepoint leaves the in-memory classification exactly as it was.
