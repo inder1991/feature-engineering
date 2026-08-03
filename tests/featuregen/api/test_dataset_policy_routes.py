@@ -347,6 +347,25 @@ def test_a_temporal_policy_naming_only_visible_columns_is_shown_to_everyone(seed
         assert got.json()["policy"]["current_flag_ref"] == f"{_MIXED}.is_current"
 
 
+def test_a_policy_declaring_unknown_declares_nothing_and_is_not_publishable(seeded, flag_on):
+    """`unknown` is the ABSENCE the platform records, not an answer. Publishing one would mint a
+    revision and move the current pointer to a declaration that the branch's own
+    `temporal_policy_agreement` immediately refuses (TEMPORAL_MODEL_UNKNOWN) — and for an
+    upload-only catalog THIS policy is the operational declaration, so it would be an absence
+    dressed as a decision."""
+    res = seeded.put(_TEMPORAL, headers=ADMIN, json=_temporal_body(
+        temporal_storage_model="unknown", historical_selection="explicit_only",
+        effective_from_ref=None, effective_to_ref=None))
+    assert res.status_code == 400, res.text        # a typed VALIDATION refusal, never a 409
+    detail = res.json()["detail"]
+    assert "unknown" in detail
+    # No-blocked framing: it names the actionable path rather than calling the operator wrong.
+    assert "scd2" in detail and "current_only" in detail
+
+    after = seeded.get(_TEMPORAL, headers=AUTH).json()
+    assert after["policy"] is None and after["pointer_version"] == 0
+
+
 def test_a_column_ref_is_not_a_dataset(seeded, flag_on):
     res = seeded.get("/catalog/dataset-policies/temporal/bank/public.customer_segment.cif_id",
                      headers=AUTH)

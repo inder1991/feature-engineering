@@ -194,6 +194,8 @@ def put_serving_policy(entity_id: str, need_role: str, serving_purpose: str,
         revision_id, version = publish_serving_policy(
             conn, revision, expected_pointer_version=body.expected_pointer_version,
             actor=identity.subject, roles=identity.role_claims)
+    # 400 covers `PolicyValidationError` too (it IS a `SelectionError`): a store-level refusal that
+    # no retry can fix is the request being wrong, not a race. 409 is reserved for the race.
     except SelectionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PolicyStoreConflict as exc:
@@ -316,6 +318,8 @@ def put_temporal_policy(source: str, object_ref: str, body: TemporalPolicyPutReq
         revision_id, version = publish_temporal_policy(
             conn, revision, expected_pointer_version=body.expected_pointer_version,
             actor=identity.subject, roles=identity.role_claims)
+    # 400 covers `PolicyValidationError` too (it IS a `SelectionError`): a store-level refusal that
+    # no retry can fix is the request being wrong, not a race. 409 is reserved for the race.
     except SelectionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PolicyStoreConflict as exc:

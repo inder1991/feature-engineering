@@ -13,7 +13,9 @@
 //     looking broken, because "two datasets are equally preferred" is a decision waiting to be made.
 //   * NOTHING IS INFERRED. The serving policy is keyed by (entity, need, purpose) and this screen
 //     is about a DATASET, so the operator names the need. Guessing it from `primary_entity` is
-//     exactly the inference the population rule forbids.
+//     exactly the inference the population rule forbids. The storage model has no default for the
+//     same reason, and `unknown` is not offered at all: the server refuses to publish it, so an
+//     editor that pre-selected it would offer a one-click path to a policy that declares nothing.
 //   * The routes 404 while the flag (or its DATASET_PROFILES dependency) is off, and the panel then
 //     renders NOTHING — a flag-off screen looks exactly like today's.
 import { useCallback, useEffect, useState } from 'react'
@@ -24,7 +26,14 @@ import {
 import type { ServingPolicyView, TemporalPolicyView } from '../api'
 
 // Closed server vocabularies (profile_vocab.py §6.1, temporal_policy.py §6.5).
-const STORAGE_MODELS = ['current_only', 'scd1', 'scd2', 'snapshot', 'event_log', 'unknown']
+//
+// `unknown` IS a member of the server enum and is deliberately NOT offered here. It is the absence
+// the platform records, not an answer to it: `publish_temporal_policy` refuses a policy declaring it
+// (400), `clarify` withholds it from the options for the very refusal it names, and
+// `learning.CHOICE_VOCABULARIES` strips it so a reviewer cannot close a gap by restating it. An
+// editor that defaulted its select to `unknown` — in exactly the upload-only case this panel exists
+// for — would make "publish an absence as a decision" the one-click path.
+const STORAGE_MODELS = ['current_only', 'scd1', 'scd2', 'snapshot', 'event_log']
 const SELECTION_KINDS = ['current_record', 'valid_at_report_cutoff', 'latest_snapshot_as_of',
   'explicit_only']
 const NEED_ROLES = ['population', 'event_source', 'dimension_source', 'reference', 'mapping']
@@ -56,7 +65,10 @@ function TemporalPolicySection({ source, objectRef }: { source: string; objectRe
   const [conflicted, setConflicted] = useState(false)
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
-  const [model, setModel] = useState('unknown')
+  // '' is NOT a member of the vocabulary — it is "the operator has not chosen yet", which is why
+  // submit stays disabled until they do. There is no default: a pre-filled storage model is a claim
+  // about the data that nobody made.
+  const [model, setModel] = useState('')
   const [current, setCurrent] = useState('current_record')
   const [historical, setHistorical] = useState('explicit_only')
   const [effectiveFrom, setEffectiveFrom] = useState('')
@@ -72,8 +84,9 @@ function TemporalPolicySection({ source, objectRef }: { source: string; objectRe
       setAbsent(false)
       if (keepDraft) return
       const p = got.policy
-      setModel(p?.temporal_storage_model
-        ?? got.load_bearing_temporal_storage_model ?? 'unknown')
+      // A governed `unknown` is still nobody's answer, so it seeds nothing.
+      const known = p?.temporal_storage_model ?? got.load_bearing_temporal_storage_model ?? ''
+      setModel(known === 'unknown' ? '' : known)
       setCurrent(p?.current_selection ?? 'current_record')
       setHistorical(p?.historical_selection ?? 'explicit_only')
       setEffectiveFrom(p?.effective_from_ref ?? '')
@@ -191,9 +204,17 @@ function TemporalPolicySection({ source, objectRef }: { source: string; objectRe
           <label>
             Stores history as
             <select value={model} onChange={e => setModel(e.target.value)}>
+              <option value="">choose one…</option>
               {STORAGE_MODELS.map(m => <option key={m} value={m}>{m}</option>)}
             </select>
           </label>
+          {!model && (
+            <p className="hint" data-testid="temporal-policy-needs-model">
+              Pick how this dataset stores history before saving. There is no "not sure" option on
+              purpose — a policy that declares nothing would still become the declaration the
+              planner reads.
+            </p>
+          )}
           {governed ? (
             <p className="hint" data-testid="temporal-policy-governed">
               A reviewed classification already says <span className="mono">{governed}</span>.
@@ -242,7 +263,7 @@ function TemporalPolicySection({ source, objectRef }: { source: string; objectRe
                    maxLength={500} />
           </label>
           <div>
-            <button type="submit" disabled={busy}>Save</button>{' '}
+            <button type="submit" disabled={busy || !model}>Save</button>{' '}
             <button type="button"
                     onClick={() => { setEditing(false); setConflicted(false); void load() }}>
               Cancel

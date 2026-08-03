@@ -28,6 +28,7 @@ from featuregen.overlay.upload.source_selection import (
     DatasetNeedRole,
     DatasetServingPolicyRevisionV1,
     PolicyStoreConflict,
+    PolicyValidationError,
     SelectionError,
     ServingPurpose,
     human_declaration_provenance,
@@ -260,26 +261,76 @@ def test_a_policy_contradicting_a_load_bearing_value_is_refused(seeded):
         "SELECT count(*) FROM dataset_temporal_policy_revision").fetchone()[0] == 0
 
 
-def test_an_unknown_storage_model_may_not_promise_history_but_may_still_be_honest(seeded):
-    """"We do not know how this table stores history" is a legitimate declaration — it just cannot
-    promise a historical answer. The contract refuses the promise before the store is reached, and
-    the honest `explicit_only` shape publishes normally."""
+def test_a_policy_declaring_unknown_declares_nothing_and_is_not_publishable(seeded):
+    """`unknown` is the ABSENCE this platform records, never an answer to it.
+
+    Two refusals, in the order a caller meets them. The CONTRACT refuses the historical PROMISE
+    (`unknown` keeps no history it can prove), and the STORE refuses the declaration itself — because
+    publishing it would mint a revision and move the current pointer to a policy that
+    `temporal_policy_agreement` immediately answers TEMPORAL_MODEL_UNKNOWN, that `clarify` will not
+    offer as an answer, and that `learning.CHOICE_VOCABULARIES` deliberately excludes. For an
+    upload-only catalog THIS policy is the operational declaration (D12.7), so an `unknown` one is
+    an absence dressed as a decision — the exact promotion the authority engine exists to prevent."""
     with pytest.raises(SelectionError, match="keeps no history"):
         publish_temporal_policy(
             seeded,
             _temporal(temporal_storage_model=TemporalStorageModel.UNKNOWN,
                       historical_selection=TemporalSelectionKind.VALID_AT_REPORT_CUTOFF),
             expected_pointer_version=0, actor="user:priya")
+
+    honest_shape = _temporal(temporal_storage_model=TemporalStorageModel.UNKNOWN,
+                             historical_selection=TemporalSelectionKind.EXPLICIT_ONLY,
+                             effective_from_ref=None, effective_to_ref=None)
+    with pytest.raises(PolicyValidationError, match="declares nothing"):
+        publish_temporal_policy(seeded, honest_shape, expected_pointer_version=0,
+                                actor="user:priya")
+    # A VALIDATION refusal, never a CAS conflict: retrying it with a fresher pointer changes nothing.
+    assert not isinstance(PolicyValidationError("x"), PolicyStoreConflict)
+    # Nothing written, nothing pointed at.
+    assert seeded.execute(
+        "SELECT count(*) FROM dataset_temporal_policy_revision").fetchone()[0] == 0
+    assert seeded.execute(
+        "SELECT count(*) FROM dataset_temporal_policy_current").fetchone()[0] == 0
+    assert current_temporal_policy(seeded, _SEG) is None
+
+    # And the actionable path is named, not just refused.
+    with pytest.raises(PolicyValidationError, match="scd2"):
+        publish_temporal_policy(seeded, honest_shape, expected_pointer_version=0,
+                                actor="user:priya")
+
+
+def test_the_unknown_refusal_survives_a_load_bearing_unknown(seeded):
+    """A governed profile value of `unknown` governs NOTHING (`contradicts_load_bearing_model`
+    returns False for it), so the contradiction branch cannot be what refuses here — the declaration
+    is refused on its own terms."""
+    _confirm_temporal_model(seeded, "unknown")
+    with pytest.raises(PolicyValidationError, match="declares nothing"):
+        publish_temporal_policy(
+            seeded,
+            _temporal(temporal_storage_model=TemporalStorageModel.UNKNOWN,
+                      historical_selection=TemporalSelectionKind.EXPLICIT_ONLY,
+                      effective_from_ref=None, effective_to_ref=None),
+            expected_pointer_version=0, actor="user:priya")
     assert seeded.execute(
         "SELECT count(*) FROM dataset_temporal_policy_revision").fetchone()[0] == 0
 
-    revision_id, _ = publish_temporal_policy(
-        seeded,
-        _temporal(temporal_storage_model=TemporalStorageModel.UNKNOWN,
-                  historical_selection=TemporalSelectionKind.EXPLICIT_ONLY,
-                  effective_from_ref=None, effective_to_ref=None),
-        expected_pointer_version=0, actor="user:priya")
-    assert current_temporal_policy(seeded, _SEG)[0].revision_id == revision_id
+
+@pytest.mark.parametrize("publish,revision", [
+    ("serving", "_policy"), ("temporal", "_temporal"),
+])
+def test_a_malformed_request_is_a_validation_refusal_not_a_pointer_conflict(seeded, publish,
+                                                                           revision):
+    """409 says "someone got there first, read again and retry"; none of these gets better on a
+    retry. A blank actor and a negative expected version are the request being wrong."""
+    publisher = publish_serving_policy if publish == "serving" else publish_temporal_policy
+    made = _policy() if revision == "_policy" else _temporal()
+    for actor in ("", "   "):
+        with pytest.raises(PolicyValidationError, match="who"):
+            publisher(seeded, made, expected_pointer_version=0, actor=actor)
+    with pytest.raises(PolicyValidationError, match="cannot be negative"):
+        publisher(seeded, made, expected_pointer_version=-1, actor="user:priya")
+    assert seeded.execute(
+        f"SELECT count(*) FROM dataset_{publish}_policy_current").fetchone()[0] == 0
 
 
 def test_the_temporal_cas_pointer_fails_closed(seeded):

@@ -35,8 +35,10 @@ from featuregen.overlay.upload.source_selection import (
     DatasetNeedRole,
     DatasetServingPolicyRevisionV1,
     PolicyStoreConflict,
+    PolicyValidationError,
     ServingPurpose,
     assert_dataset_refs_readable,
+    assert_policy_write_valid,
     provenance_from_payload,
 )
 
@@ -57,7 +59,7 @@ def record_serving_policy_revision(conn: DbConn, revision: DatasetServingPolicyR
                                    authored_by: str) -> str:
     """Append ``revision`` if absent (idempotent on identical content) and return its id."""
     if not authored_by or not authored_by.strip():
-        raise PolicyStoreConflict("a policy revision must record who authored it")
+        raise PolicyValidationError("a policy revision must record who authored it")
     conn.execute(
         "INSERT INTO dataset_serving_policy_revision ("
         "  revision_id, entity_id, need_role, serving_purpose, eligible_dataset_refs,"
@@ -83,9 +85,10 @@ def set_current_serving_policy(conn: DbConn, *, entity_id: str, need_role: str,
     ``expected_pointer_version=0`` claims first-write (INSERT); ``>=1`` names the exact version the
     caller read (UPDATE ... WHERE pointer_version = expected). A rowcount other than 1 raises."""
     if expected_pointer_version < 0:
-        raise PolicyStoreConflict("expected_pointer_version cannot be negative")
+        raise PolicyValidationError("expected_pointer_version cannot be negative")
     if not declared_by or not declared_by.strip():
-        raise PolicyStoreConflict("advancing a policy pointer must record who declared it")
+        raise PolicyValidationError(
+            "advancing a policy pointer must record who declared it")
     if expected_pointer_version == 0:
         changed = conn.execute(
             "INSERT INTO dataset_serving_policy_current "
@@ -115,6 +118,7 @@ def publish_serving_policy(conn: DbConn, revision: DatasetServingPolicyRevisionV
 
     Validation FIRST so a policy naming an unreadable dataset writes nothing at all; the CAS is the
     last step so a concurrent writer loses the pointer race rather than the whole authoring."""
+    assert_policy_write_valid(expected_pointer_version=expected_pointer_version, actor=actor)
     assert_dataset_refs_readable(
         conn, set(revision.eligible_dataset_refs) | set(revision.preferred_dataset_refs),
         roles=roles)

@@ -78,7 +78,21 @@ class PolicyStoreConflict(Exception):
 
     ONE exception for both policy stores: the two are the same mechanism over different keys, and a
     route that handles a serving-policy conflict differently from a temporal one would be handling
-    the same race twice. Routes map it to a 409."""
+    the same race twice. Routes map it to a 409, and to NOTHING ELSE — see
+    :class:`PolicyValidationError`."""
+
+
+class PolicyValidationError(SelectionError):
+    """A STORE-level refusal that is not a race: the request is malformed, whatever the pointer says.
+
+    Split out from :class:`PolicyStoreConflict` because 409 means "try again with what you now know"
+    and every one of these means "this can never be published as written": a blank actor, a negative
+    ``expected_pointer_version``, a policy declaring ``unknown``. Retrying them forever is the
+    behaviour a 409 invites, and a caller cannot tell from the status code that it is pointless.
+
+    Deliberately a :class:`SelectionError` subclass: both are pre-write validation refusals that
+    wrote nothing, so the routes' existing ``except SelectionError -> 400`` branch already gives
+    them the honest status, and no route can accidentally handle one and forget the other."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -279,6 +293,19 @@ def reject_freshness_keys(payload: dict[str, Any], *, where: str) -> None:
             for item in value:
                 if isinstance(item, dict):
                     reject_freshness_keys(item, where=where)
+
+
+def assert_policy_write_valid(*, expected_pointer_version: int, actor: str) -> None:
+    """Refuse a policy write that NO retry can fix, before either store writes anything.
+
+    The same two conditions the CAS helpers check, hoisted to the top of ``publish_*`` so the
+    module's own promise — "nothing is written when a validation refuses" — holds for them too: the
+    negative-version check used to sit AFTER the revision insert, so a request that could never
+    advance a pointer still left a revision row behind."""
+    if expected_pointer_version < 0:
+        raise PolicyValidationError("expected_pointer_version cannot be negative")
+    if not actor or not str(actor).strip():
+        raise PolicyValidationError("a policy write must record who declared it")
 
 
 def normalize_dataset_ref(raw: object, *, what: str = "dataset_ref") -> str:

@@ -136,9 +136,43 @@ it('echoes the pointer version it read, and 0 claims the first write', async () 
     revision_id: `dtp_${'b'.repeat(64)}`, pointer_version: 1,
   })
   await userEvent.click(screen.getByRole('button', { name: /declare row policy/i }))
+  await userEvent.selectOptions(screen.getByLabelText(/stores history as/i), 'scd2')
   await userEvent.click(screen.getByRole('button', { name: /^save$/i }))
   await vi.waitFor(() => expect(putTemporalPolicy).toHaveBeenCalled())
   expect(putTemporalPolicy.mock.calls[0][2].expectedPointerVersion).toBe(0)
+  expect(putTemporalPolicy.mock.calls[0][2].temporalStorageModel).toBe('scd2')
+})
+
+it('never offers unknown, and cannot be saved until a model is chosen', async () => {
+  // The server refuses a policy declaring `unknown` (it declares nothing), and this panel is FOR
+  // the upload-only catalog where nothing has attested a model — precisely where a default of
+  // `unknown` would have been the one-click answer.
+  await renderPanel(temporalView())
+  await userEvent.click(screen.getByRole('button', { name: /declare row policy/i }))
+
+  const select = screen.getByLabelText(/stores history as/i)
+  expect(Array.from(select.querySelectorAll('option')).map(o => o.getAttribute('value')))
+    .toEqual(['', 'current_only', 'scd1', 'scd2', 'snapshot', 'event_log'])
+  expect(select).toHaveValue('')
+
+  const save = screen.getByRole('button', { name: /^save$/i })
+  expect(save).toBeDisabled()
+  const why = screen.getByTestId('temporal-policy-needs-model')
+  expect(why).toHaveTextContent(/no "not sure" option on purpose/i)
+  expect(why.textContent).not.toMatch(/error|failed|blocked|invalid/i)
+  await userEvent.click(save)
+  expect(putTemporalPolicy).not.toHaveBeenCalled()
+
+  await userEvent.selectOptions(select, 'snapshot')
+  expect(screen.getByRole('button', { name: /^save$/i })).toBeEnabled()
+  expect(screen.queryByTestId('temporal-policy-needs-model')).toBeNull()
+})
+
+it('does not seed the choice from a governed unknown — that is nobody\'s answer either', async () => {
+  await renderPanel(temporalView({ load_bearing_temporal_storage_model: 'unknown' }))
+  await userEvent.click(screen.getByRole('button', { name: /declare row policy/i }))
+  expect(screen.getByLabelText(/stores history as/i)).toHaveValue('')
+  expect(screen.getByRole('button', { name: /^save$/i })).toBeDisabled()
 })
 
 it('keeps the author draft on a 409 and shows the other version beside it', async () => {

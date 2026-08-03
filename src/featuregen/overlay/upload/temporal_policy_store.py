@@ -12,6 +12,12 @@ this module adds ONE thing.
 * refuses when a LOAD-BEARING ``temporal_storage_model`` exists and CONTRADICTS the policy — a
   policy may not overrule a governed classification, because that classification is what the
   execution gates read;
+* refuses a policy that declares ``unknown`` at all (:class:`PolicyValidationError`, a 400) — a
+  declaration of the absence is not a declaration. It is the one refusal no profile state can lift:
+  ``temporal_policy_agreement`` answers ``TEMPORAL_MODEL_UNKNOWN`` for such a policy whatever the
+  profile says, and both the clarification and the learning-gap surfaces deliberately withhold
+  ``unknown`` from the choices they offer, so publishing one would mint a revision and move the
+  current pointer to a declaration every other surface on this branch already refuses to accept;
 * ACCEPTS when the profile value is absent or merely PROPOSED, in which case the POLICY ITSELF is
   the operational declaration. This is the case that keeps an upload-only catalog working: nothing
   ever attested its temporal model, and the alternative (promoting the LLM proposal to
@@ -32,10 +38,13 @@ from featuregen.contracts import DbConn
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
 from featuregen.overlay.upload.source_selection import (
+    TEMPORAL_MODEL_UNKNOWN,
     PolicyStoreConflict,
+    PolicyValidationError,
     SelectionError,
     assert_column_refs_readable,
     assert_dataset_refs_readable,
+    assert_policy_write_valid,
     provenance_from_payload,
 )
 from featuregen.overlay.upload.temporal_policy import (
@@ -59,7 +68,7 @@ def record_temporal_policy_revision(conn: DbConn, revision: DatasetTemporalPolic
                                     authored_by: str) -> str:
     """Append ``revision`` if absent (idempotent on identical content) and return its id."""
     if not authored_by or not authored_by.strip():
-        raise PolicyStoreConflict("a policy revision must record who authored it")
+        raise PolicyValidationError("a policy revision must record who authored it")
     conn.execute(
         "INSERT INTO dataset_temporal_policy_revision ("
         "  revision_id, dataset_logical_ref, temporal_storage_model, current_selection,"
@@ -84,9 +93,10 @@ def set_current_temporal_policy(conn: DbConn, *, dataset_logical_ref: str, revis
                                 expected_pointer_version: int, declared_by: str) -> int:
     """Advance the CAS current pointer and return the NEW pointer version."""
     if expected_pointer_version < 0:
-        raise PolicyStoreConflict("expected_pointer_version cannot be negative")
+        raise PolicyValidationError("expected_pointer_version cannot be negative")
     if not declared_by or not declared_by.strip():
-        raise PolicyStoreConflict("advancing a policy pointer must record who declared it")
+        raise PolicyValidationError(
+            "advancing a policy pointer must record who declared it")
     if expected_pointer_version == 0:
         changed = conn.execute(
             "INSERT INTO dataset_temporal_policy_current "
@@ -131,8 +141,24 @@ def load_bearing_temporal_model(conn: DbConn, *, source: str,
 def publish_temporal_policy(conn: DbConn, revision: DatasetTemporalPolicyRevisionV1, *,
                             expected_pointer_version: int, actor: str,
                             roles: Iterable[str] = ()) -> tuple[str, int]:
-    """Validate refs + the agreement rule, append the revision, advance the pointer — one
-    transaction, in that order (nothing is written when a validation refuses)."""
+    """Validate the request + refs + the agreement rule, append the revision, advance the pointer —
+    one transaction, in that order (nothing is written when a validation refuses)."""
+    assert_policy_write_valid(expected_pointer_version=expected_pointer_version, actor=actor)
+    # A POLICY DECLARING `unknown` DECLARES NOTHING, so it may not be published — checked before any
+    # read, because no profile state can make it publishable. The rest of this branch already treats
+    # `unknown` as the ABSENCE it is: `temporal_policy_agreement` answers TEMPORAL_MODEL_UNKNOWN for
+    # it whatever the profile says, `clarify` will not OFFER it as an answer to that very refusal,
+    # and `learning.CHOICE_VOCABULARIES` strips it from the choices for the same reason. Publishing
+    # it anyway would mint a revision and move the CURRENT pointer — and for an upload-only catalog
+    # this policy IS the operational declaration (D12.7), so the result is an absence recorded as a
+    # decision, which is exactly the promotion the authority engine exists to prevent.
+    if revision.temporal_storage_model is TemporalStorageModel.UNKNOWN:
+        raise PolicyValidationError(
+            f"a temporal policy declaring {TemporalStorageModel.UNKNOWN.value!r} declares nothing "
+            f"({TEMPORAL_MODEL_UNKNOWN}), so it cannot be the operational declaration for "
+            f"{revision.dataset_logical_ref!r}. Declare how the dataset actually stores history — "
+            f"{', '.join(m.value for m in TemporalStorageModel if m is not TemporalStorageModel.UNKNOWN)}"
+            " — or leave it undeclared, which is the honest way to record that nobody knows yet")
     source = revision.dataset_logical_ref.split("::", 1)[0]
     assert_dataset_refs_readable(conn, (revision.dataset_logical_ref,), roles=roles)
     assert_column_refs_readable(conn, revision.column_refs(), roles=roles)
