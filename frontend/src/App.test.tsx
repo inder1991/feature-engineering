@@ -12,13 +12,13 @@ vi.mock('./api', async importOriginal => {
     listQuarantine: vi.fn(),
     uploadFile: vi.fn(),
     listIntegrations: vi.fn(),
-    getTableSuggestions: vi.fn(),
+    getTableSuggestionsV2: vi.fn(),
   }
 })
 const listQuarantine = vi.mocked(api.listQuarantine)
 const uploadFile = vi.mocked(api.uploadFile)
 const listIntegrations = vi.mocked(api.listIntegrations)
-const getTableSuggestions = vi.mocked(api.getTableSuggestions)
+const getTableSuggestions = vi.mocked(api.getTableSuggestionsV2)
 
 beforeEach(() => {
   setSession({ user: 'dev', roles: ['data_owner'] })
@@ -92,16 +92,26 @@ describe('app shell', () => {
 
   it('deep-links #/suggested to the read-only suggested-features sheet, off the left rail', async () => {
     getTableSuggestions.mockResolvedValue({
-      catalog_source: 'core_banking',
-      table: 'public.comp_fin_tran',
-      table_known: true,
-      summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
-      groups: [],
-      rejections: [],
-      neighbourhood: {
-        tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1,
-        limit_reason: null,
+      read_mode: 'on_demand',
+      read_scope_key: 'scope-test',
+      projection: null,
+      collection: {
+        anchor_catalog_source: 'core_banking',
+        anchor_table_ref: 'public.comp_fin_tran',
+        anchor_column_ref: null,
+        table_known: true,
+        summary: { suggested: 0, design_checked: 0, needs_external_validation: 0, groups: 0 },
+        groups: [],
+        rejections: [],
+        neighbourhood: {
+          tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1,
+          limit_reason: null,
+        },
+        omitted_counts: {},
       },
+      hits: [],
+      facets: {},
+      next_cursor: null,
     })
     window.location.hash = '#/suggested?source=core_banking&table=public.comp_fin_tran'
     render(<App />)

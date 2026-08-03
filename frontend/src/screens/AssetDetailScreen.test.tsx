@@ -11,12 +11,12 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
-    getTableSuggestions: vi.fn(),
+    getTableSuggestionsV2: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
 const postFieldDecision = vi.mocked(api.postFieldDecision)
-const getTableSuggestions = vi.mocked(api.getTableSuggestions)
+const getTableSuggestions = vi.mocked(api.getTableSuggestionsV2)
 
 beforeEach(() => {
   getAssetDetail.mockReset()

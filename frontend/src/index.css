@@ -4678,3 +4678,525 @@ button.stat:hover {
   display: grid;
   gap: 4px;
 }
+
+/* ---------------------------------------------------------------- suggested feature card (v2)
+   Appended for the v2 discovery card shared by SuggestedFeaturesScreen and the AssetDetailScreen
+   column dossier. Composes the existing .rows/.row/.q-item, .badge, .kv, .stats/.stat, .callout,
+   .mono/.hint/.micro-label vocabulary and the token palette; nothing above this line is modified.
+
+   THREE THINGS THIS BLOCK IS RESPONSIBLE FOR.
+
+   1. HONESTY IS TYPOGRAPHIC, NOT CHROMATIC. Every state a reader must act on carries a WORD:
+      the limitation class ("Execution safety" / "Review" / "Missing fact"), the provenance basis
+      ("AI-proposed" / "derived from recipe family"), and the absent value ("not supplied",
+      "unavailable"). Colour is a second channel on top of the word, never the only one — which is
+      also why `.sfc-absent` is italic + faint rather than tinted, and `.sfc-unavailable` is a
+      DASHED chip: "nobody decided this" must not read as an error.
+
+   2. NOTHING MAY OVERFLOW THE PAGE. Catalog display names, catalog wording, object refs and
+      content hashes are all unbounded strings from an upload. Every badge inside a card is allowed
+      to WRAP (the global `.badge` is `white-space: nowrap`, which is right for a status chip and
+      wrong for a 90-character authored label), every flex/grid child that holds one sets
+      `min-width: 0`, and every ref/hash breaks with `overflow-wrap: anywhere`. A card is therefore
+      TALLER under hostile input, never wider.
+
+   3. HIERARCHY. The card has four altitudes: the name + state row, the classification strip, the
+      meaning/mechanics pairs, and the limitations. The drawer is a distinctly inset surface
+      (--surface-2) so "audit material" is visibly a different register from "what this measures".
+
+   KEYBOARD: the only control is one native <button> disclosure per card, so the base
+   :focus-visible ring (2px --accent, 2px offset) is the whole story. Nothing here sets overflow on
+   an ancestor of it, so the ring is never clipped. */
+
+.sfc {
+  /* q-item already stacks; this only tightens the internal rhythm and guards the flex track */
+  gap: 8px;
+  min-width: 0;
+}
+
+.sfc-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+
+.sfc-name {
+  margin: 0;
+  flex: 1 1 20ch;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+/* A long authored label must wrap inside its pill rather than push the row wider than the page. */
+.sfc .badge,
+.sfc-chip .badge {
+  height: auto;
+  min-height: 20px;
+  padding-block: 2px;
+  white-space: normal;
+  text-align: left;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+/* generation source + "suggested, not registered": a quiet fact, not a state */
+.badge.sfc-origin {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink-soft);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.badge.sfc-cat {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
+
+/* the count is prominent because the contract says so; the WORD "limitations" carries it */
+.badge.sfc-limcount {
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 40%, var(--line));
+  color: var(--warn);
+}
+
+/* an execution-safety limitation is the loud one: solid, like .badge.rejected */
+.badge.sfc-limcount--safety {
+  background: var(--danger-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.sfc-nolim {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.sfc-limit-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  max-width: 74ch;
+}
+
+/* ---- classification strip ---- */
+
+.sfc-tax {
+  display: grid;
+  gap: 4px;
+}
+
+.sfc-chiprow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.sfc-chiprow-label {
+  flex: 0 0 auto;
+  min-width: 104px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.sfc-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.sfc-more {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* catalog WORDING, deliberately not a pill: it is text somebody typed, not a controlled label */
+.sfc-term {
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.sfc-term::before {
+  content: '\201C';
+}
+
+.sfc-term::after {
+  content: '\201D';
+}
+
+/* authorship, always beside the value it qualifies */
+.sfc-prov {
+  font-size: 11px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.sfc-prov--proposed {
+  color: var(--proposal);
+}
+
+/* "nobody has decided this" — words + a quiet italic. Never a colour alone, never an alarm. */
+.sfc-absent {
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+/* ---- meaning + mechanics ---- */
+
+.sfc-meaning,
+.sfc-facts {
+  display: grid;
+  grid-template-columns: fit-content(160px) 1fr;
+  gap: 4px 16px;
+  margin: 0;
+  min-width: 0;
+}
+
+.sfc-fact {
+  display: contents;
+}
+
+.sfc-meaning dt,
+.sfc-facts dt {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding-top: 2px;
+}
+
+.sfc-meaning dd,
+.sfc-facts dd {
+  margin: 0;
+  min-width: 0;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+
+/* prose is clamped on the COMPACT card only; the complete value renders in the drawer */
+.sfc-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.sfc-recipe {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- limitations: visible without opening anything ---- */
+
+.sfc-lims {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.sfc-lim {
+  display: grid;
+  grid-template-columns: minmax(96px, max-content) 1fr max-content;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.sfc-lim-class {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sfc-lim-words {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sfc-lim-refs {
+  color: var(--ink-soft);
+}
+
+.sfc-lim-code {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+/* Tones are a SECOND channel: the class word above already says which kind this is. Review and
+   execution safety are deliberately different hues as well as different words, because "nobody
+   has confirmed this link" and "running this could duplicate rows" are not the same fact. */
+.sfc-lim--safety {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 35%, var(--line));
+}
+
+.sfc-lim--safety .sfc-lim-class,
+.sfc-lim--handling .sfc-lim-class {
+  color: var(--danger);
+}
+
+.sfc-lim--handling {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 22%, var(--line));
+}
+
+.sfc-lim--review,
+.sfc-lim--context {
+  background: var(--proposal-soft);
+  border-color: color-mix(in oklch, var(--proposal) 30%, var(--line));
+}
+
+.sfc-lim--review .sfc-lim-class,
+.sfc-lim--context .sfc-lim-class {
+  color: var(--proposal);
+}
+
+.sfc-lim--fact,
+.sfc-lim--design {
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 30%, var(--line));
+}
+
+.sfc-lim--fact .sfc-lim-class,
+.sfc-lim--design .sfc-lim-class {
+  color: var(--warn);
+}
+
+.sfc-lim--other .sfc-lim-class {
+  color: var(--ink-soft);
+}
+
+/* ---- footer + disclosure ---- */
+
+.sfc-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.sfc-toggle {
+  margin-left: auto;
+  padding: 0 12px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  border-color: var(--line);
+  background: transparent;
+}
+
+.sfc-toggle:hover {
+  color: var(--ink);
+}
+
+/* ---- the drawer: audit material, visibly a different register ---- */
+
+.sfc-detail {
+  display: grid;
+  gap: 18px;
+  padding: 14px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+
+.sfc-sec {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sfc-h {
+  margin: 0;
+  color: var(--ink-soft);
+}
+
+.sfc-sec .kv {
+  background: var(--surface);
+}
+
+.sfc-attr {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sfc-attr-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sfc-attr-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.sfc-attr-value {
+  font-size: 13.5px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  max-width: 74ch;
+}
+
+.sfc-attr-id {
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.sfc-evidence {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.sfc-dataset {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sfc-dataset + .sfc-dataset {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.sfc-dataset-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+}
+
+/* "no value has been decided" as a chip: dashed, neutral, never an alarm colour */
+.badge.sfc-unavailable {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--line-strong);
+  color: var(--ink-faint);
+}
+
+.sfc-operands,
+.sfc-rels,
+.sfc-reqs,
+.sfc-omit {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.sfc-reqs,
+.sfc-omit {
+  gap: 4px;
+}
+
+.sfc-operands > li,
+.sfc-rels > li {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+
+.sfc-operand-head,
+.sfc-rel-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.sfc-operands p,
+.sfc-rels p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.sfc-omit > li {
+  color: var(--ink-soft);
+}
+
+/* ---- narrow layout: the label columns collapse before anything scrolls sideways ---- */
+
+@media (max-width: 720px) {
+  .sfc-meaning,
+  .sfc-facts {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .sfc-fact {
+    display: block;
+  }
+
+  .sfc-fact + .sfc-fact {
+    margin-top: 8px;
+  }
+
+  .sfc-lim {
+    grid-template-columns: 1fr;
+  }
+
+  .sfc-chiprow-label {
+    flex-basis: 100%;
+  }
+
+  .sfc-toggle {
+    margin-left: 0;
+    width: 100%;
+  }
+}

@@ -1,8 +1,11 @@
-import { render, screen, within } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
+import { getSession, setSession } from '../session'
 import { AssetDetailScreen } from './AssetDetailScreen'
 import { fixture, suggestionsFixture } from './AssetDetailScreen.fixture'
+import { hit as suggestionHit, label } from './SuggestedFeaturesScreen.fixture'
 
 // The column dossier (richness Task 3C): clicking a column answers everything end-to-end.
 // This file pins the plan's contracts:
@@ -12,8 +15,9 @@ import { fixture, suggestionsFixture } from './AssetDetailScreen.fixture'
 //     and a governed unit replaces it;
 //   * an axis with nothing is an explicit "nothing known yet" — a NULL axis is distinguishable
 //     from a hidden one;
-//   * suggested features appear for a column a suggestion USES; a 403 renders an honest access
-//     message, never an empty list;
+//   * suggested features appear for a column a suggestion USES, in the SAME card the table screen
+//     renders (one semantic and warning vocabulary everywhere); a 403 renders an honest access
+//     message, never an empty list; a visibility-claim change clears the section;
 //   * the AI summary renders BESIDE the definition, labelled AI-drafted — never in its place.
 
 vi.mock('../api', async importOriginal => {
@@ -22,17 +26,21 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
-    getTableSuggestions: vi.fn(),
+    getTableSuggestionsV2: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
-const getTableSuggestions = vi.mocked(api.getTableSuggestions)
+const getTableSuggestions = vi.mocked(api.getTableSuggestionsV2)
+
+const BASE_SESSION = getSession()
 
 beforeEach(() => {
   getAssetDetail.mockReset()
   getTableSuggestions.mockReset()
   getTableSuggestions.mockResolvedValue(suggestionsFixture())
+  setSession({ user: 'dev', roles: ['data_owner'] })
 })
+afterEach(() => setSession(BASE_SESSION))
 
 function detail(over: (d: api.AssetDetail) => void = () => {}): api.AssetDetail {
   const base = fixture()
@@ -199,34 +207,56 @@ it('a summary without a definition still leaves the definition slot honest, not 
 
 // ── suggested features on the column ─────────────────────────────────────────────────────────────
 
-function suggestion(over: Partial<api.FeatureSuggestion> = {}): api.FeatureSuggestion {
-  return {
+// The v2 discovery hit, reusing the table screen's own builders so the dossier can never drift into
+// a second fixture shape (and therefore never into a second card vocabulary).
+function usingBalance(over: Partial<api.FeatureSuggestionV2> = {}): api.FeatureSuggestionHit {
+  return suggestionHit({
+    suggestion_id: 'sug-balance',
     name: 'account_balance_avg_30d',
-    description: 'Average balance per account over 30 days.',
-    recipe: 'AVG(balance) OVER account / 30d',
-    recipe_parts: { operation: 'AVG', measures: ['balance'], grain: 'account', window: '30d', time: 'as_of' },
-    validation_status: 'DESIGN_CHECKED',
-    requirements: [],
-    uses: ['public.accounts.balance', 'public.accounts.opened_at'],
-    binding_quality: 'direct',
-    grain_table: 'accounts',
+    display_name: 'account_balance_avg_30d',
+    operands: [
+      {
+        catalog_source: 'deposits', logical_ref: 'deposits.accounts.balance',
+        graph_object_ref: 'public.accounts.balance', table_ref: 'accounts',
+        recipe_role: 'balance', classification: 'measure',
+        visibility_requires_current: [], evidence_refs: [],
+      },
+      {
+        catalog_source: 'deposits', logical_ref: 'deposits.accounts.opened_at',
+        graph_object_ref: 'public.accounts.opened_at', table_ref: 'accounts',
+        recipe_role: 'as_of', classification: 'time',
+        visibility_requires_current: [], evidence_refs: [],
+      },
+    ],
     ...over,
+  })
+}
+
+function withHits(hits: api.FeatureSuggestionHit[], suggested = hits.length) {
+  const base = suggestionsFixture()
+  return {
+    ...base,
+    collection: {
+      ...base.collection,
+      summary: { ...base.collection.summary, suggested },
+    },
+    hits,
   }
 }
 
 it('shows the suggestions that USE the opened column and filters out the rest', async () => {
-  getTableSuggestions.mockResolvedValue({
-    ...suggestionsFixture(),
-    summary: { suggested: 2, clean_ready: 1, needs_review: 1, entities: 1 },
-    groups: [{
-      entity_ref: 'public.accounts.id',
-      entity_label: 'account',
-      suggestions: [
-        suggestion(),
-        suggestion({ name: 'account_age_days', uses: ['public.accounts.opened_at'] }),
-      ],
-    }],
-  })
+  getTableSuggestions.mockResolvedValue(withHits([
+    usingBalance(),
+    suggestionHit({
+      suggestion_id: 'sug-age', name: 'account_age_days', display_name: 'account_age_days',
+      operands: [{
+        catalog_source: 'deposits', logical_ref: 'deposits.accounts.opened_at',
+        graph_object_ref: 'public.accounts.opened_at', table_ref: 'accounts',
+        recipe_role: 'as_of', classification: 'time',
+        visibility_requires_current: [], evidence_refs: [],
+      }],
+    }),
+  ], 2))
   await renderDossier(detail())
   const section = await screen.findByTestId('column-suggestions')
   expect(await within(section).findByText('account_balance_avg_30d')).toBeInTheDocument()
@@ -235,16 +265,74 @@ it('shows the suggestions that USE the opened column and filters out the rest', 
   expect(getTableSuggestions).toHaveBeenCalledWith('deposits', 'accounts')
 })
 
-it('says which suggestions exist when none uses this column — not a bare empty', async () => {
-  getTableSuggestions.mockResolvedValue({
-    ...suggestionsFixture(),
-    summary: { suggested: 3, clean_ready: 0, needs_review: 3, entities: 1 },
-    groups: [{
-      entity_ref: 'public.accounts.id',
-      entity_label: 'account',
-      suggestions: [suggestion({ name: 'other', uses: ['public.accounts.opened_at'] })],
+it('renders the SAME card vocabulary the table screen uses, drawer included', async () => {
+  getTableSuggestions.mockResolvedValue(withHits([usingBalance({
+    business_domains: [label({ id: 'liquidity', display_name: 'Liquidity' })],
+    warnings: [{
+      code: 'RELATIONSHIP_SAFETY_UNPROVEN',
+      operand_refs: [['deposits', 'public.accounts.balance']],
+      detail: 'a traversed relationship has no governed-verified safety evidence',
     }],
+  })]))
+  await renderDossier(detail())
+  const section = await screen.findByTestId('column-suggestions')
+  // the card's own semantic and warning vocabulary, not a stripped copy
+  expect(within(section).getByText('suggested · recipe')).toBeInTheDocument()
+  expect(within(section).getByText('Trend & Trajectory')).toBeInTheDocument()
+  expect(within(section).getByText('Liquidity')).toBeInTheDocument()
+  expect(within(section).getByText('Execution safety')).toBeInTheDocument()
+  expect(within(section).getByText(/could duplicate or drop rows/i)).toBeInTheDocument()
+  expect(within(section).getByText(/predictive usefulness and production execution are not proven/i))
+    .toBeInTheDocument()
+  // the card heading sits BELOW the dossier section heading, not beside it
+  expect(within(section).getByRole('heading', { level: 4, name: 'account_balance_avg_30d' }))
+    .toBeInTheDocument()
+  await userEvent.click(within(section).getByRole('button', { name: /show full detail/i }))
+  const drawer = within(section).getByRole('group', {
+    name: /full detail for account_balance_avg_30d/i,
   })
+  expect(within(drawer).getByText('Suggestion id')).toBeInTheDocument()
+  expect(within(drawer).getByText('measured quantity')).toBeInTheDocument()
+  expect(within(drawer).getByText('profile unavailable')).toBeInTheDocument()
+})
+
+it('is read-only here too: the only control is the disclosure', async () => {
+  getTableSuggestions.mockResolvedValue(withHits([usingBalance()]))
+  await renderDossier(detail())
+  const section = await screen.findByTestId('column-suggestions')
+  const buttons = within(section).getAllByRole('button')
+  expect(buttons).toHaveLength(1)
+  expect(buttons[0]).toHaveAttribute('aria-expanded')
+  expect(within(section).queryByRole('button', { name: /accept|dismiss|edit/i })).toBeNull()
+})
+
+it('clears the section and refetches when the session visibility claims change', async () => {
+  getTableSuggestions.mockResolvedValue(withHits([usingBalance()]))
+  await renderDossier(detail())
+  const section = await screen.findByTestId('column-suggestions')
+  expect(await within(section).findByText('account_balance_avg_30d')).toBeInTheDocument()
+  expect(getTableSuggestions).toHaveBeenCalledTimes(1)
+  // the next read never resolves: a card still on screen would mean a URL-keyed cache
+  getTableSuggestions.mockReturnValue(new Promise(() => {}))
+  await act(async () => {
+    setSession({ user: 'dev', roles: ['data_owner', 'pii_reader'] })
+  })
+  expect(within(section).queryByText('account_balance_avg_30d')).toBeNull()
+  expect(getTableSuggestions).toHaveBeenCalledTimes(2)
+})
+
+it('says which suggestions exist when none uses this column — not a bare empty', async () => {
+  getTableSuggestions.mockResolvedValue(withHits([
+    suggestionHit({
+      suggestion_id: 'sug-other', name: 'other', display_name: 'other',
+      operands: [{
+        catalog_source: 'deposits', logical_ref: 'deposits.accounts.opened_at',
+        graph_object_ref: 'public.accounts.opened_at', table_ref: 'accounts',
+        recipe_role: 'as_of', classification: 'time',
+        visibility_requires_current: [], evidence_refs: [],
+      }],
+    }),
+  ], 3))
   await renderDossier(detail())
   const section = await screen.findByTestId('column-suggestions')
   expect(
@@ -260,6 +348,16 @@ it('a 403 renders an honest access message naming the permission — never an em
   expect(message).toHaveTextContent(/you don't have access to feature suggestions/i)
   expect(message).toHaveTextContent('catalog:read')
   expect(within(section).queryByText(/no suggestions/i)).toBeNull()
+})
+
+it('says the deployment does not serve the discovery contract, distinctly from a failure', async () => {
+  getTableSuggestions.mockRejectedValue(new api.ApiError(
+    422, 'unsupported contract_version 2', null, api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION))
+  await renderDossier(detail())
+  const section = await screen.findByTestId('column-suggestions')
+  expect(await within(section).findByRole('status'))
+    .toHaveTextContent(/does not serve the discovery contract/i)
+  expect(within(section).queryByRole('alert')).toBeNull()
 })
 
 it('a non-403 failure is an error, not an invented empty state', async () => {

@@ -19,11 +19,13 @@ import {
   type SemanticDivergence,
   type SemanticSubsection,
   type SemanticVerifiedEdge,
-  type TableSuggestions,
+  SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  type FeatureSuggestionPageV2,
   getAssetDetail,
-  getTableSuggestions,
+  getTableSuggestionsV2,
   postFieldDecision,
 } from '../api'
+import { useIdentityKey } from '../session'
 import { SuggestionCard } from './SuggestedFeaturesScreen'
 
 // Asset detail: ONE catalog asset opened to its bounded sections (identity + metadata + evidence +
@@ -653,9 +655,12 @@ function GovernanceSummary({ detail }: { detail: AssetDetail }) {
 }
 
 // ---- suggested features on the column (usage) -----------------------------------------------
-// The P4 per-table suggestions route, filtered to the suggestions that USE the opened column.
+// The per-table suggestions route asked for the v2 DISCOVERY contract, filtered to the suggestions
+// whose bound OPERANDS include the opened column. The card component is the one the table screen
+// renders, so a suggestion carries the same semantic and warning vocabulary on both surfaces.
 // Honesty rules: a 403 renders an access message naming the permission (never an empty section);
-// an empty filter result says whether the TABLE has suggestions that simply don't use this column.
+// an empty filter result says whether the TABLE has suggestions that simply don't use this column;
+// a deployment that does not serve v2 says so rather than showing a stripped card.
 function ColumnSuggestions({
   source,
   identity,
@@ -663,26 +668,36 @@ function ColumnSuggestions({
   source: string
   identity: AssetIdentity
 }) {
-  const [data, setData] = useState<TableSuggestions | null>(null)
+  const [data, setData] = useState<FeatureSuggestionPageV2 | null>(null)
   const [loading, setLoading] = useState(true)
   const [forbidden, setForbidden] = useState(false)
+  const [unsupported, setUnsupported] = useState(false)
   const [error, setError] = useState('')
   const table = identity.table
   const objectRef = identity.object_ref
+  // Read scope decides which suggestions exist at all, so a result read under other claims is not
+  // an answer here. Keyed on principal + claims, never on the URL alone.
+  const identityKey = useIdentityKey()
 
   useEffect(() => {
     if (!table) return
     let live = true
+    // Clear before the request, not after it resolves: a card read under the previous claims must
+    // not stay on screen while the new one is in flight.
+    setData(null)
     setLoading(true)
     setError('')
     setForbidden(false)
-    getTableSuggestions(source, table)
+    setUnsupported(false)
+    getTableSuggestionsV2(source, table)
       .then(body => {
         if (live) setData(body)
       })
       .catch((e: unknown) => {
         if (!live) return
         if (e instanceof ApiError && e.status === 403) setForbidden(true)
+        else if (e instanceof ApiError
+          && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) setUnsupported(true)
         else setError(e instanceof ApiError ? e.detail : String(e))
         setData(null)
       })
@@ -692,13 +707,13 @@ function ColumnSuggestions({
     return () => {
       live = false
     }
-  }, [source, table])
+  }, [source, table, identityKey])
 
   const matching = useMemo(() => {
     if (!data) return []
     const ref = objectRef.toLowerCase()
-    return data.groups.flatMap(g =>
-      g.suggestions.filter(s => s.uses.some(u => u.toLowerCase() === ref)),
+    return data.hits.filter(hit =>
+      hit.suggestion.operands.some(o => o.graph_object_ref.toLowerCase() === ref),
     )
   }, [data, objectRef])
 
@@ -713,19 +728,30 @@ function ColumnSuggestions({
           You don't have access to feature suggestions. This view needs the{' '}
           <code>catalog:read</code> permission and this session's roles don't carry it.
         </p>
+      ) : unsupported ? (
+        <p className="adg-unavailable" role="status">
+          This deployment does not serve the discovery contract this screen asks for, so suggestions
+          cannot be shown here. The server is older than this screen.
+        </p>
       ) : error || !data ? (
         <p role="alert" className="error">
           Could not load suggestions: {error || 'no payload returned'}
         </p>
       ) : matching.length === 0 ? (
         <p className="hint">
-          {data.summary.suggested === 0
+          {data.collection.summary.suggested === 0
             ? 'No suggestions on this table yet.'
-            : `None of the ${data.summary.suggested} suggestions on this table uses this column.`}
+            : `None of the ${data.collection.summary.suggested} suggestions on this table uses `
+              + 'this column.'}
         </p>
       ) : (
         <ul className="rows">
-          {matching.map(s => <SuggestionCard key={s.name} suggestion={s} />)}
+          {matching.map(hit => (
+            <SuggestionCard
+              key={hit.suggestion.suggestion_id} hit={hit} headingLevel={4}
+              omitted={data.collection.omitted_counts}
+            />
+          ))}
         </ul>
       )}
     </section>

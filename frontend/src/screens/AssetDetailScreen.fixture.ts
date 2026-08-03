@@ -1,19 +1,31 @@
 import type * as api from '../api'
 
-// An EMPTY per-table suggestions payload (P4 shape): what the column dossier's usage section loads
-// by default in tests that are not about suggestions — table known, nothing suggested, no
-// neighbours. Tests about the section override it.
-export function suggestionsFixture(): api.TableSuggestions {
+// An EMPTY per-table suggestions page (v2 discovery contract): what the column dossier's usage
+// section loads by default in tests that are not about suggestions — table known, nothing
+// suggested, no neighbours, Release A's `on_demand` read with no projection. Tests about the
+// section override it.
+export function suggestionsFixture(): api.FeatureSuggestionPageV2 {
   return {
-    catalog_source: 'deposits',
-    table: 'accounts',
-    table_known: true,
-    summary: { suggested: 0, clean_ready: 0, needs_review: 0, entities: 0 },
-    groups: [],
-    rejections: [],
-    neighbourhood: {
-      tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1, limit_reason: null,
+    read_mode: 'on_demand',
+    read_scope_key: 'scope-test',
+    projection: null,
+    collection: {
+      anchor_catalog_source: 'deposits',
+      anchor_table_ref: 'accounts',
+      anchor_column_ref: null,
+      table_known: true,
+      summary: { suggested: 0, design_checked: 0, needs_external_validation: 0, groups: 0 },
+      groups: [],
+      rejections: [],
+      neighbourhood: {
+        tables_considered: 0, tables_available: 0, truncated: false, max_hops: 1,
+        limit_reason: null,
+      },
+      omitted_counts: {},
     },
+    hits: [],
+    facets: {},
+    next_cursor: null,
   }
 }
 

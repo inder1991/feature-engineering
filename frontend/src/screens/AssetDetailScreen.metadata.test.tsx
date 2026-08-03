@@ -20,7 +20,7 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
-    getTableSuggestions: vi.fn(),
+    getTableSuggestionsV2: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
@@ -33,8 +33,8 @@ function detail(over: (d: api.AssetDetail) => void = () => {}): api.AssetDetail 
 
 beforeEach(() => {
   getAssetDetail.mockReset()
-  vi.mocked(api.getTableSuggestions).mockReset()
-  vi.mocked(api.getTableSuggestions).mockResolvedValue(suggestionsFixture())
+  vi.mocked(api.getTableSuggestionsV2).mockReset()
+  vi.mocked(api.getTableSuggestionsV2).mockResolvedValue(suggestionsFixture())
 })
 
 async function openTab(d: api.AssetDetail) {
