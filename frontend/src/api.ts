@@ -2562,9 +2562,13 @@ export function postFieldDecision(
 }
 
 // ── the data agent: a question, planned and previewed ────────────────────────────────────────────
-// Nothing here executes. `/analysis/plan` retrieves, extracts, grounds and previews; the API has no
-// run endpoint, because execution needs inputs a deployment must configure first. The screen must
-// not offer a Run control it cannot honour.
+// `/analysis/plan` retrieves, extracts, grounds, previews and — behind the source/temporal flag —
+// SEALS, returning the identity a caller executes that exact plan by. It never runs the statement.
+// The API DOES have a run endpoint now (`POST /analysis/execute`, Release-B Task 9), and this
+// client deliberately does not call it: running a sealed plan against the bank's warehouse is a
+// separate approval gate, and a Run control that 409'd on it would teach people to click through a
+// governance decision. The screen offers no Run button for that reason, not because nothing can
+// execute.
 
 export interface AnalysisFinding {
   code: string
@@ -2606,10 +2610,63 @@ export interface AnalysisClarification {
   options: ClarificationOption[]
 }
 
+// ── Release B: which copy answered, which of its rows, and what else was considered ─────────────
+// The candidate list is READ-SCOPED server-side: a dataset this caller may not see never appears
+// by name, only in `considered_withheld`. The UI renders that count and must never try to
+// reconstruct what is behind it.
+
+export interface AnalysisCandidate {
+  dataset_ref: string
+  disposition: string
+  reason_codes: string[]
+}
+
+export interface AnalysisSourceDecision {
+  need_role: string
+  withheld: boolean
+  dataset_ref?: string
+  selection_basis?: string
+  authority_basis?: string
+  authority_role?: string
+  considered?: AnalysisCandidate[]
+  considered_withheld?: number
+  considered_total?: number
+}
+
+export interface AnalysisRowDecision {
+  dataset_ref: string
+  selection_kind: string
+  cutoff_value_ref: string | null
+  predicates: { column_ref: string; operator: string }[]
+  predicates_withheld: boolean
+}
+
+export interface AnalysisSelectionRefusal {
+  code: string
+  subjects: string[]
+  subjects_withheld: number
+  detail: string
+  // undecided | needs_data_check | structurally_unsuitable | needs_setup. The UI renders the
+  // FAMILY: an undecided thing is not a failure and must never be drawn as one.
+  family: string
+}
+
+export interface AnalysisSelection {
+  resolved: boolean
+  sources: AnalysisSourceDecision[]
+  rows: AnalysisRowDecision[]
+  refusals: AnalysisSelectionRefusal[]
+  warnings: string[]
+}
+
 export interface AnalysisPlanResponse {
   preview: AnalysisPreview
   clarifications: AnalysisClarification[]
   retrieval?: { tables_considered: string[]; dropped_columns: number }
+  // null while FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off.
+  selection?: AnalysisSelection | null
+  // The identity this exact plan can later be executed by. null when nothing was sealed.
+  sealed_plan_hash?: string | null
 }
 
 export function planAnalysis(question: string): Promise<AnalysisPlanResponse> {

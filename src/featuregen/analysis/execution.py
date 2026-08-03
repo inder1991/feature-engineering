@@ -48,6 +48,7 @@ from featuregen.data_agent.eligibility import TransactionEligibilityPolicyV1
 from featuregen.data_agent.learning import RequiredAction
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.data_agent.relationship import RelationshipEvidenceV1
+from featuregen.data_agent.snapshots import LatestSnapshotPolicyV1
 from featuregen.overlay.upload.bridge_realization import eligible_for_production
 from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
 from featuregen.overlay.upload.source_selection import (
@@ -116,6 +117,14 @@ class ExecutionInputs:
     eligibility: TransactionEligibilityPolicyV1 | None = None
     dimension_binding: PhysicalDatasetBindingV1 | None = None
     attribution: DimensionAttributionPolicyV1 | None = None
+    #: ENGINE B's row rule, for a dimension source that is a SNAPSHOT table rather than an SCD
+    #: interval one. The IR has carried it since Task 8; this seam did not, so a resolved
+    #: ``latest_snapshot_as_of`` selection could not reach the executor through the bridge at all —
+    #: and passing an interval attribution instead would compile SCD semantics onto a snapshot
+    #: table, which runs clean and answers a different question. Exactly one of
+    #: ``attribution``/``snapshot_selection`` may be set; the IR refuses both (``ANALYSIS_TWO_ROW_
+    #: RULES``).
+    snapshot_selection: LatestSnapshotPolicyV1 | None = None
     join_evidence: RelationshipEvidenceV1 | None = None
     bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] = ()
 
@@ -267,7 +276,7 @@ def plan_to_execution_ir(grounded: GroundedPlan,
         periods[label] = Period(label=label, values=tuple(values))
 
     dimensions = tuple(IRDimension(column=_column_of(d.logical_ref)) for d in plan.dimensions)
-    if dimensions and inputs.attribution is None:
+    if dimensions and inputs.attribution is None and inputs.snapshot_selection is None:
         raise BridgeRefusal(
             "ATTRIBUTION_ABSENT",
             "dimensions were asked for with no attribution policy: nothing says whether a customer "
@@ -288,6 +297,7 @@ def plan_to_execution_ir(grounded: GroundedPlan,
         eligibility=inputs.eligibility,
         dimension_binding=inputs.dimension_binding,
         attribution=inputs.attribution,
+        snapshot_selection=inputs.snapshot_selection,
         join_evidence=inputs.join_evidence,
         bridge_realization_dependencies=tuple(realization_dependencies),
     )

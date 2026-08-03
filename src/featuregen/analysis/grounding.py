@@ -330,6 +330,43 @@ def _table_ref_of(logical_ref: str) -> str:
     return f"{source}::{'.'.join(parts[:-1])}" if len(parts) >= 2 else logical_ref
 
 
+def _qualified(conn, table_ref: str) -> str:
+    """A `source::table` ref, given the SCHEMA the catalog recorded for it.
+
+    **THE TWO SPELLINGS, JOINED.** Retrieval offers the FLATTENED operational ref
+    (`retrieval._column_ref`: `source::table.column`, "the schema is deliberately omitted, or it
+    would be a second spelling of one identity"), and the model plans in exactly those refs. The
+    Release-B selection contracts require the SCHEMA-PRESERVING one (`normalize_dataset_ref`:
+    "source, schema and table"), because a dataset decision is about a namespaced object an
+    operator can address. Both rules are right and NOTHING JOINED THEM: every LLM-planned question
+    refused `SELECTION_BINDING_MISSING` at every need, so the whole Task-9 seal/execute surface was
+    unreachable from the planning route — the plan hash was always `None`, and only tests that
+    hand-wrote schema-qualified refs ever sealed anything.
+
+    A LOOKUP, NOT A DECISION. `graph_node.schema_name` is what the upload declared — the same read
+    `binding_store.resolve_table` already performs to build the binding this ref will be addressed
+    through — so nothing new is being decided and no new authority is introduced. A ref that
+    already carries a schema is returned untouched.
+
+    **An ambiguous name is left UNADDRESSABLE on purpose.** With `dpl_eib.tran_repos` AND
+    `dpl_arc.tran_repos` in one catalog, picking either would supply the one component of the
+    address the catalog exists to supply — by guess, and then persist it as an immutable `pbr_`
+    revision (`binding_store._assert_one_addressable_table` refuses exactly that, one seam later).
+    Returning the ref unchanged makes it fail `_unaddressable` and surface as
+    `SELECTION_BINDING_MISSING`, which already routes to a PHYSICAL_BINDING_MISSING gap with a
+    BIND_PHYSICAL_SOURCE action — the queue an operator already works from.
+    """
+    source, _, rest = table_ref.partition("::")
+    parts = [p for p in rest.split(".") if p]
+    if len(parts) != 1 or not source.strip():
+        return table_ref
+    rows = conn.execute(
+        "SELECT DISTINCT schema_name FROM graph_node "
+        "WHERE catalog_source = %s AND lower(table_name) = lower(%s) AND schema_name IS NOT NULL",
+        (source.strip().lower(), parts[0])).fetchall()
+    return f"{source}::{rows[0][0]}.{parts[0]}" if len(rows) == 1 else table_ref
+
+
 def plan_cutoff_value_ref(plan: AnalysisPlanV1) -> str | None:
     """The REF this plan's runtime report cutoff binds to, from the plan's OWN time context.
 
@@ -408,14 +445,17 @@ def resolve_plan_selections(
     selections, rows, refusals, warnings = [], [], [], []
     entity = plan.entity or "entity"
     dimension_tables = tuple(dict.fromkeys(
-        _table_ref_of(dim.logical_ref) for dim in plan.dimensions))
+        _qualified(conn, _table_ref_of(dim.logical_ref)) for dim in plan.dimensions))
 
-    offered = tuple(ref for ref in candidate_dataset_refs if ref)
+    offered = tuple(_qualified(conn, ref) for ref in candidate_dataset_refs if ref)
+    base_table_ref = _qualified(conn, plan.base_table_ref) if plan.base_table_ref else ""
+    population_table_ref = (_qualified(conn, plan.population_table_ref)
+                            if plan.population_table_ref else "")
     # (need role, the one EXPLICIT declaration if there is one, the candidates it may choose from)
     wanted: list[tuple[DatasetNeedRole, str | None, tuple[str, ...]]] = [
-        (DatasetNeedRole.POPULATION, plan.population_table_ref or None, ()),
+        (DatasetNeedRole.POPULATION, population_table_ref or None, ()),
         (DatasetNeedRole.EVENT_SOURCE, None,
-         tuple(dict.fromkeys(([plan.base_table_ref] if plan.base_table_ref else []) + list(offered)))),
+         tuple(dict.fromkeys(([base_table_ref] if base_table_ref else []) + list(offered)))),
     ]
     wanted += [(DatasetNeedRole.DIMENSION_SOURCE, None, (table,)) for table in dimension_tables]
 

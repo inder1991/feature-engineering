@@ -5,19 +5,25 @@ Seven read models existed with no surface — `retrieve_candidates`, `extract_in
 a read model nobody can call is the same inert mechanism this programme has found six times already.
 These are the routes.
 
-**Nothing here executes, and one thing here WRITES.** `POST /analysis/plan` retrieves, extracts,
-grounds and previews; it never runs the statement. That split is deliberate and not merely cautious:
-execution needs an `ExecutionInputs` this deployment cannot yet build — the catalog records no
-physical database and there is no connection registry — so a route that promised to run would be
-promising something impossible. The preview reports exactly which piece is missing.
+**PLANNING NEVER EXECUTES, AND EXECUTION NEVER PLANS.** `POST /analysis/plan` retrieves, extracts,
+grounds, previews and — behind `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` — SEALS; it never runs the
+statement. `POST /analysis/execute` runs one SEALED plan by its identity and never re-plans one.
+That split is the whole design: a caller who handed a question to an execute route would be running
+decisions nobody previewed, made by a model dispatched a second time under state that may have
+moved. (Until Release-B Task 9 this module said "nothing here executes" and gave the reason that
+execution inputs could not be built — no physical database, no connection registry. Both are now
+built: the binding registry supplies the address, the Release-B declaration supplies the
+population, and the eligibility store supplies which rows count.)
 
-No WAREHOUSE data is touched. The CATALOG is written twice, and both are disclosed rather than
-implied: a refusal records a learning gap (below), and — with
-`FEATUREGEN_SOURCE_TEMPORAL_SELECTION` on — a SELECTION persists the winner's physical binding
-revision. That second write is a content-addressed catalog ADDRESS, not a decision: it is the row a
-later decision, observation or snapshot points at when it names `pbr_...`, it is idempotent, it
-happens only for the dataset that was selected, and re-deriving it produces the same id. With the
-flag off nothing is written at all.
+WAREHOUSE data is touched by ONE route, `/analysis/execute`, and only through the governed engine
+provider — whose shipped default REFUSES, because running against the bank's warehouse is a
+separate approval gate. The CATALOG is written by planning in three disclosed ways: a refusal
+records a learning gap (below); with the selection flag on a SELECTION persists the winner's
+physical binding revision; and a resolved, executable plan is SEALED into `structured_result`. The
+binding write is a content-addressed catalog ADDRESS, not a decision — the row a later decision,
+observation or snapshot points at when it names `pbr_...`, idempotent, winner only. The seal is
+content-addressed on the plan's own identity, so re-planning the same thing writes nothing new.
+With the flag off none of the three happens.
 
 **`feature:generate`, not `catalog:read`.** Planning dispatches an LLM call against catalog metadata
 on the caller's behalf — the same class of action as the feature-generation routes next door. The
@@ -48,7 +54,11 @@ from featuregen.analysis.clarify import (
     apply_answer,
     clarifications_for_codes,
 )
-from featuregen.analysis.execution import ExecutionInputs
+from featuregen.analysis.execution import (
+    BridgeRefusal,
+    ExecutionInputs,
+    plan_to_execution_ir,
+)
 from featuregen.analysis.grounding import (
     PRODUCTION_TIER,
     ground_analysis_plan,
@@ -69,13 +79,21 @@ from featuregen.analysis.retrieval import (
     retrieve_candidates,
     stable_analysis_request_id,
 )
-from featuregen.data_agent.binding_store import resolve_binding
-from featuregen.data_agent.eligibility_store import resolve_eligibility
-from featuregen.data_agent.connection import ConnectionError_
-from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
+from featuregen.api.deps import (
+    get_analysis_engine,
+    get_conn,
+    get_identity,
+    get_llm,
+    require_feature_generate,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.data_agent.connection import ConnectionError_
+from featuregen.data_agent.eligibility_store import resolve_eligibility
 from featuregen.intake.llm import LLMClient
-from featuregen.overlay.upload.source_selection import SELECTION_POPULATION_UNDECLARED
+from featuregen.overlay.upload.source_selection import (
+    SELECTION_POPULATION_UNDECLARED,
+    source_temporal_selection_enabled,
+)
 
 #: Codes this MODULE names in its own fallback. Everything else a caller sees comes from
 #: `analysis.assembly`, and a test asserts the route surfaces codes absent from here — the
@@ -180,34 +198,17 @@ def _record_selection_gaps(conn, grounded, *, question: str, roles) -> None:
         logger.warning("could not record a selection learning gap", exc_info=True)
 
 
-def _serialize_selection(selections) -> dict | None:
-    """The Release-B source/row decisions, as the caller sees them. `None` while the flag is off.
+def _serialize_selection(conn, selections, *, roles=()) -> dict | None:
+    """The Release-B source/row decisions, READ-SCOPED for this caller. `None` with the flag off.
 
-    Shown even when it refuses — especially then. "Which copy served this, and which of its rows"
-    is half of what makes an answer explainable (§5.7), and a preview that showed only the
-    resolved half would report the absence of a row rule as silence.
+    Delegates to `analysis.explain`, which owns the rule that matters here: the decision is
+    RECORDED whole (rule 9) and RENDERED narrow — a candidate this caller may not see becomes an
+    opaque count and never a name, because "there is a better copy you may not see" is an existence
+    oracle over a catalog they were never granted.
     """
-    if selections is None:
-        return None
-    return {
-        "resolved": selections.resolved,
-        "sources": [{"need_role": s.need.need_role.value,
-                     "dataset_ref": s.selected_dataset_ref,
-                     "selection_basis": s.selection_basis.value,
-                     "authority_basis": s.authority_basis.value,
-                     "considered": [{"dataset_ref": c.dataset_ref,
-                                     "disposition": c.disposition.value,
-                                     "reason_codes": list(c.reason_codes)}
-                                    for c in s.considered_candidates]}
-                    for s in selections.source_selections],
-        "rows": [{"dataset_ref": r.dataset_logical_ref,
-                  "selection_kind": r.selection_kind.value,
-                  "cutoff_value_ref": r.cutoff_value_ref}
-                 for r in selections.row_selections],
-        "refusals": [{"code": r.code, "subjects": list(r.subject_refs), "detail": r.detail}
-                     for r in selections.refusals],
-        "warnings": list(selections.warnings),
-    }
+    from featuregen.analysis.explain import render_selection
+
+    return render_selection(conn, selections, roles=roles)
 
 
 def _clarification_codes(extraction, selections) -> tuple[str, ...]:
@@ -322,12 +323,16 @@ def plan(body: PlanIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
             conn, body.question, identity, client, body.max_columns)
     except RetrievalRefused as exc:
         return _refusal_response(exc)
-    view = _previewed(conn, grounded)
+    view, sealed = _previewed(conn, grounded, identity=identity)
     return {
         "preview": _serialize_preview(view),
         # WHICH COPY served each need, and WHICH of its rows — or the typed refusal saying nobody
         # has decided yet. `None` while the selection flag is off.
-        "selection": _serialize_selection(grounded.selections),
+        "selection": _serialize_selection(conn, grounded.selections,
+                                          roles=identity.role_claims),
+        # The identity a caller executes this exact plan by. `None` when nothing was sealed —
+        # every flag-off request, and every plan that could not decide where its data comes from.
+        "sealed_plan_hash": sealed,
         "clarifications": _serialize_clarifications(extraction, retrieval, grounded),
         # Truncation is reported, never silent: a non-zero count means the plan rests on a narrower
         # view of the catalog than exists. PER LEG (D12.2) as well as in aggregate — one number
@@ -361,23 +366,251 @@ def clarify(body: AnswerIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     except ClarificationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     regrounded = _ground(conn, answered, identity, body.question)
-    view = _previewed(conn, regrounded)
+    view, sealed = _previewed(conn, regrounded, identity=identity)
     return {
         "preview": _serialize_preview(view),
-        "selection": _serialize_selection(regrounded.selections),
+        "selection": _serialize_selection(conn, regrounded.selections,
+                                          roles=identity.role_claims),
+        "sealed_plan_hash": sealed,
         "clarifications": _serialize_clarifications(
             extraction, retrieval, regrounded, answered=body.code),
     }
 
 
-def _previewed(conn, grounded):
-    """Preview, with the blocked reason sharpened by what the registry actually knows."""
+class ExecuteIn(BaseModel):
+    #: The SEALED plan identity `POST /analysis/plan` returned. Deliberately not a question: a
+    #: question would have to be re-planned (another LLM dispatch, another set of decisions), and
+    #: the caller would then be running something they never previewed.
+    plan_hash: str = Field(min_length=32, max_length=128)
+
+
+#: The engine PROVIDER, injected the same way `_Conn` is — so the suite substitutes the pilot's
+#: fixture engine through `dependency_overrides` rather than the route reaching for a driver.
+_EngineProvider = Annotated[object, Depends(get_analysis_engine)]
+
+
+@router.post("/analysis/execute", dependencies=[Depends(require_feature_generate)])
+def execute(body: ExecuteIn, conn: _Conn, identity: _Identity,
+            engine_provider: _EngineProvider) -> dict:
+    """Run ONE sealed plan, after revalidating every pin it rests on.
+
+    **Flag-gated, and 404 while the flag is off** — the surface is hidden rather than forbidden, so
+    a flag-off API is byte-identical to the one that shipped (the `dataset_policies.py` convention).
+
+    **READ SCOPE PRECEDES EVERY 409.** The caller's readability of every dataset the plan names is
+    checked immediately after replay — before the plan's engine connection is resolved and before
+    the engine provider is asked for anything. Both of those report on datasets, and a 409 handed
+    to someone who may not see them answers "a sealed plan over a catalog you were never granted
+    exists here". An unreadable plan gets the SAME body an absent one gets (D11): hidden and
+    missing are indistinguishable at the wire.
+
+    **A stale plan refuses and runs nothing.** The refusal names WHAT moved and from which value to
+    which, because "this plan is stale" sends the reader nowhere. Nothing is re-derived: running
+    today's decisions under yesterday's plan identity is precisely the silent substitution the
+    seal exists to prevent.
+    """
+    from featuregen.analysis.engine import AnalysisEngineUnavailable
+    from featuregen.analysis.sealed_execution import SealedRunV1, run_sealed_plan
+    from featuregen.analysis.sealed_plan import SealedPlanError
+    from featuregen.analysis.sealed_plan_store import (
+        caller_may_read_every_dataset,
+        replay_sealed_plan,
+    )
+
+    if not source_temporal_selection_enabled():
+        raise HTTPException(status_code=404, detail="not found")
+    record = replay_sealed_plan(conn, body.plan_hash)
+    if record is None:
+        return _sealed_plan_not_found(body.plan_hash)
+    # FIRST, and deliberately ahead of everything that could report on this plan's datasets.
+    # `run_sealed_plan` makes the same check per pin, but it ran THIRD: `_engine_connection_for`
+    # 409'd naming the event dataset and the provider 409'd naming the connection, both before any
+    # scope was read. Same body as absence, so the two cannot be told apart.
+    if not caller_may_read_every_dataset(conn, record, roles=identity.role_claims):
+        return _sealed_plan_not_found(body.plan_hash)
+
+    engine_connection = _engine_connection_for(conn, record)
+    try:
+        engine = engine_provider(engine_connection)
+    except AnalysisEngineUnavailable as exc:
+        # 409, not 503: the deployment is healthy and the plan is fine — what is missing is an
+        # approval, which is a state of the world rather than a fault.
+        return JSONResponse(status_code=409, content={
+            "detail": str(exc),
+            "refusal": {"code": exc.code, "subjects": [exc.subject], "detail": str(exc),
+                        "sealed": "", "current": ""}})
+
+    try:
+        outcome = run_sealed_plan(conn, record, engine=engine, roles=identity.role_claims)
+    except SealedPlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if not isinstance(outcome, SealedRunV1):
+        return JSONResponse(status_code=409, content={
+            "detail": outcome.detail, "refusal": outcome.as_dict()})
+    return {
+        "plan_hash": outcome.plan_hash,
+        # RESULT PROVENANCE: the exact decision refs this answer rests on, carried WITH the answer.
+        # A number whose sources have to be looked up elsewhere is a number nobody can defend.
+        "provenance": _serialize_provenance(conn, record),
+        "rows": [{"key": r.key, "previous_count": r.previous_count,
+                  "current_count": r.current_count, "decreased": r.decreased,
+                  "dimensions": dict(r.dimensions)} for r in outcome.rows],
+        "row_count": len(outcome.rows),
+    }
+
+
+def _sealed_plan_not_found(plan_hash: str) -> JSONResponse:
+    """The ONE not-found body this route has, for BOTH "nothing sealed that" and "you may not see
+    what did". One function rather than two literals, because two would eventually drift into two
+    distinguishable answers — and the whole point is that they cannot be told apart."""
+    from featuregen.analysis.sealed_plan import SEALED_PLAN_ABSENT
+
+    return JSONResponse(status_code=404, content={
+        "detail": "no sealed plan has that identity",
+        "refusal": {"code": SEALED_PLAN_ABSENT, "subjects": [plan_hash], "detail": "",
+                    "sealed": "", "current": ""}})
+
+
+def _engine_connection_for(conn, record):
+    """The governed connection the plan's EVENT source is addressed through.
+
+    One connection per plan by construction: `resolve_table` routes a whole catalog through one
+    declared engine, and every dataset in a sealed plan comes from the same catalog. Taking it from
+    the event source rather than a deployment constant is what keeps the executor pointed at the
+    cluster the decisions were made against.
+
+    **NO 409 FROM HERE NAMES A DATASET.** Read scope is checked before this is called, so a caller
+    who reaches it may see the plan's datasets — but the refusal is about ADDRESSING, and the ref
+    adds nothing a person could act on while making the message one edit away from being an
+    existence oracle if the ordering above were ever changed back.
+    """
+    from featuregen.data_agent.binding_store import resolve_table
+    from featuregen.overlay.upload.object_ref import parse_ref
+
+    events = next((s for s in record.sources if s.need_role == "event_source"), None)
+    if events is None:
+        raise HTTPException(status_code=409, detail="the sealed plan names no event source")
+    source, _schema, table, _column = parse_ref(events.dataset_ref)
+    try:
+        resolved = resolve_table(conn, catalog_source=source, table=table)
+    except ConnectionError_ as exc:
+        # The CODE and the connection's own words: a withdrawn grant is a governance answer an
+        # operator acts on, and it names a connection rather than a dataset.
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if resolved is None:
+        raise HTTPException(
+            status_code=409,
+            detail="a sealed dataset can no longer be addressed by this deployment")
+    return resolved[1]
+
+
+def _serialize_provenance(conn, record) -> dict:
+    """The seven pins, as the answer's own provenance."""
+    return {
+        "contract_version": record.contract_version,
+        "sources": [{"need_role": s.need_role, "dataset_ref": s.dataset_ref,
+                     "dataset_profile_hash": s.dataset_profile_hash,
+                     "serving_policy_revision_id": s.serving_policy_revision_id,
+                     "source_selection_hash": s.source_selection_hash,
+                     "binding_revision_id": s.binding_revision_id}
+                    for s in record.sources],
+        "rows": [{"dataset_ref": r.dataset_ref,
+                  "dataset_profile_hash": r.dataset_profile_hash,
+                  "temporal_policy_revision_id": r.temporal_policy_revision_id,
+                  "row_selection_hash": r.row_selection_hash,
+                  "selection_kind": r.selection_kind}
+                 for r in record.rows],
+        # PIN 7. The definition of WHICH ROWS COUNT this number was measured under, plus whether a
+        # human ever agreed to it: the planning preview already discloses `ELIGIBILITY_UNCONFIRMED`
+        # as a finding, and an ANSWER that dropped the disclosure would be the finding travelling
+        # only as far as the preview. Usable before confirmation is the product rule; passing
+        # silently is not.
+        "eligibility": _eligibility_provenance(conn, record),
+        "warnings": list(record.decisions.warnings),
+    }
+
+
+def _eligibility_provenance(conn, record) -> dict | None:
+    """The sealed eligibility pin, and the CURRENT confirmation state of the policy it names.
+
+    The two are deliberately different kinds of fact and both are needed. `policy_hash` is what the
+    plan was sealed under and revalidation has just proved unmoved; `confirmed` is read now, because
+    a person confirming a proposal between the seal and the run is exactly the change a reader wants
+    reflected, and it is not drift.
+    """
+    sealed = record.eligibility
+    if sealed is None:
+        return None
+    source, table = _source_and_table(sealed.dataset_ref)
+    stored = resolve_eligibility(conn, catalog_source=source, table=table)
+    return {
+        "dataset_ref": sealed.dataset_ref,
+        "policy_hash": sealed.policy_hash,
+        "confirmed": bool(stored is not None and stored.confirmed),
+        "status": ("" if stored is not None and stored.confirmed
+                   else "ELIGIBILITY_UNCONFIRMED"),
+    }
+
+
+def _previewed(conn, grounded, *, identity: IdentityEnvelope | None = None,
+               reference: datetime | None = None):
+    """Preview, with the blocked reason sharpened by what the registry actually knows — and, when
+    the plan is executable and its selections resolved, SEALED on the way past.
+
+    Sealing here rather than in a separate call is deliberate: the plan a person is shown and the
+    plan that can later be executed must be the same one, and a seal taken from a second
+    assembly could differ from the preview in any of the six pins. Returns
+    ``(view, sealed_plan_hash)``; the hash is ``None`` whenever nothing was sealed, which includes
+    every flag-off request and every refused plan.
+    """
     from dataclasses import replace as _replace
 
-    view = preview(grounded, _execution_inputs_or_none(conn, grounded.plan))
+    inputs = _execution_inputs_or_none(
+        conn, grounded, reference=reference,
+        roles=(identity.role_claims if identity is not None else ()))
+    view = preview(grounded, inputs)
     if view.blocked_by and view.blocked_by[0] == "EXECUTION_INPUTS_ABSENT":
         view = _replace(view, blocked_by=_binding_hint(conn, grounded.plan))
-    return _replace(view, findings=view.findings + _eligibility_findings(conn, grounded.plan))
+    view = _replace(view, findings=view.findings + _eligibility_findings(conn, grounded.plan))
+    return view, _sealed_plan_hash(conn, grounded, inputs, identity=identity)
+
+
+def _sealed_plan_hash(conn, grounded, inputs, *, identity: IdentityEnvelope | None) -> str | None:
+    """Seal the previewed plan, and return the identity a caller executes it by.
+
+    Fail-soft, exactly like the learning writes above: the seal is a record, and a record that
+    cannot be written must not turn a planned question into a 500. A caller that gets no hash
+    simply cannot execute yet, which is the same state a blocked plan is in.
+
+    **WITH ONE EXCEPTION.** `StructuredResultCorruption` is not a write that failed: it says one
+    plan identity already names a DIFFERENT byte sequence. Swallowing it would log a warning,
+    return no hash, and leave the caller re-planning against a store that is lying about what was
+    approved — the loudest possible fact reported as the quietest possible outcome.
+    """
+    from featuregen.analysis.sealed_plan import build_execution_ir_v2
+    from featuregen.analysis.sealed_plan_store import seal_analysis_plan
+    from featuregen.overlay.upload.structured_results import StructuredResultCorruption
+
+    selections = grounded.selections
+    if inputs is None or selections is None or not selections.resolved:
+        return None
+    try:
+        ir = plan_to_execution_ir(grounded, inputs)
+    except BridgeRefusal:
+        # The bridge refused — the plan is not executable, so there is no validated IR to seal and
+        # `blocked_by` above already says which decision is owed.
+        return None
+    try:
+        record = seal_analysis_plan(
+            conn, build_execution_ir_v2(ir, selections, question=grounded.plan.question),
+            sealed_by=(identity.subject if identity is not None else "anonymous"),
+            question=grounded.plan.question)
+    except StructuredResultCorruption:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.warning("could not seal the analysis plan", exc_info=True)
+        return None
+    return record.plan_hash
 
 
 def _eligibility_findings(conn, plan) -> tuple:
@@ -399,20 +632,28 @@ def _eligibility_findings(conn, plan) -> tuple:
         clears_when="a human confirms the eligibility policy for this table"),)
 
 
-def _execution_inputs_or_none(conn, plan) -> ExecutionInputs | None:
+def _execution_inputs_or_none(conn, grounded, *, reference: datetime | None = None,
+                              roles=()) -> ExecutionInputs | None:
     """Assemble what CAN be assembled, and return None when something real is missing.
 
-    The binding registry (migration 1037) supplies the physical address the catalog cannot — a
-    database, and the connection authorized to read it. What it cannot supply is the rest of
-    `ExecutionInputs`: a population spine distinct from the event table, which `AnalysisPlanV1`
-    structurally cannot express, and an eligibility policy, which no store yet holds.
+    **This used to return None unconditionally**, with a docstring explaining that the rest of
+    `ExecutionInputs` could not be supplied: a population spine distinct from the event table, and
+    an eligibility policy no store held. Both are now supplied — the population by the Release-B
+    declaration or serving policy, the eligibility by its store — so the honest implementation is
+    the real one.
 
-    So this still returns None — but only after LOOKING, so `_blocked_reason` can say whether the
-    operator needs to bind a table or make a decision. Returning None without checking would leave
-    both cases reading as one, and "not configured" and "cannot be expressed" call for different
-    people.
+    Behind `FEATUREGEN_SOURCE_TEMPORAL_SELECTION`, and it returns None while the flag is off
+    WITHOUT READING ANYTHING, so a flag-off preview is byte-identical to the one that shipped.
+    A None here still falls through to `_binding_hint`, which names the first unmet requirement
+    from the single enumeration in `analysis.assembly` — so "not configured" and "cannot be
+    expressed" keep reading as the different things they are.
     """
-    return None
+    from featuregen.analysis.sealed_execution import execution_inputs_for_plan
+
+    if not source_temporal_selection_enabled():
+        return None
+    return execution_inputs_for_plan(
+        conn, grounded, reference=reference or datetime.now(UTC), roles=roles)
 
 
 def _binding_hint(conn, plan) -> tuple[str, str]:

@@ -315,14 +315,52 @@ def test_a_preview_with_no_decisions_and_no_refusals_is_NEVER_resolved():
 
 
 def test_an_unaddressable_ref_is_a_typed_refusal_not_a_skipped_need(catalog, flagged):
-    """A ref the selection contracts cannot address — no schema half of the physical address — was
-    the ONE thing that legitimately raised here. It is now the refusal it always was, so the need
-    is never silently absent from the preview."""
+    """A ref the selection contracts cannot address — no schema half of the physical address, and
+    no catalog row that could supply one — was the ONE thing that legitimately raised here. It is
+    the refusal it always was, so the need is never silently absent from the preview."""
+    selections = resolve_plan_selections(
+        catalog, _plan(population_table_ref="bank::no_such_table"),
+        cutoff_value_ref=CUTOFF_REF)
+    assert SELECTION_BINDING_MISSING in selections.refusal_codes
+    assert not selections.resolved
+
+
+def test_a_FLATTENED_ref_is_qualified_from_the_catalog_rather_than_refused(catalog, flagged):
+    """The two spellings, joined. Retrieval offers `source::table.column` and the model plans in it;
+    the selection contracts require `source::schema.table`. Both are right and nothing joined them,
+    so EVERY LLM-planned question refused SELECTION_BINDING_MISSING at every need — the seal and the
+    execute surface were unreachable from the planning route.
+
+    The schema is READ from `graph_node`, the same lookup `resolve_table` already makes to build the
+    binding this ref is addressed through, so nothing new is decided."""
+    selections = resolve_plan_selections(
+        catalog, _plan(population_table_ref="bank::customer_master"),
+        cutoff_value_ref=CUTOFF_REF)
+    assert SELECTION_BINDING_MISSING not in selections.refusal_codes
+    population = next(s for s in selections.source_selections
+                      if s.need.need_role is DatasetNeedRole.POPULATION)
+    assert population.selected_dataset_ref == CUST
+    # The DECLARATION still travels as one: it was answered by a person naming a table, and the
+    # schema the catalog supplied is the address, not a second choice.
+    assert population.need.explicit_dataset_ref == CUST
+
+
+def test_an_AMBIGUOUS_table_name_stays_unaddressable_rather_than_being_guessed(catalog, flagged):
+    """Two schemas holding one table name: picking either would supply the one component of the
+    address the catalog exists to supply — by guess — and then persist it as an immutable `pbr_`
+    revision. Left unaddressable, it surfaces as the refusal that already routes to an operator."""
+    catalog.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "  schema_name) VALUES (%s, 'dpl_arc.customer_master.alt_id', 'column', "
+        "  'customer_master', 'alt_id', 'dpl_arc')", (_SRC,))
+    assert catalog.execute(
+        "SELECT count(DISTINCT schema_name) FROM graph_node "
+        "WHERE catalog_source = %s AND table_name = 'customer_master'", (_SRC,)).fetchone()[0] == 2
+
     selections = resolve_plan_selections(
         catalog, _plan(population_table_ref="bank::customer_master"),
         cutoff_value_ref=CUTOFF_REF)
     assert SELECTION_BINDING_MISSING in selections.refusal_codes
-    assert not selections.resolved
 
 
 # ── refusals become the SAME questions Task 7 wrote ─────────────────────────────────────────────

@@ -200,18 +200,38 @@ def _readable(conn: DbConn, dataset_ref: str, roles: Sequence[str]) -> bool:
     return True
 
 
+def _build_profile(conn: DbConn, dataset_ref: str):
+    """Assemble one dataset's CURRENT semantic profile, or ``None`` when it has none."""
+    from featuregen.overlay.upload.dataset_profiles import build_dataset_profile
+    from featuregen.overlay.upload.profile_store import current_catalog_profile_revision_id
+
+    source, _table = _split(dataset_ref)
+    return build_dataset_profile(
+        conn, source=source, dataset_logical_ref=dataset_ref,
+        catalog_profile_revision_id=current_catalog_profile_revision_id(conn, source))
+
+
+def current_dataset_profile_hash(conn: DbConn, dataset_ref: str) -> str:
+    """The ``dataset_profile_hash`` the catalog answers for this dataset RIGHT NOW.
+
+    The EXACT value :func:`_assess` pins into a selection, exposed because Task 9's revalidation
+    has to re-assemble it and compare — and a second notion of "the profile hash, or the
+    absent-profile stand-in when there is none" would make a plan read as drifted (or, far worse,
+    as unchanged) for a reason that has nothing to do with the catalog moving.
+    """
+    profile = _build_profile(conn, dataset_ref)
+    return (profile.dataset_profile_hash if profile is not None
+            else _absent_profile_hash(dataset_ref))
+
+
 def _assess(conn: DbConn, dataset_ref: str, *, roles: Sequence[str]) -> _Assessed:
     """Read one candidate's profile and its physical addressability. NO WRITES: the persisting
     binding seam is reserved for the winner (module docstring)."""
     from featuregen.data_agent.binding_store import resolve_table
     from featuregen.data_agent.connection import ConnectionError_
-    from featuregen.overlay.upload.dataset_profiles import build_dataset_profile
-    from featuregen.overlay.upload.profile_store import current_catalog_profile_revision_id
 
     source, table = _split(dataset_ref)
-    profile = build_dataset_profile(
-        conn, source=source, dataset_logical_ref=dataset_ref,
-        catalog_profile_revision_id=current_catalog_profile_revision_id(conn, source))
+    profile = _build_profile(conn, dataset_ref)
     assessed = _Assessed(
         dataset_ref=dataset_ref,
         profile_hash=(profile.dataset_profile_hash if profile is not None
