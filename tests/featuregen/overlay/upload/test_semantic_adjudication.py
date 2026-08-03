@@ -134,6 +134,49 @@ def test_the_counterparty_alias_is_not_a_source_conflict():
         definition="Counterparty CIF", source_entity="branch"))
 
 
+def test_the_entity_alias_seam_normalizes_both_operands():
+    """The alias seam is SYMMETRIC or it is not a seam.
+
+    D12.1-revised leaves the two operands on opposite sides of the alias: the STORED entity keeps
+    saying `counterparty` (fact keys are byte-stable) while a NEW classification canonicalizes to
+    `customer_id`, whose entity link is `customer`. Normalizing only when the CONCEPT is the alias
+    therefore read exactly the production shape — concept `customer_id`, source entity
+    `counterparty` — as a contradiction, and every such column burned one of the twelve calls on a
+    non-conflict. Both operands go through the entity-level seam, so neither direction conflicts;
+    a genuinely different entity still does."""
+    assert adj.selection_reasons(_candidate(
+        column_name="counter_party_cif_id", concept="customer_id",
+        definition="Counterparty CIF", source_entity="counterparty")) == ()
+    assert adj.selection_reasons(_candidate(
+        column_name="counter_party_cif_id", concept="counterparty_id",
+        definition="Counterparty CIF", source_entity="customer")) == ()
+    # A real disagreement survives the seam in both directions.
+    assert "source_llm_conflict" in adj.selection_reasons(_candidate(
+        column_name="owning_bank", concept="customer_id", definition="The owning bank",
+        source_entity="bank"))
+    assert "source_llm_conflict" in adj.selection_reasons(_candidate(
+        column_name="owning_bank", concept="counterparty_id", definition="The owning bank",
+        source_entity="bank"))
+
+
+def test_the_entity_alias_map_is_derived_from_the_one_alias_table():
+    """Not a second hardcoded map: the entity mapping is DERIVED from `_CANONICAL_ALIAS_TARGETS`,
+    so an alias added (or retired) there cannot leave a stale entity pair behind."""
+    from featuregen.overlay.upload import concepts as concepts_mod
+
+    assert concepts_mod.canonical_entity("counterparty") == "customer"
+    derived = {
+        CONCEPT_REGISTRY[alias].entity_link: CONCEPT_REGISTRY[target].entity_link
+        for alias, target in concepts_mod._CANONICAL_ALIAS_TARGETS.items()
+        if CONCEPT_REGISTRY[alias].entity_link and CONCEPT_REGISTRY[target].entity_link
+        and CONCEPT_REGISTRY[alias].entity_link != CONCEPT_REGISTRY[target].entity_link
+    }
+    assert concepts_mod._ENTITY_ALIAS_TARGETS == derived
+    # A name nobody aliased is returned untouched, and a blank is not an entity.
+    assert concepts_mod.canonical_entity("bank") == "bank"
+    assert concepts_mod.canonical_entity(None) is None
+
+
 def test_targets_sort_most_referred_first_so_a_capped_run_truncates_the_least_referred():
     one = _candidate(logical_ref="src::s.t.a", concept=None)
     three = _candidate(logical_ref="src::s.t.b", concept=None,

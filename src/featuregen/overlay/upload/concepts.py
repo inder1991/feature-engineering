@@ -1161,12 +1161,44 @@ _CANONICAL_ALIAS_TARGETS: dict[str, str] = {
 }
 
 
+def _derive_entity_alias_targets() -> dict[str, str]:
+    """The ENTITY half of the ONE alias seam, DERIVED from :data:`_CANONICAL_ALIAS_TARGETS`.
+
+    `counterparty_id -> customer_id` already says everything needed: the entity an aliased
+    identifier links (`counterparty`) is the entity its canonical successor links (`customer`).
+    Restating that as a second hardcoded entity map would be a parallel alias mechanism — the exact
+    thing `_validate_alias_seam` exists to forbid — and could only ever drift from the concept
+    table it duplicates. Pairs whose two concepts link the SAME entity (or link none) contribute
+    nothing and are omitted, so the map stays empty until an alias actually moves an entity."""
+    targets: dict[str, str] = {}
+    for alias, target in _CANONICAL_ALIAS_TARGETS.items():
+        alias_concept = CONCEPT_REGISTRY.get(alias)
+        target_concept = CONCEPT_REGISTRY.get(target)
+        if alias_concept is None or target_concept is None:
+            continue
+        source_entity, canonical = alias_concept.entity_link, target_concept.entity_link
+        if source_entity and canonical and source_entity != canonical:
+            targets[source_entity] = canonical
+    return targets
+
+
+_ENTITY_ALIAS_TARGETS: dict[str, str] = _derive_entity_alias_targets()
+
+
 def _validate_alias_seam() -> None:
     for alias, target in _CANONICAL_ALIAS_TARGETS.items():
         if alias not in _LEGACY_ALIASES or alias not in CONCEPT_REGISTRY:
             raise ValueError(f"canonical alias source {alias!r} must be a legacy-alias registry member")
         if target not in CONCEPT_REGISTRY or target in _LEGACY_ALIASES:
             raise ValueError(f"canonical alias target {target!r} must be a non-alias registry member")
+    # One hop only: a canonical entity that is itself an alias source would make
+    # `canonical_entity` order-dependent (A->B and B->C canonicalize differently depending on which
+    # is applied), which is not a canonical form at all.
+    for source_entity, canonical in _ENTITY_ALIAS_TARGETS.items():
+        if canonical in _ENTITY_ALIAS_TARGETS:
+            raise ValueError(
+                f"entity alias {source_entity!r} -> {canonical!r} chains: the target is itself "
+                "an alias source")
 
 
 _validate_alias_seam()
@@ -1210,6 +1242,28 @@ def display_entity(concept_name: str | None, entity: str | None) -> str | None:
     if entity is None or entity == alias.entity_link:
         return target.entity_link
     return entity
+
+
+def canonical_entity(entity: str | None) -> str | None:
+    """The canonical form of ONE entity name, through the derived entity alias seam — the operand
+    normalizer :func:`display_entity` is not.
+
+    `display_entity` answers "what entity should this COLUMN display?", and it can only normalize
+    when the column's own concept is the alias. Comparing a SOURCE-declared entity against a
+    concept's `entity_link` is a different question with two independent operands: D12.1-revised
+    leaves them on opposite sides of the alias (stored/declared entities keep saying `counterparty`
+    because bridge fact keys are byte-stable, while a new classification canonicalizes to
+    `customer_id`, whose link is `customer`). Both operands must be reduced to the same canonical
+    form or the seam reports the alias itself as a disagreement.
+
+    COMPARISON AND DISPLAY ONLY, exactly like `display_entity`: nothing stored or
+    derivation-feeding may route through this function — not `graph_node.entity`, not axis
+    projection, not grounding's `concept_entity` — because that value reaches `advisory_entity_id`
+    -> `_entity_pick` -> `fact_key`, and re-keying governed bridge facts is how a REJECTED decoy
+    resurrects under a fresh key. Returns ``None`` for a blank entity (absent is not a name)."""
+    if not entity:
+        return None
+    return _ENTITY_ALIAS_TARGETS.get(entity, entity)
 
 
 def classification_vocabulary() -> tuple[dict, ...]:

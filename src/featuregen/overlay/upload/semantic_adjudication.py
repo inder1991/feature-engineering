@@ -50,8 +50,8 @@ from featuregen.overlay.upload.concepts import (
     CONCEPT_REGISTRY,
     UNCLASSIFIED,
     canonical_concept_name,
+    canonical_entity,
     classification_vocabulary,
-    display_entity,
 )
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
@@ -251,13 +251,18 @@ class AdjudicationResultV1:
 
 # ── selection: a pure function over computed facts ──────────────────────────────────────────────
 
-def _canonical_entity(concept: str | None, entity: str | None) -> str | None:
-    """Compare entities through the READ-TIME alias seam (D12.1-revised) so the legacy
-    `counterparty` / canonical `customer` pair is not read as a contradiction. Display-only
-    normalization for a COMPARISON — nothing here is stored."""
-    if not entity:
-        return None
-    return display_entity(concept, entity) or entity
+def _canonical_entity(entity: str | None) -> str | None:
+    """One operand, reduced to its canonical entity name through the alias seam (D12.1-revised) so
+    the legacy `counterparty` / canonical `customer` pair is not read as a contradiction.
+
+    BOTH sides of the comparison go through this, which is the whole point. The earlier version
+    routed through `display_entity(concept, entity)`, which normalizes only when the COLUMN'S OWN
+    CONCEPT is the alias — so the shape production actually emits (a stored/declared entity of
+    `counterparty` against a freshly canonicalized `customer_id`) came out as a conflict, and every
+    such column spent one of the twelve capped calls re-deriving a non-disagreement. Nothing here
+    is stored: this is comparison-only normalization, and the persisted `entity_link` stays the
+    byte-stable fact-key input."""
+    return canonical_entity(entity)
 
 
 def selection_reasons(candidate: AdjudicationCandidateV1) -> tuple[str, ...]:
@@ -280,10 +285,11 @@ def selection_reasons(candidate: AdjudicationCandidateV1) -> tuple[str, ...]:
       provider fault — is NOT uncertainty about the data and does not qualify.
     * ``source_llm_conflict`` — the upload SOURCE-attested an `entity` for this column and the
       assigned concept links a DIFFERENT entity. Source-attested facts outrank LLM proposals
-      (functional rule 1), so a disagreement is a genuine referral. Compared through the alias seam,
-      so `counterparty`/`customer` is not a false conflict, and only for concepts that actually
-      declare an `entity_link` (a monetary or temporal concept links no entity, so silence there is
-      not disagreement).
+      (functional rule 1), so a disagreement is a genuine referral. BOTH operands are reduced
+      through the entity alias seam (:func:`_canonical_entity`), so `counterparty`/`customer` is
+      not a false conflict in EITHER direction, and only concepts that actually declare an
+      `entity_link` are compared at all (a monetary or temporal concept links no entity, so silence
+      there is not disagreement).
 
     A CLEAR column — a registry concept, no conflict, no critic objection, no source disagreement —
     is never referred. That is the whole point of "targeted": the adjudicator exists for the
@@ -300,8 +306,8 @@ def selection_reasons(candidate: AdjudicationCandidateV1) -> tuple[str, ...]:
         reasons.append("critic_uncertain")
     registered = CONCEPT_REGISTRY.get(concept)
     if registered is not None and registered.entity_link and candidate.source_entity:
-        declared = _canonical_entity(concept, candidate.source_entity)
-        linked = _canonical_entity(concept, registered.entity_link)
+        declared = _canonical_entity(candidate.source_entity)
+        linked = _canonical_entity(registered.entity_link)
         if declared and linked and declared != linked:
             reasons.append("source_llm_conflict")
     illegal = [r for r in reasons if r not in REASON_CODES]
