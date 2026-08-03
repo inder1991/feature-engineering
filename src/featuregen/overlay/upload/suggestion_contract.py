@@ -51,6 +51,7 @@ from featuregen.contracts.evidence_axes import (
     attributed_text_to_json,
 )
 from featuregen.contracts.resolvers import resolve_or_text
+from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.grounding_trace import (
     CARDINALITY_UNKNOWN,
@@ -596,15 +597,28 @@ def _endpoint_refs(trace: GroundingDecisionTraceV1 | None) -> tuple[tuple[str, s
     return tuple(refs)
 
 
-def _classification(idea, ref: tuple[str, str]) -> str:
-    """Grain and time FIRST: ``measure_refs`` carries every bound pair including those two, so
-    checking measures first would file the feature's own key as a quantity it aggregates."""
-    if idea.grain_ref is not None and ref == idea.grain_ref:
+def _classification(idea, ref: tuple[str, str], binding, entity_ref: str) -> str:
+    """What this operand IS to the computation, from GOVERNED inputs only.
+
+    Grain and time are decided FIRST, because ``measure_refs`` carries every bound pair — the key
+    and the clock included — so checking measure membership first would file the feature's own key
+    as a quantity it aggregates.
+
+    When the engine's typed refs do not name it, the fallback is the TEMPLATE-AUTHORED need concept
+    (``Need.concept`` -> ``Concept.pit_role``), which is registry metadata about the recipe slot,
+    not a guess about the column: an ``event_timestamp`` need is a time operand even on a recipe
+    whose point-in-time anchor is the table's own as-of column. Nothing here reads a column name, a
+    data type or the column's AI-proposed concept.
+    """
+    if ref[1] == entity_ref or (idea.grain_ref is not None and ref == idea.grain_ref):
         return "grain"
     if idea.time_ref is not None and ref == idea.time_ref:
         return "time"
     if ref in idea.grouping_refs:
         return "grouping"
+    declared = None if binding is None else concept(binding.expected_concept)
+    if declared is not None and declared.pit_role != "none":
+        return "time"
     if ref in idea.measure_refs:
         return "measure"
     return "other"
@@ -781,7 +795,8 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
             table_ref=(node.table_name if node is not None and node.table_name
                        else table_of_ref(object_ref)),
             recipe_role="" if binding is None else binding.role,
-            classification=_classification(idea, (catalog_source, object_ref)),
+            classification=_classification(idea, (catalog_source, object_ref),
+                                           binding, entity_ref),
             visibility_requires_current=() if node is None else node.visible_requires,
             evidence_refs=_evidence_refs(trace, (catalog_source, object_ref), omitted)))
     operands = tuple(operands)
@@ -1012,29 +1027,31 @@ def build_page_v2(conn, *, catalog_source: str, anchor_table_ref: str, anchored:
 
 
 # ── the explicit V1 adapter (0F-11) ─────────────────────────────────────────────────────────────
-def _grain_table(suggestion: FeatureSuggestionV2, context_role: str | None) -> str | None:
-    """V1's ``grain_table``: the table of the SOURCE-ENTITY operand when one bound, else the first
-    bound operand's table (``templates.py`` derives it exactly so). Reconstructed from the carried
-    operands rather than re-queried — the roles and the binding order are both on the page."""
-    if context_role:
+def _grain_table(suggestion: FeatureSuggestionV2) -> str | None:
+    """V1's ``grain_table``, rebuilt from the carried operands — no re-query, no second rule.
+
+    ``templates.py`` derives it as the SOURCE-ENTITY binding's table when one bound, else the first
+    bound column's table. Those two branches are exactly the two states of ``entity`` here, because
+    a source-entity role only ever resolves on an ENTITY-LINKED concept (``_is_entity_concept``
+    requires ``Concept.entity_link``): so the role bound ⇔ the entity label resolved ⇔
+    ``grain_refs[0]`` names that very column. When it did not bind, ``operands[0]`` is the first
+    bound column in needs order — the same element ``templates.py`` takes.
+    """
+    if suggestion.entity is not None and suggestion.grain_refs:
+        ref = suggestion.grain_refs[0][1]
         for operand in suggestion.operands:
-            if operand.recipe_role == context_role:
+            if operand.graph_object_ref == ref:
                 return operand.table_ref
     return suggestion.operands[0].table_ref if suggestion.operands else None
 
 
-def to_table_suggestions_v1(page: FeatureSuggestionPageV2,
-                            source_entity_roles: Mapping[str, str | None] | None = None) -> dict:
+def to_table_suggestions_v1(page: FeatureSuggestionPageV2) -> dict:
     """Today's per-table wire payload, rebuilt from the V2 page and nothing else.
 
     Every V1 byte has a V2 carrier (0F-11): the summary is a rename, the group refs and labels ride
     on the groups, the neighbourhood block is the SAME ``JoinNeighbourhood`` value re-serialized by
     its own producer, and the unknown-table state carries its synthesized zero block rather than
     having the adapter recompute one. New V2 fields are DROPPED, never folded in.
-
-    ``source_entity_roles`` maps ``suggestion_id -> source-entity recipe role`` so ``grain_table``
-    resolves to the same operand the engine grained on. It is optional because the fallback (first
-    bound operand) is already V1's own rule whenever no entity bound.
 
     It REFUSES rather than lie: if this page bounded away operands or withheld a card that the V1
     producer would have emitted, the V1 body rebuilt from it would silently differ from the one the
@@ -1055,14 +1072,13 @@ def to_table_suggestions_v1(page: FeatureSuggestionPageV2,
                 "table": collection.anchor_table_ref, "table_known": False,
                 "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
                 "groups": [], "rejections": [], "neighbourhood": neighbourhood}
-    roles = source_entity_roles or {}
     by_id = {hit.suggestion.suggestion_id: hit.suggestion for hit in page.hits}
     groups = []
     for group in collection.groups:
         groups.append({
             "entity_ref": group.grain_refs[0][1] if group.grain_refs else "",
             "entity_label": group.entity.display_name if group.entity is not None else "",
-            "suggestions": [_card_v1(by_id[sid], roles.get(sid)) for sid in group.suggestion_ids],
+            "suggestions": [_card_v1(by_id[sid]) for sid in group.suggestion_ids],
         })
     return {
         "catalog_source": collection.anchor_catalog_source,
@@ -1079,12 +1095,12 @@ def to_table_suggestions_v1(page: FeatureSuggestionPageV2,
     }
 
 
-def _card_v1(suggestion: FeatureSuggestionV2, source_entity_role: str | None) -> dict:
+def _card_v1(suggestion: FeatureSuggestionV2) -> dict:
     return {
         "name": suggestion.name,
         "description": (suggestion.business_interpretation.value
                         if suggestion.business_interpretation is not None else ""),
-        "grain_table": _grain_table(suggestion, source_entity_role),
+        "grain_table": _grain_table(suggestion),
         "validation_status": suggestion.validation_status,
         "requirements": requirements_to_json(suggestion.requirements),
         "uses": [operand.graph_object_ref for operand in suggestion.operands],

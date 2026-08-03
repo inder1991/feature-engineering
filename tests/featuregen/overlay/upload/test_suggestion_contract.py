@@ -1,0 +1,884 @@
+"""Task 2 — ``FeatureSuggestionV2`` over the REAL engine, and the byte-stable V1 adapter.
+
+Everything here runs the actual per-table grounding pass over the suggestion suite's own FTR
+fixtures, so the shapes asserted are the ones the engine produces rather than ones a test invented.
+The four proofs this suite exists for:
+
+1. **Trace consumption.** A ``DESIGN_CHECKED`` card whose decision trace is absent or cannot explain
+   the decision is INADMISSIBLE — withheld and counted, never softened.
+2. **Anchor independence.** The same cross-table candidate opened from either of its operand tables
+   yields identical suggestion AND revision bytes.
+3. **Withholding is total.** A bound operand this caller may not see removes the whole suggestion —
+   from the hits, the counts, the groups and the wire — not just the operand.
+4. **V1 is byte-stable.** ``to_table_suggestions_v1(page)`` reproduces today's payload exactly, over
+   every fixture state including the unknown-table and all-hidden ones.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+
+import pytest
+from tests.featuregen.overlay.upload.test_suggestions import (
+    _COLUMNS,
+    _ENTITY_TABLE,
+    _JOIN_COLUMNS,
+    _JOIN_SOURCE,
+    _MEASURE_TABLE,
+    OTHER_TABLE,
+    SIBLING_TABLE,
+    SOURCE,
+    TABLE,
+    _Catalog,
+    _govern_table_facts,
+    _ingest,
+    _join_edge,
+    _seal,
+    _statements,
+)
+
+from featuregen.contracts import resolvers
+from featuregen.contracts.evidence_axes import (
+    AssertionStrength,
+    AttributedLabelV1,
+    AttributedTextV1,
+    EvidenceAuthorityV1,
+    EvidenceLifecycle,
+    EvidenceProducer,
+)
+from featuregen.overlay.upload import suggestion_contract as contract_module
+from featuregen.overlay.upload import suggestions as suggestions_module
+from featuregen.overlay.upload.suggestion_contract import (
+    GENERATION_SOURCES,
+    OPERAND_CLASSIFICATIONS,
+    PROFILE_STATUS_UNAVAILABLE,
+    SCHEMA_VERSION,
+    WARNING_CODES,
+    SuggestionV1ReconstructionError,
+    SuggestionWarningV1,
+    is_family_derived_category,
+    page_to_json,
+    to_table_suggestions_v1,
+)
+from featuregen.overlay.upload.suggestion_taxonomy import (
+    FEATURE_CATEGORY_REGISTRY,
+    RECIPE_FAMILY_REGISTRY,
+)
+from featuregen.overlay.upload.suggestions import (
+    suggest_features_for_table,
+    suggest_features_page_v2,
+)
+from featuregen.overlay.upload.template_discovery import (
+    ADMISSIBLE_DISCOVERY_DISPOSITIONS,
+    DISCOVERY_METADATA,
+    discovery_metadata_revision_id,
+)
+
+
+@pytest.fixture
+def ftr_catalog(overlay_conn):
+    _seal()
+    _ingest(overlay_conn, SOURCE, _COLUMNS)
+    _govern_table_facts(overlay_conn, TABLE, "cif_id", "as_of_dt")
+    _govern_table_facts(overlay_conn, OTHER_TABLE, "book_id", "risk_dt")
+    _govern_table_facts(overlay_conn, SIBLING_TABLE, "loan_cif", "due_dt")
+    return _Catalog(source=SOURCE, table=TABLE)
+
+
+@pytest.fixture
+def join_catalog(overlay_conn):
+    _seal()
+    _ingest(overlay_conn, _JOIN_SOURCE, _JOIN_COLUMNS)
+    _govern_table_facts(overlay_conn, _MEASURE_TABLE, "ledger_acct", "ledger_dt",
+                        source=_JOIN_SOURCE)
+    _govern_table_facts(overlay_conn, _ENTITY_TABLE, "master_cif", "master_dt",
+                        source=_JOIN_SOURCE)
+    return _Catalog(source=_JOIN_SOURCE, table=_MEASURE_TABLE)
+
+
+def _page(conn, table=TABLE, *, source=SOURCE, roles=(), **kw):
+    return suggest_features_page_v2(conn, catalog_source=source, table=table, roles=roles, **kw)
+
+
+def _suggestions(page) -> dict:
+    return {hit.suggestion.name: hit.suggestion for hit in page.hits}
+
+
+def _codes(suggestion) -> set[str]:
+    return {warning.code for warning in suggestion.warnings}
+
+
+# ── contract shape and closed vocabularies ──────────────────────────────────────────────────────
+def test_every_hit_carries_the_frozen_contract_labels(overlay_conn, ftr_catalog):
+    page = _page(overlay_conn)
+    assert page.hits
+    for hit in page.hits:
+        suggestion = hit.suggestion
+        assert suggestion.schema_version == SCHEMA_VERSION == "feature-suggestion-v2"
+        assert suggestion.generation_source in GENERATION_SOURCES
+        assert suggestion.validation_status in ("DESIGN_CHECKED", "NEEDS_EXTERNAL_VALIDATION")
+        assert suggestion.binding_quality
+        assert all(o.classification in OPERAND_CLASSIFICATIONS for o in suggestion.operands)
+        assert all(w.code in WARNING_CODES for w in suggestion.warnings)
+
+
+def test_the_no_hypothesis_producer_emits_recipe_and_only_recipe(overlay_conn, ftr_catalog):
+    """This surface has no hypothesis, no LLM and no user-authored idea. The shared enum can
+    DESCRIBE free-form and user-defined candidates; projecting one into global discovery needs a
+    lifecycle this plan deliberately does not create."""
+    assert {hit.suggestion.generation_source for hit in _page(overlay_conn).hits} == {"recipe"}
+
+
+def test_release_a_reports_on_demand_with_no_projection(overlay_conn, ftr_catalog):
+    """No projection exists yet, so the page says so instead of claiming a currentness it never
+    computed. ``facets`` is empty for the same reason — Release B owns search."""
+    page = _page(overlay_conn)
+    assert page.read_mode == "on_demand"
+    assert page.projection is None and page.next_cursor is None and page.facets == {}
+    assert all(hit.projection is None for hit in page.hits)
+    assert page.read_scope_key
+
+
+def test_no_card_can_ever_render_a_needs_sme_disposition(overlay_conn, ftr_catalog):
+    """Task-1 handoff (a): ``needs_sme`` is UNREPRESENTABLE in v1 — an authored escalation with no
+    hashed carrier. A facet or badge that could render it would be showing a state the registry
+    refuses to construct."""
+    dispositions = {hit.suggestion.discovery_disposition for hit in _page(overlay_conn).hits}
+    assert dispositions <= ADMISSIBLE_DISCOVERY_DISPOSITIONS
+    assert "needs_sme" not in dispositions
+
+
+def test_a_warning_outside_the_closed_vocabulary_cannot_be_constructed():
+    with pytest.raises(ValueError, match="unknown suggestion warning code"):
+        SuggestionWarningV1(code="LOOKS_RISKY", operand_refs=(), detail="")
+
+
+# ── trace consumption: the V2 admission rule ────────────────────────────────────────────────────
+def test_every_hit_carries_the_decision_trace_it_was_admitted_on(overlay_conn, ftr_catalog):
+    for hit in _page(overlay_conn).hits:
+        assert hit.suggestion.grounding_trace_content_hash
+        assert hit.suggestion.validation_rule_content_hashes
+        assert hit.suggestion.read_scope_rule_content_hashes
+
+
+def _patch_engine(monkeypatch, transform):
+    original = suggestions_module._template_candidates
+
+    def _patched(*a, **kw):
+        return transform(original(*a, **kw))
+
+    monkeypatch.setattr(suggestions_module, "_template_candidates", _patched)
+
+
+def test_a_candidate_with_no_trace_at_all_is_withheld_and_counted(overlay_conn, ftr_catalog,
+                                                                  monkeypatch):
+    """Without a trace the card's ``grounding_trace_content_hash`` would be a fabrication and its
+    identity would have no path material. It is refused, and the refusal is COUNTED — a silently
+    shorter list is how a page starts lying about what it looked at."""
+    before = _page(overlay_conn)
+    assert before.hits
+    _patch_engine(monkeypatch, lambda r: replace(
+        r, ideas=[replace(idea, grounding_trace=None) for idea in r.ideas]))
+    after = _page(overlay_conn)
+    assert after.hits == ()
+    assert after.collection.omitted_counts["withheld_missing_trace"] == len(before.hits)
+    assert after.collection.summary.suggested == 0
+
+
+def test_a_design_checked_candidate_whose_trace_cannot_explain_it_is_refused(overlay_conn,
+                                                                            ftr_catalog,
+                                                                            monkeypatch):
+    """THE HEADLINE REFUSAL (freeze 0F-7). A readiness claim nothing can justify or invalidate is
+    not a softer card — it is inadmissible. The trace is emptied of its pins, which is exactly the
+    state ``trace_completeness_gaps`` exists to detect."""
+    before = _page(overlay_conn)
+    checked = [h for h in before.hits if h.suggestion.validation_status == "DESIGN_CHECKED"]
+    assert checked, "the fixture cleared nothing — the refusal proof would be vacuous"
+
+    def _gut(result):
+        ideas = []
+        for idea in result.ideas:
+            if idea.validation_status == "DESIGN_CHECKED" and idea.grounding_trace is not None:
+                idea = replace(idea, grounding_trace=replace(idea.grounding_trace,
+                                                             dependency_pins=()))
+            ideas.append(idea)
+        return replace(result, ideas=ideas)
+
+    _patch_engine(monkeypatch, _gut)
+    after = _page(overlay_conn)
+    assert after.collection.omitted_counts["withheld_incomplete_trace"] == len(checked)
+    assert not [h for h in after.hits if h.suggestion.validation_status == "DESIGN_CHECKED"]
+    # ...and the needs-validation cards are untouched: the rule invalidates a READINESS claim, not
+    # every candidate that ever had a gap.
+    assert len(after.hits) == len(before.hits) - len(checked)
+
+
+def _withdraw_grain_fact(conn, table=TABLE, source=SOURCE) -> None:
+    """Real drift through the real gauntlet: the table's grain is declared but no longer
+    governed-VERIFIED, which is exactly the state ``GRAIN_IS_UNIQUE`` exists to report."""
+    conn.execute("UPDATE graph_node SET grain_fact_event_id = NULL "
+                 "WHERE catalog_source = %s AND table_name = %s", (source, table))
+
+
+def _withdraw_availability_fact(conn, table=TABLE, source=SOURCE) -> None:
+    conn.execute("UPDATE graph_node SET availability_fact_event_id = NULL "
+                 "WHERE catalog_source = %s AND table_name = %s", (source, table))
+
+
+def test_a_needs_validation_candidate_is_not_refused_for_an_incomplete_trace(overlay_conn,
+                                                                            ftr_catalog,
+                                                                            monkeypatch):
+    """The rule is precisely scoped: a card that already claims no readiness is not withheld
+    because its trace has a gap. Over-refusing would hide honest work."""
+    def _gut(result):
+        return replace(result, ideas=[
+            replace(idea, grounding_trace=replace(idea.grounding_trace, dependency_pins=()))
+            if idea.validation_status != "DESIGN_CHECKED" and idea.grounding_trace else idea
+            for idea in result.ideas])
+
+    _withdraw_grain_fact(overlay_conn)
+    before = _page(overlay_conn)
+    needy = [h for h in before.hits
+             if h.suggestion.validation_status == "NEEDS_EXTERNAL_VALIDATION"]
+    assert needy, "no needs-validation candidate in the fixture — the proof would be vacuous"
+    _patch_engine(monkeypatch, _gut)
+    after = _page(overlay_conn)
+    assert "withheld_incomplete_trace" not in after.collection.omitted_counts
+    assert len(after.hits) == len(before.hits)
+
+
+def test_a_non_recipe_candidate_never_reaches_this_surface(overlay_conn, ftr_catalog, monkeypatch):
+    _patch_engine(monkeypatch, lambda r: replace(
+        r, ideas=[replace(idea, generation_source="llm_freeform") for idea in r.ideas]))
+    page = _page(overlay_conn)
+    assert page.hits == ()
+    assert page.collection.omitted_counts["withheld_non_recipe_generation_source"] > 0
+
+
+def test_the_relationship_dependencies_are_the_ones_the_planner_selected(overlay_conn,
+                                                                        join_catalog):
+    """The cross-table card carries the legs the gauntlet traversed — read off the trace, never
+    re-walked here."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    card = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                              source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert card.relationship_dependencies
+    for leg in card.relationship_dependencies:
+        assert leg.relationship_kind == "direct_equality"
+        assert leg.realization_content_hash and leg.review_status == "VERIFIED"
+
+
+# ── discovery metadata: display, provenance, bounds ─────────────────────────────────────────────
+def test_the_recipe_family_resolves_its_display_name_and_cites_the_recipe(overlay_conn,
+                                                                         ftr_catalog):
+    for hit in _page(overlay_conn).hits:
+        family = hit.suggestion.recipe_family
+        assert family is not None and family.basis == "template_authored"
+        assert family.display_name == RECIPE_FAMILY_REGISTRY[family.id].display_name
+        assert family.source_refs and family.source_refs[0].startswith("recipe-revision:")
+
+
+def test_a_family_derived_feature_category_is_distinguishable_from_an_authored_one(overlay_conn,
+                                                                                   ftr_catalog):
+    """Task-1 handoff (b). ``basis`` says ``template_authored`` for a DERIVED category, because the
+    derivation is deterministic and sanctioned — so a badge driven by ``basis`` would present a
+    taxonomy derivation as an SME-authored objective. The mapping citation is the positive signal,
+    and it survives into the wire payload."""
+    categorised = [h.suggestion for h in _page(overlay_conn).hits
+                   if h.suggestion.feature_category is not None]
+    assert categorised, "no categorised template on this table — the proof would be vacuous"
+    for suggestion in categorised:
+        category = suggestion.feature_category
+        assert category.basis == "template_authored"
+        assert category.display_name == FEATURE_CATEGORY_REGISTRY[category.id].display_name
+        assert is_family_derived_category(category)
+    body = page_to_json(_page(overlay_conn))
+    flags = {hit["suggestion"]["name"]: hit["suggestion"]
+             ["feature_category_derived_from_family_mapping"] for hit in body["hits"]}
+    assert any(flags.values())
+
+
+def test_the_discovery_revision_is_the_registrys_own(overlay_conn, ftr_catalog):
+    """Handoff (c): the discovery revision is NOT a per-template key — many templates share one.
+    It is carried as a referenced content revision and never used to index anything."""
+    revisions = {}
+    for hit in _page(overlay_conn).hits:
+        entry = DISCOVERY_METADATA[hit.suggestion.template_id]
+        assert hit.suggestion.discovery_metadata_revision_id == discovery_metadata_revision_id(
+            entry)
+        revisions.setdefault(hit.suggestion.discovery_metadata_revision_id, set()).add(
+            hit.suggestion.template_id)
+    assert revisions
+
+
+def test_the_business_interpretation_is_the_recipes_own_sentence(overlay_conn, ftr_catalog):
+    v1 = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=TABLE)
+    descriptions = {s["name"]: s["description"] for g in v1["groups"] for s in g["suggestions"]}
+    for hit in _page(overlay_conn).hits:
+        text = hit.suggestion.business_interpretation
+        assert text is not None and text.basis == "template_authored"
+        assert text.value == descriptions[hit.suggestion.name]
+
+
+def test_nothing_authored_is_fabricated_where_the_registry_is_silent(overlay_conn, ftr_catalog):
+    """Rule 12: unknown is a valid answer. No template in the baseline registry authors keywords or
+    a business value, so the cards carry none — a coverage target must never force invented
+    metadata."""
+    for hit in _page(overlay_conn).hits:
+        entry = DISCOVERY_METADATA[hit.suggestion.template_id]
+        assert len(hit.suggestion.keywords) == len(entry.keywords)
+        assert (hit.suggestion.business_value is None) == (entry.business_value is None)
+        assert len(hit.suggestion.use_cases) == len(entry.canonical_use_cases)
+
+
+# ── free-text context and the resolver seam (D9) ────────────────────────────────────────────────
+def test_catalog_domain_wording_is_attributed_text_and_never_a_facet(overlay_conn, ftr_catalog):
+    """No controlled business-domain registry exists (D9), so the catalog's own wording travels as
+    searchable attributed TEXT. It is never lowercased or slugged into an id, and it never becomes
+    a facet — an uncontrolled string as a filter key is exactly rule 13's failure."""
+    hit = _page(overlay_conn).hits[0].suggestion
+    assert hit.business_domains == ()
+    assert hit.contextual_domain_terms
+    for term in hit.contextual_domain_terms:
+        assert isinstance(term, AttributedTextV1)
+        assert term.basis == "catalog_resolved" and term.operational_influence is None
+        assert term.source_refs
+
+
+def test_a_registered_controlled_resolver_turns_the_same_wording_into_a_facet(overlay_conn,
+                                                                              ftr_catalog):
+    """The seam is the switch, and this adapter needs no change to flip it: when the semantic plan
+    registers its registry, the SAME call site yields a controlled label instead of free text."""
+    class _Resolver:
+        def resolve(self, text: str) -> AttributedLabelV1 | None:
+            return AttributedLabelV1(
+                id="retail_payments", display_name="Retail Payments", basis="catalog_resolved",
+                evidence=(EvidenceAuthorityV1(EvidenceProducer.TAXONOMY,
+                                              AssertionStrength.ATTESTED,
+                                              EvidenceLifecycle.ACTIVE, "test", None),),
+                operational_influence=None, source_refs=())
+
+    resolvers.register_resolver("business_domain", _Resolver())
+    try:
+        hit = _page(overlay_conn).hits[0].suggestion
+        assert [d.id for d in hit.business_domains] == ["retail_payments"]
+        assert hit.contextual_domain_terms == ()
+    finally:
+        resolvers.reset_resolver("business_domain")
+
+
+def test_the_entity_facet_is_the_engines_own_controlled_entity_link(overlay_conn, ftr_catalog):
+    """The entity axis has a real controlled vocabulary today — ``Concept.entity_link``, bound by
+    the grounding engine itself — so it IS a facet. Free-text catalog entity wording stays separate
+    attributed text."""
+    labelled = [h.suggestion for h in _page(overlay_conn).hits if h.suggestion.entity is not None]
+    assert labelled
+    assert {s.entity.id for s in labelled} <= {"customer", "account"}
+    for suggestion in labelled:
+        assert suggestion.entity.display_name == suggestion.entity.id
+        assert all(isinstance(t, AttributedTextV1) for t in suggestion.contextual_entity_terms)
+
+
+def test_every_profile_field_is_explicitly_unavailable_not_guessed(overlay_conn, ftr_catalog):
+    """D9. The profile plan owns data role, authority role, temporal model and primary entity; a
+    plausible guess here would be indistinguishable from a governed answer."""
+    for hit in _page(overlay_conn).hits:
+        assert hit.suggestion.semantic_context_hashes == ()
+        assert hit.suggestion.dataset_profile_hashes == ()
+        assert hit.suggestion.source_datasets
+        for dataset in hit.suggestion.source_datasets:
+            assert dataset.catalog_source and dataset.table_ref
+            assert dataset.profile_status == PROFILE_STATUS_UNAVAILABLE
+            assert (dataset.data_role, dataset.authority_role, dataset.temporal_storage_model,
+                    dataset.primary_entity, dataset.dataset_profile_hash) == (
+                        None, None, None, None, None)
+
+
+def test_the_source_datasets_are_the_tables_the_operands_actually_read(overlay_conn, join_catalog):
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    card = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                              source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert {d.table_ref for d in card.source_datasets} == {o.table_ref for o in card.operands}
+    assert {_MEASURE_TABLE, _ENTITY_TABLE} == {d.table_ref for d in card.source_datasets}
+
+
+# ── operands ────────────────────────────────────────────────────────────────────────────────────
+def test_the_operands_are_the_engines_binding_order_deduplicated_on_the_ref(overlay_conn,
+                                                                           ftr_catalog):
+    """Load-bearing for the V1 reconstruction: ``uses`` is exactly this list of refs, so the order
+    and the dedupe rule are the engine's own, not a re-derivation."""
+    v1 = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=TABLE)
+    uses = {s["name"]: s["uses"] for g in v1["groups"] for s in g["suggestions"]}
+    for hit in _page(overlay_conn).hits:
+        assert [o.graph_object_ref for o in hit.suggestion.operands] == uses[hit.suggestion.name]
+
+
+def test_the_recipe_role_is_the_template_authors_own_declaration(overlay_conn, ftr_catalog):
+    """Never inferred from a concept (concepts are AI-proposed), a column name or a data type."""
+    seen = set()
+    for hit in _page(overlay_conn).hits:
+        for operand in hit.suggestion.operands:
+            assert operand.recipe_role
+            seen.add(operand.recipe_role)
+    assert len(seen) > 1
+
+
+def test_the_key_and_the_clock_are_never_classified_as_measures(overlay_conn, ftr_catalog):
+    """``measure_refs`` carries EVERY bound pair — the key and the clock included — so classifying
+    by membership alone would file the feature's own key as a quantity it aggregates.
+
+    The clock is the subtle half: a recipe's point-in-time anchor may be the table's own as-of
+    column and not a bound operand at all, while a bound ``event_timestamp`` need IS a time operand.
+    Both are decided from the engine's typed refs and the TEMPLATE-AUTHORED need concept — never
+    from a column name or the column's AI-proposed concept."""
+    keys = clocks = 0
+    for hit in _page(overlay_conn).hits:
+        classes = {o.graph_object_ref: o.classification for o in hit.suggestion.operands}
+        for _source, ref in hit.suggestion.grain_refs:
+            if ref in classes:
+                assert classes[ref] == "grain", (hit.suggestion.name, ref)
+                keys += 1
+        if hit.suggestion.time_ref is not None and hit.suggestion.time_ref[1] in classes:
+            assert classes[hit.suggestion.time_ref[1]] == "time"
+            clocks += 1
+    assert keys and clocks
+    # ...and a bound event clock that is NOT the recipe's as-of anchor is still a time operand
+    event_clocks = {o.classification for hit in _page(overlay_conn).hits
+                    for o in hit.suggestion.operands
+                    if o.graph_object_ref.endswith(".txn_ts")}
+    assert event_clocks == {"time"}
+
+
+def test_the_evidence_refs_are_the_pins_the_gauntlet_recorded(overlay_conn, ftr_catalog):
+    """Provenance, deliberately: none of these enter a semantic hash, and they are what a reader
+    compares against the current pointer."""
+    assert any(operand.evidence_refs
+               for hit in _page(overlay_conn).hits for operand in hit.suggestion.operands)
+
+
+# ── warnings ────────────────────────────────────────────────────────────────────────────────────
+def test_warnings_come_from_typed_requirements_never_from_prose(overlay_conn, ftr_catalog):
+    """Each requirement CODE raises its matching warning code, and it names the requirement's own
+    operand. Nothing is parsed out of the human-readable detail, which is a rendering. Driven by
+    REAL drift — the table's availability fact is withdrawn, which is what
+    ``TEMPORAL_IS_POPULATED`` exists to report."""
+    expected = {"UNIT_CONSISTENT": "MISSING_UNIT", "CURRENCY_CONSISTENT": "MISSING_CURRENCY",
+                "TEMPORAL_IS_POPULATED": "MISSING_TEMPORAL_EVIDENCE"}
+    _withdraw_availability_fact(overlay_conn)
+    seen = 0
+    for hit in _page(overlay_conn).hits:
+        by_code = {w.code: w for w in hit.suggestion.warnings}
+        for requirement in hit.suggestion.requirements:
+            warning = expected.get(requirement.code)
+            if warning is None:
+                continue
+            assert warning in by_code, (hit.suggestion.name, requirement.code)
+            assert requirement.operand in by_code[warning].operand_refs
+            seen += 1
+    assert seen, "no unit/currency/temporal requirement in the fixture"
+
+
+def test_a_clean_card_raises_no_requirement_derived_warning(overlay_conn, ftr_catalog):
+    """The other half of the contract: with the governing facts in place the same cards carry no
+    missing-evidence warning at all, so the warning really is derived from the drift."""
+    codes = {w for hit in _page(overlay_conn).hits for w in _codes(hit.suggestion)}
+    assert not ({"MISSING_TEMPORAL_EVIDENCE", "MISSING_UNIT", "MISSING_CURRENCY"} & codes)
+
+
+def test_the_near_label_warning_is_the_recipes_own_declaration(overlay_conn, ftr_catalog):
+    """An authored template flag, not a heuristic about the column."""
+    from featuregen.overlay.upload.templates import ALL_TEMPLATES
+
+    near = {t.id for t in ALL_TEMPLATES if t.near_label}
+    flagged = {hit.suggestion.template_id for hit in _page(overlay_conn).hits
+               if "NEAR_LABEL" in _codes(hit.suggestion)}
+    assert flagged and flagged <= near
+    for hit in _page(overlay_conn).hits:
+        assert ("NEAR_LABEL" in _codes(hit.suggestion)) == (hit.suggestion.template_id in near)
+
+
+def test_an_unconfirmed_relationship_is_a_different_warning_from_unproven_safety(overlay_conn,
+                                                                                 join_catalog):
+    """The freeze keeps these SEPARATE because they are separate facts: a file-declared join is
+    accountable to nobody (review), while a non-clearing one has no governed safety evidence
+    (execution). A verified join raises neither."""
+    _join_edge(overlay_conn, fact_key=None, status=None)          # file-declared: clears, unreviewed
+    declared = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                                  source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert "RELATIONSHIP_UNCONFIRMED" in _codes(declared)
+    assert "RELATIONSHIP_SAFETY_UNPROVEN" not in _codes(declared)
+
+
+def test_a_governed_verified_relationship_raises_neither_relationship_warning(overlay_conn,
+                                                                              join_catalog):
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    card = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                              source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert not ({"RELATIONSHIP_UNCONFIRMED", "RELATIONSHIP_SAFETY_UNPROVEN"} & _codes(card))
+
+
+def test_a_restricted_input_raises_the_sensitive_input_warning(overlay_conn, ftr_catalog):
+    """Derived from the visibility classes RE-READ at request time under THIS caller's scope, not
+    from a template note and not from a cached indexing-time copy."""
+    restricted = f"public.{TABLE}.bal_amt"
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND object_ref = %s", (SOURCE, restricted))
+    page = _page(overlay_conn, roles=("restricted_reader",))
+    flagged = [s for s in _suggestions(page).values() if "SENSITIVE_INPUT" in _codes(s)]
+    assert flagged
+    for suggestion in flagged:
+        sensitive = [o for o in suggestion.operands if o.visibility_requires_current]
+        assert sensitive and all(o.visibility_requires_current == ("restricted",)
+                                 for o in sensitive)
+        warning = next(w for w in suggestion.warnings if w.code == "SENSITIVE_INPUT")
+        assert (SOURCE, restricted) in warning.operand_refs
+    # the caller who cannot see it never gets the card at all — nothing to warn about
+    blind = _suggestions(_page(overlay_conn, roles=()))
+    assert not [s for s in blind.values() if "SENSITIVE_INPUT" in _codes(s)]
+
+
+# ── identity over the real engine ───────────────────────────────────────────────────────────────
+def test_the_same_catalog_state_yields_the_same_identities(overlay_conn, ftr_catalog):
+    first = {h.suggestion.name: (h.suggestion.suggestion_id, h.suggestion.suggestion_revision_id)
+             for h in _page(overlay_conn).hits}
+    second = {h.suggestion.name: (h.suggestion.suggestion_id, h.suggestion.suggestion_revision_id)
+              for h in _page(overlay_conn).hits}
+    assert first == second and first
+
+
+def test_two_different_candidates_never_share_an_identity(overlay_conn, ftr_catalog):
+    hits = _page(overlay_conn).hits
+    assert len({h.suggestion.suggestion_id for h in hits}) == len(hits)
+
+
+def test_the_same_candidate_from_either_operand_table_is_byte_identical(overlay_conn,
+                                                                       join_catalog):
+    """ANCHOR INDEPENDENCE, the load-bearing proof. ``balance_trend_90d`` binds the ledger's balance
+    and the master's customer key, so it is a suggestion FOR BOTH tables. Opened from either one it
+    must be ONE card: same id, same revision, and the same canonical bytes — otherwise a global page
+    would have to choose between two conflicting renderings of one logical candidate."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    from_measure = _suggestions(_page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE))
+    from_entity = _suggestions(_page(overlay_conn, _ENTITY_TABLE, source=_JOIN_SOURCE))
+    shared = set(from_measure) & set(from_entity)
+    assert "balance_trend_90d" in shared, (sorted(from_measure), sorted(from_entity))
+    for name in shared:
+        left, right = from_measure[name], from_entity[name]
+        assert left.suggestion_id == right.suggestion_id, name
+        assert left.suggestion_revision_id == right.suggestion_revision_id, name
+        assert left == right, name
+
+
+def test_the_anchor_travels_on_the_collection_and_nowhere_else(overlay_conn, join_catalog):
+    """The two pages above differ — they must, they are different readings — but ONLY in the
+    collection envelope: the anchor, the counts, the groups and the neighbourhood."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    left = _page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE)
+    right = _page(overlay_conn, _ENTITY_TABLE, source=_JOIN_SOURCE)
+    assert left.collection.anchor_table_ref != right.collection.anchor_table_ref
+    body = json.dumps(page_to_json(left)["hits"])
+    assert _MEASURE_TABLE in body            # operand tables DO appear — they are content
+    assert '"anchor' not in body             # ...but no anchor field rides on a suggestion
+
+
+def test_a_byte_identical_reground_does_not_churn_the_revision(overlay_conn, ftr_catalog):
+    """Rule 24: content, not provenance. Re-running the same read produces the same revisions, and
+    the build provenance that DID move (nothing here, by construction) is carried separately."""
+    first = _page(overlay_conn)
+    second = _page(overlay_conn)
+    assert [h.suggestion for h in first.hits] == [h.suggestion for h in second.hits]
+    assert all(hit.provenance.producer_commit is None and hit.provenance.refresh_id is None
+               and hit.provenance.generated_at is None for hit in first.hits)
+
+
+def test_a_changed_validation_result_produces_a_new_revision(overlay_conn, ftr_catalog,
+                                                             monkeypatch):
+    before = {h.suggestion.name: h.suggestion for h in _page(overlay_conn).hits}
+    # The governed grain fact is withdrawn: real drift, through the real gauntlet.
+    overlay_conn.execute(
+        "UPDATE graph_node SET grain_fact_event_id = NULL "
+        "WHERE catalog_source = %s AND table_name = %s", (SOURCE, TABLE))
+    after = {h.suggestion.name: h.suggestion for h in _page(overlay_conn).hits}
+    moved = [name for name in set(before) & set(after)
+             if before[name].validation_status != after[name].validation_status]
+    assert moved, "the drift changed no validation result — the proof would be vacuous"
+    for name in moved:
+        assert before[name].suggestion_revision_id != after[name].suggestion_revision_id
+        assert before[name].suggestion_id == after[name].suggestion_id
+
+
+def test_a_changed_discovery_mapping_produces_a_new_revision(overlay_conn, ftr_catalog,
+                                                             monkeypatch):
+    """A category/use-case remapping is a SEMANTIC change to the card, so the revision moves — while
+    the logical candidate, which the mapping does not touch, keeps its id."""
+    before = {h.suggestion.name: h.suggestion for h in _page(overlay_conn).hits}
+    template_id = next(s.template_id for s in before.values()
+                       if s.feature_category is not None)
+    entry = DISCOVERY_METADATA[template_id]
+    patched = dict(DISCOVERY_METADATA)
+    patched[template_id] = replace(entry, feature_category=None,
+                                   disposition="partial" if entry.canonical_use_cases
+                                   else "unclassified")
+    monkeypatch.setattr(contract_module, "DISCOVERY_METADATA", patched)
+    after = {h.suggestion.name: h.suggestion for h in _page(overlay_conn).hits}
+    changed = [s for s in after.values() if s.template_id == template_id]
+    assert changed
+    for suggestion in changed:
+        assert suggestion.suggestion_id == before[suggestion.name].suggestion_id
+        assert suggestion.suggestion_revision_id != before[
+            suggestion.name].suggestion_revision_id
+
+
+# ── read scope: withholding is total ────────────────────────────────────────────────────────────
+def test_a_hidden_operand_withholds_the_whole_suggestion(overlay_conn, ftr_catalog, monkeypatch):
+    """Rule 9. Not the operand — the WHOLE suggestion, and it may not leak through the counts, the
+    groups, the ids or the wire. Simulated at the context-read seam, because on-demand grounding is
+    itself read-scoped: this is the fail-closed control for the case where an operand becomes
+    invisible or is withdrawn between the grounding read and the context read."""
+    page = _page(overlay_conn)
+    victim = page.hits[0].suggestion
+    hidden = victim.operands[0].graph_object_ref
+    real = contract_module._read_node_facts
+
+    def _blind(conn, pairs, roles):
+        facts = real(conn, pairs, roles)
+        return {key: value for key, value in facts.items() if key[1] != hidden}
+
+    monkeypatch.setattr(contract_module, "_read_node_facts", _blind)
+    after = _page(overlay_conn)
+    names = {hit.suggestion.name for hit in after.hits}
+    assert victim.name not in names
+    assert after.collection.omitted_counts["withheld_read_scope"] >= 1
+    assert after.collection.summary.suggested == len(after.hits) < len(page.hits)
+    body = json.dumps(page_to_json(after))
+    assert victim.suggestion_id not in body and victim.name not in body
+    assert all(victim.suggestion_id not in g.suggestion_ids for g in after.collection.groups)
+
+
+def test_on_demand_grounding_differs_correctly_across_public_and_sensitive_callers(overlay_conn,
+                                                                                   join_catalog):
+    """The scope is DERIVED from the caller's canonical allowed classes and threaded into grounding,
+    so a blind caller and a privileged one get genuinely different pages — not one maximum-scope
+    page filtered afterwards. The restricted endpoint hides the whole far table from the blind
+    caller, exactly as it does on the V1 surface."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (_JOIN_SOURCE, f"public.{_ENTITY_TABLE}.master_acct"))
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    blind = _page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE, roles=())
+    privileged = _page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE,
+                       roles=("restricted_reader",))
+    assert "balance_trend_90d" not in _suggestions(blind)
+    assert "balance_trend_90d" in _suggestions(privileged)
+    assert blind.read_scope_key != privileged.read_scope_key
+    refs = {o.graph_object_ref for s in _suggestions(blind).values() for o in s.operands}
+    assert all(ref.startswith(f"public.{_MEASURE_TABLE}.") for ref in refs)
+
+
+def test_the_scope_key_is_the_canonical_class_tuple_not_the_role_claims(overlay_conn,
+                                                                        ftr_catalog):
+    """Never echoes role claims, and two functional roles with the same data scope share one key."""
+    left = _page(overlay_conn, roles=("feature_engineer",))
+    right = _page(overlay_conn, roles=("data_owner", "catalog_viewer"))
+    assert left.read_scope_key == right.read_scope_key
+    assert "feature_engineer" not in json.dumps(page_to_json(left))
+
+
+# ── the collection envelope ─────────────────────────────────────────────────────────────────────
+def test_the_collection_carries_the_anchor_the_counts_and_the_typed_rejections(overlay_conn,
+                                                                               ftr_catalog):
+    page = _page(overlay_conn)
+    collection = page.collection
+    assert collection.anchor_catalog_source == SOURCE
+    assert collection.anchor_table_ref == TABLE and collection.table_known is True
+    assert collection.anchor_column_ref is None
+    assert collection.summary.suggested == len(page.hits)
+    assert (collection.summary.design_checked + collection.summary.needs_external_validation
+            == collection.summary.suggested)
+    assert collection.rejections
+    for rejection in collection.rejections:
+        assert rejection.template_id and rejection.code and rejection.candidate_name
+    assert collection.neighbourhood is not None
+
+
+def test_a_rejection_names_its_template_instead_of_being_matched_by_name(overlay_conn,
+                                                                        ftr_catalog):
+    """V1's wire rejection carries only ``{name, reason, code}``. V2 carries the template the engine
+    already knew, so nothing downstream has to re-attribute a rejection by its rendered name."""
+    from featuregen.overlay.upload.contract.gate1 import _template_candidates
+
+    engine = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(), target_ref=None,
+                                  now=None, table=TABLE)
+    page = _page(overlay_conn)
+    assert [(r.template_id, r.candidate_name, r.code) for r in page.collection.rejections] == [
+        (rec.template_id, rec.candidate_name, rec.rejection.code)
+        for rec in engine.rejection_records]
+
+
+def test_the_groups_keep_v1s_entity_semantics(overlay_conn, ftr_catalog):
+    """The summary's ``groups`` is V1's ``entities``: NAMED buckets only. A grain bucket with no
+    resolvable entity is not an entity, and counting it would claim the catalog attested one."""
+    page = _page(overlay_conn)
+    v1 = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=TABLE)
+    assert page.collection.summary.groups == v1["summary"]["entities"]
+    assert [g.grain_refs[0][1] if g.grain_refs else "" for g in page.collection.groups] == [
+        g["entity_ref"] for g in v1["groups"]]
+    assert [g.entity.display_name if g.entity else "" for g in page.collection.groups] == [
+        g["entity_label"] for g in v1["groups"]]
+
+
+def test_the_unknown_table_page_echoes_the_requested_string_verbatim(overlay_conn, ftr_catalog):
+    """0F-11's two-case rule. There is no resolver output to carry, so substituting a normalized
+    spelling would answer a question the caller did not ask."""
+    page = _page(overlay_conn, "no_such_table")
+    assert page.collection.table_known is False
+    assert page.collection.anchor_table_ref == "no_such_table"
+    assert page.hits == () and page.collection.groups == ()
+    assert page.collection.neighbourhood is not None       # never None on the table route
+    assert page.collection.neighbourhood.as_metadata()["max_hops"] == 1
+
+
+# ── the byte-stable V1 adapter (0F-11) ──────────────────────────────────────────────────────────
+def _assert_v1_identical(conn, table, *, source=SOURCE, roles=(), **kw):
+    legacy = suggest_features_for_table(conn, catalog_source=source, table=table, roles=roles,
+                                        **kw)
+    rebuilt = to_table_suggestions_v1(
+        suggest_features_page_v2(conn, catalog_source=source, table=table, roles=roles, **kw))
+    assert rebuilt == legacy
+    assert json.dumps(rebuilt, sort_keys=True) == json.dumps(legacy, sort_keys=True)
+    return legacy
+
+
+@pytest.mark.parametrize("table", [TABLE, OTHER_TABLE, SIBLING_TABLE, "no_such_table"])
+def test_the_v1_adapter_reproduces_the_legacy_payload_byte_for_byte(overlay_conn, ftr_catalog,
+                                                                    table):
+    """The migration contract: every V1 byte has a V2 carrier, so the adapter never re-queries and
+    never invents. Asserted on the WHOLE payload, over every fixture state."""
+    _assert_v1_identical(overlay_conn, table)
+
+
+def test_the_v1_adapter_reproduces_the_widened_cross_table_payload(overlay_conn, join_catalog):
+    legacy = _assert_v1_identical(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE)
+    assert legacy["summary"]["suggested"] >= 1
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    widened = _assert_v1_identical(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE)
+    assert widened["summary"]["suggested"] > legacy["summary"]["suggested"]
+
+
+def test_the_v1_adapter_reproduces_the_all_hidden_table_payload(overlay_conn, join_catalog):
+    """The read-scoped unknown state (Task 0C defect 2) has to survive the round trip too."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND kind = 'column' AND table_name = %s",
+        (_JOIN_SOURCE, _ENTITY_TABLE))
+    blind = _assert_v1_identical(overlay_conn, _ENTITY_TABLE, source=_JOIN_SOURCE, roles=())
+    assert blind["table_known"] is False
+    _assert_v1_identical(overlay_conn, _ENTITY_TABLE, source=_JOIN_SOURCE,
+                         roles=("restricted_reader",))
+
+
+def test_the_v1_adapter_reproduces_a_truncated_neighbourhood_block(overlay_conn, join_catalog):
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    _assert_v1_identical(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE, max_hops=3)
+
+
+def test_the_v1_grain_table_is_the_entity_operands_table(overlay_conn, join_catalog):
+    """0F-11 derives ``grain_table`` from the carried operands: the SOURCE-ENTITY operand's table
+    when one bound, else the first bound operand's. The cross-table card is the case that would
+    expose a wrong derivation — it is grained on the master while sitting on the ledger's screen."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    rebuilt = to_table_suggestions_v1(_page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE))
+    cards = {s["name"]: s for g in rebuilt["groups"] for s in g["suggestions"]}
+    assert cards["balance_trend_90d"]["grain_table"] == _ENTITY_TABLE
+
+
+def test_the_v1_adapter_refuses_rather_than_return_a_quietly_different_body(overlay_conn,
+                                                                           ftr_catalog,
+                                                                           monkeypatch):
+    """A bounded operand list would make ``uses`` a lie, and a withheld card would make the whole
+    payload one. V1 has no carrier for either, so the adapter refuses — a migration tool that cannot
+    tell the two bodies apart is worse than none."""
+    monkeypatch.setattr(contract_module, "MAX_OPERANDS", 1)
+    page = _page(overlay_conn)
+    assert page.collection.omitted_counts["operands"] > 0
+    with pytest.raises(SuggestionV1ReconstructionError, match="without lying"):
+        to_table_suggestions_v1(page)
+
+
+def test_a_bound_that_bites_reports_what_it_left_out(overlay_conn, ftr_catalog, monkeypatch):
+    """Every bound reports its omissions rather than silently truncating — otherwise a card claims
+    it lists every operand it has."""
+    monkeypatch.setattr(contract_module, "MAX_OPERANDS", 1)
+    page = _page(overlay_conn)
+    assert all(len(hit.suggestion.operands) == 1 for hit in page.hits)
+    assert page.collection.omitted_counts["operands"] >= len(page.hits)
+
+
+# ── cost and read-only posture ──────────────────────────────────────────────────────────────────
+def test_the_v2_page_costs_one_bounded_statement_more_than_v1(overlay_conn, ftr_catalog,
+                                                              monkeypatch):
+    """N+1 PREVENTION. Context, profile and evidence are read for the WHOLE page in one bounded
+    statement, so the extra cost is a CONSTANT — it does not grow with the number of cards. Measured
+    on a narrow table and a wide one: if the reads were per card the two deltas would differ."""
+    counter = _statements(overlay_conn, monkeypatch)
+
+    def _delta(table):
+        counter[0] = 0
+        legacy = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=table)
+        v1_cost = counter[0]
+        counter[0] = 0
+        page = _page(overlay_conn, table)
+        return counter[0] - v1_cost, len(page.hits), legacy["summary"]["suggested"]
+
+    narrow_delta, narrow_hits, narrow_v1 = _delta(OTHER_TABLE)
+    wide_delta, wide_hits, wide_v1 = _delta(TABLE)
+    assert narrow_hits == narrow_v1 and wide_hits == wide_v1
+    assert wide_hits > narrow_hits, "the two fixtures have the same card count — not a proof"
+    assert narrow_delta == wide_delta == 1, (narrow_delta, wide_delta)
+
+
+def test_the_unknown_table_page_costs_exactly_the_resolve(overlay_conn, ftr_catalog, monkeypatch):
+    counter = _statements(overlay_conn, monkeypatch)
+    counter[0] = 0
+    _page(overlay_conn, "no_such_table")
+    assert counter[0] == 1
+
+
+def test_the_v2_read_writes_nothing(overlay_conn, ftr_catalog):
+    """Release A is strictly read-only. A row COUNT cannot see an in-place write, so the row CONTENT
+    is fingerprinted."""
+    tables = ("field_evidence", "field_decision_event", "graph_node", "graph_edge",
+              "contract_intent")
+
+    def fingerprint():
+        return tuple(overlay_conn.execute(
+            f"SELECT count(*), md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) "
+            f"FROM {t} t").fetchone() for t in tables)
+
+    before = fingerprint()
+    assert _page(overlay_conn).hits
+    assert fingerprint() == before
+
+
+# ── wire serialization ──────────────────────────────────────────────────────────────────────────
+def test_the_page_serializes_to_plain_json(overlay_conn, ftr_catalog):
+    body = page_to_json(_page(overlay_conn))
+    assert json.loads(json.dumps(body)) == body
+    assert body["read_mode"] == "on_demand" and body["projection"] is None
+    suggestion = body["hits"][0]["suggestion"]
+    assert suggestion["schema_version"] == SCHEMA_VERSION
+    assert suggestion["operands"] and suggestion["source_datasets"]
+    assert suggestion["grounding_trace_content_hash"]
+
+
+def test_the_wire_keeps_every_evidence_axis_on_an_attributed_value(overlay_conn, ftr_catalog):
+    """Rule 4: authority travels. A card that dropped the producer/strength/lifecycle axes would
+    render an LLM proposal and a human attestation identically."""
+    suggestion = page_to_json(_page(overlay_conn))["hits"][0]["suggestion"]
+    family = suggestion["recipe_family"]
+    assert set(family) == {"id", "display_name", "basis", "evidence", "operational_influence",
+                           "source_refs"}
+    assert family["evidence"] and set(family["evidence"][0]) == {
+        "producer", "strength", "lifecycle", "producer_ref", "evidence_id"}
