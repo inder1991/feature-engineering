@@ -19,6 +19,7 @@ No live anything: fixtures, the local Postgres dialect, and the same code path a
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.analysis.release_b_bank import build_bank
 from tests.featuregen.data_agent.pilot_fixture import (
     CURRENT_MONTH,
     CUSTOMER_SCHEMA,
@@ -30,7 +31,6 @@ from tests.featuregen.data_agent.pilot_fixture import (
     REPORT_CUTOFF,
     TRANSACTION_SCHEMA,
     TRANSACTION_TABLE,
-    create_pilot_tables,
 )
 from tests.featuregen.data_agent.test_analysis_ir import _policy as _eligibility
 
@@ -39,32 +39,20 @@ from featuregen.analysis.grounding import ground_analysis_plan
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure, Window
 from featuregen.data_agent.analysis import run_analysis
 from featuregen.data_agent.binding_store import (
-    declare_catalog_engine,
-    record_connection,
     resolve_table,
 )
-from featuregen.data_agent.connection import DataSourceConnectionV1
 from featuregen.data_agent.sql_postgres import PostgresDialect
-from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
-from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
-from featuregen.overlay.upload.serving_policy_store import publish_serving_policy
 from featuregen.overlay.upload.source_selection import (
     CandidateDisposition,
     DatasetNeedRole,
-    DatasetServingPolicyRevisionV1,
     SelectionBasis,
-    ServingPurpose,
-    human_declaration_provenance,
 )
 from featuregen.overlay.upload.temporal_policy import (
-    DatasetTemporalPolicyRevisionV1,
     TemporalSelectionKind,
 )
 from featuregen.overlay.upload.temporal_policy_store import (
     current_temporal_policy,
-    publish_temporal_policy,
 )
 from featuregen.overlay.upload.temporal_resolver import attribution_policy_for
 
@@ -93,55 +81,15 @@ QUESTION = ("customers whose transaction count decreased last completed month, "
 def bank(db, monkeypatch):
     """The pilot's real tables PLUS the catalog, policies and physical routing that address them.
 
-    `database_name` is the test database on purpose: the derived binding's `table_id` must equal
-    the one `PILOT_JOIN_EVIDENCE` was observed against, or the verified-join gate would refuse the
-    very plan this acceptance is about — which is the gate working, and would hide the acceptance.
+    The setup now lives in `release_b_bank` because Task 9's seal/revalidation/explain/execute
+    suites need the SAME bank, and three hand-rolled copies of a fixture this load-bearing is how
+    two suites end up asserting against two different banks and both passing. Behaviour is
+    unchanged: `database_name` is still the test database, so the derived binding's `table_id`
+    equals the one `PILOT_JOIN_EVIDENCE` was observed against — otherwise the verified-join gate
+    would refuse the very plan this acceptance is about, which is the gate working and would hide
+    the acceptance.
     """
-    monkeypatch.setenv("FEATUREGEN_DATASET_PROFILES", "1")
-    monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
-    create_pilot_tables(db)
-    build_graph(db, _SRC, [
-        CanonicalRow(_SRC, CUSTOMER_TABLE, "cif_id", "text", is_grain=True, entity="Customer"),
-        CanonicalRow(_SRC, TRANSACTION_TABLE, "cif_id", "text"),
-        CanonicalRow(_SRC, TRANSACTION_TABLE, "tran_month", "text", as_of=True),
-        # The ARCHIVE copy: same shape, same entity — indistinguishable to the catalog, which is
-        # exactly why a declaration rather than a ranking has to choose between them.
-        CanonicalRow(_SRC, _ARCHIVE_TABLE, "cif_id", "text"),
-        CanonicalRow(_SRC, _ARCHIVE_TABLE, "tran_month", "text", as_of=True),
-        CanonicalRow(_SRC, DIMENSION_TABLE, "cif_id", "text", is_grain=True),
-        CanonicalRow(_SRC, DIMENSION_TABLE, "segment", "text"),
-        CanonicalRow(_SRC, DIMENSION_TABLE, "sector", "text"),
-        CanonicalRow(_SRC, DIMENSION_TABLE, "effective_from", "timestamp"),
-        CanonicalRow(_SRC, DIMENSION_TABLE, "effective_to", "timestamp"),
-        CanonicalRow(_SRC, DIMENSION_TABLE, "is_current", "boolean"),
-    ])
-    db.execute("UPDATE graph_node SET schema_name = %s WHERE catalog_source = %s",
-               (CUSTOMER_SCHEMA, _SRC))
-    record_connection(db, DataSourceConnectionV1(
-        connection_id="pilot-pg", environment_id="dev", kind="postgres", host="127.0.0.1",
-        port=5432, auth_mechanism="password", secret_ref="vault://featuregen/pg",
-        execution_principal="svc_ro", allowed_schemas=frozenset({CUSTOMER_SCHEMA}), active=True),
-        tier="pilot", database_name="featuregen_test")
-    declare_catalog_engine(db, catalog_source=_SRC, engine="postgres", tier="pilot",
-                           declared_by="user:priya")
-
-    # The EVENT source is declared by policy — the archive is eligible, the live table preferred.
-    publish_serving_policy(db, DatasetServingPolicyRevisionV1(
-        entity_id="customer", need_role=DatasetNeedRole.EVENT_SOURCE,
-        serving_purpose=ServingPurpose.ANALYTICAL,
-        eligible_dataset_refs=(TRAN, ARCHIVE), preferred_dataset_refs=(TRAN,),
-        provenance=human_declaration_provenance(producer_ref="user:priya")),
-        expected_pointer_version=0, actor="user:priya")
-    # The dimension source keeps SCD2 history: a HISTORICAL question reads the row valid at the
-    # cutoff, and a CURRENT one would read the flagged row — two different answers, declared.
-    publish_temporal_policy(db, DatasetTemporalPolicyRevisionV1(
-        dataset_logical_ref=SEG, temporal_storage_model=TemporalStorageModel.SCD2,
-        current_selection=TemporalSelectionKind.CURRENT_RECORD,
-        historical_selection=TemporalSelectionKind.VALID_AT_REPORT_CUTOFF,
-        effective_from_ref=SEG_FROM, effective_to_ref=SEG_TO, current_flag_ref=SEG_FLAG,
-        provenance=human_declaration_provenance(producer_ref="user:priya")),
-        expected_pointer_version=0, actor="user:priya")
-    return db
+    return build_bank(db, monkeypatch)
 
 
 def _plan() -> AnalysisPlanV1:

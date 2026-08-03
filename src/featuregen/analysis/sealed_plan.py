@@ -131,6 +131,12 @@ class SealedSourceDecisionV1:
     entity_id: str
     serving_purpose: str
     execution_tier: str
+    #: The remaining two ``DatasetNeedV1`` fields. They are here for ONE reason: without them the
+    #: immutable ``DatasetSourceSelectionV1`` cannot be rebuilt from the seal, and a sealed record
+    #: that cannot reproduce the hash it is filed under is a SUMMARY of the decision rather than
+    #: the decision. Both enter that contract's content hash.
+    required_concepts: tuple[str, ...]
+    explicit_dataset_ref: str | None
     dataset_ref: str
     #: PIN 1 (``dataset_profile``).
     dataset_profile_hash: str
@@ -160,6 +166,8 @@ class SealedSourceDecisionV1:
             entity_id=need.entity_id,
             serving_purpose=need.serving_purpose.value,
             execution_tier=need.execution_tier.value,
+            required_concepts=tuple(need.required_concepts),
+            explicit_dataset_ref=need.explicit_dataset_ref,
             dataset_ref=selection.selected_dataset_ref,
             dataset_profile_hash=selection.selected_dataset_profile_hash,
             serving_policy_revision_id=selection.serving_policy_revision_id,
@@ -170,14 +178,45 @@ class SealedSourceDecisionV1:
             authority_role=selection.authority_role,
             considered_candidates=tuple(selection.considered_candidates))
 
+    def need(self) -> Any:
+        """The immutable ``DatasetNeedV1`` this decision answered, rebuilt from the seal."""
+        from featuregen.overlay.upload.source_selection import DatasetNeedV1
+
+        return DatasetNeedV1(
+            entity_id=self.entity_id, need_role=self.need_role,
+            serving_purpose=self.serving_purpose, execution_tier=self.execution_tier,
+            required_concepts=self.required_concepts,
+            explicit_dataset_ref=self.explicit_dataset_ref)
+
+    def rebuild(self) -> DatasetSourceSelectionV1:
+        """The immutable ``DatasetSourceSelectionV1``, reconstructed from the sealed payload.
+
+        Its ``content_hash`` MUST equal :attr:`source_selection_hash`; revalidation checks exactly
+        that before it looks at the catalog, so a tampered or truncated seal is caught as
+        corruption rather than silently re-derived into a decision nobody made.
+        """
+        return DatasetSourceSelectionV1(
+            need=self.need(),
+            selected_dataset_ref=self.dataset_ref,
+            selected_dataset_profile_hash=self.dataset_profile_hash,
+            selected_binding_revision_id=self.binding_revision_id,
+            serving_policy_revision_id=self.serving_policy_revision_id,
+            authority_role=self.authority_role,
+            authority_basis=self.authority_basis,
+            selection_basis=self.selection_basis,
+            considered_candidates=self.considered_candidates)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SealedSourceDecisionV1:
         policy_id = payload.get("serving_policy_revision_id")
+        explicit = payload.get("explicit_dataset_ref")
         return cls(
             need_role=_text(payload.get("need_role"), what="need_role"),
             entity_id=_text(payload.get("entity_id"), what="entity_id"),
             serving_purpose=_text(payload.get("serving_purpose"), what="serving_purpose"),
             execution_tier=_text(payload.get("execution_tier"), what="execution_tier"),
+            required_concepts=tuple(str(c) for c in payload.get("required_concepts") or ()),
+            explicit_dataset_ref=(None if explicit is None else str(explicit)),
             dataset_ref=_text(payload.get("dataset_ref"), what="dataset_ref"),
             dataset_profile_hash=_text(payload.get("dataset_profile_hash"),
                                        what="dataset_profile_hash"),
@@ -204,6 +243,8 @@ class SealedSourceDecisionV1:
             "entity_id": self.entity_id,
             "serving_purpose": self.serving_purpose,
             "execution_tier": self.execution_tier,
+            "required_concepts": list(self.required_concepts),
+            "explicit_dataset_ref": self.explicit_dataset_ref,
             "dataset_ref": self.dataset_ref,
             "dataset_profile_hash": self.dataset_profile_hash,
             "serving_policy_revision_id": self.serving_policy_revision_id,
@@ -230,6 +271,11 @@ class SealedRowDecisionV1:
     #: The cutoff's REF, never its value (§6.5). A literal here would re-key the same governed
     #: decision on every day it was replayed.
     cutoff_value_ref: str | None = None
+    #: WHICH ROWS, in the row rule's own words — the half-open ``[from, to)`` pair for an SCD2
+    #: cutoff selection, the snapshot comparison for a latest-snapshot one. Sealed because "the row
+    #: semantics" is half of what plan preview has to render (§5.7): "valid at the report cutoff"
+    #: is a label, and the two column refs and two operators under it are the claim.
+    predicate_payloads: tuple[Mapping[str, Any], ...] = ()
 
     @classmethod
     def from_selection(cls, row: DatasetRowSelectionV1) -> SealedRowDecisionV1:
@@ -241,7 +287,18 @@ class SealedRowDecisionV1:
             temporal_policy_revision_id=row.temporal_policy_revision_id,
             row_selection_hash=row.content_hash,
             selection_kind=row.selection_kind.value,
-            cutoff_value_ref=row.cutoff_value_ref)
+            cutoff_value_ref=row.cutoff_value_ref,
+            predicate_payloads=tuple(dict(p) for p in row.predicate_payloads))
+
+    def rebuild(self) -> DatasetRowSelectionV1:
+        """The immutable ``DatasetRowSelectionV1``, reconstructed from the sealed payload."""
+        return DatasetRowSelectionV1(
+            dataset_logical_ref=self.dataset_ref,
+            dataset_profile_hash=self.dataset_profile_hash,
+            temporal_policy_revision_id=self.temporal_policy_revision_id,
+            selection_kind=self.selection_kind,
+            cutoff_value_ref=self.cutoff_value_ref,
+            predicate_payloads=tuple(dict(p) for p in self.predicate_payloads))
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SealedRowDecisionV1:
@@ -255,7 +312,8 @@ class SealedRowDecisionV1:
             row_selection_hash=_text(payload.get("row_selection_hash"),
                                      what="row_selection_hash"),
             selection_kind=_text(payload.get("selection_kind"), what="selection_kind"),
-            cutoff_value_ref=(None if cutoff is None else str(cutoff)))
+            cutoff_value_ref=(None if cutoff is None else str(cutoff)),
+            predicate_payloads=tuple(dict(p) for p in payload.get("predicate_payloads") or ()))
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -265,6 +323,7 @@ class SealedRowDecisionV1:
             "row_selection_hash": self.row_selection_hash,
             "selection_kind": self.selection_kind,
             "cutoff_value_ref": self.cutoff_value_ref,
+            "predicate_payloads": [dict(p) for p in self.predicate_payloads],
         }
 
 
