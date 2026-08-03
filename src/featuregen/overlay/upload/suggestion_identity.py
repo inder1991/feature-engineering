@@ -18,10 +18,13 @@ relationship path" into ``suggestion_id``. ``GroundingDecisionTraceV1.ordered_re
 is, as amended in 0F-7, a DEDUPLICATED LEG SET across the candidate's per-operand paths — so two
 candidates whose operands SWAPPED chains carry the identical field and an identity derived from it
 would fuse them into one card, breaking rule 23. The identity-bearing material named by that
-amendment is the per-operand ``JOIN_PATH`` pin assignment: ``(dependency_key, content_hash)`` pairs,
-where the content is :func:`~featuregen.overlay.upload.grounding_trace.join_path_pin_content` — that
-operand's endpoints, outcome and ordered leg hashes. :func:`join_path_assignment` reads exactly
-those pins and nothing else.
+amendment is the per-operand ``JOIN_PATH`` pin assignment — but projected onto its LOGICAL identity,
+``(relationship_kind, from_ref, to_ref)`` per leg, NOT the pin's ``content_hash``. That hash also
+covers ``approved_join_fact_key`` / ``approved_join_status`` / ``edge_authority``, so hashing it made
+an admin CONFIRMING a file-declared join re-key every suggestion crossing it — which rule 23
+forbids in as many words ("the logical path enters ``suggestion_id``; exact realization/dependency
+revisions enter the revision"). :func:`join_path_assignment` performs that projection and fails
+closed if it cannot.
 
 The alternative the amendment also permits — hashing ``trace_content_hash`` itself — is deliberately
 NOT taken for ``suggestion_id``: that hash also covers the validation status, the requirements and
@@ -53,6 +56,7 @@ __all__ = [
     "SUGGESTION_REVISION_CONTRACT",
     "SUGGESTION_CONTRACT_VERSION",
     "SuggestionReadScopeV1",
+    "UnresolvableRelationshipPath",
     "build_read_scope",
     "dependency_content_hashes",
     "join_path_assignment",
@@ -111,22 +115,69 @@ def build_read_scope(roles: Iterable[str], *, tenant: str | None = None) -> Sugg
 
 
 # ── reading the identity-bearing material off a trace ───────────────────────────────────────────
-def join_path_assignment(trace: GroundingDecisionTraceV1 | None
-                         ) -> tuple[tuple[str, str], ...]:
-    """The per-operand relationship-path ASSIGNMENT: sorted ``(dependency_key, content_hash)``
-    pairs of the trace's ``JOIN_PATH`` pins.
+class UnresolvableRelationshipPath(RuntimeError):
+    """A ``JOIN_PATH`` pin names a realization the trace's own path does not contain.
 
-    This — not ``ordered_relationship_path`` — is what rule 23 rests on: the flat leg set cannot
-    tell two candidates apart when their operands swapped chains, while the pins can, because each
-    pin's content is that operand's own endpoints, outcome and ordered leg hashes. Sorted because
-    the assignment is a mapping, not a sequence: which operand the gauntlet classified first is not
-    meaning. Every OTHER pin kind (governed reads, structural lookups, read scope) is deliberately
-    excluded — it describes the content a revision rests on, not which candidate this is.
+    The logical projection below cannot be completed, so there is no honest identity to mint. The
+    caller REFUSES the candidate and counts the refusal; it must never fall back to the physical
+    hash, which would silently reintroduce the churn that projection exists to prevent.
+    """
+
+
+#: One traversed leg's LOGICAL identity: what kind of relationship, from where, to where. Direction
+#: is preserved (a reverse hop is a different traversal); attestation state deliberately is not.
+_LogicalLeg = tuple[str, str, str, str, str]
+
+
+def join_path_assignment(trace: GroundingDecisionTraceV1 | None
+                         ) -> tuple[tuple[str, tuple[_LogicalLeg, ...]], ...]:
+    """The per-operand relationship-path ASSIGNMENT, projected onto its LOGICAL identity.
+
+    For each ``JOIN_PATH`` pin: its ``dependency_key`` (the operand) paired with that operand's own
+    ordered legs, each reduced to ``(relationship_kind, from_ref, to_ref)``. The legs are recovered
+    by joining the pin's ``path_realization_hashes`` against ``ordered_relationship_path``, whose
+    entries carry kind and endpoints alongside their realization hash. Sorted by operand, because
+    the assignment is a mapping, not a sequence.
+
+    **Why the projection, and not the pin's ``content_hash``.** That hash covers
+    :func:`~featuregen.overlay.upload.grounding_trace.join_path_pin_content`, whose per-leg
+    realization content includes ``approved_join_fact_key``, ``approved_join_status`` and
+    ``edge_authority``. Hashing it into ``suggestion_id`` meant that an admin CONFIRMING a
+    file-declared join — same recipe, same columns, same endpoints, same direction, pure governance
+    provenance — minted a brand-new stable identity for every suggestion crossing it. Plan rule 23
+    says the opposite in as many words: "The logical path enters ``suggestion_id``; exact
+    realization/dependency revisions enter the revision." Those realization hashes DO travel, in
+    ``suggestion_revision_id``, via :func:`dependency_content_hashes`.
+
+    **Rule 23 is still satisfied**, on both of its limbs: a different ordered path changes the leg
+    tuple, and two candidates whose operands SWAPPED chains differ because the tuple is keyed per
+    operand.
+
+    Raises:
+        UnresolvableRelationshipPath: a pinned realization has no matching path entry. Fail closed
+            — an identity built from a partial chain is not the identity of anything.
     """
     if trace is None:
         return ()
-    return tuple(sorted((pin.dependency_key, pin.content_hash)
-                        for pin in trace.dependency_pins if pin.dependency_kind == JOIN_PATH))
+    legs_by_hash = {leg.realization_content_hash: leg
+                    for leg in trace.ordered_relationship_path
+                    if leg.realization_content_hash is not None}
+    assignment: list[tuple[str, tuple[_LogicalLeg, ...]]] = []
+    for pin in trace.dependency_pins:
+        if pin.dependency_kind != JOIN_PATH:
+            continue
+        legs: list[_LogicalLeg] = []
+        for realization_hash in pin.path_realization_hashes:
+            leg = legs_by_hash.get(realization_hash)
+            if leg is None:
+                raise UnresolvableRelationshipPath(
+                    f"JOIN_PATH pin {pin.dependency_key!r} names realization "
+                    f"{realization_hash!r}, which the trace's ordered_relationship_path does not "
+                    f"contain; the logical chain cannot be projected and no identity is minted")
+            legs.append((leg.relationship_kind, leg.from_ref[0], leg.from_ref[1],
+                         leg.to_ref[0], leg.to_ref[1]))
+        assignment.append((pin.dependency_key, tuple(legs)))
+    return tuple(sorted(assignment, key=lambda entry: entry[0]))
 
 
 def dependency_content_hashes(trace: GroundingDecisionTraceV1 | None) -> tuple[str, ...]:
@@ -153,7 +204,8 @@ def suggestion_id(*, template_id: str | None,
                   entity_id: str | None,
                   grain_refs: Sequence[tuple[str, str]],
                   time_ref: tuple[str, str] | None,
-                  relationship_path_assignment: Sequence[tuple[str, str]]) -> str:
+                  relationship_path_assignment: Sequence[tuple[str, Sequence[_LogicalLeg]]]
+                  ) -> str:
     """The stable logical-candidate identity (0F-10).
 
     ``operands`` are ``(catalog_source, logical_ref, recipe_role)`` triples — the LOGICAL ref, read
@@ -177,9 +229,12 @@ def suggestion_id(*, template_id: str | None,
             "grain_refs": [[source, ref] for source, ref in grain_refs],
             "time_ref": _ref_json(time_ref),
         },
-        "relationship_path_assignment": sorted([key, content_hash]
-                                               for key, content_hash in
-                                               relationship_path_assignment),
+        # Per-operand LOGICAL chains (see `join_path_assignment`): the ORDER of a chain is meaning,
+        # the order of the operands is not. Governance attestation is deliberately absent — it
+        # belongs to the revision (rule 23).
+        "relationship_path_assignment": sorted(
+            ([key, [list(leg) for leg in legs]] for key, legs in relationship_path_assignment),
+            key=lambda entry: entry[0]),
     }
     return contract_hash_v1(SUGGESTION_ID_CONTRACT, SUGGESTION_CONTRACT_VERSION, payload)
 

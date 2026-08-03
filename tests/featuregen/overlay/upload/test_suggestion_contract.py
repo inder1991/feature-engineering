@@ -398,6 +398,8 @@ def test_catalog_domain_wording_is_attributed_text_and_never_a_facet(overlay_con
         assert isinstance(term, AttributedTextV1)
         assert term.basis == "catalog_resolved" and term.operational_influence is None
         assert term.source_refs
+        # AND its provenance axes: rules 4/5 forbid an LLM proposal rendering like an attestation
+        assert term.evidence
 
 
 def test_a_registered_controlled_resolver_turns_the_same_wording_into_a_facet(overlay_conn,
@@ -420,6 +422,75 @@ def test_a_registered_controlled_resolver_turns_the_same_wording_into_a_facet(ov
         assert hit.contextual_domain_terms == ()
     finally:
         resolvers.reset_resolver("business_domain")
+
+
+def test_a_proposed_domain_does_not_render_like_an_attested_one(overlay_conn, ftr_catalog):
+    """RULES 4 AND 5. The catalog's ``domain`` is LLM-enriched at ingest, so its axes are
+    ``llm``/``proposed`` — and a card that dropped them would show the same string a human had
+    attested. Read from ``field_evidence``, the real trail the enrichment writer left, at both the
+    column's own ref and (for the INHERITED case) its table's."""
+    terms = [t for hit in _page(overlay_conn).hits
+             for t in hit.suggestion.contextual_domain_terms]
+    assert terms
+    axes = {(e.producer.value, e.strength.value) for t in terms for e in t.evidence}
+    # exactly the axes field_evidence actually holds — asserted against the table, not guessed
+    recorded = {tuple(row) for row in overlay_conn.execute(
+        "SELECT DISTINCT producer, strength FROM field_evidence "
+        "WHERE field_name = 'domain' AND lifecycle = 'active'").fetchall()}
+    assert recorded and axes and axes <= recorded, (axes, recorded)
+    assert ("legacy", "proposed") not in axes          # a real trail was found, not the fallback
+    assert all(e.lifecycle.value == "active" for t in terms for e in t.evidence)
+
+    # STRENGTHEN the evidence and the card follows — proof it is READ, not hardcoded
+    overlay_conn.execute(
+        "UPDATE field_evidence SET producer = 'human', strength = 'confirmed' "
+        "WHERE field_name = 'domain'")
+    after = {(e.producer.value, e.strength.value)
+             for hit in _page(overlay_conn).hits
+             for t in hit.suggestion.contextual_domain_terms for e in t.evidence}
+    assert after == {("human", "confirmed")}
+
+
+def test_a_wording_with_no_recorded_evidence_is_explicitly_unattributed(overlay_conn,
+                                                                        ftr_catalog):
+    """Silence is the failure mode this closes: an empty evidence tuple reads as "nothing to say"
+    and renders exactly like an attested value. A projected wording whose trail was retired carries
+    the ``legacy``/``proposed`` marker — the vocabulary's own bucket for "producer not classified"
+    — so a reader can always tell."""
+    overlay_conn.execute("DELETE FROM field_evidence WHERE field_name = 'domain'")
+    terms = [t for hit in _page(overlay_conn).hits
+             for t in hit.suggestion.contextual_domain_terms]
+    assert terms
+    for term in terms:
+        assert term.evidence
+        assert {(e.producer.value, e.strength.value) for e in term.evidence} == {
+            ("legacy", "proposed")}
+
+
+def test_a_governed_entity_is_distinguishable_from_a_file_declared_one(overlay_conn,
+                                                                       ftr_catalog):
+    """The entity axis has no ``field_evidence`` row — its provenance is the governed projection on
+    the node itself (migration 1015), so it costs no statement. A VERIFIED ``entity_assignment``
+    is a human dual-owner confirmation and says so; anything else stays proposed."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET entity = 'customer' "
+        "WHERE catalog_source = %s AND object_ref = %s", (SOURCE, f"public.{TABLE}.cif_id"))
+    proposed = [t for hit in _page(overlay_conn).hits
+                for t in hit.suggestion.contextual_entity_terms]
+    assert proposed
+    assert all(("human", "confirmed") not in {(e.producer.value, e.strength.value)
+                                              for e in t.evidence} for t in proposed)
+
+    overlay_conn.execute(
+        "UPDATE graph_node SET entity_status = 'VERIFIED', entity_fact_key = 'efk-1', "
+        "entity_fact_event_id = 'efe-1' WHERE catalog_source = %s AND object_ref = %s",
+        (SOURCE, f"public.{TABLE}.cif_id"))
+    governed = [t for hit in _page(overlay_conn).hits
+                for t in hit.suggestion.contextual_entity_terms]
+    axes = {(e.producer.value, e.strength.value) for t in governed for e in t.evidence}
+    assert ("human", "confirmed") in axes
+    refs = {(e.producer_ref, e.evidence_id) for t in governed for e in t.evidence}
+    assert ("efk-1", "efe-1") in refs
 
 
 def test_the_entity_facet_is_the_engines_own_controlled_entity_link(overlay_conn, ftr_catalog):
@@ -730,6 +801,88 @@ def test_a_hidden_operand_withholds_the_whole_suggestion(overlay_conn, ftr_catal
     assert all(victim.suggestion_id not in g.suggestion_ids for g in after.collection.groups)
 
 
+def test_the_wire_cannot_tell_that_anything_was_withheld(overlay_conn, ftr_catalog, monkeypatch):
+    """RULE 9, the last inch. Publishing ``withheld_read_scope: 3`` tells a caller that three
+    suggestions exist which they may not see — the COUNT is the disclosure, exactly the "leak
+    through facets, counts, snippets or provenance" the rule names. The server still counts it (for
+    telemetry and for the V1-safety gate); the wire cannot distinguish "nothing was withheld" from
+    "N were withheld"."""
+    clean = page_to_json(_page(overlay_conn))
+    victim = _page(overlay_conn).hits[0].suggestion
+    real = contract_module._read_node_facts
+
+    def _blind(conn, pairs, roles):
+        facts = real(conn, pairs, roles)
+        return {key: value for key, value in facts.items()
+                if key[1] != victim.operands[0].graph_object_ref}
+
+    monkeypatch.setattr(contract_module, "_read_node_facts", _blind)
+    page = _page(overlay_conn)
+    withheld = page_to_json(page)
+
+    assert page.collection.omitted_counts["withheld_read_scope"] >= 1     # counted server-side
+    assert "withheld_read_scope" not in withheld["collection"]["omitted_counts"]
+    assert withheld["collection"]["omitted_counts"] == clean["collection"]["omitted_counts"]
+    assert not [k for k in json.dumps(withheld).split('"') if "withheld" in k]
+
+
+def test_a_scope_independent_omission_is_still_published(overlay_conn, ftr_catalog, monkeypatch):
+    """The suppression is surgical, not a blanket: a bound that bit is a property of the SERVER's
+    limits, identical for every caller, so hiding it would cost honesty for no privacy."""
+    monkeypatch.setattr(contract_module, "MAX_OPERANDS", 1)
+    body = page_to_json(_page(overlay_conn))
+    assert body["collection"]["omitted_counts"]["operands"] > 0
+
+
+def test_a_candidate_with_no_grounding_context_is_withheld_not_guessed(overlay_conn, ftr_catalog,
+                                                                       monkeypatch):
+    """The 2A freeze makes ``contexts[candidate_key]`` THE identity join. Without it there are no
+    logical refs, no recipe roles, no bound parameters and no recipe revision — a card built anyway
+    would carry a deterministic-but-WRONG identity, silently. Every other admission failure refuses;
+    so does this one."""
+    before = _page(overlay_conn)
+    assert before.hits
+    _patch_engine(monkeypatch, lambda r: replace(r, contexts={}))
+    after = _page(overlay_conn)
+    assert after.hits == ()
+    assert after.collection.omitted_counts["withheld_missing_context"] == len(before.hits)
+    assert after.collection.summary.suggested == 0
+    with pytest.raises(SuggestionV1ReconstructionError):
+        to_table_suggestions_v1(after)
+
+
+def test_a_candidate_whose_path_cannot_be_projected_is_withheld(overlay_conn, join_catalog,
+                                                                monkeypatch):
+    """FAIL CLOSED (finding 1's other half). If a JOIN_PATH pin names a realization the trace's own
+    path does not contain, the logical chain cannot be projected — and falling back to the physical
+    hash would silently restore the governance churn. Refuse and count."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    before = _page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE)
+    crossed = [h for h in before.hits if h.suggestion.relationship_dependencies]
+    assert crossed, "no candidate crossed the join — the proof would be vacuous"
+
+    def _corrupt_the_pin(result):
+        """Repoint ONE JOIN_PATH pin at a realization the path does not contain. The path itself is
+        left intact, so the completeness gate still passes and this refusal is reached in
+        isolation."""
+        ideas = []
+        for idea in result.ideas:
+            trace = idea.grounding_trace
+            if trace is not None and trace.ordered_relationship_path:
+                pins = tuple(
+                    replace(pin, path_realization_hashes=("no-such-realization",))
+                    if pin.dependency_kind == "join_path" else pin
+                    for pin in trace.dependency_pins)
+                idea = replace(idea, grounding_trace=replace(trace, dependency_pins=pins))
+            ideas.append(idea)
+        return replace(result, ideas=ideas)
+
+    _patch_engine(monkeypatch, _corrupt_the_pin)
+    after = _page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE)
+    assert after.collection.omitted_counts["withheld_unresolvable_path"] == len(crossed)
+    assert len(after.hits) == len(before.hits) - len(crossed)
+
+
 def test_on_demand_grounding_differs_correctly_across_public_and_sensitive_callers(overlay_conn,
                                                                                    join_catalog):
     """The scope is DERIVED from the caller's canonical allowed classes and threaded into grounding,
@@ -893,9 +1046,11 @@ def test_a_bound_that_bites_reports_what_it_left_out(overlay_conn, ftr_catalog, 
 # ── cost and read-only posture ──────────────────────────────────────────────────────────────────
 def test_the_v2_page_costs_one_bounded_statement_more_than_v1(overlay_conn, ftr_catalog,
                                                               monkeypatch):
-    """N+1 PREVENTION. Context, profile and evidence are read for the WHOLE page in one bounded
-    statement, so the extra cost is a CONSTANT — it does not grow with the number of cards. Measured
-    on a narrow table and a wide one: if the reads were per card the two deltas would differ."""
+    """N+1 PREVENTION. Visibility+context (one statement) and the provenance axes behind every
+    domain wording (one more) are read for the WHOLE page, so the extra cost is a CONSTANT — it does
+    not grow with the number of cards. Measured on a narrow table and a wide one: if either read
+    were per card the two deltas would differ, which is the property this pins. The absolute number
+    is secondary; the CONSTANCY is the contract."""
     counter = _statements(overlay_conn, monkeypatch)
 
     def _delta(table):
@@ -910,7 +1065,7 @@ def test_the_v2_page_costs_one_bounded_statement_more_than_v1(overlay_conn, ftr_
     wide_delta, wide_hits, wide_v1 = _delta(TABLE)
     assert narrow_hits == narrow_v1 and wide_hits == wide_v1
     assert wide_hits > narrow_hits, "the two fixtures have the same card count — not a proof"
-    assert narrow_delta == wide_delta == 1, (narrow_delta, wide_delta)
+    assert narrow_delta == wide_delta == 2, (narrow_delta, wide_delta)
 
 
 def test_the_unknown_table_page_costs_exactly_the_resolve(overlay_conn, ftr_catalog, monkeypatch):
@@ -945,6 +1100,78 @@ def test_the_page_serializes_to_plain_json(overlay_conn, ftr_catalog):
     assert suggestion["schema_version"] == SCHEMA_VERSION
     assert suggestion["operands"] and suggestion["source_datasets"]
     assert suggestion["grounding_trace_content_hash"]
+
+
+# ── governance provenance must not re-key a candidate (rule 23 / rule 24) ───────────────────────
+def test_confirming_a_join_moves_the_revision_but_never_the_suggestion_id(overlay_conn,
+                                                                          join_catalog):
+    """THE MISSING MUTATION. An admin confirms a file-declared join — REAL drift through the real
+    graph, not a hand-edited dataclass: `approved_join_fact_key` NULL/NULL becomes
+    'ajf-verified'/'VERIFIED'. Same recipe, same columns, same endpoints, same direction, same
+    traversal. Nothing about WHICH CANDIDATE this is has changed, so `suggestion_id` must not move.
+
+    Its `suggestion_revision_id` MUST move: the governed safety evidence is exactly the kind of
+    content the revision exists to track, and the card's own RELATIONSHIP_UNCONFIRMED warning
+    disappears with it.
+
+    This is the defect the first implementation shipped: the identity hashed the JOIN_PATH pin's
+    content_hash, which covers the realization content — fact key, status and edge authority —
+    so confirming a join re-keyed every suggestion that crossed it."""
+    _join_edge(overlay_conn, fact_key=None, status=None)          # file-declared, unconfirmed
+    before = _suggestions(_page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE))
+    card = before["balance_trend_90d"]
+    assert card.relationship_dependencies, "no join was crossed — the proof would be vacuous"
+    assert "RELATIONSHIP_UNCONFIRMED" in _codes(card)
+
+    overlay_conn.execute(
+        "UPDATE graph_edge SET approved_join_fact_key = 'ajf-verified', "
+        "approved_join_status = 'VERIFIED' WHERE catalog_source = %s AND kind = 'joins'",
+        (_JOIN_SOURCE,))
+    after = _suggestions(_page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE))
+    confirmed = after["balance_trend_90d"]
+
+    # the drift really landed: the leg's realization hash and its review status both moved
+    assert "RELATIONSHIP_UNCONFIRMED" not in _codes(confirmed)
+    assert {leg.review_status for leg in confirmed.relationship_dependencies} == {"VERIFIED"}
+    assert ({leg.realization_content_hash for leg in card.relationship_dependencies}
+            != {leg.realization_content_hash for leg in confirmed.relationship_dependencies})
+
+    assert confirmed.suggestion_id == card.suggestion_id
+    assert confirmed.suggestion_revision_id != card.suggestion_revision_id
+    # ...and every OTHER card on the page is equally unmoved
+    assert {s.suggestion_id for s in after.values()} >= {s.suggestion_id for s in before.values()}
+
+
+def test_a_genuinely_different_logical_path_still_forks_the_identity(overlay_conn, join_catalog):
+    """The complement, so the fix above cannot be "stop hashing the path at all": REMOVE the join
+    and the same recipe reaching the same measure has no traversal, which is a different logical
+    candidate."""
+    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
+    crossed = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                                 source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert crossed.relationship_dependencies
+    # the same candidate on the table it is GRAINED on needs no traversal to reach its own columns
+    on_entity = _suggestions(_page(overlay_conn, _ENTITY_TABLE,
+                                   source=_JOIN_SOURCE))["balance_trend_90d"]
+    assert on_entity.suggestion_id == crossed.suggestion_id      # anchor independence, unbroken
+    assert on_entity.relationship_dependencies == crossed.relationship_dependencies
+
+
+def test_the_identity_is_independent_of_the_presentation_bound(overlay_conn, ftr_catalog,
+                                                               monkeypatch):
+    """MAX_OPERANDS is a PRESENTATION bound and the plan keeps page truncation out of the canonical
+    revision. Computing identity from the truncated list would emit, on a page where the bound bites,
+    cards whose stable ids belong to a different logical candidate — one with fewer operands, which
+    nothing ever grounded, and which a global page would then fail to deduplicate against."""
+    full = {h.suggestion.template_id: h.suggestion for h in _page(overlay_conn).hits}
+    monkeypatch.setattr(contract_module, "MAX_OPERANDS", 1)
+    bounded = {h.suggestion.template_id: h.suggestion for h in _page(overlay_conn).hits}
+    assert set(bounded) == set(full)
+    truncated = [s for s in bounded.values() if len(s.operands) == 1]
+    assert truncated and any(len(full[s.template_id].operands) > 1 for s in truncated)
+    for template_id, suggestion in bounded.items():
+        assert suggestion.suggestion_id == full[template_id].suggestion_id, template_id
+        assert suggestion.suggestion_revision_id == full[template_id].suggestion_revision_id
 
 
 def test_one_template_index_is_built_once_not_scanned_per_suggestion(overlay_conn, ftr_catalog):

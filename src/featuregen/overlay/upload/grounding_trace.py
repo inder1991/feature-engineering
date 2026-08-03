@@ -196,6 +196,18 @@ class GroundingDependencyPinV1:
     content_hash: str
     current_revision_id: str | None
     evidence: tuple[EvidenceAuthorityV1, ...]
+    #: For a ``JOIN_PATH`` pin: THIS operand's own ordered leg list, as the realization hashes that
+    #: :func:`join_path_pin_content` already folded into ``content_hash``.
+    #:
+    #: A READABLE COPY of hashed content, not new content — which is why it is deliberately absent
+    #: from :func:`_trace_payload`: adding it would hash the same facts twice. It exists because a
+    #: consumer that must project the chain onto its LOGICAL identity (kind + endpoints, without the
+    #: attestation state the realization hash also covers) cannot do that from a hash. Without it
+    #: the only identity available is the physical one, and confirming a file-declared join —
+    #: pure governance provenance — would re-key every suggestion that crosses it. Join these
+    #: against ``ordered_relationship_path`` to recover the ordered legs; see
+    #: :func:`~featuregen.overlay.upload.suggestion_identity.join_path_assignment`.
+    path_realization_hashes: tuple[str | None, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dependency_class",
@@ -293,8 +305,13 @@ def _dependency_content_hash(dependency_kind: str, content: Mapping[str, Any],
 def dependency_pin(*, dependency_class: SuggestionDependencyClass | str, dependency_kind: str,
                    dependency_key: str, content: Mapping[str, Any],
                    current_revision_id: str | None = None,
-                   evidence: Sequence[EvidenceAuthorityV1] = ()) -> GroundingDependencyPinV1:
-    """Mint a pin, hashing ``content`` (+ the evidence axes) into its identity."""
+                   evidence: Sequence[EvidenceAuthorityV1] = (),
+                   path_realization_hashes: Sequence[str | None] = ()
+                   ) -> GroundingDependencyPinV1:
+    """Mint a pin, hashing ``content`` (+ the evidence axes) into its identity.
+
+    ``path_realization_hashes`` is carried verbatim for a ``JOIN_PATH`` pin — a readable copy of
+    the leg list already inside ``content``, never a second hashed fact."""
     if dependency_kind not in DEPENDENCY_KINDS:
         raise ValueError(
             f"unknown dependency kind {dependency_kind!r}; a pin names one of the reads the "
@@ -306,7 +323,8 @@ def dependency_pin(*, dependency_class: SuggestionDependencyClass | str, depende
         dependency_key=dependency_key,
         content_hash=_dependency_content_hash(dependency_kind, content, evidence),
         current_revision_id=current_revision_id,
-        evidence=evidence)
+        evidence=evidence,
+        path_realization_hashes=tuple(path_realization_hashes))
 
 
 def join_path_pin_content(*, from_table: str, to_table: str, outcome_kind: str,
@@ -536,13 +554,15 @@ class GroundingTraceRecorder:
     def pin(self, dependency_class: SuggestionDependencyClass, dependency_kind: str,
             dependency_key: str, content: Mapping[str, Any], *,
             current_revision_id: str | None = None,
-            evidence: Sequence[EvidenceAuthorityV1] = ()) -> None:
+            evidence: Sequence[EvidenceAuthorityV1] = (),
+            path_realization_hashes: Sequence[str | None] = ()) -> None:
         if not self.enabled:
             return
         self._pins.append(dependency_pin(
             dependency_class=dependency_class, dependency_kind=dependency_kind,
             dependency_key=dependency_key, content=content,
-            current_revision_id=current_revision_id, evidence=evidence))
+            current_revision_id=current_revision_id, evidence=evidence,
+            path_realization_hashes=path_realization_hashes))
 
     def record_operand_roles(self, roles: Sequence[tuple[str, str, str]]) -> None:
         if self.enabled:

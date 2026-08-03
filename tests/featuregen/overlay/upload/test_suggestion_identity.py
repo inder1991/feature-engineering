@@ -8,12 +8,20 @@ Two identities, deliberately separated, and this suite is where the separation i
   observation.
 * ``suggestion_revision_id`` names the exact CONTENT that produced this rendering of it.
 
-The relationship-path input is the subtle one. ``GroundingDecisionTraceV1.ordered_relationship_path``
-is a deduplicated leg SET (0F-7 as amended), so it cannot distinguish two candidates whose operands
-swapped chains. The identity therefore consumes the per-operand ``JOIN_PATH`` pins — the
-``(dependency_key, content_hash)`` assignment — which is exactly what the amendment names as the
-identity-bearing material. ``test_two_candidates_that_swap_their_operand_chains_are_not_one`` is the
-rule-23 pin.
+The relationship-path input is the subtle one, and it has TWO failure modes this suite pins from
+both sides.
+
+``GroundingDecisionTraceV1.ordered_relationship_path`` is a deduplicated leg SET (0F-7 as amended),
+so it cannot distinguish two candidates whose operands swapped chains — hence the per-operand
+``JOIN_PATH`` assignment (``test_two_candidates_that_swap_their_operand_chains_are_not_one``).
+
+But the pin's ``content_hash`` cannot be that assignment either: it covers the realization content,
+which includes ``approved_join_fact_key``, ``approved_join_status`` and ``edge_authority``. Using it
+meant an admin CONFIRMING a file-declared join re-keyed every suggestion crossing it — same recipe,
+same columns, same endpoints, same direction. Rule 23 says the opposite in as many words. So the
+assignment is the LOGICAL projection, ``(relationship_kind, from_ref, to_ref)`` per leg
+(``test_the_assignment_is_the_logical_chain_not_the_attested_one``), and the attestation state
+travels in the revision instead.
 """
 from __future__ import annotations
 
@@ -36,6 +44,7 @@ from featuregen.overlay.upload.read_scope import allowed_classes
 from featuregen.overlay.upload.suggestion_identity import (
     PRODUCER_CONTRACT_VERSION,
     SuggestionReadScopeV1,
+    UnresolvableRelationshipPath,
     build_read_scope,
     dependency_content_hashes,
     join_path_assignment,
@@ -58,11 +67,14 @@ def _leg(from_ref: str, to_ref: str, *, fact: str | None = "ajf") -> object:
 
 
 def _join_pin(operand_ref: str, *, from_table: str, to_table: str, legs) -> object:
+    """Exactly what the gauntlet mints (``feature_assist`` at the JOIN_PATH decision point): the
+    hashed content AND the readable copy of this operand's own ordered leg list."""
     return dependency_pin(
         dependency_class=SuggestionDependencyClass.VALIDATION, dependency_kind=JOIN_PATH,
         dependency_key=column_dependency_key(SOURCE, operand_ref),
         content=join_path_pin_content(from_table=from_table, to_table=to_table,
-                                      outcome_kind="OPERATIONAL", legs=legs))
+                                      outcome_kind="OPERATIONAL", legs=legs),
+        path_realization_hashes=[leg.realization_content_hash for leg in legs])
 
 
 def _identity(**overrides) -> dict:
@@ -143,13 +155,14 @@ def test_a_role_change_alone_is_a_different_candidate():
 # ── rule 23: the relationship path is logical identity ──────────────────────────────────────────
 def test_the_same_columns_over_a_different_relationship_path_are_two_candidates():
     """Rule 23, minimally: identical operands, different traversed path -> different identity."""
-    direct = (_join_pin("txn.amt", from_table="cust", to_table="txn",
-                        legs=(_leg(_G, _A),)),)
-    bridged = (_join_pin("txn.amt", from_table="cust", to_table="txn",
-                         legs=(_leg(_G, "public.bridge.cif"), _leg("public.bridge.txn", _A))),)
+    direct_legs = (_leg(_G, _A),)
+    bridged_legs = (_leg(_G, "public.bridge.cif"), _leg("public.bridge.txn", _A))
+    direct = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=direct_legs),)
+    bridged = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=bridged_legs),)
     assert suggestion_id(**_identity(
-        relationship_path_assignment=join_path_assignment_of(direct))) != suggestion_id(**_identity(
-            relationship_path_assignment=join_path_assignment_of(bridged)))
+        relationship_path_assignment=join_path_assignment_of(direct, direct_legs))) != \
+        suggestion_id(**_identity(
+            relationship_path_assignment=join_path_assignment_of(bridged, bridged_legs)))
 
 
 def test_two_candidates_that_swap_their_operand_chains_are_not_one():
@@ -166,14 +179,18 @@ def test_two_candidates_that_swap_their_operand_chains_are_not_one():
     assert {(leg.from_ref, leg.to_ref) for leg in (leg_a, leg_b)} == {
         (leg.from_ref, leg.to_ref) for leg in (leg_b, leg_a)}
     assert suggestion_id(**_identity(
-        relationship_path_assignment=join_path_assignment_of(straight))) != suggestion_id(
-            **_identity(relationship_path_assignment=join_path_assignment_of(crossed)))
+        relationship_path_assignment=join_path_assignment_of(straight, (leg_a, leg_b)))) != \
+        suggestion_id(**_identity(
+            relationship_path_assignment=join_path_assignment_of(crossed, (leg_a, leg_b))))
 
 
-def join_path_assignment_of(pins) -> tuple[tuple[str, str], ...]:
-    """The assignment as it is read off a real trace, built here from bare pins."""
+def join_path_assignment_of(pins, path=()) -> tuple:
+    """The assignment as it is read off a real trace, built here from bare pins.
+
+    ``path`` is the trace's ``ordered_relationship_path`` — the deduplicated UNION of the legs the
+    pins reference, exactly as the recorder accumulates it. The projection joins the two."""
     trace = build_trace(
-        candidate_key="k", ordered_operand_roles=(), ordered_relationship_path=(),
+        candidate_key="k", ordered_operand_roles=(), ordered_relationship_path=tuple(path),
         validation_status="DESIGN_CHECKED", requirements=(),
         dependency_pins=(*pins, dependency_pin(
             dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
@@ -186,13 +203,55 @@ def test_the_assignment_reads_only_the_join_path_pins():
     """Every OTHER pin (the governed type read, the grain lookup, the read scope) belongs to the
     revision, not to the logical identity: a column whose governed type was re-attested is the same
     candidate."""
-    pins = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=(_leg(_G, _A),)),)
-    assert len(join_path_assignment_of(pins)) == 1
-    assert join_path_assignment_of(pins)[0][0] == column_dependency_key(SOURCE, "txn.amt")
+    legs = (_leg(_G, _A),)
+    pins = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=legs),)
+    assert len(join_path_assignment_of(pins, legs)) == 1
+    assert join_path_assignment_of(pins, legs)[0][0] == column_dependency_key(SOURCE, "txn.amt")
 
 
 def test_a_candidate_with_no_traversed_path_has_an_empty_assignment():
     assert join_path_assignment_of(()) == ()
+
+
+def test_the_assignment_is_the_logical_chain_not_the_attested_one():
+    """THE GOVERNANCE-CHURN GUARD, at the unit. Two pins over the SAME logical hop that differ only
+    in the governing ``approved_join`` fact — the exact difference an admin makes by confirming a
+    file-declared join — must project to the identical assignment. The physical realization hashes
+    differ (they cover the fact key, the status and the edge authority), which is precisely why the
+    hash cannot be the identity."""
+    declared = (_leg(_G, _A, fact=None),)
+    verified = (_leg(_G, _A, fact="ajf-verified"),)
+    assert declared[0].realization_content_hash != verified[0].realization_content_hash
+
+    before = join_path_assignment_of(
+        (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=declared),), declared)
+    after = join_path_assignment_of(
+        (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=verified),), verified)
+    assert before == after
+    assert before[0][1] == (("direct_equality", SOURCE, _G, SOURCE, _A),)
+    assert suggestion_id(**_identity(relationship_path_assignment=before)) == suggestion_id(
+        **_identity(relationship_path_assignment=after))
+
+
+def test_the_projection_keeps_the_direction_of_travel():
+    """A reverse hop is a different traversal, and the logical triple says so — otherwise
+    ``customer -> transaction`` and ``transaction -> customer`` would be one candidate."""
+    forward = (_leg(_G, _A),)
+    backward = (_leg(_A, _G),)
+    assert join_path_assignment_of(
+        (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=forward),),
+        forward) != join_path_assignment_of(
+            (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=backward),), backward)
+
+
+def test_a_pin_naming_a_realization_the_path_lacks_fails_closed():
+    """FAIL CLOSED. If the chain cannot be projected there is no honest identity to mint, and
+    falling back to the physical hash would silently restore the churn. The caller counts the
+    refusal instead."""
+    legs = (_leg(_G, _A),)
+    pins = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=legs),)
+    with pytest.raises(UnresolvableRelationshipPath, match="does not"):
+        join_path_assignment_of(pins, ())          # the path lost the leg the pin names
 
 
 def test_the_dependency_content_hashes_are_content_only_and_order_independent():

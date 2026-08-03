@@ -1042,7 +1042,11 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                 trace.pin(SuggestionDependencyClass.VALIDATION, _gt.JOIN_PATH,
                           _gt.column_dependency_key(src, d),
                           _gt.join_path_pin_content(from_table=grain_table, to_table=to_table,
-                                                    outcome_kind=outcome.kind, legs=legs))
+                                                    outcome_kind=outcome.kind, legs=legs),
+                          # THIS operand's own ordered legs, readable — the same list the content
+                          # above hashes. An identity builder needs the chain's LOGICAL shape, and
+                          # a hash cannot be projected onto one.
+                          path_realization_hashes=[leg.realization_content_hash for leg in legs])
                 if outcome.kind == JoinOutcome.NO_PATH:
                     return _reject(RejectCode.NO_JOIN_PATH, f"no join path {grain_table} -> {d}")
                 if outcome.kind == JoinOutcome.DENIED:

@@ -98,7 +98,14 @@ def _trace(**overrides) -> GroundingDecisionTraceV1:
 def test_the_three_value_objects_carry_exactly_the_frozen_fields():
     assert [f.name for f in fields(GroundingDependencyPinV1)] == [
         "dependency_class", "dependency_kind", "dependency_key", "content_hash",
-        "current_revision_id", "evidence"]
+        "current_revision_id", "evidence",
+        # Task 2: a JOIN_PATH pin's own ordered leg list, READABLE. It is a copy of content
+        # `content_hash` already covers (see the hash-payload test below, which pins that it adds
+        # nothing there), added because an identity builder must project the chain onto its LOGICAL
+        # shape — kind and endpoints, without the attestation state the realization hash also
+        # covers — and a hash cannot be projected. Defaulted last, so every existing construction
+        # is unchanged.
+        "path_realization_hashes"]
     assert [f.name for f in fields(SuggestionRelationshipDependencyV1)] == [
         "relationship_ref", "relationship_kind", "from_ref", "to_ref",
         "realization_content_hash", "cardinality", "safety_status", "review_status", "evidence"]
@@ -108,6 +115,23 @@ def test_the_three_value_objects_carry_exactly_the_frozen_fields():
         "read_scope_rule_content_hashes", "trace_content_hash"]
     assert [c.value for c in SuggestionDependencyClass] == [
         "hard_availability", "validation", "semantic"]
+
+
+def test_the_readable_leg_list_adds_nothing_to_the_trace_hash():
+    """``path_realization_hashes`` is a READABLE COPY of content ``content_hash`` already covers, so
+    it must not enter the trace payload: hashing the same facts twice would let a pin and its copy
+    disagree, and would make a purely presentational carry look like decision content. Two traces
+    whose pins differ ONLY in that field are the same decision."""
+    legs = _legs()
+    content = gt.join_path_pin_content(from_table="txn", to_table="cust",
+                                       outcome_kind=JoinOutcome.OPERATIONAL, legs=legs)
+    bare = _pin(gt.JOIN_PATH, "k", content)
+    carried = _pin(gt.JOIN_PATH, "k", content,
+                   path_realization_hashes=[leg.realization_content_hash for leg in legs])
+    assert bare.content_hash == carried.content_hash
+    assert carried.path_realization_hashes and not bare.path_realization_hashes
+    assert _trace(dependency_pins=(bare,)).trace_content_hash == _trace(
+        dependency_pins=(carried,)).trace_content_hash
 
 
 def test_every_hashed_contract_is_registered_to_this_owner():

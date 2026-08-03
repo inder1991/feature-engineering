@@ -63,8 +63,10 @@ from featuregen.overlay.upload.grounding_trace import (
     trace_completeness_gaps,
 )
 from featuregen.overlay.upload.join_path import JoinNeighbourhood, table_of_ref
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_classes
 from featuregen.overlay.upload.suggestion_identity import (
+    UnresolvableRelationshipPath,
     build_read_scope,
     dependency_content_hashes,
     join_path_assignment,
@@ -102,6 +104,7 @@ __all__ = [
     "PROJECTION_STATES",
     "READ_MODES",
     "SCHEMA_VERSION",
+    "SCOPE_REVEALING_OMISSION_KEYS",
     "V1_UNSAFE_OMISSION_KEYS",
     "WARNING_CODES",
     "FacetBucketV1",
@@ -122,6 +125,7 @@ __all__ = [
     "build_page_v2",
     "is_family_derived_category",
     "page_to_json",
+    "public_omitted_counts",
     "recipe_parts",
     "recipe_parts_to_json",
     "render_recipe",
@@ -193,8 +197,27 @@ V1_UNSAFE_OMISSION_KEYS: tuple[str, ...] = (
     "withheld_read_scope",
     "withheld_missing_trace",
     "withheld_incomplete_trace",
+    "withheld_missing_context",
+    "withheld_unresolvable_path",
     "withheld_non_recipe_generation_source",
 )
+
+
+#: Omission keys that are SCOPE-REVEALING and therefore server-side only. Publishing
+#: "withheld_read_scope: 3" tells a caller that three suggestions exist which they may not see —
+#: the count IS the disclosure, and rule 9 forbids leaking a hidden dependency through "facets,
+#: counts, snippets or provenance". They stay on the dataclass for telemetry, the V1-safety gate
+#: and Release-B diagnostics, and :func:`page_to_json` drops them, so a caller cannot distinguish
+#: "nothing was withheld" from "N were withheld". Every OTHER omission key is scope-independent
+#: (a bound that bit, a trace the ENGINE failed to emit) and is published unchanged.
+SCOPE_REVEALING_OMISSION_KEYS: frozenset[str] = frozenset({"withheld_read_scope"})
+
+
+def public_omitted_counts(counts: Mapping[str, int]) -> dict[str, int]:
+    """The wire-safe view of an omission tally: everything except what would disclose the size of
+    what this caller may not see."""
+    return {key: value for key, value in counts.items()
+            if key not in SCOPE_REVEALING_OMISSION_KEYS}
 
 
 class SuggestionV1ReconstructionError(RuntimeError):
@@ -567,6 +590,26 @@ class _NodeFacts:
     domain: str | None
     entity: str | None
     table_name: str | None
+    #: The schema-preserving ``logical_ref`` this node's field evidence is keyed under, and the
+    #: ref of its TABLE — a column's ``domain`` is INHERITED from its table unless the classifier
+    #: gave it one of its own, and the evidence then lives on the table's ref (``enrich.py``
+    #: writes both). Computed in-process from the row's own identity columns, exactly as
+    #: ``column_authority.logical_ref_of`` does for one node, so attributing a whole page costs no
+    #: extra statement.
+    logical_ref: str
+    table_logical_ref: str
+    #: The governed entity projection (migration 1015): ``VERIFIED`` while a confirmed
+    #: ``entity_assignment`` fact governs the value, NULL once demoted.
+    declared_entity: str | None
+    entity_status: str | None
+    entity_fact_key: str | None
+    entity_fact_event_id: str | None
+
+
+#: The catalog field whose WORDING this surface exposes as attributed text and whose provenance it
+#: therefore has to read. (``entity`` is not a ``field_evidence`` field — its provenance is the
+#: governed projection on the node itself; see :func:`_entity_term_evidence`.)
+_CONTEXT_EVIDENCE_FIELD = "domain"
 
 
 def _read_node_facts(conn, pairs: Iterable[tuple[str, str]],
@@ -588,15 +631,97 @@ def _read_node_facts(conn, pairs: Iterable[tuple[str, str]],
     classes = allowed_classes(roles)
     for catalog_source in sorted(by_source):
         rows = conn.execute(
-            "SELECT object_ref, coalesce(visible_requires, '{}'), domain, entity, table_name "
+            "SELECT object_ref, coalesce(visible_requires, '{}'), domain, entity, table_name, "
+            "kind, schema_name, column_name, declared_entity, entity_status, entity_fact_key, "
+            "entity_fact_event_id "
             "FROM graph_node WHERE catalog_source = %s AND object_ref = ANY(%s) "
             "AND visible_requires <@ %s",
             (catalog_source, sorted(by_source[catalog_source]), classes)).fetchall()
-        for object_ref, visible, domain, entity, table_name in rows:
+        for (object_ref, visible, domain, entity, table_name, kind, schema_name, column_name,
+             declared_entity, entity_status, entity_fact_key, entity_fact_event_id) in rows:
+            schema = schema_name or "public"
             facts[(catalog_source, object_ref)] = _NodeFacts(
                 visible_requires=tuple(visible or ()), domain=domain, entity=entity,
-                table_name=table_name)
+                table_name=table_name,
+                logical_ref=normalize_ref(catalog_source, schema, table_name or "",
+                                          column_name if kind == "column" else None),
+                table_logical_ref=normalize_ref(catalog_source, schema, table_name or ""),
+                declared_entity=declared_entity, entity_status=entity_status,
+                entity_fact_key=entity_fact_key, entity_fact_event_id=entity_fact_event_id)
     return facts
+
+
+def _read_context_evidence(conn, facts: Mapping[tuple[str, str], _NodeFacts]
+                           ) -> dict[tuple[str, str], tuple[EvidenceAuthorityV1, ...]]:
+    """The ACTIVE evidence axes behind every node's ``domain``, keyed ``(logical_ref, field_name)``.
+
+    ONE set-based statement for the WHOLE page — the same shape as the visibility read beside it,
+    so attributing fifty cards costs the same as attributing one. Both a column's OWN ref and its
+    TABLE's ref are asked for in that one statement, because ``enrich.py`` writes the table's
+    domain evidence at the table ref and only writes a column ref when the classifier OVERRODE the
+    inherited value.
+
+    ALL active occurrences are returned, not a "best" one: one value may legitimately carry source,
+    LLM and human evidence at once, and collapsing that is exactly what rule 4 forbids.
+    """
+    if not facts:
+        return {}
+    refs = sorted({node.logical_ref for node in facts.values()}
+                  | {node.table_logical_ref for node in facts.values()})
+    rows = conn.execute(
+        "SELECT logical_ref, field_name, producer, strength, lifecycle, producer_ref, evidence_id "
+        "FROM field_evidence "
+        "WHERE logical_ref = ANY(%s) AND field_name = ANY(%s) AND lifecycle = 'active' "
+        "ORDER BY logical_ref, field_name, evidence_id",
+        (refs, [_CONTEXT_EVIDENCE_FIELD])).fetchall()
+    out: dict[tuple[str, str], list[EvidenceAuthorityV1]] = {}
+    for logical_ref, field_name, producer, strength, lifecycle, producer_ref, evidence_id in rows:
+        out.setdefault((logical_ref, field_name), []).append(EvidenceAuthorityV1(
+            producer=producer, strength=strength, lifecycle=lifecycle,
+            producer_ref=producer_ref, evidence_id=evidence_id))
+    return {key: tuple(value) for key, value in out.items()}
+
+
+#: The honest axes for a projected value with NO recorded evidence: ``legacy`` is the vocabulary's
+#: own bucket for "predates the axis, or a caller whose producer is not yet classified", and
+#: ``proposed`` is the weakest assertion. Emitting nothing at all would let an unattributed value
+#: render exactly like an attested one, which is the failure rules 4/5 exist to prevent.
+_UNATTRIBUTED = (EvidenceAuthorityV1(EvidenceProducer.LEGACY, AssertionStrength.PROPOSED,
+                                     EvidenceLifecycle.ACTIVE, None, None),)
+
+
+def _domain_term_evidence(node: _NodeFacts,
+                          evidence: Mapping[tuple[str, str], tuple[EvidenceAuthorityV1, ...]]
+                          ) -> tuple[EvidenceAuthorityV1, ...]:
+    """This node's OWN domain evidence, else its table's (the inherited case), else the explicit
+    unattributed marker. Never silence: a PROPOSED-strength LLM domain and a human-attested one
+    must not render identically."""
+    own = evidence.get((node.logical_ref, _CONTEXT_EVIDENCE_FIELD))
+    if own:
+        return own
+    inherited = evidence.get((node.table_logical_ref, _CONTEXT_EVIDENCE_FIELD))
+    return inherited or _UNATTRIBUTED
+
+
+def _entity_term_evidence(node: _NodeFacts) -> tuple[EvidenceAuthorityV1, ...]:
+    """The provenance of a node's effective ``entity`` — read from the governed projection the node
+    already carries (migration 1015), so it costs no statement at all.
+
+    A ``VERIFIED`` ``entity_status`` means a confirmed ``entity_assignment`` fact governs the value,
+    and that confirmation is a HUMAN dual-owner act — so the axes are ``human``/``confirmed`` with
+    the fact key and its confirming event as occurrence provenance. Anything else is a value the
+    file declared or a pre-governance path applied: ``source``/``proposed`` when it is exactly what
+    the file declared, otherwise the ``legacy`` bucket, because naming a producer we did not read
+    would be a fabrication.
+    """
+    if node.entity_status == "VERIFIED":
+        return (EvidenceAuthorityV1(EvidenceProducer.HUMAN, AssertionStrength.CONFIRMED,
+                                    EvidenceLifecycle.ACTIVE, node.entity_fact_key,
+                                    node.entity_fact_event_id),)
+    if node.declared_entity and node.declared_entity == node.entity:
+        return (EvidenceAuthorityV1(EvidenceProducer.SOURCE, AssertionStrength.PROPOSED,
+                                    EvidenceLifecycle.ACTIVE, None, None),)
+    return _UNATTRIBUTED
 
 
 # ── one suggestion ──────────────────────────────────────────────────────────────────────────────
@@ -724,6 +849,8 @@ def _warnings(idea, template, trace: GroundingDecisionTraceV1 | None,
 
 def _domain_and_entity_context(operands: Sequence[SuggestionOperandV1],
                                facts: Mapping[tuple[str, str], _NodeFacts],
+                               evidence: Mapping[tuple[str, str],
+                                                 tuple[EvidenceAuthorityV1, ...]],
                                omitted: Counter
                                ) -> tuple[tuple[AttributedLabelV1, ...],
                                           tuple[AttributedTextV1, ...],
@@ -736,31 +863,50 @@ def _domain_and_entity_context(operands: Sequence[SuggestionOperandV1],
     resolves nothing and the wording stays ``AttributedTextV1``: displayable, text-searchable, never
     a facet id — never lowercased or slugged into one.
 
-    ``evidence=()`` is deliberate and honest. This is the catalog's CURRENT projected wording; its
-    evidence chain lives in ``field_evidence`` and reading it per operand is exactly the per-card
-    N+1 this task forbids. ``basis='catalog_resolved'`` plus the source refs say precisely where the
-    words came from and claim no attestation the adapter did not read.
+    **The provenance axes travel.** A ``graph_node.domain`` may be an LLM proposal or a human
+    attestation, and rules 4/5 forbid rendering them identically — so each term carries the ACTIVE
+    ``field_evidence`` axes for the operands that contributed it (read once per page by
+    :func:`_read_context_evidence`), and a value with no recorded evidence carries the explicit
+    unattributed marker rather than an empty tuple that would read as "nothing to say".
     """
     domain_terms: dict[str, list[str]] = {}
     entity_terms: dict[str, list[str]] = {}
+    domain_axes: dict[str, list[EvidenceAuthorityV1]] = {}
+    entity_axes: dict[str, list[EvidenceAuthorityV1]] = {}
+
+    def _merge(store: dict[str, list[EvidenceAuthorityV1]], wording: str,
+               occurrences: Sequence[EvidenceAuthorityV1]) -> None:
+        """Union, order-stable and duplicate-free: two operands sharing one wording contribute one
+        combined provenance, and re-seeing an identical occurrence adds nothing."""
+        seen = store.setdefault(wording, [])
+        for occurrence in occurrences:
+            if occurrence not in seen:
+                seen.append(occurrence)
+
     for operand in operands:
         node = facts.get((operand.catalog_source, operand.graph_object_ref))
         if node is None:
             continue
         if node.domain:
             domain_terms.setdefault(node.domain, []).append(operand.graph_object_ref)
+            _merge(domain_axes, node.domain, _domain_term_evidence(node, evidence))
         if node.entity:
             entity_terms.setdefault(node.entity, []).append(operand.graph_object_ref)
+            _merge(entity_axes, node.entity, _entity_term_evidence(node))
     domains: list[AttributedLabelV1] = []
     texts: list[AttributedTextV1] = []
     for wording in sorted(domain_terms):
-        resolved = resolve_or_text("business_domain", wording, basis="catalog_resolved",
-                                   source_refs=tuple(domain_terms[wording]))
+        resolved = resolve_or_text(
+            "business_domain", wording, basis="catalog_resolved",
+            evidence=_bounded(domain_axes[wording], MAX_EVIDENCE_REFS, omitted, "term_evidence"),
+            source_refs=tuple(domain_terms[wording]))
         (domains if isinstance(resolved, AttributedLabelV1) else texts).append(resolved)
     entity_texts: list[AttributedTextV1] = []
     for wording in sorted(entity_terms):
-        resolved = resolve_or_text("entity", wording, basis="catalog_resolved",
-                                   source_refs=tuple(entity_terms[wording]))
+        resolved = resolve_or_text(
+            "entity", wording, basis="catalog_resolved",
+            evidence=_bounded(entity_axes[wording], MAX_EVIDENCE_REFS, omitted, "term_evidence"),
+            source_refs=tuple(entity_terms[wording]))
         if isinstance(resolved, AttributedLabelV1):
             # A CONTROLLED entity resolution is the entity facet's business, not free context.
             continue
@@ -816,9 +962,11 @@ def _source_datasets(operands: Sequence[SuggestionOperandV1]
 
 def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, trace,
                       binding_quality: str, facts: Mapping[tuple[str, str], _NodeFacts],
+                      context_evidence: Mapping[tuple[str, str],
+                                                tuple[EvidenceAuthorityV1, ...]],
                       omitted: Counter) -> FeatureSuggestionV2:
     template = _TEMPLATES_BY_ID.get(idea.recipe_id or "")
-    recipe_revision = None if context is None else context.template_content_hash
+    recipe_revision = context.template_content_hash
     entry = DISCOVERY_METADATA.get(idea.recipe_id or "")
     discovery_revision = None if entry is None else discovery_metadata_revision_id(entry)
     discovery_refs = () if discovery_revision is None else (
@@ -826,16 +974,24 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
     recipe_refs = () if recipe_revision is None else (
         f"{RECIPE_REVISION_CITATION_PREFIX}{recipe_revision}",)
 
-    bindings_by_ref = {} if context is None else {
-        binding.graph_object_ref: binding for binding in context.need_bindings}
+    bindings_by_ref = {binding.graph_object_ref: binding for binding in context.need_bindings}
     # The AUTHORED need concept the entity label was derived from — read off the engine's own
     # source-entity role, never re-resolved here.
     entity_concept = None
-    if context is not None and context.source_entity_need_role:
+    if context.source_entity_need_role:
         source_binding = next((b for b in context.need_bindings
                                if b.role == context.source_entity_need_role), None)
         entity_concept = None if source_binding is None else source_binding.expected_concept
     operand_refs = _operand_refs(idea)
+    # IDENTITY reads the FULL binding, always. `MAX_OPERANDS` is a PRESENTATION bound, and the plan
+    # keeps page truncation out of the canonical revision: computing identity from a truncated list
+    # would mint, on a page where the bound bites, cards whose stable ids belong to a different
+    # logical candidate — one with fewer operands, which nothing ever grounded.
+    identity_operands = tuple(
+        (catalog_source,
+         object_ref if (b := bindings_by_ref.get(object_ref)) is None else b.logical_ref,
+         "" if b is None else b.role)
+        for catalog_source, object_ref in operand_refs)
     operands = []
     for catalog_source, object_ref in _bounded(operand_refs, MAX_OPERANDS, omitted, "operands"):
         binding = bindings_by_ref.get(object_ref)
@@ -854,7 +1010,7 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
     operands = tuple(operands)
 
     business_domains, domain_terms, entity_terms = _domain_and_entity_context(
-        operands, facts, omitted)
+        operands, facts, context_evidence, omitted)
     use_cases = ()
     keywords = ()
     business_value = None
@@ -907,8 +1063,8 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
 
     identity = suggestion_id(
         template_id=idea.recipe_id,
-        bound_params=() if context is None else context.semantic_parameters,
-        operands=tuple((o.catalog_source, o.logical_ref, o.recipe_role) for o in operands),
+        bound_params=context.semantic_parameters,
+        operands=identity_operands,
         entity_id=entity_label_id or None, grain_refs=grain_refs, time_ref=idea.time_ref,
         relationship_path_assignment=join_path_assignment(trace))
     revision = suggestion_revision_id(
@@ -1053,6 +1209,9 @@ def build_page_v2(conn, *, catalog_source: str, anchor_table_ref: str, anchored:
         wanted.update(_operand_refs(idea))
         wanted.update(_endpoint_refs(trace))
     facts = _read_node_facts(conn, wanted, roles)
+    # The second and last bounded read of the page: the provenance axes behind every domain wording
+    # the cards will show. Fixed cost, like the visibility read above — never per card.
+    context_evidence = _read_context_evidence(conn, facts)
 
     hits: list[FeatureSuggestionHitV2] = []
     grouped: dict[str, list[FeatureSuggestionV2]] = {}
@@ -1061,11 +1220,26 @@ def build_page_v2(conn, *, catalog_source: str, anchor_table_ref: str, anchored:
         if not required <= set(facts):
             omitted["withheld_read_scope"] += 1
             continue
+        # The 2A freeze makes `contexts[candidate_key]` THE identity join: without it there are no
+        # logical refs, no recipe roles, no bound parameters and no recipe revision, so a card built
+        # anyway would carry a deterministic-but-wrong identity. Every other admission failure
+        # refuses; so does this one.
         context = candidates.contexts.get(trace.candidate_key)
-        suggestion = _build_suggestion(
-            idea, entity_ref=entity_ref, entity_label_id=entity_label, context=context,
-            trace=trace, binding_quality=candidates.binding_by_id.get(idea.recipe_id or "", ""),
-            facts=facts, omitted=omitted)
+        if context is None:
+            omitted["withheld_missing_context"] += 1
+            continue
+        try:
+            suggestion = _build_suggestion(
+                idea, entity_ref=entity_ref, entity_label_id=entity_label, context=context,
+                trace=trace,
+                binding_quality=candidates.binding_by_id.get(idea.recipe_id or "", ""),
+                facts=facts, context_evidence=context_evidence, omitted=omitted)
+        except UnresolvableRelationshipPath:
+            # A pinned realization the trace's own path does not contain: the logical chain cannot
+            # be projected, so there is no honest identity. Refuse rather than fall back to the
+            # physical hash, which is exactly the churn the projection exists to prevent.
+            omitted["withheld_unresolvable_path"] += 1
+            continue
         hits.append(FeatureSuggestionHitV2(
             suggestion=suggestion, projection=None, provenance=_provenance(trace, idea)))
         grouped.setdefault(entity_ref, []).append(suggestion)
@@ -1333,7 +1507,9 @@ def page_to_json(page: FeatureSuggestionPageV2) -> dict:
                            for r in collection.rejections],
             "neighbourhood": (collection.neighbourhood.as_metadata()
                               if collection.neighbourhood is not None else None),
-            "omitted_counts": dict(collection.omitted_counts),
+            # Scope-revealing keys are dropped HERE, at the wire, not at the source: the server
+            # still counts them for telemetry and for the V1-safety gate.
+            "omitted_counts": public_omitted_counts(collection.omitted_counts),
         },
         "hits": [{"suggestion": suggestion_to_json(hit.suggestion),
                   "projection": _projection_json(hit.projection),
