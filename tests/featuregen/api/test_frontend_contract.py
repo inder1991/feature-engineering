@@ -71,7 +71,9 @@ SEARCH_HIT_KEYS = {
     "object_ref", "table", "column", "kind", "data_type", "definition", "is_grain", "is_as_of",
     "catalog_source", "concept", "domain", "sensitivity", "additivity", "unit", "currency",
     "entity", "score"}
-SEARCH_RESULT_KEYS = {"hits", "facets", "total"}
+# `projection` (semantic Task 6): every search read SAYS whether a load-bearing projection was
+# behind when it ran, instead of serving rows as though it knew.
+SEARCH_RESULT_KEYS = {"hits", "facets", "total", "projection"}
 FACET_BUCKET_KEYS = {"value", "count"}
 SEARCH_FACET_KEYS = {"source", "domain", "sensitivity", "additivity", "entity", "kind"}
 

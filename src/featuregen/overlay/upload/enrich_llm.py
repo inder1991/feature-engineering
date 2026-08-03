@@ -157,6 +157,12 @@ _STRUCTURAL_META_KEYS = frozenset({
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
     # concept critic (attest/concept_critic.py)
     "logical_ref", "proposed_concept", "shape_conflicts", "proposed_concept_meaning",
+    # semantic Task 5 — targeted adjudication. Both are CLOSED-VOCABULARY token lists computed by
+    # the platform, never uploader or model text: `selection_reasons` is the deterministic subset of
+    # `semantic_context.REASON_CODES` that referred the column, and `missing_context` is the full
+    # `MISSING_CONTEXT_CODES` vocabulary the model must answer WITH (it is the menu, not data about
+    # this column). Neither can carry a sample clause or a PII span by construction.
+    "selection_reasons", "missing_context",
     # bridge identifier critic (attest/bridge_critic.py)
     "candidate_id", "candidate_revision_id", "left", "right",
     "deterministic_namespace_verdict", "governed_population_relation",
@@ -924,6 +930,43 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             },
         },
         "required": ["verdict", "reason_codes"],
+    },
+    # Targeted semantic adjudication (semantic Task 5). A REAL new body, registered here BEFORE any
+    # caller may request it (D10 — `_require_schema` raises on an unregistered requested version, so
+    # a missing body is a loud dispatch refusal, never an unenforced structured call).
+    #
+    # The shape is the `SemanticAdjudicationV2` contract, closed at every level:
+    # `selected_concept` is one name (a registry member or the literal `unclassified` — the code
+    # side validates membership, since a 280-member enum would fail the WHOLE call on one stale
+    # name); `alternatives` is capped in code at three (no array `maxItems` — the provider rejects
+    # it, the same constraint every batch schema above documents); `confidence_band` IS an enum
+    # because its three values are stable by definition and an off-vocabulary band must not be
+    # silently interpretable. `reason_codes`/`missing_context` are bounded strings gated code-side
+    # against the closed `semantic_context` vocabularies. `ontology_gap` is OPTIONAL (absent from
+    # `required`) — a gap is the rare answer, and requiring it would manufacture one per call.
+    ("semantic_adjudication", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "selected_concept": {"type": "string", "maxLength": 128},
+            "alternatives": {"type": "array", "items": {"type": "string", "maxLength": 128}},
+            "confidence_band": {"type": "string", "enum": ["high", "medium", "low"]},
+            "reason_codes": {"type": "array", "items": {"type": "string", "maxLength": 64}},
+            "missing_context": {"type": "array", "items": {"type": "string", "maxLength": 64}},
+            "ontology_gap": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "proposed_label": {"type": "string", "maxLength": 64},
+                    "parent_concept": {"type": "string", "maxLength": 64},
+                    "definition": {"type": "string", "maxLength": 400},
+                    "aliases": {"type": "array", "items": {"type": "string", "maxLength": 64}},
+                },
+                "required": ["proposed_label", "definition"],
+            },
+        },
+        "required": ["selected_concept", "alternatives", "confidence_band", "reason_codes",
+                     "missing_context"],
     },
     # Dataset-profile critic (profile Task 4). PROPOSAL-BLIND: the model returns its OWN closed
     # classification of the table evidence — never a verdict ON a proposal, which is what produces

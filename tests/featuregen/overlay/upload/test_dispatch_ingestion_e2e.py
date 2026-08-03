@@ -71,6 +71,16 @@ def _client(rows: list[CanonicalRow], *, pass_b: bool = False) -> FakeLLM:
             {"ref": h, "synonyms": "account column, ledger column"} for h in hashes]}),
         "overlay.enrich.summary": FakeResponse(output={"results": [
             {"ref": h, "summary": "A plain-English summary of this column."} for h in hashes]}),
+        # semantic Task 5: every column above is classified `unclassified`, so all three are
+        # referred to the adjudicator. It answers per column (not batched), and it must ANSWER —
+        # an unscripted task raises inside the audited client, which leaves the pre-egress dispatch
+        # row with no llm_call behind it (the orphan this file's `orphan_dispatches == 0` catches).
+        # Scripted to uphold the abstention, so no correction and no gap perturbs the Pass-A
+        # subject assertions below.
+        "overlay.enrich.semantic_adjudication": FakeResponse(output={
+            "selected_concept": "unclassified", "alternatives": [],
+            "confidence_band": "low", "reason_codes": ["insufficient_context"],
+            "missing_context": ["definition_missing"]}),
     }
     if pass_b:
         script["table_synth"] = FakeResponse(output={"results": [

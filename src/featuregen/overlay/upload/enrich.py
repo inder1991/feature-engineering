@@ -5,9 +5,11 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from featuregen.intake.llm import LLMClient
+from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
@@ -932,19 +934,85 @@ def stale_all_llm_field_evidence(conn, *, logical_ref: str, field_name: str) -> 
                                  producer=EvidenceProducer.LLM, keep_input_hash=_STALE_ALL)
 
 
+def _reusable_llm_evidence(conn, *, logical_ref: str, field_name: str, value: object):
+    """The LLM's OWN active evidence row already asserting exactly ``value``, or ``None``.
+
+    VALUE-diff, not input-diff (semantic Task 6 / D12.4): the question a consumer asks is "does the
+    platform still say the same thing?", and it must answer yes for a re-derivation that reached the
+    same answer from a slightly different prompt. Compared on ``proposed_value_hash`` — the store's
+    own order-independent digest — so a jsonb round-trip cannot make an identical value look
+    different.
+
+    Deterministic pick: ``read_active_field_evidence`` is ordered ``(created_at, evidence_id)``, so
+    the OLDEST matching row wins. That is what makes the evidence ID STABLE across reruns — picking
+    the newest would churn the very identity this function exists to preserve."""
+    target = canonical_hash(value)
+    for evidence in read_active_field_evidence(conn, logical_ref, field_name):
+        if (evidence.producer == EvidenceProducer.LLM.value
+                and evidence.proposed_value_hash == target):
+            return evidence
+    return None
+
+
+#: The per-item dispositions :func:`_write_llm_field_evidence` reports through its optional
+#: ``counts`` out-param. Four DIFFERENT things, deliberately not collapsed: a caller that counts
+#: "did not fail" as "wrote" reports rows that do not exist.
+EVIDENCE_WRITE_DISPOSITIONS: tuple[str, ...] = ("written", "reused", "skipped", "failed")
+
+
 def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
                               ref_of: Callable[[str], tuple[str, str, object] | None],
                               source_snapshot_id: str,
                               valid_fn: Callable[[str], bool] | None = None,
                               producer_configuration_hash: str | None = None,
-                              bindings: dict[str, ObjectBinding] | None = None) -> int:
+                              bindings: dict[str, ObjectBinding] | None = None,
+                              counts: dict[str, int] | None = None) -> int:
     """Write one ``llm/proposed`` ``field_evidence`` row per item of ``items`` (E1a); return the
     number of CONTAINED per-item failures so the caller's stage report can say ``partial``.
 
-    SUPERSEDE-AND-REWRITE, unconditionally: prior ACTIVE LLM evidence for the field is staled and a
-    fresh row written. No unchanged-detection and no result cache — that reuse is a DEFERRED
-    optimization (and is why this is a separate, simpler writer than ``_write_concept_evidence``,
-    which keeps its own).
+    VALUE-DIFF SUPERSESSION (semantic Task 6, amending the original unconditional
+    supersede-and-rewrite):
+
+    * a re-derivation landing on the SAME value REUSES the prior active LLM row — same current
+      value AND same ``evidence_id``. Without this, five of the six LLM fields minted a fresh
+      evidence ID on every ingest, so "every consumer returns the same current value and evidence
+      ID" was unachievable and every re-upload manufactured a supersession event that represented
+      no change. The reused row keeps its original ``input_hash``/``source_snapshot_id``: identity
+      belongs to the ASSERTION, not to the prompt that reproduced it, and rewriting them would
+      re-introduce the churn under a different name;
+    * a re-derivation landing on a DIFFERENT value stales the prior row and writes a fresh one,
+      through the SAME producer-scoped mechanics as before
+      (:func:`stale_all_llm_field_evidence` / :func:`stale_source_evidence`);
+    * either way the staling is PRODUCER-SCOPED — source-attested and human evidence is never
+      touched, so an LLM rerun leaves them byte-for-byte, and no system correction can mint a
+      human-rejection event (this writer records no decision events at all).
+
+    A same-value reuse still RETIRES the LLM's other active rows for the field (keeping the reused
+    row's input hash), so a run can never leave two live LLM proposals for one field — the state
+    that makes the resolver NULL a field on conflict. That retirement is load-bearing, not
+    housekeeping: without it a reuse would leave the previously-written row live beside the reused
+    one and the resolver would see a conflict where the model repeated itself.
+
+    THE REUSE TRADE, stated once: the reused row keeps its ORIGINAL ``input_hash`` and
+    ``source_snapshot_id``, so the store does not record that this run re-derived the same value
+    from newer inputs. Re-derivation RECENCY is therefore not observable from the evidence row —
+    accepted deliberately (rewriting those columns is the churn value-diff exists to remove), and a
+    compensating decision-log record naming "re-derived, unchanged, as of snapshot N" is DEFERRED,
+    not designed away.
+
+    TWO REUSE KEYS, two paths, deliberate: this writer reuses on ``proposed_value_hash`` (the
+    question is "does the platform still say the same thing?"), while ``_write_concept_evidence``
+    reuses on ``input_hash`` (its question is "did this column's classification INPUT change?",
+    because a cache HIT there must self-heal a missing row without re-asserting anything). They are
+    not a duplication to fold together: folding the concept writer onto value-diff would make a
+    changed input with an unchanged answer invisible to the self-heal, and folding this writer onto
+    input-diff would re-introduce the per-ingest evidence-ID churn Task 6 removed.
+
+    ``counts`` (optional out-param — the return value is unchanged): when given, receives one
+    :data:`EVIDENCE_WRITE_DISPOSITIONS` increment per item — ``written`` (a NEW row), ``reused``
+    (an existing active row kept, no new row), ``skipped`` (a designed non-write: invalid value,
+    ``ref_of`` returning ``None``, an unattachable binding) or ``failed``. A caller that reports
+    "evidence written" from the ABSENCE of failures counts skips as rows; this is how it stops.
 
     TWO IDENTITIES, never collapsed: ``ref_of(key)`` returns ``(evidence_ref, binding_ref,
     material)`` — attachability is checked against ``bindings[binding_ref]`` (the PUBLIC-flattened
@@ -957,21 +1025,39 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
     value, ``ref_of`` returning ``None``, an unattachable binding) is not a failure and is not
     counted."""
     failures = 0
+
+    def _count(disposition: str) -> None:
+        if counts is not None:
+            counts[disposition] = counts.get(disposition, 0) + 1
+
     for key, value in items.items():
         try:
             if valid_fn is not None and not valid_fn(value):
-                continue                       # skip — not a proposal, not a failure
+                _count("skipped")              # skip — not a proposal, not a failure
+                continue
             resolved = ref_of(key)
             if resolved is None:
+                _count("skipped")
                 continue
             evidence_ref, binding_ref, material = resolved
             if bindings is not None:
                 binding = bindings.get(binding_ref)          # PUBLIC-flattened attachability lookup
                 if binding is None or not may_attach(binding):
-                    continue                   # attachable columns only
+                    _count("skipped")          # attachable columns only
+                    continue
             input_hash = field_input_hash(logical_ref=evidence_ref, field_name=field_name,
                                           material=material)
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
+                reusable = _reusable_llm_evidence(
+                    conn, logical_ref=evidence_ref, field_name=field_name, value=value)
+                if reusable is not None:
+                    # Unchanged: keep THIS row (and its evidence_id) live, retire the LLM's other
+                    # active rows for the field. Producer-scoped — human/source rows untouched.
+                    stale_source_evidence(
+                        conn, logical_ref=evidence_ref, field_name=field_name,
+                        producer=EvidenceProducer.LLM, keep_input_hash=reusable.input_hash)
+                    _count("reused")
+                    continue
                 stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
                 record_field_evidence(
                     conn, logical_ref=evidence_ref, field_name=field_name, proposed_value=value,
@@ -979,8 +1065,10 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
                     producer_ref=ENRICHMENT_RUN_ID, producer_item_ref=str(key),
                     producer_configuration_hash=producer_configuration_hash,
                     source_snapshot_id=source_snapshot_id, input_hash=input_hash)
+                _count("written")
         except Exception:  # noqa: BLE001 — advisory: one item's failure never aborts the rest
             failures += 1
+            _count("failed")
             logger.warning("advisory %s field_evidence write failed for item %s", field_name, key,
                            exc_info=True)
     return failures
@@ -1467,7 +1555,8 @@ def _record_concept_critique_decision(conn, *, logical_ref: str, disposition: st
 def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, str],
                           by_hash: dict[str, CanonicalRow], meta_by_hash: dict[str, dict],
                           rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor,
-                          bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict:
+                          bundles: dict[str, SemanticContextBundleV1] | None = None,
+                          critic_outcomes: dict[str, dict] | None = None) -> dict:
     """The Pass-A ACCEPTANCE hook (ingestion-richness Task 2 step 5): run the refute-oriented
     concept critic over this run's IDENTIFIER-group assignments and apply its dispositions to
     ``result`` in place. Non-identifier assignments pass through byte-for-byte untouched.
@@ -1492,7 +1581,14 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     The classifier CACHE is deliberately not touched: it stores the classifier's own answer, and
     the critic's replay store (content-addressed on the same inputs) makes re-criticising a cache
     HIT on the next upload free. Returns the stage-detail report
-    ``{items, accepted, revised, refuted, abstained, conflicts}``."""
+    ``{items, accepted, revised, refuted, abstained, conflicts}``.
+
+    ``critic_outcomes`` (semantic Task 5, optional out-param — the return shape is unchanged):
+    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for every criticised
+    ref. It rides SEPARATELY from the returned report on purpose: the report becomes an ingest
+    STAGE DETAIL, which is contractually "a SMALL dict of counts", and a per-ref map over a wide
+    table is not that. The adjudication stage consumes this map as one of its deterministic
+    selection inputs."""
     items: dict[str, ConceptCriticItemV1] = {}
     ref_to_hash: dict[str, str] = {}
     bundles = bundles or {}
@@ -1544,6 +1640,12 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
         h = ref_to_hash.get(ref)
         if h is None:
             continue
+        if critic_outcomes is not None:
+            critic_outcomes[ref] = {
+                "disposition": outcome.disposition.value,
+                "reason_codes": list(outcome.reason_codes),
+                "conflict_codes": list(outcome.conflict_codes),
+            }
         if outcome.disposition is ConceptDisposition.ACCEPTED:
             report["accepted"] += 1
             continue
@@ -1566,6 +1668,216 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     for h, corrected in corrections:       # in-memory only after every DB write succeeded
         result[h] = corrected
     return report
+
+
+# ── semantic Task 5: targeted adjudication, applied ─────────────────────────────────────────────
+
+def _adjudication_evidence_ref(row: CanonicalRow, rec: GlossaryRecord | None) -> str:
+    """The evidence identity for one column — the glossary record's SCHEMA-PRESERVING logical ref,
+    else the public-flattened fallback. The SAME rule ``_apply_concept_critic`` uses, so a column's
+    critic verdict and its adjudication key on one identity rather than two."""
+    return (rec.logical_ref if rec is not None
+            else normalize_ref(row.source, None, row.table, row.column))
+
+
+@dataclass(frozen=True, slots=True)
+class AdjudicationRunInputs:
+    """One run's adjudication material, keyed by EVIDENCE ref throughout.
+
+    ``binding_ref_of`` is the second identity ``_write_llm_field_evidence`` refuses to collapse: a
+    binding is keyed by the PUBLIC-FLATTENED ref while evidence keys on the schema-preserving one.
+    Collapsing them silently skips every non-``public``-schema column (the miss reports zero
+    failures), which is exactly how a correction can vanish without a trace."""
+
+    candidates: list
+    context_of: dict[str, dict]
+    ref_to_hash: dict[str, str]
+    binding_ref_of: dict[str, str]
+
+
+def adjudication_candidates(
+    rows: Sequence[CanonicalRow], *, concepts: dict[str, str],
+    glossary: GlossaryUpload | None,
+    critic_outcomes: dict[str, dict] | None = None,
+    bundles: dict[str, SemanticContextBundleV1] | None = None,
+) -> AdjudicationRunInputs:
+    """Build the run's adjudication candidates + their model-facing context + both ref identities.
+
+    PURE over its arguments — no ``conn``. It used to take one and never use it, which is a lie
+    about the function's reach: a reader budgeting queries, or looking for the transaction this
+    runs in, would find neither.
+
+    Every candidate field is a COMPUTED fact of this run: the assigned concept, the deterministic
+    ``shape_conflicts`` for it, the concept critic's verdict where it ran, and the SOURCE-declared
+    ``entity`` the upload itself attested. Nothing here asks a model about a model.
+
+    The context payload is the SAME ``for_critic`` projection the critic saw, through the SAME
+    definition egress guard (the M4 rule: a technical upload's uploader free text never egresses)."""
+    from featuregen.overlay.upload.attest.representation import shape_conflicts
+    from featuregen.overlay.upload.semantic_adjudication import AdjudicationCandidateV1
+
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+    bundles = bundles or {}
+    critic_outcomes = critic_outcomes or {}
+    inputs = AdjudicationRunInputs(candidates=[], context_of={}, ref_to_hash={},
+                                   binding_ref_of={})
+    for row in rows:
+        h = content_hash(row)
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        ref = _adjudication_evidence_ref(row, rec)
+        if ref in inputs.ref_to_hash:
+            continue                      # one candidate per evidence identity
+        meta = _concept_metadata(row, rec)
+        concept_name = concepts.get(h)
+        declared = str(meta.get("type") or row.type or "") or None
+        definition = meta.get("business_definition")
+        verdict = critic_outcomes.get(ref, {})
+        inputs.candidates.append(AdjudicationCandidateV1(
+            logical_ref=ref,
+            column_name=row.column,
+            declared_type=declared,
+            definition=definition,
+            concept=concept_name,
+            shape_conflicts=shape_conflicts(row.column, declared, definition, concept_name),
+            critic_disposition=verdict.get("disposition"),
+            critic_reason_codes=tuple(verdict.get("reason_codes", ())),
+            # The upload's OWN entity declaration (technical CSV column) — source-attested, so a
+            # disagreement with the concept's entity link is a real referral (functional rule 1).
+            source_entity=(row.entity or None),
+        ))
+        bundle = bundles.get(h)
+        if bundle is not None:
+            inputs.context_of[ref] = _definition_egress_guard(
+                _semantic_context().for_critic(bundle, extra=meta), meta, curated=rec is not None)
+        inputs.ref_to_hash[ref] = h
+        inputs.binding_ref_of[ref] = normalize_ref(row.source, None, row.table, row.column)
+    return inputs
+
+
+def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow], *,
+                         concepts: dict[str, str],
+                         glossary: GlossaryUpload | None = None,
+                         bindings: dict[str, ObjectBinding] | None = None,
+                         source_snapshot_id: str | None = None,
+                         actor=None,
+                         critic_outcomes: dict[str, dict] | None = None,
+                         ingestion_run_id: str | None = None,
+                         bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict:
+    """Run targeted adjudication over this run's UNCLEAR columns; return the stage DETAIL dict.
+
+    The applied half of :mod:`semantic_adjudication`. It selects deterministically, adjudicates
+    under the module's explicit call cap, and then applies exactly one kind of change:
+
+    * a ``selected`` outcome corrects the run's ``concepts`` map in place (so ``build_graph``
+      persists the correction, exactly as the critic's revisions do) and writes normal
+      ``llm/proposed`` ``concept`` field evidence through :func:`_write_llm_field_evidence` — the
+      EXISTING proposal path, producer-scoped and (Task 6) value-diff aware, so a re-derivation that
+      lands on the same value reuses the same evidence row;
+    * ``unclassified`` writes NOTHING. It is the honest abstention, and C3's rule holds everywhere:
+      ``unclassified`` is never a proposal. It also does NOT clear a standing concept — the
+      adjudicator failing to name a better word is not evidence the current word is wrong; the
+      critic owns eviction, and doing it here too would make two components fight over one field;
+    * a gap suggestion never touches the registry and is never itself a classification (see
+      :mod:`semantic_gap`); its discovery pointer is written inside ``adjudicate_targets``. It is
+      ORTHOGONAL to the concept verdict: an answer carrying both a gap AND a better concept writes
+      the concept evidence AND records the gap. The display ranking that puts `gap_suggested` at
+      the head of such an item is a LABEL — the write path reads ``corrected_concept``, which is
+      computed from the concept verdict alone.
+
+    DB-first, dict-after (the critic's rule): the evidence write happens before ``concepts`` is
+    mutated, so a rolled-back savepoint leaves the in-memory classification exactly as it was.
+
+    ``ingestion_run_id`` (C5-T5) attributes every dispatch this stage issues to the run and the
+    exact column subject it adjudicates — and, because attribution rides the PRE-DISPATCH audit
+    gate, it is also what makes this stage fail CLOSED (no egress) when the audit store is down.
+
+    Returns ``{targets, considered, selected, unchanged, unclassified, gap_suggested, invalid,
+    not_attempted, evidence_written, evidence_reused, evidence_skipped, evidence_write_failures,
+    gaps}`` — the six outcome counts (D12.3: OUTCOMES in the stage detail, never new stage STATES)
+    plus the independent write counters, so the ranking that picks one headline per item hides
+    nothing. The outcome counts OVERLAP by design (``selected`` and ``gap_suggested`` are both true
+    of one answer that corrects and reports a missing word — see ``outcome_counts``).
+
+    THE WRITE COUNTERS COUNT WHAT HAPPENED, not what did not fail. ``evidence_written`` is NEW
+    rows; ``evidence_reused`` is corrections whose value was already asserted by a live LLM row
+    (Task 6 value-diff — the assertion is current, no row was added); ``evidence_skipped`` is a
+    designed non-write (a technical upload with no ``source_snapshot_id``, an unattachable
+    binding); ``evidence_write_failures`` is contained failures, and only that last one degrades
+    the stage. The earlier arithmetic incremented ``evidence_written`` on every non-failure, so a
+    run with ``bindings={}`` reported one row written and zero rows stored."""
+    from featuregen.overlay.upload.semantic_adjudication import (
+        adjudicate_targets,
+        adjudication_bounds,
+        outcome_counts,
+        select_adjudication_targets,
+    )
+
+    bounds = adjudication_bounds()
+    inputs = adjudication_candidates(
+        rows, concepts=concepts, glossary=glossary, critic_outcomes=critic_outcomes,
+        bundles=bundles)
+    targets = select_adjudication_targets(
+        inputs.candidates, context_of=inputs.context_of, max_targets=bounds.max_targets)
+    detail: dict = {"considered": len(inputs.candidates), "targets": len(targets),
+                    **outcome_counts(()), "evidence_written": 0, "evidence_reused": 0,
+                    "evidence_skipped": 0, "evidence_write_failures": 0, "gaps": 0}
+    if not targets:
+        return detail
+    # The replay identity of the ref set this run adjudicates against, through THE shared canonical
+    # hasher (D1: `materialize_hash`, RFC 8785 JCS) rather than an inline sha256/json.dumps — a
+    # second canonicalization scheme for a replay key is how two components come to disagree about
+    # whether a stored answer may be served.
+    catalog_revision = materialize_hash({"refs": sorted(inputs.ref_to_hash)})[:16]
+    results = adjudicate_targets(conn, client, targets, catalog_revision=catalog_revision,
+                                 actor=actor, bounds=bounds,
+                                 ingestion_run_id=ingestion_run_id)
+    detail.update(outcome_counts(results))
+    detail["gaps"] = sum(
+        1 for r in results if r.adjudication is not None and r.adjudication.ontology_gap is not None)
+
+    corrections: dict[str, str] = {}
+    for result in results:
+        corrected = result.corrected_concept
+        h = inputs.ref_to_hash.get(result.logical_ref)
+        if corrected is None or h is None:
+            continue
+        if source_snapshot_id is None:
+            # A TECHNICAL upload mints no snapshot id (`ingest`: `snapshot_id = mint_id("ing") if
+            # is_glossary else None`), and `field_evidence.source_snapshot_id` is NOT NULL — so the
+            # write is not attempted at all. An honest SKIP, not a silent success: the correction
+            # still reaches `graph_node` through `concepts`, exactly as Pass A's classification
+            # does on that path (see the note at the technical-upload seam in `ingest`).
+            detail["evidence_skipped"] += 1
+        else:
+            # The evidence material is the ADJUDICATION's identity, not the classifier's: this is a
+            # different derivation of the same field, so it must hash differently — otherwise a
+            # correction would look like the classifier's own unchanged answer and (post-Task-6) be
+            # reused rather than superseding it.
+            material = {"adjudication": result.structured_result_id,
+                        "selected_concept": corrected}
+            binding_ref = inputs.binding_ref_of.get(result.logical_ref, result.logical_ref)
+            # Count what the WRITER did, never "it did not fail, so it must have written": a skip
+            # (unattachable binding, an item the writer declined) leaves zero rows behind, and a
+            # reuse leaves the prior row live without adding one.
+            written: dict[str, int] = {}
+            failures = _write_llm_field_evidence(
+                conn, field_name="concept",
+                items={result.logical_ref: corrected},
+                ref_of=lambda ref, _b=binding_ref, _m=material: (ref, _b, _m),
+                source_snapshot_id=source_snapshot_id,
+                valid_fn=is_known_concept,
+                producer_configuration_hash=_vocab_fingerprint(),
+                bindings=bindings, counts=written)
+            detail["evidence_write_failures"] += failures
+            if failures:
+                continue        # a correction whose evidence did not land is not applied in memory
+            detail["evidence_written"] += written.get("written", 0)
+            detail["evidence_reused"] += written.get("reused", 0)
+            detail["evidence_skipped"] += written.get("skipped", 0)
+        corrections[h] = corrected
+    for h, corrected in corrections.items():   # in-memory only after every DB write succeeded
+        concepts[h] = corrected
+    return detail
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
@@ -1681,15 +1993,22 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # suggestion. Savepointed + advisory like every enrichment side-effect: a critic fault
     # degrades to un-criticised concepts and an honest ``failed`` stage, never a lost upload.
     critic_report: dict = {"failed": True}
+    critic_outcomes: dict[str, dict] = {}
     try:
         with conn.transaction():
             critic_report = _apply_concept_critic(
                 conn, client, result=result, by_hash=by_hash, meta_by_hash=meta_by_hash,
-                rec_by_tc=rec_by_tc, actor=actor, bundles=bundles)
+                rec_by_tc=rec_by_tc, actor=actor, bundles=bundles,
+                critic_outcomes=critic_outcomes)
     except Exception:  # noqa: BLE001 — advisory: the critic never aborts concept enrichment
         logger.warning("advisory concept critic failed", exc_info=True)
+        # The savepoint rolled the critic's writes back, so its per-ref verdicts describe state
+        # that no longer exists. Drop them rather than feeding a phantom refutation into
+        # adjudication selection.
+        critic_outcomes = {}
     if stats is not None:
         stats["concept_critic"] = critic_report
+        stats["concept_critic_outcomes"] = critic_outcomes
 
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
     # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
@@ -2079,8 +2398,9 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
     """Draft business synonyms for EVERY column; returns {content_hash: "term, term, term"} (E1a T4).
 
     Every column is a target — synonyms are ADDITIVE (they merge with the glossary's own terms), so
-    unlike a definition there is no "only fill a blank" rule to apply. NO CACHE: E1a defers reuse, and
-    the evidence writer supersedes-and-rewrites unconditionally.
+    unlike a definition there is no "only fill a blank" rule to apply. NO PROMPT CACHE: E1a defers
+    call reuse. That is now the only reuse missing — the evidence writer VALUE-DIFFS (Task 6), so a
+    redraft landing on the same terms reuses the same evidence row rather than churning its id.
 
     ``stats`` (optional out-param): in batch mode receives ``not_attempted``, the count the
     budget/deadline cutoff skipped WITHOUT dispatch, so the caller labels a truncated run
@@ -2159,8 +2479,9 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
     requirement. A human confirms it (Task 3); the AI only ever drafts the answer.
 
     Targets are ``_unit_targets`` — the ONE definition the writer and ingest's expected count share.
-    NO CACHE (like ``draft_synonyms``): the evidence writer supersedes-and-rewrites unconditionally,
-    and reuse is a deferred optimization.
+    NO PROMPT CACHE (like ``draft_synonyms``): call reuse is a deferred optimization. Evidence
+    reuse is NOT deferred — the writer value-diffs (Task 6), so an unchanged annotation keeps its
+    evidence id.
 
     ``currencies`` (optional out-param; the RETURN shape stays ``{hash: unit}`` so the stage report
     reads exactly like every other Pass A stage) receives ``{content_hash: ISO-4217 code}`` for the

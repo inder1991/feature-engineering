@@ -64,6 +64,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "enrich_concept", "enrich_concept_critic",
         "enrich_definition", "enrich_domain", "enrich_synonyms",
         "enrich_unit",
+        "semantic_adjudication",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
         "table_display_reprojection",
@@ -84,6 +85,8 @@ def test_successful_upload_records_all_stages_in_order(db):
         # absent from the skip loop — so the report implied a stage that never existed.
         "enrich_summary": "skipped_no_client", "enrich_domain": "skipped_no_client",
         "enrich_synonyms": "skipped_no_client", "enrich_unit": "skipped_no_client",
+        # semantic Task 5: adjudication is an LLM stage end to end, so no client = honestly skipped.
+        "semantic_adjudication": "skipped_no_client",
         "graph_persistence": "succeeded",
         "governed_joins": "disabled", "pass_c": "disabled", "pass_b": "disabled",  # flags off
         "glossary_evidence": "not_applicable",
@@ -134,7 +137,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 29
+    assert len(rec.reports) == 30
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
@@ -276,6 +279,9 @@ _ALL_INGEST_STAGES = [
     "enrich_concept", "enrich_concept_critic",
     "enrich_definition", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
+    # semantic Task 5 — targeted adjudication, between the Pass-A stages it reasons over and the
+    # graph persistence that must carry its corrections.
+    "semantic_adjudication",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
     "table_display_reprojection",

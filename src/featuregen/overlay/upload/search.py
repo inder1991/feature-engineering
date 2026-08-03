@@ -7,6 +7,11 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    PROJECTION_READY,
+    ProjectionLagV1,
+    projection_lag_marker,
+)
 from featuregen.overlay.upload.read_scope import allowed_sensitivities, visible_table_pairs
 
 # Facet name -> graph_node column. AND across facet groups, OR (= ANY) within one group.
@@ -89,6 +94,15 @@ class SearchResult:
     hits: list[SearchHit]              # limit-capped, score-ordered (all facets applied)
     facets: dict[str, list[FacetBucket]]
     total: int                         # count of ALL matching rows (may exceed len(hits))
+    # Semantic Task 6: whether a load-bearing projection was BEHIND when these rows were read.
+    # Search reads `graph_node`'s projected display columns, so a lagged projection means the hits
+    # may not yet reflect the newest resolved semantics. DISCLOSED, never refused — an empty result
+    # set would be a worse (and less honest) answer than the rows plus the marker. Defaulted so
+    # every existing constructor stays valid; `PROJECTION_READY` is the normal value, always
+    # present, because an omitted key cannot distinguish "checked and fine" from "never checked".
+    # Computed for any page that returns HITS; a page returning none keeps the default, because the
+    # marker describes the rows served and there are none (see the call site).
+    projection: ProjectionLagV1 = PROJECTION_READY
 
 
 def _hit(r: dict[str, Any]) -> SearchHit:
@@ -230,4 +244,12 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
             row = cur.fetchone()
             facets[name] = [FacetBucket(value="true", count=int(row["c"]) if row else 0)]
 
-    return SearchResult(hits=hits, facets=facets, total=total)
+    # Task 6 disclosure — ONE readiness check per search call (the gate itself is one statement,
+    # `_readiness_probe`), and only when this page actually SERVES rows. The marker qualifies the
+    # rows returned: "these may not yet reflect the newest resolved semantics". A page that returns
+    # no rows has nothing to qualify, so it keeps the default and pays nothing — search is the
+    # highest-frequency read on the platform and an empty facet-filtered page is its most common
+    # answer. A non-empty page always carries a FRESHLY computed marker; the default is never a
+    # substitute for a check that was skipped over served rows.
+    projection = projection_lag_marker(conn) if hits else PROJECTION_READY
+    return SearchResult(hits=hits, facets=facets, total=total, projection=projection)

@@ -38,7 +38,8 @@ function result(
   facets: Record<string, api.FacetBucket[]> = {},
   total = hits.length,
 ): api.SearchResult {
-  return { hits, facets, total }
+  // Task 6: every search read carries the projection marker; `ready` is the normal value.
+  return { hits, facets, total, projection: { status: 'ready', code: '', detail: '' } }
 }
 
 beforeEach(() => {

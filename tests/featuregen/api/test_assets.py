@@ -74,7 +74,10 @@ def test_asset_detail_sections_built_from_real_ingest(client):
     # platform_admin (AUTH) holds audit:read, so the F2-audit LLM-audit-summaries section is built.
     assert set(body["included_sections"]) == {
         "identity", "effective_metadata", "evidence", "relationships", "readiness", "history",
-        "actions", "audit", "source_glossary"}
+        "actions", "audit", "source_glossary", "semantic_adjudication"}
+    # semantic Task 5: the adjudication section is ALWAYS built for a column, and `absent` is its
+    # normal state — most columns are clear and were never referred to the adjudicator.
+    assert body["semantic_adjudication"] == {"status": "absent"}
 
     # identity — from the REAL graph_node the ingest built (no hardcoded values).
     ident = body["identity"]

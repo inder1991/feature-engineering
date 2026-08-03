@@ -53,6 +53,14 @@ CANONICAL_STAGES: tuple[str, ...] = (
     "enrich_concept", "enrich_concept_critic",
     "enrich_definition", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
+    # semantic Task 5: targeted adjudication of the columns Pass A + the critic left UNCLEAR. Runs
+    # after every Pass-A stage (it reasons over their output) and BEFORE `graph_persistence`, so an
+    # accepted correction reaches `graph_node` in the same run its evidence was written — the two
+    # can never disagree by a run. Stage NAMES are unconstrained by the 0996 CHECK (only ``state``
+    # is), so this registers exactly as `table_display_reprojection` did — no migration. Its six
+    # business OUTCOMES (selected/unchanged/unclassified/gap_suggested/invalid/not_attempted) live
+    # in the stage DETAIL, never in the closed state vocabulary (D12.3).
+    "semantic_adjudication",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
     # Task 0.6 Seam 5a: the unconditional tail re-projection of evidence-bearing TABLE refs a

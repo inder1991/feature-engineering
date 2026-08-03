@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from featuregen.aggregates.ids import mint_id
@@ -37,7 +38,6 @@ from featuregen.overlay.upload.field_resolution import (
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
 from featuregen.overlay.upload.templates import _Col, _load_columns
-from featuregen.projections.runner import _checkpoint_seq, _head_seq
 
 # The standard governed+hint field set the snapshot captures — mirrors the fields
 # ``column_authority`` actually MODELS (its ``_VALUE_COLUMN`` keys). NOTE: the field key for the
@@ -136,53 +136,65 @@ class CatalogProjectionUnavailable(RuntimeError):
         self.detail = detail
 
 
-def _projection_is_degraded(conn: DbConn, name: str) -> bool:
-    """True if ANY aggregate of the named projection carries a poison marker in the generic degraded
-    ledger (``projection_degraded`` — the SAME store ``runner._mark_degraded`` writes). A degraded
-    projection's read model is untrustworthy, so the snapshot must not consume it."""
-    return conn.execute(
-        "SELECT 1 FROM projection_degraded WHERE projection_name = %s LIMIT 1", (name,)
-    ).fetchone() is not None
+def _readiness_probe(conn: DbConn, projections: Sequence[str]) -> dict[str, dict]:
+    """Everything :func:`check_projection_readiness` needs, in ONE round trip.
 
+    The gate's three inputs per projection — does it have a tracked checkpoint, is it poisoned, and
+    how far behind the event head is it — were four separate queries (head, exists, degraded,
+    checkpoint), which is fine for the once-per-feature-run snapshot gate but not for a READ
+    surface that calls the detection-only sibling on every request. Same predicates, same
+    fail-closed semantics, one statement: a LEFT JOIN over the requested names so an UNTRACKED
+    projection comes back as a row with a NULL checkpoint (present but unknown) rather than as a
+    missing row indistinguishable from "not asked about".
 
-def _projection_checkpoint_exists(conn: DbConn, name: str) -> bool:
-    """True if the named projection has a tracked checkpoint row. Fail-CLOSED input to the gate: an
-    ABSENT checkpoint is an unknown/untracked projection, NOT a caught-up one — ``projection_lag``
-    would read a missing row as lag 0 (falsely 'ready') when the head is also 0."""
-    return conn.execute(
-        "SELECT 1 FROM projection_checkpoints WHERE projection_name = %s", (name,)
-    ).fetchone() is not None
+    ``{name: {"checkpoint": int | None, "degraded": bool, "head": int}}``."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT p.name AS name, c.checkpoint_seq AS checkpoint, "
+            "       (SELECT COALESCE(max(global_seq), 0) FROM events) AS head, "
+            "       EXISTS (SELECT 1 FROM projection_degraded d "
+            "               WHERE d.projection_name = p.name) AS degraded "
+            "FROM unnest(%s::text[]) AS p(name) "
+            "LEFT JOIN projection_checkpoints c ON c.projection_name = p.name",
+            (list(projections),))
+        return {r["name"]: r for r in cur.fetchall()}
 
 
 def check_projection_readiness(
     conn: DbConn, *, projections: Sequence[str] = _LOAD_BEARING_PROJECTIONS
 ) -> dict[str, int]:
-    """Readiness gate for the feature-generation snapshot (C0-T4). Reusing the projection-health
-    primitives in ``projections.runner`` (never re-implementing them), verify EVERY load-bearing
-    projection is READY, and return its ``{projection_name: checkpoint_seq}`` watermarks (the seq
-    the read model is current as-of) for pinning into the snapshot header.
+    """Readiness gate for the feature-generation snapshot (C0-T4). Over the SAME three health
+    predicates ``projections.runner`` models (checkpoint tracked, not poisoned, not behind the
+    event head), verify EVERY load-bearing projection is READY, and return its
+    ``{projection_name: checkpoint_seq}`` watermarks (the seq the read model is current as-of) for
+    pinning into the snapshot header. The predicates are read in ONE statement
+    (:func:`_readiness_probe`) rather than four, because the detection-only sibling
+    :func:`projection_lag_marker` runs this gate on every catalog READ.
 
     Fail CLOSED. Raise :class:`CatalogProjectionUnavailable` (code
     :data:`CATALOG_PROJECTION_UNAVAILABLE`) if ANY load-bearing projection:
-      * has NO tracked checkpoint (unknown/untracked — never treated as caught-up), OR
-      * is DEGRADED/poisoned (a marker in ``projection_degraded``), OR
-      * is LAGGED — its ``_checkpoint_seq`` sits below the event head ``_head_seq`` (= the
-        resolve.py lag-guard posture: a just-committed event the projection has not yet applied
-        would make the read model STALE)."""
-    head = _head_seq(conn)   # the event head: COALESCE(max(global_seq), 0) FROM events
+      * has NO tracked checkpoint — unknown/untracked, never treated as caught-up (``projection_lag``
+        would read a missing row as lag 0, falsely 'ready', when the head is also 0), OR
+      * is DEGRADED/poisoned (a marker in ``projection_degraded``, the same ledger
+        ``runner._mark_degraded`` writes — a degraded read model is untrustworthy), OR
+      * is LAGGED — its checkpoint sits below the event head (= the resolve.py lag-guard posture: a
+        just-committed event the projection has not yet applied would make the read model STALE)."""
+    probe = _readiness_probe(conn, projections)   # ONE round trip for the whole gate
     watermarks: dict[str, int] = {}
     for name in projections:
-        if not _projection_checkpoint_exists(conn, name):
+        row = probe.get(name)
+        head = 0 if row is None else int(row["head"])   # COALESCE(max(global_seq), 0) FROM events
+        if row is None or row["checkpoint"] is None:
             raise CatalogProjectionUnavailable(
                 CATALOG_PROJECTION_UNAVAILABLE,
                 f"load-bearing projection {name!r} has no tracked checkpoint (untracked/unknown)",
             )
-        if _projection_is_degraded(conn, name):
+        if row["degraded"]:
             raise CatalogProjectionUnavailable(
                 CATALOG_PROJECTION_UNAVAILABLE,
                 f"load-bearing projection {name!r} is DEGRADED (poisoned read model)",
             )
-        checkpoint = _checkpoint_seq(conn, name)
+        checkpoint = int(row["checkpoint"])
         if checkpoint < head:
             raise CatalogProjectionUnavailable(
                 CATALOG_PROJECTION_UNAVAILABLE,
@@ -191,6 +203,52 @@ def check_projection_readiness(
             )
         watermarks[name] = checkpoint
     return watermarks
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionLagV1:
+    """A typed, honest marker that a READ was served while a load-bearing projection was behind.
+
+    Semantic Task 6, scoped deliberately narrow: DETECTION AND DISCLOSURE, not a new refusal. The
+    feature path aborts on lag because it SEALS a snapshot that must be re-executable; a catalog
+    READ has no such contract — refusing to show a column because a projection is three events
+    behind would be a worse answer than showing it with the lag named. What must never happen is
+    the silent version: serving a newer semantic value under an older context hash as though the
+    two agreed.
+
+    ``code`` is the existing :data:`CATALOG_PROJECTION_UNAVAILABLE`; ``detail`` is the gate's own
+    sentence, naming which projection and why. Nothing here is re-derived — the marker is exactly
+    what :func:`check_projection_readiness` already computes."""
+
+    status: str
+    code: str
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "code": self.code, "detail": self.detail}
+
+
+#: The marker a READY read carries. Present ALWAYS (never omitted on the happy path): an absent key
+#: is indistinguishable from an older client that never had one, so "we checked and it was fine"
+#: has to be said out loud for "we checked and it was not" to mean anything.
+PROJECTION_READY = ProjectionLagV1(status="ready", code="", detail="")
+
+
+def projection_lag_marker(
+    conn: DbConn, *, projections: Sequence[str] = _LOAD_BEARING_PROJECTIONS
+) -> ProjectionLagV1:
+    """The DETECTION-ONLY sibling of :func:`check_projection_readiness`: same gate, same verdict,
+    reported instead of raised.
+
+    Reuses the readiness gate verbatim (never re-implements projection health) so a read surface
+    and the feature path can never disagree about whether the catalog is caught up. Returns
+    :data:`PROJECTION_READY` when it is, and a ``lagged`` marker carrying the gate's own code and
+    detail when it is not."""
+    try:
+        check_projection_readiness(conn, projections=projections)
+    except CatalogProjectionUnavailable as exc:
+        return ProjectionLagV1(status="lagged", code=exc.code, detail=exc.detail)
+    return PROJECTION_READY
 
 
 @dataclass(frozen=True, slots=True)
