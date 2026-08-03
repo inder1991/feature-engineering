@@ -31,7 +31,15 @@ def _record_dead_letter(queue_id: int, *, error: str, reason: str) -> None:
 # ONLY these, both under FOR UPDATE SKIP LOCKED so neither double-processes across workers.
 CONTROL_SIGNAL_HANDLERS = frozenset({"runtime.auto_park", "runtime.repair_exhausted"})
 FORMULA_SHADOW_QUEUE_HANDLERS = frozenset({"recipe_formula_shadow.author.v1"})
-_DEDICATED_HANDLERS = CONTROL_SIGNAL_HANDLERS | FORMULA_SHADOW_QUEUE_HANDLERS
+# Phase G §3.1 — the materialization compile lane. Same reason as the two sets above: a
+# materialization job carries no run-stream `event_id`, so `process_one`'s `_build_context`
+# (`dispatch.py:111-133`) would dead-letter it as an unresolvable triggering event. The name is
+# spelled here rather than imported from `featuregen.materialize.queue_lane` because that module
+# imports THIS one; `test_queue_lane.py` asserts the two spellings agree, so a rename cannot
+# silently leave `claim_one` free to steal a governed request.
+MATERIALIZATION_QUEUE_HANDLERS = frozenset({"materialization.compile.v1"})
+_DEDICATED_HANDLERS = (
+    CONTROL_SIGNAL_HANDLERS | FORMULA_SHADOW_QUEUE_HANDLERS | MATERIALIZATION_QUEUE_HANDLERS)
 
 
 class BackpressureError(RuntimeError):
@@ -302,6 +310,155 @@ def fail_recipe_formula_shadow(
             claim.id,
             error=error,
             reason="formula_permanent" if permanent else "formula_retry_exhausted",
+        )
+    return row is not None
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializationQueueClaim:
+    """A leased materialization job (Phase G §3.1).
+
+    Field-for-field the same shape as :class:`FormulaQueueClaim` and deliberately a SEPARATE type:
+    the two lanes' terminal writes are fence-guarded UPDATEs keyed on ``(id, lease_owner,
+    lease_fence)``, and a shared type would let one lane's claim be handed to the other lane's
+    completion by nothing worse than a typo. Reshaping the existing type into a shared one is not
+    available either — `runtime/queue.py` is concurrently owned, and this lane is additive.
+    """
+
+    id: int
+    message_id: str
+    partition_key: str
+    handler: str
+    payload: Mapping[str, Any]
+    attempts: int
+    max_attempts: int
+    lease_owner: str
+    lease_fence: int
+
+
+def claim_materialization(
+    conn: psycopg.Connection,
+    *,
+    owner: str,
+    lease_seconds: float,
+) -> MaterializationQueueClaim | None:
+    """Lease one materialization job with a monotonically increasing fence.
+
+    ``lease_seconds`` has NO default, unlike the formula lane's 300s. A compile's duration is
+    dominated by the L0 build proof, whose bound is the deployment's configured
+    ``L0Interpreter.timeout_seconds`` — so the only honest lease is one derived from that
+    configuration, and a default here would be a second answer that nothing keeps in step with it.
+    The lane claims with a short bootstrap lease and sizes it once, the moment the budget is known.
+
+    The partition exclusion is what stops two compiles of one logical group: the lane keys the
+    partition on the group name, and publication is atomic per group.
+    """
+    row = None
+    try:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH c AS ("
+                    " SELECT id FROM queue"
+                    " WHERE status='ready' AND available_at <= now()"
+                    "   AND handler = ANY(%s)"
+                    "   AND partition_key NOT IN "
+                    "       (SELECT partition_key FROM queue WHERE status='leased')"
+                    " ORDER BY priority, available_at, id"
+                    " FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") "
+                    "UPDATE queue q SET status='leased', lease_owner=%s, "
+                    " lease_expires_at=now() + make_interval(secs => %s), "
+                    " attempts=q.attempts + 1, lease_fence=q.lease_fence + 1 "
+                    "FROM c WHERE q.id=c.id RETURNING q.*",
+                    (list(MATERIALIZATION_QUEUE_HANDLERS), owner, lease_seconds),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UniqueViolation:
+        return None
+    if row is None:
+        return None
+    return MaterializationQueueClaim(
+        id=row["id"],
+        message_id=row["message_id"],
+        partition_key=row["partition_key"],
+        handler=row["handler"],
+        payload=row["payload"],
+        attempts=row["attempts"],
+        max_attempts=row["max_attempts"],
+        lease_owner=row["lease_owner"],
+        lease_fence=row["lease_fence"],
+    )
+
+
+def renew_materialization(
+    conn: psycopg.Connection,
+    claim: MaterializationQueueClaim,
+    *,
+    lease_seconds: float,
+) -> bool:
+    """Extend a held materialization lease, refusing a stale fence.
+
+    The lane calls this EXACTLY once, immediately after a claim, to replace the bootstrap lease
+    with one sized from the deployment's compile budget — never during a compile. See
+    ``materialize/queue_lane.py`` for why a mid-compile renewal is not merely unnecessary here but
+    structurally impossible: the build proof runs inside the chain's commit transaction, which
+    holds a row lock on the very request a renewal would have to touch.
+    """
+    row = conn.execute(
+        "UPDATE queue SET lease_expires_at=now() + make_interval(secs => %s) "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (lease_seconds, claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def complete_materialization(
+    conn: psycopg.Connection, claim: MaterializationQueueClaim
+) -> bool:
+    """Mark a materialization job done, refusing a stale fence."""
+    row = conn.execute(
+        "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def fail_materialization(
+    conn: psycopg.Connection,
+    claim: MaterializationQueueClaim,
+    *,
+    error: str,
+    permanent: bool,
+) -> bool:
+    """Fail a materialization job — retry with backoff, or dead-letter — refusing a stale fence."""
+    status = "dead" if permanent or claim.attempts >= claim.max_attempts else "ready"
+    row = conn.execute(
+        "UPDATE queue SET status=%s, last_error=%s, lease_owner=NULL, lease_expires_at=NULL, "
+        "available_at=CASE WHEN %s='ready' THEN now() + make_interval(secs => %s) "
+        "ELSE available_at END "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() RETURNING id",
+        (
+            status,
+            error,
+            status,
+            compute_backoff(claim.attempts),
+            claim.id,
+            claim.lease_owner,
+            claim.lease_fence,
+        ),
+    ).fetchone()
+    if row is not None and status == "dead":
+        _record_dead_letter(
+            claim.id,
+            error=error,
+            reason="materialization_permanent" if permanent else "materialization_retry_exhausted",
         )
     return row is not None
 

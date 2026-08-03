@@ -27,6 +27,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from featuregen.contracts import Command, Projection
+from featuregen.materialize.queue_lane import process_materialization_once
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
@@ -123,6 +124,7 @@ class WorkerTick:
     errors: int
     external_dispatched: int = 0
     formula_processed: int = 0
+    materialization_processed: int = 0
 
 
 def _control_actor():
@@ -445,6 +447,24 @@ def run_worker_once(
 
     formula_processed = _stage("recipe_formula_shadow")(_drain_formula, 0)
 
+    def _drain_materialization() -> int:
+        # Phase G §3.1's fenced lane. Its own dedicated claim (the rows are excluded from
+        # `claim_one` by `MATERIALIZATION_QUEUE_HANDLERS`), its own lease and fence, and its own
+        # configuration — resolved inside the handler only once a job is claimed, so a deployment
+        # that configures no materialization costs exactly one idle query per tick and never a
+        # counted stage error.
+        #
+        # ONE job per tick, deliberately NOT `batch`. A tick is documented as one bounded
+        # non-blocking pass, and a compile is minutes: it renders a project, hashes a tree and runs
+        # an L0 subprocess bounded only by the deployment's configured timeout. Draining a backlog
+        # of `batch` compiles inside one tick would hold the timers, the relay, the projections and
+        # every poller for the sum of them. A queued backlog still drains — one per tick, on ticks
+        # that are a second apart — which costs nothing next to a compile's own duration.
+        outcome = process_materialization_once(conn, owner=f"{owner}:materialize")
+        return 0 if outcome.status == "idle" else 1
+
+    materialization_processed = _stage("materialization")(_drain_materialization, 0)
+
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
         # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).
@@ -536,6 +556,7 @@ def run_worker_once(
         errors=errors,
         external_dispatched=external_dispatched,
         formula_processed=formula_processed,
+        materialization_processed=materialization_processed,
     )
 
 
