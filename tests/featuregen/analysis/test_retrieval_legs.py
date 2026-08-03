@@ -81,6 +81,18 @@ def _column(db, source, table, column, *, definition=None, grain=False, as_of=Fa
     rebuild_search_doc(db, source, f"public.{table}.{column}")
 
 
+def _table(db, source, table, *, definition=None, business_context=None, domain=None,
+           data_role=None, primary_entity=None):
+    """A TABLE node carrying the profile prose leg 3 harvests (profile Task 5)."""
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, "
+        "  definition, business_context, domain, data_role, primary_entity) "
+        "VALUES (%s,%s,'table',%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (catalog_source, object_ref) DO NOTHING",
+        (source, f"public.{table}", table, definition, business_context, domain, data_role,
+         primary_entity))
+
+
 @pytest.fixture
 def catalog(db):
     """A payments fact with a governed grain + as-of, and a SEPARATE table whose only connection to
@@ -170,6 +182,67 @@ def test_expansion_never_harvests_vocabulary_from_a_column_the_caller_cannot_rea
             sensitivity="restricted", concept="emirates_identity_number")
     got = retrieve_candidates(db, "the identifier", now=_NOW)
     assert "emirates_identity_number" not in " ".join(got.expansion_terms)
+
+
+# ── leg 3: the TABLE-profile harvest is read-scoped like the column harvest ─────────────────────
+
+
+@pytest.fixture
+def two_catalogs(db, monkeypatch):
+    """The reviewer's cross-source probe.
+
+    Two catalogs whose tables share a NAME. `srca.shared_name` is legitimately offered; `srcb`
+    reaches the harvest's source list only through a DIFFERENT table, and `srcb.shared_name` — whose
+    every column is restricted — is the pair the ANY/ANY cross product invents."""
+    from featuregen.overlay.upload.profile_vocab import DATASET_PROFILES_FLAG
+
+    monkeypatch.setenv(DATASET_PROFILES_FLAG, "1")
+    _watermark(db, "srca")
+    _watermark(db, "srcb")
+    _column(db, "srca", "shared_name", "settlement_id", definition="settlement identifier",
+            grain=True)
+    _table(db, "srca", "shared_name", definition="the clearing ledger",
+           business_context="run by the clearing operations desk", domain="Clearing",
+           data_role="fact", primary_entity="settlement")
+    _column(db, "srcb", "other_tbl", "settlement_code", definition="settlement identifier code")
+    _table(db, "srcb", "other_tbl", definition="reference data", domain="Reference")
+    _column(db, "srcb", "shared_name", "deal_id", definition="restricted deal identifier",
+            sensitivity="restricted")
+    _table(db, "srcb", "shared_name", definition="zzsecretword merger book",
+           business_context="zzsecretword project", domain="Zzconfidential")
+    return db
+
+
+def test_the_table_profile_harvest_never_leaks_a_restricted_table_from_another_source(
+        two_catalogs):
+    """The harvest bound `catalog_source = ANY` AND `table_name = ANY` with no post-filter, so a
+    table name shared across two catalogs pulled the OTHER catalog's prose into the expansion — and
+    from there into `expansion_terms` and the `/analysis/plan` response."""
+    got = retrieve_candidates(two_catalogs, "settlement identifier", now=_NOW)
+    # The offered set is what the caller may read — both visible columns, neither restricted one.
+    assert "srca::shared_name.settlement_id" in got.candidates.column_refs
+    assert "srcb::other_tbl.settlement_code" in got.candidates.column_refs
+    assert "srcb::shared_name.deal_id" not in got.candidates.column_refs
+
+    joined = " ".join(got.expansion_terms)
+    assert "zzsecretword" not in joined
+    assert "zzconfidential" not in joined
+    assert "merger" not in got.expansion_terms
+    # …and the legitimately-offered table's OWN prose still expands: the fix narrows the harvest,
+    # it does not switch it off.
+    assert "clearing" in got.expansion_terms
+    assert "ledger" in got.expansion_terms
+
+
+def test_the_table_profile_harvest_refuses_a_table_with_no_readable_column(two_catalogs):
+    """Defence in depth, independent of the pair post-filter: asked DIRECTLY for the restricted
+    table's own pair, the harvest query's derived-visibility predicate still refuses it. Table nodes
+    carry `visible_requires = {}`, so their scope can only ever be DERIVED from their columns."""
+    from featuregen.analysis.retrieval import _expansion_terms
+
+    terms = _expansion_terms(two_catalogs, [("srcb", "shared_name", "deal_id")], roles=(),
+                             limit=50)
+    assert "zzsecretword" not in " ".join(terms)
 
 
 def test_expansion_cannot_widen_the_catalog_without_bound(catalog):

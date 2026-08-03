@@ -311,13 +311,35 @@ def _expansion_terms(conn, refs: Sequence[tuple[str, str, str]], *, roles: Itera
     from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
 
     if dataset_profiles_enabled():
-        for row in conn.execute(
-            f"SELECT {', '.join(_TABLE_PROFILE_COLUMNS)} FROM graph_node "
-            "WHERE kind = 'table' AND catalog_source = ANY(%s) AND table_name = ANY(%s)",
-            (sources, tables)).fetchall():
-            # Table nodes carry `visible_requires = {}`, so their scope is DERIVED: this harvest is
-            # reached only for tables whose COLUMNS the caller already passed scope on above.
-            for value in row:
+        # READ-SCOPED EXACTLY LIKE THE COLUMN HARVEST ABOVE, and for the same reason: this prose
+        # becomes prompt text. Two guards, because they fail in different directions.
+        #
+        # 1. `catalog_source = ANY` AND `table_name = ANY` is a CROSS PRODUCT. Two catalogs whose
+        #    tables share a name (`shared_name` in a payments export and in a deal book) made the
+        #    harvest read a pair the caller was never offered, and the OTHER catalog's business
+        #    context — a merger codename, in the probe that found this — reached
+        #    `Retrieval.expansion_terms` and the `/analysis/plan` response. So the rows are
+        #    post-filtered to the exact (source, table) pairs the offered set implies, the same
+        #    re-check `_structural_columns` and the column harvest already do on the full triple.
+        #
+        # 2. A table node carries `visible_requires = {}` — it has no scope of its own — so its
+        #    visibility can only ever be DERIVED from its columns. The EXISTS predicate is that
+        #    derivation (the same one `read_scope.visible_table_pairs` computes for search), applied
+        #    IN the query so a caller that hands this function a pair it should not have cannot make
+        #    the harvest read prose behind it either.
+        table_pairs = {(s, t) for s, t, _c in refs}
+        for source, table, *values in conn.execute(
+            f"SELECT catalog_source, table_name, {', '.join(_TABLE_PROFILE_COLUMNS)} "
+            "FROM graph_node t WHERE t.kind = 'table' AND t.catalog_source = ANY(%s) "
+            "  AND t.table_name = ANY(%s) "
+            "  AND EXISTS (SELECT 1 FROM graph_node c WHERE c.kind = 'column' "
+            "                AND c.catalog_source = t.catalog_source "
+            "                AND c.table_name = t.table_name "
+            "                AND COALESCE(c.visible_requires, '{}') <@ %s)",
+            (sources, tables, allowed_sensitivities(roles))).fetchall():
+            if (source, table) not in table_pairs:
+                continue
+            for value in values:
                 _harvest(value)
     # Deterministic order so the same catalog state produces the same prompt.
     return tuple(sorted(terms)[:limit])
