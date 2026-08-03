@@ -54,9 +54,7 @@ from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.read_scope import (
     allowed_sensitivities,
-)
-from featuregen.overlay.upload.read_scope import (
-    read_scope_rule_content_hash as _read_scope_rule_content_hash,
+    read_scope_rule_content_hash,
 )
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
@@ -761,7 +759,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
 
     trace = GroundingTraceRecorder(
         candidate_key=candidate_key, template_id=template_id,
-        read_scope_rule_content_hashes=(_read_scope_rule_content_hash(),) if candidate_key else ())
+        read_scope_rule_content_hashes=(read_scope_rule_content_hash(),) if candidate_key else ())
 
     def _reject(code: str, message: str):
         """A refusal carrying the trace of what had been read WHEN it refused — the pins collected

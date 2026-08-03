@@ -94,10 +94,11 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     # HOW MUCH is grounded against and never WHAT may be.
     neighbourhood = clearing_neighbourhood(conn, catalog_source, table, roles=roles,
                                            max_hops=max_hops)
-    # The engine's own result object. Read BY NAME — this screen consumes six of its members and
-    # ignores the rest; it never rebuilds, re-derives or re-attributes any of them, and (rule 15) it
-    # never touches the decision traces the engine minted: they are the gauntlet's answer to a
-    # different question, and reconstructing one here would be a second copy of the decision.
+    # The engine's own result object. Read BY NAME — this screen consumes five of its members
+    # (ideas, rejections, binding_by_id, contexts, keys_by_recipe) and ignores the rest; it never
+    # rebuilds, re-derives or re-attributes any of them, and (rule 15) it never touches the decision
+    # traces the engine minted: they are the gauntlet's answer to a different question, and
+    # reconstructing one here would be a second copy of the decision.
     candidates = _template_candidates(conn, catalog_source=catalog_source, roles=roles,
                                       target_ref=None, now=None,   # no intent, no clock, no LLM
                                       table=table,                 # ...THIS table's columns...

@@ -19,7 +19,6 @@ from datetime import timedelta
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.field_evidence import canonical_hash
-from featuregen.overlay.upload import grounding_trace
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
@@ -47,6 +46,8 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     ensure_generation_run,
 )
 from featuregen.overlay.upload.grounding_trace import (
+    GROUNDING_CANDIDATE_SET,
+    READ_SCOPE,
     SuggestionDependencyClass,
     build_trace,
     dependency_pin,
@@ -461,11 +462,11 @@ def _governed_plan_trace(plan: BindingPlanV1, *, roles, pairs: tuple[tuple[str, 
     pins = [
         dependency_pin(
             dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
-            dependency_kind=grounding_trace.READ_SCOPE, dependency_key="read-scope",
+            dependency_kind=READ_SCOPE, dependency_key="read-scope",
             content={"allowed_classes": allowed_classes(roles)}),
         dependency_pin(
             dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
-            dependency_kind=grounding_trace.GROUNDING_CANDIDATE_SET,
+            dependency_kind=GROUNDING_CANDIDATE_SET,
             dependency_key="physical_read_set",
             content={"resolved_object_refs": [ref for _cs, ref in pairs]}),
         *plan_dependency_pins(plan),
