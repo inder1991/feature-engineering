@@ -25,6 +25,41 @@ _COLUMN_FACETS: dict[str, str] = {
     "entity": "entity",
     "kind": "kind",
 }
+
+# Release-A profile facets (profile Task 5 + D13.1/D13.2), added ONLY while
+# `FEATUREGEN_DATASET_PROFILES` is on — with the flag off, `search()` returns the exact facet map
+# it always did, so the flag-off payload is byte-identical (profile Task 6's own rule).
+#
+# Every one is a LITERAL `graph_node` column, because that is the only thing this mechanism can
+# read (review D: "a derived data role facet is inexpressible"). `data_role` is the migration-1052
+# projection of the canonical `table_role`; `authority_role`/`temporal_storage_model` are the 1047
+# table-node projections; `bian_path`/`process_path`/`sub_domain` are the 1051 column-node axes.
+#
+# TABLE-grain facets bucket every COLUMN row under `(none)`, which is honest rather than noisy:
+# selecting `data_role=crosswalk` returns the crosswalk TABLES, which is the question being asked.
+# Read scope is IDENTICAL to every other facet — the base predicates (including the derived
+# table-visibility rule) are applied to the facet counts too, so a hidden table's profile can never
+# be counted into a bucket.
+_PROFILE_FACETS: dict[str, str] = {
+    "data_role": "data_role",
+    "authority_role": "authority_role",
+    "temporal_storage_model": "temporal_storage_model",
+    "bian_path": "bian_path",
+    "process_path": "process_path",
+    "sub_domain": "sub_domain",
+}
+
+
+def column_facets() -> dict[str, str]:
+    """The active facet map. The ONE definition — the route builds its filter dict from it, so a
+    facet cannot exist in the query layer and be un-passable from HTTP (or the reverse)."""
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    if dataset_profiles_enabled():
+        return {**_COLUMN_FACETS, **_PROFILE_FACETS}
+    return dict(_COLUMN_FACETS)
+
+
 # Boolean-flag facets: presence of the filter means "only rows where the flag is true".
 _FLAG_FACETS: dict[str, str] = {
     "grain": "is_grain",
@@ -148,7 +183,7 @@ def _build_predicates(
         base_preds.append(f"n.search_doc @@ {_TSQUERY[match]}")
 
     facet_preds: dict[str, str] = {}
-    for name, col in _COLUMN_FACETS.items():
+    for name, col in column_facets().items():
         selected = list(filters.get(name, ()))
         if not selected:
             continue
@@ -229,7 +264,7 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
         total = int(row["c"]) if row else 0
 
         facets: dict[str, list[FacetBucket]] = {}
-        for name, col in _COLUMN_FACETS.items():
+        for name, col in column_facets().items():
             # GROUP BY the facet column over the set filtered by everything EXCEPT this facet.
             # read-scope stays in base_preds, so a forbidden sensitivity value never appears here.
             cur.execute(

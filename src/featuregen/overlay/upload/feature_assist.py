@@ -160,7 +160,12 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
            "c.domain, c.definition, c.ai_summary, c.data_type, c.declared_type, c.semantic_terms, "
            "c.entity, "
            "c.additivity, c.unit, c.currency, c.is_grain, c.is_as_of, c.grain_fact_event_id, "
-           "c.availability_fact_event_id, t.definition, t.primary_entity "
+           "c.availability_fact_event_id, t.definition, t.primary_entity, "
+           # Release-A profile ADVISORIES (profile Task 5), from the SAME already-scoped table
+           # join — never a second unscoped fetch. Display projections, so they inform the model
+           # and change no gate: the numeric, currency, grain, availability and join checks stay
+           # exactly as authoritative as they were.
+           "t.data_role, t.authority_role, t.temporal_storage_model, t.business_context "
            "FROM graph_node c "
            "LEFT JOIN graph_node t ON t.catalog_source = c.catalog_source AND t.kind = 'table' "
            "AND t.table_name = c.table_name "
@@ -183,7 +188,10 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
              "is_as_of": r[16], "grain_fact_event_id": r[17], "availability_fact_event_id": r[18],
              # The LEFT JOIN's table fields sit AFTER the column fields — inserting `ai_summary`
              # shifted every index past it, and these two were the tail I missed first time.
-             "table_definition": r[19], "table_primary_entity": r[20]} for r in rows]
+             "table_definition": r[19], "table_primary_entity": r[20],
+             "table_data_role": r[21], "table_authority_role": r[22],
+             "table_temporal_storage_model": r[23], "table_business_context": r[24]}
+            for r in rows]
 
 
 def _menu(cols: list[dict]) -> list[dict]:
@@ -414,8 +422,59 @@ def _table_context(cols: list[dict]) -> list[dict]:
                         if m.get("table_primary_entity")), None)
         if pentity:
             block["primary_entity"] = pentity
+        block.update(_profile_advisories(members))
         blocks.append(block)
     return blocks
+
+
+#: What each data role means for FEATURE construction. ADVISORY, never a gate (profile Task 5:
+#: "data role produces useful warnings… it does not hard-refuse by itself"). The numeric, currency,
+#: additivity, grain, availability and join checks in `_vet` remain the only things that can refuse
+#: a candidate — these sentences exist so the model stops proposing the mistake in the first place,
+#: which is a better outcome than rejecting it afterwards.
+_DATA_ROLE_ADVISORIES: dict[str, str] = {
+    "dimension": ("this table is a DIMENSION: its rows describe an entity, so aggregating its "
+                  "columns over rows usually counts descriptions rather than events"),
+    "snapshot_fact": ("this table is a SNAPSHOT fact: each row restates a position at a point in "
+                      "time, so summing across snapshots double-counts — compare positions or "
+                      "pick one as-of instant instead"),
+    "crosswalk": ("this table is a CROSSWALK (identifier mapping): its columns identify, they do "
+                  "not measure"),
+    "reference": ("this table is a REFERENCE list: its columns label and group, they do not "
+                  "measure"),
+}
+
+
+def _profile_advisories(members: list[dict]) -> dict:
+    """The Release-A profile fields for one table block, as CONTEXT and ADVISORIES.
+
+    Flag-gated (`FEATUREGEN_DATASET_PROFILES`): with it off, the block is byte-identical to the
+    pre-profile shape — no key, not an empty one. Every value is a rebuildable DISPLAY projection,
+    so nothing here is consulted as authority by anything downstream.
+    """
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    if not dataset_profiles_enabled():
+        return {}
+    out: dict = {}
+    for key, source_key in (("data_role", "table_data_role"),
+                            ("authority_role", "table_authority_role"),
+                            ("temporal_storage_model", "table_temporal_storage_model"),
+                            ("business_context", "table_business_context")):
+        value = next((m[source_key] for m in members if m.get(source_key)), None)
+        if value:
+            out[key] = value
+    advisory = _DATA_ROLE_ADVISORIES.get(str(out.get("data_role") or ""))
+    if advisory:
+        out["advisories"] = [advisory]
+    # A SNAPSHOT table that also carries a governed as-of column is the mismatch worth naming: the
+    # time column reads like an event stream and the storage model says it is not one.
+    if out.get("data_role") == "snapshot_fact" and any(
+            m["is_as_of"] and m["availability_fact_event_id"] for m in members):
+        out.setdefault("advisories", []).append(
+            "its as-of column marks WHEN the snapshot was taken, not when an event happened — a "
+            "windowed count over it counts snapshots, not activity")
+    return out
 
 
 # One hard byte budget on the assembled feature-context batch (spec §6). Referenced at call time so

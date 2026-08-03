@@ -73,6 +73,13 @@ LEGS: tuple[str, ...] = (LEG_GRAIN_TIME, LEG_LEXICAL, LEG_SEMANTIC_EXPANSION,
 _EXPANSION_COLUMNS = ("concept", "domain", "sub_domain", "entity", "semantic_terms",
                       "bian_path", "process_path")
 
+#: The TABLE-grain profile vocabulary (profile Task 5), harvested only while
+#: `FEATUREGEN_DATASET_PROFILES` is on. A question is usually asked in the words of the DATASET
+#: ("settlement ledger", "system of record") rather than in a column's, and these five are where
+#: those words live. All are rebuildable display projections; none is consulted as authority.
+_TABLE_PROFILE_COLUMNS = ("definition", "business_context", "domain", "data_role",
+                          "primary_entity")
+
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
@@ -280,19 +287,38 @@ def _expansion_terms(conn, refs: Sequence[tuple[str, str, str]], *, roles: Itera
     wanted = set(refs)
     terms: list[str] = []
     seen: set[str] = set()
+
+    def _harvest(value) -> None:
+        if not value:
+            return
+        for token in _TOKEN_RE.findall(str(value).lower()):
+            # One-character tokens carry no meaning and two-character ones are mostly noise
+            # ("of", "l1"); a bounded vocabulary is the point of a CONTROLLED expansion.
+            if len(token) < 3 or token in seen:
+                continue
+            seen.add(token)
+            terms.append(token)
+
     for row in rows:
         if (row[0], row[1], row[2]) not in wanted:
             continue
         for value in row[3:]:
-            if not value:
-                continue
-            for token in _TOKEN_RE.findall(str(value).lower()):
-                # One-character tokens carry no meaning and two-character ones are mostly noise
-                # ("of", "l1"); a bounded vocabulary is the point of a CONTROLLED expansion.
-                if len(token) < 3 or token in seen:
-                    continue
-                seen.add(token)
-                terms.append(token)
+            _harvest(value)
+    # The TABLE profile (profile Task 5): description, business context, domain, data role and
+    # primary entity are meaning-bearing vocabulary about the dataset a column lives in, and the
+    # question is usually asked in those words rather than in a column's. Flag-gated, so retrieval
+    # with `FEATUREGEN_DATASET_PROFILES` off expands on exactly what it expanded on before.
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    if dataset_profiles_enabled():
+        for row in conn.execute(
+            f"SELECT {', '.join(_TABLE_PROFILE_COLUMNS)} FROM graph_node "
+            "WHERE kind = 'table' AND catalog_source = ANY(%s) AND table_name = ANY(%s)",
+            (sources, tables)).fetchall():
+            # Table nodes carry `visible_requires = {}`, so their scope is DERIVED: this harvest is
+            # reached only for tables whose COLUMNS the caller already passed scope on above.
+            for value in row:
+                _harvest(value)
     # Deterministic order so the same catalog state produces the same prompt.
     return tuple(sorted(terms)[:limit])
 

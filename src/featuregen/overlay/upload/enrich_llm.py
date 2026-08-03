@@ -350,9 +350,20 @@ _FEATURE_COLUMN_MAPPING_KEYS = frozenset({"semantic_authority"})
 _FEATURE_COLUMN_DICT_LIST_KEYS: dict[str, frozenset[str]] = {
     "relationships": frozenset({"relationship_ref", "kind", "availability", "review_status"}),
 }
-_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition"})
-_TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity"})
-_TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns"})
+# `business_context` is PROSE (a data owner wrote it), so it routes through the definition
+# sanitizer exactly like `table_definition` — sample-clause stripped, data-marker scanned, PII
+# redacted. Classifying it as an identity string would have let an uploader's paragraph egress
+# unscanned, which is the whole reason the definition grade exists.
+_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_context"})
+# The Release-A profile classifications are CLOSED-vocabulary tokens (profile_vocab), not prose.
+_TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity",
+                                          "data_role", "authority_role",
+                                          "temporal_storage_model"})
+# `advisories` are PLATFORM-authored sentences from a closed table in this repo — never uploader
+# text and never model output — so they are length-bounded like any other structural list.
+_TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns", "advisories"})
+#: Advisory sentences are longer than a ref; bounded so a mutated table cannot smuggle a payload.
+_TABLE_ADVISORY_MAX_LEN = 400
 _FEATURE_STRUCTURAL_MAX_LEN = 200
 #: Bound on a v4 list/mapping so one column cannot carry an unbounded payload past the byte budget
 #: into the egress scanner.
@@ -514,9 +525,10 @@ def sanitize_feature_context(
                         return None, pii_spans, sample_audits, version
                     out[k] = v
                 elif k in _TABLE_CONTEXT_LIST_KEYS:
-                    if not (isinstance(v, list) and all(
-                            isinstance(x, str) and len(x) <= _FEATURE_STRUCTURAL_MAX_LEN
-                            for x in v)):
+                    cap = (_TABLE_ADVISORY_MAX_LEN if k == "advisories"
+                           else _FEATURE_STRUCTURAL_MAX_LEN)
+                    if not (isinstance(v, list) and len(v) <= _FEATURE_COLLECTION_MAX_ITEMS
+                            and all(isinstance(x, str) and len(x) <= cap for x in v)):
                         return None, pii_spans, sample_audits, version
                     out[k] = v
                 else:
