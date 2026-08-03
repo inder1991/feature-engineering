@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from tests.featuregen.overlay.upload.test_suggestions import (
@@ -230,6 +231,20 @@ def test_the_route_payload_carries_no_trace_material(overlay_conn, ftr_catalog):
         assert word not in body
     hashes = {i.grounding_trace.trace_content_hash for i in _engine(overlay_conn).ideas}
     assert hashes and not any(h in body for h in hashes)
+
+
+def test_the_adapter_contains_no_trace_logic_at_all(overlay_conn, ftr_catalog):
+    """RULE 15, as a source-level tripwire. ``suggestions.py`` is an ADAPTER: it consumes what the
+    engine decided. The moment it mints a pin, builds a trace or asks the join planner a question of
+    its own, there are two copies of the decision and they are free to disagree — which is the exact
+    failure this whole contract exists to prevent. Asserted on the source, because a behavioural
+    test cannot see a reconstruction that happens to agree today."""
+    source = Path(suggestions_module.__file__).read_text(encoding="utf-8")
+    for forbidden in ("grounding_trace", "build_trace", "dependency_pin", "relationship_leg",
+                      "classify_join_path", "find_join_path", "GroundingDecisionTraceV1"):
+        assert forbidden not in source, (
+            f"suggestions.py references {forbidden!r} — the adapter must consume the engine's "
+            "trace, never reconstruct it or re-run path selection")
 
 
 def test_the_candidates_themselves_are_unchanged_by_tracing(overlay_conn, ftr_catalog):
