@@ -72,6 +72,7 @@ from featuregen.materialize.control_plane import (
     append_run_event,
     read_group_binding,
     read_run_events,
+    record_compiled_artifact,
     record_generation,
     record_group_binding,
     record_plan_revision,
@@ -397,8 +398,9 @@ def compile_feature_group(
             authorized=authorized, plan=plan, contract=group.contract, admitted=by_name,
             spine_input=spine_input, datasets=datasets))))
 
-    return _commit(conn, request, plan=plan, binding=binding, existing=existing, project=sealed,
-                   refusal=selection, project_root=project_root, clock=clock)
+    return _commit(conn, request, plan=plan, contract=group.contract, binding=binding,
+                   existing=existing, project=sealed, refusal=selection, project_root=project_root,
+                   clock=clock)
 
 
 # ── the durable record ───────────────────────────────────────────────────────────────────────────
@@ -409,6 +411,7 @@ def _commit(
     request: MaterializationRequestV1,
     *,
     plan: FeatureGroupPlanV1,
+    contract: MaterializationContractV1,
     binding: GroupContractBinding,
     existing: GroupContractBinding | None,
     project: SealedProject,
@@ -416,8 +419,8 @@ def _commit(
     project_root: str | os.PathLike[str],
     clock: Callable[[], str],
 ) -> CompiledGroup:
-    """Record the generation, the §10.1 records and the truthful terminal, and write the tree — ALL
-    OR NOTHING.
+    """Record the generation, the §10.1 records, §3.6's compiled artifact and the truthful terminal,
+    and write the tree — ALL OR NOTHING.
 
     THE TRANSACTION IS THE POINT, and ordering alone was not enough. The runtime this chain is
     driven from is AUTOCOMMIT by contract (``runtime/worker.py:638``: "Autocommit is required: each
@@ -436,8 +439,8 @@ def _commit(
     caller's alone) and is what makes the guarantee testable at all.
 
     ORDER still matters inside it. The generation row comes first because every other plane record
-    takes a foreign key to it, and the tree is written last so the cheap failures happen before the
-    expensive one.
+    takes a foreign key to it — ``materialization_compiled_artifact`` included — and the tree is
+    written last so the cheap failures happen before the expensive one.
 
     ``RUNNING`` is a stepping stone here, and its documented meaning ("a run was prepared") is not
     yet true in G-1 — ``prepare_run`` is G-2. It is passed through because ``accepted → committed``
@@ -472,6 +475,12 @@ def _commit(
             record_group_binding(conn, binding)
         record_plan_revision(conn, plan_revision(plan, binding, generation_id=generation_id,
                                                  created_at=created_at))
+        # §3.6: the BODIES behind two of the generation's three hashes — the packing list §9 gates
+        # against and the contract the group publishes under. (The third, the project hash, names
+        # the tree, which is written below and kept whole.) Without this row a crash after render
+        # leaves a generation nobody can audit: three digests of objects nothing kept.
+        record_compiled_artifact(conn, generation_id=generation_id, group_plan=plan,
+                                 contract=contract)
 
         append_run_event(conn, MaterializationRunEvent(
             run_id=run_id, seq=FIRST_RUN_EVENT_SEQ, generation_id=generation_id,

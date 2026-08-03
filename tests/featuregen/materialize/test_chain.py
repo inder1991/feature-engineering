@@ -52,6 +52,7 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
 )
 
 from featuregen.materialize.admission import FeatureNamePlanError
+from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import (
     CompilationRefusalCode,
     MaterializationRefused,
@@ -76,6 +77,7 @@ from featuregen.materialize.control_plane import (
     RunEventKind,
     RunStatus,
     published_generation_ids,
+    read_compiled_artifact,
     read_group_binding,
     read_plan_revisions,
     read_run_events,
@@ -281,6 +283,29 @@ def test_the_binding_and_its_plan_revision_are_recorded(ready, catalog) -> None:
         (outcome.generation_id, outcome.group_plan_hash)]
 
 
+def test_what_the_run_INTENDED_TO_READ_survives_the_run(ready, catalog) -> None:
+    """§3.6's compile-side retention (migration 1054). Before it, a crash after render left only
+    hashes: nobody could answer "which features, which columns, which spine?" from the record, and
+    §3.3's reconciler had no compile-side evidence to reconcile against.
+
+    The bodies are asserted to re-derive to the hashes this very run reported — through the
+    package's one hasher, over a real plan and a real contract that a real compilation produced."""
+    request_id, work_items, root = ready
+
+    outcome = _run(catalog, request_id, work_items, root)
+
+    stored = read_compiled_artifact(catalog, generation_id=outcome.generation_id)
+    assert stored is not None
+    assert stored.group_plan_hash == outcome.group_plan_hash
+    assert stored.contract_hash == outcome.materialization_contract_hash
+    assert materialize_hash(stored.group_plan) == outcome.group_plan_hash
+    assert materialize_hash(stored.materialization_contract) == \
+        outcome.materialization_contract_hash
+    # the PACKING LIST itself — the thing a human could not previously read back at all
+    assert stored.group_plan["logical_group_name"] == _GROUP
+    assert [feature["column_name"] for feature in stored.group_plan["features"]] == [_FEATURE]
+
+
 def test_the_run_carries_exactly_one_event_and_it_is_the_truthful_terminal(
         ready, catalog) -> None:
     request_id, work_items, root = ready
@@ -313,18 +338,25 @@ def test_a_second_binding_for_the_same_group_is_not_written_twice(catalog, monke
     assert one.generation_id != two.generation_id
 
 
-@pytest.mark.parametrize("injected", ["append_run_event", "materialize_to"])
+@pytest.mark.parametrize("injected",
+                         ["record_compiled_artifact", "append_run_event", "materialize_to"])
 def test_the_commit_is_ALL_OR_NOTHING(ready, catalog, monkeypatch, injected) -> None:
     """The commit block must be atomic, not merely ordered — and on the runtime this chain will be
     driven from, ordering alone is not enough.
 
     `runtime/worker.py:638` and `runtime/dispatch.py:79` make the handler connection AUTOCOMMIT by
-    contract, so without an explicit transaction each write below would land on its own. The two
-    injection points are the two real failure modes: a mid-block refusal (the `group_binding`
-    unique violation has this shape) and a failed TREE write, which is the dangerous one — it would
-    otherwise leave the plane holding a committed request, a generation carrying a
-    `generated_project_hash`, and an UNRETRACTABLE terminal event for a project that was never
-    written. 1044's one-terminal trigger means nothing could ever supersede it."""
+    contract, so without an explicit transaction each write below would land on its own. The three
+    injection points are the real failure modes: a mid-block refusal (the `group_binding` unique
+    violation and the artifact table's own primary key both have this shape) and a failed TREE
+    write, which is the dangerous one — it would otherwise leave the plane holding a committed
+    request, a generation carrying a `generated_project_hash`, and an UNRETRACTABLE terminal event
+    for a project that was never written. 1044's one-terminal trigger means nothing could ever
+    supersede it.
+
+    `record_compiled_artifact` is injected as well as read back elsewhere because it is a WRITE
+    ADDED to an existing atomic block: a writer that opened its own transaction (or committed on
+    the autocommit connection) would leave a compiled artifact for a generation that was rolled
+    back — an FK-orphan claim that a compile happened, on the one table nothing can delete from."""
     request_id, work_items, root = ready
     monkeypatch.setattr(chain, injected,
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("write refused")))
@@ -335,6 +367,8 @@ def test_the_commit_is_ALL_OR_NOTHING(ready, catalog, monkeypatch, injected) -> 
     assert catalog.execute("SELECT count(*) FROM materialization_generation").fetchone()[0] == 0
     assert catalog.execute("SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
     assert catalog.execute("SELECT count(*) FROM group_binding").fetchone()[0] == 0
+    assert catalog.execute(
+        "SELECT count(*) FROM materialization_compiled_artifact").fetchone()[0] == 0
     assert read_request(catalog, request_id=request_id).lifecycle_state is \
         RequestLifecycle.ACCEPTED
     assert not list(pathlib.Path(root).iterdir())
