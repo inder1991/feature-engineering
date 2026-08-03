@@ -146,12 +146,31 @@ RELEASE_GATE_SUITES: tuple[str, ...] = (
 #: rebaselined silently.
 RELEASE_GATE_BASELINE = 269
 
-#: The suites this evaluation step owns, and their literal counts.
+#: The suites this evaluation step owns, and their literal counts. Asserted below, like
+#: RELEASE_GATE_BASELINE — an unread literal in a test module is a claim nobody checks, and this one
+#: was exactly that until the review of 2026-08-03.
 EVAL_SUITES: dict[str, int] = {
-    "tests/eval/test_gold_sets_are_consistent.py": 60,
+    "tests/eval/test_gold_sets_are_consistent.py": 63,
     "tests/eval/test_release_a_eval.py": 4,
-    "tests/eval/test_release_a_bars.py": 15,        # 14 passed + 1 strict xfail (bar 4, see there)
+    "tests/eval/test_release_a_bars.py": 16,        # 15 passed + 1 strict xfail (bar 4, see there)
 }
+
+
+@pytest.mark.timeout(_TIMEOUT)
+@pytest.mark.parametrize("suite", sorted(EVAL_SUITES), ids=lambda s: s.rsplit("/", 1)[-1])
+def test_the_eval_suites_hold_their_literal_count(suite: str, dsn: str) -> None:
+    """The evaluation's OWN suites, held to the same literal-count rule as the seventeen.
+
+    The bars file is `eval`-marked, so it is deselected by `addopts` in a default run; `run_victims`
+    clears the marker filter, which is why this can assert a real count rather than a zero. The
+    strict xfail (bar 4) is counted as collected — it is a recorded finding, not an absent test.
+    """
+    result = harness.run_victims((suite,), dsn=dsn)
+    harness.assert_ran(result, what=f"{suite} baseline")
+    assert result.all_passed, result.tail
+    assert result.collected == EVAL_SUITES[suite], (
+        f"{suite} collected {result.collected}, baseline {EVAL_SUITES[suite]}. A DROP is a deleted "
+        f"guard; a RISE is fine but must be rebaselined deliberately.\n{result.tail}")
 
 
 @pytest.mark.timeout(_TIMEOUT)
