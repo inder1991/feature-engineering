@@ -383,7 +383,7 @@ def test_bar_zero_reviewed_but_unsafe_relationships_displayed_executable(db) -> 
     assert payload["realizations"][0]["executable_now"] is False
 
 
-def test_bar_a_revalidation_fault_never_reads_as_executable(db, monkeypatch) -> None:
+def test_bar_a_revalidation_fault_never_reads_as_executable(db, monkeypatch) -> None:  # noqa: D401
     """The fail-closed half: a reader that RAISES must degrade to 'nothing is executable'."""
     import featuregen.overlay.upload.bridge_store as bridge_store
     from featuregen.overlay.upload.context_graph import _executable_realization_ids
@@ -395,3 +395,124 @@ def test_bar_a_revalidation_fault_never_reads_as_executable(db, monkeypatch) -> 
     assert _executable_realization_ids(db, "bridge_gold_reviewed") == frozenset()
     # and the transaction is still usable — the savepoint scoped the rollback
     assert db.execute("SELECT 1").fetchone()[0] == 1
+
+
+# ── bars added because the mutation harness proved these invariants were UNTESTED ────────────────
+#
+# Each of the three below was written after a required must-die mutation SURVIVED. The invariant was
+# claimed by the plans and by the module docstrings, and nothing in the suite noticed when it stopped
+# holding. They live here rather than in another stream's file so the ownership is unambiguous, and
+# they are the named victims of their mutations.
+
+_PROFILE_SRC = "gapbank"
+_PROFILE_TABLE = "orders"
+
+
+def _profile_seed(db):
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.graph import build_graph
+    from featuregen.overlay.upload.object_ref import normalize_ref
+
+    build_graph(db, _PROFILE_SRC, [CanonicalRow(_PROFILE_SRC, _PROFILE_TABLE, "amount", "numeric")])
+    return normalize_ref(_PROFILE_SRC, None, _PROFILE_TABLE)
+
+
+def _profile_evidence(db, ref, field, value, producer, strength):
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+
+    record_field_evidence(
+        db, logical_ref=ref, field_name=field, proposed_value=value,
+        producer=producer, strength=strength, producer_ref="release-a-bars",
+        source_snapshot_id="snap-bars",
+        input_hash=field_input_hash(logical_ref=ref, field_name=field,
+                                    material=f"{value}:{producer.value}:{strength.value}"))
+
+
+def _built(db, ref, revision_id=None):
+    from featuregen.overlay.upload.dataset_profiles import build_dataset_profile
+
+    return build_dataset_profile(db, source=_PROFILE_SRC, dataset_logical_ref=ref,
+                                 catalog_profile_revision_id=revision_id)
+
+
+def test_bar_data_role_and_authority_role_stay_two_questions(db) -> None:
+    """A declared table KIND must not answer the AUTHORITY question.
+
+    GAP CLOSED: the `collapse_data_and_authority_role` mutation survived the whole existing suite.
+    Nothing asserted that a table whose `table_role` is source-attested still reports its authority
+    as undecided — so a single axis answering both questions would have shipped unnoticed.
+    """
+    from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+    from featuregen.overlay.upload.semantic_context import UNRESOLVED_NO_EVIDENCE, unresolved_label
+
+    ref = _profile_seed(db)
+    _profile_evidence(db, ref, "table_role", "event_fact",
+                      EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+
+    profile = _built(db, ref)
+    assert profile.data_role.display is not None, "the declared kind should resolve"
+    assert profile.data_role.display.value == "event_fact"
+    assert profile.authority_role.display is None, (
+        f"the table KIND leaked into the AUTHORITY axis: "
+        f"{profile.authority_role.display and profile.authority_role.display.value}")
+    assert profile.authority_role.unresolved_reason == unresolved_label(UNRESOLVED_NO_EVIDENCE)
+    assert profile.temporal_storage_model.display is None
+
+
+def test_bar_a_catalog_narrative_never_defaults_a_dataset_authority(db) -> None:
+    """A catalog-level claim must not reach a dataset's authority classification.
+
+    GAP CLOSED: the `catalog_authority_inherits_onto_a_dataset` mutation survived. The existing
+    bounds test proves an UNKNOWN key is refused, which is a different statement — it says nothing
+    about what happens once a key becomes known. This asserts the outcome directly: the narrative is
+    authored, the dataset pins it as identity, and the authority axis stays undecided.
+    """
+    from featuregen.overlay.upload.catalog_profiles import (
+        NARRATIVE_KEYS,
+        build_catalog_profile_revision,
+        parse_narrative_payload,
+    )
+    from featuregen.overlay.upload.semantic_context import UNRESOLVED_NO_EVIDENCE, unresolved_label
+
+    ref = _profile_seed(db)
+
+    # The narrative vocabulary is closed and descriptive — no classification key may enter it.
+    assert set(NARRATIVE_KEYS) & {"authority_role", "temporal_storage_model", "data_role"} == set()
+    with pytest.raises(Exception):
+        parse_narrative_payload({"display_name": "ok", "authority_role": "system_of_record"})
+
+    revision = build_catalog_profile_revision(
+        catalog_source=_PROFILE_SRC,
+        display_name="The gap-bank catalog",
+        description="Every dataset in here is the system of record.",   # a claim, in prose
+        business_context="Authoritative throughout.",
+        producer_ref="release-a-bars")
+
+    profile = _built(db, ref, revision_id=revision.revision_id)
+    assert profile.catalog_profile_revision_id == revision.revision_id, "identity is pinned"
+    assert profile.authority_role.display is None, (
+        "a catalog narrative defaulted a dataset's authority: "
+        f"{profile.authority_role.display and profile.authority_role.display.value}")
+    assert profile.authority_role.unresolved_reason == unresolved_label(UNRESOLVED_NO_EVIDENCE)
+
+
+def test_bar_business_context_moves_the_dataset_profile_hash(db) -> None:
+    """`business_context` is meaning-bearing, so it must re-key the dataset profile.
+
+    GAP CLOSED: the `profile_hash_omits_business_context` mutation survived. The existing
+    hash-sensitivity test walks `definition`, `authority_role`, a governed fact head and the
+    narrative revision — every meaning-bearing input except this one.
+    """
+    from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+
+    ref = _profile_seed(db)
+    before = _built(db, ref).dataset_profile_hash
+
+    _profile_evidence(db, ref, "business_context",
+                      "One row per order line; restated nightly.",
+                      EvidenceProducer.HUMAN, AssertionStrength.CONFIRMED)
+
+    after = _built(db, ref)
+    assert after.business_context.display is not None, "the value must actually be displayed"
+    assert after.dataset_profile_hash != before, (
+        "a business_context change did not move dataset_profile_hash")
