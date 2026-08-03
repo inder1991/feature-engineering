@@ -254,6 +254,28 @@ def _readable(conn, dataset_ref: str, roles: Sequence[str]) -> bool:
     return True
 
 
+def sealed_plan_dataset_refs(record: SealedPlanRecordV1) -> tuple[str, ...]:
+    """EVERY dataset a sealed plan names, deduped and ordered. Total by construction: a ref this
+    misses is a ref no read-scope check covers."""
+    refs = {source.dataset_ref for source in record.sources}
+    refs |= {row.dataset_ref for row in record.rows}
+    if record.eligibility is not None:
+        refs.add(record.eligibility.dataset_ref)
+    return tuple(sorted(refs))
+
+
+def caller_may_read_every_dataset(conn, record: SealedPlanRecordV1, *,
+                                  roles: Sequence[str] = ()) -> bool:
+    """May this caller read every dataset the plan was sealed against?
+
+    Separate from :func:`revalidate_sealed_plan`'s per-pin check and asked FIRST by the route,
+    because everything between the two — resolving the plan's engine connection, asking the engine
+    provider for an engine — reports on datasets the caller may not be allowed to know exist. A
+    caller who cannot read them gets the same not-found a plan that was never sealed gets (D11).
+    """
+    return all(_readable(conn, ref, roles) for ref in sealed_plan_dataset_refs(record))
+
+
 def _revalidate_source(conn, decision: SealedSourceDecisionV1, *,
                        roles: Sequence[str]) -> SealedPlanRefusalV1 | None:
     from featuregen.data_agent.binding_store import binding_revision_exists, resolve_table
@@ -454,8 +476,10 @@ __all__ = [
     "SealedPlanRecordV1",
     "SealedPlanRefusalV1",
     "analysis_question_ref",
+    "caller_may_read_every_dataset",
     "current_sealed_plan",
     "replay_sealed_plan",
     "revalidate_sealed_plan",
     "seal_analysis_plan",
+    "sealed_plan_dataset_refs",
 ]

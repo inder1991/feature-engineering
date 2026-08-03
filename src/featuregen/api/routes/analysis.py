@@ -397,9 +397,12 @@ def execute(body: ExecuteIn, conn: _Conn, identity: _Identity,
     **Flag-gated, and 404 while the flag is off** — the surface is hidden rather than forbidden, so
     a flag-off API is byte-identical to the one that shipped (the `dataset_policies.py` convention).
 
-    **Read-scoped.** Revalidation checks that this caller may read every dataset the plan was
-    sealed against BEFORE it reports any drift, so a refusal can never tell someone that a catalog
-    they were not granted exists (D11) — hidden and missing get the same words.
+    **READ SCOPE PRECEDES EVERY 409.** The caller's readability of every dataset the plan names is
+    checked immediately after replay — before the plan's engine connection is resolved and before
+    the engine provider is asked for anything. Both of those report on datasets, and a 409 handed
+    to someone who may not see them answers "a sealed plan over a catalog you were never granted
+    exists here". An unreadable plan gets the SAME body an absent one gets (D11): hidden and
+    missing are indistinguishable at the wire.
 
     **A stale plan refuses and runs nothing.** The refusal names WHAT moved and from which value to
     which, because "this plan is stale" sends the reader nowhere. Nothing is re-derived: running
@@ -408,17 +411,23 @@ def execute(body: ExecuteIn, conn: _Conn, identity: _Identity,
     """
     from featuregen.analysis.engine import AnalysisEngineUnavailable
     from featuregen.analysis.sealed_execution import SealedRunV1, run_sealed_plan
-    from featuregen.analysis.sealed_plan import SEALED_PLAN_ABSENT, SealedPlanError
-    from featuregen.analysis.sealed_plan_store import replay_sealed_plan
+    from featuregen.analysis.sealed_plan import SealedPlanError
+    from featuregen.analysis.sealed_plan_store import (
+        caller_may_read_every_dataset,
+        replay_sealed_plan,
+    )
 
     if not source_temporal_selection_enabled():
         raise HTTPException(status_code=404, detail="not found")
     record = replay_sealed_plan(conn, body.plan_hash)
     if record is None:
-        return JSONResponse(status_code=404, content={
-            "detail": "no sealed plan has that identity",
-            "refusal": {"code": SEALED_PLAN_ABSENT, "subjects": [body.plan_hash], "detail": "",
-                        "sealed": "", "current": ""}})
+        return _sealed_plan_not_found(body.plan_hash)
+    # FIRST, and deliberately ahead of everything that could report on this plan's datasets.
+    # `run_sealed_plan` makes the same check per pin, but it ran THIRD: `_engine_connection_for`
+    # 409'd naming the event dataset and the provider 409'd naming the connection, both before any
+    # scope was read. Same body as absence, so the two cannot be told apart.
+    if not caller_may_read_every_dataset(conn, record, roles=identity.role_claims):
+        return _sealed_plan_not_found(body.plan_hash)
 
     engine_connection = _engine_connection_for(conn, record)
     try:
@@ -450,6 +459,18 @@ def execute(body: ExecuteIn, conn: _Conn, identity: _Identity,
     }
 
 
+def _sealed_plan_not_found(plan_hash: str) -> JSONResponse:
+    """The ONE not-found body this route has, for BOTH "nothing sealed that" and "you may not see
+    what did". One function rather than two literals, because two would eventually drift into two
+    distinguishable answers — and the whole point is that they cannot be told apart."""
+    from featuregen.analysis.sealed_plan import SEALED_PLAN_ABSENT
+
+    return JSONResponse(status_code=404, content={
+        "detail": "no sealed plan has that identity",
+        "refusal": {"code": SEALED_PLAN_ABSENT, "subjects": [plan_hash], "detail": "",
+                    "sealed": "", "current": ""}})
+
+
 def _engine_connection_for(conn, record):
     """The governed connection the plan's EVENT source is addressed through.
 
@@ -457,6 +478,11 @@ def _engine_connection_for(conn, record):
     declared engine, and every dataset in a sealed plan comes from the same catalog. Taking it from
     the event source rather than a deployment constant is what keeps the executor pointed at the
     cluster the decisions were made against.
+
+    **NO 409 FROM HERE NAMES A DATASET.** Read scope is checked before this is called, so a caller
+    who reaches it may see the plan's datasets — but the refusal is about ADDRESSING, and the ref
+    adds nothing a person could act on while making the message one edit away from being an
+    existence oracle if the ordering above were ever changed back.
     """
     from featuregen.data_agent.binding_store import resolve_table
     from featuregen.overlay.upload.object_ref import parse_ref
@@ -468,11 +494,13 @@ def _engine_connection_for(conn, record):
     try:
         resolved = resolve_table(conn, catalog_source=source, table=table)
     except ConnectionError_ as exc:
+        # The CODE and the connection's own words: a withdrawn grant is a governance answer an
+        # operator acts on, and it names a connection rather than a dataset.
         raise HTTPException(status_code=409, detail=str(exc)) from None
     if resolved is None:
         raise HTTPException(
             status_code=409,
-            detail=f"{events.dataset_ref!r} can no longer be addressed by this deployment")
+            detail="a sealed dataset can no longer be addressed by this deployment")
     return resolved[1]
 
 

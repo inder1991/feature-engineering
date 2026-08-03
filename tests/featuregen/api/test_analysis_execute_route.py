@@ -204,6 +204,86 @@ def test_with_NO_engine_wired_the_route_says_which_APPROVAL_is_outstanding(make_
     assert r.json()["refusal"]["code"] == EXECUTION_ENGINE_NOT_APPROVED
 
 
+# ── read scope precedes every 409 ────────────────────────────────────────────────────────────────
+#
+# The order used to be flag -> replay -> engine connection (409 NAMING the event dataset) ->
+# provider (409) -> scope, so a caller holding a valid plan hash learned that a sealed plan over a
+# catalog they were never granted exists here — twice, before any scope was read.
+
+
+def _hide(bank, table: str) -> None:
+    """`visible_requires` is GENERATED (migration 1032) from the sensitivity tag, so the TAG is what
+    a test sets; a direct write to the enforcement column is refused by the database."""
+    bank.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column'", (SRC, table))
+
+
+def test_a_caller_who_may_not_read_the_plans_data_gets_a_404_INDISTINGUISHABLE_from_absence(
+        make_client, bank, sealed):
+    """Byte-identical bodies, not merely the same status: a difference anywhere in the payload is
+    the oracle rebuilt in a field nobody looked at."""
+    client = _client(make_client, bank)
+    absent = client.post("/analysis/execute", json={"plan_hash": "f" * 64}, headers=_h())
+
+    _hide(bank, TRANSACTION_TABLE)
+    hidden = client.post("/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
+
+    assert hidden.status_code == absent.status_code == 404
+    assert hidden.json() == {**absent.json(), "refusal": {
+        **absent.json()["refusal"], "subjects": [sealed.plan_hash]}}
+    # The plan's own datasets appear NOWHERE — the hash the caller supplied is all that comes back.
+    assert TRANSACTION_TABLE not in hidden.text
+    assert "customer_master" not in hidden.text
+
+
+def test_read_scope_is_checked_BEFORE_the_engine_connection_409(make_client, bank, sealed):
+    """The ordering, pinned at the seam that used to leak. With the catalog engine withdrawn the
+    privileged path 409s; the unprivileged one must still get the not-found, because the 409 is a
+    statement about a plan they may not know exists."""
+    bank.execute("DELETE FROM catalog_engine WHERE catalog_source = %s", (SRC,))
+    bank.execute("DELETE FROM physical_dataset_binding WHERE catalog_source = %s", (SRC,))
+    client = _client(make_client, bank)
+
+    privileged = client.post("/analysis/execute", json={"plan_hash": sealed.plan_hash},
+                             headers=_h())
+    assert privileged.status_code == 409
+    # …and it names no dataset: "which table" adds nothing an operator acts on here.
+    assert TRANSACTION_TABLE not in privileged.text
+    assert "a sealed dataset can no longer be addressed" in privileged.text
+
+    _hide(bank, TRANSACTION_TABLE)
+    unprivileged = client.post("/analysis/execute", json={"plan_hash": sealed.plan_hash},
+                               headers=_h())
+    assert unprivileged.status_code == 404
+
+
+def test_read_scope_is_checked_BEFORE_the_engine_provider_409(make_client, bank, sealed):
+    """The other 409 that used to run first. EXECUTION_ENGINE_NOT_APPROVED is a true statement
+    about this deployment and still an existence oracle when the asker may not see the plan."""
+    _hide(bank, TRANSACTION_TABLE)
+    r = _client(make_client, bank, engine=False).post(
+        "/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
+    assert r.status_code == 404
+    assert EXECUTION_ENGINE_NOT_APPROVED not in r.text
+
+
+def test_a_PRIVILEGED_caller_keeps_every_one_of_the_409s(make_client, bank, sealed):
+    """The check narrows nothing for a caller who may read the data — the drift refusal, the
+    approval refusal and the successful run all still reach them."""
+    client = _client(make_client, bank)
+    assert client.post("/analysis/execute", json={"plan_hash": sealed.plan_hash},
+                       headers=_h()).status_code == 200
+    assert _client(make_client, bank, engine=False).post(
+        "/analysis/execute", json={"plan_hash": sealed.plan_hash},
+        headers=_h()).status_code == 409
+    publish_temporal_policy_for(bank, expected_pointer_version=1,
+                                historical_selection=TemporalSelectionKind.CURRENT_RECORD)
+    stale = client.post("/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
+    assert stale.status_code == 409
+    assert stale.json()["refusal"]["code"] == SEALED_PLAN_STALE_TEMPORAL_POLICY
+
+
 def test_execution_requires_the_feature_generate_permission(make_client, bank, sealed):
     r = _client(make_client, bank).post(
         "/analysis/execute", json={"plan_hash": sealed.plan_hash},
