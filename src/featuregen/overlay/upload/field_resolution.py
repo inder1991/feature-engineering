@@ -57,6 +57,7 @@ from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_revalidation import active_disqualifiers_for
 from featuregen.overlay.upload.graph import rebuild_search_doc
 from featuregen.overlay.upload.object_ref import parse_ref
+from featuregen.overlay.upload.profile_vocab import data_role_from_table_role
 
 # Bumped when the policy set or the resolver's projection contract changes (recorded on each decision).
 FIELD_POLICY_VERSION = "upload-field-policy-v1"
@@ -105,6 +106,11 @@ _DISPLAY_COLUMN: dict[str, str] = {
     # Task-0.6 unconditional table_display_reprojection stage restores them on every re-upload.
     "authority_role": "authority_role",
     "temporal_storage_model": "temporal_storage_model",
+    # Release-A consumption step (migration 1052): the TABLE narrative prose. It had a registered
+    # policy and real evidence but no flat column, so it could never enter `graph_node.search_doc`
+    # — and for a TECHNICAL catalog it is the only prose a table has at all. Projecting it makes it
+    # matchable; it stays display-only (RECOMMENDATION ceiling in `field_policies`).
+    "business_context": "business_context",
     # D13.1/D13.2 (migration 1051): the fine-grained COLUMN classification axes. `bian_path` /
     # `process_path` project the source's own taxonomy paths (already SOURCE evidence, previously
     # policy-less and therefore unprojectable); `sub_domain` projects the LLM's finer axis beside
@@ -141,7 +147,18 @@ _SOURCE_AUTHORED_DISPLAY_COLUMNS = frozenset({"unit", "currency"})
 # `ai_summary` is doc-bearing for the same reason `definition` is — and more so where a source fills
 # descriptions by bucket, since the summary is then the ONLY text distinguishing two columns. Without
 # it here the projection would write the column and the index would silently never see it.
-_SEARCH_DOC_DISPLAY_COLUMNS = frozenset({"concept", "definition", "domain", "ai_summary"})
+# `business_context` joins them (migration 1052): it is a doc-bearing TABLE slot, and without it
+# here the projection would write the column while the index never saw a word of it.
+_SEARCH_DOC_DISPLAY_COLUMNS = frozenset({"concept", "definition", "domain", "ai_summary",
+                                         "business_context"})
+
+# The projected fields whose value DERIVES `graph_node.data_role` (migration 1052). `data_role` is
+# not resolved from evidence of its own — correction 4: derive, do not duplicate — so it is
+# re-derived from the node's own projected `table_role` (+ the `event_or_snapshot` that splits the
+# legacy `fact` role) every time either input is projected. Both are listed because either can move
+# independently, and a `data_role` derived from a stale `event_or_snapshot` would silently disagree
+# with `build_dataset_profile`, which derives the same value from the same two resolutions.
+_DATA_ROLE_INPUTS = frozenset({"table_role", "event_or_snapshot"})
 
 # The companion *_decision_id link column per projected field (the display ≠ authority pointer).
 # ``logical_representation`` owns ``logical_type_decision_id``; ``semantic_type`` stays decision-only
@@ -162,6 +179,8 @@ _DECISION_LINK_COLUMN: dict[str, str] = {
     # profile projections above.
     "authority_role": "authority_role_decision_id",
     "temporal_storage_model": "temporal_storage_model_decision_id",
+    # Release-A consumption step (migration 1052).
+    "business_context": "business_context_decision_id",
 }
 
 
@@ -273,10 +292,44 @@ def _project_display(
         f"WHERE catalog_source = %s AND lower(object_ref) = %s{guard}",
         params,
     )
+    # A DERIVED display column follows its inputs IN THE SAME TRANSACTION: `data_role` is a
+    # projection of the `table_role`/`event_or_snapshot` this call just wrote, never its own
+    # evidence field (migration 1052 / correction 4).
+    if field_name in _DATA_ROLE_INPUTS:
+        _project_data_role(conn, catalog_source=catalog_source, object_ref_lc=object_ref_lc)
     # A doc-bearing display column changed: re-derive the node's search_doc from its now-current
     # values IN THE SAME TRANSACTION (#20), so full-text search follows the projection.
     if display_col in _SEARCH_DOC_DISPLAY_COLUMNS:
         rebuild_search_doc(conn, catalog_source, object_ref_lc)
+
+
+def _project_data_role(conn: DbConn, *, catalog_source: str, object_ref_lc: str) -> None:
+    """Re-derive ``graph_node.data_role`` from the node's OWN current ``table_role`` /
+    ``event_or_snapshot`` display columns (migration 1052).
+
+    The one adapter (:func:`profile_vocab.data_role_from_table_role`) does the mapping, so the flat
+    column and :func:`dataset_profiles.build_dataset_profile` — which maps the SAME two
+    resolutions — can never disagree about what a table is. Legacy canonical ``bridge`` displays as
+    ``crosswalk`` here without one evidence row being re-keyed.
+
+    A node with NO ``table_role`` projects ``NULL``, deliberately NOT ``DataRole.UNKNOWN``: the
+    vocabulary member means "we looked and the role is off-vocabulary", while absence means nobody
+    has said anything yet, and the facet must be able to tell those apart (a `(none)` bucket, not a
+    fabricated `unknown` one)."""
+    row = conn.execute(
+        "SELECT table_role, event_or_snapshot FROM graph_node "
+        "WHERE catalog_source = %s AND lower(object_ref) = %s",
+        (catalog_source, object_ref_lc)).fetchone()
+    if row is None:
+        return
+    table_role, event_or_snapshot = row
+    value = (None if table_role is None
+             else data_role_from_table_role(table_role,
+                                            event_or_snapshot=event_or_snapshot).value)
+    conn.execute(
+        "UPDATE graph_node SET data_role = %s "
+        "WHERE catalog_source = %s AND lower(object_ref) = %s",
+        (value, catalog_source, object_ref_lc))
 
 
 def _resolve_generic_field(

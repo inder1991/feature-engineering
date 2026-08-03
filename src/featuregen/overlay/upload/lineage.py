@@ -40,8 +40,9 @@ cut at the frontier, but never quietly wrong.
 """
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from featuregen.overlay.catalog_changes import drift_watermark
@@ -50,6 +51,35 @@ from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 LAYERS = frozenset({"joins", "entity", "features"})
 MAX_NODES = 200
+
+
+@dataclass(frozen=True, slots=True)
+class TruncationReportV1:
+    """What this map did NOT return, per kind — semantic Task 7's "never silently cut".
+
+    Two DISTINCT facts, deliberately not merged:
+
+    * ``truncated`` keeps its shipped meaning EXACTLY: a BUDGET cut. The expansion hit
+      ``max_nodes`` and a unit (or a stub) was refused, so the neighbourhood shown is smaller than
+      the neighbourhood that exists. Widening this to "anything was left out" would flip it true on
+      almost every response and destroy the signal the view badges.
+    * ``omitted`` counts everything not returned, keyed by the node kind or the edge kind that was
+      dropped — including the ``_prune_to_neighbourhood`` pass, which used to drop columns and
+      their edges with no accounting at all (review C Task 7). A caller can therefore always tell
+      the difference between "this column has no joins" and "its joins did not fit".
+
+    The neighbourhood SCOPE rule is not truncation and is not counted: for a COLUMN anchor a
+    sibling column's cross-catalog bridge is a fact about the TABLE, not about the column the
+    header names, so it is out of scope rather than cut. Counting it would report a bound that was
+    never reached.
+    """
+
+    truncated: bool = False
+    omitted: dict[str, int] = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        return {"truncated": self.truncated,
+                "omitted": {k: self.omitted[k] for k in sorted(self.omitted)}}
 
 _SCHEMA = "public"   # mirrors graph.py's ref scheme: public.<table>[.<column>]
 
@@ -90,17 +120,27 @@ def lineage_graph(conn, catalog_source: str, ref: str, *, now: datetime,
     b = _Builder(conn, layers=frozenset(layers), direction=direction, roles=roles,
                  now=now, fresh_within=fresh_within, max_nodes=max_nodes)
     b.run(("table", catalog_source, anchor[0]), depth)
-    nodes, edges = _prune_to_neighbourhood(
+    nodes, edges, pruned = _prune_to_neighbourhood(
         list(b.nodes.values()), b.edges, anchor_id=f"{catalog_source}:{ref}",
         # A COLUMN anchor asks "what does THIS column link to". Expansion starts from the column's
         # TABLE (that is how neighbours are discovered), so without this the answer was the table's
         # whole neighbourhood — nine links on the real catalog, eight belonging to other columns.
         anchor_is_column=ref.count(".") >= 2)
-    return {"nodes": nodes, "edges": edges, "truncated": b.truncated}
+    omitted = Counter(b.omitted)
+    omitted.update(pruned)
+    truncation = TruncationReportV1(truncated=b.truncated,
+                                    omitted={k: v for k, v in omitted.items() if v})
+    # `truncated` stays a top-level BOOLEAN with its shipped meaning (a budget cut) — the graph
+    # view merges two responses on it and a shape change there would be a silent client break.
+    # `truncation` carries the full per-kind accounting beside it (semantic Task 7); the boolean is
+    # a projection of the same report, never a second verdict.
+    return {"nodes": nodes, "edges": edges, "truncated": truncation.truncated,
+            "truncation": truncation.as_dict()}
 
 
-def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *, anchor_id: str,
-                            anchor_is_column: bool = False) -> tuple[list[dict], list[dict]]:
+def _prune_to_neighbourhood(
+    nodes: list[dict], edges: list[dict], *, anchor_id: str, anchor_is_column: bool = False,
+) -> tuple[list[dict], list[dict], dict[str, int]]:
     """Drop columns that neither anchor the view nor participate in a relationship.
 
     A table unit expands to EVERY visible column, so opening one column of a 111-column table beside
@@ -114,6 +154,10 @@ def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *, anchor_id: 
 
     A dropped column takes its `contains` edge with it, so the graph can never draw an edge to a
     node that is not there.
+
+    Returns the kept nodes, the kept edges, and the per-kind count of what was dropped — the
+    accounting the review found missing. The column-anchor entity-bridge narrowing below is a SCOPE
+    rule, not a cut, so it is deliberately NOT counted (see :class:`TruncationReportV1`).
     """
     if anchor_is_column:
         # Cross-catalog links ONLY: a bridge is column-to-column, so a SIBLING column's bridge is a
@@ -134,8 +178,13 @@ def _prune_to_neighbourhood(nodes: list[dict], edges: list[dict], *, anchor_id: 
         or n["id"] in participating
         or n.get("grain") or n.get("as_of")
     }
-    return ([n for n in nodes if n["id"] in keep],
-            [e for e in edges if e["from"] in keep and e["to"] in keep])
+    kept_nodes = [n for n in nodes if n["id"] in keep]
+    kept_edges = [e for e in edges if e["from"] in keep and e["to"] in keep]
+    dropped: Counter[str] = Counter(
+        n.get("kind", "unknown") for n in nodes if n["id"] not in keep)
+    dropped.update(
+        e.get("kind", "unknown") for e in edges if e["from"] not in keep or e["to"] not in keep)
+    return kept_nodes, kept_edges, dict(dropped)
 
 
 class _Builder:
@@ -155,6 +204,10 @@ class _Builder:
         self.nodes: dict[str, dict] = {}
         self.edges: list[dict] = []
         self.truncated = False
+        #: Per-kind count of what the node cap refused — node kinds for units/stubs that could not
+        #: be installed, edge kinds for the edges that went with them. A refused unit's edge must
+        #: be counted too, or "no joins" and "joins that did not fit" stay indistinguishable.
+        self.omitted: Counter[str] = Counter()
         self._edge_keys: set[tuple] = set()
         self._wm: dict[str, datetime | None] = {}               # per-source drift watermark (cached)
         self._as_of: dict[tuple[str, str], tuple[str | None, str | None]] = {}  # (source, table) -> (as-of col, basis)
@@ -176,6 +229,8 @@ class _Builder:
                     if stub["id"] not in self.nodes:
                         if len(self.nodes) >= self.max_nodes:
                             self.truncated = True
+                            self.omitted[stub.get("kind", "unknown")] += 1
+                            self.omitted[edge.get("kind", "unknown")] += 1
                             continue
                         self.nodes[stub["id"]] = stub
                     self._add_edge(edge)
@@ -183,7 +238,10 @@ class _Builder:
                 assert neighbor is not None
                 if neighbor not in seen:
                     if not self._try_install(neighbor):
-                        continue   # over the cap: skip the unit AND its edge (no dangling ends)
+                        # Over the cap: skip the unit AND its edge (no dangling ends). Both are
+                        # counted — the map is cut, and it says by how much and of what.
+                        self.omitted[edge.get("kind", "unknown")] += 1
+                        continue
                     seen.add(neighbor)
                     queue.append((neighbor, d + 1))
                 self._add_edge(edge)
@@ -246,6 +304,8 @@ class _Builder:
         new = [n for n in self._unit_nodes(unit) if n["id"] not in self.nodes]
         if len(self.nodes) + len(new) > self.max_nodes:
             self.truncated = True
+            for n in new:
+                self.omitted[n.get("kind", "unknown")] += 1
             return False
         for n in new:
             self.nodes[n["id"]] = n

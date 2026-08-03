@@ -57,6 +57,13 @@ data:
   # presents them together for approval). Truthy set: 1/true/yes/on.
   # Richer feature-generation context (v2+ payload shape) — off ⟹ the thin v1 menu, byte-for-byte.
   FEATUREGEN_FEATURE_CONTEXT: "0"
+  # THE v3 ROLLBACK LEVER for the flag above. ABSENT BY DEFAULT — absent means v4, the shared
+  # SemanticContextBundleV1 contract. Add `FEATUREGEN_FEATURE_CONTEXT_VERSION: "3"` here to fall
+  # back to the shipped v3 payload (smaller prompts, no concept ancestry / identifier namespace /
+  # party role / authority axes) WITHOUT dropping to the thin v1 menu, which is what turning
+  # FEATUREGEN_FEATURE_CONTEXT off would do — a functional regression dressed as a safety valve.
+  # Named here, commented, so an incident response edits a value instead of inventing a key: only
+  # "3" and "4" are honoured, and a typo warns and silently keeps v4.
   # Dataset/catalog semantic profiles: profile API surfaces, upload narrative part, listing
   # display names — off ⟹ every new surface 404s and existing payloads stay byte-identical.
   FEATUREGEN_DATASET_PROFILES: "0"

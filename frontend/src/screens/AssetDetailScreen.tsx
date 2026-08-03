@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AssetProfilePanel } from './AssetProfilePanel'
+import { CatalogNarrativePanel } from './CatalogNarrativePanel'
 import {
   ApiError,
   type AssetApprovedJoin,
@@ -12,6 +13,8 @@ import {
   type FieldDecisionAction,
   type RoleUsability,
   type TableRollup,
+  type ContextRelationship,
+  type ContextValue,
   type CrossCatalogLink,
   type EffectiveMetadataSection,
   type LatestFieldDecision,
@@ -37,8 +40,14 @@ import { SuggestionCard } from './SuggestedFeaturesScreen'
 // Tab order follows the dossier's arc (Task 3C): identity + meaning + semantics summary
 // (Overview) → the semantic neighbourhood (Relationships) → governance — evidence, decisions,
 // corrections (Metadata & evidence) → usage (Readiness) → History.
+// Context (semantic Task 7) sits straight after Overview: it answers "how does everything the
+// platform knows about this column connect" — source meaning, resolved meaning, concept ancestry,
+// identity axes, related columns, cross-catalog links, the profile it was assembled under, the
+// adjudicator's alternatives, and what is honestly not known. It is fed from the DOSSIER's own
+// `context` section, so opening the tab issues no second request and shows no second snapshot.
 const TABS = [
   ['overview', 'Overview'],
+  ['context', 'Context'],
   ['relationships', 'Relationships'],
   ['metadata', 'Metadata & evidence'],
   ['readiness', 'Readiness'],
@@ -333,6 +342,7 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
             isUnavailable={isUnavailable}
           />
         )}
+        {tab === 'context' && <ContextTab detail={detail} />}
         {tab === 'relationships' && (
           <RelationshipsTab detail={detail} isUnavailable={isUnavailable} />
         )}
@@ -495,6 +505,11 @@ function OverviewTab({
       {/* Release-A table profile: renders ONLY for table assets and ONLY while the server offers
           the surface (flag-gated 404 ⟹ the panel renders nothing — flag-off looks like today). */}
       <AssetProfilePanel source={source} objectRef={identity.object_ref} kind={identity.kind} />
+
+      {/* The CATALOG narrative this asset lives in. Same flag gate: 404 ⟹ renders nothing. It
+          belongs on an asset page because "what is this catalog for" is the first thing anyone
+          reading an unfamiliar column needs, and it had no reachable surface at all before. */}
+      <CatalogNarrativePanel source={source} />
 
       {identity.kind === 'column' && identity.table && (
         <ColumnSuggestions source={source} identity={identity} />
@@ -957,6 +972,314 @@ const LIFECYCLE_TONE: Record<string, string> = {
 
 function lifecycleTone(lifecycle: string): string {
   return LIFECYCLE_TONE[lifecycle] ?? 'gj-none'
+}
+
+// ---- context (semantic Task 7) ---------------------------------------------------------------
+// NO-BLOCKED FRAMING THROUGHOUT. Nothing on this tab is styled as a failure:
+//   * a proposed value is a normal, usable value wearing a neutral author chip;
+//   * "nobody has decided yet" / "needs a data check" / "structurally unsuitable" are the three
+//     product families, rendered as plain sentences;
+//   * a missing-context code says what is NOT IN THIS VIEW for THIS reader — it is read-scoped, so
+//     it is never presented as a gap in the data or as a coverage number;
+//   * ownership / usage / data-product context is "not supplied" — this platform has no producer
+//     for it, which is a different statement from "there is none".
+
+// The D2 display labels, in product words. Display only: the payload carries the real
+// producer/strength/lifecycle triple beside each value and that is what anything downstream reads.
+const AUTHORITY_WORDS: Record<string, string> = {
+  source_attested: 'source attested',
+  source_proposed: 'source proposed',
+  human: 'human confirmed',
+  llm_proposed: 'AI proposed',
+  deterministic: 'measured',
+  governed: 'governed',
+  system: 'system',
+}
+
+const FAMILY_WORDS: Record<string, string> = {
+  undecided: 'Nobody has decided yet',
+  needs_data_check: 'Needs a data check',
+  structurally_unsuitable: 'Structurally unsuitable',
+}
+
+// Codes are machine words; the tab shows them as readable phrases and keeps the code as the title
+// so anyone tracing one still has it.
+function humanizeCode(code: string): string {
+  return code.replaceAll('_', ' ').replaceAll(':', ' — ')
+}
+
+function ContextValueRow({ value }: { value: ContextValue }) {
+  const shown = value.value
+  return (
+    <li className="row adg-field" data-testid={`context-value-${value.field}`}>
+      <span className="adg-field-label">{humanizeField(value.field)}</span>
+      <span className="adg-field-value mono">
+        {shown == null || shown === '' ? '—' : String(shown)}
+      </span>
+      <span
+        className="badge"
+        title={
+          value.producer
+            ? `${value.producer}/${value.strength}/${value.lifecycle}`
+            : 'no evidence record'
+        }
+      >
+        {AUTHORITY_WORDS[value.authority_label] ?? value.authority_label}
+      </span>
+      {value.operational_influence === 'governed' && (
+        <span className="badge grain">load-bearing</span>
+      )}
+    </li>
+  )
+}
+
+function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
+  return (
+    <li className="row" data-testid={`context-link-${link.relationship_ref}`}>
+      <span className="mono">
+        {link.left_ref} ↔ {link.right_ref}
+      </span>{' '}
+      <span className="badge">{link.kind}</span>{' '}
+      {/* Three SEPARATE facts, never collapsed into one badge: whether the link is available at
+          all, whether a human reviewed it, and whether it can be executed right now. A review is
+          not permission — the server answers executability from a revalidating reader, and this
+          row repeats its answer rather than inferring one from the review. */}
+      <span className="badge">{link.availability}</span>{' '}
+      <span className="badge">
+        {link.review_status ? humanizeCode(link.review_status) : 'unreviewed'}
+      </span>{' '}
+      <span className="badge" title="revalidated against live dependencies">
+        {link.executable_now ? 'executable now' : 'not executable now'}
+      </span>
+      {link.realizations.length > 0 && (
+        <ul className="rows">
+          {link.realizations.map(r => (
+            <li key={r.realization_revision_id} className="hint">
+              {/* Fan-out never renders without its direction and scope. */}
+              <span className="mono">
+                {r.from_ref} → {r.to_ref}
+              </span>{' '}
+              · {r.cardinality ?? 'cardinality unknown'} · scope {r.scope_id ?? 'none'} ·{' '}
+              {humanizeCode(r.safety_status)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </li>
+  )
+}
+
+function ContextTab({ detail }: { detail: AssetDetail }) {
+  const context = detail.context
+  if (!context || context.status === 'unavailable') {
+    return (
+      <p className="adg-unavailable" role="status" data-testid="context-unavailable">
+        Context is not available for this asset right now. Everything else on this page still
+        describes the same snapshot.
+      </p>
+    )
+  }
+  const adjudication = detail.semantic_adjudication
+  const uncertainty = context.uncertainty
+  const notSupplied = context.not_supplied ?? uncertainty?.not_supplied ?? []
+  const truncation = context.truncation
+  const omitted = Object.entries(truncation?.omitted ?? {})
+
+  return (
+    <div data-testid="context-tab">
+      {context.status === 'projection_unavailable' && (
+        <p className="hint" role="status" data-testid="context-projection">
+          The catalog projection was behind when this page was assembled, so the resolved meaning
+          is not shown. Structural and profile context below is still true of this snapshot.
+        </p>
+      )}
+      {context.status === 'table' && (
+        <p className="hint" data-testid="context-table-note">
+          {context.note ?? 'Table asset — column meaning is assembled per column.'}
+        </p>
+      )}
+
+      {context.source_meaning && context.source_meaning.length > 0 && (
+        <section className="adg-section" data-testid="context-source-meaning">
+          <h3 className="micro-label">What the source file said</h3>
+          <ul className="rows adg-fieldsum">
+            {context.source_meaning.map(v => (
+              <ContextValueRow key={`src-${v.field}`} value={v} />
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {context.resolved_meaning && context.resolved_meaning.length > 0 && (
+        <section className="adg-section" data-testid="context-resolved-meaning">
+          <h3 className="micro-label">What the platform resolved</h3>
+          <ul className="rows adg-fieldsum">
+            {context.resolved_meaning.map(v => (
+              <ContextValueRow key={`res-${v.field}`} value={v} />
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {context.concept_path && context.concept_path.length > 0 && (
+        <section className="adg-section" data-testid="context-concept-path">
+          <h3 className="micro-label">Concept hierarchy</h3>
+          <p className="mono">{context.concept_path.join(' → ')}</p>
+        </section>
+      )}
+
+      <section className="adg-section" data-testid="context-identity">
+        <h3 className="micro-label">Identity — entity, namespace and role</h3>
+        <ul className="rows adg-fieldsum">
+          {(context.resolved_meaning ?? [])
+            .filter(v => v.field === 'entity' || v.field === 'party_role')
+            .map(v => (
+              <ContextValueRow key={`id-${v.field}`} value={v} />
+            ))}
+          <li className="row adg-field" data-testid="context-namespace">
+            <span className="adg-field-label">Identifier namespace</span>
+            {context.identifier_namespace ? (
+              <>
+                <span className="adg-field-value mono">
+                  {context.identifier_namespace.scheme}
+                </span>
+                <span className="badge" title="scheme equality alone is never equality proof">
+                  {context.identifier_namespace.issuer_scope
+                    ? `issued by ${context.identifier_namespace.issuer_scope}`
+                    : 'issuer not resolved yet'}
+                </span>
+              </>
+            ) : (
+              <span className="adg-field-value hint">
+                not an identifier — no value space to name
+              </span>
+            )}
+          </li>
+        </ul>
+      </section>
+
+      {context.related_columns && (
+        <section className="adg-section" data-testid="context-related-columns">
+          <h3 className="micro-label">Related columns in this table</h3>
+          {context.related_columns.length === 0 ? (
+            <p className="hint">No other columns you can read in this table.</p>
+          ) : (
+            <ul className="rows">
+              {context.related_columns.map(c => (
+                <li key={c.object_ref} className="row">
+                  <span className="mono">{c.column}</span>
+                  {c.concept && <span className="badge">{c.concept}</span>}
+                  {c.party_role && <span className="badge">{c.party_role}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      <section className="adg-section" data-testid="context-links">
+        <h3 className="micro-label">Cross-catalog links</h3>
+        {!context.relationships || context.relationships.length === 0 ? (
+          <p className="hint">
+            No cross-catalog link is in view for this column and your roles.
+          </p>
+        ) : (
+          <ul className="rows">
+            {context.relationships.map(link => (
+              <ContextRelationshipRow key={link.relationship_ref} link={link} />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {context.profiles && (
+        <section className="adg-section" data-testid="context-profiles">
+          <h3 className="micro-label">Assembled under</h3>
+          <ul className="rows adg-fieldsum">
+            <li className="row adg-field">
+              <span className="adg-field-label">Dataset profile</span>
+              <span className="adg-field-value mono">
+                {context.profiles.dataset_profile_hash ?? 'not assembled'}
+              </span>
+            </li>
+            <li className="row adg-field">
+              <span className="adg-field-label">Catalog narrative</span>
+              <span className="adg-field-value mono">
+                {context.profiles.catalog_profile_revision_id ?? 'none written yet'}
+              </span>
+            </li>
+            <li className="row adg-field" data-testid="context-data-role">
+              <span className="adg-field-label">Data role</span>
+              <span className="adg-field-value mono">
+                {context.profiles.data_role?.value ?? (
+                  <span className="hint">
+                    {FAMILY_WORDS[context.profiles.data_role?.unresolved_family ?? 'undecided'] ??
+                      FAMILY_WORDS.undecided}
+                  </span>
+                )}
+              </span>
+            </li>
+          </ul>
+        </section>
+      )}
+
+      {adjudication?.status === 'available' && (
+        <section className="adg-section" data-testid="context-adjudication">
+          <h3 className="micro-label">Alternatives the adjudicator considered</h3>
+          <p>
+            <span className="mono">{adjudication.selected_concept}</span>{' '}
+            <span className="badge">AI proposed</span>
+          </p>
+          {adjudication.alternatives && adjudication.alternatives.length > 0 && (
+            <ul className="rows">
+              {adjudication.alternatives.map(alt => (
+                <li key={alt} className="row mono">
+                  {alt}
+                </li>
+              ))}
+            </ul>
+          )}
+          {adjudication.ontology_gap && (
+            <p className="hint" data-testid="context-ontology-gap">
+              Suggested vocabulary addition: {' '}
+              <span className="mono">{adjudication.ontology_gap.proposed_label}</span> — a
+              suggestion for a reviewer, never applied automatically.
+            </p>
+          )}
+        </section>
+      )}
+
+      <section className="adg-section" data-testid="context-uncertainty">
+        <h3 className="micro-label">What this view does not know</h3>
+        {notSupplied.length > 0 && (
+          <p className="hint" data-testid="context-not-supplied">
+            Not supplied: {notSupplied.map(humanizeCode).join(', ')} — nothing in this platform
+            produces them yet, which is not the same as there being none.
+          </p>
+        )}
+        {uncertainty && uncertainty.missing_context.length > 0 && (
+          <ul className="rows" data-testid="context-missing">
+            {uncertainty.missing_context.map(code => (
+              <li key={code} className="row hint" title={code}>
+                {humanizeCode(code)}
+              </li>
+            ))}
+          </ul>
+        )}
+        {omitted.length > 0 && (
+          <p className="hint" data-testid="context-omitted">
+            Left out of this view:{' '}
+            {omitted.map(([kind, count]) => `${count} ${humanizeCode(kind)}`).join(', ')}.
+          </p>
+        )}
+        {truncation?.truncated && (
+          <p className="hint" data-testid="context-truncated">
+            The neighbourhood was larger than this view's budget, so it was cut.
+          </p>
+        )}
+      </section>
+    </div>
+  )
 }
 
 // ---- relationships --------------------------------------------------------------------------

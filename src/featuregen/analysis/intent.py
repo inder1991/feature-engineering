@@ -73,7 +73,14 @@ def _generation_settings() -> dict:
 
 TASK = "analysis.intent"
 PROMPT_ID = "analysis_intent_v1"
+#: The INPUT contract's version, stamped on the immutable llm_call record.
+#:   1 — offered refs + labels only (the shape this module shipped with).
+#:   2 — v1 plus bounded `SemanticContextBundleV1.for_analysis_planning` projections carrying the
+#:       D2 authority axes and the closed missing-context codes (semantic Task 9).
+#: The OUTPUT schema is UNCHANGED at both versions — the version identifies which INPUT egressed,
+#: which is the only thing that makes an audit record unambiguous about what the model was shown.
 PROMPT_VERSION = 1
+PROMPT_VERSION_V2 = 2
 SCHEMA_ID = "analysis_intent"
 SCHEMA_VERSION = 1
 
@@ -195,6 +202,42 @@ class IntentCandidates:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalysisIntentInputV2:
+    """The VERSIONED input contract for intent extraction (semantic Task 9).
+
+    :class:`IntentCandidates` is UNVERSIONED and stays that way — it is the closed offered set and
+    nothing more. This wrapper is what carries a version, so a later shape change is a contract
+    bump with an audit trail rather than a silent widening of what the model was shown.
+
+    **Placement is deliberately unchanged.** Everything here rides in the SAME `catalog_metadata`
+    block the offered refs already ride in, which lands in the USER turn beside the instruction
+    telling the model to choose only from them. Moving metadata into a cacheable `system` block once
+    separated the refs from that instruction and the extraction failed validation until the repair
+    budget ran out — a recorded repair-exhaustion history, not a hypothetical. So: version the
+    contract, add keys, move nothing.
+
+    `context` entries are bounded `for_analysis_planning` projections, each keyed by the SAME `ref`
+    spelling :func:`validate_intent` matches on. They are EXPLANATION: context can never widen what
+    may be named, because validation still turns on `candidates.column_refs` alone."""
+
+    candidates: IntentCandidates
+    context: tuple[dict, ...] = ()
+    #: Closed `MISSING_CONTEXT_CODES` for the offered set as a whole — what this view does NOT
+    #: carry. Read-scoped by construction, so it is never a data-quality verdict.
+    missing_context: tuple[str, ...] = ()
+    contract_version: int = 2
+
+
+def _as_input(candidates: IntentCandidates | AnalysisIntentInputV2) -> AnalysisIntentInputV2:
+    """Accept either contract. An `IntentCandidates` is the v1 input, unchanged and unversioned;
+    the wrapper is what a v2 caller passes. Both are supported on purpose — the analysis route is
+    not the only caller, and forcing every test to wrap would be churn without a property."""
+    if isinstance(candidates, AnalysisIntentInputV2):
+        return candidates
+    return AnalysisIntentInputV2(candidates=candidates, contract_version=1)
+
+
+@dataclass(frozen=True, slots=True)
 class IntentExtraction:
     """A candidate plan plus what the model abstained on.
 
@@ -307,7 +350,8 @@ def _plan_from(output: dict, question: str) -> AnalysisPlanV1:
     )
 
 
-def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCandidates, *,
+def extract_intent(conn, client: LLMClient, question: str,
+                   candidates: IntentCandidates | AnalysisIntentInputV2, *,
                    actor: IdentityEnvelope, model: str | None = None) -> IntentExtraction:
     """Turn a question into a candidate plan, or fail into clarification.
 
@@ -325,26 +369,37 @@ def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCan
     The plan is NOT grounded here. Grounding is a separate pass over the catalog's governed facts,
     and keeping the two apart is what stops a model's confidence being mistaken for evidence.
     """
+    supplied = _as_input(candidates)
+    candidates = supplied.candidates
     # The question is the intent; the offered catalog objects are metadata. Same split the
     # enrichment path uses, so the reserved-key contract `assert_llm_safe` checks is satisfied.
     redaction = redact_free_text(question)
+    metadata: dict = {
+        "column_refs": sorted(candidates.column_refs),
+        "table_refs": sorted(candidates.table_refs),
+        "labels": dict(sorted(candidates.labels.items())),
+        "instruction":
+            "Choose, from the offered catalog objects only, which ones this question is about. "
+            "Never name a ref that is not offered. Express periods as whole calendar units. If "
+            "the question does not determine something, list it in `unresolved` and leave it "
+            "empty rather than guessing.",
+    }
+    if supplied.contract_version >= 2:
+        # SAME BLOCK, new keys — placement is deliberately untouched (see AnalysisIntentInputV2).
+        metadata["contract_version"] = supplied.contract_version
+        if supplied.context:
+            metadata["semantic_context"] = [dict(entry) for entry in supplied.context]
+        if supplied.missing_context:
+            metadata["missing_context"] = list(supplied.missing_context)
     inputs = build_llm_inputs(
-        redaction,
-        catalog_metadata={
-            "column_refs": sorted(candidates.column_refs),
-            "table_refs": sorted(candidates.table_refs),
-            "labels": dict(sorted(candidates.labels.items())),
-            "instruction":
-                "Choose, from the offered catalog objects only, which ones this question is about. "
-                "Never name a ref that is not offered. Express periods as whole calendar units. If "
-                "the question does not determine something, list it in `unresolved` and leave it "
-                "empty rather than guessing.",
-        },
+        redaction, catalog_metadata=metadata,
         raw_input_classification=(
             "contains_pii" if redaction.redacted_spans else "clean"))
 
     request = LLMRequest(
-        task=TASK, prompt_id=PROMPT_ID, prompt_version=PROMPT_VERSION, inputs=inputs,
+        task=TASK, prompt_id=PROMPT_ID,
+        prompt_version=(PROMPT_VERSION_V2 if supplied.contract_version >= 2 else PROMPT_VERSION),
+        inputs=inputs,
         output_schema_id=SCHEMA_ID, output_schema_version=SCHEMA_VERSION,
         # From the SAME env that configures the client, so the audit record says what the adapter
         # actually applied — and `llm_call.provider` is NOT NULL, so an empty dict cannot be written

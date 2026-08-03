@@ -2221,6 +2221,139 @@ export interface SemanticAdjudicationSection {
   ontology_gap?: OntologyGapSuggestion | null
 }
 
+// ---- Context Graph V1 (semantic Task 7) ------------------------------------------------------
+// A composition of readers that already shipped — the semantic bundle, the lineage builder, the
+// assembled dataset profile and the current adjudication — served as ONE dossier section so every
+// fact belongs to the snapshot the consistency_token fingerprints.
+
+export interface ContextValue {
+  field: string
+  value: unknown
+  resolution_status: string
+  operational_influence: string | null
+  // The DERIVED D2 display label (source_attested | source_proposed | human | llm_proposed |
+  // deterministic | governed | system). For the chip only — never branch on it; the triple below
+  // is the real authority.
+  authority_label: string
+  producer: string | null
+  strength: string | null
+  lifecycle: string | null
+  evidence_ids: string[]
+}
+
+export interface ContextNode {
+  id: string
+  kind: string
+  label: string
+  detail: Record<string, unknown>
+}
+
+export interface ContextEdge {
+  from: string
+  to: string
+  kind: string
+  // 'structural' for containment (an explicit basis, empty evidence), else the D2 display label
+  // or the edge layer's own authority word.
+  authority: string
+  status: string | null
+  why: string
+  producer: string | null
+  strength: string | null
+  lifecycle: string | null
+  current: boolean
+  evidence_ids: string[]
+}
+
+export interface ContextRealization {
+  realization_revision_id: string
+  from_ref: string
+  to_ref: string
+  lifecycle: string
+  safety_status: string
+  // Fan-out never travels without its direction (from/to) and applicability scope.
+  cardinality: string | null
+  scope_id: string | null
+  sandbox_eligible: boolean
+  // A PURE predicate over the stored record: it labels history, never a live capability.
+  production_eligible: boolean
+  // The ONLY live-capability answer, from the revalidating reader.
+  executable_now: boolean
+}
+
+export interface ContextRelationship {
+  relationship_ref: string
+  kind: string
+  left_ref: string
+  right_ref: string
+  // available | unavailable, and nothing else — availability never encodes safety.
+  availability: string
+  review_status: string | null
+  assessment_revision_id: string | null
+  producer: string
+  strength: string
+  lifecycle: string
+  current: boolean
+  evidence_ids: string[]
+  executable_now: boolean
+  realizations: ContextRealization[]
+}
+
+export interface ContextProfileField {
+  value: string | null
+  producer?: string
+  strength?: string
+  lifecycle?: string
+  state: string | null
+  unresolved_family: string | null
+}
+
+export interface ContextProfiles {
+  catalog_profile_revision_id: string | null
+  dataset_profile_hash: string | null
+  data_role: ContextProfileField | null
+  primary_entity: ContextProfileField | null
+  authority_role: ContextProfileField | null
+  temporal_storage_model: ContextProfileField | null
+  missing_context: string[]
+}
+
+// Per-kind accounting of what the bounded reads left out. `truncated` keeps its shipped meaning —
+// a BUDGET cut — while `omitted` counts everything not returned, so "no joins" and "joins that did
+// not fit" are never the same answer.
+export interface ContextTruncation {
+  truncated: boolean
+  omitted: Record<string, number>
+}
+
+export interface ContextSection {
+  // available (column) | table | projection_unavailable | unavailable. None of these is an error.
+  status: string
+  version?: string
+  anchor_id?: string
+  note?: string
+  projection?: { code: string; detail: string }
+  source_meaning?: ContextValue[]
+  resolved_meaning?: ContextValue[]
+  table_context?: ContextValue[]
+  concept_path?: string[]
+  identifier_namespace?: { scheme: string; issuer_scope: string | null; basis: string } | null
+  related_columns?: {
+    object_ref: string
+    column: string
+    concept: string | null
+    party_role: string | null
+  }[]
+  relationships?: ContextRelationship[]
+  profiles?: ContextProfiles
+  uncertainty?: { missing_context: string[]; not_supplied: string[] }
+  // Context this platform has no producer for. Rendered as "not supplied", never as zero.
+  not_supplied?: string[]
+  nodes?: ContextNode[]
+  edges?: ContextEdge[]
+  truncation?: ContextTruncation
+  content_hash?: string
+}
+
 export interface AssetDetail {
   version: string
   source: string
@@ -2241,6 +2374,9 @@ export interface AssetDetail {
   // The adjudicator's reviewable second opinion for a column Pass A could not settle (Task 5).
   // `absent` is the NORMAL state — adjudication is the exception path, not a gap in the data.
   semantic_adjudication?: SemanticAdjudicationSection
+  // Context Graph V1 (Task 7). A SECTION, deliberately not its own endpoint: it rides this
+  // response's single repeatable-read snapshot and its consistency_token.
+  context?: ContextSection
   included_sections: string[]
   unavailable_sections: string[]
   // Whether a load-bearing projection was behind when this dossier was assembled (Task 6). It is

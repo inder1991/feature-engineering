@@ -177,23 +177,41 @@ def record_gap(conn, event: AnalysisLearningEventV1, *, now: datetime) -> str:
     Re-running the same blocked question under the same dependencies is not new information. A NEW
     dependency snapshot is: the gap may have been resolved, so it must be re-evaluated and recorded
     again.
+
+    THE DEDUPE IS DONE BY THE DATABASE, not by a read. This was a SELECT-then-INSERT, which is a
+    check-then-act race across two connections — and it was invisible only because the production
+    caller minted a fresh `areq-{uuid4}` per request, so no two writes ever shared a dedupe key. The
+    moment request ids became stable (which is what makes the dedupe do anything at all) the race
+    was live, and the loser died with a `UniqueViolation` the caller logs as "could not record a
+    learning gap". So the INSERT is conditional on 1034's `analysis_learning_event_gap_idx` — the
+    PARTIAL unique index over exactly (analysis_request_id, gap_key, dependency_snapshot_id) WHERE
+    kind = 'gap' — and the conflicting writer reads back the row that won rather than raising.
+
+    The index inference clause must repeat the index's own ``WHERE kind = 'gap'``: without it
+    PostgreSQL cannot match a PARTIAL index and the statement fails outright.
     """
+    inserted = conn.execute(
+        "INSERT INTO analysis_learning_event (event_id, kind, analysis_request_id, stage, code, "
+        "  gap_key, subject_refs, required_action, dependency_snapshot_id, "
+        "  candidate_refs_considered, supporting_evidence_ids, resolves_event_id, created_at) "
+        "VALUES (%s,'gap',%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s) "
+        "ON CONFLICT (analysis_request_id, gap_key, dependency_snapshot_id) WHERE kind = 'gap' "
+        "DO NOTHING RETURNING event_id",
+        (event.event_id, event.analysis_request_id, str(event.stage), event.code, event.gap_key,
+         list(event.subject_refs), str(event.required_action), event.dependency_snapshot_id,
+         list(event.candidate_refs_considered), list(event.supporting_evidence_ids),
+         now)).fetchone()
+    if inserted is not None:
+        return inserted[0]
     existing = conn.execute(
         "SELECT event_id FROM analysis_learning_event "
         "WHERE analysis_request_id = %s AND gap_key = %s AND dependency_snapshot_id = %s "
         "AND kind = 'gap'",
         (event.analysis_request_id, event.gap_key, event.dependency_snapshot_id)).fetchone()
-    if existing:
-        return existing[0]
-    conn.execute(
-        "INSERT INTO analysis_learning_event (event_id, kind, analysis_request_id, stage, code, "
-        "  gap_key, subject_refs, required_action, dependency_snapshot_id, "
-        "  candidate_refs_considered, supporting_evidence_ids, resolves_event_id, created_at) "
-        "VALUES (%s,'gap',%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s)",
-        (event.event_id, event.analysis_request_id, str(event.stage), event.code, event.gap_key,
-         list(event.subject_refs), str(event.required_action), event.dependency_snapshot_id,
-         list(event.candidate_refs_considered), list(event.supporting_evidence_ids), now))
-    return event.event_id
+    # The row is unreadable only under an isolation level that froze the snapshot before the winner
+    # committed. Returning this event's own id would then name a row that does not exist, so the
+    # caller is told there is nothing to point at instead.
+    return existing[0] if existing else ""
 
 
 def record_refusal(conn, *, analysis_request_id: str, refusal_code: str,
