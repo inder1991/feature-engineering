@@ -680,3 +680,17 @@ def test_a_table_anchor_gets_an_honest_empty_section(db, monkeypatch):
     body = build_asset_detail(db, source="deposits", object_ref="public.accounts",
                               roles=("platform-admin",))
     assert body["semantic_adjudication"]["status"] == "absent"
+
+
+def test_dispatches_carry_the_run_stage_and_column_subject_attribution():
+    """C5-T5. Attribution rides the PRE-DISPATCH audit gate, so this is also what makes the stage
+    fail CLOSED — no egress — when the audit store is unavailable (the whole-ingest proof of that
+    lives in test_dispatch_gate.py, which drives a real durable run)."""
+    context = adj._dispatch_context(_target(), "ingrun_1")
+    assert context.ingestion_run_id == "ingrun_1"
+    assert context.stage == adj.SEMANTIC_ADJUDICATION_STAGE
+    assert context.stage in CANONICAL_STAGES        # one name for the stage and its dispatches
+    assert context.subjects == ({"catalog_source": "cib", "object_ref": None,
+                                 "logical_ref": _REF, "field_names": ["concept"]},)
+    # A direct caller with no run dispatches unattributed, exactly like every other seam.
+    assert adj._dispatch_context(_target(), None) is None

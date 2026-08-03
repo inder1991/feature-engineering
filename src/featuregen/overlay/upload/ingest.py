@@ -2454,6 +2454,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         conn, client, vr.good, concepts=concepts, glossary=glossary,
                         bindings=bindings, source_snapshot_id=snapshot_id, actor=actor,
                         critic_outcomes=concept_stats.get("concept_critic_outcomes"),
+                        ingestion_run_id=ingestion_run_id,
                         bundles=enrichment_context or None)
             except Exception:  # noqa: BLE001 — advisory: adjudication never fails an upload
                 logger.warning("advisory semantic adjudication failed for %r", catalog_source,

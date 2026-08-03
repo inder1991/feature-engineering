@@ -53,7 +53,9 @@ from featuregen.overlay.upload.concepts import (
     classification_vocabulary,
     display_entity,
 )
+from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
+from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.semantic_context import MISSING_CONTEXT_CODES, REASON_CODES
 from featuregen.overlay.upload.semantic_gap import (
     OntologyGapSuggestionV1,
@@ -85,6 +87,9 @@ SEMANTIC_ADJUDICATION_PROMPT_ID = "semantic_adjudication_v1"
 SEMANTIC_ADJUDICATION_PROMPT_VERSION = 1
 SEMANTIC_ADJUDICATION_SCHEMA_ID = "semantic_adjudication"
 SEMANTIC_ADJUDICATION_SCHEMA_VERSION = 1
+#: The ingest stage name dispatches are attributed to — the SAME string `stage_report` registers,
+#: so the run's stage account and its dispatch audit name one thing.
+SEMANTIC_ADJUDICATION_STAGE = "semantic_adjudication"
 
 #: Pointer subject kinds over the 1046 table. `column` answers "what is the current adjudication of
 #: this column?" (the asset-detail read); `ontology_gap` lists "every column whose adjudication
@@ -540,11 +545,33 @@ def load_current_adjudication(conn, logical_ref: str) -> tuple[SemanticAdjudicat
 
 # ── the bounded dispatch loop ───────────────────────────────────────────────────────────────────
 
+def _dispatch_context(target: AdjudicationTargetV1,
+                      ingestion_run_id: str | None) -> DispatchAuditContext | None:
+    """The C5-T5 attribution for ONE adjudication dispatch: the run it serves, the stage, and the
+    single column subject it is about.
+
+    Threaded for the same reason every Pass-A stage threads it, and one more: the pre-dispatch
+    audit gate is what makes egress FAIL-CLOSED when the audit store is unavailable. A stage that
+    dispatched without it would keep talking to the provider during exactly the outage in which
+    nothing can be recorded — an unauditable call is not a degraded call, it is an unlogged one.
+    ``None`` (a direct caller with no run) dispatches unattributed, as every other seam does."""
+    if ingestion_run_id is None:
+        return None
+    source, _schema, _table, _column = parse_ref(target.logical_ref)
+    return DispatchAuditContext(
+        ingestion_run_id=ingestion_run_id,
+        stage=SEMANTIC_ADJUDICATION_STAGE,
+        subjects=({"catalog_source": source, "object_ref": None,
+                   "logical_ref": target.logical_ref, "field_names": ["concept"]},))
+
+
 def _drive(conn, client: LLMClient, payload: dict[str, object],
-           actor: IdentityEnvelope | None) -> tuple[dict | None, str | None]:
+           actor: IdentityEnvelope | None,
+           dispatch_audit: DispatchAuditContext | None = None) -> tuple[dict | None, str | None]:
     """One audited structured call through the seam the concept critic uses. A client throw (an
-    unscripted fake, a provider outage) is contained to ``(None, None)`` — adjudication is advisory
-    and must degrade to `not_attempted`, never abort the ingest that hosts it."""
+    unscripted fake, a provider outage, a fail-closed pre-dispatch audit) is contained to
+    ``(None, None)`` — adjudication is advisory and must degrade to `not_attempted`, never abort
+    the ingest that hosts it."""
     try:
         call = drive_audited_structured_call(
             conn, client, task=SEMANTIC_ADJUDICATION_TASK,
@@ -554,6 +581,7 @@ def _drive(conn, client: LLMClient, payload: dict[str, object],
             schema_version=SEMANTIC_ADJUDICATION_SCHEMA_VERSION,
             catalog_metadata=payload, instruction=_INSTRUCTION, actor=actor,
             run_id=SEMANTIC_ADJUDICATION_RUN_ID, record_egress_block=True,
+            dispatch_audit=dispatch_audit,
             cacheable_metadata_keys=("vocabulary",))
     except Exception:  # noqa: BLE001 — advisory: a provider fault never aborts the ingest
         logger.warning("semantic adjudication call failed; treating as not attempted",
@@ -570,6 +598,7 @@ def adjudicate_targets(
     catalog_revision: str,
     actor: IdentityEnvelope | None = None,
     bounds: AdjudicationBounds | None = None,
+    ingestion_run_id: str | None = None,
 ) -> tuple[AdjudicationResultV1, ...]:
     """Adjudicate the selected targets under an explicit provider-call cap.
 
@@ -609,7 +638,8 @@ def adjudicate_targets(
                 "adjudicator_unavailable" if client is None else "call_cap_reached"))
             continue
         calls += 1
-        output, llm_call_ref = _drive(conn, client, payload, actor)
+        output, llm_call_ref = _drive(
+            conn, client, payload, actor, _dispatch_context(target, ingestion_run_id))
         if output is None:
             results.append(AdjudicationResultV1(
                 target.logical_ref, AdjudicationOutcome.NOT_ATTEMPTED, None,

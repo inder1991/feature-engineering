@@ -1715,6 +1715,7 @@ def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow
                          source_snapshot_id: str | None = None,
                          actor=None,
                          critic_outcomes: dict[str, dict] | None = None,
+                         ingestion_run_id: str | None = None,
                          bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict:
     """Run targeted adjudication over this run's UNCLEAR columns; return the stage DETAIL dict.
 
@@ -1735,6 +1736,10 @@ def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow
 
     DB-first, dict-after (the critic's rule): the evidence write happens before ``concepts`` is
     mutated, so a rolled-back savepoint leaves the in-memory classification exactly as it was.
+
+    ``ingestion_run_id`` (C5-T5) attributes every dispatch this stage issues to the run and the
+    exact column subject it adjudicates — and, because attribution rides the PRE-DISPATCH audit
+    gate, it is also what makes this stage fail CLOSED (no egress) when the audit store is down.
 
     Returns ``{targets, considered, selected, unchanged, unclassified, gap_suggested, invalid,
     not_attempted, evidence_written, evidence_write_failures, gaps}`` — the six outcome counts
@@ -1761,7 +1766,8 @@ def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow
     catalog_revision = hashlib.sha256(
         json.dumps(sorted(inputs.ref_to_hash)).encode("utf-8")).hexdigest()[:16]
     results = adjudicate_targets(conn, client, targets, catalog_revision=catalog_revision,
-                                 actor=actor, bounds=bounds)
+                                 actor=actor, bounds=bounds,
+                                 ingestion_run_id=ingestion_run_id)
     detail.update(outcome_counts(results))
     detail["gaps"] = sum(
         1 for r in results if r.adjudication is not None and r.adjudication.ontology_gap is not None)
