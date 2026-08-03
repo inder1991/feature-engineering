@@ -17,15 +17,29 @@ holds, which is why this half is worth building before there is anything to exec
 **Read scope first, and as absence.** A column the caller may not see is reported as
 ``COLUMN_ABSENT``, never as "hidden" — otherwise the refusal itself becomes an existence oracle for
 sensitive columns, the same rule ``formula/tools`` and ``asset_detail`` already follow.
+
+**Release-B (Task 8): grounding also resolves WHICH COPY and WHICH ROWS.** The review recorded that
+population enforcement was spread across intent/assembly/execution/clarify and that this module had
+zero ``population`` hits at all. It now resolves the plan's dataset NEEDS through the source
+selector and the temporal resolver — behind ``FEATUREGEN_SOURCE_TEMPORAL_SELECTION``, so with the
+flag off every ``GroundedPlan`` is byte-identical to before.
+
+Those decisions ride the plan as a :class:`SelectionPreviewV1` and their refusals do NOT flip
+``answerable``. That is deliberate and it is this module's own doctrine: a refusal here means the
+plan could not be EXPRESSED against the catalog, and "nobody has declared which copy serves this"
+is a question for a person, not an inexpressible plan. The HARD gate is the execution bridge —
+which is exactly where the review found the hole, and where Task 8 closes it.
 """
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import datetime
 
 from featuregen.analysis.plan import (
     AnalysisPlanV1,
     Finding,
     GroundedPlan,
+    SelectionPreviewV1,
     Window,
 )
 from featuregen.overlay.upload.bridge_assessment import (
@@ -137,12 +151,19 @@ def _window_findings(window: Window, anchor: dict | None) -> list[Finding]:
 
 
 def ground_analysis_plan(conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (),
-                         min_cell_size: int = DEFAULT_MIN_CELL_SIZE) -> GroundedPlan:
-    """Check one plan against the catalog. Read-only; no data is touched.
+                         min_cell_size: int = DEFAULT_MIN_CELL_SIZE,
+                         execution_tier: str = "sandbox",
+                         cutoff_value_ref: str | None = None,
+                         candidate_dataset_refs: Iterable[str] = (),
+                         recorded_by: str | None = None) -> GroundedPlan:
+    """Check one plan against the catalog. Read-only apart from the binding a SELECTION pins.
 
     Refusals mean the plan cannot be expressed. Findings mean it can be answered but the answer
     rests on something unconfirmed — they travel with the result rather than stopping it, which is
     the same contract the feature gauntlet uses.
+
+    The four Release-B keyword arguments are inert while the flag is off; every existing caller
+    keeps its exact behaviour without passing any of them.
     """
     refs = [plan.entity_ref, plan.measure.logical_ref,
             *(w.anchor_ref for w in plan.windows),
@@ -255,5 +276,138 @@ def ground_analysis_plan(conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (
     if plan.comparison and len({w.anchor_ref for w in plan.windows}) > 1:
         refusals.append(("NO_PATH_TO_DIMENSION", plan.base_table_ref))
 
-    return GroundedPlan(plan=plan, answerable=not refusals,
-                        findings=tuple(findings), refusals=tuple(refusals))
+    return GroundedPlan(
+        plan=plan, answerable=not refusals,
+        findings=tuple(findings), refusals=tuple(refusals),
+        selections=resolve_plan_selections(
+            conn, plan, roles=roles, execution_tier=execution_tier,
+            cutoff_value_ref=cutoff_value_ref, candidate_dataset_refs=candidate_dataset_refs,
+            recorded_by=recorded_by))
+
+
+# ── Release-B: WHICH COPY, and WHICH ROWS (Task 8) ───────────────────────────────────────────────
+
+
+def _table_ref_of(logical_ref: str) -> str:
+    """The TABLE a column ref belongs to, by string. Deriving is safe; inferring is the thing the
+    population doctrine forbids, and this derives."""
+    source, _, rest = logical_ref.partition("::")
+    parts = [p for p in rest.split(".") if p]
+    return f"{source}::{'.'.join(parts[:-1])}" if len(parts) >= 2 else logical_ref
+
+
+def resolve_plan_selections(
+    conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (), execution_tier: str = "sandbox",
+    cutoff_value_ref: str | None = None, candidate_dataset_refs: Iterable[str] = (),
+    recorded_by: str | None = None,
+) -> SelectionPreviewV1 | None:
+    """Resolve this plan's dataset NEEDS, or ``None`` while the flag is off.
+
+    THREE need roles, and no more. The POPULATION (who is in the answer), the EVENT SOURCE (what is
+    counted) and one DIMENSION SOURCE per distinct group-by table.
+
+    **Only the dimension sources get a ROW decision**, deliberately. "Which row classifies this
+    customer" is the question the renderer used to answer by itself, and it is the one §6.5 exists
+    for. The population's and the event table's row rules are the window/eligibility machinery that
+    already exists and is already declared; demanding a temporal policy for them would refuse every
+    plan that works today in order to re-declare something that is not in doubt.
+    """
+    from featuregen.overlay.upload.source_selection import (
+        DatasetNeedRole,
+        DatasetNeedV1,
+        SelectionError,
+        ServingPurpose,
+        source_temporal_selection_enabled,
+    )
+    from featuregen.overlay.upload.source_selector import select_dataset_source
+    from featuregen.overlay.upload.temporal_resolver import (
+        RequestTemporality,
+        resolve_row_selection,
+    )
+
+    if not source_temporal_selection_enabled():
+        return None
+
+    selections, rows, refusals, warnings = [], [], [], []
+    entity = plan.entity or "entity"
+    dimension_tables = tuple(dict.fromkeys(
+        _table_ref_of(dim.logical_ref) for dim in plan.dimensions))
+
+    wanted: list[tuple[DatasetNeedRole, str | None]] = [
+        (DatasetNeedRole.POPULATION, plan.population_table_ref or None),
+        (DatasetNeedRole.EVENT_SOURCE, plan.base_table_ref or None),
+    ]
+    wanted += [(DatasetNeedRole.DIMENSION_SOURCE, table) for table in dimension_tables]
+
+    for need_role, explicit in wanted:
+        try:
+            need = DatasetNeedV1(
+                entity_id=entity, need_role=need_role,
+                serving_purpose=ServingPurpose.ANALYTICAL, execution_tier=execution_tier,
+                explicit_dataset_ref=explicit)
+            outcome = select_dataset_source(
+                conn, need=need, candidate_dataset_refs=candidate_dataset_refs, roles=roles,
+                recorded_by=recorded_by)
+        except SelectionError:
+            # A malformed ref is the CALLER's bug, not a governed refusal, and it must not turn a
+            # groundable plan into an outage. The need is skipped and the plan carries no decision
+            # for it — which the preview shows as an absence rather than a false pin.
+            continue
+        if outcome.refusal is not None:
+            refusals.append(outcome.refusal)
+            continue
+        selections.append(outcome.selection)
+        warnings.extend(outcome.warnings)
+        if need_role is not DatasetNeedRole.DIMENSION_SOURCE:
+            continue
+        try:
+            row = resolve_row_selection(
+                conn, dataset_logical_ref=outcome.selection.selected_dataset_ref,
+                dataset_profile_hash=outcome.selection.selected_dataset_profile_hash,
+                # A period-over-period question is HISTORICAL by construction: it is asked about a
+                # window that has closed, so "today's segment" would reattribute it.
+                temporality=(RequestTemporality.HISTORICAL if plan.comparison
+                             else RequestTemporality.CURRENT),
+                cutoff_value_ref=cutoff_value_ref, roles=roles)
+        except SelectionError:
+            continue
+        if row.refusal is not None:
+            refusals.append(row.refusal)
+        else:
+            rows.append(row.row_selection)
+
+    return SelectionPreviewV1(
+        source_selections=tuple(selections), row_selections=tuple(rows),
+        refusals=tuple(refusals), warnings=tuple(dict.fromkeys(warnings)))
+
+
+def record_selection_gaps(conn, selections: SelectionPreviewV1 | None, *, question: str,
+                          dependency_snapshot_id: str, now: datetime) -> tuple[str, ...]:
+    """Record each selection REFUSAL as a learning gap. Returns the event ids that were written.
+
+    **The request id is DERIVED, never minted** — ``stable_analysis_request_id``, the precedent the
+    retrieval producer set. ``record_gap`` dedupes on (request, gap, snapshot), so a per-call
+    ``areq-{uuid4}`` would make every row unique by construction and three retries of one blocked
+    question would read as demand 3 for one thing to decide. With the derived id the retry is
+    idempotent, which is pinned by test.
+
+    ``REFUSAL_TO_GAP`` decides which refusals are evidence at all: seven of the eight closed codes
+    map, and ``TEMPORAL_SCD_OVERLAP`` deliberately does not, because a data defect is not a decision
+    anyone is waiting to make. ``record_refusal`` returns ``None`` for it and this records nothing.
+    """
+    from featuregen.analysis.retrieval import stable_analysis_request_id
+    from featuregen.data_agent.learning import LearningStage, record_refusal
+
+    if selections is None or not selections.refusals:
+        return ()
+    request_id = stable_analysis_request_id(
+        question, dependency_snapshot_id=dependency_snapshot_id)
+    written: list[str] = []
+    for refusal in selections.refusals:
+        event_id = record_refusal(
+            conn, analysis_request_id=request_id, refusal_code=refusal.code,
+            subject_refs=refusal.subject_refs, dependency_snapshot_id=dependency_snapshot_id,
+            now=now, stage=LearningStage.GROUNDING)
+        if event_id:
+            written.append(event_id)
+    return tuple(written)

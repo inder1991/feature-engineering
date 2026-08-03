@@ -86,7 +86,21 @@ def clarifications_for(extraction: IntentExtraction,
     Ordering is not cosmetic: the entity decides which table the rest of the question is about, so it
     is asked first. A user who picks dimensions before an entity can be asked to pick again.
     """
-    raised = {code for code in extraction.unresolved if code in UNRESOLVED_CODES}
+    return clarifications_for_codes(extraction.unresolved, candidates)
+
+
+def clarifications_for_codes(codes: tuple[str, ...] | frozenset[str],
+                             candidates: IntentCandidates) -> tuple[Clarification, ...]:
+    """The SAME rendering, driven by codes rather than by a model extraction (Release-B Task 8).
+
+    A selection refusal is raised by the SELECTOR, not by the model, so it never appears in an
+    ``IntentExtraction`` — and the wire schema's enum deliberately cannot carry it (the D5 wire-enum
+    split: a model must not be able to assert an overlap or a binding refusal). Routing it through
+    this function rather than through a second renderer is what keeps ONE set of question wordings
+    and ONE total order: the population still outranks every row question, whichever half of the
+    system noticed the gap.
+    """
+    raised = {code for code in codes if code in UNRESOLVED_CODES}
     return tuple(_build(code, candidates) for code in sorted(raised, key=_clarification_rank))
 
 

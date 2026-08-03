@@ -24,6 +24,12 @@ clears the finding. Only a plan that cannot be expressed at all is refused.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:      # import weight: `source_selection` reaches the concept registry (~1s)
+    from featuregen.overlay.upload.source_selection import DatasetSourceSelectionV1
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1
+    from featuregen.overlay.upload.temporal_policy import DatasetRowSelectionV1
 
 #: Findings a grounded plan can carry. A CLOSED vocabulary: a new doubt gets a code here, so it can
 #: never be smuggled into prose that the caller has to read to notice.
@@ -159,6 +165,39 @@ class AnalysisPlanV1:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectionPreviewV1:
+    """The Release-B source/row decisions this plan rests on — BOUNDED, for preview.
+
+    **This is a SEAM, not the record.** Task 9 seals the exact decision refs into
+    ``AnalysisExecutionIRV2`` and the six snapshot kinds, and revalidates the current pointers
+    immediately before execution. Until it does, these decisions travel with the plan so a preview
+    can SHOW which copy was chosen, which rows, and what else was considered — which is the half of
+    "separately explainable" (§5.7) that a person actually reads. Nothing here is persisted, and
+    nothing downstream may treat it as a pin.
+
+    Empty by construction while ``FEATUREGEN_SOURCE_TEMPORAL_SELECTION`` is off, so a flag-off
+    ``GroundedPlan`` is byte-identical to the one this release found.
+    """
+
+    source_selections: tuple[DatasetSourceSelectionV1, ...] = field(default_factory=tuple)
+    row_selections: tuple[DatasetRowSelectionV1, ...] = field(default_factory=tuple)
+    refusals: tuple[SelectionRefusalV1, ...] = field(default_factory=tuple)
+    #: Warnings riding a RESOLVED decision — e.g. `PROPOSED_AUTHORITY_USED`. Visible, never a log
+    #: line: the point of letting an unconfirmed classification be useful is that its authority
+    #: travels with it.
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def refusal_codes(self) -> tuple[str, ...]:
+        """The closed codes, deduped and ordered — what clarify renders and learning records."""
+        return tuple(sorted({refusal.code for refusal in self.refusals}))
+
+    @property
+    def resolved(self) -> bool:
+        return not self.refusals
+
+
+@dataclass(frozen=True, slots=True)
 class GroundedPlan:
     """A plan checked against the catalog.
 
@@ -170,6 +209,11 @@ class GroundedPlan:
     answerable: bool
     findings: tuple[Finding, ...] = field(default_factory=tuple)
     refusals: tuple[tuple[str, str], ...] = field(default_factory=tuple)   # (code, subject)
+    #: The Release-B decisions, when the flag is on. Deliberately NOT folded into ``refusals``: that
+    #: tuple sets ``answerable``, and a source that is merely undeclared is a question for a person,
+    #: not a plan that could not be expressed. The HARD gate is the execution bridge, which is where
+    #: the review found the population hole.
+    selections: SelectionPreviewV1 | None = None
 
     @property
     def trustworthy(self) -> bool:
