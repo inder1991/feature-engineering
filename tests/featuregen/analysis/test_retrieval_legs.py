@@ -425,7 +425,7 @@ def test_bundles_are_bounded_far_below_the_offered_set(catalog):
 
 def test_a_retrieval_refusal_records_an_actionable_gap(catalog):
     event_id = record_retrieval_gap(
-        catalog, "which merchants had chargeback velocity spikes", roles=(),
+        catalog, "which merchant counterparty exposure spiked", roles=(),
         analysis_request_id="areq-1", now=_NOW)
     assert event_id
     row = catalog.execute(
@@ -433,13 +433,13 @@ def test_a_retrieval_refusal_records_an_actionable_gap(catalog):
         "WHERE event_id = %s", (event_id,)).fetchone()
     assert row[0] == "SEMANTIC_TERM_UNRESOLVED"
     assert row[1] == "define_semantic_term"
-    assert "chargeback" in row[2]
+    assert "counterparty" in row[2]
 
 
 def test_the_same_unanswered_question_dedupes_under_one_catalog_state(catalog):
-    first = record_retrieval_gap(catalog, "chargeback velocity", roles=(),
+    first = record_retrieval_gap(catalog, "counterparty exposure", roles=(),
                                  analysis_request_id="areq-1", now=_NOW)
-    again = record_retrieval_gap(catalog, "chargeback velocity", roles=(),
+    again = record_retrieval_gap(catalog, "counterparty exposure", roles=(),
                                  analysis_request_id="areq-1", now=_NOW)
     assert first == again
     assert catalog.execute(
@@ -447,23 +447,23 @@ def test_the_same_unanswered_question_dedupes_under_one_catalog_state(catalog):
 
 
 def test_a_new_catalog_state_re_records_because_the_gap_may_have_been_resolved(catalog):
-    record_retrieval_gap(catalog, "chargeback velocity", roles=(), analysis_request_id="areq-1",
+    record_retrieval_gap(catalog, "counterparty exposure", roles=(), analysis_request_id="areq-1",
                          now=_NOW)
     catalog.execute("UPDATE overlay_drift_watermark SET last_completed_at = %s",
                     (datetime(2026, 8, 1, tzinfo=UTC),))
-    record_retrieval_gap(catalog, "chargeback velocity", roles=(), analysis_request_id="areq-1",
+    record_retrieval_gap(catalog, "counterparty exposure", roles=(), analysis_request_id="areq-1",
                          now=_NOW)
     assert catalog.execute(
         "SELECT count(*) FROM analysis_learning_event WHERE kind = 'gap'").fetchone()[0] == 2
 
 
-def test_the_gap_subject_comes_from_redacted_text_never_the_raw_question(catalog):
-    """`subject_refs` is durable and reviewable. A question is free text from a person, so a
-    customer name in it must never become an ontology candidate."""
+def test_the_gap_subject_is_CONTROLLED_VOCABULARY_never_the_question_words(catalog):
+    """`subject_refs` is durable, reviewable and feeds an ontology-candidate queue. The words the
+    asker typed are not admissible there — only words the platform already has."""
     from featuregen.intake.redaction import redact_free_text
 
-    # A pattern the deterministic detectors DO find, so the assertion below is about the
-    # redaction actually happening rather than about a regex that never fired.
+    # A pattern the deterministic detectors DO find, so the redaction assertion is about the
+    # redactor actually firing rather than about a regex that never matched.
     question = "spend for customer 4111 1111 1111 1111 last month"
     assert redact_free_text(question).redacted_spans, (
         "this fixture only means something if the redactor actually finds the identifier")
@@ -474,8 +474,57 @@ def test_the_gap_subject_comes_from_redacted_text_never_the_raw_question(catalog
         (event_id,)).fetchone()[0]
     assert "4111" not in " ".join(subjects)
     assert "1111" not in " ".join(subjects)
-    # The ANALYSABLE words survive — the gap is still actionable.
-    assert "spend" in subjects
+    # The KNOWN term survives — the gap is still actionable, and says which word this catalog has
+    # nothing readable behind.
+    assert "customer" in subjects
+    # …and the words the platform has no concept for do not, however analysable they look. `spend`
+    # is a perfectly good English word and is NOT in the vocabulary, which is the point: the filter
+    # is membership, not plausibility.
+    assert "spend" not in subjects
+    assert "last" not in subjects and "month" not in subjects
+    # The redaction MARKER must not become a subject either.
+    assert "redacted" not in subjects and "pan" not in subjects
+
+
+def test_a_customer_NAME_never_becomes_an_ontology_candidate(catalog):
+    """The probe that found this. The old docstring claimed redaction was the guard; it is not —
+    :mod:`featuregen.intake.redaction` documents personal-NAME detection as DEFERRED, so the name
+    reaches the tokenizer untouched and used to be stored durably."""
+    from featuregen.intake.redaction import redact_free_text
+
+    question = "transactions for Ahmed Al-Mansouri last quarter"
+    assert redact_free_text(question).text == question, (
+        "if the redactor ever DOES catch names this test is asserting the wrong thing")
+    record_retrieval_gap(catalog, question, roles=(), analysis_request_id="areq-1", now=_NOW)
+    stored = " ".join(
+        " ".join(row[0]) for row in catalog.execute(
+            "SELECT subject_refs FROM analysis_learning_event").fetchall())
+    assert "ahmed" not in stored
+    assert "mansouri" not in stored
+
+
+def test_a_question_naming_a_REAL_concept_records_that_concept(catalog):
+    """The other half: filtering to the vocabulary must not silence the gap. A question naming a
+    concept the registry carries records exactly that concept — tokenized, because the registry
+    says `bank_bic` / namespace `swift_bic` where a person says "swift bic"."""
+    event_id = record_retrieval_gap(catalog, "which swift bic did the payment use", roles=(),
+                                    analysis_request_id="areq-1", now=_NOW)
+    subjects = catalog.execute(
+        "SELECT subject_refs FROM analysis_learning_event WHERE event_id = %s",
+        (event_id,)).fetchone()[0]
+    assert {"swift", "bic"} <= set(subjects)
+    assert "which" not in subjects and "did" not in subjects
+
+
+def test_the_subject_vocabulary_is_READ_SCOPED_like_every_other_harvest(db):
+    """A restricted column's CONCEPT is as disclosing as its name, and a subject is durable — so
+    the vocabulary a gap may be phrased in cannot include words only a privileged reader can see."""
+    _watermark(db, "ftr")
+    _column(db, "ftr", "t", "id", definition="the identifier", grain=True)
+    _column(db, "ftr", "t", "hidden_col", definition="the identifier detail",
+            sensitivity="restricted", concept="zzhiddenconcept")
+    assert record_retrieval_gap(db, "zzhiddenconcept balances", roles=(),
+                                analysis_request_id="areq-1", now=_NOW) is None
 
 
 def test_a_question_with_no_recordable_term_records_nothing(catalog):

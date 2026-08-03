@@ -205,6 +205,49 @@ def _structural_columns(conn, pairs: Iterable[tuple[str, str]], *,
 #: Bound on the terms a refusal records as the thing nobody could resolve.
 _MAX_GAP_TERMS = 8
 
+#: How many DISTINCT rows of controlled catalog vocabulary the refusal path reads. A refusal is
+#: uncommon and the distinct set is small, but the table it is distinct over is not — the bound is
+#: there so a failure path can never become the slowest query in the deployment.
+_MAX_VOCABULARY_ROWS = 5000
+
+
+def _controlled_vocabulary(conn, *, roles: Iterable[str]) -> frozenset[str]:
+    """Every token the platform ALREADY has a word for, as the lower-cased pieces of those words.
+
+    Two sources, both CONTROLLED — neither is user text:
+
+    * the concept registry — every concept name, its group, the entity an identifier links and the
+      identifier namespace it draws from. Static, platform-authored, and true of every deployment;
+    * the catalog's own flat controlled columns (leg 3's ``_EXPANSION_COLUMNS``: concept, domain,
+      sub-domain, entity, glossary terms, the D13.1 BIAN/process paths), READ-SCOPED exactly as the
+      expansion harvest is — a restricted column's concept is as disclosing as its name, and this
+      set decides what a durable row may say.
+
+    Tokenized rather than matched whole, because a question says "swift bic" where the registry says
+    ``bank_bic`` with namespace ``swift_bic``; matching the phrase would recognise nothing.
+    """
+    from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
+
+    tokens: set[str] = set()
+
+    def _absorb(value: object) -> None:
+        if not value:
+            return
+        tokens.update(t for t in _TOKEN_RE.findall(str(value).lower()) if len(t) >= 3)
+
+    for name, record in CONCEPT_REGISTRY.items():
+        _absorb(name)
+        _absorb(record.group)
+        _absorb(record.entity_link)
+        _absorb(record.namespace)
+    for row in conn.execute(
+        f"SELECT DISTINCT {', '.join(_EXPANSION_COLUMNS)} FROM graph_node "
+        "WHERE kind = 'column' AND COALESCE(visible_requires, '{}') <@ %s LIMIT %s",
+        (allowed_sensitivities(roles), _MAX_VOCABULARY_ROWS)).fetchall():
+        for value in row:
+            _absorb(value)
+    return frozenset(tokens)
+
 
 def stable_analysis_request_id(question: str, *, dependency_snapshot_id: str) -> str:
     """A DETERMINISTIC request id for one question against one catalog state.
@@ -245,13 +288,25 @@ def record_retrieval_gap(conn, question: str, *, roles: Iterable[str] = (),
     metadata". The retrieval path is reached on every planning request, so writing here is the
     opposite: a real, recurring signal about a real gap in the vocabulary.
 
-    THE SUBJECT IS REDACTED. A question is free text from a person ("transactions for Ahmed
-    Al-Mansouri"), and `subject_refs` is durable. The terms are taken from the REDACTED text, so a
-    customer name can never become an ontology candidate; they are bounded, lower-cased and sorted
-    so the same unanswered question dedupes to one gap however it was typed.
+    **THE SUBJECT COMES FROM THE CONTROLLED VOCABULARY, NOT FROM THE QUESTION.** ``subject_refs`` is
+    durable, reviewable, and feeds an ontology-candidate queue — and this used to store the
+    question's own words, tokenized. Redaction was named as the guard and IS NOT ONE for that: the
+    deterministic detectors find EMAIL, SSN, PAN, IBAN, PHONE and context-anchored ACCOUNT / DOB
+    patterns, and :mod:`featuregen.intake.redaction` states plainly that personal-NAME detection is
+    DEFERRED because a regex cannot do it safely. So "transactions for Ahmed Al-Mansouri" passed
+    through untouched and stored ``ahmed`` and ``mansouri`` as durable ontology candidates.
 
-    Returns the event id, or ``None`` when the question yielded no recordable term (a refusal with
-    no subject is not actionable, and inventing one would be worse than recording nothing)."""
+    Redaction still runs — it is strictly better than unscanned text and it fails CLOSED — but the
+    guard that actually holds is an INTERSECTION: a term is recorded only where the platform already
+    has that word, as a concept-registry token or a token of the READ-SCOPED controlled catalog
+    vocabulary leg 3 expands on. The gap stays actionable (it names which known term this catalog
+    has nothing readable behind, for this caller) while a durable subject becomes structurally
+    incapable of carrying text only the asker wrote. Terms are bounded, lower-cased and sorted, so
+    the same unanswered question dedupes to one gap however it was typed.
+
+    Returns the event id, or ``None`` when the question named nothing the platform knows (a refusal
+    whose only subject would be a stranger's words is not actionable, and inventing one is worse
+    than recording nothing)."""
     from featuregen.data_agent.learning import (
         AnalysisLearningEventV1,
         LearningStage,
@@ -263,7 +318,9 @@ def record_retrieval_gap(conn, question: str, *, roles: Iterable[str] = (),
     redaction = redact_free_text(question)
     if redaction.text is None:      # the redactor failed closed — nothing safe to persist
         return None
-    terms = sorted({t for t in _TOKEN_RE.findall(redaction.text.lower()) if len(t) >= 3})
+    vocabulary = _controlled_vocabulary(conn, roles=roles)
+    terms = sorted({t for t in _TOKEN_RE.findall(redaction.text.lower())
+                    if len(t) >= 3 and t in vocabulary})
     if not terms:
         return None
     return record_gap(conn, AnalysisLearningEventV1(
