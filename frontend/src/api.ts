@@ -2562,9 +2562,13 @@ export function postFieldDecision(
 }
 
 // ── the data agent: a question, planned and previewed ────────────────────────────────────────────
-// Nothing here executes. `/analysis/plan` retrieves, extracts, grounds and previews; the API has no
-// run endpoint, because execution needs inputs a deployment must configure first. The screen must
-// not offer a Run control it cannot honour.
+// `/analysis/plan` retrieves, extracts, grounds, previews and — behind the source/temporal flag —
+// SEALS, returning the identity a caller executes that exact plan by. It never runs the statement.
+// The API DOES have a run endpoint now (`POST /analysis/execute`, Release-B Task 9), and this
+// client deliberately does not call it: running a sealed plan against the bank's warehouse is a
+// separate approval gate, and a Run control that 409'd on it would teach people to click through a
+// governance decision. The screen offers no Run button for that reason, not because nothing can
+// execute.
 
 export interface AnalysisFinding {
   code: string

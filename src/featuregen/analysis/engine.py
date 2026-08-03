@@ -49,8 +49,18 @@ def default_analysis_engine(connection: DataSourceConnectionV1) -> AnalysisEngin
     """The shipped provider: refuse, and say which approval is outstanding.
 
     Not a stub and not a TODO — it is the correct behaviour until the pilot run is approved. The
-    whole path above it is built and exercised end to end against the fixture engine, so approving
-    the run is a configuration decision rather than a further slice of work.
+    whole path above it is built and exercised end to end against the FIXTURE engine (the pilot's
+    own Postgres), which is what makes the refusal a governance gate rather than an unfinished
+    seam.
+
+    **Enabling it is not a configuration decision, and this docstring used to say it was.** A
+    deployment that has the approval must supply a PROVIDER — a callable that opens the governed
+    connection and returns an :class:`AnalysisEngineV1` with the dialect that compiles for its
+    engine — and the driver seam it depends on must be installed for that engine
+    (``data_agent.connection``'s ``_DRIVERS`` reports a missing one as a typed refusal). Against
+    Hive that is real work with no test coverage on this tree: the fixture engine is Postgres, so
+    the Hive dialect's compiled output is asserted but never executed. Calling the remaining step
+    "configuration" would send an operator to look for a setting that does not exist.
     """
     raise AnalysisEngineUnavailable(
         EXECUTION_ENGINE_NOT_APPROVED,

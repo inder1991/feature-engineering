@@ -47,6 +47,14 @@ NEEDS_DATA_CHECK = "needs_data_check"
 STRUCTURALLY_UNSUITABLE = "structurally_unsuitable"
 NEEDS_SETUP = "needs_setup"
 
+#: What a code NOT in the map renders as. The default used to be ``UNDECIDED``, which FAILS OPEN:
+#: it tells a reader "nobody has decided yet" about a refusal this build cannot read at all, and
+#: that claim may simply be untrue — a structurally unsuitable source or a missing registration
+#: would both come back as somebody's outstanding decision. Loud instead, and forbidden in the
+#: production vocabulary by the totality test below, so it can only ever appear for a code that
+#: reached here without being adjudicated.
+UNMAPPED = "unmapped_refusal"
+
 REFUSAL_FAMILIES: dict[str, str] = {
     "SELECTION_POPULATION_UNDECLARED": UNDECIDED,
     "SELECTION_SOURCE_AMBIGUOUS": UNDECIDED,
@@ -175,7 +183,7 @@ def _refusal(refusal, scope: _Scope) -> dict[str, Any]:
         subjects.append(ref)
     return {"code": refusal.code, "subjects": subjects, "subjects_withheld": withheld,
             "detail": refusal.detail,
-            "family": REFUSAL_FAMILIES.get(refusal.code, UNDECIDED)}
+            "family": REFUSAL_FAMILIES.get(refusal.code, UNMAPPED)}
 
 
 def render_selection(conn, selections, *, roles: Sequence[str] = ()) -> dict | None:
@@ -216,4 +224,4 @@ def render_selection(conn, selections, *, roles: Sequence[str] = ()) -> dict | N
     }
 
 
-__all__ = ["REFUSAL_FAMILIES", "render_selection"]
+__all__ = ["REFUSAL_FAMILIES", "UNMAPPED", "render_selection"]

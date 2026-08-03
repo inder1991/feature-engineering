@@ -37,6 +37,7 @@ from featuregen.analysis.explain import (
     REFUSAL_FAMILIES,
     STRUCTURALLY_UNSUITABLE,
     UNDECIDED,
+    UNMAPPED,
     render_selection,
 )
 from featuregen.analysis.grounding import ground_analysis_plan
@@ -206,6 +207,27 @@ def test_every_closed_refusal_code_has_a_family_a_person_can_act_on(bank):
     assert set(SELECTION_REFUSAL_CODES) <= set(REFUSAL_FAMILIES)
     assert set(REFUSAL_FAMILIES.values()) == {
         UNDECIDED, NEEDS_DATA_CHECK, STRUCTURALLY_UNSUITABLE, NEEDS_SETUP}
+    # The loud fallback may never be a PRODUCTION family: it exists to be visible when a code
+    # reaches the renderer unadjudicated, and a map that assigned it would make that unfalsifiable.
+    assert UNMAPPED not in set(REFUSAL_FAMILIES.values())
+
+
+def test_an_UNMAPPED_code_is_LOUD_rather_than_reported_as_undecided(bank):
+    """It used to default to `undecided`, which FAILS OPEN: "nobody has decided yet" is a claim
+    about a refusal this build cannot read, and it may be false — a structurally unsuitable source
+    and a missing registration would both come back as somebody's outstanding decision."""
+    from featuregen.analysis.explain import _refusal, _Scope
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1
+
+    rendered = _refusal(
+        SelectionRefusalV1(code="SELECTION_FROM_A_NEWER_BUILD", subject_refs=(TRAN,),
+                           detail="a code this renderer has never adjudicated"),
+        _Scope(bank, ()))
+    assert rendered["family"] == UNMAPPED
+    assert rendered["family"] != UNDECIDED
+    # The CODE still rides the payload for the audit — the family says only that nothing here
+    # knows what to tell a person about it.
+    assert rendered["code"] == "SELECTION_FROM_A_NEWER_BUILD"
 
 
 def test_an_undeclared_population_reads_as_UNDECIDED_never_as_a_failure(bank):

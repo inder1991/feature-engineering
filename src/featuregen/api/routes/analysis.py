@@ -581,9 +581,15 @@ def _sealed_plan_hash(conn, grounded, inputs, *, identity: IdentityEnvelope | No
     Fail-soft, exactly like the learning writes above: the seal is a record, and a record that
     cannot be written must not turn a planned question into a 500. A caller that gets no hash
     simply cannot execute yet, which is the same state a blocked plan is in.
+
+    **WITH ONE EXCEPTION.** `StructuredResultCorruption` is not a write that failed: it says one
+    plan identity already names a DIFFERENT byte sequence. Swallowing it would log a warning,
+    return no hash, and leave the caller re-planning against a store that is lying about what was
+    approved — the loudest possible fact reported as the quietest possible outcome.
     """
     from featuregen.analysis.sealed_plan import build_execution_ir_v2
     from featuregen.analysis.sealed_plan_store import seal_analysis_plan
+    from featuregen.overlay.upload.structured_results import StructuredResultCorruption
 
     selections = grounded.selections
     if inputs is None or selections is None or not selections.resolved:
@@ -599,6 +605,8 @@ def _sealed_plan_hash(conn, grounded, inputs, *, identity: IdentityEnvelope | No
             conn, build_execution_ir_v2(ir, selections, question=grounded.plan.question),
             sealed_by=(identity.subject if identity is not None else "anonymous"),
             question=grounded.plan.question)
+    except StructuredResultCorruption:
+        raise
     except Exception:  # noqa: BLE001
         logger.warning("could not seal the analysis plan", exc_info=True)
         return None

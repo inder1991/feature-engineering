@@ -590,3 +590,31 @@ as gate-environment dependencies, the same way it supplies Temurin 17.
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |
+
+### A.33 🟡 Analysis Task 9 — the snapshot pin kinds, and the join-free sealed envelope (2026-08-03)
+
+Recorded while remediating the Release-B Task-9 review. Two decisions that were argued in module
+prose and belong in the register, because both are reachable in production and neither is visible
+from the code that would need them.
+
+**The six shared snapshot item kinds get no builder.** `feature_metadata_snapshot.ITEM_KINDS`
+registers `dataset_profile`, `serving_policy`, `source_selection`, `physical_binding`,
+`temporal_policy` and `row_selection`, and Task 9's own rule is "use the six shared kinds WHEN
+feature/materialization consumes the same decision". ANALYSIS now consumes all of them — it seals
+them into `AnalysisExecutionIRV2` and revalidates every one immediately before a run — but the
+FEATURE side does not, and a snapshot pin with exactly one producer and no consumer is the inert
+mechanism this programme has found seven times.
+
+**A sealed analysis plan cannot contain a join.** `plan_to_execution_ir` refuses
+`JOIN_REALIZATION_ABSENT` for any `plan.join_refs` unless `inputs.bridge_realizations` carries an
+exact current deterministic directional realization for the fact key — and NOTHING supplies
+`bridge_realizations` on the sealed path: `execution_inputs_for_plan` leaves it at its `()`
+default, so the only plans that can seal are single-catalog ones. The refusal is correct (analysis
+must not infer direction or cardinality from a symmetric link) and the field is not a stub — it is
+a producer that has not landed. The consequence is worth stating plainly: cross-catalog questions
+reach the seal and refuse, rather than sealing something unverified.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **The six `ITEM_KINDS` snapshot builders for the analysis pins** | Building them now ships a comparator whose first real exercise is months away. Nothing is lost by waiting: D6's compat-safe hash rule is already in place, so the builders land ADDITIVELY with no migration and no re-hash of a stored snapshot. | The Phase-G execution-wiring merge-back, or any feature-side consumption of the same six decisions. |
+| 🟡 **Sealed execution refuses every join plan (`JOIN_REALIZATION_ABSENT`), because `bridge_realizations` has no producer on this path** | The alternative is a sealed plan that joins on a declared-but-unmeasured relationship, which is exactly what the verified-join doctrine exists to prevent. Single-catalog analysis — the Release-B pilot — is unaffected. | Release C / Phase-G, when a reader for current directional realizations is wired into `execution_inputs_for_plan`; fix = supply `bridge_realizations` from `bridge_store` at assembly time and pin the chosen revisions (the IR already hashes `bridge_realization_dependencies`). |
