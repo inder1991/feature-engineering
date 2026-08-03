@@ -94,12 +94,18 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     # HOW MUCH is grounded against and never WHAT may be.
     neighbourhood = clearing_neighbourhood(conn, catalog_source, table, roles=roles,
                                            max_hops=max_hops)
-    ideas, rejections, _grounded, _rejected, binding_by_id, _incomplete, contexts, keys_by_recipe = (
-        _template_candidates(conn, catalog_source=catalog_source, roles=roles,
-                             target_ref=None, now=None,           # no intent, no clock, no LLM
-                             table=table,                         # ...THIS table's columns...
-                             also_tables=neighbourhood.neighbours))   # ...+ what it can join to
-    mine = [idea for idea in ideas if _binds(idea, table)]
+    # The engine's own result object. Read BY NAME — this screen consumes six of its members and
+    # ignores the rest; it never rebuilds, re-derives or re-attributes any of them, and (rule 15) it
+    # never touches the decision traces the engine minted: they are the gauntlet's answer to a
+    # different question, and reconstructing one here would be a second copy of the decision.
+    candidates = _template_candidates(conn, catalog_source=catalog_source, roles=roles,
+                                      target_ref=None, now=None,   # no intent, no clock, no LLM
+                                      table=table,                 # ...THIS table's columns...
+                                      also_tables=neighbourhood.neighbours)  # ...+ what it joins to
+    binding_by_id = candidates.binding_by_id
+    contexts = candidates.contexts
+    keys_by_recipe = candidates.keys_by_recipe
+    mine = [idea for idea in candidates.ideas if _binds(idea, table)]
     # Keyed on the entity REF alone: keying on (ref, label) lets one column open two groups, which
     # the screen then renders with the same React key.
     groups: dict[str, list[dict]] = {}
@@ -125,7 +131,7 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
         # own columns, plus whatever a clearing join reaches), so the engine's list is already this
         # screen's and needs no re-attribution — see the module docstring. With no join the
         # neighbourhood is the table itself and the list is exactly the table's, as before.
-        "rejections": rejections,
+        "rejections": candidates.rejections,
         # WHAT WAS LEFT OUT. A page that grounds against a bounded slice of a table's join
         # neighbourhood must say so, or its empty states become false claims ("nothing else is
         # buildable here" when the truth is "we did not look"). These are the screen's numbers.

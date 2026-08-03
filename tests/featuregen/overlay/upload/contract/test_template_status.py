@@ -53,17 +53,11 @@ def test_template_candidate_carries_needs_external_validation_status(db, monkeyp
             GroundingOutcome("sum_balance", GroundingStatus.GROUNDED, _GF)
         ],
     )
-    (
-        ideas,
-        rejections,
-        grounded_ids,
-        rejected_ids,
-        binding,
-        incomplete,
-        contexts,
-        candidate_keys,
-    ) = _template_candidates(
+    result = _template_candidates(
         db, catalog_source="ftr", roles=(), target_ref=None, now=NOW, templates=(_TMPL,))
+    ideas, grounded_ids = result.ideas, result.grounded_ids
+    incomplete, contexts, candidate_keys = (
+        result.incomplete_ids, result.contexts, result.keys_by_recipe)
     assert ideas, "the grounded numeric template should survive as a needs-check candidate"
     idea = ideas[0]
     # [F9]: the APPENDED idea is the validator's RETURNED idea (status + requirements), not the
