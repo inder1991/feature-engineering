@@ -598,12 +598,24 @@ class _NodeFacts:
     #: extra statement.
     logical_ref: str
     table_logical_ref: str
+    #: The graph object_ref of this node's TABLE — the key its visibility is checked under. A
+    #: column node's table is asked for in the same scope-filtered statement, so inherited
+    #: provenance is only read for a table this caller may actually see.
+    table_object_ref: str
     #: The governed entity projection (migration 1015): ``VERIFIED`` while a confirmed
     #: ``entity_assignment`` fact governs the value, NULL once demoted.
     declared_entity: str | None
     entity_status: str | None
     entity_fact_key: str | None
     entity_fact_event_id: str | None
+
+
+def _table_object_ref(object_ref: str) -> str | None:
+    """The ``graph_node`` object_ref of the TABLE a COLUMN ref belongs to — ``public.txn.amt`` ->
+    ``public.txn``, the spelling ``graph._table_ref`` writes. ``None`` when the ref is not a
+    column ref, so a table ref is never re-truncated into a schema."""
+    parts = object_ref.split(".")
+    return ".".join(parts[:-1]) if len(parts) >= 3 else None
 
 
 #: The catalog field whose WORDING this surface exposes as attributed text and whose provenance it
@@ -626,7 +638,17 @@ def _read_node_facts(conn, pairs: Iterable[tuple[str, str]],
     """
     by_source: dict[str, set[str]] = {}
     for catalog_source, object_ref in pairs:
-        by_source.setdefault(catalog_source, set()).add(object_ref)
+        wanted = by_source.setdefault(catalog_source, set())
+        wanted.add(object_ref)
+        # The column's TABLE node, in the SAME statement and therefore under the SAME read-scope
+        # predicate. A column's `domain` is INHERITED from its table, so its provenance is read at
+        # the table's ref — and reading that for a table this caller cannot see would leak the
+        # producer/strength/evidence-id of an object they may not know exists. Deriving the ref
+        # here (drop the column segment, `graph._table_ref`'s own spelling) keeps it to ONE
+        # statement; a second round trip to learn the table name would not.
+        table_ref = _table_object_ref(object_ref)
+        if table_ref is not None:
+            wanted.add(table_ref)
     facts: dict[tuple[str, str], _NodeFacts] = {}
     classes = allowed_classes(roles)
     for catalog_source in sorted(by_source):
@@ -646,6 +668,7 @@ def _read_node_facts(conn, pairs: Iterable[tuple[str, str]],
                 logical_ref=normalize_ref(catalog_source, schema, table_name or "",
                                           column_name if kind == "column" else None),
                 table_logical_ref=normalize_ref(catalog_source, schema, table_name or ""),
+                table_object_ref=_table_object_ref(object_ref) or object_ref,
                 declared_entity=declared_entity, entity_status=entity_status,
                 entity_fact_key=entity_fact_key, entity_fact_event_id=entity_fact_event_id)
     return facts
@@ -666,8 +689,13 @@ def _read_context_evidence(conn, facts: Mapping[tuple[str, str], _NodeFacts]
     """
     if not facts:
         return {}
-    refs = sorted({node.logical_ref for node in facts.values()}
-                  | {node.table_logical_ref for node in facts.values()})
+    # A table ref is asked for ONLY when its own node came back from the scope-filtered read above.
+    # An invisible table's domain provenance is not this caller's to see, even though the wording
+    # it explains reaches them through a column they can.
+    refs = sorted(
+        {node.logical_ref for node in facts.values()}
+        | {node.table_logical_ref for (catalog_source, _ref), node in facts.items()
+           if (catalog_source, node.table_object_ref) in facts})
     rows = conn.execute(
         "SELECT logical_ref, field_name, producer, strength, lifecycle, producer_ref, evidence_id "
         "FROM field_evidence "
@@ -699,6 +727,8 @@ def _domain_term_evidence(node: _NodeFacts,
     own = evidence.get((node.logical_ref, _CONTEXT_EVIDENCE_FIELD))
     if own:
         return own
+    # Absent when the table node is outside this caller's scope — the inherited provenance is then
+    # simply not read, and the wording falls back to the explicit unattributed marker.
     inherited = evidence.get((node.table_logical_ref, _CONTEXT_EVIDENCE_FIELD))
     return inherited or _UNATTRIBUTED
 
@@ -1474,7 +1504,10 @@ def _projection_json(projection: SuggestionProjectionStateV1 | None) -> dict | N
             "generated_at": (None if projection.generated_at is None
                              else projection.generated_at.isoformat()),
             "stale_reason": projection.stale_reason,
-            "omitted_counts": dict(projection.omitted_counts)}
+            # The SECOND wire site for an omission tally. Dead in Release A (`projection` is
+            # always None here) and routed through the filter now, so Release B populating it
+            # cannot quietly reintroduce the scope leak the collection's tally just closed.
+            "omitted_counts": public_omitted_counts(projection.omitted_counts)}
 
 
 def page_to_json(page: FeatureSuggestionPageV2) -> dict:

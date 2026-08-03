@@ -467,6 +467,51 @@ def test_a_wording_with_no_recorded_evidence_is_explicitly_unattributed(overlay_
             ("legacy", "proposed")}
 
 
+def test_an_invisible_tables_domain_provenance_is_not_read(overlay_conn, ftr_catalog):
+    """SAME LEAK CLASS AS THE WITHHELD COUNT. A column's ``domain`` is INHERITED from its table, so
+    its provenance is read at the TABLE's ref — a ref this adapter SYNTHESIZES rather than receives
+    from the scope-filtered read. Hide the table node and that inherited provenance (producer,
+    strength, producer_ref, evidence_id) must not reach the wire, even though the wording itself
+    still arrives through a column the caller can see.
+
+    Unreachable today — table nodes carry no sensitivity — which is exactly why it is pinned before
+    Release B widens the surface."""
+    def _axes(roles=()):
+        return {(e.producer.value, e.strength.value)
+                for hit in _page(overlay_conn, roles=roles).hits
+                for term in hit.suggestion.contextual_domain_terms for e in term.evidence}
+
+    # Drop the per-COLUMN rows so the domain really is INHERITED — the fixture's table-level rows
+    # (`llm`) then become the only trail, which is the state this check is about.
+    overlay_conn.execute(
+        "DELETE FROM field_evidence WHERE field_name = 'domain' AND logical_ref LIKE '%%.%%.%%'")
+    assert _axes() == {("llm", "proposed")}, "the inherited trail is not being read at all"
+
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND kind = 'table' AND table_name = %s", (SOURCE, TABLE))
+    blind = _page(overlay_conn, roles=()).hits
+    assert blind, "the columns are still visible — the caller must still get their cards"
+    terms = [t for hit in blind for t in hit.suggestion.contextual_domain_terms]
+    assert terms, "the wording still travels; only its provenance is withheld"
+    assert {(e.producer.value, e.strength.value) for t in terms for e in t.evidence} == {
+        ("legacy", "proposed")}
+    # ...and a caller who MAY see the table gets the real provenance through the same code path
+    assert _axes(roles=("restricted_reader",)) == {("llm", "proposed")}
+
+
+def test_the_projection_tally_is_filtered_at_the_wire_too(overlay_conn, ftr_catalog):
+    """Release A never populates ``projection``, so this is a REGRESSION GUARD, not a behaviour
+    test: the moment Release B fills that tally it must go through the same filter the collection's
+    does, or the scope leak returns by a second door."""
+    state = contract_module.SuggestionProjectionStateV1(
+        state="current", scope_set_id=None, read_scope_key="k", scope_epoch=1,
+        target_fingerprint="t", current_fingerprint="t", generated_at=None, stale_reason=None,
+        omitted_counts={"withheld_read_scope": 3, "operands": 2})
+    published = contract_module._projection_json(state)
+    assert published["omitted_counts"] == {"operands": 2}
+
+
 def test_a_governed_entity_is_distinguishable_from_a_file_declared_one(overlay_conn,
                                                                        ftr_catalog):
     """The entity axis has no ``field_evidence`` row — its provenance is the governed projection on
@@ -1142,19 +1187,50 @@ def test_confirming_a_join_moves_the_revision_but_never_the_suggestion_id(overla
     assert {s.suggestion_id for s in after.values()} >= {s.suggestion_id for s in before.values()}
 
 
+def _joins_edge(conn, from_ref: str, to_ref: str) -> None:
+    conn.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority, "
+        "approved_join_fact_key, approved_join_status) "
+        "VALUES (%s, 'joins', %s, %s, 'N:1', 'operational', NULL, NULL)",
+        (_JOIN_SOURCE, from_ref, to_ref))
+
+
 def test_a_genuinely_different_logical_path_still_forks_the_identity(overlay_conn, join_catalog):
-    """The complement, so the fix above cannot be "stop hashing the path at all": REMOVE the join
-    and the same recipe reaching the same measure has no traversal, which is a different logical
-    candidate."""
-    _join_edge(overlay_conn, fact_key="ajf-verified", status="VERIFIED")
-    crossed = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
-                                 source=_JOIN_SOURCE))["balance_trend_90d"]
-    assert crossed.relationship_dependencies
-    # the same candidate on the table it is GRAINED on needs no traversal to reach its own columns
-    on_entity = _suggestions(_page(overlay_conn, _ENTITY_TABLE,
+    """THE COMPLEMENT, so the fix above cannot be "stop hashing the path at all".
+
+    Two catalogs identical in every way the recipe cares about — same template, same bound columns,
+    same entity, same grain, same time anchor — differing ONLY in which join connects the two
+    tables: the account key, or the as-of date. The traversal is genuinely different, so these are
+    different logical candidates and their ids must fork.
+
+    This is the integration-level half of rule 23. It is deliberately NOT an anchor test: the
+    account-key edge is REPLACED by the date edge, so the second read crosses a different chain
+    rather than the same one from another side."""
+    _joins_edge(overlay_conn, f"public.{_MEASURE_TABLE}.ledger_acct",
+                f"public.{_ENTITY_TABLE}.master_acct")
+    over_account = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
+                                      source=_JOIN_SOURCE))["balance_trend_90d"]
+    overlay_conn.execute(
+        "DELETE FROM graph_edge WHERE catalog_source = %s AND kind = 'joins'", (_JOIN_SOURCE,))
+    _joins_edge(overlay_conn, f"public.{_MEASURE_TABLE}.ledger_dt",
+                f"public.{_ENTITY_TABLE}.master_dt")
+    over_date = _suggestions(_page(overlay_conn, _MEASURE_TABLE,
                                    source=_JOIN_SOURCE))["balance_trend_90d"]
-    assert on_entity.suggestion_id == crossed.suggestion_id      # anchor independence, unbroken
-    assert on_entity.relationship_dependencies == crossed.relationship_dependencies
+
+    # everything the recipe binds is IDENTICAL — otherwise the fork would prove nothing about paths
+    assert ([o.graph_object_ref for o in over_account.operands]
+            == [o.graph_object_ref for o in over_date.operands])
+    assert (over_account.template_id, over_account.grain_refs, over_account.time_ref) == (
+        over_date.template_id, over_date.grain_refs, over_date.time_ref)
+    assert over_account.entity == over_date.entity
+    # ...and ONLY the traversal differs
+    account_legs = [(leg.from_ref[1], leg.to_ref[1])
+                    for leg in over_account.relationship_dependencies]
+    date_legs = [(leg.from_ref[1], leg.to_ref[1]) for leg in over_date.relationship_dependencies]
+    assert account_legs and date_legs and account_legs != date_legs
+
+    assert over_account.suggestion_id != over_date.suggestion_id
+    assert over_account.suggestion_revision_id != over_date.suggestion_revision_id
 
 
 def test_the_identity_is_independent_of_the_presentation_bound(overlay_conn, ftr_catalog,
