@@ -804,6 +804,71 @@ def test_a_gap_without_a_correction_writes_no_concept_evidence(db, monkeypatch):
     assert detail["evidence_written"] == 0
 
 
+def _adjudicate_rows(db, client, **kw):
+    """`adjudicate_semantics` over one technical row, with the run's concept map pre-seeded to the
+    Pass-A abstention the adjudicator exists to answer."""
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.enrich import adjudicate_semantics, content_hash
+
+    row = CanonicalRow("deposits", "accounts", "sol_desc", "varchar(255)")
+    concepts = {content_hash(row): UNCLASSIFIED}
+    detail = adjudicate_semantics(db, client, [row], concepts=concepts, actor=_actor(), **kw)
+    return detail, concepts, content_hash(row)
+
+
+def test_a_skipped_evidence_write_is_never_counted_as_written(db):
+    """`evidence_written` counted NON-FAILURES: the loop did `if failures: continue` and then
+    incremented, so an item the writer SKIPPED — an unattachable binding, an empty binding map —
+    reported one evidence row written and zero rows in the store. The stage said `succeeded` over a
+    write that never happened, which is the one thing a write counter exists to prevent.
+
+    The counters now name three different things: rows WRITTEN, items SKIPPED (a designed
+    non-write, never a failure) and contained FAILURES."""
+    from featuregen.overlay.field_evidence import read_active_field_evidence
+
+    detail, concepts, h = _adjudicate_rows(
+        db, _client(), bindings={}, source_snapshot_id="snap-1")
+    assert detail["targets"] == 1 and detail["selected"] == 1
+    assert detail["evidence_written"] == 0            # nothing was written
+    assert detail["evidence_skipped"] == 1            # ...and the run says so out loud
+    assert detail["evidence_write_failures"] == 0     # a skip is not a failure
+    assert read_active_field_evidence(db, "deposits::public.accounts.sol_desc", "concept") == []
+    # The stage-state rule reads only the failure/attempt counters, so a skip cannot degrade a
+    # stage — and `succeeded` here is now a truthful claim about zero writes rather than a
+    # laundered one about a phantom row.
+    assert not (detail["not_attempted"] or detail["invalid"]
+                or detail["evidence_write_failures"])
+    assert concepts[h] == "branch_id"    # the correction still reaches build_graph (Pass A's rule)
+
+
+def test_an_evidence_write_the_run_could_not_attempt_is_skipped_not_written(db):
+    """A TECHNICAL upload has no `source_snapshot_id` (the column is NOT NULL), so the write is
+    never attempted at all. That is a skip too — and the count must say so rather than inheriting
+    the old "not a failure means written" arithmetic."""
+    detail, _concepts, _h = _adjudicate_rows(db, _client())
+    assert detail["selected"] == 1
+    assert detail["evidence_written"] == 0
+    assert detail["evidence_skipped"] == 1
+
+
+def test_a_written_row_is_counted_once_and_a_reuse_is_named_separately(db, monkeypatch):
+    """The positive control: a real write counts one. A re-derivation landing on the SAME value
+    reuses the existing row (Task 6), which is not a new row — counted as `evidence_reused` so
+    `evidence_written` keeps meaning rows."""
+    _result, rec = _ingest_glossary(db, _UnclassifiedThenAdjudicated(selected="branch_id"),
+                                    monkeypatch)
+    first = _stage(rec, "semantic_adjudication").detail
+    assert (first["evidence_written"], first["evidence_skipped"]) == (1, 0)
+    assert first["evidence_reused"] == 0
+    evidence_id = _concept_evidence(db)[0].evidence_id
+
+    _result, rec = _ingest_glossary(db, _UnclassifiedThenAdjudicated(selected="branch_id"),
+                                    monkeypatch)
+    again = _stage(rec, "semantic_adjudication").detail
+    assert again["evidence_written"] == 0 and again["evidence_reused"] == 1
+    assert _concept_evidence(db)[0].evidence_id == evidence_id
+
+
 def test_an_unclear_column_with_no_client_is_skipped_not_guessed(db, monkeypatch):
     _result, rec = _ingest_one(db, None, monkeypatch)
     assert _stage(rec, "semantic_adjudication").state == "skipped_no_client"
