@@ -414,13 +414,13 @@ whose ~82 order/environment-dependent failures are recorded in `DEFERRED-WORK` �
 
 | Suite set | Count | Asserted in code by |
 | --- | --- | --- |
-| The Task-0 seventeen (`RELEASE_GATE_SUITES`) | **269** (Task-0 baseline was 238; Release-A integration added 31) | `test_the_named_release_gate_suites_hold_their_literal_count` |
+| The Task-0 seventeen (`RELEASE_GATE_SUITES`) | **273** (Task-0 baseline was 238; Release-A integration added 31 = 269; the Track-2 merge added 4 first-hop cardinality tests to `test_joins.py` — rebaselined deliberately 2026-08-03) | `test_the_named_release_gate_suites_hold_their_literal_count` |
 | `tests/eval/test_gold_sets_are_consistent.py` | 63 | `test_the_eval_suites_hold_their_literal_count` |
 | `tests/eval/test_release_a_eval.py` | 4 | ″ |
 | `tests/eval/test_release_a_bars.py` | 16 (15 passed + 1 strict xfail — bar 4) | ″ |
 | `tests/eval/mutation/` | 24 | — (it is the runner) |
 
-Regression gates re-run after the §11 corrections, all green: the seventeen above (**269 passed**),
+Regression gates re-run after the §11 corrections, all green: the seventeen above (**269 passed** at the tagged candidate; **273** on the post-Track-2-merge tree, see the rebaseline note above),
 the four eval suites (**63 + 43 passed, 1 xfailed**), and the whole `tests/featuregen/overlay/upload`
 half (**3838 collected — 3827 passed, 11 skipped, exit 0**). This branch ADDS 15 files and modifies
 none — `git diff --name-only 05160fcc..HEAD` is additions only, and `src/`, `frontend/`, `deploy/`
