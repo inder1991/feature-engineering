@@ -730,19 +730,56 @@ def _retryable(
     When the retry BUDGET is gone the message is dead-lettered by ``fail_materialization``, and then
     there is no owner left at all — so the request is failed rather than left adoptable by a
     redelivery that will never come.
+
+    Both writes go through :func:`_still_ours`, for the reason its sibling states: ``renew_lease``
+    and ``advance_lifecycle`` both refuse a terminal request with a ``ValueError``, so a concurrent
+    adopter that finished first would turn a legible retryable failure into an uncaught exception
+    out of the handler.
+
+    The status reports WHAT HAPPENED, which is not the same as what was attempted: when the budget
+    is gone and this call never held the request, the message is dead and the request is untouched —
+    ``dead_letter``, not ``failed``.
     """
     exhausted = claim.attempts >= claim.max_attempts
-    if fail_materialization(conn, claim, error=error, permanent=False) and accepted \
-            and request_id is not None:
+    ended = False
+    ours = (_still_ours(conn, request_id, accepted=accepted)
+            if fail_materialization(conn, claim, error=error, permanent=False) else None)
+    if ours is not None:
         if exhausted:
-            advance_lifecycle(conn, request_id=request_id, to_state=RequestLifecycle.FAILED)
+            advance_lifecycle(conn, request_id=ours, to_state=RequestLifecycle.FAILED)
+            ended = True
         else:
-            renew_lease(conn, request_id=request_id, lease_seconds=_RELEASED_LEASE_SECONDS)
-    status = "failed" if exhausted else "retryable"
+            renew_lease(conn, request_id=ours, lease_seconds=_RELEASED_LEASE_SECONDS)
+    if not exhausted:
+        status = "retryable"
+    else:
+        status = "failed" if ended else "dead_letter"
     counters.incr(f"materialize.lane.{status}")
-    log("materialize.lane.retryable", level="warning", request_id=request_id, error=error,
-        attempts=claim.attempts, max_attempts=claim.max_attempts, exhausted=exhausted)
+    log("materialize.lane.retryable", level="warning", status=status, request_id=request_id,
+        error=error, attempts=claim.attempts, max_attempts=claim.max_attempts,
+        exhausted=exhausted)
     return MaterializationLaneOutcome(status, request_id, detail=error)
+
+
+def _still_ours(conn: psycopg.Connection, request_id: str | None, *,
+                accepted: bool) -> str | None:
+    """The request id when this call may still write that request's lifecycle, else ``None``.
+
+    The ONE rule, in one place — and it returns the id rather than a boolean so the narrowing is the
+    type checker's too, not just a fact about the call order.
+
+    Two conditions, both load-bearing. It must be a request this call itself accepted or adopted
+    (one somebody else holds is not this worker's to terminalize), and it must STILL be ``accepted``
+    when re-read: "this call raised" and "the chain recorded a terminal" are not mutually exclusive
+    — a fault after ``_commit``'s transaction closes is both, and so is losing a race to an adopter.
+    Writing a lifecycle from either state raises a SECOND exception out of an error path, replacing
+    a legible failure with a stage fault that says nothing about the job.
+    """
+    if not accepted or request_id is None:
+        return None
+    current = read_request(conn, request_id=request_id)
+    return (request_id if current is not None
+            and current.lifecycle_state is RequestLifecycle.ACCEPTED else None)
 
 
 def _recorded(
@@ -802,16 +839,12 @@ def _deterministic_failure(
     forever. Only a request this call itself accepted is failed — one somebody else holds is not
     this worker's to terminalize.
 
-    The state is RE-READ rather than assumed, and the write is skipped unless it is still
-    ``accepted``. "The chain raised" and "the chain recorded a terminal" are not mutually exclusive
-    in general — a failure after ``_commit``'s transaction closes would be both — and advancing a
-    request the chain already terminalized would raise a SECOND exception out of the error path,
-    turning a legible failure into a stage fault that says nothing about the job.
+    The state is RE-READ rather than assumed (:func:`_still_ours`), and the write is skipped unless
+    it is still ``accepted``.
     """
-    if accepted and request_id is not None:
-        current = read_request(conn, request_id=request_id)
-        if current is not None and current.lifecycle_state is RequestLifecycle.ACCEPTED:
-            advance_lifecycle(conn, request_id=request_id, to_state=RequestLifecycle.FAILED)
+    ours = _still_ours(conn, request_id, accepted=accepted)
+    if ours is not None:
+        advance_lifecycle(conn, request_id=ours, to_state=RequestLifecycle.FAILED)
     fail_materialization(conn, claim, error=error, permanent=True)
     counters.incr(f"materialize.lane.{status}")
     log("materialize.lane.failed", level="error", status=status, request_id=request_id,

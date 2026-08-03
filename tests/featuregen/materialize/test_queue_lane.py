@@ -154,6 +154,17 @@ def _boom(exc: Exception):
     return _raise
 
 
+def _commit_then_boom(exc: Exception):
+    """The chain records its terminal and THEN the call fails — the state the re-read guard is for."""
+    real = queue_lane.compile_feature_group
+
+    def _run(*args, **kwargs):
+        real(*args, **kwargs)
+        raise exc
+
+    return _run
+
+
 def _boom_once(exc: Exception):
     """Fails the FIRST compile and runs the real chain afterwards — a transient fault, exactly.
 
@@ -453,6 +464,41 @@ def test_an_EXHAUSTED_retry_budget_terminalizes_the_request(enqueued, catalog,
     assert outcome.status == "failed"
     assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
         RequestLifecycle.FAILED
+    assert _queue_row(catalog, request.request_id)[0] == "dead"
+
+
+def test_a_transient_fault_AFTER_the_chain_committed_does_not_raise_out_of_the_handler(
+        enqueued, catalog, monkeypatch) -> None:
+    """"This call raised" and "the chain recorded a terminal" are not mutually exclusive — a fault
+    after `_commit`'s transaction closes is both, and so is losing a race to an adopter. Both
+    `renew_lease` and `advance_lifecycle` refuse a terminal request with a ValueError, so an
+    unguarded write here would replace a legible retryable failure with an uncaught exception."""
+    request, _, config = enqueued
+    monkeypatch.setattr(queue_lane, "compile_feature_group",
+                        _commit_then_boom(ConnectionError("gone")))
+
+    outcome = _drain(catalog, config)
+
+    assert outcome.status == "retryable"
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.COMMITTED     # the chain's verdict stands, unmolested by the error path
+
+
+def test_an_exhausted_budget_this_worker_never_CLAIMED_is_a_dead_letter_not_a_failure(
+        enqueued, catalog, monkeypatch) -> None:
+    """The status must report what HAPPENED. A configuration failure whose retries run out leaves
+    the message dead and the request untouched at `requested` — calling that "failed" would name a
+    request nobody failed."""
+    request, _, _ = enqueued
+    monkeypatch.delenv("FEATUREGEN_MATERIALIZE_PROJECT_ROOT", raising=False)
+    catalog.execute("UPDATE queue SET attempts = max_attempts - 1 WHERE message_id = %s",
+                    (f"materialize:{request.request_id}",))
+
+    outcome = process_materialization_once(catalog, owner="w1")
+
+    assert outcome.status == "dead_letter"
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.REQUESTED
     assert _queue_row(catalog, request.request_id)[0] == "dead"
 
 
