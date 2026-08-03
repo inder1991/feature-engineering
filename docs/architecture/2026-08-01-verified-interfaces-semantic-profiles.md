@@ -288,7 +288,7 @@ The shared mutation harness is created explicitly by semantic Task 10. It has:
 Release claims name the actual environment: generated-project L0 runs only through the codegen
 plan's pinned Kedro/Spark environments, and cluster/Hive acceptance requires a separate approval.
 
-## 11. Non-Claims and Deferred Work
+## 11. Non-Claims and Deferred Work (see also §12)
 
 - Profile/binding hashes do not prove immutable source contents; replay is metadata/configuration
   replay unless a source snapshot or partition digest is pinned.
@@ -299,3 +299,27 @@ plan's pinned Kedro/Spark environments, and cluster/Hive acceptance requires a s
   temporal profiler probes are recorded deferrals—not silently deleted scope.
 - No deployment, catalog upload/re-upload, live LLM call, Hive/ODS query or generated cluster run is
   authorized by this document.
+
+## 12. Companion Freeze: Suggested Feature Semantic Discovery (Task 0F, 2026-08-03)
+
+The suggestion-discovery plan's Release-A contracts are frozen in the companion document
+`2026-08-03-verified-interfaces-suggestion-discovery.md` (same binding force as this ledger; kept
+separate only because its content is larger than this entire document). Cross-plan facts recorded
+there that amend or extend this ledger:
+
+- **Baseline successor recorded** (per this document's header clause): branch
+  `worktree-suggested-feature-semantic-discovery` at `30f8442b` = `origin/main f3424c36`
+  (2026-08-03) + one docs commit; `fa9a20b0` is an ancestor.
+- **§5 update**: `1044_run_event_ordering.sql` now exists on main — reservation consumed as
+  reserved. 1045–1050 unchanged. The suggestion-discovery plan reserves nothing for Release A
+  (in-repo registries, on-demand reads); its Release-B persistence must allocate **≥ 1051** by
+  amending §5 first.
+- **§2/§3 handoff**: `featuregen/canonical.py` (`jcs_sha256` + `contract_hash_v1`) and
+  `EvidenceAuthorityV1` (at `featuregen/contracts/evidence_axes.py`) will be landed by the
+  suggestion plan's Task 0S; semantic Task 1 and every later plan **import** those definitions —
+  the one-owner rule of §2 stands, with the first-lander owning the file.
+- New frozen owners: discovery metadata registry
+  (`overlay/upload/taxonomy/discovery_metadata.py`), feature-category and recipe-family
+  registries (Task 1), `GroundingDecisionTraceV1` producer seam (feature_assist/_validate_idea +
+  join_path + gate1 — `suggestions.py` never reconstructs it), `SuggestionReadScopeV1` derived
+  solely from `read_scope.allowed_classes` (3 classes ⇒ 8 canonical tuples, import-gated).
