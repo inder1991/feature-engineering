@@ -123,6 +123,30 @@ def row_of(case: SemanticGoldCase) -> CanonicalRow:
     return CanonicalRow(case.catalog_source, case.table, case.column, case.column_type)
 
 
+def physical_type(spec: dict | None) -> str:
+    """The bare type family of a declared SQL type — `varchar(11)` -> `varchar`.
+
+    The classifier fixtures keep FTR's real shape (`CanonicalRow.type == "unknown"`; a business
+    glossary is not the physical-type authority). The CATALOG seed used for identifier pairing and
+    retrieval needs an attested type, because `_resolve_family` classifies an unattested,
+    undeclared column as family `other` and candidate derivation excludes it — measured on the first
+    run of this harness, that produced zero candidates and made the cross-namespace bar vacuous.
+    Attesting the type here keeps the question under test the NAMESPACE gate rather than type
+    attestation, which has its own tests elsewhere.
+    """
+    declared = (spec or {}).get("declared_type", "")
+    return declared.split("(", 1)[0].strip() or "text"
+
+
+def catalog_row_of(case: SemanticGoldCase) -> CanonicalRow:
+    """The gold column as the CATALOG holds it: attested physical type plus the curated definition,
+    so the search index and the pairing path have the material they really would have."""
+    return CanonicalRow(
+        case.catalog_source, case.table, case.column, physical_type(case.glossary),
+        definition=(case.glossary or {}).get("definition", ""),
+    )
+
+
 @lru_cache(maxsize=1)
 def cohort() -> tuple[CanonicalRow, ...]:
     """Every gold column of the anchor table, in declaration order — this IS the sibling roster the
@@ -225,7 +249,9 @@ def peer_columns() -> tuple[tuple[CanonicalRow, str, GlossaryRecord], ...]:
     schema = load()["schema"]
     out = []
     for spec in peer["columns"]:
-        row = CanonicalRow(peer["catalog_source"], peer["table"], spec["column"], spec["type"])
+        row = CanonicalRow(peer["catalog_source"], peer["table"], spec["column"],
+                           physical_type(spec["glossary"]),
+                           definition=spec["glossary"]["definition"])
         rec = _record(peer["catalog_source"], schema, peer["table"], spec["column"],
                       spec["glossary"])
         out.append((row, spec["expected_concept"], rec))
