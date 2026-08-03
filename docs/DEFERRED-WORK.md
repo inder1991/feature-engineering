@@ -618,3 +618,11 @@ reach the seal and refuse, rather than sealing something unverified.
 |---|---|---|
 | 🟡 **The six `ITEM_KINDS` snapshot builders for the analysis pins** | Building them now ships a comparator whose first real exercise is months away. Nothing is lost by waiting: D6's compat-safe hash rule is already in place, so the builders land ADDITIVELY with no migration and no re-hash of a stored snapshot. | The Phase-G execution-wiring merge-back, or any feature-side consumption of the same six decisions. |
 | 🟡 **Sealed execution refuses every join plan (`JOIN_REALIZATION_ABSENT`), because `bridge_realizations` has no producer on this path** | The alternative is a sealed plan that joins on a declared-but-unmeasured relationship, which is exactly what the verified-join doctrine exists to prevent. Single-catalog analysis — the Release-B pilot — is unaffected. | Release C / Phase-G, when a reader for current directional realizations is wired into `execution_inputs_for_plan`; fix = supply `bridge_realizations` from `bridge_store` at assembly time and pin the chosen revisions (the IR already hashes `bridge_realization_dependencies`). |
+
+**Pin 7's drift refusal names two opaque hashes, not what changed.** The eligibility anchor is
+DERIVED (`eligibility_policy_hash`) because migration `1038_eligibility_policy` is a mutable
+UPSERT row — no revision table, no event, no version — so `SEALED_PLAN_STALE_ELIGIBILITY` cannot
+show a diff the way the six revision-anchored pins can, and 1038 keeps only the current
+`proposed_by`, so the previous definition is gone entirely. Inherent to the 1038 shape, not to the
+seal. **Trigger:** when eligibility gets a revision store, replace the derived hash with the
+revision id and make the refusal name the change.
