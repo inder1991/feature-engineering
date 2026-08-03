@@ -91,6 +91,11 @@ def clarifications_for(extraction: IntentExtraction,
 
     Ordering is not cosmetic: the entity decides which table the rest of the question is about, so it
     is asked first. A user who picks dimensions before an entity can be asked to pick again.
+
+    The MODEL's half only. ``/analysis/plan`` calls :func:`clarifications_for_codes` directly
+    because it has a second source of questions — the selector's refusals — and merging them into
+    ONE sorted call is what keeps the population outranking every row question. This stays the
+    entry point for a caller holding an extraction and nothing else.
     """
     return clarifications_for_codes(extraction.unresolved, candidates)
 
