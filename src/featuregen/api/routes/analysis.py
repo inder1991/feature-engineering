@@ -168,7 +168,7 @@ def _record_selection_gaps(conn, grounded, *, question: str, roles) -> None:
     into a 500. Unlike that one it does NOT need a returned-rather-than-raised dance, because this
     path answers 200 and the transaction reaches its commit on its own.
     """
-    selections = getattr(grounded, "selections", None)
+    selections = grounded.selections
     if selections is None or not selections.refusals:
         return
     try:
@@ -229,7 +229,7 @@ def _clarification_codes(extraction, selections) -> tuple[str, ...]:
 
 
 def _serialize_clarifications(extraction, retrieval, grounded, *, answered: str = "") -> list[dict]:
-    selections = getattr(grounded, "selections", None)
+    selections = grounded.selections
     return [
         {"code": c.code, "question": c.question, "optional": c.optional,
          "allows_multiple": c.allows_multiple,
