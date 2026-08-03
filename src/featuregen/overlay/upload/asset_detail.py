@@ -65,6 +65,9 @@ _HISTORY_RUN_LIMIT = 20
 _F0_SECTIONS: tuple[str, ...] = (
     "identity", "effective_metadata", "evidence", "relationships", "readiness", "history", "actions",
     "audit", "source_glossary",
+    # semantic Task 5: the adjudicator's reviewable second opinion for a column Pass A could not
+    # settle — alternatives, closed reason/missing-context codes and any ontology-gap suggestion.
+    "semantic_adjudication",
 )
 
 # The subject-linked LLM-audit-summaries section returns at most this many newest dispatches.
@@ -664,6 +667,38 @@ def _audit_section(conn: DbConn, source: str, object_ref: str, logical_ref: str)
     return {"status": "available", "summaries": summaries, "truncated": truncated}
 
 
+def _semantic_adjudication_section(conn: DbConn, logical_ref: str) -> dict:
+    """The column's CURRENT semantic adjudication, read through the migration-1046 subject/current
+    pointer — one pointer row plus one revision row, never a scan over ``output_json``.
+
+    ``status`` is ``available`` or ``absent``; ABSENT is the NORMAL state (adjudication is the
+    exception path — most columns are clear and were never referred), so it is rendered as a plain
+    empty section, never as a gap or a failure. ``confidence_band`` rides here as EXPLANATION for
+    the reader: nothing on this surface, or behind it, may treat it as authority — the adjudicated
+    concept is `llm/proposed` evidence like any other, and its authority is shown by the
+    ``evidence``/``effective_metadata`` sections that already carry the producer/strength triple.
+
+    The anchor passed read-scope before this runs, and nothing here reaches beyond its own
+    ``logical_ref``."""
+    from featuregen.overlay.upload.semantic_adjudication import load_current_adjudication
+
+    adjudication, result_id = load_current_adjudication(conn, logical_ref)
+    if adjudication is None:
+        return {"status": "absent"}
+    gap = adjudication.ontology_gap
+    return {
+        "status": "available",
+        "structured_result_id": result_id,
+        "selected_concept": adjudication.selected_concept,
+        "alternatives": list(adjudication.alternatives),
+        # Explanatory only — never authority (semantic Task 5 contract).
+        "confidence_band": adjudication.confidence_band,
+        "reason_codes": list(adjudication.reason_codes),
+        "missing_context": list(adjudication.missing_context),
+        "ontology_gap": None if gap is None else gap.as_dict(),
+    }
+
+
 def _consistency_token(body: dict) -> str:
     """A content-hash fingerprint of the assembled snapshot — the ``consistency_token`` and HTTP
     ``ETag``. Canonical JSON (sorted keys, ``default=str`` for datetimes) so the same snapshot
@@ -729,6 +764,14 @@ def build_asset_detail(
     if "source_glossary" in requested:
         body["source_glossary"] = _source_glossary_section(conn, logical_ref)
         built.append("source_glossary")
+
+    if "semantic_adjudication" in requested:
+        # Columns only: adjudication answers "which concept is this column?", a question a TABLE
+        # anchor does not have. An honest empty section beats a fabricated one.
+        body["semantic_adjudication"] = (
+            _semantic_adjudication_section(conn, logical_ref) if is_column
+            else {"status": "absent", "note": "table asset — no column adjudication"})
+        built.append("semantic_adjudication")
 
     if "relationships" in requested:
         relationships, rel_unavailable = _relationships_section(

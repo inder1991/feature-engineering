@@ -44,15 +44,20 @@ allowlist names wherever a matching key exists.
 **DELIBERATE DEFERRALS (declared so nobody reads them as oversights).** Task 1 freezes the
 contract; three of its surfaces are intentionally unconsumed at this commit:
 
-* `structured_results` — the bundle carries no adjudication/critic result projection. Task 5 owns
-  the structured-result subject/current pointer (migration 1046) and wires it in.
+* `structured_results` — the bundle carries no adjudication/critic result projection, and still
+  does not after Task 5: the adjudication is an LLM JUDGEMENT ABOUT the semantics, not one of them,
+  so it is served beside the bundle (the asset-detail `semantic_adjudication` section over the
+  migration-1046 subject/current pointer), never folded into the value contract whose content hash
+  feeds replay identity.
 * Observation-store READS — this module never queries an observation store. `ObservationContextV1`
   is projected only from observations the CALLER supplies, together with the caller-supplied
   currentness pointer (see `bundle_from_store`); the store itself, and therefore
   `relationship_observation_current`, arrives with the Hive/ODS slice. Until then
   `observation_context` is empty and `observation_context_absent` is the honest code.
-* `REASON_CODES` — frozen NOW because D5 makes it hash-load-bearing from day one, but it has no
-  emitter in this module. Its consumers (adjudication + the critic surfacing) land in Task 5.
+* `REASON_CODES` — frozen at Task 1 because D5 makes it hash-load-bearing from day one; it has no
+  emitter in THIS module and never will. Its consumer landed at Task 5
+  (`semantic_adjudication.py`), which is also where the vocabulary grows if a needed code is
+  missing — this module stays its canonical home.
 """
 from __future__ import annotations
 
@@ -144,12 +149,19 @@ MISSING_CONTEXT_CODES: frozenset[str] = frozenset({
     "neighbour_roster_truncated",
 })
 
-#: Closed adjudication/critic reason codes (consumed from Task 5 on; frozen NOW per D5).
+#: Closed adjudication/critic reason codes. Frozen at Task 1 per D5 (hash-load-bearing from day
+#: one) and GAINING ITS CONSUMERS at Task 5: `semantic_adjudication` emits the first five as
+#: DETERMINISTIC selection reasons (why this column was put to the adjudicator at all) and accepts
+#: any member as the model's own explanation of its answer. Closed means closed — an off-vocabulary
+#: reason string is audit colour inside the stored output, never part of a typed result.
 REASON_CODES: frozenset[str] = frozenset({
+    # ── deterministic selection reasons (Task 5, computed — never model-asserted) ──
+    "unclassified_column",            # no concept was assigned at all
     "deterministic_shape_conflict",
     "source_llm_conflict",
     "critic_refuted",
     "critic_uncertain",
+    # ── the model's own explanation of its answer ──
     "ambiguous_alternatives",
     "insufficient_context",
     "name_only_signal",

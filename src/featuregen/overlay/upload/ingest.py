@@ -59,6 +59,7 @@ from featuregen.overlay.upload.enrich import (
     _write_summary_evidence,
     _write_synonym_evidence,
     _write_unit_evidence,
+    adjudicate_semantics,
     build_enrichment_context,
     classify_domains,
     content_hash,
@@ -2191,7 +2192,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # NOT in this list: Step 6c moved it to the ingest tail, which records its own outcome
         # (skipped_no_client there too when no client is configured).
         for _stage in ("enrich_concept", "enrich_concept_critic", "enrich_definition",
-                       "enrich_domain", "enrich_synonyms", "enrich_unit"):
+                       "enrich_domain", "enrich_synonyms", "enrich_unit",
+                       # Adjudication is an LLM stage end to end (selection without a model to ask
+                       # produces nothing), so with no client it is honestly skipped, not "run with
+                       # zero targets".
+                       "semantic_adjudication"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
@@ -2427,6 +2432,53 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             not_attempted=unit_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_unit", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
+
+        # ── semantic Task 5: targeted adjudication ────────────────────────────────────────────
+        # The columns Pass A and the critic left UNCLEAR get one bounded second opinion, and the
+        # vocabulary gets a channel for saying "you have no word for this". Selection is
+        # deterministic (never a model-confidence threshold), the call count is explicitly capped,
+        # and a `selected` correction lands as normal llm/proposed evidence PLUS the in-memory
+        # `concepts` correction — so `build_graph` below persists the same answer the evidence
+        # asserts. Savepointed + advisory like every enrichment side-effect: a fault degrades to an
+        # honest `failed` stage, never a lost upload. The six OUTCOMES ride the stage DETAIL
+        # (D12.3); the stage STATE stays inside the 0996 vocabulary.
+        stage_started = datetime.now(UTC)
+        adjudication_detail: dict | None = None
+        if concepts is not None:
+            # A concept stage that DIED leaves no classification to adjudicate: every column would
+            # look `unclassified_column` and burn the call cap re-deriving what Pass A failed to
+            # produce. The stage records `not_run` below instead.
+            try:
+                with conn.transaction():
+                    adjudication_detail = adjudicate_semantics(
+                        conn, client, vr.good, concepts=concepts, glossary=glossary,
+                        bindings=bindings, source_snapshot_id=snapshot_id, actor=actor,
+                        critic_outcomes=concept_stats.get("concept_critic_outcomes"),
+                        bundles=enrichment_context or None)
+            except Exception:  # noqa: BLE001 — advisory: adjudication never fails an upload
+                logger.warning("advisory semantic adjudication failed for %r", catalog_source,
+                               exc_info=True)
+        if concepts is None:
+            record_stage(stage_recorder, "semantic_adjudication", "not_run",
+                         reason_code="enrich_concept_failed")
+        elif adjudication_detail is None:
+            record_stage(stage_recorder, "semantic_adjudication", "failed",
+                         reason_code="exception", started_at=stage_started)
+        elif not adjudication_detail.get("targets"):
+            # Every column was CLEAR — the designed normal case, and never a failure.
+            record_stage(stage_recorder, "semantic_adjudication", "not_applicable",
+                         reason_code="no_unclear_columns", detail=adjudication_detail,
+                         started_at=stage_started)
+        elif (adjudication_detail.get("not_attempted") or adjudication_detail.get("invalid")
+              or adjudication_detail.get("evidence_write_failures")):
+            record_stage(stage_recorder, "semantic_adjudication", "partial",
+                         reason_code="items_not_adjudicated",
+                         detail=_with_audit_degradations(adjudication_detail),
+                         started_at=stage_started)
+        else:
+            record_stage(stage_recorder, "semantic_adjudication", "succeeded",
+                         detail=_with_audit_degradations(adjudication_detail),
+                         started_at=stage_started)
     stage_started = datetime.now(UTC)
     # Additive schema preservation (round-4 #5): object_ref-keyed maps from the glossary's
     # schema-carrying records; None/empty for technical and generic-glossary uploads, whose

@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from featuregen.intake.llm import LLMClient
@@ -1467,7 +1468,8 @@ def _record_concept_critique_decision(conn, *, logical_ref: str, disposition: st
 def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, str],
                           by_hash: dict[str, CanonicalRow], meta_by_hash: dict[str, dict],
                           rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor,
-                          bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict:
+                          bundles: dict[str, SemanticContextBundleV1] | None = None,
+                          critic_outcomes: dict[str, dict] | None = None) -> dict:
     """The Pass-A ACCEPTANCE hook (ingestion-richness Task 2 step 5): run the refute-oriented
     concept critic over this run's IDENTIFIER-group assignments and apply its dispositions to
     ``result`` in place. Non-identifier assignments pass through byte-for-byte untouched.
@@ -1492,7 +1494,14 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     The classifier CACHE is deliberately not touched: it stores the classifier's own answer, and
     the critic's replay store (content-addressed on the same inputs) makes re-criticising a cache
     HIT on the next upload free. Returns the stage-detail report
-    ``{items, accepted, revised, refuted, abstained, conflicts}``."""
+    ``{items, accepted, revised, refuted, abstained, conflicts}``.
+
+    ``critic_outcomes`` (semantic Task 5, optional out-param — the return shape is unchanged):
+    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for every criticised
+    ref. It rides SEPARATELY from the returned report on purpose: the report becomes an ingest
+    STAGE DETAIL, which is contractually "a SMALL dict of counts", and a per-ref map over a wide
+    table is not that. The adjudication stage consumes this map as one of its deterministic
+    selection inputs."""
     items: dict[str, ConceptCriticItemV1] = {}
     ref_to_hash: dict[str, str] = {}
     bundles = bundles or {}
@@ -1544,6 +1553,12 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
         h = ref_to_hash.get(ref)
         if h is None:
             continue
+        if critic_outcomes is not None:
+            critic_outcomes[ref] = {
+                "disposition": outcome.disposition.value,
+                "reason_codes": list(outcome.reason_codes),
+                "conflict_codes": list(outcome.conflict_codes),
+            }
         if outcome.disposition is ConceptDisposition.ACCEPTED:
             report["accepted"] += 1
             continue
@@ -1566,6 +1581,176 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     for h, corrected in corrections:       # in-memory only after every DB write succeeded
         result[h] = corrected
     return report
+
+
+# ── semantic Task 5: targeted adjudication, applied ─────────────────────────────────────────────
+
+def _adjudication_evidence_ref(row: CanonicalRow, rec: GlossaryRecord | None) -> str:
+    """The evidence identity for one column — the glossary record's SCHEMA-PRESERVING logical ref,
+    else the public-flattened fallback. The SAME rule ``_apply_concept_critic`` uses, so a column's
+    critic verdict and its adjudication key on one identity rather than two."""
+    return (rec.logical_ref if rec is not None
+            else normalize_ref(row.source, None, row.table, row.column))
+
+
+@dataclass(frozen=True, slots=True)
+class AdjudicationRunInputs:
+    """One run's adjudication material, keyed by EVIDENCE ref throughout.
+
+    ``binding_ref_of`` is the second identity ``_write_llm_field_evidence`` refuses to collapse: a
+    binding is keyed by the PUBLIC-FLATTENED ref while evidence keys on the schema-preserving one.
+    Collapsing them silently skips every non-``public``-schema column (the miss reports zero
+    failures), which is exactly how a correction can vanish without a trace."""
+
+    candidates: list
+    context_of: dict[str, dict]
+    ref_to_hash: dict[str, str]
+    binding_ref_of: dict[str, str]
+
+
+def adjudication_candidates(
+    conn, rows: Sequence[CanonicalRow], *, concepts: dict[str, str],
+    glossary: GlossaryUpload | None,
+    critic_outcomes: dict[str, dict] | None = None,
+    bundles: dict[str, SemanticContextBundleV1] | None = None,
+) -> AdjudicationRunInputs:
+    """Build the run's adjudication candidates + their model-facing context + both ref identities.
+
+    Every candidate field is a COMPUTED fact of this run: the assigned concept, the deterministic
+    ``shape_conflicts`` for it, the concept critic's verdict where it ran, and the SOURCE-declared
+    ``entity`` the upload itself attested. Nothing here asks a model about a model.
+
+    The context payload is the SAME ``for_critic`` projection the critic saw, through the SAME
+    definition egress guard (the M4 rule: a technical upload's uploader free text never egresses)."""
+    from featuregen.overlay.upload.attest.representation import shape_conflicts
+    from featuregen.overlay.upload.semantic_adjudication import AdjudicationCandidateV1
+
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+    bundles = bundles or {}
+    critic_outcomes = critic_outcomes or {}
+    inputs = AdjudicationRunInputs(candidates=[], context_of={}, ref_to_hash={},
+                                   binding_ref_of={})
+    for row in rows:
+        h = content_hash(row)
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        ref = _adjudication_evidence_ref(row, rec)
+        if ref in inputs.ref_to_hash:
+            continue                      # one candidate per evidence identity
+        meta = _concept_metadata(row, rec)
+        concept_name = concepts.get(h)
+        declared = str(meta.get("type") or row.type or "") or None
+        definition = meta.get("business_definition")
+        verdict = critic_outcomes.get(ref, {})
+        inputs.candidates.append(AdjudicationCandidateV1(
+            logical_ref=ref,
+            column_name=row.column,
+            declared_type=declared,
+            definition=definition,
+            concept=concept_name,
+            shape_conflicts=shape_conflicts(row.column, declared, definition, concept_name),
+            critic_disposition=verdict.get("disposition"),
+            critic_reason_codes=tuple(verdict.get("reason_codes", ())),
+            # The upload's OWN entity declaration (technical CSV column) — source-attested, so a
+            # disagreement with the concept's entity link is a real referral (functional rule 1).
+            source_entity=(row.entity or None),
+        ))
+        bundle = bundles.get(h)
+        if bundle is not None:
+            inputs.context_of[ref] = _definition_egress_guard(
+                _semantic_context().for_critic(bundle, extra=meta), meta, curated=rec is not None)
+        inputs.ref_to_hash[ref] = h
+        inputs.binding_ref_of[ref] = normalize_ref(row.source, None, row.table, row.column)
+    return inputs
+
+
+def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow], *,
+                         concepts: dict[str, str],
+                         glossary: GlossaryUpload | None = None,
+                         bindings: dict[str, ObjectBinding] | None = None,
+                         source_snapshot_id: str | None = None,
+                         actor=None,
+                         critic_outcomes: dict[str, dict] | None = None,
+                         bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict:
+    """Run targeted adjudication over this run's UNCLEAR columns; return the stage DETAIL dict.
+
+    The applied half of :mod:`semantic_adjudication`. It selects deterministically, adjudicates
+    under the module's explicit call cap, and then applies exactly one kind of change:
+
+    * a ``selected`` outcome corrects the run's ``concepts`` map in place (so ``build_graph``
+      persists the correction, exactly as the critic's revisions do) and writes normal
+      ``llm/proposed`` ``concept`` field evidence through :func:`_write_llm_field_evidence` — the
+      EXISTING proposal path, producer-scoped and (Task 6) value-diff aware, so a re-derivation that
+      lands on the same value reuses the same evidence row;
+    * ``unclassified`` writes NOTHING. It is the honest abstention, and C3's rule holds everywhere:
+      ``unclassified`` is never a proposal. It also does NOT clear a standing concept — the
+      adjudicator failing to name a better word is not evidence the current word is wrong; the
+      critic owns eviction, and doing it here too would make two components fight over one field;
+    * a gap suggestion writes NO concept evidence and never touches the registry (see
+      :mod:`semantic_gap`); its discovery pointer is written inside ``adjudicate_targets``.
+
+    DB-first, dict-after (the critic's rule): the evidence write happens before ``concepts`` is
+    mutated, so a rolled-back savepoint leaves the in-memory classification exactly as it was.
+
+    Returns ``{targets, considered, selected, unchanged, unclassified, gap_suggested, invalid,
+    not_attempted, evidence_written, evidence_write_failures, gaps}`` — the six outcome counts
+    (D12.3: OUTCOMES in the stage detail, never new stage STATES) plus the independent write
+    counters, so the ranking that picks one headline per item hides nothing."""
+    from featuregen.overlay.upload.semantic_adjudication import (
+        adjudicate_targets,
+        adjudication_bounds,
+        outcome_counts,
+        select_adjudication_targets,
+    )
+
+    bounds = adjudication_bounds()
+    inputs = adjudication_candidates(
+        conn, rows, concepts=concepts, glossary=glossary, critic_outcomes=critic_outcomes,
+        bundles=bundles)
+    targets = select_adjudication_targets(
+        inputs.candidates, context_of=inputs.context_of, max_targets=bounds.max_targets)
+    detail: dict = {"considered": len(inputs.candidates), "targets": len(targets),
+                    **outcome_counts(()), "evidence_written": 0,
+                    "evidence_write_failures": 0, "gaps": 0}
+    if not targets:
+        return detail
+    catalog_revision = hashlib.sha256(
+        json.dumps(sorted(inputs.ref_to_hash)).encode("utf-8")).hexdigest()[:16]
+    results = adjudicate_targets(conn, client, targets, catalog_revision=catalog_revision,
+                                 actor=actor, bounds=bounds)
+    detail.update(outcome_counts(results))
+    detail["gaps"] = sum(
+        1 for r in results if r.adjudication is not None and r.adjudication.ontology_gap is not None)
+
+    corrections: dict[str, str] = {}
+    for result in results:
+        corrected = result.corrected_concept
+        h = inputs.ref_to_hash.get(result.logical_ref)
+        if corrected is None or h is None:
+            continue
+        if source_snapshot_id is not None:
+            # The evidence material is the ADJUDICATION's identity, not the classifier's: this is a
+            # different derivation of the same field, so it must hash differently — otherwise a
+            # correction would look like the classifier's own unchanged answer and (post-Task-6) be
+            # reused rather than superseding it.
+            material = {"adjudication": result.structured_result_id,
+                        "selected_concept": corrected}
+            binding_ref = inputs.binding_ref_of.get(result.logical_ref, result.logical_ref)
+            failures = _write_llm_field_evidence(
+                conn, field_name="concept",
+                items={result.logical_ref: corrected},
+                ref_of=lambda ref, _b=binding_ref, _m=material: (ref, _b, _m),
+                source_snapshot_id=source_snapshot_id,
+                valid_fn=is_known_concept,
+                producer_configuration_hash=_vocab_fingerprint(),
+                bindings=bindings)
+            detail["evidence_write_failures"] += failures
+            if failures:
+                continue        # a correction whose evidence did not land is not applied in memory
+            detail["evidence_written"] += 1
+        corrections[h] = corrected
+    for h, corrected in corrections.items():   # in-memory only after every DB write succeeded
+        concepts[h] = corrected
+    return detail
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
@@ -1681,15 +1866,22 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # suggestion. Savepointed + advisory like every enrichment side-effect: a critic fault
     # degrades to un-criticised concepts and an honest ``failed`` stage, never a lost upload.
     critic_report: dict = {"failed": True}
+    critic_outcomes: dict[str, dict] = {}
     try:
         with conn.transaction():
             critic_report = _apply_concept_critic(
                 conn, client, result=result, by_hash=by_hash, meta_by_hash=meta_by_hash,
-                rec_by_tc=rec_by_tc, actor=actor, bundles=bundles)
+                rec_by_tc=rec_by_tc, actor=actor, bundles=bundles,
+                critic_outcomes=critic_outcomes)
     except Exception:  # noqa: BLE001 — advisory: the critic never aborts concept enrichment
         logger.warning("advisory concept critic failed", exc_info=True)
+        # The savepoint rolled the critic's writes back, so its per-ref verdicts describe state
+        # that no longer exists. Drop them rather than feeding a phantom refutation into
+        # adjudication selection.
+        critic_outcomes = {}
     if stats is not None:
         stats["concept_critic"] = critic_report
+        stats["concept_critic_outcomes"] = critic_outcomes
 
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
     # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
