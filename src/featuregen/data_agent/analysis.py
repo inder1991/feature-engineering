@@ -33,6 +33,12 @@ from featuregen.data_agent.learning import record_refusal
 from featuregen.data_agent.observation import ObservationPlanError, require_identifier
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.data_agent.relationship import RelationshipEvidence, join_refusal
+from featuregen.data_agent.snapshots import (
+    LatestSnapshotPolicyV1,
+    SnapshotScope,
+    SnapshotSelectionError,
+    assert_no_snapshot_tie,
+)
 
 
 class AnalysisIRError(ValueError):
@@ -115,6 +121,12 @@ class AnalysisExecutionIRV1:
     #: population without duplicating it.
     dimension_binding: PhysicalDatasetBindingV1 | None = None
     attribution: DimensionAttributionPolicyV1 | None = None
+    #: ENGINE B (Release-B Task 8). The ALTERNATIVE row rule for a dimension source that is a
+    #: SNAPSHOT table rather than an SCD interval table: keep the row at the greatest snapshot value
+    #: at or before the cutoff. Exactly one of `attribution`/`snapshot_selection` may be set — two
+    #: row rules for one dimension source is a contradiction, not a fallback. Defaults to None, so
+    #: every plan built before this field existed compiles and hashes byte-identically.
+    snapshot_selection: LatestSnapshotPolicyV1 | None = None
     #: OBSERVED evidence that the event key and the spine key denote the same entity — the release's
     #: "verified joins". Not validated at construction: like `assert_no_dimension_overlap`, this is a
     #: statement about the state of the data rather than about the shape of the plan, so a plan can
@@ -144,11 +156,26 @@ class AnalysisExecutionIRV1:
                 "ANALYSIS_NO_ELIGIBILITY_POLICY",
                 "no transaction eligibility policy: without one, pending, failed and REVERSED "
                 "transactions count as activity")
-        if self.dimensions and (self.dimension_binding is None or self.attribution is None):
+        if self.attribution is not None and self.snapshot_selection is not None:
+            raise AnalysisIRError(
+                "ANALYSIS_TWO_ROW_RULES",
+                "the dimension source carries BOTH an attribution policy and a latest-snapshot "
+                "selection. They are two different row rules over one table and they disagree on "
+                "any table that has both an interval and a snapshot column; one of them has to be "
+                "the declared one")
+        if self.dimensions and (self.dimension_binding is None
+                                or (self.attribution is None and self.snapshot_selection is None)):
             raise AnalysisIRError(
                 "ANALYSIS_NO_ATTRIBUTION_POLICY",
                 "dimensions were requested with no attribution policy: the renderer must not choose "
                 "between today's segment, the segment at the cutoff, and the segment per period")
+        if self.dimensions and self.snapshot_selection is not None \
+                and self.snapshot_selection.scope is SnapshotScope.PER_TABLE:
+            raise AnalysisIRError(
+                "ANALYSIS_SNAPSHOT_SCOPE_UNJOINABLE",
+                "a per-TABLE latest-snapshot selection has no entity key, so it cannot be joined to "
+                "the population spine — it describes a reference dataset republished whole, not a "
+                "per-customer dimension. Declare the entity key and the per-entity scope")
         for period in (self.current, self.previous):
             if not period.values:
                 raise AnalysisIRError(
@@ -187,6 +214,17 @@ class AnalysisExecutionIRV1:
             str(self.attribution.attribution_basis), self.attribution.report_cutoff,
             self.attribution.effective_from_column, self.attribution.effective_to_column,
             str(self.attribution.missing_value_behavior),
+            self.dimension_binding.identity.table_id if self.dimension_binding else "",
+        # Both Release-B additions APPEND, and only when the thing they describe is present, so
+        # every plan hash computed before ENGINE A/B existed is byte-identical to what it was. A
+        # `current_flag_column` only exists on a `current_value` policy, which could not be
+        # constructed at all before this release.
+        ]) + ([] if not (self.attribution and self.attribution.current_flag_column) else [
+            self.attribution.current_flag_column,
+        ]) + ([] if self.snapshot_selection is None else [
+            self.snapshot_selection.snapshot_column, self.snapshot_selection.cutoff,
+            str(self.snapshot_selection.scope), self.snapshot_selection.key_column,
+            ",".join(self.snapshot_selection.tie_break_columns),
             self.dimension_binding.identity.table_id if self.dimension_binding else "",
         ]))
         return hashlib.sha256(material.encode()).hexdigest()[:32]
@@ -237,19 +275,29 @@ def compile_analysis(ir: AnalysisExecutionIRV1, *, dialect) -> str:
 
     if ir.dimensions:
         attribution = ir.attribution
-        if attribution is None:  # guarded by __post_init__
+        snapshot = ir.snapshot_selection
+        if attribution is None and snapshot is None:  # guarded by __post_init__
             raise AssertionError("validated dimensional analysis has no attribution policy")
         # The dimension SNAPSHOT is built first, then LEFT JOINed — the same rule as the period
         # aggregates. Effective-date predicates in the outer WHERE would drop every customer with no
         # dimension history, repeating the population-spine mistake one layer up.
         dim_ref = dialect.table_ref(_Shim(ir.dimension_binding))
-        validity = attribution.validity_predicate(_q)
         dim_cols = ", ".join(_q(d.column) for d in ir.dimensions)
-        ctes.append(
-            f"dim AS (SELECT {_q(ir.spine.key_column)} AS k, {dim_cols} "
-            f"FROM {dim_ref} WHERE {validity})")
+        if snapshot is not None:
+            # ENGINE B. The same LEFT-JOINed shape; only the row rule differs, and it needs a
+            # window function rather than a flat predicate because "the greatest snapshot at or
+            # before the cutoff" is not expressible as one.
+            body = snapshot.ranked_selection(
+                _q, table_ref=dim_ref, columns=tuple(d.column for d in ir.dimensions))
+            ctes.append(f"dim AS ({body})")
+            missing_behavior = snapshot.missing_value_behavior
+        else:
+            ctes.append(
+                f"dim AS (SELECT {_q(ir.spine.key_column)} AS k, {dim_cols} "
+                f"FROM {dim_ref} WHERE {attribution.validity_predicate(_q)})")
+            missing_behavior = attribution.missing_value_behavior
         dimension_join = f"LEFT JOIN dim ON dim.k = s.{key}\n"
-        if attribution.missing_value_behavior is MissingValueBehavior.UNKNOWN_BUCKET:
+        if missing_behavior is MissingValueBehavior.UNKNOWN_BUCKET:
             # Totals still reconcile: an unclassified customer is a bucket, not a disappearance.
             dimension_select = "".join(
                 f", COALESCE(dim.{_q(d.column)}, '{UNKNOWN}') AS {_q(d.column)}"
@@ -281,8 +329,12 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
     if not ir.dimensions:
         return
     attribution = ir.attribution
-    if attribution is None:  # guarded by __post_init__
-        raise AssertionError("validated dimensional analysis has no attribution policy")
+    if attribution is None:
+        # ENGINE B's row rule. Overlap is a statement about INTERVALS; a snapshot table has none,
+        # and its analogous defect is a tie at the greatest snapshot — refused by
+        # `assert_no_snapshot_tie`, which `run_analysis` calls instead. Returning rather than
+        # raising keeps this probe honest about what it can answer.
+        return
     class _Shim:
         def __init__(self, b): self.binding = b
     _q = dialect.ident
@@ -326,10 +378,28 @@ def assert_join_is_verified(ir: AnalysisExecutionIRV1) -> None:
             f"{spine_id}.{ir.spine.key_column}", f"{event_id}.{ir.event_key_column}"))
 
 
+def assert_snapshot_selection_is_unique(conn, ir: AnalysisExecutionIRV1, *, dialect) -> None:
+    """ENGINE B's data gate: the latest snapshot must be ONE row per entity, or refuse.
+
+    The mirror of :func:`assert_no_dimension_overlap` — both ask a question about the STATE of the
+    data rather than the shape of the plan, which is why both run at execution and not at
+    construction."""
+    if not ir.dimensions or ir.snapshot_selection is None:
+        return
+
+    class _Shim:
+        def __init__(self, b): self.binding = b
+
+    assert_no_snapshot_tie(
+        conn, ir.snapshot_selection,
+        table_ref=dialect.table_ref(_Shim(ir.dimension_binding)), dialect=dialect)
+
+
 def run_analysis(conn, ir: AnalysisExecutionIRV1, *, dialect) -> tuple[AnalysisRow, ...]:
     """Compile and execute, returning one row per entity in the population."""
     assert_join_is_verified(ir)
     assert_no_dimension_overlap(conn, ir, dialect=dialect)
+    assert_snapshot_selection_is_unique(conn, ir, dialect=dialect)
     cursor = conn.cursor()
     try:
         cursor.execute(compile_analysis(ir, dialect=dialect))
@@ -372,7 +442,7 @@ def recording_refusals(learning_conn, *, analysis_request_id: str, dependency_sn
     """
     try:
         yield
-    except (AnalysisIRError, AttributionError, EligibilityError) as exc:
+    except (AnalysisIRError, AttributionError, EligibilityError, SnapshotSelectionError) as exc:
         record_refusal(
             learning_conn, analysis_request_id=analysis_request_id, refusal_code=exc.code,
             subject_refs=getattr(exc, "subjects", ()) or subjects,
