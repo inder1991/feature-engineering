@@ -7,10 +7,11 @@ A.24. It lands in this SIBLING module rather than in the package's ``__init__`` 
 and the failure would surface as an ``ImportError`` in whichever module happened to be imported
 first. This file may import ``identity`` freely; ``compile/__init__.py`` stays free of imports.
 
-WHAT THIS CHAIN COVERS. Phase G §4 stages the programme, and this is G-1: stages 1 through SEAL.
-``run_l0`` is Task 6; ``prepare_run``, ``run_l1`` and ``submit`` are G-2, which is designed but
+WHAT THIS CHAIN COVERS. Phase G §4 stages the programme, and this is G-1: stages 1 through SEAL,
+plus §11.2's **L0**. ``prepare_run``, ``run_l1`` and ``submit`` are G-2, which is designed but
 **not approved**; publication is G-3 and does not exist at all. Nothing here reaches past
-:func:`~featuregen.materialize.render.project.materialize_to`.
+:func:`~featuregen.materialize.validation.run_l0`, which launches a *local* interpreter and touches
+no cluster.
 
 THE TRUTHFUL TERMINAL, and why it is not a bug to be worked around. ``select_publisher`` decides
 publication capability from recorded attestations, and the only thing that can produce one is
@@ -19,11 +20,46 @@ every G-1 run reaches ``CAPABILITY_UNPROVEN``, and that verdict is exactly right
 compiled, rendered and sealed, and publication genuinely is unproven. The run therefore terminates
 ``PUBLICATION_REFUSED`` carrying that code.
 
+WHAT THAT TERMINAL MEANS, EXACTLY — and the two it must never be swapped for. There are three
+outcomes once a project is sealed, one terminal each, and they are not interchangeable:
+
+* L0 ``passed`` → ``PUBLICATION_REFUSED (CAPABILITY_UNPROVEN)``. *Compiled, rendered, sealed, and
+  PROVEN to import and construct its pipeline in a separate interpreter; publication unproven.*
+  This is the only terminal in this module that folds to a non-failed status
+  (``RunStatus.REFUSED``), and it is legitimate only because a build proof was obtained.
+* L0 ``failed`` → ``RUN_FAILED``, request ``failed``. *The build was proved NOT to work.* The
+  findings and their §11.2 classification — who fixes it — are in the report and in the event
+  detail.
+* L0 ``error`` → ``RUN_FAILED``, request ``failed``. *The build was never proven.* §11.2's
+  ``error`` is "the validation could not run", carries **zero** findings, and is neither a pass nor
+  a failure of the artifact. It reaches the same terminal as a failure for one reason: the terminal
+  above is the only alternative this module has, and it would claim a proof this run does not hold.
+
+**L0 is always ATTEMPTED and its absence is an OUTCOME, never a skip** (the Task 6 decision).
+Whether an interpreter is usable cannot be known before using it — a path that exists may be
+non-executable, the wrong architecture, or missing ``kedro`` — so availability cannot be a
+precondition, only a result. ``run_l0`` already says so: a launch failure, a timeout and a probe
+that printed no verdict are one answer, ``status="error"`` with no findings. A deployment that
+configures no interpreter at all (``l0=None``) is the same non-answer stated earlier, and is
+recorded as the same ``error`` report rather than as a fourth vocabulary word meaning "skipped".
+A skipped gate that left ``PUBLICATION_REFUSED`` behind would be indistinguishable from a passed
+one, on a plane that can never retract it.
+
 **This module must never append** ``RunEventKind.PUBLISHED`` (plan §3.5). The plane is append-only,
 with a partial unique index admitting one terminal event per run and migration 1044's BEFORE-INSERT
 ordering trigger refusing anything after it — so a publication claim, once written, can never be
 retracted by any code path that exists. A test reads this module's AST and asserts that
-``PUBLICATION_REFUSED`` is the only event kind it names.
+``PUBLICATION_REFUSED`` and ``RUN_FAILED`` are the only two event kinds it names.
+
+WHY ``RUN_FAILED`` AND NOT ``GATES_FAILED``, against the two kinds' documented meanings.
+``GATES_FAILED`` is "a §9 gate failed — the group is rejected and the previous partition stays
+untouched"; it folds to ``RunStatus.REJECTED`` and its place in the sequence is after
+``COMPUTATION_COMPLETED``, because §9's gates run *inside* the submitted pipeline over output that
+has been staged. In G-1 nothing is submitted, nothing is computed and no partition exists, so that
+kind would assert a computation that never happened and a gate that never ran — a second claim the
+plane could not retract. ``RUN_FAILED`` is documented as "the run failed **outside** the gates —
+execution, submission or the environment", which is exactly where a build verification sits: before
+any run, and (for ``error``) squarely in the environment.
 
 WHERE THE RECORD LIVES, and why a pre-render refusal writes nothing to the plane.
 ``MaterializationGeneration`` requires ``generated_project_hash``, which does not exist until the
@@ -110,11 +146,20 @@ from featuregen.materialize.request_store import (
 )
 from featuregen.materialize.resolve import resolve_feature_inputs
 from featuregen.materialize.spine import SpineSourceDeclarationV1
+from featuregen.materialize.validation import (
+    ValidationLevel,
+    ValidationReportV1,
+    ValidationStatus,
+    read_validation_reports,
+    record_validation_report,
+    run_l0,
+)
 
 __all__ = [
     "FIRST_RUN_EVENT_SEQ",
     "ChainStage",
     "CompiledGroup",
+    "L0Interpreter",
     "NodeAssembler",
     "NodeAssemblyInputs",
     "PublishStepMissing",
@@ -158,9 +203,14 @@ class ChainStage(StrEnum):
     """The stages that can END a run, in the order the chain runs them.
 
     A caller reads :attr:`CompiledGroup.stopped_at` to learn WHICH stage stopped a run without
-    parsing any string. Only stages that can produce a governed verdict are members:
-    ``build_group_plan``, ``render_project`` and ``materialize_to`` have no refusal path at all —
-    they raise, and a raise is a defect in this code rather than a verdict about a feature.
+    parsing any string. Only stages that can produce a VERDICT are members: ``build_group_plan``,
+    ``render_project`` and ``materialize_to`` have no refusal path at all — they raise, and a raise
+    is a defect in this code rather than a verdict about a feature.
+
+    A verdict is not always a :class:`~featuregen.materialize.codes.MaterializationRefused`.
+    :attr:`VALIDATE_L0` produces a :class:`~featuregen.materialize.validation.ValidationReportV1`
+    instead, which is why :attr:`CompiledGroup.refusal` is ``None`` when it is the stage that
+    stopped a run and :attr:`CompiledGroup.validation_report` carries the evidence.
     """
 
     #: The resolution seam — the run has no terminal trace event, cannot be replayed, did not
@@ -180,8 +230,52 @@ class ChainStage(StrEnum):
     BIND = "bind_group"
     #: §3.3 — the declared population's table could not be resolved to a physical input.
     SPINE_INPUT = "derive_requirement"
-    #: §10.3 — publication capability. In G-1 this is where every successful run ends.
+    #: §10.3 — publication capability. In G-1 this is where every run that PROVED its build ends.
     PUBLISHER = "select_publisher"
+    #: §11.2's L0 — the sealed project imports and constructs its pipeline in another interpreter.
+    #: Last because it is the last thing a run does, and it is the one stage whose verdict is a
+    #: report rather than a refusal. A run stops HERE when the build failed or was never proven.
+    VALIDATE_L0 = "run_l0"
+
+
+@dataclass(frozen=True, slots=True)
+class L0Interpreter:
+    """The interpreter §11.2's L0 imports the generated project in — the CALLER's configuration.
+
+    It is a parameter of :func:`compile_feature_group` and not an environment read, because this
+    module is a library: a chain that read ``FEATUREGEN_L0_PYTHON`` for itself would make every
+    deployment's build proof depend on a variable no record names, and the trigger surface is what
+    owns configuration. ``run_l0`` takes the same view — it has no default interpreter, "so nothing
+    can silently validate the artifact against the validator's own environment"
+    (``validation.py:580``), and this platform's own interpreter has neither ``kedro`` nor
+    ``pyspark``.
+
+    ``env`` is overlaid on the process environment for the probe, and the trap it exists for is
+    stated in ``run_l0``: ``PYSPARK_PYTHON`` and ``PYSPARK_DRIVER_PYTHON`` must BOTH name the same
+    interpreter, or Spark launches workers on the system Python.
+
+    ``timeout_seconds`` has no default for the reason ``published_schema`` and ``spine_declaration``
+    have none: a bound on how long a build proof may take is a decision, and inheriting one by
+    omission is how a caller ends up not having made it. After it, the probe is *unreachable* —
+    ``status="error"`` — not failing.
+    """
+
+    python_executable: str
+    timeout_seconds: float
+    env: Mapping[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.python_executable, str) or not self.python_executable.strip():
+            raise ValueError(
+                f"the L0 interpreter is blank ({self.python_executable!r}): 'no interpreter is "
+                f"configured' is stated by passing l0=None, which records an 'error' report; a "
+                f"blank string is a third state that would be launched and fail as the artifact's "
+                f"fault")
+        if not isinstance(self.timeout_seconds, int | float) or \
+                isinstance(self.timeout_seconds, bool) or self.timeout_seconds <= 0:
+            raise ValueError(
+                f"the L0 timeout is {self.timeout_seconds!r}: a non-positive bound cannot let any "
+                f"probe finish, so every run would record 'the build was never proven'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +326,10 @@ class CompiledGroup:
     logical_group_name: str
     #: The stage whose verdict ended the run. ``None`` only on a replay (see :attr:`replayed`).
     stopped_at: ChainStage | None
+    #: The refusing stage's own object — ``None`` when the stage that stopped the run does not
+    #: produce one. :attr:`ChainStage.VALIDATE_L0` is the case: its verdict is
+    #: :attr:`validation_report`, and a caller must read ``stopped_at`` rather than infer a
+    #: successful run from ``refusal is None``.
     refusal: MaterializationRefused | None
     terminal_event: RunEventKind | None
     lifecycle_state: RequestLifecycle
@@ -241,6 +339,13 @@ class CompiledGroup:
     group_plan_hash: str | None
     generated_project_hash: str | None
     project_root: str | None
+    #: §11.2's L0 verdict for this generation, present on EVERY run that sealed a project — the one
+    #: field that says whether the terminal above rests on a build proof. ``None`` means no project
+    #: was rendered, never "it built": a report is a claim about an artifact that exists.
+    #:
+    #: On a replay it is READ BACK from ``pipeline_validation_report`` rather than left ``None``.
+    #: Unlike :attr:`stopped_at`, it is durable, so reporting it is a reading and not an invention.
+    validation_report: ValidationReportV1 | None = None
     #: True when the request was already terminal and this call did no work. The durable record
     #: does not say which stage stopped a run or carry the refusing object, so both are ``None``
     #: rather than inferred — a replay reports what was recorded, never a reconstruction of it.
@@ -260,6 +365,7 @@ def compile_feature_group(
     published_schema: Sequence[str] | None,
     assemble_nodes: NodeAssembler,
     project_root: str | os.PathLike[str],
+    l0: L0Interpreter | None,
     clock: Callable[[], str],
     contract_overrides: ContractOverrides | None = None,
 ) -> CompiledGroup:
@@ -298,13 +404,20 @@ def compile_feature_group(
         project_root: the directory the sealed project is written UNDER. The project itself lands in
             ``project_root/<generation_id>``, because ``materialize_to`` refuses a non-empty
             directory and two generations of one group must not share a tree.
+        l0: the interpreter §11.2's L0 imports the sealed project in, or ``None`` for "this
+            deployment has none". No default: whether a run's build is proved is not a thing to
+            inherit by omission. ``None`` does not skip the check — it records the same
+            ``status="error"`` report an interpreter that could not be launched would, and the run
+            terminates ``RUN_FAILED`` (see the module docstring for the argument).
         clock: an offset-aware ISO 8601 instant, matching ``run_l0``/``run_l1``'s ``clock``. The
             plane mints no timestamps; every ``created_at`` and ``occurred_at`` here is this one.
         contract_overrides: §5's declared tightenings, if any.
 
     Returns:
         A :class:`CompiledGroup`. In G-1 a run that gets all the way through stops at
-        :attr:`ChainStage.PUBLISHER` with ``CAPABILITY_UNPROVEN`` and a sealed project on disk.
+        :attr:`ChainStage.PUBLISHER` with ``CAPABILITY_UNPROVEN``, a sealed project on disk and a
+        PASSED L0 report; one whose build failed or was never proven stops at
+        :attr:`ChainStage.VALIDATE_L0` with the report that says which.
 
     Raises:
         ValueError: the request does not exist or is not ``accepted`` — and every ``ValueError`` the
@@ -400,7 +513,7 @@ def compile_feature_group(
 
     return _commit(conn, request, plan=plan, contract=group.contract, binding=binding,
                    existing=existing, project=sealed, refusal=selection, project_root=project_root,
-                   clock=clock)
+                   environment_id=inventory.environment_id, l0=l0, clock=clock)
 
 
 # ── the durable record ───────────────────────────────────────────────────────────────────────────
@@ -417,10 +530,12 @@ def _commit(
     project: SealedProject,
     refusal: MaterializationRefused,
     project_root: str | os.PathLike[str],
+    environment_id: str,
+    l0: L0Interpreter | None,
     clock: Callable[[], str],
 ) -> CompiledGroup:
-    """Record the generation, the §10.1 records, §3.6's compiled artifact and the truthful terminal,
-    and write the tree — ALL OR NOTHING.
+    """Record the generation, the §10.1 records, §3.6's compiled artifact, L0's verdict and the
+    terminal that verdict earns, and write the tree — ALL OR NOTHING.
 
     THE TRANSACTION IS THE POINT, and ordering alone was not enough. The runtime this chain is
     driven from is AUTOCOMMIT by contract (``runtime/worker.py:638``: "Autocommit is required: each
@@ -438,9 +553,14 @@ def _commit(
     SAVEPOINT, which is exactly the semantics wanted here (roll back this chain's writes, leave the
     caller's alone) and is what makes the guarantee testable at all.
 
-    ORDER still matters inside it. The generation row comes first because every other plane record
-    takes a foreign key to it — ``materialization_compiled_artifact`` included — and the tree is
-    written last so the cheap failures happen before the expensive one.
+    ORDER still matters inside it, and L0 changed it. The generation row comes first because every
+    other plane record takes a foreign key to it — ``materialization_compiled_artifact`` and
+    ``pipeline_validation_report`` included. The tree used to be written last; it now has to be
+    written before the terminal, because L0 validates a project ON DISK and the terminal is chosen
+    from its verdict. What stays last is the ``os.replace`` that makes the tree VISIBLE at the
+    project's own path: L0 runs over the staging sibling, so a failure anywhere in this block —
+    including at the validation write — still leaves nothing at ``root`` for a rollback to be
+    unable to clean up.
 
     ``RUNNING`` is a stepping stone here, and its documented meaning ("a run was prepared") is not
     yet true in G-1 — ``prepare_run`` is G-2. It is passed through because ``accepted → committed``
@@ -448,60 +568,142 @@ def _commit(
     state that stamps ``generation_id``/``run_id`` onto the request. Inside one transaction no
     reader ever observes it.
 
-    The terminal event is ``PUBLICATION_REFUSED`` carrying ``select_publisher``'s own code. That is
-    the honest end of a G-1 run and the only terminal this module may append; see the module
-    docstring for why ``PUBLISHED`` can never be.
+    **A FAILING L0 IS NOT A ROLLBACK.** The generation, the artifact, the report, the ``RUN_FAILED``
+    terminal and the tree are all committed, and the request lands ``failed`` rather than
+    ``committed``. Rolling back would destroy the only evidence of *why* the build failed, and the
+    project is what an operator opens to see it; the transaction exists so that a run is recorded
+    ONCE and WHOLE, not so that bad news is discarded. Only a raised exception rolls back.
+
+    The terminal event is ``PUBLICATION_REFUSED`` carrying ``select_publisher``'s own code when the
+    build was proved, and ``RUN_FAILED`` when it was not. See the module docstring for what each
+    means, why ``GATES_FAILED`` is not the second one, and why ``PUBLISHED`` can never be either.
     """
     generation_id = _generation_id(request.request_id)
     run_id = _run_id(request.request_id)
     created_at = clock()
     root = pathlib.Path(project_root) / generation_id
+    staging = root.parent / f".{root.name}.partial"
 
-    with conn.transaction():
-        record_generation(conn, MaterializationGeneration(
-            generation_id=generation_id,
-            logical_group_name=plan.logical_group_name,
-            materialization_contract_hash=plan.materialization_contract_hash,
-            group_plan_hash=group_plan_hash(plan),
-            generated_project_hash=project.identity.generated_project_hash,
-            created_at=created_at))
-        advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.RUNNING,
-                          generation_id=generation_id, run_id=run_id)
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        with conn.transaction():
+            record_generation(conn, MaterializationGeneration(
+                generation_id=generation_id,
+                logical_group_name=plan.logical_group_name,
+                materialization_contract_hash=plan.materialization_contract_hash,
+                group_plan_hash=group_plan_hash(plan),
+                generated_project_hash=project.identity.generated_project_hash,
+                created_at=created_at))
+            advance_lifecycle(conn, request_id=request.request_id,
+                              to_state=RequestLifecycle.RUNNING, generation_id=generation_id,
+                              run_id=run_id)
 
-        # `bind_group` RETURNS the existing binding unchanged when the contract still agrees, and
-        # `record_group_binding` is a UniqueViolation on a second write for one logical name — so
-        # the binding is written exactly when it was minted here.
-        if existing is None:
-            record_group_binding(conn, binding)
-        record_plan_revision(conn, plan_revision(plan, binding, generation_id=generation_id,
-                                                 created_at=created_at))
-        # §3.6: the BODIES behind two of the generation's three hashes — the packing list §9 gates
-        # against and the contract the group publishes under. (The third, the project hash, names
-        # the tree, which is written below and kept whole.) Without this row a crash after render
-        # leaves a generation nobody can audit: three digests of objects nothing kept.
-        record_compiled_artifact(conn, generation_id=generation_id, group_plan=plan,
-                                 contract=contract)
+            # `bind_group` RETURNS the existing binding unchanged when the contract still agrees,
+            # and `record_group_binding` is a UniqueViolation on a second write for one logical
+            # name — so the binding is written exactly when it was minted here.
+            if existing is None:
+                record_group_binding(conn, binding)
+            record_plan_revision(conn, plan_revision(plan, binding, generation_id=generation_id,
+                                                     created_at=created_at))
+            # §3.6: the BODIES behind two of the generation's three hashes — the packing list §9
+            # gates against and the contract the group publishes under. (The third, the project
+            # hash, names the tree, which is written below and kept whole.) Without this row a crash
+            # after render leaves a generation nobody can audit: three digests of objects nothing
+            # kept.
+            record_compiled_artifact(conn, generation_id=generation_id, group_plan=plan,
+                                     contract=contract)
 
-        append_run_event(conn, MaterializationRunEvent(
-            run_id=run_id, seq=FIRST_RUN_EVENT_SEQ, generation_id=generation_id,
-            event_kind=RunEventKind.PUBLICATION_REFUSED, occurred_at=created_at,
-            detail=f"{refusal.code.value}: {refusal.detail}"))
-        moved = advance_lifecycle(conn, request_id=request.request_id,
-                                  to_state=RequestLifecycle.COMMITTED)
-        _materialize(project, root)
+            materialize_to(project, staging)
+            report = _prove_the_build(staging, project=project, l0=l0,
+                                      generation_id=generation_id, environment_id=environment_id,
+                                      report_id=_report_id(request.request_id), clock=clock)
+            record_validation_report(conn, report)
+            built = report.status is ValidationStatus.PASSED
+
+            append_run_event(conn, MaterializationRunEvent(
+                run_id=run_id, seq=FIRST_RUN_EVENT_SEQ, generation_id=generation_id,
+                event_kind=(RunEventKind.PUBLICATION_REFUSED if built
+                            else RunEventKind.RUN_FAILED),
+                occurred_at=created_at,
+                detail=(f"{refusal.code.value}: {refusal.detail}" if built
+                        else _unproven_detail(report, configured=l0 is not None))))
+            moved = advance_lifecycle(
+                conn, request_id=request.request_id,
+                to_state=RequestLifecycle.COMMITTED if built else RequestLifecycle.FAILED)
+            _publish_tree(staging, root)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
     return CompiledGroup(
         request_id=request.request_id, logical_group_name=request.logical_group_name,
-        stopped_at=ChainStage.PUBLISHER, refusal=refusal,
-        terminal_event=RunEventKind.PUBLICATION_REFUSED, lifecycle_state=moved.lifecycle_state,
+        stopped_at=ChainStage.PUBLISHER if built else ChainStage.VALIDATE_L0,
+        refusal=refusal if built else None,
+        terminal_event=(RunEventKind.PUBLICATION_REFUSED if built else RunEventKind.RUN_FAILED),
+        lifecycle_state=moved.lifecycle_state,
         generation_id=generation_id, run_id=run_id,
         materialization_contract_hash=plan.materialization_contract_hash,
         group_plan_hash=group_plan_hash(plan),
-        generated_project_hash=project.identity.generated_project_hash, project_root=str(root))
+        generated_project_hash=project.identity.generated_project_hash, project_root=str(root),
+        validation_report=report)
 
 
-def _materialize(project: SealedProject, root: pathlib.Path) -> None:
-    """Write the sealed tree so that it appears complete or not at all.
+def _prove_the_build(root: pathlib.Path, *, project: SealedProject, l0: L0Interpreter | None,
+                     generation_id: str, environment_id: str, report_id: str,
+                     clock: Callable[[], str]) -> ValidationReportV1:
+    """§11.2's L0 over the materialized project — or the honest non-answer when it cannot be run.
+
+    ``l0 is None`` says this deployment configures no interpreter. That is not a reason to skip the
+    check and it is not a fourth verdict: it is the SAME thing ``run_l0`` reports when the
+    interpreter it was given could not be launched, timed out, or printed no verdict —
+    ``status="error"``, **zero** findings, "the validation could not run". Constructing it here
+    rather than launching something is the whole of the difference; inventing an interpreter (this
+    process's own, say) would import a project that needs ``kedro`` into one that has none and
+    report ``PROJECT_DOES_NOT_BUILD``, blaming the renderer for the environment.
+
+    The report is built off the SEALED identity rather than off the tree, because the two hashes it
+    carries are claims about the artifact this generation names, and a directory that failed to
+    hash to its lock is a finding rather than a new identity.
+    """
+    if l0 is None:
+        started_at = clock()
+        return ValidationReportV1(
+            report_id=report_id, generation_id=generation_id, run_id=None,
+            generated_project_hash=project.identity.generated_project_hash,
+            group_plan_hash=project.identity.compilation.group_plan_hash,
+            level=ValidationLevel.L0, environment_id=environment_id,
+            status=ValidationStatus.ERROR, started_at=started_at, finished_at=clock(),
+            findings=())
+    return run_l0(root, generation_id=generation_id, environment_id=environment_id,
+                  report_id=report_id, python_executable=l0.python_executable, clock=clock,
+                  env=l0.env, timeout_seconds=l0.timeout_seconds)
+
+
+def _unproven_detail(report: ValidationReportV1, *, configured: bool) -> str:
+    """The ``RUN_FAILED`` event's operator-facing text: what L0 saw, and WHO fixes it.
+
+    §14's rule for a detail — counts, types, codes and locations, never data values — and §11.2's
+    rule that a finding's CLASS is what routes a decision. A reader of the append-only stream gets
+    the codes, their classes and the report id to open; the findings themselves stay in
+    ``pipeline_validation_report``, where ``read_validation_reports`` returns them intact.
+
+    ``error`` prints no findings because it HAS none, and says which of the two silences it is:
+    a deployment that configured no interpreter is an operator's act, while an interpreter that did
+    not answer is the environment's — different people fix them.
+    """
+    if report.status is ValidationStatus.ERROR:
+        because = ("no L0 interpreter is configured" if not configured else
+                   "the configured interpreter did not answer (launch failure, timeout, or no "
+                   "verdict printed)")
+        return (f"L0 could not run, so this project's build is UNPROVEN ({report.report_id}): "
+                f"{because}")
+    seen = "; ".join(f"{finding.code.value}({finding.classification.value}) x{finding.count}"
+                     for finding in report.findings)
+    return f"L0 failed, so this project does not build ({report.report_id}): {seen}"
+
+
+def _publish_tree(staging: pathlib.Path, root: pathlib.Path) -> None:
+    """Make the staged tree VISIBLE at the project's own path — complete, or not at all.
 
     A filesystem takes no part in the transaction above, so a half-written tree is the one piece of
     state a rollback cannot remove — and it would be permanent damage rather than litter: the
@@ -509,19 +711,13 @@ def _materialize(project: SealedProject, root: pathlib.Path) -> None:
     and ``materialize_to`` refuses a non-empty directory (``render/project.py:1294``). A partial
     tree would poison every re-drive of that request forever.
 
-    So the project is written to a sibling and moved into place with one ``os.replace``, which is
-    atomic on a POSIX filesystem and — because ``rename`` onto a non-empty directory fails — cannot
-    silently overwrite an earlier generation's tree either. Any failure removes the partial.
+    So the project is written to a sibling (and validated there) and moved into place with one
+    ``os.replace``, which is atomic on a POSIX filesystem and — because ``rename`` onto a non-empty
+    directory fails — cannot silently overwrite an earlier generation's tree either. ``_commit``'s
+    own ``except`` removes the partial on any failure.
     """
-    staging = root.parent / f".{root.name}.partial"
-    shutil.rmtree(staging, ignore_errors=True)
-    try:
-        materialize_to(project, staging)
-        root.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging, root)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    root.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staging, root)
 
 
 class _Stop:
@@ -584,6 +780,11 @@ def _replayed(conn: DbConn, request: MaterializationRequestV1) -> CompiledGroup:
     ``stopped_at`` and ``refusal`` are ``None`` because neither is durable. Inferring a stage from
     the terminal event would be an invention about a decision nothing recorded, and
     :attr:`CompiledGroup.replayed` is how a caller tells this answer from a fresh one.
+
+    The L0 report IS durable, so it is read back rather than dropped: a re-delivered queue job that
+    lost the build proof would leave a caller with a terminal and no way to see what stands behind
+    it. That is a reading of ``pipeline_validation_report``, not a reconstruction — which is exactly
+    why the two fields above stay ``None`` and this one does not.
     """
     events = read_run_events(conn, request.run_id) if request.run_id else ()
     return CompiledGroup(
@@ -592,7 +793,24 @@ def _replayed(conn: DbConn, request: MaterializationRequestV1) -> CompiledGroup:
         terminal_event=events[-1].event_kind if events and events[-1].is_terminal() else None,
         lifecycle_state=request.lifecycle_state, generation_id=request.generation_id,
         run_id=request.run_id, materialization_contract_hash=None, group_plan_hash=None,
-        generated_project_hash=None, project_root=None, replayed=True)
+        generated_project_hash=None, project_root=None,
+        validation_report=_recorded_l0(conn, request.generation_id), replayed=True)
+
+
+def _recorded_l0(conn: DbConn, generation_id: str | None) -> ValidationReportV1 | None:
+    """The NEWEST recorded L0 report for a generation, or ``None`` when there is not one.
+
+    ``read_validation_reports`` is the package's reader and returns oldest-first, so the last L0 row
+    is the newest — the same "newest report of each level" rule
+    :func:`~featuregen.materialize.validation.may_regenerate_for` applies, and for the same reason:
+    a re-validation supersedes the verdict it re-checked. G-1 records exactly one, and a request
+    that never reached a generation has none to read.
+    """
+    if generation_id is None:
+        return None
+    l0_reports = [report for report in read_validation_reports(conn, generation_id=generation_id)
+                  if report.level is ValidationLevel.L0]
+    return l0_reports[-1] if l0_reports else None
 
 
 def _claim(conn: DbConn, request_id: str) -> MaterializationRequestV1:
@@ -646,6 +864,14 @@ def _generation_id(request_id: str) -> str:
 
 def _run_id(request_id: str) -> str:
     return _derived_id("mrun", purpose="materialization_run", material=request_id)
+
+
+def _report_id(request_id: str) -> str:
+    """``run_l0`` mints no ids (``validation.py:576``), and ``pipeline_validation_report.report_id``
+    is a primary key — so a re-entry that reached the write with a random id would append a SECOND
+    verdict for one generation instead of colliding, which on an append-only table with no repair
+    path is the difference between a loud failure and two build proofs nobody can order."""
+    return _derived_id("l0rep", purpose="l0_validation_report", material=request_id)
 
 
 def _binding_id(logical_group_name: str) -> str:

@@ -623,3 +623,26 @@ which orchestrator is the real one — not a wiring detail.
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🔴 **`formula/authoring.py` + `formula/trace.py` + migration 1020 have no writer and no reader** | Ownership: `formula/**` was explicitly out of scope for the session that found this, and the fix is a choice between two whole orchestrators rather than a repair. Both lanes remain individually correct and tested; the defect is that only one of them is connected to anything. | Any decision by whoever owns `formula/` about which authoring orchestrator is authoritative. The two closures are: DELETE the 1020 lane (and mark 1020 obsolete), or REPOINT `recipe_formula_worker` at `formula/authoring.py` — in which case `materialize/authoring_trace.py` must move back to the 1020 store and check 6 narrows to four fields again. Note the 1020 terminal payload carries no `result` material, so the second option also needs a durable authoring result before anything can be resolved. |
+
+### A.34 🟡 L0's probe runs inside `_commit`'s open transaction (2026-08-03)
+
+Found and accepted by Phase G T6, which put §11.2's L0 into `compile/chain.py`. `run_l0` launches a
+separate interpreter and waits up to `L0Interpreter.timeout_seconds` for it; that wait happens
+between the plane writes and the terminal append, **inside** the `with conn.transaction()` block
+`_commit` opens.
+
+It is inside deliberately. The terminal event is CHOSEN from L0's verdict, and the verdict is about
+a tree on disk, so the ordering is forced: render → validate → record the terminal that the verdict
+earns. Splitting the transaction so the probe ran outside it would put the generation row and the
+build proof in two separately-committing units, and the failure window between them is exactly the
+"a terminal that claims more than the evidence" shape this task existed to close. The tree is staged
+at a sibling and `os.replace`d into place as the block's last statement, so a rollback anywhere —
+including at the validation write — still leaves nothing at the project's own path.
+
+The cost is transaction duration: a compile that used to hold a transaction for milliseconds now
+holds one for as long as the probe takes (seconds in practice — importing kedro and pyspark and
+constructing the pipeline object — but bounded only by the caller's timeout).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A PostgreSQL session sits "idle in transaction" for the duration of the L0 probe** | No deployment in this repo sets `idle_in_transaction_session_timeout` (grepped: zero occurrences in `src/`, tests and migrations), so nothing kills it today, and the alternative costs an atomicity guarantee that is worth more than the connection-hold. The bound is the caller's: `L0Interpreter.timeout_seconds` has no default precisely so a trigger surface must choose one. | Setting `idle_in_transaction_session_timeout` anywhere, or moving this chain onto a pooled/shared connection. Either makes the hold a real failure mode, and the closure is to run the probe before the transaction over the STAGED tree and re-read nothing from it — which is sound but needs the report's `location` (the staging path) to stop being operator-facing first. |

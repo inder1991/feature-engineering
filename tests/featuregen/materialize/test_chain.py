@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import importlib.util
 import inspect
 import pathlib
+import sys
 
 import psycopg
 import pytest
@@ -57,12 +59,14 @@ from featuregen.materialize.codes import (
     CompilationRefusalCode,
     MaterializationRefused,
     PublicationRefusalCode,
+    ValidationFindingCode,
 )
 from featuregen.materialize.compile import chain
 from featuregen.materialize.compile.chain import (
     FIRST_RUN_EVENT_SEQ,
     ChainStage,
     CompiledGroup,
+    L0Interpreter,
     compile_feature_group,
 )
 from featuregen.materialize.compile.wiring import assemble_nodes
@@ -95,6 +99,14 @@ from featuregen.materialize.request_store import (
     accept_request,
     read_request,
     record_request,
+)
+from featuregen.materialize.validation import (
+    FindingClass,
+    ValidationFinding,
+    ValidationLevel,
+    ValidationReportV1,
+    ValidationStatus,
+    read_validation_reports,
 )
 
 _FEATURE = "total_debit_amount_30d"
@@ -149,8 +161,51 @@ def _authored(db, monkeypatch, name=_FEATURE, suffix="a"):
     return work_item_id
 
 
+# ── the L0 seam: a real interpreter is CONFIGURED, and its VERDICT is what a test drives ─────────
+#
+# `sys.executable` is a genuine, launchable interpreter that does NOT have kedro — the honest
+# statement of what this suite's environment is. Tests that need a particular L0 verdict inject it
+# at `chain.run_l0` (as Tasks 3/5 inject `materialize_to`); tests that do not are running the REAL
+# `run_l0` against it, which is why `test_the_chain_calls_the_REAL_run_l0_...` is not a mock at all.
+# No collected test needs kedro or pyspark: the real-interpreter proof lives in `l0_gate.py`.
+_L0 = L0Interpreter(python_executable=sys.executable, timeout_seconds=60.0)
+
+
+def _verdict(root, *, generation_id, environment_id, report_id, clock,
+             status=ValidationStatus.PASSED, findings=()) -> ValidationReportV1:
+    """An L0 report for a tree that REALLY EXISTS — its identity is read off the lock on disk.
+
+    Deliberately not a constant. A stub that ignored ``root`` would let the chain hand `run_l0` a
+    path that was never materialized and still record a build proof, which is the exact shape of
+    lie this task exists to make impossible.
+    """
+    identity = read_lock((pathlib.Path(root) / GENERATED_LOCK_FILENAME).read_text())
+    return ValidationReportV1(
+        report_id=report_id, generation_id=generation_id, run_id=None,
+        generated_project_hash=identity.generated_project_hash,
+        group_plan_hash=identity.compilation.group_plan_hash, level=ValidationLevel.L0,
+        environment_id=environment_id, status=status, started_at=clock(), finished_at=clock(),
+        findings=tuple(findings))
+
+
+def _inject_l0(monkeypatch, status=ValidationStatus.PASSED, findings=()):
+    def _run_l0(root, *, generation_id, environment_id, report_id, python_executable, clock,
+                env=None, timeout_seconds=300.0):
+        assert python_executable == _L0.python_executable, "the caller's interpreter, or none"
+        return _verdict(root, generation_id=generation_id, environment_id=environment_id,
+                        report_id=report_id, clock=clock, status=status, findings=findings)
+
+    monkeypatch.setattr(chain, "run_l0", _run_l0)
+
+
 @pytest.fixture
-def ready(catalog, monkeypatch, tmp_path):
+def l0_passes(monkeypatch):
+    """L0 PASSES — the precondition of every test below whose subject is not L0 itself."""
+    _inject_l0(monkeypatch)
+
+
+@pytest.fixture
+def ready(catalog, monkeypatch, l0_passes, tmp_path):
     """One accepted request naming one resolvable feature — the whole durable identity."""
     return _request(catalog), [_authored(catalog, monkeypatch)], tmp_path
 
@@ -174,12 +229,12 @@ def _clock():
 
 
 def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schema=None,
-         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble) -> CompiledGroup:
+         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble, l0=_L0) -> CompiledGroup:
     return compile_feature_group(
         db, request_id=request_id, work_item_ids=work_item_ids, inventory=inventory,
         spine_declaration=spine, cadence=_CADENCE, availability_promise=_PROMISE,
         contract_overrides=overrides, mechanism=PublishMechanism.VERSIONED_POINTER,
-        published_schema=published_schema, assemble_nodes=assemble, project_root=root,
+        published_schema=published_schema, assemble_nodes=assemble, project_root=root, l0=l0,
         clock=_clock)
 
 
@@ -320,7 +375,7 @@ def test_the_run_carries_exactly_one_event_and_it_is_the_truthful_terminal(
     assert run_status(catalog, outcome.run_id) is RunStatus.REFUSED
 
 
-def test_a_second_binding_for_the_same_group_is_not_written_twice(catalog, monkeypatch,
+def test_a_second_binding_for_the_same_group_is_not_written_twice(catalog, monkeypatch, l0_passes,
                                                                   tmp_path) -> None:
     """`record_group_binding` is a UniqueViolation on a second write, so the chain must recognise
     the binding `bind_group` RETURNED UNCHANGED and append only the revision."""
@@ -338,8 +393,233 @@ def test_a_second_binding_for_the_same_group_is_not_written_twice(catalog, monke
     assert one.generation_id != two.generation_id
 
 
+# ── L0: the terminal may never imply a build proof the run does not hold ─────────────────────────
+
+def test_a_PASSING_L0_is_recorded_and_is_what_the_truthful_terminal_now_MEANS(
+        ready, catalog) -> None:
+    """The G-1 terminal was "compiled, rendered and sealed". With L0 in the chain it is "…and
+    proven to BUILD", and that upgrade is only honest if the proof is durable and readable.
+
+    The report is read back through `read_validation_reports` — the recorded rule, not the object
+    this process happened to hold — and its two hashes must be the generation's own, or the proof
+    would be about some other project."""
+    request_id, work_items, root = ready
+
+    outcome = _run(catalog, request_id, work_items, root)
+
+    reports = read_validation_reports(catalog, generation_id=outcome.generation_id)
+    assert [(r.level, r.status, r.findings) for r in reports] == \
+        [(ValidationLevel.L0, ValidationStatus.PASSED, ())]
+    assert reports[0].generated_project_hash == outcome.generated_project_hash
+    assert reports[0].group_plan_hash == outcome.group_plan_hash
+    assert reports[0].environment_id == INVENTORY.environment_id
+    assert reports[0].run_id is None                  # L0 validates the project before any run
+    assert outcome.validation_report == reports[0]
+    # …and only THEN the terminal Task 3 records.
+    assert outcome.stopped_at is ChainStage.PUBLISHER
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+    assert outcome.refusal.code is PublicationRefusalCode.CAPABILITY_UNPROVEN
+    assert outcome.lifecycle_state is RequestLifecycle.COMMITTED
+
+
+@pytest.mark.parametrize("code", [ValidationFindingCode.PROJECT_DOES_NOT_BUILD,
+                                  ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE,
+                                  ValidationFindingCode.PROJECT_HASH_MISMATCH])
+def test_a_FAILING_L0_stops_the_run_and_the_terminal_says_the_BUILD_failed(
+        catalog, monkeypatch, tmp_path, code) -> None:
+    """A project that does not build must not reach `PUBLICATION_REFUSED`: that terminal folds to
+    `RunStatus.REFUSED`, which reads as "everything worked and publication was declined".
+
+    `RUN_FAILED` is the documented "failed outside the gates" kind (`control_plane.py:120`);
+    `GATES_FAILED` is §9's, and §9 gates run inside a SUBMITTED run over computed output that in
+    G-1 does not exist. The findings and their CLASSIFICATION — who fixes it — must survive in the
+    plane's own record and in the event detail a reader of the append-only stream sees."""
+    request_id = _request(catalog, request_id=f"req-{code.value.lower()}")
+    work_items = [_authored(catalog, monkeypatch, suffix="l0fail")]
+    _inject_l0(monkeypatch, status=ValidationStatus.FAILED, findings=(
+        ValidationFinding(code=code, location="sandbox_feature_cif_daily.pipeline_registry",
+                          expected="importable", observed="ImportError", count=1),))
+
+    outcome = _run(catalog, request_id, work_items, tmp_path)
+
+    assert outcome.stopped_at is ChainStage.VALIDATE_L0
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert outcome.lifecycle_state is RequestLifecycle.FAILED
+    assert read_request(catalog, request_id=request_id).lifecycle_state is RequestLifecycle.FAILED
+    assert run_status(catalog, outcome.run_id) is RunStatus.FAILED
+    assert published_generation_ids(catalog) == frozenset()
+
+    stored = read_validation_reports(catalog, generation_id=outcome.generation_id)
+    assert [f.code for f in stored[0].findings] == [code]
+    assert stored[0].status is ValidationStatus.FAILED
+    assert outcome.validation_report == stored[0]
+
+    # legible from the event stream alone: the code, WHO fixes it, and the report to open
+    detail = read_run_events(catalog, outcome.run_id)[0].detail
+    assert code.value in detail
+    assert stored[0].findings[0].classification.value in detail
+    assert stored[0].report_id in detail
+
+
+def test_a_FAILING_L0_still_leaves_the_project_where_the_RECORD_says_it_is(
+        catalog, monkeypatch, tmp_path) -> None:
+    """The generation row carries a `generated_project_hash` and the record names a project, so the
+    tree must exist — it is the evidence an operator opens to see why it does not build. A failed
+    build is a committed, legible outcome, not a rollback."""
+    request_id = _request(catalog, request_id="req-l0-evidence")
+    work_items = [_authored(catalog, monkeypatch, suffix="l0evidence")]
+    _inject_l0(monkeypatch, status=ValidationStatus.FAILED, findings=(
+        ValidationFinding(code=ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE,
+                          location="p.pipeline_registry", expected="a pipeline with at least one "
+                          "node", observed="0 pipelines", count=1),))
+
+    outcome = _run(catalog, request_id, work_items, tmp_path)
+
+    project = pathlib.Path(outcome.project_root)
+    assert (project / GENERATED_LOCK_FILENAME).is_file()
+    assert read_lock((project / GENERATED_LOCK_FILENAME).read_text()).generated_project_hash == \
+        outcome.generated_project_hash
+    assert catalog.execute(
+        "SELECT generated_project_hash FROM materialization_generation WHERE generation_id = %s",
+        (outcome.generation_id,)).fetchone()[0] == outcome.generated_project_hash
+    assert not [entry for entry in project.parent.iterdir() if entry.name.startswith(".")]
+
+
+def test_an_L0_THAT_COULD_NOT_RUN_never_looks_like_one_that_PASSED(
+        catalog, monkeypatch, tmp_path) -> None:
+    """THE decision, stated as a test. `l0=None` is "this deployment has no interpreter", and the
+    run is `RUN_FAILED` with a `status="error"` report carrying ZERO findings — §11.2's own
+    vocabulary for "the validation did not run", not an invented notion of "skipped".
+
+    A skipped gate that leaves a `PUBLICATION_REFUSED` terminal behind is indistinguishable from a
+    gate that passed, and the plane is append-only: that claim could never be retracted."""
+    request_id = _request(catalog, request_id="req-no-interpreter")
+    work_items = [_authored(catalog, monkeypatch, suffix="nol0")]
+
+    def _never(*_args, **_kwargs):
+        raise AssertionError("nothing may be launched when no interpreter was configured")
+
+    monkeypatch.setattr(chain, "run_l0", _never)
+
+    outcome = _run(catalog, request_id, work_items, tmp_path, l0=None)
+
+    assert outcome.stopped_at is ChainStage.VALIDATE_L0
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert outcome.lifecycle_state is RequestLifecycle.FAILED
+    assert outcome.validation_report.status is ValidationStatus.ERROR
+    assert outcome.validation_report.findings == ()          # nothing was looked at, so nothing out
+    stored = read_validation_reports(catalog, generation_id=outcome.generation_id)
+    assert (stored[0].status, stored[0].findings) == (ValidationStatus.ERROR, ())
+    assert stored[0].generated_project_hash == outcome.generated_project_hash
+    detail = read_run_events(catalog, outcome.run_id)[0].detail
+    assert "no L0 interpreter is configured" in detail
+    assert PublicationRefusalCode.CAPABILITY_UNPROVEN.value not in detail
+
+
+def test_the_interpreter_and_the_TIMEOUT_are_the_CALLERS_never_the_environments(
+        catalog, monkeypatch, tmp_path) -> None:
+    """The chain is a library; the trigger surface owns configuration. A chain that read
+    `FEATUREGEN_L0_PYTHON` itself would make every deployment's build proof depend on an
+    environment variable no record names.
+
+    It also pins what `run_l0` is handed: a directory that REALLY holds the sealed tree, AT THE
+    MOMENT OF THE CALL. That timing is the whole assertion — the tree is validated at the staging
+    sibling and only then moved to the project's own path, so a check made after the chain returned
+    would look at a path that no longer exists and pass or fail for the wrong reason. A chain that
+    handed L0 a path nothing had materialized would raise `ValueError` rather than prove anything,
+    and one that validated the tree AFTER moving it would leave the failure path unable to clean
+    up; the lock is therefore read inside the seam."""
+    seen: dict = {}
+    request_id = _request(catalog, request_id="req-config")
+    work_items = [_authored(catalog, monkeypatch, suffix="config")]
+
+    def _capture(root, **kwargs):
+        lock = pathlib.Path(root) / GENERATED_LOCK_FILENAME
+        seen.update(kwargs, root=root, sealed_here=lock.is_file(),
+                    hash_on_disk=read_lock(lock.read_text()).generated_project_hash)
+        return _verdict(root, generation_id=kwargs["generation_id"],
+                        environment_id=kwargs["environment_id"], report_id=kwargs["report_id"],
+                        clock=kwargs["clock"])
+
+    monkeypatch.setattr(chain, "run_l0", _capture)
+    configured = L0Interpreter(python_executable="/opt/l0/bin/python", timeout_seconds=17.5,
+                               env={"PYSPARK_PYTHON": "/opt/l0/bin/python"})
+
+    outcome = _run(catalog, request_id, work_items, tmp_path, l0=configured)
+
+    assert seen["python_executable"] == "/opt/l0/bin/python"
+    assert seen["timeout_seconds"] == 17.5
+    assert seen["env"] == {"PYSPARK_PYTHON": "/opt/l0/bin/python"}
+    assert seen["environment_id"] == INVENTORY.environment_id
+    assert seen["generation_id"] == outcome.generation_id
+    assert seen["sealed_here"] is True
+    assert seen["hash_on_disk"] == outcome.generated_project_hash
+    # …and the tree L0 proved is the one the record names, moved into place afterwards.
+    assert pathlib.Path(seen["root"]) != pathlib.Path(outcome.project_root)
+    assert read_lock((pathlib.Path(outcome.project_root) / GENERATED_LOCK_FILENAME).read_text()
+                     ).generated_project_hash == seen["hash_on_disk"]
+
+
+def test_the_chain_calls_the_REAL_run_l0_and_an_interpreter_without_kedro_proves_NOTHING(
+        catalog, monkeypatch, tmp_path) -> None:
+    """Nothing is injected here: the chain launches the REAL `run_l0` against `sys.executable`,
+    which genuinely does not have kedro, over the REAL rendered project.
+
+    That is the whole point — it proves the chain's L0 call is the module's own function and not a
+    seam every test replaces, and it proves a run whose build was not proven cannot reach the
+    success-shaped terminal. It needs no venv, which is why it belongs in the collected suite;
+    proving that the project DOES build under a real kedro is `l0_gate.py`'s job."""
+    if importlib.util.find_spec("kedro") is not None:
+        pytest.skip("this interpreter HAS kedro; the subject of this test is one that does not")
+    request_id = _request(catalog, request_id="req-real-l0")
+    work_items = [_authored(catalog, monkeypatch, suffix="reall0")]
+
+    outcome = _run(catalog, request_id, work_items, tmp_path)
+
+    assert chain.run_l0.__module__ == "featuregen.materialize.validation"
+    assert outcome.stopped_at is ChainStage.VALIDATE_L0
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert outcome.validation_report.status is ValidationStatus.FAILED
+    assert [f.code for f in outcome.validation_report.findings] == \
+        [ValidationFindingCode.PROJECT_DOES_NOT_BUILD]
+    assert outcome.validation_report.findings[0].classification is FindingClass.RENDERER_DEFECT
+
+
+def test_a_replayed_run_reports_the_RECORDED_build_proof(catalog, monkeypatch, tmp_path) -> None:
+    """`stopped_at` and `refusal` stay `None` on a replay because neither is durable — the report
+    IS, so reading it back is a reading rather than a reconstruction. A re-delivered queue job that
+    lost the build proof would invite a caller to re-drive a run whose project never built."""
+    request_id = _request(catalog, request_id="req-replay-l0")
+    work_items = [_authored(catalog, monkeypatch, suffix="replayl0")]
+    _inject_l0(monkeypatch, status=ValidationStatus.FAILED, findings=(
+        ValidationFinding(code=ValidationFindingCode.PROJECT_DOES_NOT_BUILD, location="p",
+                          expected="importable", observed="SyntaxError", count=1),))
+    first = _run(catalog, request_id, work_items, tmp_path)
+
+    again = _run(catalog, request_id, work_items, tmp_path)
+
+    assert again.replayed is True
+    assert again.stopped_at is None
+    assert again.terminal_event is RunEventKind.RUN_FAILED
+    assert again.validation_report == first.validation_report
+
+
+def test_a_run_refused_before_the_project_exists_carries_NO_build_proof(
+        catalog, monkeypatch, tmp_path) -> None:
+    """A refusal before rendering has no project to validate, and a report is a claim about one."""
+    request_id = _request(catalog, request_id="req-nospine-l0")
+    work_item_id = _authored(catalog, monkeypatch, suffix="nospinel0")
+
+    outcome = _run(catalog, request_id, [work_item_id], tmp_path, spine=None)
+
+    assert outcome.stopped_at is ChainStage.COMPILE
+    assert outcome.validation_report is None
+    assert catalog.execute("SELECT count(*) FROM pipeline_validation_report").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("injected",
-                         ["record_compiled_artifact", "append_run_event", "materialize_to"])
+                         ["record_compiled_artifact", "append_run_event", "materialize_to",
+                          "record_validation_report"])
 def test_the_commit_is_ALL_OR_NOTHING(ready, catalog, monkeypatch, injected) -> None:
     """The commit block must be atomic, not merely ordered — and on the runtime this chain will be
     driven from, ordering alone is not enough.
@@ -356,7 +636,14 @@ def test_the_commit_is_ALL_OR_NOTHING(ready, catalog, monkeypatch, injected) -> 
     `record_compiled_artifact` is injected as well as read back elsewhere because it is a WRITE
     ADDED to an existing atomic block: a writer that opened its own transaction (or committed on
     the autocommit connection) would leave a compiled artifact for a generation that was rolled
-    back — an FK-orphan claim that a compile happened, on the one table nothing can delete from."""
+    back — an FK-orphan claim that a compile happened, on the one table nothing can delete from.
+
+    `record_validation_report` is the same hazard one step later, and its table is append-only too
+    (1034's guard): a build proof that survived a rolled-back generation would be a verdict about a
+    project the record does not contain. It is also the injection that pins the tree ORDER — L0
+    needs a materialized project, so the tree is now written before the terminal is chosen, and it
+    is written to the sibling and moved into place LAST so that a failure here still leaves nothing
+    at the project's own path."""
     request_id, work_items, root = ready
     monkeypatch.setattr(chain, injected,
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("write refused")))
@@ -369,6 +656,7 @@ def test_the_commit_is_ALL_OR_NOTHING(ready, catalog, monkeypatch, injected) -> 
     assert catalog.execute("SELECT count(*) FROM group_binding").fetchone()[0] == 0
     assert catalog.execute(
         "SELECT count(*) FROM materialization_compiled_artifact").fetchone()[0] == 0
+    assert catalog.execute("SELECT count(*) FROM pipeline_validation_report").fetchone()[0] == 0
     assert read_request(catalog, request_id=request_id).lifecycle_state is \
         RequestLifecycle.ACCEPTED
     assert not list(pathlib.Path(root).iterdir())
@@ -428,15 +716,21 @@ def test_the_chain_can_never_append_PUBLISHED() -> None:
     `MaterializationRunEvent.__post_init__` COERCES `event_kind` (`control_plane.py:238`), so
     `event_kind="PUBLISHED"` produces the real terminal member and a guard that only inspected
     attribute access would stay green while the plane recorded a lie. Subscript, call and `getattr`
-    are the three ways to reach a member through a name the AST cannot resolve."""
+    are the three ways to reach a member through a name the AST cannot resolve.
+
+    Task 6 widened the permitted set by exactly ONE — `RUN_FAILED`, the terminal a run whose build
+    was not proven ends on. The assertion stays an EQUALITY over the whole set rather than a
+    "`PUBLISHED` is absent" check, so every future widening is a deliberate edit here.
+    """
     tree = ast.parse(inspect.getsource(chain))
     members = {member.name for member in RunEventKind}
+    permitted = {"PUBLICATION_REFUSED", "RUN_FAILED"}
 
     attributes = {node.attr for node in ast.walk(tree)
                   if isinstance(node, ast.Attribute) and _is_run_event_kind(node.value)}
-    assert attributes == {"PUBLICATION_REFUSED"}
+    assert attributes == permitted
 
-    assert _code_strings(tree) & members <= {"PUBLICATION_REFUSED"}
+    assert _code_strings(tree) & members <= permitted
 
     indirect = [
         ast.dump(node) for node in ast.walk(tree)
@@ -702,7 +996,7 @@ def test_an_empty_group_is_a_caller_error_not_a_refusal(catalog, tmp_path) -> No
         _run(catalog, request_id, [], tmp_path)
 
 
-def test_gate_2_authorizes_under_the_REQUESTS_OWN_role_snapshot(catalog, monkeypatch,
+def test_gate_2_authorizes_under_the_REQUESTS_OWN_role_snapshot(catalog, monkeypatch, l0_passes,
                                                                 tmp_path) -> None:
     """The roles are not a parameter, so this is the only thing that can decide Gate 2: the
     snapshot taken when the request was recorded (`request_store.py:182-184` — a run is judged
