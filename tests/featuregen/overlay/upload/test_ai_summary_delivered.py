@@ -97,9 +97,17 @@ def test_relevance_scoring_reads_it():
 def test_the_input_contract_version_was_bumped(monkeypatch):
     """`_feature_schema_version` is stamped on the immutable llm_call so a reader knows what shape
     egressed. Adding `ai_summary` to the payload while leaving it at 2 would make a v2 record
-    ambiguous — with or without summaries — defeating the reason it is stamped."""
+    ambiguous — with or without summaries — defeating the reason it is stamped.
+
+    v3 is the version THIS delivery minted, and it is still reachable on demand (semantic Task 8
+    added v4 and the D8 rollback ladder, whose whole point is that v3 does not disappear). Pinned
+    both ways: the override selects exactly v3, and the default selects the current contract."""
     monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    monkeypatch.setenv(feature_assist.FEATURE_CONTEXT_VERSION_ENV, "3")
     assert feature_assist._feature_schema_version() == 3
+    monkeypatch.delenv(feature_assist.FEATURE_CONTEXT_VERSION_ENV)
+    assert feature_assist._feature_schema_version() == (
+        feature_assist._FEATURE_CONTEXT_SCHEMA_VERSION)
 
 
 def test_the_base_contract_is_still_version_1(monkeypatch):
