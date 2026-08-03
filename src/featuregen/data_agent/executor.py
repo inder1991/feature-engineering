@@ -148,8 +148,16 @@ class DirectSqlExecutor:
         """
         physical_id = plan.binding.identity.table_id
         statement = self._dialect.render_schema_observation(plan)
+        transaction = getattr(self._conn, "transaction", None)
         try:
-            rows = self._run(plan, statement, fetch_all=True)
+            if callable(transaction):
+                # SAVEPOINT, exactly like observe_relationship: on psycopg a failed read otherwise
+                # aborts the CALLER's transaction and the typed-coverage result below would be
+                # unstorable. Plain DBAPI connections (Hive) have no transaction(); same fallback.
+                with self._conn.transaction():
+                    rows = self._run(plan, statement, fetch_all=True)
+            else:
+                rows = self._run(plan, statement, fetch_all=True)
         except Exception as exc:                      # noqa: BLE001 — any engine error is coverage
             reason = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
             logger.info("schema observation failed for %s: %s", physical_id, reason)

@@ -37,7 +37,6 @@ from featuregen.overlay.upload.glossary_reader import (
     read_glossary,
 )
 from featuregen.overlay.upload.ingest import ingest_upload
-from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,

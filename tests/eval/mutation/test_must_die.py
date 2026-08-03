@@ -144,7 +144,8 @@ RELEASE_GATE_SUITES: tuple[str, ...] = (
 #: Measured on this branch, 2026-08-03. The Task-0 record put the same seventeen at 238; the
 #: Release-A integration added 31. A DROP here is a deleted guard and must be explained, not
 #: rebaselined silently.
-RELEASE_GATE_BASELINE = 269
+RELEASE_GATE_BASELINE = 273  # rebaselined 2026-08-03: the Track-2 merge added 4 first-hop
+# cardinality tests to test_joins.py (one of the seventeen); a deliberate rise, per the gate's contract
 
 #: The suites this evaluation step owns, and their literal counts. Asserted below, like
 #: RELEASE_GATE_BASELINE — an unread literal in a test module is a claim nobody checks, and this one

@@ -105,8 +105,8 @@ def test_1052_applies_with_its_real_neighbours_and_none_of_the_unwritten_reserva
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
     assert {"1043", "1045", "1046", "1047", "1051", "1052"} <= present
-    # 1048-1050 belong to Releases B/C and are not written; 1044 landed with the Track-2 merge and is not
-    # this tree, so 1052 stands on what exists.
+    # 1048-1050 belong to Releases B/C and are not written; 1044 IS present (it landed with the
+    # Track-2 merge), so only the three reservations are asserted absent.
     assert not ({"1048", "1049", "1050"} & present)
 
 
