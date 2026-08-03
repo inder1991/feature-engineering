@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Iterable
 from dataclasses import asdict
+from datetime import UTC, datetime
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -51,6 +53,8 @@ from featuregen.overlay.upload.operational_facts import OperationalValue, read_o
 from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.semantic_binding_governance import caller_binding_actions
+
+logger = logging.getLogger(__name__)
 
 # The response contract version — bump on a breaking shape change so a client can negotiate.
 ASSET_DETAIL_VERSION = "asset-detail/v1"
@@ -69,6 +73,10 @@ _F0_SECTIONS: tuple[str, ...] = (
     # semantic Task 5: the adjudicator's reviewable second opinion for a column Pass A could not
     # settle — alternatives, closed reason/missing-context codes and any ontology-gap suggestion.
     "semantic_adjudication",
+    # semantic Task 7: Context Graph V1. A SECTION, not a route — the review killed the separate
+    # `/context` design because a second endpoint serves a snapshot this dossier's single
+    # repeatable-read transaction and `consistency_token` do not cover.
+    "context",
 )
 
 # The subject-linked LLM-audit-summaries section returns at most this many newest dispatches.
@@ -700,6 +708,54 @@ def _semantic_adjudication_section(conn: DbConn, logical_ref: str) -> dict:
     }
 
 
+def _context_section(
+    conn: DbConn, source: str, anchor: dict, logical_ref: str, roles: Iterable[str],
+) -> dict:
+    """Context Graph V1 (semantic Task 7) as ONE dossier section, assembled inside this dossier's
+    repeatable-read transaction so its bytes ride the same ``consistency_token``.
+
+    The assembled dataset profile and the current catalog-narrative revision are resolved HERE and
+    handed down, so the section reuses the SAME ``build_dataset_profile`` output feature generation
+    and retrieval consume — never a second assembly that could disagree with them. When the
+    profiles flag is off, both are simply absent and the section says so through the profile's own
+    missing-context codes rather than fabricating a blank node.
+
+    Never raises into the dossier: an assembly fault degrades to an explicit ``unavailable`` status
+    (the F0 contract), because a context tab that 500s takes the whole asset page with it."""
+    from featuregen.overlay.upload.context_graph import build_context_section
+    from featuregen.overlay.upload.dataset_profiles import build_dataset_profile, profile_payload
+    from featuregen.overlay.upload.profile_store import current_catalog_profile_revision_id
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    dataset_profile: dict | None = None
+    revision_id: str | None = None
+    try:
+        if dataset_profiles_enabled():
+            revision_id = current_catalog_profile_revision_id(conn, source)
+            table_logical_ref = logical_ref if anchor["kind"] == "table" else _table_logical_ref(
+                logical_ref)
+            assembled = build_dataset_profile(
+                conn, source=source, dataset_logical_ref=table_logical_ref,
+                catalog_profile_revision_id=revision_id)
+            dataset_profile = None if assembled is None else profile_payload(assembled)
+        return build_context_section(
+            conn, source=source, object_ref=anchor["object_ref"], kind=anchor["kind"],
+            logical_ref=logical_ref, roles=roles, now=datetime.now(UTC),
+            dataset_profile=dataset_profile, catalog_profile_revision_id=revision_id)
+    except Exception:  # noqa: BLE001 — one section must never take the dossier down
+        logger.warning("context section unavailable for %r %r", source, anchor["object_ref"],
+                       exc_info=True)
+        return {"status": "unavailable"}
+
+
+def _table_logical_ref(column_logical_ref: str) -> str:
+    """The TABLE logical ref of a COLUMN logical ref — the dataset profile is table-grain."""
+    from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+
+    source, schema, table, _column = parse_ref(column_logical_ref)
+    return normalize_ref(source, schema, table)
+
+
 def _consistency_token(body: dict) -> str:
     """A content-hash fingerprint of the assembled snapshot — the ``consistency_token`` and HTTP
     ``ETag``. Canonical JSON (sorted keys, ``default=str`` for datetimes) so the same snapshot
@@ -773,6 +829,10 @@ def build_asset_detail(
             _semantic_adjudication_section(conn, logical_ref) if is_column
             else {"status": "absent", "note": "table asset — no column adjudication"})
         built.append("semantic_adjudication")
+
+    if "context" in requested:
+        body["context"] = _context_section(conn, norm_source, anchor, logical_ref, roles)
+        built.append("context")
 
     if "relationships" in requested:
         relationships, rel_unavailable = _relationships_section(
