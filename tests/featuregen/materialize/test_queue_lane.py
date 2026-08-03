@@ -42,6 +42,8 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
     no_dsn,
 )
 
+from featuregen.materialize import queue_lane
+from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.compile.chain import L0Interpreter
 from featuregen.materialize.compile.wiring import assemble_nodes
 from featuregen.materialize.control_plane import read_run_events
@@ -63,6 +65,7 @@ from featuregen.materialize.request_store import (
     read_request,
     record_request,
 )
+from featuregen.materialize.validation import ValidationFinding, ValidationStatus
 from featuregen.runtime.observability import counters
 from featuregen.runtime.queue import (
     MATERIALIZATION_QUEUE_HANDLERS,
@@ -124,6 +127,56 @@ def _queue_row(db, request_id: str):
     return db.execute(
         "SELECT status, last_error, attempts, lease_fence FROM queue WHERE message_id = %s",
         (f"materialize:{request_id}",)).fetchone()
+
+
+def _release(db, request_id: str) -> None:
+    """Make a rescheduled message deliverable NOW — the backoff `fail_materialization` set is real
+    time, and a test must not sleep through it."""
+    db.execute("UPDATE queue SET available_at = now() - interval '1 minute' WHERE message_id = %s",
+               (f"materialize:{request_id}",))
+
+
+def _expire_lease(db, request_id: str) -> None:
+    """The state a worker that died mid-compile leaves: claimed, leased, and the lease is past."""
+    db.execute("UPDATE materialization_request SET lease_expires_at = now() - interval '1 hour' "
+               "WHERE request_id = %s", (request_id,))
+
+
+def _now():
+    return _datetime.datetime.now(tz=_datetime.UTC)
+
+
+def _boom(exc: Exception):
+    """A chain call that fails the way a dropped connection does — not a governed verdict."""
+    def _raise(*_args, **_kwargs):
+        raise exc
+
+    return _raise
+
+
+def _boom_once(exc: Exception):
+    """Fails the FIRST compile and runs the real chain afterwards — a transient fault, exactly.
+
+    Deliberately not ``monkeypatch.undo()`` between the two drains: that would also revert the
+    ``l0_passes`` fixture's injection and hand the second attempt a real ``run_l0`` against an
+    interpreter with no kedro, so the "retry succeeded" assertion would be testing the environment
+    rather than the lane.
+    """
+    real = queue_lane.compile_feature_group
+    raised = []
+
+    def _maybe(*args, **kwargs):
+        if not raised:
+            raised.append(True)
+            raise exc
+        return real(*args, **kwargs)
+
+    return _maybe
+
+
+_FINDING = ValidationFinding(
+    code=ValidationFindingCode.PROJECT_DOES_NOT_BUILD, location="pipeline_registry",
+    expected=None, observed=None, count=1)
 
 
 # ── enqueue → drain → the chain ran, and the record says so ──────────────────────────────────────
@@ -331,21 +384,127 @@ def test_an_undecodable_payload_fails_permanently_rather_than_looping(catalog, t
     assert "99" in error
 
 
-def test_a_deployment_with_no_configuration_fails_the_request_rather_than_the_TICK(
-        enqueued, catalog, monkeypatch) -> None:
-    """Configuration is resolved AFTER a claim, so an unconfigured deployment costs one idle query
-    per tick and never crashes the worker. When a job DOES arrive, the deployment's own defect is
-    recorded against the request instead of retried against a value that will not change."""
-    request, _, _ = enqueued
+def test_an_UNCONFIGURED_deployment_does_not_burn_the_request(
+        enqueued, catalog, monkeypatch, tmp_path) -> None:
+    """The failure that must not be terminal. A missing `FEATUREGEN_MATERIALIZE_*` variable is an
+    operator's five-second fix — but the request is governed and cannot be re-minted, so failing it
+    would destroy work nobody could recover. Configuration is therefore resolved BEFORE the request
+    is accepted, and its failure is retryable: the request stays `requested` behind a live queue
+    row, and the very next delivery runs it."""
+    request, _, config = enqueued
     monkeypatch.delenv("FEATUREGEN_MATERIALIZE_PROJECT_ROOT", raising=False)
     monkeypatch.delenv("FEATUREGEN_MATERIALIZE_INVENTORY", raising=False)
 
     outcome = process_materialization_once(catalog, owner="w1")
 
+    assert outcome.status == "retryable"
+    stored = read_request(catalog, request_id=request.request_id)
+    assert stored.lifecycle_state is RequestLifecycle.REQUESTED   # untouched, and still claimable
+    assert stored.lease_expires_at is None
+    status, error, _, _ = _queue_row(catalog, request.request_id)
+    assert status == "ready"                                      # a live owner, not a dead letter
+    assert "FEATUREGEN_MATERIALIZE" in error
+
+    # …and once the deployment IS configured, the same message runs. This is the assertion that
+    # makes "retryable" a claim about recovery rather than a label.
+    _release(catalog, request.request_id)
+    assert _drain(catalog, config).status == "completed"
+
+
+def test_a_TRANSIENT_fault_leaves_a_request_the_retry_can_actually_take(
+        enqueued, catalog, monkeypatch) -> None:
+    """The other half of the same property, and the one that is easy to get wrong. A retryable
+    failure that left the request `accepted` under a full-size lease would be a retry that could
+    never succeed: the redelivery reads a live claim, refuses it and dead-letters the message. So a
+    worker that gives up must RELEASE the lease it took."""
+    request, _, config = enqueued
+    monkeypatch.setattr(queue_lane, "compile_feature_group", _boom_once(ConnectionError("gone")))
+
+    outcome = _drain(catalog, config)
+
+    assert outcome.status == "retryable"
+    stored = read_request(catalog, request_id=request.request_id)
+    assert stored.lifecycle_state is RequestLifecycle.ACCEPTED
+    # RELEASED: a lease this worker still held would be `config.lease_seconds` — minutes — out.
+    assert stored.lease_expires_at - _now() < _datetime.timedelta(seconds=1)
+    assert config.lease_seconds > 60.0
+    assert _queue_row(catalog, request.request_id)[0] == "ready"
+
+    _release(catalog, request.request_id)
+    again = _drain(catalog, config)
+
+    assert again.status == "completed"
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.COMMITTED
+
+
+def test_an_EXHAUSTED_retry_budget_terminalizes_the_request(enqueued, catalog,
+                                                            monkeypatch) -> None:
+    """Releasing the lease is right while a redelivery is still coming. Once the queue has given up
+    there is no owner left at all, and a request left adoptable by a delivery that will never
+    arrive is exactly the stuck class this lane must not mint."""
+    request, _, config = enqueued
+    catalog.execute("UPDATE queue SET attempts = max_attempts - 1 WHERE message_id = %s",
+                    (f"materialize:{request.request_id}",))
+    monkeypatch.setattr(queue_lane, "compile_feature_group", _boom(ConnectionError("gone")))
+
+    outcome = _drain(catalog, config)
+
     assert outcome.status == "failed"
     assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
         RequestLifecycle.FAILED
-    assert "FEATUREGEN_MATERIALIZE" in _queue_row(catalog, request.request_id)[1]
+    assert _queue_row(catalog, request.request_id)[0] == "dead"
+
+
+def test_an_ABANDONED_claim_is_ADOPTED_once_its_lease_has_demonstrably_expired(
+        enqueued, catalog) -> None:
+    """A worker that dies mid-compile leaves `accepted` — which PROVES no run evidence exists, since
+    every plane write the chain makes is inside one transaction that ends terminal. There is
+    nothing for §3.3's evidence-reading reconciler to read, so adoption here is the retry the queue
+    was always going to perform, not a verdict about a run."""
+    request, _, config = enqueued
+    accept_request(catalog, request_id=request.request_id, lease_seconds=300)
+    _expire_lease(catalog, request.request_id)
+
+    outcome = _drain(catalog, config)
+
+    assert outcome.status == "completed"
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.COMMITTED
+    assert _queue_row(catalog, request.request_id)[0] == "done"
+
+
+def test_a_LIVE_claim_is_still_refused(enqueued, catalog) -> None:
+    """The lease is the only evidence there is that another worker is alive, so a live one is
+    conclusive: adoption is bounded to a lease that has demonstrably expired, and everything else
+    stays the reconciler's."""
+    request, _, config = enqueued
+    accept_request(catalog, request_id=request.request_id, lease_seconds=3600)
+
+    assert _drain(catalog, config).status == "unclaimable"
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.ACCEPTED
+
+
+def test_a_run_whose_BUILD_FAILED_is_not_reported_as_a_governed_refusal(
+        catalog, monkeypatch, tmp_path) -> None:
+    """Opposite facts about one run. A run that stopped at L0 was compiled, rendered and sealed and
+    then failed to BUILD — there is no governed refusal in it and `refusal` is None. Reporting it
+    as `refused` would tell an operator the catalog rejected their feature when the project simply
+    does not import."""
+    request = _recorded(catalog, request_id="req-lane-nobuild")
+    work_items = [_authored(catalog, monkeypatch, suffix="nobuild")]
+    enqueue_materialization(catalog, request, job=_job(request.request_id, work_items))
+    _inject_l0(monkeypatch, status=ValidationStatus.FAILED, findings=(_FINDING,))
+
+    outcome = _drain(catalog, _config(tmp_path))
+
+    assert outcome.status == "build_unproven"
+    assert outcome.stopped_at == "run_l0"
+    assert outcome.detail is None                       # no governed refusal to report
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.FAILED
+    assert _queue_row(catalog, request.request_id)[0] == "done"
 
 
 # ── the lease: sized, not renewed ────────────────────────────────────────────────────────────────

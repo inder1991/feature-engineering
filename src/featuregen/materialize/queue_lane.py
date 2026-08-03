@@ -38,13 +38,15 @@ returning — a raise records nothing, so a request left ``accepted`` would be i
 could account for. On every returning path the handler reads the chain's outcome and writes no
 lifecycle at all.
 
-**THE LEASE, and why it is sized rather than renewed.** A compile now includes an L0 subprocess that
-runs INSIDE the chain's commit transaction (``chain._commit``), and that transaction has already
-UPDATEd ``materialization_request`` to ``running`` — so it holds a row lock on the exact row a
-renewal would have to touch. A renewer on a second connection would block on that lock until the
-transaction committed, i.e. precisely through the window a renewal exists to cover; a renewer on
-THIS connection cannot run at all, because the connection is inside the subprocess call. Mid-compile
-renewal is therefore not a policy this lane declined — it is structurally unavailable.
+**THE LEASE, and why it is sized rather than renewed.** The one stage of a compile whose duration is
+open-ended is the L0 build proof, and it runs INSIDE the chain's commit transaction
+(``chain._commit``) — a transaction that has already UPDATEd ``materialization_request`` to
+``running``, so it holds a row lock on the exact row a renewal would have to touch. A renewer on a
+second connection would block on that lock until the transaction committed, i.e. precisely through
+the window a renewal exists to cover; a renewer on THIS connection cannot run at all, because the
+connection is inside the subprocess call. (Renewal is available during the EARLIER stages, which are
+outside that transaction — but those are the bounded ones, so it would be available exactly where it
+is not needed.) Mid-compile renewal is therefore not a policy this lane declined.
 
 What IS available is a bound. The one unbounded-looking part of a compile is the build proof, and
 its duration is configured (``L0Interpreter.timeout_seconds``, no default, by Task 6's decision), so
@@ -56,7 +58,14 @@ request's (so §3.3's reconciler does not adopt one).
 And if a lease expires anyway, nothing silent happens. ``accept_request`` and ``advance_lifecycle``
 are conditional UPDATEs naming the states they are legal from, so a reconciler that tried to adopt a
 live request would block on the chain's row lock and then match no row — a loud refusal, not a
-double write. The lane adds the third guard: it refuses to drive a request it did not itself accept.
+double write. The lane adds the third guard: it drives a request it did not itself accept ONLY when
+that request is ``accepted`` with a demonstrably EXPIRED lease, which proves no run evidence exists
+(:func:`_adoptable`); anything else is refused to plan §3.3's reconciler.
+
+**A LEASE IS RELEASED WHEN A WORKER GIVES UP.** A retryable failure that left the request leased
+would be a retry that could never succeed — the redelivery would read a live claim and refuse it. So
+:func:`_retryable` expires this worker's lease, and the next delivery adopts it. That, plus adoption,
+is what makes "retryable" a true word in this lane rather than a label on a dead end.
 
 **PublishStepMissing is classified, not crashed.** It is a statement about the PLATFORM — an
 operator ingesting one passing probe attestation flips every run of this chain into it — so it fails
@@ -78,6 +87,7 @@ import psycopg
 from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.materialize.codes import MaterializationRefused
 from featuregen.materialize.compile.chain import (
+    ChainStage,
     CompiledGroup,
     L0Interpreter,
     NodeAssembler,
@@ -152,6 +162,13 @@ PAYLOAD_VERSION = 1
 #: read a request row and resolve a configuration, and no longer, so a worker that dies in that
 #: window releases the job promptly.
 _BOOTSTRAP_LEASE_SECONDS = 60.0
+
+#: The lease a worker leaves behind when it GIVES UP a request it had claimed — long enough to be a
+#: positive duration (``request_store`` refuses zero: "a lease must have a positive duration"), short
+#: enough that the redelivery which follows a backoff finds it expired and adoptable. Releasing a
+#: lease by expiring it is the only release migration 1053 permits: an ``accepted`` row must HAVE
+#: one, so "nobody is working this" cannot be spelled as a null.
+_RELEASED_LEASE_SECONDS = 0.001
 
 #: Everything a compile does APART from the build proof: resolve, admit, compile every expression,
 #: authorize, derive the contract, plan, bind, render, seal and write the tree. Bounded by the DB
@@ -416,10 +433,19 @@ def enqueue_materialization(
     guarantee the formula lane gets from a content-hashed work-item row, held here by the queue row
     itself — this lane may add no table.
 
-    Partitioned by the LOGICAL GROUP, not the request: ``claim_materialization`` skips a partition
-    that already has an in-flight lease, so two requests for one group compile one at a time.
-    §10.1 writes one binding per logical name and publication is atomic per group, so running them
-    concurrently would have them race for the same binding row.
+    Partitioned by the LOGICAL GROUP, not the request, because §10.1 writes one ``group_binding``
+    per logical name and publication is atomic per group.
+
+    **What that partition key actually delivers, exactly.** ``queue_one_inflight_per_partition``
+    (``runtime/ddl.py:52``) is a UNIQUE partial index on ``(partition_key) WHERE status='leased'``,
+    so while one job of a group is leased the database itself refuses a second — the claim's
+    ``NOT IN`` subquery is an optimization and the index is the guarantee. What it does NOT deliver
+    is mutual exclusion across a lease EXPIRY: once ``reclaim_stuck_queue`` returns an overrun row
+    to ``ready``, a different request for the same group is claimable and can compile concurrently
+    with the first. That case degrades LOUDLY rather than silently — the two runs have different
+    derived generation ids, so they collide on ``record_group_binding``'s unique logical name and
+    one transaction rolls back whole — but it is a collision, not an exclusion, and the sizing of
+    the lease is what keeps it rare.
     """
     if job.request_id != request.request_id:
         raise ValueError(
@@ -542,8 +568,22 @@ def process_materialization_once(
 ) -> MaterializationLaneOutcome:
     """Claim one materialization job, compile it, and record what happened.
 
-    ``config`` defaults to :func:`lane_config_from_env` and is resolved only AFTER a claim, so a
-    deployment that configures nothing pays one query per tick.
+    THE ORDER OF THE FIRST FOUR STEPS IS THE RECOVERABILITY DESIGN, and each one is placed where it
+    is because of what a failure there leaves behind:
+
+    1. **claim** under a short bootstrap lease — nothing else is known yet.
+    2. **decode** the payload. A payload nothing can read will never read, so this is permanent —
+       and it happens before any request is touched, because a garbled payload may not even name a
+       real request.
+    3. **resolve the configuration** — BEFORE accepting, and classified RETRYABLE. A deployment
+       missing ``FEATUREGEN_MATERIALIZE_*`` is an operator's five-second fix, and a request left at
+       ``requested`` behind a live queue row still has a durable owner that will drive it once the
+       variable is set. Accepting first and then failing on configuration would burn every arriving
+       request into a TERMINAL ``failed`` that no fix can recover.
+    4. **size the queue lease** to the now-known budget, before any request write. A lost fence
+       here means another worker owns the row and this one has changed nothing at all.
+
+    Only then is the request read and claimed.
     """
     claim = claim_materialization(conn, owner=owner, lease_seconds=_BOOTSTRAP_LEASE_SECONDS)
     if claim is None:
@@ -554,6 +594,22 @@ def process_materialization_once(
     try:
         job = decode_job(claim.payload)
         request_id = job.request_id
+    except (ValueError, TypeError) as exc:
+        return _deterministic_failure(conn, claim, None, accepted=False, status="failed",
+                                      error=f"{type(exc).__name__}: {exc}")
+    try:
+        resolved = lane_config_from_env() if config is None else config
+    except (ValueError, OSError) as exc:
+        # NOT deterministic in the sense that matters: the job is fine and the catalog is fine, and
+        # the next attempt runs against whatever the operator sets. `OSError` is included because
+        # `load_inventory` deliberately does not translate "the operator pointed at a path that is
+        # not there" into a malformed declaration.
+        return _retryable(conn, claim, request_id, accepted=False,
+                          error=f"the materialization lane is not configured: {exc}")
+    if not renew_materialization(conn, claim, lease_seconds=resolved.lease_seconds):
+        return _stale(claim, request_id)
+
+    try:
         request = read_request(conn, request_id=request_id)
         if request is None:
             raise ValueError(
@@ -561,20 +617,13 @@ def process_materialization_once(
                 f"job is enqueued, so a job naming none can only be a caller that assembled the "
                 f"trigger wrongly — and no retry will make the row appear")
         if request.lifecycle_state is RequestLifecycle.REQUESTED:
-            accept_request(conn, request_id=request_id,
-                           lease_seconds=_BOOTSTRAP_LEASE_SECONDS)
+            accept_request(conn, request_id=request_id, lease_seconds=resolved.lease_seconds)
+            accepted = True
+        elif _adoptable(request):
+            _adopt(conn, request, lease_seconds=resolved.lease_seconds)
             accepted = True
         elif not request.lifecycle_state.is_terminal():
             return _unclaimable(conn, claim, request)
-
-        resolved = lane_config_from_env() if config is None else config
-        if accepted:
-            # Both leases sized ONCE, now that the budget is known — see "THE LEASE" above. The
-            # queue lease first: if its fence has already moved, this worker is not the owner and
-            # must not extend a request lease on another worker's behalf.
-            if not renew_materialization(conn, claim, lease_seconds=resolved.lease_seconds):
-                return _stale(claim, request_id)
-            renew_lease(conn, request_id=request_id, lease_seconds=resolved.lease_seconds)
 
         outcome = compile_feature_group(
             conn,
@@ -599,16 +648,101 @@ def process_materialization_once(
         return _deterministic_failure(conn, claim, request_id, accepted=accepted,
                                       status="failed", error=f"{type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001 — the lane's backstop, mirroring the formula lane
-        # NOT deterministic, so the request keeps its lease and its state: this attempt failed for
-        # a reason another one might not, and terminalizing it here would record a verdict about a
-        # feature from a dropped connection.
-        fail_materialization(conn, claim, error=f"{type(exc).__name__}: {exc}", permanent=False)
-        counters.incr("materialize.lane.retryable")
-        log("materialize.lane.retryable", level="warning", request_id=request_id,
-            error=repr(exc))
-        return MaterializationLaneOutcome("retryable", request_id, detail=repr(exc))
+        # NOT deterministic: this attempt failed for a reason another one might not, and
+        # terminalizing the request here would record a verdict about a feature from a dropped
+        # connection.
+        return _retryable(conn, claim, request_id, accepted=accepted,
+                          error=f"{type(exc).__name__}: {exc}")
 
     return _recorded(conn, claim, outcome)
+
+
+def _adoptable(request: MaterializationRequestV1) -> bool:
+    """Whether this worker may take over a request somebody else claimed.
+
+    ``accepted`` with an EXPIRED lease, and nothing else. The two halves both matter.
+
+    *Why ``accepted`` is safe to adopt without reading run evidence.* Every write the chain makes is
+    inside ``_commit``'s single transaction, which moves the request ``accepted → running →
+    committed|failed`` and commits all of it or none. So a durably-visible ``accepted`` request
+    PROVES no generation, no compiled artifact, no validation report and no run event exist —
+    there is nothing for plan §3.3's evidence-reading reconciler to read, and adoption is not a
+    verdict about a run. It is the retry the queue was always going to perform.
+
+    *Why the lease must have expired.* A live lease is the only evidence available that another
+    worker is still working, and it is the same evidence ``expired_requests`` uses. A request whose
+    lease is live stays :func:`_unclaimable`.
+
+    ``running`` is deliberately NOT adoptable. It is unreachable durably in G-1 (no reader ever
+    observes it — it exists only inside the chain's transaction), so a ``running`` row that somehow
+    appears is a state this code cannot account for, and it is exactly the case where plane evidence
+    might exist. That one is the reconciler's.
+
+    And if this rule is ever wrong — two workers driving one request — the failure is LOUD, never
+    silent: the generation id is a pure function of the request id, so the second compile collides
+    on ``materialization_generation``'s primary key and its whole transaction rolls back. It can
+    never append a second terminal event.
+    """
+    return (request.lifecycle_state is RequestLifecycle.ACCEPTED
+            and request.lease_expires_at is not None
+            and request.lease_expires_at < _datetime.datetime.now(tz=_datetime.UTC))
+
+
+def _adopt(conn: psycopg.Connection, request: MaterializationRequestV1, *,
+           lease_seconds: float) -> None:
+    """Take over an abandoned claim by taking over its LEASE — ``renew_lease``'s one real use.
+
+    There is no ``accepted → accepted`` edge and no second door into ``accepted``
+    (``advance_lifecycle`` refuses that target by design), which is correct: acceptance is the
+    original claim and it happened once. What changes hands is the lease, and ``renew_lease`` is
+    legal from exactly the two states that hold one.
+    """
+    renew_lease(conn, request_id=request.request_id, lease_seconds=lease_seconds)
+    counters.incr("materialize.lane.adopted")
+    log("materialize.lane.adopted", level="warning", request_id=request.request_id,
+        expired_at=str(request.lease_expires_at))
+
+
+def _retryable(
+    conn: psycopg.Connection,
+    claim: MaterializationQueueClaim,
+    request_id: str | None,
+    *,
+    accepted: bool,
+    error: str,
+) -> MaterializationLaneOutcome:
+    """A transient failure — reschedule the message, and RELEASE the request so the retry can work.
+
+    The release is the whole point. A redelivered message re-reads the request, and a request left
+    ``accepted`` under a full-size lease reads as "a worker is on it": :func:`_adoptable` refuses
+    it, :func:`_unclaimable` dead-letters the delivery, and the retry this branch exists to arrange
+    can never succeed. So a worker that is giving up expires its own lease.
+
+    Expiring it, rather than clearing it: migration 1053 CHECKs that an ``accepted`` row HAS a lease
+    ("'accepted' MEANS claimed-and-leased"), and a lease-less accepted row would be non-terminal and
+    invisible to ``expired_requests`` — the exact loss that table exists to prevent. An expired
+    lease says precisely the true thing: this request was claimed, and nobody is working it now.
+
+    The queue write goes FIRST and gates the release: if the fence has moved, another worker owns
+    both the row and the request, and releasing a lease it just took would be this worker reaching
+    into somebody else's claim.
+
+    When the retry BUDGET is gone the message is dead-lettered by ``fail_materialization``, and then
+    there is no owner left at all — so the request is failed rather than left adoptable by a
+    redelivery that will never come.
+    """
+    exhausted = claim.attempts >= claim.max_attempts
+    if fail_materialization(conn, claim, error=error, permanent=False) and accepted \
+            and request_id is not None:
+        if exhausted:
+            advance_lifecycle(conn, request_id=request_id, to_state=RequestLifecycle.FAILED)
+        else:
+            renew_lease(conn, request_id=request_id, lease_seconds=_RELEASED_LEASE_SECONDS)
+    status = "failed" if exhausted else "retryable"
+    counters.incr(f"materialize.lane.{status}")
+    log("materialize.lane.retryable", level="warning", request_id=request_id, error=error,
+        attempts=claim.attempts, max_attempts=claim.max_attempts, exhausted=exhausted)
+    return MaterializationLaneOutcome(status, request_id, detail=error)
 
 
 def _recorded(
@@ -619,11 +753,21 @@ def _recorded(
     A governed refusal is NOT a queue failure: the message was processed and its verdict is durable
     on the request (and, once a generation exists, on the plane). Re-delivering it could only
     produce a replay.
+
+    ``build_unproven`` and ``refused`` are separate members because they are opposite facts about
+    one run. A run that stopped at :attr:`ChainStage.VALIDATE_L0` was compiled, rendered and sealed
+    and then FAILED to build (or was never proved to) — there is no governed refusal in it at all,
+    and ``CompiledGroup.refusal`` is ``None``. A ``refused`` run's verdict is a
+    :class:`MaterializationRefused` from a governed stage. Folding the first into the second would
+    tell an operator the catalog refused their feature when the project simply does not import; the
+    recorded ``ValidationReportV1`` is where "does not build" and "was never proven" are told apart.
     """
     if outcome.replayed:
         status = "replayed"
     elif outcome.lifecycle_state is RequestLifecycle.COMMITTED:
         status = "completed"
+    elif outcome.stopped_at is ChainStage.VALIDATE_L0:
+        status = "build_unproven"
     else:
         status = "refused"
     reported = MaterializationLaneOutcome(
