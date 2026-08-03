@@ -306,6 +306,15 @@ def resolve_plan_selections(
     THREE need roles, and no more. The POPULATION (who is in the answer), the EVENT SOURCE (what is
     counted) and one DIMENSION SOURCE per distinct group-by table.
 
+    **Only the POPULATION is an explicit declaration.** ``population_table_ref`` is answered by a
+    PERSON through the population clarification — ``spine.py``'s doctrine is that the declaration
+    chooses the source and governed facts may only validate it. ``base_table_ref`` and the group-by
+    tables are NOT declarations: they are what the model picked out of a bounded retrieval set, and
+    treating a model's pick as an explicit request would hand it the source decision that §5.3
+    reserves for a serving policy or a load-bearing authority value. So they enter as CANDIDATES,
+    and the policy/authority precedence decides among them. A single candidate still resolves — as
+    ``single_eligible_candidate``, which is what it honestly is.
+
     **Only the dimension sources get a ROW decision**, deliberately. "Which row classifies this
     customer" is the question the renderer used to answer by itself, and it is the one §6.5 exists
     for. The population's and the event table's row rules are the window/eligibility machinery that
@@ -333,20 +342,23 @@ def resolve_plan_selections(
     dimension_tables = tuple(dict.fromkeys(
         _table_ref_of(dim.logical_ref) for dim in plan.dimensions))
 
-    wanted: list[tuple[DatasetNeedRole, str | None]] = [
-        (DatasetNeedRole.POPULATION, plan.population_table_ref or None),
-        (DatasetNeedRole.EVENT_SOURCE, plan.base_table_ref or None),
+    offered = tuple(ref for ref in candidate_dataset_refs if ref)
+    # (need role, the one EXPLICIT declaration if there is one, the candidates it may choose from)
+    wanted: list[tuple[DatasetNeedRole, str | None, tuple[str, ...]]] = [
+        (DatasetNeedRole.POPULATION, plan.population_table_ref or None, ()),
+        (DatasetNeedRole.EVENT_SOURCE, None,
+         tuple(dict.fromkeys(([plan.base_table_ref] if plan.base_table_ref else []) + list(offered)))),
     ]
-    wanted += [(DatasetNeedRole.DIMENSION_SOURCE, table) for table in dimension_tables]
+    wanted += [(DatasetNeedRole.DIMENSION_SOURCE, None, (table,)) for table in dimension_tables]
 
-    for need_role, explicit in wanted:
+    for need_role, explicit, candidates in wanted:
         try:
             need = DatasetNeedV1(
                 entity_id=entity, need_role=need_role,
                 serving_purpose=ServingPurpose.ANALYTICAL, execution_tier=execution_tier,
                 explicit_dataset_ref=explicit)
             outcome = select_dataset_source(
-                conn, need=need, candidate_dataset_refs=candidate_dataset_refs, roles=roles,
+                conn, need=need, candidate_dataset_refs=candidates, roles=roles,
                 recorded_by=recorded_by)
         except SelectionError:
             # A malformed ref is the CALLER's bug, not a governed refusal, and it must not turn a
