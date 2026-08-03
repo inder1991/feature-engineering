@@ -91,6 +91,7 @@ __all__ = [
     "MAX_CONTEXTUAL_DOMAIN_TERMS",
     "MAX_CONTEXTUAL_ENTITY_TERMS",
     "MAX_EVIDENCE_REFS",
+    "MAX_AUTHORING_NOTES",
     "MAX_KEYWORDS",
     "MAX_OPERANDS",
     "MAX_RELATIONSHIP_DEPENDENCIES",
@@ -176,6 +177,7 @@ MAX_CONTEXTUAL_ENTITY_TERMS = 8
 MAX_OPERANDS = 32
 MAX_RELATIONSHIP_DEPENDENCIES = 16
 MAX_EVIDENCE_REFS = 16
+MAX_AUTHORING_NOTES = 8
 
 #: Omission keys whose presence means a V1 payload rebuilt from this page would be FALSE — a
 #: shortened ``uses`` list, or a card the V1 producer would have emitted and this page withheld.
@@ -311,6 +313,20 @@ class FeatureSuggestionV2:
     time_ref: tuple[str, str] | None
     recipe: str
     recipe_parts: RecipePartsV2
+
+    # ── the remaining AUTHORED recipe declarations (deviation DEV-2-1; see the module docstring).
+    #    Verified gap 1 of the plan is that ``_suggestion`` drops the template's stage, eligibility,
+    #    near-label and "other discovery metadata" before the API response, and the plan's UI
+    #    contract requires the full PIT intent on the expanded card — but the frozen dataclass
+    #    listing has no carrier for any of them. Added here as attributed text rather than left on
+    #    the floor. They cost NO identity change: ``recipe_revision_id`` is the existing
+    #    ``template_content_hash``, which already covers every authored ``Template`` field (D5), so
+    #    editing one of these re-revisions the recipe and the suggestion revision follows.
+    recipe_stage: AttributedTextV1 | None
+    eligibility_note: AttributedTextV1 | None
+    authoring_notes: tuple[AttributedTextV1, ...]
+    output_additivity: AttributedTextV1 | None
+    point_in_time_declaration: AttributedTextV1 | None
 
     source_datasets: tuple[SuggestionSourceDatasetV1, ...]
     operands: tuple[SuggestionOperandV1, ...]
@@ -832,6 +848,20 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
             basis="template_authored", evidence=_recipe_evidence(recipe_revision),
             operational_influence=None, source_refs=recipe_refs)
 
+    def _authored(value: str | None) -> AttributedTextV1 | None:
+        """One authored recipe declaration as attributed text — or ``None`` when the SME wrote
+        none. An empty authored field is silence, not an empty value, and rendering it as one would
+        make "no eligibility note" indistinguishable from "the note is blank"."""
+        if not value:
+            return None
+        return AttributedTextV1(value=value, basis="template_authored",
+                                evidence=_recipe_evidence(recipe_revision),
+                                operational_influence=None, source_refs=recipe_refs)
+
+    notes = () if template is None else _bounded(
+        [_authored(note) for note in template.notes if note],
+        MAX_AUTHORING_NOTES, omitted, "authoring_notes")
+
     grain_source = next((source for source, ref in idea.derives_pairs if ref == entity_ref),
                         operands[0].catalog_source if operands else "")
     grain_refs = ((grain_source, entity_ref),) if entity_ref else ()
@@ -875,6 +905,11 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
         contextual_entity_terms=entity_terms, grain_refs=grain_refs,
         operation_kind=idea.operation_kind, window=idea.window, time_ref=idea.time_ref,
         recipe=render_recipe(idea, entity_ref), recipe_parts=recipe_parts(idea, entity_ref),
+        recipe_stage=_authored(None if template is None else template.stage),
+        eligibility_note=_authored(None if template is None else template.eligibility),
+        authoring_notes=notes,
+        output_additivity=_authored(None if template is None else template.additivity),
+        point_in_time_declaration=_authored(None if template is None else template.pit),
         source_datasets=_source_datasets(operands), operands=operands,
         relationship_dependencies=relationships, validation_status=idea.validation_status,
         requirements=tuple(idea.requirements),
@@ -1186,6 +1221,11 @@ def suggestion_to_json(suggestion: FeatureSuggestionV2) -> dict:
         "time_ref": _ref_json(suggestion.time_ref),
         "recipe": suggestion.recipe,
         "recipe_parts": recipe_parts_to_json(suggestion.recipe_parts),
+        "recipe_stage": _text_json(suggestion.recipe_stage),
+        "eligibility_note": _text_json(suggestion.eligibility_note),
+        "authoring_notes": [attributed_text_to_json(n) for n in suggestion.authoring_notes],
+        "output_additivity": _text_json(suggestion.output_additivity),
+        "point_in_time_declaration": _text_json(suggestion.point_in_time_declaration),
         "source_datasets": [_dataset_json(d) for d in suggestion.source_datasets],
         "operands": [_operand_json(o) for o in suggestion.operands],
         "relationship_dependencies": [_relationship_json(leg)

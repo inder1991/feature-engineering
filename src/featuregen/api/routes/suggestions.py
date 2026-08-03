@@ -296,6 +296,13 @@ class FeatureSuggestionV2Response(_Model):
     time_ref: list[str] | None
     recipe: str
     recipe_parts: RecipePartsResponse
+    #: The remaining AUTHORED recipe declarations. `null` means the SME wrote none — silence, not
+    #: an empty value.
+    recipe_stage: AttributedTextResponse | None
+    eligibility_note: AttributedTextResponse | None
+    authoring_notes: list[AttributedTextResponse]
+    output_additivity: AttributedTextResponse | None
+    point_in_time_declaration: AttributedTextResponse | None
     source_datasets: list[SuggestionSourceDatasetResponse]
     operands: list[SuggestionOperandResponse]
     relationship_dependencies: list[SuggestionRelationshipDependencyResponse]

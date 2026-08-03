@@ -320,6 +320,61 @@ def test_the_business_interpretation_is_the_recipes_own_sentence(overlay_conn, f
         assert text.value == descriptions[hit.suggestion.name]
 
 
+def test_the_remaining_authored_recipe_declarations_reach_the_card(overlay_conn, ftr_catalog):
+    """VERIFIED GAP 1, closed. ``_suggestion`` dropped the template's stage, eligibility,
+    near-label, notes, additivity and PIT rule before the API response, so no surface could show
+    what the recipe actually declares. They travel as attributed text citing the recipe revision —
+    and they cost no identity change, because ``recipe_revision_id`` already covers every authored
+    ``Template`` field (D5)."""
+    from featuregen.overlay.upload.templates import ALL_TEMPLATES
+
+    by_id = {t.id: t for t in ALL_TEMPLATES}
+    checked = 0
+    for hit in _page(overlay_conn).hits:
+        suggestion = hit.suggestion
+        template = by_id[suggestion.template_id]
+        for field, authored in (("recipe_stage", template.stage),
+                                ("eligibility_note", template.eligibility),
+                                ("output_additivity", template.additivity),
+                                ("point_in_time_declaration", template.pit)):
+            value = getattr(suggestion, field)
+            if authored:
+                assert value is not None and value.value == authored, (suggestion.name, field)
+                assert value.basis == "template_authored" and value.evidence
+                assert value.source_refs[0].startswith("recipe-revision:")
+                checked += 1
+            else:
+                # silence, not an empty string: "no eligibility note" must stay distinguishable
+                assert value is None, (suggestion.name, field)
+        assert [n.value for n in suggestion.authoring_notes] == [n for n in template.notes if n]
+    assert checked
+
+
+def test_an_authored_declaration_edit_moves_the_revision_but_not_the_identity(overlay_conn,
+                                                                             ftr_catalog,
+                                                                             monkeypatch):
+    """The identity consequence of D5, made visible: these declarations ride inside the recipe's
+    own content hash, so editing one re-revisions the card while the logical candidate — same
+    recipe, same bindings, same path — keeps its id."""
+    from featuregen.overlay.upload import recipe_grounding_context as rgc
+
+    before = {h.suggestion.template_id: h.suggestion for h in _page(overlay_conn).hits}
+    real = rgc.canonical_template
+
+    def _edited(template):
+        payload = real(template)
+        payload["template"]["pit"] = payload["template"]["pit"] + " (edited)"
+        return payload
+
+    monkeypatch.setattr(rgc, "canonical_template", _edited)
+    after = {h.suggestion.template_id: h.suggestion for h in _page(overlay_conn).hits}
+    assert set(after) == set(before)
+    for template_id, suggestion in after.items():
+        assert suggestion.suggestion_id == before[template_id].suggestion_id
+        assert suggestion.recipe_revision_id != before[template_id].recipe_revision_id
+        assert suggestion.suggestion_revision_id != before[template_id].suggestion_revision_id
+
+
 def test_nothing_authored_is_fabricated_where_the_registry_is_silent(overlay_conn, ftr_catalog):
     """Rule 12: unknown is a valid answer. No template in the baseline registry authors keywords or
     a business value, so the cards carry none — a coverage target must never force invented
@@ -577,9 +632,22 @@ def test_the_anchor_travels_on_the_collection_and_nowhere_else(overlay_conn, joi
     left = _page(overlay_conn, _MEASURE_TABLE, source=_JOIN_SOURCE)
     right = _page(overlay_conn, _ENTITY_TABLE, source=_JOIN_SOURCE)
     assert left.collection.anchor_table_ref != right.collection.anchor_table_ref
-    body = json.dumps(page_to_json(left)["hits"])
-    assert _MEASURE_TABLE in body            # operand tables DO appear — they are content
-    assert '"anchor' not in body             # ...but no anchor field rides on a suggestion
+    hits = page_to_json(left)["hits"]
+    assert _MEASURE_TABLE in json.dumps(hits)   # operand tables DO appear — they are content
+
+    def _keys(node):
+        if isinstance(node, dict):
+            yield from node
+            for value in node.values():
+                yield from _keys(value)
+        elif isinstance(node, list):
+            for item in node:
+                yield from _keys(item)
+
+    # ...but no anchor-shaped FIELD rides anywhere inside a hit, at any depth
+    assert not [key for key in _keys(hits) if key.startswith("anchor")]
+    assert {key for key in _keys(page_to_json(left)["collection"]) if key.startswith("anchor")} == {
+        "anchor_catalog_source", "anchor_table_ref", "anchor_column_ref"}
 
 
 def test_a_byte_identical_reground_does_not_churn_the_revision(overlay_conn, ftr_catalog):

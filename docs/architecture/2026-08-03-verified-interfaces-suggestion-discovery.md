@@ -369,8 +369,10 @@ chain: a compiled plan has one path.
 
 The trace is produced where the decisions are made. The current seam discards its own evidence:
 `_validate_idea` reads governed values, join outcomes and hints, mints requirements/rejections,
-and returns only `(FeatureIdea, Rejection)`. The named producer changes — **all additive, none
-moving a decision**:
+and returns only `(FeatureIdea, Rejection)`. The named producer changes — **none moving a decision**
+(amended 2026-08-03: this preamble previously said "all additive", which contradicts the P3 row
+below — replacing the 8-tuple with `TemplateCandidatesResult` is a BREAKING arity change and is
+frozen as one. P1/P2/P4/P5/P6 are additive; P3 is not):
 
 | # | Owner module | Change |
 | --- | --- | --- |
@@ -682,6 +684,42 @@ Recorded, never silently redesigned:
 - **D10 — verified UI gaps confirmed as described**: `'clean & ready'` label
   (`SuggestedFeaturesScreen.tsx:43`), `key={s.name}` identity, client-side column filtering
   (`AssetDetailScreen.tsx:697`), no generation-source badge.
+- **D12 — `suggestion_id`'s relationship-path input is the per-operand `JOIN_PATH` pin assignment**
+  (amended 2026-08-03, Task 2). [0F-10](#identity)'s bullet above still reads "ordered logical
+  relationship path", which the [0F-7 amendment](#trace) supersedes: that field is a deduplicated
+  leg SET, so two candidates whose operands swapped chains carry identical legs and an identity
+  derived from it would fuse them, breaking rule 23. The implemented input is the sorted
+  `(dependency_key, content_hash)` pairs of the trace's `JOIN_PATH` pins
+  (`suggestion_identity.join_path_assignment`). The amendment's other option — hashing
+  `trace_content_hash` itself — is deliberately NOT taken for the LOGICAL id: that hash also covers
+  the validation status and every governed read, so re-attesting a column's type would mint a
+  different candidate. It enters the REVISION instead, as 0F-10 already requires.
+- **D13 — the V2 contract module is `suggestion_contract.py`** (singular), not the
+  `suggestion_contracts.py` named in [0F-9](#v2), and Task 1's registries are
+  `overlay/upload/suggestion_taxonomy.py` + `template_discovery.py`, not the `taxonomy/*.py` paths
+  named in [0F-5](#discovery-registry)/[0F-6](#axes). The plan document governs the module names;
+  the freeze transcribed them wrongly. Identity/behaviour unaffected.
+- **D14 — `FeatureSuggestionV2` gains five ADDITIVE authored-declaration fields** (Task 2):
+  `recipe_stage`, `eligibility_note`, `authoring_notes`, `output_additivity`,
+  `point_in_time_declaration`, each `AttributedTextV1` (or a tuple) citing `recipe_revision_id`,
+  `None`/empty when the SME authored none. The plan's dataclass listing — frozen verbatim in
+  [0F-9](#v2) — has no carrier for them, yet the plan's own **verified gap 1** is that `_suggestion`
+  "drops the template's family, use cases, stage, eligibility, near-label and other discovery
+  metadata before the API response", its Task-2 checklist requires assembling "stage, eligibility,
+  near-label, notes, additivity and PIT declaration", and its UI information contract requires the
+  "Full recipe/PIT intent" on the expanded card. The listing was incomplete against its own goal;
+  the fields are added rather than the requirement dropped. **No identity change**: `recipe_revision_id`
+  is the existing `template_content_hash`, which already covers every authored `Template` field
+  (D5), so editing one of these re-revisions the recipe and the suggestion revision follows.
+  `near_label` needs no field — it is the `NEAR_LABEL` warning code.
+- **D15 — operand `classification` falls back to the AUTHORED need concept's `pit_role`.**
+  `GroundedNeedBinding.join_role`/`temporal_role` are populated only by an explicit author override
+  and are set on **0 of 605** needs at this baseline (measured), so they cannot classify anything
+  today. `measure_refs` carries every bound pair including the key and the clock, so membership
+  alone files a bound `event_timestamp` as a quantity the feature aggregates. The implemented order
+  is: the engine's typed `grain_ref`/resolved entity ref, then `time_ref`, then `grouping_refs`,
+  then `Concept.pit_role` of the template-authored `Need.concept`, then `measure_refs`, else
+  `other`. Nothing reads a column name, a data type or the column's AI-proposed concept.
 - **D11 — `EvidenceAuthorityV1` ownership handoff.** The shared ledger sketches it under
   semantic Task 1; this plan's Task 0S will land it first at
   `featuregen/contracts/evidence_axes.py`. Cross-plan rule frozen in [0F-4](#task0s): one
