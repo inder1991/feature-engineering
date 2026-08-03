@@ -1,0 +1,824 @@
+{
+  "gold_set_version": 1,
+  "gold_set_id": "semantic_context_gold_v1",
+  "owner": "semantic plan Task 10 / profile plan Task 6 (Release-A evaluation step)",
+  "purpose": "Replay/fixture gold set for the Release-A semantic-context evaluation. NO live catalog rows and NO live provider: every column below is a self-contained fixture (a CanonicalRow plus an optional GlossaryRecord sidecar) that the REAL Pass-A enrichment payload builders can be driven over.",
+  "how_the_oracle_works": "Each case names the concept a human reviewer expects (`expected_concept`) and the concept the SAME question collapses to when the disambiguating context is absent (`confusable_concept`). The replay oracle inspects the payload the pipeline ACTUALLY built for the column and answers `expected_concept` only when the `discriminator` is satisfied by that payload. The discriminator therefore measures ONE thing: does the rich (v4/flag-on) path put the disambiguating evidence in front of the model where the thin (v1/flag-off) path does not. It deliberately does NOT model provider skill -- that is Gate B.",
+  "discriminator_modes": {
+    "requires_any": "answer `expected_concept` iff at least one listed term appears in the serialized payload; otherwise `confusable_concept`.",
+    "requires_absent": "answer `expected_concept` iff NONE of the listed payload KEYS is present; otherwise `confusable_concept`. Used by the honestly-unclassified family, where the correct behaviour is to decline rather than to invent."
+  },
+  "invariants_enforced_by_the_self_check": [
+    "every `expected_concept`/`confusable_concept`/`acceptable_concepts` member is a real registry concept or the literal 'unclassified'",
+    "every `requires_any` discriminator term IS present in the rich payload and IS NOT present in the thin payload (otherwise the eval would be tautological or vacuous)",
+    "every family carries at least one `case` and at least one `counterexample`",
+    "the six named CIB/FTR witnesses are present as fixture columns",
+    "no two cases share a (table, column)"
+  ],
+  "catalog_source": "ftr",
+  "schema": "dpl_eib_compliance",
+  "table": "comp_fin_tran",
+  "table_context": {
+    "table_role": "event_fact",
+    "primary_entity": "counterparty"
+  },
+  "witnesses": [
+    "counter_party_bic",
+    "counter_party_cif_id",
+    "actual_counter_party_amt",
+    "tran_crncy",
+    "pstd_date",
+    "sol_desc"
+  ],
+  "families": [
+    {
+      "family": "bic_vs_cif",
+      "defect": "A counterparty's SWIFT bank code read as the bank's own customer-file identifier (or the reverse). The two live in DISJOINT identifier namespaces (swift_bic vs cif), so the conflation manufactures a cross-namespace join.",
+      "cases": [
+        {
+          "id": "bic_vs_cif/counter_party_bic",
+          "role": "case",
+          "witness": true,
+          "column": "counter_party_bic",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Counterparty BIC",
+            "definition": "The SWIFT Business Identifier Code of the counterparty bank on the transaction.",
+            "domain": "Compliance",
+            "declared_type": "varchar(11)",
+            "term_type": "Attribute",
+            "bian_path": "Party Reference Data Directory > Party Routing Profile",
+            "fibo_path": "fibo-fbc-fi:BankIdentifier",
+            "process_path": "Payments > Cross Border > Beneficiary Routing",
+            "synonyms": ["SWIFT Code", "BIC"],
+            "related_terms": ["Sender BIC", "Beneficiary Bank"]
+          },
+          "expected_concept": "bank_bic",
+          "acceptable_concepts": ["bank_bic"],
+          "confusable_concept": "customer_id",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["counter_party_cif_id", "Beneficiary Bank"],
+            "why": "the roster proves a SEPARATE CIF column exists on this same table, and `related_terms` names the bank leg -- neither reaches the thin payload"
+          },
+          "forbidden_concepts": ["customer_id", "customer_identifier"]
+        },
+        {
+          "id": "bic_vs_cif/counter_party_cif_id",
+          "role": "counterexample",
+          "witness": true,
+          "column": "counter_party_cif_id",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Counterparty CIF Identifier",
+            "definition": "The bank's own customer information file identifier for the counterparty.",
+            "domain": "Party",
+            "declared_type": "varchar(20)",
+            "term_type": "Dimension",
+            "bian_path": "Party Reference Data Directory > Customer Identification",
+            "fibo_path": "fibo-fnd-pty:PartyIdentifier",
+            "process_path": "Onboarding > KYC > Customer Identification",
+            "synonyms": ["CIF", "Customer Number"],
+            "related_terms": ["Customer", "Counterparty"]
+          },
+          "expected_concept": "customer_id",
+          "acceptable_concepts": ["customer_id", "customer_identifier"],
+          "confusable_concept": "bank_bic",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["counter_party_bic", "Onboarding > KYC > Customer Identification"],
+            "why": "the roster proves a SEPARATE BIC column carries the bank code; the process path is an onboarding path, not a payment-routing path"
+          },
+          "forbidden_concepts": ["bank_bic"]
+        }
+      ]
+    },
+    {
+      "family": "internal_vs_external_account",
+      "defect": "A beneficiary account reference at another institution read as an account in our own ledger. Same defect shape as BIC/CIF: internal_account and external_account are disjoint namespaces.",
+      "cases": [
+        {
+          "id": "internal_vs_external_account/benef_acct_num",
+          "role": "case",
+          "column": "benef_acct_num",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Beneficiary Account Number",
+            "definition": "The account number held at the receiving institution to which the funds are credited.",
+            "domain": "Payments",
+            "declared_type": "varchar(34)",
+            "term_type": "Attribute",
+            "bian_path": "Payment Execution > Payment Order",
+            "process_path": "Payments > Cross Border > Beneficiary Routing",
+            "fibo_path": "fibo-fbc-pas-fpas:AccountIdentifier",
+            "synonyms": ["Credit Account"],
+            "related_terms": ["Receiving Institution", "Beneficiary Bank"]
+          },
+          "expected_concept": "external_account_ref",
+          "acceptable_concepts": ["external_account_ref"],
+          "confusable_concept": "account_id",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["dr_acct_num", "Receiving Institution"],
+            "why": "the roster proves the OWN-LEDGER debit account is a different column; `related_terms` names the foreign institution"
+          },
+          "forbidden_concepts": ["account_id"]
+        },
+        {
+          "id": "internal_vs_external_account/dr_acct_num",
+          "role": "counterexample",
+          "column": "dr_acct_num",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Debit Account Number",
+            "definition": "The account on this bank's core ledger that the transaction is debited from.",
+            "domain": "Payments",
+            "declared_type": "varchar(20)",
+            "term_type": "Dimension",
+            "bian_path": "Current Account > Account Position",
+            "process_path": "Servicing > Core Ledger > Posting",
+            "fibo_path": "fibo-fbc-pas-fpas:AccountIdentifier",
+            "synonyms": ["Source Account"],
+            "related_terms": ["Core Ledger"]
+          },
+          "expected_concept": "account_id",
+          "acceptable_concepts": ["account_id", "account_identifier"],
+          "confusable_concept": "external_account_ref",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["benef_acct_num", "Servicing > Core Ledger > Posting"],
+            "why": "the roster proves the FOREIGN account is a different column; the process path is a core-ledger path"
+          },
+          "forbidden_concepts": ["external_account_ref"]
+        }
+      ]
+    },
+    {
+      "family": "amount_vs_identifier",
+      "defect": "An all-digit settlement amount read as a serial number, or a numeric core-banking serial read as money. Attributing money to an identifier column is the acceptance path for a silently wrong feature.",
+      "cases": [
+        {
+          "id": "amount_vs_identifier/actual_counter_party_amt",
+          "role": "case",
+          "witness": true,
+          "column": "actual_counter_party_amt",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Actual Counterparty Amount",
+            "definition": "The settled amount transferred to the counterparty on this transaction.",
+            "domain": "Payments",
+            "declared_type": "decimal(18,2)",
+            "term_type": "Measure",
+            "bian_path": "Payment Execution > Payment Order",
+            "fibo_path": "fibo-fnd-acc-cur:MonetaryAmount",
+            "process_path": "Payments > Settlement > Posting",
+            "synonyms": ["Settled Amount"],
+            "related_terms": ["Transaction Currency"]
+          },
+          "expected_concept": "monetary_flow",
+          "acceptable_concepts": ["monetary_flow", "monetary_amount"],
+          "confusable_concept": "internal_transaction_serial",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["tran_crncy", "Transaction Currency"],
+            "why": "a sibling currency column and a currency related-term are what make a bare decimal MONEY rather than a serial"
+          },
+          "forbidden_concepts": ["internal_transaction_serial", "transaction_id"]
+        },
+        {
+          "id": "amount_vs_identifier/tran_serial_num",
+          "role": "counterexample",
+          "column": "tran_serial_num",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Transaction Serial Number",
+            "definition": "The monotonically increasing serial the core banking system assigns to each posting.",
+            "domain": "Payments",
+            "declared_type": "decimal(18,0)",
+            "term_type": "Dimension",
+            "bian_path": "Payment Execution > Payment Order",
+            "fibo_path": "fibo-fnd-rel-rel:Reference",
+            "process_path": "Payments > Settlement > Reconciliation",
+            "synonyms": ["Posting Serial"],
+            "related_terms": ["Core Banking System"]
+          },
+          "expected_concept": "internal_transaction_serial",
+          "acceptable_concepts": ["internal_transaction_serial", "transaction_id"],
+          "confusable_concept": "monetary_flow",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Payments > Settlement > Reconciliation", "Core Banking System"],
+            "why": "a reconciliation process path and a system related-term separate a numeric SERIAL from a numeric AMOUNT"
+          },
+          "forbidden_concepts": ["monetary_flow", "monetary_amount"]
+        }
+      ]
+    },
+    {
+      "family": "branch_id_vs_description",
+      "defect": "The live conflation the concept critic exists for: a free-text branch DESCRIPTION classified as the branch IDENTIFIER, which then offers a description column as a join key.",
+      "cases": [
+        {
+          "id": "branch_id_vs_description/sol_desc",
+          "role": "case",
+          "witness": true,
+          "column": "sol_desc",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Branch Description",
+            "definition": "The free-text description of the service outlet (branch) that booked the transaction.",
+            "domain": "Party",
+            "declared_type": "varchar(200)",
+            "term_type": "Attribute",
+            "bian_path": "Party Reference Data Directory > Service Outlet",
+            "fibo_path": "fibo-fnd-org-fm:Branch",
+            "process_path": "Onboarding > Servicing > Branch Administration",
+            "synonyms": ["Branch Name"],
+            "related_terms": ["Service Outlet Identifier"]
+          },
+          "expected_concept": "branch_name",
+          "acceptable_concepts": ["branch_name"],
+          "confusable_concept": "branch_id",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["sol_id", "Service Outlet Identifier"],
+            "why": "the roster proves the branch IDENTIFIER is a different column, so this varchar(200) is the label, not the key"
+          },
+          "forbidden_concepts": ["branch_id"]
+        },
+        {
+          "id": "branch_id_vs_description/sol_id",
+          "role": "counterexample",
+          "column": "sol_id",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Service Outlet Identifier",
+            "definition": "The code identifying the service outlet that booked the transaction.",
+            "domain": "Party",
+            "declared_type": "varchar(8)",
+            "term_type": "Dimension",
+            "bian_path": "Party Reference Data Directory > Service Outlet",
+            "fibo_path": "fibo-fnd-org-fm:Branch",
+            "process_path": "Onboarding > Servicing > Branch Administration",
+            "synonyms": ["SOL ID"],
+            "related_terms": ["Branch Description"]
+          },
+          "expected_concept": "branch_id",
+          "acceptable_concepts": ["branch_id"],
+          "confusable_concept": "branch_name",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["sol_desc", "Branch Description"],
+            "why": "the roster proves the free-text label is a different column, so this varchar(8) is the key"
+          },
+          "forbidden_concepts": ["branch_name"]
+        }
+      ]
+    },
+    {
+      "family": "event_time_vs_ingestion_time",
+      "defect": "A business event date read as a system/load timestamp (or the reverse). Point-in-time correctness dies here: a feature cut on the load time leaks the future.",
+      "cases": [
+        {
+          "id": "event_time_vs_ingestion_time/pstd_date",
+          "role": "case",
+          "witness": true,
+          "column": "pstd_date",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Posted Date",
+            "definition": "The business date on which the transaction was posted to the ledger.",
+            "domain": "Payments",
+            "declared_type": "date",
+            "term_type": "Attribute",
+            "bian_path": "Payment Execution > Payment Order",
+            "fibo_path": "fibo-fnd-dt-fd:Date",
+            "process_path": "Payments > Settlement > Posting",
+            "synonyms": ["Posting Date"],
+            "related_terms": ["Value Date"]
+          },
+          "expected_concept": "booking_date",
+          "acceptable_concepts": ["booking_date", "value_date", "event_timestamp"],
+          "confusable_concept": "system_time",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["rec_load_ts", "Value Date"],
+            "why": "the roster proves the LOAD timestamp is a different column, so this date is the business event"
+          },
+          "forbidden_concepts": ["system_time", "record_date"]
+        },
+        {
+          "id": "event_time_vs_ingestion_time/rec_load_ts",
+          "role": "counterexample",
+          "column": "rec_load_ts",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Record Load Timestamp",
+            "definition": "The wall-clock time at which this row landed in the compliance extract.",
+            "domain": "Compliance",
+            "declared_type": "timestamp",
+            "term_type": "Attribute",
+            "bian_path": "Information Provider Operations > Data Sourcing",
+            "fibo_path": "fibo-fnd-dt-fd:DateTime",
+            "process_path": "Data Management > Ingestion > Landing",
+            "synonyms": ["Load Time"],
+            "related_terms": ["Extract Batch"]
+          },
+          "expected_concept": "system_time",
+          "acceptable_concepts": ["system_time", "record_date"],
+          "confusable_concept": "event_timestamp",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["pstd_date", "Data Management > Ingestion > Landing"],
+            "why": "the roster proves the BUSINESS date is a different column; the process path is an ingestion path"
+          },
+          "forbidden_concepts": ["booking_date", "event_timestamp"]
+        }
+      ]
+    },
+    {
+      "family": "currency_vs_amount",
+      "defect": "A three-character currency denomination read as the monetary value it denominates (or the reverse). Aggregating the currency column, or summing across denominations, both follow.",
+      "cases": [
+        {
+          "id": "currency_vs_amount/tran_crncy",
+          "role": "case",
+          "witness": true,
+          "column": "tran_crncy",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Transaction Currency",
+            "definition": "The ISO-4217 currency the transaction amount is denominated in.",
+            "domain": "Payments",
+            "declared_type": "char(3)",
+            "term_type": "Attribute",
+            "bian_path": "Payment Execution > Payment Order",
+            "fibo_path": "fibo-fnd-acc-cur:Currency",
+            "process_path": "Payments > Settlement > Posting",
+            "synonyms": ["Currency Code"],
+            "related_terms": ["Actual Counterparty Amount"]
+          },
+          "expected_concept": "currency_code",
+          "acceptable_concepts": ["currency_code"],
+          "confusable_concept": "monetary_flow",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["actual_counter_party_amt", "Actual Counterparty Amount"],
+            "why": "the roster proves the AMOUNT is a different column, so this char(3) denominates rather than measures"
+          },
+          "forbidden_concepts": ["monetary_flow", "monetary_amount"]
+        },
+        {
+          "id": "currency_vs_amount/tran_amt_lcy",
+          "role": "counterexample",
+          "column": "tran_amt_lcy",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Transaction Amount Local",
+            "definition": "The transaction value converted into the booking entity's reporting currency.",
+            "domain": "Payments",
+            "declared_type": "decimal(18,2)",
+            "term_type": "Measure",
+            "bian_path": "Payment Execution > Payment Order",
+            "fibo_path": "fibo-fnd-acc-cur:MonetaryAmount",
+            "process_path": "Payments > Settlement > Posting",
+            "synonyms": ["Local Amount"],
+            "related_terms": ["Reporting Currency"]
+          },
+          "expected_concept": "monetary_flow",
+          "acceptable_concepts": ["monetary_flow", "monetary_amount"],
+          "confusable_concept": "currency_code",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["tran_crncy", "Reporting Currency"],
+            "why": "the roster proves the CURRENCY is a different column, so this decimal is the value"
+          },
+          "forbidden_concepts": ["currency_code"]
+        }
+      ]
+    },
+    {
+      "family": "status_code_vs_description",
+      "defect": "A coded status and its human-readable label conflated. The label is then offered as a groupable state, and the code as prose.",
+      "cases": [
+        {
+          "id": "status_code_vs_description/tran_stat_cd",
+          "role": "case",
+          "column": "tran_stat_cd",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Transaction Status Code",
+            "definition": "The coded settlement state of the transaction at extract time.",
+            "domain": "Payments",
+            "declared_type": "char(2)",
+            "term_type": "Dimension",
+            "bian_path": "Payment Execution > Payment Status",
+            "fibo_path": "fibo-fnd-rel-rel:Reference",
+            "process_path": "Payments > Settlement > Status Reporting",
+            "synonyms": ["Status Code"],
+            "related_terms": ["Status Description"]
+          },
+          "expected_concept": "settlement_status",
+          "acceptable_concepts": ["settlement_status", "lifecycle_state"],
+          "confusable_concept": "code_label",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["tran_stat_desc", "Status Description"],
+            "why": "the roster proves the LABEL is a different column, so this char(2) is the state itself"
+          },
+          "forbidden_concepts": ["code_label", "free_text"]
+        },
+        {
+          "id": "status_code_vs_description/tran_stat_desc",
+          "role": "counterexample",
+          "column": "tran_stat_desc",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Transaction Status Description",
+            "definition": "The human-readable rendering of the coded settlement state.",
+            "domain": "Payments",
+            "declared_type": "varchar(120)",
+            "term_type": "Attribute",
+            "bian_path": "Payment Execution > Payment Status",
+            "fibo_path": "fibo-fnd-rel-rel:Reference",
+            "process_path": "Payments > Settlement > Status Reporting",
+            "synonyms": ["Status Text"],
+            "related_terms": ["Transaction Status Code"]
+          },
+          "expected_concept": "code_label",
+          "acceptable_concepts": ["code_label", "free_text"],
+          "confusable_concept": "settlement_status",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["tran_stat_cd", "Transaction Status Code"],
+            "why": "the roster proves the CODE is a different column, so this varchar(120) is its rendering"
+          },
+          "forbidden_concepts": ["settlement_status"]
+        }
+      ]
+    },
+    {
+      "family": "sensitive_party_attributes",
+      "defect": "Two failure directions, and both are graded here: a personal attribute NOT recognized as sensitive (it then flows into an egress payload), and an ordinary commercial attribute OVER-flagged as protected (a real column is then withheld for no reason).",
+      "cases": [
+        {
+          "id": "sensitive_party_attributes/cust_dob",
+          "role": "case",
+          "column": "cust_dob",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Customer Date Of Birth",
+            "definition": "The birth date recorded for the natural person on the customer file.",
+            "domain": "Party",
+            "declared_type": "date",
+            "term_type": "Attribute",
+            "bian_path": "Party Reference Data Directory > Party Profile",
+            "fibo_path": "fibo-fnd-pty-pty:PartyAttribute",
+            "process_path": "Onboarding > KYC > Identity Verification",
+            "synonyms": ["DOB"],
+            "related_terms": ["Natural Person"]
+          },
+          "expected_concept": "pii",
+          "acceptable_concepts": ["pii", "protected_attribute", "special_category"],
+          "confusable_concept": "record_date",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Onboarding > KYC > Identity Verification", "Natural Person"],
+            "why": "an identity-verification process path and a natural-person related-term are what make this DATE a person, not a timestamp"
+          },
+          "forbidden_concepts": ["record_date", "system_time", "booking_date"]
+        },
+        {
+          "id": "sensitive_party_attributes/cust_ctzn_ctry_cd",
+          "role": "case",
+          "column": "cust_ctzn_ctry_cd",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Customer Citizenship Country Code",
+            "definition": "The ISO country code of the citizenship declared by the customer.",
+            "domain": "Party",
+            "declared_type": "char(2)",
+            "term_type": "Attribute",
+            "bian_path": "Party Reference Data Directory > Party Profile",
+            "fibo_path": "fibo-fnd-plc-loc:Country",
+            "process_path": "Onboarding > KYC > Identity Verification",
+            "synonyms": ["Citizenship"],
+            "related_terms": ["Nationality"]
+          },
+          "expected_concept": "protected_attribute",
+          "acceptable_concepts": ["protected_attribute", "special_category", "residency_status"],
+          "confusable_concept": "country_code",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Nationality", "Onboarding > KYC > Identity Verification"],
+            "why": "nationality is a protected characteristic; without the related-term this reads as an ordinary geography code"
+          },
+          "forbidden_concepts": ["country_code", "geographic"]
+        },
+        {
+          "id": "sensitive_party_attributes/cust_seg_cd",
+          "role": "counterexample",
+          "column": "cust_seg_cd",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Customer Segment Code",
+            "definition": "The commercial portfolio segment the relationship is managed under.",
+            "domain": "Party",
+            "declared_type": "char(4)",
+            "term_type": "Dimension",
+            "bian_path": "Customer Relationship Management > Customer Portfolio",
+            "fibo_path": "fibo-fnd-rel-rel:Reference",
+            "process_path": "Marketing > Segmentation > Portfolio Analytics",
+            "synonyms": ["Segment"],
+            "related_terms": ["Commercial Relationship Tier"]
+          },
+          "expected_concept": "segment",
+          "acceptable_concepts": ["segment", "category_code"],
+          "confusable_concept": "protected_attribute",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Marketing > Segmentation > Portfolio Analytics", "Commercial Relationship Tier"],
+            "why": "a commercial segmentation path is what keeps a per-customer code from being over-flagged as a protected characteristic"
+          },
+          "forbidden_concepts": ["protected_attribute", "special_category", "pii"]
+        }
+      ]
+    },
+    {
+      "family": "target_leakage_labels",
+      "defect": "An outcome recorded AFTER the decision, used as an input feature. The counterexample guards the opposite error: an ordinary operational flag treated as a label and needlessly withheld.",
+      "cases": [
+        {
+          "id": "target_leakage_labels/sar_filed_flag",
+          "role": "case",
+          "column": "sar_filed_flag",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Suspicious Activity Report Filed Flag",
+            "definition": "Set when an investigation concluded and a regulatory report was filed for this transaction.",
+            "domain": "Compliance",
+            "declared_type": "char(1)",
+            "term_type": "Attribute",
+            "bian_path": "Regulatory Compliance > Case Management",
+            "fibo_path": "fibo-fnd-rel-rel:Reference",
+            "process_path": "Financial Crime > Investigation > Case Outcome",
+            "synonyms": ["SAR Flag"],
+            "related_terms": ["Investigation Outcome"]
+          },
+          "expected_concept": "outcome_label",
+          "acceptable_concepts": ["outcome_label"],
+          "confusable_concept": "boolean_flag",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Financial Crime > Investigation > Case Outcome", "Investigation Outcome"],
+            "why": "the OUTCOME process path is the only signal that this flag is set after the fact -- a leakage anchor, not an input"
+          },
+          "forbidden_concepts": ["boolean_flag"]
+        },
+        {
+          "id": "target_leakage_labels/stmt_visible_flag",
+          "role": "counterexample",
+          "column": "stmt_visible_flag",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Statement Visibility Flag",
+            "definition": "Set when the posting is shown on the customer's statement.",
+            "domain": "Payments",
+            "declared_type": "char(1)",
+            "term_type": "Attribute",
+            "bian_path": "Current Account > Account Statement",
+            "fibo_path": "fibo-fnd-rel-rel:Reference",
+            "process_path": "Servicing > Statements > Delivery Preferences",
+            "synonyms": ["Show On Statement"],
+            "related_terms": ["Customer Communication Preference"]
+          },
+          "expected_concept": "statement_visibility_flag",
+          "acceptable_concepts": ["statement_visibility_flag", "boolean_flag"],
+          "confusable_concept": "outcome_label",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Servicing > Statements > Delivery Preferences", "Customer Communication Preference"],
+            "why": "a delivery-preference path is what stops an ordinary presentation flag from being quarantined as a target"
+          },
+          "forbidden_concepts": ["outcome_label"]
+        }
+      ]
+    },
+    {
+      "family": "honestly_unclassified",
+      "defect": "Two directions again. A column with no meaning at all must come back `unclassified` rather than pattern-matched from its name; a column whose meaning only the RICH context carries must not be dismissed as opaque.",
+      "cases": [
+        {
+          "id": "honestly_unclassified/misc_fld_017",
+          "role": "case",
+          "column": "misc_fld_017",
+          "type": "unknown",
+          "glossary": null,
+          "expected_concept": "unclassified",
+          "acceptable_concepts": ["unclassified"],
+          "confusable_concept": "code_label",
+          "discriminator": {
+            "mode": "requires_absent",
+            "keys": ["business_definition", "term_name", "bian_path", "fibo_path", "process_path", "related_terms", "concept"],
+            "why": "no meaning-bearing key exists for this column in EITHER mode, so the honest answer is to decline. The measurement this makes falsifiable: the rich adapter must not FABRICATE a meaning-bearing key out of the sibling roster or the table context."
+          },
+          "forbidden_concepts": ["code_label", "free_text", "category_code"]
+        },
+        {
+          "id": "honestly_unclassified/col_a1",
+          "role": "case",
+          "column": "col_a1",
+          "type": "unknown",
+          "glossary": null,
+          "expected_concept": "unclassified",
+          "acceptable_concepts": ["unclassified"],
+          "confusable_concept": "account_id",
+          "discriminator": {
+            "mode": "requires_absent",
+            "keys": ["business_definition", "term_name", "bian_path", "fibo_path", "process_path", "related_terms", "concept"],
+            "why": "an opaque name whose leading token invites an `account`/`a1` guess; nothing in either payload licenses one"
+          },
+          "forbidden_concepts": ["account_id", "account_identifier"]
+        },
+        {
+          "id": "honestly_unclassified/chrg_amt",
+          "role": "counterexample",
+          "column": "chrg_amt",
+          "type": "unknown",
+          "glossary": {
+            "term_name": "Charge Amount",
+            "definition": "The fee levied on the payer for executing this transfer.",
+            "domain": "Payments",
+            "declared_type": "decimal(18,2)",
+            "term_type": "Measure",
+            "bian_path": "Payment Execution > Payment Order",
+            "fibo_path": "fibo-fnd-acc-cur:MonetaryAmount",
+            "process_path": "Fees And Charges > Assessment > Posting",
+            "synonyms": ["Fee"],
+            "related_terms": ["Charging Option"]
+          },
+          "expected_concept": "monetary_flow",
+          "acceptable_concepts": ["monetary_flow", "monetary_amount", "interchange"],
+          "confusable_concept": "unclassified",
+          "discriminator": {
+            "mode": "requires_any",
+            "terms": ["Fees And Charges > Assessment > Posting", "Charging Option"],
+            "why": "the fee process path is what turns an abbreviated four-letter name into a known monetary flow; without it the honest answer really is `unclassified`, and THAT is the precision cost the thin baseline pays"
+          },
+          "forbidden_concepts": []
+        }
+      ]
+    }
+  ],
+  "cross_namespace_pairs": {
+    "purpose": "The `zero BIC<->CIF candidates` release bar, and the `false cross-namespace candidates` per-family metric. Each entry names two gold columns and whether the platform may EVER offer them as an identifier-link candidate. Evaluated against the real grounding assessor, not a re-implementation.",
+    "must_not_pair": [
+      {"left": "counter_party_bic", "right": "counter_party_cif_id", "why": "swift_bic and cif are disjoint registries; equal values would be a coincidence"},
+      {"left": "counter_party_bic", "right": "dr_acct_num", "why": "swift_bic vs internal_account"},
+      {"left": "benef_acct_num", "right": "dr_acct_num", "why": "external_account vs internal_account -- the same defect one level down"},
+      {"left": "counter_party_cif_id", "right": "sol_id", "why": "cif vs branch_sol"},
+      {"left": "counter_party_cif_id", "right": "tran_serial_num", "why": "cif vs core_serial"},
+      {"left": "sol_desc", "right": "sol_id", "why": "a DESCRIPTION is never an identifier endpoint, even for the same branch"}
+    ],
+    "may_pair": [
+      {"left": "counter_party_cif_id", "right": "cust_cif_id", "why": "same cif registry, same issuer -- the positive control that proves the gate is not simply refusing everything"}
+    ]
+  },
+  "peer_catalog": {
+    "purpose": "A SECOND catalog source so cross-catalog pairing has something to pair with. Only the columns the cross-namespace controls reference.",
+    "catalog_source": "cib",
+    "table": "cust_master",
+    "table_context": {"table_role": "dimension", "primary_entity": "customer"},
+    "columns": [
+      {
+        "column": "cust_cif_id",
+        "type": "unknown",
+        "expected_concept": "customer_id",
+        "glossary": {
+          "term_name": "Customer CIF Identifier",
+          "definition": "The customer information file identifier on the customer master.",
+          "domain": "Customer",
+          "declared_type": "varchar(20)",
+          "term_type": "Dimension",
+          "bian_path": "Party Reference Data Directory > Customer Identification",
+          "fibo_path": "fibo-fnd-pty:PartyIdentifier",
+          "process_path": "Onboarding > KYC > Customer Identification",
+          "synonyms": ["CIF"],
+          "related_terms": ["Customer"]
+        }
+      },
+      {
+        "column": "cust_swift_cd",
+        "type": "unknown",
+        "expected_concept": "bank_bic",
+        "glossary": {
+          "term_name": "Customer SWIFT Code",
+          "definition": "The SWIFT Business Identifier Code of the institution where this customer banks.",
+          "domain": "Customer",
+          "declared_type": "varchar(11)",
+          "term_type": "Attribute",
+          "bian_path": "Party Reference Data Directory > Party Routing Profile",
+          "fibo_path": "fibo-fbc-fi:BankIdentifier",
+          "process_path": "Payments > Cross Border > Beneficiary Routing",
+          "synonyms": ["BIC"],
+          "related_terms": ["Beneficiary Bank"]
+        }
+      }
+    ]
+  },
+  "retrieval_questions": {
+    "purpose": "Grounded-retrieval hit rate and the thin-vs-rich retrieval lift. A hit is a retrieved object ref that appears in `expected_refs`; `forbidden_refs` are objects whose retrieval for this question is a defect, not a miss.",
+    "questions": [
+      {
+        "id": "q_settled_amount",
+        "question": "how much did we actually settle to the counterparty, and in what currency",
+        "expected_columns": ["actual_counter_party_amt", "tran_crncy"],
+        "forbidden_columns": ["tran_serial_num"]
+      },
+      {
+        "id": "q_branch_booked",
+        "question": "which branch booked the transaction",
+        "expected_columns": ["sol_id", "sol_desc"],
+        "forbidden_columns": []
+      },
+      {
+        "id": "q_counterparty_bank",
+        "question": "what bank is the counterparty at",
+        "expected_columns": ["counter_party_bic"],
+        "forbidden_columns": ["counter_party_cif_id"]
+      },
+      {
+        "id": "q_posting_date",
+        "question": "when was the transaction posted to the ledger",
+        "expected_columns": ["pstd_date"],
+        "forbidden_columns": ["rec_load_ts"]
+      },
+      {
+        "id": "q_beneficiary_account",
+        "question": "what account at the receiving institution did the money go to",
+        "expected_columns": ["benef_acct_num"],
+        "forbidden_columns": ["dr_acct_num"]
+      },
+      {
+        "id": "q_reportable_outcome",
+        "question": "which transactions ended in a filed regulatory report",
+        "expected_columns": ["sar_filed_flag"],
+        "forbidden_columns": ["stmt_visible_flag"]
+      }
+    ]
+  },
+  "unsafe_features": {
+    "purpose": "The `zero unsafe gold features accepted` release bar. Each entry is a feature a generator might propose over these columns; `unsafe` ones must never be accepted as design-checked.",
+    "cases": [
+      {
+        "id": "leak_sar_outcome",
+        "name": "sar_filed_rate_90d",
+        "derives_from": ["ftr.comp_fin_tran.sar_filed_flag"],
+        "unsafe": true,
+        "why": "derives an input feature from an outcome recorded after the decision -- textbook target leakage"
+      },
+      {
+        "id": "leak_protected_attribute",
+        "name": "citizenship_default_propensity",
+        "derives_from": ["ftr.comp_fin_tran.cust_ctzn_ctry_cd"],
+        "unsafe": true,
+        "why": "a protected characteristic used as a model input"
+      },
+      {
+        "id": "leak_pii_direct",
+        "name": "customer_dob_bucket",
+        "derives_from": ["ftr.comp_fin_tran.cust_dob"],
+        "unsafe": true,
+        "why": "a direct personal identifier used as an input"
+      },
+      {
+        "id": "unsafe_currency_sum",
+        "name": "total_amount_all_currencies",
+        "derives_from": ["ftr.comp_fin_tran.actual_counter_party_amt"],
+        "unsafe": true,
+        "why": "sums a monetary flow with no currency dimension -- the currency column exists on the same table"
+      },
+      {
+        "id": "unsafe_description_join",
+        "name": "branch_description_join_key",
+        "derives_from": ["ftr.comp_fin_tran.sol_desc"],
+        "unsafe": true,
+        "why": "uses a free-text description as a join key"
+      },
+      {
+        "id": "safe_settled_amount_by_currency",
+        "name": "settled_amount_sum_by_currency_30d",
+        "derives_from": ["ftr.comp_fin_tran.actual_counter_party_amt", "ftr.comp_fin_tran.tran_crncy"],
+        "unsafe": false,
+        "why": "the control: a monetary flow aggregated WITH its currency and a bounded window"
+      },
+      {
+        "id": "safe_branch_volume",
+        "name": "branch_transaction_count_30d",
+        "derives_from": ["ftr.comp_fin_tran.sol_id", "ftr.comp_fin_tran.pstd_date"],
+        "unsafe": false,
+        "why": "the control: a count grouped by the branch KEY over the business date"
+      }
+    ]
+  }
+}
