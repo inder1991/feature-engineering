@@ -266,3 +266,160 @@ def test_rebuild_backfill_is_idempotent_and_a_noop_for_an_unknown_source(db) -> 
         "SELECT object_ref, search_doc::text FROM graph_node WHERE catalog_source = %s "
         "ORDER BY object_ref", (_SRC,)).fetchall() == first
     assert rebuild_search_docs(db, "no-such-catalog") == 0
+
+
+# ── the BACKFILL COMMAND: what makes both surfaces reachable on live data ────────────────────────
+#
+# `rebuild_search_docs` and the `data_role` projection both had ZERO production callers, so on a
+# catalog uploaded before 1052 the new facet and the table-prose matching stayed empty until
+# somebody happened to re-upload. These pin the command that reaches them.
+
+
+def _pre_1052_catalog(db) -> None:
+    """A catalog in the shape a live deployment is in after `migrate`: the graph and the field
+    EVIDENCE are there (an older upload wrote them), and the 1052 projections are not — because the
+    code that writes them runs only during an upload."""
+    _seal()
+    _seed_graph(db)
+    _seed_evidence(db, "table_role", "bridge")
+    _seed_evidence(db, "business_context",
+                   "Owned by financial crime operations for sanctions screening.",
+                   producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED)
+    # Deliberately NOT projected: this is the state `resolve_and_project` has never run against.
+    assert _table_row(db, "data_role", "business_context") == (None, None)
+
+
+def test_the_backfill_command_fills_the_data_role_facet_and_the_prose_slots(db) -> None:
+    from featuregen.overlay.upload.backfill_projections import backfill_projections
+
+    _pre_1052_catalog(db)
+    assert _hits(db, "sanctions") == [], "the prose is unmatchable before the backfill"
+
+    reports = backfill_projections(db, sources=[_SRC])
+
+    assert [r.catalog_source for r in reports] == [_SRC]
+    assert reports[0].table_refs_projected == 1
+    assert reports[0].table_refs_failed == 0
+    assert reports[0].search_docs_rebuilt == 3      # one table node + two column nodes
+    assert reports[0].ok
+    # The FACET column the search facet reads literally, and the prose it now matches on.
+    role, context = _table_row(db, "data_role", "business_context")
+    assert role == DataRole.CROSSWALK.value
+    assert context is not None
+    assert [h.object_ref for h in _hits(db, "sanctions")] == [_TABLE_OBJECT_REF]
+
+
+def test_the_backfill_command_is_idempotent_in_what_it_projects(db) -> None:
+    """Idempotent in the PROJECTION, which is the property an operator running it twice needs. The
+    append-only decision log does gain a RESOLVED event per resolved field per run — exactly as
+    every re-upload does — so the command is safe to repeat, not free."""
+    from featuregen.overlay.upload.backfill_projections import backfill_projections
+
+    _pre_1052_catalog(db)
+    backfill_projections(db, sources=[_SRC])
+    first = db.execute(
+        "SELECT object_ref, data_role, business_context, definition, search_doc::text "
+        "FROM graph_node WHERE catalog_source = %s ORDER BY object_ref", (_SRC,)).fetchall()
+
+    second = backfill_projections(db, sources=[_SRC])
+
+    assert second[0].table_refs_failed == 0
+    assert db.execute(
+        "SELECT object_ref, data_role, business_context, definition, search_doc::text "
+        "FROM graph_node WHERE catalog_source = %s ORDER BY object_ref",
+        (_SRC,)).fetchall() == first
+
+
+def test_the_backfill_command_covers_EVERY_catalog_when_no_source_is_named(db) -> None:
+    from featuregen.overlay.upload.backfill_projections import backfill_projections
+
+    _pre_1052_catalog(db)
+    ingest_upload(db, "other", [CanonicalRow("other", "t2", "c2", "text")], actor=ACTOR, now=_NOW)
+
+    got = {r.catalog_source for r in backfill_projections(db)}
+    assert {_SRC, "other"} <= got
+
+
+def test_a_MISNAMED_source_is_refused_rather_than_reported_as_a_clean_run(db) -> None:
+    """"0 rows, exit 0" reads a typo as a completed backfill. An operator who names a source that
+    is not there has to be told."""
+    import pytest
+
+    from featuregen.overlay.upload.backfill_projections import (
+        UnknownCatalogSource,
+        backfill_projections,
+    )
+
+    _pre_1052_catalog(db)
+    with pytest.raises(UnknownCatalogSource, match="no catalog nodes"):
+        backfill_projections(db, sources=["ftrr"])
+
+
+def test_one_tables_fault_leaves_the_rest_of_the_catalog_projected(db, monkeypatch) -> None:
+    """A savepoint per ref, and the failure COUNTED — a backfill that swallowed a partial failure
+    and reported success would tell an operator the catalog is consistent when it is not."""
+    from featuregen.overlay.upload import backfill_projections as backfill
+
+    _pre_1052_catalog(db)
+
+    def _boom(conn, **_kwargs):
+        conn.execute("SELECT no_such_column_zz FROM graph_node")
+
+    monkeypatch.setattr(backfill, "resolve_and_project", _boom)
+    reports = backfill.backfill_projections(db, sources=[_SRC])
+    assert reports[0].table_refs_failed == 1
+    assert reports[0].ok is False
+    # The transaction survived the fault, so the search-document rebuild still ran.
+    assert reports[0].search_docs_rebuilt == 3
+
+
+# ── the CLI wiring (a thin adapter over the DB-tested functions above) ───────────────────────────
+
+
+def test_the_parser_accepts_the_backfill_subcommand() -> None:
+    import featuregen.__main__ as m
+
+    args = m._build_parser().parse_args(["backfill-projections", "--dsn", "postgresql:///x"])
+    assert args.command == "backfill-projections"
+    assert args.source is None
+    args = m._build_parser().parse_args(
+        ["backfill-projections", "--dsn", "postgresql:///x", "--source", "ftr"])
+    assert args.source == "ftr"
+
+
+def test_main_routes_the_backfill_subcommand(monkeypatch) -> None:
+    import featuregen.__main__ as m
+
+    seen: dict = {}
+    monkeypatch.setattr(m, "_run_backfill_projections",
+                        lambda dsn, source: seen.update(dsn=dsn, source=source) or 0)
+    assert m.main(["backfill-projections", "--dsn", "postgresql:///x", "--source", "ftr"]) == 0
+    assert seen == {"dsn": "postgresql:///x", "source": "ftr"}
+
+
+def test_the_command_exits_NONZERO_on_a_partial_failure(monkeypatch) -> None:
+    """The exit code is the only thing a deploy script reads. A partial backfill that exits 0 is a
+    silent inconsistency in the surfaces Gate A is being asked to sign off."""
+    import featuregen.__main__ as m
+    from featuregen.overlay.upload.backfill_projections import SourceBackfillReportV1
+
+    class _FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def commit(self): pass
+        def rollback(self): pass
+
+    monkeypatch.setattr(m.psycopg, "connect", lambda _dsn: _FakeConn())
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.backfill_projections.backfill_projections",
+        lambda _conn, sources=None: (
+            SourceBackfillReportV1(catalog_source="ftr", table_refs_projected=2,
+                                   table_refs_failed=1, search_docs_rebuilt=9),))
+    assert m.main(["backfill-projections", "--dsn", "postgresql:///x"]) == 1
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.backfill_projections.backfill_projections",
+        lambda _conn, sources=None: (
+            SourceBackfillReportV1(catalog_source="ftr", table_refs_projected=3,
+                                   search_docs_rebuilt=9),))
+    assert m.main(["backfill-projections", "--dsn", "postgresql:///x"]) == 0
