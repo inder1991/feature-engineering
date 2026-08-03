@@ -119,3 +119,36 @@ def test_a_governed_cross_catalog_option_carries_its_trace(db):
     assert trace.ordered_operand_roles, "the plan's ingredient bindings are the operand roles"
     assert trace_completeness_gaps(trace, validation_status=ideas[0].validation_status,
                                    requirements=ideas[0].requirements) == ()
+
+
+def test_the_cross_catalog_trace_is_reproducible_for_the_same_catalog_state(db):
+    """IDENTITY, not a build observation — the cross-catalog counterpart of the same-catalog
+    reproducibility pin.
+
+    This candidate's identity is ``plan.physical_plan_id`` (it has no recipe candidate key), and
+    the segment pin keys embed it, so the whole trace hangs off that id being a property of the
+    COMPILED PLAN and not of the run that compiled it. If a run-scoped input ever leaks into it,
+    every cross-catalog suggestion identity churns on every rebuild — silently. This fails loudly
+    instead.
+    """
+    _cross_seed(db)
+    first, _ = _governed_cross_catalog_options(
+        db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
+        now=_NOW, templates=(_txn_template(),))
+    second, _ = _governed_cross_catalog_options(
+        db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
+        now=_NOW, templates=(_txn_template(),))
+    assert len(first) == len(second) == 1
+    assert first[0].plan_envelope.physical_plan_id == second[0].plan_envelope.physical_plan_id
+    assert first[0].grounding_trace.candidate_key == second[0].grounding_trace.candidate_key
+    assert (first[0].grounding_trace.trace_content_hash
+            == second[0].grounding_trace.trace_content_hash)
+    assert (first[0].grounding_trace.ordered_relationship_path
+            == second[0].grounding_trace.ordered_relationship_path)
+    # NON-VACUOUS, and the reason this test is the tripwire for a churning plan id: that id IS the
+    # candidate key and is embedded in every segment pin key, and `candidate_key` is covered by
+    # `trace_content_hash` (pinned in test_grounding_trace.py) — so an id that absorbed a
+    # run-scoped input could not leave the assertions above green.
+    assert first[0].grounding_trace.candidate_key == first[0].plan_envelope.physical_plan_id
+    assert any(p.dependency_key.startswith(first[0].plan_envelope.physical_plan_id)
+               for p in first[0].grounding_trace.dependency_pins)

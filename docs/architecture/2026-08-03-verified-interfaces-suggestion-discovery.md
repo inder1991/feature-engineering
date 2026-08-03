@@ -338,6 +338,33 @@ content_hash)` pins, `validation_rule_content_hashes`, `read_scope_rule_content_
 **Excluded**: `current_revision_id` pins, evidence occurrence IDs, timestamps, build observations
 — those persist as scope/build provenance for currentness comparison only.
 
+### `ordered_relationship_path` is a leg SET (amended 2026-08-03, Task 2A review)
+
+The plan's wording ("the ordered logical relationship path") reads as ONE chain. It is one chain
+only when a candidate reaches ONE neighbour table. The gauntlet classifies **one path per
+cross-table operand**, so the field holds the **deduplicated union of the legs those paths
+selected, in first-traversal (operand-binding) order**. For a candidate grained on `G` with
+measures in `A` and `B` it is `legs(G→A) + legs(G→B)`, which must never be rendered as the
+traversal `G→A→G→B` — no such walk happened. Consumers:
+
+- **Rendering "which relationships did this depend on"** → read the field directly; that is what it
+  is.
+- **Rendering a chain / explaining one operand** → read that operand's own `JOIN_PATH` pin
+  (keyed by `column_dependency_key(catalog_source, object_ref)`), whose content is
+  `grounding_trace.join_path_pin_content(from_table, to_table, outcome_kind, legs)` — the endpoints,
+  the outcome and that operand's ordered leg hashes. The pin carries this as a HASH, so from the
+  trace alone a chain is **verifiable by recompute**, not directly readable; a consumer that must
+  READ chains consumes the engine's `TemplateCandidatesResult` in the same call, which V2 assembly
+  does by construction (persistence rule: it never consumes a reloaded snapshot).
+- **Identity (plan rule 23)** → the per-operand ASSIGNMENT is identity-bearing: each `JOIN_PATH`
+  pin's `(key, content_hash)` enters `trace_content_hash`, so two candidates with the same leg set
+  but different operand→chain assignments hash differently. An identity builder therefore derives
+  `suggestion_id` material from `trace_content_hash` (or from the pins), **never from
+  `ordered_relationship_path` alone** — being a set, it cannot distinguish them.
+
+The cross-catalog counterpart (`plan_envelope.plan_relationship_dependencies`) IS a single ordered
+chain: a compiled plan has one path.
+
 ### The actual decision seam (verified) and required producer changes
 
 The trace is produced where the decisions are made. The current seam discards its own evidence:

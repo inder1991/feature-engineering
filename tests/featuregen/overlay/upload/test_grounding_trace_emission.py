@@ -24,6 +24,9 @@ from featuregen.overlay.upload.feature_assist import RejectCode, _validate_idea
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.grounding_trace import (
     SuggestionDependencyClass,
+    build_trace,
+    dependency_pin,
+    join_path_pin_content,
     recompute_trace_content_hash,
     trace_completeness_gaps,
 )
@@ -333,6 +336,118 @@ def test_no_consumer_could_rerun_the_search_and_get_a_different_answer(db):
     assert [leg.to_ref[1] for leg in legs] == ["public.transactions.acct_id"]
     assert legs[0].review_status == "VERIFIED" and legs[0].safety_status == "clearing"
     assert legs[0].cardinality == "1:N"    # AS TRAVERSED (accounts -> transactions), not as stored
+
+
+# ── two neighbour tables: the leg tuple is a SET of paths, and it says so ────────────────────────
+def _two_neighbours(db):
+    """Grain ``accounts``, measures in TWO different neighbour tables — the shape that makes the
+    difference between "a path" and "the legs of several paths" observable."""
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               "is_grain) VALUES ('bank', 'public.accounts.account_id', 'column', 'accounts', "
+               "'account_id', true)")
+    for table, column in (("transactions", "amount"), ("fees", "charged")):
+        db.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+            "data_type) VALUES ('bank', %s, 'column', %s, %s, 'numeric')",
+            (f"public.{table}.{column}", table, column))
+        db.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name) "
+            "VALUES ('bank', %s, 'column', %s, 'acct_id')", (f"public.{table}.acct_id", table))
+        db.execute(
+            "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, "
+            "authority) VALUES ('bank', 'joins', %s, 'public.accounts.account_id', 'N:1', "
+            "'operational')", (f"public.{table}.acct_id",))
+    _fresh(db)
+
+
+_TWO_NEIGHBOUR_RAW = {"name": "txn_and_fee_per_acct",
+                      "derives_from": ["public.transactions.amount", "public.fees.charged"],
+                      "aggregation": "count", "grain_table": "accounts"}
+
+
+def test_two_neighbour_tables_yield_a_leg_SET_not_one_chain(db):
+    """The contract, made observable. Two operands in two DIFFERENT neighbour tables produce two
+    separate one-hop paths; the trace's tuple is their UNION, in operand-binding order. Read as a
+    chain it would claim accounts->transactions->accounts->fees, a walk that never happened — so
+    the second leg deliberately does NOT continue from the first leg's endpoint."""
+    _two_neighbours(db)
+    idea, rej = _validate(db, _TWO_NEIGHBOUR_RAW,
+                          ["public.transactions.amount", "public.fees.charged"])
+    assert rej is None
+    legs = idea.grounding_trace.ordered_relationship_path
+    assert len(legs) == 2
+    # both legs START at the grain table — two paths out of G, not one chain through it
+    assert [leg.from_ref[1] for leg in legs] == ["public.accounts.account_id"] * 2
+    assert [leg.to_ref[1] for leg in legs] == [
+        "public.transactions.acct_id", "public.fees.acct_id"]
+    assert legs[1].from_ref != legs[0].to_ref, "consecutive legs do not compose — this is a SET"
+    # operand-binding order, and no leg appears twice
+    assert len({leg.realization_content_hash for leg in legs}) == 2
+    assert _gaps(idea) == ()
+
+
+def test_the_two_neighbour_leg_set_is_deterministic(db):
+    """Well-defined content, not incidental ordering: the same catalog state yields the same tuple
+    and the same identity every time."""
+    _two_neighbours(db)
+    first, _ = _validate(db, _TWO_NEIGHBOUR_RAW,
+                         ["public.transactions.amount", "public.fees.charged"])
+    second, _ = _validate(db, _TWO_NEIGHBOUR_RAW,
+                          ["public.transactions.amount", "public.fees.charged"])
+    assert (first.grounding_trace.ordered_relationship_path
+            == second.grounding_trace.ordered_relationship_path)
+    assert (first.grounding_trace.trace_content_hash
+            == second.grounding_trace.trace_content_hash)
+
+
+def test_each_operands_own_chain_is_recoverable_from_its_join_path_pin(db):
+    """The per-operand chains are not flattened away. Each cross-table operand has its own
+    JOIN_PATH pin whose content is that operand's ordered chain — rebuilt here through the SAME
+    `join_path_pin_content` definition the gauntlet used, which is how a V2 consumer verifies which
+    path served which operand instead of re-walking the graph."""
+    _two_neighbours(db)
+    idea, _ = _validate(db, _TWO_NEIGHBOUR_RAW,
+                        ["public.transactions.amount", "public.fees.charged"])
+    for ref, table in (("public.transactions.amount", "transactions"),
+                       ("public.fees.charged", "fees")):
+        outcome = classify_join_path(db, "bank", "accounts", table, roles=())
+        chain = join_outcome_relationship_path(outcome, catalog_source="bank")
+        expected = dependency_pin(
+            dependency_class=SuggestionDependencyClass.VALIDATION, dependency_kind=gt.JOIN_PATH,
+            dependency_key=gt.column_dependency_key("bank", ref),
+            content=join_path_pin_content(from_table="accounts", to_table=table,
+                                          outcome_kind=outcome.kind, legs=chain))
+        pin = _pin(idea.grounding_trace, gt.JOIN_PATH, gt.column_dependency_key("bank", ref))
+        assert pin.content_hash == expected.content_hash, table
+        # and that operand's chain really is a SUBSET of the flat union, never something else
+        assert {leg.realization_content_hash for leg in chain} <= {
+            leg.realization_content_hash
+            for leg in idea.grounding_trace.ordered_relationship_path}
+
+
+def test_which_operand_used_which_path_is_identity_bearing(db):
+    """RULE 23. Two candidates with the SAME leg set but a different operand→chain assignment must
+    not share an identity. The flat tuple cannot tell them apart — the JOIN_PATH pins can, and they
+    are inside `trace_content_hash`, which is what an identity builder must consume."""
+    _two_neighbours(db)
+    idea, _ = _validate(db, _TWO_NEIGHBOUR_RAW,
+                        ["public.transactions.amount", "public.fees.charged"])
+    trace = idea.grounding_trace
+    joins = [p for p in trace.dependency_pins if p.dependency_kind == gt.JOIN_PATH]
+    assert len(joins) == 2
+    others = [p for p in trace.dependency_pins if p.dependency_kind != gt.JOIN_PATH]
+    # swap the two operands' chains: identical leg SET, different assignment
+    swapped = (replace(joins[0], content_hash=joins[1].content_hash),
+               replace(joins[1], content_hash=joins[0].content_hash))
+    mutated = build_trace(
+        candidate_key=trace.candidate_key,
+        ordered_operand_roles=trace.ordered_operand_roles,
+        ordered_relationship_path=trace.ordered_relationship_path,   # UNCHANGED
+        validation_status=trace.validation_status, requirements=trace.requirements,
+        dependency_pins=(*others, *swapped),
+        validation_rule_content_hashes=trace.validation_rule_content_hashes,
+        read_scope_rule_content_hashes=trace.read_scope_rule_content_hashes)
+    assert mutated.trace_content_hash != trace.trace_content_hash
 
 
 # ── rejections carry the trace that explains them ───────────────────────────────────────────────

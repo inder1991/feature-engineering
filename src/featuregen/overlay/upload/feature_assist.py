@@ -1034,13 +1034,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                 outcome = classify_join_path(conn, jcat, grain_table, to_table, roles=roles)
                 # The path the planner SELECTED, converted at its own seam and RETAINED here — the
                 # legs, in order, in the direction travelled. Nothing downstream may search again.
+                # This loop runs PER cross-table operand, so `record_path` accumulates a UNION of
+                # chains (see its docstring); THIS operand's own chain is pinned below, which is
+                # what keeps the operand→path assignment identity-bearing and verifiable.
                 legs = join_outcome_relationship_path(outcome, catalog_source=jcat)
                 trace.record_path(legs)
                 trace.pin(SuggestionDependencyClass.VALIDATION, _gt.JOIN_PATH,
                           _gt.column_dependency_key(src, d),
-                          {"from_table": grain_table, "to_table": to_table,
-                           "outcome": outcome.kind,
-                           "legs": [leg.realization_content_hash for leg in legs]})
+                          _gt.join_path_pin_content(from_table=grain_table, to_table=to_table,
+                                                    outcome_kind=outcome.kind, legs=legs))
                 if outcome.kind == JoinOutcome.NO_PATH:
                     return _reject(RejectCode.NO_JOIN_PATH, f"no join path {grain_table} -> {d}")
                 if outcome.kind == JoinOutcome.DENIED:

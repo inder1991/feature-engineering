@@ -68,6 +68,7 @@ __all__ = [
     "build_trace",
     "column_dependency_key",
     "dependency_pin",
+    "join_path_pin_content",
     "recompute_trace_content_hash",
     "relationship_leg",
     "table_dependency_key",
@@ -235,10 +236,39 @@ class GroundingDecisionTraceV1:
 
     Build it with :func:`build_trace` (which mints ``trace_content_hash``); never construct the
     hash by hand.
+
+    **``ordered_relationship_path`` is a leg SET, not a single chain.** One candidate may reach
+    measures in SEVERAL neighbour tables, and the gauntlet classifies one path per cross-table
+    operand — so the field holds the DEDUPLICATED UNION of the legs those paths selected, in
+    first-traversal (operand-binding) order. For the common one-neighbour candidate that union IS
+    the chain, in order; for a candidate grained on ``G`` with measures in ``A`` and ``B`` it is
+    ``legs(G→A) + legs(G→B)``, which must NOT be rendered as the traversal ``G→A→G→B`` — no such
+    walk happened. A renderer that wants chains reads them per operand (below); a renderer that
+    wants "which relationships did this candidate depend on" reads this field directly, which is
+    what it is for.
+
+    **Recovering the per-operand chain.** Each cross-table operand has its own ``JOIN_PATH`` pin,
+    keyed by :func:`column_dependency_key` of that operand, whose content is
+    :func:`join_path_pin_content` — the endpoints, the outcome and that operand's ordered leg
+    hashes. The pin carries that content as a HASH, so from the trace alone a chain is VERIFIABLE
+    by recompute (build the candidate content, hash it, compare) rather than directly readable; a
+    consumer that needs to READ chains consumes the engine's result in the same call, which V2
+    assembly does by construction (it never consumes a reloaded snapshot — see the persistence
+    rule). :func:`join_path_pin_content` exists so the producer and any verifier build byte-
+    identical payloads from one definition.
+
+    **Identity (plan rule 23).** The per-operand ASSIGNMENT is identity-bearing even though the
+    field above flattens it: each ``JOIN_PATH`` pin's ``(key, content_hash)`` enters
+    ``trace_content_hash``, so two candidates with the same leg set but different operand→chain
+    assignments have different trace hashes. An identity builder therefore derives
+    ``suggestion_id`` material from ``trace_content_hash`` (or from the pins), NEVER from
+    ``ordered_relationship_path`` alone — which, being a set, cannot distinguish them.
     """
 
     candidate_key: str
     ordered_operand_roles: tuple[tuple[str, str, str], ...]   # (catalog_source, object_ref, role)
+    #: The deduplicated UNION of every selected path's legs, in first-traversal order — see the
+    #: class docstring. Not a single chain when the candidate reaches two neighbour tables.
     ordered_relationship_path: tuple[SuggestionRelationshipDependencyV1, ...]
     validation_status: str
     requirements: tuple[Any, ...]           # feature_assist.Requirement (D1); typed there, not here
@@ -277,6 +307,21 @@ def dependency_pin(*, dependency_class: SuggestionDependencyClass | str, depende
         content_hash=_dependency_content_hash(dependency_kind, content, evidence),
         current_revision_id=current_revision_id,
         evidence=evidence)
+
+
+def join_path_pin_content(*, from_table: str, to_table: str, outcome_kind: str,
+                          legs: Sequence[SuggestionRelationshipDependencyV1]) -> dict[str, Any]:
+    """The content of ONE cross-table operand's ``JOIN_PATH`` pin — ONE definition.
+
+    The gauntlet hashes this when it classifies the operand's path; a consumer that wants to
+    verify which chain that operand actually used rebuilds the identical payload and compares
+    hashes. Both sides therefore read from this function and can never drift into two shapes that
+    almost agree. ``legs`` is that operand's own ordered chain — the reason the flat
+    ``ordered_relationship_path`` (a union across operands) is not the last word on which path
+    served which operand.
+    """
+    return {"from_table": from_table, "to_table": to_table, "outcome": outcome_kind,
+            "legs": [leg.realization_content_hash for leg in legs]}
 
 
 def relationship_leg(*, relationship_ref: str, relationship_kind: str,
@@ -509,11 +554,20 @@ class GroundingTraceRecorder:
             self._rules.add(code)
 
     def record_path(self, legs: Iterable[SuggestionRelationshipDependencyV1]) -> None:
-        """Append the legs of one selected path, first-seen order preserved.
+        """Add the legs of ONE selected path to the candidate's leg set, first-seen order kept.
 
-        Two operands in the same neighbour table are classified separately and select the same
-        legs; recording the duplicate would claim a traversal that happened once happened twice.
-        Which operand needed which legs stays recoverable from that operand's own JOIN_PATH pin.
+        This is called once per cross-table operand, so the accumulated tuple is a UNION of paths,
+        not one chain — see :class:`GroundingDecisionTraceV1`'s docstring, which is the contract:
+
+        * TWO OPERANDS, SAME NEIGHBOUR TABLE — the second path selects the same legs. Recording
+          them again would claim a traversal that happened once happened twice, so they dedupe.
+        * TWO OPERANDS, DIFFERENT NEIGHBOUR TABLES (grain ``G``, measures in ``A`` and ``B``) — the
+          two paths share no legs, and the result ``legs(G→A) + legs(G→B)`` is a SET of traversed
+          legs that must never be rendered as the chain ``G→A→G→B``.
+
+        Which operand needed which legs is not flattened away: it lives in that operand's own
+        JOIN_PATH pin (:func:`join_path_pin_content`) and, through the pin's content hash, in
+        ``trace_content_hash`` — so the assignment stays identity-bearing.
         """
         if not self.enabled:
             return
