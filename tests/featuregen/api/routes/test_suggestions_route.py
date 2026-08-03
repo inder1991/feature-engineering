@@ -325,6 +325,14 @@ def test_the_openapi_operation_publishes_both_contracts_and_the_typed_error(clie
     operation = spec["paths"]["/catalog/{catalog_source}/tables/{table}/suggestions"]["get"]
     parameters = {p["name"]: p for p in operation["parameters"]}
     assert set(parameters) >= {"catalog_source", "table", "max_hops", "contract_version"}
+    # THE SCOPE IS NOT NEGOTIABLE IN THE REQUEST. There is no QUERY parameter through which a
+    # caller can supply a scope key, a role list or a tenant — grounding reads the authenticated
+    # session and nothing else, so a widened scope cannot be requested, only granted. (The
+    # `x-roles` HEADER that also appears here is the platform-wide dev auth stub, off by default
+    # in production via FEATUREGEN_AUTH_STUB and owned by `deps.get_identity`, not by this route.)
+    assert not [name for name, p in parameters.items()
+                if p["in"] == "query"
+                and any(word in name for word in ("scope", "role", "tenant", "visib"))]
     version = parameters["contract_version"]["schema"]
     assert version.get("default") == 1
     assert "maximum" not in version and "exclusiveMaximum" not in version
