@@ -684,16 +684,40 @@ Recorded, never silently redesigned:
 - **D10 — verified UI gaps confirmed as described**: `'clean & ready'` label
   (`SuggestedFeaturesScreen.tsx:43`), `key={s.name}` identity, client-side column filtering
   (`AssetDetailScreen.tsx:697`), no generation-source badge.
-- **D12 — `suggestion_id`'s relationship-path input is the per-operand `JOIN_PATH` pin assignment**
-  (amended 2026-08-03, Task 2). [0F-10](#identity)'s bullet above still reads "ordered logical
-  relationship path", which the [0F-7 amendment](#trace) supersedes: that field is a deduplicated
-  leg SET, so two candidates whose operands swapped chains carry identical legs and an identity
-  derived from it would fuse them, breaking rule 23. The implemented input is the sorted
-  `(dependency_key, content_hash)` pairs of the trace's `JOIN_PATH` pins
-  (`suggestion_identity.join_path_assignment`). The amendment's other option — hashing
-  `trace_content_hash` itself — is deliberately NOT taken for the LOGICAL id: that hash also covers
-  the validation status and every governed read, so re-attesting a column's type would mint a
-  different candidate. It enters the REVISION instead, as 0F-10 already requires.
+- **D12 — `suggestion_id`'s relationship-path input is the per-operand `JOIN_PATH` LOGICAL
+  projection** (amended 2026-08-03, Task 2; revised after review). [0F-10](#identity)'s bullet above
+  still reads "ordered logical relationship path", which the [0F-7 amendment](#trace) supersedes:
+  that field is a deduplicated leg SET, so two candidates whose operands swapped chains carry
+  identical legs and an identity derived from it would fuse them, breaking rule 23.
+
+  The amendment's two suggested inputs are **both wrong for the LOGICAL id**, and the first
+  implementation shipped one of them as a defect:
+
+  - the pin's `content_hash` covers `join_path_pin_content`, whose per-leg realization content
+    includes `approved_join_fact_key`, `approved_join_status` and `edge_authority`
+    (`join_path.py:451-459`). Hashing it meant that an admin **confirming a file-declared join**
+    re-keyed every suggestion crossing it — same recipe, same columns, same endpoints, same
+    direction. Rule 23 forbids exactly this ("the logical path enters `suggestion_id`; exact
+    realization/dependency revisions enter the revision") and rule 24 separates content from
+    governance provenance;
+  - `trace_content_hash` additionally covers the validation status, the requirements and every
+    governed read, so re-attesting a column's type would mint a different logical candidate.
+
+  **Frozen construction:** for each `JOIN_PATH` pin, `dependency_key` paired with that operand's
+  ordered legs reduced to `(relationship_kind, from_ref, to_ref)`, sorted by operand
+  (`suggestion_identity.join_path_assignment`). Direction is preserved; attestation state is not.
+  Both limbs of rule 23 still hold — a different ordered path changes the leg tuple, and a swapped
+  operand→chain assignment differs because the tuple is keyed per operand. The realization hashes
+  travel in `suggestion_revision_id` via `dependency_content_hashes`. An unprojectable chain **fails
+  closed** (`UnresolvableRelationshipPath`); the candidate is withheld and counted, never falling
+  back to the physical hash.
+
+  **Producer change this requires (additive):** `GroundingDependencyPinV1` gains
+  `path_realization_hashes` — this operand's own ordered leg list, a READABLE copy of the list
+  `content_hash` already covers. Without it the chain is only verifiable-by-recompute (0F-7's own
+  wording) and cannot be projected at all. It is deliberately **absent from `_trace_payload`**: it
+  is not new content, and hashing the same facts twice would let a pin and its copy disagree.
+  Test-pinned both ways (`test_the_readable_leg_list_adds_nothing_to_the_trace_hash`).
 - **D13 — the V2 contract module is `suggestion_contract.py`** (singular), not the
   `suggestion_contracts.py` named in [0F-9](#v2), and Task 1's registries are
   `overlay/upload/suggestion_taxonomy.py` + `template_discovery.py`, not the `taxonomy/*.py` paths
