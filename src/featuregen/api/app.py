@@ -23,6 +23,7 @@ from featuregen.api.routes import (
     catalogs,
     contract,
     data_sources,
+    dataset_policies,
     entity,
     entity_map,
     features,
@@ -53,6 +54,10 @@ from featuregen.overlay.facts import register_overlay_event_types
 from featuregen.overlay.upload.contract.live_activation import startup_artifact_check
 from featuregen.overlay.upload.contract.scope_mode import scope_mode_status
 from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
+from featuregen.overlay.upload.source_selection import (
+    SOURCE_TEMPORAL_SELECTION_FLAG,
+    source_temporal_selection_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +92,32 @@ def _startup_migration_check(app: FastAPI) -> None:
         logger.warning("could not check pending migrations at startup", exc_info=True)
 
 
+def _startup_flag_dependency_check(app: FastAPI) -> None:
+    """D8 / plan §5.16: `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` DEPENDS ON
+    `FEATUREGEN_DATASET_PROFILES`, and an invalid combination fails configuration validation
+    instead of running a half-enabled path.
+
+    Two halves, both needed. The reader itself fails CLOSED — with the dependency unmet the feature
+    reports disabled and every Release-B route 404s — so no surface can accidentally opt out by
+    forgetting to check. This function is the other half: it makes the mistake LOUD at boot and
+    records it on `app.state`, because a silently-ignored flag is how an operator concludes the
+    feature is broken rather than misconfigured. It never blocks startup: the running configuration
+    is a valid one (the feature is simply off), so refusing to boot would turn a misconfiguration
+    into an outage.
+    """
+    status = source_temporal_selection_status()
+    app.state.source_temporal_selection_valid = status.configuration_valid
+    app.state.source_temporal_selection_enabled = status.enabled
+    if not status.configuration_valid:
+        logger.warning(
+            "INVALID FLAG COMBINATION: %s=%r requests source/temporal selection, but "
+            "FEATUREGEN_DATASET_PROFILES is off. The dependency is required (verified-interfaces "
+            "D8), so source/temporal selection stays DISABLED and its routes 404. Set "
+            "FEATUREGEN_DATASET_PROFILES=1 to enable it, or unset %s.",
+            SOURCE_TEMPORAL_SELECTION_FLAG, status.configured_value,
+            SOURCE_TEMPORAL_SELECTION_FLAG)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The same process bootstrap the worker and the test suite use: event schemas (idempotent)
@@ -97,6 +128,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_overlay_event_types(event_registry())
     register_overlay_config(overlay_config_from_env())
     _startup_migration_check(app)
+    _startup_flag_dependency_check(app)
     # H3c — the lightweight 3C.2 signed-gate posture signal at boot (log-only, never blocks startup): a
     # loud warning when the live cross-catalog flag is ON but the signed artifact is absent/stale/invalid,
     # so a mis-provisioned gate is visible early. The per-request admission check still enforces fail-closed.
@@ -151,6 +183,9 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # Distinct `/catalog/asset-profiles` prefix — the assets greedy `{object_ref:path}` route
     # would swallow a nested literal (see profiles.py module docstring).
     app.include_router(profiles.router)
+    # Release-B serving/temporal policies (flag-gated 404 while
+    # FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off OR its DATASET_PROFILES dependency is unmet).
+    app.include_router(dataset_policies.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
     app.include_router(readiness.router)

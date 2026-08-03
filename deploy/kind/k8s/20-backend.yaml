@@ -67,6 +67,10 @@ data:
   # Dataset/catalog semantic profiles: profile API surfaces, upload narrative part, listing
   # display names — off ⟹ every new surface 404s and existing payloads stay byte-identical.
   FEATUREGEN_DATASET_PROFILES: "0"
+  # Release-B serving/temporal policy surfaces. DEPENDS ON FEATUREGEN_DATASET_PROFILES and is
+  # FAIL-CLOSED (D8): flipping this to "1" while the line above is "0" leaves the feature DISABLED
+  # (routes still 404) and logs a loud startup warning — the dependency is enforced, not assumed.
+  FEATUREGEN_SOURCE_TEMPORAL_SELECTION: "0"
 ---
 apiVersion: apps/v1
 kind: Deployment

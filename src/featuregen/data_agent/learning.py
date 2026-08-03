@@ -29,6 +29,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
+from featuregen.overlay.upload.source_selection import (
+    SELECTION_AUTHORITY_INSUFFICIENT,
+    SELECTION_BINDING_MISSING,
+    SELECTION_POPULATION_UNDECLARED,
+    SELECTION_SOURCE_AMBIGUOUS,
+    TEMPORAL_HISTORICAL_CURRENT_ONLY,
+    TEMPORAL_MODEL_UNKNOWN,
+    TEMPORAL_SNAPSHOT_TIE,
+)
+
 
 class LearningError(ValueError):
     def __init__(self, code: str, message: str) -> None:
@@ -52,6 +63,12 @@ class RequiredAction(StrEnum):
     BIND_PHYSICAL_SOURCE = "bind_physical_source"
     CONFIRM_POPULATION = "confirm_population"
     CONFIRM_TIME_SEMANTICS = "confirm_time_semantics"
+    # Release B: the two authoring surfaces `api/routes/dataset_policies.py` ships. Named
+    # separately from CONFIRM_BUSINESS_POLICY because "declare which dataset serves this need" and
+    # "declare how this dataset stores history" are different screens, and an action a reviewer
+    # cannot locate is not actionable.
+    DECLARE_SERVING_POLICY = "declare_serving_policy"
+    DECLARE_TEMPORAL_POLICY = "declare_temporal_policy"
 
 
 #: Actionable FUNCTIONAL gaps only. A code absent from here is refused — which is how a technical
@@ -68,6 +85,13 @@ GAP_CODES: frozenset[str] = frozenset({
     "PHYSICAL_BINDING_MISSING",
     "MEASURE_DEFINITION_UNRESOLVED",
     "DIMENSION_UNRESOLVED",
+    # Release B — source and row selection. Each is a decision a person can make on a real screen;
+    # none is a technical failure or a capability limit.
+    "DATASET_SOURCE_UNRESOLVED",        # which copy serves this need
+    "DATASET_AUTHORITY_UNRESOLVED",     # which copy is authoritative enough for this tier
+    "TEMPORAL_MODEL_UNRESOLVED",        # how this dataset stores history
+    "HISTORICAL_SOURCE_UNAVAILABLE",    # nothing here holds the history the question needs
+    "SNAPSHOT_TIE_BREAK_UNDECLARED",    # which column breaks a snapshot tie
 })
 
 #: The choices a decision-maker picks between, for the gaps whose answer is a closed vocabulary.
@@ -78,6 +102,12 @@ CHOICE_VOCABULARIES: dict[str, tuple[str, ...]] = {
         "report_cutoff", "period_end_per_period", "transaction_event_time", "current_value"),
     "POPULATION_AS_OF_UNRESOLVED": (
         "membership_at_cutoff", "membership_today", "ever_a_member"),
+    # Derived from the enum, not hand-typed: adding a storage model without updating this list is
+    # the drift the `profile_vocab` vocabularies exist to prevent. `unknown` is excluded — it is
+    # the absence this gap records, so offering it as an ANSWER would let a reviewer "resolve" a
+    # gap by restating it.
+    "TEMPORAL_MODEL_UNRESOLVED": tuple(
+        m.value for m in TemporalStorageModel if m is not TemporalStorageModel.UNKNOWN),
 }
 
 
@@ -98,6 +128,14 @@ CHOICE_VOCABULARIES: dict[str, tuple[str, ...]] = {
 #:   ATTRIBUTION_OVERLAPPING_RECORDS
 #:       a DATA defect in the dimension table. Real, and someone must fix it, but it belongs to data
 #:       quality: the ontology already says what it should say.
+#:   TEMPORAL_SCD_OVERLAP  (Release B)
+#:       the SAME judgement, re-argued rather than assumed. The profile plan lists "SCD overlap"
+#:       among its closed refusal codes, and it IS one — it refuses, and it renders as a
+#:       clarification so a user is told why their question stopped. But it is not an ontology gap
+#:       for exactly the reason recorded above for ATTRIBUTION_OVERLAPPING_RECORDS: nobody is
+#:       waiting to DECIDE anything. Two history rows claiming the same key at the same instant is
+#:       a defect in the source data, and recording it here would put a "decision" in the reviewer
+#:       queue that no decision can close.
 REFUSAL_TO_GAP: dict[str, tuple[str, RequiredAction]] = {
     # The relationship was never observed, was observed for something else, or does not hold.
     "JOIN_EVIDENCE_MISSING": ("RELATIONSHIP_UNVERIFIED", RequiredAction.CONFIRM_RELATIONSHIP),
@@ -117,6 +155,35 @@ REFUSAL_TO_GAP: dict[str, tuple[str, RequiredAction]] = {
     # "Count the transactions" is not a definition until someone says WHICH transactions count.
     "ANALYSIS_NO_ELIGIBILITY_POLICY": (
         "MEASURE_DEFINITION_UNRESOLVED", RequiredAction.CONFIRM_BUSINESS_POLICY),
+
+    # ── Release B: source and row selection (profile plan Task 7) ────────────────────────────────
+    # Seven of the eight closed `SELECTION_REFUSAL_CODES` map here; TEMPORAL_SCD_OVERLAP does not,
+    # for the reason argued in the "deliberately absent" block above.
+    #
+    # Which table is the population is the decision this platform has parked longest, and it is
+    # already spelled POPULATION_UNRESOLVED — the selector reaching it from a different direction
+    # does not make it a different gap.
+    SELECTION_POPULATION_UNDECLARED: (
+        "POPULATION_UNRESOLVED", RequiredAction.CONFIRM_POPULATION),
+    SELECTION_SOURCE_AMBIGUOUS: (
+        "DATASET_SOURCE_UNRESOLVED", RequiredAction.DECLARE_SERVING_POLICY),
+    # An address nobody configured — the same gap the compile path already records, so the same
+    # code and the same action.
+    SELECTION_BINDING_MISSING: (
+        "PHYSICAL_BINDING_MISSING", RequiredAction.BIND_PHYSICAL_SOURCE),
+    # WHICH COPY IS AUTHORITATIVE is a governed classification, confirmed through the four-eyes
+    # profile flow — not something a serving policy may quietly assert.
+    SELECTION_AUTHORITY_INSUFFICIENT: (
+        "DATASET_AUTHORITY_UNRESOLVED", RequiredAction.CONFIRM_BUSINESS_POLICY),
+    TEMPORAL_MODEL_UNKNOWN: (
+        "TEMPORAL_MODEL_UNRESOLVED", RequiredAction.DECLARE_TEMPORAL_POLICY),
+    # "This table keeps no history" is a fact about the data; the DECISION is which dataset does.
+    TEMPORAL_HISTORICAL_CURRENT_ONLY: (
+        "HISTORICAL_SOURCE_UNAVAILABLE", RequiredAction.DECLARE_SERVING_POLICY),
+    # A tie IS closable by a declaration — name a governed tie-breaker — which is exactly what
+    # separates it from the overlap defect above.
+    TEMPORAL_SNAPSHOT_TIE: (
+        "SNAPSHOT_TIE_BREAK_UNDECLARED", RequiredAction.DECLARE_TEMPORAL_POLICY),
 }
 
 

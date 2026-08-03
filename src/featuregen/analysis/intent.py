@@ -29,7 +29,6 @@ is a refusal rather than a default. The model is never asked for them.
 from __future__ import annotations
 
 import os
-
 from dataclasses import dataclass, field
 
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure, Window
@@ -53,6 +52,13 @@ from featuregen.intake.redaction import (
     build_llm_inputs,
     redact_free_text,
 )
+
+# The CLOSED Release-B refusal vocabulary, imported rather than re-spelled: one set, one spelling,
+# one owner (`overlay.upload.source_selection`). That module is deliberately import-light — it
+# defers `semantic_context` to call time — so this stays a cheap import for the analysis package,
+# unlike the `enrich_llm` dependency the helper above exists to avoid.
+from featuregen.overlay.upload.source_selection import SELECTION_REFUSAL_CODES
+
 
 def _generation_settings() -> dict:
     """Provider + model + the pinned knobs, from the SAME env that configures the client.
@@ -90,9 +96,10 @@ MEASURE_OPS: frozenset[str] = frozenset({"count", "count_distinct", "sum", "avg"
 COMPARISONS: frozenset[str] = frozenset({"", "decrease", "increase", "change"})
 CALENDAR_UNITS: frozenset[str] = frozenset({"month", "day"})
 
-#: What the model may say it could not determine. Closed so an abstention is actionable — a free-text
-#: "not sure" cannot be routed to a clarification question.
-UNRESOLVED_CODES: frozenset[str] = frozenset({
+#: What THE MODEL may say it could not determine. Closed so an abstention is actionable — a
+#: free-text "not sure" cannot be routed to a clarification question. This set, and only this set,
+#: is what the wire schema's `unresolved` enum admits and what `validate_intent` accepts back.
+MODEL_UNRESOLVED_CODES: frozenset[str] = frozenset({
     "entity",          # who the question is about
     "measure",         # what is being counted or aggregated
     "windows",         # which periods
@@ -104,6 +111,19 @@ UNRESOLVED_CODES: frozenset[str] = frozenset({
     # something with less standing than the catalog.
     "population",
 })
+
+#: Every abstention that can become a CLARIFICATION — the model's own codes plus the closed
+#: Release-B selection refusals (`overlay.upload.source_selection.SELECTION_REFUSAL_CODES`).
+#:
+#: THE SPLIT IS DELIBERATE, and it is the reason `MODEL_UNRESOLVED_CODES` exists at all. The wire
+#: schema's enum is derived from this vocabulary, so widening one set widens what the model is
+#: invited to assert. Functional rule 1 says the LLM never attests uniqueness, overlap, population
+#: completeness or row-history correctness — so a model must not be able to answer `TEMPORAL_SCD_OVERLAP`
+#: or `SELECTION_BINDING_MISSING`. Those are conditions the SELECTOR observes about the catalog and
+#: the data, never things a language model can know. Keeping the schema enum on the narrow set also
+#: leaves the request body byte-identical, so no prompt/schema version bump and no replay churn
+#: (D10: a schema change is a REAL version bump, never a silent widening).
+UNRESOLVED_CODES: frozenset[str] = MODEL_UNRESOLVED_CODES | SELECTION_REFUSAL_CODES
 
 #: Every wire object is CLOSED (`additionalProperties: false`) and every slot declared. A previous
 #: schema in this codebase left objects open and a model omitted a required-but-unenforced field,
@@ -172,8 +192,10 @@ INTENT_SCHEMA: dict = {
             },
         },
         "comparison": {"type": "string", "enum": sorted(COMPARISONS)},
+        # The MODEL's vocabulary only (see MODEL_UNRESOLVED_CODES): a language model may not assert
+        # a selection/temporal condition it cannot observe.
         "unresolved": {"type": "array", "items": {"type": "string",
-                                                 "enum": sorted(UNRESOLVED_CODES)}},
+                                                 "enum": sorted(MODEL_UNRESOLVED_CODES)}},
     },
 }
 
@@ -310,9 +332,10 @@ def validate_intent(output: dict, candidates: IntentCandidates) -> None:
         raise SchemaValidationError(f"comparison {comparison!r} is not one of {sorted(COMPARISONS)}")
 
     for code in output.get("unresolved") or ():
-        if code not in UNRESOLVED_CODES:
+        if code not in MODEL_UNRESOLVED_CODES:
             raise SchemaValidationError(
-                f"unresolved code {code!r} is not actionable; use one of {sorted(UNRESOLVED_CODES)}")
+                f"unresolved code {code!r} is not actionable; use one of "
+                f"{sorted(MODEL_UNRESOLVED_CODES)}")
 
 
 def _plan_from(output: dict, question: str) -> AnalysisPlanV1:

@@ -32,6 +32,18 @@ from featuregen.analysis.intent import (
     IntentExtraction,
 )
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure
+from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
+from featuregen.overlay.upload.source_selection import (
+    SELECTION_AUTHORITY_INSUFFICIENT,
+    SELECTION_BINDING_MISSING,
+    SELECTION_POPULATION_UNDECLARED,
+    SELECTION_REFUSAL_CODES,
+    SELECTION_SOURCE_AMBIGUOUS,
+    TEMPORAL_HISTORICAL_CURRENT_ONLY,
+    TEMPORAL_MODEL_UNKNOWN,
+    TEMPORAL_SCD_OVERLAP,
+    TEMPORAL_SNAPSHOT_TIE,
+)
 
 
 class ClarificationError(ValueError):
@@ -79,11 +91,28 @@ def clarifications_for(extraction: IntentExtraction,
                  for code in sorted(raised, key=lambda c: _ORDER.get(c, 99)))
 
 
-_ORDER = {"population": 0, "entity": 1, "measure": 2, "windows": 3, "comparison": 4,
-          "dimensions": 5}
+# Asked in the order they must be answered. The Release-B SELECTION refusals sit at the FRONT,
+# ahead of every intent question: which dataset serves the need, and which of its rows, decide what
+# the rest of the question can even mean. Asking "which attributes should the answer be split by?"
+# before "which copy of the customer master is this about?" invites a user to refine an answer that
+# is about to change underneath them.
+_ORDER = {
+    SELECTION_POPULATION_UNDECLARED: -6,
+    SELECTION_SOURCE_AMBIGUOUS: -5,
+    SELECTION_AUTHORITY_INSUFFICIENT: -4,
+    SELECTION_BINDING_MISSING: -3,
+    TEMPORAL_MODEL_UNKNOWN: -2,
+    TEMPORAL_HISTORICAL_CURRENT_ONLY: -1,
+    TEMPORAL_SNAPSHOT_TIE: 0,
+    TEMPORAL_SCD_OVERLAP: 0,
+    "population": 0, "entity": 1, "measure": 2, "windows": 3, "comparison": 4,
+    "dimensions": 5,
+}
 
 
 def _build(code: str, candidates: IntentCandidates) -> Clarification:
+    if code in SELECTION_REFUSAL_CODES:
+        return _selection_clarification(code, candidates)
     if code == "population":
         # Asked FIRST and never optional. `spine.py`: the declaration chooses the source, governed
         # facts may only validate it — because look-alike population tables are indistinguishable to
@@ -136,6 +165,20 @@ def apply_answer(plan: AnalysisPlanV1, code: str, chosen: tuple[str, ...],
     if code not in UNRESOLVED_CODES:
         raise ClarificationError(code, f"{code!r} is not an answerable abstention")
 
+    # A SELECTION refusal is answered by the source/row SELECTOR, not by folding a value into
+    # `AnalysisPlanV1` — the plan contract has no per-need source slot, and inventing one here would
+    # be a second, ungoverned place where a source gets chosen. `SELECTION_POPULATION_UNDECLARED` is
+    # the one exception, and only because it means exactly what the existing `population` abstention
+    # means: it folds through the SAME branch below rather than growing a parallel one.
+    if code == SELECTION_POPULATION_UNDECLARED:
+        code = "population"
+    elif code in SELECTION_REFUSAL_CODES:
+        raise ClarificationError(
+            code,
+            f"{code} is answered when the plan selects its sources and rows, not by editing the "
+            "plan: the answer is a serving/temporal policy declaration or a different requested "
+            "dataset, and the selector applies it")
+
     if code == "comparison":
         (value,) = chosen or ("",)
         if value not in COMPARISONS:
@@ -176,3 +219,79 @@ def apply_answer(plan: AnalysisPlanV1, code: str, chosen: tuple[str, ...],
     if len(chosen) != 1:
         raise ClarificationError(code, "exactly one column anchors the periods")
     return replace(plan, windows=tuple(replace(w, anchor_ref=chosen[0]) for w in plan.windows))
+
+
+# ── Release-B selection refusals rendered as questions (plan rule 10) ────────────────────────────
+#
+# "Every typed refusal becomes a data-agent clarification when interactive." These render the eight
+# closed `SELECTION_REFUSAL_CODES`. The options stay bounded by the same candidate set intent was
+# given, or by a CLOSED server vocabulary — a clarification may never introduce a ref the plan was
+# not grounded against, and that rule does not relax because the refusal came from the selector
+# rather than from the model.
+#
+# NO-BLOCKED FRAMING: none of these is worded as a failure. Each says what is undecided and what
+# deciding it would look like, because an unreviewed or undeclared value is "nobody has decided
+# yet", not "this is broken".
+
+_STORAGE_MODEL_OPTIONS: tuple[Option, ...] = tuple(
+    Option(value=m.value, label=m.value.replace("_", " "))
+    for m in TemporalStorageModel if m is not TemporalStorageModel.UNKNOWN)
+
+
+def _selection_clarification(code: str, candidates: IntentCandidates) -> Clarification:
+    tables = _options(candidates.table_refs, candidates)
+    if code == SELECTION_POPULATION_UNDECLARED:
+        # The same decision the `population` abstention asks for, reached from the selector instead
+        # of from the model — so it asks the SAME question, in the same words, with the SAME
+        # options. Only the code differs, and it must: the answer is routed back by code, and
+        # `apply_answer` folds this one through the `population` branch.
+        return replace(_build("population", candidates), code=code)
+    if code == SELECTION_SOURCE_AMBIGUOUS:
+        return Clarification(
+            code=code,
+            question="More than one dataset is equally eligible to serve this. Which one should "
+                     "be used?",
+            options=tables)
+    if code == SELECTION_AUTHORITY_INSUFFICIENT:
+        return Clarification(
+            code=code,
+            question="No dataset here is declared authoritative enough to answer this in "
+                     "production. Which copy should serve it — or should this run in sandbox?",
+            options=tables)
+    if code == SELECTION_BINDING_MISSING:
+        return Clarification(
+            code=code,
+            question="This dataset has no configured physical address yet, so it can be described "
+                     "but not read. Which dataset should be used instead?",
+            options=tables)
+    if code == TEMPORAL_MODEL_UNKNOWN:
+        return Clarification(
+            code=code,
+            question="Nobody has recorded how this dataset stores history. How does it?",
+            options=_STORAGE_MODEL_OPTIONS)
+    if code == TEMPORAL_HISTORICAL_CURRENT_ONLY:
+        return Clarification(
+            code=code,
+            question="This dataset keeps only today's values, so it cannot answer a question about "
+                     "an earlier date. Which dataset holds the history?",
+            options=tables)
+    if code == TEMPORAL_SNAPSHOT_TIE:
+        return Clarification(
+            code=code,
+            question="Two snapshots are equally close to the cutoff and nothing says which wins. "
+                     "Which column should break the tie?",
+            options=_options(candidates.as_of_refs or candidates.column_refs, candidates))
+    if code == TEMPORAL_SCD_OVERLAP:
+        # Deliberately answerable by NOBODY here: overlapping history rows are a DATA defect, not a
+        # decision waiting on a person — see the `REFUSAL_TO_GAP` rationale in `data_agent.learning`
+        # (which excludes ATTRIBUTION_OVERLAPPING_RECORDS for the same reason). It is still SHOWN,
+        # because a user staring at a refused question deserves to know why, and it names the fix
+        # instead of offering a choice that would paper over bad data.
+        return Clarification(
+            code=code,
+            question="This dataset has history rows whose validity periods overlap, so more than "
+                     "one row is 'the' value at some dates. That is a data-quality fix in the "
+                     "source, not a choice — the answer cannot be trusted until it is corrected.",
+            options=(),
+            optional=True)
+    raise ClarificationError(code, f"no clarification is defined for {code!r}")
