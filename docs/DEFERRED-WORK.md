@@ -360,6 +360,7 @@ session today.
 |---|---|---|
 | 🔴 **No trustworthy full-suite CI signal** | ~82 whole-repo test failures (count is environment/ordering dependent; measured 82 at both `9aee241f` and Child-1 HEAD). Cause: cross-test DB contamination — **all pass in isolation**. Child-1 introduced **zero** (verified by `comm` on sorted FAILED lists at base vs head, empty in both directions). Nobody owns this. | Before relying on CI to gate a merge, or before the next program adds more surface. |
 | ⚪ Frontend `vitest` hangs on worker-start in this environment | Changed files pass individually; CI must run the full frontend suite. | Frontend work. |
+| 🟡 Leg-4 `_endpoint_from_legacy_link` trusts the ledger ref's schema (2026-08-03) | `retrieval._link_neighbours` has no guard on a non-`public` schema in a ledger row — a hand-written/migrated row would 500 `/analysis/plan` from an OPTIONAL enrichment leg instead of degrading. Unreachable today: `bridge_assessment._canonical_logical_ref` contract-refuses non-public members, so production's own writer cannot mint one (pinned by test beside the probe that depends on it). | Any migration/backfill that writes `entity_bridge_candidate_evidence` rows directly, or the first schema-preserving bridge contract change. |
 
 ---
 
