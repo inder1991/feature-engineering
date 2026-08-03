@@ -71,6 +71,11 @@ is what makes "retryable" a true word in this lane rather than a label on a dead
 operator ingesting one passing probe attestation flips every run of this chain into it — so it fails
 the request with the exception's own text on the queue row's ``last_error`` and dead-letters the
 message rather than retrying a state no retry can change.
+
+**AND NONE OF IT RUNS UNLESS THE DEPLOYMENT SAYS SO.** :func:`materialization_enabled` (T9) is the
+switch, default OFF, read by the worker stage before the claim. Off, this lane costs a deployment
+nothing at all — not a query, not a counter, not a log line. See that function for why the switch
+belongs above the claim rather than inside it.
 """
 from __future__ import annotations
 
@@ -131,6 +136,8 @@ from featuregen.runtime.queue import (
 )
 
 __all__ = [
+    "MATERIALIZATION_ENV_VARS",
+    "MATERIALIZATION_FLAG",
     "MATERIALIZATION_HANDLER",
     "MaterializationJobV1",
     "MaterializationLaneConfig",
@@ -139,6 +146,7 @@ __all__ = [
     "encode_job",
     "enqueue_materialization",
     "lane_config_from_env",
+    "materialization_enabled",
     "process_materialization_once",
 ]
 
@@ -180,6 +188,16 @@ _PROJECT_ROOT_ENV = "FEATUREGEN_MATERIALIZE_PROJECT_ROOT"
 _INVENTORY_ENV = "FEATUREGEN_MATERIALIZE_INVENTORY"
 _L0_PYTHON_ENV = "FEATUREGEN_MATERIALIZE_L0_PYTHON"
 _L0_TIMEOUT_ENV = "FEATUREGEN_MATERIALIZE_L0_TIMEOUT_SECONDS"
+
+#: **THE KILL SWITCH.** One env gate for the whole of materialization, default OFF — see
+#: :func:`materialization_enabled`.
+MATERIALIZATION_FLAG = "FEATUREGEN_MATERIALIZE_ENABLED"
+
+#: Every variable a deployment sets for this lane, in ONE list. A test asserts each member is
+#: documented in ``.env.example`` and ``deploy/kind/k8s/20-backend.yaml``, so a sixth variable added
+#: here without telling the two files a deployer actually edits fails CI rather than a deployment.
+MATERIALIZATION_ENV_VARS = (
+    MATERIALIZATION_FLAG, _PROJECT_ROOT_ENV, _INVENTORY_ENV, _L0_PYTHON_ENV, _L0_TIMEOUT_ENV)
 
 #: Failures that are DETERMINISTIC: the same job, the same catalog and the same configuration would
 #: produce them again, so the request is failed and the message dead-lettered instead of retried
@@ -460,6 +478,46 @@ def enqueue_materialization(
         payload=encode_job(job),
         priority=priority,
     )
+
+
+# ── the kill switch ──────────────────────────────────────────────────────────────────────────────
+
+
+def materialization_enabled() -> bool:
+    """Whether this deployment runs materialization at all. Default **OFF**.
+
+    **THE ONE PUBLIC DEFINITION.** Task 8's route consults this rather than re-reading the variable
+    (``feature_assist``'s RF-C3 rule, for the reason that rule exists: two readings of one switch are
+    two switches, and the second one is the one nobody flips).
+
+    **Why it is a kill switch and not just a feature gate.** ``run_worker_once`` drives every stage
+    on one connection, in order, in one thread. A materialization compile therefore holds the relay,
+    the timers, the projections, the drift scan and the ingestion sweep for its whole duration —
+    :data:`COMPILE_BUDGET_SECONDS` plus the deployment's configured L0 timeout, in the worst case.
+    An operator who needs that to stop has exactly two other options today: stop the worker (which
+    also stops everything the compile was blocking) or drop the queue rows (which destroys governed
+    work). This is the third.
+
+    **Read from the environment on EVERY call**, never captured at import and never cached. The
+    stage reads it once per tick, before the claim, so the first tick after this process's
+    environment says otherwise obeys — and a compile already in flight is never interrupted (a
+    leased message cannot be un-claimed, and the chain's writes are one transaction).
+
+    **What that buys, precisely.** A container's environment is fixed at start, so on Kubernetes
+    flipping the ConfigMap means restarting that pod. The point is what it comes back as: a worker
+    doing everything EXCEPT materialization, rather than no worker at all. And because an undrained
+    job stays a durable ``ready`` queue row, nothing is lost in between — the complementary lever
+    that needs no restart is the queue itself (pushing those rows' ``available_at`` forward pauses
+    the drain from psql, since :func:`claim_materialization` only takes rows that are due).
+
+    **The truthy set is the platform's**, copied verbatim from
+    ``overlay/upload/feature_assist.py:feature_context_enabled`` — ``.strip().lower()`` into
+    ``{"1", "true", "yes", "on"}``. It is a strict superset of the ``== "1"`` form the older flags
+    (``OVERLAY_PASS_C``, ``FEATUREGEN_INTENT_LIVE_CROSS_CATALOG``) use, so the documented ``"0"`` /
+    ``"1"`` values mean the same thing under either reading. Anything unrecognised — a typo, a
+    truncated write — is OFF, which for a kill switch is the safe side of every ambiguity.
+    """
+    return os.environ.get(MATERIALIZATION_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ── the deployment's half of the configuration ───────────────────────────────────────────────────

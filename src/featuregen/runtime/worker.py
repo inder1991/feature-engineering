@@ -27,7 +27,10 @@ import psycopg
 from psycopg.rows import dict_row
 
 from featuregen.contracts import Command, Projection
-from featuregen.materialize.queue_lane import process_materialization_once
+from featuregen.materialize.queue_lane import (
+    materialization_enabled,
+    process_materialization_once,
+)
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
@@ -448,6 +451,24 @@ def run_worker_once(
     formula_processed = _stage("recipe_formula_shadow")(_drain_formula, 0)
 
     def _drain_materialization() -> int:
+        # THE KILL SWITCH (T9), read from the environment EVERY tick and BEFORE the claim. Nothing
+        # caches it, so the first tick after this process's environment says otherwise obeys — and
+        # stopping materialization is never the same act as stopping the WORKER, which would also
+        # stop the relay, the timers, the projections and every poller below.
+        #
+        # Off is SILENT, not loud. A tick is a second: a stage that announced "disabled" every tick
+        # would write ~86k lines a day saying nothing happened, and the next real signal would have
+        # to be found inside it. Nothing is lost by the silence — an undrained job stays `ready` and
+        # is counted by the `queue.depth` gauge two stages below, which is the number an operator
+        # already watches. Off is therefore byte-identical to the tick that existed before this lane
+        # did: no claim query, no counter, no log.
+        #
+        # It stops the NEXT claim; it never interrupts one in flight. A leased message cannot be
+        # un-claimed, and abandoning a compile mid-transaction would leave a leased row, a
+        # non-terminal request and a half-written tree — to save the seconds until that transaction
+        # ends anyway.
+        if not materialization_enabled():
+            return 0
         # Phase G §3.1's fenced lane. Its own dedicated claim (the rows are excluded from
         # `claim_one` by `MATERIALIZATION_QUEUE_HANDLERS`), its own lease and fence, and its own
         # configuration — resolved inside the handler only once a job is claimed, so a deployment

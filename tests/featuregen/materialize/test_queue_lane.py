@@ -50,6 +50,7 @@ from featuregen.materialize.control_plane import read_run_events
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME
 from featuregen.materialize.publish import PublishMechanism
 from featuregen.materialize.queue_lane import (
+    MATERIALIZATION_FLAG,
     MATERIALIZATION_HANDLER,
     MaterializationJobV1,
     MaterializationLaneConfig,
@@ -617,11 +618,15 @@ def test_no_interpreter_configured_is_a_STATE_not_a_missing_configuration(monkey
 # ── the worker stage ─────────────────────────────────────────────────────────────────────────────
 
 def test_a_worker_TICK_drains_the_lane(enqueued, catalog, monkeypatch) -> None:
-    """The stage is registered beside the existing ones, so `run_forever` drives it."""
+    """The stage is registered beside the existing ones, so `run_forever` drives it.
+
+    T9's flag is set explicitly: it defaults OFF, and `test_materialization_flag.py` owns what that
+    default does. This test's subject is the stage, so it states the deployment it needs."""
     from featuregen.runtime.handlers import HandlerRegistry
     from featuregen.runtime.worker import run_worker_once
 
     request, _, config = enqueued
+    monkeypatch.setenv(MATERIALIZATION_FLAG, "1")
     monkeypatch.setattr("featuregen.materialize.queue_lane.lane_config_from_env", lambda: config)
 
     tick = run_worker_once(catalog, HandlerRegistry(), [], owner="w1", now=_NOW)
@@ -633,10 +638,14 @@ def test_a_worker_TICK_drains_the_lane(enqueued, catalog, monkeypatch) -> None:
 
 def test_an_unconfigured_deployment_costs_the_tick_NOTHING(catalog, monkeypatch) -> None:
     """Nothing enqueued means the stage never resolves a configuration, so a deployment with no
-    materialization environment is not a counted stage error once a second, forever."""
+    materialization environment is not a counted stage error once a second, forever.
+
+    The flag is ON here on purpose: the subject is a deployment that ENABLED materialization and has
+    not configured it, which the switch must not be allowed to mask."""
     from featuregen.runtime.handlers import HandlerRegistry
     from featuregen.runtime.worker import run_worker_once
 
+    monkeypatch.setenv(MATERIALIZATION_FLAG, "1")
     for variable in ("FEATUREGEN_MATERIALIZE_PROJECT_ROOT", "FEATUREGEN_MATERIALIZE_INVENTORY"):
         monkeypatch.delenv(variable, raising=False)
     counters.reset()
