@@ -183,8 +183,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | 1050 | Release C Task 10 — crosswalk store |
 | 1051 | D13 — `graph_node` display-projection columns `bian_path`, `process_path`, `sub_domain` (joint Task 4 / profile Task 5) |
 | 1052 | consumption step — `graph_node.data_role` display projection (derived from the normalized `table_role` at projection time; the facet mechanism requires a literal column; a rebuildable projection is NOT the duplicate store §4-correction-4 forbids) + table-node search-doc slots for `definition`/`business_context` (insert-time + rebuild parity — the read-time join cannot reach FTS matching) |
+| 1053-1055 | RESERVED BLOCK — Phase-G execution wiring (PARALLEL SESSION; run lifecycle / publish pointer / whatever its approved plan needs; unused numbers return to the pool when Phase G's plan finalizes). The 1048-1050 reservations above remain Release B/C's, unchanged. |
 
-New needs append 1053+ to this table FIRST (edit this doc in the same commit as the migration).
+New needs append 1056+ to this table FIRST (edit this doc in the same commit as the migration).
 
 ## D8. Flag matrix
 
