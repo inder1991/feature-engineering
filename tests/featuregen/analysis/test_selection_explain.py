@@ -134,6 +134,10 @@ def test_a_caller_who_may_not_see_the_SELECTED_dataset_gets_the_whole_entry_with
     The shape is a decision MADE by someone with wide scope and READ by someone without it, which
     is the only way a selected dataset can be unreadable at render time: the selector itself drops
     a candidate the PLANNER cannot see, so a narrow planner never selects one at all.
+
+    ASSERTED ON THE WHOLE PAYLOAD. The source entry was withheld while `rows[0].dataset_ref` named
+    the very same hidden table two keys later — a section-local assertion passed and the body
+    leaked. A withheld dataset is withheld everywhere, so the probe is the whole body.
     """
     grounded = _grounded(bank, roles=(_ARCHIVE_READER,))
     bank.execute(
@@ -145,7 +149,37 @@ def test_a_caller_who_may_not_see_the_SELECTED_dataset_gets_the_whole_entry_with
     dimension = next(s for s in view["sources"] if s["need_role"] == "dimension_source")
     assert dimension["withheld"] is True
     assert "dataset_ref" not in dimension
-    assert "customer_segment_history" not in json.dumps(dimension)
+    # The ROW rule is about a dataset too, and it is the second place the same name reaches the
+    # payload. Withheld whole: no ref, no predicates, no selection kind.
+    row = view["rows"][0]
+    assert row == {"withheld": True}
+
+    body = json.dumps(view)
+    assert SEG not in body
+    assert "customer_segment_history" not in body
+
+
+def test_a_hidden_REFUSAL_SUBJECT_is_a_count_and_its_name_appears_NOWHERE(bank):
+    """The third leak path, on the same whole-payload probe. A refusal names what it is ABOUT, and
+    the ambiguity path enumerates a policy's whole eligible set — which can include a dataset this
+    caller was never granted."""
+    from featuregen.analysis.explain import _refusal, _Scope
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1
+
+    bank.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column'",
+        (SRC, "tran_archive"))
+    rendered = _refusal(
+        SelectionRefusalV1(code="SELECTION_SOURCE_AMBIGUOUS", subject_refs=(TRAN, ARCHIVE),
+                           detail="two eligible copies"),
+        _Scope(bank, ()))
+
+    assert rendered["subjects"] == [TRAN]
+    assert rendered["subjects_withheld"] == 1
+    body = json.dumps(rendered)
+    assert ARCHIVE not in body
+    assert "tran_archive" not in body
 
 
 def test_row_predicates_are_withheld_WHOLE_when_a_named_column_is_hidden(bank):

@@ -24,6 +24,13 @@ refs, they follow the column-level scope rule the temporal policy route settled:
 not see every column the rule names, the whole predicate list is withheld rather than filtered.
 Withholding one field at a time still answers "a column exists here that you may not see", one
 field at a time.
+
+**A WITHHELD DATASET IS WITHHELD EVERYWHERE.** The three places a dataset ref can reach the payload
+— the selected source, the alternatives considered, and a refusal's subjects — are each scoped, and
+so is the ROW rule, which is about a dataset too. Withholding it in one section while naming it in
+another is not a narrower rendering; the test therefore asserts on the WHOLE serialized body rather
+than on the section under repair, because a leak in a field nobody thought to check is the leak
+that ships.
 """
 
 from __future__ import annotations
@@ -132,6 +139,13 @@ def _considered(selection, scope: _Scope) -> dict[str, Any]:
 
 
 def _row(row, scope: _Scope) -> dict[str, Any]:
+    # A WITHHELD DATASET IS WITHHELD EVERYWHERE. The sources loop drops the whole entry for a
+    # dataset this caller may not see; this one used to emit its `dataset_ref` regardless, so one
+    # payload carried `{"withheld": true}` for the source AND named the same hidden table two keys
+    # later. Withholding a decision in one section and naming its subject in another is not a
+    # narrower rendering, it is the existence oracle with an extra step.
+    if not scope.dataset(row.dataset_logical_ref):
+        return {"withheld": True}
     column_refs = tuple(p["column_ref"] for p in row.predicate_payloads if p.get("column_ref"))
     readable = scope.columns(column_refs)
     return {
@@ -142,6 +156,7 @@ def _row(row, scope: _Scope) -> dict[str, Any]:
         "predicates": ([{"column_ref": p["column_ref"], "operator": p["operator"]}
                         for p in row.predicate_payloads] if readable else []),
         "predicates_withheld": not readable,
+        "withheld": False,
     }
 
 
