@@ -53,28 +53,53 @@ class OperationalColumnFacts:
     provenance: str | None     # a *_decision_id or *_fact_event_id, else None
 
 
-def logical_ref_of(conn: DbConn, catalog_source: str, object_ref: str) -> str:
+def logical_ref_of(conn: DbConn, catalog_source: str, object_ref: str, *,
+                   kind: str | None = None) -> str:
     """Rebuild the SCHEMA-PRESERVING logical_ref for a graph_node ``(catalog_source, object_ref)``
     so the same string keys the decision log / field_evidence (via is_feature_eligible). graph_node
-    object_refs are stored PUBLIC-FLATTENED (``public.table.column``), but the REAL (pre-flatten)
-    schema a non-``public`` source declared lives in ``graph_node.schema_name`` — read it here (a
-    single PK lookup) rather than assuming ``"public"``, so a real-schema upload's evidence/decisions
-    (keyed under their schema-preserving logical_ref, per ``field_resolution.py`` / ``object_ref.py``)
-    are actually reachable. ``normalize_ref`` (not string concatenation) so the case-folding EXACTLY
-    matches how the writers keyed the row. Falls back to ``"public"`` when ``schema_name`` is NULL or
-    the graph_node row is absent — public/technical uploads stay byte-identical."""
+    object_refs are stored PUBLIC-FLATTENED (``public.table.column`` for a column, ``public.table``
+    for a table), and the REAL (pre-flatten) schema a non-``public`` source declared lives in
+    ``graph_node.schema_name``.
+
+    Object KIND and schema come from the CANONICAL graph row (one PK lookup of
+    ``kind/schema_name/table_name/column_name``), never from the dot-count of the ref: positional
+    guessing read the two-part TABLE ref ``public.accounts`` as table="public", column="accounts"
+    and so keyed a table field decision under the phantom COLUMN ``public.public.accounts``
+    (Task 0C defect 1). When the row exists, its own identity columns are the ref — a table node
+    yields a TABLE ref regardless of how many dots its object_ref carries, and an explicit ``kind``
+    argument is ignored in the row's favour.
+
+    When no row exists the ref is rebuilt public-flattened (schema ``"public"``), byte-identical to
+    the old fallback for the unambiguous arities: three or more parts is the flattened column
+    spelling (``…[-2]`` table, ``…[-1]`` column), one part is a bare table name. A TWO-part rowless
+    ref is ambiguous — ``schema.table`` or the legacy ``table.column`` spelling — so it resolves
+    only with an explicit ``kind`` (``"table"`` -> ``public.<parts[-1]>`` table ref, ``"column"`` ->
+    the legacy ``<table>.<column>``) and raises ``ValueError`` otherwise: guessing here is exactly
+    the defect. ``normalize_ref`` (not string concatenation) so the case-folding EXACTLY matches how
+    the writers keyed the row."""
+    row = conn.execute(
+        "SELECT kind, schema_name, table_name, column_name FROM graph_node "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (catalog_source, object_ref)).fetchone()
+    if row is not None:
+        node_kind, schema_name, table_name, column_name = row
+        column = column_name if node_kind == "column" else None
+        return normalize_ref(catalog_source, schema_name or "public", table_name, column)
     parts = object_ref.split(".")
     if len(parts) >= 3:
         table, column = parts[-2], parts[-1]
     elif len(parts) == 2:
-        table, column = parts[0], parts[1]
+        if kind == "table":
+            table, column = parts[-1], None
+        elif kind == "column":
+            table, column = parts[0], parts[1]
+        else:
+            raise ValueError(
+                f"ambiguous two-part object_ref {object_ref!r} for {catalog_source!r}: no "
+                "graph_node row declares its kind — pass kind='table' or kind='column' explicitly")
     else:
-        table, column = object_ref, ""
-    row = conn.execute(
-        "SELECT schema_name FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
-        (catalog_source, object_ref)).fetchone()
-    schema = row[0] if row is not None and row[0] else "public"
-    return normalize_ref(catalog_source, schema, table, column or None)
+        table, column = object_ref, None
+    return normalize_ref(catalog_source, "public", table, column)
 
 
 def _render(raw: object) -> str | None:
