@@ -108,30 +108,41 @@ def test_revise_pass_result_replaces_the_refuted_identifier(db, monkeypatch):
     assert stats["concept_critic"]["revised"] == 1
 
 
-def test_upheld_identifier_and_non_identifier_pass_through_unchanged(db, monkeypatch):
+def test_every_high_impact_group_is_criticised_and_low_impact_passes_through(db, monkeypatch):
+    """Joint Task 4 (d): the critic runs for EVERY high-impact proposal group — identifier,
+    monetary, temporal, label — not identifiers alone. A low-impact display concept (categorical)
+    still passes through untouched: it decides no join, no aggregation, no point-in-time semantics
+    and no training target, so a second paid pass over it buys nothing."""
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
     source = "cib"
     csv = (_HDR
            + "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.CIF_ID,CIF,Customer CIF,Party,,,\n"
-           + "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.ACCT_BAL,Balance,Ledger balance,Deposits,,,\n")
+           + "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.ACCT_BAL,Balance,Ledger balance,Deposits,,,\n"
+           + "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.OPEN_DT,Open Date,Account opening date,Deposits,,,\n"
+           + "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.CHURN_FLG,Churn,Customer churned,Deposits,,,\n"
+           + "DPL_EIB_COMPLIANCE.BO_CIB_CUSTOMER.CTRY_CD,Country,Country of residence,Party,,,\n")
     upload = read_glossary(csv, source=source)
     bindings, _ = classify_upload(upload.rows)
     rows = {r.column: r for r in upload.rows}
-    h_cif, h_bal = content_hash(rows["CIF_ID"]), content_hash(rows["ACCT_BAL"])
+    h = {c: content_hash(rows[c]) for c in
+         ("CIF_ID", "ACCT_BAL", "OPEN_DT", "CHURN_FLG", "CTRY_CD")}
+    proposals = {"CIF_ID": "customer_id", "ACCT_BAL": "monetary_stock",
+                 "OPEN_DT": "origination_date", "CHURN_FLG": "outcome_label",
+                 "CTRY_CD": "country_code"}
     client = FakeLLM(script={
         _TASK: FakeResponse(output={"results": [
-            {"ref": h_cif, "concept": "customer_id"},
-            {"ref": h_bal, "concept": "monetary_stock"}]}),
+            {"ref": h[c], "concept": v} for c, v in proposals.items()]}),
         CONCEPT_CRITIC_TASK: FakeResponse(output={"verdict": "supported", "reason_codes": []}),
     })
     stats: dict = {}
     out = enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
                           source_snapshot_id="snap-1", stats=stats)
-    assert out[h_cif] == "customer_id"
-    assert out[h_bal] == "monetary_stock"                # non-identifier: the critic never saw it
+    for column, concept in proposals.items():
+        assert out[h[column]] == concept, column         # every proposal is upheld
     report = stats["concept_critic"]
-    assert report["items"] == 1                          # only the identifier assignment
-    assert report["accepted"] == 1 and report["refuted"] == 0
+    # identifier + monetary + temporal + label were criticised; the categorical one was not.
+    assert report["items"] == 4
+    assert report["accepted"] == 4 and report["refuted"] == 0
 
 
 def test_critic_provider_failure_abstains_and_keeps_the_proposal(db, monkeypatch):
@@ -177,14 +188,17 @@ def test_ingest_records_skipped_no_client(db):
     assert _stage(rec, "enrich_concept_critic").state == "skipped_no_client"
 
 
-def test_ingest_records_not_applicable_with_no_identifier_assignments(db, monkeypatch):
+def test_ingest_records_not_applicable_with_no_high_impact_assignments(db, monkeypatch):
+    """`not_applicable` still means "the critic had nothing in scope" — but scope is now the four
+    HIGH-IMPACT groups (joint Task 4 item d), so the witness must be a low-impact concept. A
+    monetary assignment, which this test used to rely on, is now squarely in scope."""
     _seal_config()
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
     rec = StageRecorder()
-    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
+    rows = [CanonicalRow("deposits", "accounts", "country_cd", "text")]
     h = content_hash(rows[0])
     client = FakeLLM(script={
-        _TASK: FakeResponse(output={"results": [{"ref": h, "concept": "monetary_stock"}]}),
+        _TASK: FakeResponse(output={"results": [{"ref": h, "concept": "country_code"}]}),
         "overlay.enrich.definition": FakeResponse(output={"results": []}),
         "overlay.enrich.domain": FakeResponse(output={"results": []}),
         "overlay.enrich.synonyms": FakeResponse(output={"results": []}),

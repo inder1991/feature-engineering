@@ -213,6 +213,19 @@ SHAPE_CONFLICT_CODES = frozenset({
     "identifier_namespace_mismatch",
     "name_or_description_not_identifier",
     "measure_not_identifier",
+    # ── joint Task 4 (d): the same deterministic-first discipline for the other HIGH-IMPACT
+    # proposal groups. Each code below fires ONLY on a signal that provably exists in this
+    # platform's data — an exact word token in the column name/definition, a claimed identifier
+    # NAMESPACE shape, or an inherently fractional DECLARED type. Where the signal is absent (a
+    # glossary catalog's `operational_type` is uniformly "unknown" and many columns declare no
+    # type at all) every rule ABSTAINS: it emits nothing and the question stays the critic's.
+    "identifier_shape_not_monetary",
+    "text_not_monetary",
+    "identifier_shape_not_temporal",
+    "text_not_temporal",
+    "measure_not_temporal",
+    "identifier_shape_not_label",
+    "measure_not_label",
 })
 
 # Measure-name word tokens. Deliberately the four the remediation plan closes on — a wider net
@@ -252,17 +265,107 @@ def _claimed_namespaces(tokens: set[str]) -> set[str]:
     return claimed
 
 
+#: The concept GROUPS the deterministic ruleset (and therefore the critic) covers. High-impact by
+#: the plan's own naming: an identifier decides join candidacy, a monetary/temporal misclassification
+#: decides aggregation and point-in-time semantics, and a label/leakage misclassification decides
+#: whether a model is trained on its own answer. Everything else is low-impact display meaning and
+#: stays on the classifier's single-model path.
+CRITIC_GROUPS: frozenset[str] = frozenset({"identifier", "monetary", "temporal", "label"})
+
+#: Text roles — the shapes that can never be an amount, a timestamp or an identifier VALUE.
+_TEXT_ROLES = frozenset({
+    RepresentationRole.DESCRIPTION_TEXT,
+    RepresentationRole.HUMAN_LABEL,
+    RepresentationRole.FREE_TEXT,
+})
+
+
+def _bare_role(column_name: str, definition: str | None,
+               declared_type: str | None) -> RepresentationRole:
+    """The representation role computed WITHOUT the proposed concept — the concept under
+    refutation must never be allowed to vouch for itself."""
+    return representation_role(
+        column_name=column_name,
+        definition=definition,
+        concept_name=None,
+        observed_format=None,
+        data_type_family=type_family(declared_type),
+    )
+
+
+def _identifier_conflicts(column_name, declared_type, definition, registered,
+                          tokens: set[str]) -> set[str]:
+    conflicts: set[str] = set()
+    claimed = _claimed_namespaces(tokens)
+    if claimed and registered.namespace not in claimed:
+        conflicts.add("identifier_namespace_mismatch")
+    if _bare_role(column_name, definition, declared_type) in _TEXT_ROLES:
+        conflicts.add("name_or_description_not_identifier")
+    if _tokens(column_name) & _MEASURE_NAME_TOKENS or _fractional_declared_type(declared_type):
+        conflicts.add("measure_not_identifier")
+    return conflicts
+
+
+def _monetary_conflicts(column_name, declared_type, definition, tokens: set[str]) -> set[str]:
+    """A MONETARY claim is contradicted by two shapes, both name/definition-token exact.
+
+    * ``identifier_shape_not_monetary`` — the wording claims a specific identifier NAMESPACE (a
+      BIC, a UUID/UETR). Those value spaces are not quantities under any reading.
+    * ``text_not_monetary`` — the column reads as description/label/free text.
+
+    Deliberately NOT a rule: "the declared type is not numeric". Banks routinely declare amounts as
+    ``varchar`` in extract layers, and a glossary attests no physical type at all — a type-shaped
+    refutation would fire on correct assignments across whole catalogs. Absent signal ABSTAINS."""
+    conflicts: set[str] = set()
+    if _claimed_namespaces(tokens):
+        conflicts.add("identifier_shape_not_monetary")
+    if _bare_role(column_name, definition, declared_type) in _TEXT_ROLES:
+        conflicts.add("text_not_monetary")
+    return conflicts
+
+
+def _temporal_conflicts(column_name, declared_type, definition, tokens: set[str]) -> set[str]:
+    """A TEMPORAL claim is contradicted by the identifier-namespace shape, by text shape, and by a
+    measure shape (a measure-name word token or an inherently FRACTIONAL declared type — a
+    ``double`` column is not a date, and unlike the integer families no real date encoding lands
+    there). An integer-declared date (``20240131``) is common and deliberately NOT refuted."""
+    conflicts: set[str] = set()
+    if _claimed_namespaces(tokens):
+        conflicts.add("identifier_shape_not_temporal")
+    if _bare_role(column_name, definition, declared_type) in _TEXT_ROLES:
+        conflicts.add("text_not_temporal")
+    if _tokens(column_name) & _MEASURE_NAME_TOKENS or _fractional_declared_type(declared_type):
+        conflicts.add("measure_not_temporal")
+    return conflicts
+
+
+def _label_conflicts(column_name, declared_type, definition, tokens: set[str]) -> set[str]:
+    """A LABEL claim — the group that carries every ``leakage_anchor`` concept — is contradicted by
+    an identifier-namespace shape or a measure shape. Text shape is deliberately NOT a conflict
+    here: an outcome label legitimately arrives as a short categorical/status word, which
+    :func:`representation_role` reads as ``HUMAN_LABEL``."""
+    conflicts: set[str] = set()
+    if _claimed_namespaces(tokens):
+        conflicts.add("identifier_shape_not_label")
+    if _tokens(column_name) & _MEASURE_NAME_TOKENS or _fractional_declared_type(declared_type):
+        conflicts.add("measure_not_label")
+    return conflicts
+
+
 def shape_conflicts(
     column_name: str,
     declared_type: str | None,
     definition: str | None,
     concept: str | None,
 ) -> tuple[str, ...]:
-    """Deterministic contradictions between a column's shape and its proposed IDENTIFIER concept.
+    """Deterministic contradictions between a column's shape and its proposed HIGH-IMPACT concept.
 
     Returns a sorted tuple of closed codes (subset of :data:`SHAPE_CONFLICT_CODES`); ``()`` for a
-    clean assignment AND for any non-identifier concept — this extension corroborates identifier
-    assignments only, so measures/labels/temporals pass through untouched.
+    clean assignment AND for every concept outside :data:`CRITIC_GROUPS` — the low-impact display
+    groups (categorical, flag, text, quantity_risk, …) stay on the classifier's single-model path
+    and are never refuted here.
+
+    IDENTIFIER (unchanged):
 
     * ``identifier_namespace_mismatch`` — the name/definition claims a specific namespace shape
       (BIC / UUID-UETR) but the concept's registry namespace is a different value space.
@@ -272,31 +375,27 @@ def shape_conflicts(
       would otherwise short-circuit the definition-token evidence).
     * ``measure_not_identifier`` — a measure-name word token, or an inherently fractional declared
       type, on a column claimed to be an identifier.
+
+    MONETARY / TEMPORAL / LABEL: see the per-group helpers above. Every rule keys on a signal that
+    provably exists here (exact word tokens, a claimed namespace shape, a fractional declared type);
+    where the signal is ABSENT — no declared type, an ``unknown`` operational type, a bare
+    lower-cased name with no telling token — the group's rules emit NOTHING and the assignment goes
+    to the critic as a live question. Abstention is the designed answer, never a manufactured one.
     """
     registered = lookup_concept((concept or "").strip().lower())
-    if registered is None or registered.group != "identifier":
+    if registered is None or registered.group not in CRITIC_GROUPS:
         return ()
     tokens = _tokens(column_name) | _tokens(definition)
-    conflicts: set[str] = set()
-
-    claimed = _claimed_namespaces(tokens)
-    if claimed and registered.namespace not in claimed:
-        conflicts.add("identifier_namespace_mismatch")
-
-    role = representation_role(
-        column_name=column_name,
-        definition=definition,
-        concept_name=None,             # never let the disputed concept vouch for itself
-        observed_format=None,
-        data_type_family=type_family(declared_type),
-    )
-    if role in {
-        RepresentationRole.DESCRIPTION_TEXT,
-        RepresentationRole.HUMAN_LABEL,
-        RepresentationRole.FREE_TEXT,
-    }:
-        conflicts.add("name_or_description_not_identifier")
-
-    if _tokens(column_name) & _MEASURE_NAME_TOKENS or _fractional_declared_type(declared_type):
-        conflicts.add("measure_not_identifier")
+    if registered.group == "identifier":
+        conflicts = _identifier_conflicts(column_name, declared_type, definition, registered,
+                                          tokens)
+    elif registered.group == "monetary":
+        conflicts = _monetary_conflicts(column_name, declared_type, definition, tokens)
+    elif registered.group == "temporal":
+        conflicts = _temporal_conflicts(column_name, declared_type, definition, tokens)
+    else:
+        conflicts = _label_conflicts(column_name, declared_type, definition, tokens)
+    illegal = conflicts - SHAPE_CONFLICT_CODES
+    if illegal:   # structurally impossible; guards vocabulary drift
+        raise ValueError(f"shape conflict codes outside the closed set: {sorted(illegal)}")
     return tuple(sorted(conflicts))

@@ -156,7 +156,11 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
     assert synth_reqs, "Pass B phase-2 synthesis never ran"
     roster = synth_reqs[0].inputs["catalog_metadata"]["items"][0]["column_roster"]
     assert len(roster) == 126
-    assert roster[0].keys() == {"column", "operational_type", "declared_type"}
+    # Profile Task 4 widened the compact roster by the resolved CONCEPT (present only where Pass A
+    # classified one) — the sole signal the crosswalk contradiction can key on, which would
+    # otherwise have to abstain on every wide table. The three identity keys are always present.
+    assert {"column", "operational_type", "declared_type"} <= roster[0].keys()
+    assert roster[0].keys() <= {"column", "operational_type", "declared_type", "concept"}
 
     # Pass B abstained on the one table (the required abstaining synthesis) — no proposed facts.
     assert r.passb_abstained == 1

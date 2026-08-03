@@ -84,6 +84,11 @@ def test_genuine_unclassified_is_a_real_classification_and_caches(db):
 class _CapturingFake(FakeLLM):
     def call(self, request):
         self.last = request
+        # EVERY request, keyed by task. `last` alone is ambiguous now that a monetary/temporal/
+        # label assignment ALSO reaches the concept critic (joint Task 4 item d) — an invariant
+        # asserted about "the classifier payload" must name the classifier call.
+        self.by_task = getattr(self, "by_task", {})
+        self.by_task.setdefault(request.task, []).append(request)
         return super().call(request)
 
 
@@ -94,7 +99,7 @@ def test_b1b_hands_the_full_vocabulary_to_the_classifier_and_accepts_a_rich_conc
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
     client = _CapturingFake(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
     out = enrich_concepts(db, rows, client)
-    vocab = client.last.inputs[INPUT_KEY_CATALOG]["vocabulary"]
+    vocab = client.by_task[_TASK][0].inputs[INPUT_KEY_CATALOG]["vocabulary"]
     names = {v["name"] for v in vocab}
     assert "monetary_stock" in names and "outcome_label" in names   # rich §3 concepts offered
     assert "monetary_amount" not in names                           # legacy alias excluded as a target
@@ -192,12 +197,20 @@ def test_legitimate_open_vocab_domain_is_accepted_and_cached(db, domain):
 
 
 def test_concept_inputs_exclude_free_text_definition(db):
-    """M4: the uploader's free-text definition must not be sent to the LLM."""
-    captured = {}
+    """M4: the uploader's free-text definition must not be sent to the LLM — on ANY call.
+
+    Strengthened at the joint Task-4 step. The old form captured only the LAST request and pinned
+    its exact key set; both assumptions broke once the payload became the purpose adapter and the
+    critic started running for the monetary group. The INVARIANT is what matters and it is now
+    asserted over every request the stage issues: no `definition`, no `business_definition`, and
+    the PII string nowhere in any payload. `bundle_from_upload` DOES carry a technical row's
+    declared definition as source semantics (correctly — it is what the file said), so this is a
+    live guard on `_withhold_uncurated_definition`, not a tautology."""
+    captured = []
 
     class _Capture:
         def call(self, request):
-            captured["inputs"] = dict(request.inputs)
+            captured.append((request.task, dict(request.inputs)))
             from featuregen.intake.llm import LLMResult
             return LLMResult(output={"concept": "monetary_amount"}, self_reported_scores={},
                              call_ref="", status="ok")
@@ -206,14 +219,22 @@ def test_concept_inputs_exclude_free_text_definition(db):
                          definition="holder SSN 123-45-6789")]   # PII in free text
     enrich_concepts(db, rows, _Capture())
     from featuregen.intake.redaction import INPUT_KEY_CATALOG
-    # Inputs are reserved-keyed; the LLM-visible catalog metadata is names/types + the static
-    # classification vocabulary (B1b) only — the uploader's free-text definition (and its PII) is
-    # nowhere in the outbound payload.
-    catalog = captured["inputs"][INPUT_KEY_CATALOG]
-    assert catalog["table"] == "accounts" and catalog["column"] == "bal" and catalog["type"] == "numeric"
-    assert "definition" not in catalog                        # the free-text definition is excluded (M4)
-    assert set(catalog) == {"table", "column", "type", "vocabulary"}   # nothing else is sent
-    assert "123-45-6789" not in str(captured["inputs"])       # the PII never reaches the payload
+    assert captured, "the classifier was never dispatched"
+    for _task, inputs in captured:
+        catalog = inputs[INPUT_KEY_CATALOG]
+        assert "definition" not in catalog            # the plain key stays forbidden (M4)
+        assert "business_definition" not in catalog   # and the curated key is withheld: uncurated
+        assert "123-45-6789" not in str(inputs)       # the PII never reaches any payload
+        for item in catalog.get("items", []):
+            assert "definition" not in item and "business_definition" not in item
+    # The SINGLE-seam classifier payload (the batch's per-item fallback here — the scripted output
+    # is not a batch envelope) is the purpose adapter's closed key set plus the static vocabulary:
+    # no uploader free text can enter it under any other name either.
+    classifier = next(inputs[INPUT_KEY_CATALOG] for task, inputs in captured
+                      if task == _TASK and "table" in inputs[INPUT_KEY_CATALOG])
+    assert classifier["table"] == "accounts"
+    assert classifier["column"] == "bal" and classifier["type"] == "numeric"
+    assert set(classifier) == {"table", "column", "type", "column_roster", "vocabulary"}
 
 
 # ── R5-5: the FTR-declared SQL type reaches the concept classifier ───────────────────────────────

@@ -105,6 +105,15 @@ _DISPLAY_COLUMN: dict[str, str] = {
     # Task-0.6 unconditional table_display_reprojection stage restores them on every re-upload.
     "authority_role": "authority_role",
     "temporal_storage_model": "temporal_storage_model",
+    # D13.1/D13.2 (migration 1051): the fine-grained COLUMN classification axes. `bian_path` /
+    # `process_path` project the source's own taxonomy paths (already SOURCE evidence, previously
+    # policy-less and therefore unprojectable); `sub_domain` projects the LLM's finer axis beside
+    # the coarse `domain`. Rebuildable display, never authoritative — the same contract as every
+    # entry above; the per-column `resolve_and_project` pass at the end of glossary/technical
+    # evidence ingestion re-derives them from surviving evidence on every re-upload.
+    "bian_path": "bian_path",
+    "process_path": "process_path",
+    "sub_domain": "sub_domain",
 }
 
 # The projected columns ``graph.build_graph`` ALSO populates, straight from the uploaded file — so

@@ -75,17 +75,37 @@ _REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing 
 
 # Finding #19: glossary sidecar values (business definitions, synonyms, data domains, BIAN/FIBO
 # taxonomy paths, the term name) are uploader-authored FREE TEXT — not structural names/types — so
-# they are never presumable-clean. Phase-2 Slice 1 makes the boundary FIELD-AWARE: the two curated
-# DEFINITION fields (business_definition + the table-level table_definition) can EMBED raw sample
-# values in prose, so they route through `sanitize.sanitize_definition` (sample-clause strip +
-# fail-closed data-marker scan + PII redaction); every other free-text field is PII-only via
-# `redaction.redact_free_text`. The deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/
+# they are never presumable-clean. Phase-2 Slice 1 makes the boundary FIELD-AWARE: the curated
+# NARRATIVE fields (`_DEFINITION_META_KEYS` — column/table definitions, the Pass-B table narrative,
+# and the projected semantic terms) can EMBED raw sample values in prose, so they route through
+# `sanitize.sanitize_definition` (sample-clause strip + fail-closed data-marker scan + PII
+# redaction); every other free-text field is PII-only via `redaction.redact_free_text`. The deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/
 # address) classifies + scrubs, and a REGISTERED IntentRedactor (`register_intent_redactor` — the
 # NER seam redaction.py documents as the DEFERRED personal-NAMES closer) supersedes the default
 # when present (sanitize_definition's PII step rides the same seam). A value that fails closed
 # (redactor failure, or a definition the sanitizer blanks) blocks the ITEM (batch: excluded +
 # audited; single: no dispatch).
-_DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition"})
+# Definition-KIND is a statement about what a field CAN CARRY, not about which name it goes by:
+# curated narrative prose, authored against real data, which can therefore embed real sample values
+# in a sentence. `business_definition` (column) and `table_definition` (table) were the original
+# two; the joint/profile work added three more of exactly that class and they now share the grade:
+#
+# * `table_description` / `business_context` — the Pass-B table narrative. Classifying them as
+#   plain prose gave them the PII backstop ONLY: a probe of "ACCT-8891, 1234.56, Jane Roe" in a
+#   canonical sample clause survived intact, while the SAME sentence under `table_definition` was
+#   stripped. Same class of field, same pipeline.
+# * `semantic_terms` — the platform's term expansion, built from the sidecar's uploader-authored
+#   terms. It was ALREADY definition-kind in the feature-menu adapter
+#   (`_FEATURE_COLUMN_DEFINITION_KEYS`) and prose here: one field, two grades, depending only on
+#   which seam it rode. The two seams now agree.
+#
+# Definition grade = `sanitize_definition` (sample-clause strip to a fixed point + FAIL-CLOSED
+# data-marker scan + PII redaction) plus a per-field `sample_strip` audit; prose grade is PII only,
+# with no gate for a data marker at all. The strictly-stronger direction, so nothing that used to
+# egress cleanly is newly leaked; a value carrying an unconsumable marker now BLOCKS its item
+# (audited) instead of egressing.
+_DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition",
+                                   "table_description", "business_context", "semantic_terms"})
 # [F6] `synonyms` is prose emitted as list[str] (enrich.py) — a LIST of prose values, each
 # PII-scanned per item and audited at an indexed path (`synonyms[0]`).
 # `source_attributes` joins `synonyms` here deliberately: these are uploader-authored values, so
@@ -97,6 +117,11 @@ _LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_ter
 # comma-joined synonym draft riding the tail summary payload — all PII-scanned as prose. The
 # remaining Step-6c summary keys (`concept`, `party_role`, `grain_role`, `table_role`) are
 # PLATFORM-derived closed-vocabulary tokens, allowlisted but deliberately not prose-scanned.
+# `semantic_terms` (joint Task 4) and the `table_description`/`business_context` table narrative
+# (profile Task 4) were classified here and are now DEFINITION-kind — see `_DEFINITION_META_KEYS`
+# above for why. What stays prose is genuinely short, non-narrative field text: a term name, a
+# domain, a taxonomy/process path, a term type, and the AI's comma-joined synonym draft. None of
+# those is authored against real rows, so none carries a sample clause by contract.
 _SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path",
                                      "term_type", "process_path", "ai_synonyms"})
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
@@ -120,6 +145,16 @@ _STRUCTURAL_META_KEYS = frozenset({
     "party_role", "grain_role", "table_role",
     # classification vocabulary + the reclassifier's shape hints (attest/reclassify.py)
     "vocabulary", "sample_shape", "sample_semantic_type",
+    # joint Task 4 — the semantic-context purpose adapters' structural half. All platform-derived:
+    # `declared_type`/`operational_type` are bounded type tokens (the dual-type split Pass B
+    # already carries per column), `primary_entity` is a `known_entities()` member, `concept_path`
+    # is a tuple of registry concept names, `identifier_namespace` is the closed
+    # {scheme, issuer_scope, basis} projection, `entity` is a registry entity link.
+    "declared_type", "operational_type", "primary_entity", "concept_path",
+    "identifier_namespace", "entity",
+    # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
+    # evidence-ref roster the model must cite from).
+    "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
     # concept critic (attest/concept_critic.py)
     "logical_ref", "proposed_concept", "shape_conflicts", "proposed_concept_meaning",
     # bridge identifier critic (attest/bridge_critic.py)
@@ -612,6 +647,51 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                                    "required": ["column", "domain"]}}},
                       "required": ["ref", "domain"]}}},
         "required": ["results"]},
+    # D13.2 — the domain task's v2 body: a REAL new schema, not an alias. It adds the per-column
+    # `column_sub_domains` array beside the existing table-first `domain` / `column_domains` shape,
+    # so the FINER axis is produced by the SAME call (no second LLM request, D13.2's explicit rule).
+    #
+    # Two separate arrays on purpose. `column_domains` lists ONLY the columns whose COARSE domain
+    # differs from the table default (an override — inheritance is never fabricated as evidence);
+    # `column_sub_domains` may name ANY column, because a sub-domain is additive: it refines a
+    # domain the column still inherits. Collapsing them into one array would force a model that
+    # wants to say "this BIC is Correspondent Banking under the table's Compliance domain" to also
+    # restate Compliance as an override, which the accept gate would then drop as equal-to-default.
+    #
+    # Bounded strings, never enums: `reg.validate` rejects the WHOLE response on one schema
+    # violation, so an off-shape sub-domain must not be able to lose a valid table domain with it
+    # (the [F1] per-field-salvage rule the Pass-B schemas already follow).
+    ("overlay_domain_batch", 2): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array",
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 256},
+                                     "domain": {"type": "string", "maxLength": 64},
+                                     "column_domains": {"type": "array",
+                                         "items": {"type": "object", "additionalProperties": False,
+                                                   "properties": {
+                                                       "column": {"type": "string",
+                                                                  "maxLength": 128},
+                                                       "domain": {"type": "string",
+                                                                  "maxLength": 64}},
+                                                   "required": ["column", "domain"]}},
+                                     "column_sub_domains": {"type": "array",
+                                         "items": {"type": "object", "additionalProperties": False,
+                                                   "properties": {
+                                                       "column": {"type": "string",
+                                                                  "maxLength": 128},
+                                                       "sub_domain": {"type": "string",
+                                                                      "maxLength": 64}},
+                                                   "required": ["column", "sub_domain"]}}},
+                      "required": ["ref", "domain"]}}},
+        "required": ["results"]},
+    # The FLAT domain seam at v2 — a DELIBERATE byte-alias of v1, and honestly so: the flat
+    # single/fallback shape carries only the table domain, gains no field at v2, and exists only so
+    # a v2 batch that degrades to per-item fallback resolves a REGISTERED (id, version) pair instead
+    # of dispatching unenforced (the `schema_for(id, N+1) -> None` trap D10 closes). The alias rule
+    # D10 bans is aliasing a schema that must ADMIT NEW FIELDS; nothing new rides this one.
+    ("overlay_domain", 2): {"type": "object", "additionalProperties": False,
+                            "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
     # Table-synthesis (Pass B) output schemas. `_batch` is an array of per-item {ref, synthesis}
     # objects (batch harness treats `synthesis` as one structured out-key); the flat sibling is the
     # `_single_fallback` shape. [F1] per-field salvage: `as_of_basis`, `table_role`, and
@@ -641,6 +721,51 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                             "primary_entity": {"type": ["string", "null"], "maxLength": 128},
                             "table_role": {"type": ["string", "null"], "maxLength": 64},
                             "event_or_snapshot": {"type": ["string", "null"], "maxLength": 64},
+                        }, "required": ["grain_columns"]}},
+                "required": ["ref", "synthesis"]}}},
+        "required": ["results"]},
+    # Pass B v3 (profile Task 4) — a REAL new body, not an alias. v2 is a byte-alias of v1 with
+    # `additionalProperties: false` at every level, so it REJECTS every field below; adding them
+    # under v2 would fail the whole synthesis closed. The four new suggestions sit BESIDE the
+    # existing role/entity/event-snapshot fields (same call, same item, no second pass), and each
+    # carries its citations in `evidence_refs`.
+    #
+    # `evidence_refs` is an ARRAY of closed `{field, refs}` objects, never a free-key map: a map
+    # with dynamic keys cannot be expressed under `additionalProperties: false`, and an open object
+    # fails the provider's structured-output contract (the same reason `column_domains` is an array).
+    #
+    # Every value is a BOUNDED STRING, never a schema enum — [F1] per-field salvage: `reg.validate`
+    # rejects the WHOLE response on one schema violation, so an off-vocabulary `authority_role`
+    # must not be able to take a valid grain down with it. The closed vocabularies are enumerated in
+    # the PROMPT and enforced CODE-side per field in `table_synth.make_ref_accept`.
+    ("overlay_table_synth_batch", 3): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array",
+            "items": {"type": "object", "additionalProperties": False,
+                "properties": {
+                    "ref": {"type": "string", "maxLength": 256},
+                    "synthesis": {"type": "object", "additionalProperties": False,
+                        "properties": {
+                            "grain_columns": {"type": "array",
+                                              "items": {"type": "string", "maxLength": 128}},
+                            "as_of_column": {"type": ["string", "null"], "maxLength": 128},
+                            "as_of_basis": {"type": ["string", "null"], "maxLength": 64},
+                            "primary_entity": {"type": ["string", "null"], "maxLength": 128},
+                            "table_role": {"type": ["string", "null"], "maxLength": 64},
+                            "event_or_snapshot": {"type": ["string", "null"], "maxLength": 64},
+                            "table_description": {"type": ["string", "null"], "maxLength": 600},
+                            "business_context": {"type": ["string", "null"], "maxLength": 600},
+                            "authority_role": {"type": ["string", "null"], "maxLength": 64},
+                            "temporal_storage_model": {"type": ["string", "null"],
+                                                       "maxLength": 64},
+                            "evidence_refs": {"type": "array",
+                                "items": {"type": "object", "additionalProperties": False,
+                                          "properties": {
+                                              "field": {"type": "string", "maxLength": 64},
+                                              "refs": {"type": "array",
+                                                       "items": {"type": "string",
+                                                                 "maxLength": 128}}},
+                                          "required": ["field", "refs"]}},
                         }, "required": ["grain_columns"]}},
                 "required": ["ref", "synthesis"]}}},
         "required": ["results"]},
@@ -800,6 +925,20 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         },
         "required": ["verdict", "reason_codes"],
     },
+    # Dataset-profile critic (profile Task 4). PROPOSAL-BLIND: the model returns its OWN closed
+    # classification of the table evidence — never a verdict ON a proposal, which is what produces
+    # agreement bias for an operational classification. The comparison happens code-side, outside
+    # the prompt. `unknown` is a first-class member of the enum so an honest abstention is
+    # expressible on the wire rather than smuggled in as a low-confidence guess.
+    ("dataset_profile_critique", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "classification": {"type": "string", "maxLength": 64},
+            "reason_codes": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["classification"],
+    },
     # The critic's one revise pass: a single concept name from the provided controlled vocabulary
     # (or the literal 'unclassified'). Free-form on the wire by necessity — the vocabulary is data,
     # not schema — so the code-side registry + shape gate is what makes an off-registry or
@@ -828,6 +967,15 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
 for _synth_schema_id in ("overlay_table_synth_batch", "overlay_table_synth",
                          "overlay_table_synth_summary_batch"):
     _SCHEMAS[(_synth_schema_id, 2)] = _SCHEMAS[(_synth_schema_id, 1)]
+
+# Pass B v3 (profile Task 4) stamps ONE contract generation across the whole run, so the two
+# companion schema ids follow the batch body's version even though their own shapes are unchanged:
+# the flat single-fallback shape carries no `synthesis` wrapper at all (a ref_aware task has no
+# single seam — `_single_fallback` returns MISSING) and the phase-1 chunk SUMMARY emits no
+# suggestions, so neither gains a field. They are registered at v3 so a request that stamps v3
+# resolves, instead of hitting the `schema_for(id, 3) -> None` trap D10 closes.
+for _synth_alias_id in ("overlay_table_synth", "overlay_table_synth_summary_batch"):
+    _SCHEMAS[(_synth_alias_id, 3)] = _SCHEMAS[(_synth_alias_id, 1)]
 
 # Feature-assist v2 (Phase-2 Slice 3A-iv, spec §8): the OUTPUT contract is byte-for-byte v1 — the
 # permissive `additionalProperties: True` shape already admits the new proposal fields, and semantic
@@ -1175,6 +1323,14 @@ _ITEM_META_ALLOWED = frozenset({
     # closed-vocabulary tokens (party_vocab / table_vocab / the grain flags), never uploader text.
     "term_type", "process_path", "related_terms", "ai_synonyms",
     "party_role", "grain_role", "table_role",
+    # Joint Task 4 — the purpose adapters' widened per-item context. `semantic_terms` is
+    # prose-classified above; the rest are platform-derived closed-vocabulary/bounded tokens
+    # (`primary_entity` from `known_entities()`, the dual type tokens, the concept ancestry tuple).
+    "semantic_terms", "primary_entity", "declared_type", "operational_type", "concept_path",
+    # Profile Task 4 (Pass B v3) — the table-narrative context the synthesis reasons over and the
+    # bounded evidence-ref roster every suggestion must cite from.
+    "table_description", "business_context", "authority_role", "temporal_storage_model",
+    "evidence_refs",
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
@@ -1199,10 +1355,18 @@ _MAX_COLUMN_PROFILES = 64
 #: must not push the real signal out of a batch.
 _MAX_SOURCE_ATTRIBUTES = 40
 
-# A STRUCTURED wide-roster entry (Task 4): only the three identity keys, short strings only —
+# A STRUCTURED wide-roster entry (Task 4): only the identity keys, short strings only —
 # structured (never the old `name:type` flat string) because a column name may itself contain
 # `:`/`/`, which the flat form conflated irrecoverably.
-_ROSTER_ENTRY_KEYS = frozenset({"column", "operational_type", "declared_type"})
+#
+# Joint Task 4 widens it by TWO platform-derived closed-vocabulary tokens: `concept` (a registry
+# concept name) and `party_role` (a `party_vocab` member). Both are the whole point of a SIBLING
+# roster — a classifier that can see that its neighbours are `customer_id`/`counterparty` is being
+# asked a different, answerable question from one shown bare names. Neither can carry uploader free
+# text (the registry and the role vocabulary are closed), so they stay structural rather than
+# prose-scanned; the length bound applies to them exactly as to the type tokens.
+_ROSTER_ENTRY_KEYS = frozenset({"column", "operational_type", "declared_type",
+                                "concept", "party_role"})
 
 # A phase-2 chunk-summary (#1) carries ONLY column-name lists + an event/snapshot signal — bounded,
 # egress-safe, and column-name-shaped (never a data value). `event_or_snapshot` is the lone scalar
@@ -1236,6 +1400,15 @@ MAX_DEFINITION_LEN = 600
 # definition is not cut mid-sentence before it egresses. `business_definition` matches
 # `enrich.bounded_definition`'s bound (same constant); [F7] gives the table-level
 # `table_definition` the SAME 600 window (it previously inherited the 200 default).
+#
+# DELIBERATELY not widened for the three keys that joined `_DEFINITION_META_KEYS` later
+# (`table_description`, `business_context`, `semantic_terms`): the sanitize PIPELINE and the length
+# WINDOW are separate knobs, and widening what may egress is not part of grading them. They keep
+# the tight 200 default they had as prose. Note the direction of the mismatch is safe: Pass B bounds
+# its own narrative OUTPUT at 600 (`table_synth._MAX_PROFILE_PROSE`), so a future producer threading
+# a full-length `business_context` back into ITEM metadata would have the item EXCLUDED + audited by
+# `_item_len_ok`, never silently truncated — at which point widening this map is the deliberate
+# decision to make.
 _MAX_LEN_DEFAULT = 200
 _MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
                    "table_definition": MAX_DEFINITION_LEN}

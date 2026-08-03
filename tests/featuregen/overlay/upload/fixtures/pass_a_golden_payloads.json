@@ -1,0 +1,564 @@
+{
+  "actual_counter_party_amt": {
+    "classifier": {
+      "bian_path": "Payment Execution > Payment Order",
+      "business_definition": "The settled amount transferred to the counterparty on this transaction.",
+      "column": "actual_counter_party_amt",
+      "column_roster": [
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "data_domain": "Payments",
+      "fibo_path": "fibo-fnd-acc-cur:MonetaryAmount",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Settlement > Posting",
+      "related_terms": [
+        "Transaction Currency"
+      ],
+      "synonyms": [
+        "Settled Amount"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Actual Counterparty Amount",
+      "term_type": "Measure",
+      "type": "decimal(18,2)"
+    },
+    "critic": {
+      "bian_path": "Payment Execution > Payment Order",
+      "business_definition": "The settled amount transferred to the counterparty on this transaction.",
+      "column": "actual_counter_party_amt",
+      "column_roster": [
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "concept_path": [],
+      "data_domain": "Payments",
+      "fibo_path": "fibo-fnd-acc-cur:MonetaryAmount",
+      "identifier_namespace": null,
+      "logical_ref": "ftr::dpl_eib_compliance.comp_fin_tran.actual_counter_party_amt",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Settlement > Posting",
+      "proposed_concept": "monetary_flow",
+      "proposed_concept_meaning": {
+        "entity_link": "",
+        "group": "monetary",
+        "hint": "Transaction amount, payment, fee, interest paid/earned, drawdown, repayment, P&L, revenue",
+        "namespace": ""
+      },
+      "related_terms": [
+        "Transaction Currency"
+      ],
+      "shape_conflicts": [],
+      "synonyms": [
+        "Settled Amount"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Actual Counterparty Amount",
+      "term_type": "Measure",
+      "type": "decimal(18,2)"
+    }
+  },
+  "counter_party_bic": {
+    "classifier": {
+      "bian_path": "Party Reference Data Directory > Party Routing Profile",
+      "business_definition": "The SWIFT Business Identifier Code of the counterparty bank on the transaction.",
+      "column": "counter_party_bic",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "data_domain": "Compliance",
+      "fibo_path": "fibo-fbc-fi:BankIdentifier",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Cross Border > Beneficiary Routing",
+      "related_terms": [
+        "Sender BIC",
+        "Beneficiary Bank"
+      ],
+      "synonyms": [
+        "SWIFT Code",
+        "BIC"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Counterparty BIC",
+      "term_type": "Attribute",
+      "type": "varchar(11)"
+    },
+    "critic": {
+      "bian_path": "Party Reference Data Directory > Party Routing Profile",
+      "business_definition": "The SWIFT Business Identifier Code of the counterparty bank on the transaction.",
+      "column": "counter_party_bic",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "concept_path": [],
+      "data_domain": "Compliance",
+      "fibo_path": "fibo-fbc-fi:BankIdentifier",
+      "identifier_namespace": null,
+      "logical_ref": "ftr::dpl_eib_compliance.comp_fin_tran.counter_party_bic",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Cross Border > Beneficiary Routing",
+      "proposed_concept": "bank_bic",
+      "proposed_concept_meaning": {
+        "entity_link": "bank",
+        "group": "identifier",
+        "hint": "SWIFT BIC of a BANK (8/11 alphanumeric)",
+        "namespace": "swift_bic"
+      },
+      "related_terms": [
+        "Sender BIC",
+        "Beneficiary Bank"
+      ],
+      "shape_conflicts": [],
+      "synonyms": [
+        "SWIFT Code",
+        "BIC"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Counterparty BIC",
+      "term_type": "Attribute",
+      "type": "varchar(11)"
+    }
+  },
+  "counter_party_cif_id": {
+    "classifier": {
+      "bian_path": "Party Reference Data Directory > Customer Identification",
+      "business_definition": "The bank's own customer information file identifier for the counterparty.",
+      "column": "counter_party_cif_id",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "data_domain": "Party",
+      "fibo_path": "fibo-fnd-pty:PartyIdentifier",
+      "primary_entity": "counterparty",
+      "process_path": "Onboarding > KYC > Customer Identification",
+      "related_terms": [
+        "Customer",
+        "Counterparty"
+      ],
+      "synonyms": [
+        "CIF",
+        "Customer Number"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Counterparty CIF Identifier",
+      "term_type": "Dimension",
+      "type": "varchar(20)"
+    },
+    "critic": {
+      "bian_path": "Party Reference Data Directory > Customer Identification",
+      "business_definition": "The bank's own customer information file identifier for the counterparty.",
+      "column": "counter_party_cif_id",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "concept_path": [],
+      "data_domain": "Party",
+      "fibo_path": "fibo-fnd-pty:PartyIdentifier",
+      "identifier_namespace": null,
+      "logical_ref": "ftr::dpl_eib_compliance.comp_fin_tran.counter_party_cif_id",
+      "primary_entity": "counterparty",
+      "process_path": "Onboarding > KYC > Customer Identification",
+      "proposed_concept": "customer_id",
+      "proposed_concept_meaning": {
+        "entity_link": "customer",
+        "group": "identifier",
+        "hint": "Links to the customer entity",
+        "namespace": "cif"
+      },
+      "related_terms": [
+        "Customer",
+        "Counterparty"
+      ],
+      "shape_conflicts": [],
+      "synonyms": [
+        "CIF",
+        "Customer Number"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Counterparty CIF Identifier",
+      "term_type": "Dimension",
+      "type": "varchar(20)"
+    }
+  },
+  "pstd_date": {
+    "classifier": {
+      "bian_path": "Payment Execution > Payment Order",
+      "business_definition": "The business date on which the transaction was posted to the ledger.",
+      "column": "pstd_date",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "data_domain": "Payments",
+      "fibo_path": "fibo-fnd-dt-fd:Date",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Settlement > Posting",
+      "related_terms": [
+        "Value Date"
+      ],
+      "synonyms": [
+        "Posting Date"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Posted Date",
+      "term_type": "Attribute",
+      "type": "date"
+    },
+    "critic": {
+      "bian_path": "Payment Execution > Payment Order",
+      "business_definition": "The business date on which the transaction was posted to the ledger.",
+      "column": "pstd_date",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "sol_desc"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "concept_path": [],
+      "data_domain": "Payments",
+      "fibo_path": "fibo-fnd-dt-fd:Date",
+      "identifier_namespace": null,
+      "logical_ref": "ftr::dpl_eib_compliance.comp_fin_tran.pstd_date",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Settlement > Posting",
+      "proposed_concept": "booking_date",
+      "proposed_concept_meaning": {
+        "entity_link": "",
+        "group": "temporal",
+        "hint": "Date an entry was booked to the ledger (a knowledge/system-time date)",
+        "namespace": ""
+      },
+      "related_terms": [
+        "Value Date"
+      ],
+      "shape_conflicts": [],
+      "synonyms": [
+        "Posting Date"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Posted Date",
+      "term_type": "Attribute",
+      "type": "date"
+    }
+  },
+  "sol_desc": {
+    "classifier": {
+      "bian_path": "Party Reference Data Directory > Service Outlet",
+      "business_definition": "The free-text description of the service outlet (branch) that booked the transaction.",
+      "column": "sol_desc",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "data_domain": "Party",
+      "fibo_path": "fibo-fnd-org-fm:Branch",
+      "primary_entity": "counterparty",
+      "process_path": "Onboarding > Servicing > Branch Administration",
+      "related_terms": [
+        "Branch"
+      ],
+      "synonyms": [
+        "Branch Name"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Branch Description",
+      "term_type": "Attribute",
+      "type": "varchar(200)"
+    },
+    "critic": {
+      "bian_path": "Party Reference Data Directory > Service Outlet",
+      "business_definition": "The free-text description of the service outlet (branch) that booked the transaction.",
+      "column": "sol_desc",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "tran_crncy"
+        }
+      ],
+      "concept_path": [],
+      "data_domain": "Party",
+      "fibo_path": "fibo-fnd-org-fm:Branch",
+      "identifier_namespace": null,
+      "logical_ref": "ftr::dpl_eib_compliance.comp_fin_tran.sol_desc",
+      "primary_entity": "counterparty",
+      "process_path": "Onboarding > Servicing > Branch Administration",
+      "proposed_concept": "branch_id",
+      "proposed_concept_meaning": {
+        "entity_link": "branch",
+        "group": "identifier",
+        "hint": "Links to the branch entity via a branch/SOL CODE",
+        "namespace": "branch_sol"
+      },
+      "related_terms": [
+        "Branch"
+      ],
+      "shape_conflicts": [
+        "name_or_description_not_identifier"
+      ],
+      "synonyms": [
+        "Branch Name"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Branch Description",
+      "term_type": "Attribute",
+      "type": "varchar(200)"
+    }
+  },
+  "tran_crncy": {
+    "classifier": {
+      "bian_path": "Payment Execution > Payment Order",
+      "business_definition": "The ISO-4217 currency the transaction amount is denominated in.",
+      "column": "tran_crncy",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        }
+      ],
+      "data_domain": "Payments",
+      "fibo_path": "fibo-fnd-acc-cur:Currency",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Settlement > Posting",
+      "related_terms": [
+        "Actual Counterparty Amount"
+      ],
+      "synonyms": [
+        "Currency Code"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Transaction Currency",
+      "term_type": "Attribute",
+      "type": "char(3)"
+    },
+    "critic": {
+      "bian_path": "Payment Execution > Payment Order",
+      "business_definition": "The ISO-4217 currency the transaction amount is denominated in.",
+      "column": "tran_crncy",
+      "column_roster": [
+        {
+          "column": "actual_counter_party_amt",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_bic",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "counter_party_cif_id",
+          "party_role": "counterparty"
+        },
+        {
+          "column": "pstd_date"
+        },
+        {
+          "column": "sol_desc"
+        }
+      ],
+      "concept_path": [],
+      "data_domain": "Payments",
+      "fibo_path": "fibo-fnd-acc-cur:Currency",
+      "identifier_namespace": null,
+      "logical_ref": "ftr::dpl_eib_compliance.comp_fin_tran.tran_crncy",
+      "primary_entity": "counterparty",
+      "process_path": "Payments > Settlement > Posting",
+      "proposed_concept": "currency_code",
+      "proposed_concept_meaning": {
+        "entity_link": "",
+        "group": "currency",
+        "hint": "The monetary UNIT",
+        "namespace": ""
+      },
+      "related_terms": [
+        "Actual Counterparty Amount"
+      ],
+      "shape_conflicts": [],
+      "synonyms": [
+        "Currency Code"
+      ],
+      "table": "comp_fin_tran",
+      "table_role": "event_fact",
+      "term_name": "Transaction Currency",
+      "term_type": "Attribute",
+      "type": "char(3)"
+    }
+  }
+}

@@ -602,7 +602,7 @@ def _classified(raw: str) -> tuple[dict, dict]:
     envelope, _reason = enrich_mod._accept_domain_result(64)(raw)
     if envelope is None:
         return {}, {}
-    table_domain, overrides = enrich_mod._parse_domain_result(envelope)
+    table_domain, overrides, _sub_domains = enrich_mod._parse_domain_result(envelope)
     return ({"comp_fin_tran": table_domain},
             {("comp_fin_tran", c): v for c, v in overrides.items()})
 

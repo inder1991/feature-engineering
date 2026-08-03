@@ -83,11 +83,14 @@ def _recs(detail: dict) -> dict[tuple[str, str], dict]:
 
 
 def _assert_total(detail: dict) -> dict[tuple[str, str], dict]:
-    """(e) TOTALITY: the persisted ``pass_b`` detail carries exactly the five per-field records
-    for the fixture's one evaluated table — no field missing, none duplicated."""
+    """(e) TOTALITY: the persisted ``pass_b`` detail carries exactly ONE per-field record for every
+    `DISPOSITION_FIELDS` member of the fixture's one evaluated table — no field missing, none
+    duplicated. The set grew from five to nine at the joint Task-4 step (profile Task 4 added the
+    four profile suggestions); the CONTRACT asserted here is totality, not the literal count, so it
+    reads off the constant rather than a number that has to be chased."""
     recs = _recs(detail)
     assert {f for (t, f) in recs if t == _TABLE} == set(DISPOSITION_FIELDS)
-    assert len(detail["dispositions"]) == 5
+    assert len(detail["dispositions"]) == len(DISPOSITION_FIELDS)
     return recs
 
 

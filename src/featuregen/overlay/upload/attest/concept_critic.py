@@ -26,12 +26,15 @@ never mutation of human decisions).
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from featuregen.overlay.field_evidence import canonical_hash
+from featuregen.overlay.upload.attest.representation import (
+    CRITIC_GROUPS as CRITIC_GROUPS,  # re-exported: ONE definition of "high impact", never two
+)
 from featuregen.overlay.upload.attest.representation import shape_conflicts
 from featuregen.overlay.upload.concepts import (
     CONCEPT_REGISTRY,
@@ -55,7 +58,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CONCEPT_CRITIC_VERSION = 1
+#: v2 (joint Task 4): the critic payload gained the purpose-adapted semantic context and the
+#: refuted-group set widened beyond identifiers, so a v1 stored verdict was reached against a
+#: DIFFERENT question. The version bump retires those rows explicitly rather than replaying them.
+CONCEPT_CRITIC_VERSION = 2
 CONCEPT_CRITIC_RESULT_TYPE = "concept_critique"
 CONCEPT_CRITIC_RUN_ID = "concept-critic"
 CONCEPT_CRITIC_TASK = "overlay.enrich.concept_critique"
@@ -116,13 +122,19 @@ class ConceptDisposition(StrEnum):
 class ConceptCriticItemV1:
     """One assignment under critique. ``definition`` must already be the SANITIZED, bounded
     business definition (the caller owns the M4 rule that a technical upload's free text never
-    egresses — pass ``None`` for those); it is defensively re-bounded before any dispatch."""
+    egresses — pass ``None`` for those); it is defensively re-bounded before any dispatch.
+
+    ``context`` (joint Task 4) is the caller's ``semantic_context.for_critic`` payload — the SAME
+    purpose-adapted context the classifier saw plus the deterministic identity axes. It is merged
+    UNDER the critic's own keys in :func:`_item_payload` (the critic-owned identity keys always
+    win) and it is part of the replay identity: a column whose context changed is a new question."""
 
     logical_ref: str
     column_name: str
     declared_type: str | None
     definition: str | None
     proposed_concept: str
+    context: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,14 +157,36 @@ class ConceptCriticResultV1:
     skipped_reason: str | None = None
 
 
+#: EVERY registry field the critic RENDERS, in payload order. Semantic Task 3: the fingerprint
+#: covers exactly what the model was shown — `proposed_concept_meaning` publishes group, namespace,
+#: entity_link and the description HINT; `for_critic`'s `concept_path` publishes the `is_a`
+#: ancestry. A field here that stops being rendered, or a rendered field missing from here, is the
+#: defect the property tests exist to catch.
+CRITIC_RENDERED_REGISTRY_FIELDS: tuple[str, ...] = (
+    "name", "group", "namespace", "entity_link", "is_a", "description_hint")
+
+
+def _description_hint(description: str) -> str:
+    """The EXACT hint substring `_item_payload` renders — one function, so the fingerprint can
+    never hash a different slice of the description than the payload sends."""
+    return description.split(".")[0].strip()[:120]
+
+
 def _registry_fingerprint() -> str:
-    """Identity of the registry facts the critic reasons over (name/group/namespace). Folded into
-    every replay hash so a registry repair (e.g. a namespace fix) re-critiques instead of replaying
-    a verdict reached against the old vocabulary. Names-only fingerprints are not enough here —
-    the namespace IS the load-bearing axis."""
-    return canonical_hash(sorted(
-        f"{c.name}:{c.group}:{c.namespace or ''}" for c in CONCEPT_REGISTRY.values()
-    ))
+    """Identity of the registry facts the critic RENDERS. Folded into every replay hash so a
+    registry repair (a namespace fix, a re-worded first sentence, a re-parented `is_a`) re-critiques
+    instead of replaying a verdict reached against the old vocabulary.
+
+    Canonical and order-insensitive by construction: a SORTED list of per-concept dicts through the
+    ONE `canonical_hash` (JSON with sorted keys), so neither the registry's declaration order nor a
+    dict's key order can invalidate replay. Names-only fingerprints are not enough here — the
+    namespace is the load-bearing join axis and the hint is what the model actually reads."""
+    return canonical_hash([
+        {"name": c.name, "group": c.group, "namespace": c.namespace or "",
+         "entity_link": c.entity_link or "", "is_a": c.is_a or "",
+         "description_hint": _description_hint(c.description)}
+        for c in sorted(CONCEPT_REGISTRY.values(), key=lambda c: c.name)
+    ])
 
 
 def _bounded(text: str | None, limit: int) -> str | None:
@@ -164,15 +198,22 @@ def _bounded(text: str | None, limit: int) -> str | None:
 def _item_payload(item: ConceptCriticItemV1, conflicts: tuple[str, ...]) -> dict[str, object]:
     """The bounded metadata-only egress payload for one item. The proposed concept's registry
     meaning rides along (its description is the routing signal the registry authors wrote for
-    exactly this purpose); no sample values, no free SQL, nothing row-level."""
+    exactly this purpose); no sample values, no free SQL, nothing row-level.
+
+    Joint Task 4: the caller's ``for_critic`` context is merged UNDER the critic's own keys —
+    source definition, business term, declared/operational type, domain, synonyms and related
+    terms, BIAN/FIBO and process paths, table role, primary entity and the bounded sibling roster.
+    The critic-owned identity keys (``logical_ref``/``column``/``type``/``proposed_concept``/
+    ``shape_conflicts``) always win, so widening the context can never rewrite the question."""
     registered = lookup_concept(item.proposed_concept)
-    payload: dict[str, object] = {
+    payload: dict[str, object] = dict(item.context or {})
+    payload.update({
         "logical_ref": item.logical_ref,
         "column": item.column_name,
         "type": _bounded(item.declared_type, 64) or "unknown",
         "proposed_concept": item.proposed_concept,
         "shape_conflicts": list(conflicts),
-    }
+    })
     definition = _bounded(item.definition, MAX_DEFINITION_LEN)
     if definition:
         payload["business_definition"] = definition

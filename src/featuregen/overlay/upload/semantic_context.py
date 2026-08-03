@@ -868,6 +868,7 @@ def bundle_from_upload(
     observation_context: Sequence[ObservationContextV1] = (),
     catalog_profile_revision_id: str | None = None,
     dataset_profile_hash: str | None = None,
+    table_context: Sequence[SemanticValueV1] = (),
 ) -> SemanticContextBundleV1:
     """Build the bundle from upload material only — `CanonicalRow` + glossary sidecar + the same
     table's cohort. NO graph queries: this runs before `build_graph` exists. Relationship and
@@ -876,7 +877,14 @@ def bundle_from_upload(
 
     Read scope (D11): the anchor must itself be visible to `roles`; cohort neighbours are
     filtered by their declared tags. The glossary record's schema keys the whole table's
-    schema-preserving refs (one physical table has one schema — `ingest._schema_by_table`)."""
+    schema-preserving refs (one physical table has one schema — `ingest._schema_by_table`).
+
+    `table_context` (joint Task 4) is the CALLER-supplied table-grain semantics — the previous
+    run's `table_role`/`primary_entity` resolution at the TABLE logical ref. It is caller-supplied
+    for the same reason `relationship_context` is: this builder runs before `build_graph` exists
+    and issues NO queries. It is deliberately OUTSIDE `shared_identity_payload` (like every other
+    derived field whose inputs legitimately differ between the two builders), so supplying it
+    cannot break builder byte-identity; supplying nothing keeps `table_context_absent` honest."""
     allowed = set(allowed_classes(roles))
     if not _tag_visible(row.sensitivity, allowed):
         raise KeyError(f"column {row.column!r} is not visible to the caller")
@@ -936,6 +944,7 @@ def bundle_from_upload(
     source_map = {v.field_name: v for v in source_values}
     relationship = tuple(relationship_context)
     observations = tuple(observation_context)
+    table_values = tuple(sorted(table_context, key=lambda v: v.field_name))
     missing = _missing_codes(
         concept_name=None,
         concept_path_t=(),
@@ -943,7 +952,7 @@ def bundle_from_upload(
         source=source_map,
         identifier_namespace=None,
         glossary_present=glossary_record is not None,
-        table_context=(),
+        table_context=table_values,
         relationship_context=relationship,
         observation_context=observations,
         catalog_profile_revision_id=catalog_profile_revision_id,
@@ -960,7 +969,7 @@ def bundle_from_upload(
         resolved_semantics=(),
         concept_path=(),
         identifier_namespace=None,
-        table_context=(),
+        table_context=table_values,
         catalog_profile_revision_id=catalog_profile_revision_id,
         dataset_profile_hash=dataset_profile_hash,
         neighbouring_columns=neighbours,
@@ -1320,10 +1329,63 @@ def _identity_parts(bundle: SemanticContextBundleV1) -> tuple[str, str]:
 
 
 def _roster(bundle: SemanticContextBundleV1) -> list[dict]:
-    return [
-        {"column": n.column_name, "concept": n.concept, "party_role": n.party_role}
-        for n in bundle.neighbouring_columns[:ADAPTER_LIST_LIMIT]
-    ]
+    """The bounded sibling roster. Entry keys are exactly the widened `_ROSTER_ENTRY_KEYS`
+    (`column` + the two closed-vocabulary tokens); an absent concept/role is OMITTED rather than
+    sent as null — the egress roster gate admits short strings only, and "we do not know" is
+    honestly the absence of the key, not a null masquerading as a value."""
+    out: list[dict] = []
+    for n in bundle.neighbouring_columns[:ADAPTER_LIST_LIMIT]:
+        entry: dict = {"column": n.column_name}
+        if n.concept:
+            entry["concept"] = n.concept
+        if n.party_role:
+            entry["party_role"] = n.party_role
+        out.append(entry)
+    return out
+
+
+#: The separator `ingest._write_glossary_source_evidence` joins `GlossaryRecord.related_terms` with
+#: before persisting it as ONE evidence value. The adapters split on it to restore the LIST form,
+#: which is the shape the egress layer classifies `related_terms` under (`_LIST_PROSE_META_KEYS`):
+#: each term is then PII-scanned at its own indexed path (`related_terms[0]`) and length-bounded
+#: per TERM rather than per joined blob — a 40-term glossary column whose joined string exceeds the
+#: 200-char per-value cap would otherwise have its WHOLE item egress-excluded.
+_RELATED_TERMS_JOIN = ", "
+
+
+def _related_terms(bundle: SemanticContextBundleV1) -> list[str] | None:
+    raw = _value_of(bundle, "related_terms")
+    if raw is None:
+        return None
+    terms = [t.strip() for t in str(raw).split(_RELATED_TERMS_JOIN) if t.strip()]
+    return terms or None
+
+
+def _table_value(bundle: SemanticContextBundleV1, field_name: str):
+    for v in bundle.table_context:
+        if v.field_name == field_name and v.value not in (None, ""):
+            return v.value
+    return None
+
+
+def _with_extra(payload: dict, extra: Mapping | None) -> dict:
+    """Merge caller-supplied UPLOAD-only material under the adapter's own keys.
+
+    The bundle contract deliberately does not carry three things the ingest-time classifier has
+    always had: the file's DECLARED SQL type token, the sidecar `synonyms`, and the uploader's
+    residual `source_attributes` columns. None of them exists as persisted field evidence, so
+    putting them in `source_semantics` would fork the two builders' byte-identity (D1) for material
+    only one of them can ever see. They ride HERE instead — lowest precedence, so a bundle-derived
+    key always wins and `extra` can only ADD. Empty/None values are dropped: an adapter payload
+    never carries a fabricated blank."""
+    if not extra:
+        return payload
+    for key in sorted(extra):
+        value = extra[key]
+        if key in payload or value in (None, "", [], ()):
+            continue
+        payload[key] = list(value) if isinstance(value, (list, tuple)) else value
+    return payload
 
 
 def _namespace_dict(bundle: SemanticContextBundleV1) -> dict | None:
@@ -1333,33 +1395,69 @@ def _namespace_dict(bundle: SemanticContextBundleV1) -> dict | None:
     return {"scheme": ns.scheme, "issuer_scope": ns.issuer_scope, "basis": ns.basis}
 
 
-def for_concept_enrichment(bundle: SemanticContextBundleV1) -> dict:
-    """Pass-A concept classification context. Key names reuse `_ITEM_META_ALLOWED` /
-    `_COLUMN_PROFILE_KEYS` members where one exists; `column_roster` entry keys beyond the current
-    `_ROSTER_ENTRY_KEYS` require classification before egress (D10). NOT wired into dispatch here."""
+#: The EXACT key list `for_concept_enrichment` renders from bundle-derived material, in emission
+#: order. Frozen as data (not implied by the code) because the replay fingerprint (semantic Task 3)
+#: hashes precisely what is RENDERED to the classifier: a key added here is a payload change and
+#: MUST re-key the cache; a bundle field that is not here was never shown and must not.
+CONCEPT_ENRICHMENT_RENDERED_KEYS: tuple[str, ...] = (
+    "table", "column",
+    "term_name", "business_definition", "data_domain", "bian_path", "fibo_path", "term_type",
+    "process_path", "related_terms",
+    "concept", "declared_type", "operational_type", "party_role",
+    "table_role", "primary_entity",
+    "column_roster",
+)
+
+#: The critic's ADDITIONAL rendered keys on top of the classifier payload (same contract).
+CRITIC_RENDERED_KEYS: tuple[str, ...] = ("entity", "concept_path", "identifier_namespace")
+
+#: The summary/definition/synonym/unit drafting keys (same contract).
+SUMMARY_RENDERED_KEYS: tuple[str, ...] = (
+    "table", "column", "term_name", "business_definition", "data_domain", "term_type",
+    "process_path", "related_terms", "semantic_terms", "concept", "party_role",
+    "table_role", "primary_entity",
+)
+
+
+def for_concept_enrichment(bundle: SemanticContextBundleV1, *,
+                           extra: Mapping | None = None) -> dict:
+    """Pass-A concept classification context — the ONE assembly point for the classifier payload.
+
+    Key names reuse `_ITEM_META_ALLOWED` / `_COLUMN_PROFILE_KEYS` members where one exists; every
+    key emitted here is classified in the enrichment egress allowlists (D10), including the widened
+    `_ROSTER_ENTRY_KEYS` the roster entries use. `extra` carries the upload-only material the
+    bundle contract cannot hold (see :func:`_with_extra`)."""
     table, column = _identity_parts(bundle)
     out: dict = {"table": table, "column": column}
     for key, field_name in (("term_name", "business_term"),
                             ("business_definition", "definition"),
                             ("data_domain", "domain"), ("bian_path", "bian_path"),
                             ("fibo_path", "fibo_path"), ("term_type", "term_type"),
-                            ("process_path", "process_path"),
-                            ("related_terms", "related_terms")):
+                            ("process_path", "process_path")):
         value = _value_of(bundle, field_name)
         if value is not None:
             out[key] = value
+    related = _related_terms(bundle)
+    if related is not None:
+        out["related_terms"] = related
     for key, field_name in (("concept", "concept"), ("declared_type", "declared_type"),
                             ("operational_type", "data_type"), ("party_role", "party_role")):
         value = _value_of(bundle, field_name)
         if value is not None:
             out[key] = value
+    # Table-grain semantics (joint Task 4): the role this column's TABLE plays and the entity it is
+    # about. Both are the platform's own resolved closed-vocabulary tokens, never uploader text.
+    for key in ("table_role", "primary_entity"):
+        value = _table_value(bundle, key)
+        if value is not None:
+            out[key] = value
     out["column_roster"] = _roster(bundle)
-    return out
+    return _with_extra(out, extra)
 
 
-def for_critic(bundle: SemanticContextBundleV1) -> dict:
+def for_critic(bundle: SemanticContextBundleV1, *, extra: Mapping | None = None) -> dict:
     """Concept-critic context: the classification inputs plus the deterministic identity axes."""
-    out = for_concept_enrichment(bundle)
+    out = for_concept_enrichment(bundle, extra=extra)
     entity = _value_of(bundle, "entity")
     if entity is not None:
         out["entity"] = entity
@@ -1368,21 +1466,29 @@ def for_critic(bundle: SemanticContextBundleV1) -> dict:
     return out
 
 
-def for_summary(bundle: SemanticContextBundleV1) -> dict:
-    """Column-summary drafting context: curated meaning + role, no relationship payloads."""
+def for_summary(bundle: SemanticContextBundleV1, *, extra: Mapping | None = None) -> dict:
+    """Drafting context for the prose/annotation Pass-A tasks (summary, definition, synonyms,
+    unit): curated meaning + role + table grain, no relationship payloads and no sibling roster —
+    those tasks answer about ONE column and a roster is contamination surface, not signal."""
     table, column = _identity_parts(bundle)
     out: dict = {"table": table, "column": column}
     for key, field_name in (("term_name", "business_term"),
                             ("business_definition", "definition"),
                             ("data_domain", "domain"), ("term_type", "term_type"),
                             ("process_path", "process_path"),
-                            ("related_terms", "related_terms"),
                             ("semantic_terms", "semantic_terms"), ("concept", "concept"),
                             ("party_role", "party_role")):
         value = _value_of(bundle, field_name)
         if value is not None:
             out[key] = value
-    return out
+    related = _related_terms(bundle)
+    if related is not None:
+        out["related_terms"] = related
+    for key in ("table_role", "primary_entity"):
+        value = _table_value(bundle, key)
+        if value is not None:
+            out[key] = value
+    return _with_extra(out, extra)
 
 
 def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:

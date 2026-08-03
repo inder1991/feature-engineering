@@ -13,12 +13,18 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload import enrich_config, table_vocab
-from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
-from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
+from featuregen.overlay.upload.attest.dataset_profile_critic import CRITIC_BUDGET_EXHAUSTED
+from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
+from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES, ENRICHMENT_RUN_ID
 from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.profile_vocab import AuthorityRole as _AuthorityRole
+from featuregen.overlay.upload.profile_vocab import TemporalStorageModel as _TemporalStorageModel
 from featuregen.overlay.upload.taxonomy.dimensions import known_entities
 from featuregen.runtime.observability import counters
 
@@ -76,12 +82,38 @@ def assemble_table_items(views: dict[str, TableMetadataView]) -> list[BatchItem]
 
 _VALID_BASIS = {"posted_at", "ingested_at"}  # lag-free bases only (event_time_plus_lag needs lag_hours)
 
-# The five per-table disposition fields — the per-run record set is TOTAL over them: every table
-# that reaches `make_ref_accept` gets exactly one record per field, and every assembled table that
-# never resolves gets the same five as `not_evaluated` ([F12]). ONE constant so the accept, the
-# totalizer, and their tests can never drift.
-DISPOSITION_FIELDS = ("grain", "availability_time", "table_role", "primary_entity",
-                      "event_or_snapshot")
+# The per-table disposition fields — the per-run record set is TOTAL over them: every table that
+# reaches `make_ref_accept` gets exactly one record per field, and every assembled table that never
+# resolves gets the same set as `not_evaluated` ([F12]). ONE constant so the accept, the totalizer,
+# and their tests can never drift.
+#
+# Profile Task 4 adds the four PROFILE suggestions beside the existing structural ones. They are the
+# same KIND of thing (advisory table-level proposals) and share the same totality contract.
+_STRUCTURAL_DISPOSITION_FIELDS = ("grain", "availability_time", "table_role", "primary_entity",
+                                  "event_or_snapshot")
+PROFILE_DISPOSITION_FIELDS = ("table_description", "business_context", "authority_role",
+                              "temporal_storage_model")
+DISPOSITION_FIELDS = (*_STRUCTURAL_DISPOSITION_FIELDS, *PROFILE_DISPOSITION_FIELDS)
+
+#: The closed per-field disposition vocabulary. `not_evaluated` (the table never reached
+#: validation) and `not_attempted` (the table WAS evaluated but this field was deliberately never
+#: asked — e.g. the proposal-blind critic had no client) are DISTINCT on purpose: one is an
+#: infrastructure outcome, the other a decision this run took.
+DISPOSITION_STATUSES = frozenset({
+    "accepted",         # validated and (where applicable) written as llm/proposed evidence
+    "abstained",        # the model was asked and offered nothing
+    "dropped_invalid",  # offered, but the code-side gate could not accept it
+    "refuted",          # a deterministic contradiction, or the proposal-blind critic, refused it
+    "superseded",       # a stronger CURRENT value already governs the field; kept for review only
+    "not_attempted",    # in scope, deliberately not asked this run
+    "not_evaluated",    # the table never reached per-field validation at all ([F12])
+})
+
+#: Critic reason codes that mean the critique NEVER RAN, so the field is `not_attempted` rather
+#: than `refuted`. A starved critic disagreed with nothing — it was never asked. (The other
+#: `PROFILE_CRITIC_REASON_CODES` all describe a critique that DID run, or a fault while running it,
+#: and the critic itself resolves those to UPHELD before this mapping is ever consulted.)
+CRITIC_NOT_ATTEMPTED_REASONS = frozenset({CRITIC_BUDGET_EXHAUSTED})
 
 
 def add_not_evaluated(dispositions: list[dict], table: str) -> None:
@@ -96,8 +128,244 @@ def add_not_evaluated(dispositions: list[dict], table: str) -> None:
                              "reason": None, "prior_value_staled": False})
 
 
+# ── profile Task 4: deterministic contradictions, run BEFORE any model opinion is consulted ─────
+#
+# Honest signals only. Each rule names the evidence it keys on and ABSTAINS when that evidence is
+# absent from the bounded table context — a deterministic refutation no model may overturn must
+# never fire on the ordinary case (a glossary catalog whose `operational_type` is uniformly
+# "unknown", a wide table presented as a compact roster).
+
+#: Closed vocabulary of profile contradictions.
+PROFILE_CONTRADICTION_CODES = frozenset({
+    "scd2_without_candidate_boundaries",
+    "event_fact_without_time_column",
+    "crosswalk_with_fewer_than_two_identifier_sides",
+    "authority_claim_without_source_context",
+})
+
+#: Word tokens a validity-boundary column carries. Exact tokens, split on non-alphanumerics — never
+#: substrings ("mandate" must not fire "date").
+_BOUNDARY_TOKENS = frozenset({
+    "from", "to", "start", "end", "eff", "effective", "expiry", "expiration", "exp",
+    "valid", "since", "until", "open", "close", "closed",
+})
+#: Word tokens (and declared-type families) that mark a TIME column.
+_TIME_TOKENS = frozenset({
+    "date", "dt", "time", "ts", "timestamp", "datetime", "day", "month", "year", "asof", "when",
+})
+_TIME_TYPE_TOKENS = frozenset({"date", "timestamp", "timestamptz", "datetime", "time"})
+#: The authority roles that CLAIM this copy is the place the data is decided.
+_AUTHORITATIVE_ROLES = frozenset({"system_of_record", "mastered_view", "authoritative_replica"})
+
+
+def _words(value: object) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9]+", str(value or "").lower()) if w}
+
+
+def _is_time_column(entry: dict) -> bool:
+    if _words(entry.get("column")) & _TIME_TOKENS:
+        return True
+    for key in ("declared_type", "operational_type"):
+        if _words(entry.get(key)) & _TIME_TYPE_TOKENS:
+            return True
+    return False
+
+
+def _is_boundary_column(entry: dict) -> bool:
+    words = _words(entry.get("column"))
+    return bool(words & _BOUNDARY_TOKENS) and (
+        bool(words & _TIME_TOKENS) or _is_time_column(entry))
+
+
+def profile_contradictions(
+    synthesis: dict, inventory: Sequence[dict], *,
+    source_context: bool = False, catalog_context_available: bool = False,
+) -> dict[str, str]:
+    """Deterministic contradictions between a Pass-B profile suggestion and the table's own shape.
+
+    Returns ``{field: code}`` — a subset of :data:`PROFILE_CONTRADICTION_CODES` keyed by the
+    disposition field it refutes. Computed FIRST, before any critic dispatch: a contradiction
+    refutes on its own and survives having no LLM client at all.
+
+    ``inventory`` is the item's own column list — the full ``column_profiles`` on the narrow path,
+    the compact ``column_roster`` on the wide one. What each rule can see differs, and each says so:
+
+    * ``scd2_without_candidate_boundaries`` — a claimed SCD2 model needs a validity interval, which
+      is a pair of BOUNDARY-shaped time columns (``valid_from``/``eff_dt``/``end_date``…). Keys on
+      column NAMES plus declared/operational type families, both of which the compact roster carries
+      in full — so this one does NOT abstain on a wide table. It abstains when there is no column
+      inventory at all (nothing to look at).
+    * ``event_fact_without_time_column`` — an event fact needs a time axis. Same signals, plus the
+      synthesis' own ``as_of_column`` proposal, which satisfies it directly.
+    * ``crosswalk_with_fewer_than_two_identifier_sides`` — a crosswalk maps at least two identifier
+      value spaces. Keys on the resolved CONCEPT GROUP of each column, which only exists where Pass A
+      classified one; a table whose inventory carries NO concept at all ABSTAINS (the review's
+      explicit caveat: a glossary catalog's roster can be concept-free, and refuting every bridge
+      claim there would be the misfire this rule exists to avoid).
+    * ``authority_claim_without_source_context`` — an authoritative-copy claim needs something
+      authored to rest on. It fires ONLY when the catalog demonstrably HAS source context to check
+      against (``catalog_context_available``) and this table carries none; with no narrative
+      anywhere it abstains, because "unsupported" and "unknown" are then indistinguishable.
+    """
+    from featuregen.overlay.upload.concepts import concept as lookup_concept
+
+    out: dict[str, str] = {}
+    entries = [e for e in inventory if isinstance(e, dict)]
+
+    temporal = table_vocab_normalize_temporal(synthesis.get("temporal_storage_model"))
+    if entries and temporal == "scd2" and not any(_is_boundary_column(e) for e in entries):
+        out["temporal_storage_model"] = "scd2_without_candidate_boundaries"
+
+    role = str(synthesis.get("table_role") or "").strip().lower()
+    kind = str(synthesis.get("event_or_snapshot") or "").strip().lower()
+    if entries and (role == "event_fact" or kind == "event"):
+        if not synthesis.get("as_of_column") and not any(_is_time_column(e) for e in entries):
+            out["table_role"] = "event_fact_without_time_column"
+
+    if role == "bridge":
+        concepts = [str(e.get("concept") or "") for e in entries if e.get("concept")]
+        if concepts:      # ABSTAIN when the inventory carries no concept at all
+            identifier_sides = sum(
+                1 for name in concepts
+                if (rec := lookup_concept(name)) is not None and rec.group == "identifier")
+            if identifier_sides < 2:
+                out["table_role"] = "crosswalk_with_fewer_than_two_identifier_sides"
+
+    authority = str(synthesis.get("authority_role") or "").strip().lower()
+    if (authority in _AUTHORITATIVE_ROLES and catalog_context_available and not source_context):
+        out["authority_role"] = "authority_claim_without_source_context"
+
+    illegal = set(out.values()) - PROFILE_CONTRADICTION_CODES
+    if illegal:   # structurally impossible; guards vocabulary drift
+        raise ValueError(f"profile contradiction codes outside the closed set: {sorted(illegal)}")
+    return out
+
+
+def table_vocab_normalize_temporal(raw: object) -> str | None:
+    """`profile_vocab.normalize_temporal_storage_model`, imported lazily (profile_vocab imports
+    table_vocab, which this module also imports)."""
+    from featuregen.overlay.upload.profile_vocab import normalize_temporal_storage_model
+    return normalize_temporal_storage_model(raw)
+
+
+#: The bounded per-value length of a profile PROSE suggestion — the same 600-char window the
+#: sanitized business definition uses (`enrich_llm.MAX_DEFINITION_LEN`), so a description and a
+#: definition can never drift apart on what "bounded" means.
+_MAX_PROFILE_PROSE = 600
+#: The one non-column citation a suggestion may name: the table's own curated definition.
+_TABLE_DEFINITION_REF = "table_definition"
+
+
+def _cited_refs(synthesis: dict, field: str, *, cols: set[str]) -> list[str]:
+    """The refs this suggestion cites, filtered to the BOUNDED TABLE CONTEXT it was given: a real
+    column of THIS table, or the literal ``table_definition``. A hallucinated ref is dropped rather
+    than trusted, so "names existing evidence refs" is enforced, never assumed."""
+    allowed = {c.lower() for c in cols} | {_TABLE_DEFINITION_REF}
+    out: list[str] = []
+    for entry in synthesis.get("evidence_refs") or []:
+        if not isinstance(entry, dict) or str(entry.get("field") or "").strip() != field:
+            continue
+        for ref in entry.get("refs") or []:
+            if isinstance(ref, str) and ref.strip().lower() in allowed:
+                cited = ref.strip().lower()
+                if cited not in out:
+                    out.append(cited)
+    return out
+
+
+def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
+                           contradictions: dict[str, str], put, source_definition: str | None,
+                           critic) -> dict:
+    """Validate the four profile suggestions, appending one disposition each (TOTAL over
+    :data:`PROFILE_DISPOSITION_FIELDS`). Returns the accepted values, keyed by field.
+
+    The order of authority is fixed and mirrors the concept critic's:
+
+    1. a DETERMINISTIC contradiction refutes outright — no model may overturn it, and the critic is
+       never even asked;
+    2. the code-side vocabulary/shape gate drops an unusable value (that FIELD only — [F1]);
+    3. every surviving suggestion must NAME evidence refs from the bounded table context;
+    4. a SOURCE-authored table definition stays current: the LLM's alternative description is
+       recorded ``superseded`` (kept for review in the structured result) and never written as
+       competing evidence;
+    5. for the two OPERATIONAL classifications only, the proposal-blind critic gets a veto.
+    """
+    from featuregen.overlay.upload.profile_vocab import (
+        normalize_authority_role,
+        normalize_temporal_storage_model,
+    )
+
+    accepted: dict = {}
+
+    def _prose(field: str, *, superseded_by_source: bool) -> None:
+        raw = synthesis.get(field)
+        if contradictions.get(field):
+            put(ref, field, "refuted", contradictions[field])
+            return
+        if not isinstance(raw, str) or not raw.strip():
+            put(ref, field, "abstained")
+            return
+        value = raw.strip()[:_MAX_PROFILE_PROSE]
+        refs = _cited_refs(synthesis, field, cols=cols)
+        if not refs:
+            put(ref, field, "dropped_invalid", "no_evidence_ref")
+            return
+        if superseded_by_source:
+            # The curated text stays CURRENT. The alternative is real review material — it rides
+            # the structured result — but it never becomes competing `definition` evidence.
+            put(ref, field, "superseded", "source_authored_definition_current")
+            return
+        accepted[field] = value
+        accepted.setdefault("evidence_refs", {})[field] = refs
+        put(ref, field, "accepted")
+
+    def _classification(field: str, normalize) -> None:
+        raw = synthesis.get(field)
+        if contradictions.get(field):
+            put(ref, field, "refuted", contradictions[field])
+            return
+        if raw in (None, ""):
+            put(ref, field, "abstained")
+            return
+        value = normalize(raw)
+        if value is None:
+            put(ref, field, "dropped_invalid", f"{field}_off_vocab")
+            return
+        refs = _cited_refs(synthesis, field, cols=cols)
+        if not refs:
+            put(ref, field, "dropped_invalid", "no_evidence_ref")
+            return
+        if critic is None:
+            # In scope but deliberately not asked this run (no client / critic disabled) — an
+            # OPERATIONAL classification never lands unreviewed on a single model's say-so.
+            put(ref, field, "not_attempted", "critic_unavailable")
+            return
+        verdict = critic(ref, field, value, refs)
+        if verdict is not True:
+            # A critique that never RAN is `not_attempted`, not `refuted`: nobody disagreed with
+            # this value — nobody was asked. Either way the value does not land.
+            status = ("not_attempted" if verdict in CRITIC_NOT_ATTEMPTED_REASONS else "refuted")
+            put(ref, field, status,
+                verdict if isinstance(verdict, str) else "critic_refuted")
+            return
+        accepted[field] = value
+        accepted.setdefault("evidence_refs", {})[field] = refs
+        put(ref, field, "accepted")
+
+    _prose("table_description", superseded_by_source=bool(source_definition))
+    _prose("business_context", superseded_by_source=False)
+    _classification("authority_role", normalize_authority_role)
+    _classification("temporal_storage_model", normalize_temporal_storage_model)
+    return accepted
+
+
 def make_ref_accept(columns_by_table: dict[str, set[str]], *,
-                    dispositions: list[dict] | None = None):
+                    dispositions: list[dict] | None = None,
+                    inventory_by_table: dict[str, Sequence[dict]] | None = None,
+                    source_context_by_table: dict[str, bool] | None = None,
+                    source_definition_by_table: dict[str, str] | None = None,
+                    catalog_context_available: bool = False,
+                    critic=None):
     """A ref-aware accept for `validate_batch_results(..., ref_aware=True)`. `ref` is the table name;
     validate the serialized `synthesis` against THAT table's real columns and map a valid result onto
     the FACT_VALUE_SCHEMAS shapes (grain `{columns, is_unique}` / availability `{column, basis}`).
@@ -113,8 +381,22 @@ def make_ref_accept(columns_by_table: dict[str, set[str]], *,
     disp = dispositions if dispositions is not None else []
 
     def _put(ref: str, field: str, status: str, reason: str | None = None) -> None:
+        if status not in DISPOSITION_STATUSES:   # closed vocabulary; guards drift
+            raise ValueError(f"disposition status {status!r} is not in the closed set")
         disp.append({"table": ref, "field": field, "status": status, "reason": reason,
                      "prior_value_staled": False})
+
+    def _replace(ref: str, field: str, status: str, reason: str | None = None) -> None:
+        """Upgrade THIS run's record for `{ref, field}` in place (searched newest-first), so a
+        deterministic refutation supersedes the accept's own verdict instead of appending a second,
+        contradictory record for the same field. Appends when no record exists yet."""
+        for rec in reversed(disp):
+            if rec.get("table") == ref and rec.get("field") == field:
+                if status not in DISPOSITION_STATUSES:
+                    raise ValueError(f"disposition status {status!r} is not in the closed set")
+                rec["status"], rec["reason"] = status, reason
+                return
+        _put(ref, field, status, reason)
 
     def accept(raw: str, ref: str) -> tuple[str | None, str]:
         cols = columns_by_table.get(ref, set())
@@ -198,11 +480,30 @@ def make_ref_accept(columns_by_table: dict[str, set[str]], *,
         else:
             _put(ref, "primary_entity", "accepted" if ent else "abstained")
 
+        # ── profile Task 4: the four PROFILE suggestions, deterministic contradictions FIRST.
+        inventory = list((inventory_by_table or {}).get(ref, ()))
+        contradictions = profile_contradictions(
+            {**s, "table_role": role, "event_or_snapshot": eos}, inventory,
+            source_context=(source_context_by_table or {}).get(ref, False),
+            catalog_context_available=catalog_context_available)
+        # A refuted STRUCTURAL field is evicted here too: the disposition `make_ref_accept` already
+        # appended for it is upgraded to `refuted`, and the value is dropped so nothing downstream
+        # can propose it. A deterministic contradiction outranks every model opinion, including the
+        # one that produced this synthesis.
+        if contradictions.get("table_role") and role is not None:
+            _replace(ref, "table_role", "refuted", contradictions["table_role"])
+            role = None
+
+        profile = _accept_profile_fields(
+            s, ref, cols=cols, contradictions=contradictions, put=_put,
+            source_definition=(source_definition_by_table or {}).get(ref),
+            critic=critic)
+
         # A parseable synthesis with neither grain nor availability is a VALID ABSTENTION (some tables
         # genuinely have no single grain / as-of) — retain the surviving advisory fields and propose
         # zero grain/availability facts. Only unparseable / non-object raw (above) is a failure.
         out = {"grain": grain, "availability_time": availability,
-               "table_role": role, "primary_entity": ent, "event_or_snapshot": eos}
+               "table_role": role, "primary_entity": ent, "event_or_snapshot": eos, **profile}
         return json.dumps(out, sort_keys=True), ("valid" if (grain or availability) else "abstained")
     return accept
 
@@ -274,12 +575,62 @@ def _dispatch_subjects_for(items: list[BatchItem], *, catalog_source: str | None
     return out
 
 
+def _profile_critic(conn, client, items: list[BatchItem], *, catalog_source: str | None,
+                    schema_by_table: dict[str, str] | None, context_revision: str, actor):
+    """The proposal-blind veto for the two OPERATIONAL profile classifications (profile Task 4).
+
+    Returns ``critic(ref, field, value, cited_refs, *, budget=None) -> True | reason_code`` —
+    ``True`` upholds; :data:`CRITIC_NOT_ATTEMPTED_REASONS` members mean the critique never ran; any
+    other code refutes. The comparison happens INSIDE `attest.dataset_profile_critic`, code-side
+    and outside the prompt; this closure only routes the table's own bounded context to it. A run
+    with no client gets ``None``, and `_accept_profile_fields` then records `not_attempted` rather
+    than landing an operational classification on one model's unreviewed say-so.
+
+    ``budget`` is the enclosing synthesis run's shared ``CallLedger``, bound by `_run_synthesis`:
+    each critique is a PHYSICAL provider call and must be spent from the run's own ceiling."""
+    if client is None:
+        return None
+    from featuregen.overlay.upload.attest.dataset_profile_critic import (
+        CRITIC_FIELDS,
+        ProfileCriticDisposition,
+        critique_profile_claim,
+    )
+    context_by_ref = {it.ref: it.metadata for it in items}
+    sbt = schema_by_table or {}
+
+    def _critic(ref: str, field: str, value: str, cited_refs, *, budget=None):
+        if field not in CRITIC_FIELDS:
+            return True                       # out of scope: the one-model path stands
+        context = context_by_ref.get(ref, {})
+        table = str(context.get("table") or ref)
+        dataset_ref = (normalize_ref(catalog_source, sbt.get(table.strip().lower()), table)
+                       if catalog_source else table)
+        try:
+            outcome = critique_profile_claim(
+                conn, client, dataset_ref=dataset_ref, field=field, proposed_value=value,
+                context=context, cited_refs=cited_refs, context_revision=context_revision,
+                actor=actor, call_budget=budget)
+        except Exception:  # noqa: BLE001 — advisory: a critic fault never fails the synthesis
+            logger.warning("advisory profile critic failed for %r/%s", ref, field, exc_info=True)
+            return True                       # fail-soft UPHELD; never evict on infrastructure
+        if outcome.disposition is ProfileCriticDisposition.UPHELD:
+            return True
+        if outcome.disposition is ProfileCriticDisposition.NOT_ATTEMPTED:
+            # The critique never ran (the run's call budget was spent). Report the reason as-is so
+            # the disposition is `not_attempted` — a starved critic is not a disagreeing one.
+            return outcome.reason_codes[0] if outcome.reason_codes else CRITIC_BUDGET_EXHAUSTED
+        return "independent_disagrees"
+
+    return _critic
+
+
 def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table, actor,
                       dispositions: list[dict] | None = None,
                       ingestion_run_id: str | None = None,
                       catalog_source: str | None = None,
                       schema_by_table: dict[str, str] | None = None,
-                      stats: dict | None = None) -> dict[str, dict]:
+                      stats: dict | None = None,
+                      catalog_context_available: bool = False) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
@@ -316,6 +667,19 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
               if len(it.metadata.get("column_profiles") or []) <= _MAX_COLUMN_PROFILES]
     wide = [it for it in items
             if len(it.metadata.get("column_profiles") or []) > _MAX_COLUMN_PROFILES]
+    # The replay identity of THIS run's Pass-B context: a byte-identical re-upload replays every
+    # stored critique and synthesis for free, while any content change re-asks the affected
+    # questions. Folds in the profile VOCABULARY fingerprint (a changed admissible-answer set is a
+    # changed question) and the prompt/schema versions the synthesis stamps.
+    context_revision = canonical_hash({
+        "prompt_id": _SYNTH_PROMPT_ID, "prompt_version": _SYNTH_PROMPT_VERSION,
+        "schema_id": "overlay_table_synth_batch", "schema_version": _SYNTH_SCHEMA_VERSION,
+        "profile_vocabulary": _profile_vocabulary_fingerprint(),
+        "items": {it.ref: it.metadata for it in sorted(items, key=lambda i: i.ref)},
+    })
+    critic = _profile_critic(conn, client, items, catalog_source=catalog_source,
+                             schema_by_table=schema_by_table,
+                             context_revision=context_revision, actor=actor)
     resolved: dict[str, dict] = {}
     if narrow:
         # Today's exact path: one synthesis batch over the full profiles (fast path, byte-for-byte).
@@ -324,15 +688,66 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                                        dispositions=dispositions,
                                        ingestion_run_id=ingestion_run_id,
                                        catalog_source=catalog_source,
-                                       schema_by_table=schema_by_table, stats=stats))
+                                       schema_by_table=schema_by_table, stats=stats,
+                                       catalog_context_available=catalog_context_available,
+                                       critic=critic))
     if wide:
         resolved.update(_synthesize_wide_tables(conn, client, wide,
                                                 columns_by_table=columns_by_table, actor=actor,
                                                 dispositions=dispositions,
                                                 ingestion_run_id=ingestion_run_id,
                                                 catalog_source=catalog_source,
-                                                schema_by_table=schema_by_table, stats=stats))
+                                                schema_by_table=schema_by_table, stats=stats,
+                                                catalog_context_available=catalog_context_available,
+                                                critic=critic))
+    # Profile Task 4: record the accepted synthesis in the shared structured-result store so the
+    # Release-A evaluation can REPLAY it without a live LLM. Immutable + content-addressed on the
+    # exact context that produced it; a second store would be the duplication the plan forbids.
+    _record_synthesis_results(conn, resolved, context_revision=context_revision,
+                              catalog_source=catalog_source, schema_by_table=schema_by_table)
     return resolved
+
+
+#: The Pass-B synthesis contract, named once so the request, the replay identity and the tests read
+#: the same values.
+_SYNTH_PROMPT_ID = "overlay_table_synth_v4"
+_SYNTH_PROMPT_VERSION = 4
+_SYNTH_SCHEMA_VERSION = 3
+#: The phase-1 (wide-table) summary prompt id. Its VERSIONS are `_SYNTH_PROMPT_VERSION` /
+#: `_SYNTH_SCHEMA_VERSION` — one Pass B run stamps ONE contract generation across both phases.
+_SUMMARY_PROMPT_ID = f"overlay_table_synth_summary_v{_SYNTH_PROMPT_VERSION}"
+PASS_B_RESULT_TYPE = "table_profile_synthesis"
+PASS_B_RESULT_VERSION = 1
+
+
+def _profile_vocabulary_fingerprint() -> str:
+    from featuregen.overlay.upload.profile_vocab import profile_vocabulary_fingerprint
+    return profile_vocabulary_fingerprint()
+
+
+def _record_synthesis_results(conn, resolved: dict[str, dict], *, context_revision: str,
+                              catalog_source: str | None,
+                              schema_by_table: dict[str, str] | None) -> None:
+    """Persist each accepted synthesis through the EXISTING `structured_result` store, keyed by the
+    exact input hash the context produced. Fail-soft per table: a store failure degrades replay,
+    never the upload."""
+    from featuregen.overlay.upload.structured_results import record_structured_result
+
+    sbt = schema_by_table or {}
+    for table, synthesis in resolved.items():
+        dataset_ref = (normalize_ref(catalog_source, sbt.get(table.strip().lower()), table)
+                       if catalog_source else table)
+        input_hash = canonical_hash({"context_revision": context_revision, "table": table})
+        try:
+            with conn.transaction():   # savepoint: one bad row never poisons the caller's tx
+                record_structured_result(
+                    conn, result_type=PASS_B_RESULT_TYPE, result_version=PASS_B_RESULT_VERSION,
+                    input_content_hash=input_hash, output=dict(synthesis),
+                    producer_kind="llm_call", producer_ref=f"{ENRICHMENT_RUN_ID}:pass_b",
+                    authority={"authority": "llm_advisory", "logical_ref": dataset_ref})
+        except Exception:  # noqa: BLE001 — advisory: replay persistence never fails an upload
+            logger.warning("advisory Pass-B structured-result write failed for %r", table,
+                           exc_info=True)
 
 
 def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, actor, instruction,
@@ -340,14 +755,18 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                    ingestion_run_id: str | None = None,
                    catalog_source: str | None = None,
                    schema_by_table: dict[str, str] | None = None,
-                   stats: dict | None = None) -> dict[str, dict]:
+                   stats: dict | None = None,
+                   catalog_context_available: bool = False,
+                   critic=None) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
 
-    Ships the Pass B Slice-2 contract via the Task-1 version seam: **prompt v3** (the code-side
-    `table_role` vocab is enumerated in the instruction) over the **unchanged canonical v2
-    schema**. [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
+    Ships the Pass B contract via the Task-1 version seam, read from `_SYNTH_PROMPT_VERSION` /
+    `_SYNTH_SCHEMA_VERSION` (never re-typed): **prompt v4** (the code-side `table_role` vocab is
+    enumerated in the instruction) over the **canonical v3 schema** — a REAL v3 body, because v2 is
+    a byte-alias of v1 with `additionalProperties: false` and would reject the profile suggestions.
+    [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
     WHOLE synthesis on one schema violation, so a strict role enum would lose a valid grain to one
     off-vocab role; the vocab is enforced per-field in `make_ref_accept` instead.
 
@@ -355,12 +774,27 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     appends the five per-field records for every table it validates (retries never duplicate: a
     resolved ref is excluded from every retry/split chunk, and only a parseable-dict raw — which
     always resolves — appends records)."""
-    accept = make_ref_accept(columns_by_table, dispositions=dispositions)
+    inventory = {it.ref: (it.metadata.get("column_profiles")
+                          or it.metadata.get("column_roster") or []) for it in items}
+    source_definitions = {it.ref: it.metadata.get("table_definition") for it in items
+                          if it.metadata.get("table_definition")}
+    # ONE ledger for this synthesis run, shared by the batching ladder AND the critic it fires from
+    # inside `accept`: a critique is a physical provider call, so it spends the SAME ceiling the
+    # chunks spend (the finding — critic calls were invisible to `max_provider_calls`). The ledger
+    # is per-run_batched-run, exactly the scope `max_provider_calls` has always had.
+    ledger = CallLedger(enrich_config.budget("table_synth").max_provider_calls)
+    budgeted_critic = None if critic is None else (
+        lambda ref, field, value, refs: critic(ref, field, value, refs, budget=ledger))
+    accept = make_ref_accept(
+        columns_by_table, dispositions=dispositions, inventory_by_table=inventory,
+        source_definition_by_table=source_definitions,
+        source_context_by_table={ref: True for ref in source_definitions},
+        catalog_context_available=catalog_context_available, critic=budgeted_critic)
     batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
-        prompt_id="overlay_table_synth_v3", schema_id="overlay_table_synth_batch",
-        prompt_version=3, schema_version=2,
+        prompt_id=_SYNTH_PROMPT_ID, schema_id="overlay_table_synth_batch",
+        prompt_version=_SYNTH_PROMPT_VERSION, schema_version=_SYNTH_SCHEMA_VERSION,
         shared_metadata={}, items=items, out_key="synthesis",
         instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
@@ -369,6 +803,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
         dispatch_subjects=_dispatch_subjects_for(items, catalog_source=catalog_source,
                                                  schema_by_table=schema_by_table),
+        call_ledger=ledger,
     )
     # ACCUMULATE (narrow + wide-phase-2 both funnel here): these table-granular refs are exactly
     # Pass B's expected unit, so a truncated synthesis surfaces as the stage's `not_attempted`.
@@ -390,9 +825,16 @@ def _roster_entry(desc: dict) -> dict:
     exactly these keys from the view — is the projection source). Structured, never the old
     `name:type` flat string: a column name may itself contain `:`/`/`, which the flat form
     conflated irrecoverably. Values are bounded to the default per-value egress cap."""
-    return {"column": (desc.get("column") or "")[:200],
-            "operational_type": (desc.get("operational_type") or "")[:200],
-            "declared_type": (desc.get("declared_type") or "")[:200]}
+    entry = {"column": (desc.get("column") or "")[:200],
+             "operational_type": (desc.get("operational_type") or "")[:200],
+             "declared_type": (desc.get("declared_type") or "")[:200]}
+    # Profile Task 4: the resolved CONCEPT rides the compact roster too. It is the only signal the
+    # crosswalk contradiction can key on ("a crosswalk maps >= 2 identifier value spaces"), so
+    # without it that rule would have to abstain on every wide table — which is most of them.
+    # `_ROSTER_ENTRY_KEYS` classifies it as a bounded structural token (a registry concept name).
+    if desc.get("concept"):
+        entry["concept"] = str(desc["concept"])[:200]
+    return entry
 
 
 def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, columns_by_table, actor,
@@ -400,7 +842,9 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
                             ingestion_run_id: str | None = None,
                             catalog_source: str | None = None,
                             schema_by_table: dict[str, str] | None = None,
-                            stats: dict | None = None) -> dict[str, dict]:
+                            stats: dict | None = None,
+                            catalog_context_available: bool = False,
+                            critic=None) -> dict[str, dict]:
     """Two-phase synthesis for tables wider than the egress cap (#1). ``dispositions`` threads to
     the PHASE-2 synthesis only (whose refs are the table names); the phase-1 chunk summaries are
     advisory input keyed by chunk ref and record no per-field dispositions.
@@ -441,12 +885,16 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
 
     summaries = run_batched(
         conn, client, short="table_synth", task="table_synth_summary",
-        # Slice-2 stamp: prompt v3 / canonical schema v2, matching the synthesis call so one Pass B
-        # run never egresses under two contract generations. The summary TEXT is unchanged at v3
-        # (it emits no table_role, so there is no vocab to enumerate) — the bump identifies the
-        # Slice-2 contract, mirroring the Slice-1 v2-aliases-v1 schema precedent.
-        prompt_id="overlay_table_synth_summary_v3", schema_id="overlay_table_synth_summary_batch",
-        prompt_version=3, schema_version=2,
+        # The phase-1 summary is stamped with the SAME contract generation as the phase-2 synthesis
+        # it feeds (`_SYNTH_PROMPT_VERSION` / `_SYNTH_SCHEMA_VERSION` — prompt v4 over the canonical
+        # v3 schema), so one Pass B run never egresses under two generations. Read from the
+        # constants rather than re-typed: the previous literal 4/3 pair carried a comment still
+        # claiming "prompt v3 / canonical schema v2", which is exactly how a drifted copy hides. The
+        # summary TEXT itself is unchanged by the bump (it emits no table_role, so there is no vocab
+        # to enumerate) — the version identifies the contract, mirroring the Slice-1 v2-aliases-v1
+        # schema precedent.
+        prompt_id=_SUMMARY_PROMPT_ID, schema_id="overlay_table_synth_summary_batch",
+        prompt_version=_SYNTH_PROMPT_VERSION, schema_version=_SYNTH_SCHEMA_VERSION,
         shared_metadata={}, items=chunk_items, out_key="summary",
         instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
         extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,
@@ -494,7 +942,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
                           actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION,
                           dispositions=dispositions, ingestion_run_id=ingestion_run_id,
                           catalog_source=catalog_source, schema_by_table=schema_by_table,
-                          stats=stats)
+                          stats=stats, catalog_context_available=catalog_context_available,
+                          critic=critic)
 
 
 _TYPE_FIELDS_NOTE = (
@@ -514,15 +963,42 @@ _ROLE_VOCAB_NOTE = (
     " (any other value is discarded); event_or_snapshot MUST be event or snapshot. "
 )
 
-_INSTRUCTION = (
-    _TYPE_FIELDS_NOTE +
+# Prompt v4 (profile Task 4): the four PROFILE suggestions, their closed vocabularies, and the two
+# rules that make them evidence-bound rather than decorative — cite from the given context, and
+# never paraphrase curated text into a competing description. The vocabularies are interpolated
+# from `profile_vocab` (never re-typed), so a member added there re-versions the prompt by
+# construction instead of silently drifting out of it.
+_PROFILE_VOCAB_NOTE = (
+    "authority_role MUST be one of: "
+    + ", ".join(sorted(m.value for m in _AuthorityRole))
+    + "; temporal_storage_model MUST be one of: "
+    + ", ".join(sorted(m.value for m in _TemporalStorageModel))
+    + " (any other value is discarded). ")
+
+_PROFILE_NOTE = (
+    "ALSO suggest, where the evidence supports it: table_description (one plain sentence describing "
+    "what one row of this table IS); business_context (why the business keeps this dataset); "
+    "authority_role (how authoritative this COPY is); and temporal_storage_model (how it stores "
+    "history). "
+    "EVERY suggestion must cite its evidence in `evidence_refs` as {field, refs}, naming ONLY "
+    "columns from the provided list or the literal 'table_definition' — a suggestion citing nothing "
+    "is discarded. "
+    "When a table_definition is already provided it is CURATED and stays current: offer a "
+    "table_description only as an ALTERNATIVE for human review, never as a correction, and NEVER "
+    "paraphrase the curated text back. Omit any field the evidence does not settle — an omission is "
+    "an honest abstention and is always preferred to a guess. "
+)
+
+_INSTRUCTION_HEAD = (
     "For each table, identify: the grain (the minimal set of columns whose combination uniquely "
     "identifies one row) — RETURN AN EMPTY grain_columns list if you cannot determine it, do not "
     "guess; the as-of/availability column and its basis (posted_at|ingested_at); "
     "the primary business entity; the table role; and whether it is an event or snapshot table. "
-    + _ROLE_VOCAB_NOTE +
-    "Only name columns that appear in the provided column list."
 )
+
+
+_INSTRUCTION = (_TYPE_FIELDS_NOTE + _INSTRUCTION_HEAD + _ROLE_VOCAB_NOTE + _PROFILE_VOCAB_NOTE
+                + _PROFILE_NOTE + "Only name columns that appear in the provided column list.")
 
 _SUMMARY_INSTRUCTION = (
     _TYPE_FIELDS_NOTE +
@@ -533,18 +1009,21 @@ _SUMMARY_INSTRUCTION = (
     "snapshot data. Only name columns that appear in the provided column list."
 )
 
-_SYNTH_WIDE_INSTRUCTION = (
-    _TYPE_FIELDS_NOTE +
+_WIDE_HEAD = (
     "This is a WIDE table presented as per-chunk SUMMARIES (each with candidate grain/id columns, "
     "temporal/as-of columns, entity signals, and an event/snapshot hint) PLUS the table's COMPLETE "
-    "column roster (each entry an object {column, operational_type, declared_type} — the same two "
-    "type fields described above). Using the summaries and the roster, identify for the WHOLE "
-    "table: the grain (the minimal set of columns whose combination uniquely identifies one row) — "
-    "RETURN AN EMPTY grain_columns list if you cannot determine it, do not guess; the as-of/availability "
-    "column and its basis (posted_at|ingested_at); the primary business entity; the table role; and "
-    "whether it is an event or snapshot table. " + _ROLE_VOCAB_NOTE +
-    "Only name columns that appear in the column roster."
+    "column roster (each entry an object {column, operational_type, declared_type, concept?} — the "
+    "same two type fields described above, plus the resolved concept where one exists). Using the "
+    "summaries and the roster, identify for the WHOLE table: the grain (the minimal set of columns "
+    "whose combination uniquely identifies one row) — RETURN AN EMPTY grain_columns list if you "
+    "cannot determine it, do not guess; the as-of/availability column and its basis "
+    "(posted_at|ingested_at); the primary business entity; the table role; and whether it is an "
+    "event or snapshot table. "
 )
+
+
+_SYNTH_WIDE_INSTRUCTION = (_TYPE_FIELDS_NOTE + _WIDE_HEAD + _ROLE_VOCAB_NOTE + _PROFILE_VOCAB_NOTE
+                           + _PROFILE_NOTE + "Only name columns that appear in the column roster.")
 
 
 # The folded fact states in which a Pass B proposal is SKIPPED QUIETLY — a stronger/active claim
@@ -558,7 +1037,16 @@ _SYNTH_WIDE_INSTRUCTION = (
 _SKIP_QUIET_STATES = frozenset({"VERIFIED", "DRAFT", "PARTIALLY_CONFIRMED"})
 
 # The advisory table-level fields Pass B records as LLM field evidence (never governed facts).
-_ADVISORY_TABLE_FIELDS = ("table_role", "primary_entity", "event_or_snapshot")
+# Profile Task 4 adds the three PERSISTABLE profile suggestions. `table_description` persists under
+# the table's `definition` field — the same field a source-authored table term writes — which is
+# exactly why `_accept_profile_fields` withholds it (disposition `superseded`) whenever the item
+# carried a curated `table_definition`: an accepted description only ever fills an ABSENCE, it never
+# becomes competing evidence against curated text.
+_ADVISORY_TABLE_FIELDS = ("table_role", "primary_entity", "event_or_snapshot",
+                          "table_description", "business_context", "authority_role",
+                          "temporal_storage_model")
+#: synthesis key -> the `field_evidence` field_name it persists under (identity where absent).
+_ADVISORY_FIELD_NAMES = {"table_description": "definition"}
 
 
 def _mark_staled(dispositions: list[dict] | None, table: str, field: str, *,
@@ -703,8 +1191,9 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
         # Pass B savepoint+except (ingest wiring).
         schema = (schema_by_table or {}).get(table.strip().lower())
         logical_ref = normalize_ref(source, schema, table)
-        for field_name in _ADVISORY_TABLE_FIELDS:
-            v = syn.get(field_name)
+        for synthesis_key in _ADVISORY_TABLE_FIELDS:
+            field_name = _ADVISORY_FIELD_NAMES.get(synthesis_key, synthesis_key)
+            v = syn.get(synthesis_key)
             if v:
                 staled = _write_producer_field(
                     conn, logical_ref=logical_ref, field_name=field_name, value=v,
@@ -712,7 +1201,7 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                     producer_ref=ENRICHMENT_RUN_ID, snapshot_id=source_snapshot_id, material=v)
                 if staled > 0:
                     # [F9] present-replaces-older: the accepted value superseded prior LLM rows.
-                    _mark_staled(dispositions, table, field_name, status_if_missing="accepted")
+                    _mark_staled(dispositions, table, synthesis_key, status_if_missing="accepted")
                 continue
             # Dropped/absent advisory field (the stale-value lifecycle): retire ALL of the LLM's
             # prior ACTIVE rows for this field — _STALE_ALL can never equal a real input_hash, so
@@ -723,7 +1212,7 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
             if n > 0:
                 # [F9] DECOUPLED from the clear-gate: the LLM rows WERE staled even when a human
                 # confirmation below keeps the field alive and blocks the clear.
-                _mark_staled(dispositions, table, field_name, status_if_missing="abstained")
+                _mark_staled(dispositions, table, synthesis_key, status_if_missing="abstained")
                 if field_name not in _active_field_names(conn, logical_ref):
                     # NO producer's evidence remains: resolve_and_project would SKIP this field
                     # (it iterates active field names), leaving the prior display visible. Record
