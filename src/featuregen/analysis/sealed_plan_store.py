@@ -9,10 +9,12 @@ migration, no new table, no second notion of "the plan we recorded".
 **The input key IS the plan identity.** ``find_structured_result`` replays by
 ``(result_type, result_version, input_content_hash)``, and here ``input_content_hash`` is
 ``AnalysisExecutionIRV2.plan_hash``. The output is the plan's own canonical content, so the seal is
-a fixed point: the same plan identity can only ever seal the same bytes, and the store's
-``StructuredResultCorruption`` guard becomes a real invariant rather than a theoretical one. This
-is also why ``question`` is outside the sealed content — two wordings of one computation are one
-plan, and putting the wording inside would make the second wording a corruption report.
+a fixed point — and :func:`_record_from_output` CHECKS it on every read, which is what turns the
+fixed point into an invariant. The store's own two guards cannot: ``output_content_hash`` and the
+``sres_`` identity are both functions of the output alone, so a rewritten row re-derives both and
+passes. ``input_content_hash`` is the one value that does not move with the bytes. This is also why
+``question`` is outside the sealed content — two wordings of one computation are one plan, and
+putting the wording inside would make the second wording a corruption report.
 
 **A REFUSED PLAN SEALS NOTHING.** ``seal_refs_from_selections`` already refuses an unresolved
 preview; :func:`seal_analysis_plan` never sees one. A plan that could not decide where its data
@@ -53,6 +55,7 @@ from featuregen.analysis.sealed_plan import (
 )
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.upload.structured_results import (
+    StructuredResultCorruption,
     StructuredResultPointerConflict,
     find_structured_result,
     record_structured_result,
@@ -118,6 +121,19 @@ class SealedPlanRefusalV1:
 
 def _record_from_output(output: Mapping[str, Any], *, structured_result_id: str,
                         plan_hash: str) -> SealedPlanRecordV1:
+    # THE FIXED POINT, CHECKED. The seal's whole claim is that ``input_content_hash`` IS
+    # ``materialize_hash`` of the bytes filed under it, so one plan identity can only ever name one
+    # computation and one set of decisions. The store's own two guards cannot enforce that: both
+    # ``output_content_hash`` and the ``sres_`` identity are functions of the OUTPUT alone, so
+    # anyone who can rewrite the row re-derives them and both pass — and the rewritten plan then
+    # executes cleanly under the identity a person approved. This is the one comparison that does
+    # not move with the bytes, so it is the one that has to be made on every read.
+    computed = materialize_hash(dict(output))
+    if computed != plan_hash:
+        raise StructuredResultCorruption(
+            f"a sealed analysis plan filed under {plan_hash!r} contains bytes whose own identity is "
+            f"{computed!r}; one plan identity names one computation and one set of decisions, so "
+            "these bytes may not be replayed as the plan that identity was approved as")
     contract = output.get("contract")
     version = output.get("contract_version")
     if contract != ANALYSIS_PLAN_CONTRACT or version != ANALYSIS_PLAN_CONTRACT_VERSION:

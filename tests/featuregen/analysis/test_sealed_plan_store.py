@@ -16,6 +16,7 @@ exactly what it was. Nothing claims a historical output was corrected.
 from __future__ import annotations
 
 import pytest
+from psycopg.types.json import Jsonb
 from tests.featuregen.analysis.release_b_bank import (
     ARCHIVE,
     CUST,
@@ -125,6 +126,46 @@ def _count(bank) -> int:
         (ANALYSIS_PLAN_CONTRACT,)).fetchone()[0]
 
 
+def _rewrite_stored_seal(bank, record, mutate) -> dict:
+    """THE REVIEWER'S PROBE. Rewrite a sealed plan's stored bytes and RE-DERIVE both of the store's
+    own guards, so an attacker with a database write passes them.
+
+    Spelled out from the store's public constants rather than by importing its private helper: the
+    point of the probe is that nothing here needs privileged knowledge. Both guards
+    (``output_content_hash`` and the ``sres_`` identity) are functions of the OUTPUT alone, so both
+    move with it — and the one thing that does NOT is ``input_content_hash``, which stays the
+    original plan identity the caller executes by.
+    """
+    import copy
+
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.structured_results import STRUCTURED_RESULT_STORE_VERSION
+
+    row = bank.execute(
+        "SELECT structured_result_id, result_version, output_json FROM structured_result "
+        "WHERE result_type = %s AND input_content_hash = %s",
+        (ANALYSIS_PLAN_CONTRACT, record.plan_hash)).fetchone()
+    old_id, version, output = row[0], int(row[1]), copy.deepcopy(row[2])
+    mutate(output)
+    output_hash = canonical_hash(output)
+    new_id = "sres_" + canonical_hash({
+        "store_version": STRUCTURED_RESULT_STORE_VERSION,
+        "result_type": ANALYSIS_PLAN_CONTRACT,
+        "result_version": version,
+        "input_content_hash": record.plan_hash,
+        "output_content_hash": output_hash,
+    })
+    bank.execute("DELETE FROM structured_result_current WHERE structured_result_id = %s", (old_id,))
+    bank.execute("DELETE FROM structured_result_provenance WHERE structured_result_id = %s",
+                 (old_id,))
+    bank.execute("DELETE FROM structured_result WHERE structured_result_id = %s", (old_id,))
+    bank.execute(
+        "INSERT INTO structured_result (structured_result_id, result_type, result_version, "
+        "  input_content_hash, output_content_hash, output_json) VALUES (%s,%s,%s,%s,%s,%s)",
+        (new_id, ANALYSIS_PLAN_CONTRACT, version, record.plan_hash, output_hash, Jsonb(output)))
+    return output
+
+
 # ── nothing pre-exists ───────────────────────────────────────────────────────────────────────────
 
 
@@ -210,6 +251,77 @@ def test_only_a_validated_V2_may_be_sealed(bank):
         seal_analysis_plan(bank, object(), sealed_by="user:priya", question=QUESTION)
     with pytest.raises(SealedPlanError, match="producer ref"):
         seal_analysis_plan(bank, _v2(bank), sealed_by="  ", question=QUESTION)
+
+
+# ── the computation half is verified against the plan identity ON READ ───────────────────────────
+#
+# The store's own two guards are functions of the OUTPUT alone: `output_content_hash` and the
+# `sres_` identity both move when the bytes are rewritten, so both can be re-derived by anyone who
+# can write the row. The one thing that CANNOT be re-derived is the plan identity the caller
+# executes by — `input_content_hash` IS `AnalysisExecutionIRV2.plan_hash`, and the seal is a fixed
+# point over its own content. Checking it on read is what makes the fixed point load-bearing rather
+# than a remark in a docstring.
+
+
+def test_a_seal_whose_COMPUTATION_was_rewritten_refuses_to_replay(bank):
+    """The probe. `included_status_values` is "which rows count" — rewriting POSTED to ALL under the
+    original plan identity makes a sealed plan answer a different question with a clean audit trail
+    saying a person approved this one."""
+    from featuregen.overlay.upload.structured_results import StructuredResultCorruption
+
+    record = _sealed(bank)
+    _rewrite_stored_seal(bank, record, lambda out: out["computation"]["eligibility"].__setitem__(
+        "included_status_values", ["POSTED", "PENDING", "REVERSED"]))
+
+    with pytest.raises(StructuredResultCorruption) as exc:
+        replay_sealed_plan(bank, record.plan_hash)
+    # BOTH hashes, because "the plan is corrupt" sends the reader nowhere: one is the identity it is
+    # filed under, the other is what its bytes actually say.
+    assert record.plan_hash in str(exc.value)
+
+
+def test_a_seal_whose_DECISION_REFS_were_rewritten_refuses_to_replay(bank):
+    """The governance half is covered by the same one check — a rewritten binding revision, serving
+    policy or dataset ref is the same class of substitution as a rewritten computation."""
+    from featuregen.overlay.upload.structured_results import StructuredResultCorruption
+
+    record = _sealed(bank)
+    _rewrite_stored_seal(bank, record, lambda out: out["decisions"]["sources"][0].__setitem__(
+        "binding_revision_id", "pbr_" + "0" * 64))
+
+    with pytest.raises(StructuredResultCorruption):
+        replay_sealed_plan(bank, record.plan_hash)
+
+
+def test_the_CURRENT_POINTER_reads_a_rewritten_seal_no_more_freely_than_replay_does(bank):
+    """Same check on every read path. A pointer that returned what replay refuses would be the
+    identity check with a way around it."""
+    from featuregen.overlay.upload.structured_results import StructuredResultCorruption
+
+    record = _sealed(bank)
+    _rewrite_stored_seal(bank, record, lambda out: out["computation"].__setitem__(
+        "measure", "sum"))
+    # The rewrite drops the pointer with the row it referenced; re-file it at the tampered revision,
+    # which is what an attacker who wanted the question's CURRENT plan poisoned would do.
+    tampered_id = bank.execute(
+        "SELECT structured_result_id FROM structured_result WHERE input_content_hash = %s",
+        (record.plan_hash,)).fetchone()[0]
+    bank.execute(
+        "INSERT INTO structured_result_current (subject_kind, subject_ref, result_type, "
+        "  structured_result_id) VALUES (%s,%s,%s,%s)",
+        (SEALED_PLAN_SUBJECT_KIND, analysis_question_ref(QUESTION), ANALYSIS_PLAN_CONTRACT,
+         tampered_id))
+
+    with pytest.raises(StructuredResultCorruption):
+        current_sealed_plan(bank, QUESTION)
+
+
+def test_an_UNTAMPERED_seal_replays_through_the_identity_check_unchanged(bank):
+    """The check must not be a hash function that only ever refuses: a seal round-tripped through
+    JSONB reproduces its own identity exactly."""
+    record = _sealed(bank)
+    assert replay_sealed_plan(bank, record.plan_hash) == record
+    assert current_sealed_plan(bank, QUESTION) == record
 
 
 # ── revalidation: the happy path ─────────────────────────────────────────────────────────────────
