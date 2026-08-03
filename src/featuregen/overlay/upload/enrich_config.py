@@ -49,7 +49,7 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 #   this fixture's roster entries are mostly bare names: on a RE-upload every sibling carries a
 #   resolved concept + party role. RE-MEASURED (review correction — the original "~750 tok/item,
 #   ~60% headroom" here was wrong): a golden classifier payload carrying a FULL 40-entry roster of
-#   resolved {column, concept, party_role} entries is 971 tok/item on the fixture's own column names
+#   resolved entries (column name + concept + party role) is 971 tok/item on the fixture's own names
 #   (mean 9.3 chars) and 1,105-1,144 tok/item on longer bank-style names — 20 x that is
 #   19,420-22,880 against the 24000 cap, i.e. 81-95% of it USED and ~5-19% headroom, not 60%. The
 #   bound is kept: crossing it is not a cliff (see the chunking note below), and the headroom that
