@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pathlib
+import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -115,6 +116,7 @@ __all__ = [
     "CompiledGroup",
     "NodeAssembler",
     "NodeAssemblyInputs",
+    "PublishStepMissing",
     "compile_feature_group",
 ]
 
@@ -127,9 +129,28 @@ __all__ = [
 #: recovered from the code that enforces it. ``append_run_event`` deliberately does not compute
 #: ``max(seq) + 1`` — that read-modify-write is a race two appenders can both win — so ``seq`` is
 #: the caller's, and migration 1044's ``materialization_run_event_ordered`` trigger refuses any
-#: value that does not strictly extend the run. A G-1 run appends exactly one event, its terminal
-#: one, at this seq; G-2's ``RUN_PREPARED``/``RUN_SUBMITTED``/… continue from it.
+#: value that does not strictly extend the run.
+#:
+#: **A G-1 run is CLOSED at this seq.** It appends exactly one event and that event is terminal, so
+#: 1044's trigger refuses every later insert on the same run — G-2's ``RUN_PREPARED`` /
+#: ``RUN_SUBMITTED`` / … cannot continue from it and will need their own request and their own run.
+#: The increment convention above governs a run that is still open, which in G-1 never happens.
 FIRST_RUN_EVENT_SEQ = 0
+
+
+class PublishStepMissing(RuntimeError):
+    """``select_publisher`` proved a mechanism, and there is no publish step to honour it.
+
+    Exported and named so a queue lane can classify it and fail the request with a reason, because
+    its trigger is a legitimate operational act rather than a code change: ``record_attestation``
+    is callable today, so ingesting one passing probe result for the target environment flips every
+    run of this chain from the truthful ``CAPABILITY_UNPROVEN`` terminal into this state.
+
+    It is a ``RuntimeError`` rather than a governed refusal because it is a statement about the
+    PLATFORM, not about the feature: §14's closed vocabulary has no member for "the step that would
+    have acted on this verdict has not been built", and inventing one would tell an operator the
+    catalog refused their feature.
+    """
 
 
 class ChainStage(StrEnum):
@@ -230,7 +251,6 @@ def compile_feature_group(
     *,
     request_id: str,
     work_item_ids: Sequence[str],
-    roles: Sequence[str],
     inventory: ClusterInventoryV1,
     spine_declaration: SpineSourceDeclarationV1 | None,
     cadence: CadenceDecl,
@@ -250,14 +270,18 @@ def compile_feature_group(
     a terminal request is REPLAYED rather than re-run, which is what keeps a re-delivered queue job
     from minting a second generation or a second terminal event.
 
+    **Gate 2's roles are the request's own snapshot**, read here rather than passed. They are not a
+    parameter for the same reason the group name is not: a second source for a governed input is a
+    second answer, and the only legal value a caller could supply is the one already recorded.
+    ``request_store.py:182-184`` settles which value that is — a run is judged against the scope its
+    requester *actually held*, not against whatever anyone holds by the time the work is claimed —
+    so there is no legitimate call that narrows or widens it either.
+
     Args:
-        request_id: the durable request. Its ``logical_group_name`` is the group's identity — this
-            function takes no group name, because a second source for it is a second answer.
+        request_id: the durable request. Its ``logical_group_name`` is the group's identity and its
+            ``authorized_roles`` are Gate 2's — this function takes neither as a parameter.
         work_item_ids: the group's members, as ``recipe_formula_shadow_work_item`` ids. Nothing maps
             a logical group to its members yet, so the caller supplies them (Task 2's §15.2).
-        roles: the roles Gate 2 authorizes under. Checked against the request's recorded snapshot:
-            a call that passed wider roles would authorize reads nobody asked for, under an actor
-            the record says never held them.
         inventory: the captured cluster facts (§0). ``environment_id`` and ``engine_versions`` are
             read off it, so the artifact cannot be rendered for one environment and pinned to
             another's versions.
@@ -282,19 +306,19 @@ def compile_feature_group(
         :attr:`ChainStage.PUBLISHER` with ``CAPABILITY_UNPROVEN`` and a sealed project on disk.
 
     Raises:
-        ValueError: the request does not exist, is not ``accepted``, or ``roles`` disagrees with its
-            recorded snapshot — and every ``ValueError`` the stages themselves raise, which are
-            calls assembled wrongly rather than governed verdicts.
+        ValueError: the request does not exist or is not ``accepted`` — and every ``ValueError`` the
+            stages themselves raise, which are calls assembled wrongly rather than governed
+            verdicts.
         featuregen.materialize.admission.FeatureNamePlanError: two members normalize to one Hive
             identifier, or a name cannot be one at all. A plan error, not a §14 code.
-        RuntimeError: ``select_publisher`` RETURNED a selection. There is no publish step to honour
-            it (plan §3.5), so continuing would either render a publishing artifact nothing will
-            ever publish or leave a run with no terminal event at all.
+        PublishStepMissing: ``select_publisher`` RETURNED a selection and there is no publish step
+            to honour it (plan §3.5).
     """
-    request = _claim(conn, request_id, roles)
+    request = _claim(conn, request_id)
     if request.lifecycle_state.is_terminal():
         return _replayed(conn, request)
 
+    roles = request.authorized_roles
     stop = _Stop(conn, request)
     resolved = _governed(stop, ChainStage.RESOLVE,
                          lambda: resolve_feature_inputs(conn, work_item_ids=work_item_ids))
@@ -357,7 +381,7 @@ def compile_feature_group(
                                  engine_versions=inventory.engine_versions, mechanism=mechanism,
                                  group_plan=plan, published_schema=published_schema)
     if isinstance(selection, PublisherSelection):
-        raise RuntimeError(
+        raise PublishStepMissing(
             f"select_publisher proved {mechanism.value} for {inventory.environment_id!r} "
             f"(attestation {selection.capability_attestation_id}), and this chain has no publish "
             f"step to honour it: the metastore write, the active-revision record and the pointer "
@@ -392,12 +416,34 @@ def _commit(
     project_root: str | os.PathLike[str],
     clock: Callable[[], str],
 ) -> CompiledGroup:
-    """Record the generation, the §10.1 records and the truthful terminal — then write the disk.
+    """Record the generation, the §10.1 records and the truthful terminal, and write the tree — ALL
+    OR NOTHING.
 
-    ORDER IS THE POINT. The generation row comes first because every other plane record takes a
-    foreign key to it. The project tree is written LAST, so a database failure cannot leave a
-    directory no record names; the converse — a record whose tree failed to write — surfaces as a
-    raised exception that rolls the caller's transaction back, and L0 would refuse the tree anyway.
+    THE TRANSACTION IS THE POINT, and ordering alone was not enough. The runtime this chain is
+    driven from is AUTOCOMMIT by contract (``runtime/worker.py:638``: "Autocommit is required: each
+    stage owns its own ``with conn.transaction()``"; ``runtime/dispatch.py:79`` sets it on the
+    handler connection), so without an explicit transaction every statement below commits on its
+    own. A tree write that then failed — a full disk, a permission, or ``materialize_to``'s
+    non-empty-directory refusal — would leave the plane holding a committed request, a generation
+    row carrying a ``generated_project_hash``, and an **unretractable terminal event** for a project
+    that was never written; migration 1044's one-terminal trigger means nothing can ever supersede
+    it. A mid-block failure (the ``group_binding`` unique violation, say) would leave a committed
+    generation and a ``running`` request with no terminal at all.
+
+    So the whole block — including the tree write — is one transaction. Opened unconditionally
+    rather than only on autocommit: nested inside a caller's transaction psycopg makes it a
+    SAVEPOINT, which is exactly the semantics wanted here (roll back this chain's writes, leave the
+    caller's alone) and is what makes the guarantee testable at all.
+
+    ORDER still matters inside it. The generation row comes first because every other plane record
+    takes a foreign key to it, and the tree is written last so the cheap failures happen before the
+    expensive one.
+
+    ``RUNNING`` is a stepping stone here, and its documented meaning ("a run was prepared") is not
+    yet true in G-1 — ``prepare_run`` is G-2. It is passed through because ``accepted → committed``
+    is not a legal edge (``request_store.LEGAL_LIFECYCLE_TRANSITIONS``) and because it is the only
+    state that stamps ``generation_id``/``run_id`` onto the request. Inside one transaction no
+    reader ever observes it.
 
     The terminal event is ``PUBLICATION_REFUSED`` carrying ``select_publisher``'s own code. That is
     the honest end of a G-1 run and the only terminal this module may append; see the module
@@ -406,34 +452,35 @@ def _commit(
     generation_id = _generation_id(request.request_id)
     run_id = _run_id(request.request_id)
     created_at = clock()
-
-    record_generation(conn, MaterializationGeneration(
-        generation_id=generation_id,
-        logical_group_name=plan.logical_group_name,
-        materialization_contract_hash=plan.materialization_contract_hash,
-        group_plan_hash=group_plan_hash(plan),
-        generated_project_hash=project.identity.generated_project_hash,
-        created_at=created_at))
-    advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.RUNNING,
-                      generation_id=generation_id, run_id=run_id)
-
-    # `bind_group` RETURNS the existing binding unchanged when the contract still agrees, and
-    # `record_group_binding` is a UniqueViolation on a second write for one logical name — so the
-    # binding is written exactly when it was minted here.
-    if existing is None:
-        record_group_binding(conn, binding)
-    record_plan_revision(conn, plan_revision(plan, binding, generation_id=generation_id,
-                                             created_at=created_at))
-
-    append_run_event(conn, MaterializationRunEvent(
-        run_id=run_id, seq=FIRST_RUN_EVENT_SEQ, generation_id=generation_id,
-        event_kind=RunEventKind.PUBLICATION_REFUSED, occurred_at=created_at,
-        detail=f"{refusal.code.value}: {refusal.detail}"))
-    moved = advance_lifecycle(conn, request_id=request.request_id,
-                              to_state=RequestLifecycle.COMMITTED)
-
     root = pathlib.Path(project_root) / generation_id
-    materialize_to(project, root)
+
+    with conn.transaction():
+        record_generation(conn, MaterializationGeneration(
+            generation_id=generation_id,
+            logical_group_name=plan.logical_group_name,
+            materialization_contract_hash=plan.materialization_contract_hash,
+            group_plan_hash=group_plan_hash(plan),
+            generated_project_hash=project.identity.generated_project_hash,
+            created_at=created_at))
+        advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.RUNNING,
+                          generation_id=generation_id, run_id=run_id)
+
+        # `bind_group` RETURNS the existing binding unchanged when the contract still agrees, and
+        # `record_group_binding` is a UniqueViolation on a second write for one logical name — so
+        # the binding is written exactly when it was minted here.
+        if existing is None:
+            record_group_binding(conn, binding)
+        record_plan_revision(conn, plan_revision(plan, binding, generation_id=generation_id,
+                                                 created_at=created_at))
+
+        append_run_event(conn, MaterializationRunEvent(
+            run_id=run_id, seq=FIRST_RUN_EVENT_SEQ, generation_id=generation_id,
+            event_kind=RunEventKind.PUBLICATION_REFUSED, occurred_at=created_at,
+            detail=f"{refusal.code.value}: {refusal.detail}"))
+        moved = advance_lifecycle(conn, request_id=request.request_id,
+                                  to_state=RequestLifecycle.COMMITTED)
+        _materialize(project, root)
+
     return CompiledGroup(
         request_id=request.request_id, logical_group_name=request.logical_group_name,
         stopped_at=ChainStage.PUBLISHER, refusal=refusal,
@@ -442,6 +489,30 @@ def _commit(
         materialization_contract_hash=plan.materialization_contract_hash,
         group_plan_hash=group_plan_hash(plan),
         generated_project_hash=project.identity.generated_project_hash, project_root=str(root))
+
+
+def _materialize(project: SealedProject, root: pathlib.Path) -> None:
+    """Write the sealed tree so that it appears complete or not at all.
+
+    A filesystem takes no part in the transaction above, so a half-written tree is the one piece of
+    state a rollback cannot remove — and it would be permanent damage rather than litter: the
+    generation id is a pure function of the request id, so ``root`` never changes for this request,
+    and ``materialize_to`` refuses a non-empty directory (``render/project.py:1294``). A partial
+    tree would poison every re-drive of that request forever.
+
+    So the project is written to a sibling and moved into place with one ``os.replace``, which is
+    atomic on a POSIX filesystem and — because ``rename`` onto a non-empty directory fails — cannot
+    silently overwrite an earlier generation's tree either. Any failure removes the partial.
+    """
+    staging = root.parent / f".{root.name}.partial"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        materialize_to(project, staging)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, root)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 class _Stop:
@@ -515,7 +586,7 @@ def _replayed(conn: DbConn, request: MaterializationRequestV1) -> CompiledGroup:
         generated_project_hash=None, project_root=None, replayed=True)
 
 
-def _claim(conn: DbConn, request_id: str, roles: Sequence[str]) -> MaterializationRequestV1:
+def _claim(conn: DbConn, request_id: str) -> MaterializationRequestV1:
     """The request this call is for, proved to be one this caller may compile.
 
     ``accepted`` is required rather than granted here: acceptance is the CLAIM on the work and it
@@ -535,12 +606,6 @@ def _claim(conn: DbConn, request_id: str, roles: Sequence[str]) -> Materializati
             f"{request.lifecycle_state.value!r}, not 'accepted': the lease granted by acceptance is "
             f"what makes this the single writer for the run, and compiling without one would put "
             f"two writers on an append-only event stream that has no repair path")
-    if frozenset(roles) != frozenset(request.authorized_roles):
-        raise ValueError(
-            f"the supplied roles {sorted(set(roles))} are not request {request_id!r}'s recorded "
-            f"authorized_roles {sorted(set(request.authorized_roles))}: Gate 2 authorizes the "
-            f"group's read set against the roles it is HANDED, so a set that disagrees with the "
-            f"snapshot would authorize reads under an actor the record says never held them")
     return request
 
 

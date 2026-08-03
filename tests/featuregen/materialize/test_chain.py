@@ -24,6 +24,7 @@ publication claim can never be retracted.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import pathlib
 
@@ -162,10 +163,10 @@ def _clock():
     return "2026-08-03T12:00:00+00:00"
 
 
-def _run(db, request_id, work_item_ids, root, *, roles=_ROLES, overrides=None,
-         published_schema=None, spine=DECLARATION) -> CompiledGroup:
+def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schema=None,
+         spine=DECLARATION, inventory=INVENTORY) -> CompiledGroup:
     return compile_feature_group(
-        db, request_id=request_id, work_item_ids=work_item_ids, roles=roles, inventory=INVENTORY,
+        db, request_id=request_id, work_item_ids=work_item_ids, inventory=inventory,
         spine_declaration=spine, cadence=_CADENCE, availability_promise=_PROMISE,
         contract_overrides=overrides, mechanism=PublishMechanism.VERSIONED_POINTER,
         published_schema=published_schema, assemble_nodes=_assemble, project_root=root,
@@ -274,16 +275,50 @@ def test_a_second_binding_for_the_same_group_is_not_written_twice(catalog, monke
     assert one.generation_id != two.generation_id
 
 
-def test_a_plane_that_refuses_the_record_leaves_no_project_on_disk(ready, catalog,
-                                                                   monkeypatch) -> None:
-    """The ORDER in `_commit` is load-bearing, so it is asserted rather than described. A tree
-    written before the record would be a project directory no record names — and L0 re-derives the
-    project hash off exactly such a directory, so it is not an inert leftover."""
-    request_id, work_items, root = ready
-    monkeypatch.setattr(chain, "append_run_event",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plane refused")))
+@pytest.mark.parametrize("injected", ["append_run_event", "materialize_to"])
+def test_the_commit_is_ALL_OR_NOTHING(ready, catalog, monkeypatch, injected) -> None:
+    """The commit block must be atomic, not merely ordered — and on the runtime this chain will be
+    driven from, ordering alone is not enough.
 
-    with pytest.raises(RuntimeError, match="plane refused"):
+    `runtime/worker.py:638` and `runtime/dispatch.py:79` make the handler connection AUTOCOMMIT by
+    contract, so without an explicit transaction each write below would land on its own. The two
+    injection points are the two real failure modes: a mid-block refusal (the `group_binding`
+    unique violation has this shape) and a failed TREE write, which is the dangerous one — it would
+    otherwise leave the plane holding a committed request, a generation carrying a
+    `generated_project_hash`, and an UNRETRACTABLE terminal event for a project that was never
+    written. 1044's one-terminal trigger means nothing could ever supersede it."""
+    request_id, work_items, root = ready
+    monkeypatch.setattr(chain, injected,
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("write refused")))
+
+    with pytest.raises(RuntimeError, match="write refused"):
+        _run(catalog, request_id, work_items, root)
+
+    assert catalog.execute("SELECT count(*) FROM materialization_generation").fetchone()[0] == 0
+    assert catalog.execute("SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
+    assert catalog.execute("SELECT count(*) FROM group_binding").fetchone()[0] == 0
+    assert read_request(catalog, request_id=request_id).lifecycle_state is \
+        RequestLifecycle.ACCEPTED
+    assert not list(pathlib.Path(root).iterdir())
+
+
+def test_a_half_written_tree_never_appears_at_the_projects_own_path(ready, catalog,
+                                                                    monkeypatch) -> None:
+    """The filesystem takes no part in the transaction, so the tree is written to a sibling and
+    moved into place atomically. It matters more than litter: `generation_id` is a pure function of
+    the request id, so `project_root/<generation_id>` never changes for this request, and
+    `materialize_to` refuses a non-empty directory — a partial tree left there would poison every
+    re-drive of that request forever."""
+    request_id, work_items, root = ready
+    genuine = chain.materialize_to
+
+    def _half_write(project, target):
+        genuine(project, target)
+        raise RuntimeError("died after writing")
+
+    monkeypatch.setattr(chain, "materialize_to", _half_write)
+
+    with pytest.raises(RuntimeError, match="died after writing"):
         _run(catalog, request_id, work_items, root)
 
     assert not list(pathlib.Path(root).iterdir())
@@ -291,18 +326,53 @@ def test_a_plane_that_refuses_the_record_leaves_no_project_on_disk(ready, catalo
 
 # ── truthfulness: the chain may never claim publication ──────────────────────────────────────────
 
+def _is_run_event_kind(node: ast.expr) -> bool:
+    return isinstance(node, ast.Name) and node.id == "RunEventKind"
+
+
+def _code_strings(tree: ast.AST) -> set[str]:
+    """Every string constant in the module's CODE. Docstrings are excluded — prose must be free to
+    name what the code may not, and this module's docstrings say `PUBLISHED` repeatedly in order to
+    forbid it."""
+    docstrings = {
+        id(node.body[0].value) for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.body and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)}
+    return {node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docstrings}
+
+
 def test_the_chain_can_never_append_PUBLISHED() -> None:
     """THE test that stops a future well-meaning change from lying.
 
     Read off the AST rather than the behaviour: a behavioural assertion only proves that today's
-    paths do not claim publication, and the whole hazard (plan §3.5) is a path added later. Every
-    `RunEventKind.<member>` the module names is collected; the set must be exactly the one terminal
-    a G-1 run can truthfully record."""
+    paths do not claim publication, and the whole hazard (plan §3.5) is a path added later.
+
+    It closes FOUR routes to the same unretractable write, not one. The attribute route is the
+    obvious one. The STRING route is the likeliest "quick fix" and is the same write —
+    `MaterializationRunEvent.__post_init__` COERCES `event_kind` (`control_plane.py:238`), so
+    `event_kind="PUBLISHED"` produces the real terminal member and a guard that only inspected
+    attribute access would stay green while the plane recorded a lie. Subscript, call and `getattr`
+    are the three ways to reach a member through a name the AST cannot resolve."""
     tree = ast.parse(inspect.getsource(chain))
-    named = {node.attr for node in ast.walk(tree)
-             if isinstance(node, ast.Attribute)
-             and isinstance(node.value, ast.Name) and node.value.id == "RunEventKind"}
-    assert named == {"PUBLICATION_REFUSED"}
+    members = {member.name for member in RunEventKind}
+
+    attributes = {node.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Attribute) and _is_run_event_kind(node.value)}
+    assert attributes == {"PUBLICATION_REFUSED"}
+
+    assert _code_strings(tree) & members <= {"PUBLICATION_REFUSED"}
+
+    indirect = [
+        ast.dump(node) for node in ast.walk(tree)
+        if (isinstance(node, ast.Subscript) and _is_run_event_kind(node.value))
+        or (isinstance(node, ast.Call) and _is_run_event_kind(node.func))
+        or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr" and node.args and _is_run_event_kind(node.args[0]))]
+    assert indirect == []
 
 
 def test_no_path_records_a_published_generation(ready, catalog) -> None:
@@ -326,7 +396,7 @@ def test_a_PROVEN_capability_stops_the_chain_rather_than_letting_it_claim_a_publ
     work_items = [_authored(catalog, monkeypatch, suffix="proven")]
     _attest_capability(catalog)
 
-    with pytest.raises(RuntimeError, match="publish"):
+    with pytest.raises(chain.PublishStepMissing, match="publish step"):
         _run(catalog, request_id, work_items, tmp_path)
 
     assert not list(tmp_path.iterdir())
@@ -440,6 +510,47 @@ def test_a_denied_read_stops_the_chain_at_GATE_2(catalog, monkeypatch, tmp_path)
     _assert_nothing_was_written(catalog, tmp_path, request_id)
 
 
+def test_an_unpublishable_column_type_stops_the_chain_at_PHYSICAL_TYPE(
+        catalog, monkeypatch, tmp_path) -> None:
+    """§6 refuses `half_even` rounding on a RATIO (DEFERRED A.28): Spark's decimal division rounds
+    HALF_UP at the result scale before any explicit rounding call runs, so a declared `half_even` is
+    unenforceable. The shipped ratio fixture declares `half_up` for exactly that reason; this run
+    authors the mode the engine will not apply — genuinely, through the real orchestrator — and the
+    refusal arrives from materialize rather than from authoring."""
+    from tests.featuregen.materialize import test_resolve as authoring
+
+    name = "cross_border_value_ratio_90d"
+    request_id = _request(catalog, request_id="req-ratio")
+    work_item_id = _seed_work_item(catalog, name, "ratio")
+    unenforceable = fixtures.raw_proposal(name)
+    unenforceable["decimal"]["rounding"] = "half_even"
+    monkeypatch.setattr(authoring, "raw_proposal", lambda _name: unenforceable)
+    _author_the_run(catalog, monkeypatch, work_item_id, name)
+
+    outcome = _run(catalog, request_id, [work_item_id], tmp_path)
+
+    assert outcome.stopped_at is ChainStage.PHYSICAL_TYPE
+    assert outcome.refusal.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    _assert_nothing_was_written(catalog, tmp_path, request_id)
+
+
+def test_a_spine_the_inventory_never_captured_stops_the_chain_at_SPINE_INPUT(
+        catalog, monkeypatch, tmp_path) -> None:
+    """§3.4's "absent is not unpartitioned". The declared population's table is governed and the
+    features compile against it, but the environment was never captured holding it — so its
+    physical input cannot be resolved and no project may be rendered for the group."""
+    request_id = _request(catalog, request_id="req-nospinetable")
+    work_item_id = _authored(catalog, monkeypatch, suffix="nospinetable")
+    without_customers = dataclasses.replace(INVENTORY, tables={
+        name: layout for name, layout in INVENTORY.tables.items() if name != "banking.customers"})
+
+    outcome = _run(catalog, request_id, [work_item_id], tmp_path, inventory=without_customers)
+
+    assert outcome.stopped_at is ChainStage.SPINE_INPUT
+    assert outcome.refusal.code is CompilationRefusalCode.PARTITION_IDENTITY_UNKNOWN
+    _assert_nothing_was_written(catalog, tmp_path, request_id)
+
+
 def test_a_prohibited_input_stops_the_chain_at_CONTRACT(catalog, monkeypatch, tmp_path) -> None:
     """§5.2's classification refuses the contract. Driven through the caller-supplied override —
     tightening all the way to the top is a legal declaration and an illegal artifact."""
@@ -519,15 +630,22 @@ def test_an_empty_group_is_a_caller_error_not_a_refusal(catalog, tmp_path) -> No
         _run(catalog, request_id, [], tmp_path)
 
 
-def test_roles_that_disagree_with_the_requests_snapshot_are_a_caller_error(
-        ready, catalog) -> None:
-    """Gate 2 authorizes against the roles it is HANDED. A caller that passed roles wider than the
-    ones recorded when the request was made would authorize reads nobody asked for, under an
-    actor the record says never held them."""
-    request_id, work_items, root = ready
+def test_gate_2_authorizes_under_the_REQUESTS_OWN_role_snapshot(catalog, monkeypatch,
+                                                                tmp_path) -> None:
+    """The roles are not a parameter, so this is the only thing that can decide Gate 2: the
+    snapshot taken when the request was recorded (`request_store.py:182-184` — a run is judged
+    against the scope its requester actually held). The same catalog and the same feature refuse
+    or authorize purely on what the REQUEST says, which is what proves the snapshot is read."""
+    _tag(catalog, "transactions", "dr_cr_flag", "pii")
+    denied = _request(catalog, request_id="req-roles-denied", roles=_ROLES)
+    allowed = _request(catalog, request_id="req-roles-allowed", roles=(*_ROLES, "pii_reader"))
+    items = [_authored(catalog, monkeypatch, suffix="roles")]
 
-    with pytest.raises(ValueError, match="authorized_roles"):
-        _run(catalog, request_id, work_items, root, roles=("platform_admin", *_ROLES))
+    refused = _run(catalog, denied, items, tmp_path / "denied")
+
+    assert refused.stopped_at is ChainStage.AUTHORIZE
+    assert refused.refusal.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert _run(catalog, allowed, items, tmp_path / "allowed").stopped_at is ChainStage.PUBLISHER
 
 
 def test_a_request_nobody_recorded_is_a_caller_error(catalog, monkeypatch, tmp_path) -> None:
