@@ -8,7 +8,11 @@
 // Three rules it follows:
 //   * CAS in the BODY. `pointer_version` is echoed back exactly as it was read (0 claims the first
 //     write); a 409 means someone else wrote first, and the panel reloads and asks for a
-//     re-review rather than silently retrying over their words.
+//     re-review rather than silently retrying over their words. THE AUTHOR'S DRAFT SURVIVES that
+//     reload: the reload refreshes the CAS anchor and the comparison copy, never the form. The
+//     first version reloaded straight into the form, so protecting the server's copy destroyed the
+//     one only this person had — a paragraph nobody else could retype, lost to a race the person
+//     did not cause.
 //   * NO-BLOCKED FRAMING. A catalog with no narrative is not an error and not a gap — it is a
 //     catalog nobody has described yet, and the empty state says exactly that.
 //   * The routes 404 while FEATUREGEN_DATASET_PROFILES is off, and the panel then renders
@@ -22,17 +26,22 @@ export function CatalogNarrativePanel({ source }: { source: string }) {
   const [profile, setProfile] = useState<CatalogProfile | null>(null)
   const [absent, setAbsent] = useState(false)   // 404: the surface is off — render nothing
   const [editing, setEditing] = useState(false)
+  const [conflicted, setConflicted] = useState(false)   // 409: show their version beside the draft
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [displayName, setDisplayName] = useState('')
   const [description, setDescription] = useState('')
   const [businessContext, setBusinessContext] = useState('')
 
-  const load = useCallback(async () => {
+  // `keepDraft` is what makes the conflict path non-destructive: it refreshes the CAS anchor and
+  // the copy shown for comparison, and leaves the form exactly as the author left it. Without it
+  // every reload is a load()-into-the-form-while-editing, which is precisely how the draft was lost.
+  const load = useCallback(async (keepDraft = false) => {
     try {
       const got = await getCatalogProfile(source)
       setProfile(got)
       setAbsent(false)
+      if (keepDraft) return
       setDisplayName(got.profile?.display_name ?? '')
       setDescription(got.profile?.description ?? '')
       setBusinessContext(got.profile?.business_context ?? '')
@@ -63,12 +72,18 @@ export function CatalogNarrativePanel({ source }: { source: string }) {
       })
       setNotice('Saved.')
       setEditing(false)
+      setConflicted(false)
       await load()
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         setNotice('Someone else described this catalog while you were writing — nothing was '
-          + 'overwritten. Their version is shown below; re-review it before saving again.')
-        await load()
+          + 'overwritten, and neither were your words. Their version is shown beside yours; '
+          + 're-review it, then save again.')
+        setConflicted(true)
+        // KEEP THE DRAFT. This reload exists to refresh the CAS anchor (so the next save is
+        // anchored on the version just read, not on the stale one that lost) and to fetch the
+        // other person's words for comparison — not to overwrite the author's.
+        await load(true)
       } else {
         setNotice(err instanceof ApiError ? err.detail : String(err))
       }
@@ -117,13 +132,39 @@ export function CatalogNarrativePanel({ source }: { source: string }) {
               findable by what it is FOR, not only by its column names.
             </p>
           )}
-          <button type="button" onClick={() => setEditing(true)}>
+          <button type="button" onClick={() => { setConflicted(false); setEditing(true) }}>
             {current ? 'Edit' : 'Describe this catalog'}
           </button>
         </>
       )}
       {editing && (
         <form onSubmit={save} style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+          {conflicted && current && (
+            <div className="adg-kv" data-testid="catalog-narrative-theirs">
+              <p className="hint">
+                Their version — yours is still in the fields below, unchanged. Fold in anything
+                worth keeping, then save.
+              </p>
+              <div className="kv">
+                <span className="k">Their name</span>
+                <span className="v">
+                  {current.display_name ?? <span className="hint">not set</span>}
+                </span>
+              </div>
+              <div className="kv">
+                <span className="k">Their description</span>
+                <span className="v">
+                  {current.description ?? <span className="hint">not written</span>}
+                </span>
+              </div>
+              <div className="kv">
+                <span className="k">Their business context</span>
+                <span className="v">
+                  {current.business_context ?? <span className="hint">not written</span>}
+                </span>
+              </div>
+            </div>
+          )}
           <label>
             Name
             <input value={displayName} onChange={e => setDisplayName(e.target.value)}
@@ -141,7 +182,10 @@ export function CatalogNarrativePanel({ source }: { source: string }) {
           </label>
           <div>
             <button type="submit" disabled={busy}>Save</button>{' '}
-            <button type="button" onClick={() => { setEditing(false); void load() }}>Cancel</button>
+            <button type="button"
+                    onClick={() => { setEditing(false); setConflicted(false); void load() }}>
+              Cancel
+            </button>
           </div>
         </form>
       )}

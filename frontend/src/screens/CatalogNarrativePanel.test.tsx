@@ -103,3 +103,51 @@ it('a concurrent write reloads and asks for a re-review instead of overwriting',
   // Exactly ONE write attempt: a blind retry would clobber the other person's words.
   expect(putCatalogProfile).toHaveBeenCalledTimes(1)
 })
+
+it('a 409 keeps the author DRAFT and shows the server values beside it', async () => {
+  // The conflict handler reloaded the profile into the FORM, so the author's unsaved paragraph was
+  // replaced by the other person's — protecting the server's copy by destroying the one only this
+  // person had. Re-review needs BOTH versions present.
+  await renderPanel({ source: 'ftr', pointer_version: 3, profile: revision() })
+  putCatalogProfile.mockRejectedValue(new api.ApiError(409, 'conflict'))
+  getCatalogProfile.mockResolvedValue({
+    source: 'ftr', pointer_version: 4,
+    profile: revision({ business_context: 'Rewritten by someone else.' }),
+  })
+
+  await userEvent.click(screen.getByRole('button', { name: 'Edit' }))
+  const draft = screen.getByLabelText('Business context')
+  await userEvent.clear(draft)
+  await userEvent.type(draft, 'My unsaved paragraph.')
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+  expect(await screen.findByRole('status')).toHaveTextContent(/nothing was overwritten/i)
+  // The draft survives, in the field the author typed it into.
+  expect(screen.getByLabelText('Business context')).toHaveValue('My unsaved paragraph.')
+  // …and the server's current values are shown beside it, to re-review against.
+  const theirs = await screen.findByTestId('catalog-narrative-theirs')
+  expect(theirs).toHaveTextContent('Rewritten by someone else.')
+})
+
+it('a re-save after a 409 anchors on the version it just re-read', async () => {
+  await renderPanel({ source: 'ftr', pointer_version: 3, profile: revision() })
+  putCatalogProfile.mockRejectedValueOnce(new api.ApiError(409, 'conflict'))
+  getCatalogProfile.mockResolvedValue({
+    source: 'ftr', pointer_version: 4,
+    profile: revision({ business_context: 'Rewritten by someone else.' }),
+  })
+  await userEvent.click(screen.getByRole('button', { name: 'Edit' }))
+  const draft = screen.getByLabelText('Business context')
+  await userEvent.clear(draft)
+  await userEvent.type(draft, 'My unsaved paragraph.')
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+  await screen.findByTestId('catalog-narrative-theirs')
+
+  putCatalogProfile.mockResolvedValue({ source: 'ftr', revision_id: 'cpr_y', pointer_version: 5 })
+  await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+  expect(putCatalogProfile).toHaveBeenLastCalledWith('ftr', expect.objectContaining({
+    expectedPointerVersion: 4,
+    businessContext: 'My unsaved paragraph.',
+  }))
+})

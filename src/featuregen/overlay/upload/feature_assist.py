@@ -496,6 +496,15 @@ def _profile_advisories(members: list[dict]) -> dict:
 # policy (prose first) and refuses only when even the fully trimmed set does not fit. A mandatory
 # column is never silently dropped — a missing grain or time column produces a confidently wrong
 # feature rather than a smaller one.
+#
+# WHAT THIS BUDGET DOES NOT BOUND — the COST. This is the assembly's own byte ceiling and nothing
+# downstream caps input size: the provider call carries no input-token limit, so raising the budget
+# from 60_000 to 300_000 removed a refusal, not a spend control. On the measured catalogs above v4
+# sends ~2.2x the v3 prompt bytes for the same 237 columns (248_601 vs 175_520), and a mid-size
+# catalog that previously refused now succeeds at ~4x the bytes it used to attempt. Input tokens are
+# the cheaper half of a call and this is metadata, not data — but "cheaper" is not "free", and the
+# number belongs beside the constant that produces it rather than in a review nobody re-reads.
+# `FEATUREGEN_FEATURE_CONTEXT_VERSION=3` is the lever that takes it back (the D8 ladder above).
 FEATURE_CONTEXT_BYTE_BUDGET = 300_000
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")

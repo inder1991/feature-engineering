@@ -151,9 +151,13 @@ def _search_doc_params(kind: str, table: str | None, column: str | None, definit
             (domain or "") + " " + (entity or ""), semantic_terms or "", ai_summary or "", "")
 
 
-assert _SEARCH_DOC.count("%s") == _SEARCH_DOC_SLOTS == len(
-    _search_doc_params("table", "t", None, None, None, None, None, None)), (
-    "the search_doc expression and its parameter builder disagree on slot count")
+# An explicit RuntimeError, NOT a bare `assert`: `python -O` strips assertions, so the one guard
+# standing between a changed document expression and a silently mis-bound INSERT would vanish in
+# exactly the build a deployment is most likely to run. The check is cheap and runs once at import.
+if not (_SEARCH_DOC.count("%s") == _SEARCH_DOC_SLOTS == len(
+        _search_doc_params("table", "t", None, None, None, None, None, None))):
+    raise RuntimeError(
+        "the search_doc expression and its parameter builder disagree on slot count")
 
 #: The columns :func:`rebuild_search_doc` re-reads, in the order :func:`_search_doc_params` takes
 #: them after ``kind``. Named once so the SELECT and the call site cannot drift apart.
