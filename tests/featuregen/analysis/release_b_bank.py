@@ -15,6 +15,7 @@ from tests.featuregen.data_agent.pilot_fixture import (
     CUSTOMER_SCHEMA,
     CUSTOMER_TABLE,
     DIMENSION_TABLE,
+    SNAPSHOT_TABLE,
     TRANSACTION_SCHEMA,
     TRANSACTION_TABLE,
     create_pilot_tables,
@@ -55,12 +56,23 @@ SEG_FROM = normalize_ref(SRC, CUSTOMER_SCHEMA, DIMENSION_TABLE, "effective_from"
 SEG_TO = normalize_ref(SRC, CUSTOMER_SCHEMA, DIMENSION_TABLE, "effective_to")
 SEG_FLAG = normalize_ref(SRC, CUSTOMER_SCHEMA, DIMENSION_TABLE, "is_current")
 
+#: The SNAPSHOT-shaped dimension source — ENGINE B's half of the pilot bank. The SAME classification
+#: kept the other way a bank keeps it (one row per customer per publication instant), beside the
+#: SCD2 table rather than instead of it, because the two row rules give DIFFERENT answers and which
+#: one applies is a declaration rather than a guess.
+SNAP = normalize_ref(SRC, CUSTOMER_SCHEMA, SNAPSHOT_TABLE)
+SNAP_SEG = normalize_ref(SRC, CUSTOMER_SCHEMA, SNAPSHOT_TABLE, "segment")
+SNAP_SEC = normalize_ref(SRC, CUSTOMER_SCHEMA, SNAPSHOT_TABLE, "sector")
+SNAP_DATE = normalize_ref(SRC, CUSTOMER_SCHEMA, SNAPSHOT_TABLE, "snapshot_date")
+SNAP_SEQ = normalize_ref(SRC, CUSTOMER_SCHEMA, SNAPSHOT_TABLE, "load_seq")
+
 CUTOFF_REF = "report_cutoff_param"
 QUESTION = ("customers whose transaction count decreased last completed month, "
             "by segment and sector")
 
 
-def build_bank(db, monkeypatch, *, restricted_archive: bool = False):
+def build_bank(db, monkeypatch, *, restricted_archive: bool = False,
+               snapshot_dimension: bool = False):
     """The pilot's real tables PLUS the catalog, policies and physical routing that address them.
 
     `database_name` is the test database on purpose: the derived binding's `table_id` must equal
@@ -69,6 +81,11 @@ def build_bank(db, monkeypatch, *, restricted_archive: bool = False):
 
     `restricted_archive` puts the LOSING candidate behind a role claim the default caller does not
     hold — the shape Task 9's read-scoped explain has to render as a COUNT and never as a name.
+
+    `snapshot_dimension` describes and governs the SNAPSHOT-shaped dimension table as well, so a
+    plan can ask the SAME question of the other row rule. Off by default: adding it unconditionally
+    would put a second dimension table in every suite's catalog, and the tables are deliberately
+    indistinguishable in shape.
     """
     monkeypatch.setenv("FEATUREGEN_DATASET_PROFILES", "1")
     monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
@@ -87,6 +104,13 @@ def build_bank(db, monkeypatch, *, restricted_archive: bool = False):
         CanonicalRow(SRC, DIMENSION_TABLE, "effective_from", "timestamp"),
         CanonicalRow(SRC, DIMENSION_TABLE, "effective_to", "timestamp"),
         CanonicalRow(SRC, DIMENSION_TABLE, "is_current", "boolean"),
+        *([
+            CanonicalRow(SRC, SNAPSHOT_TABLE, "cif_id", "text", is_grain=True),
+            CanonicalRow(SRC, SNAPSHOT_TABLE, "segment", "text"),
+            CanonicalRow(SRC, SNAPSHOT_TABLE, "sector", "text"),
+            CanonicalRow(SRC, SNAPSHOT_TABLE, "snapshot_date", "text", as_of=True),
+            CanonicalRow(SRC, SNAPSHOT_TABLE, "load_seq", "int"),
+        ] if snapshot_dimension else []),
     ])
     db.execute("UPDATE graph_node SET schema_name = %s WHERE catalog_source = %s",
                (CUSTOMER_SCHEMA, SRC))
@@ -108,6 +132,8 @@ def build_bank(db, monkeypatch, *, restricted_archive: bool = False):
     # The dimension source keeps SCD2 history: a HISTORICAL question reads the row valid at the
     # cutoff, and a CURRENT one would read the flagged row — two different answers, declared.
     publish_temporal_policy_for(db)
+    if snapshot_dimension:
+        publish_snapshot_policy_for(db)
     if restricted_archive:
         # AFTER the policies are published, deliberately: `publish_serving_policy` validates that
         # its AUTHOR can see every dataset it names, so hiding the archive first would refuse the
@@ -138,6 +164,37 @@ def publish_temporal_policy_for(db, **over):
     kw.update(over)
     return publish_temporal_policy(db, DatasetTemporalPolicyRevisionV1(**kw),
                                    expected_pointer_version=expected, actor="user:priya")
+
+
+def publish_snapshot_policy_for(db, **over):
+    """ENGINE B's declaration for the snapshot table.
+
+    `tie_break_refs` is `load_seq` and that is load-bearing rather than decorative: C4 has TWO rows
+    stamped on the same snapshot date, and without a governed tie-breaker the engine REFUSES
+    (`TEMPORAL_SNAPSHOT_TIE`) rather than picking one — which is the honest behaviour and the reason
+    the pin exists.
+    """
+    from featuregen.overlay.upload.temporal_policy_store import publish_temporal_policy
+
+    kw = {"dataset_logical_ref": SNAP, "temporal_storage_model": TemporalStorageModel.SNAPSHOT,
+          # The dataset has no notion of "the current row" other than its latest snapshot, so both
+          # questions read the same rule. Declaring `current_record` would need a flag column the
+          # table does not have.
+          "current_selection": TemporalSelectionKind.LATEST_SNAPSHOT_AS_OF,
+          "historical_selection": TemporalSelectionKind.LATEST_SNAPSHOT_AS_OF,
+          "snapshot_ref": SNAP_DATE, "tie_break_refs": (SNAP_SEQ,),
+          "provenance": human_declaration_provenance(producer_ref="user:priya")}
+    expected = over.pop("expected_pointer_version", 0)
+    kw.update(over)
+    return publish_temporal_policy(db, DatasetTemporalPolicyRevisionV1(**kw),
+                                   expected_pointer_version=expected, actor="user:priya")
+
+
+def pilot_snapshot_plan(**over) -> AnalysisPlanV1:
+    """The SAME pilot question, asked of the snapshot-shaped dimension source."""
+    kw = {"dimensions": (Dimension(logical_ref=SNAP_SEG), Dimension(logical_ref=SNAP_SEC))}
+    kw.update(over)
+    return pilot_plan(**kw)
 
 
 def pilot_plan(**over) -> AnalysisPlanV1:

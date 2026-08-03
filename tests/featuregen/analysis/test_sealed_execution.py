@@ -21,9 +21,11 @@ import pytest
 from tests.featuregen.analysis.release_b_bank import (
     CUTOFF_REF,
     QUESTION,
+    SNAP,
     SRC,
     build_bank,
     pilot_plan,
+    pilot_snapshot_plan,
     publish_temporal_policy_for,
 )
 from tests.featuregen.data_agent.pilot_fixture import (
@@ -55,7 +57,9 @@ from featuregen.analysis.sealed_plan import (
 )
 from featuregen.analysis.sealed_plan_store import replay_sealed_plan, seal_analysis_plan
 from featuregen.data_agent.binding_store import resolve_table
+from featuregen.data_agent.dimensions import MissingValueBehavior
 from featuregen.data_agent.eligibility_store import record_eligibility
+from featuregen.data_agent.snapshots import SnapshotScope
 from featuregen.data_agent.sql_postgres import PostgresDialect
 from featuregen.overlay.upload.temporal_policy import TemporalSelectionKind
 
@@ -216,6 +220,123 @@ def test_a_sealed_plan_whose_source_MOVED_refuses_before_it_reads_a_row(bank):
     outcome = run_sealed_plan(bank, record, engine=_engine(bank))
     assert not isinstance(outcome, SealedRunV1)
     assert "sealed against" in outcome.detail or "different physical object" in outcome.detail
+
+
+# ── ENGINE B: the snapshot chain, end to end ─────────────────────────────────────────────────────
+#
+# `latest_snapshot_as_of` had ZERO coverage through seal and execute. Every piece existed — the
+# resolver adapts the policy, `ExecutionInputs` carries `snapshot_selection`, the IR hashes it, the
+# rebuild reads it back — and nothing joined them, which is how a chain ships with one link missing
+# and every unit test green. This is the same pilot question asked of the OTHER row rule.
+
+
+@pytest.fixture
+def snapshot_bank(db, monkeypatch):
+    built = build_bank(db, monkeypatch, snapshot_dimension=True)
+    record_eligibility(built, catalog_source=SRC, table=TRANSACTION_TABLE, policy=_eligibility(),
+                       proposed_by="user:priya")
+    return built
+
+
+def _snapshot_grounded(bank, **over):
+    return ground_analysis_plan(bank, pilot_snapshot_plan(**over), cutoff_value_ref=CUTOFF_REF,
+                                recorded_by="task9", roles=())
+
+
+def _snapshot_seal(bank, *, reference=REFERENCE):
+    from featuregen.analysis.execution import plan_to_execution_ir
+
+    grounded = _snapshot_grounded(bank)
+    inputs = execution_inputs_for_plan(bank, grounded, reference=reference)
+    assert inputs is not None, "the assembler found nothing to run"
+    # THE ASYMMETRY THAT MATTERS: engine B's row rule is set and engine A's is NOT. Passing an
+    # interval attribution here would compile SCD semantics onto a snapshot table — it runs clean
+    # and answers a different question, which is the failure this branch exists to prevent.
+    assert inputs.snapshot_selection is not None
+    assert inputs.attribution is None
+    ir = build_execution_ir_v2(plan_to_execution_ir(grounded, inputs), grounded.selections,
+                               question=QUESTION)
+    return seal_analysis_plan(bank, ir, sealed_by="user:priya", question=QUESTION)
+
+
+def test_a_SNAPSHOT_dimension_resolves_to_the_latest_snapshot_row_rule(snapshot_bank):
+    selections = _snapshot_grounded(snapshot_bank).selections
+    assert selections.resolved, selections.refusals
+    row = selections.row_selections[0]
+    assert row.dataset_logical_ref == SNAP
+    assert row.selection_kind is TemporalSelectionKind.LATEST_SNAPSHOT_AS_OF
+
+
+def test_the_snapshot_row_rule_reaches_the_ASSEMBLER_as_engine_Bs_input(snapshot_bank):
+    inputs = execution_inputs_for_plan(snapshot_bank, _snapshot_grounded(snapshot_bank),
+                                       reference=REFERENCE)
+    assert inputs is not None
+    assert inputs.attribution is None
+    snapshot = inputs.snapshot_selection
+    assert snapshot is not None
+    assert (snapshot.snapshot_column, snapshot.key_column) == ("snapshot_date", "cif_id")
+    # The cutoff VALUE, from the same instant the windows were measured back from.
+    assert snapshot.cutoff == "2026-06-30"
+    # The governed tie-breaker, carried from the policy. C4 has two rows on one snapshot date and
+    # without this the engine refuses rather than picking.
+    assert snapshot.tie_break_columns == ("load_seq",)
+
+
+def test_the_sealed_snapshot_plan_REBUILDS_into_the_computation_that_was_sealed(snapshot_bank):
+    record = _snapshot_seal(snapshot_bank)
+    ir = rebuild_execution_ir(record, execution_inputs_from_sealed(snapshot_bank, record))
+    assert ir.identity_payload() == dict(record.computation)
+    assert ir.attribution is None
+    assert ir.snapshot_selection is not None
+    assert ir.snapshot_selection.scope is SnapshotScope.PER_ENTITY
+    assert ir.snapshot_selection.missing_value_behavior is MissingValueBehavior.UNKNOWN_BUCKET
+
+
+def test_running_the_sealed_SNAPSHOT_plan_attributes_every_customer(snapshot_bank):
+    """The end of ENGINE B's chain. Six customers, the hand-counted decrease, and the segment each
+    one carried at the cutoff — read from the LATEST SNAPSHOT at or before it rather than from an
+    interval."""
+    outcome = run_sealed_plan(snapshot_bank, _snapshot_seal(snapshot_bank),
+                              engine=_engine(snapshot_bank))
+    assert isinstance(outcome, SealedRunV1), getattr(outcome, "detail", outcome)
+    rows = {r.key: r for r in outcome.rows}
+    assert set(rows) == {"C1", "C2", "C3", "C4", "C5", "C6"}
+    assert tuple(sorted(k for k, r in rows.items() if r.decreased)) == \
+        EXPECTED["decreased_customers"]
+    # C4 is the tie: two rows on 2026-06-30, separated ONLY by the policy's `load_seq`.
+    # C5's only snapshot is AFTER the cutoff and C6 has none — both are Unknown, never dropped.
+    assert {k: r.dimensions["segment"] for k, r in rows.items()} == EXPECTED["segment_at_cutoff"]
+
+
+def test_a_re_declared_SNAPSHOT_policy_refuses_the_sealed_plan(snapshot_bank):
+    """Pin 5 over engine B: the row rule moved, so the plan may not answer under the old one."""
+    from tests.featuregen.analysis.release_b_bank import publish_snapshot_policy_for
+
+    record = _snapshot_seal(snapshot_bank)
+    publish_snapshot_policy_for(snapshot_bank, expected_pointer_version=1, tie_break_refs=())
+
+    outcome = run_sealed_plan(snapshot_bank, record, engine=_engine(snapshot_bank))
+    assert not isinstance(outcome, SealedRunV1)
+    assert outcome.code == SEALED_PLAN_STALE_TEMPORAL_POLICY
+
+
+def test_an_ENGINE_B_plan_with_its_row_rule_STRIPPED_refuses_rather_than_running(snapshot_bank):
+    """The regression guard on `plan_to_execution_ir`'s `and inputs.snapshot_selection is None`.
+
+    Drop that clause and this plan compiles with NO row rule at all: dimensions asked for, nothing
+    saying which row classifies each customer, and the renderer free to pick. `ATTRIBUTION_ABSENT`
+    is the honest answer, and it is what the test above proves is NOT reached when the rule is
+    present."""
+    from dataclasses import replace
+
+    from featuregen.analysis.execution import BridgeRefusal, plan_to_execution_ir
+
+    grounded = _snapshot_grounded(snapshot_bank)
+    inputs = execution_inputs_for_plan(snapshot_bank, grounded, reference=REFERENCE)
+    stripped = replace(inputs, snapshot_selection=None)
+    with pytest.raises(BridgeRefusal) as exc:
+        plan_to_execution_ir(grounded, stripped)
+    assert exc.value.code == "ATTRIBUTION_ABSENT"
 
 
 # ── the flag law ─────────────────────────────────────────────────────────────────────────────────
