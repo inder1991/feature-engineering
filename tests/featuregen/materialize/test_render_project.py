@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import inspect
+import os
 import pathlib
 import re
 
@@ -142,9 +143,10 @@ def _stub(name, func, inputs, outputs, *, imports=(), tags=()) -> RenderedNode:
         source=f'def {func}({body}):\n    """Task 13/14 renders this body."""\n    return {returns}\n')
 
 
-def _nodes(datasets: ProjectDatasets) -> tuple[RenderedNode, ...]:
+def _nodes(datasets: ProjectDatasets, *,
+           spine_table: str = "banking.customers") -> tuple[RenderedNode, ...]:
     """A complete, closed wiring over `datasets` — the shape Tasks 13 and 14 must produce."""
-    customers = datasets.raw["banking.customers"]
+    customers = datasets.raw[spine_table]
     transactions = datasets.raw["banking.transactions"]
     nodes = [_stub("spine", "build_spine", [customers], [datasets.spine], tags=["primary"],
                    imports=("from pyspark.sql import DataFrame",))]
@@ -513,6 +515,24 @@ def test_the_hook_refuses_UNEXPECTED_parameters_as_well_as_missing_ones(
     assert "raise RuntimeError" in hooks
 
 
+def test_the_hook_reads_both_kedro_run_param_keys(project: SealedProject) -> None:
+    """kedro 0.19.x passes the dict as `extra_params`; kedro 1.x as `runtime_params`. The artifact
+    pins 0.19.9 (goldens/cif_daily/requirements.lock), so reading only the 1.x key means every run
+    refuses RUN_PARAMETERS_MISSING."""
+    hooks = project.files[f"{SOURCE_ROOT}/hooks.py"]
+    assert 'get("runtime_params")' in hooks
+    assert 'get("extra_params")' in hooks
+
+
+def test_spark_yml_pins_ansi_off(project: SealedProject) -> None:
+    """The emitted gates observe LEGACY cast semantics: the OVERFLOW_VIOLATION gate reads the NULL
+    an out-of-range cast produces, and under ANSI mode (pyspark 4.x's default) that cast raises a
+    raw SparkArithmeticException outside the closed gate vocabulary — so the artifact pins the
+    setting rather than inheriting whichever default the cluster runs."""
+    spark_yml = project.files["conf/base/spark.yml"]
+    assert 'spark.sql.ansi.enabled: "false"' in spark_yml
+
+
 def test_the_readme_states_the_kedro_run_versus_spark_submit_distinction(
         project: SealedProject) -> None:
     """§7: `kedro run` inside a Spark session configured by a Kedro hook, with `spark-submit` used
@@ -738,13 +758,94 @@ def test_every_catalog_entry_declares_one_of_section_7s_LAYERS(project: SealedPr
 
 
 def test_each_feature_stages_INDEPENDENTLY(project: SealedProject) -> None:
-    """§7: no scan sharing in this slice. One staging output and one manifest per feature."""
+    """§7: no scan sharing in this slice. One staging output and one manifest per feature.
+
+    The three name FAMILIES are disjoint by prefix — `feature_staging_<column>`,
+    `feature_manifest__<column>`, `feature_group__assembled` — so no filter here has to carve one
+    family out of another, which is exactly the collision the old `feature_staging_manifest_`
+    prefix invited (a feature legitimately named `manifest_x` staged onto another feature's
+    manifest).
+    """
     entries = _yaml_of(project, "conf/base/catalog.yml")
-    staged = [name for name in entries if name.startswith("feature_staging_")
-              and not name.startswith("feature_staging_manifest_")
-              and name != "feature_staging_assembled"]
-    manifests = [name for name in entries if name.startswith("feature_staging_manifest_")]
+    staged = [name for name in entries if name.startswith("feature_staging_")]
+    manifests = [name for name in entries if name.startswith("feature_manifest__")]
     assert len(staged) == 3 and len(manifests) == 3
+
+
+def test_a_feature_named_manifest_x_RENDERS(catalog, db) -> None:  # noqa: F811
+    """`manifest_<x>` and `assembled` are legitimate hive column names, and the group also stages a
+    feature named `x`. Under the old prefixes, `x`'s manifest dataset was
+    `feature_staging_manifest_x` — the SAME name as `manifest_x`'s staging dataset — and `assembled`
+    staged onto the fixed assembled dataset, so `_unique` refused a group nobody misnamed. The
+    `feature_manifest__`/`feature_group__` families cannot collide with any
+    `feature_staging_<hive_identifier>`: they differ from it at the character after `feature_`.
+    """
+    authorized, plan, spine_input = _compiled(db, SUM_30D, COUNT_90D, RATIO_90D)
+    renames = {SUM_30D: "x", COUNT_90D: "manifest_x", RATIO_90D: "assembled"}
+    irs = tuple(dataclasses.replace(ir, feature_name=renames[ir.feature_name])
+                for ir in authorized.irs)
+    authorized = dataclasses.replace(authorized, irs=irs)
+    hashes = {ir.feature_name: ir_hash(ir) for ir in irs}
+    plan = dataclasses.replace(plan, features=tuple(
+        dataclasses.replace(feature, column_name=renames[feature.column_name],
+                            ir_hash=hashes[renames[feature.column_name]])
+        for feature in plan.features))
+
+    datasets = project_datasets(authorized, plan, spine_input=spine_input)
+    assert datasets.staging["manifest_x"] == "feature_staging_manifest_x"
+    assert datasets.manifests["x"] == "feature_manifest__x"
+    assert datasets.staging["assembled"] == "feature_staging_assembled"
+    assert datasets.assembled == "feature_group__assembled"
+
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=spine_input,
+                             nodes=_nodes(datasets))
+    entries = _yaml_of(project, "conf/base/catalog.yml")
+    assert {"feature_staging_manifest_x", "feature_manifest__x",
+            "feature_staging_assembled", "feature_group__assembled"} <= set(entries)
+
+
+def test_a_dotted_schema_addresses_the_right_table(catalog, db) -> None:  # noqa: F811
+    """`split(".", 1)` on `edp.raw.customers` yields table `raw.customers` — a table that does not
+    exist. The LAST dot separates schema from table: a dotted schema is real (a catalog-qualified
+    namespace), a dotted table is not."""
+    authorized, plan, spine_input = _compiled(db, SUM_30D)
+    dotted = dataclasses.replace(spine_input, schema="edp.raw")
+    datasets = project_datasets(authorized, plan, spine_input=dotted)
+    assert "edp.raw.customers" in datasets.raw
+
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=dotted,
+                             nodes=_nodes(datasets, spine_table="edp.raw.customers"))
+    entry = _yaml_of(project, "conf/base/catalog.yml")[datasets.raw["edp.raw.customers"]]
+    assert entry["database"] == "edp.raw"
+    assert entry["table"] == "customers"
+
+
+def test_a_dotted_publication_namespace_addresses_the_right_table(catalog, db, monkeypatch) -> None:  # noqa: F811
+    """The published target's split has the same defect in the other entry: a catalog-qualified
+    sandbox namespace must stay the database, whole."""
+    monkeypatch.setattr(binding, "SANDBOX_NAMESPACE", "lake.sandbox_feature")
+    published = _yaml_of(_render(db, SUM_30D), "conf/base/catalog.yml")[f"feature_{GROUP}"]
+    assert published["database"] == "lake.sandbox_feature"
+    assert published["table"] == GROUP
+
+
+def test_a_control_character_in_a_schema_cannot_change_the_rendered_location(catalog, db) -> None:  # noqa: F811
+    """Two defects at once, and both must be closed: the `database:` scalar must ESCAPE the
+    newline (or the value silently folds to a different name), and the `# comment` line above it
+    must not let the newline END the comment (or the remainder becomes YAML nobody wrote)."""
+    authorized, plan, spine_input = _compiled(db, SUM_30D)
+    hostile = dataclasses.replace(spine_input, schema="edp\nraw")
+    datasets = project_datasets(authorized, plan, spine_input=hostile)
+
+    project = render_project(authorized, plan, environment_id=ENVIRONMENT,
+                             engine_versions=fixtures.ENGINE_VERSIONS, spine_input=hostile,
+                             nodes=_nodes(datasets, spine_table="edp\nraw.customers"))
+    entries = _yaml_of(project, "conf/base/catalog.yml")  # a raw newline fails the parse itself
+    entry = entries[datasets.raw["edp\nraw.customers"]]
+    assert entry["database"] == "edp\nraw"
+    assert entry["table"] == "customers"
 
 
 # ══ parameters — and what must never become one ══════════════════════════════════════════════════
@@ -906,11 +1007,18 @@ def test_the_rendered_project_matches_its_GOLDENS(project: SealedProject) -> Non
     `GENERATED.lock` is deliberately NOT a golden: it holds the hash of the other files, so it would
     have to be regenerated for any change at all and would never be read.
     """
-    assert GOLDENS.is_dir(), f"regenerate with {__file__}::_write_goldens"
-    expected = {str(path.relative_to(GOLDENS)): path.read_text(encoding="utf-8")
-                for path in GOLDENS.rglob("*") if path.is_file()}
     actual = {path: text for path, text in project.files.items()
               if path != GENERATED_LOCK_FILENAME}
+    if not GOLDENS.is_dir():
+        if os.environ.get("UPDATE_GOLDENS") != "1":
+            pytest.fail(f"golden dir {GOLDENS} is missing — if this is an intended renderer "
+                        f"change, regenerate with UPDATE_GOLDENS=1 and REVIEW the diff")
+        for path, text in actual.items():
+            target = GOLDENS / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+    expected = {str(path.relative_to(GOLDENS)): path.read_text(encoding="utf-8")
+                for path in GOLDENS.rglob("*") if path.is_file()}
     assert set(actual) == set(expected)
     for path in sorted(expected):
         assert actual[path] == expected[path], path

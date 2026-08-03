@@ -76,7 +76,14 @@ from featuregen.materialize.inventory import (
 )
 from featuregen.materialize.ir import BridgeExecutionAuthorization, FormulaExecutionIRV1
 from featuregen.materialize.render.project import REQUIRED_RUN_PARAMETERS
-from featuregen.materialize.spine import CurrentSnapshot, LatestAvailableAsOf, SpineSpec
+from featuregen.materialize.spine import (
+    ActivePopulation,
+    CurrentSnapshot,
+    LatestAvailableAsOf,
+    PartitionMappedSnapshot,
+    SpineSpec,
+)
+from featuregen.overlay.upload.object_ref import parse_ref
 
 __all__ = [
     "DAYS_PER_UNIT",
@@ -244,9 +251,13 @@ class PhysicalInputSnapshot:
         """One entry of the ``input_snapshots`` run parameter (§11.1).
 
         This is the shape Task 13a declined to invent (A.16): it names the read, the expression it
-        belongs to and the physical table, so the generated project can apply exactly these
-        predicates and prove afterwards that it read precisely them. It carries no data value and
-        no location — a location is a catalog entry, and a value is what the run computes.
+        belongs to and the physical table. It is prepared EVIDENCE, not an enforced read scope:
+        the set is resolved here at preparation and consumed by L1's ``PARTITION_ABSENT`` check
+        (the same resolved partitions must still exist at validation time); the rendered nodes
+        filter by the window/availability predicates and do not re-apply the snapshot list, so
+        nothing proves afterwards that the run read precisely these partitions (DEFERRED-WORK
+        A.31). It carries no data value and no location — a location is a catalog entry, and a
+        value is what the run computes.
         """
         return {
             "snapshot_id": self.snapshot_id(),
@@ -623,14 +634,23 @@ def spine_input_request(
     ``PARTITION_MAPPED`` is the business date's own partition, exactly what the rendered spine node
     selects.
 
-    **This is where §4.2's `CurrentSnapshot` vintage condition becomes reachable.** A table that
-    holds no history was observed at one vintage; asked for any other business date it would answer
-    with the rows it has, and the run would publish one day's population under another day's date.
-    §4.2 says it refuses rather than pretending, so it does. The refusal is typed
-    ``SPINE_DECLARATION_REJECTED_BY_FACTS``: §14's vocabularies are closed and no member names a
-    run-preparation verdict, and of the members that exist this is the only one that says *this
-    spine declaration does not stand*. The strain is real and recorded — the refuting input is the
-    run's business date rather than a governed catalog fact.
+    **This is where §4.2's vintage condition becomes reachable — for BOTH present-tense
+    policies.** A table that holds no history was observed at one vintage; asked for any other
+    business date it would answer with the rows it has, and the run would publish one day's
+    population under another day's date. §4.2 says it refuses rather than pretending, so it does.
+    The refusal is typed ``SPINE_DECLARATION_REJECTED_BY_FACTS``: §14's vocabularies are closed and
+    no member names a run-preparation verdict, and of the members that exist this is the only one
+    that says *this spine declaration does not stand*. The strain is real and recorded — the
+    refuting input is the run's business date rather than a governed catalog fact.
+
+    ``CurrentSnapshot`` declares its vintage as ``observed_snapshot_ref`` — an opaque identifier,
+    a date or a version. ``ActivePopulation`` — the other history-free policy — declares
+    ``observed_on``, the calendar date its current rows were observed valid: its status column is
+    CURRENT-valued, so any other business date is review §2.1's confirmed leak (a January backfill
+    run in July silently publishing July's actives), and requiring an ``availability_ref`` instead
+    would only half-close it — an entity CLOSED since a historical business date has no row left
+    for rule 6 to filter. Both vintages enter identity, so the remedy the refusal points at — a
+    RE-DECLARATION with a new vintage — is a hash-visible, reviewable act.
 
     A vintage that is not a calendar date is refused too. It is an opaque declared identifier, a
     version and a date have no ordering between them, and *"this module cannot check the vintage"*
@@ -654,26 +674,50 @@ def spine_input_request(
     anchor = _business_date(business_dt)
     policy = spine.snapshot_policy
 
-    if isinstance(policy, CurrentSnapshot):
-        vintage = policy.observed_snapshot_ref.strip()
+    if isinstance(policy, CurrentSnapshot | ActivePopulation):
+        # ONE guard for the two present-tense policies; only WHICH declared field holds the
+        # vintage differs. `label` puts the policy's name in the shared refusal, so the operator
+        # reading it knows which declaration to re-declare with a new vintage.
+        if isinstance(policy, CurrentSnapshot):
+            vintage, vintage_source = policy.observed_snapshot_ref.strip(), "observed at"
+        else:
+            vintage, vintage_source = policy.observed_on.strip(), "observed on"
+        label = policy.kind.name
         try:
             observed = dt.date.fromisoformat(vintage)
         except ValueError:
             return _refuse(
                 CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
-                f"the population of {spine.source_table_ref} is declared CURRENT_SNAPSHOT observed "
-                f"at {vintage!r}, which is not a calendar date: the run's business date is "
+                f"the population of {spine.source_table_ref} is declared {label} {vintage_source} "
+                f"{vintage!r}, which is not a calendar date: the run's business date is "
                 f"{anchor.isoformat()}, and a version identifier and a date have no ordering "
                 f"between them — so whether this table can answer this date cannot be established, "
                 f"and an unestablished vintage is not a matching one")
         if observed != anchor:
             return _refuse(
                 CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS,
-                f"the population of {spine.source_table_ref} is declared CURRENT_SNAPSHOT observed "
-                f"at {observed.isoformat()}, and this run's business date is {anchor.isoformat()}: "
+                f"the population of {spine.source_table_ref} is declared {label} {vintage_source} "
+                f"{observed.isoformat()}, and this run's business date is {anchor.isoformat()}: "
                 f"a table that holds no history cannot answer another date, and answering with the "
                 f"rows it happens to hold would publish one day's population under another day's "
                 f"date")
+
+    if isinstance(policy, PartitionMappedSnapshot) and not isinstance(
+            spine_input.partition_mapping, EventTimePartition | StaticSnapshot):
+        # The supported set is the renderer's, read off `render.nodes_compute._partition_mapped`:
+        # only an EventTimePartition or a StaticSnapshot RESOLVES a business date to partition
+        # VALUES. Refusing here is the governed verdict; the renderer's own raise stays as
+        # defense-in-depth, because a bare ValueError mid-render is outside §14's vocabulary.
+        mapping = spine_input.partition_mapping
+        return _refuse(
+            CompilationRefusalCode.PARTITION_MAPPING_NOT_DECLARED,
+            f"the population of {spine.source_table_ref} is declared PARTITION_MAPPED, but "
+            f"{spine_input.schema}.{spine_input.table} declares the partition mapping "
+            f"{type(mapping).__name__ if mapping is not None else None}, which does not resolve a "
+            f"business date to partition VALUES: PARTITION_MAPPED says a business date selects the "
+            f"partitions, and rendering it over a mapping that reads every partition — or none, or "
+            f"a widened set for late arrivals — would read a population the declaration did not "
+            f"describe")
 
     if isinstance(policy, LatestAvailableAsOf) and isinstance(
             spine_input.partition_mapping, EventTimePartition | AvailabilityPartition):
@@ -727,6 +771,61 @@ def staging_root_for(staging_base: str, *, generation_id: str) -> str:
             f"unscoped root is the reused path §9's stale-manifest gate exists to make "
             f"unreachable")
     return f"{staging_base.strip().rstrip('/')}/{generation_id.strip()}"
+
+
+def _date_typed_clock_refusal(
+    requests: tuple[RunInputRequest, ...], inventory: ClusterInventoryV1
+) -> MaterializationRefused | None:
+    """Refuse a run whose PIT clock is a Hive ``DATE`` read under a non-UTC window zone.
+
+    The rendered window comparison is ``F.col(clock) >= F.to_utc_timestamp(boundary, zone)``:
+    casting the boundary DATE lands on midnight, and ``to_utc_timestamp`` re-reads it as ``zone``'s
+    wall clock, so west of UTC the whole window shifts by a day — the first day drops and an extra
+    trailing day is admitted (measured with America/New_York; east of UTC is correct by luck). The
+    IR carries no physical type for the clock (``PitSpec.event_time_ref`` is a bare ref), so the
+    check lives here, where the inventory's ``TableLayout.columns`` holds ``(name, physical
+    type)`` — fail-closed, until the IR carries physical time types (DEFERRED-WORK A.29).
+
+    BOTH PIT refs are checked: rule 1's availability gate compares under the same zone arithmetic
+    as rule 2's window, so a DATE-typed ``availability_ref`` shifts the cutoff the same way.
+
+    A ref whose column the requirement's layout does not list passes through, deliberately: a
+    multi-requirement expression attaches its ONE ``PitSpec`` to every table it reads, so the clock
+    column legitimately appears in exactly one of those layouts — and the request for that table is
+    the one that refuses. A missing layout is unreachable here because :func:`resolve_snapshots`
+    already refused it (``PARTITION_IDENTITY_UNKNOWN``, which also proves the fingerprint still
+    matches, so ``columns`` below is the layout compilation saw); re-litigating it would give one
+    verdict two owners.
+    """
+    for request in requests:
+        pit = request.pit_spec
+        if pit is None or pit.window_timezone == "UTC":
+            continue
+        requirement = request.physical_requirement
+        layout = inventory.layout_for(requirement.schema, requirement.table)
+        if layout is None:  # pragma: no cover — resolve_snapshots refused before this runs
+            continue
+        types = {_fold(name): dtype.strip().lower() for name, dtype in layout.columns}
+        for role, ref in (("event_time_ref", pit.event_time_ref),
+                          ("availability_ref", pit.availability_ref)):
+            _source, _schema, _table, column = parse_ref(ref)
+            if column is None:
+                # A table ref cannot be a clock; the renderer already raised on it at build time.
+                continue
+            if types.get(_fold(column)) == "date":
+                return _refuse(
+                    CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED,
+                    f"the {role} of {request.feature_name}/{request.expr_path} is {ref!r}, whose "
+                    f"column {column!r} is a Hive DATE in {requirement.schema}."
+                    f"{requirement.table}, and the declared window zone is "
+                    f"{pit.window_timezone!r}: the rendered comparison casts the DATE boundary to "
+                    f"midnight and to_utc_timestamp re-reads it as {pit.window_timezone!r} wall "
+                    f"clock, which shifts the whole window by a day west of UTC — the first day "
+                    f"drops and an extra trailing day is admitted. The IR carries no physical "
+                    f"time type for the clock, so this run refuses until PitSpec carries the "
+                    f"clock dtype and the renderer emits date-typed comparisons "
+                    f"(DEFERRED-WORK A.29)")
+    return None
 
 
 def prepare_run(
@@ -785,6 +884,12 @@ def prepare_run(
     if isinstance(snapshots, MaterializationRefused):
         return snapshots
 
+    # AFTER snapshots resolve (so the layouts below are present and fingerprint-verified) and
+    # BEFORE the hash: a run this refuses never acquires an execution identity.
+    date_clock_refusal = _date_typed_clock_refusal(requests, inventory)
+    if date_clock_refusal is not None:
+        return date_clock_refusal
+
     covered: dict[str, Any] = {
         "business_dt": _business_date(business_dt).isoformat(),
         "generation_id": generation_id,
@@ -799,7 +904,7 @@ def prepare_run(
             f"additional run parameters overwrite owned parameters: {sorted(overlap)}")
     execution_hash = sandbox_execution_hash(
         rendered, environment_id=inventory.environment_id, parameters={**covered, **extras},
-        business_dt=business_dt, input_snapshot_ids=input_snapshot_ids(snapshots),
+        business_dt=covered["business_dt"], input_snapshot_ids=input_snapshot_ids(snapshots),
         capability_attestation_id=capability_attestation_id)
 
     parameters = {**covered, **extras, "sandbox_execution_hash": execution_hash}

@@ -5,11 +5,14 @@
 the dual human confirmation; never VERIFIED here). Two invariants a two-round review baked in:
 
 * GRAIN-GATE — only a candidate with `cardinality_status == INFERRED_FROM_CONFIRMED_GRAIN`
-  AND a non-None `proposed_cardinality` is ever proposed. The approved_join value schema
-  requires `1:1|1:N|N:1`, so an `ApprovedJoinRef(cardinality=None)` would schema-deny; it must
-  never be built. Weak / cardinality-less / both-grain candidates are ledger diagnostics
-  (Tasks 9/10), not proposals. Belt-and-suspenders: a strong+grain-inferred candidate WITHOUT
-  a cardinality (a scorer-contract violation) is skipped LOUD (counter + warning).
+  AND a non-None `proposed_cardinality` is ever proposed. The approved_join value schema now
+  admits a null cardinality (Task 5, codegen-review remediation: a HUMAN upload that omitted
+  cardinality proposes its join as UNKNOWN rather than a fabricated N:1), but Pass C's whole
+  basis is the grain-inferred cardinality — a MACHINE candidate without one has nothing to
+  propose, so `ApprovedJoinRef(cardinality=None)` must never be built HERE. Weak /
+  cardinality-less / both-grain candidates are ledger diagnostics (Tasks 9/10), not proposals.
+  Belt-and-suspenders: a strong+grain-inferred candidate WITHOUT a cardinality (a
+  scorer-contract violation) is skipped LOUD (counter + warning).
 
 * REVIEWER EVIDENCE RIDES `evidence_ref`, NOT the payload — `propose_fact` persists a FIXED
   `proposed_value` and the join schema is `additionalProperties:false`, so candidate evidence
@@ -96,10 +99,12 @@ def propose_join_candidates(
             continue
         if ev.proposed_cardinality is None:
             # Scorer rule 1 forces every non-inferred candidate weak, so this shape is a
-            # contract violation — skip LOUD; never build ApprovedJoinRef(cardinality=None).
+            # contract violation — skip LOUD; never build ApprovedJoinRef(cardinality=None) HERE.
+            # (The schema now admits null for a human upload that omitted cardinality — Task 5 —
+            # but Pass C's basis IS the inferred cardinality, so a None one is a scorer bug.)
             counters.incr("overlay.passc.propose.skipped_no_cardinality")
             logger.warning("Pass C candidate %s is strong+grain-inferred but carries no "
-                           "cardinality — skipping (schema would deny a None cardinality)",
+                           "cardinality — skipping (a scorer-contract violation)",
                            ev.candidate_id)
             continue
         try:

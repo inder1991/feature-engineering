@@ -51,6 +51,7 @@ from featuregen.overlay.upload.bridge_realization import (
     BridgeJoinRealizationRevisionV1,
     BridgeRealizationCurrentV1,
     Cardinality,
+    CardinalityBasis,
     StructuredPredicateV1,
     eligible_for_production,
 )
@@ -127,6 +128,19 @@ _DIRECTIONAL_CARDINALITY = {
     Cardinality.ONE_TO_MANY: "1:N",
     Cardinality.MANY_TO_MANY: "N:N",
 }
+
+
+#: The bases on which a directional cardinality claim counts as ATTESTED — exactly the two the
+#: shipped producers establish deterministically: ``infer_metadata_cardinality`` concludes
+#: GOVERNED_KEY from declared complete keys, and deterministic profile admission concludes
+#: EXACT_PROFILE from an exact observed scan. The other members (approximate profile, metadata
+#: inference, none) record HOW WELL the direction is known rather than establishing it, and the
+#: store rehydrates the basis independently of the claim — so a MANY_TO_ONE on an unattested basis
+#: is refused, because "we do not know" is not "it is safe" (rule 2 above).
+_ATTESTED_CARDINALITY_BASES = frozenset({
+    CardinalityBasis.GOVERNED_KEY,
+    CardinalityBasis.EXACT_PROFILE,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +378,15 @@ def plan_cross_catalog_join(
             CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
             f"directional realization {revision.realization_revision_id} has unresolved "
             "additional-key requirements",
+        )
+    if revision.cardinality_basis not in _ATTESTED_CARDINALITY_BASES:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"directional realization {revision.realization_revision_id} claims "
+            f"{revision.cardinality.value.value} on basis {revision.cardinality_basis.value!r}, "
+            "which is not an attested basis (governed_key, exact_profile): the basis records how "
+            "well the direction is actually known, and a claim on an unattested basis may BE "
+            "fanning — \"we do not know\" is not \"it is safe\"",
         )
 
     pairs = tuple(

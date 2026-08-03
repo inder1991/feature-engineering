@@ -52,6 +52,9 @@ class CompilationRefusalCode(StrEnum):
     # Read scope and safety classification.
     READ_SCOPE_INSUFFICIENT = "READ_SCOPE_INSUFFICIENT"
     PROHIBITED_INPUT = "PROHIBITED_INPUT"
+    #: a physical read names a column the governed catalog does not describe — §11's L1 would
+    #: call it COLUMN_ABSENT, but compile must not emit a read nobody governs.
+    COLUMN_NOT_GOVERNED = "COLUMN_NOT_GOVERNED"
 
     # Physical resolution and join planning (§3).
     AMBIGUOUS_TABLE_NAME = "AMBIGUOUS_TABLE_NAME"

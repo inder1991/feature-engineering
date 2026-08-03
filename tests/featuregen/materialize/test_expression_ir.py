@@ -466,6 +466,97 @@ def test_the_same_expression_compiles_to_the_same_hash_twice(catalog):
     assert expression_ir_hash(first) == expression_ir_hash(second)
 
 
+# Task 24: every relative `f(x) == f(x)` assertion above stays green if a component is DELETED from
+# `identity_payload()` — these three make the deletable components load-bearing.
+
+
+def test_two_aggregations_over_the_same_operand_hash_differently(catalog):
+    # Deletable-payload-component finding: drop "aggregation" from identity_payload() and the suite
+    # stayed green — SUM and COUNT_DISTINCT of the same column would be ONE sealed artifact.
+    total = _compile(catalog, expr=_expr(aggregation=AggregateFunction.SUM))
+    distinct = _compile(catalog, expr=_expr(aggregation=AggregateFunction.COUNT_DISTINCT))
+    assert isinstance(total, ExpressionExecutionIR)
+    assert isinstance(distinct, ExpressionExecutionIR)
+    assert expression_ir_hash(total) != expression_ir_hash(distinct)
+
+
+def test_a_filters_presence_hashes_differently(catalog):
+    # Deletable-payload-component finding: drop "filter_tree" from identity_payload() and the suite
+    # stayed green — "all transactions" and "posted debits only" would be ONE sealed artifact.
+    unfiltered = _compile(catalog)
+    filtered = _compile(catalog, expr=_expr(filter_node=_posted_debit_filter()))
+    assert isinstance(unfiltered, ExpressionExecutionIR)
+    assert isinstance(filtered, ExpressionExecutionIR)
+    assert expression_ir_hash(unfiltered) != expression_ir_hash(filtered)
+    # Presence alone also moves `physical_read_set` (the FILTER_LEFT reads), which would keep this
+    # inequality green with "filter_tree" deleted. Debits-vs-credits reads the SAME columns — its
+    # payloads differ in `filter_tree` and NOWHERE else, so only the real component satisfies it.
+    def _flag_filter(value):
+        return FilterPredicate(op=FilterPredicateOp.EQUAL, left=TXN_DR_CR,
+                               right_literal=TypedLiteral(type=LiteralType.STRING, value=value))
+    debits = _compile(catalog, expr=_expr(filter_node=_flag_filter("D")))
+    credits = _compile(catalog, expr=_expr(filter_node=_flag_filter("C")))
+    assert isinstance(debits, ExpressionExecutionIR)
+    assert isinstance(credits, ExpressionExecutionIR)
+    assert expression_ir_hash(debits) != expression_ir_hash(credits)
+
+
+def test_a_join_steps_cardinality_hashes_differently(catalog):
+    # Deletable-payload-component finding: drop the step "cardinality" from identity_payload() and
+    # the suite stayed green — yet cardinality decides whether the generated join can duplicate
+    # rows, so an N:1 plan and a 1:1 plan must never share an identity. Both spellings fan IN
+    # (`joins._FANS_IN`), so the second compile differs ONLY in that one step field.
+    n_to_one = _compile(catalog, grain_keys=(CUSTOMERS_CIF,))
+    catalog.execute("UPDATE graph_edge SET cardinality = '1:1' WHERE from_ref = %s",
+                    ("public.accounts.cif_id",))
+    one_to_one = _compile(catalog, grain_keys=(CUSTOMERS_CIF,))
+    assert isinstance(n_to_one, ExpressionExecutionIR)
+    assert isinstance(one_to_one, ExpressionExecutionIR)
+    assert expression_ir_hash(n_to_one) != expression_ir_hash(one_to_one)
+
+
+def test_ref_casing_does_not_fork_identity(catalog):
+    """`formula_content_hash` folds ref case, so `HDFC::PUBLIC.TRANSACTIONS.TXN_AMT` and its
+    lower-case spelling are ONE governed artifact — the IR must agree (remediation report §5).
+
+    Every other fixture in this file is lower-case, which is exactly how the fork stayed invisible:
+    `graph_node.object_ref` keeps the upload's own casing and the formula tools hand raw refs to
+    the authoring model, so a mixed-case spelling is reachable in production. The comparison
+    LITERALS are deliberately left alone — `'D'` and `'d'` really are two different filters."""
+    upper_filter = FilterBool(op=FilterBoolOp.AND, children=(
+        FilterPredicate(op=FilterPredicateOp.EQUAL, left=TXN_DR_CR.upper(),
+                        right_literal=TypedLiteral(type=LiteralType.STRING, value="D")),
+        FilterPredicate(op=FilterPredicateOp.EQUAL, left=TXN_STATUS.upper(),
+                        right_literal=TypedLiteral(type=LiteralType.STRING, value="posted")),
+    ))
+    lower = _compile(catalog, expr=_expr(filter_node=_posted_debit_filter()))
+    upper = _compile(
+        catalog,
+        expr=_expr(operand=TXN_AMT.upper(), table=TXN.upper(), filter_node=upper_filter,
+                   window=_window(event_time_ref=TXN_DT.upper())),
+        grain_keys=(TXN_CIF.upper(),))
+    assert isinstance(lower, ExpressionExecutionIR)
+    assert isinstance(upper, ExpressionExecutionIR), upper
+    assert expression_ir_hash(upper) == expression_ir_hash(lower)
+    assert _refs(upper) == _refs(lower)            # the payload carries only the folded spellings
+    assert upper.filter_tree == lower.filter_tree  # a mixed-case filter LEFT folds; its VALUE never
+    assert upper.pit == lower.pit
+    assert len(upper.input_requirements) == len(lower.input_requirements)
+
+
+def test_a_mixed_case_source_spelling_does_not_DUPLICATE_the_tables_requirement(catalog):
+    """The sharpest symptom of a raw ref used as a cache key: the source relation spelled with a
+    raw schema segment and the grain key's FOLDED table ref (`_table_ref_of` folds) would land on
+    two `_Tables` entries for ONE physical table, and
+    `identity_payload()["input_requirements"]` would carry the same requirement twice."""
+    lower = _compile(catalog)
+    mixed = _compile(catalog, expr=_expr(table=f"{_SRC}::PUBLIC.transactions"))
+    assert isinstance(lower, ExpressionExecutionIR)
+    assert isinstance(mixed, ExpressionExecutionIR), mixed
+    assert len(mixed.input_requirements) == 1
+    assert expression_ir_hash(mixed) == expression_ir_hash(lower)
+
+
 def test_the_body_path_is_part_of_identity(catalog):
     """A ratio of an expression with itself still stages two outputs; one hash for both would let
     the assembly step read one where it meant the other."""

@@ -26,7 +26,10 @@ class ApprovedJoinRef:
     from_ref: CatalogObjectRef
     to_ref: CatalogObjectRef
     column_pairs: tuple[ColumnPair, ...]
-    cardinality: str
+    # None = UNKNOWN (an upload that omitted cardinality). Never fabricate a value here: consumers
+    # treat None via `_cardinality_verdict`'s NULL branch, and `plan_join` refuses the hop until a
+    # human supplies one.
+    cardinality: str | None
 
 
 @dataclass(frozen=True, slots=True)

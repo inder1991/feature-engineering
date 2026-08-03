@@ -127,7 +127,7 @@ feature_staging_total_debit_amount_30d:
     kedro-viz:
       layer: "feature_staging"
 
-feature_staging_manifest_cross_border_value_ratio_90d:
+feature_manifest__cross_border_value_ratio_90d:
   # StagingManifestV1 for cross_border_value_ratio_90d: §9's completeness evidence
   type: json.JSONDataset
   filepath: "${runtime_params:staging_root}/feature_staging/cross_border_value_ratio_90d/manifest.json"
@@ -135,7 +135,7 @@ feature_staging_manifest_cross_border_value_ratio_90d:
     kedro-viz:
       layer: "feature_staging"
 
-feature_staging_manifest_distinct_merchant_count_90d:
+feature_manifest__distinct_merchant_count_90d:
   # StagingManifestV1 for distinct_merchant_count_90d: §9's completeness evidence
   type: json.JSONDataset
   filepath: "${runtime_params:staging_root}/feature_staging/distinct_merchant_count_90d/manifest.json"
@@ -143,7 +143,7 @@ feature_staging_manifest_distinct_merchant_count_90d:
     kedro-viz:
       layer: "feature_staging"
 
-feature_staging_manifest_total_debit_amount_30d:
+feature_manifest__total_debit_amount_30d:
   # StagingManifestV1 for total_debit_amount_30d: §9's completeness evidence
   type: json.JSONDataset
   filepath: "${runtime_params:staging_root}/feature_staging/total_debit_amount_30d/manifest.json"
@@ -151,7 +151,7 @@ feature_staging_manifest_total_debit_amount_30d:
     kedro-viz:
       layer: "feature_staging"
 
-feature_staging_assembled:
+feature_group__assembled:
   # the assembled group — §9's gates run on THIS, and only a group that passes every one of them reaches the publication target
   type: spark.SparkDataset
   filepath: "${runtime_params:staging_root}/feature_staging/_assembled"

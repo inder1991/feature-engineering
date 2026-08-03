@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import psycopg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
@@ -36,7 +36,8 @@ from featuregen.overlay.upload.glossary_reader import (
     is_glossary_csv,
     read_glossary,
 )
-from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
+from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -169,7 +170,10 @@ def create_upload(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
     catalog_profile_json: Annotated[str | None, Form()] = None,
-) -> IngestResult:
+) -> dict[str, Any]:
+    # The body is `IngestResult.response_payload()` — the IngestResult serialization with the I3
+    # correction fields SPARSE (omitted when nothing was dropped), which is what keeps the
+    # ordinary upload's body byte-identical to the pre-I3 contract the tests pin.
     # The source id IS the catalog identity (fact keys, snapshots, the brake all key on it raw), so
     # normalize it the way every other identity component is normalized — strip+LOWER, matching
     # object_ref._norm — before anything downstream sees it: 'sales', 'sales ' and 'Sales' must be
@@ -314,9 +318,10 @@ def create_upload(
                         profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
         # #22: the stage reports commit WITH the terminal state on the request connection
         # (flush is savepointed + fail-contained, so it can neither 500 the upload nor change
-        # the response body — which stays exactly the IngestResult serialization).
+        # the response body — which stays exactly the IngestResult serialization, sparse
+        # correction fields included only when a correction was dropped).
         recorder.flush(conn, run_id, now=datetime.now(UTC))
-        return result
+        return result.response_payload()
     except HTTPException as exc:
         # The request transaction is rolling back — terminalize on an independent connection so
         # the failed attempt's manifest survives. Redaction: record the exception CLASS (of the

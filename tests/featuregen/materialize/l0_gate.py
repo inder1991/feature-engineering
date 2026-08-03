@@ -25,17 +25,28 @@ Python and pyspark's own ``types.py`` dies on ``X | Y``.
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import pathlib
 import subprocess
 
 import pytest
+from tests.featuregen.materialize import fixtures
 from tests.featuregen.materialize.test_group_plan import catalog  # noqa: F401 - a fixture
-from tests.featuregen.materialize.test_render_project import project  # noqa: F401 - a fixture
+from tests.featuregen.materialize.test_render_project import (  # noqa: F401 - `project` fixture
+    _render,
+    project,
+)
 
 from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.identity import SealedProject
-from featuregen.materialize.render.project import materialize_to
+from featuregen.materialize.render.project import (
+    PIPELINE_NAME,
+    REQUIRED_RUN_PARAMETERS,
+    materialize_to,
+)
+from featuregen.materialize.submit import submission_command
 from featuregen.materialize.validation import ValidationStatus, run_l0
 
 GEN = "gen-l0-gate"
@@ -112,3 +123,68 @@ def test_a_hand_edit_of_the_RENDERED_project_is_caught_in_the_real_environment(
     assert report.status is ValidationStatus.FAILED
     assert [finding.code for finding in report.findings] == \
         [ValidationFindingCode.PROJECT_HASH_MISMATCH]
+
+
+def test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session(
+        catalog, db, tmp_path, l0_python: str, l0_env) -> None:  # noqa: F811
+    """Task 1 proved `RunParametersHook`'s refusal by reading a substring of the rendered bytes;
+    this proves it by EXECUTION. A real `KedroSession` is created over the rendered project through
+    the production run script (`submission_command`'s `_RUN_SCRIPT`, which asks the INSTALLED
+    `KedroSession.create` signature whether the kwarg is `runtime_params` — kedro >= 1.0 — or
+    `extra_params` — the 0.19.x line), and `session.run(pipeline_name=...)` is what fires the hook.
+
+    The project is rendered with THIS gate environment's own installed versions, not the suite's
+    fixture pins: §7 runs the artifact in the environment it was rendered FOR, and kedro's
+    `bootstrap_project` enforces the `kedro_init_version` pin at session startup — a project
+    pinned 0.19.9 refuses to even bootstrap under kedro 1.5.0, before any hook could fire. Asking
+    the interpreter is exactly what a real `ClusterInventoryV1` capture of this venv-as-cluster
+    would record.
+
+    Two runs, one claim each, and the first is what keeps the second from passing vacuously:
+
+    * MISSING a required parameter -> the run dies WITH ``RUN_PARAMETERS_MISSING``. The hook fires
+      on this exact execution path in this exact environment. (`business_dt` is the one dropped
+      because the rendered catalog interpolates only ``staging_root`` — removing THAT would abort
+      config resolution before the hook ever ran, proving nothing about it.)
+    * ALL prepared parameters -> whatever the environment then fails on (no `banking.*` tables, no
+      cluster), the failure is NOT ``RUN_PARAMETERS_MISSING``. The hook fired and PASSED — a run
+      that dies later is fine; a run refused by the gate is the regression this test exists for.
+    """
+    proved = subprocess.run(  # noqa: S603
+        [l0_python, "-c",
+         "import json, platform, kedro, kedro_datasets, pyspark; "
+         "print(json.dumps({'kedro': kedro.__version__, "
+         "'kedro_datasets': kedro_datasets.__version__, "
+         "'pyspark': pyspark.__version__, 'python': platform.python_version()}))"],
+        capture_output=True, text=True, check=False)
+    assert proved.returncode == 0, proved.stderr
+    installed = json.loads(proved.stdout.strip().splitlines()[-1])
+    sealed = _render(db, engine_versions=dataclasses.replace(
+        fixtures.ENGINE_VERSIONS, **installed))
+    root = materialize_to(sealed, tmp_path / "generated")
+    parameters = {
+        "business_dt": "2026-07-28",
+        "generation_id": GEN,
+        "input_snapshots": [
+            {"catalog_source": "hdfc", "object_ref": "banking.transactions",
+             "snapshot_id": "snap-transactions-0001"}],
+        "run_id": "run-l0-gate",
+        "sandbox_execution_hash": "0" * 64,
+        "staging_root": str(tmp_path / "staging"),
+    }
+    assert sorted(parameters) == sorted(REQUIRED_RUN_PARAMETERS)
+    environment = {**os.environ, **l0_env}
+
+    short = {name: value for name, value in parameters.items() if name != "business_dt"}
+    refused = subprocess.run(  # noqa: S603 - fixed argv, the production submission command
+        submission_command(l0_python, root, short, PIPELINE_NAME),
+        capture_output=True, text=True, timeout=480, check=False, cwd=str(root), env=environment)
+    assert refused.returncode != 0
+    assert "RUN_PARAMETERS_MISSING" in refused.stdout + refused.stderr, \
+        (refused.stdout[-2000:], refused.stderr[-2000:])
+
+    completed = subprocess.run(  # noqa: S603 - fixed argv, the production submission command
+        submission_command(l0_python, root, parameters, PIPELINE_NAME),
+        capture_output=True, text=True, timeout=480, check=False, cwd=str(root), env=environment)
+    assert "RUN_PARAMETERS_MISSING" not in completed.stdout + completed.stderr, \
+        (completed.stdout[-2000:], completed.stderr[-2000:])

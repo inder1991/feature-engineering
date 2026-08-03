@@ -17,7 +17,11 @@ def test_cardinality_token_mapping():
     assert cardinality_from_token("N:1") is Cardinality.MANY_TO_ONE
     assert cardinality_from_token("1:N") is Cardinality.ONE_TO_MANY
     assert cardinality_from_token("1:1") is Cardinality.ONE_TO_ONE
-    assert cardinality_from_token(None) is Cardinality.MANY_TO_ONE   # unstated -> the common FK default
+    # Task 5 codegen-review remediation (F1): unstated used to fabricate MANY_TO_ONE ("the common
+    # FK default"), which the planner then served as REALIZATION-authority fan-in evidence.
+    # Unknown stays None; the deriver skips the edge and the hop fails closed.
+    assert cardinality_from_token(None) is None
+    assert cardinality_from_token("") is None
     with pytest.raises(ValueError, match="unknown cardinality"):
         cardinality_from_token("weird")
 
@@ -238,6 +242,31 @@ def test_linked_but_unverified_join_is_not_realized(db):
     # a governed edge that is linked (fact_key set) but NOT yet VERIFIED (e.g. DRAFT) -> not realized
     _mark_join(db, "core", approved_join_fact_key="fk:x", approved_join_status="DRAFT")
     assert derive_catalog_realizations(db, "core").realizations == ()
+
+
+def test_null_cardinality_edge_is_unresolvable_never_many_to_one(db):
+    # Task 5 codegen-review remediation (F1): a NULL-cardinality operational edge — file-declared
+    # blank, or a VERIFIED approved_join whose cardinality is None — used to be fabricated into
+    # MANY_TO_ONE and served by the planner as REALIZATION-authority fan-in evidence. It must be
+    # UNRESOLVABLE: no realization / conflict / local / proposal, so `_hop_evidence` finds no
+    # realization and the hop fails closed (`physical_cardinality_unavailable`).
+    catalog = [
+        (CanonicalRow("nc", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("nc", "accounts", "customer_id", "integer",
+                      joins_to="customer_master.customer_id"), "customer_id"),   # cardinality blank
+        (CanonicalRow("nc", "customer_master", "customer_id", "integer", is_grain=True), "customer_id"),
+    ]
+    rows = [r for r, _ in catalog]
+    build_graph(db, "nc", rows, concepts={content_hash(r): c for r, c in catalog})
+    # file-declared blank edge (cardinality NULL in graph_edge): unresolvable
+    result = derive_catalog_realizations(db, "nc")
+    assert result.realizations == () and result.conflicts == ()
+    assert result.local_relationships == () and result.proposals == ()
+    # the SAME edge after two admins verify the None-cardinality approved_join: still unresolvable
+    _mark_join(db, "nc", approved_join_fact_key="fk:nc", approved_join_status="VERIFIED")
+    result = derive_catalog_realizations(db, "nc")
+    assert result.realizations == () and result.conflicts == ()
+    assert result.local_relationships == () and result.proposals == ()
 
 
 def test_fingerprint_reflects_a_join_governance_status_change(db):

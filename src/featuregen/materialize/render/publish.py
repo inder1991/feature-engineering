@@ -117,7 +117,9 @@ def publish_entry_body(
     """
     _check(plan, selection)
     target = physical_target_for(plan.logical_group_name)
-    _, table = target.split(".", 1)
+    # The LAST dot separates namespace from table: the sandbox namespace may itself be
+    # catalog-qualified, and the group name (a hive identifier) never carries a dot.
+    _, table = target.rsplit(".", 1)
     versions = selection.engine_versions
     return (
         f"  # THE PUBLICATION TARGET (§10.3), derived from the sandbox binding: {target}",
