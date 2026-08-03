@@ -127,6 +127,12 @@ def run_without_terminal(catalog):
     return run_id
 
 
+#: ``actor=None`` on every DIRECT ``open_authoring_run`` below, while the real runs pass ``_ACTOR``:
+#: not an inconsistency. ``replay_trace.open_authoring_run`` ``json.dumps`` its ``actor`` argument,
+#: so it takes the SERIALIZED form; ``replay_authoring.run_authoring`` takes the envelope and
+#: converts it (``_actor_json``). Passing ``_ACTOR`` to the former raises.
+
+
 def _write_terminal_directly(conn, run_id: str, payload: str, payload_hash: str | None) -> None:
     """Insert a terminal event whose ``payload_hash`` does not cover its payload.
 

@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 from featuregen.contracts.db import DbConn
 from featuregen.formula.control import FormulaControlFlow
@@ -200,7 +201,10 @@ def _read_intent(conn: DbConn, work_item_id: str) -> AuthoringIntent:
         hypothesis=str(material.get("hypothesis", "")),
         target_entity=str(material.get("target_entity", "")),
         target_grain_keys=tuple(grain_keys),
-        recipe_authoring_context=dict(material) if material else None,
+        # The worker sets this UNCONDITIONALLY to `provider_input`, so an EMPTY stored object must
+        # rebuild as `{}` and not as `None`: those hash differently, and `None` here would refuse a
+        # genuine feature at check 6. Keyed off the column's shape, never off its truthiness.
+        recipe_authoring_context=dict(material) if isinstance(provider_input, Mapping) else None,
     )
 
 
@@ -256,8 +260,12 @@ def _restore_result(
     (``RecoveryRequiresReconciliation``, ``LeaseFenceLost``): none of them can be a bare exception
     escaping a governed boundary (§14), and all of them mean the same thing to a caller that only
     wants to know whether a verdict is readable."""
-    versions_row = conn.execute(_SELECT_MANIFEST_VERSIONS, (run_id,)).fetchone()
-    versions = versions_row[0] if versions_row is not None else {}
+    # `cast`, not an absent-row branch and not an `assert`: `_verify_manifest_intent` has already
+    # read `intent_hash` off this exact row on this exact connection and refused when it was
+    # missing, so a fallback here would be unreachable code pretending to be a safety net — and an
+    # `assert` would vanish under `-O`. The cast records that the narrowing is the caller's, not
+    # the type checker's.
+    versions = cast(tuple, conn.execute(_SELECT_MANIFEST_VERSIONS, (run_id,)).fetchone())[0]
     try:
         checkpoint = _load_checkpoint(
             conn, run_id, intent_hash=intent_hash, versions=versions)

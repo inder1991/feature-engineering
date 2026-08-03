@@ -132,8 +132,9 @@ def read_terminal_event(conn: DbConn, run_id: str) -> TerminalEvent | None:
     kind, payload, payload_hash = row
     return TerminalEvent(
         kind=str(kind),
-        # Copied when it is a mapping, so the frozen record cannot alias a dict the caller could
-        # mutate between the digest and the field reads.
+        # A SHALLOW copy, so the record does not alias psycopg's own dict — nested values are still
+        # shared, and nothing here should be read as deep isolation. Admission only ever reads
+        # top-level fields, and check 2 digests before any of them.
         payload=dict(payload) if isinstance(payload, Mapping) else payload,
         payload_hash=None if payload_hash is None else str(payload_hash),
     )

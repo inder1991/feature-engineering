@@ -11,8 +11,30 @@ So nothing here trusts the supplied object. Every check is against the run's **i
 trace event** (``materialize.authoring_trace.read_terminal_event``) and its **write-once manifest**
 (``read_run_intent_hash``) — rows migration **1022** physically forbids updating, deleting or
 truncating, carrying a canonical payload and the sha256 ``payload_hash`` that makes it
-tamper-evident. The supplied result contributes exactly one thing the trace does not hold: the
-formula OBJECT itself, whose content hash must equal the one the run recorded.
+tamper-evident.
+
+⚠️ **WHAT THE SUPPLIED RESULT CONTRIBUTES CHANGED WITH THE LANE.** Against 1020 it contributed
+exactly one thing the trace did not hold — the formula OBJECT itself — and every other field of it
+was checked against a record written from somewhere else. **1022's terminal payload holds the
+result material too**: ``_terminal_payload`` writes ``"result": _plain(result)`` alongside the
+dispositions and axes (``replay_authoring.py:151-162``). Two consequences, and neither is a
+loophole, but both must be stated rather than implied:
+
+* against a FORGING CALLER — the attack in the paragraph above — nothing weakens. Such a caller
+  supplies an object from thin air, and checks 3/4/5 compare it field by field against a WORM row
+  it did not write.
+* against ``materialize.resolve``, which rebuilds its object FROM that same payload, check 5 is an
+  intra-payload consistency check: the axes it compares were written from one object, in one row, by
+  one statement, so for a genuine row they cannot disagree. What is load-bearing on that path is
+  **check 2** (the payload is authentic against its own ``payload_hash``, on a row 1022 forbids
+  updating) and **check 6** (the intent comes from migration 1023's work item — a DIFFERENT store —
+  and must re-hash to the manifest). Check 4 also stays a genuine cross-EVENT derivation: the
+  restorer rebuilds the formula from the ``AUTHOR_PROPOSAL_PARSED`` and ``OUTPUT_POLICY_RESOLVED``
+  events, so its digest is re-derived from material the TERMINAL event does not contain.
+
+This is inherent to the lane: 1022's terminal payload is the only durable source of the result
+material there is, so any resolution path must read it. It is bounded by check 2's threat model —
+altering it requires the same out-of-band write that would defeat 1020.
 
 ⚠️ **THE EVIDENCE LANE MOVED (Phase G).** These checks read migration 1022's
 ``formula_authoring_run`` / ``formula_authoring_trace_event``, not migration 1020's
@@ -317,7 +339,12 @@ def _verify_axes(event: _trace.TerminalEvent, result: AuthoringResult, run_id: s
     the fold was performed over, and a result whose axes were rewritten under a genuine RESOLVED
     disposition is misreporting WHY the feature was admitted (a ``blocking`` critic quietly relabelled
     ``clean``, say). Everything a later stage records about this feature's provenance comes from the
-    supplied object, so the two records must be the same record."""
+    supplied object, so the two records must be the same record.
+
+    ⚠️ STRENGTH DEPENDS ON WHO SUPPLIED THE OBJECT, and the module docstring says why: against a
+    forging caller this is a real comparison against a WORM row; against ``materialize.resolve``,
+    whose object is rebuilt from this very payload's nested ``result``, it is an intra-payload
+    consistency check and checks 2 and 6 are what carry that path."""
     differing = tuple(
         field for field in _AXIS_FIELDS
         if getattr(result, field) != _payload_field(event, field)
