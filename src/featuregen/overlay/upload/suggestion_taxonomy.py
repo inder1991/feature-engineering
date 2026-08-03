@@ -398,6 +398,10 @@ TAXONOMY_CHANGE_LOG: tuple[TaxonomyChangeRecord, ...] = (
                          "Review fix: a family-derived feature_category now cites the mapping "
                          "content hash and family rule that produced it, not the recipe "
                          "revision alone, so it never reads as an SME-authored objective."),
+    TaxonomyChangeRecord(6, "authored", "template-discovery-metadata",
+                         "Review fix: needs_sme is inadmissible in v1. The disposition is "
+                         "excluded from the revision hash because it is derived; an authored "
+                         "escalation there would move no hash and could serve stale forever."),
 )
 
 

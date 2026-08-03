@@ -17,6 +17,13 @@ Frozen identity rules (0F-5 / 0F-10 / D5):
   text values, per-value basis and canonicalized evidence axes (0F-4 rule 3: occurrence
   provenance excluded), sorted — so display order never moves identity and replayed evidence
   changes no revision.
+* ``disposition`` is EXCLUDED from that hash because it is a total pure function of the hashed
+  payload (:func:`compute_discovery_disposition`) — it carries no information the hash lacks,
+  so a disposition can never move without its causing content moving the revision and the
+  registry fencing hash with it. That is only true while every admissible disposition is
+  derived, which is why ``needs_sme`` — an AUTHORED escalation, not a derivation — is
+  inadmissible in v1 (see :data:`ADMISSIBLE_DISCOVERY_DISPOSITIONS`).
+
 Citation rule (per-value, never one template-level authority): a value cites what actually
 produced it. A canonical use case is read straight out of ``Template.primary_objective`` and
 cites the recipe revision; a ``feature_category`` is DERIVED here by
@@ -71,6 +78,7 @@ from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 from featuregen.overlay.upload.templates import ALL_TEMPLATES, Template
 
 __all__ = [
+    "ADMISSIBLE_DISCOVERY_DISPOSITIONS",
     "DISCOVERY_BASIS_VALUES",
     "DISCOVERY_DISPOSITIONS",
     "DISCOVERY_METADATA",
@@ -118,8 +126,21 @@ TEMPLATE_DISCOVERY_OWNER = "featuregen.overlay.upload.template_discovery"
 #: resolved from catalog wording).
 DISCOVERY_BASIS_VALUES = frozenset({"template_authored", "human", "llm_proposed"})
 
-#: Coverage summary only — never a substitute for per-value basis/evidence (0F-5).
+#: Coverage summary only — never a substitute for per-value basis/evidence (0F-5). The frozen
+#: vocabulary is unchanged; what a v1 ENTRY may carry is the narrower set below.
 DISCOVERY_DISPOSITIONS = frozenset({"complete", "partial", "unclassified", "needs_sme"})
+
+#: What a v1 entry may actually carry: exactly the values :func:`compute_discovery_disposition`
+#: derives from hashed content. ``needs_sme`` is deliberately absent — it is an authored human
+#: escalation, and v1 has no carrier for its provenance (no author, no evidence, no timestamp,
+#: nothing hashed). Admitting it would let an escalation change the user-visible
+#: ``discovery_disposition`` while ``discovery_metadata_revision_id`` and
+#: ``discovery_registry_content_hash`` — the plan's rebuild/fencing inputs — stood still, so a
+#: projection could serve a stale disposition forever. It becomes admissible when the escalation
+#: record lands with its own provenance and enters the entry payload like every other authored
+#: value. This is the same honesty rule as D9's business-domain refusal: frozen shape, gated
+#: admissibility.
+ADMISSIBLE_DISCOVERY_DISPOSITIONS = frozenset({"complete", "partial", "unclassified"})
 
 #: The one operational influence an LLM-proposed discovery value may carry (brief: a hint,
 #: never a fabricated governed authority label). Authored/human discovery values carry ``None``
@@ -198,7 +219,7 @@ class TemplateDiscoveryMetadataV1:
     canonical_use_cases: tuple[DiscoveryControlledAssignmentV1, ...]
     keywords: tuple[DiscoveryTextAssignmentV1, ...]
     business_value: DiscoveryTextAssignmentV1 | None
-    disposition: str                         # complete | partial | unclassified | needs_sme
+    disposition: str                         # complete | partial | unclassified (v1)
 
     def __post_init__(self) -> None:
         if not isinstance(self.template_id, str) or not self.template_id:
@@ -207,6 +228,13 @@ class TemplateDiscoveryMetadataV1:
             raise TaxonomyValidationError(
                 f"disposition must be one of {sorted(DISCOVERY_DISPOSITIONS)}, got "
                 f"{self.disposition!r}")
+        if self.disposition not in ADMISSIBLE_DISCOVERY_DISPOSITIONS:
+            raise TaxonomyValidationError(
+                f"disposition {self.disposition!r} is inadmissible in v1: 'needs_sme' is an "
+                f"authored escalation, not a summary derived from hashed content, and v1 has "
+                f"no carrier for its provenance — it would change the user-visible disposition "
+                f"while discovery_metadata_revision_id and discovery_registry_content_hash "
+                f"stood still. Admissible: {sorted(ADMISSIBLE_DISCOVERY_DISPOSITIONS)}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -244,7 +272,13 @@ def discovery_metadata_revision_id(entry: TemplateDiscoveryMetadataV1) -> str:
     """0F-5: the entry's controlled IDs, text values, per-value basis and canonicalized
     evidence axes, sorted. Occurrence provenance (``producer_ref``/``evidence_id``),
     display order and the derived ``disposition`` summary are excluded, so reordering and
-    evidence replay never move the revision."""
+    evidence replay never move the revision.
+
+    Excluding ``disposition`` is safe ONLY because it is a total pure function of this payload
+    (:func:`compute_discovery_disposition`) and nothing authored may hide inside it — see
+    :data:`ADMISSIBLE_DISCOVERY_DISPOSITIONS`. A derived-only transition (an entry gaining a
+    category and moving ``unclassified``→``partial``) always moves this revision, because the
+    category that caused it IS hashed."""
     payload = {
         "feature_category": (_canonical_controlled(entry.feature_category)
                              if entry.feature_category else None),
@@ -279,8 +313,11 @@ def compute_discovery_disposition(
         keywords: tuple[DiscoveryTextAssignmentV1, ...],
         business_value: DiscoveryTextAssignmentV1 | None) -> str:
     """``complete`` needs category + domains + use cases + business value; anything present
-    short of that is ``partial``; nothing present is ``unclassified``. ``needs_sme`` is an
-    authored HUMAN escalation, never computed — fabricating it would be inventing a review."""
+    short of that is ``partial``; nothing present is ``unclassified``. TOTAL over the hashed
+    payload: every admissible disposition is one of these three, which is exactly why the
+    summary itself need not be hashed. ``needs_sme`` is never computed (fabricating it would be
+    inventing a review) and is inadmissible in v1 — see
+    :data:`ADMISSIBLE_DISCOVERY_DISPOSITIONS`."""
     if feature_category and business_domains and canonical_use_cases and business_value:
         return "complete"
     if (feature_category or business_domains or canonical_use_cases or keywords
@@ -481,8 +518,7 @@ def validate_discovery_entries(entries: Sequence[TemplateDiscoveryMetadataV1],
     plausible legacy string dies here); canonical use cases are selectable leaves with no
     duplicates; keyword/prose bounds; basis/influence/evidence rules; a ``template_authored``
     category cites the mapping that derived it, never a bare recipe attestation; and the
-    disposition is the honest computed summary (``needs_sme`` allowed only as an authored
-    escalation of a non-complete entry)."""
+    disposition is EXACTLY the computed summary (no authored escalation may hide in it)."""
     known = {t.id for t in templates}
     leaves = set(selectable_leaves())
     seen: set[str] = set()
@@ -553,11 +589,12 @@ def validate_discovery_entries(entries: Sequence[TemplateDiscoveryMetadataV1],
             business_domains=entry.business_domains,
             canonical_use_cases=entry.canonical_use_cases,
             keywords=entry.keywords, business_value=entry.business_value)
-        if entry.disposition != computed and not (
-                entry.disposition == "needs_sme" and computed != "complete"):
+        if entry.disposition != computed:
             raise TaxonomyValidationError(
                 f"template {tid!r} disposition {entry.disposition!r} does not summarize its "
-                f"contents (computed {computed!r})")
+                f"contents (computed {computed!r}) — the disposition is excluded from the "
+                f"revision hash precisely because it is derived, so it may never carry content "
+                f"of its own")
     missing = known - seen
     if missing:
         raise TaxonomyValidationError(

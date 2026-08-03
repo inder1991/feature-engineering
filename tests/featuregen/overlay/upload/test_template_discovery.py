@@ -27,6 +27,7 @@ from featuregen.overlay.upload.suggestion_taxonomy import (
 from featuregen.overlay.upload.taxonomy.legacy_crosswalk import LEGACY_TAG_CROSSWALK
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 from featuregen.overlay.upload.template_discovery import (
+    ADMISSIBLE_DISCOVERY_DISPOSITIONS,
     DISCOVERY_BASIS_VALUES,
     DISCOVERY_DISPOSITIONS,
     DISCOVERY_METADATA,
@@ -196,6 +197,67 @@ def test_the_mapping_citation_is_occurrence_provenance_and_never_churns_identity
                 if e.producer_ref.startswith(FAMILY_MAPPING_CITATION_PREFIX) else e
                 for e in entry.feature_category.evidence)))
     assert discovery_metadata_revision_id(recited) == baseline
+
+
+# ── review finding 2: no admissible content may hide from the registry hashes ──────────────────
+
+def test_needs_sme_is_unrepresentable_in_v1():
+    """``disposition`` is excluded from the revision payload because it is DERIVED from hashed
+    content. ``needs_sme`` is not derivable — it is an authored escalation with no v1 carrier for
+    its provenance — so admitting it would let an escalation change the user-visible disposition
+    while both ``discovery_metadata_revision_id`` and the registry hash stand still."""
+    # the field is INVISIBLE to both hashes — two entries differing only in disposition are one
+    # revision and one registry hash, so whatever sits in it had better be pure derivation
+    entry = DISCOVERY_METADATA["dormancy_days"]
+    relabelled = dataclasses.replace(entry, disposition="unclassified")
+    assert entry.disposition == "partial"
+    assert discovery_metadata_revision_id(relabelled) == discovery_metadata_revision_id(entry)
+    assert (discovery_registry_content_hash([relabelled])
+            == discovery_registry_content_hash([entry]))
+    assert "needs_sme" in DISCOVERY_DISPOSITIONS               # the 0F-5 vocabulary is unchanged
+    assert ADMISSIBLE_DISCOVERY_DISPOSITIONS == frozenset(
+        {"complete", "partial", "unclassified"})               # …but v1 admits only derived ones
+    with pytest.raises(TaxonomyValidationError, match="needs_sme"):
+        dataclasses.replace(DISCOVERY_METADATA["nmd_stickiness"], disposition="needs_sme")
+    with pytest.raises(TaxonomyValidationError, match="needs_sme"):
+        TemplateDiscoveryMetadataV1(
+            template_id="nmd_stickiness", feature_category=None, business_domains=(),
+            canonical_use_cases=(), keywords=(), business_value=None, disposition="needs_sme")
+    # …and it is never computed either — fabricating a review is worse than admitting one
+    assert compute_discovery_disposition(
+        feature_category=None, business_domains=(), canonical_use_cases=(), keywords=(),
+        business_value=None) == "unclassified"
+
+
+def test_equal_discovery_revision_implies_equal_disposition():
+    """The property that makes excluding ``disposition`` from the hash safe: it carries no
+    information the hashed payload lacks. Any admissible content that the hash did not cover
+    would break this (two entries with one revision showing different dispositions)."""
+    by_revision: dict[str, set[str]] = {}
+    for entry in DISCOVERY_METADATA.values():
+        by_revision.setdefault(discovery_metadata_revision_id(entry), set()).add(
+            entry.disposition)
+    assert len(by_revision) < len(DISCOVERY_METADATA)   # entries really do share revisions
+    assert all(len(dispositions) == 1 for dispositions in by_revision.values())
+
+
+def test_a_derived_disposition_change_always_moves_both_hashes():
+    """The stated rule for a derived-only transition: an entry gaining a category moves
+    unclassified→partial, and the CONTENT that caused it is hashed — so the entry revision and
+    the registry fencing hash both move. The summary never has to be hashed itself."""
+    entries = _entries()
+    idx = next(i for i, e in enumerate(entries) if e.disposition == "unclassified")
+    before = entries[idx]
+    category = DiscoveryControlledAssignmentV1(
+        controlled_id="ratio", basis="human",
+        evidence=(_evidence(EvidenceProducer.HUMAN, ref="human-decision:1"),),
+        operational_influence=None)
+    after = dataclasses.replace(before, feature_category=category, disposition="partial")
+    assert before.disposition == "unclassified" and after.disposition == "partial"
+    assert discovery_metadata_revision_id(after) != discovery_metadata_revision_id(before)
+    mutated = [*entries[:idx], after, *entries[idx + 1:]]
+    assert discovery_registry_content_hash(mutated) != discovery_registry_content_hash(entries)
+    validate_discovery_entries(mutated)   # …and the honest summary still passes the gate
 
 
 def test_dispositions_match_the_computed_summary():
