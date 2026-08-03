@@ -49,6 +49,7 @@ from featuregen.overlay.upload.structured_results import (
 if TYPE_CHECKING:
     from featuregen.contracts.envelopes import IdentityEnvelope
     from featuregen.intake.llm import LLMClient
+    from featuregen.overlay.upload.enrich_batch import CallLedger
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +76,25 @@ PROFILE_CRITIC_REASON_CODES = frozenset({
     "independent_unknown",
     "critic_unavailable",
     "critic_invalid_result",
+    "critic_budget_exhausted",
 })
+
+#: The reason a critique NEVER RAN: the enclosing run's provider-call budget was spent before this
+#: field's turn. Distinct from every other code here, which all describe a critique that DID run
+#: (or an infrastructure fault while running it).
+CRITIC_BUDGET_EXHAUSTED = "critic_budget_exhausted"
 
 
 class ProfileCriticDisposition(StrEnum):
     """``UPHELD`` keeps the proposal (agreement, or an honest abstention — the refute-oriented rule:
     absence of independent support is not evidence against). ``REFUTED`` evicts it: an independent
-    read of the SAME evidence reached a DIFFERENT closed answer."""
+    read of the SAME evidence reached a DIFFERENT closed answer. ``NOT_ATTEMPTED`` is neither: the
+    critique was never asked (the run's call budget was spent), so there is no verdict to report —
+    the caller must not read it as agreement OR as disagreement."""
 
     UPHELD = "upheld"
     REFUTED = "refuted"
+    NOT_ATTEMPTED = "not_attempted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +173,14 @@ def _result(dataset_ref, field, proposed, independent, reasons, result_id, call_
         llm_call_ref=call_ref)
 
 
+def _not_attempted(dataset_ref: str, field: str, proposed: str) -> ProfileCriticResultV1:
+    """The honest "never asked" outcome: no independent value, no verdict, one closed reason."""
+    return ProfileCriticResultV1(
+        dataset_ref=dataset_ref, field=field, proposed_value=proposed, independent_value=None,
+        disposition=ProfileCriticDisposition.NOT_ATTEMPTED,
+        reason_codes=(CRITIC_BUDGET_EXHAUSTED,), structured_result_id=None, llm_call_ref=None)
+
+
 def critique_profile_claim(
     conn,
     client: LLMClient | None,
@@ -174,6 +192,7 @@ def critique_profile_claim(
     cited_refs: Sequence[str],
     context_revision: str,
     actor: IdentityEnvelope | None = None,
+    call_budget: CallLedger | None = None,
 ) -> ProfileCriticResultV1:
     """Independently classify one profile claim and COMPARE OUTSIDE THE PROMPT.
 
@@ -181,7 +200,15 @@ def critique_profile_claim(
     blocked dispatch or an off-vocabulary answer all resolve to an honest UPHELD abstention with a
     closed reason code — an advisory critic never aborts the Pass-B run that hosts it, and never
     evicts a plausible proposal on an infrastructure failure. A byte-identical re-ask replays from
-    the structured-result store with no dispatch at all."""
+    the structured-result store with no dispatch at all.
+
+    ``call_budget`` — the enclosing run's shared ``CallLedger``. This critic issues a PHYSICAL
+    provider call, so it must spend from the run's own ceiling rather than beside it (the finding:
+    a 12-table Pass B spent 3 counted synthesis calls and 12 UNCOUNTED critic calls against
+    ``max_provider_calls=32``). Charged only for a call actually DISPATCHED — a replay from the
+    structured-result store is free, and an exhausted budget dispatches NOTHING and returns
+    ``NOT_ATTEMPTED``, never a fabricated agreement or refutation. ``None`` (a direct/test caller)
+    leaves the critic unbudgeted, exactly as before."""
     if field not in CRITIC_FIELDS:
         raise ValueError(f"{field!r} is outside this critic's scope ({sorted(CRITIC_FIELDS)})")
     payload = _payload(dataset_ref, field, context, cited_refs)
@@ -204,6 +231,12 @@ def critique_profile_claim(
     if client is None:
         return _result(dataset_ref, field, proposed_value, None, ["critic_unavailable"],
                        None, None)
+    # Budget check LAST — after the replay lookup (a replayed critique costs no provider call, so
+    # it must cost no budget) and after the no-client path (which never dispatches either).
+    if call_budget is not None and not call_budget.charge():
+        logger.info("dataset profile critic budget exhausted before %s/%s — not attempted",
+                    dataset_ref, field)
+        return _not_attempted(dataset_ref, field, proposed_value)
     try:
         call = drive_audited_structured_call(
             conn, client, task=PROFILE_CRITIC_TASK, prompt_id=PROFILE_CRITIC_PROMPT_ID,

@@ -39,6 +39,41 @@ class BatchItem:
     metadata: dict    # metadata-only fields for the prompt (table/column/type/columns/concept)
 
 
+@dataclass
+class CallLedger:
+    """The run's SHARED physical-provider-call counter — the ONE accounting `run_batched` keeps.
+
+    ``run_batched`` has always counted calls locally against ``budget(short).max_provider_calls``.
+    That is correct only while every provider call of the run is issued BY the ladder. Pass B broke
+    that: its ref-aware ``accept`` fires the dataset-profile critic from INSIDE the batch call, one
+    extra physical call per criticised field, which the local counter never saw (a 12-table run
+    spent 3 counted + 12 uncounted calls against a 32-call ceiling).
+
+    Making the counter an OBJECT the caller can hold fixes it without a second budget: the caller
+    builds one ledger, hands it to ``run_batched`` AND to the nested seam, and both spend from it.
+    A seam that cannot get budget must NOT dispatch and must say so honestly (never a silent skip).
+    """
+
+    max_provider_calls: int
+    calls: int = 0
+
+    def exhausted(self) -> bool:
+        return self.calls >= self.max_provider_calls
+
+    def charge(self, n: int = 1) -> bool:
+        """Reserve ``n`` physical calls BEFORE dispatching them. Returns False and charges nothing
+        when the ceiling is already reached — the caller must then not dispatch."""
+        if self.exhausted():
+            return False
+        self.calls += n
+        return True
+
+    def settle(self, *, reserved: int, actual: int) -> None:
+        """Reconcile a reservation against what the provider actually cost (a driver may repair or
+        retry, and a blocked call costs nothing), so the ledger always holds the PHYSICAL total."""
+        self.calls += actual - reserved
+
+
 @dataclass(frozen=True)
 class BatchItemOutcome:
     ref: str
@@ -161,7 +196,8 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 now: Callable[[], float] = time.monotonic, deadline_s: float | None = None,
                 report: dict | None = None,
                 ingestion_run_id: str | None = None, dispatch_stage: str | None = None,
-                dispatch_subjects: Mapping[str, dict] | None = None) -> dict[str, str]:
+                dispatch_subjects: Mapping[str, dict] | None = None,
+                call_ledger: CallLedger | None = None) -> dict[str, str]:
     """Chunk `items`, call the governed batch seam, and walk the bounded degradation ladder
     (spec C4): salvage valid -> retry a failed chunk -> adaptive split -> capped single fallback ->
     leave remainder uncached. Returns {ref: accepted_value} for items resolved this run.
@@ -184,13 +220,20 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
     for exactly the items IN that call — ``dispatch_stage`` (falling back to ``task``) as the stage,
     and ``dispatch_subjects`` (a ``{ref: subject}`` mapping) supplying each item's
     ``{catalog_source, object_ref, logical_ref, field_names}`` subject. ``ingestion_run_id=None``
-    (every direct caller) threads ``dispatch_audit=None`` — byte-for-byte today's behavior."""
+    (every direct caller) threads ``dispatch_audit=None`` — byte-for-byte today's behavior.
+
+    ``call_ledger`` — the run's SHARED :class:`CallLedger`, for a caller whose ``accept`` itself
+    issues provider calls (Pass B's dataset-profile critic, which dispatches from INSIDE the batch
+    call). Passing one makes those nested calls spend from the SAME ceiling this ladder spends
+    from, so ``max_provider_calls`` bounds the run's PHYSICAL total rather than only its chunks.
+    ``None`` (every other caller) builds a private ledger holding exactly today's local counter —
+    byte-for-byte unchanged."""
     from featuregen.overlay.upload.enrich_llm import audited_batch_call  # lazy (import cycle)
     b = enrich_config.budget(short)
     max_items = enrich_config.max_items(short)
     max_tokens = enrich_config.max_input_tokens(short)
     started = time.monotonic()
-    calls = 0
+    ledger = call_ledger if call_ledger is not None else CallLedger(b.max_provider_calls)
     resolved: dict[str, str] = {}
     fallback_used = 0
     # Refs actually SENT to the provider (any batch chunk this ladder issued). Its complement over
@@ -209,22 +252,29 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             subjects=tuple(subs[it.ref] for it in call_items if it.ref in subs))
 
     def over_budget() -> bool:
-        return (calls >= b.max_provider_calls
+        return (ledger.exhausted()
                 or (time.monotonic() - started) * 1000 >= b.wallclock_budget_ms)
 
     def process(chunk: list[BatchItem], attempt: int) -> None:
-        nonlocal calls, fallback_used
+        nonlocal fallback_used
         if not chunk or over_budget():
             counters.incr(f"overlay.enrich.{short}.batch.budget_exhausted") if chunk else None
             return
         dispatched.update(it.ref for it in chunk)   # this chunk is now being sent to the provider
+        # RESERVE this chunk's call BEFORE issuing it (the guard above already cleared it), so a
+        # seam nested inside the call — Pass B's critic, which fires from `accept` — sees the
+        # in-flight call in the ledger and cannot spend the ceiling out from under it. `settle`
+        # then reconciles against what the driver actually cost (repairs/retries, or 0 for a
+        # blocked call), leaving the ledger at the same total the old `calls += provider_calls`
+        # produced.
+        ledger.charge()
         res = audited_batch_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
                                  shared_metadata=shared_metadata, items=chunk, out_key=out_key,
                                  instruction=instruction, accept=accept, actor=actor,
                                  extract=extract, ref_aware=ref_aware,
                                  prompt_version=prompt_version, schema_version=schema_version,
                                  dispatch_audit=_ctx_for(chunk))
-        calls += res.provider_calls
+        ledger.settle(reserved=1, actual=res.provider_calls)
         counters.incr(f"overlay.enrich.{short}.batch.calls")
         for o in res.outcomes:
             if o.status in (VALID,) and o.value is not None:
@@ -253,7 +303,7 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         _fallback(unresolved)
 
     def _fallback(unresolved: list[BatchItem]) -> None:
-        nonlocal calls, fallback_used
+        nonlocal fallback_used
         # A ref_aware (structured) task has NO single-call fallback (see _single_fallback): each item
         # would resolve to (None, MISSING) WITHOUT a provider call. Skip the loop entirely so a no-op
         # fallback never inflates `calls`/`fallback_used` — on a >max_items multi-chunk Pass B run the
@@ -268,7 +318,7 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
                 continue
             fallback_used += 1
-            calls += 1
+            ledger.charge()          # one per-item call, reserved before it is issued (as before)
             counters.incr(f"overlay.enrich.{short}.batch.single_fallback")
             try:
                 value, status = _single_fallback(conn, client, task=task, out_key=out_key,

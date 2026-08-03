@@ -435,6 +435,58 @@ def test_the_critic_replays_from_the_structured_result_store(db) -> None:
     assert second.structured_result_id == first.structured_result_id
 
 
+def test_the_critic_never_dispatches_on_an_exhausted_budget(db) -> None:
+    """Fix 1: the critic is a PHYSICAL provider call, so it must be spendable only out of the run's
+    own call budget. With nothing left, it does NOT dispatch and says so honestly — never a silent
+    skip, never a fabricated agreement or refutation."""
+    from featuregen.overlay.upload.attest import dataset_profile_critic as dpc
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+    calls: list = []
+
+    class _Counting(FakeLLM):
+        def call(self, request):
+            calls.append(request)
+            return super().call(request)
+
+    client = _Counting(script={dpc.PROFILE_CRITIC_TASK: FakeResponse(
+        output={"classification": "derived"})})
+    ledger = CallLedger(max_provider_calls=0)
+    outcome = dpc.critique_profile_claim(
+        db, client, dataset_ref="ftr::s.t", field="authority_role", proposed_value="derived",
+        context=_critic_context(), cited_refs=["cust_id"], context_revision="rev-1",
+        call_budget=ledger)
+    assert calls == [], "an exhausted budget must not reach the provider"
+    assert outcome.disposition is dpc.ProfileCriticDisposition.NOT_ATTEMPTED
+    assert outcome.reason_codes == ("critic_budget_exhausted",)
+    assert outcome.independent_value is None
+
+
+def test_a_replayed_critique_consumes_no_budget(db) -> None:
+    """A replay is not a provider call, so it must cost nothing — otherwise a re-upload would burn
+    the run's ceiling on questions nobody re-asks."""
+    from featuregen.overlay.upload.attest import dataset_profile_critic as dpc
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+    calls: list = []
+
+    class _Counting(FakeLLM):
+        def call(self, request):
+            calls.append(request)
+            return super().call(request)
+
+    client = _Counting(script={dpc.PROFILE_CRITIC_TASK: FakeResponse(
+        output={"classification": "derived"})})
+    ledger = CallLedger(max_provider_calls=1)
+    kwargs = dict(dataset_ref="ftr::s.t", field="authority_role", proposed_value="derived",
+                  context=_critic_context(), cited_refs=["cust_id"], context_revision="rev-1",
+                  call_budget=ledger)
+    first = dpc.critique_profile_claim(db, client, **kwargs)
+    assert ledger.calls == 1                       # the dispatch was charged
+    second = dpc.critique_profile_claim(db, client, **kwargs)
+    assert len(calls) == 1, "the second ask replayed"
+    assert ledger.calls == 1, "a replayed critique is FREE — it charged nothing"
+    assert second.structured_result_id == first.structured_result_id
+
+
 def test_the_critic_refuses_a_field_outside_its_scope(db) -> None:
     from featuregen.overlay.upload.attest import dataset_profile_critic as dpc
     with pytest.raises(ValueError, match="outside this critic's scope"):
@@ -455,6 +507,50 @@ def test_the_critic_replay_identity_folds_in_the_profile_vocabulary(db, monkeypa
     # And the fingerprint itself is order-insensitive over the closed vocabularies.
     assert profile_vocab.profile_vocabulary_fingerprint() == \
         profile_vocab.profile_vocabulary_fingerprint()
+
+
+# ── the run's provider-call budget covers the critic (Fix 1) ─────────────────────────────────────
+
+
+def _budget_items(n: int) -> list[BatchItem]:
+    return [BatchItem(ref=f"tbl_{i:02d}", metadata={
+        "table": f"tbl_{i:02d}",
+        "column_profiles": [{"column": "cust_id", "operational_type": "unknown",
+                             "declared_type": "varchar"}]}) for i in range(n)]
+
+
+#: A synthesis proposing BOTH criticised classifications (each properly cited), so every resolved
+#: table costs two critic dispatches on top of its share of the synthesis call.
+_CLASSIFIED = _synthesis(authority_role="system_of_record", temporal_storage_model="snapshot",
+                         evidence_refs=[_cite("authority_role", "cust_id"),
+                                        _cite("temporal_storage_model", "cust_id")])
+
+
+class _CountingClient(FakeLLM):
+    """Counts every PHYSICAL provider call and answers BOTH Pass-B tasks from the request itself —
+    a static script cannot, because each synthesis chunk carries different refs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tasks: list[str] = []
+
+    def call(self, request):
+        from featuregen.intake.llm import PROVIDER_OK, LLMResult
+        from featuregen.intake.redaction import INPUT_KEY_CATALOG
+        from featuregen.overlay.upload.attest.dataset_profile_critic import PROFILE_CRITIC_TASK
+        self.tasks.append(request.task)
+        if request.task == PROFILE_CRITIC_TASK:
+            return LLMResult(output={"classification": "unknown"}, self_reported_scores={},
+                             call_ref="", status=PROVIDER_OK)
+        items = request.inputs[INPUT_KEY_CATALOG]["items"]
+        return LLMResult(
+            output={"results": [{"ref": it["ref"], "synthesis": _CLASSIFIED} for it in items]},
+            self_reported_scores={}, call_ref="", status=PROVIDER_OK)
+
+    @property
+    def critic_calls(self) -> list[str]:
+        from featuregen.overlay.upload.attest.dataset_profile_critic import PROFILE_CRITIC_TASK
+        return [t for t in self.tasks if t == PROFILE_CRITIC_TASK]
 
 
 # ── replay persistence of the synthesis itself ───────────────────────────────────────────────────
@@ -484,6 +580,46 @@ def test_the_accepted_synthesis_lands_in_the_structured_result_store(db) -> None
     assert stored is not None
     assert stored.output["business_context"] == "It records customers."
     assert stored.output["grain"] == {"columns": ["cust_id"], "is_unique": True}
+
+
+def test_the_run_wide_call_ceiling_counts_the_critic(db, monkeypatch) -> None:
+    """Fix 1 (the finding): a Pass-B run over N tables issues ONE synthesis call per chunk plus TWO
+    critic calls per resolved table. Before the fix the critic calls were invisible to
+    ``max_provider_calls``, so a 12-table run spent 3 counted + 12 uncounted calls. The ceiling now
+    bounds the PHYSICAL total."""
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", "4")
+    items = _budget_items(6)
+    client = _CountingClient()
+    ts.synthesize_tables(db, client, items,
+                         columns_by_table={it.ref: {"cust_id"} for it in items},
+                         actor=None, catalog_source="ftr")
+    assert client.critic_calls, "the critic DID dispatch — the ceiling is not vacuously satisfied"
+    assert len(client.tasks) <= 4, client.tasks
+
+
+def test_an_exhausted_budget_disposes_the_rest_not_attempted_and_the_run_completes(
+        db, monkeypatch) -> None:
+    """Exhaustion is honest, not silent: the fields whose critique never ran are ``not_attempted``
+    (never ``refuted``, never accepted unreviewed), and the synthesis run still returns its
+    resolved tables."""
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", "3")
+    items = _budget_items(6)
+    client = _CountingClient()
+    disp: list[dict] = []
+    resolved = ts.synthesize_tables(db, client, items,
+                                    columns_by_table={it.ref: {"cust_id"} for it in items},
+                                    actor=None, dispositions=disp, catalog_source="ftr")
+    assert resolved, "the run completed — a spent critic budget never fails Pass B"
+    classified = [r for r in disp
+                  if r["field"] in ("authority_role", "temporal_storage_model")]
+    starved = [r for r in classified if r["status"] == "not_attempted"]
+    assert starved, "the budget ran out mid-run — some critiques must be unattempted"
+    assert {r["reason"] for r in starved} == {"critic_budget_exhausted"}
+    # An unattempted critique NEVER lands its classification, and is never mislabeled a refutation.
+    for rec in starved:
+        assert resolved.get(rec["table"], {}).get(rec["field"]) in (None, "")
+    assert all(r["reason"] != "critic_budget_exhausted"
+               for r in classified if r["status"] == "refuted")
 
 
 def test_replay_is_stable_for_a_byte_identical_re_run(db) -> None:

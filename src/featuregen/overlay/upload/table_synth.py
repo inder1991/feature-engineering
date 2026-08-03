@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING
 
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload import enrich_config, table_vocab
-from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
+from featuregen.overlay.upload.attest.dataset_profile_critic import CRITIC_BUDGET_EXHAUSTED
+from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES, ENRICHMENT_RUN_ID
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.profile_vocab import AuthorityRole as _AuthorityRole
@@ -107,6 +108,12 @@ DISPOSITION_STATUSES = frozenset({
     "not_attempted",    # in scope, deliberately not asked this run
     "not_evaluated",    # the table never reached per-field validation at all ([F12])
 })
+
+#: Critic reason codes that mean the critique NEVER RAN, so the field is `not_attempted` rather
+#: than `refuted`. A starved critic disagreed with nothing — it was never asked. (The other
+#: `PROFILE_CRITIC_REASON_CODES` all describe a critique that DID run, or a fault while running it,
+#: and the critic itself resolves those to UPHELD before this mapping is ever consulted.)
+CRITIC_NOT_ATTEMPTED_REASONS = frozenset({CRITIC_BUDGET_EXHAUSTED})
 
 
 def add_not_evaluated(dispositions: list[dict], table: str) -> None:
@@ -335,7 +342,10 @@ def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
             return
         verdict = critic(ref, field, value, refs)
         if verdict is not True:
-            put(ref, field, "refuted",
+            # A critique that never RAN is `not_attempted`, not `refuted`: nobody disagreed with
+            # this value — nobody was asked. Either way the value does not land.
+            status = ("not_attempted" if verdict in CRITIC_NOT_ATTEMPTED_REASONS else "refuted")
+            put(ref, field, status,
                 verdict if isinstance(verdict, str) else "critic_refuted")
             return
         accepted[field] = value
@@ -569,11 +579,15 @@ def _profile_critic(conn, client, items: list[BatchItem], *, catalog_source: str
                     schema_by_table: dict[str, str] | None, context_revision: str, actor):
     """The proposal-blind veto for the two OPERATIONAL profile classifications (profile Task 4).
 
-    Returns ``critic(ref, field, value, cited_refs) -> True | reason_code`` — ``True`` upholds. The
-    comparison happens INSIDE `attest.dataset_profile_critic`, code-side and outside the prompt;
-    this closure only routes the table's own bounded context to it. A run with no client gets
-    ``None``, and `_accept_profile_fields` then records `not_attempted` rather than landing an
-    operational classification on one model's unreviewed say-so."""
+    Returns ``critic(ref, field, value, cited_refs, *, budget=None) -> True | reason_code`` —
+    ``True`` upholds; :data:`CRITIC_NOT_ATTEMPTED_REASONS` members mean the critique never ran; any
+    other code refutes. The comparison happens INSIDE `attest.dataset_profile_critic`, code-side
+    and outside the prompt; this closure only routes the table's own bounded context to it. A run
+    with no client gets ``None``, and `_accept_profile_fields` then records `not_attempted` rather
+    than landing an operational classification on one model's unreviewed say-so.
+
+    ``budget`` is the enclosing synthesis run's shared ``CallLedger``, bound by `_run_synthesis`:
+    each critique is a PHYSICAL provider call and must be spent from the run's own ceiling."""
     if client is None:
         return None
     from featuregen.overlay.upload.attest.dataset_profile_critic import (
@@ -584,7 +598,7 @@ def _profile_critic(conn, client, items: list[BatchItem], *, catalog_source: str
     context_by_ref = {it.ref: it.metadata for it in items}
     sbt = schema_by_table or {}
 
-    def _critic(ref: str, field: str, value: str, cited_refs):
+    def _critic(ref: str, field: str, value: str, cited_refs, *, budget=None):
         if field not in CRITIC_FIELDS:
             return True                       # out of scope: the one-model path stands
         context = context_by_ref.get(ref, {})
@@ -595,12 +609,16 @@ def _profile_critic(conn, client, items: list[BatchItem], *, catalog_source: str
             outcome = critique_profile_claim(
                 conn, client, dataset_ref=dataset_ref, field=field, proposed_value=value,
                 context=context, cited_refs=cited_refs, context_revision=context_revision,
-                actor=actor)
+                actor=actor, call_budget=budget)
         except Exception:  # noqa: BLE001 — advisory: a critic fault never fails the synthesis
             logger.warning("advisory profile critic failed for %r/%s", ref, field, exc_info=True)
             return True                       # fail-soft UPHELD; never evict on infrastructure
         if outcome.disposition is ProfileCriticDisposition.UPHELD:
             return True
+        if outcome.disposition is ProfileCriticDisposition.NOT_ATTEMPTED:
+            # The critique never ran (the run's call budget was spent). Report the reason as-is so
+            # the disposition is `not_attempted` — a starved critic is not a disagreeing one.
+            return outcome.reason_codes[0] if outcome.reason_codes else CRITIC_BUDGET_EXHAUSTED
         return "independent_disagrees"
 
     return _critic
@@ -755,11 +773,18 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                           or it.metadata.get("column_roster") or []) for it in items}
     source_definitions = {it.ref: it.metadata.get("table_definition") for it in items
                           if it.metadata.get("table_definition")}
+    # ONE ledger for this synthesis run, shared by the batching ladder AND the critic it fires from
+    # inside `accept`: a critique is a physical provider call, so it spends the SAME ceiling the
+    # chunks spend (the finding — critic calls were invisible to `max_provider_calls`). The ledger
+    # is per-run_batched-run, exactly the scope `max_provider_calls` has always had.
+    ledger = CallLedger(enrich_config.budget("table_synth").max_provider_calls)
+    budgeted_critic = None if critic is None else (
+        lambda ref, field, value, refs: critic(ref, field, value, refs, budget=ledger))
     accept = make_ref_accept(
         columns_by_table, dispositions=dispositions, inventory_by_table=inventory,
         source_definition_by_table=source_definitions,
         source_context_by_table={ref: True for ref in source_definitions},
-        catalog_context_available=catalog_context_available, critic=critic)
+        catalog_context_available=catalog_context_available, critic=budgeted_critic)
     batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
@@ -773,6 +798,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
         dispatch_subjects=_dispatch_subjects_for(items, catalog_source=catalog_source,
                                                  schema_by_table=schema_by_table),
+        call_ledger=ledger,
     )
     # ACCUMULATE (narrow + wide-phase-2 both funnel here): these table-granular refs are exactly
     # Pass B's expected unit, so a truncated synthesis surfaces as the stage's `not_attempted`.
