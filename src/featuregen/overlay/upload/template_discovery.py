@@ -67,6 +67,20 @@ __all__ = [
     "DISCOVERY_BASIS_VALUES",
     "DISCOVERY_DISPOSITIONS",
     "DISCOVERY_METADATA",
+    "DISCOVERY_PROPOSAL_ABSTAIN",
+    "DISCOVERY_PROPOSAL_EGRESS_FIELDS",
+    "DISCOVERY_PROPOSAL_PROMPT_ID",
+    "DISCOVERY_PROPOSAL_SCHEMA_ID",
+    "DISCOVERY_PROPOSAL_TASK",
+    "DiscoveryProposalAssignments",
+    "DiscoveryProposalBatchResult",
+    "DiscoveryProposalProvenanceV1",
+    "DiscoveryProposalResultV1",
+    "DiscoveryProposalV1",
+    "discovery_proposal_items",
+    "proposal_assignments",
+    "run_discovery_proposal_batch",
+    "templates_needing_proposal",
     "MAX_BUSINESS_VALUE_LEN",
     "MAX_KEYWORDS",
     "MAX_KEYWORD_LEN",
@@ -554,6 +568,362 @@ def legacy_audit_manifest_content_hash(rows: Sequence[Mapping]) -> str:
     payload = {"rows": sorted((dict(row) for row in rows),
                               key=lambda row: row["legacy_tag"])}
     return contract_hash_v1("legacy-use-case-audit-manifest", "1", payload)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# LLM proposal batch — bounded, audited, optional; SUPPORT PATH ONLY
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# One audited batch MAY propose category/use-case/value/keyword mappings, once per template
+# revision (``templates_needing_proposal``). It is NEVER run at import, from tests, or on an
+# ordinary page read — dispatching it is a separately approved/audited action, and there is no
+# per-grounded-suggestion LLM call. Outputs validate EXCLUSIVELY against existing controlled
+# IDs plus the explicit abstention token; ``basis=llm_proposed`` with
+# ``operational_influence='hint'`` — a proposal, never a fabricated governed authority label.
+
+DISCOVERY_PROPOSAL_TASK = "overlay.discovery.taxonomy_proposal"
+DISCOVERY_PROPOSAL_PROMPT_ID = "overlay_discovery_proposal_v1"
+DISCOVERY_PROPOSAL_SCHEMA_ID = "overlay_discovery_proposal_batch"
+DISCOVERY_PROPOSAL_ABSTAIN = "abstain"
+
+#: The NAMED bounded template fields allowed to egress (the enrich_llm ``_ITEM_META_ALLOWED``
+#: extension carries exactly these keys). Repo-authored recipe metadata only — never catalog
+#: content, sample values or uploader text. Values are NFC-normalized and length-bounded.
+DISCOVERY_PROPOSAL_EGRESS_FIELDS: dict[str, int] = {
+    "recipe_family": 64,
+    "recipe_intent": 400,
+    "recipe_aggregation": 64,
+    "funnel_stage": 64,
+    "legacy_use_case_tags": 64,   # bound per tag; the list itself is template-authored (≤5)
+}
+
+_PROPOSAL_FAILURE_STATUSES = frozenset({"malformed", "missing", "egress_blocked"})
+
+_DISCOVERY_PROPOSAL_INSTRUCTION = (
+    "For each recipe item, propose discovery metadata from the CLOSED vocabularies provided in "
+    "the shared metadata: feature_category from feature_category_ids, use_case_ids from "
+    "canonical_use_case_ids, a one-sentence business_value, and up to 8 short keywords. When "
+    "unsure, abstain explicitly: feature_category='abstain', use_case_ids=[], "
+    "business_value='abstain', keywords=[]. Never invent an ID outside the vocabularies.")
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryProposalV1:
+    """One VALIDATED proposal: every ID already resolved against its controlled registry;
+    ``None``/empty means the model abstained on that axis."""
+
+    feature_category: str | None
+    canonical_use_cases: tuple[str, ...]
+    business_value: str | None
+    keywords: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryProposalResultV1:
+    """The typed per-template outcome. A blocked, malformed or abstaining item records ITS
+    result and the batch continues — one bad item never becomes an unexplained zero-output
+    run, and free text is never coerced into a controlled ID."""
+
+    template_id: str
+    recipe_revision_id: str
+    status: str            # proposed | abstained | malformed | missing | egress_blocked
+    proposal: DiscoveryProposalV1 | None
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryProposalProvenanceV1:
+    """Model/prompt/schema/producer provenance for one proposal batch. The immutable
+    ``llm_call`` audit row is recorded by the governed batch seam; this record travels with
+    the typed results so every derived ``llm_proposed`` value stays attributable."""
+
+    task: str
+    prompt_id: str
+    prompt_version: int
+    schema_id: str
+    schema_version: int
+    provider: str
+    model: str
+    producer: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryProposalBatchResult:
+    batch_status: str      # completed | failure_budget_exceeded
+    results: tuple[DiscoveryProposalResultV1, ...]
+    provenance: DiscoveryProposalProvenanceV1
+    provider_calls: int
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryProposalAssignments:
+    """A proposal converted to registry-shaped assignments (``basis=llm_proposed``,
+    ``operational_influence='hint'``, LLM evidence). Consumers merge these into discovery
+    entries; the validator relabels nothing."""
+
+    feature_category: DiscoveryControlledAssignmentV1 | None
+    canonical_use_cases: tuple[DiscoveryControlledAssignmentV1, ...]
+    keywords: tuple[DiscoveryTextAssignmentV1, ...]
+    business_value: DiscoveryTextAssignmentV1 | None
+
+
+def discovery_proposal_items(templates: Sequence[Template]) -> list:
+    """Closed input: one metadata-only item per template carrying ONLY the named bounded
+    fields. Authored content outside its bound is a repo bug and dies loudly here — nothing
+    is silently truncated on the way to a provider."""
+    from featuregen.overlay.upload.enrich_batch import BatchItem  # lazy: heavy import chain
+
+    def _bounded(value: str, *, field: str, bound: int) -> str:
+        import unicodedata
+        normalized = unicodedata.normalize("NFC", value)
+        if len(normalized) > bound:
+            raise TaxonomyValidationError(
+                f"authored template field {field} exceeds its {bound}-char egress bound")
+        return normalized
+
+    items = []
+    for template in templates:
+        metadata: dict = {
+            "recipe_family": _bounded(template.family, field="recipe_family", bound=64),
+            "recipe_intent": _bounded(template.intent, field="recipe_intent", bound=400),
+            "recipe_aggregation": _bounded(template.aggregation,
+                                           field="recipe_aggregation", bound=64),
+        }
+        if template.stage:
+            metadata["funnel_stage"] = _bounded(template.stage, field="funnel_stage",
+                                                bound=64)
+        if template.use_cases:
+            metadata["legacy_use_case_tags"] = [
+                _bounded(tag, field="legacy_use_case_tags", bound=64)
+                for tag in template.use_cases]
+        items.append(BatchItem(ref=template.id, metadata=metadata))
+    return items
+
+
+def _extract_proposal(entry: Mapping) -> str:
+    proposal = entry.get("proposal")
+    return json.dumps(proposal, sort_keys=True) if isinstance(proposal, dict) else ""
+
+
+def _accept_proposal(raw: str) -> tuple[str | None, str]:
+    """Validate one proposal EXCLUSIVELY against existing controlled IDs plus abstention.
+    Rejection returns a typed reason code; free text is never coerced into an ID."""
+    try:
+        proposal = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "proposal_unparseable"
+    if not isinstance(proposal, dict):
+        return None, "proposal_unparseable"
+    category = proposal.get("feature_category")
+    if not isinstance(category, str) or (
+            category != DISCOVERY_PROPOSAL_ABSTAIN
+            and category not in FEATURE_CATEGORY_REGISTRY):
+        return None, "category_uncontrolled"
+    use_case_ids = proposal.get("use_case_ids")
+    if not isinstance(use_case_ids, list) or not all(
+            isinstance(u, str) for u in use_case_ids):
+        return None, "use_case_uncontrolled"
+    leaves = set(selectable_leaves())
+    if any(u not in leaves for u in use_case_ids):
+        return None, "use_case_uncontrolled"
+    if len(set(use_case_ids)) != len(use_case_ids):
+        return None, "use_case_duplicate"
+    business_value = proposal.get("business_value")
+    if not isinstance(business_value, str):
+        return None, "business_value_unsafe"
+    if business_value != DISCOVERY_PROPOSAL_ABSTAIN:
+        try:
+            business_value = safe_registry_text(
+                business_value, field="proposed business_value",
+                max_len=MAX_BUSINESS_VALUE_LEN)
+        except TaxonomyValidationError:
+            return None, "business_value_unsafe"
+    keywords = proposal.get("keywords")
+    if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+        return None, "keyword_unsafe"
+    if len(keywords) > MAX_KEYWORDS:
+        return None, "keyword_budget_exceeded"
+    safe_keywords = []
+    for keyword in keywords:
+        try:
+            safe_keywords.append(safe_registry_text(keyword, field="proposed keyword",
+                                                    max_len=MAX_KEYWORD_LEN))
+        except TaxonomyValidationError:
+            return None, "keyword_unsafe"
+    if len({k.casefold() for k in safe_keywords}) != len(safe_keywords):
+        return None, "keyword_duplicate"
+    accepted = {"feature_category": category, "use_case_ids": use_case_ids,
+                "business_value": business_value, "keywords": safe_keywords}
+    return json.dumps(accepted, sort_keys=True), "valid"
+
+
+def _result_from_value(template_id: str, revision: str, value: str
+                       ) -> DiscoveryProposalResultV1:
+    accepted = json.loads(value)
+    abstained = (accepted["feature_category"] == DISCOVERY_PROPOSAL_ABSTAIN
+                 and not accepted["use_case_ids"]
+                 and accepted["business_value"] == DISCOVERY_PROPOSAL_ABSTAIN
+                 and not accepted["keywords"])
+    if abstained:
+        return DiscoveryProposalResultV1(
+            template_id=template_id, recipe_revision_id=revision, status="abstained",
+            proposal=None, reason_codes=(DISCOVERY_PROPOSAL_ABSTAIN,))
+    proposal = DiscoveryProposalV1(
+        feature_category=(None if accepted["feature_category"] == DISCOVERY_PROPOSAL_ABSTAIN
+                          else accepted["feature_category"]),
+        canonical_use_cases=tuple(accepted["use_case_ids"]),
+        business_value=(None if accepted["business_value"] == DISCOVERY_PROPOSAL_ABSTAIN
+                        else accepted["business_value"]),
+        keywords=tuple(accepted["keywords"]))
+    return DiscoveryProposalResultV1(
+        template_id=template_id, recipe_revision_id=revision, status="proposed",
+        proposal=proposal, reason_codes=("valid",))
+
+
+def templates_needing_proposal(templates: Sequence[Template],
+                               proposed_revision_ids: Iterable[str]) -> tuple[Template, ...]:
+    """Once per template REVISION: a template whose current ``recipe_revision_id`` already has
+    a stored proposal is filtered out; a recipe-content edit re-revisions it and re-qualifies
+    it, while discovery-side edits (keywords/mappings) never do."""
+    done = set(proposed_revision_ids)
+    return tuple(t for t in templates if recipe_revision_id(t) not in done)
+
+
+def run_discovery_proposal_batch(conn, client, *,
+                                 templates: Sequence[Template] | None = None,
+                                 items: list | None = None,
+                                 actor=None,
+                                 max_failure_fraction: float = 0.5,
+                                 chunk_max_items: int = 24,
+                                 chunk_max_input_tokens: int = 8000,
+                                 ) -> DiscoveryProposalBatchResult:
+    """Run ONE bounded, audited taxonomy-proposal batch through the governed batch seam
+    (``audited_batch_call``: per-item egress gate, batch egress backstop, schema-validated
+    array call, immutable ``llm_call`` audit row). Never called at import, from tests with a
+    real client, or on a page read — the caller owns the separately approved dispatch.
+
+    Every requested template yields a typed :class:`DiscoveryProposalResultV1`; failures
+    (malformed / missing / egress-blocked) are counted against ``max_failure_fraction`` and
+    flip ``batch_status`` to ``failure_budget_exceeded`` without discarding the typed results.
+    """
+    if not 0.0 <= max_failure_fraction <= 1.0:
+        raise ValueError("max_failure_fraction must be within [0, 1]")
+    from featuregen.overlay.upload.enrich_batch import (  # lazy: heavy import chain
+        BLANK,
+        DUPLICATE,
+        EGRESS,
+        INVALID,
+        MISSING,
+        VALID,
+        chunk_items,
+    )
+    from featuregen.overlay.upload.enrich_llm import (
+        audited_batch_call,
+        current_enrichment_generation_settings,
+    )
+    chosen = tuple(templates) if templates is not None else ALL_TEMPLATES
+    by_id = {t.id: t for t in chosen}
+    if items is None:
+        items = discovery_proposal_items(chosen)
+    shared_metadata = {
+        "feature_category_ids": sorted(FEATURE_CATEGORY_REGISTRY),
+        "canonical_use_case_ids": sorted(selectable_leaves()),
+        "abstention_token": DISCOVERY_PROPOSAL_ABSTAIN,
+    }
+    outcomes = []
+    provider_calls = input_tokens = output_tokens = 0
+    for chunk in chunk_items(items, max_items=chunk_max_items,
+                             max_input_tokens=chunk_max_input_tokens):
+        res = audited_batch_call(
+            conn, client, task=DISCOVERY_PROPOSAL_TASK,
+            prompt_id=DISCOVERY_PROPOSAL_PROMPT_ID,
+            schema_id=DISCOVERY_PROPOSAL_SCHEMA_ID,
+            shared_metadata=shared_metadata, items=chunk, out_key="proposal",
+            instruction=_DISCOVERY_PROPOSAL_INSTRUCTION,
+            accept=_accept_proposal, extract=_extract_proposal, actor=actor)
+        outcomes.extend(res.outcomes)
+        provider_calls += res.provider_calls
+        input_tokens += res.input_tokens
+        output_tokens += res.output_tokens
+    results: list[DiscoveryProposalResultV1] = []
+    for outcome in outcomes:
+        template = by_id.get(outcome.ref)
+        if template is None:
+            continue   # an EXTRA ref the provider invented — classified by the seam, no template
+        revision = recipe_revision_id(template)
+        if outcome.status == VALID and outcome.value is not None:
+            results.append(_result_from_value(template.id, revision, outcome.value))
+        elif outcome.status == EGRESS:
+            results.append(DiscoveryProposalResultV1(
+                template_id=template.id, recipe_revision_id=revision,
+                status="egress_blocked", proposal=None,
+                reason_codes=tuple(outcome.reason_codes)))
+        elif outcome.status == MISSING:
+            results.append(DiscoveryProposalResultV1(
+                template_id=template.id, recipe_revision_id=revision, status="missing",
+                proposal=None, reason_codes=tuple(outcome.reason_codes)))
+        elif outcome.status in (BLANK, INVALID, DUPLICATE):
+            results.append(DiscoveryProposalResultV1(
+                template_id=template.id, recipe_revision_id=revision, status="malformed",
+                proposal=None, reason_codes=tuple(outcome.reason_codes)))
+    settings = current_enrichment_generation_settings()
+    provenance = DiscoveryProposalProvenanceV1(
+        task=DISCOVERY_PROPOSAL_TASK, prompt_id=DISCOVERY_PROPOSAL_PROMPT_ID,
+        prompt_version=1, schema_id=DISCOVERY_PROPOSAL_SCHEMA_ID, schema_version=1,
+        provider=str(settings.get("provider", "")), model=str(settings.get("model", "")),
+        producer=TEMPLATE_DISCOVERY_OWNER)
+    failures = sum(1 for r in results if r.status in _PROPOSAL_FAILURE_STATUSES)
+    total = len(results)
+    batch_status = ("failure_budget_exceeded"
+                    if total and failures / total > max_failure_fraction else "completed")
+    return DiscoveryProposalBatchResult(
+        batch_status=batch_status, results=tuple(results), provenance=provenance,
+        provider_calls=provider_calls, input_tokens=input_tokens,
+        output_tokens=output_tokens)
+
+
+def _llm_evidence(provenance: DiscoveryProposalProvenanceV1) -> tuple[EvidenceAuthorityV1, ...]:
+    return (EvidenceAuthorityV1(
+        producer=EvidenceProducer.LLM,
+        strength=AssertionStrength.PROPOSED,
+        lifecycle=EvidenceLifecycle.ACTIVE,
+        producer_ref=(f"{provenance.provider}/{provenance.model}:"
+                      f"{provenance.prompt_id}@{provenance.schema_id}"),
+        evidence_id=None),)
+
+
+def proposal_assignments(result: DiscoveryProposalResultV1,
+                         provenance: DiscoveryProposalProvenanceV1
+                         ) -> DiscoveryProposalAssignments:
+    """Convert one PROPOSED result into registry-shaped assignments: ``basis=llm_proposed``,
+    ``operational_influence='hint'``, LLM evidence. Anything but a proposed result converts
+    to nothing — an abstention or failure never fabricates a value."""
+    if result.status != "proposed" or result.proposal is None:
+        return DiscoveryProposalAssignments(
+            feature_category=None, canonical_use_cases=(), keywords=(), business_value=None)
+    evidence = _llm_evidence(provenance)
+    proposal = result.proposal
+    feature_category = (DiscoveryControlledAssignmentV1(
+        controlled_id=proposal.feature_category, basis="llm_proposed", evidence=evidence,
+        operational_influence=_LLM_PROPOSED_INFLUENCE)
+        if proposal.feature_category else None)
+    canonical_use_cases = tuple(
+        DiscoveryControlledAssignmentV1(controlled_id=uid, basis="llm_proposed",
+                                        evidence=evidence,
+                                        operational_influence=_LLM_PROPOSED_INFLUENCE)
+        for uid in proposal.canonical_use_cases)
+    keywords = tuple(
+        DiscoveryTextAssignmentV1(value=keyword, basis="llm_proposed", evidence=evidence,
+                                  operational_influence=_LLM_PROPOSED_INFLUENCE)
+        for keyword in proposal.keywords)
+    business_value = (DiscoveryTextAssignmentV1(
+        value=proposal.business_value, basis="llm_proposed", evidence=evidence,
+        operational_influence=_LLM_PROPOSED_INFLUENCE)
+        if proposal.business_value else None)
+    return DiscoveryProposalAssignments(
+        feature_category=feature_category, canonical_use_cases=canonical_use_cases,
+        keywords=keywords, business_value=business_value)
 
 
 # ── contract registrations (one owner; contract_hash_v1 refuses unregistered pairs) ────────────

@@ -543,6 +543,33 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                                    "required": ["column", "domain"]}}},
                       "required": ["ref", "domain"]}}},
         "required": ["results"]},
+    # Suggestion-discovery Task 1 — the CLOSED output schema of the bounded taxonomy-proposal
+    # batch (template_discovery.run_discovery_proposal_batch). One {ref, proposal} object per
+    # requested template; every proposal field is required so an abstention is EXPLICIT (the
+    # "abstain" token / empty lists), never an absent key. Controlled-ID membership (feature
+    # categories, selectable use-case leaves) is enforced CODE-side by the accept callback —
+    # never a schema enum, which would fail the whole chunk on one off-vocabulary value.
+    ("overlay_discovery_proposal_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array",
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {
+                          "ref": {"type": "string", "maxLength": 128},
+                          "proposal": {
+                              "type": "object", "additionalProperties": False,
+                              "properties": {
+                                  "feature_category": {"type": "string", "maxLength": 64},
+                                  "use_case_ids": {"type": "array",
+                                                   "items": {"type": "string",
+                                                             "maxLength": 128}},
+                                  "business_value": {"type": "string", "maxLength": 400},
+                                  "keywords": {"type": "array",
+                                               "items": {"type": "string",
+                                                         "maxLength": 40}}},
+                              "required": ["feature_category", "use_case_ids",
+                                           "business_value", "keywords"]}},
+                      "required": ["ref", "proposal"]}}},
+        "required": ["results"]},
     # Table-synthesis (Pass B) output schemas. `_batch` is an array of per-item {ref, synthesis}
     # objects (batch harness treats `synthesis` as one structured out-key); the flat sibling is the
     # `_single_fallback` shape. [F1] per-field salvage: `as_of_basis`, `table_role`, and
@@ -1080,6 +1107,13 @@ _ITEM_META_ALLOWED = frozenset({
     # closed-vocabulary tokens (party_vocab / table_vocab / the grain flags), never uploader text.
     "term_type", "process_path", "related_terms", "ai_synonyms",
     "party_role", "grain_role", "table_role",
+    # Suggestion-discovery Task 1 — the NAMED bounded template fields of the taxonomy-proposal
+    # batch (template_discovery.discovery_proposal_items). These are REPO-AUTHORED recipe
+    # metadata (SME-authored family/intent/aggregation/stage labels and legacy use-case tags),
+    # never uploader data or sample values; each is length-bounded (`recipe_intent` below, the
+    # 200 default otherwise) and the item builder normalizes/validates them before egress.
+    "recipe_family", "recipe_intent", "recipe_aggregation", "funnel_stage",
+    "legacy_use_case_tags",
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
@@ -1143,7 +1177,10 @@ MAX_DEFINITION_LEN = 600
 # `table_definition` the SAME 600 window (it previously inherited the 200 default).
 _MAX_LEN_DEFAULT = 200
 _MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
-                   "table_definition": MAX_DEFINITION_LEN}
+                   "table_definition": MAX_DEFINITION_LEN,
+                   # Task 1: the authored one-line recipe intent (longest authored value is 323
+                   # chars at the 0F-2 baseline) — bounded above the 200 default, still closed.
+                   "recipe_intent": 400}
 
 
 def _max_len_for(key: str) -> int:
