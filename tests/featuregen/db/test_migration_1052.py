@@ -5,9 +5,9 @@ so a column addition that trips over an existing row passes every test and fails
 database that matters ("migration audits are blind to legacy data"). These tests seed a PRE-1052
 shape first, then re-apply the migration SQL exactly as the runner does.
 
-They also pin the D7 reservation reality on the tree as it IS: 1043/1045/1046/1047/1051 exist,
-1044 (codegen, other track) and 1048-1050 (Release B/C) do NOT — so 1052 may not depend on
-anything those numbers would create.
+They also pin the D7 reservation reality on the tree as it IS: 1043/1045/1046/1047/1051 exist, and
+1048/1049 landed with Release-B Task 7; 1044 (codegen, other track) and 1050 (Release C) do NOT —
+so 1052 may not depend on anything those numbers would create.
 """
 from __future__ import annotations
 
@@ -105,9 +105,10 @@ def test_1052_applies_with_its_real_neighbours_and_none_of_the_unwritten_reserva
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
     assert {"1043", "1045", "1046", "1047", "1051", "1052"} <= present
-    # 1044 belongs to the codegen-remediation track and 1048-1050 to Releases B/C; neither is on
-    # this tree, so 1052 stands on what exists.
-    assert not ({"1044", "1048", "1049", "1050"} & present)
+    # 1044 belongs to the codegen-remediation track and 1050 to Release C; neither is on this tree,
+    # so 1052 stands on what exists. (1048/1049 arrived with Release-B Task 7 and are irrelevant to
+    # 1052, which touches only `graph_node`.)
+    assert not ({"1044", "1050"} & present)
 
 
 def test_1052_is_the_only_number_this_stream_allocated() -> None:

@@ -40,6 +40,7 @@ package's import graph (the same concern ``intent.py``'s own docstring records a
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -54,6 +55,7 @@ from featuregen.overlay.upload.bridge_realization import ExecutionTier
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
 if TYPE_CHECKING:                      # import weight — see the module docstring
+    from featuregen.contracts import DbConn
     from featuregen.overlay.upload.semantic_context import EvidenceAuthorityV1
 
 #: Canonical-content contract tokens — bump only on a meaning-bearing schema change.
@@ -69,6 +71,14 @@ class SelectionError(ValueError):
 
     Routes map it to a 400; nothing was written. Distinct from a governed REFUSAL
     (:data:`SELECTION_REFUSAL_CODES`), which is a decision outcome, not a malformed input."""
+
+
+class PolicyStoreConflict(Exception):
+    """A CAS miss (the current pointer advanced past the expected version) or store corruption.
+
+    ONE exception for both policy stores: the two are the same mechanism over different keys, and a
+    route that handles a serving-policy conflict differently from a temporal one would be handling
+    the same race twice. Routes map it to a 409."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -664,3 +674,61 @@ class DatasetSourceSelectionV1:
         }
         reject_freshness_keys(payload, where="a source selection")
         return payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# Authoring-time reference validation (Task 7: "validate every dataset and column ref exists and is
+# readable when authored"). Lives HERE, beside `normalize_dataset_ref`, so both policy stores and
+# the routes share ONE notion of "this ref names something the author may see" — a second copy in
+# each store is how two surfaces end up with two different answers for one ref.
+#
+# HIDDEN AND MISSING ARE THE SAME MESSAGE, deliberately. Telling an author "that dataset exists but
+# you may not see it" is an existence oracle over a catalog they were not granted; the D11 derived
+# table-anchor scope is applied and both outcomes read as "not a readable dataset".
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _graph_key(logical_ref: str) -> tuple[str, str]:
+    """(catalog_source, graph object_ref) for a normalized logical ref.
+
+    The graph stores nodes PUBLIC-FLATTENED (`field_resolution._graph_key` convention), so a
+    schema-preserving `bank::dpl_eib.orders` is looked up as `public.orders`."""
+    source, _schema, table, column = parse_ref(logical_ref)
+    ref = f"public.{table}" + (f".{column}" if column else "")
+    return source, ref.lower()
+
+
+def assert_dataset_refs_readable(conn: DbConn, refs: Iterable[str], *,
+                                 roles: Iterable[str] = ()) -> None:
+    """Every ref must name a TABLE node the caller can see under the D11 DERIVED anchor scope."""
+    from featuregen.overlay.upload.read_scope import allowed_classes, anchor_visibility_predicate
+
+    allowed = allowed_classes(roles)
+    for ref in refs:
+        source, object_ref = _graph_key(ref)
+        row = conn.execute(
+            "SELECT 1 FROM graph_node gn WHERE gn.catalog_source = %s AND gn.object_ref = %s "
+            f"AND gn.kind = 'table' AND {anchor_visibility_predicate('gn')} LIMIT 1",
+            (source, object_ref, allowed, allowed)).fetchone()
+        if row is None:
+            raise SelectionError(
+                f"{ref!r} is not a readable dataset in this catalog: a policy may only name "
+                "datasets that exist and that its author can see")
+
+
+def assert_column_refs_readable(conn: DbConn, refs: Iterable[str], *,
+                                roles: Iterable[str] = ()) -> None:
+    """Every ref must name a COLUMN node the caller can see (its own ``visible_requires``)."""
+    from featuregen.overlay.upload.read_scope import allowed_classes
+
+    allowed = allowed_classes(roles)
+    for ref in refs:
+        source, object_ref = _graph_key(ref)
+        row = conn.execute(
+            "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = %s "
+            "AND kind = 'column' AND COALESCE(visible_requires, '{}') <@ %s LIMIT 1",
+            (source, object_ref, allowed)).fetchone()
+        if row is None:
+            raise SelectionError(
+                f"{ref!r} is not a readable column in this catalog: a policy may only reference "
+                "columns that exist and that its author can see")
