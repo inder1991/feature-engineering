@@ -23,9 +23,14 @@ DECLARATION gap, not a data defect (unlike SCD overlap): naming a tie-break colu
 is exactly why ``data_agent.learning`` routes it to ``SNAPSHOT_TIE_BREAK_UNDECLARED`` while it
 deliberately routes overlap nowhere.
 
-**Ordering is DESC, and the tie-breakers are too.** "Latest" is the greatest snapshot value; a
-tie-break column is read the same way, so a declared ``load_seq``/``version`` picks the highest.
-Any other reading would have to be declared, and no frozen contract carries that declaration.
+**Ordering is DESC NULLS LAST, and the tie-breakers are too.** "Latest" is the greatest snapshot
+value; a tie-break column is read the same way, so a declared ``load_seq``/``version`` picks the
+highest. Any other reading would have to be declared, and no frozen contract carries that
+declaration. The null placement is EXPLICIT rather than the dialect's default, because the defaults
+disagree — PostgreSQL orders NULLS FIRST on DESC and Hive/Spark NULLS LAST, so one governed decision
+selected a different row per engine. A NULL tie-break value cannot WIN a tie (it declares nothing);
+two NULLs are simply not separated by that ref and the ordering falls through to the next one. See
+:meth:`LatestSnapshotPolicyV1._ordering`.
 
 **Rendered through the caller's dialect**, exactly like every other predicate in this package:
 ``quote`` is the dialect's ``ident`` and the table reference is the dialect's ``table_ref``. A
@@ -112,8 +117,28 @@ class LatestSnapshotPolicyV1:
         return f"{quote(self.snapshot_column)} <= {literal}"
 
     def _ordering(self, quote) -> str:
-        parts = [f"{quote(self.snapshot_column)} DESC"]
-        parts += [f"{quote(column)} DESC" for column in self.tie_break_columns]
+        """``DESC NULLS LAST``, on every column, in every dialect — never a bare ``DESC``.
+
+        A bare ``DESC`` is not one ordering, it is two: PostgreSQL defaults to NULLS FIRST and
+        Hive/Spark to NULLS LAST, so a nullable tie-break column picked a DIFFERENT winner per
+        engine for the same governed decision — and worse, the tie probe agreed with it. On
+        PostgreSQL a NULL ``load_seq`` sorted alone at rank 1, so ``RANK`` saw no tie, nothing
+        refused, and the row that answered the question was the one that declared nothing.
+
+        The SEMANTIC, stated once here: **a NULL tie-break value cannot WIN a tie.** A tie-breaker
+        is a declaration about which row supersedes another, and a row that carries no value has
+        made no such declaration — it must not beat a row that has. NULLS LAST on DESC is exactly
+        that rule. Two rows that are BOTH null are not separated by that ref at all: the ordering
+        falls through to the next declared ref, and refuses when none of them separates the pair,
+        which is :func:`assert_no_snapshot_tie` doing its job rather than read order doing it.
+
+        ``NULLS LAST`` is explicit in BOTH rendered statements (the selection and the probe), so
+        the two can never disagree, and it is standard SQL that PostgreSQL, Hive (2.1+) and Spark
+        all parse — the ordering does not need to know which dialect it is being read by, only that
+        it may not rely on that dialect's default.
+        """
+        parts = [f"{quote(self.snapshot_column)} DESC NULLS LAST"]
+        parts += [f"{quote(column)} DESC NULLS LAST" for column in self.tie_break_columns]
         return ", ".join(parts)
 
     def _partition(self, quote) -> str:

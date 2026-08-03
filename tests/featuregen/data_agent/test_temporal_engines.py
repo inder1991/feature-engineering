@@ -213,6 +213,78 @@ def test_a_tie_breaker_that_does_not_separate_them_still_refuses(pilot):
     assert exc.value.code == TEMPORAL_SNAPSHOT_TIE
 
 
+# ── ENGINE B: the null half of a tie-breaker ────────────────────────────────────────────────────
+#
+# A tie-break column is nullable in every real bank table, and a bare `DESC` is not one ordering:
+# PostgreSQL puts NULLS FIRST, Hive/Spark put them LAST. The same governed decision therefore
+# selected a different row per engine, and the tie probe AGREED with the wrong one — a NULL sorted
+# alone at rank 1, `RANK` saw no tie, and the row that answered the question was the one that
+# declared nothing.
+
+
+def _tied_pair(conn, key: str, *seq_values) -> None:
+    """Two rows for one entity, stamped on the SAME snapshot date, differing only in `load_seq`."""
+    for index, seq in enumerate(seq_values):
+        conn.execute(
+            f"INSERT INTO {CUSTOMER_SCHEMA}.{SNAPSHOT_TABLE} VALUES (%s, %s, %s, %s, %s)",
+            (key, f"SEG{index}", f"SECTOR{index}", REPORT_CUTOFF, seq))
+
+
+def test_a_NULL_tie_break_value_cannot_WIN_a_tie(pilot):
+    """The probe the review ran: on PostgreSQL the NULL beat the 5, because DESC defaults to NULLS
+    FIRST there. A row carrying no `load_seq` has declared nothing about superseding anything."""
+    _tied_pair(pilot, "C8", None, 5)
+    policy = _snapshot(tie_break_columns=("load_seq",))
+    picked = {r[0]: r[1] for r in pilot.execute(
+        policy.ranked_selection(_Q, table_ref=_SNAPSHOT_REF, columns=("segment",))).fetchall()}
+    assert picked["C8"] == "SEG1"                    # the row that declared load_seq = 5
+
+
+def test_a_NULL_against_a_VALUE_is_separated_and_does_not_refuse(pilot):
+    """The other half of the same rule: the ordering genuinely decides that pair, so the tie gate
+    has nothing to refuse — and the winner is the declared row, not read order."""
+    _tied_pair(pilot, "C8", None, 5)
+    assert_no_snapshot_tie(pilot, _snapshot(tie_break_columns=("load_seq",)),
+                           table_ref=_SNAPSHOT_REF, dialect=PostgresDialect())
+
+
+def test_two_NULL_tie_break_values_are_UNRESOLVED_by_that_ref_and_refuse(pilot):
+    """NULLS LAST separates a null from a value; it cannot separate two nulls. Nothing declared
+    tells these two rows apart, so the answer would be read order — refused."""
+    _tied_pair(pilot, "C8", None, None)
+    with pytest.raises(SnapshotSelectionError) as exc:
+        assert_no_snapshot_tie(pilot, _snapshot(tie_break_columns=("load_seq",)),
+                               table_ref=_SNAPSHOT_REF, dialect=PostgresDialect())
+    assert exc.value.code == TEMPORAL_SNAPSHOT_TIE
+
+
+def test_an_unresolved_ref_falls_through_to_the_NEXT_declared_ref(pilot):
+    """"Unresolved by that ref" means the ordering continues, not that it stops: both rows are NULL
+    on `load_seq`, and the second declared tie-breaker separates them."""
+    _tied_pair(pilot, "C8", None, None)
+    policy = _snapshot(tie_break_columns=("load_seq", "sector"))
+    assert_no_snapshot_tie(pilot, policy, table_ref=_SNAPSHOT_REF, dialect=PostgresDialect())
+    picked = {r[0]: r[1] for r in pilot.execute(
+        policy.ranked_selection(_Q, table_ref=_SNAPSHOT_REF, columns=("segment",))).fetchall()}
+    assert picked["C8"] == "SEG1"                    # SECTOR1 > SECTOR0 descending
+
+
+def test_both_rendered_statements_carry_EXPLICIT_null_placement_in_BOTH_dialects():
+    """The defaults disagree, so neither statement may rely on one. Pinned on the SELECTION and the
+    PROBE together: the two disagreeing is how a tie gate passes a query it cannot see."""
+    from featuregen.data_agent.sql_hive import HiveDialect
+
+    policy = _snapshot(tie_break_columns=("load_seq",))
+    for dialect in (PostgresDialect(), HiveDialect()):
+        quote = dialect.ident
+        selection = policy.ranked_selection(quote, table_ref="t", columns=("segment",))
+        probe = policy.tie_probe(quote, table_ref="t")
+        for sql in (selection, probe):
+            assert f"{quote('snapshot_date')} DESC NULLS LAST" in sql, (dialect.name, sql)
+            assert f"{quote('load_seq')} DESC NULLS LAST" in sql, (dialect.name, sql)
+        assert " DESC," not in selection and " DESC)" not in selection
+
+
 def test_a_per_table_snapshot_scope_names_no_entity_key():
     with pytest.raises(SnapshotSelectionError, match="SNAPSHOT_SCOPE_CONTRADICTION"):
         _snapshot(scope=SnapshotScope.PER_TABLE)
