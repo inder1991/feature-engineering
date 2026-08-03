@@ -101,10 +101,47 @@ def test_the_unclassified_family_declines_in_both_modes(case: sg.SemanticGoldCas
 
 def test_the_cross_namespace_controls_name_real_gold_columns() -> None:
     known = {c.column for c in sg.cases()} | {row.column for row, _c, _r in sg.peer_columns()}
-    for left, right, _why in (*sg.must_not_pair(), *sg.may_pair()):
+    for left, right, _why in (*sg.must_not_pair(), *sg.unreachable_by_topology(), *sg.may_pair()):
         assert left in known, left
         assert right in known, right
     assert sg.may_pair(), "a must-not-pair list with no positive control proves nothing"
+
+
+def test_every_graded_cross_namespace_control_is_cross_source() -> None:
+    """The load-bearing shape guard on the bar-1 gold.
+
+    `derive_bridge_candidates` enumerates `combinations(sources, 2)`, so it can only ever offer a
+    CROSS-source pair. A must-not-pair control whose two columns share a catalog source is therefore
+    refused by the topology before the namespace gate is consulted, and grading it makes the bar
+    unfailable — which is exactly what the six original controls did until 2026-08-03. This refuses
+    to let one back in.
+    """
+    assert sg.must_not_pair(), "no graded control at all"
+    for left, right, _why in sg.must_not_pair():
+        assert sg.column_source(left) != sg.column_source(right), (
+            f"{left} <-> {right} is intra-source; move it to `unreachable_by_topology`")
+
+
+def test_the_unreachable_controls_are_honestly_labelled() -> None:
+    """The relabelled six must be exactly what the name claims: intra-source, hence unreachable."""
+    assert sg.unreachable_by_topology(), "the relabelled list vanished rather than being carried"
+    for left, right, _why in sg.unreachable_by_topology():
+        assert sg.column_source(left) == sg.column_source(right), (
+            f"{left} <-> {right} is CROSS-source and therefore reachable — it belongs in "
+            f"`must_not_pair`, where it would be graded")
+    graded = {frozenset({a, b}) for a, b, _why in sg.must_not_pair()}
+    for left, right, _why in sg.unreachable_by_topology():
+        assert frozenset({left, right}) not in graded, f"{left} <-> {right} is in both lists"
+
+
+def test_the_positive_controls_are_cross_source_too() -> None:
+    """A same-namespace control that the derivation could not offer either would prove nothing."""
+    for left, right, _why in sg.may_pair():
+        assert sg.column_source(left) != sg.column_source(right), f"{left} <-> {right}"
+    forbidden = {frozenset({a, b}) for a, b, _why in sg.must_not_pair()}
+    for left, right, _why in sg.may_pair():
+        assert frozenset({left, right}) not in forbidden, \
+            f"{left} <-> {right} is both permitted and forbidden"
 
 
 def test_the_retrieval_questions_name_real_gold_columns() -> None:

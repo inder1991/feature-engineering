@@ -52,8 +52,13 @@ def report(hermetic, db, monkeypatch) -> dict:
     families = h.family_accuracy(thin, rich)
 
     # ── 3: false cross-namespace candidates over the REAL derivation ─────────────────────────────
+    # Measured twice: once as the platform runs, and once with the namespace gate collapsed. The
+    # second run is the reachability denominator — it is what makes the first run's zero a
+    # measurement rather than a property of the fixture's topology.
     h.seed_gold_catalog(db)
     namespaces = h.cross_namespace_candidates(db)
+    with h.namespace_gate_disabled():
+        namespaces_ungated = h.cross_namespace_candidates(db)
 
     # ── 4: grounded retrieval, profiles off then on ──────────────────────────────────────────────
     monkeypatch.delenv("FEATUREGEN_DATASET_PROFILES", raising=False)
@@ -102,6 +107,7 @@ def report(hermetic, db, monkeypatch) -> dict:
         "unclassified_precision": {"thin": h.unclassified_precision(thin),
                                    "rich": h.unclassified_precision(rich)},
         "cross_namespace": namespaces,
+        "cross_namespace_reachability_control": namespaces_ungated,
         "grounded_retrieval": {"thin": retrieval_thin, "rich": retrieval_rich},
         "passb_replay": passb,
         "table_selection": {"thin": selection_thin, "rich": selection_rich},

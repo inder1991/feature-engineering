@@ -44,17 +44,68 @@ def test_bar_zero_bic_cif_candidates_on_the_gold_set(db) -> None:
     """No identifier-link candidate may ever pair two disjoint namespaces.
 
     Driven through the REAL `derive_bridge_candidates`, whose blocking key IS the namespace, over a
-    catalog seeded with the reviewer-expected concepts. The positive control is asserted in the same
-    test: a derivation that produced nothing at all would satisfy the zero trivially, and did
-    exactly that the first time this harness ran.
+    catalog seeded with the reviewer-expected concepts.
+
+    Two controls sit beside the zero, because a zero on its own is not a pass:
+
+    * POSITIVE — both same-namespace pairs (`cif↔cif`, `swift_bic↔swift_bic`) must be OFFERED. A
+      derivation that produced nothing at all would satisfy the zero trivially, and did exactly that
+      the first time this harness ran.
+    * REACHABILITY — every graded control must be a pair the derivation could actually produce; the
+      next test proves it by removing the gate and watching all of them appear.
     """
     h.seed_gold_catalog(db, now=NOW)
     result = h.cross_namespace_candidates(db)
 
+    # Every graded control is cross-source: an intra-source pair is refused by the topology, not by
+    # the gate, and grading one would make this bar unfailable. Asserted here, not assumed.
+    for left, right, _why in sg.must_not_pair():
+        assert sg.column_source(left) != sg.column_source(right), (
+            f"{left} <-> {right} is an INTRA-source control; `derive_bridge_candidates` never "
+            f"enumerates same-source pairs, so this bar could not fail on it")
+
     assert result["false_cross_namespace_candidates"] == 0, result["violations"]
-    assert result["positive_controls_offered"], (
-        "the same-namespace control produced no candidate either — the zero above is vacuous, "
-        "not a pass")
+    assert result["must_not_pair_checked"] == len(sg.must_not_pair()) > 0
+    assert result["positive_controls_offered"] == result["positive_controls_expected"], (
+        f"a same-namespace control was NOT offered "
+        f"({result['positive_controls_offered']} vs {result['positive_controls_expected']}) — the "
+        f"zero above is vacuous, not a pass")
+
+
+def test_bar_one_controls_are_reachable_only_the_namespace_gate_stops_them(db) -> None:
+    """The bar can FAIL. Remove the namespace gate and every graded control becomes a candidate.
+
+    `Concept.namespace` is the blocking key, so collapsing it to one literal removes the gate and
+    changes nothing else — same grounding, same type families, same source distinctness, same
+    hard-conflict suppression. What comes back is the honest denominator for the bar above:
+
+    * gate ON  — 2 candidates, both same-namespace, 0 violations
+    * gate OFF — 10 candidates, and ALL of the gold's cross-source controls are offered
+
+    That is the same standard the mutation harness holds itself to: a guard that nothing can break
+    is a guard nobody is testing. The six intra-source pairs are asserted here too, in the other
+    direction — they stay absent even with the gate gone, which is precisely why they are carried as
+    `unreachable_by_topology` and not as graded controls.
+    """
+    h.seed_gold_catalog(db, now=NOW)
+    gated = h.cross_namespace_candidates(db)
+    with h.namespace_gate_disabled():
+        ungated = h.cross_namespace_candidates(db)
+
+    assert ungated["candidates_derived"] > gated["candidates_derived"], (
+        "collapsing the namespace produced no additional candidate, so the injection is not "
+        "removing anything and this control proves nothing")
+    assert ungated["false_cross_namespace_candidates"] > 0, (
+        "with the namespace gate REMOVED the gold still recorded zero violations — the controls are "
+        "unreachable and the bar above cannot fail")
+    assert ungated["false_cross_namespace_candidates"] == ungated["must_not_pair_checked"], (
+        f"only some controls are reachable: {ungated['violations']}")
+    assert ungated["positive_controls_offered"] == ungated["positive_controls_expected"]
+
+    # The relabelled six: forbidden, and refused one layer EARLIER than this bar is about.
+    assert ungated["unreachable_by_topology_offered"] == [], (
+        f"an intra-source pair became reachable: {ungated['unreachable_by_topology_offered']}")
+    assert ungated["unreachable_by_topology_checked"] == len(sg.unreachable_by_topology()) > 0
 
 
 # ── bar 2 ────────────────────────────────────────────────────────────────────────────────────────

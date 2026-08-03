@@ -674,16 +674,28 @@
   ],
   "cross_namespace_pairs": {
     "purpose": "The `zero BIC<->CIF candidates` release bar, and the `false cross-namespace candidates` per-family metric. Each entry names two gold columns and whether the platform may EVER offer them as an identifier-link candidate. Evaluated against the real grounding assessor, not a re-implementation.",
+    "why_must_not_pair_is_cross_source": "`derive_bridge_candidates` enumerates pairs only across DISTINCT catalog sources (`_derive_from_identifier_columns` blocks by (namespace, type_family) and then walks `combinations(sources, 2)`). An INTRA-source control is therefore refused by the topology before the namespace gate is ever consulted, and grading one proves nothing about the gate. Every entry below is cross-source and reachable: with the namespace collapsed, ALL of them are offered as candidates (`test_bar_one_controls_are_reachable_only_the_namespace_gate_stops_them`).",
     "must_not_pair": [
-      {"left": "counter_party_bic", "right": "counter_party_cif_id", "why": "swift_bic and cif are disjoint registries; equal values would be a coincidence"},
-      {"left": "counter_party_bic", "right": "dr_acct_num", "why": "swift_bic vs internal_account"},
-      {"left": "benef_acct_num", "right": "dr_acct_num", "why": "external_account vs internal_account -- the same defect one level down"},
-      {"left": "counter_party_cif_id", "right": "sol_id", "why": "cif vs branch_sol"},
-      {"left": "counter_party_cif_id", "right": "tran_serial_num", "why": "cif vs core_serial"},
-      {"left": "sol_desc", "right": "sol_id", "why": "a DESCRIPTION is never an identifier endpoint, even for the same branch"}
+      {"left": "cust_swift_cd", "right": "counter_party_cif_id", "why": "swift_bic and cif are disjoint registries; equal values would be a coincidence -- the named BIC<->CIF defect, cross-catalog"},
+      {"left": "cust_cif_id", "right": "counter_party_bic", "why": "the same defect in the other direction: a CIF on the customer master against a counterparty BIC"},
+      {"left": "cust_cif_id", "right": "dr_acct_num", "why": "cif vs internal_account -- a customer registry is not an account registry"},
+      {"left": "cust_cif_id", "right": "benef_acct_num", "why": "cif vs external_account"},
+      {"left": "cust_cif_id", "right": "sol_id", "why": "cif vs branch_sol"},
+      {"left": "cust_swift_cd", "right": "dr_acct_num", "why": "swift_bic vs internal_account"},
+      {"left": "cust_swift_cd", "right": "benef_acct_num", "why": "swift_bic vs external_account -- an IBAN-shaped value is not a BIC"},
+      {"left": "cust_swift_cd", "right": "sol_id", "why": "swift_bic vs branch_sol -- an inter-bank routing code against an internal service-outlet code"}
+    ],
+    "unreachable_by_topology": [
+      {"left": "counter_party_bic", "right": "counter_party_cif_id", "why": "swift_bic and cif are disjoint registries; equal values would be a coincidence", "unreachable_because": "both columns sit in ftr.comp_fin_tran, and same-source pairs are never enumerated"},
+      {"left": "counter_party_bic", "right": "dr_acct_num", "why": "swift_bic vs internal_account", "unreachable_because": "both columns sit in ftr.comp_fin_tran"},
+      {"left": "benef_acct_num", "right": "dr_acct_num", "why": "external_account vs internal_account -- the same defect one level down", "unreachable_because": "both columns sit in ftr.comp_fin_tran"},
+      {"left": "counter_party_cif_id", "right": "sol_id", "why": "cif vs branch_sol", "unreachable_because": "both columns sit in ftr.comp_fin_tran"},
+      {"left": "counter_party_cif_id", "right": "tran_serial_num", "why": "cif vs core_serial", "unreachable_because": "both columns sit in ftr.comp_fin_tran, and `tran_serial_num` additionally resolves to type family `other`, which is excluded before pairing"},
+      {"left": "sol_desc", "right": "sol_id", "why": "a DESCRIPTION is never an identifier endpoint, even for the same branch", "unreachable_because": "both columns sit in ftr.comp_fin_tran, and `sol_desc` carries no identifier concept at all"}
     ],
     "may_pair": [
-      {"left": "counter_party_cif_id", "right": "cust_cif_id", "why": "same cif registry, same issuer -- the positive control that proves the gate is not simply refusing everything"}
+      {"left": "counter_party_cif_id", "right": "cust_cif_id", "why": "same cif registry, same issuer -- the positive control that proves the gate is not simply refusing everything"},
+      {"left": "counter_party_bic", "right": "cust_swift_cd", "why": "same swift_bic registry -- the second positive control, on the other namespace the must-not-pair list uses"}
     ]
   },
   "peer_catalog": {

@@ -262,13 +262,39 @@ def peer_columns() -> tuple[tuple[CanonicalRow, str, GlossaryRecord], ...]:
 
 
 def must_not_pair() -> tuple[tuple[str, str, str], ...]:
+    """The graded controls. Every one is CROSS-source, because that is the only shape
+    `derive_bridge_candidates` can ever produce — see `unreachable_by_topology` below."""
     return tuple((p["left"], p["right"], p["why"])
                  for p in load()["cross_namespace_pairs"]["must_not_pair"])
+
+
+def unreachable_by_topology() -> tuple[tuple[str, str, str], ...]:
+    """Dangerous pairs that the DERIVATION CANNOT OFFER whatever the namespace gate does.
+
+    They were graded as must-not-pair controls until the review of 2026-08-03 pointed out that all
+    six are intra-source, and `_derive_from_identifier_columns` enumerates only
+    `combinations(sources, 2)` — so "zero violations" was guaranteed by topology and said nothing
+    about the gate. They are kept, honestly relabelled, and asserted to be exactly what this name
+    claims: still forbidden, and refused one layer earlier than the bar is about.
+    """
+    return tuple((p["left"], p["right"], p["why"])
+                 for p in load()["cross_namespace_pairs"]["unreachable_by_topology"])
 
 
 def may_pair() -> tuple[tuple[str, str, str], ...]:
     return tuple((p["left"], p["right"], p["why"])
                  for p in load()["cross_namespace_pairs"]["may_pair"])
+
+
+def column_source(column: str) -> str:
+    """The catalog source a gold column belongs to — the anchor catalog or the peer."""
+    for c in cases():
+        if c.column == column:
+            return c.catalog_source
+    for row, _concept, _rec in peer_columns():
+        if row.column == column:
+            return row.source
+    raise KeyError(f"no gold column {column!r} in either catalog source")
 
 
 def retrieval_questions() -> tuple[dict, ...]:

@@ -382,7 +382,14 @@ def observed_table_fields(conn, *, source: str) -> dict[str, dict]:
 
 
 def cross_namespace_candidates(conn) -> dict:
-    """Run the REAL candidate derivation and grade every gold control against it."""
+    """Run the REAL candidate derivation and grade every gold control against it.
+
+    The graded controls (`must_not_pair`) are all CROSS-source, which is not a detail: the
+    derivation enumerates pairs only across distinct catalog sources, so an intra-source control is
+    refused by the topology before the namespace gate is consulted and its zero is free. Those six
+    intra-source pairs are still carried — as `unreachable_by_topology`, counted separately, so the
+    headline number is a statement about the gate and nothing else.
+    """
     from featuregen.overlay.upload.bridge_candidates import derive_bridge_candidates
 
     candidates = derive_bridge_candidates(conn, roles=("platform_admin", "pii_reader"))
@@ -393,6 +400,8 @@ def cross_namespace_candidates(conn) -> dict:
 
     violations = [f"{a} <-> {b} ({why})" for a, b, why in sg.must_not_pair()
                   if frozenset({a, b}) in pairs]
+    unreachable_seen = [f"{a} <-> {b} ({why})" for a, b, why in sg.unreachable_by_topology()
+                        if frozenset({a, b}) in pairs]
     permitted_seen = [f"{a} <-> {b}" for a, b, _why in sg.may_pair()
                       if frozenset({a, b}) in pairs]
     return {
@@ -400,8 +409,46 @@ def cross_namespace_candidates(conn) -> dict:
         "must_not_pair_checked": len(sg.must_not_pair()),
         "false_cross_namespace_candidates": len(violations),
         "violations": violations,
+        "unreachable_by_topology_checked": len(sg.unreachable_by_topology()),
+        "unreachable_by_topology_offered": unreachable_seen,
+        "positive_controls_expected": [f"{a} <-> {b}" for a, b, _why in sg.may_pair()],
         "positive_controls_offered": permitted_seen,
     }
+
+
+@contextmanager
+def namespace_gate_disabled() -> Iterator[None]:
+    """Collapse every identifier namespace to one value for the duration — the REACHABILITY control.
+
+    This is the review's injection, kept: `Concept.namespace` is the blocking key
+    (`_derive_from_identifier_columns` blocks on `(namespace, type_family)`), so rewriting every
+    endpoint's namespace to a single literal removes the gate and leaves everything else — grounding,
+    type family, source distinctness, hard-conflict suppression — exactly as it was.
+
+    It exists for the same reason the mutation harness exists: a bar that reports zero violations has
+    said nothing until someone shows the machine CAN report a violation. Under this injection the
+    gold's cross-source controls all become candidates, so the zero above is the gate's doing and not
+    the fixture's shape.
+
+    `_identifier_columns` is read from the module's globals at call time by
+    `derive_bridge_candidates_with_report`, so patching it here genuinely changes what the real
+    derivation does; the original is restored on exit.
+    """
+    from dataclasses import replace
+
+    from featuregen.overlay.upload import bridge_candidates as bc
+
+    original = bc._identifier_columns
+
+    def _collapsed(conn, *, roles):
+        return [replace(col, namespace="ALL_NAMESPACES_COLLAPSED")
+                for col in original(conn, roles=roles)]
+
+    bc._identifier_columns = _collapsed          # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        bc._identifier_columns = original        # type: ignore[assignment]
 
 
 def _column_of(ref: str) -> str:
