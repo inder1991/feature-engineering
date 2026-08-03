@@ -455,10 +455,18 @@ def _link_neighbours(conn, refs: Sequence[str], *, roles: Iterable[str],
         for link in available_identifier_links(conn, object_ref=ref):
             for endpoint in (link.assessment.left_endpoint, link.assessment.right_endpoint):
                 for member in endpoint.members:
-                    m_source, m_schema, m_table, m_column = parse_ref(member.logical_column_ref)
+                    m_source, _m_schema, m_table, m_column = parse_ref(member.logical_column_ref)
                     if m_column is None:
                         continue
-                    flat = f"{m_schema}.{m_table}.{m_column}"
+                    # PUBLIC-FLATTENED, exactly like `mine` and the `flat_refs` the caller builds.
+                    # `graph.build_graph` stores every column node as `public.<table>.<column>`
+                    # whatever schema the glossary declared, so that is the only spelling this probe
+                    # can match. Using the ref's OWN parsed schema is byte-identical today — the
+                    # bridge contract refuses a non-public member ref outright
+                    # (`bridge_assessment._canonical_logical_ref`) — but it states the invariant
+                    # three modules away from the probe that depends on it, and a widened bridge
+                    # contract would then make every partner silently unfindable rather than fail.
+                    flat = f"public.{m_table}.{m_column}"
                     if flat in mine or (m_source, m_table, m_column) in seen:
                         continue
                     considered += 1

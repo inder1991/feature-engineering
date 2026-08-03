@@ -11,7 +11,9 @@ What this file pins:
 * leg 3 expands on CONTROLLED vocabulary (concept, domain, sub-domain, entity, glossary terms and
   the D13.1 BIAN/process paths) and finds a column whose NAME shares nothing with the question —
   the functional improvement, with no embeddings anywhere;
-* leg 4 offers one-hop link partners, both endpoints re-scoped, bounded;
+* leg 4 offers one-hop link partners, both endpoints re-scoped, bounded — against a REAL available
+  identifier link, because a leg that finds the link and then drops every partner reports exactly
+  what "there are no links" reports;
 * THE OFFERED SET STAYS CLOSED: every ref legs 3/4 add is in `column_refs` before the model is
   called, and `validate_intent` still rejects anything outside it — a neighbour that was not
   offered can never enter a plan;
@@ -20,8 +22,10 @@ What this file pins:
   the offered refs already ride in — placement unchanged, which is what the recorded
   repair-exhaustion history demands;
 * a retrieval refusal now RECORDS a learning gap, which is what finally gives that store a
-  production producer — with the subject taken from REDACTED text so a customer name in a question
-  can never become an ontology candidate.
+  production producer — with the subject drawn from the platform's CONTROLLED VOCABULARY, never
+  from the question's own words, so a customer name in a question cannot become an ontology
+  candidate. (Redaction alone does not achieve that: it documents personal-name detection as
+  deferred, and the Ahmed Al-Mansouri probe below is what proves it.)
 """
 from __future__ import annotations
 
@@ -294,6 +298,79 @@ def test_the_link_leg_reports_itself_even_with_no_links(catalog):
     leg = _legs(got)[LEG_LINK_NEIGHBOURHOOD]
     assert leg.leg == LEG_LINK_NEIGHBOURHOOD
     assert leg.offered == 0 and leg.considered == 0
+
+
+@pytest.fixture
+def linked_catalogs(db):
+    """An AVAILABLE identifier link whose partner lives in a SCHEMA-BEARING catalog.
+
+    That is the FTR norm, not an edge case: a glossary declares `dpl_eib`, the ledger stores the
+    endpoint schema-preserving, and `graph.build_graph` stores the NODE public-flattened. Leg 4
+    probed the graph with the ledger's spelling, so on every such catalog the partner was
+    unfindable — considered > 0, offered 0, and the leg reported itself as having simply found
+    nothing."""
+    import json
+
+    from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+
+    from featuregen.events.registry import event_registry
+    from featuregen.overlay.facts import register_overlay_event_types
+
+    # The root harness resets the event registry per test; the governed bridge stream is appended
+    # through the REAL event store, so its schemas have to be present.
+    register_overlay_event_types(event_registry())
+    _watermark(db, "srca")
+    _watermark(db, "srcb")
+    _column(db, "srca", "trades", "trade_id", definition="trade identifier", grain=True)
+    # Deliberately shares NO word with the question: it must arrive through the LINK, or the test
+    # would pass on a lexical hit and prove nothing about leg 4.
+    _column(db, "srcb", "settlements", "stl_ref", definition="settled row marker", grain=True)
+    db.execute(
+        "INSERT INTO entity_bridge_candidate_evidence (entity_id, left_catalog_source, "
+        " left_object_ref, right_catalog_source, right_object_ref, candidate_id, fact_key, "
+        " data_type_family, evidence_json, derivation_version) "
+        "VALUES ('trade','srca','public.trades.trade_id','srcb','public.settlements.stl_ref', "
+        "        'cand-1','fk-trade','text',%s,'1.0.0')",
+        (json.dumps({"entity_id": "trade", "type_basis": "declared", "candidate_id": "cand-1",
+                     "left_is_grain": True, "right_is_grain": True,
+                     "data_type_family": "text", "derivation_version": "1.0.0"}),))
+    govern_bridge_fact(db, "fk-trade", entity="trade",
+                       left_source="srca", left_ref="public.trades.trade_id",
+                       right_source="srcb", right_ref="public.settlements.stl_ref",
+                       status="DRAFT")
+    return db
+
+
+def test_leg_four_offers_a_REAL_partner_from_a_schema_bearing_catalog(linked_catalogs):
+    """The missing REAL-link test. Every other leg-4 assertion in this file ran against a fixture
+    with no links at all, so a leg that found the link and then dropped every partner reported
+    exactly what "no links" reports."""
+    got = retrieve_candidates(linked_catalogs, "trade identifier", now=_NOW)
+    leg = _legs(got)[LEG_LINK_NEIGHBOURHOOD]
+    assert leg.considered > 0, "the link was never found — this fixture proves nothing"
+    assert leg.offered > 0, "the partner was found and dropped: the graph probe used the wrong ref"
+    # Offered in the PUBLIC-FLATTENED spelling every other leg and `validate_intent` use — two
+    # spellings of one identity in one prompt is how a model names the wrong column.
+    assert "srcb::settlements.stl_ref" in got.candidates.column_refs
+    assert "srcb::settlements" in got.candidates.table_refs
+
+
+def test_a_bridge_member_ref_can_only_ever_be_PUBLIC_FLATTENED(catalog):
+    """Why leg 4's graph probe may spell the partner `public.<table>.<column>` outright: the bridge
+    contract refuses any other schema, and the graph stores column nodes flat regardless. Pinned
+    HERE, beside the probe that depends on it — if the bridge contract ever widens to carry a real
+    schema, this fails loudly instead of every partner silently becoming unfindable."""
+    from featuregen.overlay.upload.bridge_assessment import (
+        BridgeContractError,
+        IdentifierColumnMemberV1,
+        TypeBasis,
+    )
+
+    member = IdentifierColumnMemberV1("srcb::public.settlements.stl_ref", "text",
+                                      TypeBasis.UNKNOWN)
+    assert member.logical_column_ref == "srcb::public.settlements.stl_ref"
+    with pytest.raises(BridgeContractError, match="flat public namespace"):
+        IdentifierColumnMemberV1("srcb::dpl_eib.settlements.stl_ref", "text", TypeBasis.UNKNOWN)
 
 
 # ── the offered set stays CLOSED ────────────────────────────────────────────────────────────────
