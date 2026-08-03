@@ -585,6 +585,39 @@ def test_the_chain_calls_the_REAL_run_l0_and_an_interpreter_without_kedro_proves
     assert outcome.validation_report.findings[0].classification is FindingClass.RENDERER_DEFECT
 
 
+def test_a_build_proof_about_ANOTHER_ARTIFACT_is_refused_rather_than_recorded(
+        catalog, monkeypatch, tmp_path) -> None:
+    """A PASSED report is only a proof if it is a proof about THIS generation's bytes.
+
+    Nothing violates that today — `run_l0` is handed the tree `materialize_to` wrote four lines
+    above the call — but that is a property of two adjacent lines, and adjacency is not a guarantee.
+    A report carried over from another tree (a cached verdict, a re-used report object, a seam
+    someone rewires) would let the terminal say "proven to build" about bytes nobody validated.
+
+    It raises rather than refuses — this is a defect in the chain, not a verdict about a feature —
+    and the raise aborts the whole transaction, so no generation, no terminal and no tree survive
+    it. Recording the proof and flagging it afterwards is not available on an append-only plane."""
+    request_id = _request(catalog, request_id="req-wrong-artifact")
+    work_items = [_authored(catalog, monkeypatch, suffix="wrongart")]
+
+    def _proof_of_something_else(root, **kwargs):
+        honest = _verdict(root, generation_id=kwargs["generation_id"],
+                          environment_id=kwargs["environment_id"], report_id=kwargs["report_id"],
+                          clock=kwargs["clock"])
+        return dataclasses.replace(honest, generated_project_hash="b" * 64)
+
+    monkeypatch.setattr(chain, "run_l0", _proof_of_something_else)
+
+    with pytest.raises(ValueError, match="this generation seals"):
+        _run(catalog, request_id, work_items, tmp_path)
+
+    assert catalog.execute("SELECT count(*) FROM materialization_generation").fetchone()[0] == 0
+    assert catalog.execute("SELECT count(*) FROM pipeline_validation_report").fetchone()[0] == 0
+    assert catalog.execute("SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
+    assert read_request(catalog, request_id=request_id).lifecycle_state is RequestLifecycle.ACCEPTED
+    assert not list(pathlib.Path(tmp_path).iterdir())
+
+
 def test_a_replayed_run_reports_the_RECORDED_build_proof(catalog, monkeypatch, tmp_path) -> None:
     """`stopped_at` and `refusal` stay `None` on a replay because neither is durable — the report
     IS, so reading it back is a reading rather than a reconstruction. A re-delivered queue job that

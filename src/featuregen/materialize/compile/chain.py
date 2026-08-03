@@ -664,19 +664,38 @@ def _prove_the_build(root: pathlib.Path, *, project: SealedProject, l0: L0Interp
     The report is built off the SEALED identity rather than off the tree, because the two hashes it
     carries are claims about the artifact this generation names, and a directory that failed to
     hash to its lock is a finding rather than a new identity.
+
+    Raises:
+        ValueError: the report describes a DIFFERENT artifact than the one this generation names.
+            Today that cannot happen — ``root`` is the tree ``materialize_to(project, …)`` wrote
+            four lines above the call — but "cannot happen" is a property of two adjacent lines,
+            and the whole of this task is that a build proof must be about the project the record
+            names STRUCTURALLY rather than by proximity. A ``ValueError`` rather than a governed
+            code, for §14's reason: this is a defect in this module, not a verdict about a feature,
+            and it aborts the transaction rather than recording a proof about the wrong bytes.
     """
     if l0 is None:
         started_at = clock()
-        return ValidationReportV1(
+        report = ValidationReportV1(
             report_id=report_id, generation_id=generation_id, run_id=None,
             generated_project_hash=project.identity.generated_project_hash,
             group_plan_hash=project.identity.compilation.group_plan_hash,
             level=ValidationLevel.L0, environment_id=environment_id,
             status=ValidationStatus.ERROR, started_at=started_at, finished_at=clock(),
             findings=())
-    return run_l0(root, generation_id=generation_id, environment_id=environment_id,
-                  report_id=report_id, python_executable=l0.python_executable, clock=clock,
-                  env=l0.env, timeout_seconds=l0.timeout_seconds)
+    else:
+        report = run_l0(root, generation_id=generation_id, environment_id=environment_id,
+                        report_id=report_id, python_executable=l0.python_executable, clock=clock,
+                        env=l0.env, timeout_seconds=l0.timeout_seconds)
+
+    sealed = project.identity.generated_project_hash
+    if report.generated_project_hash != sealed:
+        raise ValueError(
+            f"L0 reported on {report.generated_project_hash!r} and this generation seals "
+            f"{sealed!r}: a build proof is a claim about a SPECIFIC artifact, and one carried over "
+            f"from another tree would let the terminal say 'proven to build' about bytes nobody "
+            f"validated — which the append-only plane could never retract")
+    return report
 
 
 def _unproven_detail(report: ValidationReportV1, *, configured: bool) -> str:
@@ -715,6 +734,17 @@ def _publish_tree(staging: pathlib.Path, root: pathlib.Path) -> None:
     ``os.replace``, which is atomic on a POSIX filesystem and — because ``rename`` onto a non-empty
     directory fails — cannot silently overwrite an earlier generation's tree either. ``_commit``'s
     own ``except`` removes the partial on any failure.
+
+    WHAT IS PUBLISHED IS THE STAGED TREE **PLUS L0'S RESIDUE**, and that is worth stating.
+    ``_probe_verdict`` runs the probe with ``cwd`` set to the staging directory and imports the
+    project there, so ``__pycache__`` written by that import is inside the tree this function then
+    publishes: the directory at ``root`` is NOT byte-identical to ``materialize_to``'s output.
+    It is benign today and by design — ``validation.py``'s ``_files_on_disk`` skips ``__pycache__``
+    for exactly this reason ("L0's own probe creates the first of them") and the rendered
+    ``PROJECT_INTEGRITY`` gate uses the same skip list, so both hashers still see the sealed file
+    set. It is recorded because the invariant is narrower than it looks: a future probe with richer
+    side effects (a ``.lock``, a log, a compiled extension) would publish those too, and anything
+    outside that shared skip list becomes drift the integrity gate reports against the operator.
     """
     root.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, root)
