@@ -277,8 +277,16 @@ def test_template_content_edit_moves_recipe_revision_not_discovery_revision():
     entry = DISCOVERY_METADATA[template.id]
     edited = dataclasses.replace(template, notes=("edited",))
     assert recipe_revision_id(edited) != recipe_revision_id(template)  # D5, accepted
-    # the discovery entry's semantic hash cites nothing occurrence-shaped, so it stands still
-    assert discovery_metadata_revision_id(entry) == discovery_metadata_revision_id(entry)
+    # Re-citing the NEW recipe revision in the evidence is occurrence provenance (0F-4 rule 3),
+    # so the discovery revision stands still — the two identities never drag each other.
+    recited = dataclasses.replace(
+        entry,
+        canonical_use_cases=tuple(
+            dataclasses.replace(a, evidence=(dataclasses.replace(
+                a.evidence[0],
+                producer_ref=f"recipe-revision:{recipe_revision_id(edited)}"),))
+            for a in entry.canonical_use_cases))
+    assert discovery_metadata_revision_id(recited) == discovery_metadata_revision_id(entry)
 
 
 def test_discovery_revision_survives_reordering_and_evidence_replay():

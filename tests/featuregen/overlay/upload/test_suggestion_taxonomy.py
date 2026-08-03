@@ -9,7 +9,6 @@ from __future__ import annotations
 import pytest
 
 from featuregen.contracts.contract_versions import contract_owner
-from featuregen.overlay.upload.templates import ALL_TEMPLATES
 from featuregen.overlay.upload.suggestion_taxonomy import (
     FEATURE_CATEGORY_REGISTRY,
     RECIPE_FAMILY_REGISTRY,
@@ -26,6 +25,7 @@ from featuregen.overlay.upload.suggestion_taxonomy import (
     validate_recipe_families,
     validate_taxonomy_change_log,
 )
+from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 _OWNER_MODULE = "featuregen.overlay.upload.suggestion_taxonomy"
 

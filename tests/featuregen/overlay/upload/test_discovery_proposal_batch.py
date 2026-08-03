@@ -15,7 +15,6 @@ import pytest
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.enrich_batch import BatchItem
 from featuregen.overlay.upload.enrich_llm import _ITEM_META_ALLOWED, _SCHEMAS
-from featuregen.overlay.upload.suggestion_taxonomy import FEATURE_CATEGORY_REGISTRY
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 from featuregen.overlay.upload.template_discovery import (
     DISCOVERY_PROPOSAL_ABSTAIN,

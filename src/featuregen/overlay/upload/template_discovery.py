@@ -36,6 +36,7 @@ NO live dispatch from import, tests or page reads.
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -675,7 +676,6 @@ def discovery_proposal_items(templates: Sequence[Template]) -> list:
     from featuregen.overlay.upload.enrich_batch import BatchItem  # lazy: heavy import chain
 
     def _bounded(value: str, *, field: str, bound: int) -> str:
-        import unicodedata
         normalized = unicodedata.normalize("NFC", value)
         if len(normalized) > bound:
             raise TaxonomyValidationError(
