@@ -40,9 +40,15 @@ from featuregen.data_agent.learning import (
 )
 from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
 from featuregen.overlay.upload.source_selection import (
+    SELECTION_AUTHORITY_INSUFFICIENT,
+    SELECTION_BINDING_MISSING,
     SELECTION_POPULATION_UNDECLARED,
     SELECTION_REFUSAL_CODES,
+    SELECTION_SOURCE_AMBIGUOUS,
+    TEMPORAL_HISTORICAL_CURRENT_ONLY,
+    TEMPORAL_MODEL_UNKNOWN,
     TEMPORAL_SCD_OVERLAP,
+    TEMPORAL_SNAPSHOT_TIE,
 )
 
 _TABLE = "bank::public.customer_master"
@@ -149,6 +155,69 @@ def test_the_other_refusals_are_applied_by_the_selector_not_by_editing_the_plan(
                           base_table_ref=_TABLE, measure=Measure(op="count", logical_ref=""))
     with pytest.raises(ClarificationError, match="selects its sources and rows"):
         apply_answer(plan, code, (_COL,), CANDIDATES)
+
+
+# ── the order the questions are asked in is a DECISION, not an accident ─────────────────────────
+
+def test_the_question_order_is_a_total_order_no_two_codes_can_swap():
+    """`clarifications_for` sorts a SET, and a set of strings iterates in an order PYTHONHASHSEED
+    decides. Any two codes sharing a rank therefore swap places between processes — the same
+    question order is not even reproducible for one user twice. The rank alone is not enough to
+    prevent it (three codes sat at rank 0), so the key carries the code NAME as a tiebreak and this
+    test pins that the resulting key is INJECTIVE over the whole vocabulary."""
+    from featuregen.analysis.clarify import _ORDER, _clarification_rank
+
+    codes = sorted(UNRESOLVED_CODES | set(_ORDER))
+    keys = [_clarification_rank(code) for code in codes]
+    assert len(set(keys)) == len(keys)
+
+
+def test_the_population_outranks_every_question_it_decides_the_meaning_of():
+    """Which table is the population decides what every later answer is ABOUT (`spine.py`: a wrong
+    population silently shrinks the answer). Only the refusals that settle WHICH dataset and WHICH
+    rows serve the need may precede it — and the selector's own population refusal is first of all.
+    Nothing about the shape of the answer, and neither ROW question, may come before it."""
+    from featuregen.analysis.clarify import _ORDER, _clarification_rank
+
+    ahead = {code for code in UNRESOLVED_CODES
+             if _clarification_rank(code) < _clarification_rank("population")}
+    assert ahead == {SELECTION_POPULATION_UNDECLARED, SELECTION_SOURCE_AMBIGUOUS,
+                     SELECTION_AUTHORITY_INSUFFICIENT, SELECTION_BINDING_MISSING,
+                     TEMPORAL_MODEL_UNKNOWN, TEMPORAL_HISTORICAL_CURRENT_ONLY}
+    assert min(_clarification_rank(c) for c in UNRESOLVED_CODES) == _clarification_rank(
+        SELECTION_POPULATION_UNDECLARED)
+    # The two that used to TIE with `population` are strictly after it BY RANK — not merely broken
+    # apart by the name tiebreak, which would leave the real ordering to alphabetical luck.
+    for code in (TEMPORAL_SNAPSHOT_TIE, TEMPORAL_SCD_OVERLAP):
+        assert _ORDER[code] > _ORDER["population"], code
+
+
+def test_the_asked_order_is_byte_stable_across_shuffled_input():
+    """Three runs, the raised codes shuffled each time: the questions come back identical. The
+    caller's enumeration order is an implementation detail and must not reach the user."""
+    import random
+
+    from featuregen.analysis.clarify import clarifications_for
+    from featuregen.analysis.intent import IntentExtraction
+    from featuregen.analysis.plan import AnalysisPlanV1, Measure
+
+    raised = ["population", "entity", "dimensions", "measure", TEMPORAL_SNAPSHOT_TIE,
+              TEMPORAL_SCD_OVERLAP, SELECTION_POPULATION_UNDECLARED, "windows", "comparison"]
+    plan = AnalysisPlanV1(question="q", entity="customer", entity_ref=_COL, base_table_ref=_TABLE,
+                          measure=Measure(op="count", logical_ref=""))
+    seen = set()
+    for seed in (1, 2, 3):
+        shuffled = list(raised)
+        random.Random(seed).shuffle(shuffled)
+        asked = tuple(c.code for c in clarifications_for(
+            IntentExtraction(plan=plan, unresolved=tuple(shuffled)), CANDIDATES))
+        seen.add(asked)
+    assert len(seen) == 1, seen
+    (asked,) = seen
+    assert asked[0] == SELECTION_POPULATION_UNDECLARED   # the selector's population, then the rest
+    assert asked.index("population") < asked.index(TEMPORAL_SNAPSHOT_TIE)
+    assert asked.index("population") < asked.index(TEMPORAL_SCD_OVERLAP)
+    assert set(asked) == set(raised)
 
 
 # ── learning: seven gaps, one deliberate non-gap ────────────────────────────────────────────────

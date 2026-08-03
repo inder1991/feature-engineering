@@ -87,15 +87,22 @@ def clarifications_for(extraction: IntentExtraction,
     is asked first. A user who picks dimensions before an entity can be asked to pick again.
     """
     raised = {code for code in extraction.unresolved if code in UNRESOLVED_CODES}
-    return tuple(_build(code, candidates)
-                 for code in sorted(raised, key=lambda c: _ORDER.get(c, 99)))
+    return tuple(_build(code, candidates) for code in sorted(raised, key=_clarification_rank))
 
 
 # Asked in the order they must be answered. The Release-B SELECTION refusals sit at the FRONT,
-# ahead of every intent question: which dataset serves the need, and which of its rows, decide what
-# the rest of the question can even mean. Asking "which attributes should the answer be split by?"
-# before "which copy of the customer master is this about?" invites a user to refine an answer that
-# is about to change underneath them.
+# ahead of every intent question — which dataset serves the need, and which of its rows, decide what
+# the rest of the question can even mean — with ONE exception, and it is the reason these ranks were
+# renumbered: the POPULATION outranks even them. Which table the answer is per decides what every
+# later answer is about, and asking which column breaks a snapshot tie before that is settled invites
+# a user to refine an answer that is about to change underneath them.
+#
+# EVERY RANK IS DISTINCT, and that is load-bearing rather than tidy. `clarifications_for` sorts a
+# SET, whose iteration order for strings is decided by PYTHONHASHSEED — so any two codes sharing a
+# rank swap places between processes, and the question order is not reproducible for one user twice.
+# Three codes used to sit at rank 0, `population` among them, which is exactly the pair the doctrine
+# above says must never invert. `_clarification_rank` carries the code NAME as a second key so a
+# rank added later without reading this comment still cannot reintroduce the coin flip.
 _ORDER = {
     SELECTION_POPULATION_UNDECLARED: -6,
     SELECTION_SOURCE_AMBIGUOUS: -5,
@@ -103,11 +110,22 @@ _ORDER = {
     SELECTION_BINDING_MISSING: -3,
     TEMPORAL_MODEL_UNKNOWN: -2,
     TEMPORAL_HISTORICAL_CURRENT_ONLY: -1,
-    TEMPORAL_SNAPSHOT_TIE: 0,
-    TEMPORAL_SCD_OVERLAP: 0,
-    "population": 0, "entity": 1, "measure": 2, "windows": 3, "comparison": 4,
-    "dimensions": 5,
+    "population": 0,
+    # Both are ROW questions about a source the population has already settled, so they follow it —
+    # and they stay ahead of the remaining intent questions, which are about the shape of the answer.
+    TEMPORAL_SNAPSHOT_TIE: 1,
+    TEMPORAL_SCD_OVERLAP: 2,
+    "entity": 3, "measure": 4, "windows": 5, "comparison": 6,
+    "dimensions": 7,
 }
+
+
+def _clarification_rank(code: str) -> tuple[int, str]:
+    """The sort key for one question: declared rank first, then the code name.
+
+    Total by construction. An unranked code sorts last (99) and, among unranked codes, alphabetically
+    — never by hash order."""
+    return (_ORDER.get(code, 99), code)
 
 
 def _build(code: str, candidates: IntentCandidates) -> Clarification:
