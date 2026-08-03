@@ -203,6 +203,19 @@ def test_unknown_cardinality_on_an_INTERMEDIATE_hop_is_refused(two_hop_catalog):
     assert result.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
 
 
+def test_unknown_cardinality_on_the_FIRST_hop_is_refused(two_hop_catalog):
+    """The mirror of the intermediate-hop test above, and the one every pre-existing fixture
+    missed: the defect sits on hop 1 and the LAST hop is a clean governed N:1. A checker that read
+    only the final hop (`steps[-1:]`) passes every other test in this file and fails here."""
+    two_hop_catalog.execute(
+        "UPDATE graph_edge SET cardinality = NULL WHERE from_ref = 'public.transactions.acct_id'")
+    result = plan_join(two_hop_catalog, catalog_source=_SRC,
+                       from_identity=TXN, to_identity=CUSTOMERS, roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+    assert "public.transactions.acct_id" in result.detail   # the FIRST hop is the one named
+
+
 def test_a_cardinality_token_outside_the_governed_vocabulary_is_also_unknown():
     """Fail closed on a token nobody has classified. The DB CHECK admits only 1:1 / 1:N / N:1
     today, so this is unreachable through the catalog — which is exactly why it is asserted on the
@@ -258,6 +271,61 @@ def test_fan_out_is_detected_on_a_REVERSE_hop(db):
                        from_identity=TXN, to_identity=CUSTOMERS, roles=_ROLES)
     assert isinstance(result, MaterializationRefused)
     assert result.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
+
+
+def test_fan_out_on_the_FIRST_hop_is_refused(db):
+    """The split-settlement shape: one transaction row lands on MANY account rows, and the second
+    hop is a perfectly governed N:1. Every pre-existing fan-out fixture put the 1:N last, so a
+    checker that only read the final hop looked correct."""
+    _col(db, "transactions", "acct_id")
+    _col(db, "accounts", "account_id")
+    _col(db, "accounts", "cif_id")
+    _col(db, "customers", "cif_id")
+    _edge(db, "public.transactions.acct_id", "public.accounts.account_id", cardinality="1:N",
+          fact_key="ajf-split-settlement", status="VERIFIED")
+    _edge(db, "public.accounts.cif_id", "public.customers.cif_id",
+          fact_key="ajf-acct-cust", status="VERIFIED")
+    result = plan_join(db, catalog_source=_SRC,
+                       from_identity=TXN, to_identity=CUSTOMERS, roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
+    assert "public.transactions.acct_id" in result.detail
+
+
+def test_fan_out_is_detected_on_a_REVERSE_FIRST_hop(db):
+    """The reverse-orientation trap, moved to hop 1: the stored edge reads accounts -N:1->
+    transactions, which travelled transactions -> accounts is 1:N. The second hop is clean, so
+    only a checker that reads EVERY hop in traversal orientation refuses this path."""
+    _col(db, "transactions", "acct_id")
+    _col(db, "accounts", "account_id")
+    _col(db, "accounts", "cif_id")
+    _col(db, "customers", "cif_id")
+    _edge(db, "public.accounts.account_id", "public.transactions.acct_id", cardinality="N:1",
+          fact_key="ajf-reverse-first", status="VERIFIED")
+    _edge(db, "public.accounts.cif_id", "public.customers.cif_id",
+          fact_key="ajf-acct-cust", status="VERIFIED")
+    result = plan_join(db, catalog_source=_SRC,
+                       from_identity=TXN, to_identity=CUSTOMERS, roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
+
+
+def test_an_N_N_token_reaching_the_adapter_END_TO_END_is_refused_as_unknown(db):
+    """`_cardinality_verdict("N:N")` is asserted directly above because migration 0993's CHECK
+    keeps the token out of `graph_edge` today. This test is the day the vocabulary widens: with
+    the CHECK gone (rolled back with the test transaction), an `N:N` edge really reaches
+    `plan_join` through the planner — and the adapter, not the schema, must be the thing that
+    refuses it."""
+    db.execute("ALTER TABLE graph_edge DROP CONSTRAINT graph_edge_cardinality_check")
+    _col(db, "transactions", "acct_id")
+    _col(db, "accounts", "account_id")
+    _edge(db, "public.transactions.acct_id", "public.accounts.account_id", cardinality="N:N",
+          fact_key="ajf-many-many", status="VERIFIED")
+    result = plan_join(db, catalog_source=_SRC,
+                       from_identity=TXN, to_identity=ACCOUNTS, roles=_ROLES)
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+    assert "'N:N'" in result.detail
 
 
 def test_the_same_edge_is_planned_when_it_fans_IN(db):

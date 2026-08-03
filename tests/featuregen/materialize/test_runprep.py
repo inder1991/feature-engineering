@@ -71,11 +71,14 @@ ZONE = "Asia/Kolkata"
 
 # ── the declared environment: one table, one mapping at a time ───────────────────────────────────
 
-def _layout(mapping, *, partition_columns=(("load_dt", "string"),), table="transactions"):
+def _layout(mapping, *, partition_columns=(("load_dt", "string"),), table="transactions",
+            columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "timestamp"))):
+    # `txn_dt` is TIMESTAMP-typed by default: the default `_pit()` zone is Asia/Kolkata, and a
+    # DATE-typed clock under a non-UTC zone now refuses at `prepare_run` (codegen-review Task 9) —
+    # the date-typed variant is built per test via `columns=_DATE_CLOCK_COLUMNS`.
     return TableLayout(
         schema="banking", table=table, partition_columns=partition_columns,
-        partition_mapping=mapping,
-        columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "date")),
+        partition_mapping=mapping, columns=columns,
         location=f"hdfs://nn/warehouse/banking.db/{table}", rewritten_in_place=False)
 
 
@@ -655,6 +658,15 @@ def test_the_execution_hash_is_reproducible_for_one_prepared_run() -> None:
     assert _ok(_prepared()).sandbox_execution_hash == _ok(_prepared()).sandbox_execution_hash
 
 
+def test_business_dt_whitespace_does_not_fork_execution_identity() -> None:
+    """One day, one identity: `_business_date` canonicalizes the date everywhere ELSE (the covered
+    parameters, every snapshot id), so the raw caller spelling reaching the hash would make two
+    spellings of one run two execution identities while every covered value agrees they are one."""
+    a = _ok(_prepared(business_dt=BUSINESS_DT))
+    b = _ok(_prepared(business_dt=f" {BUSINESS_DT} "))
+    assert a.parameters["sandbox_execution_hash"] == b.parameters["sandbox_execution_hash"]
+
+
 def test_a_different_GENERATION_or_RUN_moves_the_execution_hash() -> None:
     baseline = _ok(_prepared()).sandbox_execution_hash
     assert _ok(_prepared(generation_id="gen-0002")).sandbox_execution_hash != baseline
@@ -737,6 +749,62 @@ def test_the_prepared_parameters_are_read_only() -> None:
     prep = _ok(_prepared())
     with pytest.raises(TypeError):
         prep.parameters["business_dt"] = NEXT_DT  # type: ignore[index]
+
+
+# ══ codegen-review Task 9 — a DATE-typed clock outside UTC refuses at run preparation ════════════
+#
+# The emitted window comparison casts the boundary DATE to midnight and `to_utc_timestamp` re-reads
+# it as the window zone's wall clock, so west of UTC the whole window shifts by a day (report §2.3,
+# measured with America/New_York: the first day drops and an extra trailing day is admitted; east
+# of UTC is correct by luck). The IR carries no physical type for the clock, but the inventory's
+# `TableLayout.columns` does — so run preparation is where the refusal can live, fail-closed, until
+# `PitSpec` carries the clock dtype (DEFERRED-WORK A.29).
+
+_DATE_CLOCK_COLUMNS = (("txn_amt", "decimal(18,2)"), ("txn_dt", "date"))
+
+
+def test_a_DATE_typed_clock_with_a_non_utc_zone_is_refused() -> None:
+    layout = _layout(_event_mapping(), columns=_DATE_CLOCK_COLUMNS)
+    refused = _prepared(layout=layout, requests=(
+        _request(_requirement(layout), pit=_pit(length=30, timezone="America/New_York")),))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert "txn_dt" in refused.detail, "the refusal names the COLUMN"
+    assert "America/New_York" in refused.detail, "the refusal names the ZONE"
+    assert "to_utc_timestamp" in refused.detail, "the refusal names the MECHANISM"
+
+
+def test_a_DATE_typed_clock_under_utc_still_prepares() -> None:
+    """The shift is zero under UTC — refusing there would refuse every date-columned daily table."""
+    layout = _layout(_event_mapping(), columns=_DATE_CLOCK_COLUMNS)
+    prep = _prepared(layout=layout, requests=(
+        _request(_requirement(layout), pit=_pit(length=30, timezone="UTC")),))
+    assert isinstance(prep, runprep.RunPreparation)
+
+
+def test_a_TIMESTAMP_typed_clock_in_a_non_utc_zone_still_prepares() -> None:
+    """The no-over-refusal control: an instant-typed clock is what the emitted comparison is
+    correct for, in every zone."""
+    layout = _layout(_event_mapping(),
+                     columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "timestamp")))
+    prep = _prepared(layout=layout, requests=(
+        _request(_requirement(layout), pit=_pit(length=30, timezone="America/New_York")),))
+    assert isinstance(prep, runprep.RunPreparation)
+
+
+def test_the_availability_ref_is_checked_too() -> None:
+    """Rule 1's gate compares under the same zone arithmetic as rule 2's window, so a DATE-typed
+    availability column shifts the cutoff the same way a DATE-typed clock shifts the window."""
+    layout = _layout(_event_mapping(),
+                     columns=(("txn_amt", "decimal(18,2)"), ("txn_dt", "timestamp"),
+                              ("posted_dt", "date")))
+    pit = dataclasses.replace(
+        _pit(length=30, timezone="America/New_York"),
+        availability_ref=f"{SOURCE}::public.transactions.posted_dt")
+    refused = _prepared(layout=layout, requests=(_request(_requirement(layout), pit=pit),))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_TYPE_UNSUPPORTED
+    assert "posted_dt" in refused.detail
 
 
 # ══ the inventory is CONSULTED, and a drifted one fails closed ═══════════════════════════════════
@@ -870,6 +938,26 @@ def test_a_PARTITION_MAPPED_spine_resolves_the_business_dates_OWN_partition() ->
         [(("snapshot_dt", BUSINESS_DT),)]
 
 
+def test_a_PARTITION_MAPPED_spine_over_an_UNRESOLVABLE_mapping_refuses_at_prep() -> None:
+    """The renderer's `_partition_mapped` resolves a business date against an EventTimePartition
+    or a StaticSnapshot mapping and NOTHING else — a FullScan reads every partition, the opposite
+    of what the policy claims. Today that dies in the renderer as a bare ValueError, outside §14's
+    vocabulary; preparation must refuse instead, naming the mapping kind."""
+    scanned = _layout(FullScan(), table="customers")
+    refused = spine_input_request(
+        _spine(PartitionMappedSnapshot(
+            ordered_partition_refs=(f"{SOURCE}::public.customers.load_dt",))),
+        _requirement(scanned), business_dt=BUSINESS_DT)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.PARTITION_MAPPING_NOT_DECLARED
+    assert "FullScan" in refused.detail
+    # The control: the refusal is about the POLICY-mapping PAIR, never about FullScan itself — a
+    # present-tense policy over the same scanned table still prepares.
+    assert isinstance(
+        spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref=BUSINESS_DT)),
+                            _requirement(scanned), business_dt=BUSINESS_DT), RunInputRequest)
+
+
 def test_a_CURRENT_SNAPSHOT_whose_vintage_IS_the_business_date_resolves() -> None:
     request = spine_input_request(_spine(CurrentSnapshot(observed_snapshot_ref=BUSINESS_DT)),
                                   _requirement(_CUSTOMERS), business_dt=BUSINESS_DT)
@@ -926,11 +1014,36 @@ def test_an_SCD_spine_over_an_UNPARTITIONED_table_is_fine() -> None:
                                           business_dt=BUSINESS_DT), RunInputRequest)
 
 
-def test_an_ACTIVE_POPULATION_spine_needs_no_vintage_and_resolves() -> None:
-    policy = ActivePopulation(status_ref=f"{SOURCE}::public.customers.status_cd",
-                              allowed_status_values=("ACTIVE",))
-    assert isinstance(spine_input_request(_spine(policy), _requirement(_CUSTOMERS),
-                                          business_dt=BUSINESS_DT), RunInputRequest)
+def _active_population(observed_on: str) -> ActivePopulation:
+    """The vintage is stated by EVERY caller: which date the gate answers is the point under test."""
+    return ActivePopulation(status_ref=f"{SOURCE}::public.customers.status_cd",
+                            allowed_status_values=("ACTIVE",), observed_on=observed_on)
+
+
+def test_an_ACTIVE_POPULATION_spine_is_refused_for_a_date_its_vintage_cannot_answer() -> None:
+    """`status_cd` is CURRENT-valued: the table can only answer "who is active NOW", and the
+    declared `observed_on` is the one date on record for when "now" was. Any other business date
+    is the population-level as-of leak the review confirmed by execution (report §2.1): a January
+    backfill run in July silently publishing July's actives. Rule 6's availability filter cannot
+    close it — an entity CLOSED since the business date has no row left to filter."""
+    policy = _active_population(observed_on=BUSINESS_DT)
+    for not_the_vintage in (NEXT_DT, "2026-01-15"):  # the next day, and the review's backfill
+        refused = spine_input_request(_spine(policy), _requirement(_CUSTOMERS),
+                                      business_dt=not_the_vintage)
+        assert isinstance(refused, MaterializationRefused), not_the_vintage
+        assert refused.code is CompilationRefusalCode.SPINE_DECLARATION_REJECTED_BY_FACTS
+        assert "ACTIVE_POPULATION" in refused.detail  # the refusal names the policy
+        assert not_the_vintage in refused.detail and BUSINESS_DT in refused.detail
+
+
+def test_an_ACTIVE_POPULATION_spine_resolves_for_its_own_DECLARED_vintage() -> None:
+    """The gate reads the policy's DECLARED `observed_on` — nothing else. `NEXT_DT` is chosen
+    because it differs from every other date the fixture declaration carries (its `recorded_at`
+    sits on `BUSINESS_DT`'s calendar day), so a pass here cannot come from a coincidence."""
+    request = spine_input_request(
+        _spine(_active_population(observed_on=NEXT_DT)), _requirement(_CUSTOMERS),
+        business_dt=NEXT_DT)
+    assert isinstance(request, RunInputRequest)
 
 
 def test_the_spine_request_key_cannot_COLLIDE_with_a_feature_expression() -> None:

@@ -80,8 +80,11 @@ def parse_join_ref(joins_to: str) -> ParsedJoinTarget:
 def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
     """Build the governed `ApprovedJoinRef` a declared join maps to, or None when the row has no join
     or a malformed one (parse_join_ref not ok). Both endpoints are same-source column refs; the single
-    declared column pair is (this column -> target column); cardinality defaults to 'N:1' (a child
-    row referencing a parent — the safe-fan default) when the upload left it blank."""
+    declared column pair is (this column -> target column); a blank uploaded cardinality stays None —
+    UNKNOWN. It used to default to 'N:1' ("the safe-fan default"), but a fabricated cardinality would
+    be admitted, confirmed by two admins, and then trusted absolutely at runtime; "we do not know"
+    must never become "it is safe". `plan_join` refuses an unknown-cardinality hop
+    (`_cardinality_verdict`'s NULL branch) until a human supplies one."""
     parsed = parse_join_ref(row.joins_to)
     if not parsed.ok:
         return None
@@ -90,7 +93,7 @@ def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
         from_ref=CatalogObjectRef(row.source, "column", _SCHEMA, row.table, row.column),
         to_ref=CatalogObjectRef(row.source, "column", _SCHEMA, parsed.to_table, parsed.to_col),
         column_pairs=(ColumnPair(row.column, parsed.to_col),),
-        cardinality=row.cardinality or "N:1")
+        cardinality=row.cardinality or None)
 
 # Weighted tsvector: column name (A) > definition (B) > table/concept/domain/semantics (C). The ONE
 # definition of the search_doc expression (#20) — the build_graph/add_column_row INSERTs and

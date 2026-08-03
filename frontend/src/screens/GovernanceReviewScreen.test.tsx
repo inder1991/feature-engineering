@@ -516,6 +516,23 @@ describe('governance review — the basis of the claim being endorsed', () => {
     expect(cells.getByRole('checkbox').closest('.gq-panel')).toContainElement(caution)
   })
 
+  it('states an unstated cardinality honestly in the join agreement, never as fact', async () => {
+    // Task 5 codegen-review remediation (M3): a blank uploaded cardinality is proposed as null
+    // now, and this sentence is the agreement the confirmation records. The old fallback
+    // ("at the stated cardinality") asserted a cardinality that does not exist.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [join({ detail: { ...join().detail, cardinality: null } })],
+      items_visible_to_you_by_kind: { entity_bridge: 0, approved_join: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${join().fact_key}`))
+    await userEvent.click(cells.getByRole('button', { name: /^confirm/i }))
+    const label = cells.getByRole('checkbox').closest('label')!
+    expect(label).toHaveTextContent(/at an unstated cardinality/i)
+    expect(label).toHaveTextContent(/stays unusable until one is supplied/i)
+    expect(label).not.toHaveTextContent(/the stated cardinality/i)
+  })
+
   it('reports an attested basis differently, and a missing one as missing', async () => {
     getGovernanceQueue.mockResolvedValue(queue({
       items: [

@@ -152,6 +152,14 @@ migration 1038) field-for-field. Binding decisions:
   unresolved — profile §6.3 amended).
 - `DatasetNeedV1.execution_tier` reuses `bridge_realization.ExecutionTier`; semantic Task 8's
   feature path constructs needs with `SANDBOX` until a production feature flow exists.
+- HOME DECISION (2026-08-03, Task 7 review-ratified): the §6.4/§6.5 selection/temporal contracts
+  live in `overlay/upload` (both execution stacks already import it; neither imports the other for
+  a source decision; `overlay/upload/__init__.py` stays empty). Release C's crosswalk contracts
+  use the SAME home — do not re-litigate.
+- WIRE-ENUM SPLIT (2026-08-03, ratified): `MODEL_UNRESOLVED_CODES` (the intent wire schema enum)
+  is deliberately DISJOINT from `SELECTION_REFUSAL_CODES` — the model must never be able to assert
+  an overlap/binding/population refusal (functional rule 1), and the request body stays
+  byte-identical (D10 no-silent-widening). Selection refusals surface via clarify/learning only.
 
 ## D6. Snapshot pins — six kinds, compat-safe hashing
 
@@ -194,7 +202,7 @@ New needs append 1056+ to this table FIRST (edit this doc in the same commit as 
 | `FEATUREGEN_FEATURE_CONTEXT` | Release-A deploy gate | — |
 | `FEATUREGEN_DATASET_PROFILES` | Release-A deploy gate (same approval, both flags presented) | — |
 | `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` | Release-B gate | `FEATUREGEN_DATASET_PROFILES=1` |
-| `FEATUREGEN_CROSSWALK_EXECUTION` | Release-C gate | `FEATUREGEN_SOURCE_TEMPORAL_SELECTION=1` — enforced fail-closed at startup, not by convention |
+| `FEATUREGEN_CROSSWALK_EXECUTION` | Release-C gate | `FEATUREGEN_SOURCE_TEMPORAL_SELECTION=1` — enforced fail-closed at startup, not by convention. NOTE (2026-08-03): Release B's flag dependency ships as fail-closed-at-every-call-site + loud boot log, which honors its row; Release C's row REQUIRES a true boot refusal and must NOT inherit the log-only precedent |
 
 - All four use the widened truthy set `{"1","true","yes","on"}` (`feature_assist.py:193` pattern)
   and are added to `deploy/kind/k8s/20-backend.yaml` + `.env.example` (defaults off).

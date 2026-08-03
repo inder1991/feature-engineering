@@ -13,3 +13,9 @@
 # perform.
 spark.app.name: "sandbox_feature_cif_daily"
 spark.sql.session.timeZone: "UTC"
+#
+# ANSI mode changes what the emitted gates observe: the OVERFLOW_VIOLATION gate
+# reads a NULL from an out-of-range cast (legacy semantics); under ANSI the cast
+# raises a raw SparkArithmeticException outside the closed gate vocabulary. The
+# governed semantics therefore must not depend on a cluster default.
+spark.sql.ansi.enabled: "false"

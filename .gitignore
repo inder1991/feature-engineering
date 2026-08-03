@@ -23,8 +23,11 @@ build/
 .claude/worktrees/
 deploy/kind/.llm-key
 
-# Local L0 validation environment (PySpark + Kedro; not a project dependency)
+# Local L0 validation environments (PySpark + Kedro; not project dependencies).
+# .venv-artifact and .venv-l0-modern are built by `make l0-gate`.
 .venv-l0/
+.venv-artifact/
+.venv-l0-modern/
 
 # Real bank glossary exports — LOCAL ONLY, never committed.
 # These carry production schema, business definitions and PII/sensitivity classifications.

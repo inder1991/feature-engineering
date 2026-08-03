@@ -7,7 +7,7 @@ PRE-1048/1049 shape, re-apply the SQL exactly as the runner does, and then re-ap
 populated tables.
 
 They also pin the D7 reservation reality on the tree as it IS: 1045/1046/1047/1051/1052 exist,
-while 1044 (codegen, other track), 1050 (Release C crosswalk) and the 1053-1055 Phase-G RESERVED
+while 1050 (Release C crosswalk) and the 1053-1055 Phase-G RESERVED
 BLOCK do not — 1048/1049 may therefore not depend on anything those numbers would create. The
 1053-1055 assertion is deliberately an ABSENCE check: that block belongs to a parallel session, so
 this stream must neither create those files nor assume they exist.
@@ -199,10 +199,10 @@ def test_1048_1049_apply_with_their_real_neighbours_and_none_of_the_unwritten_re
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
     assert {"1045", "1046", "1047", "1048", "1049", "1051", "1052"} <= present
-    # 1044 is the codegen-remediation track's, 1050 is Release C's crosswalk store, and 1053-1055
+    # 1044 arrived with the Track-2 merge; 1050 is Release C's crosswalk store, and 1053-1055
     # are the Phase-G RESERVED BLOCK owned by a PARALLEL session. None is on this tree; asserting
     # their ABSENCE is what keeps this stream from silently claiming a number it does not own.
-    assert not ({"1044", "1050", "1053", "1054", "1055"} & present)
+    assert not ({"1050", "1053", "1054", "1055"} & present)
 
 
 def test_this_stream_allocated_exactly_two_numbers() -> None:

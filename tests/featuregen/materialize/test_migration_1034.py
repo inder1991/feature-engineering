@@ -241,7 +241,11 @@ def test_the_truncate_guard_is_a_STATEMENT_level_trigger(conn, table: str) -> No
         assert tgtype & 2, f"{name} is not a BEFORE trigger (tgtype={tgtype})"
         assert not tgtype & 1, f"{name} is FOR EACH ROW, which never fires on TRUNCATE"
 
-    row_guard = [(name, tgtype) for name, tgtype in rows if tgtype & 1]
+    # Only row triggers aimed at UPDATE or DELETE are the append-only guard: since 1044,
+    # materialization_run_event also carries a row-level BEFORE INSERT ordering trigger — a
+    # different guard with its own suite (test_migration_1044) — which covers neither and must not
+    # fail this structural check.
+    row_guard = [(name, tgtype) for name, tgtype in rows if tgtype & 1 and tgtype & (8 | 16)]
     assert row_guard, f"{table} has no row-level UPDATE/DELETE guard: {rows}"
     for name, tgtype in row_guard:
         assert tgtype & 8 and tgtype & 16, f"{name} does not cover both UPDATE and DELETE"
@@ -277,10 +281,16 @@ def test_destructive_dml_is_revoked_from_the_app_role(db, table: str) -> None:
 
 
 def test_run_id_and_seq_are_unique_on_events(conn) -> None:
+    """The PK is the arbiter of the race 1044's ordering trigger cannot see: two concurrent
+    appenders whose EXISTS checks both ran before either committed. In one session that trigger
+    fires BEFORE INSERT and would refuse this duplicate first, so it is disabled (transactionally —
+    rolled back on teardown) to reach the constraint, exactly as the race window does."""
     _generation(conn)
     _event(conn, seq=0)
     _event(conn, seq=1)                       # a second event in the same run is fine
     _event(conn, run_id="other-run", seq=0)   # …as is seq 0 in a different run
+    conn.execute("ALTER TABLE materialization_run_event "
+                 "DISABLE TRIGGER materialization_run_event_ordered")
     with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
         _event(conn, seq=1, kind=RunEventKind.RUN_SUBMITTED)
 
@@ -338,10 +348,14 @@ def test_exactly_one_terminal_manifest_per_run(conn) -> None:
 
 def test_at_most_one_TERMINAL_event_per_run(conn) -> None:
     """The fold derives status from events; two terminal events would make "current status" a
-    choice rather than a reading."""
+    choice rather than a reading. The partial index is the CONCURRENT backstop behind 1044's
+    ordering trigger, which would refuse this insert first in a single session — disabled
+    (transactionally) to reach the index, as the race window the trigger cannot see does."""
     _generation(conn)
     _event(conn, seq=0, kind=RunEventKind.RUN_PREPARED)
     _event(conn, seq=1, kind=RunEventKind.PUBLISHED)
+    conn.execute("ALTER TABLE materialization_run_event "
+                 "DISABLE TRIGGER materialization_run_event_ordered")
     with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
         _event(conn, seq=2, kind=RunEventKind.RUN_FAILED)
     # …but two terminal events in DIFFERENT runs are ordinary.

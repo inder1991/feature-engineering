@@ -65,7 +65,16 @@ class Dialect(Protocol):
 
 
 class DirectSqlExecutor:
-    """Run an observation over an existing read-only connection."""
+    """Run an observation over an existing read-only connection.
+
+    The connection is BORROWED and deliberately DB-API-2.0-generic (only ``cursor()`` is assumed,
+    so PyHive and impyla work). On psycopg the relationship probe additionally runs inside a
+    savepoint (``Connection.transaction()`` emits a SAVEPOINT when nested), so a failed probe
+    never aborts the caller's transaction — the failure observation this executor returns must
+    remain storable through the same connection, and an aborted transaction would reject the
+    store's INSERT and bury the evidence. On DB-API-only engines (Hive) there is no enclosing
+    Postgres transaction to protect, so behavior there is unchanged.
+    """
 
     def __init__(self, conn, dialect: Dialect) -> None:
         self._conn = conn
@@ -105,8 +114,16 @@ class DirectSqlExecutor:
         timestamp = observed_at or utc_now()
         statement = self._dialect.render_relationship_probe(plan)
         method = self._method(plan)
+        transaction = getattr(self._conn, "transaction", None)
         try:
-            row = self._run(plan, statement)
+            if callable(transaction):
+                # psycopg3: a nested transaction block is a SAVEPOINT. A failure rolls back to
+                # it AND re-raises, so the except below still shapes the failure observation
+                # while the caller's transaction stays usable to store it.
+                with self._conn.transaction():
+                    row = self._run(plan, statement)
+            else:
+                row = self._run(plan, statement)
         except Exception as exc:  # noqa: BLE001 — data-side failures are typed coverage
             reason = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
             logger.info(
@@ -131,8 +148,16 @@ class DirectSqlExecutor:
         """
         physical_id = plan.binding.identity.table_id
         statement = self._dialect.render_schema_observation(plan)
+        transaction = getattr(self._conn, "transaction", None)
         try:
-            rows = self._run(plan, statement, fetch_all=True)
+            if callable(transaction):
+                # SAVEPOINT, exactly like observe_relationship: on psycopg a failed read otherwise
+                # aborts the CALLER's transaction and the typed-coverage result below would be
+                # unstorable. Plain DBAPI connections (Hive) have no transaction(); same fallback.
+                with self._conn.transaction():
+                    rows = self._run(plan, statement, fetch_all=True)
+            else:
+                rows = self._run(plan, statement, fetch_all=True)
         except Exception as exc:                      # noqa: BLE001 — any engine error is coverage
             reason = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
             logger.info("schema observation failed for %s: %s", physical_id, reason)

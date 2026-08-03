@@ -120,6 +120,12 @@ FEATURE_NAMES: tuple[str, ...] = (
 _TIMEZONE = "Asia/Kolkata"
 _DECIMAL = DecimalPolicy(precision=38, scale=6, rounding=RoundingMode.HALF_EVEN,
                          overflow=OverflowBehavior.ERROR)
+#: The ratio's own policy. ``half_up``, not ``half_even``: Spark's decimal division rounds HALF_UP
+#: at the result scale before any explicit rounding call runs, so a declared ``half_even`` on a
+#: ratio is unenforceable and ``resolve_physical_type`` REFUSES it (DEFERRED-WORK A.28). The worked
+#: feature declares the mode the engine actually applies.
+_RATIO_DECIMAL = DecimalPolicy(precision=38, scale=6, rounding=RoundingMode.HALF_UP,
+                               overflow=OverflowBehavior.ERROR)
 _GRAIN = Grain(entity="customer", keys=(REF_CIF,))
 
 
@@ -200,13 +206,14 @@ def _cross_border_filter() -> FilterNode:
                            right_literal=TypedLiteral(type=LiteralType.BOOLEAN, value="true"))
 
 
-def _formula(body, output: FormulaOutputPolicyV1) -> TypedFormulaV1:
+def _formula(body, output: FormulaOutputPolicyV1,
+             decimal: DecimalPolicy = _DECIMAL) -> TypedFormulaV1:
     return TypedFormulaV1(
         formula_schema_version=FORMULA_SCHEMA_VERSION,
         operation_grammar_version=OPERATION_GRAMMAR_VERSION,
         output_policy_version=OUTPUT_POLICY_VERSION,
         canonicalization_version=CANONICALIZATION_VERSION,
-        grain=_GRAIN, body=body, parameters=(), decimal=_DECIMAL, output=output)
+        grain=_GRAIN, body=body, parameters=(), decimal=decimal, output=output)
 
 
 def _total_debit_amount_30d() -> TypedFormulaV1:
@@ -258,7 +265,8 @@ def _cross_border_value_ratio_90d() -> TypedFormulaV1:
             zero_denominator=ZeroDenominator.NULL),
         FormulaOutputPolicyV1(
             output_type="decimal", unit=None, currency=None,
-            output_additivity=AdditivityClass.NON_ADDITIVE, external_type_required=False))
+            output_additivity=AdditivityClass.NON_ADDITIVE, external_type_required=False),
+        decimal=_RATIO_DECIMAL)
 
 
 _FORMULAS = {
@@ -293,14 +301,14 @@ def _raw_equal(left: str, literal_type: str, value: str) -> dict[str, Any]:
             "right_literal": {"type": literal_type, "value": value}}
 
 
-def _raw_proposal(body: dict[str, Any]) -> dict[str, Any]:
+def _raw_proposal(body: dict[str, Any], *, rounding: str = "half_even") -> dict[str, Any]:
     return {"formula_schema_version": FORMULA_SCHEMA_VERSION,
             "operation_grammar_version": OPERATION_GRAMMAR_VERSION,
             "canonicalization_version": CANONICALIZATION_VERSION,
             "grain": {"entity": "customer", "keys": [REF_CIF]},
             "body": body,
             "parameters": [],
-            "decimal": {"precision": 38, "scale": 6, "rounding": "half_even",
+            "decimal": {"precision": 38, "scale": 6, "rounding": rounding,
                         "overflow": "error"},
             # The ADVISORY expected_output is deliberately absent: it is never identity-bearing, and
             # asserting one would put the run on the §F expectation axis for no fixture value.
@@ -323,7 +331,7 @@ _RAW_PROPOSALS: dict[str, dict[str, Any]] = {
         "numerator": _raw_expr("sum", REF_AMT, length=90,
                                filter_node=_raw_equal(REF_CROSS_BORDER, "boolean", "true")),
         "denominator": _raw_expr("sum", REF_AMT, length=90),
-        "zero_denominator": "null"}),
+        "zero_denominator": "null"}, rounding="half_up"),
 }
 
 
