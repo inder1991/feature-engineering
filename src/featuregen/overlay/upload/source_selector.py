@@ -122,6 +122,13 @@ class SelectionRefusalV1:
     subject_refs: tuple[str, ...]
     detail: str
     considered_candidates: tuple[CandidateDecisionV1, ...] = ()
+    #: WHAT is actually absent, for the codes that cover more than one situation (the closed eight
+    #: cannot grow, so the payload discriminates — the same move `considered_candidates` makes for
+    #: SELECTION_SOURCE_AMBIGUOUS). Closed micro-vocabulary, temporal refusals only:
+    #: "temporal_policy" (nothing declared), "report_cutoff" (rule reads as-of, request names no
+    #: instant), "current_row_rule" (policy declares no rule for a current question). None for
+    #: source-side refusals. Ephemeral decision payload — never content-hashed.
+    missing: str | None = None
 
     def __post_init__(self) -> None:
         if not self.subject_refs:

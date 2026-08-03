@@ -354,6 +354,24 @@ def _selection_clarification(code: str, candidates: IntentCandidates,
                      "but not read. Which dataset should be used instead?",
             options=tables)
     if code == TEMPORAL_MODEL_UNKNOWN:
+        # ONE code, THREE situations (the closed eight cannot grow); the refusal's `missing`
+        # payload says which — the same move the SELECTION_SOURCE_AMBIGUOUS branch above makes
+        # with candidate dispositions. Asking the storage-model question when the model IS
+        # recorded would state a falsehood and offer five options none of which fixes anything.
+        missing = getattr(refusal, "missing", None) if refusal is not None else None
+        if missing == "report_cutoff":
+            return Clarification(
+                code=code,
+                question="This dataset's history rule reads rows as of an instant, but the "
+                         "question names no report date. What date should the answer be as of?",
+                options=())
+        if missing == "current_row_rule":
+            return Clarification(
+                code=code,
+                question="This dataset keeps history, and its temporal policy declares no rule "
+                         "for a current-values question. Declare which row counts as current "
+                         "(a current flag, or open-ended validity) in the dataset's policy.",
+                options=())
         return Clarification(
             code=code,
             question="Nobody has recorded how this dataset stores history. How does it?",

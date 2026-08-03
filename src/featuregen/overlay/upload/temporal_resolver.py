@@ -141,7 +141,8 @@ def resolve_row_selection(
     if found is None:
         return _refuse(dataset_logical_ref, TEMPORAL_MODEL_UNKNOWN, (
             f"nothing declares how {dataset_logical_ref!r} stores history, so nothing can say which "
-            "of its rows answers this question. Declare a temporal policy for the dataset"))
+            "of its rows answers this question. Declare a temporal policy for the dataset"),
+            missing="temporal_policy")
     policy, _pointer = found
 
     source = dataset_logical_ref.split("::", 1)[0]
@@ -177,7 +178,7 @@ def resolve_row_selection(
             f"{kind.value!r}, which reads rows AS OF an instant, and the request names no "
             "parameter for the report cutoff to bind to. Without one the row rule is 'whatever is "
             "there now', which is a different question — ask with a report cutoff, or declare a "
-            "row rule that does not need one"), policy=policy)
+            "row rule that does not need one"), policy=policy, missing="report_cutoff")
     if kind is TemporalSelectionKind.EXPLICIT_ONLY:
         if temporality is RequestTemporality.HISTORICAL:
             return _refuse(dataset_logical_ref, TEMPORAL_HISTORICAL_CURRENT_ONLY, (
@@ -187,7 +188,8 @@ def resolve_row_selection(
                 "accept the limitation explicitly"), policy=policy)
         return _refuse(dataset_logical_ref, TEMPORAL_MODEL_UNKNOWN, (
             f"the temporal policy for {dataset_logical_ref!r} declares no rule for a CURRENT "
-            "question; nothing says which of its rows is the current one"), policy=policy)
+            "question; nothing says which of its rows is the current one"), policy=policy,
+            missing="current_row_rule")
 
     predicates = _predicates_for(kind, policy, cutoff_value_ref)
     return RowSelectionOutcomeV1(
@@ -234,10 +236,12 @@ def _predicates_for(kind: TemporalSelectionKind, policy: DatasetTemporalPolicyRe
 
 
 def _refuse(dataset_logical_ref: str, code: str, detail: str,
-            policy: DatasetTemporalPolicyRevisionV1 | None = None) -> RowSelectionOutcomeV1:
+            policy: DatasetTemporalPolicyRevisionV1 | None = None,
+            missing: str | None = None) -> RowSelectionOutcomeV1:
     return RowSelectionOutcomeV1(
         dataset_logical_ref=dataset_logical_ref, policy=policy,
-        refusal=SelectionRefusalV1(code=code, subject_refs=(dataset_logical_ref,), detail=detail))
+        refusal=SelectionRefusalV1(code=code, subject_refs=(dataset_logical_ref,), detail=detail,
+                                   missing=missing))
 
 
 # ── engine adapters: a governed decision -> the thing that renders SQL ───────────────────────────

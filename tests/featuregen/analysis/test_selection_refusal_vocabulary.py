@@ -312,3 +312,48 @@ def test_the_temporal_model_choices_are_the_enum_minus_the_absence_being_recorde
     assert set(choices) == {m.value for m in TemporalStorageModel
                             if m is not TemporalStorageModel.UNKNOWN}
     assert "unknown" not in choices
+
+# ── one temporal code, three truthful questions (review residual, 2026-08-03) ────────────────────
+#
+# TEMPORAL_MODEL_UNKNOWN covers three situations (the closed eight cannot grow); the refusal's
+# `missing` payload discriminates, exactly as candidate dispositions do for
+# SELECTION_SOURCE_AMBIGUOUS. The storage-model question when the model IS recorded would state a
+# falsehood ("nobody has recorded...") and offer five options none of which fixes anything.
+
+def _temporal_refusal(missing):
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1
+    return SelectionRefusalV1(
+        code=TEMPORAL_MODEL_UNKNOWN, subject_refs=("bank::dpl.seg",),
+        detail="probe", missing=missing)
+
+
+def test_a_missing_cutoff_asks_for_the_report_date_not_the_storage_model():
+    from featuregen.analysis.clarify import clarifications_for_codes
+    [c] = clarifications_for_codes(
+        {TEMPORAL_MODEL_UNKNOWN}, CANDIDATES, refusals=[_temporal_refusal("report_cutoff")])
+    assert "report date" in c.question
+    assert "recorded how" not in c.question
+    assert c.options == ()
+
+
+def test_a_missing_current_rule_asks_for_the_rule_not_the_storage_model():
+    from featuregen.analysis.clarify import clarifications_for_codes
+    [c] = clarifications_for_codes(
+        {TEMPORAL_MODEL_UNKNOWN}, CANDIDATES, refusals=[_temporal_refusal("current_row_rule")])
+    assert "counts as current" in c.question
+    assert "recorded how" not in c.question
+    assert c.options == ()
+
+
+def test_an_undeclared_model_still_asks_the_storage_model_question():
+    from featuregen.analysis.clarify import clarifications_for_codes
+    [c] = clarifications_for_codes(
+        {TEMPORAL_MODEL_UNKNOWN}, CANDIDATES, refusals=[_temporal_refusal("temporal_policy")])
+    assert "recorded how" in c.question
+    assert len(c.options) == 5
+
+
+def test_a_temporal_refusal_with_no_payload_keeps_the_model_question():
+    from featuregen.analysis.clarify import clarifications_for_codes
+    [c] = clarifications_for_codes({TEMPORAL_MODEL_UNKNOWN}, CANDIDATES)
+    assert "recorded how" in c.question
