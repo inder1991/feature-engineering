@@ -386,6 +386,79 @@ def test_the_refusal_COMMITS_the_learning_write_instead_of_rolling_it_back(conn,
     assert len(_gap_rows(conn)) == 1
 
 
+# ── the SELECTION, on the production path (Release-B Task 8 review) ─────────────────────────────
+#
+# The review's probe: a HISTORICAL plan grounded through the real route came back with
+# `row_selections=()`, `refusals=()` and `resolved=True` — the row rule raised, a blanket except
+# swallowed it, and the agent had no row rule while claiming resolution. The invariant these pin is
+# that the two can never happen together again: either the decisions are there, or their absence is
+# on the response.
+
+
+@pytest.fixture
+def selecting(monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_DATASET_PROFILES", "1")
+    monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
+
+
+def test_the_selection_is_never_EMPTY_AND_RESOLVED(make_client, catalog, selecting):
+    """THE PROBE. "Decreased this month vs last" is historical by construction, so it has a row
+    rule to resolve — and if nothing could be decided, the response says which needs were not."""
+    _bind(catalog)
+    body = _client(make_client).post(
+        "/analysis/plan", json={"question": _QUESTION}, headers=_h()).json()
+    selection = body["selection"]
+    assert selection is not None, "the flag is on; the decisions must be visible"
+    assert selection["rows"] or selection["refusals"], selection
+    assert not (selection["resolved"] and not selection["rows"]), selection
+
+
+def test_a_selection_refusal_is_RENDERED_as_a_question(make_client, catalog, selecting):
+    """Every typed refusal becomes a clarification when interactive (plan rule 10). Reaching the
+    person is the whole point of returning it instead of raising it."""
+    _bind(catalog)
+    body = _client(make_client).post(
+        "/analysis/plan", json={"question": _QUESTION}, headers=_h()).json()
+    codes = {c["code"] for c in body["clarifications"]}
+    assert {r["code"] for r in body["selection"]["refusals"]} & codes, body["clarifications"]
+    # The population is asked ONCE, whichever half of the system noticed it is undeclared.
+    assert [c["code"] for c in body["clarifications"]].count("population") == 1
+
+
+def test_with_the_flag_OFF_the_response_carries_no_selection_at_all(make_client, catalog,
+                                                                   monkeypatch):
+    monkeypatch.delenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", raising=False)
+    _bind(catalog)
+    body = _client(make_client).post(
+        "/analysis/plan", json={"question": _QUESTION}, headers=_h()).json()
+    assert body["selection"] is None
+
+
+def test_a_route_level_refusal_writes_ONE_learning_gap(make_client, catalog, selecting):
+    """`record_selection_gaps` had NO production caller — the same inert-mechanism shape this
+    programme has found repeatedly. This is it, at the surface a refusal reaches a person."""
+    _bind(catalog)
+    client = _client(make_client)
+    assert client.post("/analysis/plan", json={"question": _QUESTION},
+                       headers=_h()).status_code == 200
+    gaps = {row[1] for row in _gap_rows(catalog)}
+    assert gaps, "a visible refusal recorded nothing to decide"
+    assert len(_gap_rows(catalog)) == len(gaps), "one row per thing to decide"
+
+
+def test_asking_the_SAME_blocked_question_twice_is_one_thing_to_decide(make_client, catalog,
+                                                                      selecting):
+    """The derived request id, at the route: `record_gap` dedupes on (request, gap, snapshot), and
+    a minted id would make each retry a new row and read as demand 2 for one decision."""
+    _bind(catalog)
+    client = _client(make_client)
+    for _ in range(2):
+        client.post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    rows = _gap_rows(catalog)
+    assert len(rows) == len({(row[0], row[1], row[2]) for row in rows})
+    assert len({row[0] for row in rows}) == 1, "two askings, one request id"
+
+
 def test_a_model_that_cannot_express_the_question_is_422_not_500(make_client, catalog):
     """The question could not be expressed — that is about the request, not a fault in the service."""
     from featuregen.analysis.intent import TASK

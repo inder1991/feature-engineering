@@ -16,6 +16,7 @@ from tests.featuregen._helpers import mint_test_identity
 from featuregen.analysis.clarify import clarifications_for_codes
 from featuregen.analysis.grounding import (
     ground_analysis_plan,
+    plan_cutoff_value_ref,
     record_selection_gaps,
     resolve_plan_selections,
 )
@@ -33,6 +34,7 @@ from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
 from featuregen.overlay.upload.serving_policy_store import publish_serving_policy
 from featuregen.overlay.upload.source_selection import (
     SELECTION_AUTHORITY_INSUFFICIENT,
+    SELECTION_BINDING_MISSING,
     SELECTION_POPULATION_UNDECLARED,
     SELECTION_SOURCE_AMBIGUOUS,
     TEMPORAL_MODEL_UNKNOWN,
@@ -210,9 +212,8 @@ def test_a_dimension_source_with_no_temporal_policy_refuses(catalog, flagged):
     assert selections.row_selections == ()
 
 
-def test_a_proposed_authority_warning_rides_the_plan(catalog, flagged):
-    """Visible, never a log line (§5.2: the authority travels with the value)."""
-    _temporal(catalog)
+def _proposed_authorities(catalog) -> None:
+    """Two candidates a GOVERNED authority cannot separate — only an LLM PROPOSAL can."""
     for table in ("customer_master", "customer_ods"):
         ref = normalize_ref(_SRC, _SCHEMA, table)
         record_field_evidence(
@@ -222,22 +223,106 @@ def test_a_proposed_authority_warning_rides_the_plan(catalog, flagged):
             producer_ref="llm-test", source_snapshot_id=SNAPSHOT,
             input_hash=field_input_hash(logical_ref=ref, field_name="authority_role",
                                         material=f"{table}:llm:proposed"))
-    # The need with no explicit ref RANKS the two candidates, and the only thing separating them is
-    # an LLM proposal — allowed in sandbox, and the warning is what says so.
+
+
+def test_the_DEFAULT_tier_is_PRODUCTION_and_will_not_rank_on_a_proposal(catalog, flagged):
+    """CHANGE OF INTENT (Task-8 review, F2). `execution_tier` defaulted to "sandbox" and NOTHING
+    passed a tier, so every real selection ran under the tier that may rank on an unconfirmed LLM
+    classification — the governance default moved production -> sandbox on the production path.
+    The tier you get by saying nothing is now the strict one."""
+    _temporal(catalog)
+    _proposed_authorities(catalog)
     selections = _resolve(catalog, plan=_plan(base_table_ref=""),
                           candidate_dataset_refs=(CUST, CUST_ODS))
+    assert selections.warnings == ()
+    assert SELECTION_AUTHORITY_INSUFFICIENT in selections.refusal_codes
+    assert not selections.resolved
+
+
+def test_a_proposed_authority_ranks_only_when_SANDBOX_is_ASKED_FOR(catalog, flagged):
+    """Visible, never a log line (§5.2: the authority travels with the value) — and reachable only
+    by naming the tier, which is what makes sandbox opt-in rather than the default."""
+    _temporal(catalog)
+    _proposed_authorities(catalog)
+    selections = _resolve(catalog, plan=_plan(base_table_ref=""),
+                          candidate_dataset_refs=(CUST, CUST_ODS), execution_tier="sandbox")
     assert selections.warnings == (PROPOSED_AUTHORITY_USED,)
     event = [s for s in selections.source_selections
              if s.need.need_role is DatasetNeedRole.EVENT_SOURCE][0]
     assert event.selected_dataset_ref == CUST
 
-    # PRODUCTION may not, and the population is refused either way: candidates never decide it.
+
+def test_the_population_is_refused_in_either_tier_candidates_never_decide_it(catalog, flagged):
+    _temporal(catalog)
+    _proposed_authorities(catalog)
     production = _resolve(catalog, plan=_plan(base_table_ref="", population_table_ref="",
                                               population_key_ref=""),
                           candidate_dataset_refs=(CUST, CUST_ODS), execution_tier="production")
     assert production.warnings == ()
     assert SELECTION_POPULATION_UNDECLARED in production.refusal_codes
     assert SELECTION_AUTHORITY_INSUFFICIENT in production.refusal_codes
+    sandbox = _resolve(catalog, plan=_plan(base_table_ref="", population_table_ref="",
+                                           population_key_ref=""),
+                       candidate_dataset_refs=(CUST, CUST_ODS), execution_tier="sandbox")
+    assert SELECTION_POPULATION_UNDECLARED in sandbox.refusal_codes
+
+
+# ── the row rule is present, or its absence is VISIBLE ──────────────────────────────────────────
+
+
+def test_a_historical_plan_with_no_cutoff_REFUSES_instead_of_silently_having_no_row_rule(
+        catalog, flagged):
+    """THE REVIEW'S PROBE (F1). The resolver raised here, a blanket `except SelectionError:
+    continue` in this module erased it, and the plan came back with no row rule, no refusal, and
+    `resolved` True: the agent silently had no row rule while claiming resolution."""
+    _temporal(catalog)
+    selections = resolve_plan_selections(catalog, _plan(), cutoff_value_ref=None)
+    assert selections.row_selections == ()
+    assert TEMPORAL_MODEL_UNKNOWN in selections.refusal_codes
+    assert not selections.resolved
+
+
+def test_the_cutoff_ref_is_DERIVED_from_the_plans_own_time_context(catalog, flagged):
+    """What the route threads: a plan's windows are measured back from the instant it is asked as
+    of, and that instant IS the report cutoff the dimension row rule reads."""
+    _temporal(catalog)
+    assert plan_cutoff_value_ref(_plan()) == "report_cutoff"
+    selections = resolve_plan_selections(
+        catalog, _plan(), cutoff_value_ref=plan_cutoff_value_ref(_plan()))
+    assert [r.cutoff_value_ref for r in selections.row_selections] == ["report_cutoff"]
+    assert selections.resolved
+
+
+def test_a_plan_with_NO_time_context_has_no_cutoff_to_derive_and_says_so(catalog, flagged):
+    """No windows means no instant to be "as of". The honest answer is that there is nothing to
+    derive — and for a historical question that is a refusal, not a silent absence."""
+    _temporal(catalog)
+    timeless = _plan(windows=())
+    assert plan_cutoff_value_ref(timeless) is None
+    selections = resolve_plan_selections(
+        catalog, timeless, cutoff_value_ref=plan_cutoff_value_ref(timeless))
+    assert TEMPORAL_MODEL_UNKNOWN in selections.refusal_codes
+    assert not selections.resolved
+
+
+def test_a_preview_with_no_decisions_and_no_refusals_is_NEVER_resolved():
+    """The shape a swallowed exception leaves behind. "Nothing complained" is not "everything was
+    decided", and reporting the first as the second is what made the defect invisible."""
+    from featuregen.analysis.plan import SelectionPreviewV1
+
+    assert SelectionPreviewV1().resolved is False
+    assert SelectionPreviewV1(needs_considered=3).resolved is False
+
+
+def test_an_unaddressable_ref_is_a_typed_refusal_not_a_skipped_need(catalog, flagged):
+    """A ref the selection contracts cannot address — no schema half of the physical address — was
+    the ONE thing that legitimately raised here. It is now the refusal it always was, so the need
+    is never silently absent from the preview."""
+    selections = resolve_plan_selections(
+        catalog, _plan(population_table_ref="bank::customer_master"),
+        cutoff_value_ref=CUTOFF_REF)
+    assert SELECTION_BINDING_MISSING in selections.refusal_codes
+    assert not selections.resolved
 
 
 # ── refusals become the SAME questions Task 7 wrote ─────────────────────────────────────────────

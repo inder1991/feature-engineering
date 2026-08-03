@@ -124,6 +124,62 @@ def test_scd_overlap_is_shown_but_offers_no_choice_that_would_paper_over_bad_dat
     assert "data-quality" in clarification.question
 
 
+# ── ONE code, TWO situations: the ambiguity question tells the truth about which ────────────────
+#
+# `source_selector` reuses SELECTION_SOURCE_AMBIGUOUS for "NOTHING is eligible" because the
+# vocabulary is closed at eight and the gap/action (DATASET_SOURCE_UNRESOLVED /
+# DECLARE_SERVING_POLICY) are right for both. The QUESTION was not: it said "more than one dataset
+# is equally eligible" and offered the candidates that had each already failed.
+
+
+def _refusal(*dispositions):
+    from featuregen.overlay.upload.source_selection import CandidateDecisionV1, CandidateDisposition
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1
+
+    refs = (_TABLE, "bank::public.customer_ods")
+    return SelectionRefusalV1(
+        code=SELECTION_SOURCE_AMBIGUOUS, subject_refs=refs, detail="x",
+        considered_candidates=tuple(
+            CandidateDecisionV1(dataset_ref=ref, dataset_profile_hash="h",
+                                binding_revision_id=None,
+                                disposition=CandidateDisposition(disposition))
+            for ref, disposition in zip(refs, dispositions, strict=True)))
+
+
+def test_the_ZERO_candidate_question_says_so_and_offers_no_failed_candidates():
+    """Both candidates were REJECTED — nothing has a profile and an address. Offering them as
+    choices invites an answer the selector will refuse again, and tells the reader the system found
+    something it did not."""
+    clarification = _build(SELECTION_SOURCE_AMBIGUOUS, CANDIDATES,
+                           _refusal("rejected", "rejected"))
+    assert clarification.question.startswith("No dataset is eligible to serve this need")
+    assert "serving policy" in clarification.question
+    assert clarification.options == ()
+
+
+def test_the_MANY_candidate_question_still_asks_which_one():
+    clarification = _build(SELECTION_SOURCE_AMBIGUOUS, CANDIDATES, _refusal("tied", "tied"))
+    assert clarification.question.startswith("More than one dataset is equally eligible")
+    assert {o.value for o in clarification.options} == set(CANDIDATES.table_refs)
+
+
+def test_a_caller_with_only_the_CODE_gets_the_common_case():
+    """The vocabulary is the contract; the payload is an enrichment. A caller holding codes alone
+    still gets a question, and it is the one the code's common case describes."""
+    assert _build(SELECTION_SOURCE_AMBIGUOUS, CANDIDATES).question == _build(
+        SELECTION_SOURCE_AMBIGUOUS, CANDIDATES, _refusal("tied", "tied")).question
+
+
+def test_both_situations_stay_ONE_code_and_ONE_action():
+    """The wording branches; the vocabulary does not. Both are DATASET_SOURCE_UNRESOLVED, and the
+    action for both is to declare a serving policy."""
+    assert REFUSAL_TO_GAP[SELECTION_SOURCE_AMBIGUOUS] == (
+        "DATASET_SOURCE_UNRESOLVED", RequiredAction.DECLARE_SERVING_POLICY)
+    for refusal in (_refusal("rejected", "rejected"), _refusal("tied", "tied")):
+        assert _build(SELECTION_SOURCE_AMBIGUOUS, CANDIDATES, refusal).code == \
+            SELECTION_SOURCE_AMBIGUOUS
+
+
 def test_the_population_refusal_asks_exactly_what_the_population_abstention_asks():
     """Same decision reached from the selector instead of the model — so the same question and the
     same options, with only the code differing so the answer routes back correctly."""

@@ -66,6 +66,14 @@ ENGINE_REFUSAL_TO_SELECTION: dict[str, str] = {
     TEMPORAL_SNAPSHOT_TIE: TEMPORAL_SNAPSHOT_TIE,
 }
 
+#: The selection kinds that read rows AS OF an instant, and therefore cannot be resolved without
+#: the REF the runtime cutoff binds to. `current_record` is not one: "the row the source flags as
+#: current" needs no instant at all.
+_CUTOFF_REQUIRING_KINDS: frozenset[TemporalSelectionKind] = frozenset({
+    TemporalSelectionKind.VALID_AT_REPORT_CUTOFF,
+    TemporalSelectionKind.LATEST_SNAPSHOT_AS_OF,
+})
+
 
 class RequestTemporality(StrEnum):
     """WHICH question is being asked of the dataset. Not a property of the dataset."""
@@ -121,7 +129,8 @@ def resolve_row_selection(
     """Resolve WHICH ROWS of one dataset answer the question being asked.
 
     ``cutoff_value_ref`` is the REF the runtime cutoff binds to (a request parameter's name), never
-    a date: the two kinds that need one refuse without it, and a literal is refused by the contract.
+    a date: the two kinds that need one RETURN A REFUSAL without it — like every other outcome in
+    this module — and a literal is refused by the contract.
     """
     from featuregen.overlay.upload.temporal_policy_store import (
         current_temporal_policy,
@@ -149,6 +158,26 @@ def resolve_row_selection(
 
     kind = (policy.current_selection if temporality is RequestTemporality.CURRENT
             else policy.historical_selection)
+    if kind in _CUTOFF_REQUIRING_KINDS and not cutoff_value_ref:
+        # RETURNED, NOT RAISED. This was the ONE place the new code raised a `SelectionError`, and
+        # the caller's blanket `except SelectionError: continue` then erased it: the plan came back
+        # with no row rule, no refusal, and `resolved` True — the agent silently had no row rule
+        # while claiming resolution, which is worse than either outcome on its own.
+        #
+        # VOCABULARY ADJUDICATION (the closed eight). TEMPORAL_MODEL_UNKNOWN, and deliberately not
+        # TEMPORAL_HISTORICAL_CURRENT_ONLY: that code says the DATASET keeps only current values,
+        # which on an SCD2 table asked without a cutoff would be a plain falsehood about the data,
+        # and a refusal may not assert something untrue to get a better-worded question. This code
+        # already covers "the temporal model is not SETTLED" in both directions — absence AND
+        # contradiction (`temporal_policy_agreement` records that reading) — and a row rule that
+        # cannot be applied because the request names no as-of instant is exactly that: unsettled,
+        # not false. The DETAIL carries the actual fix, because the shared clarification cannot.
+        return _refuse(dataset_logical_ref, TEMPORAL_MODEL_UNKNOWN, (
+            f"the temporal policy for {dataset_logical_ref!r} answers this question with "
+            f"{kind.value!r}, which reads rows AS OF an instant, and the request names no "
+            "parameter for the report cutoff to bind to. Without one the row rule is 'whatever is "
+            "there now', which is a different question — ask with a report cutoff, or declare a "
+            "row rule that does not need one"), policy=policy)
     if kind is TemporalSelectionKind.EXPLICIT_ONLY:
         if temporality is RequestTemporality.HISTORICAL:
             return _refuse(dataset_logical_ref, TEMPORAL_HISTORICAL_CURRENT_ONLY, (
@@ -174,9 +203,11 @@ def resolve_row_selection(
 
 def _predicates_for(kind: TemporalSelectionKind, policy: DatasetTemporalPolicyRevisionV1,
                     cutoff_value_ref: str | None) -> list[dict[str, object]]:
-    """The typed, closed-shape row filter for one selection kind. Never free SQL."""
+    """The typed, closed-shape row filter for one selection kind. Never free SQL.
+
+    The cutoff's PRESENCE is decided by :func:`resolve_row_selection` — as a returned refusal, not
+    an exception — so this function is only ever reached for a kind whose inputs are all there."""
     if kind is TemporalSelectionKind.VALID_AT_REPORT_CUTOFF:
-        _require_cutoff(kind, cutoff_value_ref)
         # HALF-OPEN [from, to) — the same convention `data_agent.dimensions` renders, stated here
         # as the two complementary operators rather than re-derived.
         predicates = [
@@ -184,7 +215,6 @@ def _predicates_for(kind: TemporalSelectionKind, policy: DatasetTemporalPolicyRe
             _predicate("effective_time", policy.effective_to_ref, ">", cutoff_value_ref),
         ]
     elif kind is TemporalSelectionKind.LATEST_SNAPSHOT_AS_OF:
-        _require_cutoff(kind, cutoff_value_ref)
         predicates = [_predicate("snapshot_time", policy.snapshot_ref, "<=", cutoff_value_ref)]
     elif kind is TemporalSelectionKind.CURRENT_RECORD:
         # No flag is legal ONLY on a current-only dataset, where every row IS the current row and
@@ -201,13 +231,6 @@ def _predicates_for(kind: TemporalSelectionKind, policy: DatasetTemporalPolicyRe
         predicates.append(
             _predicate("availability_time", policy.availability_ref, "<=", cutoff_value_ref))
     return predicates
-
-
-def _require_cutoff(kind: TemporalSelectionKind, cutoff_value_ref: str | None) -> None:
-    if not cutoff_value_ref:
-        raise SelectionError(
-            f"selection kind {kind.value!r} needs the REF the runtime cutoff binds to; without it "
-            "the row rule is 'whatever is there now', which is a different question")
 
 
 def _refuse(dataset_logical_ref: str, code: str, detail: str,

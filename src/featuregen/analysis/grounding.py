@@ -37,6 +37,13 @@ binding becomes a thing decisions, observations and snapshots reference, and a d
 revision that was never recorded is unreplayable. It is idempotent, it happens only for the
 SELECTED dataset, and only with the flag on — a flag-off ground writes nothing at all, pinned by
 test.
+
+That write rides the CALLER'S TRANSACTION, and this module neither commits nor rolls back: a route
+whose request later fails takes the pin with it. That is the honest trade rather than a wart to fix
+with a second connection — the id is content-addressed, so the next call re-derives the identical
+revision and the only cost of a rollback is doing the work twice. It is worth saying out loud
+because the neighbouring learning write has the OPPOSITE property: `routes/analysis.py` returns its
+refusal rather than raising it precisely so that write commits.
 """
 from __future__ import annotations
 
@@ -61,6 +68,21 @@ from featuregen.overlay.upload.read_scope import allowed_sensitivities
 #: Below this many rows in a group, a result can isolate individuals. A default, not a policy: a
 #: deployment sets its own, and the finding says which value was applied.
 DEFAULT_MIN_CELL_SIZE = 5
+
+#: The DEFAULT execution tier for a selection, and it is PRODUCTION.
+#:
+#: It was ``"sandbox"``, and nothing passed a tier, so every real selection ran under the tier that
+#: is allowed to rank on a merely PROPOSED (LLM) authority value — the governance default moved
+#: production -> sandbox on the production path, silently, for every caller. The tier decides
+#: whether an unconfirmed classification may choose which copy of a dataset answers a question, so
+#: the safe value has to be the one you get by saying nothing. Sandbox is now reachable only by
+#: asking for it, which is what "sandbox is opt-in" means.
+PRODUCTION_TIER = "production"
+
+#: The parameter name a plan's runtime report cutoff binds to. A NAME, never a date: the decision
+#: carries the ref and the engines take the value, so two replays of one governed decision hash
+#: identically however many days apart they run (`temporal_policy._reject_literal_cutoff`).
+REPORT_CUTOFF_VALUE_REF = "report_cutoff"
 
 _NUMERIC_TYPES = frozenset({
     "numeric", "decimal", "double", "double precision", "float", "float4", "float8", "real",
@@ -160,7 +182,7 @@ def _window_findings(window: Window, anchor: dict | None) -> list[Finding]:
 
 def ground_analysis_plan(conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (),
                          min_cell_size: int = DEFAULT_MIN_CELL_SIZE,
-                         execution_tier: str = "sandbox",
+                         execution_tier: str = PRODUCTION_TIER,
                          cutoff_value_ref: str | None = None,
                          candidate_dataset_refs: Iterable[str] = (),
                          recorded_by: str | None = None) -> GroundedPlan:
@@ -171,7 +193,11 @@ def ground_analysis_plan(conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (
     the same contract the feature gauntlet uses.
 
     The four Release-B keyword arguments are inert while the flag is off; every existing caller
-    keeps its exact behaviour without passing any of them.
+    keeps its exact behaviour without passing any of them. ``execution_tier`` defaults to
+    :data:`PRODUCTION_TIER` — the tier you get by saying nothing is the one that may NOT rank on an
+    unconfirmed authority value. ``cutoff_value_ref`` is the caller's: the route derives it from
+    the plan's own time context with :func:`plan_cutoff_value_ref`, and a plan that needs one and
+    has none gets a typed refusal on the preview rather than an unnoticed absence.
     """
     refs = [plan.entity_ref, plan.measure.logical_ref,
             *(w.anchor_ref for w in plan.windows),
@@ -304,8 +330,24 @@ def _table_ref_of(logical_ref: str) -> str:
     return f"{source}::{'.'.join(parts[:-1])}" if len(parts) >= 2 else logical_ref
 
 
+def plan_cutoff_value_ref(plan: AnalysisPlanV1) -> str | None:
+    """The REF this plan's runtime report cutoff binds to, from the plan's OWN time context.
+
+    A plan expresses time through its ``windows``: each is measured back from the instant the
+    question is asked as of, and that instant IS the report cutoff — the same one the dimension row
+    rule reads. So a plan with a window has a cutoff to name, and a plan with none has no time
+    context at all: there is no instant to be "as of", and a row rule that needs one must refuse
+    rather than quietly read whatever is there now.
+
+    A NAME is returned, never a date. The value is a runtime parameter (§6.5) and a literal here
+    would re-key the same governed decision on every day it was replayed.
+    """
+    return REPORT_CUTOFF_VALUE_REF if plan.windows else None
+
+
 def resolve_plan_selections(
-    conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (), execution_tier: str = "sandbox",
+    conn, plan: AnalysisPlanV1, *, roles: Sequence[str] = (),
+    execution_tier: str = PRODUCTION_TIER,
     cutoff_value_ref: str | None = None, candidate_dataset_refs: Iterable[str] = (),
     recorded_by: str | None = None,
 ) -> SelectionPreviewV1 | None:
@@ -330,13 +372,15 @@ def resolve_plan_selections(
     plan that works today in order to re-declare something that is not in doubt.
     """
     from featuregen.overlay.upload.source_selection import (
+        SELECTION_BINDING_MISSING,
         DatasetNeedRole,
         DatasetNeedV1,
         SelectionError,
         ServingPurpose,
+        normalize_dataset_ref,
         source_temporal_selection_enabled,
     )
-    from featuregen.overlay.upload.source_selector import select_dataset_source
+    from featuregen.overlay.upload.source_selector import SelectionRefusalV1, select_dataset_source
     from featuregen.overlay.upload.temporal_resolver import (
         RequestTemporality,
         resolve_row_selection,
@@ -344,6 +388,22 @@ def resolve_plan_selections(
 
     if not source_temporal_selection_enabled():
         return None
+
+    def _unaddressable(refs: Iterable[str]) -> tuple[str, ...]:
+        """The refs that cannot name a DATASET at all — a ref with no schema, or a column ref.
+
+        A ref the selection contracts cannot address is not a caller bug and not an outage: it is
+        a catalog that has not supplied the schema half of a physical address, which is what
+        `SELECTION_BINDING_MISSING` already names. It is reported as a REFUSAL rather than skipped,
+        because the alternative is the defect this whole review item is about — a need with no
+        decision and nothing saying so."""
+        bad = []
+        for ref in refs:
+            try:
+                normalize_dataset_ref(ref)
+            except SelectionError:
+                bad.append(ref)
+        return tuple(bad)
 
     selections, rows, refusals, warnings = [], [], [], []
     entity = plan.entity or "entity"
@@ -359,20 +419,29 @@ def resolve_plan_selections(
     ]
     wanted += [(DatasetNeedRole.DIMENSION_SOURCE, None, (table,)) for table in dimension_tables]
 
+    # NO BLANKET `except SelectionError`. It used to wrap both calls below, and it erased the ONE
+    # refusal the resolver raised — a historical plan with no cutoff came back with no row rule, no
+    # refusal, and `resolved` True. A genuine bug must crash and a refusal must ride the payload;
+    # the only thing that legitimately raised here was an unaddressable REF, which is checked up
+    # front and reported as the typed refusal it is.
+    row_decisions_expected = 0
     for need_role, explicit, candidates in wanted:
-        try:
-            need = DatasetNeedV1(
-                entity_id=entity, need_role=need_role,
-                serving_purpose=ServingPurpose.ANALYTICAL, execution_tier=execution_tier,
-                explicit_dataset_ref=explicit)
-            outcome = select_dataset_source(
-                conn, need=need, candidate_dataset_refs=candidates, roles=roles,
-                recorded_by=recorded_by)
-        except SelectionError:
-            # A malformed ref is the CALLER's bug, not a governed refusal, and it must not turn a
-            # groundable plan into an outage. The need is skipped and the plan carries no decision
-            # for it — which the preview shows as an absence rather than a false pin.
+        bad_refs = _unaddressable(([explicit] if explicit else []) + list(candidates))
+        if bad_refs:
+            refusals.append(SelectionRefusalV1(
+                code=SELECTION_BINDING_MISSING, subject_refs=bad_refs,
+                detail=(f"{', '.join(repr(r) for r in bad_refs)} cannot address a dataset: a "
+                        "source decision needs source, schema and table, and the catalog has not "
+                        "supplied all three for this table. Bind the table, or ask about one that "
+                        "is addressable")))
             continue
+        need = DatasetNeedV1(
+            entity_id=entity, need_role=need_role,
+            serving_purpose=ServingPurpose.ANALYTICAL, execution_tier=execution_tier,
+            explicit_dataset_ref=explicit)
+        outcome = select_dataset_source(
+            conn, need=need, candidate_dataset_refs=candidates, roles=roles,
+            recorded_by=recorded_by)
         if outcome.refusal is not None:
             refusals.append(outcome.refusal)
             continue
@@ -380,17 +449,15 @@ def resolve_plan_selections(
         warnings.extend(outcome.warnings)
         if need_role is not DatasetNeedRole.DIMENSION_SOURCE:
             continue
-        try:
-            row = resolve_row_selection(
-                conn, dataset_logical_ref=outcome.selection.selected_dataset_ref,
-                dataset_profile_hash=outcome.selection.selected_dataset_profile_hash,
-                # A period-over-period question is HISTORICAL by construction: it is asked about a
-                # window that has closed, so "today's segment" would reattribute it.
-                temporality=(RequestTemporality.HISTORICAL if plan.comparison
-                             else RequestTemporality.CURRENT),
-                cutoff_value_ref=cutoff_value_ref, roles=roles)
-        except SelectionError:
-            continue
+        row_decisions_expected += 1
+        row = resolve_row_selection(
+            conn, dataset_logical_ref=outcome.selection.selected_dataset_ref,
+            dataset_profile_hash=outcome.selection.selected_dataset_profile_hash,
+            # A period-over-period question is HISTORICAL by construction: it is asked about a
+            # window that has closed, so "today's segment" would reattribute it.
+            temporality=(RequestTemporality.HISTORICAL if plan.comparison
+                         else RequestTemporality.CURRENT),
+            cutoff_value_ref=cutoff_value_ref, roles=roles)
         if row.refusal is not None:
             refusals.append(row.refusal)
         else:
@@ -398,7 +465,8 @@ def resolve_plan_selections(
 
     return SelectionPreviewV1(
         source_selections=tuple(selections), row_selections=tuple(rows),
-        refusals=tuple(refusals), warnings=tuple(dict.fromkeys(warnings)))
+        refusals=tuple(refusals), warnings=tuple(dict.fromkeys(warnings)),
+        needs_considered=len(wanted), row_decisions_expected=row_decisions_expected)
 
 
 def record_selection_gaps(conn, selections: SelectionPreviewV1 | None, *, question: str,

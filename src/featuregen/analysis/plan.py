@@ -186,6 +186,11 @@ class SelectionPreviewV1:
     #: line: the point of letting an unconfirmed classification be useful is that its authority
     #: travels with it.
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: How many dataset NEEDS the resolver set out to answer, and how many ROW decisions it owed
+    #: once the sources were chosen. Carried so :attr:`resolved` can mean "every need got its
+    #: decision" rather than "nothing complained" — see that property.
+    needs_considered: int = 0
+    row_decisions_expected: int = 0
 
     @property
     def refusal_codes(self) -> tuple[str, ...]:
@@ -194,7 +199,19 @@ class SelectionPreviewV1:
 
     @property
     def resolved(self) -> bool:
-        return not self.refusals
+        """Every need that was asked about got its decision, and nothing refused.
+
+        NOT merely ``not refusals``. That definition called an EMPTY preview resolved, which is
+        exactly the shape a swallowed exception leaves behind — no decisions, no refusals, and a
+        caller told the selection resolved. The review found precisely that: a historical plan
+        whose row rule raised, was caught by a blanket ``except`` and vanished, leaving
+        ``row_selections=()``, ``refusals=()`` and ``resolved`` True. An empty preview is never
+        resolved now, and a need whose decision is missing for any reason keeps it False.
+        """
+        if self.refusals or not self.source_selections:
+            return False
+        return (len(self.source_selections) == self.needs_considered
+                and len(self.row_selections) == self.row_decisions_expected)
 
 
 @dataclass(frozen=True, slots=True)

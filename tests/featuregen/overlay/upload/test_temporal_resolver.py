@@ -160,10 +160,29 @@ def test_effective_time_and_availability_time_stay_separate_predicates(seeded):
     assert availability["column_ref"] == SEG_AVAIL
 
 
-def test_a_kind_that_needs_a_cutoff_refuses_without_the_ref(seeded):
+def test_a_kind_that_needs_a_cutoff_RETURNS_a_refusal_without_the_ref(seeded):
+    """CHANGE OF INTENT (Task-8 review, F1). This used to RAISE — the one place in the new code that
+    did — and grounding's blanket `except SelectionError: continue` erased it: the plan came back
+    with no row rule, no refusal and `resolved` True. A refusal is a decision outcome, so it rides
+    the payload like every other one in this module.
+
+    The code is TEMPORAL_MODEL_UNKNOWN rather than TEMPORAL_HISTORICAL_CURRENT_ONLY: this dataset
+    KEEPS history, and a refusal may not assert something false about the data to get a
+    better-worded question. See `resolve_row_selection` for the full adjudication."""
     _publish(seeded)
-    with pytest.raises(SelectionError, match="cutoff"):
-        _resolve(seeded, cutoff_value_ref=None)
+    outcome = _resolve(seeded, cutoff_value_ref=None)
+    assert not outcome.resolved
+    assert outcome.refusal.code == TEMPORAL_MODEL_UNKNOWN
+    assert "report cutoff" in outcome.refusal.detail
+    assert outcome.refusal.subject_refs == (SEG,)
+
+
+def test_a_kind_that_needs_NO_cutoff_resolves_without_one(seeded):
+    """`current_record` reads the row the source FLAGS as current, which needs no instant — so the
+    refusal above is about the two as-of kinds, not about a missing argument in general."""
+    _publish(seeded)
+    outcome = _resolve(seeded, temporality=RequestTemporality.CURRENT, cutoff_value_ref=None)
+    assert outcome.resolved
 
 
 # ── CURRENT_RECORD (ENGINE A) ───────────────────────────────────────────────────────────────────

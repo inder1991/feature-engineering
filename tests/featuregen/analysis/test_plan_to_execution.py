@@ -270,7 +270,7 @@ def test_a_spine_binding_that_MATCHES_the_declaration_is_accepted():
     assert ir.spine.binding.identity.table == CUSTOMER_TABLE
 
 
-def test_an_UNDECLARED_population_still_works_with_the_selection_flag_OFF():
+def test_an_UNDECLARED_population_still_works_with_the_selection_flag_OFF(monkeypatch):
     """CHANGE OF INTENT, Release-B Task 8 — this test was
     `test_an_UNDECLARED_population_still_works_for_a_caller_that_supplies_its_own_spine`, and it
     pinned the fail-open as intended: "the check is on the DECLARATION, not a new requirement to
@@ -284,8 +284,13 @@ def test_an_UNDECLARED_population_still_works_with_the_selection_flag_OFF():
     behaviour is to refuse.
 
     The old acceptance survives EXACTLY, as the flag-off half of the matrix: a tree that has not
-    enabled `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` behaves byte-identically to before.
+    enabled `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` behaves byte-identically to before — and the
+    flag is UNSET here rather than assumed unset, like its siblings below. A matrix test whose
+    half depends on the ambient environment passes for the wrong reason on a developer machine
+    that exported the flag once.
     """
+    monkeypatch.delenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", raising=False)
+    monkeypatch.delenv("FEATUREGEN_DATASET_PROFILES", raising=False)
     ir = plan_to_execution_ir(_grounded(), _inputs())
     assert ir.spine.binding.identity.table == CUSTOMER_TABLE
 
