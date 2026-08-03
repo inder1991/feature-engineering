@@ -12,10 +12,13 @@ the computation         **unchanged** — V2 CONTAINS a validated ``AnalysisExec
                         the computation is defined. ``run_analysis`` still takes the V1.
 (no version field)      ``contract_version = 2``, and the token is INSIDE the hashed content, so a
                         future V3 cannot collide with a V2 that happens to carry the same fields.
-(no decision refs)      the SIX PINS (D6), per need and per row decision:
-                        ``dataset_profile_hash``, ``serving_policy_revision_id``,
+(no decision refs)      the SEVEN PINS, per need, per row decision and per event table: the six of
+                        D6 — ``dataset_profile_hash``, ``serving_policy_revision_id``,
                         ``source_selection_hash``, ``binding_revision_id``,
-                        ``temporal_policy_revision_id``, ``row_selection_hash``.
+                        ``temporal_policy_revision_id``, ``row_selection_hash`` — plus the
+                        eligibility policy's derived anchor
+                        (:class:`SealedEligibilityDecisionV1`), which was the one governed input
+                        consumed from the seal and never re-read.
 ``plan_hash`` = sha256  ``plan_hash`` = ``materialize_hash`` (RFC 8785 JCS, D1) over canonical
 of a ``|``-joined       content that includes the version token AND the decision refs. V1's join
 string, truncated       is NOT retained: it cannot carry a version, it does not escape (a column
@@ -88,6 +91,8 @@ class SealedPlanError(ValueError):
 
 SEALED_PLAN_ABSENT = "SEALED_PLAN_ABSENT"
 SEALED_PLAN_STALE_DATASET_PROFILE = "SEALED_PLAN_STALE_DATASET_PROFILE"
+#: PIN 7 — WHICH ROWS COUNT was re-declared. See :class:`SealedEligibilityDecisionV1`.
+SEALED_PLAN_STALE_ELIGIBILITY = "SEALED_PLAN_STALE_ELIGIBILITY"
 SEALED_PLAN_STALE_SERVING_POLICY = "SEALED_PLAN_STALE_SERVING_POLICY"
 SEALED_PLAN_STALE_SOURCE_SELECTION = "SEALED_PLAN_STALE_SOURCE_SELECTION"
 SEALED_PLAN_STALE_PHYSICAL_BINDING = "SEALED_PLAN_STALE_PHYSICAL_BINDING"
@@ -106,6 +111,7 @@ SEALED_PLAN_REFUSAL_CODES: frozenset[str] = frozenset({
     SEALED_PLAN_STALE_PHYSICAL_BINDING,
     SEALED_PLAN_STALE_TEMPORAL_POLICY,
     SEALED_PLAN_STALE_ROW_SELECTION,
+    SEALED_PLAN_STALE_ELIGIBILITY,
     SEALED_PLAN_SOURCE_UNREADABLE,
 })
 
@@ -327,12 +333,78 @@ class SealedRowDecisionV1:
         }
 
 
+def eligibility_policy_hash(policy: Any) -> str:
+    """The identity anchor of ONE stored eligibility policy — PIN 7's sealed value.
+
+    **Why a re-assembled hash and not a revision id.** Every other governed fact this plan pins
+    carries a persisted anchor: ``dsp_`` for a serving policy, ``dtp_`` for a temporal policy,
+    ``pbr_`` for a physical binding, each with its own immutable-revision + CAS-pointer pair.
+    Eligibility does not. Migration 1038 is a single MUTABLE row keyed ``(catalog_source,
+    table_name)``, ``record_eligibility`` UPSERTS it in place, ``confirm_eligibility`` UPDATEs it in
+    place, and neither writes an event, a revision or a version — so there is no id to seal and
+    nothing that increments when someone re-declares which rows count.
+
+    So the anchor is derived the way PIN 1's is (``current_dataset_profile_hash``: "re-ASSEMBLED,
+    not re-read from a cache"). The six fields below ARE the policy — the same six
+    ``AnalysisExecutionIRV1.identity_payload`` enumerates and the same six
+    ``TransactionEligibilityPolicyV1.predicates`` compiles — so a hash over them moves exactly when
+    the definition of "counts" moves and never otherwise. A test pins the two enumerations to each
+    other, because a field added to one and forgotten here would make a re-declaration read as
+    unchanged.
+    """
+    return materialize_hash({
+        "contract": "transaction_eligibility_policy_v1",
+        "status_column": policy.status_column,
+        "included_status_values": list(policy.included_status_values),
+        "reversal_mode": str(policy.reversal_mode),
+        "reversal_column": policy.reversal_column,
+        "non_reversed_values": list(policy.non_reversed_values),
+        "null_behavior": str(policy.null_behavior),
+    })
+
+
+@dataclass(frozen=True, slots=True)
+class SealedEligibilityDecisionV1:
+    """PIN 7 — WHICH ROWS COUNT, and the table whose policy decided it.
+
+    The seventh pin exists because eligibility was the ONE governed input consumed from the seal at
+    execution and never re-read: a re-declared temporal policy correctly refused every already-
+    sealed plan, while a re-declared eligibility policy left them answering under the old definition
+    of "a transaction that counts". Both are judgements a person makes about the bank's data, both
+    change the number rather than widening it, and the asymmetry was an accident of which fact
+    happened to have a revision id.
+
+    ``dataset_ref`` is the EVENT source's ref, because that is the table the policy is keyed by and
+    the address revalidation re-reads it from.
+    """
+
+    dataset_ref: str
+    policy_hash: str
+
+    @classmethod
+    def from_policy(cls, policy: Any, *, dataset_ref: str) -> SealedEligibilityDecisionV1:
+        return cls(dataset_ref=_text(dataset_ref, what="dataset_ref"),
+                   policy_hash=eligibility_policy_hash(policy))
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> SealedEligibilityDecisionV1:
+        return cls(dataset_ref=_text(payload.get("dataset_ref"), what="dataset_ref"),
+                   policy_hash=_text(payload.get("policy_hash"), what="policy_hash"))
+
+    def payload(self) -> dict[str, Any]:
+        return {"dataset_ref": self.dataset_ref, "policy_hash": self.policy_hash}
+
+
 @dataclass(frozen=True, slots=True)
 class SealedDecisionRefsV1:
-    """Every decision ref one analysis plan rests on — the six pins, grouped by what they pin."""
+    """Every decision ref one analysis plan rests on — the SEVEN pins, grouped by what they pin."""
 
     sources: tuple[SealedSourceDecisionV1, ...] = ()
     rows: tuple[SealedRowDecisionV1, ...] = ()
+    #: PIN 7. ``None`` only on a refs object built for a round-trip test; an
+    #: :class:`AnalysisExecutionIRV2` refuses one, because a plan that pins no definition of "which
+    #: rows count" is a plan whose central number nobody agreed to.
+    eligibility: SealedEligibilityDecisionV1 | None = None
     #: Warnings that rode a RESOLVED decision (e.g. ``PROPOSED_AUTHORITY_USED``). Sealed with the
     #: plan because the authority a decision was made under is part of what the decision WAS — a
     #: warning dropped at seal time would make an unconfirmed classification look confirmed the
@@ -352,15 +424,19 @@ class SealedDecisionRefsV1:
         return {
             "sources": [s.payload() for s in self.sources],
             "rows": [r.payload() for r in self.rows],
+            "eligibility": None if self.eligibility is None else self.eligibility.payload(),
             "warnings": list(self.warnings),
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SealedDecisionRefsV1:
+        eligibility = payload.get("eligibility")
         return cls(
             sources=tuple(SealedSourceDecisionV1.from_payload(s)
                           for s in payload.get("sources") or ()),
             rows=tuple(SealedRowDecisionV1.from_payload(r) for r in payload.get("rows") or ()),
+            eligibility=(None if eligibility is None
+                         else SealedEligibilityDecisionV1.from_payload(eligibility)),
             warnings=tuple(str(w) for w in payload.get("warnings") or ()))
 
 
@@ -395,6 +471,11 @@ class AnalysisExecutionIRV2:
             raise SealedPlanError(
                 "an AnalysisExecutionIRV2 with no source decisions pins nothing and is a V1 "
                 "wearing a version number; build it only from a RESOLVED selection")
+        if self.decisions.eligibility is None:
+            raise SealedPlanError(
+                "an AnalysisExecutionIRV2 with no eligibility decision pins no definition of WHICH "
+                "ROWS COUNT, so a re-declaration would leave it answering under the old one; build "
+                "it through build_execution_ir_v2, which takes the pin from the validated IR")
 
     def content_payload(self) -> dict[str, Any]:
         """The canonical JCS content the plan identity is taken over.
@@ -429,13 +510,23 @@ class AnalysisExecutionIRV2:
         return self.execution_ir.plan_hash
 
 
-def seal_refs_from_selections(selections: object) -> SealedDecisionRefsV1:
-    """The six pins, lifted from a RESOLVED :class:`~featuregen.analysis.plan.SelectionPreviewV1`.
+#: The need role whose table the eligibility policy is keyed by. One spelling, shared with
+#: ``sealed_execution``'s assembler so the pin and the executor can never read different tables.
+EVENT_SOURCE_ROLE = "event_source"
+
+
+def seal_refs_from_selections(selections: object, *,
+                              eligibility: Any = None) -> SealedDecisionRefsV1:
+    """The seven pins, lifted from a RESOLVED :class:`~featuregen.analysis.plan.SelectionPreviewV1`.
 
     Refuses an unresolved preview rather than sealing a partial one: ``resolved`` already means
     "every need that was asked about got its decision and nothing refused", and a plan sealed
     without one of its decisions would be replayed later as though the missing decision had been
     made and simply not recorded.
+
+    ``eligibility`` is the validated IR's own policy — the seventh pin does not come from the
+    selection preview, because "which rows count" is not a source or a row-rule decision; it is the
+    event table's own governed judgement, and the selector never reads it.
     """
     if selections is None:
         raise SealedPlanError(
@@ -445,29 +536,42 @@ def seal_refs_from_selections(selections: object) -> SealedDecisionRefsV1:
         raise SealedPlanError(
             "a plan whose selections did not resolve seals nothing: a refusal is a question for a "
             "person, and recording it as a plan would replay as a decision that was never made")
+    sources = tuple(SealedSourceDecisionV1.from_selection(s)
+                    for s in selections.source_selections)
+    events = next((s for s in sources if s.need_role == EVENT_SOURCE_ROLE), None)
     return SealedDecisionRefsV1(
-        sources=tuple(SealedSourceDecisionV1.from_selection(s)
-                      for s in selections.source_selections),
+        sources=sources,
         rows=tuple(SealedRowDecisionV1.from_selection(r) for r in selections.row_selections),
+        eligibility=(None if eligibility is None or events is None
+                     else SealedEligibilityDecisionV1.from_policy(
+                         eligibility, dataset_ref=events.dataset_ref)),
         warnings=tuple(selections.warnings))
 
 
 def build_execution_ir_v2(execution_ir: AnalysisExecutionIRV1, selections: object, *,
                           question: str = "") -> AnalysisExecutionIRV2:
-    """V1 + the sealed decision refs. The ONLY constructor callers should use."""
+    """V1 + the sealed decision refs. The ONLY constructor callers should use.
+
+    The eligibility pin is taken from the IR rather than asked for: a validated
+    ``AnalysisExecutionIRV1`` cannot exist without an eligibility policy, so there is exactly one
+    place it can come from and no way for a caller to seal a plan under a different definition of
+    "counts" than the one it will execute under.
+    """
     return AnalysisExecutionIRV2(
         execution_ir=execution_ir,
-        decisions=seal_refs_from_selections(selections),
+        decisions=seal_refs_from_selections(selections, eligibility=execution_ir.eligibility),
         question=question or execution_ir.question)
 
 
 __all__ = [
     "ANALYSIS_PLAN_CONTRACT",
     "ANALYSIS_PLAN_CONTRACT_VERSION",
+    "EVENT_SOURCE_ROLE",
     "SEALED_PLAN_ABSENT",
     "SEALED_PLAN_REFUSAL_CODES",
     "SEALED_PLAN_SOURCE_UNREADABLE",
     "SEALED_PLAN_STALE_DATASET_PROFILE",
+    "SEALED_PLAN_STALE_ELIGIBILITY",
     "SEALED_PLAN_STALE_PHYSICAL_BINDING",
     "SEALED_PLAN_STALE_ROW_SELECTION",
     "SEALED_PLAN_STALE_SERVING_POLICY",
@@ -476,9 +580,11 @@ __all__ = [
     "SNAPSHOT_KINDS_DEFERRED",
     "AnalysisExecutionIRV2",
     "SealedDecisionRefsV1",
+    "SealedEligibilityDecisionV1",
     "SealedPlanError",
     "SealedRowDecisionV1",
     "SealedSourceDecisionV1",
     "build_execution_ir_v2",
+    "eligibility_policy_hash",
     "seal_refs_from_selections",
 ]

@@ -290,6 +290,39 @@ def test_every_one_of_the_SIX_PINS_re_keys_the_plan(changed):
     assert _v2(selections=selections).plan_hash != base.plan_hash
 
 
+def test_the_SEVENTH_pin_re_keys_the_plan_ON_ITS_OWN():
+    """PIN 7 — which rows COUNT. Isolated from the computation deliberately: changing the policy
+    itself would move the plan hash through the computation half anyway, and what has to be proved
+    is that the DECISION REF carries identity of its own. Without that the pin is a field nobody
+    would notice going missing."""
+    from dataclasses import replace
+
+    from featuregen.analysis.sealed_plan import SealedEligibilityDecisionV1
+
+    base = _v2()
+    moved = AnalysisExecutionIRV2(
+        execution_ir=base.execution_ir,
+        decisions=replace(base.decisions, eligibility=SealedEligibilityDecisionV1(
+            dataset_ref=TRAN, policy_hash="0" * 64)))
+    assert moved.execution_ir.plan_hash == base.execution_ir.plan_hash
+    assert moved.plan_hash != base.plan_hash
+
+
+def test_the_eligibility_pin_names_the_EVENT_source_and_not_the_population():
+    """The policy is keyed by the table it governs. Pinned against the population table it would
+    revalidate the wrong fact — and pass, because customer_master has no eligibility policy at
+    all."""
+    pin = _v2().decisions.eligibility
+    assert pin is not None
+    assert pin.dataset_ref == TRAN
+
+
+def test_the_seventh_pin_round_trips_through_its_payload():
+    refs = _v2().decisions
+    assert SealedDecisionRefsV1.from_payload(refs.payload()) == refs
+    assert refs.payload()["eligibility"]["dataset_ref"] == TRAN
+
+
 def test_the_candidate_SET_order_does_not_re_key_the_plan():
     """Alternatives-considered is a SET. The order the resolver walked its needs in is an
     implementation detail and must not produce two identities for one decision."""

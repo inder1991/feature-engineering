@@ -442,7 +442,7 @@ def execute(body: ExecuteIn, conn: _Conn, identity: _Identity,
         "plan_hash": outcome.plan_hash,
         # RESULT PROVENANCE: the exact decision refs this answer rests on, carried WITH the answer.
         # A number whose sources have to be looked up elsewhere is a number nobody can defend.
-        "provenance": _serialize_provenance(record),
+        "provenance": _serialize_provenance(conn, record),
         "rows": [{"key": r.key, "previous_count": r.previous_count,
                   "current_count": r.current_count, "decreased": r.decreased,
                   "dimensions": dict(r.dimensions)} for r in outcome.rows],
@@ -476,8 +476,8 @@ def _engine_connection_for(conn, record):
     return resolved[1]
 
 
-def _serialize_provenance(record) -> dict:
-    """The six pins, as the answer's own provenance."""
+def _serialize_provenance(conn, record) -> dict:
+    """The seven pins, as the answer's own provenance."""
     return {
         "contract_version": record.contract_version,
         "sources": [{"need_role": s.need_role, "dataset_ref": s.dataset_ref,
@@ -492,7 +492,35 @@ def _serialize_provenance(record) -> dict:
                   "row_selection_hash": r.row_selection_hash,
                   "selection_kind": r.selection_kind}
                  for r in record.rows],
+        # PIN 7. The definition of WHICH ROWS COUNT this number was measured under, plus whether a
+        # human ever agreed to it: the planning preview already discloses `ELIGIBILITY_UNCONFIRMED`
+        # as a finding, and an ANSWER that dropped the disclosure would be the finding travelling
+        # only as far as the preview. Usable before confirmation is the product rule; passing
+        # silently is not.
+        "eligibility": _eligibility_provenance(conn, record),
         "warnings": list(record.decisions.warnings),
+    }
+
+
+def _eligibility_provenance(conn, record) -> dict | None:
+    """The sealed eligibility pin, and the CURRENT confirmation state of the policy it names.
+
+    The two are deliberately different kinds of fact and both are needed. `policy_hash` is what the
+    plan was sealed under and revalidation has just proved unmoved; `confirmed` is read now, because
+    a person confirming a proposal between the seal and the run is exactly the change a reader wants
+    reflected, and it is not drift.
+    """
+    sealed = record.eligibility
+    if sealed is None:
+        return None
+    source, table = _source_and_table(sealed.dataset_ref)
+    stored = resolve_eligibility(conn, catalog_source=source, table=table)
+    return {
+        "dataset_ref": sealed.dataset_ref,
+        "policy_hash": sealed.policy_hash,
+        "confirmed": bool(stored is not None and stored.confirmed),
+        "status": ("" if stored is not None and stored.confirmed
+                   else "ELIGIBILITY_UNCONFIRMED"),
     }
 
 

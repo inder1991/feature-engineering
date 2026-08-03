@@ -6,14 +6,18 @@ Three claims, against the pilot bank and nothing live:
     ``analysis_execution_plan``, version 2) — no second replay table, no migration — and replays by
     its own identity;
   * a REFUSED plan seals nothing;
-  * every one of the SIX PINS is re-read immediately before execution, and any drift is a TYPED
+  * every one of the SEVEN PINS is re-read immediately before execution, and any drift is a TYPED
     refusal naming what moved — never a silent re-derivation. That is
-    `authorize_execution_realizations`' doctrine, not runprep's.
+    `authorize_execution_realizations`' doctrine, not runprep's. (The seventh is ELIGIBILITY: it
+    was consumed from the seal and never re-read, so a re-declared definition of "which rows
+    count" left every sealed plan answering under the old one.)
 
 And the pin property that the pin exists for: when a policy changes LATER, the sealed plan stays
 exactly what it was. Nothing claims a historical output was corrected.
 """
 from __future__ import annotations
+
+from datetime import UTC, datetime
 
 import pytest
 from psycopg.types.json import Jsonb
@@ -34,6 +38,7 @@ from tests.featuregen.data_agent.pilot_fixture import (
     PILOT_JOIN_EVIDENCE,
     PREVIOUS_MONTH,
     REPORT_CUTOFF,
+    TRANSACTION_TABLE,
 )
 from tests.featuregen.data_agent.test_analysis_ir import _policy as _eligibility
 
@@ -43,6 +48,7 @@ from featuregen.analysis.sealed_plan import (
     ANALYSIS_PLAN_CONTRACT,
     SEALED_PLAN_SOURCE_UNREADABLE,
     SEALED_PLAN_STALE_DATASET_PROFILE,
+    SEALED_PLAN_STALE_ELIGIBILITY,
     SEALED_PLAN_STALE_PHYSICAL_BINDING,
     SEALED_PLAN_STALE_ROW_SELECTION,
     SEALED_PLAN_STALE_SERVING_POLICY,
@@ -61,6 +67,8 @@ from featuregen.analysis.sealed_plan_store import (
     seal_analysis_plan,
 )
 from featuregen.data_agent.binding_store import resolve_table
+from featuregen.data_agent.eligibility import NullBehavior
+from featuregen.data_agent.eligibility_store import confirm_eligibility, record_eligibility
 from featuregen.overlay.upload.catalog_profiles import build_catalog_profile_revision
 from featuregen.overlay.upload.profile_store import (
     record_catalog_profile_revision,
@@ -79,7 +87,13 @@ from featuregen.overlay.upload.temporal_resolver import attribution_policy_for
 
 @pytest.fixture
 def bank(db, monkeypatch):
-    return build_bank(db, monkeypatch)
+    built = build_bank(db, monkeypatch)
+    # WHICH ROWS COUNT — PIN 7's governed fact. STORED, because revalidation re-reads it from the
+    # store: a suite that only ever passed a policy object in would seal a pin nothing could
+    # revalidate, which is the shape of the defect the pin closes.
+    record_eligibility(built, catalog_source=SRC, table=TRANSACTION_TABLE, policy=_eligibility(),
+                       proposed_by="user:priya")
+    return built
 
 
 def _grounded(bank, **over):
@@ -438,6 +452,102 @@ def test_drift_ROW_SELECTION_a_tampered_row_seal_cannot_be_replayed_either(bank)
     refusal = revalidate_sealed_plan(bank, tampered)
     assert refusal is not None
     assert refusal.code == SEALED_PLAN_STALE_ROW_SELECTION
+
+
+# ── PIN 7: which rows COUNT ──────────────────────────────────────────────────────────────────────
+#
+# The pin the review found missing. Eligibility was consumed FROM THE SEAL at execution and never
+# re-read, so a re-declared eligibility policy left every already-sealed plan answering under the
+# old definition — while a re-declared TEMPORAL policy correctly refused. Both are judgements a
+# person makes about the bank's data and both change the number rather than widening it.
+
+
+def test_the_seal_carries_the_SEVENTH_pin(bank):
+    from featuregen.analysis.sealed_plan import eligibility_policy_hash
+
+    record = _sealed(bank)
+    assert record.eligibility is not None
+    assert record.eligibility.dataset_ref == TRAN
+    assert record.eligibility.policy_hash == eligibility_policy_hash(_eligibility())
+
+
+def test_drift_ELIGIBILITY_a_re_declared_definition_of_counts_refuses_by_name(bank):
+    """Someone decides PENDING transactions are activity after all. Every already-sealed plan would
+    go on answering under the old definition with a clean audit trail — the exact asymmetry with the
+    temporal policy this pin closes."""
+    record = _sealed(bank)
+    record_eligibility(
+        bank, catalog_source=SRC, table=TRANSACTION_TABLE,
+        policy=_eligibility(included_status_values=("POSTED", "PENDING")),
+        proposed_by="user:sam")
+
+    refusal = revalidate_sealed_plan(bank, record)
+    assert refusal is not None
+    assert refusal.code == SEALED_PLAN_STALE_ELIGIBILITY
+    assert refusal.subject_refs == (TRAN,)
+    assert refusal.sealed_value != refusal.current_value
+    assert refusal.current_value
+
+
+def test_drift_ELIGIBILITY_a_policy_that_VANISHED_refuses_too(bank):
+    """The plan was sealed where a person had said which rows count, and now nobody has. That is
+    drift, not an absence to default through."""
+    record = _sealed(bank)
+    bank.execute("DELETE FROM eligibility_policy WHERE catalog_source = %s", (SRC,))
+
+    refusal = revalidate_sealed_plan(bank, record)
+    assert refusal is not None
+    assert refusal.code == SEALED_PLAN_STALE_ELIGIBILITY
+    assert refusal.current_value == ""
+
+
+def test_CONFIRMING_the_same_eligibility_policy_is_not_drift(bank):
+    """A human agreeing to the proposal the plan was sealed under changes the AUTHORITY, never
+    which rows count. Refusing there would punish exactly the act the disclosure asks for."""
+    record = _sealed(bank)
+    confirm_eligibility(bank, catalog_source=SRC, table=TRANSACTION_TABLE, actor="user:priya",
+                        now=datetime.now(UTC))
+    assert revalidate_sealed_plan(bank, record) is None
+
+
+def test_a_plan_that_pins_NO_eligibility_decision_may_not_be_replayed(bank):
+    """The pin is not optional. A record without one was sealed by a build that did not have it,
+    and running it would skip pin 7 in silence — the inert-mechanism failure the pin closes."""
+    from dataclasses import replace
+
+    record = _sealed(bank)
+    unpinned = replace(record, decisions=replace(record.decisions, eligibility=None))
+    with pytest.raises(SealedPlanError, match="pins no eligibility decision"):
+        revalidate_sealed_plan(bank, unpinned)
+
+
+def test_a_V2_cannot_be_built_without_the_eligibility_pin(bank):
+    from featuregen.analysis.sealed_plan import AnalysisExecutionIRV2
+
+    grounded = _grounded(bank)
+    with pytest.raises(SealedPlanError, match="WHICH ROWS COUNT"):
+        AnalysisExecutionIRV2(execution_ir=_v2(bank, grounded).execution_ir,
+                              decisions=seal_refs_from_selections(grounded.selections))
+
+
+def test_the_eligibility_ANCHOR_enumerates_the_same_facts_the_IR_identity_does(bank):
+    """The drift guard between the two enumerations. A field added to the policy and folded into
+    the IR's identity but forgotten in the pin would make a re-declaration read as UNCHANGED — the
+    silent case this whole task exists to prevent."""
+    from featuregen.analysis.sealed_plan import eligibility_policy_hash
+
+    ir = _v2(bank).execution_ir
+    anchor_facts = {"status_column", "included_status_values", "reversal_mode", "reversal_column",
+                    "non_reversed_values", "null_behavior"}
+    assert set(ir.identity_payload()["eligibility"]) == anchor_facts
+    # And every one of them MOVES the anchor.
+    base = eligibility_policy_hash(_eligibility())
+    for over in ({"status_column": "posting_status"},
+                 {"included_status_values": ("POSTED", "SETTLED")},
+                 {"reversal_column": "rev_flag"},
+                 {"non_reversed_values": ("NO",)},
+                 {"null_behavior": NullBehavior.INCLUDE}):
+        assert eligibility_policy_hash(_eligibility(**over)) != base, over
 
 
 def test_a_caller_who_may_not_read_the_source_gets_the_SAME_words_as_a_missing_one(bank):

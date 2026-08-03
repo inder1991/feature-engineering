@@ -25,9 +25,15 @@ made.
 (``materialize/ir.py:327-340``) re-reads the CURRENT authority immediately before execution and
 refuses on drift rather than re-deriving — because a plan authorized under one state and executed
 under another is exactly the class of defect that produces a confident wrong answer. Here the same
-rule applies to the six pins: every one is re-read against current catalog state, the FIRST drift
+rule applies to the SEVEN pins: every one is re-read against current catalog state, the FIRST drift
 is named, and nothing is ever silently re-derived. The refusal says WHAT moved and from what to
 what, because "the plan is stale" sends the reader nowhere.
+
+**The seventh pin is eligibility**, and it is here because the review found the six were not all of
+them: "which rows count" was consumed from the seal at execution and never re-read, so a
+re-declared eligibility policy left every already-sealed plan answering under the old definition
+while a re-declared temporal policy correctly refused. See :class:`SealedEligibilityDecisionV1` for
+why its anchor is derived rather than a revision id.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from featuregen.analysis.sealed_plan import (
     ANALYSIS_PLAN_CONTRACT_VERSION,
     SEALED_PLAN_SOURCE_UNREADABLE,
     SEALED_PLAN_STALE_DATASET_PROFILE,
+    SEALED_PLAN_STALE_ELIGIBILITY,
     SEALED_PLAN_STALE_PHYSICAL_BINDING,
     SEALED_PLAN_STALE_ROW_SELECTION,
     SEALED_PLAN_STALE_SERVING_POLICY,
@@ -49,9 +56,11 @@ from featuregen.analysis.sealed_plan import (
     SEALED_PLAN_STALE_TEMPORAL_POLICY,
     AnalysisExecutionIRV2,
     SealedDecisionRefsV1,
+    SealedEligibilityDecisionV1,
     SealedPlanError,
     SealedRowDecisionV1,
     SealedSourceDecisionV1,
+    eligibility_policy_hash,
 )
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.upload.structured_results import (
@@ -102,6 +111,10 @@ class SealedPlanRecordV1:
     @property
     def rows(self) -> tuple[SealedRowDecisionV1, ...]:
         return self.decisions.rows
+
+    @property
+    def eligibility(self) -> SealedEligibilityDecisionV1 | None:
+        return self.decisions.eligibility
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,14 +381,48 @@ def _revalidate_row(conn, decision: SealedRowDecisionV1, *,
     return None
 
 
+def _revalidate_eligibility(conn, decision: SealedEligibilityDecisionV1, *,
+                            roles: Sequence[str]) -> SealedPlanRefusalV1 | None:
+    """PIN 7 — WHICH ROWS COUNT, re-read against the current stored policy.
+
+    The pin this task's review found missing. Eligibility was consumed FROM THE SEAL at execution
+    and never revalidated, so a re-declared eligibility policy left every already-sealed plan
+    answering under the old definition — while a re-declared TEMPORAL policy correctly refused. Both
+    are judgements a person makes about the bank's data and both change the number; the asymmetry
+    was an accident of which fact happened to have a revision id.
+    """
+    from featuregen.data_agent.eligibility_store import resolve_eligibility
+    from featuregen.overlay.upload.object_ref import parse_ref
+
+    ref = decision.dataset_ref
+    if not _readable(conn, ref, roles):
+        return SealedPlanRefusalV1(
+            code=SEALED_PLAN_SOURCE_UNREADABLE, subject_refs=(ref,),
+            detail=(f"{ref!r} is not a readable dataset for this caller, so the eligibility policy "
+                    "sealed against it cannot be revalidated on their behalf"))
+    source, _schema, table, _column = parse_ref(ref)
+    stored = resolve_eligibility(conn, catalog_source=source, table=table)
+    # A policy that VANISHED is drift exactly as a re-declared one is: the plan was sealed where a
+    # person had said which rows count, and now nobody has.
+    current = "" if stored is None else eligibility_policy_hash(stored.policy)
+    if current != decision.policy_hash:
+        return SealedPlanRefusalV1(
+            code=SEALED_PLAN_STALE_ELIGIBILITY, subject_refs=(ref,),
+            detail=(f"which rows of {ref!r} COUNT is no longer the definition this plan was sealed "
+                    "under, so every number it produces would be measured against a rule nobody "
+                    "approved for it"),
+            sealed_value=decision.policy_hash, current_value=current)
+    return None
+
+
 def revalidate_sealed_plan(conn, record: SealedPlanRecordV1, *,
                            roles: Sequence[str] = ()) -> SealedPlanRefusalV1 | None:
-    """Re-read all six pins against CURRENT state. ``None`` means the plan may execute.
+    """Re-read all SEVEN pins against CURRENT state. ``None`` means the plan may execute.
 
-    Sources first, then rows, each in the D6 pin order, and the FIRST drift wins. Order is not
-    cosmetic: a moved source makes its row rule's dataset profile a different thing, so reporting
-    the row rule first would send a person to re-declare a temporal policy for a table that is no
-    longer the one being read.
+    Sources first, then eligibility, then rows — each in the D6 pin order, and the FIRST drift
+    wins. Order is not cosmetic: a moved source makes both its eligibility policy and its row
+    rule's dataset profile a different thing, so reporting either first would send a person to
+    re-declare a policy for a table that is no longer the one being read.
 
     **Nothing is re-derived.** A drifted pin refuses; it never re-runs the selector and substitutes
     today's answer, because that would silently give a person the plan they did not approve under
@@ -385,6 +432,16 @@ def revalidate_sealed_plan(conn, record: SealedPlanRecordV1, *,
         refusal = _revalidate_source(conn, source, roles=roles)
         if refusal is not None:
             return refusal
+    if record.eligibility is None:
+        # Not a drift outcome: `AnalysisExecutionIRV2` refuses to exist without the pin, so a sealed
+        # record without one was written by a build that did not have it. Running it would mean
+        # skipping pin 7 silently, which is the inert-mechanism failure the pin exists to close.
+        raise SealedPlanError(
+            "this sealed plan pins no eligibility decision, so 'which rows count' cannot be "
+            "revalidated; it was sealed by a build that did not pin it and may not be replayed")
+    refusal = _revalidate_eligibility(conn, record.eligibility, roles=roles)
+    if refusal is not None:
+        return refusal
     for row in record.rows:
         refusal = _revalidate_row(conn, row, roles=roles)
         if refusal is not None:

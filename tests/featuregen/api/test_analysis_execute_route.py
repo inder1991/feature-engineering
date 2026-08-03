@@ -33,12 +33,13 @@ from featuregen.analysis.grounding import ground_analysis_plan
 from featuregen.analysis.sealed_execution import execution_inputs_for_plan
 from featuregen.analysis.sealed_plan import (
     SEALED_PLAN_ABSENT,
+    SEALED_PLAN_STALE_ELIGIBILITY,
     SEALED_PLAN_STALE_TEMPORAL_POLICY,
     build_execution_ir_v2,
 )
 from featuregen.analysis.sealed_plan_store import seal_analysis_plan
 from featuregen.api.deps import get_analysis_engine
-from featuregen.data_agent.eligibility_store import record_eligibility
+from featuregen.data_agent.eligibility_store import confirm_eligibility, record_eligibility
 from featuregen.data_agent.sql_postgres import PostgresDialect
 from featuregen.overlay.upload.temporal_policy import TemporalSelectionKind
 
@@ -124,6 +125,49 @@ def test_the_result_carries_the_SEALED_REFS_as_its_provenance(make_client, bank,
     row = provenance["rows"][0]
     assert row["temporal_policy_revision_id"].startswith("dtp_")
     assert row["selection_kind"] == TemporalSelectionKind.VALID_AT_REPORT_CUTOFF.value
+
+
+def test_the_answer_DISCLOSES_that_nobody_confirmed_which_rows_count(make_client, bank, sealed):
+    """PIN 7's disclosure half. "Usable before confirmation" is the product rule; passing silently
+    is not — and a finding that reached the PREVIEW and not the answer is the disclosure stopping
+    exactly where the number starts."""
+    r = _client(make_client, bank).post(
+        "/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
+    eligibility = r.json()["provenance"]["eligibility"]
+    assert eligibility["dataset_ref"].endswith(TRANSACTION_TABLE)
+    assert eligibility["policy_hash"]
+    assert eligibility["confirmed"] is False
+    assert eligibility["status"] == "ELIGIBILITY_UNCONFIRMED"
+
+
+def test_a_CONFIRMED_eligibility_policy_reports_no_outstanding_disclosure(make_client, bank,
+                                                                          sealed):
+    """The other half: a human agreeing between the seal and the run is not drift, and the answer
+    says so rather than carrying a finding nobody owes anything about."""
+    confirm_eligibility(bank, catalog_source=SRC, table=TRANSACTION_TABLE, actor="user:priya",
+                        now=datetime.now(UTC))
+    r = _client(make_client, bank).post(
+        "/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
+    assert r.status_code == 200, r.text
+    assert r.json()["provenance"]["eligibility"] == {
+        **r.json()["provenance"]["eligibility"], "confirmed": True, "status": ""}
+
+
+def test_a_RE_DECLARED_definition_of_which_rows_count_refuses_the_sealed_plan(make_client, bank,
+                                                                              sealed):
+    """The seventh pin, over HTTP. Before it existed this ran clean and answered under the OLD
+    definition of "a transaction that counts" — while a re-declared TEMPORAL policy refused."""
+    record_eligibility(bank, catalog_source=SRC, table=TRANSACTION_TABLE,
+                       policy=_eligibility(included_status_values=("POSTED", "PENDING")),
+                       proposed_by="user:sam")
+    r = _client(make_client, bank).post(
+        "/analysis/execute", json={"plan_hash": sealed.plan_hash}, headers=_h())
+    assert r.status_code == 409
+    refusal = r.json()["refusal"]
+    assert refusal["code"] == SEALED_PLAN_STALE_ELIGIBILITY
+    assert refusal["sealed"] != refusal["current"]
+    # NO RESTATEMENT CLAIM, as with every other pin: this is about THIS run.
+    assert "correct" not in r.text.lower()
 
 
 def test_an_UNKNOWN_plan_identity_is_a_typed_absence(make_client, bank, sealed):
