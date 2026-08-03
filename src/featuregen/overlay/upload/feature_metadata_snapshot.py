@@ -72,6 +72,14 @@ _ISOLATION_LEVEL = "repeatable read"
 # ── Task 0.6 Seam 4 (D6): the six snapshot pin KINDS. ``column_field`` is the only kind with a
 # builder/comparator today; the other five are RESERVED vocabulary whose builders arrive with the
 # profile/serving/temporal deliveries. No DB change: ``item_kind`` is an existing text column.
+#
+# STILL RESERVED AFTER RELEASE-B TASK 9, deliberately. Task 9's own rule is "use the six shared
+# snapshot kinds WHEN feature/materialization consumes the same decision". Analysis now consumes
+# all six — it seals them into `AnalysisExecutionIRV2` and revalidates them before every run
+# (`analysis/sealed_plan.py`) — but the FEATURE side does not until the Phase-G wiring merge, and a
+# pin with one producer and no consumer is the inert mechanism this programme keeps rediscovering.
+# The compat-safe hash rule below is already in place, so the builders land additively: no
+# migration, and not one stored snapshot re-hashed.
 ITEM_KIND_COLUMN_FIELD = "column_field"
 ITEM_KINDS: frozenset[str] = frozenset({
     ITEM_KIND_COLUMN_FIELD, "dataset_profile", "serving_policy", "source_selection",
