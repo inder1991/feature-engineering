@@ -161,9 +161,9 @@ def test_every_new_key_has_exactly_one_egress_classification(key: str) -> None:
 
 
 @pytest.mark.parametrize("key,expected_kind", [
-    ("semantic_terms", "prose"),
-    ("table_description", "prose"),
-    ("business_context", "prose"),
+    ("semantic_terms", "definition"),
+    ("table_description", "definition"),
+    ("business_context", "definition"),
 ])
 def test_new_free_text_keys_are_pii_scanned_as_their_declared_kind(key, expected_kind) -> None:
     assert llm._meta_field_kind(key) == expected_kind
@@ -172,6 +172,69 @@ def test_new_free_text_keys_are_pii_scanned_as_their_declared_kind(key, expected
     assert scrubbed is not None
     assert version is not None                             # it WAS scanned, not waved through
     assert "john.doe@example.com" not in scrubbed[key]     # and the scan actually scrubbed
+
+
+# ── the narrative TABLE fields are the same class of field as a definition ───────────────────────
+
+#: The reviewer's probe text: an FTR-shaped sample clause carrying an account number, an amount and
+#: a personal name. The PII backstop catches none of the three by itself.
+_SAMPLE_LADEN = ("Posted ledger transactions per counterparty. The sample profile is TEXT, with "
+                 "representative values such as ACCT-8891; 1234.56; Jane Roe.")
+
+#: The three keys that carry curated TABLE narrative into a prompt. `table_definition` already had
+#: the definition-grade pipeline; the other two are the same class of field and now share it.
+_NARRATIVE_KEYS = ("table_definition", "business_context", "table_description")
+
+
+@pytest.mark.parametrize("key", _NARRATIVE_KEYS)
+def test_a_narrative_table_field_is_sample_stripped_not_merely_pii_scanned(key: str) -> None:
+    scrubbed, _spans, audits, _v = llm._redact_free_text_meta({"table": "t", key: _SAMPLE_LADEN})
+    assert scrubbed is not None
+    for value in ("ACCT-8891", "1234.56", "Jane Roe"):
+        assert value not in scrubbed[key], (key, value)
+    assert any(a["path"] == key and a["state"] == "stripped" for a in audits), audits
+
+
+def test_the_narrative_table_fields_yield_BYTE_IDENTICAL_output() -> None:
+    """The probe the finding names: the SAME text must not egress differently because of which
+    narrative key it happened to ride."""
+    out = {key: llm._redact_free_text_meta({"table": "t", key: _SAMPLE_LADEN})[0][key]
+           for key in _NARRATIVE_KEYS}
+    assert len(set(out.values())) == 1, out
+
+
+@pytest.mark.parametrize("key", _NARRATIVE_KEYS)
+def test_a_narrative_table_field_fails_closed_on_an_unhandled_data_marker(key: str) -> None:
+    """Fail-closed parity: a sample clause the stripper cannot consume blocks the ITEM, exactly as
+    it does for a business/table definition — the prose grade had no such gate at all."""
+    blocked, _spans, _audits, _v = llm._redact_free_text_meta(
+        {"table": "t", key: "sample values: OPN; CLS; PND"})
+    assert blocked is None
+
+
+def test_the_live_producer_of_semantic_terms_egresses_it_stripped() -> None:
+    """The byte-impact check: `for_summary` is the ONE live producer that puts `semantic_terms`
+    into item metadata (summary/definition/synonyms/unit). Its payload's bytes change exactly when
+    the value carries a sample clause — which is the fix, not a regression."""
+    assert "semantic_terms" in sc.SUMMARY_RENDERED_KEYS      # the producer contract, pinned
+    payload = {"table": _TABLE, "column": "counter_party_bic", "semantic_terms": _SAMPLE_LADEN}
+    scrubbed, _spans, audits, _v = llm._redact_free_text_meta(payload)
+    assert scrubbed is not None
+    assert scrubbed["semantic_terms"] == "Posted ledger transactions per counterparty."
+    assert any(a["path"] == "semantic_terms" and a["state"] == "stripped" for a in audits)
+
+
+def test_semantic_terms_is_definition_grade_on_BOTH_egress_seams() -> None:
+    """It was definition-kind in the feature-menu adapter and prose in the enrichment classifier —
+    one field, two grades. The two seams now agree."""
+    assert llm._meta_field_kind("semantic_terms") == "definition"
+    assert "semantic_terms" in llm._FEATURE_COLUMN_DEFINITION_KEYS
+    scrubbed, _spans, _audits, _v = llm._redact_free_text_meta(
+        {"table": "t", "semantic_terms": _SAMPLE_LADEN})
+    menu, _s, _a, _v2 = llm.sanitize_feature_context(
+        {"columns": [{"column": "c", "semantic_terms": _SAMPLE_LADEN}]})
+    assert scrubbed is not None and menu is not None
+    assert scrubbed["semantic_terms"] == menu["columns"][0]["semantic_terms"]
 
 
 @pytest.mark.parametrize("key", ["primary_entity", "declared_type", "operational_type",

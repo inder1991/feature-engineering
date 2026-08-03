@@ -75,17 +75,37 @@ _REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing 
 
 # Finding #19: glossary sidecar values (business definitions, synonyms, data domains, BIAN/FIBO
 # taxonomy paths, the term name) are uploader-authored FREE TEXT — not structural names/types — so
-# they are never presumable-clean. Phase-2 Slice 1 makes the boundary FIELD-AWARE: the two curated
-# DEFINITION fields (business_definition + the table-level table_definition) can EMBED raw sample
-# values in prose, so they route through `sanitize.sanitize_definition` (sample-clause strip +
-# fail-closed data-marker scan + PII redaction); every other free-text field is PII-only via
-# `redaction.redact_free_text`. The deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/
+# they are never presumable-clean. Phase-2 Slice 1 makes the boundary FIELD-AWARE: the curated
+# NARRATIVE fields (`_DEFINITION_META_KEYS` — column/table definitions, the Pass-B table narrative,
+# and the projected semantic terms) can EMBED raw sample values in prose, so they route through
+# `sanitize.sanitize_definition` (sample-clause strip + fail-closed data-marker scan + PII
+# redaction); every other free-text field is PII-only via `redaction.redact_free_text`. The deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/
 # address) classifies + scrubs, and a REGISTERED IntentRedactor (`register_intent_redactor` — the
 # NER seam redaction.py documents as the DEFERRED personal-NAMES closer) supersedes the default
 # when present (sanitize_definition's PII step rides the same seam). A value that fails closed
 # (redactor failure, or a definition the sanitizer blanks) blocks the ITEM (batch: excluded +
 # audited; single: no dispatch).
-_DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition"})
+# Definition-KIND is a statement about what a field CAN CARRY, not about which name it goes by:
+# curated narrative prose, authored against real data, which can therefore embed real sample values
+# in a sentence. `business_definition` (column) and `table_definition` (table) were the original
+# two; the joint/profile work added three more of exactly that class and they now share the grade:
+#
+# * `table_description` / `business_context` — the Pass-B table narrative. Classifying them as
+#   plain prose gave them the PII backstop ONLY: a probe of "ACCT-8891, 1234.56, Jane Roe" in a
+#   canonical sample clause survived intact, while the SAME sentence under `table_definition` was
+#   stripped. Same class of field, same pipeline.
+# * `semantic_terms` — the platform's term expansion, built from the sidecar's uploader-authored
+#   terms. It was ALREADY definition-kind in the feature-menu adapter
+#   (`_FEATURE_COLUMN_DEFINITION_KEYS`) and prose here: one field, two grades, depending only on
+#   which seam it rode. The two seams now agree.
+#
+# Definition grade = `sanitize_definition` (sample-clause strip to a fixed point + FAIL-CLOSED
+# data-marker scan + PII redaction) plus a per-field `sample_strip` audit; prose grade is PII only,
+# with no gate for a data marker at all. The strictly-stronger direction, so nothing that used to
+# egress cleanly is newly leaked; a value carrying an unconsumable marker now BLOCKS its item
+# (audited) instead of egressing.
+_DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition",
+                                   "table_description", "business_context", "semantic_terms"})
 # [F6] `synonyms` is prose emitted as list[str] (enrich.py) — a LIST of prose values, each
 # PII-scanned per item and audited at an indexed path (`synonyms[0]`).
 # `source_attributes` joins `synonyms` here deliberately: these are uploader-authored values, so
@@ -97,13 +117,13 @@ _LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_ter
 # comma-joined synonym draft riding the tail summary payload — all PII-scanned as prose. The
 # remaining Step-6c summary keys (`concept`, `party_role`, `grain_role`, `table_role`) are
 # PLATFORM-derived closed-vocabulary tokens, allowlisted but deliberately not prose-scanned.
-# `semantic_terms` (joint Task 4) is the platform's own term expansion, but it is BUILT from the
-# sidecar's uploader-authored terms (`_project_semantic_terms` joins term_name/synonyms/BIAN/FIBO/
-# process paths), so it inherits their never-presumable-clean status and is PII-scanned as prose.
-# `table_description` / `business_context` (profile Task 4) are curated table narrative — prose.
+# `semantic_terms` (joint Task 4) and the `table_description`/`business_context` table narrative
+# (profile Task 4) were classified here and are now DEFINITION-kind — see `_DEFINITION_META_KEYS`
+# above for why. What stays prose is genuinely short, non-narrative field text: a term name, a
+# domain, a taxonomy/process path, a term type, and the AI's comma-joined synonym draft. None of
+# those is authored against real rows, so none carries a sample clause by contract.
 _SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path",
-                                     "term_type", "process_path", "ai_synonyms",
-                                     "semantic_terms", "table_description", "business_context"})
+                                     "term_type", "process_path", "ai_synonyms"})
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
 _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 
@@ -1380,6 +1400,15 @@ MAX_DEFINITION_LEN = 600
 # definition is not cut mid-sentence before it egresses. `business_definition` matches
 # `enrich.bounded_definition`'s bound (same constant); [F7] gives the table-level
 # `table_definition` the SAME 600 window (it previously inherited the 200 default).
+#
+# DELIBERATELY not widened for the three keys that joined `_DEFINITION_META_KEYS` later
+# (`table_description`, `business_context`, `semantic_terms`): the sanitize PIPELINE and the length
+# WINDOW are separate knobs, and widening what may egress is not part of grading them. They keep
+# the tight 200 default they had as prose. Note the direction of the mismatch is safe: Pass B bounds
+# its own narrative OUTPUT at 600 (`table_synth._MAX_PROFILE_PROSE`), so a future producer threading
+# a full-length `business_context` back into ITEM metadata would have the item EXCLUDED + audited by
+# `_item_len_ok`, never silently truncated — at which point widening this map is the deliberate
+# decision to make.
 _MAX_LEN_DEFAULT = 200
 _MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
                    "table_definition": MAX_DEFINITION_LEN}
