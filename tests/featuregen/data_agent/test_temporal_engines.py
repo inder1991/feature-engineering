@@ -153,6 +153,18 @@ def test_current_value_with_no_declaration_at_all_is_refused():
             effective_from_column="effective_from", effective_to_column="")
 
 
+def test_a_current_flag_on_a_REPORT_CUTOFF_policy_is_refused_not_ignored():
+    """The mirror of the refusal below. Only `_current_predicate` reads the flag, so on a cutoff
+    policy it changes no rows — while still entering `plan_hash`, which forks the identity of two
+    plans that compile to the same statement. Existing policies are unaffected: no `report_cutoff`
+    policy in the tree declares one."""
+    with pytest.raises(AttributionError, match="ATTRIBUTION_CURRENT_FLAG_ON_CUTOFF"):
+        DimensionAttributionPolicyV1(
+            attribution_basis=AttributionBasis.REPORT_CUTOFF,
+            effective_from_column="effective_from", effective_to_column="effective_to",
+            report_cutoff=REPORT_CUTOFF, current_flag_column="is_current")
+
+
 def test_a_cutoff_on_a_current_value_policy_is_refused_not_ignored():
     with pytest.raises(AttributionError, match="ATTRIBUTION_CUTOFF_ON_CURRENT_VALUE"):
         DimensionAttributionPolicyV1(
@@ -345,3 +357,27 @@ def test_the_snapshot_selection_changes_the_plan_hash(pilot):
     base = _ir().plan_hash
     assert _ir(snapshot_selection=_snapshot(cutoff="2026-05-31")).plan_hash != base
     assert _ir(snapshot_selection=_snapshot(tie_break_columns=("load_seq",))).plan_hash != base
+
+
+def test_the_snapshot_MISSING_VALUE_BEHAVIOUR_is_part_of_the_plan_hash(pilot):
+    """The review's probe: `compile_analysis` BRANCHES on this field — one statement COALESCEs the
+    unclassified customer into a named bucket, the other leaves the group NULL — and the two IRs
+    shared one plan_hash. That is a cached answer computed under the other definition."""
+    retain = _ir(snapshot_selection=_snapshot(
+        missing_value_behavior=MissingValueBehavior.RETAIN_NULL))
+    bucket = _ir(snapshot_selection=_snapshot(
+        missing_value_behavior=MissingValueBehavior.UNKNOWN_BUCKET))
+    assert retain.plan_hash != bucket.plan_hash
+    # ... and the two statements really are different, which is why the identity has to be.
+    dialect = PostgresDialect()
+    assert compile_analysis(retain, dialect=dialect) != compile_analysis(bucket, dialect=dialect)
+
+
+def test_a_plan_that_carries_NO_snapshot_selection_hashes_exactly_as_it_did():
+    """The identity change is scoped to plans carrying a `snapshot_selection`, and NONE exist
+    outside this release — the field shipped on this branch. The pre-Task-8 IR keeps its literal,
+    which is what makes "append only, only when present" a checked claim rather than a comment."""
+    from tests.featuregen.data_agent.test_analysis_ir import _ir as _pre_task8_ir
+
+    assert _pre_task8_ir().plan_hash == "b876b7f5a812567aaab96394fd76d894"
+    assert _pre_task8_ir().snapshot_selection is None

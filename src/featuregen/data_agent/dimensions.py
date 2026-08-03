@@ -95,9 +95,11 @@ class DimensionAttributionPolicyV1:
     interval_semantics: str = "start_inclusive_end_exclusive"
     missing_value_behavior: MissingValueBehavior = MissingValueBehavior.UNKNOWN_BUCKET
     overlap_behavior: OverlapBehavior = OverlapBehavior.REFUSE
-    #: For `current_value`: the column the SOURCE declares its current row with (the temporal
+    #: For `current_value` ONLY: the column the SOURCE declares its current row with (the temporal
     #: policy's `current_flag_ref`). Empty falls back to the open-ended-row convention
-    #: (`effective_to IS NULL`), which is the only other shape a declaration can take.
+    #: (`effective_to IS NULL`), which is the only other shape a declaration can take. Declaring it
+    #: on a `report_cutoff` policy is REFUSED rather than ignored — nothing reads it there, and an
+    #: unread field that still enters `plan_hash` forks identity without changing an answer.
     #:
     #: A BOOLEAN column, checked by the caller that reads the catalog — the predicate renders
     #: `flag = TRUE`, and rendering that against a `text` flag holding 'Y' is the exact class of
@@ -118,6 +120,18 @@ class DimensionAttributionPolicyV1:
         if self.attribution_basis is AttributionBasis.CURRENT_VALUE:
             self._validate_current_value()
             return
+        if self.current_flag_column.strip():
+            # The MIRROR of the cutoff-on-current_value refusal above, and refused for the same
+            # reason: only `_current_predicate` reads this column, so on a `report_cutoff` policy it
+            # renders nothing and changes no rows — yet it IS part of `plan_hash`, so two policies
+            # that compile to the identical statement would carry two identities. A field that
+            # forks identity and never changes an answer is worse than a rejected one.
+            raise AttributionError(
+                "ATTRIBUTION_CURRENT_FLAG_ON_CUTOFF",
+                f"current_flag_column {self.current_flag_column!r} is declared on a "
+                f"{self.attribution_basis.value!r} policy, where nothing reads it: 'the row the "
+                "source flags as current' is the OTHER basis. Declare current_value, or drop the "
+                "flag — a silently ignored declaration reads as applied")
         if not self.report_cutoff.strip():
             raise AttributionError(
                 "ATTRIBUTION_NO_CUTOFF",

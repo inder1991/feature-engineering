@@ -225,6 +225,13 @@ class AnalysisExecutionIRV1:
             self.snapshot_selection.snapshot_column, self.snapshot_selection.cutoff,
             str(self.snapshot_selection.scope), self.snapshot_selection.key_column,
             ",".join(self.snapshot_selection.tie_break_columns),
+            # `missing_value_behavior` is IDENTITY, exactly as it is on the attribution block above
+            # and for the same reason: `compile_analysis` BRANCHES on it — UNKNOWN_BUCKET coalesces
+            # an unclassified customer into a named bucket and RETAIN_NULL leaves the group NULL —
+            # so two IRs differing only here compile to two different statements. Omitting it gave
+            # them ONE plan_hash, which is a cached answer computed under the other definition of
+            # "unclassified".
+            str(self.snapshot_selection.missing_value_behavior),
             self.dimension_binding.identity.table_id if self.dimension_binding else "",
         ]))
         return hashlib.sha256(material.encode()).hexdigest()[:32]
