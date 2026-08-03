@@ -537,6 +537,63 @@ def test_widening_never_binds_a_column_the_caller_could_not_already_see(overlay_
             assert _uses(_screen(overlay_conn, table=table, roles=roles)) <= visible, (roles, table)
 
 
+# ── Task 0C defect 2: table EXISTENCE is a read-scoped fact. `_resolve_table` used to treat the
+# world-visible table node as proof, so a caller whose scope could see NO column of a table still
+# learned the table exists through `table_known` (and would then see its rejections, neighbourhood
+# metadata and counts). Existence now derives from at least one caller-VISIBLE column
+# (`visible_requires`), like every other read on this surface. ──────────────────────────────────
+
+
+def _hide_every_column(conn, table: str) -> None:
+    conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND kind = 'column' AND table_name = %s",
+        (_JOIN_SOURCE, table))
+
+
+def test_an_all_hidden_table_does_not_exist_for_the_blind_caller(overlay_conn, join_catalog):
+    """The all-hidden fixture. Every column of ``cust_master`` is restricted: to a caller with no
+    reader roles the table must be INDISTINGUISHABLE from one this catalog does not hold — the
+    byte-identical unknown-table payload, so nothing leaks through ``table_known``, rejections,
+    neighbourhood metadata or counts. The restricted fixture is the same probe under
+    ``restricted_reader``: the table exists again, through the same door."""
+    _hide_every_column(overlay_conn, _ENTITY_TABLE)
+    blind = _screen(overlay_conn, table=_ENTITY_TABLE, roles=())
+    assert blind["table_known"] is False
+    unknown = _screen(overlay_conn, table="no_such_table", roles=())
+    assert blind == {**unknown, "table": _ENTITY_TABLE}   # only the echoed request string differs
+    privileged = _screen(overlay_conn, table=_ENTITY_TABLE, roles=("restricted_reader",))
+    assert privileged["table_known"] is True
+    assert privileged["table"] == _ENTITY_TABLE
+
+
+def test_the_schema_qualified_ref_of_an_all_hidden_table_is_also_unknown(overlay_conn,
+                                                                         join_catalog):
+    """The deep-link spelling must not be a side door: probing the table's own ``object_ref``
+    (``public.cust_master``) reveals exactly as little as the bare name — and the unknown payload
+    echoes the caller's requested string verbatim, per the frozen two-case rule (0F-11)."""
+    _hide_every_column(overlay_conn, _ENTITY_TABLE)
+    out = _screen(overlay_conn, table=f"public.{_ENTITY_TABLE}", roles=())
+    assert out["table_known"] is False
+    assert out["table"] == f"public.{_ENTITY_TABLE}"
+
+
+def test_one_visible_column_keeps_the_table_resolving_exactly_as_before(overlay_conn,
+                                                                        join_catalog):
+    """The public/restricted split, and the compatibility half of the fix: hide every column BUT one
+    untagged (public) column, and the no-roles caller still resolves the table — both spellings,
+    same resolved bare name. A caller who can see at least one column sees no behaviour change."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND kind = 'column' AND table_name = %s "
+        "AND column_name <> 'master_dt'",
+        (_JOIN_SOURCE, _ENTITY_TABLE))
+    bare = _screen(overlay_conn, table=_ENTITY_TABLE, roles=())
+    qualified = _screen(overlay_conn, table=f"public.{_ENTITY_TABLE}", roles=())
+    assert bare["table_known"] is True and bare["table"] == _ENTITY_TABLE
+    assert qualified["table_known"] is True and qualified["table"] == _ENTITY_TABLE
+
+
 def test_the_catalog_wide_path_never_widens(overlay_conn, join_catalog):
     """The SCOPE guarantee for the feature-generation flow: widening is meaningless without an anchor
     table, so the catalog-wide default is inert to it — argument-for-argument the pass it always was."""

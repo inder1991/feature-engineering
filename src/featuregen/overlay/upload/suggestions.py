@@ -52,6 +52,7 @@ from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.gate1 import _template_candidates
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.join_path import clearing_neighbourhood, table_of_ref
+from featuregen.overlay.upload.read_scope import allowed_classes
 from featuregen.overlay.upload.recipe_grounding_context import RecipeGroundingContextV1
 
 
@@ -67,13 +68,15 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     ``table_known`` is a FOURTH state, and the load-bearing one for honesty: a table this catalog does
     not hold produces exactly the same zero-suggestion payload as a table whose columns carry no
     concepts, so without it the screen diagnoses a NONEXISTENT table as "your columns don't carry
-    business concepts". Resolved from ``graph_node`` alone, before the engine runs.
+    business concepts". Resolved from ``graph_node`` before the engine runs — under THIS CALLER's
+    read scope: a table none of whose columns are visible to the caller is, for that caller, a table
+    this catalog does not hold (see :func:`_resolve_table`).
 
     ``max_hops`` is the EXPLICIT opt-in for a wider neighbourhood. ``None`` — what every automatic
     page load passes — is the capped default (``join_path.MAX_HOPS_DEFAULT``: one hop). A deliberate
     caller may ask for more; the table cap and the column budget still apply, so expansion changes
     which tables are ELIGIBLE, never how many are admitted."""
-    known = _resolve_table(conn, catalog_source, table)
+    known = _resolve_table(conn, catalog_source, table, roles=roles)
     if known is None:
         # Zeroes are the truth here, not a placeholder: a table this catalog does not hold has no
         # neighbours to have truncated. Reported anyway so the payload's shape never varies.
@@ -147,16 +150,32 @@ def _binds(idea: FeatureIdea, table: str) -> bool:
     return any(table_of_ref(ref) == table for _src, ref in idea.derives_pairs)
 
 
-def _resolve_table(conn, catalog_source: str, table: str) -> str | None:
+def _resolve_table(conn, catalog_source: str, table: str, roles=()) -> str | None:
     """This catalog's own ``graph_node.table_name`` for ``table`` — ``None`` when it holds no such
-    table. The bare name is the engine's key (``FeatureIdea.grain_table``), but a deep link naturally
-    carries the schema-qualified table ``object_ref`` (``public.txns``), which is UNIQUE per catalog
-    (the node's primary key), so accepting it too is unambiguous. A bare match wins the tie."""
+    table FOR THIS CALLER. The bare name is the engine's key (``FeatureIdea.grain_table``), but a
+    deep link naturally carries the schema-qualified table ``object_ref`` (``public.txns``), which is
+    UNIQUE per catalog (the node's primary key), so accepting it too is unambiguous. A bare match
+    wins the tie.
+
+    Existence is a READ-SCOPED fact, derived from at least one caller-VISIBLE column (Task 0C defect
+    2). The table node itself is world-visible, so treating it as proof let a caller whose scope
+    could see NO column of a table still learn the table exists through ``table_known`` — and would
+    then be shown its rejections, neighbourhood metadata and counts. The visibility rule is the
+    grounding set's own (``visible_requires <@ allowed_classes(roles)``, the migration-1032
+    predicate every read-scope call site binds), so "the table exists for you" and "some column of
+    it could ground for you" can never disagree: all-hidden resolves exactly like nonexistent, while
+    one visible column keeps the resolution — and the payload — precisely what it always was. The
+    deep-link spelling still resolves through the table node's own ref, but only NAMES the table;
+    it never proves existence."""
     row = conn.execute(
-        "SELECT table_name FROM graph_node WHERE catalog_source = %s "
-        "AND (table_name = %s OR (kind = 'table' AND object_ref = %s)) "
-        "ORDER BY (table_name = %s) DESC LIMIT 1",
-        (catalog_source, table, table, table)).fetchone()
+        "SELECT c.table_name FROM graph_node c "
+        "WHERE c.catalog_source = %s AND c.kind = 'column' "
+        "AND c.visible_requires <@ %s "
+        "AND (c.table_name = %s OR c.table_name = ("
+        "    SELECT t.table_name FROM graph_node t "
+        "    WHERE t.catalog_source = %s AND t.kind = 'table' AND t.object_ref = %s)) "
+        "ORDER BY (c.table_name = %s) DESC LIMIT 1",
+        (catalog_source, allowed_classes(roles), table, catalog_source, table, table)).fetchone()
     return row[0] if row else None
 
 
