@@ -19,6 +19,11 @@ DESIGN, and why each choice is the way it is.
   therefore parses the counts and `assert_ran` refuses a run that collected nothing.
 * **The baseline is measured once per victim set**, not per mutation, because it is the same
   command; `must_survive` reuses it as its control.
+* **A kill is the EXPECTED failure, not any failure.** `RunResult` keeps the child's full output so
+  `test_the_mutation_is_caught` can require the registry's `expect_failure_contains` in it and
+  require that a NAMED victim is among the failures. Counting any red as a kill scored a broken
+  import or a malformed query as a caught invariant — which is exactly what
+  `retrieval_drops_profile_context` was doing until this check went in.
 """
 from __future__ import annotations
 
@@ -43,6 +48,17 @@ class RunResult:
     exit_code: int
     counts: dict[str, int]
     tail: str
+    #: The child's FULL stdout+stderr. Kept because the kill criterion reads the failure DETAIL, not
+    #: only the counts: `tail` is the last 25 lines and the assertion that names the broken
+    #: invariant is usually further up, above pytest's summary.
+    output: str = ""
+
+    @property
+    def failed_node_ids(self) -> tuple[str, ...]:
+        """The node ids pytest reported as FAILED/ERROR, from its own summary lines."""
+        return tuple(line.split(" ", 1)[1].split(" - ", 1)[0].strip()
+                     for line in self.output.splitlines()
+                     if line.startswith(("FAILED ", "ERROR ")))
 
     @property
     def collected(self) -> int:
@@ -91,7 +107,8 @@ def run_victims(victims: tuple[str, ...], *, dsn: str, mutation_id: str | None =
         cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout_s, check=False)
     out = proc.stdout + proc.stderr
     counts = {kind: int(n) for n, kind in _COUNT.findall(out)}
-    return RunResult(exit_code=proc.returncode, counts=counts, tail="\n".join(out.splitlines()[-25:]))
+    return RunResult(exit_code=proc.returncode, counts=counts, output=out,
+                     tail="\n".join(out.splitlines()[-25:]))
 
 
 @cache

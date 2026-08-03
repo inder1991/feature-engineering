@@ -33,6 +33,17 @@ class Mutation:
     target: str                      # module:symbol, for the report
     victims: tuple[str, ...]         # pytest node ids expected to FAIL (must_die) / PASS (survive)
     apply: Callable[[], None]
+    #: A substring of the failure the victim is expected to produce — the assertion's own message
+    #: where it has one, otherwise the failing source line as pytest renders it. REQUIRED for
+    #: must-die.
+    #:
+    #: Without it, "the run failed" is the whole kill criterion, and a mutation that merely broke an
+    #: import, malformed a query or tripped an unrelated fixture would be scored as a caught
+    #: invariant. Every string below was taken from an actual mutated run, not composed. It earned
+    #: its keep immediately: `retrieval_drops_profile_context` was killing its victims with
+    #: `psycopg.errors.SyntaxError: syntax error at or near "FROM"` — a malformed SELECT, not a
+    #: missing harvest — and was rewritten to break the invariant instead of the SQL.
+    expect_failure_contains: str = ""
     notes: str = ""
     dropped_reason: str = field(default="")
 
@@ -184,10 +195,19 @@ def _m_feature_gen_drops_profile_context() -> None:
 
 
 def _m_retrieval_drops_profile_context() -> None:
-    """Leg 3 stops harvesting the table profile projections."""
+    """Leg 3 stops harvesting the table profile projections.
+
+    The projected columns are replaced by a literal NULL rather than emptied. Emptying the tuple was
+    the first shape of this mutation and it killed its victims with
+    `psycopg.errors.SyntaxError: syntax error at or near "FROM"` — the harvest query became
+    `SELECT catalog_source, table_name,  FROM graph_node`, so the victims died of a malformed
+    statement and never reached the question. The NULL keeps the SELECT well-formed and the rows
+    read; `_harvest` then discards every falsy value, so what is broken is exactly the invariant:
+    leg 3 runs, and harvests no profile vocabulary.
+    """
     from featuregen.analysis import retrieval
 
-    retrieval._TABLE_PROFILE_COLUMNS = ()
+    retrieval._TABLE_PROFILE_COLUMNS = ("NULL",)
 
 
 def _m_graph_projection_read_as_authority() -> None:
@@ -257,6 +277,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_REPLAY}::test_mutating_a_rendered_registry_field_invalidates_classifier_replay",
         ),
         apply=_m_fingerprint_drops_hint,
+        expect_failure_contains="assert enrich._vocab_fingerprint() != before",
         notes="the fingerprint hashes the first-sentence 120-char hint, not the whole description",
     ),
     Mutation(
@@ -269,6 +290,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_SCOPE}::test_different_declared_issuers_refuse_cross_catalog_cif_pairs",
         ),
         apply=_m_issuer_never_resolves,
+        expect_failure_contains="cif columns issued by two different banks must not pair",
     ),
     Mutation(
         mutation_id="entity_reenters_the_blocking_key",
@@ -280,6 +302,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_SCOPE}::test_same_declared_issuer_keeps_the_normal_candidates",
         ),
         apply=_m_entity_reenters_the_blocking_key,
+        expect_failure_contains="candidate = by_pair[frozenset({left_col, right_col})]",
     ),
     Mutation(
         mutation_id="accept_off_registry_concept",
@@ -293,6 +316,7 @@ REGISTRY: tuple[Mutation, ...] = (
             "::test_run_batched_salvages_valid_and_leaves_invalid_uncached",
         ),
         apply=_m_accept_free_text_concept,
+        expect_failure_contains="totally_made_up",
     ),
     Mutation(
         mutation_id="disable_stale_value_retirement",
@@ -304,6 +328,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_SUPERSESSION}::test_a_same_value_reuse_still_retires_the_llms_other_live_proposal",
         ),
         apply=_m_disable_stale_value_retirement,
+        expect_failure_contains="assert len(current) == 1",
     ),
     Mutation(
         mutation_id="feature_gen_reads_the_thin_menu",
@@ -315,6 +340,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_V4}::test_v4_carries_the_shared_bundle_keys",
         ),
         apply=_m_feature_gen_reads_the_thin_menu,
+        expect_failure_contains="where 1 = _feature_schema_version()",
     ),
     Mutation(
         mutation_id="drop_per_kind_truncation_reporting",
@@ -326,6 +352,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_CTXGRAPH}::test_lineage_truncation_report_distinguishes_a_budget_cut_from_a_prune",
         ),
         apply=_m_drop_per_kind_truncation_reporting,
+        expect_failure_contains='assert graph["truncation"]["omitted"]',
     ),
     Mutation(
         mutation_id="review_status_implies_executable",
@@ -337,6 +364,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_BARS}::test_bar_zero_reviewed_but_unsafe_relationships_displayed_executable",
         ),
         apply=_m_review_status_implies_executable,
+        expect_failure_contains="an approved review was displayed as executable",
     ),
     Mutation(
         mutation_id="collapse_data_and_authority_role",
@@ -345,6 +373,7 @@ REGISTRY: tuple[Mutation, ...] = (
         target="dataset_profiles:_PROFILE_FIELD_SOURCES",
         victims=(f"{_BARS}::test_bar_data_role_and_authority_role_stay_two_questions",),
         apply=_m_collapse_data_and_authority_role,
+        expect_failure_contains="the table KIND leaked into the AUTHORITY axis",
         notes="SURVIVED the whole pre-existing suite. Nothing asserted that a table whose "
               "`table_role` is source-attested still reports its AUTHORITY as undecided, so one "
               "axis answering both questions would have shipped unnoticed. The victim is the bar "
@@ -359,6 +388,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_BARS}::test_bar_a_catalog_narrative_never_defaults_a_dataset_authority",
         ),
         apply=_m_catalog_authority_inherits,
+        expect_failure_contains="assert {'authority_role'} == set()",
         notes="SURVIVED. `test_bounds_are_enforced_before_persistence` proves an UNKNOWN key is "
               "refused, which says nothing about what happens once a key becomes known. The "
               "outcome — narrative authored, dataset authority still undecided — was untested.",
@@ -373,6 +403,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_PROFILES}::test_four_eyes_is_not_weakened_for_operational_profile_fields",
         ),
         apply=_m_llm_authority_becomes_load_bearing,
+        expect_failure_contains="assert f.load_bearing is None",
     ),
     Mutation(
         mutation_id="search_drops_profile_context",
@@ -384,6 +415,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_CONSUME}::test_the_authority_and_temporal_axes_are_facetable",
         ),
         apply=_m_search_drops_profile_context,
+        expect_failure_contains='assert "data_role" in facets',
     ),
     Mutation(
         mutation_id="feature_gen_drops_profile_context",
@@ -395,6 +427,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_CONSUME}::test_a_snapshot_table_earns_the_time_mismatch_advisory",
         ),
         apply=_m_feature_gen_drops_profile_context,
+        expect_failure_contains="KeyError: 'advisories'",
     ),
     Mutation(
         mutation_id="retrieval_drops_profile_context",
@@ -406,6 +439,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_BARS}::test_bar_profile_context_lifts_retrieval",
         ),
         apply=_m_retrieval_drops_profile_context,
+        expect_failure_contains="the profile harvest added no expansion terms",
     ),
     Mutation(
         mutation_id="graph_projection_read_as_authority",
@@ -417,6 +451,7 @@ REGISTRY: tuple[Mutation, ...] = (
             "tests/featuregen/overlay/upload/test_feature_menu_enrichment.py",
         ),
         apply=_m_graph_projection_read_as_authority,
+        expect_failure_contains="where False = is_feature_eligible(",
     ),
     Mutation(
         mutation_id="profile_hash_omits_business_context",
@@ -427,6 +462,7 @@ REGISTRY: tuple[Mutation, ...] = (
             f"{_BARS}::test_bar_business_context_moves_the_dataset_profile_hash",
         ),
         apply=_m_profile_hash_omits_a_meaning_bearing_field,
+        expect_failure_contains="a business_context change did not move dataset_profile_hash",
         notes="SURVIVED. The pre-existing hash-sensitivity test walks definition, authority_role, "
               "a governed fact head and the narrative revision — every meaning-bearing input "
               "EXCEPT business_context.",

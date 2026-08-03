@@ -43,6 +43,22 @@ def test_the_mutation_is_caught(mutation: mutations.Mutation, dsn: str) -> None:
         f"'{mutation.invariant}' stopped holding — the invariant is claimed but not tested.\n"
         f"target: {mutation.target}\nvictims: {list(mutation.victims)}\n{mutated.tail}")
 
+    # A kill is the EXPECTED failure, not any failure. Two independent checks, because "the run went
+    # red" is satisfied by a broken import, a malformed query or an unrelated fixture blowing up —
+    # none of which is evidence that anything noticed the invariant break.
+    named = [node for node in mutated.failed_node_ids
+             if any(node.startswith(victim) for victim in mutation.victims)]
+    assert named, (
+        f"{mutation.mutation_id}: the run failed, but none of the NAMED victims did — the failures "
+        f"are collateral.\nfailed: {list(mutated.failed_node_ids)}\n"
+        f"victims: {list(mutation.victims)}\n{mutated.tail}")
+    assert mutation.expect_failure_contains in mutated.output, (
+        f"{mutation.mutation_id}: its victims failed, but not with the failure this mutation is "
+        f"supposed to cause. Expected to find {mutation.expect_failure_contains!r} in the output. "
+        f"Either the mutation is now killing for an unrelated reason (a broken import, a malformed "
+        f"query), or the victim was rewritten and the registry must be re-derived from a real "
+        f"run.\nfailed: {list(mutated.failed_node_ids)}\n{mutated.tail}")
+
 
 @pytest.mark.timeout(_TIMEOUT)
 @pytest.mark.parametrize("mutation", mutations.must_survive(), ids=lambda m: m.mutation_id)
@@ -87,6 +103,19 @@ def test_every_mutation_names_at_least_one_victim() -> None:
     for m in mutations.REGISTRY:
         assert m.victims, f"{m.mutation_id} names no victim, so it can neither die nor survive"
         assert m.invariant, f"{m.mutation_id} does not say what guarantee it breaks"
+
+
+def test_every_must_die_mutation_declares_the_failure_it_expects() -> None:
+    """No must-die entry may fall back to 'any failure counts'.
+
+    A mutation with no expected failure is scored by exit code alone, so a broken import or a
+    malformed query reads as a caught invariant. This keeps the field mandatory for the kind of
+    mutation that is graded on failing.
+    """
+    for m in mutations.must_die():
+        assert m.expect_failure_contains, (
+            f"{m.mutation_id} declares no expect_failure_contains, so ANY failure would count as a "
+            f"kill. Run its victims under the mutation and record a substring of the real failure.")
 
 
 # ── the literal baseline count for the NAMED release-gate suites (D9) ────────────────────────────
