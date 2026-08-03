@@ -245,6 +245,22 @@ def test_declare_then_read_back_a_temporal_policy(seeded, flag_on):
     assert got["load_bearing_temporal_storage_model"] is None
 
 
+def test_the_temporal_GET_carries_the_editors_selection_kinds(seeded, flag_on):
+    """Task 8 hygiene: `SELECTION_KINDS` was a bottom-of-file re-export with NO reader anywhere in
+    `src/` or `tests/`. It is now served on the GET — including when no policy exists yet, which is
+    exactly when an editor needs the options — so the caller does not have to know which module
+    owns the vocabulary."""
+    from featuregen.api.routes.dataset_policies import SELECTION_KINDS
+
+    empty = seeded.get(_TEMPORAL, headers=AUTH).json()
+    assert empty["policy"] is None
+    assert empty["selection_kinds"] == list(SELECTION_KINDS)
+    # All four members are real answers after Task 8: one reused engine, two new ones, and the
+    # honest terminal state.
+    assert set(SELECTION_KINDS) == {"current_record", "valid_at_report_cutoff",
+                                    "latest_snapshot_as_of", "explicit_only"}
+
+
 def test_a_historical_promise_a_dataset_cannot_keep_is_refused(seeded, flag_on):
     res = seeded.put(_TEMPORAL, headers=ADMIN, json=_temporal_body(
         temporal_storage_model="current_only", effective_from_ref=None, effective_to_ref=None,
