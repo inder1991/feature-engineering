@@ -192,34 +192,17 @@ def _record_selection_gaps(conn, grounded, *, question: str, roles) -> None:
         logger.warning("could not record a selection learning gap", exc_info=True)
 
 
-def _serialize_selection(selections) -> dict | None:
-    """The Release-B source/row decisions, as the caller sees them. `None` while the flag is off.
+def _serialize_selection(conn, selections, *, roles=()) -> dict | None:
+    """The Release-B source/row decisions, READ-SCOPED for this caller. `None` with the flag off.
 
-    Shown even when it refuses — especially then. "Which copy served this, and which of its rows"
-    is half of what makes an answer explainable (§5.7), and a preview that showed only the
-    resolved half would report the absence of a row rule as silence.
+    Delegates to `analysis.explain`, which owns the rule that matters here: the decision is
+    RECORDED whole (rule 9) and RENDERED narrow — a candidate this caller may not see becomes an
+    opaque count and never a name, because "there is a better copy you may not see" is an existence
+    oracle over a catalog they were never granted.
     """
-    if selections is None:
-        return None
-    return {
-        "resolved": selections.resolved,
-        "sources": [{"need_role": s.need.need_role.value,
-                     "dataset_ref": s.selected_dataset_ref,
-                     "selection_basis": s.selection_basis.value,
-                     "authority_basis": s.authority_basis.value,
-                     "considered": [{"dataset_ref": c.dataset_ref,
-                                     "disposition": c.disposition.value,
-                                     "reason_codes": list(c.reason_codes)}
-                                    for c in s.considered_candidates]}
-                    for s in selections.source_selections],
-        "rows": [{"dataset_ref": r.dataset_logical_ref,
-                  "selection_kind": r.selection_kind.value,
-                  "cutoff_value_ref": r.cutoff_value_ref}
-                 for r in selections.row_selections],
-        "refusals": [{"code": r.code, "subjects": list(r.subject_refs), "detail": r.detail}
-                     for r in selections.refusals],
-        "warnings": list(selections.warnings),
-    }
+    from featuregen.analysis.explain import render_selection
+
+    return render_selection(conn, selections, roles=roles)
 
 
 def _clarification_codes(extraction, selections) -> tuple[str, ...]:
@@ -339,7 +322,8 @@ def plan(body: PlanIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
         "preview": _serialize_preview(view),
         # WHICH COPY served each need, and WHICH of its rows — or the typed refusal saying nobody
         # has decided yet. `None` while the selection flag is off.
-        "selection": _serialize_selection(grounded.selections),
+        "selection": _serialize_selection(conn, grounded.selections,
+                                          roles=identity.role_claims),
         # The identity a caller executes this exact plan by. `None` when nothing was sealed —
         # every flag-off request, and every plan that could not decide where its data comes from.
         "sealed_plan_hash": sealed,
@@ -379,7 +363,8 @@ def clarify(body: AnswerIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     view, sealed = _previewed(conn, regrounded, identity=identity)
     return {
         "preview": _serialize_preview(view),
-        "selection": _serialize_selection(regrounded.selections),
+        "selection": _serialize_selection(conn, regrounded.selections,
+                                          roles=identity.role_claims),
         "sealed_plan_hash": sealed,
         "clarifications": _serialize_clarifications(
             extraction, retrieval, regrounded, answered=body.code),

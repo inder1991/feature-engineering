@@ -4209,6 +4209,7 @@ button.stat:hover {
 
 .adg-plan,
 .adg-rests-on,
+.adg-selection,
 .adg-blocked,
 .adg-clarifications,
 .adg-sql {
@@ -4222,12 +4223,74 @@ button.stat:hover {
 
 .adg-plan h3,
 .adg-rests-on h3,
+.adg-selection h3,
 .adg-blocked h3,
 .adg-clarifications h3,
 .adg-sql h3 {
   margin: 0;
   font-size: 14px;
 }
+
+/* Release B — where the answer comes from. Deliberately styled like the plan panel next to it and
+   NOT like `.adg-error`: an undecided source is a choice somebody has to make, and drawing it in
+   danger colours would tell a user the system broke. */
+.adg-sources,
+.adg-row-rules,
+.adg-selection-warnings {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.adg-source,
+.adg-row-rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.adg-source-role,
+.adg-row-kind { color: var(--ink-soft); }
+
+.adg-source-ref,
+.adg-row-ref {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.adg-source-basis,
+.adg-source-alternatives,
+.adg-row-predicates {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.adg-source.withheld .adg-source-ref,
+.adg-row-predicates.withheld {
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+.adg-selection-warnings li {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.adg-open {
+  display: grid;
+  gap: 4px;
+  border-left: 3px solid var(--line-strong);
+  padding-left: 12px;
+}
+
+.adg-open p { margin: 0; font-size: 13px; }
+.adg-open-heading { font-weight: 600; }
+.adg-open-detail,
+.adg-open-who { color: var(--ink-soft); }
 
 /* label / value pairs: the label column is fixed so the values line up down the panel */
 .adg-plan-fields {

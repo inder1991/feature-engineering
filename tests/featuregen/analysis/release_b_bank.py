@@ -90,15 +90,6 @@ def build_bank(db, monkeypatch, *, restricted_archive: bool = False):
     ])
     db.execute("UPDATE graph_node SET schema_name = %s WHERE catalog_source = %s",
                (CUSTOMER_SCHEMA, SRC))
-    if restricted_archive:
-        # D11 derived anchor scope: a table is visible when >= 1 of its COLUMNS is, so hiding
-        # the archive means hiding every one of its columns. The enforcement column
-        # `visible_requires` is GENERATED (migration 1032) — the SENSITIVITY tag is the input, and
-        # the database refuses a direct write to the generated one.
-        db.execute(
-            "UPDATE graph_node SET sensitivity = 'restricted' "
-            "WHERE catalog_source = %s AND table_name = %s AND kind = 'column'",
-            (SRC, ARCHIVE_TABLE))
     record_connection(db, DataSourceConnectionV1(
         connection_id="pilot-pg", environment_id="dev", kind="postgres", host="127.0.0.1",
         port=5432, auth_mechanism="password", secret_ref="vault://featuregen/pg",
@@ -117,6 +108,20 @@ def build_bank(db, monkeypatch, *, restricted_archive: bool = False):
     # The dimension source keeps SCD2 history: a HISTORICAL question reads the row valid at the
     # cutoff, and a CURRENT one would read the flagged row — two different answers, declared.
     publish_temporal_policy_for(db)
+    if restricted_archive:
+        # AFTER the policies are published, deliberately: `publish_serving_policy` validates that
+        # its AUTHOR can see every dataset it names, so hiding the archive first would refuse the
+        # very policy that makes it a considered candidate. The shape being built is a policy
+        # authored by someone with wide scope and READ by someone without it.
+        #
+        # D11 derived anchor scope: a table is visible when >= 1 of its COLUMNS is, so hiding the
+        # archive means hiding every one of its columns. The enforcement column `visible_requires`
+        # is GENERATED (migration 1032) — the SENSITIVITY tag is its input, and the database
+        # refuses a direct write to the generated column.
+        db.execute(
+            "UPDATE graph_node SET sensitivity = 'restricted' "
+            "WHERE catalog_source = %s AND table_name = %s AND kind = 'column'",
+            (SRC, ARCHIVE_TABLE))
     return db
 
 
