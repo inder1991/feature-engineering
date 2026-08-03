@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AssetProfilePanel } from './AssetProfilePanel'
 import { CatalogNarrativePanel } from './CatalogNarrativePanel'
+import { DatasetPolicyPanel } from './DatasetPolicyPanel'
 import {
   ApiError,
   type AssetApprovedJoin,
@@ -505,6 +506,12 @@ function OverviewTab({
       {/* Release-A table profile: renders ONLY for table assets and ONLY while the server offers
           the surface (flag-gated 404 ⟹ the panel renders nothing — flag-off looks like today). */}
       <AssetProfilePanel source={source} objectRef={identity.object_ref} kind={identity.kind} />
+
+      {/* Release-B dataset policies: how this dataset's rows are chosen, and which dataset serves a
+          need. Separate flag (FEATUREGEN_SOURCE_TEMPORAL_SELECTION, fail-closed on
+          FEATUREGEN_DATASET_PROFILES) ⟹ 404 ⟹ renders nothing. It sits under the profile because
+          the profile is what a policy must agree with. */}
+      <DatasetPolicyPanel source={source} objectRef={identity.object_ref} kind={identity.kind} />
 
       {/* The CATALOG narrative this asset lives in. Same flag gate: 404 ⟹ renders nothing. It
           belongs on an asset page because "what is this catalog for" is the first thing anyone

@@ -5,8 +5,8 @@ so a column addition that trips over an existing row passes every test and fails
 database that matters ("migration audits are blind to legacy data"). These tests seed a PRE-1052
 shape first, then re-apply the migration SQL exactly as the runner does.
 
-They also pin the D7 reservation reality on the tree as it IS: 1043/1045/1046/1047/1051 exist,
-1048-1050 (Release B/C) do NOT — so 1052 may not depend on
+They also pin the D7 reservation reality: on the fully integrated tree 1043-1049 and 1051 exist;
+1050 (Release C) and 1053-1055 (the Phase-G parallel block) do NOT — so 1052 may not depend on
 anything those numbers would create.
 """
 from __future__ import annotations
@@ -104,10 +104,10 @@ def test_1052_data_role_check_refuses_an_off_vocabulary_value(db) -> None:
 def test_1052_applies_with_its_real_neighbours_and_none_of_the_unwritten_reservations() -> None:
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
-    assert {"1043", "1045", "1046", "1047", "1051", "1052"} <= present
-    # 1048-1050 belong to Releases B/C and are not written; 1044 IS present (it landed with the
-    # Track-2 merge), so only the three reservations are asserted absent.
-    assert not ({"1048", "1049", "1050"} & present)
+    assert {"1043", "1044", "1045", "1046", "1047", "1048", "1049", "1051", "1052"} <= present
+    # 1050 belongs to Release C and 1053-1055 to the Phase-G parallel session; none is written,
+    # so 1052 stands on what exists.
+    assert not ({"1050", "1053", "1054", "1055"} & present)
 
 
 def test_1052_is_the_only_number_this_stream_allocated() -> None:

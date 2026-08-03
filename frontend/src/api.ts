@@ -2880,3 +2880,135 @@ export function putCatalogProfile(
     }),
   })
 }
+
+// ── Release-B dataset policies (flag-gated: 404 while FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off,
+// or while its FEATUREGEN_DATASET_PROFILES dependency is unmet — the panel then renders nothing).
+//
+// expectedPointerVersion rides IN THE BODY and is REQUIRED (0 == "no policy existed when I opened
+// this form"). A miss 409s; the panel keeps the author's draft and shows the other version beside it.
+
+export interface PolicyProvenance {
+  evidence: {
+    producer: string
+    strength: string
+    lifecycle: string
+    producer_ref: string | null
+    evidence_id: string | null
+  }[]
+  decision_refs: string[]
+}
+
+export interface ServingPolicyRevision {
+  revision_id: string
+  content_hash: string
+  eligible_dataset_refs: string[]
+  preferred_dataset_refs: string[]
+  provenance: PolicyProvenance
+}
+
+export interface ServingPolicyView {
+  entity_id: string
+  need_role: string
+  serving_purpose: string
+  pointer_version: number
+  declared_by?: string
+  // True when the policy cannot by itself pick one dataset. Shown as an explicit statement, never
+  // resolved by rendering the first element first.
+  ambiguous: boolean
+  policy: ServingPolicyRevision | null
+}
+
+export function getServingPolicy(
+  entityId: string, needRole: string, servingPurpose: string,
+): Promise<ServingPolicyView> {
+  return request('/catalog/dataset-policies/serving/'
+    + `${encodeURIComponent(entityId)}/${encodeURIComponent(needRole)}`
+    + `/${encodeURIComponent(servingPurpose)}`)
+}
+
+export function putServingPolicy(
+  entityId: string, needRole: string, servingPurpose: string,
+  req: {
+    expectedPointerVersion: number
+    eligibleDatasetRefs: string[]
+    preferredDatasetRefs: string[]
+  },
+): Promise<{ revision_id: string; pointer_version: number; ambiguous: boolean }> {
+  return request('/catalog/dataset-policies/serving/'
+    + `${encodeURIComponent(entityId)}/${encodeURIComponent(needRole)}`
+    + `/${encodeURIComponent(servingPurpose)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_pointer_version: req.expectedPointerVersion,
+      eligible_dataset_refs: req.eligibleDatasetRefs,
+      preferred_dataset_refs: req.preferredDatasetRefs,
+    }),
+  })
+}
+
+export interface TemporalPolicyRevision {
+  revision_id: string
+  content_hash: string
+  temporal_storage_model: string
+  current_selection: string
+  historical_selection: string
+  effective_from_ref: string | null
+  effective_to_ref: string | null
+  snapshot_ref: string | null
+  current_flag_ref: string | null
+  availability_ref: string | null
+  tie_break_refs: string[]
+  provenance: PolicyProvenance
+}
+
+export interface TemporalPolicyView {
+  dataset_logical_ref: string
+  // The PROFILE's answer. Non-null means a governed classification exists and the policy must agree
+  // with it; null means nobody has decided, and the policy IS the operational declaration.
+  load_bearing_temporal_storage_model: string | null
+  displayed_temporal_storage_model: string | null
+  pointer_version: number
+  declared_by?: string
+  policy: TemporalPolicyRevision | null
+}
+
+export interface TemporalPolicyPut {
+  expectedPointerVersion: number
+  temporalStorageModel: string
+  currentSelection: string
+  historicalSelection: string
+  effectiveFromRef?: string
+  effectiveToRef?: string
+  snapshotRef?: string
+  currentFlagRef?: string
+  availabilityRef?: string
+  tieBreakRefs?: string[]
+}
+
+export function getTemporalPolicy(source: string, objectRef: string): Promise<TemporalPolicyView> {
+  return request('/catalog/dataset-policies/temporal/'
+    + `${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`)
+}
+
+export function putTemporalPolicy(
+  source: string, objectRef: string, req: TemporalPolicyPut,
+): Promise<{ dataset_logical_ref: string; revision_id: string; pointer_version: number }> {
+  return request('/catalog/dataset-policies/temporal/'
+    + `${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_pointer_version: req.expectedPointerVersion,
+      temporal_storage_model: req.temporalStorageModel,
+      current_selection: req.currentSelection,
+      historical_selection: req.historicalSelection,
+      effective_from_ref: req.effectiveFromRef || null,
+      effective_to_ref: req.effectiveToRef || null,
+      snapshot_ref: req.snapshotRef || null,
+      current_flag_ref: req.currentFlagRef || null,
+      availability_ref: req.availabilityRef || null,
+      tie_break_refs: req.tieBreakRefs ?? [],
+    }),
+  })
+}

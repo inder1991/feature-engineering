@@ -14,6 +14,35 @@ written before a schema was revoked.
 **A missing binding is an ABSENCE, not an error.** Most deployments will have none, and the honest
 response is that the plan cannot execute yet — which the preview already reports as
 `EXECUTION_INPUTS_ABSENT`. Raising here would turn "not configured" into a fault.
+
+**Two writers, one identity (Release-B Task 7 reconciliation).**
+
+This module owned a flat `physical_dataset_binding` UPSERT that wrote no revision, while the
+append-only revision writer lived in `physical.record_binding_revision` — so `resolve_table`'s
+derived branch returned an in-memory binding that had never been recorded anywhere, and any
+decision naming its `binding_revision_id` would have referenced a row that does not exist.
+
+The reconciliation, deliberately chosen and recorded here:
+
+* :func:`record_binding` now writes BOTH rows in the caller's ONE transaction, and it writes the
+  revision by CALLING `physical.record_binding_revision` rather than composing a second INSERT.
+  That is what keeps `physical_id` un-forked: the address string is computed in exactly one place
+  (`PhysicalObjectIdentityV1.table_id`) from exactly one content payload
+  (`PhysicalDatasetBindingV1.content_payload`), and this module never re-derives either.
+* :func:`select_table_binding` is the SELECTION seam: it resolves a table and persists whatever it
+  resolved — including a catalog-engine-derived binding, recorded the first time a plan selects it,
+  before any decision, observation or snapshot can reference it. `resolve_table` itself stays a
+  pure read; a resolver that wrote would surprise every preview path that calls it.
+* Identity is deterministic (`pbr_` + the JCS content hash scoped to `binding_id`), so recording
+  the same binding twice — once derived, once through the explicit branch that now finds the row —
+  yields the SAME revision id and a single revision row. That is pinned by test.
+
+**What is NOT reconciled here, and why.** `physical.resolve_dataset_binding` derives the address
+component `database` from `ClusterInventoryV1.environment_id`, while this module derives it from
+`data_source_connection.database_name`. Those are two derivations of the ADDRESS, not two
+computations of the id — and unifying them would re-address every binding a materialization run has
+already recorded. That belongs to the separately reviewed materialization-wiring slice, not to
+Task 7; it is named in the Release-B report rather than silently left as a surprise.
 """
 
 from __future__ import annotations
@@ -24,7 +53,11 @@ from featuregen.data_agent.connection import (
     DataSourceConnectionV1,
     authorize_binding,
 )
-from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+from featuregen.data_agent.physical import (
+    PhysicalDatasetBindingV1,
+    PhysicalObjectIdentityV1,
+    record_binding_revision,
+)
 
 
 def record_connection(conn, connection: DataSourceConnectionV1, *, tier: str = "",
@@ -54,9 +87,19 @@ def record_connection(conn, connection: DataSourceConnectionV1, *, tier: str = "
     return connection.connection_id
 
 
-def record_binding(conn, binding: PhysicalDatasetBindingV1) -> str:
-    """Upsert one address. Keyed on (source, schema, table): a second binding for one physical table
-    would let two callers reach it under different principals, with read order deciding which."""
+def record_binding(conn, binding: PhysicalDatasetBindingV1, *, recorded_by: str | None = None,
+                   ) -> str:
+    """Upsert one address AND append its immutable revision, in the caller's one transaction.
+
+    Keyed on (source, schema, table): a second binding for one physical table would let two callers
+    reach it under different principals, with read order deciding which.
+
+    The revision is written through `physical.record_binding_revision` — the append-only writer —
+    so there is one `physical_id`/content-payload implementation and one deterministic `pbr_` id
+    (module docstring). Re-recording byte-identical content is idempotent on BOTH rows. The return
+    value stays the `binding_id` for existing callers; :func:`binding_revision_id_of` (or the
+    binding's own property) names the revision.
+    """
     identity = binding.identity
     conn.execute(
         "INSERT INTO physical_dataset_binding (binding_id, catalog_source, catalog_logical_ref, "
@@ -69,6 +112,10 @@ def record_binding(conn, binding: PhysicalDatasetBindingV1) -> str:
         (binding.binding_id, identity.catalog_source, binding.catalog_logical_ref,
          binding.connection_id, identity.database, identity.schema, identity.table,
          identity.object_kind))
+    # SAME transaction, by design: a flat address row whose immutable revision landed separately
+    # (or not at all) is exactly the state that let `selected_binding_revision_id` name a row that
+    # does not exist.
+    record_binding_revision(conn, binding, recorded_by=recorded_by)
     return binding.binding_id
 
 
@@ -218,3 +265,105 @@ def resolve_table(conn, *, catalog_source: str,
     # exactly as they do for a stored binding.
     authorize_binding(connection, binding)
     return binding, connection
+
+
+# ── the selection seam ───────────────────────────────────────────────────────────────────────────
+
+def binding_revision_id_of(binding: PhysicalDatasetBindingV1) -> str:
+    """The deterministic revision id for `binding` — one name for the one computation."""
+    return binding.binding_revision_id
+
+
+def binding_revision_exists(conn, binding_revision_id: str) -> bool:
+    """Is this revision PERSISTED? The authoring-time check behind
+    `DatasetSourceSelectionV1.selected_binding_revision_id`.
+
+    The contract validates the `pbr_` SHAPE; only the store can answer whether the row exists, and a
+    selection referencing a revision that does not is unreplayable — the observation store's FK
+    would refuse it later, at execution, where the failure is far more expensive.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM physical_dataset_binding_revision WHERE binding_revision_id = %s",
+        (binding_revision_id,)).fetchone()
+    return row is not None
+
+
+def _assert_one_addressable_table(conn, *, catalog_source: str, table: str) -> None:
+    """Refuse to SELECT a table name that names more than one table in this catalog.
+
+    `_schema_of` answers with `LIMIT 1` and no ORDER BY, and a logical ref carries no schema
+    (`ftr::tran_repos`), so a catalog holding `dpl_eib.tran_repos` AND `dpl_arc.tran_repos` returned
+    whichever row the planner happened to hand back — as the SCHEMA, the one component of the address
+    the catalog exists to supply. Reading a guess is one problem; PERSISTING it is another, and this
+    is the seam that persists: the arbitrary pick becomes an immutable `pbr_` revision that decisions,
+    observations and snapshots then reference and replay against.
+
+    An EXPLICIT binding lifts the refusal — that is this module's documented exception mechanism, and
+    it is a real declaration: an operator saying which table this catalog's name means. TWO explicit
+    rows do not, because `resolve_binding` reads one of them with `fetchone()` and nothing says which.
+
+    Deliberately NOT in `resolve_table`: that is a pure read behind every preview path, its answer is
+    already reported as `EXECUTION_INPUTS_ABSENT`, and narrowing it is a separately reviewable change.
+
+    The refusal carries `SELECTION_BINDING_MISSING` from the closed selection vocabulary rather than
+    a new spelling: `data_agent.learning` already routes that code to the PHYSICAL_BINDING_MISSING
+    gap with a BIND_PHYSICAL_SOURCE action, which is exactly what closing this needs — so it lands in
+    a queue an operator already works from. It is imported LAZILY, the precedent `source_selection`
+    sets for itself: at module scope it costs every importer of this module ~150ms of contract
+    package it does not use, and this function runs once per selected source.
+    """
+    from featuregen.overlay.upload.source_selection import SELECTION_BINDING_MISSING
+
+    explicit = conn.execute(
+        "SELECT count(*) FROM physical_dataset_binding "
+        "WHERE catalog_source = %s AND lower(table_name) = lower(%s)",
+        (catalog_source, table)).fetchone()[0]
+    if explicit == 1:
+        return
+    if explicit > 1:
+        raise ConnectionError_(
+            SELECTION_BINDING_MISSING,
+            f"{catalog_source}::{table} has {explicit} explicit bindings, so the one a selection "
+            "would read is whichever the store returns first. Remove the binding that is not "
+            "intended: two addresses for one name is not an exception, it is a coin flip")
+    schemas = [row[0] for row in conn.execute(
+        "SELECT DISTINCT schema_name FROM graph_node "
+        "WHERE catalog_source = %s AND lower(table_name) = lower(%s) AND schema_name IS NOT NULL "
+        "ORDER BY schema_name", (catalog_source, table)).fetchall()]
+    if len(schemas) > 1:
+        raise ConnectionError_(
+            SELECTION_BINDING_MISSING,
+            f"{catalog_source}::{table} names {len(schemas)} tables in this catalog "
+            f"({', '.join(schemas)}), and a logical ref carries no schema — so deriving the address "
+            "from the catalog engine would freeze an arbitrary one into an immutable revision that "
+            f"every later decision replays against. Record an explicit binding naming the schema "
+            f"this catalog's {table!r} means (the per-table exception this module documents)")
+
+
+def select_table_binding(
+    conn, *, catalog_source: str, table: str, recorded_by: str | None = None,
+) -> tuple[PhysicalDatasetBindingV1, DataSourceConnectionV1, str] | None:
+    """Resolve one table's binding AND persist it, returning `(binding, connection, revision_id)`.
+
+    This is the seam a PLAN uses when it selects a source. `resolve_table` stays a pure read for
+    preview paths; selection is the moment a derived binding becomes a thing decisions reference, so
+    it is the moment it must exist as a row.
+
+    Idempotent: the second call takes `resolve_table`'s EXPLICIT branch (the row is now there) and
+    reconstructs a binding with the same id, address, connection and layout — therefore the same
+    content hash and the same `pbr_` revision. Derived and explicit cannot fork identity, and the
+    test that proves it is the point of this function existing rather than each caller remembering
+    to record.
+
+    `None` when the table cannot be addressed at all (unconfigured), exactly as `resolve_table`;
+    a REVOKED grant still raises, because "not configured" must not absorb "no longer allowed", and
+    an AMBIGUOUS table name raises too (:func:`_assert_one_addressable_table`) rather than persisting
+    whichever schema came back first.
+    """
+    _assert_one_addressable_table(conn, catalog_source=catalog_source, table=table)
+    resolved = resolve_table(conn, catalog_source=catalog_source, table=table)
+    if resolved is None:
+        return None
+    binding, connection = resolved
+    record_binding(conn, binding, recorded_by=recorded_by)
+    return binding, connection, binding.binding_revision_id

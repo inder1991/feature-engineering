@@ -72,14 +72,16 @@ def test_1051_is_re_runnable_against_an_already_migrated_database(db) -> None:
 
 
 def test_1051_applies_with_its_real_neighbours_and_none_of_the_unwritten_reservations() -> None:
-    """D7 reservation reality on the integrated tree: 1043/1045/1046/1047 exist (1046 landed with
-    semantic Task 5's `structured_result_current`; 1044 landed with the Track-2 merge) and 1048-1050
-    (Release B/C) do not. 1051 must therefore stand on the tree as it IS — a dependency on an
-    unwritten number would be a migration that cannot apply."""
+    """D7 reservation reality on the FULLY integrated tree: 1043/1045/1046/1047 (Release A),
+    1044 (Track-2 merge) and 1048/1049 (Release B Task 7) all exist; 1050 (Release C) and
+    1053-1055 (the Phase-G parallel block) do not. 1051 must stand on the tree as it IS —
+    a dependency on an unwritten number would be a migration that cannot apply."""
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
-    present = {n for n in names if n.startswith(("1043_", "1045_", "1046_", "1047_", "1051_"))}
-    assert len(present) == 5, sorted(present)
-    for absent in ("1048_", "1049_", "1050_"):
+    present = {n for n in names
+               if n.startswith(("1043_", "1044_", "1045_", "1046_", "1047_", "1048_", "1049_",
+                                "1051_"))}
+    assert len(present) == 8, sorted(present)
+    for absent in ("1050_", "1053_", "1054_", "1055_"):
         assert not [n for n in names if n.startswith(absent)], absent
     # Lexical order is the runner's order (`_sql_file_migrations`), so 1051 lands last of these.
     assert sorted(present)[-1].startswith("1051_")
