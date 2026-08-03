@@ -189,6 +189,70 @@ class AnalysisExecutionIRV1:
                     "mistake or an unbounded scan awaiting a fallback")
 
 
+    def identity_payload(self) -> dict[str, object]:
+        """WHAT this plan computes, as canonical STRUCTURE rather than a delimiter-joined string.
+
+        Exactly the facts :attr:`plan_hash` joins and nothing else — `question` stays excluded for
+        the same reason it is excluded there. This exists because the Release-B Task-9
+        ``AnalysisExecutionIRV2`` takes its identity from RFC-8785 JCS over structure (D1), and a
+        ``|``-joined string cannot carry a version token and does not escape: a column literally
+        named ``a|b`` and the pair ``a``, ``b`` produce the same bytes, and two IRs differing only
+        in where a boundary falls hash identically.
+
+        **V1's own `plan_hash` is UNCHANGED and still computed from the join.** Nothing stored
+        re-keys; the two enumerations are pinned to each other by a mutation test that moves every
+        identity-bearing field and asserts BOTH hashes move.
+
+        The structure is deliberately TOTAL where the join is conditional: the join appends the
+        attribution and snapshot blocks only when present, because appending is the only way a
+        string can stay backward-compatible. Structure has no such problem, so an absent block is
+        an explicit ``None`` and `current_flag_column` is always a key.
+        """
+        e = self.eligibility
+        if e is None:  # guarded by __post_init__; keeps the identity function total for type checkers
+            raise AssertionError("validated analysis IR has no eligibility policy")
+        return {
+            "spine": {"table_id": self.spine.binding.identity.table_id,
+                      "key_column": self.spine.key_column},
+            "event": {"table_id": self.event_binding.identity.table_id,
+                      "key_column": self.event_key_column,
+                      "period_column": self.period_column},
+            "periods": {"current": list(self.current.values),
+                        "previous": list(self.previous.values)},
+            "measure": self.measure,
+            "comparison": str(self.comparison),
+            "dimensions": [d.column for d in self.dimensions],
+            "dimension_table_id": (self.dimension_binding.identity.table_id
+                                   if self.dimension_binding else None),
+            "eligibility": {
+                "status_column": e.status_column,
+                "included_status_values": list(e.included_status_values),
+                "reversal_mode": str(e.reversal_mode),
+                "reversal_column": e.reversal_column,
+                "non_reversed_values": list(e.non_reversed_values),
+                "null_behavior": str(e.null_behavior),
+            },
+            "bridge_realization_dependencies": [
+                {"realization_revision_id": revision, "dependency_snapshot_id": snapshot}
+                for revision, snapshot in self.bridge_realization_dependencies],
+            "attribution": None if self.attribution is None else {
+                "attribution_basis": str(self.attribution.attribution_basis),
+                "report_cutoff": self.attribution.report_cutoff,
+                "effective_from_column": self.attribution.effective_from_column,
+                "effective_to_column": self.attribution.effective_to_column,
+                "missing_value_behavior": str(self.attribution.missing_value_behavior),
+                "current_flag_column": self.attribution.current_flag_column,
+            },
+            "snapshot_selection": None if self.snapshot_selection is None else {
+                "snapshot_column": self.snapshot_selection.snapshot_column,
+                "cutoff": self.snapshot_selection.cutoff,
+                "scope": str(self.snapshot_selection.scope),
+                "key_column": self.snapshot_selection.key_column,
+                "tie_break_columns": list(self.snapshot_selection.tie_break_columns),
+                "missing_value_behavior": str(self.snapshot_selection.missing_value_behavior),
+            },
+        }
+
     @property
     def plan_hash(self) -> str:
         """Stable identity of WHAT this plan computes.
