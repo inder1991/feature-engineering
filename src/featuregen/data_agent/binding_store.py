@@ -288,6 +288,58 @@ def binding_revision_exists(conn, binding_revision_id: str) -> bool:
     return row is not None
 
 
+def _assert_one_addressable_table(conn, *, catalog_source: str, table: str) -> None:
+    """Refuse to SELECT a table name that names more than one table in this catalog.
+
+    `_schema_of` answers with `LIMIT 1` and no ORDER BY, and a logical ref carries no schema
+    (`ftr::tran_repos`), so a catalog holding `dpl_eib.tran_repos` AND `dpl_arc.tran_repos` returned
+    whichever row the planner happened to hand back — as the SCHEMA, the one component of the address
+    the catalog exists to supply. Reading a guess is one problem; PERSISTING it is another, and this
+    is the seam that persists: the arbitrary pick becomes an immutable `pbr_` revision that decisions,
+    observations and snapshots then reference and replay against.
+
+    An EXPLICIT binding lifts the refusal — that is this module's documented exception mechanism, and
+    it is a real declaration: an operator saying which table this catalog's name means. TWO explicit
+    rows do not, because `resolve_binding` reads one of them with `fetchone()` and nothing says which.
+
+    Deliberately NOT in `resolve_table`: that is a pure read behind every preview path, its answer is
+    already reported as `EXECUTION_INPUTS_ABSENT`, and narrowing it is a separately reviewable change.
+
+    The refusal carries `SELECTION_BINDING_MISSING` from the closed selection vocabulary rather than
+    a new spelling: `data_agent.learning` already routes that code to the PHYSICAL_BINDING_MISSING
+    gap with a BIND_PHYSICAL_SOURCE action, which is exactly what closing this needs — so it lands in
+    a queue an operator already works from. It is imported LAZILY, the precedent `source_selection`
+    sets for itself: at module scope it costs every importer of this module ~150ms of contract
+    package it does not use, and this function runs once per selected source.
+    """
+    from featuregen.overlay.upload.source_selection import SELECTION_BINDING_MISSING
+
+    explicit = conn.execute(
+        "SELECT count(*) FROM physical_dataset_binding "
+        "WHERE catalog_source = %s AND lower(table_name) = lower(%s)",
+        (catalog_source, table)).fetchone()[0]
+    if explicit == 1:
+        return
+    if explicit > 1:
+        raise ConnectionError_(
+            SELECTION_BINDING_MISSING,
+            f"{catalog_source}::{table} has {explicit} explicit bindings, so the one a selection "
+            "would read is whichever the store returns first. Remove the binding that is not "
+            "intended: two addresses for one name is not an exception, it is a coin flip")
+    schemas = [row[0] for row in conn.execute(
+        "SELECT DISTINCT schema_name FROM graph_node "
+        "WHERE catalog_source = %s AND lower(table_name) = lower(%s) AND schema_name IS NOT NULL "
+        "ORDER BY schema_name", (catalog_source, table)).fetchall()]
+    if len(schemas) > 1:
+        raise ConnectionError_(
+            SELECTION_BINDING_MISSING,
+            f"{catalog_source}::{table} names {len(schemas)} tables in this catalog "
+            f"({', '.join(schemas)}), and a logical ref carries no schema — so deriving the address "
+            "from the catalog engine would freeze an arbitrary one into an immutable revision that "
+            f"every later decision replays against. Record an explicit binding naming the schema "
+            f"this catalog's {table!r} means (the per-table exception this module documents)")
+
+
 def select_table_binding(
     conn, *, catalog_source: str, table: str, recorded_by: str | None = None,
 ) -> tuple[PhysicalDatasetBindingV1, DataSourceConnectionV1, str] | None:
@@ -304,8 +356,11 @@ def select_table_binding(
     to record.
 
     `None` when the table cannot be addressed at all (unconfigured), exactly as `resolve_table`;
-    a REVOKED grant still raises, because "not configured" must not absorb "no longer allowed".
+    a REVOKED grant still raises, because "not configured" must not absorb "no longer allowed", and
+    an AMBIGUOUS table name raises too (:func:`_assert_one_addressable_table`) rather than persisting
+    whichever schema came back first.
     """
+    _assert_one_addressable_table(conn, catalog_source=catalog_source, table=table)
     resolved = resolve_table(conn, catalog_source=catalog_source, table=table)
     if resolved is None:
         return None
