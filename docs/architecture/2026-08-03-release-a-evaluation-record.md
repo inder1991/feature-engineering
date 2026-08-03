@@ -11,6 +11,9 @@ Gate-A approval package; it does not grant, imply, or request that approval.
 - **Mode:** REPLAY / FIXTURE only. Per the verified-interfaces doc **D9**, the live same-model
   comparison and the token/call cost measurement are **Gate B**, behind a separate approval.
 - **No live LLM call, no network egress, no migration, no deploy, no upload was made.**
+- **Revised 2026-08-03 after adversarial review.** Two of this evaluation's own instruments were
+  unfalsifiable as first submitted; both are fixed and the corrections are itemised in **§11**. No
+  measurement in §3 moved.
 
 ---
 
@@ -105,6 +108,20 @@ A *forbidden selection* is not merely a miss: it is the specific wrong answer th
 catch — a BIC read as a CIF, a business date read as a load timestamp, a protected characteristic
 read as an ordinary geography code. Sixteen of them in the thin arm, none in the rich arm.
 
+**What 22/22 does and does not say — read this before quoting the number.** The rich arm's perfect
+score is not a surprising empirical result. It is *entailed* by how the gold guard and the oracle are
+built: `test_every_discriminator_is_rich_only` requires every discriminating term to be present in
+the rich payload and absent from the thin one, and the oracle answers the reviewer's concept exactly
+when it finds that term in the bytes. So **given** that the pipeline assembles the v4 payload the
+gold describes, 22/22 follows by construction — and a score below 22 would mean the guard and the
+oracle contradict each other, not that a model got something wrong.
+
+The information the measurement adds is therefore the antecedent, not the score: the **real**
+`enrich_concepts` path, over real bundles, actually delivered those bytes for all 22 columns, and the
+same machinery delivered almost none of them (2/22) when the bundle was withheld. It is a **payload
+delivery** check with a matched negative arm. It is not a model-accuracy claim, and nothing in §3.1
+or §3.2 may be quoted as one. Provider skill is Gate B (§8).
+
 ### 3.2 Unclassified precision
 
 | | declined | correctly declined | precision | recall |
@@ -118,20 +135,47 @@ to check and the one a rich context could plausibly have broken.
 
 ### 3.3 False cross-namespace candidates
 
-Driven through the real `derive_bridge_candidates`, whose blocking key **is** the identifier
-namespace, over both gold catalog sources seeded with the reviewer-expected concepts.
+**Exactly what is checked.** Both gold catalog sources (`ftr.comp_fin_tran`, `cib.cust_master`) are
+seeded with the reviewer-expected concepts and put through the real `derive_bridge_candidates`, whose
+blocking key **is** the identifier namespace. Every graded control names two columns that sit in
+**different catalog sources** and belong to **disjoint identifier namespaces**; a candidate carrying
+such a pair is a violation.
 
-| | |
-| --- | --- |
-| candidates derived | 2 |
-| must-not-pair controls checked | 6 |
-| **false cross-namespace candidates** | **0** |
-| positive control offered | `counter_party_cif_id ↔ cust_cif_id` (same `cif` registry) |
+| | gate as shipped | namespace gate collapsed |
+| --- | --- | --- |
+| candidates derived | 2 | **10** |
+| graded (cross-source) must-not-pair controls | 8 | 8 |
+| **false cross-namespace candidates** | **0** | **8 of 8** |
+| positive controls offered | `counter_party_cif_id ↔ cust_cif_id`, `counter_party_bic ↔ cust_swift_cd` | both |
+| intra-source pairs offered | 0 | 0 |
 
-The positive control is load-bearing. On the first run the derivation produced **zero** candidates
-of any kind — every gold column resolved to type family `other` because FTR's `type='unknown'` was
-never accompanied by an attested type — and the "zero violations" number was therefore vacuous. The
-control is what exposed it.
+**Two controls, because a zero on its own is not a pass.**
+
+*Positive.* Both same-namespace pairs must be **offered**. On the first run of this harness the
+derivation produced zero candidates of any kind — every gold column resolved to type family `other`
+because FTR's `type='unknown'` carried no attested type — and the zero was vacuous. That control is
+what exposed it.
+
+*Reachability (added 2026-08-03, after review).* The right-hand column above is the bar's denominator.
+`Concept.namespace` is the blocking key, so collapsing it to one literal removes the gate and changes
+nothing else — same grounding, same type families, same source distinctness, same hard-conflict
+suppression. Under that injection **all eight** controls are offered as candidates. The zero on the
+left is therefore the gate's doing and not the fixture's shape, and the bar is demonstrably capable of
+failing — the same standard the mutation harness holds itself to. It is asserted, not merely
+recorded, by `test_bar_one_controls_are_reachable_only_the_namespace_gate_stops_them`.
+
+**The controls were reachable only after they were rewritten.** Until the review, all six controls
+named two columns of the *same* table. `_derive_from_identifier_columns` enumerates
+`combinations(sources, 2)` — it can only ever offer a **cross-source** pair — so those six were
+refused by the topology before the namespace gate was ever consulted, and "zero violations" was
+guaranteed regardless of what the gate did. The graded list is now eight cross-source wrong-scheme
+pairs drawn from both fixture catalogs (`cust_swift_cd ↔ counter_party_cif_id`,
+`cust_cif_id ↔ counter_party_bic`, and six more against `dr_acct_num`, `benef_acct_num`, `sol_id`).
+
+The original six are **kept and relabelled** `unreachable_by_topology` rather than deleted or quietly
+regraded: they are still forbidden pairs, they are simply refused one layer earlier than this bar is
+about. Gold guards assert they really are intra-source, that no pair appears in both lists, and that
+they stay absent even with the gate removed.
 
 ### 3.4 Grounded retrieval, and where the lift actually is
 
@@ -194,7 +238,7 @@ on. Every zero-violations bar carries its own positive control in the same test.
 
 | # | Bar | Result |
 | --- | --- | --- |
-| 1 | zero BIC↔CIF candidates on the gold set | **PASS** (0 violations, control offered) |
+| 1 | zero BIC↔CIF candidates on the gold set | **PASS** (0 of 8 cross-source controls violated; both positive controls offered; reachability proven — §3.3) |
 | 2 | zero physical facts attributed to an LLM producer | **PASS** (structural + empirical) |
 | 3 | zero source/human evidence overwritten across a full re-enrichment replay | **PASS** (2 passes, byte-identical) |
 | 4 | zero unsafe gold features accepted | **NOT MET — see §5** |
@@ -202,6 +246,12 @@ on. Every zero-violations bar carries its own positive control in the same test.
 | 6 | measurable retrieval lift | **PASS** on leg-3 contribution; hit rate non-regressed |
 | 7 | no unexplained zero-output stage | **PASS** (4 stages, predicate proven able to fire) |
 | 8 | zero reviewed-but-unsafe relationships displayed executable | **PASS** (both halves) |
+
+Bar 1 carries a second named test rather than a footnote:
+`test_bar_one_controls_are_reachable_only_the_namespace_gate_stops_them` collapses the namespace —
+the blocking key — and requires all eight controls to appear. A bar whose controls cannot be reached
+is not a passing bar; it is an unasked question, which is what bar 1 was until the review (§3.3,
+§11).
 
 Bar 2 is asserted twice over: **structurally**, the fields Pass B may propose are disjoint from every
 physical assertion the gold names, so an LLM cannot reach one even in principle; **empirically**, no
@@ -220,7 +270,7 @@ Three further bars were added **after** the mutation harness proved their invari
 | `test_bar_a_catalog_narrative_never_defaults_a_dataset_authority` | **PASS** |
 | `test_bar_business_context_moves_the_dataset_profile_hash` | **PASS** |
 
-`tests/eval/test_release_a_bars.py` — **14 passed, 1 xfailed** (the xfail is bar 4).
+`tests/eval/test_release_a_bars.py` — **15 passed, 1 xfailed** (the xfail is bar 4).
 
 ---
 
@@ -280,13 +330,20 @@ Design, and the reason for each choice:
 - **Mutations patch the CONSUMER, not the producer,** wherever a symbol travels by
   `from X import Y`. Patching the producer would be a mutation that mutates nothing and would then
   kill its victims for no reason — or, worse, kill nothing and read as a survival.
+- **A kill is the EXPECTED failure, not any failure** (added 2026-08-03, after review). Each must-die
+  entry records `expect_failure_contains` — the victim's own assertion message, or the failing source
+  line as pytest renders it, taken from a real mutated run — and the mutated run must contain it AND
+  report a NAMED victim among its failures. Scoring on exit code alone counted a broken import or a
+  malformed query as a caught invariant. See §11 for what that immediately caught.
 - **Nothing touches `src/`.** Every mutation is a runtime patch installed by a pytest plugin in a
   throwaway process.
 
 ### Results
 
-**16 / 16 must-die mutations killed. 1 / 1 must-survive control survived. 0 dropped.**
-Suite: `20 passed in 27.84s` (16 must-die + 1 control + 2 registry meta-tests + the count baseline).
+**16 / 16 must-die mutations killed, each with the failure the registry expects. 1 / 1 must-survive
+control survived. 0 dropped.**
+Suite: `24 passed in 34.6s` (16 must-die + 1 control + 3 registry meta-tests + 3 per-eval-suite
+counts + the release-gate count baseline).
 
 | # | Mutation | Invariant broken | Killed |
 | --- | --- | --- | --- |
@@ -303,10 +360,14 @@ Suite: `20 passed in 27.84s` (16 must-die + 1 control + 2 registry meta-tests + 
 | 11 | `llm_authority_becomes_load_bearing` | an LLM proposal is displayed, never load-bearing | yes |
 | 12 | `search_drops_profile_context` | profile classifications are facetable with the flag on | yes |
 | 13 | `feature_gen_drops_profile_context` | the feature-context block carries the profile advisories | yes |
-| 14 | `retrieval_drops_profile_context` | leg 3 harvests the table profile with the flag on | yes |
+| 14 | `retrieval_drops_profile_context` | leg 3 harvests the table profile with the flag on | yes ‡ |
 | 15 | `graph_projection_read_as_authority` | eligibility comes from the decision log, not the projection | yes |
 | 16 | `profile_hash_omits_business_context` | every meaning-bearing field moves `dataset_profile_hash` | yes † |
 | — | `noop_reorder_registry_declarations` | *(must survive)* declaration/dict order is not meaning | survived |
+
+Every "yes" above now means **killed by the failure the registry expects**, named per mutation and
+taken from a real mutated run — not merely "the run went red". ‡ marks the one mutation that had to
+be rewritten before it could earn that (§11).
 
 **Nothing was dropped.** Every mutation the two plans named maps onto a symbol that exists in the
 as-built code and was verified against it before the mutation was written. Where a plan named a
@@ -351,22 +412,24 @@ gate.
 Per D9, the literal-count gate is scoped to named focused suites and never to the whole repository,
 whose ~82 order/environment-dependent failures are recorded in `DEFERRED-WORK` §C.
 
-| Suite set | Count |
-| --- | --- |
-| The Task-0 seventeen (`RELEASE_GATE_SUITES`) | **269** (Task-0 baseline was 238; Release-A integration added 31) |
-| `tests/eval/test_gold_sets_are_consistent.py` | 60 |
-| `tests/eval/test_release_a_eval.py` | 4 |
-| `tests/eval/test_release_a_bars.py` | 15 (14 passed + 1 strict xfail — bar 4) |
-| `tests/eval/mutation/` | 20 |
+| Suite set | Count | Asserted in code by |
+| --- | --- | --- |
+| The Task-0 seventeen (`RELEASE_GATE_SUITES`) | **269** (Task-0 baseline was 238; Release-A integration added 31) | `test_the_named_release_gate_suites_hold_their_literal_count` |
+| `tests/eval/test_gold_sets_are_consistent.py` | 63 | `test_the_eval_suites_hold_their_literal_count` |
+| `tests/eval/test_release_a_eval.py` | 4 | ″ |
+| `tests/eval/test_release_a_bars.py` | 16 (15 passed + 1 strict xfail — bar 4) | ″ |
+| `tests/eval/mutation/` | 24 | — (it is the runner) |
 
-Regression gates run for this step, all green with `pipefail`: the seventeen above (**269 passed**),
-the four eval suites (**60 + 38 passed, 1 xfailed**), and the whole `tests/featuregen/overlay/upload`
-half (**3838 collected, exit 0**). This branch ADDS 14 files and modifies none — `git diff
---name-only 05160fcc..HEAD` is additions only, and `src/`, `frontend/`, `deploy/` and every
-controlling document are untouched.
+Regression gates re-run after the §11 corrections, all green: the seventeen above (**269 passed**),
+the four eval suites (**63 + 43 passed, 1 xfailed**), and the whole `tests/featuregen/overlay/upload`
+half (**3838 collected — 3827 passed, 11 skipped, exit 0**). This branch ADDS 15 files and modifies
+none — `git diff --name-only 05160fcc..HEAD` is additions only, and `src/`, `frontend/`, `deploy/`
+and every controlling document are untouched.
 
-`test_the_named_release_gate_suites_hold_their_literal_count` asserts the 269 in code. A **drop** is
-a deleted guard and must be explained; a rise is fine but must be rebaselined deliberately.
+Both baselines are now **asserted**, not merely written down. `EVAL_SUITES` carried its three counts
+as an unread literal until the review — a claim nobody checked — and is now held to the same rule as
+the seventeen, one parametrized case per suite. A **drop** is a deleted guard and must be explained;
+a rise is fine but must be rebaselined deliberately.
 
 ---
 
@@ -403,6 +466,11 @@ Per D9 these are **not** pre-gate deliverables and were not attempted:
    `dataset_profile_hash`. All three are now closed by named bars. No defect was found in the
    PRODUCT for any of them — the code was correct; only the evidence that it was correct was
    missing. Worth knowing which claims in the Gate-A package rested on nothing until today.
+6. **Two of this evaluation's own instruments were unfalsifiable when first submitted** (§11): bar 1
+   graded controls the derivation could not offer, and the mutation gate counted any failure as a
+   kill. Both are fixed and both zeros are now backed by a control that makes them capable of
+   failing. The general point is worth carrying into Gate B: for every "zero" in this record, ask
+   what was shown to produce a non-zero.
 
 ## 10. Reproducing this record
 
@@ -414,3 +482,53 @@ uv run --extra dev pytest -q tests/eval/test_gold_sets_are_consistent.py    # th
 ```
 
 The eval run writes a timestamped JSON report to `tests/eval/reports/` (a run artifact, git-ignored).
+Its `cross_namespace` and `cross_namespace_reachability_control` blocks are the two columns of §3.3,
+produced by the same execution.
+
+---
+
+## 11. Corrections after review (2026-08-03)
+
+The first submission of this record was reviewed adversarially. Five items came back; two of them
+were findings about the **evaluation itself** rather than about the platform, and both are the kind
+that make a green result mean less than it appears to. They are recorded here rather than folded
+away, because a Gate-A reader is entitled to know which numbers changed after someone pushed on them.
+
+**1. Bar 1 could not fail (major).** All six must-not-pair controls named two columns of the same
+table, and `derive_bridge_candidates` only ever enumerates pairs across *distinct* catalog sources.
+The controls were therefore refused by the topology, not by the namespace gate, and
+`false_cross_namespace_candidates == 0` was guaranteed whatever the gate did — including if it were
+deleted. The reviewer demonstrated it by collapsing every namespace: candidates rose 2 → 10 and the
+violation count stayed 0.
+
+Fixed by regrading the bar on eight **cross-source** controls drawn from both fixture catalogs, adding
+a second positive control, keeping the original six as an honestly-labelled `unreachable_by_topology`
+list, and adding a reachability control that reproduces the reviewer's injection as a named test:
+with the gate collapsed, **all eight** controls are offered. §3.3 states what is checked; the bar's
+verdict did not change, but it now means something.
+
+**2. The mutation gate scored any failure as a kill (minor).** `test_the_mutation_is_caught` required
+only that the mutated run go red. A mutation that broke an import, malformed a query or upset an
+unrelated fixture would have been reported as a caught invariant. Each must-die entry now records the
+failure it expects, taken from a real mutated run, and a named victim must be among the failures.
+
+It caught one immediately. `retrieval_drops_profile_context` emptied `_TABLE_PROFILE_COLUMNS`, which
+turned leg 3's harvest into `SELECT catalog_source, table_name,  FROM graph_node` — both victims died
+of `psycopg.errors.SyntaxError`, having never reached the question. The mutation now projects a
+literal `NULL`: the statement stays well-formed, the rows are read, and the victims fail on the
+invariant itself. **The 16/16 kill count is unchanged; what changed is that it is now 16/16 for the
+right reasons.**
+
+**3. `EVAL_SUITES` was an unread literal (minor).** Three per-suite counts sat in the mutation module
+with nothing asserting them. Now asserted, and rebaselined (§7).
+
+**4. This record said the branch adds 14 files (minor).** It adds 15. Corrected in §7.
+
+**5. The 22/22 could be over-read (minor).** §3.1 now states plainly that the rich arm's perfect score
+is *entailed* by the leak-guard and the oracle construction, and that the measurement's actual content
+is the antecedent — that the real pipeline delivered the payload — with the thin arm's 2/22 as the
+matched negative.
+
+All numbers in §3 were re-measured after these changes and are unchanged: thin 2/22, rich 22/22,
+16 → 0 forbidden selections, unclassified precision 0.33 → 1.00, grounded hits 8/8 both arms,
+expansion terms 80 → 142, leg-3 offers 56 → 68, table selection 0 → 6 of 6, Pass-B replay 11/11.
