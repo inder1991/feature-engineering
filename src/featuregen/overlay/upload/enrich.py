@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from featuregen.intake.llm import LLMClient
+from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
@@ -1695,12 +1696,16 @@ class AdjudicationRunInputs:
 
 
 def adjudication_candidates(
-    conn, rows: Sequence[CanonicalRow], *, concepts: dict[str, str],
+    rows: Sequence[CanonicalRow], *, concepts: dict[str, str],
     glossary: GlossaryUpload | None,
     critic_outcomes: dict[str, dict] | None = None,
     bundles: dict[str, SemanticContextBundleV1] | None = None,
 ) -> AdjudicationRunInputs:
     """Build the run's adjudication candidates + their model-facing context + both ref identities.
+
+    PURE over its arguments — no ``conn``. It used to take one and never use it, which is a lie
+    about the function's reach: a reader budgeting queries, or looking for the transaction this
+    runs in, would find neither.
 
     Every candidate field is a COMPUTED fact of this run: the assigned concept, the deterministic
     ``shape_conflicts`` for it, the concept critic's verdict where it ran, and the SOURCE-declared
@@ -1809,7 +1814,7 @@ def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow
 
     bounds = adjudication_bounds()
     inputs = adjudication_candidates(
-        conn, rows, concepts=concepts, glossary=glossary, critic_outcomes=critic_outcomes,
+        rows, concepts=concepts, glossary=glossary, critic_outcomes=critic_outcomes,
         bundles=bundles)
     targets = select_adjudication_targets(
         inputs.candidates, context_of=inputs.context_of, max_targets=bounds.max_targets)
@@ -1818,8 +1823,11 @@ def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow
                     "evidence_skipped": 0, "evidence_write_failures": 0, "gaps": 0}
     if not targets:
         return detail
-    catalog_revision = hashlib.sha256(
-        json.dumps(sorted(inputs.ref_to_hash)).encode("utf-8")).hexdigest()[:16]
+    # The replay identity of the ref set this run adjudicates against, through THE shared canonical
+    # hasher (D1: `materialize_hash`, RFC 8785 JCS) rather than an inline sha256/json.dumps — a
+    # second canonicalization scheme for a replay key is how two components come to disagree about
+    # whether a stored answer may be served.
+    catalog_revision = materialize_hash({"refs": sorted(inputs.ref_to_hash)})[:16]
     results = adjudicate_targets(conn, client, targets, catalog_revision=catalog_revision,
                                  actor=actor, bounds=bounds,
                                  ingestion_run_id=ingestion_run_id)

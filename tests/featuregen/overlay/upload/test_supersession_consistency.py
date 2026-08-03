@@ -128,16 +128,48 @@ def test_a_different_value_stales_the_prior_row_and_writes_a_fresh_one(graphed):
                                     ("End-of-day ledger balance.", "active")}
 
 
-def test_a_value_that_returns_reuses_the_row_it_never_deleted(graphed):
-    """A → B → A. The A row was STALED, so the return writes a fresh row: reuse is over the ACTIVE
-    set only. What must hold is the invariant — exactly one live LLM proposal, and it says A."""
+def test_a_value_that_returns_is_written_fresh_not_resurrected(graphed):
+    """A → B → A. Reuse is over the ACTIVE set only, so the return does NOT recover the original
+    row: A was staled by B, and the third pass writes a NEW row with a new id. Named for what it
+    proves — the earlier name ("reuses the row it never deleted") claimed the opposite of the
+    assertions underneath it. What must hold is the invariant: exactly one live LLM proposal, and
+    it says A."""
     _write(graphed, "definition", "A")
+    original = _active(graphed)[0]
     _write(graphed, "definition", "B")
     _write(graphed, "definition", "A")
     current = _active(graphed)
     assert len(current) == 1 and current[0].proposed_value == "A"
+    assert current[0].evidence_id != original.evidence_id      # a fresh row, not a resurrection
     assert [lifecycle for _v, lifecycle in _lifecycles(graphed)].count("active") == 1
     assert ("A", "active") in _lifecycles(graphed)
+
+
+def test_a_same_value_reuse_still_retires_the_llms_other_live_proposal(graphed):
+    """MUTATION GATE (M3): the `stale_source_evidence` call inside the value-diff REUSE branch.
+
+    Deleting it survived the whole suite, because every other reuse test starts from a store
+    holding exactly ONE live LLM row — where "retire the others" is a no-op and its absence is
+    invisible. The state it defends is the one the resolver NULLs a field on: two live LLM
+    proposals for one field. Reached here by seeding a second active LLM row directly (a prior
+    run's write that a crash left live, or any path that recorded beside the writer), then
+    re-deriving the FIRST value so the reuse branch — not the supersede branch — is the only thing
+    that can clean it up."""
+    _write(graphed, "definition", "The ledger balance.")
+    kept = _active(graphed)[0]
+    record_field_evidence(
+        graphed, logical_ref=_REF, field_name="definition",
+        proposed_value="A second live opinion.", producer=EvidenceProducer.LLM,
+        strength=AssertionStrength.PROPOSED, producer_ref="test", source_snapshot_id="snap-0",
+        input_hash=field_input_hash(logical_ref=_REF, field_name="definition",
+                                    material="a different prompt"))
+    assert len([e for e in _active(graphed) if e.producer == EvidenceProducer.LLM.value]) == 2
+
+    assert _write(graphed, "definition", "The ledger balance.") == 0   # the REUSE branch
+
+    live = [e for e in _active(graphed) if e.producer == EvidenceProducer.LLM.value]
+    assert [e.evidence_id for e in live] == [kept.evidence_id]     # reused, id preserved
+    assert ("A second live opinion.", "stale") in _lifecycles(graphed)
 
 
 @pytest.mark.parametrize("field_name", ["definition", "ai_summary", "domain", "semantic_terms",
@@ -272,6 +304,45 @@ def test_a_ready_projection_reports_ready_out_loud(graphed):
     detail = build_asset_detail(graphed, source=_SOURCE, object_ref=_OBJECT_REF, roles=_ROLES)
     assert detail["projection"]["status"] == "ready"
     assert search(graphed, "", now=_NOW, roles=_ROLES).projection.status == "ready"
+
+
+def test_the_readiness_gate_is_one_statement(graphed, monkeypatch):
+    """The gate ran four queries (head, checkpoint-exists, degraded, checkpoint-seq). That is fine
+    once per feature-generation snapshot and wrong on a read surface that calls the detection-only
+    sibling on every request — so the three predicates are read in ONE statement. Counted at the
+    driver, because "one round trip" is a claim about statements, not about how the code reads."""
+    import psycopg
+
+    statements: list[object] = []
+    execute = psycopg.Cursor.execute
+
+    def _counting(self, query, *args, **kwargs):
+        statements.append(query)
+        return execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg.Cursor, "execute", _counting)
+    assert projection_lag_marker(graphed).status == "ready"
+    assert len(statements) == 1
+
+
+def test_an_empty_search_page_does_not_pay_for_a_lag_marker(graphed, monkeypatch):
+    """The marker qualifies the rows SERVED ("these may not yet reflect the newest resolved
+    semantics"). A page that serves none has nothing to qualify, so the gate is not run at all —
+    and a page that DOES serve rows always carries a freshly computed marker."""
+    from featuregen.overlay.upload import search as search_mod
+
+    checks: list[object] = []
+    real = search_mod.projection_lag_marker
+    monkeypatch.setattr(
+        search_mod, "projection_lag_marker",
+        lambda conn, **kw: (checks.append(conn), real(conn, **kw))[1])
+
+    served = search(graphed, "", now=_NOW, roles=_ROLES)
+    assert served.hits and len(checks) == 1          # exactly one readiness check per call
+    empty = search(graphed, "no_such_term_anywhere", now=_NOW, roles=_ROLES)
+    assert empty.hits == [] and empty.total == 0
+    assert len(checks) == 1                          # no rows served -> no check at all
+    assert empty.projection.status == "ready"
 
 
 def _lag(monkeypatch):

@@ -2146,6 +2146,16 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # (glossary=None) skips ALL of the below and is byte-for-byte unchanged. The ingestion-run id is
     # the source_snapshot_id that keys per-field evidence + staleness for THIS upload (review #5). ──
     is_glossary = glossary is not None
+    # NO SNAPSHOT ID ON THE TECHNICAL PATH, and therefore NO field evidence on it: every
+    # `field_evidence` row requires a NOT-NULL `source_snapshot_id`, so a technical upload's
+    # LLM-derived values (Pass A's classification and, since semantic Task 5, the adjudicator's
+    # corrections alike) reach `graph_node` through the in-memory `concepts`/`definitions` maps and
+    # `build_graph`, with no evidence row, no producer-scoped staleness and no decision link behind
+    # them. That is Pass A's PRE-EXISTING behaviour, not a Task-5 regression — adjudication
+    # deliberately matches it rather than inventing a second rule for one stage — and the
+    # adjudication stage detail counts those items as `evidence_skipped` so the run says so. The
+    # governed read surfaces treat such a value as an unbacked display value, which is exactly what
+    # it is; a technical upload that needs governed metadata is one that needs a glossary sidecar.
     snapshot_id = mint_id("ing") if is_glossary else None
     bindings: dict[str, ObjectBinding] | None = None
     if glossary is not None:
