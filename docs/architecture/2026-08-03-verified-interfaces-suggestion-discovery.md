@@ -347,12 +347,41 @@ moving a decision**:
 
 | # | Owner module | Change |
 | --- | --- | --- |
-| P1 | `overlay/upload/feature_assist.py` (`_validate_idea`) | Emit one `GroundingDecisionTraceV1` per candidate alongside its existing return: record a `GroundingDependencyPinV1` at every read it already performs — `_ground_refs` grounding set, `_column_meta` additivity/unit/currency hints, `_governed_read` of `logical_representation`/`additivity`/`is_as_of`/`is_grain` (class VALIDATION; `content_hash` over the read value+status, `current_revision_id` = the C1 decision/projection pin), `_as_of_column_ref`/`_grain_column_ref` structural lookups (HARD_AVAILABILITY), `_ai_suggestion` unit/currency surfacing (SEMANTIC), and the `classify_join_path` outcome per cross-table operand. Return signature extends additively (existing callers unaffected). |
+| P1 | `overlay/upload/feature_assist.py` (`_validate_idea`) | Emit one `GroundingDecisionTraceV1` per candidate: record a `GroundingDependencyPinV1` at every read it already performs — `_ground_refs` grounding set, `_column_meta` additivity/unit/currency hints, `_governed_read` of `logical_representation`/`additivity`/`is_as_of`/`is_grain` (class VALIDATION; `content_hash` over the read value+status, `current_revision_id` = the C1 decision/projection pin), `_as_of_column_ref`/`_grain_column_ref` structural lookups (HARD_AVAILABILITY), `_ai_suggestion` unit/currency surfacing (SEMANTIC), and the `classify_join_path` outcome per cross-table operand. **Carrier: the return ARITY stays `(FeatureIdea | None, Rejection | None)`** — the trace travels on the returned objects via two new defaulted fields, `FeatureIdea.grounding_trace: GroundingDecisionTraceV1 | None = None` and `Rejection.trace: GroundingDecisionTraceV1 | None = None` (both frozen dataclasses; defaults-last is this codebase's established additive pattern). Two new optional keyword-only inputs `candidate_key: str | None = None` and `template_id: str | None = None` let the caller thread candidate identity into the trace; callers that pass nothing (the LLM path) are unchanged. See the call-site freeze below. |
 | P2 | `overlay/upload/join_path.py` (`classify_join_path`) | Stop discarding the selected path: the returned `JoinOutcome.steps` (already ordered, already carrying `approved_join_fact_key`/`approved_join_status`/`authority`/`cardinality`) is converted **at this seam** into the ordered `SuggestionRelationshipDependencyV1` legs handed to P1. No re-walk, no adapter-side path selection. |
-| P3 | `overlay/upload/contract/gate1.py` (`_template_candidates`) | Thread the per-candidate traces to callers as an additive 9th return element keyed by `recipe_candidate_key` (beside the existing `contexts`). Rejected candidates carry a trace with their rejection decision so `SuggestionRejectionV2.template_id` is attributable. |
+| P3 | `overlay/upload/contract/gate1.py` (`_template_candidates`) | **Carrier: the plain 8-tuple return is REPLACED by a frozen result dataclass** `TemplateCandidatesResult` in `contract/gate1.py`, with named fields carrying the exact same eight objects under their established names (`ideas, rejections, grounded_ids, rejected_ids, binding_by_id, incomplete_ids, contexts, keys_by_recipe`) plus `rejection_records: tuple[RejectionRecordV1, ...]` where `RejectionRecordV1 = {template_id, candidate_name, rejection: Rejection}` (the rejection carries its trace from P1). Survivor traces ride inside `ideas` on `FeatureIdea.grounding_trace` — `dataclasses.replace` at the existing server-stamp (gate1.py:297) preserves the field by construction. The V1 wire `rejections` element stays the byte-identical `{name, reason, code}` dict list; `SuggestionRejectionV2.template_id` is populated from `rejection_records`, never by name-matching. This is a **breaking arity change and is frozen as such**; every call site is enumerated below. |
 | P4 | `overlay/upload/templates.py` (grounding) | No decision change. `GroundedFeature.role_bindings` / `binding_resolutions` / `tied_candidate_set_hash` already carry binding evidence; P1 copies `ordered_operand_roles` from them (`(catalog_source, logical_ref, role)` in binding order). |
 | P5 | `overlay/upload/read_scope.py` | New pure function `read_scope_rule_content_hash()` = `contract_hash_v1("read-scope-rules", "1", {SENSITIVITY_ROLES, RESTRICTION_ROLES, VISIBILITY_PREDICATE, precedence: "migration-1032"})`, the single member of `read_scope_rule_content_hashes` today. |
 | P6 | `overlay/upload/validation_requirements.py` | New pure function returning per-rule content hashes for the rule set `_validate_idea` actually evaluated (registry schema entries + rule constants), populating `validation_rule_content_hashes` — the exact rules evaluated, not a global registry version. |
+
+### Call-site freeze (amended 2026-08-03 after review)
+
+Both seams are unpacked **positionally** today, so the carrier choice above is frozen together
+with its exact blast radius (all sites verified by grep at `30f8442b`):
+
+- `_validate_idea` — arity unchanged, therefore **zero call-site changes required**. The six
+  production two-name unpacks remain valid as-is: `feature_assist.py:995`,
+  `feature_assist.py:1270`, `contract/gate1.py:286`, `contract/review.py:68`,
+  `planner/b_gauntlet.py:123`, `planner/b_slice_spike.py:277`; likewise the ~45 test unpack
+  sites across `tests/featuregen/overlay/upload/` (test_validate_idea_tristate,
+  test_feature_loop, test_feature_v2_schemas, test_unit_confirm_loop, test_gating_confirm_lift,
+  test_validation_requirements, test_ai_unit_proposal, test_suggestions,
+  contract/test_operand_roles_carry) and `tests/featuregen/api/test_confirm_tamper_safety.py`.
+  Only P3's caller (`gate1.py:286`) is *updated* — to pass `candidate_key`/`template_id` and read
+  the trace — and that is already a P3-owned edit.
+- `_template_candidates` — the result-dataclass change **breaks every positional unpack** and
+  each must be migrated to attribute access in the same task (Task 1): production
+  `overlay/upload/suggestions.py:95` (8-name unpack) and `contract/gate1.py:627`
+  (`build_considered_set`'s own call), plus the **13 test call sites** in 7 files:
+  `tests/featuregen/overlay/upload/test_suggestions.py`,
+  `test_per_table_grounding_measurement.py`, `test_gating_confirm_lift.py`,
+  `contract/test_operand_roles_carry.py`, `contract/test_gate1_scoped.py`,
+  `contract/test_template_status.py`, `contract/test_h3c_governed_lineage.py`. No other
+  production caller exists (verified).
+- **Persistence rule**: `grounding_trace`/`trace` are transient carry. The existing considered-
+  set (de)serializers are not extended; a persisted-and-reloaded `FeatureIdea` has
+  `grounding_trace=None`, which is valid because V2 assembly always consumes fresh grounding
+  output, never a reloaded snapshot (rule 15's "one grounding truth").
 
 **Hard rule restated**: `overlay/upload/suggestions.py` and any V2 adapter consume the trace;
 they never reconstruct it, never rerun path selection, and a `DESIGN_CHECKED` candidate without a
@@ -410,6 +439,9 @@ dataclass listings, with these bindings to real symbols:
   reachable here).
 - `neighbourhood` carries the existing `JoinNeighbourhood` value; its wire form is
   `as_metadata()` — the name `JoinNeighbourhoodV1` denotes exactly that five-field shape (D2).
+  On the table route it is never `None` — even for an unknown table, where the synthesized zero
+  block is carried (see the [0F-11](#v1proof) nullability rule); `None` occurs only on the
+  global page.
 - `RecipePartsV2` := frozen dataclass with exactly the V1 parts semantics —
   `{operation: str, measures: tuple[str, ...], grain: str, window: str, time: str}` — produced by
   the same rendering code as today (`suggestions._recipe_parts`); V2 adds **no** field here
@@ -487,7 +519,7 @@ byte-for-byte from `FeatureSuggestionPageV2` alone. Proof by exhaustive field ma
 | V1 field | Source in V2 | Note |
 | --- | --- | --- |
 | `catalog_source` | `collection.anchor_catalog_source` | table route always sets it |
-| `table` | `collection.anchor_table_ref` | the resolved bare name (`_resolve_table` output), preserved as-is |
+| `table` | `collection.anchor_table_ref` | **frozen two-case rule**: when `table_known=True`, the resolved bare name (`suggestions.py:87` rebinds `table = known`); when `table_known=False`, the **caller's requested string verbatim** (`suggestions.py:80` echoes the raw input — no resolver output exists to carry). `anchor_table_ref` holds whichever V1 emitted, so the adapter copies it in both states |
 | `table_known` | `collection.table_known` | tri-state `bool | None`; table route sets True/False; global page None |
 | `summary.suggested` | `collection.summary.suggested` | |
 | `summary.clean_ready` | `collection.summary.design_checked` | rename only; adapter re-emits the V1 key |
@@ -506,8 +538,8 @@ byte-for-byte from `FeatureSuggestionPageV2` alone. Proof by exhaustive field ma
 | card `recipe` | `recipe` | carried verbatim (rendered once by the engine-side renderer, not re-rendered) |
 | card `recipe_parts` | `recipe_parts` (`RecipePartsV2`) | field-identical shape ([0F-9](#v2)) |
 | `rejections[]` `{name, reason, code}` | `SuggestionRejectionV2 {candidate_name, explanation, code}` | `template_id` is additive; adapter drops it |
-| `neighbourhood` (5 fields) | `collection.neighbourhood.as_metadata()` | identical producer |
-| unknown-table payload | `table_known=False` + zeroed summary + empty groups/rejections + the zero/`max_hops` neighbourhood block | all values carried; the V1 zero-shape is a pure function of `table_known` and `max_hops` |
+| `neighbourhood` (5 fields) | `collection.neighbourhood.as_metadata()` | identical producer. **Frozen nullability rule**: on the table route `collection.neighbourhood` is **never `None`** — including the unknown-table state, where V1 synthesizes the zero block (`suggestions.py:83-86`: zeros, `truncated=False`, the effective `max_hops`, `limit_reason=None`) and V2 carries that same `JoinNeighbourhood` value. The plan's `JoinNeighbourhoodV1 | None` typing reserves `None` for the global page only |
+| unknown-table payload | `table_known=False` + `anchor_table_ref` (raw requested string, row above) + zeroed summary + empty groups/rejections + the carried zero-neighbourhood block | every V1 byte is a carried value: the zero-shape needs no recomputation because the synthesized neighbourhood block (including `max_hops`) travels in `collection.neighbourhood`, not as a derived function |
 
 New V2 fields the adapter must **drop** (never invent): `omitted_counts`, `hits`, `facets`,
 `read_mode`, `read_scope_key`, `projection`, per-suggestion discovery/identity/provenance
@@ -522,8 +554,13 @@ Route unchanged: `GET /catalog/{catalog_source}/tables/{table}/suggestions`, gat
 `require_catalog_read`, read scope from `identity.role_claims` only, `max_hops` bounds and the
 30s statement timeout retained.
 
-- **Version negotiation**: query parameter `contract_version: int = Query(default=1, ge=1, le=2)`.
-  No `contract_version` exists anywhere in `src/featuregen/api` today (verified) — this is a new,
+- **Version negotiation**: query parameter `contract_version: int = Query(default=1)` —
+  **deliberately unbounded at the FastAPI layer** (amended after review: a `ge`/`le` bound would
+  make FastAPI reject an unsupported version before the handler runs, so the typed error code
+  below could never be emitted and the error shape would be FastAPI's list-`detail` validation
+  body instead). The **handler** validates membership in the supported set `{1, 2}` and returns
+  the typed 422 body for any other integer — exactly one mechanism, in the handler. No
+  `contract_version` exists anywhere in `src/featuregen/api` today (verified) — this is a new,
   additive parameter. `contract_version=1` (and absence) returns today's dict **byte-identical**
   (the V1 adapter path of [0F-11](#v1proof)). `contract_version=2` returns the
   `FeatureSuggestionPageV2` serialization with `read_mode="on_demand"`, `projection=None`,
@@ -535,11 +572,16 @@ Route unchanged: `GET /catalog/{catalog_source}/tables/{table}/suggestions`, gat
   in OpenAPI as the default via the existing dict contract.
 - **Typed error bodies**: errors keep FastAPI's `{"detail": ...}` envelope (the platform-wide
   convention, verified in `api/routes/*.py`) and add a machine field:
-  `{"detail": str, "error_code": str}` with closed codes `SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION`
-  (422, out-of-range/unknown version — FastAPI's own bounds 422 remains for type errors),
-  `SUGGESTIONS_TABLE_TIMEOUT` (500, statement-timeout surfaced honestly), plus the untouched
-  existing 401/403 auth envelopes. `table_known=false` remains a **200** payload state, never an
-  error (frozen honesty rule).
+  `{"detail": str, "error_code": str}` — emitted **only by handler-level checks**, where the
+  shape is actually controllable. Closed codes: `SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION`
+  (422, an integer `contract_version` outside `{1, 2}`, returned by the handler check above via
+  an explicit `JSONResponse`) and `SUGGESTIONS_TABLE_TIMEOUT` (500, statement-timeout surfaced
+  honestly). **Explicit boundary** (amended after review): a non-integer `contract_version` —
+  and any other parameter type/bounds failure, e.g. `max_hops` — keeps FastAPI's native
+  validation error, status 422 with `detail` as a **list**, which is the platform's existing
+  behavior and sits *outside* the typed `{detail: str, error_code: str}` contract. Task 3 types
+  only the two handler-emitted codes plus the untouched existing 401/403 auth envelopes.
+  `table_known=false` remains a **200** payload state, never an error (frozen honesty rule).
 - **Caching/cursor**: no ETag, no cursor and no cache-control changes in Release A —
   production of cursor/ETag binding to `scope_key` is Task 0P; Release A responses remain
   uncached/private by default.
