@@ -13,6 +13,8 @@ No database: these are contract tests over hand-built objects.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from featuregen.analysis.plan import SelectionPreviewV1
@@ -33,12 +35,19 @@ from featuregen.data_agent.analysis import (
     Period,
     PopulationSpine,
 )
+from featuregen.data_agent.analysis import Dimension as IRDimension
+from featuregen.data_agent.dimensions import (
+    AttributionBasis,
+    DimensionAttributionPolicyV1,
+    MissingValueBehavior,
+)
 from featuregen.data_agent.eligibility import (
     NullBehavior,
     ReversalMode,
     TransactionEligibilityPolicyV1,
 )
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1, PhysicalObjectIdentityV1
+from featuregen.data_agent.snapshots import LatestSnapshotPolicyV1, SnapshotScope
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.upload.bridge_realization import ExecutionTier
 from featuregen.overlay.upload.profile_vocab import TemporalStorageModel
@@ -187,28 +196,202 @@ def test_V1_plan_hash_is_still_the_delimiter_join_and_is_UNCHANGED():
     assert len(ir.plan_hash) == 32
 
 
-def test_identity_payload_enumerates_the_SAME_facts_the_join_does():
-    """The drift guard between the two enumerations: every field that moves one moves the other.
+# ── THE KEEP-IN-STEP GUARD, over the FULL field inventory ────────────────────────────────────────
+#
+# The drift guard between the two enumerations: every field that moves one moves the other. Without
+# it the structural restatement is a second hand-maintained list and the failure mode is silent —
+# a field in `plan_hash` and not here leaves two IRs with different answers sharing one V2 identity.
+#
+# It used to mutate EIGHT fields. Attribution's six (including `current_flag_column`), snapshot
+# selection's six (including `missing_value_behavior`), `dimensions`, `dimension_table_id`,
+# `measure` and five of eligibility's six were never moved, and the review proved a DROPPED field
+# survived the whole suite. So the inventory is now derived FROM `identity_payload()` itself and
+# checked against the registry below: a field added to the payload with no mutation case fails
+# `test_the_mutation_inventory_is_TOTAL`, and a field REMOVED from the payload fails it too.
 
-    Without this the structural restatement is a second hand-maintained list, and the failure mode
-    is silent — a field added to `plan_hash` and forgotten here would leave two IRs with different
-    answers sharing one V2 identity.
+
+def _attribution_binding() -> PhysicalDatasetBindingV1:
+    return _binding("customer_segment_history")
+
+
+def _attribution(**over) -> DimensionAttributionPolicyV1:
+    kw = {"attribution_basis": AttributionBasis.REPORT_CUTOFF,
+          "effective_from_column": "effective_from", "effective_to_column": "effective_to",
+          "report_cutoff": "2026-06-30",
+          "missing_value_behavior": MissingValueBehavior.UNKNOWN_BUCKET}
+    kw.update(over)
+    return DimensionAttributionPolicyV1(**kw)
+
+
+def _current_value(**over) -> DimensionAttributionPolicyV1:
+    kw = {"attribution_basis": AttributionBasis.CURRENT_VALUE,
+          "effective_from_column": "effective_from", "effective_to_column": "effective_to",
+          "missing_value_behavior": MissingValueBehavior.UNKNOWN_BUCKET}
+    kw.update(over)
+    return DimensionAttributionPolicyV1(**kw)
+
+
+def _snapshot(**over) -> LatestSnapshotPolicyV1:
+    kw = {"snapshot_column": "snapshot_date", "cutoff": "2026-06-30",
+          "scope": SnapshotScope.PER_ENTITY, "key_column": "cif_id",
+          "tie_break_columns": ("loaded_seq",),
+          "missing_value_behavior": MissingValueBehavior.UNKNOWN_BUCKET}
+    kw.update(over)
+    return LatestSnapshotPolicyV1(**kw)
+
+
+def _attr_ir(**over) -> AnalysisExecutionIRV1:
+    """The ENGINE-A shape: dimensions, a dimension binding, an interval attribution, bridge deps."""
+    kw = {"dimensions": (IRDimension(column="segment"),),
+          "dimension_binding": _attribution_binding(),
+          "attribution": _attribution(),
+          "bridge_realization_dependencies": (("rlz_a", "snap_a"),)}
+    kw.update(over)
+    return _ir(**kw)
+
+
+def _snap_ir(**over) -> AnalysisExecutionIRV1:
+    """The ENGINE-B shape. Same plan, the other row rule — so the snapshot block's six fields are
+    reachable at all, which they are not from an attribution-shaped IR."""
+    kw = {"dimensions": (IRDimension(column="segment"),),
+          "dimension_binding": _attribution_binding(),
+          "snapshot_selection": _snapshot(),
+          "bridge_realization_dependencies": (("rlz_a", "snap_a"),)}
+    kw.update(over)
+    return _ir(**kw)
+
+
+def _unjoined_snap_ir(**over) -> AnalysisExecutionIRV1:
+    """ENGINE B with NO dimensions, the only shape in which `scope` can move: the IR refuses a
+    per-TABLE snapshot alongside dimensions (`ANALYSIS_SNAPSHOT_SCOPE_UNJOINABLE`), because a
+    per-table selection names no entity key to join the spine on."""
+    return _snap_ir(dimensions=(), **over)
+
+
+#: path in ``identity_payload()`` -> a factory returning ``(base, mutated)``. One entry per LEAF.
+_MUTATIONS: dict[str, Any] = {
+    "spine.table_id": lambda: (_attr_ir(), _attr_ir(
+        spine=PopulationSpine(binding=_binding("kyc_customers"), key_column="cif_id"))),
+    "spine.key_column": lambda: (_attr_ir(), _attr_ir(
+        spine=PopulationSpine(binding=_binding("customer_master"), key_column="party_id"))),
+    "event.table_id": lambda: (_attr_ir(), _attr_ir(event_binding=_binding("tran_archive"))),
+    "event.key_column": lambda: (_attr_ir(), _attr_ir(event_key_column="customer_id")),
+    "event.period_column": lambda: (_attr_ir(), _attr_ir(period_column="posting_month")),
+    "periods.current": lambda: (_attr_ir(), _attr_ir(
+        current=Period(label="current", values=("2026-07",)))),
+    "periods.previous": lambda: (_attr_ir(), _attr_ir(
+        previous=Period(label="previous", values=("2026-04",)))),
+    "comparison": lambda: (_attr_ir(), _attr_ir(comparison=Comparison.INCREASED)),
+    "dimensions": lambda: (_attr_ir(), _attr_ir(
+        dimensions=(IRDimension(column="segment"), IRDimension(column="sector")))),
+    "dimension_table_id": lambda: (_attr_ir(), _attr_ir(
+        dimension_binding=_binding("customer_segment_snapshot"))),
+    "eligibility.status_column": lambda: (_attr_ir(), _attr_ir(
+        eligibility=_eligibility(status_column="posting_status"))),
+    "eligibility.included_status_values": lambda: (_attr_ir(), _attr_ir(
+        eligibility=_eligibility(included_status_values=("POSTED", "SETTLED")))),
+    "eligibility.reversal_column": lambda: (_attr_ir(), _attr_ir(
+        eligibility=_eligibility(reversal_column="rev_flag"))),
+    "eligibility.non_reversed_values": lambda: (_attr_ir(), _attr_ir(
+        eligibility=_eligibility(non_reversed_values=("NO",)))),
+    "eligibility.null_behavior": lambda: (_attr_ir(), _attr_ir(
+        eligibility=_eligibility(null_behavior=NullBehavior.INCLUDE))),
+    "bridge_realization_dependencies": lambda: (_attr_ir(), _attr_ir(
+        bridge_realization_dependencies=(("rlz_b", "snap_b"),))),
+    # ENGINE A's row rule, field by field. `attribution_basis` and `current_flag_column` cross the
+    # two bases, because each is refused on the other one: a cutoff on `current_value` and a current
+    # flag on `report_cutoff` are both contradictions rather than unused fields.
+    "attribution.attribution_basis": lambda: (_attr_ir(),
+                                              _attr_ir(attribution=_current_value())),
+    "attribution.report_cutoff": lambda: (_attr_ir(), _attr_ir(
+        attribution=_attribution(report_cutoff="2026-05-31"))),
+    "attribution.effective_from_column": lambda: (_attr_ir(), _attr_ir(
+        attribution=_attribution(effective_from_column="valid_from"))),
+    "attribution.effective_to_column": lambda: (_attr_ir(), _attr_ir(
+        attribution=_attribution(effective_to_column="valid_to"))),
+    "attribution.missing_value_behavior": lambda: (_attr_ir(), _attr_ir(
+        attribution=_attribution(missing_value_behavior=MissingValueBehavior.RETAIN_NULL))),
+    "attribution.current_flag_column": lambda: (
+        _attr_ir(attribution=_current_value()),
+        _attr_ir(attribution=_current_value(current_flag_column="is_current"))),
+    # ENGINE B's row rule, field by field.
+    "snapshot_selection.snapshot_column": lambda: (_snap_ir(), _snap_ir(
+        snapshot_selection=_snapshot(snapshot_column="as_of_date"))),
+    "snapshot_selection.cutoff": lambda: (_snap_ir(), _snap_ir(
+        snapshot_selection=_snapshot(cutoff="2026-05-31"))),
+    "snapshot_selection.key_column": lambda: (_snap_ir(), _snap_ir(
+        snapshot_selection=_snapshot(key_column="party_id"))),
+    "snapshot_selection.tie_break_columns": lambda: (_snap_ir(), _snap_ir(
+        snapshot_selection=_snapshot(tie_break_columns=("loaded_seq", "ingest_seq")))),
+    "snapshot_selection.missing_value_behavior": lambda: (_snap_ir(), _snap_ir(
+        snapshot_selection=_snapshot(missing_value_behavior=MissingValueBehavior.RETAIN_NULL))),
+    # `scope` cannot move ALONE: per_table refuses a key column and per_entity requires one, so the
+    # only constructible pair moves both. The INVENTORY test is what keeps `scope` covered if it
+    # were ever dropped from the payload.
+    "snapshot_selection.scope": lambda: (_unjoined_snap_ir(), _unjoined_snap_ir(
+        snapshot_selection=_snapshot(scope=SnapshotScope.PER_TABLE, key_column=""))),
+}
+
+#: Identity fields the IR itself pins to ONE legal value, so no two constructible IRs can differ in
+#: them. Each names the refusal that makes it so — the inventory stays TOTAL, and if a constraint is
+#: ever relaxed the assertion below fails and demands a real mutation case.
+_CONSTANT_FIELDS: dict[str, tuple[str, dict]] = {
+    "measure": ("ANALYSIS_UNSUPPORTED_MEASURE", {"measure": "sum"}),
+    "eligibility.reversal_mode": ("ELIGIBILITY_UNSUPPORTED_REVERSAL_MODE",
+                                  {"reversal_mode": ReversalMode.COMPENSATING_ROW}),
+}
+
+
+def _leaf_paths(payload: object, prefix: str = "") -> set[str]:
+    """Every LEAF of an identity payload, as a dotted path. Lists are leaves: an identity is over
+    the list's whole content, and walking into it would enumerate today's values, not fields."""
+    if isinstance(payload, dict):
+        out: set[str] = set()
+        for key, value in payload.items():
+            out |= _leaf_paths(value, f"{prefix}.{key}" if prefix else str(key))
+        return out
+    return {prefix}
+
+
+def _identity_field_inventory() -> set[str]:
+    """The union of the leaves across BOTH row-rule shapes.
+
+    An optional block is `None` in one shape and expanded in the other, so a bare `attribution` /
+    `snapshot_selection` leaf appears beside its own children. A path that is a strict PREFIX of
+    another is that block, not a field — dropped. A genuinely new always-`None` field keeps no
+    children and therefore stays in the inventory, which is the case that must not slip through.
     """
-    base = _ir()
-    mutations = {
-        "spine": PopulationSpine(binding=_binding("kyc_customers"), key_column="cif_id"),
-        "event_binding": _binding("tran_archive"),
-        "event_key_column": "customer_id",
-        "period_column": "posting_month",
-        "current": Period(label="current", values=("2026-07",)),
-        "previous": Period(label="previous", values=("2026-04",)),
-        "comparison": Comparison.INCREASED,
-        "eligibility": _eligibility(included_status_values=("POSTED", "SETTLED")),
-    }
-    for field_name, value in mutations.items():
-        mutated = _ir(**{field_name: value})
-        assert mutated.plan_hash != base.plan_hash, field_name
-        assert mutated.identity_payload() != base.identity_payload(), field_name
+    paths = _leaf_paths(_attr_ir().identity_payload()) | _leaf_paths(_snap_ir().identity_payload())
+    return {p for p in paths if not any(q.startswith(p + ".") for q in paths)}
+
+
+def test_the_mutation_inventory_is_TOTAL_over_the_identity_payload():
+    """The guard on the guard. The reviewer dropped `bridge_realization_dependencies` from
+    `identity_payload` and the whole suite still passed; that field's path simply disappears from
+    the inventory here, and this assertion is what notices."""
+    assert set(_MUTATIONS) | set(_CONSTANT_FIELDS) == _identity_field_inventory()
+
+
+@pytest.mark.parametrize("path", sorted(_MUTATIONS))
+def test_identity_payload_and_the_join_move_TOGETHER_on(path):
+    base, mutated = _MUTATIONS[path]()
+    assert mutated.plan_hash != base.plan_hash, f"{path} does not move the V1 join"
+    assert mutated.identity_payload() != base.identity_payload(), \
+        f"{path} does not move identity_payload"
+
+
+@pytest.mark.parametrize("path", sorted(_CONSTANT_FIELDS))
+def test_a_CONSTANT_identity_field_is_constant_because_the_IR_refuses_the_alternative(path):
+    from featuregen.data_agent.analysis import AnalysisIRError
+    from featuregen.data_agent.eligibility import EligibilityError
+
+    code, over = _CONSTANT_FIELDS[path]
+    with pytest.raises((AnalysisIRError, EligibilityError)) as exc:
+        if path.startswith("eligibility."):
+            _attr_ir(eligibility=_eligibility(**over))
+        else:
+            _attr_ir(**over)
+    assert exc.value.code == code
 
 
 def test_identity_payload_excludes_the_question_exactly_as_the_join_does():
