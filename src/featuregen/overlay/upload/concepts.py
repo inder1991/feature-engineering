@@ -47,6 +47,32 @@ class Concept:
     near_label: bool = False        # True for funnel-tail signals that BORDER the label (forbearance,
     #                                 stage-3 impairment, 90+ DPD, CASS switch, filed SAR) — the 3-part
     #                                 leakage control must FLAG these (softer than leakage_anchor).
+    #: True for THE LABEL THAT STANDS BESIDE A CODE FOR THE SAME THING — a branch NAME beside
+    #: `branch_id`, a status DESCRIPTION beside the status code, a merchant's trading name beside
+    #: `merchant_id`. Every concept that sets it says so in its own description ("(the label beside
+    #: X)"), and each adds the same warning in prose: "never a join key", "the id joins, the name
+    #: does not", "conflates what you GROUP BY with what you DISPLAY". This field is that sentence
+    #: made readable by the feature USE gate. It follows the `leakage_anchor` precedent exactly — a
+    #: behaviour-carrying boolean, not a name pattern.
+    #:
+    #: DELIBERATELY NOT every name. `party_name`, `beneficiary_name` and `postal_address` are NOT
+    #: descriptive, because the registry documents a real computable use for each: a beneficiary
+    #: name is the match input of `external_own_transfer_trend` (§A9), and an address "generalises
+    #: to a region or distance feature". They are personal data, which is a POLICY question with a
+    #: policy answer — not a structural one. Marking them here would tell a reviewer "no approval
+    #: can ever help" about a feature an approval is exactly what unblocks.
+    #:
+    #: AND DELIBERATELY NOT every free-text column. The `text` GROUP was once swept in wholesale;
+    #: the sweep never applied the criterion above to its members, and the result told a reviewer
+    #: that `payment_narrative` — which the registry's own description calls "the single richest
+    #: signal in transaction data … it drives categorisation, merchant identification and AML
+    #: screening" — could never be built from, and sent them to "use the CODE column beside it"
+    #: when a narration has no code beside it and no approval could have helped. Every `text`
+    #: concept is now adjudicated on its OWN description (§3.9), and none of them sets this field:
+    #: they are PII-laden computable text, which is the policy class. The rule holds again in both
+    #: directions — every concept that sets `descriptive` says so in its own description, and every
+    #: concept whose description says so sets it.
+    descriptive: bool = False
     description: str = ""
 
 
@@ -275,6 +301,28 @@ _ALL: tuple[Concept, ...] = (
                         "§D.8 derived intermediate — probabilistic PII entity-resolution)."),
 
     # ── §3.9 Text & documents ─────────────────────────────────────────────────────────────────────
+    # THE USE-GATE ADJUDICATION FOR THE WHOLE `text` GROUP, recorded once here because the members
+    # live in three sections (§3.9, §3.19 record_author, §3.20 payment_narrative + kyc_narrative).
+    # `descriptive` means ONE thing — the label that stands beside a CODE for the same thing — and
+    # not one of these six is that. A narration has no code column beside it, so the structural
+    # refusal ("use the CODE column beside it") names a column that does not exist, and the
+    # structural family says "no approval can ever help" about text the registry itself documents a
+    # computable use for. Each is therefore adjudicated on its own description:
+    #
+    #   payment_narrative  POLICY  — "drives categorisation, merchant identification and AML
+    #                                 screening"; the richest computable text in the catalog, and
+    #                                 pii because it carries names and account numbers.
+    #   free_text          POLICY  — memo / complaint text: complaint-driven features are ordinary
+    #                                 conduct and churn signals; pii because it may carry PII.
+    #   kyc_narrative      POLICY  — high-risk rationale prose; an AML/CDD input under a policy.
+    #   unstructured_doc   POLICY  — document bodies; pii, possibly special-category CONTENT, but
+    #                                 the content is not a declared special-category ATTRIBUTE.
+    #   record_author      POLICY  — a named member of staff; "rarely a legitimate feature" is a
+    #                                 judgement about usefulness, not a structural impossibility.
+    #   document_reference NEITHER — a pointer with no declared sensitivity and no label-beside-a-
+    #                                 code semantics. Counting documents per customer is an ordinary
+    #                                 feature, so the gate leaves it alone entirely — the same
+    #                                 "absence is not an assertion" rule the whole gate is built on.
     Concept("free_text", "text", sensitivity="pii",
             description="Memo, notes, complaint text. Tagged pii: may carry PII — read-scoped + screen "
                         "on egress (a deterministic gate, not just a prose warning)."),
@@ -1021,28 +1069,28 @@ _ALL: tuple[Concept, ...] = (
     # Every concept here is `categorical` with NO entity_link — the two conditions the bridge
     # derivation requires — so a label can never be proposed as a join key. The paired identifier is
     # untouched and still links catalogs; only the name stops pretending to.
-    Concept("branch_name", "categorical",
+    Concept("branch_name", "categorical", descriptive=True,
             description="Human-readable name of a branch (the label beside branch_id). Groups and "
                         "displays; never a join key — two catalogs' branch names are text that may "
                         "coincide, not a shared identifier."),
-    Concept("relationship_manager_name", "categorical", sensitivity="pii",
+    Concept("relationship_manager_name", "categorical", sensitivity="pii", descriptive=True,
             description="Name of the relationship manager (the label beside "
                         "relationship_manager_id). An identifiable employee, so it carries a pii "
                         "floor for the same reason record_author does."),
-    Concept("merchant_name", "categorical",
+    Concept("merchant_name", "categorical", descriptive=True,
             description="Trading name of a merchant (the label beside merchant_id). Notoriously "
                         "inconsistent across acquirers — the id joins, the name does not."),
-    Concept("account_name", "categorical",
+    Concept("account_name", "categorical", descriptive=True,
             description="Display name or title of an account (the label beside account_id). Often "
                         "carries the holder's name, so treat as free text rather than a key."),
-    Concept("instrument_name", "categorical",
+    Concept("instrument_name", "categorical", descriptive=True,
             description="Readable name of a financial instrument (the label beside instrument_id). "
                         "The ISIN/CUSIP identifies it; the name only describes it."),
-    Concept("counterparty_name", "categorical",
+    Concept("counterparty_name", "categorical", descriptive=True,
             description="Name of the counterparty to a transaction (the label beside "
                         "counterparty_id). Distinct from beneficiary_name, which names the party a "
                         "payment is FOR rather than the party it is WITH."),
-    Concept("code_label", "categorical",
+    Concept("code_label", "categorical", descriptive=True,
             description="The readable description of a coded value — a sector description beside a "
                         "sector code, a reason description beside a reason code. Landing these on "
                         "the CODE's own concept conflates what you GROUP BY with what you DISPLAY, "
@@ -1076,6 +1124,11 @@ def _validate_registry(records: tuple[Concept, ...] = _ALL) -> None:
             raise ValueError(f"identifier concept {c.name!r} declares no namespace")
         if c.group != "identifier" and c.namespace is not None:
             raise ValueError(f"non-identifier concept {c.name!r} declares namespace {c.namespace!r}")
+        # `descriptive` and `identifier` are contradictory claims about the SAME column: one says
+        # "this is prose that displays", the other "this is a value space you may join on". A
+        # concept asserting both would make the USE gate refuse a legitimate join key.
+        if c.descriptive and c.group == "identifier":
+            raise ValueError(f"concept {c.name!r} is both descriptive and an identifier")
     for c in records:
         if c.is_a is not None and c.is_a not in by_name:
             raise ValueError(f"concept {c.name!r} has unresolved is_a {c.is_a!r}")
@@ -1110,6 +1163,105 @@ def humanize(c: str) -> str:
 def concept(name: str) -> Concept | None:
     """The full behaviour record for a concept name, or None if it isn't in the registry."""
     return CONCEPT_REGISTRY.get(name)
+
+
+# ── the USE-class predicates (Bar-4 feature use gate) ────────────────────────────────────────────
+#
+# WHAT THESE ARE FOR, and what they deliberately are NOT. `sensitivity` has always answered "who may
+# SEE this column" (read_scope). It never answered "may a feature be BUILT from it", and the
+# Release-A evaluation measured the consequence: a visible PII column, a visible protected
+# characteristic, a visible currency-blind amount and a visible free-text label all landed as
+# DESIGN_CHECKED with zero requirements. The predicates below are the registry half of the USE
+# answer — the behaviour each concept already declares, read as a question about USE.
+#
+# They are REGISTRY predicates over a concept NAME, never over a column name: `sol_desc` is refused
+# because its concept is `branch_name` and `branch_name.descriptive` is True, not because the string
+# ends in "_desc". A column with no concept answers False everywhere and is untouched.
+
+#: THERE IS NO GROUP SWEEP, and the absence is the fix. `DESCRIPTIVE_GROUPS = {"text"}` used to
+#: pull six concepts into the structural class without ever asking them the question `descriptive`
+#: asks — see the §3.9 adjudication block for the per-concept answers. A group is a taxonomy
+#: bucket; `descriptive` is a claim about a specific column's semantics, and only a concept can
+#: make that claim about itself.
+
+#: The sensitivity classes a POLICY can never license as a model input. ECOA/fair-lending
+#: (`protected_attribute`) and GDPR Article 9 (`special_category`) do not have an "allow" switch —
+#: refusing these is a statement about the column, not about a missing setting.
+PROTECTED_SENSITIVITIES: frozenset[str] = frozenset({"protected_attribute", "special_category"})
+
+#: The sensitivity class a lawful-basis policy COULD license (AML use of a pep_flag is the standing
+#: example). No such policy surface exists yet, so today this refuses — with wording that names the
+#: missing policy rather than the column.
+PERSONAL_DATA_SENSITIVITY = "pii"
+
+#: The concept group whose values are denominated in a currency, and the group that carries the
+#: denomination itself.
+MONETARY_GROUP = "monetary"
+CURRENCY_GROUP = "currency"
+
+
+def is_descriptive(name: str | None) -> bool:
+    """Is this concept THE LABEL THAT STANDS BESIDE A CODE for the same thing — a branch name beside
+    `branch_id`, a status description beside the status code?
+
+    Reads the `descriptive` FIELD and nothing else: one concept, one self-declaration. Unknown /
+    absent concepts answer False (absence is not an assertion). A concept that says only "this is
+    free prose" is NOT this — prose can be computed over, and the answer to PII-laden text is a
+    policy, which :func:`is_personal_data` routes to.
+    """
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.descriptive
+
+
+def is_protected_characteristic(name: str | None) -> bool:
+    """Is this concept a protected characteristic or a GDPR special category?
+
+    WHAT THIS CAN ACTUALLY SEE, stated so no caller over-reads it. The registry holds exactly THREE
+    concepts in these sensitivity classes — the umbrellas `protected_attribute` and
+    `special_category`, plus `vulnerability_flag` — and NO per-attribute concept:
+    `protected_attribute` enumerates "age, gender, race, ethnicity, marital status, national origin,
+    religion" INSIDE its own description, so there is no `gender` or `ethnicity` concept for a column
+    to land on. This therefore answers True only when ENRICHMENT chose one of those three. A
+    `gender_cd` column left unclassified, or landed on some ordinary categorical, is invisible here,
+    and the USE gate built on this predicate will not refuse it. That is a limit of the VOCABULARY,
+    not of the gate — the fix is per-attribute concepts in the registry, and until they exist this
+    is a floor rather than a guarantee.
+    """
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.sensitivity in PROTECTED_SENSITIVITIES
+
+
+def is_personal_data(name: str | None) -> bool:
+    """Is this concept personal data (the registry's `pii` sensitivity class)?"""
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.sensitivity == PERSONAL_DATA_SENSITIVITY
+
+
+def carries_currency(name: str | None) -> bool:
+    """Is a value of this concept denominated in a currency (every `monetary` group member)?"""
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.group == MONETARY_GROUP
+
+
+def is_currency_denomination(name: str | None) -> bool:
+    """Does this concept NAME a denomination — the currency dimension that sits beside an amount?
+
+    The `currency` group holds two different things: the CODES that say what an amount is
+    denominated in (`currency_code`, `base_currency`, `local_currency`) and the conversion RATES
+    that move between them (`fx_conversion_rate`, `cross_rate`). Only the codes answer "in what
+    currency is this number", so only the codes count here. The discriminator is a registry field
+    and not a name list: a rate IS a number and therefore declares its additivity, while a code
+    declares none — so a currency concept added later is classified by what it declares about
+    itself rather than by anyone remembering to extend a set.
+    """
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.group == CURRENCY_GROUP and record.additivity == "n/a"
+
+
+def denomination_concepts() -> frozenset[str]:
+    """Every concept name that denotes a currency dimension — bound into the sibling-column query
+    so the "the currency column is right there on the same table" check is a registry lookup."""
+    return frozenset(c.name for c in _ALL if is_currency_denomination(c.name))
 
 
 def concept_path(name: str | None) -> tuple[str, ...]:

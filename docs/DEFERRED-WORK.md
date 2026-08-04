@@ -626,3 +626,42 @@ show a diff the way the six revision-anchored pins can, and 1038 keeps only the 
 `proposed_by`, so the previous definition is gone entirely. Inherent to the 1038 shape, not to the
 seal. **Trigger:** when eligibility gets a revision store, replace the derived hash with the
 revision id and make the refusal name the change.
+
+### A.34 🟡 The feature USE gate — the two surfaces it deliberately does not build (2026-08-04)
+
+Recorded while landing the Bar-4 USE gate (`feature_assist._use_gate`), which closes the Release-A
+finding that sensitivity gated VISIBILITY and nothing gated USE. The gate refuses four classes
+outright. Two things a complete answer needs are deliberately NOT in it, and both are governance
+surfaces rather than validator work.
+
+**There is no human-confirmed override path.** A `PROTECTED_CHARACTERISTIC` or
+`DESCRIPTIVE_OPERAND` refusal is structurally_unsuitable and needs none. But
+`PERSONAL_DATA_POLICY_REQUIRED` and `CURRENCY_POLICY_REQUIRED` are `needs_setup` refusals — they
+name an artifact that does not exist yet — and today the only ways past them are to fix the
+concept, bind the currency column, or turn the WHOLE gate off with
+`FEATUREGEN_FEATURE_USE_GATE=0`, which drops all four classes at once and is aimed at nothing. An
+override is a governed decision with an actor, a reason, a scope
+and a review trail; building it inside a validator would produce a bypass flag wearing a
+governance word, which is the failure mode the "a review badge is never a permission" bar already
+exists to prevent.
+
+**A THIRD idea producer does not run the gauntlet at all, and it is not the gate's to fix.** Every
+proposed feature converges on `_validate_idea` — `_vet` (the menu), `contract.review.
+validate_minimum` (the confirm-time MCV), `contract.gate1._template_candidates` (the recipe
+options) and `planner.b_gauntlet` (cross-catalog proposals) — with ONE exception found while
+wiring this: `gate1._governed_cross_catalog_options` builds a `FeatureIdea` straight from a
+compiled binding plan (`_governed_idea_from_result`) and never calls the gauntlet. Its refusals
+speak the planner's closed `ReasonCode` vocabulary, not `RejectCode`, so emitting a USE refusal
+there would mix two closed vocabularies owned by different streams. The CONSEQUENCE is bounded and
+worth stating exactly: such an option can be DISPLAYED as choosable at Gate #1, and is then refused
+at confirm by the MCV — so nothing unsafe is ever persisted, but a reviewer can be shown a choice
+the platform will not honour. Recorded as a defect of the 3C.2b governed-planner surface, not of
+this gate.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`gate1._governed_cross_catalog_options` shows options the confirm-time MCV will refuse** | Gating it means adjudicating whether a `RejectCode` may appear in the planner's `ReasonCode`-shaped rejection dicts — a cross-vocabulary decision belonging to 3C.2b, and the wrong thing to settle inside a validator slice. Nothing unsafe persists: `validate_minimum` runs the same gate at confirm. | The next 3C.2b governed-planner change, or the first reviewer report of a Gate-#1 option that will not confirm. Fix shape: run `_use_gate` over `_plan_read_set_pairs(plan)` inside `_governed_idea_from_result` and map its code onto the planner's own reason vocabulary. |
+| 🟡 **A personal-data USE policy (lawful basis + purpose), and the confirmed override that consumes it. THE TRIGGER HAS ALREADY FIRED — this disables five shipped recipes today** | Not "the first real request that needs a `pii` operand" — the platform's OWN recipe registry already ships five templates whose REQUIRED anchor is a `pii`-classed concept, so every one of them is now permanently refused with `PERSONAL_DATA_POLICY_REQUIRED` on every catalog: **`screening_exposure_365d`** (`pep_flag`, required; the PEP/sanctions/adverse-media KYC marker), **`device_sharing_velocity`** and **`new_device_flag`** (`device_fingerprint`), **`geo_velocity_impossible`** (`geolocation`) — the two account-takeover access markers and the synthetic-ID ring detector — and **`external_own_transfer_trend_90d`** (`pii` + `beneficiary_name`), which `test_grounding_load_once` already asserts as refused with this exact code. Building the store would still ship a policy with one writer and no reader if it landed alone, which is why this is a deferral and not a bug; but the cost is no longer hypothetical, it is a named list of financial-crime recipes the platform advertises and will not build. THE ONLY BYPASS TODAY IS `FEATUREGEN_FEATURE_USE_GATE=0`, which disables ALL FOUR classes at once — protected characteristics and descriptive labels included — for the entire process. That coarseness is part of this record: the escape hatch cannot be aimed at the one class that has a legitimate answer, so using it to run an AML model also un-gates ECOA. | Now, by count of affected recipes — or the first customer asking why a fraud/AML recipe the menu lists never appears. Fix shape unchanged: a governed policy revision scoped to (catalog, purpose), read by `_use_gate` exactly as `_governed_read` reads an operational value, so an ABSENT policy still refuses; the five recipes above are the acceptance set, and `pep_flag` / `sanctions_hit_flag` (registry-annotated "usable for AML") are the first two concepts it must license. |
+| 🟡 **A currency CONVERSION policy** — the third way through `CURRENCY_POLICY_REQUIRED`, beside binding the dimension and declaring the column's currency | The refusal message already offers it as an option, so the wording is forward-compatible, but no store exists. Conversion is not a validator decision: it needs a base currency, a point-in-time FX source and a governed rate, which is a materialization concern (`fx_conversion_rate` is already in the registry with nothing reading it). | The first cross-currency aggregate a customer actually asks for. Fix shape: a governed policy naming base currency + rate source; `_use_gate` clears on its presence, and the requirement rides to materialization rather than being dropped. |
+| 🟡 **`sensitivity="proxy"` concepts (`country_code`, `geographic`, `corridor`, `alternative_data`, `fatca_crs_classification`) are NOT gated** | A proxy is context-dependent in a way the other four classes are not: `country_code` is a national-origin proxy for CREDIT and an ordinary risk dimension for AML, and the platform has no use-case axis to tell them apart. Refusing every proxy would refuse legitimate AML features today; refusing none is the honest state until the axis exists. The registry already flags them, so nothing is lost. | The first credit/pricing use case, or the arrival of a declared model PURPOSE on the feature request. Fix shape: gate proxies on purpose, not on the concept alone. |
+| ⚪ **The refusal FAMILY is server-side only; the wire still carries `{name, reason, code}`** | `FEATURE_REFUSAL_FAMILIES` maps every `RejectCode` to a D5 family and an import-time validator refuses a code without one, but the family is not on the `/features/recommend` payload. Putting it there means adjudicating `GOVERNED_CROSS_CATALOG_PLAN_REQUIRED` — a rejection code `gate1` emits that is NOT a `RejectCode` member — and that code belongs to the cross-catalog stream, not this slice. The actionable wording is in `reason` today, and the frontend labels the four new codes. | The rejections-panel reframe (render the family, not a red "rejected" badge). Fix shape: one `_rejection` factory in `feature_assist`, `gate1`'s two non-`RejectCode` sites adjudicated with it, then the field on the wire and `api.ts`. |
