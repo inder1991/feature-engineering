@@ -323,3 +323,36 @@ def test_a_direct_equality_plan_carries_no_crosswalk_step(catalog):
     assert ir.join_plan.steps == ()
     assert not any(isinstance(step, CrossCatalogJoinStepV1 | CrosswalkJoinStepV1)
                    for step in ir.join_plan.steps)
+
+
+def test_a_non_crosswalk_expression_identity_gains_NO_KEY(catalog):
+    """The identity payload's SHAPE, pinned by key set.
+
+    Crosswalk pins ride inside the join steps' own payloads and nowhere else, so an expression
+    with no crosswalk emits exactly the keys it emitted before this task — no conditional slot, no
+    null placeholder. (The whole-project byte golden ``goldens/cif_daily`` is the other half of
+    this proof and is unchanged; this states the rule the golden happens to satisfy.)
+    """
+    payload = _plan(catalog, grain=(cf.CIB_ACCT,), crosswalks=()).identity_payload()
+    assert set(payload) == {
+        "expr_path", "physical_read_set", "join_steps", "pit", "input_requirements",
+        "aggregation", "filter_tree"}
+    assert payload["join_steps"] == []
+
+
+def test_a_group_with_no_crosswalk_carries_NO_crosswalk_key_in_its_compilation_identity():
+    """Same rule one level up, and the same reason: the single-catalog artifact's identity bytes
+    are what they were before crosswalks could be compiled at all."""
+    from featuregen.materialize.identity import CompilationIdentity
+
+    plain = CompilationIdentity(
+        formula_content_hashes=("f" * 64,), ir_hashes=("i" * 64,),
+        materialization_contract_hash="c" * 64, group_plan_hash="g" * 64)
+    assert set(plain.identity_payload()) == {
+        "formula_content_hashes", "ir_hashes", "materialization_contract_hash", "group_plan_hash"}
+
+    with_crosswalk = CompilationIdentity(
+        formula_content_hashes=("f" * 64,), ir_hashes=("i" * 64,),
+        materialization_contract_hash="c" * 64, group_plan_hash="g" * 64,
+        crosswalk_execution_pins=(("cwx_1", "cwd_1", "pbr_1", "dtp_1", "cwo_1"),))
+    assert "crosswalk_execution_pins" in with_crosswalk.identity_payload()
