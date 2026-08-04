@@ -609,6 +609,72 @@ describe('re-uploading into a catalog somebody has already described', () => {
     })
   })
 
+  // EMPTYING A PREFILLED BOX IS A DELETION. Only non-empty fields ride, and the server reads a key
+  // it did not receive as an explicit null — so clearing ONE field nulls it on the next revision,
+  // while clearing them ALL sends no part and preserves everything. The screen has to say which
+  // of the two is about to happen; neither is a warning, and neither blocks the upload.
+  async function prefilledFtr() {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+  }
+
+  it('names the field an emptied box will clear from the catalog', async () => {
+    await prefilledFtr()
+    await userEvent.clear(screen.getByLabelText('Description'))
+
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+    expect(screen.getByTestId('narrative-clearing')).toHaveTextContent(
+      "This will clear Description from the catalog's current description.")
+    // Nothing about it is an error: the section still uploads exactly as it did.
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+    // …and the note is telling the truth about the wire: the key is gone, which is the null.
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).not.toHaveProperty('description')
+  })
+
+  it('names every emptied field, in the order the boxes are read', async () => {
+    await prefilledFtr()
+    await userEvent.clear(screen.getByLabelText('Name'))
+    await userEvent.click(screen.getByRole('button', { name: 'Remove domain Compliance' }))
+    expect(screen.getByTestId('narrative-clearing')).toHaveTextContent(
+      "This will clear Name and Business domains from the catalog's current description.")
+  })
+
+  it('drops the clearing note the moment the field is typed back', async () => {
+    await prefilledFtr()
+    const description = screen.getByLabelText('Description')
+    await userEvent.clear(description)
+    await screen.findByTestId('narrative-clearing')
+
+    await userEvent.type(description, 'Financial transaction reporting terms.')
+    expect(screen.queryByTestId('narrative-clearing')).toBeNull()
+    // Back to the catalog's own words: the same value comparison puts the unchanged note back.
+    expect(screen.getByTestId('narrative-unchanged')).toBeInTheDocument()
+  })
+
+  it('emptying EVERY field clears nothing — no part rides, and it says so', async () => {
+    await prefilledFtr()
+    await userEvent.clear(screen.getByLabelText('Name'))
+    await userEvent.clear(screen.getByLabelText('Description'))
+    await userEvent.clear(screen.getByLabelText('Business context'))
+    await userEvent.click(screen.getByRole('button', { name: 'Remove domain Compliance' }))
+
+    // An empty section is absence, not erasure. Naming fields to clear here would be a lie.
+    expect(screen.queryByTestId('narrative-clearing')).toBeNull()
+    expect(screen.getByTestId('narrative-nothing-sent'))
+      .toHaveTextContent(/no description rides with this upload/i)
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'ftr', undefined)
+  })
+
   it('sends the prefilled narrative back unchanged rather than dropping it', async () => {
     getCatalogProfile.mockResolvedValue(DESCRIBED)
     uploadFile.mockResolvedValue(result({ asserted: 4 }))

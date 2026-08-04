@@ -213,6 +213,34 @@ function serializeNarrative(draft: NarrativeDraft): string | undefined {
   return Object.keys(payload).length === 0 ? undefined : JSON.stringify(payload)
 }
 
+// The wire key each on-screen field lands under, in the order the fields are laid out — so a
+// sentence naming several of them names them top to bottom, the way the eye already reads them.
+const NARRATIVE_WIRE_KEYS: { key: string; label: string }[] = [
+  { key: 'display_name', label: 'Name' },
+  { key: 'description', label: 'Description' },
+  { key: 'business_context', label: 'Business context' },
+  { key: 'business_domains', label: 'Business domains' },
+]
+
+// Which of the catalog's CURRENT fields this draft would erase. The very rule that makes an
+// all-empty section safe — only non-empty fields ride — makes a PARTLY-emptied one destructive:
+// the server reads a key it did not receive as an explicit null, so emptying one prefilled box
+// nulls that field on the next revision. Measured on the same payload the part is built from, so
+// "empty" here means exactly what the server will see.
+function clearedFields(draft: NarrativeDraft, currentWords: NarrativeDraft): string[] {
+  const next = narrativePayload(draft)
+  const now = narrativePayload(currentWords)
+  return NARRATIVE_WIRE_KEYS
+    .filter(({ key }) => now[key] !== undefined && next[key] === undefined)
+    .map(({ label }) => label)
+}
+
+function joinLabels(labels: string[]): string {
+  return labels.length < 2
+    ? labels.join('')
+    : `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`
+}
+
 // How long after the last keystroke in the source box the catalog is looked up. One lookup per
 // name, not one per letter.
 const NARRATIVE_PREFILL_DEBOUNCE_MS = 300
@@ -396,6 +424,19 @@ function CatalogNarrativeFields({
   // written. Comparing the serialized parts is comparing precisely what would be sent.
   const unchanged = current !== null && serializeNarrative(value) === serializeNarrative(current)
 
+  // The two other things this draft can do to a catalog that already has words, each said out
+  // loud in the same neutral voice as the unchanged note. None of the three is a warning and none
+  // blocks anything: they name the outcome, they do not judge the author.
+  //   · EVERY field emptied -> no part rides at all, and the catalog keeps every word. Silence
+  //     here would read as "erased", which is the opposite of what happens.
+  //   · SOME fields emptied -> a part rides WITHOUT their keys, and the server nulls exactly
+  //     those. That is a deletion made by leaving a box blank inside a collapsible section, so it
+  //     is the one that most needs saying.
+  // They are mutually exclusive by construction: `unchanged` implies a part identical to the
+  // current words, which erases nothing.
+  const nothingSent = current !== null && serializeNarrative(value) === undefined
+  const clearing = current === null || nothingSent ? [] : clearedFields(value, current)
+
   // Suggested domain chips are the catalogs this caller can ALREADY see — the only vocabulary this
   // system can honestly offer (there is no domain taxonomy anywhere in it). Loaded lazily on first
   // open, so a person who never describes a catalog issues no request; a failure leaves the chips
@@ -464,6 +505,17 @@ function CatalogNarrativeFields({
         {unchanged && (
           <p className="hint" style={{ margin: 0 }} data-testid="narrative-unchanged">
             These are this catalog&#39;s current words, unchanged — nothing will be re-versioned.
+          </p>
+        )}
+        {nothingSent && (
+          <p className="hint" style={{ margin: 0 }} data-testid="narrative-nothing-sent">
+            Every field is empty, so no description rides with this upload — this catalog keeps
+            its current words.
+          </p>
+        )}
+        {clearing.length > 0 && (
+          <p className="hint" style={{ margin: 0 }} data-testid="narrative-clearing">
+            This will clear {joinLabels(clearing)} from the catalog&#39;s current description.
           </p>
         )}
         <div className="field">
