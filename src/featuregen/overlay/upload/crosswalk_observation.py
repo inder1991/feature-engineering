@@ -122,6 +122,12 @@ class CrosswalkObservationCaveat(StrEnum):
     LEG_EVIDENCE_NOT_EXACT = "leg_evidence_not_exact"
 
 
+#: Operators whose CONTENT is the operator itself — "the row the source flags as current" binds no
+#: value and needs none. Everything else must pin values or the parameter ref it bound to, because
+#: an operator and a column alone cannot say what was selected.
+_NULLARY_OPERATORS: frozenset[str] = frozenset({"is_true", "is_false", "is_null", "is_not_null"})
+
+
 # ── the full pins the V2 rows cannot carry ──────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +186,8 @@ class ObservedPredicatePinV1:
         object.__setattr__(self, "values", tuple(str(value) for value in self.values))
         if self.parameter_ref is not None:
             object.__setattr__(self, "parameter_ref", str(self.parameter_ref).strip() or None)
-        if not self.values and self.parameter_ref is None:
+        if (not self.values and self.parameter_ref is None
+                and self.operator not in _NULLARY_OPERATORS):
             raise CrosswalkObservationError(
                 CROSSWALK_OBSERVATION_MALFORMED,
                 f"predicate {self.predicate_id!r} pins neither values nor a parameter ref, so "
