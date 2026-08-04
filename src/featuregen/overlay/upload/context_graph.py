@@ -460,7 +460,11 @@ def build_context_section(
         bundle = bundle_from_store(
             conn, source, object_ref, roles=roles,
             catalog_profile_revision_id=catalog_profile_revision_id,
-            dataset_profile_hash=profiles["dataset_profile_hash"])
+            dataset_profile_hash=profiles["dataset_profile_hash"],
+            # What the read could not serve lands in the section's own omission counter — a
+            # crosswalk whose stored row failed content verification is OMITTED, and saying so is
+            # what keeps it distinguishable from a catalog that never had one.
+            omitted=omitted)
     except CatalogProjectionUnavailable as exc:
         # DISCLOSE, never raise into the dossier and never serve a lagged bundle as current: the
         # rest of the section (structural + profile context) is still true of this snapshot.

@@ -49,6 +49,9 @@ from featuregen.overlay.upload.crosswalk import (
     LogicalMappingPairV1,
 )
 from featuregen.overlay.upload.crosswalk_store import (
+    CROSSWALK_OMITTED_UNREADABLE,
+    CrosswalkStoreConflict,
+    load_crosswalk_definition_revision,
     publish_crosswalk_definition,
     set_crosswalk_review_status,
 )
@@ -242,6 +245,44 @@ def test_confirming_a_crosswalk_changes_review_status_and_not_availability(db) -
     assert after.availability == before.availability == "available"
     assert after.strength == "confirmed"     # somebody is accountable; nothing else moved
     assert after.crosswalk == before.crosswalk
+
+
+# ── one corrupt row is not a catalog-wide outage ────────────────────────────────────────────────
+
+def _tamper(db) -> None:
+    db.execute(
+        "UPDATE crosswalk_definition_revision SET definition_json = jsonb_set("
+        "    definition_json, '{mapping_dataset_ref}', '\"cib::public.somewhere_else\"')")
+
+
+def test_one_corrupt_crosswalk_row_does_not_take_the_whole_dossier_with_it(db) -> None:
+    """A crosswalk names THREE datasets, so a single tampered row raising through the listing takes
+    out the dossier of every column of all three. The crosswalk is omitted and COUNTED instead —
+    the omission has to be visible, or a corrupted record reads as a catalog that never had one."""
+    _bank(db)
+    _tamper(db)
+    bundle = sc.bundle_from_store(db, "cib", ANCHOR, roles=())
+    assert [link.kind for link in bundle.relationship_context] == ["direct_equality"]
+    section = _section(db)
+    assert section["status"] == "available"
+    assert section["truncation"]["omitted"][CROSSWALK_OMITTED_UNREADABLE] == 1
+    assert not [r for r in section["relationships"] if r["kind"] == "crosswalk"]
+
+
+def test_a_column_of_the_mapping_dataset_still_gets_its_dossier(db) -> None:
+    _bank(db)
+    _tamper(db)
+    bundle = sc.bundle_from_store(db, "cib", f"public.{MAP_TABLE}.cust_num", roles=())
+    assert bundle.relationship_context == ()
+
+
+def test_the_point_read_of_the_corrupt_revision_still_refuses(db) -> None:
+    """Omitting from a LISTING and refusing a POINT read are different answers to different
+    questions: "show me what is here" versus "give me THIS crosswalk"."""
+    _assessment, _revision, crosswalk = _bank(db)
+    _tamper(db)
+    with pytest.raises(CrosswalkStoreConflict):
+        load_crosswalk_definition_revision(db, crosswalk.revision_id)
 
 
 # ── contract guards ─────────────────────────────────────────────────────────────────────────────

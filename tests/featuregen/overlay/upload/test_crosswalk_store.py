@@ -36,6 +36,7 @@ from featuregen.overlay.upload.crosswalk_store import (
     MAX_PAIRS_PER_LEG,
     CrosswalkStoreConflict,
     crosswalks_for_column,
+    crosswalks_for_column_listing,
     current_crosswalk_definition,
     load_crosswalk_definition_revision,
     publish_crosswalk_definition,
@@ -43,6 +44,7 @@ from featuregen.overlay.upload.crosswalk_store import (
     set_crosswalk_review_status,
     set_current_crosswalk_definition,
     visible_crosswalk_definitions,
+    visible_crosswalk_listing,
 )
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.source_selection import SelectionError
@@ -107,6 +109,82 @@ def test_a_corrupted_revision_raises_instead_of_being_served(db) -> None:
         "    '\"cib::public.somewhere_else\"')")
     with pytest.raises(CrosswalkStoreConflict):
         load_crosswalk_definition_revision(db, revision.revision_id)
+
+
+def _tamper(db, revision_id: str) -> None:
+    """Corrupt ONE stored row so it can no longer reproduce its own identity."""
+    db.execute(
+        "UPDATE crosswalk_definition_revision SET definition_json = jsonb_set("
+        "    definition_json, '{mapping_dataset_ref}', '\"cib::public.somewhere_else\"') "
+        "WHERE revision_id = %s", (revision_id,))
+
+
+def _second_crosswalk():
+    """A DIFFERENT crosswalk through the same mapping table: CIB customer -> FTR legal entity."""
+    from tests.featuregen.overlay.upload._crosswalk_fixtures import (
+        FTR_TABLE,
+        MAP_CIB,
+        MAP_FTR,
+        endpoint,
+    )
+
+    from featuregen.overlay.upload.crosswalk import CrosswalkDefinitionRevisionV1
+
+    return CrosswalkDefinitionRevisionV1(
+        source_endpoint=endpoint("cib", CIB_TABLE, "cust_num", concept="customer_id",
+                                 entity="customer"),
+        mapping_dataset_ref=MAP,
+        source_to_mapping_pairs=(LogicalMappingPairV1(
+            normalize_ref("cib", "public", CIB_TABLE, "cust_num"), MAP_CIB),),
+        mapping_to_target_pairs=(LogicalMappingPairV1(
+            normalize_ref("ftr", "public", FTR_TABLE, "party_lei"), MAP_FTR),),
+        target_endpoint=endpoint("ftr", FTR_TABLE, "party_lei", concept="lei",
+                                 entity="legal_entity"))
+
+
+def test_a_corrupt_row_is_omitted_from_the_listing_and_COUNTED(db) -> None:
+    """A LISTING must omit rather than raise (the module docstring already promises it). One
+    tampered row taking every other crosswalk down with it turns a single corrupted record into a
+    catalog-wide outage — and the corruption still has to be VISIBLE, so it is counted, not
+    swallowed."""
+    build_catalog(db)
+    corrupt, healthy = definition(), _second_crosswalk()
+    _published(db, corrupt)
+    _published(db, healthy)
+    _tamper(db, corrupt.revision_id)
+
+    listing = visible_crosswalk_listing(db)
+    assert [c.current.definition_id for c in listing.crosswalks] == [healthy.definition_id]
+    assert listing.corrupt_definition_ids == (corrupt.definition_id,)
+    # The plain reader keeps its shape and simply omits the unreadable one.
+    assert [c.current.definition_id for c in visible_crosswalk_definitions(db)] == [
+        healthy.definition_id]
+
+
+def test_a_corrupt_row_does_not_end_a_column_anchored_read_either(db) -> None:
+    build_catalog(db)
+    corrupt = definition()
+    _published(db, corrupt)
+    _tamper(db, corrupt.revision_id)
+    listing = crosswalks_for_column_listing(
+        db, column_logical_ref=normalize_ref("cib", "public", CIB_TABLE, "acct_no"))
+    assert listing.crosswalks == ()
+    assert listing.corrupt_definition_ids == (corrupt.definition_id,)
+    assert crosswalks_for_column(
+        db, column_logical_ref=normalize_ref("cib", "public", CIB_TABLE, "acct_no")) == ()
+
+
+def test_the_POINT_read_of_a_corrupt_revision_still_refuses(db) -> None:
+    """The listing omits; the point read refuses. Asking for one specific crosswalk BY ID and
+    getting `None` would report "no such crosswalk" for a crosswalk that exists and is broken."""
+    build_catalog(db)
+    revision = definition()
+    _published(db, revision)
+    _tamper(db, revision.revision_id)
+    with pytest.raises(CrosswalkStoreConflict):
+        load_crosswalk_definition_revision(db, revision.revision_id)
+    with pytest.raises(CrosswalkStoreConflict):
+        current_crosswalk_definition(db, revision.definition_id)
 
 
 def test_a_pointer_at_a_missing_revision_raises(db) -> None:

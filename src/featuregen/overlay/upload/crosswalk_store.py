@@ -328,9 +328,44 @@ def _visible_refs(conn: DbConn, refs: Sequence[str], *, kind: str,
     return {(r[0], r[1]) for r in rows}
 
 
-def visible_crosswalk_definitions(
+def _load_for_listing(conn: DbConn, revision_id: str) -> CrosswalkDefinitionRevisionV1 | None:
+    """Load one revision for a LISTING, degrading a corrupt row to ``None`` instead of raising.
+
+    Inside a SAVEPOINT, the ``context_graph._executable_realization_ids`` discipline: catching the
+    exception does not un-abort a transaction a DATABASE fault aborted, and the next statement in
+    the dossier's one repeatable-read transaction would then raise ``InFailedSqlTransaction``.
+    Scoping the rollback is what makes "omit this one" a degraded answer rather than the first
+    casualty of a dossier-wide failure.
+
+    Returning ``None`` here is NOT the same answer as the point read's refusal — see
+    :func:`visible_crosswalk_listing`. The caller counts what it omitted."""
+    try:
+        with conn.transaction():
+            return load_crosswalk_definition_revision(conn, revision_id)
+    except Exception:       # noqa: BLE001 — corruption must not end a listing
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class CrosswalkListingV1:
+    """What a listing found, and what it had to omit because it could not be read.
+
+    The omission is a VALUE, not a log line: a corrupted crosswalk silently absent from a dossier
+    is indistinguishable from a catalog that never had one, which is the failure mode the whole
+    read-back-and-re-derive discipline exists to prevent."""
+
+    crosswalks: tuple[CurrentCrosswalkV1, ...]
+    #: The definition ids whose CURRENT revision would not reconstruct or failed verification.
+    corrupt_definition_ids: tuple[str, ...] = ()
+
+
+#: The truncation/omission key a context section reports an unreadable crosswalk under.
+CROSSWALK_OMITTED_UNREADABLE = "crosswalk_unreadable"
+
+
+def visible_crosswalk_listing(
     conn: DbConn, *, dataset_logical_ref: str | None = None, roles: Iterable[str] = (),
-) -> tuple[CurrentCrosswalkV1, ...]:
+) -> CrosswalkListingV1:
     """Every CURRENT crosswalk this caller may see, optionally narrowed to one dataset.
 
     WHOLE-PAYLOAD read scope: a crosswalk is returned only when EVERY dataset it names (both
@@ -338,7 +373,14 @@ def visible_crosswalk_definitions(
     mapping dataset withholds the whole crosswalk — a redacted crosswalk would still disclose that
     two identifier schemes are connected, and by what shape, which is the fact being protected.
 
-    Fail-closed: a ref with no graph node is not PROVABLY visible, so its crosswalk is omitted."""
+    Fail-closed: a ref with no graph node is not PROVABLY visible, so its crosswalk is omitted.
+
+    A LISTING OMITS, IT DOES NOT RAISE — including for a corrupt row. A crosswalk names three
+    datasets, so one tampered record raising here takes out the dossier of every column of all
+    three: a single corrupted row becomes a catalog-wide outage. The corrupt ones are counted in
+    :attr:`CrosswalkListingV1.corrupt_definition_ids` so the omission stays visible, and
+    :func:`load_crosswalk_definition_revision` keeps refusing on the point read, where "give me
+    THIS crosswalk" deserves the integrity failure rather than a ``None`` that reads as absence."""
     where, params = "", []
     if dataset_logical_ref is not None:
         where = ("WHERE r.source_endpoint_ref = %s OR r.target_endpoint_ref = %s "
@@ -350,11 +392,9 @@ def visible_crosswalk_definitions(
         "JOIN crosswalk_definition_revision r ON r.revision_id = c.revision_id "
         f"{where} ORDER BY c.definition_id", params).fetchall()
     if not rows:
-        return ()
-    loaded = [
-        (row, load_crosswalk_definition_revision(conn, row[1]))
-        for row in rows
-    ]
+        return CrosswalkListingV1(crosswalks=())
+    loaded = [(row, _load_for_listing(conn, row[1])) for row in rows]
+    corrupt = tuple(row[0] for row, revision in loaded if revision is None)
     all_datasets = sorted({ref for _row, rev in loaded if rev for ref in rev.dataset_refs()})
     all_columns = sorted({ref for _row, rev in loaded if rev for ref in rev.column_refs()})
     visible_tables = _visible_refs(conn, all_datasets, kind="table", roles=roles)
@@ -362,8 +402,7 @@ def visible_crosswalk_definitions(
     out: list[CurrentCrosswalkV1] = []
     for row, revision in loaded:
         if revision is None:
-            raise CrosswalkStoreConflict(
-                f"crosswalk_definition_current for {row[0]!r} points at missing revision {row[1]}")
+            continue
         needed_tables = {_graph_key(ref) for ref in revision.dataset_refs()}
         needed_columns = {_graph_key(ref) for ref in revision.column_refs()}
         if not (needed_tables <= visible_tables and needed_columns <= visible_columns):
@@ -374,26 +413,45 @@ def visible_crosswalk_definitions(
                 definition_id=row[0], revision_id=row[1],
                 review_status=LinkReviewStatus(row[2]), pointer_version=row[3],
                 declared_by=row[4])))
-    return tuple(out)
+    return CrosswalkListingV1(crosswalks=tuple(out), corrupt_definition_ids=corrupt)
+
+
+def visible_crosswalk_definitions(
+    conn: DbConn, *, dataset_logical_ref: str | None = None, roles: Iterable[str] = (),
+) -> tuple[CurrentCrosswalkV1, ...]:
+    """:func:`visible_crosswalk_listing` for a caller with nowhere to report an omission."""
+    return visible_crosswalk_listing(
+        conn, dataset_logical_ref=dataset_logical_ref, roles=roles).crosswalks
+
+
+def crosswalks_for_column_listing(
+    conn: DbConn, *, column_logical_ref: str, roles: Iterable[str] = (),
+) -> CrosswalkListingV1:
+    """The visible crosswalks whose SOURCE or TARGET endpoint contains ``column_logical_ref``.
+
+    The mapping dataset's own columns are deliberately NOT an anchor: a mapping column takes part
+    in the crosswalk's mechanism, not in the relationship it expresses. The corrupt count is the
+    DATASET's, not the endpoint filter's — a crosswalk that could not be read cannot then be asked
+    whether this column is one of its endpoints, and reporting it is the honest answer."""
+    source, schema, table, column = parse_ref(column_logical_ref)
+    if column is None:
+        return CrosswalkListingV1(crosswalks=())
+    dataset_ref = normalize_ref(source, schema, table, None)
+    listing = visible_crosswalk_listing(conn, dataset_logical_ref=dataset_ref, roles=roles)
+    return CrosswalkListingV1(
+        crosswalks=tuple(
+            crosswalk for crosswalk in listing.crosswalks
+            if column_logical_ref in {
+                member.logical_column_ref
+                for endpoint in (crosswalk.revision.source_endpoint,
+                                 crosswalk.revision.target_endpoint)
+                for member in endpoint.members}),
+        corrupt_definition_ids=listing.corrupt_definition_ids)
 
 
 def crosswalks_for_column(
     conn: DbConn, *, column_logical_ref: str, roles: Iterable[str] = (),
 ) -> tuple[CurrentCrosswalkV1, ...]:
-    """The visible crosswalks whose SOURCE or TARGET endpoint contains ``column_logical_ref``.
-
-    The mapping dataset's own columns are deliberately NOT an anchor: a mapping column takes part
-    in the crosswalk's mechanism, not in the relationship it expresses."""
-    source, schema, table, column = parse_ref(column_logical_ref)
-    if column is None:
-        return ()
-    dataset_ref = normalize_ref(source, schema, table, None)
-    return tuple(
-        crosswalk for crosswalk in visible_crosswalk_definitions(
-            conn, dataset_logical_ref=dataset_ref, roles=roles)
-        if column_logical_ref in {
-            member.logical_column_ref
-            for endpoint in (crosswalk.revision.source_endpoint,
-                             crosswalk.revision.target_endpoint)
-            for member in endpoint.members}
-    )
+    """:func:`crosswalks_for_column_listing` for a caller with nowhere to report an omission."""
+    return crosswalks_for_column_listing(
+        conn, column_logical_ref=column_logical_ref, roles=roles).crosswalks

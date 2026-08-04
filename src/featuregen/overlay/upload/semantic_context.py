@@ -61,6 +61,7 @@ contract; three of its surfaces are intentionally unconsumed at this commit:
 """
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass, replace
 from dataclasses import fields as dataclass_fields
@@ -1170,8 +1171,15 @@ def bundle_from_store(
     dataset_profile_hash: str | None = None,
     observations: Sequence[RelationshipObservationV2] = (),
     current_observation_revision_ids: Iterable[str] | None = None,
+    omitted: Counter[str] | None = None,
 ) -> SemanticContextBundleV1:
     """Build the bundle from the persisted stores through read-scoped, BATCHED reads.
+
+    `omitted` is an OUT parameter and is deliberately not a bundle field: it counts what THIS READ
+    could not serve (today, an unreadable crosswalk row), which is a property of the read and not
+    of the column's meaning. Folding it into the bundle would move `content_hash` whenever a
+    neighbouring record was corrupt. A caller with somewhere to report an omission passes a
+    counter; one without simply does not.
 
     `object_ref` is the graph's (public-flattened) ref; the bundle re-keys everything by the
     SCHEMA-PRESERVING logical ref rebuilt from the authoritative `graph_node.schema_name` (the
@@ -1323,7 +1331,7 @@ def bundle_from_store(
                 UNRESOLVED_PENDING_REVIEW))
 
     relationship = _scoped_relationship_context(
-        conn, flat_ref, allowed, logical_ref=logical_ref, roles=roles)
+        conn, flat_ref, allowed, logical_ref=logical_ref, roles=roles, omitted=omitted)
     path = concept_path(concept_name)
     # The ISSUER axis (Task 2): the same `identifier_scope` production the grounded bridge path
     # consumes — one seam, no third namespace surface. Unresolved stays honest (basis
@@ -1392,7 +1400,7 @@ def bundle_from_store(
 
 def _scoped_relationship_context(
     conn: DbConn, flat_ref: str, allowed: list[str], *, logical_ref: str = "",
-    roles: Iterable[str] = (),
+    roles: Iterable[str] = (), omitted: Counter[str] | None = None,
 ) -> tuple[RelationshipContextV1, ...]:
     """The anchor's available links through the ONE shipped reader, then read-scoped (D11): a
     link is shown only when EVERY member column of both endpoints is itself visible — a
@@ -1404,15 +1412,25 @@ def _scoped_relationship_context(
     ("these ids are equal" vs "these ids are related through this table"), so both appear, each
     with its own ref and kind. The crosswalk half is read-scoped by its own store, which withholds
     a crosswalk WHOLE rather than trimming it — a redacted crosswalk still discloses that two
-    identifier schemes are connected."""
+    identifier schemes are connected.
+
+    A crosswalk the store could not READ is omitted and, when the caller supplies `omitted`,
+    counted there. The count lives on the SECTION rather than on the hashed bundle: it describes
+    this read, not this column's meaning, and a bundle whose content hash moved because a
+    neighbouring row was corrupt would be a different kind of lie."""
     crosswalks: tuple[RelationshipContextV1, ...] = ()
     if logical_ref:
-        from featuregen.overlay.upload.crosswalk_store import crosswalks_for_column
+        from featuregen.overlay.upload.crosswalk_store import (
+            CROSSWALK_OMITTED_UNREADABLE,
+            crosswalks_for_column_listing,
+        )
 
+        listing = crosswalks_for_column_listing(
+            conn, column_logical_ref=logical_ref, roles=roles)
+        if omitted is not None and listing.corrupt_definition_ids:
+            omitted[CROSSWALK_OMITTED_UNREADABLE] += len(listing.corrupt_definition_ids)
         crosswalks = tuple(
-            relationship_context_from_crosswalk(current)
-            for current in crosswalks_for_column(
-                conn, column_logical_ref=logical_ref, roles=roles))
+            relationship_context_from_crosswalk(current) for current in listing.crosswalks)
     links = available_identifier_links(conn, object_ref=flat_ref)
     if not links:
         return tuple(sorted(crosswalks, key=lambda link: link.relationship_ref))
