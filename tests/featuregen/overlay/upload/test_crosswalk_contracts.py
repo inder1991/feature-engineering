@@ -300,13 +300,18 @@ def _scope(tier: ExecutionTier = ExecutionTier.SANDBOX) -> RealizationApplicabil
         scope_id="scope-1", execution_tier=tier, purposes=("analysis",), environment="dev")
 
 
-def _leg(kind: JoinLegKind = JoinLegKind.CROSS_CATALOG, plan_hash: str = "plan-a") -> JoinLegPinV1:
-    if kind is JoinLegKind.SAME_CATALOG:
-        return JoinLegPinV1(kind=kind, plan_hash=plan_hash, binding_revision_ids=("pbr_a",))
-    return JoinLegPinV1(
-        kind=kind, plan_hash=plan_hash, binding_revision_ids=("pbr_a", "pbr_b"),
-        fact_keys=("bfk_1",), realization_revision_ids=("rr_1",),
-        dependency_snapshot_ids=("dep_1",))
+def _leg(kind: JoinLegKind = JoinLegKind.CROSS_CATALOG, plan_hash: str = "plan-a",
+         **over) -> JoinLegPinV1:
+    kwargs: dict = dict(
+        kind=kind, plan_hash=plan_hash,
+        from_dataset_ref="cib::public.customers", to_dataset_ref="cib::public.customer_cif_map",
+        from_binding_revision_id="pbr_from", to_binding_revision_id="pbr_to",
+        read_set_hash="rs-" + "a" * 8)
+    if kind is not JoinLegKind.SAME_CATALOG:
+        kwargs.update(fact_keys=("bfk_1",), realization_revision_ids=("rr_1",),
+                      dependency_snapshot_ids=("dep_1",))
+    kwargs.update(over)
+    return JoinLegPinV1(**kwargs)
 
 
 def _execution(**over) -> CrosswalkExecutionRevisionV1:
@@ -374,21 +379,96 @@ def test_deterministic_safety_cannot_be_claimed_without_a_composed_observation()
 
 def test_a_same_catalog_leg_may_not_pretend_to_be_an_entity_bridge() -> None:
     with pytest.raises(CrosswalkContractError) as exc:
-        JoinLegPinV1(kind=JoinLegKind.SAME_CATALOG, plan_hash="p",
-                     binding_revision_ids=("pbr_a",), fact_keys=("bfk_1",))
+        _leg(JoinLegKind.SAME_CATALOG, fact_keys=("bfk_1",))
     assert exc.value.code == JOIN_LEG_PIN_MALFORMED
 
 
 def test_a_cross_catalog_leg_must_pin_its_realization() -> None:
     with pytest.raises(CrosswalkContractError) as exc:
-        JoinLegPinV1(kind=JoinLegKind.CROSS_CATALOG, plan_hash="p",
-                     binding_revision_ids=("pbr_a",), fact_keys=("bfk_1",))
+        _leg(JoinLegKind.CROSS_CATALOG, realization_revision_ids=())
     assert exc.value.code == JOIN_LEG_PIN_MALFORMED
 
 
-def test_a_leg_pin_needs_a_plan_and_a_binding() -> None:
+def test_a_leg_pin_needs_a_plan() -> None:
     with pytest.raises(CrosswalkContractError):
-        JoinLegPinV1(kind=JoinLegKind.SAME_CATALOG, plan_hash="  ",
-                     binding_revision_ids=("pbr_a",))
+        _leg(JoinLegKind.SAME_CATALOG, plan_hash="  ")
+
+
+# ── the pin is §6.6's FULL shape (review A5) ────────────────────────────────────────────────────
+
+
+def test_a_leg_pin_names_both_SIDES_not_a_bag_of_bindings() -> None:
+    """A5's exact loss. `binding_revision_ids` is an unnamed tuple: from it you cannot say WHICH
+    side each binding belongs to, and a leg that cannot say that cannot be replayed or explained."""
+    leg = _leg(JoinLegKind.SAME_CATALOG)
+    assert leg.from_dataset_ref == "cib::public.customers"
+    assert leg.to_dataset_ref == "cib::public.customer_cif_map"
+    assert leg.from_binding_revision_id == "pbr_from"
+    assert leg.to_binding_revision_id == "pbr_to"
+    # The shipped tuple keeps its meaning and is filled from the named sides when not given, so
+    # there is ONE truth about which bindings a leg pinned rather than two that can disagree.
+    assert leg.binding_revision_ids == ("pbr_from", "pbr_to")
+
+
+def test_the_two_sides_of_a_leg_are_ORDERED() -> None:
+    """A leg is directional — unlike the crosswalk DEFINITION, which canonicalizes its endpoints
+    because a relationship is unordered. Swapping a leg's sides is a different pin."""
+    forward = _leg(JoinLegKind.SAME_CATALOG)
+    reverse = _leg(
+        JoinLegKind.SAME_CATALOG,
+        from_dataset_ref=forward.to_dataset_ref, to_dataset_ref=forward.from_dataset_ref,
+        from_binding_revision_id="pbr_to", to_binding_revision_id="pbr_from")
+    assert reverse.identity_payload() != forward.identity_payload()
+
+
+def test_a_leg_that_reads_one_dataset_twice_is_refused() -> None:
+    with pytest.raises(CrosswalkContractError) as exc:
+        _leg(JoinLegKind.SAME_CATALOG, to_dataset_ref="cib::public.customers")
+    assert exc.value.code == JOIN_LEG_PIN_MALFORMED
+
+
+@pytest.mark.parametrize("field_name", [
+    "from_dataset_ref", "to_dataset_ref", "from_binding_revision_id", "to_binding_revision_id",
+    "read_set_hash",
+])
+def test_every_named_field_of_a_leg_pin_is_required(field_name) -> None:
+    with pytest.raises(CrosswalkContractError) as exc:
+        _leg(JoinLegKind.SAME_CATALOG, **{field_name: "   "})
+    assert exc.value.code == JOIN_LEG_PIN_MALFORMED
+
+
+def test_a_binding_tuple_that_omits_a_named_side_is_refused() -> None:
+    """Two places to say which bindings a leg pinned is two places to disagree."""
+    with pytest.raises(CrosswalkContractError) as exc:
+        _leg(JoinLegKind.SAME_CATALOG, binding_revision_ids=("pbr_from",))
+    assert exc.value.code == JOIN_LEG_PIN_MALFORMED
+    # A WIDER tuple is legal: a leg may pin more than its two sides.
+    wide = _leg(JoinLegKind.SAME_CATALOG,
+                binding_revision_ids=("pbr_from", "pbr_to", "pbr_extra"))
+    assert wide.binding_revision_ids == ("pbr_from", "pbr_to", "pbr_extra")
+
+
+@pytest.mark.parametrize("mutation", [
+    {"from_dataset_ref": "cib::public.other"},
+    {"to_dataset_ref": "cib::public.other"},
+    {"from_binding_revision_id": "pbr_other"},
+    {"to_binding_revision_id": "pbr_other"},
+    {"read_set_hash": "rs-" + "b" * 8},
+    {"predicate_content_hashes": ("pred-1",)},
+])
+def test_every_restored_field_moves_the_execution_revision_id(mutation) -> None:
+    """The pin travels inside `execution_revision_id`, which hashes `identity_payload()`. A field
+    the identity does not cover is a field two different executions can disagree on while claiming
+    the same id — which is why this shape had to be complete BEFORE a producer exists."""
+    base = _execution()
+    moved = _execution(source_leg=_leg(plan_hash="plan-a", **mutation))
+    assert moved.execution_revision_id != base.execution_revision_id
+
+
+def test_a_leg_pin_binding_tuple_that_names_a_blank_id_is_refused() -> None:
+    with pytest.raises(CrosswalkContractError) as exc:
+        _leg(JoinLegKind.SAME_CATALOG,
+             binding_revision_ids=("pbr_from", "pbr_to", "  "))
+    assert exc.value.code == JOIN_LEG_PIN_MALFORMED
     with pytest.raises(CrosswalkContractError):
-        JoinLegPinV1(kind=JoinLegKind.SAME_CATALOG, plan_hash="p", binding_revision_ids=())
+        _leg(JoinLegKind.SAME_CATALOG, predicate_content_hashes=("  ",))

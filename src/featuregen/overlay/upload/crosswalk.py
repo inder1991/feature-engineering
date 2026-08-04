@@ -384,11 +384,23 @@ class JoinLegKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class JoinLegPinV1:
-    """One resolved crosswalk leg, pinned (D5 amended form).
+    """One resolved crosswalk leg, pinned — §6.6's FULL shape in the D5 amended spellings.
 
     The amended form supersedes semantic's ``leg_plan_hashes``: a bare plan hash is not enough for
-    replay or explainability, so a pin names the plan, the side-specific BINDING revisions, the
-    governed join fact keys, the realization revisions and the dependency snapshots.
+    replay or explainability, so a pin names the plan, the ORDERED datasets it read, the
+    side-specific BINDING revisions BY SIDE, the read set, the predicates, the governed join fact
+    keys, the realization revisions and the dependency snapshots.
+
+    **The two sides are NAMED, and ordered.** ``binding_revision_ids`` alone cannot say which
+    binding belongs to which side, and a leg that cannot say that cannot be replayed or explained —
+    it is the one field a reader most needs when a result looks wrong. The unnamed tuple is kept
+    (it is the leg's FULL set of pinned bindings, which may be wider than its two sides) and is
+    required to CONTAIN both named sides, so there is one truth about what a leg pinned rather than
+    two that can disagree. It defaults to the two named sides.
+
+    Unlike :class:`CrosswalkDefinitionRevisionV1`, a leg is DIRECTIONAL and its sides are not
+    canonicalized: the definition describes a relationship (unordered), a pin describes a traversal
+    that was actually resolved.
 
     ``dependency_snapshot_ids`` is plural DELIBERATELY, and it is not a re-pluralization of the
     per-realization singular (``bridge_realization.dependency_snapshot_id``): a pin is per LEG, and
@@ -398,26 +410,61 @@ class JoinLegPinV1:
 
     kind: JoinLegKind
     plan_hash: str
+    #: The two datasets this leg read, in traversal order.
+    from_dataset_ref: str
+    to_dataset_ref: str
+    #: Their binding revisions, BY SIDE.
+    from_binding_revision_id: str
+    to_binding_revision_id: str
+    #: What the leg actually read. A plan hash without it can be replayed against different data
+    #: and still claim to be the same leg.
+    read_set_hash: str
     binding_revision_ids: tuple[str, ...] = ()
     fact_keys: tuple[str, ...] = ()
     realization_revision_ids: tuple[str, ...] = ()
     dependency_snapshot_ids: tuple[str, ...] = ()
+    #: The filter/temporal predicates applied, by content. Empty is a legitimate answer (no
+    #: predicate), which is why it is a tuple rather than a nullable hash.
+    predicate_content_hashes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.plan_hash.strip():
             raise CrosswalkContractError(
                 JOIN_LEG_PIN_MALFORMED, "a join leg pin must name the plan it resolved")
+        for name in ("from_dataset_ref", "to_dataset_ref"):
+            value = getattr(self, name)
+            if not value or not value.strip():
+                raise CrosswalkContractError(
+                    JOIN_LEG_PIN_MALFORMED, f"a join leg pin must name its {name}")
+            object.__setattr__(self, name, _logical_table_ref(value))
+        if self.from_dataset_ref == self.to_dataset_ref:
+            raise CrosswalkContractError(
+                JOIN_LEG_PIN_MALFORMED,
+                f"a leg reads two datasets; {self.from_dataset_ref!r} on both sides is not a leg")
+        for name in ("from_binding_revision_id", "to_binding_revision_id", "read_set_hash"):
+            value = getattr(self, name)
+            if not value or not value.strip():
+                raise CrosswalkContractError(
+                    JOIN_LEG_PIN_MALFORMED,
+                    f"a join leg pin must name its {name} — a pin that cannot say which binding "
+                    "each side used, or what it read, can neither replay nor explain")
+            object.__setattr__(self, name, value.strip())
         for name in ("binding_revision_ids", "fact_keys", "realization_revision_ids",
-                     "dependency_snapshot_ids"):
+                     "dependency_snapshot_ids", "predicate_content_hashes"):
             values = tuple(str(v).strip() for v in getattr(self, name))
             if any(not v for v in values):
                 raise CrosswalkContractError(
                     JOIN_LEG_PIN_MALFORMED, f"{name} must not contain a blank id")
             object.__setattr__(self, name, values)
+        sides = tuple(dict.fromkeys(
+            (self.from_binding_revision_id, self.to_binding_revision_id)))
         if not self.binding_revision_ids:
+            object.__setattr__(self, "binding_revision_ids", sides)
+        elif not set(sides) <= set(self.binding_revision_ids):
             raise CrosswalkContractError(
                 JOIN_LEG_PIN_MALFORMED,
-                "a leg reads at least one side, so it pins at least one binding revision")
+                "binding_revision_ids must contain both named sides; two places to say which "
+                "bindings a leg pinned is two places to disagree")
         bridge_fields = (*self.fact_keys, *self.realization_revision_ids)
         if self.kind is JoinLegKind.SAME_CATALOG and bridge_fields:
             raise CrosswalkContractError(
@@ -436,10 +483,16 @@ class JoinLegPinV1:
         return {
             "kind": self.kind.value,
             "plan_hash": self.plan_hash,
+            "from_dataset_ref": self.from_dataset_ref,
+            "to_dataset_ref": self.to_dataset_ref,
+            "from_binding_revision_id": self.from_binding_revision_id,
+            "to_binding_revision_id": self.to_binding_revision_id,
+            "read_set_hash": self.read_set_hash,
             "binding_revision_ids": list(self.binding_revision_ids),
             "fact_keys": list(self.fact_keys),
             "realization_revision_ids": list(self.realization_revision_ids),
             "dependency_snapshot_ids": list(self.dependency_snapshot_ids),
+            "predicate_content_hashes": list(self.predicate_content_hashes),
         }
 
 
