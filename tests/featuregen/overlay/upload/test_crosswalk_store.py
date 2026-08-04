@@ -12,8 +12,11 @@ from __future__ import annotations
 import pytest
 from tests.featuregen.overlay.upload._crosswalk_fixtures import (
     CIB,
+    CIB_TABLE,
     FTR,
+    FTR_TABLE,
     MAP,
+    MAP_TABLE,
     build_catalog,
     definition,
     wide_endpoint,
@@ -202,11 +205,11 @@ def test_an_over_wide_leg_is_refused_as_a_discovery_bug(db) -> None:
     build_catalog(db)
     columns = tuple(f"k{i}" for i in range(MAX_PAIRS_PER_LEG + 1))
     wide = definition(
-        source_endpoint=wide_endpoint("cib", "bo_cib_customer", columns),
+        source_endpoint=wide_endpoint("cib", CIB_TABLE, columns),
         source_to_mapping_pairs=tuple(
             LogicalMappingPairV1(
-                normalize_ref("cib", "public", "bo_cib_customer", column),
-                normalize_ref("cib", "public", "cust_cif_xref", column))
+                normalize_ref("cib", "public", CIB_TABLE, column),
+                normalize_ref("cib", "public", MAP_TABLE, column))
             for column in columns))
     with pytest.raises(CrosswalkContractError) as exc:
         record_crosswalk_definition_revision(db, wide, authored_by=ACTOR)
@@ -225,8 +228,8 @@ def test_a_negative_expected_pointer_version_is_refused(db) -> None:
 # ── read scope: whole payload ───────────────────────────────────────────────────────────────────
 
 def test_an_author_who_cannot_see_the_mapping_dataset_cannot_publish(db) -> None:
-    build_catalog(db, map_columns=(("cust_num", "customer_id", "restricted"),
-                                   ("cif_id", "customer_id", "restricted")))
+    build_catalog(db, map_columns=(("acct_no", "account_id", "restricted"),
+                                   ("ext_acct_ref", "external_account_ref", "restricted")))
     with pytest.raises(SelectionError):
         publish_crosswalk_definition(
             db, definition(), expected_pointer_version=0, actor=ACTOR, roles=())
@@ -236,8 +239,8 @@ def test_a_crosswalk_naming_a_hidden_mapping_dataset_is_withheld_WHOLE(db) -> No
     """Not trimmed, not redacted, not listed-without-its-mapping: a redacted crosswalk still
     discloses that two identifier schemes are connected and by what shape, which is the fact being
     protected."""
-    build_catalog(db, map_columns=(("cust_num", "customer_id", "restricted"),
-                                   ("cif_id", "customer_id", "restricted")))
+    build_catalog(db, map_columns=(("acct_no", "account_id", "restricted"),
+                                   ("ext_acct_ref", "external_account_ref", "restricted")))
     revision = definition()
     publish_crosswalk_definition(
         db, revision, expected_pointer_version=0, actor=ACTOR, roles=("restricted_reader",))
@@ -246,7 +249,7 @@ def test_a_crosswalk_naming_a_hidden_mapping_dataset_is_withheld_WHOLE(db) -> No
 
 
 def test_a_hidden_endpoint_column_also_withholds_the_whole_crosswalk(db) -> None:
-    build_catalog(db, ftr_columns=(("cif_id", "customer_id", "restricted"),
+    build_catalog(db, ftr_columns=(("counter_party_acct_no", "external_account_ref", "restricted"),
                                    ("party_lei", "lei", "")))
     publish_crosswalk_definition(
         db, definition(), expected_pointer_version=0, actor=ACTOR, roles=("restricted_reader",))
@@ -282,8 +285,9 @@ def test_a_mapping_column_is_not_an_endpoint_anchor(db) -> None:
     build_catalog(db)
     _published(db)
     assert len(crosswalks_for_column(
-        db, column_logical_ref=normalize_ref("cib", "public", "bo_cib_customer", "cust_num"))) == 1
+        db, column_logical_ref=normalize_ref("cib", "public", CIB_TABLE, "acct_no"))) == 1
     assert len(crosswalks_for_column(
-        db, column_logical_ref=normalize_ref("ftr", "public", "party_master", "cif_id"))) == 1
+        db, column_logical_ref=normalize_ref(
+            "ftr", "public", FTR_TABLE, "counter_party_acct_no"))) == 1
     assert crosswalks_for_column(
-        db, column_logical_ref=normalize_ref("cib", "public", "cust_cif_xref", "cust_num")) == ()
+        db, column_logical_ref=normalize_ref("cib", "public", MAP_TABLE, "acct_no")) == ()
