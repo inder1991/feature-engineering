@@ -261,6 +261,47 @@ def test_every_transition_is_allowed_or_refused_exactly_as_the_table_says(
         assert read_request(conn, request_id=request.request_id).lifecycle_state is source
 
 
+def test_expected_from_NARROWS_the_write_to_the_state_the_caller_judged(conn) -> None:
+    """A verdict reached from evidence about ONE state must not be applied to another.
+
+    ``running → failed`` and ``accepted → failed`` are both legal, so an unnarrowed UPDATE matching
+    every legal source would let §3.3's reconciler terminalize a request that had moved to
+    ``running`` since it was judged — on a finding ("nothing is stamped, so nothing reached the
+    plane") that is only true of ``accepted``. Naming the source makes the row's own state part of
+    the write's precondition, so the moved request is refused and nothing is written.
+    """
+    request = _record(conn, "narrow")
+    accept_request(conn, request_id=request.request_id, lease_seconds=60)
+    advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.RUNNING,
+                      run_id="mrun-narrow")
+
+    with pytest.raises(ValueError, match="moved to 'running'"):
+        advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.FAILED,
+                          expected_from=RequestLifecycle.ACCEPTED)
+    assert read_request(conn, request_id=request.request_id).lifecycle_state \
+        is RequestLifecycle.RUNNING
+
+    # …and naming the state the row IS in writes exactly as before.
+    moved = advance_lifecycle(conn, request_id=request.request_id,
+                              to_state=RequestLifecycle.FAILED,
+                              expected_from=RequestLifecycle.RUNNING)
+    assert moved.lifecycle_state is RequestLifecycle.FAILED
+
+
+def test_expected_from_names_an_edge_that_EXISTS_or_refuses(conn) -> None:
+    """A narrowing to a source the target is not reachable from could never match a row, so it is a
+    call assembled wrongly rather than a race — and it is refused as one, loudly, instead of being
+    reported as "the request moved"."""
+    request = _record(conn, "noedge")
+    accept_request(conn, request_id=request.request_id, lease_seconds=60)
+    # `accepted → failed` IS legal, so the generic check passes and only the narrowing can catch it.
+    with pytest.raises(ValueError, match="not an edge of the shipped state machine"):
+        advance_lifecycle(conn, request_id=request.request_id, to_state=RequestLifecycle.FAILED,
+                          expected_from=RequestLifecycle.REQUESTED)
+    assert read_request(conn, request_id=request.request_id).lifecycle_state \
+        is RequestLifecycle.ACCEPTED
+
+
 def test_advance_lifecycle_will_not_open_a_SECOND_lease_less_door_into_accepted(conn) -> None:
     """``requested → accepted`` is a legal lifecycle edge, and ``advance_lifecycle`` still refuses to
     walk it: it takes no ``lease_seconds``, so all it could produce is an ``accepted`` row with no

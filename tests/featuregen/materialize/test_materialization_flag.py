@@ -147,10 +147,12 @@ def _tick(db, monkeypatch, *, flag: str | None) -> list[str]:
 #: keeps the flag-OFF tick byte-identical to the tick that existed before any of this.
 _MATERIALIZATION_STATEMENTS = (
     ("the lane's fenced claim", ("FROM queue", "status='leased'", "lease_fence")),
-    ("the reconciler's expired-lease query",
-     ("FROM materialization_request", "lease_expires_at IS NOT NULL")),
+    # The SUFFICIENT query runs first: it is the one that decides which candidates a verdict can be
+    # written for, and the other's rows are ranked against its result.
     ("the reconciler's unreachable-message query",
      ("FROM materialization_request", "NOT EXISTS", "queue.message_id")),
+    ("the reconciler's expired-lease query",
+     ("FROM materialization_request", "lease_expires_at IS NOT NULL")),
 )
 
 

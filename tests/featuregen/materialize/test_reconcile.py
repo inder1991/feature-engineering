@@ -26,7 +26,9 @@ redelivery that follows must report ``completed``, i.e. a compile that actually 
 from __future__ import annotations
 
 import datetime as _datetime
+import re
 
+import psycopg
 import pytest
 from tests.featuregen.materialize.test_chain import _authored, _inject_l0, _seed
 from tests.featuregen.materialize.test_queue_lane import (
@@ -51,6 +53,8 @@ from featuregen.materialize.queue_lane import (
     process_materialization_once,
 )
 from featuregen.materialize.reconcile import (
+    TERMINALIZE_LOCK_TIMEOUT_MS,
+    UNREACHABLE_MESSAGE_STATUSES,
     ReconciliationVerdict,
     reconcile_abandoned_requests,
 )
@@ -410,6 +414,126 @@ def test_a_class_with_NO_verdict_does_not_STARVE_a_class_with_one(
     assert sweep.verdict_for(live.request_id) is ReconciliationVerdict.FAILED
     assert read_request(catalog, request_id=live.request_id).lifecycle_state is \
         RequestLifecycle.FAILED
+
+
+def test_a_RELEASE_BACKOFF_storm_does_not_STARVE_an_abandoned_claim(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The mirror of the test above, and the sharper half.
+
+    A released claim is ``accepted`` with a lease expired the instant it was released, so it is a
+    full member of ``expired_requests`` for its whole backoff — and ``compute_backoff`` schedules a
+    redelivery up to **an hour** out. A row released half an hour ago therefore has an expired lease
+    HALF AN HOUR OLD while a claim abandoned seconds ago has one seconds old, so the backoff row
+    wins both of the orderings a naive rank would use: query 1's ``lease_expires_at`` and
+    ``requested_at``. A rank that asked only "does this state have a terminal edge?" would put it in
+    the same top tier as the abandoned claim and truncate the claim out of a bounded sweep, every
+    tick, until the storm drained. The rank asks the narrower question — can a verdict be WRITTEN
+    for this? — which the backoff row fails on its still-deliverable message.
+
+    The two timestamps are wound to place the rows in that relationship. Both are values the lane
+    itself produced — the release and the backoff are real, driven through ``_retryable`` — shifted
+    to the age a half-hour-old release has.
+    """
+    from tests.featuregen.materialize.test_queue_lane import _boom
+
+    config = _config(tmp_path)
+    work_items = [_authored(catalog, monkeypatch)]
+    backoff = _recorded(catalog, request_id="req-storm-older")
+    enqueue_materialization(catalog, backoff, job=_job(backoff.request_id, work_items))
+    monkeypatch.setattr(queue_lane, "compile_feature_group", _boom(ConnectionError("gone")))
+    assert _drain(catalog, config).status == "retryable"
+    assert _queue_row(catalog, backoff.request_id)[0] == "ready"     # a redelivery is scheduled
+    # …released half an hour ago, with half an hour of its backoff still to run. `requested_at` is
+    # wound back with it: `record_request` defaults it from now(), which is the TRANSACTION's start,
+    # so two rows minted in one test would otherwise tie and be separated by request_id alone.
+    catalog.execute("UPDATE materialization_request "
+                    "SET lease_expires_at = now() - interval '30 minutes', "
+                    "requested_at = now() - interval '35 minutes' WHERE request_id = %s",
+                    (backoff.request_id,))
+    catalog.execute("UPDATE queue SET available_at = now() + interval '30 minutes' "
+                    "WHERE message_id = %s", (materialization_message_id(backoff.request_id),))
+
+    abandoned = _recorded(catalog, request_id="req-storm-newer")
+    enqueue_materialization(catalog, abandoned, job=_job(abandoned.request_id, work_items))
+    accept_request(catalog, request_id=abandoned.request_id, lease_seconds=3600)
+    _dead_letter_the_message(catalog, config, abandoned.request_id)
+    catalog.execute("UPDATE materialization_request "
+                    "SET lease_expires_at = now() - interval '1 second' WHERE request_id = %s",
+                    (abandoned.request_id,))
+
+    sweep = reconcile_abandoned_requests(catalog, now=_now(), limit=1)
+
+    assert sweep.verdict_for(abandoned.request_id) is ReconciliationVerdict.FAILED
+    assert read_request(catalog, request_id=backoff.request_id).lifecycle_state is \
+        RequestLifecycle.ACCEPTED
+
+
+# ── the row lock the write could contend for ─────────────────────────────────────────────────────
+
+def _p1(catalog, config, request) -> None:
+    accept_request(catalog, request_id=request.request_id, lease_seconds=3600)
+    _dead_letter_the_message(catalog, config, request.request_id)
+    _expire_lease(catalog, request.request_id)
+
+
+def test_the_terminalizing_write_BOUNDS_its_wait_for_the_row_lock(enqueued, catalog) -> None:
+    """``_commit`` holds this row's lock for its whole transaction, L0 subprocess included. The
+    queue consult means the sweep does not normally reach such a row — that compile's message is
+    ``leased`` — but ``lease_seconds`` is a stated budget, not an enforced one, so a compile that
+    OVERRAN it can still hold the lock when the sweep decides its lease is gone. Unbounded, that is
+    a worker tick parked for an L0 timeout."""
+    from tests.featuregen.materialize.test_materialization_flag import _RecordingCursor
+
+    request, _, config = enqueued
+    _p1(catalog, config, request)
+    catalog.cursor_factory = _RecordingCursor
+    _RecordingCursor.sql = []
+    try:
+        assert _verdict(catalog, request.request_id) is ReconciliationVerdict.FAILED
+        issued = list(_RecordingCursor.sql)
+    finally:
+        catalog.cursor_factory = None
+
+    assert [sql for sql in issued
+            if "lock_timeout" in sql and str(TERMINALIZE_LOCK_TIMEOUT_MS) in sql], issued
+
+
+def test_a_HELD_row_lock_is_a_counted_verdict_not_a_parked_TICK(
+        enqueued, catalog, monkeypatch) -> None:
+    """And when the bound is reached, the sweep keeps going: one candidate is reported ``locked``,
+    nothing is written, and the next sweep looks again."""
+    request, _, config = enqueued
+    _p1(catalog, config, request)
+
+    def _held(*_args, **_kwargs):
+        raise psycopg.errors.LockNotAvailable("canceling statement due to lock timeout")
+
+    monkeypatch.setattr("featuregen.materialize.reconcile.advance_lifecycle", _held)
+
+    assert _verdict(catalog, request.request_id) is ReconciliationVerdict.LOCKED
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.ACCEPTED
+
+
+# ── the queue-status vocabulary this module decides against ──────────────────────────────────────
+
+def test_an_UNKNOWN_queue_status_would_read_as_REACHABLE_not_as_abandoned(catalog) -> None:
+    """The set is stated as the UNREACHABLE one so that its default is "leave it alone".
+
+    An allow-list of reachable statuses would default to "terminalize": a fifth status added to
+    ``queue``'s CHECK — in a table `runtime/` owns and Phase G does not — would fall outside it and
+    silently make live messages eligible for a verdict. This pins the two sets against the DEPLOYED
+    vocabulary, so a fifth status fails here rather than changing what this module decides.
+    """
+    definition = catalog.execute(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conrelid = 'queue'::regclass AND contype = 'c' "
+        "AND pg_get_constraintdef(oid) LIKE '%%status%%'").fetchone()[0]
+    vocabulary = set(re.findall(r"'([a-z_]+)'", definition))
+
+    assert vocabulary == {"ready", "leased", "done", "dead"}, definition
+    assert UNREACHABLE_MESSAGE_STATUSES < vocabulary
+    assert vocabulary - UNREACHABLE_MESSAGE_STATUSES == {"ready", "leased"}
 
 
 def test_the_sweep_is_BOUNDED(catalog, monkeypatch) -> None:

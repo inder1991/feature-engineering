@@ -457,8 +457,18 @@ def advance_lifecycle(
     to_state: RequestLifecycle,
     generation_id: str | None = None,
     run_id: str | None = None,
+    expected_from: RequestLifecycle | None = None,
 ) -> MaterializationRequestV1:
     """Move the request along a LEGAL edge of :data:`LEGAL_LIFECYCLE_TRANSITIONS`, and link it.
+
+    ``expected_from`` NARROWS the conditional UPDATE to one source state — the state the caller
+    decided against. Without it the UPDATE matches every state the target is legal from, which is
+    right for a writer that only has to know the edge exists, and wrong for one whose verdict was
+    reached from EVIDENCE about a specific state: §3.3's reconciler judges an ``accepted`` request by
+    the absence of a generation and a run, and that absence says nothing about a request that has
+    since become ``running``. Naming the source makes the row's own state part of the write's
+    precondition, so a request that moved in between is refused rather than terminalized on evidence
+    gathered about something else.
 
     ``accepted`` is NOT a target this function will move to, even though ``requested → accepted`` is
     a legal edge: acceptance *is* the granting of a lease, and this function takes no
@@ -505,13 +515,22 @@ def advance_lifecycle(
         raise ValueError(
             f"materialization request {request_id!r} cannot move to 'running' without a run_id: "
             f"'running' means a run was prepared, and the reconciler reads run evidence BY run id")
+    sources = _LEGAL_FROM[target]
+    if expected_from is not None:
+        source = RequestLifecycle(expected_from)
+        if source not in sources:
+            raise ValueError(
+                f"materialization request {request_id!r} cannot be advanced from "
+                f"{source.value!r} to {target.value!r}: that is not an edge of the shipped state "
+                f"machine, so no UPDATE narrowed to it could ever match")
+        sources = frozenset({source})
 
     moved = _row(conn.execute(
         "UPDATE materialization_request SET lifecycle_state = %s, "
         "generation_id = COALESCE(%s, generation_id), run_id = COALESCE(%s, run_id) "
         f"WHERE request_id = %s AND lifecycle_state = ANY(%s) RETURNING {REQUEST_COLUMNS}",
         (target.value, generation, run, request_id,
-         sorted(state.value for state in _LEGAL_FROM[target]))).fetchone())
+         sorted(state.value for state in sources))).fetchone())
     if moved is None:
         concurrent = _must_exist(conn, request_id)
         raise ValueError(
