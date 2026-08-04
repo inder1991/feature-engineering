@@ -277,6 +277,44 @@ INVENTORY = ClusterInventoryV1(
     captured_at="2026-08-04T00:00:00Z")
 
 
+def drift_table(db, logical_ref: str, *, schema: str) -> ClusterInventoryV1:
+    """MOVE one table to a different physical schema, and return the matching inventory.
+
+    A re-ingest that moved a table, in full: §3.5 resolves against the schema the governed CATALOG
+    attests and refuses (``AMBIGUOUS_TABLE_NAME``) when the environment's declared map disagrees, so
+    a drift that touched only one of the two would be refused before anything physical was compared
+    and would prove nothing. Both move here, together, and the layout is declared under the new
+    schema — so resolution SUCCEEDS and answers ``schema``.
+
+    Nothing about the crosswalk's governance moves, which is the entire point: the measurement still
+    pins the old table, so a compilation that does not compare the two plans a traversal whose
+    composed fan-out verdict, leg uniqueness and mapping row rule were all measured somewhere else.
+    """
+    source, table = logical_ref.split("::", 1)[0], logical_ref.split(".")[-1]
+    db.execute(
+        "UPDATE graph_node SET schema_name = %s WHERE catalog_source = %s AND table_name = %s",
+        (schema, source, table))
+    layout = INVENTORY.tables[f"{INVENTORY.logical_schema_map[logical_ref]}.{table}"]
+    return replace(
+        INVENTORY,
+        tables={**INVENTORY.tables, f"{schema}.{table}": replace(layout, schema=schema)},
+        logical_schema_map={**INVENTORY.logical_schema_map, logical_ref: schema})
+
+
+def two_way(**over) -> AdmittedCrosswalkV1:
+    """A crosswalk measured 1:1 in BOTH directions.
+
+    The standing :func:`admitted` fixture is measured FANNING in reverse — the ordinary mapping-table
+    shape, and what lets one bank serve both the "plans" and the "refuses independently" tests. A
+    test about a REVERSE traversal's mechanics needs one that reaches the mechanics, so both the
+    landing duplicate count and the reverse max are measured clean here.
+    """
+    return admitted(obs=observation(
+        target_to_source_max_matches=1,
+        mapping=mapping_observation(MAP_BINDING, duplicate_source_tuple_count=0,
+                                    max_rows_per_source_tuple=1)), **over)
+
+
 # ── the governed crosswalk ───────────────────────────────────────────────────────────────────────
 
 DEFINITION = definition()
@@ -388,6 +426,8 @@ def admitted(*, scope=PRODUCTION_SCOPE, selection=None, obs=None,
         scope=scope, observation=measured,
         mapping_temporal_policy_revision_id=TEMPORAL_POLICY)
     kwargs = dict(definition=DEFINITION, execution=execution, decision=decision,
+                  source_binding=SOURCE_BINDING, target_binding=TARGET_BINDING,
+                  mapping_binding=MAP_BINDING,
                   mapping_row_selection=selection, observation=measured)
     kwargs.update(over)
     return AdmittedCrosswalkV1(**kwargs)
@@ -403,7 +443,10 @@ def unmeasured(*, scope=SANDBOX_SCOPE) -> AdmittedCrosswalkV1:
         decision, source_leg=source_pin, target_leg=target_pin,
         mapping_binding_revision_id=MAP_BINDING.binding_revision_id,
         scope=scope, observation=None)
-    return AdmittedCrosswalkV1(definition=DEFINITION, execution=execution, decision=decision)
+    return AdmittedCrosswalkV1(
+        definition=DEFINITION, execution=execution, decision=decision,
+        source_binding=SOURCE_BINDING, target_binding=TARGET_BINDING,
+        mapping_binding=MAP_BINDING)
 
 
 # ── the expression a crosswalk traversal is planned for ──────────────────────────────────────────

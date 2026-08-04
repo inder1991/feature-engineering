@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.data_agent.relationship_observation import RelationshipMethod, RowCoverage
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.field_evidence import canonical_hash
@@ -622,11 +623,29 @@ class AdmittedCrosswalkV1:
     uniqueness was measured under. What IS checked here is that the selection is the one the pins
     name — same dataset, same policy revision, and the same content hash the composed measurement
     recorded.
+
+    **THE THREE PHYSICAL BINDINGS ARE PART OF THE BUNDLE, and they are not optional.** A crosswalk's
+    pins are revision IDS — ``mapping_binding_revision_id`` on the execution, two per leg on the
+    pins — and an id cannot be compared with a table a compilation RESOLVED onto the cluster. So the
+    bindings those ids name travel here too, and the compiler compares each resolved
+    :class:`~featuregen.materialize.joins.PhysicalIdentity` against the one that was measured
+    (``joins.plan_crosswalk_join``). Without them, re-pointing an environment's schema map moved all
+    three tables of a measured crosswalk and the traversal planned cleanly against tables nobody
+    measured — the exact hazard ``joins._refuse_unpinned_mapping`` claims to close and closes only
+    for the mapping dataset's LOGICAL name. They are required rather than defaulted for the reason
+    every other field here is checked: an optional safety input is one a caller can omit, and the
+    omission looks like the safe case.
     """
 
     definition: CrosswalkDefinitionRevisionV1
     execution: CrosswalkExecutionRevisionV1
     decision: CrosswalkAdmissionDecisionV1
+    #: The three tables as the measurement pinned them, by the DEFINITION's canonical sides. Which
+    #: of ``source``/``target`` a traversal starts from is the compiler's question (it depends on
+    #: the requested direction), never this bundle's.
+    source_binding: PhysicalDatasetBindingV1
+    target_binding: PhysicalDatasetBindingV1
+    mapping_binding: PhysicalDatasetBindingV1
     mapping_row_selection: DatasetRowSelectionV1 | None = None
     observation: CrosswalkExecutionObservationV1 | None = None
 
@@ -674,6 +693,46 @@ class AdmittedCrosswalkV1:
                 raise ValueError(
                     "the mapping row selection's content hash differs from the one the composed "
                     f"measurement recorded ({selection.content_hash} != {measured})")
+        self._check_bindings()
+
+    def _check_bindings(self) -> None:
+        """Each supplied binding must BE the revision the execution pinned, for the RIGHT table.
+
+        Two questions, and the first does not answer the second. ``binding_revision_id`` is a
+        content hash over the binding, so an equal id proves the object is the pinned revision —
+        but not that the pinned revision belongs in the slot it was handed to. The leg pins name
+        their datasets, so the second question has a governed answer already recorded and this
+        checks against it rather than inventing one.
+
+        The mapping binding is checked THREE ways because three pins name it and a crosswalk whose
+        two legs travelled through different mapping tables is not a crosswalk.
+        """
+        source_leg, target_leg = self.execution.source_leg, self.execution.target_leg
+        for binding, pinned_id, dataset_ref, side in (
+                (self.source_binding, source_leg.from_binding_revision_id,
+                 source_leg.from_dataset_ref, "source"),
+                (self.target_binding, target_leg.to_binding_revision_id,
+                 target_leg.to_dataset_ref, "target"),
+                (self.mapping_binding, self.execution.mapping_binding_revision_id,
+                 self.definition.mapping_dataset_ref, "mapping"),
+                (self.mapping_binding, source_leg.to_binding_revision_id,
+                 source_leg.to_dataset_ref, "mapping (as the source leg's destination)"),
+                (self.mapping_binding, target_leg.from_binding_revision_id,
+                 target_leg.from_dataset_ref, "mapping (as the target leg's origin)")):
+            if binding.binding_revision_id != pinned_id:
+                raise ValueError(
+                    f"the supplied {side} binding is revision {binding.binding_revision_id} and "
+                    f"the execution pins {pinned_id}: a traversal planned against a binding the "
+                    "measurement did not pin would read a table whose uniqueness nobody measured")
+            catalog, remainder = dataset_ref.split("::", 1)
+            expected = (catalog.strip().lower(), remainder.split(".")[-1].strip().lower())
+            actual = (binding.identity.catalog_source.strip().lower(),
+                      binding.identity.table.strip().lower())
+            if actual != expected:
+                raise ValueError(
+                    f"the {side} binding addresses {actual[0]}::{actual[1]} and the pin names "
+                    f"{dataset_ref!r}: the right revision id in the wrong slot would compare a "
+                    "resolved table against another table's pinned address")
 
     def verdict_for(self, direction: str) -> CrosswalkDirectionVerdictV1:
         """The verdict for ONE requested direction — never ``execution.combined_cardinality``."""

@@ -52,11 +52,11 @@ def catalog(db):
 
 
 def _plan(catalog, *, expr=None, grain=None, crosswalks=None,
-          execution_tier=ExecutionTier.PRODUCTION, roles=_ROLES):
+          execution_tier=ExecutionTier.PRODUCTION, roles=_ROLES, inventory=None):
     return compile_expression(
         catalog, expr_path="body.expr", expr=expr if expr is not None else cf.expression(),
         grain_keys=grain if grain is not None else cf.FORWARD_GRAIN, roles=roles,
-        inventory=cf.INVENTORY,
+        inventory=cf.INVENTORY if inventory is None else inventory,
         crosswalks=(cf.admitted(),) if crosswalks is None else crosswalks,
         execution_tier=execution_tier)
 
@@ -180,6 +180,79 @@ def test_a_measured_composed_FANOUT_refuses_as_a_fan_out_and_is_never_deduplicat
         CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED,
         CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
     }
+
+
+# ══ the three tables must be the three tables that were measured ═════════════════════════════════
+#
+# Every pin a crosswalk carries is a revision ID, and an id cannot be compared with a table a
+# compilation resolved onto the cluster. Re-pointing the environment's declared schema map is the
+# ordinary way a table moves (an environment recapture), and until this check nothing between
+# admission and planning asked whether the resolved addresses were the pinned ones: all three
+# tables could move and the traversal planned cleanly, carrying a composed fan-out verdict, two leg
+# uniqueness verdicts and a mapping row rule that were all measured somewhere else.
+
+
+@pytest.mark.parametrize("logical_ref, role", [
+    (cf.SOURCE_REF, "source relation"),
+    (cf.MAP, "mapping dataset"),
+    (cf.TARGET_REF, "target relation"),
+])
+def test_a_table_resolved_to_a_DIFFERENT_SCHEMA_than_the_measurement_pinned_refuses(
+        catalog, logical_ref, role):
+    inventory = cf.drift_table(catalog, logical_ref, schema="dpl_moved")
+    refused = _plan(catalog, inventory=inventory)
+    assert isinstance(refused, MaterializationRefused), getattr(refused, "join_plan", refused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED
+    # The operator's question is always "which table did it actually read", so BOTH addresses are
+    # named — a message carrying only the binding revision id cannot answer it.
+    assert role in refused.detail
+    assert "dpl_moved" in refused.detail
+    assert cf.CIB_SCHEMA in refused.detail or cf.FTR_SCHEMA in refused.detail
+
+
+def test_a_table_moved_and_moved_BACK_still_plans(catalog):
+    """The control, so the three refusals above cannot be "any `drift_table` call refuses".
+
+    Same helper, same rewritten catalog attestation and same re-declared layout — pointed at the
+    schema the measurement actually pinned.
+    """
+    inventory = cf.drift_table(catalog, cf.MAP, schema=cf.CIB_SCHEMA)
+    ir = _plan(catalog, inventory=inventory)
+    assert isinstance(ir, ExpressionExecutionIR), getattr(ir, "detail", ir)
+
+
+def test_a_reverse_traversal_compares_its_OWN_ENDS_against_the_pinned_bindings(catalog):
+    """The definition's sides are canonical; a traversal's are directional.
+
+    A reverse traversal STARTS at the target side and ARRIVES at the source side, so a comparison
+    fixed to the definition's order would refuse every legal reverse plan and let a drifted one
+    through. Needs a crosswalk measured 1:1 BOTH ways — the standing fixture fans in reverse and
+    would never reach this check.
+    """
+    both = cf.two_way()
+    ok = _plan(catalog, expr=cf.reverse_expression(), grain=cf.REVERSE_GRAIN, crosswalks=(both,))
+    assert isinstance(ok, ExpressionExecutionIR), getattr(ok, "detail", ok)
+
+    # Move the SOURCE side, which a REVERSE traversal reaches as its DESTINATION.
+    inventory = cf.drift_table(catalog, cf.SOURCE_REF, schema="dpl_moved")
+    refused = _plan(catalog, expr=cf.reverse_expression(), grain=cf.REVERSE_GRAIN,
+                    crosswalks=(both,), inventory=inventory)
+    assert isinstance(refused, MaterializationRefused), getattr(refused, "join_plan", refused)
+    assert refused.code is CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED
+    assert "target relation" in refused.detail
+
+
+def test_a_binding_the_execution_did_not_pin_cannot_be_ASSEMBLED(catalog):
+    """The other half: the bundle refuses a binding that is not the pinned revision at all.
+
+    A compiler comparing against a binding nobody pinned would be comparing two guesses, so the
+    mismatch is refused where the bundle is built rather than being carried into a plan.
+    """
+    from tests.featuregen.overlay.upload._crosswalk_fixtures import binding
+
+    elsewhere = binding("cib", cf.MAP_TABLE, database=cf.ENVIRONMENT, schema="dpl_eib_v2")
+    with pytest.raises(ValueError, match="binding"):
+        cf.admitted(mapping_binding=elsewhere)
 
 
 def test_two_admitted_crosswalks_for_one_pair_refuse_rather_than_pick_one(catalog):

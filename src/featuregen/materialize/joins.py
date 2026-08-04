@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from featuregen.contracts.db import DbConn
+from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.overlay.upload.bridge_realization import (
     BridgeJoinRealizationRevisionV1,
@@ -478,6 +479,22 @@ def plan_join(
                     fans_out=False)
 
 
+def _matches_binding(
+    identity: PhysicalIdentity, binding: PhysicalDatasetBindingV1
+) -> bool:
+    """Is the table this compilation RESOLVED the table the governance pinned? (§3.5)
+
+    All three parts, and the schema is the one that matters: a re-pointed environment schema map
+    changes only that member, so a comparison on catalog + table alone reads ``dpl_eib_v2`` while
+    claiming the uniqueness measured on ``dpl_eib``.
+    """
+    return (
+        _fold(identity.catalog_source) == _fold(binding.identity.catalog_source)
+        and _fold(identity.schema) == _fold(binding.identity.schema)
+        and _fold(identity.table) == _fold(binding.identity.table)
+    )
+
+
 def _matches_physical_identity(
     identity: PhysicalIdentity,
     revision: BridgeJoinRealizationRevisionV1,
@@ -486,12 +503,7 @@ def _matches_physical_identity(
 ) -> bool:
     endpoint = revision.from_endpoint if from_side else revision.to_endpoint
     binding = endpoint.physical_binding
-    return (
-        binding is not None
-        and _fold(identity.catalog_source) == _fold(binding.identity.catalog_source)
-        and _fold(identity.schema) == _fold(binding.identity.schema)
-        and _fold(identity.table) == _fold(binding.identity.table)
-    )
+    return binding is not None and _matches_binding(identity, binding)
 
 
 def plan_cross_catalog_join(
@@ -691,6 +703,21 @@ def plan_crosswalk_join(
             return adapted
         row_predicates = adapted
 
+    # ── the three tables must be the three tables that were MEASURED (§3.5) ──────────────────────
+    #
+    # Every pin above is a revision ID, and an id cannot be compared with a table this compilation
+    # resolved onto the cluster. Nothing between admission and here asked whether the resolved
+    # addresses are the pinned ones, so re-pointing the environment's schema map moved all three
+    # tables of a measured crosswalk and the traversal planned cleanly: a mapping table whose row
+    # uniqueness was measured on `dpl_eib.acct_xref` was read from `dpl_eib_v2.acct_xref`, and the
+    # composed fan-out verdict gating the whole plan describes the other table. The check is the
+    # bridge family's own (`_matches_physical_identity`), applied to three tables instead of two.
+    unresolved = _refuse_unpinned_physical(
+        admitted, direction=direction, from_identity=from_identity, to_identity=to_identity,
+        mapping_identity=mapping_identity)
+    if unresolved is not None:
+        return unresolved
+
     forward = direction == SOURCE_TO_TARGET
     # The DEFINITION's sides are canonically ordered and its pair tuples travel with their endpoint,
     # so which side a traversal STARTS from decides which pin and which pair tuple each leg uses.
@@ -765,10 +792,57 @@ def _leg_pin_fields(pin: JoinLegPinV1) -> dict[str, object]:
     }
 
 
+def _refuse_unpinned_physical(
+    admitted: AdmittedCrosswalkV1,
+    *,
+    direction: str,
+    from_identity: PhysicalIdentity,
+    to_identity: PhysicalIdentity,
+    mapping_identity: PhysicalIdentity,
+) -> MaterializationRefused | None:
+    """All THREE resolved tables against the bindings the composed measurement pinned.
+
+    The definition's sides are canonical and the traversal's are directional, so which pinned
+    binding a resolved endpoint is compared against depends on the requested direction — comparing
+    a reverse traversal's origin against the source binding would refuse every legal reverse plan
+    and admit an illegal one.
+
+    Refuses with ``PHYSICAL_SCHEMA_NOT_RESOLVED`` and names both addresses: the operator's question
+    is always "which table did it actually read", and an id-only message cannot answer it.
+    """
+    if direction == SOURCE_TO_TARGET:
+        origin, destination = admitted.source_binding, admitted.target_binding
+    else:
+        origin, destination = admitted.target_binding, admitted.source_binding
+    for identity, binding, role in (
+            (from_identity, origin, "source relation"),
+            (mapping_identity, admitted.mapping_binding, "mapping dataset"),
+            (to_identity, destination, "target relation")):
+        if not _matches_binding(identity, binding):
+            pinned = binding.identity
+            return _refuse(
+                CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED,
+                f"the {role} resolved to {identity.catalog_source}::{identity.schema}."
+                f"{identity.table} and crosswalk "
+                f"{admitted.definition.definition_id} was measured against "
+                f"{pinned.catalog_source}::{pinned.schema}.{pinned.table} "
+                f"(binding revision {binding.binding_revision_id}): every verdict gating this "
+                "traversal — the composed fan-out, both legs' uniqueness, the mapping row rule — "
+                "was measured over THAT table, so planning against this one would carry the "
+                "evidence of a table nobody is reading")
+    return None
+
+
 def _refuse_unpinned_mapping(
     mapping_identity: PhysicalIdentity, mapping_dataset_ref: str
 ) -> MaterializationRefused | None:
-    """The mapping dataset must have RESOLVED onto the cluster before a leg may travel through it.
+    """The mapping dataset's resolved LOGICAL identity must be the crosswalk's mapping dataset.
+
+    The logical half of the question :func:`_refuse_unpinned_physical` answers physically, and kept
+    because the two are answered from different governed sources: this one against the DEFINITION's
+    own ``mapping_dataset_ref``, that one against the binding the MEASUREMENT pinned. A definition
+    and an execution that disagreed about which table the mapping is would satisfy either check
+    alone.
 
     Task 5 owns resolution and refuses on its own when it cannot answer; this only refuses the
     case resolution cannot see — a caller passing an identity for some other table. The mapping
