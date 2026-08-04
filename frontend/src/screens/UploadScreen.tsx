@@ -314,12 +314,36 @@ function CatalogNarrativeFields({
   // Set by any edit the AUTHOR makes. A ref, not state: it must not re-run the lookup, and it is
   // read inside an async callback that would otherwise close over a stale value.
   const authored = useRef(false)
+  // The serialized part a prefill last WROTE INTO the draft — `undefined` when nothing in the
+  // draft came from one. Refs for the same two reasons as `authored`: neither may re-run the
+  // lookup, and both are read from the async callback below.
+  const prefilled = useRef<string | undefined>(undefined)
+  // The live draft, mirrored for that callback. `value` cannot go in the effect's dependency
+  // list — the lookup would then re-fire on every keystroke — and a ref read at await-time is
+  // the current draft, which is the whole point.
+  const liveDraft = useRef(value)
+  liveDraft.current = value
 
   // RE-UPLOAD PREFILL. Uploading again into a catalog someone has already described should show
   // what it says, not an empty form the author has to retype from memory. Debounced on the source
   // name, and it NEVER writes over words this person has already typed — the CatalogNarrativePanel
   // 409 discipline: a reload may refresh what the server says, never the draft only they have.
   useEffect(() => {
+    // A PREFILL BELONGS TO THE CATALOG IT WAS READ FROM. When the source name stops naming a
+    // described catalog, prefilled words are another catalog's description sitting in this one's
+    // form — inside a section that is collapsed by default, so nothing on screen says so, and the
+    // server would commit them verbatim as this catalog's own words. A miss therefore WITHDRAWS
+    // the prefill. It withdraws only what the prefill itself put there: the test is the same
+    // serialized-part comparison the unchanged note makes, so a draft this person has since
+    // changed is never clobbered by a source edit — their typing outlives the source box exactly
+    // as it outlives a failed upload.
+    const withdrawPrefill = () => {
+      if (prefilled.current !== undefined
+        && serializeNarrative(liveDraft.current) === prefilled.current) {
+        onChange(EMPTY_NARRATIVE)
+      }
+      prefilled.current = undefined
+    }
     const src = source.trim()
     if (!src) {
       setCurrent(null)
@@ -338,18 +362,26 @@ function CatalogNarrativeFields({
             businessDomains: got.profile?.business_domains ?? [],
           }
           // An undescribed catalog has nothing to prefill — and nothing to call unchanged.
-          if (serializeNarrative(described) === undefined) {
+          const part = serializeNarrative(described)
+          if (part === undefined) {
             setCurrent(null)
+            withdrawPrefill()
             return
           }
           setCurrent(described)
-          if (!authored.current) onChange(described)
+          if (!authored.current) {
+            onChange(described)
+            prefilled.current = part
+          }
         } catch {
           // SILENT. The narrative routes 404 while FEATUREGEN_DATASET_PROFILES is off, and 404 for
           // a catalog this caller cannot see; neither is a problem the uploader caused or can fix,
           // and neither is a reason to put error styling on an optional section. Degrade to the
           // empty form, which is exactly what a first upload sees.
-          if (!cancelled) setCurrent(null)
+          if (!cancelled) {
+            setCurrent(null)
+            withdrawPrefill()
+          }
         }
       })()
     }, NARRATIVE_PREFILL_DEBOUNCE_MS)

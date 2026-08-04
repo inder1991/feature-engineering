@@ -546,6 +546,69 @@ describe('re-uploading into a catalog somebody has already described', () => {
     expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
   })
 
+  // Only 'ftr' is described. Every other name is the flag-off / unknown-catalog answer, which is
+  // what "the source stopped matching" looks like from the screen.
+  function onlyFtrIsDescribed() {
+    getCatalogProfile.mockImplementation(async (src: string) => {
+      if (src === 'ftr') return DESCRIBED
+      throw new api.ApiError(404, 'Not Found')
+    })
+  }
+
+  it('withdraws the prefill when the source stops naming a described catalog', async () => {
+    onlyFtrIsDescribed()
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    const sourceBox = screen.getByLabelText(/source name/i)
+    await userEvent.type(sourceBox, 'ftr')
+    expect(await screen.findByDisplayValue('FTR compliance glossary')).toBeInTheDocument()
+
+    // Retargeted at a catalog nobody has described. FTR's words must not follow: the section is
+    // collapsed by default, so nothing would say they had, and the server commits what it is sent.
+    await userEvent.clear(sourceBox)
+    await userEvent.type(sourceBox, 'payments')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('payments'))
+    await vi.waitFor(() => expect(screen.getByLabelText('Name')).toHaveValue(''))
+    expect(screen.getByLabelText('Description')).toHaveValue('')
+    expect(screen.getByLabelText('Business context')).toHaveValue('')
+    expect(screen.queryByRole('button', { name: 'Remove domain Compliance' })).toBeNull()
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+
+    // The wire is the proof: an empty form is no part at all, so payments keeps whatever it has.
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'payments', undefined)
+  })
+
+  it('withdraws only what the prefill wrote — a draft the author changed survives the switch', async () => {
+    onlyFtrIsDescribed()
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    const sourceBox = screen.getByLabelText(/source name/i)
+    await userEvent.type(sourceBox, 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+    await userEvent.type(screen.getByLabelText('Description'), ' Updated by me.')
+
+    await userEvent.clear(sourceBox)
+    await userEvent.type(sourceBox, 'payments')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('payments'))
+
+    // Words this person has touched are theirs. A source edit is not a reason to throw them away
+    // — the same discipline that keeps the draft through a failed upload.
+    expect(screen.getByLabelText('Description'))
+      .toHaveValue('Financial transaction reporting terms. Updated by me.')
+    expect(screen.getByLabelText('Name')).toHaveValue('FTR compliance glossary')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toMatchObject({
+      description: 'Financial transaction reporting terms. Updated by me.',
+    })
+  })
+
   it('sends the prefilled narrative back unchanged rather than dropping it', async () => {
     getCatalogProfile.mockResolvedValue(DESCRIBED)
     uploadFile.mockResolvedValue(result({ asserted: 4 }))
