@@ -450,6 +450,33 @@ describe('SuggestedFeaturesScreen', () => {
     expect(within(card).getByText(/no stored projection/i)).toBeInTheDocument()
   })
 
+  it('renders a stored projection’s stale state and its reason, not an invented freshness',
+    async () => {
+      // Release A always sends `projection: null`, so this path is the one a Release-B payload
+      // takes. It is covered here because "stale" and "pending" are states the contract requires
+      // the UI to render HONESTLY, and an untested branch is where a fabricated "current" hides.
+      const projection: api.SuggestionProjectionState = {
+        state: 'stale', scope_set_id: null, read_scope_key: 'scope-abc', scope_epoch: 3,
+        target_fingerprint: 'fp-target', current_fingerprint: 'fp-built',
+        generated_at: '2026-08-01T10:00:00Z',
+        stale_reason: 'an input table changed since it was built',
+        omitted_counts: {},
+      }
+      getTableSuggestionsV2.mockResolvedValue(page(
+        {}, [{ ...hit(), projection }], { read_mode: 'projected', projection },
+      ))
+      renderScreen()
+      expect(await screen.findByTestId('currentness'))
+        .toHaveTextContent(/served from a stored projection, state stale/i)
+      const card = await openDetail('account_balance_trend_90d')
+      expect(within(card).getByText('stale')).toBeInTheDocument()
+      expect(within(card).getByText(/an input table changed since it was built/i))
+        .toBeInTheDocument()
+      expect(within(card).getByText(/scope-abc · epoch 3/)).toBeInTheDocument()
+      // ...and the null-projection copy is not ALSO claimed
+      expect(document.body.textContent).not.toMatch(/no stored projection/i)
+    })
+
   // ── read-only ─────────────────────────────────────────────────────────────────────────────────
   it('is strictly read-only: the only control is a disclosure, never accept/edit/dismiss',
     async () => {
@@ -554,6 +581,42 @@ describe('SuggestedFeaturesScreen', () => {
     for (const n of names) expect(n.length).toBeLessThanOrEqual(120)
     // ...while the complete value is still on the page as text
     expect(screen.getByText(long)).toBeInTheDocument()
+  })
+
+  it('bounds the OPENED drawer’s accessible name too, not only the button’s', async () => {
+    // The button and the region it controls are two different accessible names, and a region name
+    // is announced on entry. An unbounded catalog display name would make it a 400-character
+    // announcement.
+    const long = `q_${'x'.repeat(400)}`
+    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({ display_name: long })]))
+    renderScreen()
+    const card = (await screen.findByText(long)).closest('li')!
+    await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
+    const drawer = within(card).getByRole('group')
+    const name = drawer.getAttribute('aria-label') ?? ''
+    expect(name.length).toBeLessThanOrEqual(120)
+    // it is still the SAME suggestion's region: a truncation, not a different string
+    expect(name.startsWith('Full detail for q_xxx')).toBe(true)
+    expect(name.endsWith('…')).toBe(true)
+    // ...and the complete value is never lost — it is the card's own heading, in full, as text
+    expect(within(card).getByRole('heading', { name: long })).toBeInTheDocument()
+  })
+
+  it('nests the drawer’s sections UNDER the card heading, never beside it', async () => {
+    getTableSuggestionsV2.mockResolvedValue(page({}, [hit()]))
+    renderScreen()
+    const card = await openDetail('account_balance_trend_90d')
+    // group h2 → card h3 → drawer sections h4: one unbroken outline, so a screen-reader user
+    // reading by heading level is told the audit material sits INSIDE the suggestion.
+    expect(within(card).getByRole('heading', { level: 3, name: 'account_balance_trend_90d' }))
+      .toBeInTheDocument()
+    const drawer = within(card).getByRole('group')
+    const tags = within(drawer).getAllByRole('heading').map(h => h.tagName)
+    expect(tags.length).toBeGreaterThan(1)
+    expect([...new Set(tags)]).toEqual(['H4'])
+    expect(within(drawer).getByRole('heading', { level: 4, name: 'Meaning' })).toBeInTheDocument()
+    expect(within(drawer).getByRole('heading', { level: 4, name: 'Requirements and limitations' }))
+      .toBeInTheDocument()
   })
 
   it('bounds every tooltip while leaving the whole value readable in the detail', async () => {

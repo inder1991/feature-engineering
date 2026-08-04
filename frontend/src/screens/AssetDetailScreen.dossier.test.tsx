@@ -296,6 +296,38 @@ it('renders the SAME card vocabulary the table screen uses, drawer included', as
   expect(within(drawer).getByText('profile unavailable')).toBeInTheDocument()
 })
 
+it('threads the heading level one deeper here: section h3 → card h4 → drawer h5', async () => {
+  // The dossier's own section heading is already h3, so a drawer with FIXED h4 sections would put
+  // the audit material at the same level as the card — telling a screen-reader user it sits beside
+  // the suggestion rather than inside it.
+  getTableSuggestions.mockResolvedValue(withHits([usingBalance()]))
+  await renderDossier(detail())
+  const section = await screen.findByTestId('column-suggestions')
+  expect(
+    within(section).getByRole('heading', { level: 3, name: /suggested features using this column/i }),
+  ).toBeInTheDocument()
+  expect(await within(section).findByRole('heading', { level: 4, name: 'account_balance_avg_30d' }))
+    .toBeInTheDocument()
+  await userEvent.click(within(section).getByRole('button', { name: /show full detail/i }))
+  const drawer = within(section).getByRole('group', { name: /full detail for/i })
+  const tags = within(drawer).getAllByRole('heading').map(h => h.tagName)
+  expect(tags.length).toBeGreaterThan(1)
+  expect([...new Set(tags)]).toEqual(['H5'])
+  expect(within(drawer).getByRole('heading', { level: 5, name: 'Meaning' })).toBeInTheDocument()
+})
+
+it('bounds the drawer’s accessible name on this surface too', async () => {
+  const long = `q_${'x'.repeat(400)}`
+  getTableSuggestions.mockResolvedValue(withHits([usingBalance({ display_name: long })]))
+  await renderDossier(detail())
+  const section = await screen.findByTestId('column-suggestions')
+  await within(section).findByText(long)
+  await userEvent.click(within(section).getByRole('button', { name: /show full detail/i }))
+  const drawer = within(section).getByRole('group', { name: /full detail for/i })
+  expect((drawer.getAttribute('aria-label') ?? '').length).toBeLessThanOrEqual(120)
+  expect(within(section).getByRole('heading', { name: long })).toBeInTheDocument()
+})
+
 it('is read-only here too: the only control is the disclosure', async () => {
   getTableSuggestions.mockResolvedValue(withHits([usingBalance()]))
   await renderDossier(detail())

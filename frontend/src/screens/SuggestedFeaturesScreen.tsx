@@ -198,8 +198,14 @@ function Absent({ children }: { children: ReactNode }) {
   return <span className="sfc-absent">{children}</span>
 }
 
-function Micro({ children }: { children: ReactNode }) {
-  return <h4 className="micro-label sfc-h">{children}</h4>
+// A drawer section heading. The level is THREADED from the card so the drawer's sections nest
+// UNDER the suggestion's own heading on both surfaces: the table screen heads a card at h3 and its
+// sections at h4, and the column dossier (whose own section heading is already h3) heads the card
+// at h4 and its sections at h5. A fixed level would flatten the dossier into two sibling h4s and
+// tell a screen-reader user the audit material sits beside the suggestion rather than inside it.
+function Micro({ level, children }: { level: 4 | 5; children: ReactNode }) {
+  const Tag = level === 5 ? 'h5' : 'h4'
+  return <Tag className="micro-label sfc-h">{children}</Tag>
 }
 
 // ── attributed values ───────────────────────────────────────────────────────────────────────────
@@ -586,7 +592,12 @@ export function SuggestionCard({
         </button>
       </div>
 
-      {open && <SuggestionDetail hit={hit} id={detailId} omitted={omitted} />}
+      {open && (
+        <SuggestionDetail
+          hit={hit} id={detailId} omitted={omitted}
+          headingLevel={headingLevel === 4 ? 5 : 4}
+        />
+      )}
     </li>
   )
 }
@@ -748,17 +759,25 @@ function SuggestionDetail({
   hit,
   id,
   omitted,
+  headingLevel,
 }: {
   hit: FeatureSuggestionHit
   id: string
   omitted?: SuggestionOmittedCounts
+  headingLevel: 4 | 5
 }) {
   const s = hit.suggestion
   const p = hit.provenance
   return (
-    <div className="sfc-detail" id={id} role="group" aria-label={`Full detail for ${s.display_name}`}>
+    // The region's accessible name is BOUNDED like every other one: a display name is an unbounded
+    // catalog string, and a 400-character region name is unusable in a screen reader. The complete
+    // value is never lost — it is the card's own heading, in full, as text.
+    <div
+      className="sfc-detail" id={id} role="group"
+      aria-label={`Full detail for ${bounded(s.display_name, 80)}`}
+    >
       <section className="sfc-sec">
-        <Micro>Meaning</Micro>
+        <Micro level={headingLevel}>Meaning</Micro>
         <TextDetail label="What it measures" text={s.business_interpretation} />
         <TextDetail label="Why it is useful" text={s.business_value} />
         <div className="sfc-chiprow">
@@ -770,7 +789,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Classification</Micro>
+        <Micro level={headingLevel}>Classification</Micro>
         <dl className="kv">
           <div>
             <dt>Feature category</dt>
@@ -806,7 +825,7 @@ function SuggestionDetail({
             derived={s.feature_category_derived_from_family_mapping}
           />
         )}
-        <Micro>Business domains</Micro>
+        <Micro level={headingLevel}>Business domains</Micro>
         {s.business_domains.length === 0 ? (
           <p className="hint">
             <Absent>not supplied.</Absent> No controlled business-domain vocabulary is registered on
@@ -821,7 +840,7 @@ function SuggestionDetail({
             />
           ))
         )}
-        <Micro>Use cases</Micro>
+        <Micro level={headingLevel}>Use cases</Micro>
         {s.use_cases.length === 0 ? (
           <p className="hint"><Absent>not supplied.</Absent> This recipe has no canonical use case
             mapped yet.</p>
@@ -836,7 +855,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec" data-testid="sfc-catalog-terms">
-        <Micro>Catalog terms</Micro>
+        <Micro level={headingLevel}>Catalog terms</Micro>
         <p className="hint">
           The catalog&apos;s own wording on the columns this feature reads. These are terms, not
           controlled business domains or entities: nothing has mapped them to a governed vocabulary,
@@ -869,7 +888,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Entity and grain</Micro>
+        <Micro level={headingLevel}>Entity and grain</Micro>
         {s.entity === null ? (
           <p className="hint">
             <Absent>no entity was named.</Absent> The recipe bound no entity-linked concept here, so
@@ -894,7 +913,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Computation</Micro>
+        <Micro level={headingLevel}>Computation</Micro>
         <p className="mono sfc-recipe">{s.recipe}</p>
         <dl className="kv">
           <div><dt>Operation</dt><dd className="mono">{s.recipe_parts.operation}</dd></div>
@@ -939,7 +958,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Source datasets</Micro>
+        <Micro level={headingLevel}>Source datasets</Micro>
         {s.source_datasets.length === 0
           ? <p className="hint"><Absent>no dataset was bound</Absent></p>
           : s.source_datasets.map(d => (
@@ -948,7 +967,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Every input column</Micro>
+        <Micro level={headingLevel}>Every input column</Micro>
         <ul className="sfc-operands">
           {s.operands.map(o => (
             <li key={`${o.catalog_source}:${o.graph_object_ref}`}>
@@ -977,7 +996,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Relationships this feature crosses</Micro>
+        <Micro level={headingLevel}>Relationships this feature crosses</Micro>
         {s.relationship_dependencies.length === 0 ? (
           <p className="hint">
             No relationship was traversed: every input column is on one table.
@@ -993,7 +1012,7 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Requirements and limitations</Micro>
+        <Micro level={headingLevel}>Requirements and limitations</Micro>
         {s.warnings.length === 0 && s.requirements.length === 0 ? (
           <p className="hint">Nothing was raised against this suggestion.</p>
         ) : (
@@ -1033,12 +1052,12 @@ function SuggestionDetail({
       </section>
 
       <section className="sfc-sec">
-        <Micro>Currentness</Micro>
+        <Micro level={headingLevel}>Currentness</Micro>
         <Currentness projection={hit.projection} />
       </section>
 
       <section className="sfc-sec">
-        <Micro>Provenance and revisions</Micro>
+        <Micro level={headingLevel}>Provenance and revisions</Micro>
         <dl className="kv">
           <div><dt>Suggestion id</dt><dd className="mono">{s.suggestion_id}</dd></div>
           <div><dt>Revision</dt><dd className="mono">{s.suggestion_revision_id}</dd></div>
@@ -1102,7 +1121,7 @@ function SuggestionDetail({
 
       {omitted && (
         <section className="sfc-sec">
-          <Micro>Truncated on this page</Micro>
+          <Micro level={headingLevel}>Truncated on this page</Micro>
           <p className="hint">
             Counted for the whole page, not for this card alone.
           </p>
