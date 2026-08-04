@@ -1107,7 +1107,14 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
 
     # ── class 2 — a protected characteristic as an operand or a grouping key. structurally_
     #    unsuitable: ECOA/fair-lending and GDPR Article 9 have no "allow" switch, so there is no
-    #    setup step to name and the wording must not imply one. ──
+    #    setup step to name and the wording must not imply one.
+    #
+    #    WHAT THIS CLASS CAN SEE (the full note lives on `concepts.is_protected_characteristic`):
+    #    the registry holds THREE concepts in these sensitivity classes — the umbrellas
+    #    `protected_attribute` / `special_category` and `vulnerability_flag` — and no per-attribute
+    #    concept, so this fires only when ENRICHMENT landed the column on one of those three. It is
+    #    a floor over a vocabulary, not a detector for every protected characteristic in a catalog,
+    #    and a `gender_cd` that enrichment left unclassified passes it. ──
     for _src, ref in pairs:
         concept_name = meta.get(ref, {}).get("concept")
         if is_protected_characteristic(concept_name):
@@ -1123,15 +1130,22 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
     #    sentence as a field, SELF-DECLARED PER CONCEPT — there is no group sweep, because a group
     #    is a taxonomy bucket and cannot make a claim about a specific column's semantics. Free
     #    prose (`payment_narrative`, `free_text`) is deliberately NOT here: it is computable text
-    #    that carries personal data, so it lands in class 1, where a policy can license it. ──
+    #    that carries personal data, so it lands in class 1, where a policy can license it.
+    #
+    #    THE MESSAGE DOES NOT CLAIM A JOIN RULE, because this gate does not enforce one. Join
+    #    candidacy is excluded STRUCTURALLY and elsewhere: every label concept is `categorical` with
+    #    no entity_link, and `derive_bridge_candidates` pairs only columns sharing an IDENTIFIER
+    #    concept — so a label can never be proposed as a join key whether or not this gate ever
+    #    runs, and the read-set pairs own the rest. Saying "can never be a join key" here would
+    #    credit this code with a guarantee two other components actually provide, and would go on
+    #    being printed if either of them regressed. ──
     for _src, ref in pairs:
         concept_name = meta.get(ref, {}).get("concept")
         if is_descriptive(concept_name):
             return Rejection(
                 RejectCode.DESCRIPTIVE_OPERAND,
                 f"{ref} is a descriptive label ({concept_name}), not a computable value — it "
-                f"displays and groups but can never be a measure or a join key. Use the CODE "
-                f"column beside it")
+                f"displays and groups but can never be a measure. Use the CODE column beside it")
 
     # ── class 1 — personal data as a model input. needs_setup: a lawful-basis / purpose policy
     #    COULD license this (AML use of a sanctions or PEP signal is the standing example), and no

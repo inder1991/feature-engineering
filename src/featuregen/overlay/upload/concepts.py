@@ -1214,7 +1214,19 @@ def is_descriptive(name: str | None) -> bool:
 
 
 def is_protected_characteristic(name: str | None) -> bool:
-    """Is this concept a protected characteristic or a GDPR special category?"""
+    """Is this concept a protected characteristic or a GDPR special category?
+
+    WHAT THIS CAN ACTUALLY SEE, stated so no caller over-reads it. The registry holds exactly THREE
+    concepts in these sensitivity classes — the umbrellas `protected_attribute` and
+    `special_category`, plus `vulnerability_flag` — and NO per-attribute concept:
+    `protected_attribute` enumerates "age, gender, race, ethnicity, marital status, national origin,
+    religion" INSIDE its own description, so there is no `gender` or `ethnicity` concept for a column
+    to land on. This therefore answers True only when ENRICHMENT chose one of those three. A
+    `gender_cd` column left unclassified, or landed on some ordinary categorical, is invisible here,
+    and the USE gate built on this predicate will not refuse it. That is a limit of the VOCABULARY,
+    not of the gate — the fix is per-attribute concepts in the registry, and until they exist this
+    is a floor rather than a guarantee.
+    """
     record = CONCEPT_REGISTRY.get(name or "")
     return record is not None and record.sensitivity in PROTECTED_SENSITIVITIES
 

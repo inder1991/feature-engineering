@@ -102,6 +102,27 @@ def test_a_protected_characteristic_is_refused_as_a_GROUPING_operand_too(db):
     assert rej is not None and rej.code == RejectCode.PROTECTED_CHARACTERISTIC
 
 
+def test_the_protected_class_sees_exactly_the_three_umbrella_concepts_and_says_so(db):
+    """The honesty bound on this class, pinned so the docstring cannot drift from the registry.
+
+    There is no `gender` or `ethnicity` concept — `protected_attribute` enumerates them INSIDE its
+    own description — so the class fires only when enrichment landed the column on one of three
+    umbrellas. A `gender_cd` column enrichment left unclassified is invisible to it. That is a limit
+    of the VOCABULARY, and a docstring that implied a detector rather than a floor would be the same
+    kind of overclaim this whole slice exists to correct.
+    """
+    protected = {c.name for c in CONCEPT_REGISTRY.values()
+                 if is_protected_characteristic(c.name)}
+    assert protected == {"protected_attribute", "special_category", "vulnerability_flag"}
+    assert "gender" in CONCEPT_REGISTRY["protected_attribute"].description
+
+    unclassified_gender = _col(db, "cust", "gender_cd", data_type="text")
+    _idea, rej = _validate(db, [unclassified_gender])
+    assert rej is None, (
+        "if this now refuses, per-attribute concepts arrived — correct the docstring that says "
+        "they have not, then delete this half of the test")
+
+
 def test_a_special_category_concept_is_refused_by_the_same_class(db):
     """`special_category` (GDPR Art. 9 health/biometric) shares the class with protected
     characteristics — the registry says so through `sensitivity`, not through a second list."""
@@ -127,6 +148,23 @@ def test_a_descriptive_label_is_refused_and_the_code_beside_it_is_accepted(db):
 
     idea, rej = _validate(db, [code], aggregation="count")
     assert rej is None and idea.validation_status == "DESIGN_CHECKED"
+
+
+def test_the_refusal_does_not_claim_a_join_rule_this_gate_does_not_enforce(db):
+    """Honesty about scope. Join candidacy is excluded STRUCTURALLY and elsewhere — every label
+    concept is `categorical` with no entity_link, and bridge derivation pairs only columns sharing
+    an IDENTIFIER concept — so "can never be a join key" credits this code with a guarantee two
+    other components provide, and would keep printing if either regressed. The message now says what
+    this gate actually decides: it can never be a MEASURE."""
+    label = _col(db, "txn", "sol_desc", concept="branch_name", data_type="text")
+    _idea, rej = _validate(db, [label])
+
+    assert "can never be a measure" in rej.message
+    assert "join key" not in rej.message, rej.message
+
+    # and the structural exclusion the message no longer claims is real, in the registry itself:
+    record = CONCEPT_REGISTRY["branch_name"]
+    assert record.group == "categorical" and record.entity_link is None
 
 
 def test_the_gate_reads_the_CONCEPT_not_the_column_name(db):
