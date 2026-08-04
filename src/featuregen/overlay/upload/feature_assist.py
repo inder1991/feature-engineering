@@ -21,6 +21,13 @@ from datetime import datetime, timedelta
 
 import psycopg
 
+from featuregen.analysis.explain import (
+    NEEDS_DATA_CHECK,
+    NEEDS_SETUP,
+    STRUCTURALLY_UNSUITABLE,
+    UNDECIDED,
+    UNMAPPED,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
@@ -29,6 +36,13 @@ from featuregen.overlay.field_evidence import read_active_field_evidence
 from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
     read_column_facts,
+)
+from featuregen.overlay.upload.concepts import (
+    carries_currency,
+    denomination_concepts,
+    is_descriptive,
+    is_personal_data,
+    is_protected_characteristic,
 )
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.feature_metadata_snapshot import (
@@ -98,6 +112,91 @@ class RejectCode:
     CRITIC = "CRITIC"                       # LLM-2 critic flagged a quality/fit issue (item 5)
     NO_REVISION = "NO_REVISION"             # refine_idea: the model produced no revision to validate
     CONTEXT_TOO_LARGE = "CONTEXT_TOO_LARGE"
+    # ── the USE gate (Bar 4). Sensitivity says who may SEE a column; these say whether a visible
+    #    column may be USED to build a feature. See `_use_gate` for what each one reads. ──
+    PROTECTED_CHARACTERISTIC = "PROTECTED_CHARACTERISTIC"   # ECOA/GDPR-Art-9 class as an input
+    DESCRIPTIVE_OPERAND = "DESCRIPTIVE_OPERAND"             # a human-readable label as an operand/key
+    PERSONAL_DATA_POLICY_REQUIRED = "PERSONAL_DATA_POLICY_REQUIRED"   # PII input, no allow-policy
+    CURRENCY_POLICY_REQUIRED = "CURRENCY_POLICY_REQUIRED"   # amount + visible currency dim, unbound
+
+
+#: Every :class:`RejectCode` mapped to one of the four product families the UI renders, so a
+#: refusal is never a bare red badge (the no-blocked rule). The families are imported from the ONE
+#: place they are defined — a second vocabulary spelled the same way is a vocabulary that drifts.
+#:
+#:   undecided               — nobody has decided yet; a human action resolves it.
+#:   needs_data_check        — the metadata is settled; an observation of the DATA is outstanding.
+#:   structurally_unsuitable — the column/feature cannot answer this question, ever. No setting helps.
+#:   needs_setup             — an operator/governance artifact does not exist yet. Name it, don't
+#:                             blame the column.
+#:
+#: `_validate_idea` never emits an `undecided` refusal today (an undecided FACT becomes a
+#: requirement on a NEEDS_EXTERNAL_VALIDATION idea, not a rejection) — the family is listed for the
+#: loop-level codes below, which really are "nobody has decided which of these duplicates wins".
+_REFUSAL_FAMILIES: frozenset[str] = frozenset(
+    {UNDECIDED, NEEDS_DATA_CHECK, STRUCTURALLY_UNSUITABLE, NEEDS_SETUP})
+
+FEATURE_REFUSAL_FAMILIES: dict[str, str] = {
+    # Structural: the proposal does not describe a computable, authorized feature at all.
+    RejectCode.UNGROUNDED: STRUCTURALLY_UNSUITABLE,
+    RejectCode.MALFORMED_ITEM: STRUCTURALLY_UNSUITABLE,
+    RejectCode.AMBIGUOUS_CATALOG: STRUCTURALLY_UNSUITABLE,
+    RejectCode.UNKNOWN_COLUMN: STRUCTURALLY_UNSUITABLE,
+    RejectCode.LEAKAGE: STRUCTURALLY_UNSUITABLE,
+    RejectCode.NON_NUMERIC: STRUCTURALLY_UNSUITABLE,
+    RejectCode.NO_JOIN_PATH: STRUCTURALLY_UNSUITABLE,
+    RejectCode.PROTECTED_CHARACTERISTIC: STRUCTURALLY_UNSUITABLE,
+    RejectCode.DESCRIPTIVE_OPERAND: STRUCTURALLY_UNSUITABLE,
+    # The declared metadata CONTRADICTS itself or the operation; only a look at the data (or a
+    # correction to the declaration) settles it.
+    RejectCode.ADDITIVITY: NEEDS_DATA_CHECK,
+    RejectCode.MIXED_UNITS: NEEDS_DATA_CHECK,
+    RejectCode.MIXED_CURRENCY: NEEDS_DATA_CHECK,
+    RejectCode.NO_POINT_IN_TIME: NEEDS_DATA_CHECK,
+    RejectCode.STALE: NEEDS_DATA_CHECK,
+    # Something an operator or a governance owner has to create/grant. Not the column's fault.
+    RejectCode.JOIN_DENIED: NEEDS_SETUP,
+    RejectCode.PERSONAL_DATA_POLICY_REQUIRED: NEEDS_SETUP,
+    RejectCode.CURRENCY_POLICY_REQUIRED: NEEDS_SETUP,
+    RejectCode.CONTEXT_TOO_LARGE: NEEDS_SETUP,
+    # Nobody has decided which of these near-identical candidates is the one to keep.
+    RejectCode.REDUNDANT: UNDECIDED,
+    RejectCode.ALREADY_REGISTERED: UNDECIDED,
+    RejectCode.CRITIC: UNDECIDED,
+    RejectCode.NO_REVISION: UNDECIDED,
+}
+
+
+def _validate_refusal_families() -> None:
+    """Every code in the closed vocabulary declares a family, and every family is a real one.
+
+    Import-time, so a code added without a family is a startup failure rather than a bare red badge
+    discovered by a user. This is the mechanical half of the no-blocked rule.
+    """
+    codes = {v for k, v in vars(RejectCode).items()
+             if not k.startswith("_") and isinstance(v, str)}
+    missing = codes - set(FEATURE_REFUSAL_FAMILIES)
+    if missing:
+        raise ValueError(f"RejectCode members with no product family: {sorted(missing)}")
+    unknown = set(FEATURE_REFUSAL_FAMILIES) - codes
+    if unknown:
+        raise ValueError(f"FEATURE_REFUSAL_FAMILIES names non-codes: {sorted(unknown)}")
+    bad = {c: f for c, f in FEATURE_REFUSAL_FAMILIES.items() if f not in _REFUSAL_FAMILIES}
+    if bad:
+        raise ValueError(f"unknown refusal families: {bad}")
+
+
+_validate_refusal_families()
+
+
+def refusal_family(code: str) -> str:
+    """The product family for a refusal code, or the LOUD sentinel for one this build cannot read.
+
+    Defaulting to `undecided` would tell a reader "somebody is still deciding" about a refusal we
+    cannot classify — a claim that may simply be false. `explain.UNMAPPED` is the same choice the
+    selection renderer already made, for the same reason.
+    """
+    return FEATURE_REFUSAL_FAMILIES.get(code, UNMAPPED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,16 +897,21 @@ class FeatureIdea:
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
     """Additivity/catalog for each (catalog_source, object_ref) pair — scoped to the EXACT pair, so a
     same-named column in another catalog cannot contaminate the reading (M3), and a fabricated pair is
-    simply absent from the result (used for the M4 existence check)."""
+    simply absent from the result (used for the M4 existence check).
+
+    `concept` and `table_name` ride along for the USE gate (`_use_gate`). They come off the SAME
+    already-scoped row rather than a second query, for the reason `_candidate_columns` states about
+    its own table join: a second fetch is a second chance to read a different catalog's column."""
     if not pairs:
         return {}
     refs = [ref for _, ref in pairs]
     rows = conn.execute(
-        "SELECT catalog_source, object_ref, additivity, unit, currency FROM graph_node "
-        "WHERE kind = 'column' AND object_ref = ANY(%s)", (refs,)).fetchall()
+        "SELECT catalog_source, object_ref, additivity, unit, currency, concept, table_name "
+        "FROM graph_node WHERE kind = 'column' AND object_ref = ANY(%s)", (refs,)).fetchall()
     wanted = set(pairs)
-    return {ref: {"catalog_source": cs, "additivity": add, "unit": unit, "currency": cur}
-            for cs, ref, add, unit, cur in rows if (cs, ref) in wanted}
+    return {ref: {"catalog_source": cs, "additivity": add, "unit": unit, "currency": cur,
+                  "concept": concept, "table_name": table}
+            for cs, ref, add, unit, cur, concept, table in rows if (cs, ref) in wanted}
 
 
 # Aggregation words that REQUIRE a numeric measure (ratio/mean/sum/…); count/count_distinct do not.
@@ -898,6 +1002,144 @@ def _ai_suggestion(conn, logical_ref: str, field_name: str) -> str | None:
     return next(iter(values))[:_MAX_SUGGESTION_LEN]
 
 
+FEATURE_USE_GATE_FLAG = "FEATUREGEN_FEATURE_USE_GATE"
+_FLAG_OFF = frozenset({"0", "false", "no", "off"})
+
+
+def feature_use_gate_enabled() -> bool:
+    """The USE gate ships ON. The flag exists to DISABLE it, never to enable it.
+
+    Every other flag in this module defaults OFF because it widens behaviour, and a widening that
+    nobody asked for is a surprise. This one NARROWS: it closes the Release-A finding that a
+    visible PII column, a protected characteristic, a currency-blind amount and a free-text label
+    were all accepted as DESIGN_CHECKED with zero requirements. Default-off would have shipped the
+    hole with a switch beside it, so the default is on and the escape hatch is explicit.
+    """
+    return os.environ.get(FEATURE_USE_GATE_FLAG, "1").strip().lower() not in _FLAG_OFF
+
+
+def _denomination_siblings(conn, tables: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """(catalog_source, table) -> the object_ref of a currency-dimension column ON that table.
+
+    "The currency column exists on the same table" is the fact that makes a currency-blind amount a
+    refusal rather than an unanswerable question: the platform can SEE the denomination and the
+    feature dropped it, and the refusal can name the exact column that fixes it. Concept-driven —
+    :func:`concepts.denomination_concepts` decides what a currency column IS, never a column name.
+    Deterministic pick (lowest object_ref) so the refusal text is stable across runs.
+    """
+    if not tables:
+        return {}
+    sources = [src for src, _table in tables]
+    names = [table for _src, table in tables]
+    rows = conn.execute(
+        "SELECT catalog_source, table_name, min(object_ref) FROM graph_node "
+        "WHERE kind = 'column' AND concept = ANY(%s) "
+        "AND (catalog_source, table_name) IN (SELECT * FROM unnest(%s::text[], %s::text[])) "
+        "GROUP BY catalog_source, table_name",
+        (sorted(denomination_concepts()), sources, names)).fetchall()
+    return {(src, table): ref for src, table, ref in rows}
+
+
+def _use_gate(conn, pairs: list[tuple[str, str]],
+              meta: dict[str, dict]) -> Rejection | None:
+    """May a feature be BUILT from these operands? Four refusals, or None.
+
+    THE FINDING THIS CLOSES (Release-A evaluation, 2026-08-03). ``sensitivity`` controls who may SEE
+    a column and nothing controlled whether a visible column may be USED. Of five unsafe gold
+    classes the platform refused exactly one — target leakage. This is the other four.
+
+    WHAT IT READS. The concept REGISTRY (:mod:`concepts`) and the column's own governed currency
+    fact. Never a column name: ``sol_desc`` is refused because its concept is ``branch_name`` and
+    the registry marks that concept descriptive, and a column called ``customer_description`` whose
+    concept is ``customer_id`` is NOT refused. An operand with no concept at all is not refused by
+    this gate — absence is not an assertion, and the ungoverned-catalog case must keep working.
+
+    WHY A CONCEPT MAY DRIVE THIS WHEN IT MAY NOT DRIVE THE UNIT CHECK. The unit/currency narrowing
+    a few blocks down refuses to read concepts, and says so loudly: one wrong AI-proposed concept
+    would CLEAR a real dollars-vs-fils mismatch. The direction is the whole difference. Here a
+    concept can only ADD a refusal, never remove one — a wrong concept costs a false refusal that a
+    human corrects by fixing the concept, where a wrong concept there would cost a silent wrong
+    number. Tightening on an AI proposal is safe; clearing on one is not.
+
+    WHY IT IS NOT ``visible_requires``. That column answers "who may see this", which is exactly
+    the question the finding says was mistaken for this one. Reading it here would re-fuse the two
+    axes the gate exists to separate — and would make the refusal depend on the CALLER's roles,
+    so the same feature would be safe for one reviewer and unsafe for another.
+
+    ORDER. Structurally-unsuitable classes first, then the ones a policy could license, then
+    operands in the order the model proposed them. Deterministic, and it means a candidate that is
+    both PII and a protected characteristic reports the refusal no policy can ever lift.
+    """
+    if not feature_use_gate_enabled():
+        return None
+
+    # ── class 2 — a protected characteristic as an operand or a grouping key. structurally_
+    #    unsuitable: ECOA/fair-lending and GDPR Article 9 have no "allow" switch, so there is no
+    #    setup step to name and the wording must not imply one. ──
+    for _src, ref in pairs:
+        concept_name = meta.get(ref, {}).get("concept")
+        if is_protected_characteristic(concept_name):
+            return Rejection(
+                RejectCode.PROTECTED_CHARACTERISTIC,
+                f"{ref} is a protected characteristic ({concept_name}) and cannot be a model "
+                f"input or a grouping key. No approval makes it one — use a legitimate business "
+                f"driver instead, or correct the concept if this column is not one")
+
+    # ── class 4 — a human-readable label as an operand or a join key. structurally_unsuitable:
+    #    two catalogs' branch names are text that may coincide, not a shared identifier, and no
+    #    setting makes prose computable. The registry already said this in every such concept's
+    #    description; `descriptive` is that sentence as a field. ──
+    for _src, ref in pairs:
+        concept_name = meta.get(ref, {}).get("concept")
+        if is_descriptive(concept_name):
+            return Rejection(
+                RejectCode.DESCRIPTIVE_OPERAND,
+                f"{ref} is a descriptive label ({concept_name}), not a computable value — it "
+                f"displays and groups but can never be a measure or a join key. Use the CODE "
+                f"column beside it")
+
+    # ── class 1 — personal data as a model input. needs_setup: a lawful-basis / purpose policy
+    #    COULD license this (AML use of a sanctions or PEP signal is the standing example), and no
+    #    such policy surface exists yet. So the refusal names the missing artifact rather than
+    #    blaming the column, and it must not read as "this is forbidden forever". ──
+    for _src, ref in pairs:
+        concept_name = meta.get(ref, {}).get("concept")
+        if is_personal_data(concept_name):
+            return Rejection(
+                RejectCode.PERSONAL_DATA_POLICY_REQUIRED,
+                f"{ref} is personal data ({concept_name}) and this catalog declares no "
+                f"personal-data use policy, so nothing authorizes it as a model input. A "
+                f"governance owner must declare one (lawful basis + purpose) before this feature "
+                f"can be built")
+
+    # ── class 3 — a currency-carrying amount whose denomination is neither declared on the column
+    #    nor bound as an operand, while the currency column sits on the SAME table. needs_setup:
+    #    the fix is a decision (bind the dimension, or declare a conversion policy), and the
+    #    refusal names the exact column that supplies it. ──
+    bound = {ref for _src, ref in pairs}
+    amounts = [(src, ref) for src, ref in pairs
+               if carries_currency(meta.get(ref, {}).get("concept"))
+               and not meta.get(ref, {}).get("currency")]
+    if amounts:
+        siblings = _denomination_siblings(
+            conn, {(src, meta[ref]["table_name"]) for src, ref in amounts
+                   if meta.get(ref, {}).get("table_name")})
+        for src, ref in amounts:
+            dimension = siblings.get((src, meta[ref]["table_name"]))
+            if dimension is None or dimension in bound:
+                # Either the platform cannot see a currency dimension at all (the existing
+                # MIXED_CURRENCY / CURRENCY_CONSISTENT machinery owns that case and nothing here
+                # can name a fix), or the feature already binds it — which is the safe shape.
+                continue
+            return Rejection(
+                RejectCode.CURRENCY_POLICY_REQUIRED,
+                f"{ref} carries no declared currency and the feature does not bind {dimension}, "
+                f"the currency dimension on its own table — the result would silently mix "
+                f"currencies. Bind that column, declare the column's currency, or record a "
+                f"conversion policy")
+    return None
+
+
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
                    target_ref: str | None, now: datetime | None, fresh_within: timedelta,
                    *, roles: Iterable[str] = (),
@@ -932,6 +1174,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             wm = drift_watermark(conn, src)
             if wm is None or wm < now - fresh_within:
                 return None, Rejection(RejectCode.STALE, f"stale source: {src}")
+
+    # ── the USE gate (Bar 4). Sensitivity decided who may SEE these operands; this decides whether
+    #    the feature may be BUILT from them. Placed with the other hard rejects, AFTER leakage and
+    #    freshness — a leaky or stale candidate is refused for the reason it has always been
+    #    refused, so no existing rejection changes code — and BEFORE any requirement is minted,
+    #    because a refused feature must never reach the tri-state at all. ──
+    use_rejection = _use_gate(conn, pairs, meta)
+    if use_rejection is not None:
+        return None, use_rejection
 
     # C2-C3: every requirement below is minted through the SANCTIONED, registry-validated factory
     # (validation_requirements.build_requirement) — the deterministic code picks code + typed params

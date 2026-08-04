@@ -236,18 +236,38 @@ def test_bar_zero_unsafe_gold_features_accepted_leakage_class(db) -> None:
     assert unsafe_accepted(gens) == [], [g.name for g in unsafe_accepted(gens)]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "RELEASE-A FINDING, not a flaky test. Measured 2026-08-03: of the five unsafe gold classes the "
-    "platform refuses exactly ONE — target leakage. It accepts as DESIGN_CHECKED with zero "
-    "requirements: a PII column (cust_dob), a protected characteristic (cust_ctzn_ctry_cd), a "
-    "currency-blind sum of a monetary flow whose currency column sits on the same table, and a "
-    "free-text description used as a join key. Sensitivity gates VISIBILITY (read scope worked "
-    "correctly — the columns were visible because the caller held pii_reader/restricted_reader) "
-    "and does not gate USE. No Release-A task owns that gate, so this is recorded for the Gate-A "
-    "approver rather than silently weakened. strict=True: the day the gate lands, THIS test fails "
-    "and someone must promote it to a real bar."))
+#: Which refusal each unsafe gold case must draw. A count of five refusals is not the bar — five
+#: refusals for five DIFFERENT reasons is, because a gate that refused everything with one code
+#: (or refused the currency case for being stale) would satisfy a bare zero and mean nothing.
+_EXPECTED_REFUSAL: dict[str, str] = {
+    "leak_sar_outcome": "LEAKAGE",
+    "leak_protected_attribute": "PROTECTED_CHARACTERISTIC",
+    "leak_pii_direct": "PERSONAL_DATA_POLICY_REQUIRED",
+    "unsafe_currency_sum": "CURRENCY_POLICY_REQUIRED",
+    "unsafe_description_join": "DESCRIPTIVE_OPERAND",
+}
+
+
 def test_bar_zero_unsafe_gold_features_accepted(db) -> None:
-    """The full bar as the plans state it: no unsafe gold feature is accepted."""
+    """The full bar as the plans state it: no unsafe gold feature is accepted.
+
+    WAS A STRICT XFAIL until the USE gate landed. The Release-A evaluation measured (2026-08-03)
+    that of the five unsafe gold classes the platform refused exactly ONE — target leakage — and
+    accepted the other four as DESIGN_CHECKED with zero requirements: a PII column (`cust_dob`), a
+    protected characteristic (`cust_ctzn_ctry_cd`), a currency-blind aggregate of a monetary flow
+    whose currency column sits on the same table, and a free-text description used as a join key.
+    Sensitivity gated VISIBILITY correctly — those columns were visible precisely because the
+    caller held `pii_reader`/`restricted_reader` — and nothing gated USE.
+    `feature_assist._use_gate` is that gate; this is the bar it has to hold.
+
+    Three things are asserted, not one:
+
+    * the safe controls are still ACCEPTED, or "refuse everything" would read as a pass;
+    * no unsafe case is accepted;
+    * each unsafe case draws ITS OWN refusal code. Five refusals under one code would be a gate
+      that cannot tell a protected characteristic from a missing currency policy, and the bar
+      would pass on it.
+    """
     report = _propose_gold_features(db)
     accepted = {idea.name for idea in report.ideas}
     unsafe_names = {c["name"] for c in sg.unsafe_feature_cases() if c["unsafe"]}
@@ -258,6 +278,19 @@ def test_bar_zero_unsafe_gold_features_accepted(db) -> None:
         f"rejections={report.rejections}) — a zero below would be vacuous")
     assert accepted & unsafe_names == set(), (
         f"unsafe gold features accepted: {sorted(accepted & unsafe_names)}")
+
+    by_name = {r["name"]: r["code"] for r in report.rejections}
+    for case in sg.unsafe_feature_cases():
+        if not case["unsafe"]:
+            continue
+        expected = _EXPECTED_REFUSAL[case["id"]]
+        assert by_name.get(case["name"]) == expected, (
+            f"{case['name']} ({case['why']}) was refused as {by_name.get(case['name'])!r}, "
+            f"expected {expected!r} — the gate refused it for the wrong reason, so the wording "
+            f"the reviewer reads is about something else")
+    assert len(set(_EXPECTED_REFUSAL.values())) == len(_EXPECTED_REFUSAL), (
+        "two unsafe classes share a refusal code; this bar would then pass on a gate that cannot "
+        "tell them apart")
 
 
 def _flat(ref: str) -> str:
