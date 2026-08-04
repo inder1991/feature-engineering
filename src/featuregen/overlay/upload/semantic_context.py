@@ -410,6 +410,61 @@ class DirectionalRealizationContextV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CrosswalkDirectionContextV1:
+    """One NAMED direction's measured state (Release C Task 11).
+
+    The two directions are SIDES of the canonically-ordered definition, never traversal order, and
+    they are independent: a crosswalk that is 1:1 forward and N:1 in reverse is ordinary, and a
+    surface that showed one verdict for the pair would either hide a usable direction or imply an
+    unusable one.
+
+    `safety_status` here is a MEASURED conclusion, not a fabrication: it exists only when an
+    admission decision has been taken against a real observation. `production_admissible` is the
+    pure predicate and labels history; it is NOT "executable now" — nothing on this tree can be, and
+    :attr:`CrosswalkContextV1.executable_now` says so in one place."""
+
+    direction: str
+    safety_status: str
+    cardinality: str | None
+    sandbox_admissible: bool
+    production_admissible: bool
+    reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.production_admissible and not self.sandbox_admissible:
+            raise SemanticContextError("production admissibility implies sandbox admissibility")
+        if self.production_admissible and self.safety_status != "deterministically_validated":
+            raise SemanticContextError(
+                "production_admissible requires deterministic validation — review or a stale "
+                "projection can never substitute (D3)")
+
+
+@dataclass(frozen=True, slots=True)
+class CrosswalkMeasurementContextV1:
+    """What the CURRENT composed measurement of a crosswalk found (Release C Task 11).
+
+    Absent (`None` on the extension) means DISCOVERABLE, UNMEASURED — a state, never a failure and
+    never a refusal. The no-blocked rule applies verbatim: "nobody has measured this yet" and "this
+    cannot work" are different answers and must not render alike."""
+
+    observation_revision_id: str
+    scope_id: str
+    observed_at: str
+    as_of: str | None
+    method: str
+    row_coverage: str
+    complete: bool
+    composed_row_count: int
+    source_to_target_max_matches: int
+    target_to_source_max_matches: int
+    mapping_row_count: int
+    mapping_temporal_policy_revision_id: str | None
+    #: The CLOSED caveat vocabulary — what the numbers do not answer. Shown, never swallowed.
+    caveats: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class CrosswalkContextV1:
     """The D3 ADDITIVE crosswalk extension (Release C Task 10).
 
@@ -430,6 +485,12 @@ class CrosswalkContextV1:
     mapping_to_target_refs: tuple[str, ...]
     mapping_temporal_policy_revision_id: str | None = None
     leg_pins: tuple[JoinLegPinV1, ...] = ()
+    #: Release C Task 11. `None` is "discoverable, unmeasured" — a state, not a failure.
+    measurement: CrosswalkMeasurementContextV1 | None = None
+    #: Exactly two when a measurement has been admitted, empty otherwise. Never one: a single
+    #: direction on a two-direction record reads as a verdict about the pair.
+    directions: tuple[CrosswalkDirectionContextV1, ...] = ()
+    admission_policy_version: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("definition_id", "definition_revision_id", "mapping_dataset_ref"):
@@ -438,6 +499,28 @@ class CrosswalkContextV1:
         if not self.source_to_mapping_refs or not self.mapping_to_target_refs:
             raise SemanticContextError(
                 "a crosswalk context names both legs; one leg alone is the 'omit one leg' mutation")
+        if len(self.directions) not in (0, 2):
+            raise SemanticContextError(
+                "a crosswalk carries BOTH named directions or neither; one alone would read as a "
+                "verdict about the pair, which is the 'invert cardinality' mutation's neighbour")
+        if self.directions and len({d.direction for d in self.directions}) != 2:
+            raise SemanticContextError(
+                "the two crosswalk directions must be distinct sides, not one side twice")
+
+    @property
+    def measured(self) -> bool:
+        return self.measurement is not None
+
+    @property
+    def executable_now(self) -> bool:
+        """ALWAYS FALSE on this tree, and stated in ONE place rather than inferred at each surface.
+
+        Task 12 wires compilation and execution; until it does, no crosswalk can run whatever its
+        measurement, its admission verdicts or its review status say. A surface that derived this
+        from `production_admissible` would be reading a pure predicate about history as a live
+        capability — the exact D3 error the bridge family's `executable_bridge_realizations` reader
+        exists to prevent."""
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,7 +881,41 @@ def relationship_context_from_link(
     )
 
 
-def relationship_context_from_crosswalk(current) -> RelationshipContextV1:
+def crosswalk_measurement_context(observation) -> CrosswalkMeasurementContextV1:
+    """Project one `CrosswalkExecutionObservationV1` for display. Numbers only, never a verdict."""
+    return CrosswalkMeasurementContextV1(
+        observation_revision_id=observation.observation_revision_id,
+        scope_id=observation.scope_id,
+        observed_at=observation.observed_at.isoformat(),
+        as_of=observation.as_of,
+        method=observation.method,
+        row_coverage=observation.row_coverage.value,
+        complete=observation.complete,
+        composed_row_count=observation.composed_row_count,
+        source_to_target_max_matches=observation.source_to_target_max_matches,
+        target_to_source_max_matches=observation.target_to_source_max_matches,
+        mapping_row_count=observation.mapping.row_count,
+        mapping_temporal_policy_revision_id=observation.mapping_temporal_policy_revision_id,
+        caveats=tuple(observation.caveats),
+        failures=tuple(observation.failures))
+
+
+def crosswalk_direction_contexts(decision) -> tuple[CrosswalkDirectionContextV1, ...]:
+    """Project both directions of one `CrosswalkAdmissionDecisionV1`. Always two, never one."""
+    return tuple(
+        CrosswalkDirectionContextV1(
+            direction=verdict.direction,
+            safety_status=verdict.safety_status.value,
+            cardinality=(verdict.cardinality.value.value
+                         if verdict.cardinality.value is not None else None),
+            sandbox_admissible=verdict.sandbox_admissible,
+            production_admissible=verdict.production_admissible,
+            reason_codes=tuple(verdict.reason_codes))
+        for verdict in (decision.forward, decision.reverse))
+
+
+def relationship_context_from_crosswalk(current, *, observation=None,
+                                        decision=None) -> RelationshipContextV1:
     """Project one CURRENT crosswalk (`crosswalk_store.CurrentCrosswalkV1`) into the D3 shape.
 
     Three things this projection refuses to do, each of them a way the surface could lie:
@@ -814,7 +931,12 @@ def relationship_context_from_crosswalk(current) -> RelationshipContextV1:
     The authority triple is the discovery's honest axis: a candidate derived from the table role
     plus the identifier namespaces is `producer=taxonomy`; one that exists only because an LLM
     suggested it is `producer=llm`. A crosswalk nobody has reviewed is a usable discovery in the
-    PROPOSED state, never a failure."""
+    PROPOSED state, never a failure.
+
+    RELEASE C TASK 11: `observation` and `decision` are OPTIONAL, and their absence is the honest
+    "discoverable, unmeasured" state rather than a gap. When supplied they add measured numbers and
+    per-direction verdicts — and still nothing that could be read as "this can run": `executable_now`
+    stays False on the extension, in one place, until Task 12 wires execution."""
     from featuregen.overlay.upload.bridge_assessment import EvidenceKind
 
     revision = current.revision
@@ -845,6 +967,10 @@ def relationship_context_from_crosswalk(current) -> RelationshipContextV1:
             mapping_to_target_refs=tuple(
                 pair.mapping_member_ref for pair in revision.mapping_to_target_pairs),
             mapping_temporal_policy_revision_id=revision.mapping_temporal_policy_revision_id,
+            measurement=(None if observation is None
+                         else crosswalk_measurement_context(observation)),
+            directions=(() if decision is None else crosswalk_direction_contexts(decision)),
+            admission_policy_version=(None if decision is None else decision.policy_version),
         ),
     )
 

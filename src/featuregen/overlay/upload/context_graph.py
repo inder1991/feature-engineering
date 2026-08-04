@@ -180,6 +180,31 @@ def _executable_realization_ids(conn: DbConn, relationship_ref: str) -> frozense
     return frozenset(r.revision.realization_revision_id for r in realizations)
 
 
+def _crosswalk_measurement_payload(measurement) -> dict[str, object]:
+    """The measured numbers, with their caveats. NEVER a verdict — verdicts are per direction.
+
+    `caveats` rides on the same payload as the counts, deliberately: a reader who sees
+    "3 mapping rows, 1:1" without "measured over unfiltered SCD history" has been told something
+    true and understood something false."""
+    return {
+        "observation_revision_id": measurement.observation_revision_id,
+        "scope_id": measurement.scope_id,
+        "observed_at": measurement.observed_at,
+        "as_of": measurement.as_of,
+        "method": measurement.method,
+        "row_coverage": measurement.row_coverage,
+        "complete": measurement.complete,
+        "composed_row_count": measurement.composed_row_count,
+        "source_to_target_max_matches": measurement.source_to_target_max_matches,
+        "target_to_source_max_matches": measurement.target_to_source_max_matches,
+        "mapping_row_count": measurement.mapping_row_count,
+        "mapping_temporal_policy_revision_id":
+            measurement.mapping_temporal_policy_revision_id,
+        "caveats": list(measurement.caveats),
+        "failures": list(measurement.failures),
+    }
+
+
 def _relationship_dict(conn: DbConn, link: RelationshipContextV1) -> dict:
     """One link, projected with availability, review and deterministic safety kept SEPARATE.
 
@@ -197,9 +222,24 @@ def _relationship_dict(conn: DbConn, link: RelationshipContextV1) -> dict:
         "mapping_to_target_refs": list(link.crosswalk.mapping_to_target_refs),
         "mapping_temporal_policy_revision_id":
             link.crosswalk.mapping_temporal_policy_revision_id,
-        # EMPTY at discovery, by contract: a leg is pinned by resolving it (Task 11), and nothing
-        # in this release resolves anything.
+        # EMPTY at discovery, by contract: a leg is pinned by RESOLVING it, which admission does.
         "leg_pins": [pin.identity_payload() for pin in link.crosswalk.leg_pins],
+        # RELEASE C TASK 11. `null` measurement is "discoverable, unmeasured" — a state, never a
+        # failure — and `directions` is empty until an admission decision has been taken against a
+        # real measurement. Both are rendered as what they are; neither is ever inferred from the
+        # other, and neither makes the crosswalk runnable.
+        "measurement": (None if link.crosswalk.measurement is None
+                        else _crosswalk_measurement_payload(link.crosswalk.measurement)),
+        "directions": [
+            {"direction": d.direction, "safety_status": d.safety_status,
+             "cardinality": d.cardinality, "sandbox_admissible": d.sandbox_admissible,
+             "production_admissible": d.production_admissible,
+             "reason_codes": list(d.reason_codes)}
+            for d in link.crosswalk.directions],
+        "admission_policy_version": link.crosswalk.admission_policy_version,
+        # STILL FALSE, always, and read from the extension's single source rather than derived here:
+        # Task 12 wires compilation and execution, and no measurement or verdict substitutes.
+        "executable_now": link.crosswalk.executable_now,
     }
     return {
         "relationship_ref": link.relationship_ref,

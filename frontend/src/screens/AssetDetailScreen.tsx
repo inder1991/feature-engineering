@@ -1074,6 +1074,41 @@ function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
           Running a crosswalk is not available yet, whatever its review says.
         </p>
       )}
+      {link.crosswalk && (
+        // MEASUREMENT AND ADMISSION (Release C Task 11). Unmeasured is a STATE, described as
+        // "discoverable, unmeasured" and never as a failure or a blocker. When it HAS been
+        // measured, both directions appear with their own verdict — showing one would read as a
+        // verdict about the pair, and a 1:1 forward with an N:1 reverse is ordinary.
+        <p className="hint" data-testid={`crosswalk-measurement-${link.relationship_ref}`}>
+          {!link.crosswalk.measurement ? (
+            <>Discoverable, unmeasured — nobody has profiled this mapping yet.</>
+          ) : (
+            <>
+              Measured {link.crosswalk.measurement.observed_at.slice(0, 10)} ·{' '}
+              {link.crosswalk.measurement.method} /{' '}
+              {link.crosswalk.measurement.row_coverage} ·{' '}
+              {link.crosswalk.measurement.composed_row_count} joined rows over{' '}
+              {link.crosswalk.measurement.mapping_row_count} mapping rows.{' '}
+              {(link.crosswalk.directions ?? []).map(d => (
+                <span key={d.direction} className="badge" title={d.reason_codes.join(', ')}>
+                  {humanizeCode(d.direction)}: {d.cardinality ?? 'cardinality unknown'} ·{' '}
+                  {d.production_admissible
+                    ? 'production admissible'
+                    : d.sandbox_admissible
+                      ? 'sandbox only'
+                      : 'refused'}
+                </span>
+              ))}{' '}
+              {/* Caveats are never swallowed: they say which question the numbers do not answer. */}
+              {link.crosswalk.measurement.caveats.map(code => (
+                <span key={code} className="badge" title="what this measurement does not answer">
+                  {humanizeCode(code)}
+                </span>
+              ))}
+            </>
+          )}
+        </p>
+      )}
       {link.realizations.length > 0 && (
         <ul className="rows">
           {link.realizations.map(r => (

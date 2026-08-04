@@ -250,6 +250,59 @@ it('a CONFIRMED crosswalk is still not runnable, and says so in the same breath'
   expect(detail).not.toHaveTextContent(/blocked|failed|invalid|error/i)
 })
 
+it('an unmeasured crosswalk reads as discoverable-unmeasured, never as a blocker', async () => {
+  // Release C Task 11. "Nobody has profiled this yet" and "this cannot work" are different
+  // answers, and the no-blocked rule says the first must never wear the second's clothes.
+  await openContext(contextFixture({ relationships: [crosswalkRelationship()] }))
+  const measured = screen.getByTestId('crosswalk-measurement-cwd_1')
+  expect(measured).toHaveTextContent(/discoverable, unmeasured/i)
+  expect(measured).not.toHaveTextContent(/blocked|failed|invalid|error|unavailable/i)
+})
+
+it('a measured crosswalk shows BOTH directions, which may disagree', async () => {
+  // The headline shape: 1:1 forward, N:1 reverse. Rendering one verdict for the pair would either
+  // hide the usable direction or imply the unusable one is fine.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        definition_id: 'cwd_1', definition_revision_id: 'cwd_2',
+        mapping_dataset_ref: 'deposits::public.acct_xref',
+        source_to_mapping_refs: ['deposits::public.acct_xref.acct_no'],
+        mapping_to_target_refs: ['deposits::public.acct_xref.cif_id'],
+        mapping_temporal_policy_revision_id: null, leg_pins: [],
+        executable_now: false,
+        admission_policy_version: 'crosswalk-admission-v1:abc',
+        measurement: {
+          observation_revision_id: 'cwo_1', scope_id: 'sandbox', observed_at: '2026-08-04T13:00:00Z',
+          as_of: '2026-08-04', method: 'exact', row_coverage: 'full', complete: true,
+          composed_row_count: 7, source_to_target_max_matches: 1, target_to_source_max_matches: 2,
+          mapping_row_count: 3, mapping_temporal_policy_revision_id: null,
+          caveats: ['mapping_temporal_policy_absent'], failures: [],
+        },
+        directions: [
+          { direction: 'source_to_target', safety_status: 'deterministically_validated',
+            cardinality: 'many_to_one', sandbox_admissible: true, production_admissible: true,
+            reason_codes: ['deterministic_crosswalk_policy_satisfied'] },
+          { direction: 'target_to_source', safety_status: 'unsafe', cardinality: 'one_to_many',
+            sandbox_admissible: false, production_admissible: false,
+            reason_codes: ['directional_crosswalk_fanout'] },
+        ],
+      },
+    })],
+  }))
+  const measured = screen.getByTestId('crosswalk-measurement-cwd_1')
+  expect(measured).toHaveTextContent(/7 joined rows over 3 mapping rows/i)
+  expect(measured).toHaveTextContent(/source to target/i)
+  expect(measured).toHaveTextContent(/target to source/i)
+  expect(measured).toHaveTextContent(/production admissible/i)
+  expect(measured).toHaveTextContent(/refused/i)
+  // The caveat is SHOWN, never swallowed: the counts alone would read as a claim about now.
+  expect(measured).toHaveTextContent(/mapping temporal policy absent/i)
+  // And admission never makes it runnable.
+  const cross = screen.getByTestId('context-link-cwd_1')
+  expect(within(cross).getByText('not executable now')).toBeInTheDocument()
+})
+
 it('says no link is in view rather than asserting none exists', async () => {
   await openContext(contextFixture())
   expect(screen.getByTestId('context-links')).toHaveTextContent(/no cross-catalog link is in view/i)
