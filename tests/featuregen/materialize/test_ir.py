@@ -65,6 +65,7 @@ from featuregen.materialize.ir import (
     authorize_compilation,
     compile_ir,
     ir_hash,
+    physical_read_set,
 )
 from featuregen.materialize.spine import (
     CurrentSnapshot,
@@ -611,15 +612,40 @@ def test_a_read_scope_tag_in_ANOTHER_CATALOG_does_not_deny_this_group(catalog):
 
 
 def test_the_union_covers_the_spine_SOURCE_TABLE_node(catalog):
-    """The table node carries its own read-scope tag, and the population's table is a read."""
+    """The population's TABLE is a read, and its scope is DERIVED from its columns (D11).
+
+    THE PRODUCTION SHAPE, deliberately. The earlier version of this test set
+    ``graph_node.sensitivity`` on the TABLE row and asserted the refusal — which passed, and proved
+    nothing that could ever happen: ``build_graph`` never writes sensitivity on a table node, so on
+    every real catalog a table row's ``visible_requires`` is ``'{}'`` and the table half of Gate 2
+    passed for everybody, always. Here the restriction is put where a catalog actually carries it —
+    on the COLUMNS — and the spine source is hidden because the caller can see none of them, which
+    is ``read_scope.anchor_visibility_predicate``'s rule and the one five other surfaces use.
+    """
     ir = _ok(_compile(catalog, PUBLIC_FEATURE))
-    catalog.execute(
-        "UPDATE graph_node SET sensitivity = 'restricted' WHERE catalog_source = %s "
-        "AND object_ref = %s AND kind = 'table'", (_SRC, "public.customers"))
+    assert CUSTOMERS in physical_read_set((ir,), ir.spine)
+    for column in ("cif_id", "load_ts", "status_cd", "effective_from", "version_seq"):
+        _floor(catalog, "customers", column, "restricted")
     refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
     assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
     assert CUSTOMERS in refused.detail
     assert ReadElementKind.SPINE_SOURCE.value in refused.detail
+
+
+def test_one_visible_column_is_enough_to_see_the_spine_source_table(catalog):
+    """The other half of D11's derived rule, so the test above cannot pass by hiding everything.
+
+    A caller who can see AT LEAST ONE of the table's columns sees the table anchor. The columns
+    they cannot see still refuse on their own account — which is why this asserts the TABLE ref is
+    absent from the refusal rather than asserting the group is authorized.
+    """
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _floor(catalog, "customers", "cif_id", "restricted")
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert CUSTOMERS_CIF in refused.detail
+    assert ReadElementKind.SPINE_SOURCE.value not in refused.detail
 
 
 def test_the_union_covers_every_JOIN_STEP_ENDPOINT(catalog):

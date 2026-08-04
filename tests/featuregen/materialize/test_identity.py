@@ -150,10 +150,11 @@ def _code_string_literals(module: types.ModuleType) -> set[str]:
 def test_the_compilation_identity_has_only_static_compilation_fields() -> None:
     """Pinned with `==`, not `<=`: a superset assertion would let `generated_project_hash` be added
     back tomorrow, which is precisely the circularity rev 3 shipped.  Exact directional bridge
-    dependencies are static compilation inputs and are the final revalidation handle."""
+    dependencies and crosswalk execution pins are static compilation inputs and are the final
+    revalidation handle."""
     assert {field.name for field in dataclasses.fields(CompilationIdentity)} == {
         "formula_content_hashes", "ir_hashes", "materialization_contract_hash", "group_plan_hash",
-        "bridge_realization_dependencies"}
+        "bridge_realization_dependencies", "crosswalk_execution_pins"}
 
 
 def test_the_rendered_identity_is_the_compilation_PLUS_the_project_hash() -> None:

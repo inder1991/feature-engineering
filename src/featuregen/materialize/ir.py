@@ -40,10 +40,19 @@ takes the token cannot be entered by a caller who skipped the gate.
 **Read scope is the shipped predicate over BOTH sensitivity axes (migration 1032).** Gate 2 checks
 ``graph_node.visible_requires`` — the GENERATED column folding the raw file tag AND the governed
 ``effective_restriction`` floor into the classes a reader must hold — against
-``allowed_classes(roles)``, via ``read_scope.visibility_predicate``. So a governed-``restricted``
-column whose file attested nothing refuses here, and a ``prohibited`` floor is ungrantable at this
-gate. §5.2 classification still owns the contract-time answer: it re-reads the catalog and refuses a
-``prohibited`` input with ``PROHIBITED_INPUT`` even for a group authorized before the ruling.
+``allowed_classes(roles)``, via ``read_scope.anchor_visibility_predicate``. So a governed-
+``restricted`` column whose file attested nothing refuses here, and a ``prohibited`` floor is
+ungrantable at this gate. §5.2 classification still owns the contract-time answer: it re-reads the
+catalog and refuses a ``prohibited`` input with ``PROHIBITED_INPUT`` even for a group authorized
+before the ruling.
+
+The ANCHOR predicate and not the plain column one, because this read set is not all columns: it
+carries the spine's own TABLE and every relation a traversal reads, and ``build_graph`` writes no
+sensitivity on a table node — so under the column predicate the table half of this gate passed for
+every caller on every real catalog. D11's derived rule (a table is visible iff the caller can see
+at least one of its columns) is the one that answers it, and it branches on ``graph_node.kind``
+itself, so ONE predicate covers both element kinds without minting a second rule here. See
+:func:`_hidden`.
 """
 from __future__ import annotations
 
@@ -70,21 +79,27 @@ from featuregen.materialize.expression_ir import (
     join_key_ref,
 )
 from featuregen.materialize.inventory import ClusterInventoryV1
-from featuregen.materialize.joins import CrossCatalogJoinStepV1
+from featuregen.materialize.joins import CrossCatalogJoinStepV1, CrosswalkJoinStepV1
 from featuregen.materialize.spine import (
     SpineSourceDeclarationV1,
     SpineSpec,
     validate_spine_declaration,
 )
-from featuregen.overlay.upload.bridge_realization import ExecutionTier
+from featuregen.overlay.upload.bridge_realization import (
+    AdditionalKeyRequirementV1,
+    AsOfIntervalRequirementV1,
+    ExecutionTier,
+    FixedValueReferencePredicateV1,
+)
 from featuregen.overlay.upload.bridge_store import (
     CurrentBridgeRealizationV1,
     executable_bridge_realizations,
     load_current_bridge_realizations,
     revalidate_bridge_realization,
 )
+from featuregen.overlay.upload.crosswalk_admission import AdmittedCrosswalkV1
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.read_scope import allowed_classes, visibility_predicate
+from featuregen.overlay.upload.read_scope import allowed_classes, anchor_visibility_predicate
 
 __all__ = [
     "AuthorizedCompilation",
@@ -95,6 +110,7 @@ __all__ = [
     "authorize_execution_realizations",
     "bridge_realization_dependencies",
     "compile_ir",
+    "crosswalk_execution_pins",
     "ir_hash",
     "physical_read_set",
 ]
@@ -110,6 +126,7 @@ class ReadElementKind(StrEnum):
 
     EXPRESSION_READ = "expression_read"   # an operand, a filter `left`, an event time, a grain key…
     JOIN_ENDPOINT = "join_endpoint"       # a column the governed traversal joins ON
+    JOIN_PREDICATE = "join_predicate"     # a column a step's own filter is applied to
     AVAILABILITY = "availability"         # the column the point-in-time gate is applied to
     SPINE_SOURCE = "spine_source"         # the population's own table
     SPINE_KEY = "spine_key"               # an ordered key of the population
@@ -271,6 +288,7 @@ def compile_ir(
     spine_decl: SpineSourceDeclarationV1 | None,
     inventory: ClusterInventoryV1,
     bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] | None = None,
+    crosswalks: tuple[AdmittedCrosswalkV1, ...] = (),
     execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
 ) -> FormulaExecutionIRV1 | MaterializationRefused:
     """Compile ONE admitted feature into its complete executable plan, or refuse it (§2).
@@ -331,7 +349,8 @@ def compile_ir(
     for expr_path, expr in body_expressions(formula.body):
         compiled = compile_expression(
             conn, expr_path=expr_path, expr=expr, grain_keys=formula.grain.keys, roles=roles_used,
-            inventory=inventory, bridge_realizations=bridge_realizations)
+            inventory=inventory, bridge_realizations=bridge_realizations,
+            crosswalks=crosswalks, execution_tier=execution_tier)
         if isinstance(compiled, MaterializationRefused):
             return compiled
         expressions.append(compiled)
@@ -364,14 +383,63 @@ def compile_ir(
 def bridge_realization_dependencies(
     irs: Sequence[FormulaExecutionIRV1],
 ) -> tuple[tuple[str, str], ...]:
-    dependencies = {
-        (step.realization_revision_id, step.dependency_snapshot_id)
+    """Every exact ``(realization_revision_id, dependency_snapshot_id)`` this group would execute.
+
+    A CROSSWALK leg contributes here too, and that is what extends the
+    :func:`authorize_execution_realizations` doctrine to crosswalk pins for free: a
+    ``JoinLegPinV1`` that resolved through a governed bridge realization pins that realization and
+    its dependency snapshot by side, so a leg whose current pointer moved between compilation and
+    run preparation is refused by exactly the check a direct bridge is refused by. A same-catalog
+    leg pins neither (``JoinLegPinV1`` refuses the pretence that every leg is an entity bridge) and
+    so contributes nothing — its staleness is caught by the row-selection and observation pins the
+    step carries instead.
+
+    The two tuples are paired POSITIONALLY, which is the pin's own contract:
+    ``dependency_snapshot_ids`` holds "one singular value per realization it pinned".
+    """
+    dependencies: set[tuple[str, str]] = set()
+    for ir in irs:
+        for expression in ir.expressions:
+            for step in expression.join_plan.steps:
+                if isinstance(step, CrossCatalogJoinStepV1):
+                    dependencies.add(
+                        (step.realization_revision_id, step.dependency_snapshot_id))
+                elif isinstance(step, CrosswalkJoinStepV1):
+                    dependencies.update(zip(
+                        step.leg_realization_revision_ids,
+                        step.leg_dependency_snapshot_ids,
+                        strict=True))
+    return tuple(sorted(dependencies))
+
+
+def crosswalk_execution_pins(
+    irs: Sequence[FormulaExecutionIRV1],
+) -> tuple[tuple[str, str, str, str, str], ...]:
+    """Every pinned crosswalk revision this group would execute, deduplicated and sorted.
+
+    One tuple per two-leg traversal, in the order
+    ``(execution, definition, mapping binding, mapping temporal policy, composed observation)``.
+    Both legs of one crosswalk carry the same five values (they are the execution-level pins, not
+    per-leg ones), so a two-step plan contributes one tuple rather than two.
+
+    A blank stands for a pin the crosswalk legitimately does not carry — a mapping table with no
+    declared temporal policy has no policy revision, and recording an empty string says that,
+    where omitting the slot would let a reader mistake it for a different pin's value.
+    """
+    pins = {
+        (
+            step.crosswalk_execution_revision_id,
+            step.crosswalk_definition_revision_id,
+            step.mapping_binding_revision_id,
+            step.mapping_temporal_policy_revision_id or "",
+            step.composed_observation_revision_id or "",
+        )
         for ir in irs
         for expression in ir.expressions
         for step in expression.join_plan.steps
-        if isinstance(step, CrossCatalogJoinStepV1)
+        if isinstance(step, CrosswalkJoinStepV1)
     }
-    return tuple(sorted(dependencies))
+    return tuple(sorted(pins))
 
 
 def authorize_execution_realizations(
@@ -489,6 +557,33 @@ def _catalog_of(expression: ExpressionExecutionIR) -> str | None:
     return None
 
 
+def _step_predicate_refs(step: Any) -> tuple[str, ...]:
+    """Every COLUMN a join step's own predicates are applied to, in the step's own address grammar.
+
+    The vocabularies are closed and owned elsewhere — ``bridge_realization``'s three structured
+    predicates and ``joins.MappingRowPredicateV1`` — so this reads them, it does not re-derive
+    them. An unknown member raises rather than returning nothing: silently authorizing no column
+    for a predicate this gate has never been taught is how a governance extension loses effect.
+    """
+    if isinstance(step, CrosswalkJoinStepV1):
+        return tuple(predicate.column_ref for predicate in step.mapping_row_predicates)
+    if not isinstance(step, CrossCatalogJoinStepV1):
+        return ()
+    refs: list[str] = []
+    for predicate in step.predicates:
+        if isinstance(predicate, FixedValueReferencePredicateV1):
+            refs.append(predicate.logical_column_ref)
+        elif isinstance(predicate, AsOfIntervalRequirementV1):
+            refs.extend((predicate.effective_from_ref, predicate.effective_to_ref))
+        elif isinstance(predicate, AdditionalKeyRequirementV1):
+            refs.extend((predicate.from_logical_column_ref, predicate.to_logical_column_ref))
+        else:  # pragma: no cover - the realization constructor closes the vocabulary
+            raise AssertionError(
+                f"unknown structured bridge predicate {type(predicate).__name__}: Gate 2 cannot "
+                f"authorize the columns of a predicate it has never been taught")
+    return tuple(refs)
+
+
 def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_ReadElement, ...]:
     """The COMPLETE physical read set of the group (§1.3), from every structural source there is."""
     union = _Union()
@@ -511,7 +606,14 @@ def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_R
                         f"assembled wrongly, and guessing a catalog would authorize nodes in one "
                         f"and read them in another")
                 for step in expression.join_plan.steps:
-                    if isinstance(step, CrossCatalogJoinStepV1):
+                    # ADDRESSED BY KIND, not by the expression's single catalog. A cross-catalog
+                    # step and a crosswalk leg carry FULL governed logical refs that name their own
+                    # catalog; qualifying those with `catalog_source` (the source relation's) would
+                    # authorize a node in one catalog while the run reads it in another — and a
+                    # crosswalk's second leg is precisely the case where the two differ, because
+                    # the mapping dataset and the target endpoint need not live where the source
+                    # relation does.
+                    if isinstance(step, CrossCatalogJoinStepV1 | CrosswalkJoinStepV1):
                         for pair in step.column_pairs:
                             for endpoint in pair:
                                 union.add(
@@ -522,6 +624,15 @@ def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_R
                         for endpoint in (step.from_ref, step.to_ref):
                             union.add(join_key_ref(catalog_source, endpoint),
                                       ReadElementKind.JOIN_ENDPOINT)
+                    # THE STEP'S PREDICATES ARE READS. A structured bridge predicate (a fixed
+                    # value, an as-of interval, an additional key) and a crosswalk's mapping row
+                    # rule are both applied on the cluster, so their columns are columns this group
+                    # reads. Task 6 folds them into the expression read set as well; §1.3 names
+                    # them here as their own element class for the same reason it names endpoints —
+                    # a gate that could only see them through one path would stop seeing them the
+                    # day that path changed.
+                    for predicate_ref in _step_predicate_refs(step):
+                        union.add(predicate_ref, ReadElementKind.JOIN_PREDICATE)
 
             # Every row this expression aggregates is admitted or excluded by the availability
             # column (§8 rule 1), so it is read whether or not anything else names it.
@@ -565,15 +676,28 @@ def _hidden(
 ) -> tuple[tuple[_ReadElement, ...], tuple[_ReadElement, ...]]:
     """``(hidden, missing)`` — what the read scope may not see, and what the catalog does not have.
 
-    The shipped read-scope rule, genuinely INHERITED rather than re-implemented: one predicate
-    (``read_scope.visibility_predicate``) over one parameter (``read_scope.allowed_classes``),
-    exactly as ``read_scope.py``'s module contract prescribes and as every other read-scope call
-    site binds it since migration 1032. ``visible_requires`` is the GENERATED column folding BOTH
-    axes — the raw file tag AND the governed ``effective_restriction`` floor — so a
-    governed-``restricted`` column whose file attested nothing (``sensitivity = NULL``, the shipped
-    FTR shape) refuses here instead of compiling for a caller with no reader role. An untagged,
-    unfloored node has ``visible_requires = '{}'``, contained in every allowed list, and stays
-    visible to everyone; ``prohibited`` appears in no role map and fails CLOSED for every caller.
+    The shipped read-scope rule, genuinely INHERITED rather than re-implemented: one predicate over
+    one parameter (``read_scope.allowed_classes``), exactly as ``read_scope.py``'s module contract
+    prescribes and as every other read-scope call site binds it since migration 1032.
+    ``visible_requires`` is the GENERATED column folding BOTH axes — the raw file tag AND the
+    governed ``effective_restriction`` floor — so a governed-``restricted`` column whose file
+    attested nothing (``sensitivity = NULL``, the shipped FTR shape) refuses here instead of
+    compiling for a caller with no reader role. An untagged, unfloored node has
+    ``visible_requires = '{}'``, contained in every allowed list, and stays visible to everyone;
+    ``prohibited`` appears in no role map and fails CLOSED for every caller.
+
+    **The predicate is the ANCHOR one (D11), and that is a fix.** This gate's read set contains
+    TABLE elements as well as column ones — ``SPINE_SOURCE`` always, and every relation a traversal
+    reads — and ``build_graph`` never writes sensitivity on a table node, so a table row's
+    ``visible_requires`` is ``'{}'`` on every real catalog. Under the plain column predicate the
+    table half of this gate therefore passed for everybody, on every catalog, always: a
+    fully-restricted spine source authorized cleanly for a principal who could not read one of its
+    columns. ``read_scope.anchor_visibility_predicate`` is the one that already answers this — a
+    table is visible iff the caller can see at least one of its columns, the
+    ``catalogs.py:50-59`` shape D11 adopted — and it branches on ``graph_node.kind`` itself, so
+    ONE predicate serves both element kinds here and no second rule is minted. It binds
+    ``allowed_classes(roles)`` TWICE, which is the shape of the predicate rather than a call-site
+    choice.
 
     A ref with no ``graph_node`` row at all is returned as MISSING (Task 12). The doctrine used to
     be the reverse — pass it through and let §11's L1 validation report ``COLUMN_ABSENT`` against
@@ -594,10 +718,11 @@ def _hidden(
     missing: list[_ReadElement] = []
     for catalog_source, indexed in by_source.items():
         rows = conn.execute(
-            f"SELECT lower(object_ref), (NOT ({visibility_predicate()})) AS hidden "
+            "SELECT lower(object_ref), "
+            f"(NOT ({anchor_visibility_predicate('graph_node')})) AS hidden "
             "FROM graph_node "
             "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s)",
-            (allowed, catalog_source, list(indexed))).fetchall()
+            (allowed, allowed, catalog_source, list(indexed))).fetchall()
         # Fail CLOSED across duplicates: should the catalog ever hold two rows for one folded
         # object_ref, one hidden row hides the node — mirroring the old shape, where the query
         # returned hidden rows directly and any one of them sufficed.
