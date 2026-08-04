@@ -19,6 +19,9 @@ same namespace are a duplicate key, not a mapping). Both halves are required, an
   (internal account -> correspondent account reference, core serial -> SWIFT UETR, and so on). If
   the bank's CIB customer number and FTR CIF are in truth two different schemes, the fix is a
   registry change — two concepts with two namespaces — not a weaker discovery rule.
+  RESOLVED 2026-08-04: the user confirmed they are ONE scheme (the same numbers in both
+  systems), so the direct-equality bridge is the correct join for that pair and the shipped
+  registry stands. Crosswalks serve genuinely two-scheme pairs.
 
 **Source (b) — an LLM structured suggestion.** THIS TASK ADDS NO LLM CALL. What it adds is the typed
 INGESTION seam: a suggestion that arrives through the EXISTING structured-result path
