@@ -154,6 +154,7 @@ from featuregen.materialize.validation import (
     record_validation_report,
     run_l0,
 )
+from featuregen.overlay.upload.bridge_realization import ExecutionTier
 
 __all__ = [
     "FIRST_RUN_EVENT_SEQ",
@@ -368,6 +369,7 @@ def compile_feature_group(
     l0: L0Interpreter | None,
     clock: Callable[[], str],
     contract_overrides: ContractOverrides | None = None,
+    execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
 ) -> CompiledGroup:
     """Compile the group ``request_id`` names into a sealed project on disk, or stop and say where.
 
@@ -412,6 +414,16 @@ def compile_feature_group(
         clock: an offset-aware ISO 8601 instant, matching ``run_l0``/``run_l1``'s ``clock``. The
             plane mints no timestamps; every ``created_at`` and ``occurred_at`` here is this one.
         contract_overrides: §5's declared tightenings, if any.
+        execution_tier: the bridge-realization APPLICABILITY scope this compilation reads joins at
+            (``overlay/upload/bridge_realization.py:81``) — whether a cross-catalog join approved
+            only for sandbox data may be used. **It is not a run execution tier** and it names no
+            namespace: plan §3.4 decided Phase G introduces none, because the sandbox namespace is
+            inside ``sandbox_execution_hash`` and a second one would fork execution identity. Two
+            runs of one group at the two tiers seal identically; only which realizations
+            ``compile_ir`` can SEE differs. It defaults to ``PRODUCTION`` — the value this chain
+            asserted by omission before it was a parameter — because the durable request carries no
+            tier of its own, so requiring it here would only move the same literal into the queue
+            lane, one caller further from anything that governs it.
 
     Returns:
         A :class:`CompiledGroup`. In G-1 a run that gets all the way through stops at
@@ -448,7 +460,7 @@ def compile_feature_group(
     irs: list[FormulaExecutionIRV1] = []
     for feature in admitted:
         compiled = compile_ir(conn, feature, roles=roles, spine_decl=spine_declaration,
-                              inventory=inventory)
+                              inventory=inventory, execution_tier=execution_tier)
         if isinstance(compiled, MaterializationRefused):
             return stop.refused(ChainStage.COMPILE, compiled)
         irs.append(compiled)

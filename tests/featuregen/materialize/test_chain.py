@@ -108,6 +108,7 @@ from featuregen.materialize.validation import (
     ValidationStatus,
     read_validation_reports,
 )
+from featuregen.overlay.upload.bridge_realization import ExecutionTier
 
 _FEATURE = "total_debit_amount_30d"
 _GROUP = "cif_daily"
@@ -229,13 +230,14 @@ def _clock():
 
 
 def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schema=None,
-         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble, l0=_L0) -> CompiledGroup:
+         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble, l0=_L0,
+         **kwargs) -> CompiledGroup:
     return compile_feature_group(
         db, request_id=request_id, work_item_ids=work_item_ids, inventory=inventory,
         spine_declaration=spine, cadence=_CADENCE, availability_promise=_PROMISE,
         contract_overrides=overrides, mechanism=PublishMechanism.VERSIONED_POINTER,
         published_schema=published_schema, assemble_nodes=assemble, project_root=root, l0=l0,
-        clock=_clock)
+        clock=_clock, **kwargs)
 
 
 # ── THE happy path: a governed feature becomes a sealed project ──────────────────────────────────
@@ -1149,3 +1151,60 @@ def test_the_derived_generation_id_is_the_SECOND_line_of_defence(ready, catalog)
             "materialization_contract_hash, group_plan_hash, generated_project_hash, created_at) "
             "VALUES (%s, 'other', 'c', 'p', 'g', '2026-08-03T12:00:00+00:00')",
             (chain._generation_id(request_id),))
+
+
+# ── the realization applicability tier reaches the compile stage (Phase G, P2) ───────────────────
+
+
+def _tier_spy(monkeypatch) -> list:
+    """Record the applicability tier every ``compile_ir`` call is made at, and let the REAL one run.
+
+    A wrapper rather than a stub: the chain must still produce its real terminal, so the assertion
+    is about what was ASKED for on a run that genuinely happened.
+    """
+    asked: list = []
+    real = chain.compile_ir
+
+    def _record(conn, feature, **kwargs):
+        asked.append(kwargs["execution_tier"])
+        return real(conn, feature, **kwargs)
+
+    monkeypatch.setattr(chain, "compile_ir", _record)
+    return asked
+
+
+def test_the_chain_compiles_at_the_PRODUCTION_tier_when_it_is_told_nothing(
+        ready, catalog, monkeypatch) -> None:
+    """The default preserves what every existing caller — the queue lane included — already got."""
+    request_id, work_items, root = ready
+    asked = _tier_spy(monkeypatch)
+    outcome = _run(catalog, request_id, work_items, root)
+    assert asked == [ExecutionTier.PRODUCTION]
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+
+
+def test_the_chain_compiles_at_the_APPLICABILITY_TIER_it_is_GIVEN(
+        ready, catalog, monkeypatch) -> None:
+    """P2: a SANDBOX-scoped bridge realization now has a parameter that can reach it. The group
+    below is same-catalog, so the tier changes nothing it produces — which is the point: this is a
+    scope on which JOINS may be read, and not a run tier."""
+    request_id, work_items, root = ready
+    asked = _tier_spy(monkeypatch)
+    outcome = _run(catalog, request_id, work_items, root,
+                   execution_tier=ExecutionTier.SANDBOX)
+    assert asked == [ExecutionTier.SANDBOX]
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+
+
+def test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """Plan §3.4's constraint, asserted rather than trusted: the sandbox namespace lives inside
+    ``sandbox_execution_hash``, so a RUN tier would fork execution identity. Two runs of one group
+    at the two APPLICABILITY tiers therefore seal to the same project — the scope decides which
+    joins may be read, and nothing about how the run is named."""
+    work_items = [_authored(catalog, monkeypatch)]
+    production = _run(catalog, _request(catalog), work_items, tmp_path / "a")
+    sandbox = _run(catalog, _request(catalog, request_id="req-0002"), work_items, tmp_path / "b",
+                   execution_tier=ExecutionTier.SANDBOX)
+    assert production.generated_project_hash == sandbox.generated_project_hash
+    assert production.materialization_contract_hash == sandbox.materialization_contract_hash
