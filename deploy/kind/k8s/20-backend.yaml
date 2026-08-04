@@ -58,9 +58,15 @@ data:
   # worker's one connection, so while it runs the relay, the timers, the projections and every
   # poller wait for it. `kubectl -n featuregen edit configmap backend-config` + a pod restart is the
   # supported way to stop materialization WITHOUT stopping the worker; queued jobs stay `ready` and
-  # drain when it comes back on. OFF here because this image has no kedro environment and no
-  # captured cluster inventory, so every compile would honestly record "the build was never
-  # proven". Truthy: 1/true/yes/on.
+  # drain when it comes back on. Truthy: 1/true/yes/on.
+  #
+  # STILL OFF, and the reason is now exactly ONE thing. The image gained a kedro/pyspark interpreter
+  # at /opt/kedro-venv (see deploy/kind/Dockerfile.backend), so three of the four settings below have
+  # genuinely usable values in THIS pod. The fourth, INVENTORY, does not: the only §0 inventory in the
+  # repo is conf/environments/hdfc-local-inventory.yml, which is a TEMPLATE that `load_inventory`
+  # refuses by design (`engine_versions.hive is missing or null`, and `tables: {}`), and it is not
+  # copied into the image at all. Turning the switch on against it would not degrade politely — see
+  # the paragraph below for what it would actually do.
   FEATUREGEN_MATERIALIZE_ENABLED: "0"
   # The four settings a deployment that turns the switch ON must also supply. Deliberately left
   # UNSET rather than pointed at paths this image does not contain: the lane resolves them only when
@@ -69,14 +75,27 @@ data:
   # queue's ordinary budget (12 attempts) and then DEAD-LETTERED, and because the lane never claimed
   # the request it writes no lifecycle: the request is left stranded at `requested` with nothing
   # queued behind it. Past that point re-triggering needs a FRESH idempotency key (the old one names
-  # the stranded request, and the API answers 409). So turn the switch on and these four together.
-  #   the directory each sealed project tree is written under (one subdirectory per generation)
+  # the stranded request, and the API answers 409), and the stranded row can never be CLOSED at all —
+  # §3.2 ships no `requested → failed` edge, so T13's reconciler reports NO_LEGAL_TERMINAL and
+  # changes nothing (DEFERRED-WORK A.35). An INVENTORY that exists but does not LOAD is the same
+  # failure exactly: `load_inventory` raises before the lane accepts anything. So turn the switch on
+  # and these four together — and only once the inventory is one a compilation can read.
+  #   the directory each sealed project tree is written under (one subdirectory per generation).
+  #   READY: no volume is mounted there, so a demo cluster writes to the pod's EPHEMERAL layer and a
+  #   restart takes every sealed tree with it. `materialize_to` mkdirs its parents and the container
+  #   runs as root, so the path needs no volume to work — it needs one to SURVIVE.
   # FEATUREGEN_MATERIALIZE_PROJECT_ROOT: "/var/lib/featuregen/materialize"
-  #   the YAML of captured cluster facts every compilation reads (§0's typed input)
+  #   the YAML of captured cluster facts every compilation reads (§0's typed input).
+  #   NOT READY — the one blocker. Nothing in this repo or this image satisfies it; a compile needs
+  #   engine versions AND a TableLayout per governed table, and nobody has captured a cluster.
   # FEATUREGEN_MATERIALIZE_INVENTORY: "/etc/featuregen/cluster-inventory.yaml"
-  #   the interpreter the L0 build proof runs in; unset means no run is ever proven to build
+  #   the interpreter the L0 build proof runs in; unset means no run is ever proven to build.
+  #   READY: the venv is in the image and was proved to import kedro+pyspark and to build a real
+  #   rendered project's pipeline. It proves a project BUILDS; it does not run Spark (no JVM).
   # FEATUREGEN_MATERIALIZE_L0_PYTHON: "/opt/kedro-venv/bin/python"
-  #   that proof's bound in seconds; required with L0_PYTHON, and the worker's lease derives from it
+  #   that proof's bound in seconds; required with L0_PYTHON, and the worker's lease derives from it.
+  #   READY at the sandbox/gate precedent of 900 — but note what it buys: the lease becomes 600 + 900
+  #   = 1500s, and for that whole window one compile holds the single-threaded worker tick.
   # FEATUREGEN_MATERIALIZE_L0_TIMEOUT_SECONDS: "900"
 ---
 apiVersion: apps/v1

@@ -14,6 +14,43 @@ ENV PYTHONUNBUFFERED=1 PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel
+
+# ── the L0 build-proof interpreter ───────────────────────────────────────────────────────────────
+# Phase G's L0 gate (`materialize/validation.py:run_l0`) launches a SUBPROCESS that imports the
+# rendered Kedro project and constructs its pipeline. That project imports `kedro.pipeline`,
+# `kedro.framework.hooks` and `pyspark.sql`; this platform depends on NEITHER (`src/` never imports
+# either, and `validation.py` takes the interpreter as a parameter precisely so it cannot validate
+# the artifact against the validator's own environment). Without an interpreter that has them,
+# `FEATUREGEN_MATERIALIZE_L0_PYTHON` has nothing to point at and every run honestly records "the
+# build was never proven" — which is why the flag could not simply be turned on.
+#
+# A SEPARATE VENV, not the app's environment. It exists only to be launched as a subprocess, and
+# merging ~500 MB of pyspark into the app's site-packages would put the control plane one `import`
+# away from the artifact it validates — the exact coupling `run_l0`'s interpreter parameter exists
+# to prevent. Nothing in `CMD` can reach it.
+#
+# THE PINS ARE THE SANDBOX'S (`deploy/kind/sandbox/Dockerfile.spark`), deliberately, and its
+# reasoning carries over verbatim: Spark 3 defaults `spark.sql.ansi.enabled` FALSE and Spark 4
+# defaults it TRUE, and the rendered `OVERFLOW_VIOLATION` gate is built for the FALSE (return-NULL)
+# behaviour; kedro 1.5.0 is the API Task 12 verified the renderer's emitted code against. A build
+# proved against different pins is a proof about a different project.
+#
+# NO JVM, established empirically rather than assumed. The probe imports the package and constructs
+# the pipeline; it never starts a SparkSession, and `pyspark`/`kedro`/`kedro-datasets` import
+# without Java (verified by running the real `_BUILD_PROBE` against a real rendered project inside
+# this image — see .superpowers/sdd/2026-08-03-phase-g-execution-wiring/task-enable-report.md).
+# `openjdk-17-jre-headless` would add ~200 MB to every backend pod to serve an import that does not
+# need it. NB: this makes the image able to PROVE a project builds, not to RUN one — an actual Spark
+# run needs the JVM, and that is the sandbox pod's job.
+#
+# ABOVE `COPY src` on purpose. That COPY invalidates every layer below it on any source change, and
+# this is the largest install in the file; below it, every backend rebuild would re-resolve pyspark.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/kedro-venv \
+ && /opt/kedro-venv/bin/pip install --upgrade pip setuptools wheel \
+ && /opt/kedro-venv/bin/pip install --timeout 120 --retries 10 \
+      "pyspark==3.5.3" "kedro==1.5.0" "kedro-datasets[spark]==9.5.0"
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 # The `llm` extra pulls the anthropic SDK — a PRODUCTION-only lazy import (CI uses FakeLLM), version-
