@@ -61,6 +61,7 @@ from featuregen.materialize.runprep import (
     run_input_requests,
     staging_root_for,
 )
+from featuregen.materialize.submit import check_run_parameters
 
 BUSINESS_DT = "2026-07-27"
 NEXT_DT = "2026-07-28"
@@ -605,6 +606,25 @@ def test_cross_catalog_run_requires_exact_final_bridge_authorization() -> None:
         _prepared(rendered=rendered, bridge_authorization=exact),
         runprep.RunPreparation,
     )
+
+
+def test_the_cross_catalog_parameters_prepare_run_PRODUCED_are_submittable() -> None:
+    """P1 end to end: the set this function returns is the set the submitter accepts.
+
+    Before the fix, ``check_run_parameters`` compared against the constant, so a cross-catalog group
+    could be compiled, rendered, sealed and prepared — and then refused at the last mile for
+    carrying the one parameter its own join-gate node reads.
+    """
+    required = (*REQUIRED_RUN_PARAMETERS, "bridge_predicate_values")
+    prepared = _ok(_prepared(
+        additional_parameters={"bridge_predicate_values": {"tenant_id": "HDFC"}},
+        required_parameters=required,
+    ))
+    assert check_run_parameters(prepared.parameters, required_parameters=required) \
+        is prepared.parameters
+    # And the same set, offered as though the artifact were same-catalog, is still refused.
+    with pytest.raises(ValueError, match="unexpected"):
+        check_run_parameters(prepared.parameters)
 
 
 def test_additional_rendered_parameters_enter_the_execution_hash() -> None:

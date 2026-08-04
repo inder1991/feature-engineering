@@ -359,6 +359,7 @@ session today.
 |---|---|---|
 | 🔴 **No trustworthy full-suite CI signal** | ~82 whole-repo test failures (count is environment/ordering dependent; measured 82 at both `9aee241f` and Child-1 HEAD). Cause: cross-test DB contamination — **all pass in isolation**. Child-1 introduced **zero** (verified by `comm` on sorted FAILED lists at base vs head, empty in both directions). Nobody owns this. | Before relying on CI to gate a merge, or before the next program adds more surface. |
 | ⚪ Frontend `vitest` hangs on worker-start in this environment | Changed files pass individually; CI must run the full frontend suite. | Frontend work. |
+| 🟡 **`test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter` is flaky under load** | `tests/featuregen/materialize/test_submit.py:283`. The `/bin/sh` stub backgrounds `( sleep 120 ) &` and writes `grandchild.pid` on the *next* line, while the submitter under test has `timeout_seconds=1.0` — so on a loaded machine the process group is killed before the write lands and line 307's `read_text` raises `FileNotFoundError` instead of asserting anything. Observed 2026-08-04 by Phase G: flaked twice, then passed three consecutive runs. The property under test (the whole process GROUP dies, not just the direct child) is sound and is not what failed — the failure is the test's own setup racing the behaviour it is measuring. Not fixed here: the file belongs to the codegen program's submitter task, not to Phase G. | Any CI run that reports it. Closure: poll for the pid file until the submit deadline rather than reading it once — the test already polls for the pid's *death* ten lines down, so it is the same shape one step earlier. |
 
 ---
 
@@ -589,7 +590,177 @@ as gate-environment dependencies, the same way it supplies Temurin 17.
 |---|---|---|
 | 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |
 
-### A.33 🟡 Phantom-keyed `field_evidence` / `field_decision_event` rows on deployed catalogs (2026-08-03)
+### A.33 🔴 The migration-1020 authoring lane is orphaned: nothing writes it, and nothing reads it any more (2026-08-03)
+
+Found by Phase G T2, which was the first caller ever to try to reach `admit_artifacts` from a
+durable identity. Two complete authoring lanes exist side by side and describe DISJOINT sets of
+runs — a given run is in exactly one of them, never both:
+
+| | 1020 lane | 1022 lane |
+|---|---|---|
+| orchestrator | `formula/authoring.py::run_authoring` | `formula/replay_authoring.py::run_authoring` |
+| trace module | `formula/trace.py` | `formula/replay_trace.py` |
+| tables | `authoring_run`, `authoring_trace_event` | `formula_authoring_run`, `formula_authoring_trace_event` |
+| run ids | `arun_…` (minted internally) | `far_…` (caller may supply) |
+| terminal kinds | `COMPLETED` / `FAILED` | `completed` / `failed` |
+| payload hash | sha256 over RFC 8785 (JCS) bytes | sha256 over `json.dumps(sort_keys, separators, ensure_ascii=False)` |
+| intent hash | `authoring.authoring_intent_hash` — 4 fields | `canonical_hash(replay_authoring._intent_material(…))` — 5 fields |
+| terminal payload | dispositions/axes/hashes only | the same, **plus** `result: _plain(result)` |
+
+The live worker imports `run_authoring` from `formula.replay_authoring`
+(`overlay/upload/recipe_formula_worker.py:35`), so **the 1020 store has never been written by
+anything in `src/`**: its only writer is `formula/trace.py::open_authoring_run`, whose only caller
+is `formula/authoring.py::run_authoring`, whose only callers are tests. `materialize/admission.py`
+proved against 1020 until 2026-08-03 and therefore refused every real governed feature at check 1
+with `AUTHORING_RUN_INCOMPLETE`; it now proves against 1022
+(`materialize/authoring_trace.py`). The consequence of the move is recorded there and in
+`admission.py`: check 6 went from a 4-field to a 5-field digest, so
+`AuthoringIntent.recipe_authoring_context` is now inside the proof.
+
+The 1020 lane is consequently unreferenced from `src/` in both directions. It is not deleted here:
+`formula/**` is not Phase G's to change, and which way to close this is a design decision about
+which orchestrator is the real one — not a wiring detail.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`formula/authoring.py` + `formula/trace.py` + migration 1020 have no writer and no reader** | Ownership: `formula/**` was explicitly out of scope for the session that found this, and the fix is a choice between two whole orchestrators rather than a repair. Both lanes remain individually correct and tested; the defect is that only one of them is connected to anything. | Any decision by whoever owns `formula/` about which authoring orchestrator is authoritative. The two closures are: DELETE the 1020 lane (and mark 1020 obsolete), or REPOINT `recipe_formula_worker` at `formula/authoring.py` — in which case `materialize/authoring_trace.py` must move back to the 1020 store and check 6 narrows to four fields again. Note the 1020 terminal payload carries no `result` material, so the second option also needs a durable authoring result before anything can be resolved. |
+
+### A.34 🟡 L0's probe runs inside `_commit`'s open transaction (2026-08-03)
+
+Found and accepted by Phase G T6, which put §11.2's L0 into `compile/chain.py`. `run_l0` launches a
+separate interpreter and waits up to `L0Interpreter.timeout_seconds` for it; that wait happens
+between the plane writes and the terminal append, **inside** the `with conn.transaction()` block
+`_commit` opens.
+
+It is inside deliberately. The terminal event is CHOSEN from L0's verdict, and the verdict is about
+a tree on disk, so the ordering is forced: render → validate → record the terminal that the verdict
+earns. Splitting the transaction so the probe ran outside it would put the generation row and the
+build proof in two separately-committing units, and the failure window between them is exactly the
+"a terminal that claims more than the evidence" shape this task existed to close. The tree is staged
+at a sibling and `os.replace`d into place as the block's last statement, so a rollback anywhere —
+including at the validation write — still leaves nothing at the project's own path.
+
+The cost is transaction duration: a compile that used to hold a transaction for milliseconds now
+holds one for as long as the probe takes (seconds in practice — importing kedro and pyspark and
+constructing the pipeline object — but bounded only by the caller's timeout).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A PostgreSQL session sits "idle in transaction" for the duration of the L0 probe** | No deployment in this repo sets `idle_in_transaction_session_timeout` (grepped: zero occurrences in `src/`, tests and migrations), so nothing kills it today, and the alternative costs an atomicity guarantee that is worth more than the connection-hold. The bound is the caller's: `L0Interpreter.timeout_seconds` has no default precisely so a trigger surface must choose one. | Setting `idle_in_transaction_session_timeout` anywhere, or moving this chain onto a pooled/shared connection. Either makes the hold a real failure mode, and the closure is to run the probe before the transaction over the STAGED tree and re-read nothing from it — which is sound but needs the report's `location` (the staging path) to stop being operator-facing first. |
+| 🟡 **Two concurrent compiles of ONE `logical_group_name` serialize for the full probe duration** | The consequence that neither of the triggers above would surface, because it needs no timeout and no pool: the first compile to reach `record_group_binding` holds `group_binding`'s unique index until it commits, and it does not commit until its probe finishes — so a second request for the same group blocks on the row lock for seconds rather than milliseconds, however many workers are free. It is correct (one binding per logical name is the §10.1 invariant) and it is bounded by `timeout_seconds`, so it degrades throughput rather than truth. | Any queue lane that fans out several requests for one logical group, or a `lock_timeout` short enough to turn the wait into a spurious failure. Same closure as above — probing before the transaction removes the probe from the critical section entirely. |
+
+### A.35 🟡 A request stranded at `requested` has no legal terminal (2026-08-04)
+
+Found by Phase G T7's review and owned by T13's reconciler (`materialize/reconcile.py`), which
+**finds** the class, reports it and refuses to invent a verdict for it.
+
+The shape: an unconfigured deployment (or an undecodable payload) makes every delivery fail, and
+when the queue's attempt budget runs out the message is dead-lettered while the request is still at
+`requested`. It holds no lease — the lane deliberately does not accept before it has a configuration,
+because accepting first would burn every arriving request into a terminal no operator fix could
+recover. So nothing will ever deliver it again, and §3.2 ships no edge from `requested` to a terminal
+state (`LEGAL_LIFECYCLE_TRANSITIONS[REQUESTED] == {ACCEPTED}`, and migration 1053 carries the state
+vocabulary as a CHECK).
+
+The reconciler will not reach a terminal through `accepted` either: `accept_request` stamps
+`accepted_at` and grants a lease, so walking the row through it to reach `failed` would record that
+a worker claimed work nobody ever claimed — the same edge added quietly, in two hops. The sweep
+therefore returns `NO_LEGAL_TERMINAL`, gauges the standing count
+(`materialize.reconcile.no_legal_terminal`), and changes nothing.
+
+Nothing is lost while it stands: the request is durable, honest about its state, and re-runnable —
+§3.3's rule is that a re-run is a NEW request, and a fresh idempotency key produces one. What an
+operator cannot do today is close the old row.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
+
+### A.36 🟡 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+
+Flagged by Phase G T4's review and again by T11's, which is why it is here rather than in a task
+report: two independent reviews have now recorded the same gap, and neither had a tracked home for it.
+
+What IS proved: `compile/wiring.py` assembles join-gate nodes for a cross-catalog group
+(`test_wiring.py`), and `compile_ir` produces a cross-catalog IR carrying both catalogs and the exact
+realization (`test_cross_catalog_ir.py`). What is NOT proved is that the two **compose through
+`compile_feature_group`** — every cross-catalog test hands `compile_ir` a
+`CurrentBridgeRealizationV1` built in Python, and `chain.py:462` calls `compile_ir` with no
+realization argument at all. So an HTTP- or lane-driven bridged run must load its realizations from
+the database, and no test has ever made it do that. T11's acceptance test covers the same-catalog
+path end to end (the plan's §5 criterion) and deliberately stopped there.
+
+The enabling work is one fixture, and it is the reason this was scoped out rather than squeezed in: a
+**durable** bridge-realization seed helper beside `tests/featuregen/materialize/test_cross_catalog_ir.py`
+that writes through `bridge_store` — binding revisions, endpoints, column pairs, an `ACTIVE`
+lifecycle, a `DETERMINISTICALLY_VALIDATED` safety status and a PRODUCTION applicability scope.
+Nothing in the tree seeds one durably today. Three smaller pieces ride along: a fourth hand-authored
+`TypedFormulaV1` + matching `raw_proposal` in `tests/featuregen/materialize/fixtures.py` whose read
+set genuinely spans catalogs (all three worked features read `hdfc::public.transactions.*`), the
+`crm_banking.customer_master` layout and `logical_schema_map` entry in the inventory, and `crm`
+graph nodes with a governed logical type.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **No test drives a cross-catalog group through `compile_feature_group`, so the realization LOAD on the chain's own path is unexercised** | It is a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. G-1's acceptance criterion is the same-catalog path, and inventing the seed under acceptance-test pressure would have produced a fixture nobody had reviewed. | The first bridged group anybody triggers, or any change to how `compile_ir` resolves realizations. Closure: the durable seed helper above, then a fifth case in `tests/featuregen/api/test_materialization_e2e.py` driving the bridged group over HTTP — the harness already exists and takes one more fixture. |
+| 🟡 **The trigger surface carries no `execution_tier`, so every HTTP-driven run compiles at `PRODUCTION`** | `MaterializationJobV1` and `MaterializationRunIn` have no such field, and adding one is a governance decision about who may widen the joins a compile may read — not a wiring change. Harmless today: the applicability tier only decides which joins are readable and forks no execution identity (pinned by `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity`). | Anyone needing a SANDBOX-scoped realization to reach a triggered run. Closure: a declared field on the job, argued the way `published_schema` was — no default, so a caller must state it. |
+
+### A.37 🟡 A pre-seal governed refusal records no stage and no code anywhere queryable (2026-08-04)
+
+Found by Phase G T11 while writing the acceptance test, and the scoping decision it rests on is
+correct — this records the consequence, which had no tracked home.
+
+The plane cannot hold a refusal that happens before the project is sealed:
+`materialization_run_event.generation_id` is a foreign key to a generation row that only exists once
+a project has been rendered and hashed. So `_Stop.refused` (`compile/chain.py`) writes exactly one
+thing — the request's lifecycle, `failed` — and `materialization_run_detail` correctly reports
+`run_status: null` with a reason saying which silence it is.
+
+The consequence is diagnostic, not correctness. An operator holding a `failed` request cannot ask
+the database **which stage** refused it or **which `CompilationRefusalCode`** it carried: those exist
+only in the lane's returned `MaterializationLaneOutcome`, in one `materialize.lane.recorded` log line,
+and in a counter. T11's two refusal probes had to call `process_materialization_once` directly rather
+than drive `run_worker_once`, because through the worker tick the stage and the code are unobservable
+— which is the clearest available statement of the gap.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`ChainStage` and `CompilationRefusalCode` for a pre-seal refusal are unqueryable — log line and counter only** | Closing it means either a nullable-`generation_id` run event (which weakens the plane's "a run event is about a generation" invariant and its one-terminal index) or two new columns on `materialization_request` (a migration Phase G may not add — 1053/1054 are used, 1055 is reserved for G-3). Both are §3.2 decisions rather than a test or lane detail. | The first operator triaging a refused request from the database rather than from logs, or any UI that lists refusals with a reason. Closure: prefer the two write-once columns on `materialization_request` (`refused_at_stage`, `refusal_code`), written by `_Stop.refused` in the same conditional UPDATE that terminalizes the row, so they cannot disagree with the lifecycle; then `materialization_run_detail` reports them beside `run_status_reason` and the acceptance suite's probes can drive `run_worker_once` like every other case. |
+
+### A.38 Phase G G-1 — the §3.6 / §3.4 deferrals, with the consequence a WIRED chain gives them (2026-08-04)
+
+G-1 ran §2's compile half end to end for the first time: trigger → resolve → admit → compile →
+Gate 2 → physical types → contract → plan → bind → select_publisher → render → seal → L0 → a durable
+terminal. Plan §3.6 named six durability deferrals that stay deferred and §3.4 named an identity
+decision. Five of the six already have entries; what none of them had is **the consequence now that
+a chain exists**, which is the thing §3.6 asks to be recorded rather than the name. Each row below
+**extends** the entry it names and does not replace it — the original trigger still stands.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **Atomic multi-write publish — G-1 reaches none of it, which is why the exposure did not grow** (extends the A-head row `:21`) | The multi-write set that row names — data commit + run manifest + active-revision pointer + stats + callback — is all run-side, and G-1 terminates at `PUBLICATION_REFUSED (CAPABILITY_UNPROVEN)` before the first member of it. What G-1 *did* make atomic is the COMPILE half: `compile/chain.py::_commit` writes the generation row, the retained plan + contract (1054), the L0 validation report, the group binding/plan revision and the terminal event inside ONE transaction, so a crash leaves either all of them or none. The consequence to carry forward is that this buys nothing for the run side: the moment G-2 lands `submit` + reconcile, the run-manifest write and the terminal event become a second multi-write with **no** atomicity, and §3.3's reconciler is the only repair path — by design, since the plane is append-only and a mis-sequenced write bricks the fold permanently. | Unchanged (two writers to one feature table, or the first restatement), plus **G-2's first `record_run_manifest` caller** — that is where the un-atomic pair first exists. |
+| 🟡 **The outbox/reconciliation generalization — G-1 shipped one lane's reconciler, not the facility** (extends the A-head row `:22`) | `materialize/reconcile.py` sweeps exactly one class: a `materialization_request` whose queue message is unreachable (`done`/`dead`/absent), judged from two tables it knows by name. It is not "reconciliation when either side is down", because the other side does not exist yet — there is still no external executor, and G-1 submits nothing. Consequence: the verdict vocabulary (`FAILED`, `NO_LEGAL_TERMINAL`, `NO_RUN_EVIDENCE`, `LOCKED`, `REPLAYED`), the lease-expiry rank, the bounded sweep and the `SET LOCAL lock_timeout` discipline are all spelled **inside this module**, so the next lane needing the same guarantee copies them rather than calling them — and a second copy is a second chance to disagree about what "abandoned" means. | Unchanged (the first external, non-in-process executor), plus a second queue lane needing an abandoned-work sweep — at which point the shape is worth lifting into `runtime/` rather than copied a third time. |
+| 🟡 **Content-addressed inputs — G-1 makes the gap REACHABLE for the first time** (extends A.1 `:38`) | A.1 recorded that two runs over the same partitions after an in-place source rewrite share one execution identity. Until this branch nothing could produce a run at all, so the property was theoretical. It is not any more: a governed feature can now be re-triggered on demand, and §3.3's rule is that a re-run is a NEW request and a NEW generation — so "regenerate and compare the hashes" is the natural operator move for *did this number change because the definition moved or because the data moved?*, and it **cannot answer the second half**. The compile-side hashes (`group_plan_hash`, `materialization_contract_hash`, `generated_project_hash`) describe the definition and the governed facts; `catalog_state_stamp` moves only when a governed fact moves. A source rewritten under an unchanged partition list produces byte-identical artifacts with equal hashes, and nothing says so. | Unchanged (reproducibility/replay, restatement), plus **the first operator who compares two generations of one group to attribute a change**. |
+| 🟡 **The full run state machine — G-1 shipped five of its seven states, and one of the five is durably unobservable** (extends the A-head row `:20`) | `RequestLifecycle` (migration 1053) carries `requested`/`accepted`/`running`/`committed`/`failed`; that row's `CANCELLED` and `STALE_INPUT` are absent. `running` exists but no reader ever sees it — the chain enters and leaves it inside `_commit`'s single transaction (`reconcile.py:471-473,514`), so it is a state the code passes through rather than one a status query can return. Three consequences: **(a)** there is no way to cancel an accepted request — an operator's only lever is to let the lease expire and let the reconciler judge it; **(b)** nothing expresses "the inputs moved under this run" as a terminal, so a compile refused because the catalog moved reports a `CompilationRefusalCode` at the stage that saw it, which A.37 records as unqueryable; **(c)** `requested → failed` is missing, which is A.35's own item. | Unchanged (scheduled/unattended runs), plus **the first cancellation request** — the absent state an operator meets first. |
+| 🟡 **The publish pointer — G-1's terminal is the honest statement of its absence** (extends A.26 `:484`) | `sandbox_feature.<group>` is still named in `group_binding.physical_target` and in the rendered README and is still not a queryable object. G-1 is forbidden from claiming otherwise: `compile/chain.py` never appends `RunEventKind.PUBLISHED` and terminates `PUBLICATION_REFUSED` carrying `select_publisher`'s own `CAPABILITY_UNPROVEN`. Stated plainly, because a reader of "G-1 is done" will otherwise misread it: **every run this program can currently produce ends in a refusal, and that is the truthful terminal rather than a failure** — what a consumer holds afterwards is a sealed, build-verified Kedro project on disk plus a plane record of what it would read, and no name by which to read a result. Note the constraint is a test rather than physics: `test_the_chain_can_never_append_PUBLISHED` matches `ast.Name("RunEventKind")`, so an aliased import (`… as REK`) would evade it. | Unchanged — G-3, gated on the live 16b probe and on the §3.5 governance decision. |
+| 🟡 **Recording actually-read partitions — G-1 made the INTENDED read set durable, which is the other half** (extends A.31) | A.31's gap is that `input_snapshots` is carried and hashed but never enforced as the run's read scope. G-1 changes the audit side and not the enforcement side: migration 1054 retains the group plan and the contract body keyed by `generation_id`, so a human holding a `group_plan_hash` can now answer *which features, which columns, which spine, which physical requirements* without re-deriving the compilation from a catalog that has since moved. What is still absent is the run side — nothing records what was actually read, and G-1 runs nothing at all. An auditor can now prove what a generation **intended** to read and still cannot prove what it read. | Unchanged (§3.4 identity relied on for audit), and now a **G-2 obligation** rather than a general wish: the intent half exists, so the actual half is the only missing term. |
+| 🟡 **§3.4 — a production run execution tier needs a second execution-hash scheme or an accepted identity migration** (NEW: nothing recorded this) | `derive_namespace()` takes no arguments by design (`identity.py:28-30`) and the sandbox namespace is inside `sandbox_execution_hash` (`identity.py:34`, "There is no production execution hash"). Introducing a production namespace therefore **forks execution identity**: every hash already recorded would describe a run that could not be reproduced under the new scheme. G-1 introduced no run tier — T10's `execution_tier` reaches only the bridge-realization *applicability* readers, and `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity` pins that both tiers yield identical `generated_project_hash` and `materialization_contract_hash`. The consequence: the platform can compile and seal **sandbox-identity artifacts only**, there is no parameter by which a caller could ask for a production run, and adding one is a governance decision (do the recorded hashes stay valid, or are they migrated?) taken before any code is written. | The first request to materialize a feature for production data. Closure is one of exactly two: a second, explicitly-versioned execution-hash scheme with both kept readable, or an accepted identity migration that restates every existing hash — not a parameter added to `derive_namespace`. |
+
+### A.39 Phase G G-1 — what execution accumulated (2026-08-04)
+
+Consequences G-1 accepted while wiring the chain, each verified against the branch. None is a live
+defect: every one of them fails closed, has no `src/` caller that can reach it, or is bounded by a
+volume G-1 cannot produce. Each is here because someone picking up G-2 would otherwise have to
+rediscover it, and three of the five are met in G-2's first week.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **`_check_wiring` rule 7 is weaker than its own docstring, and `compile_feature_group` has no default assembler** | Rule 7 (`render/project.py:642-647`) requires every bridge-gate output to be READ by some node. Its docstring claims the stronger property — that "merely running a sibling validation node beside a projection leaves the computation free to read the unchecked raw target" is refused — and a node that reads the gate output and does nothing with it satisfies the implemented check. The exposure is the assembler seam: `compile_feature_group(…, assemble_nodes: NodeAssembler, …)` (`chain.py:367`) is keyword-only with **no default**, so `compile/wiring.py` is a convention rather than a floor. A caller supplying a different `NodeAssembler` could seal a bridged projection reading the RAW frame with the gate node running beside it, and the project would pass every wiring rule. Nothing does today: the only `src/` caller is the lane, whose `assemble_nodes` defaults to the wired assembler (`queue_lane.py:560`). | A second `NodeAssembler`, or any bridged group compiled by a caller outside `compile/`. Closure lives in `render/`: the check needs the hop→node map only the assembler has, so rule 7 must be told *which* node has to consume *which* gate rather than that someone did. |
+| 🟡 **The compile-time and authorize-time realization tiers are independent defaults** | `compile_feature_group(execution_tier=…)` threads the tier into `compile_ir` **only** (`chain.py:463`); `authorize_execution_realizations` carries its own `ExecutionTier.PRODUCTION` default (`ir.py:377-382`) and has no `src/` caller yet. G-2 is where the two meet in one chain (`compile → Gate 2 → authorize → prepare_run`). It fails closed in both directions — a disagreement is refused with `realization_execution_tier_mismatch`, never silently granted — so this is ergonomic rather than a correctness hole: a caller must remember to state the same tier twice and nothing structural obliges it to. | G-2, the first code to call both in one chain. Closure: carry the tier on the token that already binds `ir_hashes` and `environment_id` for exactly this reason — `AuthorizedCompilation` or `BridgeExecutionAuthorization`, both `materialize/ir.py` dataclasses and therefore Phase-G-ownable. |
+| ⚪ **The reconciler's three recorded follow-ups** | **(a) Metric-name collision** — `materialize.reconcile.<verdict>` is emitted both as a gauge (this sweep's standing count) and as a counter (cumulative terminalizations) at `reconcile.py:585-587`, so a dashboard globbing the prefix shows two series under one name; the fix is two namespaces (`…verdict.<name>` gauge, `…terminalized.<name>` counter). **(b) No `EXPLAIN` test for the query the sweep depends on** — the plan assertion covers `_EXPIRED_REQUESTS_SQL` (`test_request_store.py:483-491`), while the *sufficient* query is `_UNREACHABLE_MESSAGE_SQL`'s correlated `NOT EXISTS` over `queue.message_id` (`reconcile.py:265-271`), which has none: an index change on `queue` could turn each candidate's lookup into a scan with nothing red. **(c) N+1** — one `_message` read per candidate (`reconcile.py:305`), bounded by the sweep's `limit`, collapsible into a single `= ANY(...)`. | A deployment whose sweep is large enough to measure, or the first dashboard built on the `materialize.reconcile` prefix. All three are cosmetic at G-1 volumes: with the flag off nothing enqueues materialization work at all. |
+| 🟡 **G-2's prepared parameters need their OWN run-keyed table — 1054 can never hold them** | Plan §3.6's amendment, restated here because it is a G-2 precondition and a migration author looks in this file rather than in a plan. Two independent proofs: `prepare_run` is keyed on `run_id`/`business_dt` (`runprep.py:831`) so the parameter set is RUN-scoped while `materialization_compiled_artifact` is `generation_id PRIMARY KEY` — one row could hold only one run's set; and 1054 takes 1034's append-only guards, whose function has no escape branch, so a nullable column reserved today could never be filled by a later `UPDATE`. Numbering consequence: **1053 and 1054 are used; 1055 stays reserved for G-3's active-revision pointer; 1056 is numerically free but claiming it requires appending to the Track-1-owned D7 reservation table in the same commit** — `docs/architecture/2026-08-01-verified-interfaces-semantic-profiles.md`, which is not on this branch. A coordination step, not a unilateral one. | G-2's first migration. Taking 1056 without the D7 append repeats the 1032/1033 double-allocation A.22 records. |
+| 🟡 **`/materialization-runs` is absent from both ingress prefix lists** | `deploy/kind/nginx.conf:16`'s `location ~ ^/(uploads\|search\|…\|data-sources)(/\|$)` and `frontend/vite.config.ts:15-19`'s `API_PATHS` both omit it, so a `POST` through the ingress falls through to the SPA location and answers 405 without ever reaching the API. Harmless today — the flag is default-OFF, both routes 404 while it is off, and no frontend code calls them — but the consequence is precise and easy to lose: **enabling `FEATUREGEN_MATERIALIZE_ENABLED` in a deployed environment is not sufficient to make the trigger reachable.** Not fixed on this branch by decision: both files are shared with a parallel session holding an in-flight `/data-sources` change, and a two-line edit there buys a merge conflict in exchange for a route nothing calls. | Before the flag is turned on in ANY environment reached through the ingress. Closure is one prefix in each list, and it belongs in the same change that enables the flag so the two cannot disagree. |
+### A.40 🟡 Phantom-keyed `field_evidence` / `field_decision_event` rows on deployed catalogs (2026-08-03)
 
 Recorded while remediating the final whole-branch review of Release A of the
 suggested-feature semantic-discovery plan (Task 0C minor, carried to the checkpoint).

@@ -33,21 +33,30 @@ import subprocess
 
 import pytest
 from tests.featuregen.materialize import fixtures
+from tests.featuregen.materialize import test_chain as chain_tests
 from tests.featuregen.materialize.test_group_plan import catalog  # noqa: F401 - a fixture
 from tests.featuregen.materialize.test_render_project import (  # noqa: F401 - `project` fixture
     _render,
     project,
 )
+from tests.featuregen.materialize.test_resolve import no_dsn  # noqa: F401 - autouse, see below
 
-from featuregen.materialize.codes import ValidationFindingCode
+from featuregen.materialize.codes import PublicationRefusalCode, ValidationFindingCode
+from featuregen.materialize.compile.chain import ChainStage, L0Interpreter
+from featuregen.materialize.control_plane import RunEventKind
 from featuregen.materialize.identity import SealedProject
 from featuregen.materialize.render.project import (
     PIPELINE_NAME,
     REQUIRED_RUN_PARAMETERS,
     materialize_to,
 )
+from featuregen.materialize.request_store import RequestLifecycle
 from featuregen.materialize.submit import submission_command
-from featuregen.materialize.validation import ValidationStatus, run_l0
+from featuregen.materialize.validation import (
+    ValidationStatus,
+    read_validation_reports,
+    run_l0,
+)
 
 GEN = "gen-l0-gate"
 ENVIRONMENT = "hdfc-local"
@@ -123,6 +132,48 @@ def test_a_hand_edit_of_the_RENDERED_project_is_caught_in_the_real_environment(
     assert report.status is ValidationStatus.FAILED
     assert [finding.code for finding in report.findings] == \
         [ValidationFindingCode.PROJECT_HASH_MISMATCH]
+
+
+def test_the_CHAIN_ITSELF_seals_a_project_whose_build_is_PROVED(
+        db, monkeypatch, tmp_path, l0_python: str, l0_env) -> None:
+    """Phase G T6: L0 driven BY `compile_feature_group`, against a real kedro+pyspark interpreter.
+
+    The collected suite proves the failing direction end to end — it runs the real `run_l0` against
+    `sys.executable`, which has no kedro, and shows the run terminating `RUN_FAILED` with the build
+    unproven. It structurally cannot prove the PASSING direction, because that needs the engines.
+    This is the other half, and it is the claim the G-1 terminal now makes: *compiled, rendered,
+    sealed, and proven to import and construct its pipeline in a separate interpreter.*
+
+    Everything is the real thing — the seeded catalog, an authoring run written by the 1022
+    orchestrator, the real assembler, the real `run_l0` — and the assertion is on the DURABLE
+    record, read back through `read_validation_reports`, rather than on the object this process
+    happened to hold. `no_dsn` is imported above because it is autouse in `test_resolve` and autouse
+    applies per collected module; without it the authoring lane would look for a durable DSN.
+
+    A generous timeout: importing pyspark and constructing the pipeline in a cold interpreter is
+    seconds, but this gate also runs on machines that are paging the JVM in for the first time.
+    """
+    seeded = chain_tests._seed(db)
+    request_id = chain_tests._request(seeded)
+    work_items = [chain_tests._authored(seeded, monkeypatch)]
+
+    outcome = chain_tests._run(
+        seeded, request_id, work_items, tmp_path,
+        l0=L0Interpreter(python_executable=l0_python, timeout_seconds=600.0, env=l0_env))
+
+    assert outcome.validation_report is not None
+    assert (outcome.validation_report.status, outcome.validation_report.findings) == \
+        (ValidationStatus.PASSED, ()), \
+        [finding.payload() for finding in outcome.validation_report.findings]
+
+    stored = read_validation_reports(seeded, generation_id=outcome.generation_id)
+    assert [(r.status, r.generated_project_hash) for r in stored] == \
+        [(ValidationStatus.PASSED, outcome.generated_project_hash)]
+
+    assert outcome.stopped_at is ChainStage.PUBLISHER
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+    assert outcome.refusal.code is PublicationRefusalCode.CAPABILITY_UNPROVEN
+    assert outcome.lifecycle_state is RequestLifecycle.COMMITTED
 
 
 def test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session(

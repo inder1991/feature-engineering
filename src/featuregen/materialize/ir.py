@@ -76,6 +76,7 @@ from featuregen.materialize.spine import (
     SpineSpec,
     validate_spine_declaration,
 )
+from featuregen.overlay.upload.bridge_realization import ExecutionTier
 from featuregen.overlay.upload.bridge_store import (
     CurrentBridgeRealizationV1,
     executable_bridge_realizations,
@@ -221,6 +222,39 @@ class BridgeExecutionAuthorization:
 # ── compilation ──────────────────────────────────────────────────────────────────────────────────
 
 
+#: The one purpose every read on this path is for. It is a value the applicability scope is checked
+#: against, not a switch: a realization approved for another purpose is not approved for this one.
+_BRIDGE_PURPOSE = "feature_generation"
+
+
+def _executable_realizations_for_tier(
+    conn: DbConn, *, environment_id: str, execution_tier: ExecutionTier,
+) -> tuple[CurrentBridgeRealizationV1, ...]:
+    """Every current realization this environment may execute AT THIS applicability tier.
+
+    ``ExecutionTier`` scopes whether a directional bridge realization is approved for sandbox or
+    production DATA (``bridge_realization.py:81``). It is emphatically **not** a run execution tier:
+    there is one namespace here, it is baked into ``sandbox_execution_hash``, and nothing on this
+    path mints or reads a second one.
+
+    ``executable_bridge_realizations`` is the typed production reader and STAYS the production path
+    — it fixes the tier at ``PRODUCTION`` in its own body and ``overlay/upload/`` is not this
+    module's to change. Any other tier composes the same two typed readers with the tier passed
+    through, which is that reader's own body and not a looser one: the realizations still have to be
+    CURRENT and still have to pass full execution revalidation. Nothing here ever falls back to link
+    availability, which is discovery evidence rather than execution authority.
+    """
+    if execution_tier is ExecutionTier.PRODUCTION:
+        return executable_bridge_realizations(
+            conn, purpose=_BRIDGE_PURPOSE, environment=environment_id)
+    assessments = (
+        revalidate_bridge_realization(
+            conn, realization, purpose=_BRIDGE_PURPOSE, environment=environment_id,
+            execution_tier=execution_tier)
+        for realization in load_current_bridge_realizations(conn))
+    return tuple(assessment.realization for assessment in assessments if assessment.executable)
+
+
 def _refuse(code: CompilationRefusalCode, detail: str) -> MaterializationRefused:
     return MaterializationRefused(code, detail)
 
@@ -237,6 +271,7 @@ def compile_ir(
     spine_decl: SpineSourceDeclarationV1 | None,
     inventory: ClusterInventoryV1,
     bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] | None = None,
+    execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
 ) -> FormulaExecutionIRV1 | MaterializationRefused:
     """Compile ONE admitted feature into its complete executable plan, or refuse it (§2).
 
@@ -255,6 +290,13 @@ def compile_ir(
     :func:`authorize_compilation`, which refuses to authorize IRs compiled against a population
     other than the one it was handed.
 
+    ``execution_tier`` is the bridge-realization APPLICABILITY scope this compilation reads at — is
+    the join approved for production data, or only for sandbox data. It is not a run tier and it
+    changes no identity: see :func:`_executable_realizations_for_tier`. It defaults to
+    ``PRODUCTION``, which is what this entry point silently asserted before it was a parameter, so
+    an existing caller compiles against exactly the realizations it always did. It is ignored when
+    ``bridge_realizations`` is injected, because then no read happens at all.
+
     Raises:
         featuregen.formula.schema.SchemaError: ``formula.body`` is not one of Child-1's three body
             shapes. A body outside the discriminated union is a forged object rather than a governed
@@ -267,10 +309,10 @@ def compile_ir(
         # deterministic unit tests, but omission must not mean "there are no bridges": that would
         # make every cross-catalog formula fail even though a current executable realization
         # exists, and would encourage callers to bypass the typed reader.
-        bridge_realizations = executable_bridge_realizations(
+        bridge_realizations = _executable_realizations_for_tier(
             conn,
-            purpose="feature_generation",
-            environment=inventory.environment_id,
+            environment_id=inventory.environment_id,
+            execution_tier=execution_tier,
         )
     spine = validate_spine_declaration(conn, spine_decl, roles=roles_used)
     if isinstance(spine, MaterializationRefused):
@@ -337,6 +379,7 @@ def authorize_execution_realizations(
     authorized: AuthorizedCompilation,
     *,
     environment_id: str,
+    execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
 ) -> BridgeExecutionAuthorization | MaterializationRefused:
     """Revalidate every exact directional realization immediately before run preparation.
 
@@ -344,6 +387,11 @@ def authorize_execution_realizations(
     pointer advanced, a dependency changed, exact evidence expired, or the bridge lifecycle closed
     after compilation, the old revision is refused rather than silently replaced with a newer
     realization that was never rendered into this artifact.
+
+    ``execution_tier`` is the applicability scope this run is authorized AT, and must be the one the
+    compilation read at — a realization approved only for sandbox data is refused here at the
+    ``PRODUCTION`` default with ``realization_execution_tier_mismatch``, which is the correct answer
+    and not the bug. The bug was that it was the ONLY answer.
     """
     if not isinstance(authorized, AuthorizedCompilation):
         raise TypeError(
@@ -371,8 +419,9 @@ def authorize_execution_realizations(
             assessment = revalidate_bridge_realization(
                 conn,
                 realization,
-                purpose="feature_generation",
+                purpose=_BRIDGE_PURPOSE,
                 environment=environment_id,
+                execution_tier=execution_tier,
             )
             if not assessment.executable:
                 return _refuse(

@@ -15,6 +15,7 @@ import ast
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -102,6 +103,63 @@ def test_a_MISSING_parameter_names_which_one(project_root) -> None:
 def test_the_complete_prepared_set_is_accepted() -> None:
     assert check_run_parameters(PREPARED) is PREPARED
     assert set(PREPARED) == set(REQUIRED_RUN_PARAMETERS)
+
+
+# ── a CROSS-CATALOG artifact reads one more parameter, and only it may carry it ──────────────────
+#
+# The join-gate node §8 renders for a `CrossCatalogJoinStepV1` wires `params:bridge_predicate_values`
+# (`render/nodes_join_gate.py:115`), so `render_project` puts that name into the artifact's OWN
+# required set and the rendered hook demands it. A same-catalog artifact renders no such node and no
+# such parameter. The requirement is therefore CONDITIONAL on the artifact, and the check is strict
+# against whichever set the artifact declared — never a static widening that would let a
+# same-catalog run carry a value nothing reads.
+
+CROSS_CATALOG_REQUIRED = (*REQUIRED_RUN_PARAMETERS, "bridge_predicate_values")
+CROSS_CATALOG_PREPARED = {**PREPARED, "bridge_predicate_values": {"tenant_id": "HDFC"}}
+
+
+def test_a_cross_catalog_prepared_set_is_ACCEPTED_against_the_artifacts_own_required_set() -> None:
+    """P1: before this, every cross-catalog group was unsubmittable at the last mile."""
+    assert check_run_parameters(
+        CROSS_CATALOG_PREPARED, required_parameters=CROSS_CATALOG_REQUIRED
+    ) is CROSS_CATALOG_PREPARED
+
+
+def test_a_SAME_CATALOG_run_carrying_the_bridge_parameter_is_STILL_refused() -> None:
+    """The other direction of the same strictness: nothing in that artifact reads the value."""
+    with pytest.raises(ValueError, match="unexpected \\['bridge_predicate_values'\\]"):
+        check_run_parameters(CROSS_CATALOG_PREPARED)
+
+
+def test_a_cross_catalog_run_MISSING_the_bridge_parameter_is_refused() -> None:
+    with pytest.raises(ValueError, match="missing \\['bridge_predicate_values'\\]"):
+        check_run_parameters(PREPARED, required_parameters=CROSS_CATALOG_REQUIRED)
+
+
+def test_a_required_set_that_DROPS_a_base_parameter_is_refused_outright() -> None:
+    """The base set is a floor, exactly as it is in ``prepare_run``: a caller may only ADD."""
+    dropped = tuple(name for name in REQUIRED_RUN_PARAMETERS if name != "staging_root")
+    with pytest.raises(ValueError, match="base run parameters"):
+        check_run_parameters(
+            {k: v for k, v in PREPARED.items() if k != "staging_root"},
+            required_parameters=dropped)
+
+
+def test_the_submitter_refuses_a_cross_catalog_set_it_was_NOT_told_about(project_root) -> None:
+    submitter = LocalClusterSubmitter(python_executable="/nonexistent/python")
+    with pytest.raises(ValueError, match="unexpected"):
+        submitter.submit(project_root, run_parameters=CROSS_CATALOG_PREPARED)
+
+
+def test_the_submitter_gets_PAST_the_parameter_check_when_the_artifact_requires_it(
+        project_root) -> None:
+    """It never starts (the interpreter does not exist) — but it got as far as trying, which is
+    exactly the boundary P1 could not cross."""
+    submitter = LocalClusterSubmitter(python_executable="/nonexistent/python", env=_PYSPARK_ENV)
+    outcome = submitter.submit(project_root, run_parameters=CROSS_CATALOG_PREPARED,
+                               required_parameters=CROSS_CATALOG_REQUIRED)
+    assert not outcome.started
+    assert "never started" in outcome.detail
 
 
 # ── what actually crosses the boundary ───────────────────────────────────────────────────────────
@@ -235,10 +293,22 @@ def test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter(tmp_path) -> 
     stub = tmp_path / "python"
     grandchild_pid_file = tmp_path / "grandchild.pid"
     stub.write_text("#!/bin/sh\n"
+                    'if [ -n "$STUB_WARMUP" ]; then exit 0; fi\n'
                     "( sleep 120 ) &\n"
                     f'echo $! > "{grandchild_pid_file}"\n'
                     "sleep 120\n", encoding="utf-8")
     stub.chmod(0o755)
+    # WARM THE EXEC PATH FIRST, or this test is a coin toss under load. The host's malware scanner
+    # charges the FIRST exec of a freshly written executable a synchronous scan — measured on an
+    # idle box at ~215ms per new file against every later exec of the SAME file at ~4ms, and it
+    # stretches into whole seconds when the machine is busy. `submit`'s budget here is 1.0s, so on a
+    # loaded box the process group is killed before the stub's own body ever runs: `grandchild.pid`
+    # is never written and the read below fails with FileNotFoundError, which is a fact about the
+    # scanner rather than about the process-group kill this test exists to assert.
+    # The warm-up execs the SAME file, so the scan is paid outside the timed window and the real run
+    # starts in ~4ms. The early exit is what keeps the warm-up from leaving a 120s sleeper behind.
+    subprocess.run([str(stub)], env={**os.environ, "STUB_WARMUP": "1"}, check=True, timeout=60.0)
+
     submitter = LocalClusterSubmitter(python_executable=str(stub), timeout_seconds=1.0,
                                       env=_PYSPARK_ENV)
     started = time.monotonic()
@@ -247,7 +317,21 @@ def test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter(tmp_path) -> 
 
         assert time.monotonic() - started < 40.0      # old code: ~120s pipe-drain hang (Windows)
         assert outcome.completed is False and outcome.returncode is None
-        grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+        # POLLED, not read once: the shell creates the file with the redirect and writes into it a
+        # moment later, so a single read can land on "absent" or on "" even when the stub started
+        # in time. Same shape as the liveness poll below.
+        deadline = time.monotonic() + 10.0
+        while True:
+            recorded = (grandchild_pid_file.read_text(encoding="utf-8").strip()
+                        if grandchild_pid_file.exists() else "")
+            if recorded:
+                break
+            if time.monotonic() > deadline:
+                pytest.fail("the stub never recorded a grandchild pid, so this test cannot say "
+                            "whether the group was killed — the warm-up above exists to stop the "
+                            "first-exec security scan from eating the 1.0s budget")
+            time.sleep(0.05)
+        grandchild_pid = int(recorded)
         deadline = time.monotonic() + 10.0            # a killed orphan may be a zombie briefly
         while True:
             try:
