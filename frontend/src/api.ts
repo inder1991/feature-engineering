@@ -2452,9 +2452,26 @@ export interface SuggestionSourceDataset {
   profile_status: string
 }
 
-// One TRAVERSED relationship leg, in the direction travelled. `cardinality` is 'unknown' when the
-// edge declared none (never guessed at 1:1); `safety_status` is 'clearing' when governed-verified
-// or file-declared-and-cleared; `review_status` is 'file_declared' when nobody confirmed it.
+// One TRAVERSED relationship leg, in the direction travelled.
+//
+// The last three are LEFT AS `string` ON PURPOSE, and the reason is worth stating because the rest
+// of this block narrows aggressively. Each is written by TWO producers that do not agree, and the
+// dataclass carrying them validates only `relationship_kind` — so a TS union here would be a claim
+// the server does not enforce, and a payload that violated it would type-check as impossible while
+// rendering as garbage. The renderer maps every member below to words and degrades unknown members
+// gracefully, which is the honest equivalent.
+//
+//   cardinality   — the join-path walker passes the `graph_edge` column through verbatim, whose DB
+//                   CHECK is '1:1' | '1:N' | 'N:1' | NULL; the planner instead emits the taxonomy's
+//                   `Cardinality` StrEnum: 'one_to_one' | 'one_to_many' | 'many_to_one' |
+//                   'many_to_many'. NULL becomes 'unknown' — never guessed at 1:1. Nothing
+//                   normalizes the two notations.
+//   safety_status — 'clearing' (governed-verified, or declared with no contradicting fact) or
+//                   'unverified'. Closed by call-site enumeration only, not by any validator.
+//   review_status — 'file_declared' when nobody confirmed it. Otherwise the approved_join status
+//                   column, whose CHECK admits 'DRAFT' | 'PARTIALLY_CONFIRMED' | 'VERIFIED' |
+//                   'REJECTED' | 'STALE' | 'REVERIFY' (only VERIFIED is reachable on an
+//                   operational edge today), or the planner's own 'governed_bridge' | 'unlinked'.
 export interface SuggestionRelationshipDependency {
   relationship_ref: string
   relationship_kind: string
@@ -2572,7 +2589,9 @@ export interface SuggestionProjectionState {
   current_fingerprint: string | null
   generated_at: string | null
   stale_reason: string | null
-  omitted_counts: Record<string, number>
+  // The SAME closed key vocabulary the collection's identical field carries — a projection omits
+  // things for the same reasons a live page does, so it may not be the looser type.
+  omitted_counts: SuggestionOmittedCounts
 }
 
 export interface FeatureSuggestionHit {

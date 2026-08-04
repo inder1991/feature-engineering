@@ -404,8 +404,16 @@ describe('SuggestedFeaturesScreen', () => {
     // relationship legs, with the direction travelled and every unproven axis
     expect(within(drawer).getByText(/public.comp_fin_tran.cif_id → public.cust.cif_id/))
       .toBeInTheDocument()
-    expect(within(drawer).getByText(/cardinality unknown/i)).toBeInTheDocument()
-    expect(within(drawer).getByText(/review file_declared/i)).toBeInTheDocument()
+    // Every axis of the leg reads as WORDS — this is the row a reader consults to find out which
+    // join is unproven — with the server's own raw member beside it for audit.
+    const leg = drawer.querySelector('.sfc-rel') as HTMLElement
+    expect(within(leg).getByText(/not declared, so row multiplication is unknown/i))
+      .toBeInTheDocument()
+    expect(within(leg).getByText(/not cleared to run/i)).toBeInTheDocument()
+    expect(within(leg).getByText(/declared by an upload, confirmed by nobody/i)).toBeInTheDocument()
+    for (const raw of ['unknown', 'unverified', 'file_declared', 'identifier_link']) {
+      expect(within(leg).getByText(raw)).toBeInTheDocument()
+    }
     // revisions
     expect(within(drawer).getByText('Suggestion id')).toBeInTheDocument()
     expect(within(drawer).getByText('sug-1')).toBeInTheDocument()
@@ -413,6 +421,39 @@ describe('SuggestedFeaturesScreen', () => {
     expect(within(drawer).getByText('trace-1')).toBeInTheDocument()
     expect(within(drawer).getByText('d1')).toBeInTheDocument()
   })
+
+  it('keys repeatable lists without collision: one column in two recipe slots, repeated words',
+    async () => {
+      // None of these lists is unique by value. A column bound to TWO recipe slots is the real
+      // collision — React would drop one of the two operands and the drawer would under-report the
+      // inputs, which is precisely the thing "every input column" promises not to do.
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+          keywords: [text({ value: 'balance' }), text({ value: 'balance' })],
+          authoring_notes: [text({ value: 'check the sign' }), text({ value: 'check the sign' })],
+          operands: [
+            operand({ recipe_role: 'balance' }),
+            operand({ recipe_role: 'comparison' }),
+          ],
+        })]))
+        renderScreen()
+        const card = await openDetail('account_balance_trend_90d')
+        // both operands survive — same column, two slots
+        expect(within(card).getByText(/recipe slot balance/i)).toBeInTheDocument()
+        expect(within(card).getByText(/recipe slot comparison/i)).toBeInTheDocument()
+        const operands = card.querySelector('.sfc-operands') as HTMLElement
+        expect(within(operands).getAllByText('bal_amt')).toHaveLength(2)
+        expect(within(card).getAllByText('balance')).toHaveLength(2)
+        expect(within(card).getAllByText('check the sign')).toHaveLength(2)
+        // ...and React never warned about a duplicate key
+        const warned = errors.mock.calls.some(args =>
+          args.some(a => typeof a === 'string' && /same key/i.test(a)))
+        expect(warned).toBe(false)
+      } finally {
+        errors.mockRestore()
+      }
+    })
 
   it('renders the honest unavailable state for source datasets and unconsumed context', async () => {
     getTableSuggestionsV2.mockResolvedValue(page())
@@ -792,6 +833,17 @@ describe('SuggestedFeaturesScreen', () => {
     expect(note).toHaveTextContent(/all 4 directly joined tables/i)
     expect(note).toHaveTextContent(/within 1 join of this one/i)
     expect(note).not.toHaveTextContent(/Showing 4 of 4/i)
+  })
+
+  it('still states the hop limit when the payload reports NO neighbourhood at all', async () => {
+    // `neighbourhood: null` is an absent fact, not permission to drop the paragraph. Omitting it
+    // would turn the empty state below back into "nothing else is buildable here" when the truth
+    // is "we did not look" — the exact claim this note exists to prevent.
+    getTableSuggestionsV2.mockResolvedValue(page({ neighbourhood: null }))
+    renderScreen()
+    const note = await screen.findByTestId('neighbourhood')
+    expect(note).toHaveTextContent(/join neighbourhood was not reported/i)
+    expect(note).toHaveTextContent(/not as a statement about what deeper join paths could build/i)
   })
 
   it('says so plainly when no confirmed join reaches another table', async () => {
