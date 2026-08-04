@@ -19,9 +19,13 @@ import json
 import pytest
 from tests.featuregen.overlay.upload.conftest import overlay_conn  # noqa: F401 — fixture
 from tests.featuregen.overlay.upload.test_suggestions import (  # noqa: F401 — fixture
+    _JOIN_SOURCE,
+    _MEASURE_TABLE,
     SOURCE,
     TABLE,
+    _join_edge,
     ftr_catalog,
+    join_catalog,
 )
 
 from featuregen.api.routes import suggestions as suggestions_route
@@ -213,6 +217,33 @@ def test_the_v2_body_matches_its_declared_response_model_exactly(client, ftr_cat
     field the body never sends — fails here rather than misleading a client."""
     body = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
     assert suggestions_route.FeatureSuggestionPageV2Response.model_validate(body)
+
+
+def test_the_v2_body_validates_when_a_relationship_warning_is_on_it(
+        client, conn, join_catalog):  # noqa: F811
+    """THE SAME CHECK, OVER A CATALOG THAT HAS JOINS. `ftr_catalog` holds no join edges at all, so
+    no relationship warning can reach the model above and the three relationship codes were
+    published, rendered and shipped without a single response-model validation. They emitted a
+    NESTED `[[[src, a], [src, b]]]` instead of the declared flat `[[src, ref], …]`, which this test
+    fails on `operand_refs.0.0` and which the card turns into a blank screen.
+
+    The edge is FILE-DECLARED (no approved-join fact — the default for an upload-declared
+    relationship) with no cardinality, so both `RELATIONSHIP_UNCONFIRMED` and
+    `DIRECTIONAL_CARDINALITY_UNAVAILABLE` are on the page."""
+    _join_edge(conn, fact_key=None, status=None, cardinality=None)
+    path = f"/catalog/{_JOIN_SOURCE}/tables/{_MEASURE_TABLE}/suggestions?contract_version=2"
+    r = client.get(path, headers=_h())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    warnings = [w for hit in body["hits"] for w in hit["suggestion"]["warnings"]]
+    codes = {w["code"] for w in warnings}
+    assert {"RELATIONSHIP_UNCONFIRMED", "DIRECTIONAL_CARDINALITY_UNAVAILABLE"} <= codes, codes
+    assert suggestions_route.FeatureSuggestionPageV2Response.model_validate(body)
+    # ...and, said directly: every entry is a FLAT (catalog_source, ref) pair of strings, one arity
+    # for every code on the page.
+    for warning in warnings:
+        for ref in warning["operand_refs"]:
+            assert [type(part) for part in ref] == [str, str], warning
 
 
 def test_the_v1_body_matches_its_declared_response_model_exactly(client, ftr_catalog):  # noqa: F811

@@ -16,7 +16,9 @@ The four proofs this suite exists for:
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+import os
+from dataclasses import fields, replace
+from pathlib import Path
 
 import pytest
 from tests.featuregen.overlay.upload.test_suggestions import (
@@ -94,6 +96,64 @@ def join_catalog(overlay_conn):
     _govern_table_facts(overlay_conn, _ENTITY_TABLE, "master_cif", "master_dt",
                         source=_JOIN_SOURCE)
     return _Catalog(source=_JOIN_SOURCE, table=_MEASURE_TABLE)
+
+
+# ── the ASYMMETRIC catalog: G — L — X, where the asymmetry IS the fixture ───────────────────────
+# `join_catalog` above has exactly two mutually-joined tables, so both anchors see an identical
+# grounding universe and every anchor-independence proof over it is unfalsifiable in the one way
+# that matters. Here the entity table G holds the customer key, the ledger L holds a balance, and
+# the shadow ledger X holds a SECOND balance — joined to L only. At the default one-hop bound the
+# two anchors therefore ground over genuinely different universes: from L it is {G, L, X} and the
+# monetary-stock tie set has two members; from G it is {G, L} and it has one. X is named to sort
+# LAST, and `_ranked_matches` breaks ties on (score, table, column, object_ref), so the SELECTED
+# binding — and hence the logical candidate — is identical from either anchor.
+_ASYM_SOURCE = "p4_suggestions_asym_ftr"
+_ASYM_ENTITY = "acct_master"        # G — the customer key
+_ASYM_LEDGER = "ledger_book"        # L — the balance that wins every tie
+_ASYM_SHADOW = "zz_shadow_book"     # X — a second balance, one hop further from G
+_ASYM_COLUMNS = {
+    _ASYM_ENTITY: {
+        "MASTER_CIF": ("customer_id", "varchar", "Master Customer Identifier"),
+        "MASTER_ACCT": ("account_id", "varchar", "Master Account Identifier"),
+        "MASTER_DT": ("as_of_date", "date", "Master As Of Date"),
+    },
+    _ASYM_LEDGER: {
+        "LEDGER_ACCT": ("account_id", "varchar", "Ledger Account Identifier"),
+        "BAL_AMT": ("monetary_stock", "decimal", "Ledger Balance"),
+        "TXN_AMT": ("monetary_flow", "decimal", "Ledger Transaction Amount"),
+        "TXN_TS": ("event_timestamp", "timestamp", "Ledger Posting Timestamp"),
+        "LEDGER_DT": ("as_of_date", "date", "Ledger As Of Date"),
+    },
+    _ASYM_SHADOW: {
+        "SHADOW_ACCT": ("account_id", "varchar", "Shadow Account Identifier"),
+        "BAL_AMT": ("monetary_stock", "decimal", "Shadow Balance"),
+        "SHADOW_DT": ("as_of_date", "date", "Shadow As Of Date"),
+    },
+}
+
+
+def _asym_edge(conn, from_ref: str, to_ref: str) -> None:
+    """One governed-VERIFIED operational join. VERIFIED on purpose: a file-declared edge would add
+    relationship warnings to the comparison and blur what the asymmetry proof is about."""
+    conn.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority, "
+        "approved_join_fact_key, approved_join_status) "
+        "VALUES (%s, 'joins', %s, %s, 'N:1', 'operational', 'ajf-verified', 'VERIFIED')",
+        (_ASYM_SOURCE, from_ref, to_ref))
+
+
+@pytest.fixture
+def asymmetric_catalog(overlay_conn):
+    _seal()
+    _ingest(overlay_conn, _ASYM_SOURCE, _ASYM_COLUMNS)
+    _govern_table_facts(overlay_conn, _ASYM_ENTITY, "master_cif", "master_dt", source=_ASYM_SOURCE)
+    _govern_table_facts(overlay_conn, _ASYM_LEDGER, "ledger_acct", "ledger_dt", source=_ASYM_SOURCE)
+    _govern_table_facts(overlay_conn, _ASYM_SHADOW, "shadow_acct", "shadow_dt", source=_ASYM_SOURCE)
+    _asym_edge(overlay_conn, f"public.{_ASYM_LEDGER}.ledger_acct",
+               f"public.{_ASYM_ENTITY}.master_acct")
+    _asym_edge(overlay_conn, f"public.{_ASYM_SHADOW}.shadow_acct",
+               f"public.{_ASYM_LEDGER}.ledger_acct")
+    return _Catalog(source=_ASYM_SOURCE, table=_ASYM_LEDGER)
 
 
 def _page(conn, table=TABLE, *, source=SOURCE, roles=(), **kw):
@@ -745,6 +805,175 @@ def test_the_same_candidate_from_either_operand_table_is_byte_identical(overlay_
         assert left.suggestion_id == right.suggestion_id, name
         assert left.suggestion_revision_id == right.suggestion_revision_id, name
         assert left == right, name
+
+
+def _asym_pages(conn, **kw):
+    """The same catalog read from the ledger (three tables in reach) and from the entity table (two),
+    with the candidates keyed by name."""
+    left = _page(conn, _ASYM_LEDGER, source=_ASYM_SOURCE, **kw)
+    right = _page(conn, _ASYM_ENTITY, source=_ASYM_SOURCE, **kw)
+    return left, right
+
+
+def _tie_sensitive(left: dict, right: dict) -> list[str]:
+    """The shared candidates whose GROUNDING PASS provably ran over different universes: their trace
+    hashes differ, because the trace covers ``candidate_key``, which folds in each role's tie set.
+    Every anchor-independence assertion below is vacuous unless this list is non-empty."""
+    return sorted(name for name in set(left) & set(right)
+                  if left[name].grounding_trace_content_hash
+                  != right[name].grounding_trace_content_hash)
+
+
+def test_the_same_candidate_from_asymmetric_anchors_shares_both_identities(overlay_conn,
+                                                                          asymmetric_catalog):
+    """ANCHOR INDEPENDENCE where it can actually fail. ``join_catalog``'s two mutually-joined tables
+    give both anchors an IDENTICAL grounding universe, so the proof above cannot fail whatever the
+    revision hashes. Here the universes genuinely differ: from the ledger the monetary-stock role
+    ties between two tables' balances, from the entity table it does not — same winner either way.
+
+    That difference reaches ``candidate_key`` (via ``binding_resolution_hash`` ->
+    ``tied_candidate_set_hash``) and therefore ``trace_content_hash``, which is why the revision
+    hashes a build-universe-INDEPENDENT projection of the trace instead. One logical candidate, one
+    id, one revision — otherwise Release B's global page would hold two disagreeing revisions of it
+    and rule 26 / DoD 17 would withhold it permanently."""
+    left, right = (_suggestions(page) for page in _asym_pages(overlay_conn))
+    shared = sorted(set(left) & set(right))
+    assert "balance_trend_90d" in shared, (sorted(left), sorted(right))
+
+    # NON-VACUITY: the two reads really did ground over different universes.
+    sensitive = _tie_sensitive(left, right)
+    assert sensitive, "both anchors saw the same tie sets — the asymmetry fixture is not asymmetric"
+    assert "balance_trend_90d" in sensitive
+
+    for name in shared:
+        assert left[name].suggestion_id == right[name].suggestion_id, name
+        assert left[name].suggestion_revision_id == right[name].suggestion_revision_id, name
+
+
+def test_the_revision_does_not_move_with_the_neighbourhood_bound(overlay_conn,
+                                                                 asymmetric_catalog):
+    """The same property against ``max_hops`` rather than the anchor. From the entity table one hop
+    reaches the ledger only; two hops also reach the shadow ledger, which adds a second equally
+    fitting balance and so widens the tie set. A CLIENT-SUPPLIED bound must not be able to mint a
+    second revision of a candidate it did not otherwise change."""
+    near = _suggestions(_page(overlay_conn, _ASYM_ENTITY, source=_ASYM_SOURCE, max_hops=1))
+    far = _suggestions(_page(overlay_conn, _ASYM_ENTITY, source=_ASYM_SOURCE, max_hops=2))
+    shared = sorted(set(near) & set(far))
+    assert shared
+    sensitive = _tie_sensitive(near, far)
+    assert sensitive, "widening the bound changed no tie set — the proof would be vacuous"
+    for name in shared:
+        assert near[name].suggestion_id == far[name].suggestion_id, name
+        assert near[name].suggestion_revision_id == far[name].suggestion_revision_id, name
+
+
+def test_the_revision_does_not_move_with_the_callers_read_scope(overlay_conn, asymmetric_catalog):
+    """And against the READ SCOPE. Hiding the shadow ledger's balance from a public caller removes
+    it from that caller's grounding universe and shrinks the tie set — the third way one logical
+    candidate could have acquired two revisions."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND object_ref = %s",
+        (_ASYM_SOURCE, f"public.{_ASYM_SHADOW}.bal_amt"))
+    public = _suggestions(_page(overlay_conn, _ASYM_LEDGER, source=_ASYM_SOURCE))
+    privileged = _suggestions(_page(overlay_conn, _ASYM_LEDGER, source=_ASYM_SOURCE,
+                                    roles=("restricted_reader",)))
+    shared = sorted(set(public) & set(privileged))
+    assert shared
+    sensitive = _tie_sensitive(public, privileged)
+    assert sensitive, "the two scopes saw the same tie sets — the proof would be vacuous"
+    for name in shared:
+        assert public[name].suggestion_id == privileged[name].suggestion_id, name
+        assert public[name].suggestion_revision_id == privileged[name].suggestion_revision_id, name
+
+
+def test_exactly_which_payload_fields_still_read_the_build_universe(overlay_conn,
+                                                                    asymmetric_catalog):
+    """THE PINNED RESIDUAL. The two identities are anchor-independent; the canonical payload is not
+    yet, in exactly two places, and both are build OBSERVATIONS rather than candidate content:
+
+    * ``binding_quality`` is ``AMBIGUOUS`` precisely when the pass saw a tie, so it reports the
+      universe it ran over;
+    * ``grounding_trace_content_hash`` is the identity of THAT build's trace, which is what it is
+      for.
+
+    Relocating both onto ``SuggestionBuildProvenanceV1`` (where the other exact build ids already
+    live) is the modelling-correct answer, but it is a wire + UI contract change and is recorded as
+    a Release-B decision in the freeze doc's deviation log rather than taken unilaterally here. This
+    test exists so the residual cannot grow silently: a THIRD anchor-sensitive payload field fails
+    it."""
+    left, right = (_suggestions(page) for page in _asym_pages(overlay_conn))
+    divergent: set[str] = set()
+    for name in sorted(set(left) & set(right)):
+        for field in fields(left[name]):
+            if getattr(left[name], field.name) != getattr(right[name], field.name):
+                divergent.add(field.name)
+    assert divergent == {"binding_quality", "grounding_trace_content_hash"}
+
+
+# ── the captured server body the frontend renders ───────────────────────────────────────────────
+_CAPTURE = (Path(__file__).resolve().parents[4] / "frontend" / "src" / "screens"
+            / "SuggestedFeaturesScreen.serverCapture.json")
+#: Sub-trees whose KEYS are data rather than contract: an omission tally is keyed by whatever was
+#: omitted, and the facet map by whatever facets exist. Their presence is pinned, their key sets
+#: are not.
+_DATA_KEYED = ("facets", "omitted_counts")
+
+
+def _key_paths(node, prefix: str = "") -> set[str]:
+    """Every dotted key path in a wire body, with list indices collapsed — the body's CONTRACT
+    surface, independent of the values a particular fixture happens to hold."""
+    paths: set[str] = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            paths.add(f"{prefix}{key}")
+            if key not in _DATA_KEYED:
+                paths |= _key_paths(value, f"{prefix}{key}.")
+    elif isinstance(node, list):
+        for item in node:
+            paths |= _key_paths(item, prefix)
+    return paths
+
+
+def _captured_body(conn) -> dict:
+    """The join catalog with a FILE-DECLARED, cardinality-less edge — so the captured body carries
+    real relationship warnings, which is exactly what the hand-written frontend fixtures could not
+    produce and what the nested-ref defect hid behind."""
+    _join_edge(conn, fact_key=None, status=None, cardinality=None)
+    return page_to_json(_page(conn, _MEASURE_TABLE, source=_JOIN_SOURCE))
+
+
+def test_the_frontends_captured_server_body_is_still_the_body_the_server_sends(overlay_conn,
+                                                                               join_catalog):
+    """THE CONTRACT TEST the frontend suite never had. Its fixtures are hand-written literals, so
+    they agree with the server only for as long as someone re-reads both — and the one shape nobody
+    hand-wrote (a relationship warning) shipped with the wrong arity through every green suite.
+
+    ``frontend/src/screens/SuggestedFeaturesScreen.serverCapture.json`` is a REAL ``page_to_json``
+    body, checked in and rendered by ``SuggestionCard.capture.test.tsx``. This test is the other
+    half: it re-derives that body from the real engine and compares the CONTRACT SURFACE — every
+    dotted key path — so a field the server adds, drops or renames fails here instead of silently
+    leaving the capture describing a server that no longer exists. Values are deliberately not
+    compared: a template edit legitimately moves every hash on the page.
+
+    Regenerate with::
+
+        FEATUREGEN_REGEN_SUGGESTION_CAPTURE=1 uv run pytest \\
+          tests/featuregen/overlay/upload/test_suggestion_contract.py -k captured_server_body
+    """
+    body = _captured_body(overlay_conn)
+    if os.environ.get("FEATUREGEN_REGEN_SUGGESTION_CAPTURE"):
+        _CAPTURE.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert _CAPTURE.exists(), f"the frontend capture is missing: {_CAPTURE}"
+    captured = json.loads(_CAPTURE.read_text(encoding="utf-8"))
+    live, pinned = _key_paths(body), _key_paths(captured)
+    assert live == pinned, {"server_only": sorted(live - pinned),
+                            "capture_only": sorted(pinned - live)}
+    # ...and the capture really does carry the shapes the hand-written fixtures cannot invent.
+    codes = {w["code"] for h in captured["hits"] for w in h["suggestion"]["warnings"]}
+    assert {"RELATIONSHIP_UNCONFIRMED", "DIRECTIONAL_CARDINALITY_UNAVAILABLE"} <= codes, codes
+    assert any(h["suggestion"]["relationship_dependencies"] for h in captured["hits"])
 
 
 def test_the_anchor_travels_on_the_collection_and_nowhere_else(overlay_conn, join_catalog):

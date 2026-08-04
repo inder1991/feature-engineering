@@ -9,7 +9,11 @@ Three content-addressed identities, all minted through the shared JCS hasher
   from, of the validation OUTCOME and of every build observation, so opening the same cross-table
   candidate from either of its operand tables — or from a global page — yields one id.
 * ``suggestion_revision_id`` — WHICH EXACT CONTENT produced this rendering of it. Everything the
-  meaning rested on, including the grounding trace hash and the validation result.
+  meaning rested on, including the grounding decision and the validation result. The decision
+  enters as :func:`build_universe_independent_trace_hash`, NOT as the trace's own
+  ``trace_content_hash``: that one folds in the candidate key, whose tie sets are a property of the
+  universe the grounding pass ran over (anchor table + neighbourhood, bounded by ``max_hops`` and
+  filtered by read scope), so hashing it gave one logical candidate two revisions.
 * ``SuggestionReadScopeV1.scope_key`` — WHICH VISIBILITY PROFILE the read ran under, as the
   canonical class tuple, never a user id and never a raw role list.
 
@@ -45,7 +49,12 @@ from typing import Any
 
 from featuregen.canonical import contract_hash_v1
 from featuregen.contracts.contract_versions import register_contract_version
-from featuregen.overlay.upload.grounding_trace import JOIN_PATH, GroundingDecisionTraceV1
+from featuregen.overlay.upload.grounding_trace import (
+    JOIN_PATH,
+    GroundingDecisionTraceV1,
+    build_universe_independent_content,
+    build_universe_independent_pins,
+)
 from featuregen.overlay.upload.read_scope import allowed_classes
 
 __all__ = [
@@ -55,9 +64,11 @@ __all__ = [
     "SUGGESTION_ID_CONTRACT",
     "SUGGESTION_REVISION_CONTRACT",
     "SUGGESTION_CONTRACT_VERSION",
+    "TRACE_PROJECTION_CONTRACT",
     "SuggestionReadScopeV1",
     "UnresolvableRelationshipPath",
     "build_read_scope",
+    "build_universe_independent_trace_hash",
     "dependency_content_hashes",
     "join_path_assignment",
     "suggestion_id",
@@ -70,6 +81,10 @@ _OWNER = "featuregen.overlay.upload.suggestion_identity"
 SUGGESTION_CONTRACT_VERSION = "2"
 SUGGESTION_ID_CONTRACT = "feature-suggestion-id"
 SUGGESTION_REVISION_CONTRACT = "feature-suggestion-revision"
+#: The grounding decision, projected onto the part of it that does not depend on WHICH COLUMNS were
+#: in scope when it was built (see :func:`build_universe_independent_trace_hash`). Its own contract
+#: name because it is a different claim from ``trace_content_hash``, not a re-spelling of it.
+TRACE_PROJECTION_CONTRACT = "grounding-decision-trace-projection"
 READ_SCOPE_CONTRACT = "suggestion-read-scope"
 READ_SCOPE_CONTRACT_VERSION = "1"
 
@@ -180,14 +195,57 @@ def join_path_assignment(trace: GroundingDecisionTraceV1 | None
     return tuple(sorted(assignment, key=lambda entry: entry[0]))
 
 
+def build_universe_independent_trace_hash(trace: GroundingDecisionTraceV1) -> str:
+    """The grounding decision as the REVISION hashes it: the trace's content with the build-universe
+    -sensitive ``candidate_key`` projected out.
+
+    **Why the revision cannot hash ``trace_content_hash`` directly.** That hash covers
+    ``candidate_key``, i.e. ``recipe_candidate_key``, one of whose inputs is
+    ``binding_resolution_hash`` — a fold of each role's ``tied_candidate_set_hash``, the set of
+    columns that TIED for that role in the universe the grounding pass happened to run over. That
+    universe is the anchor table plus its join neighbourhood, bounded by the caller's ``max_hops``
+    and filtered by the caller's read scope. So the SAME winning binding of the SAME recipe over the
+    SAME operands yields two different trace hashes when opened from two different operand tables of
+    an asymmetric join graph — and would have yielded two ``suggestion_revision_id`` values under one
+    ``suggestion_id``. The plan's Identity rules forbid exactly that: "The canonical suggestion
+    payload is also anchor-independent. Requested table, neighbourhood limits, page truncation and
+    search cursor belong to ``FeatureSuggestionPageV2``." Invisible in Release A, where both surfaces
+    read one anchor and nothing is persisted; permanent in Release B, where rule 26 / DoD 17 would
+    withhold a suggestion whose revision bytes disagree with themselves.
+
+    **Why not fix ``trace_content_hash`` instead.** That hash is the TRACE's own identity — the
+    identity of one grounding decision, made in one universe, over one read scope — and the tie set
+    genuinely is part of what that decision was. It is pinned by its own tests and by
+    ``recompute_trace_content_hash``'s tamper check. The suggestion asks a different question
+    ("which content produced this rendering of this logical candidate"), so it gets its own
+    projection and its own contract name rather than redefining the trace's.
+
+    The tie set is not discarded, it is RECLASSIFIED: it remains readable as build provenance on
+    ``SuggestionBuildProvenanceV1`` / ``FeatureSuggestionV2.grounding_trace_content_hash``, which is
+    where a reader compares two builds. Everything the plan requires the revision to move on still
+    moves: the ordered relationship path, the dependency pins, the requirements, the validation
+    status and the evaluated rule hashes are all inside this projection, and the recipe/discovery/
+    semantic/profile content is hashed alongside it by :func:`suggestion_revision_id`.
+    """
+    return contract_hash_v1(TRACE_PROJECTION_CONTRACT, SUGGESTION_CONTRACT_VERSION,
+                            build_universe_independent_content(trace))
+
+
 def dependency_content_hashes(trace: GroundingDecisionTraceV1 | None) -> tuple[str, ...]:
-    """The sorted, deduplicated content hashes of everything the decision read — every dependency
-    pin plus every traversed leg's selected realization (0F-10's "relationship/dependency content
-    hashes"). Content only: ``current_revision_id`` and evidence occurrence ids are provenance and
-    never appear here."""
+    """The sorted, deduplicated content hashes of everything the decision read about the CANDIDATE —
+    every dependency pin plus every traversed leg's selected realization (0F-10's
+    "relationship/dependency content hashes"). Content only: ``current_revision_id`` and evidence
+    occurrence ids are provenance and never appear here.
+
+    The caller-scoped pins (:data:`~featuregen.overlay.upload.grounding_trace
+    .BUILD_SCOPE_DEPENDENCY_KINDS` — today the read-scope pin, whose content is the caller's own
+    visibility classes) are projected out for the same reason
+    :func:`build_universe_independent_trace_hash` drops them: the revision of one logical candidate
+    may not depend on WHO read it. That scope travels on the page, as
+    ``SuggestionReadScopeV1.scope_key``."""
     if trace is None:
         return ()
-    hashes = {pin.content_hash for pin in trace.dependency_pins}
+    hashes = {pin.content_hash for pin in build_universe_independent_pins(trace)}
     hashes |= {leg.realization_content_hash for leg in trace.ordered_relationship_path
                if leg.realization_content_hash is not None}
     return tuple(sorted(hashes))
@@ -244,7 +302,7 @@ def suggestion_revision_id(*, suggestion_id: str,
                            discovery_metadata_revision_id: str | None,
                            semantic_context_hashes: Sequence[str],
                            dataset_profile_hashes: Sequence[str],
-                           trace_content_hash: str,
+                           trace_projection_hash: str,
                            dependency_content_hashes: Sequence[str],
                            validation_rule_content_hashes: Sequence[str],
                            read_scope_rule_content_hashes: Sequence[str],
@@ -254,14 +312,20 @@ def suggestion_revision_id(*, suggestion_id: str,
 
     Everything meaning-bearing enters: the logical identity, the referenced recipe and discovery
     revisions, the referenced semantic-context and dataset-profile content, the grounding decision
-    (its trace hash, its dependency/realization content hashes, the exact rules it evaluated) and
-    the validation result.
+    (its build-universe-independent projection, its dependency/realization content hashes, the exact
+    rules it evaluated) and the validation result.
 
     Everything OBSERVATIONAL stays out, and cannot be passed: raw catalog snapshot ids, evidence
     occurrence/event ids, realization revision ids, refresh ids, timestamps, producer commit,
     deployment/job identity and the registry-wide fencing hashes. Byte-identical content that is
     re-uploaded, re-authored or rebuilt by a new commit therefore REUSES this revision (rule 24),
     while a genuinely different attestation moves it.
+
+    ``trace_projection_hash`` is :func:`build_universe_independent_trace_hash`, NOT the trace's own
+    ``trace_content_hash``: the latter folds in the tie sets of the universe the pass ran over, so
+    it moves with the anchor table, the ``max_hops`` bound and the caller's read scope — none of
+    which a revision of one logical candidate may depend on. The parameter is named for what it is
+    so a call site cannot pass the wrong hash by keyword without noticing.
     """
     payload = {
         "suggestion_id": suggestion_id,
@@ -270,7 +334,7 @@ def suggestion_revision_id(*, suggestion_id: str,
         # SETS: the collection order of these hashes is an implementation detail.
         "semantic_context_hashes": sorted(set(semantic_context_hashes)),
         "dataset_profile_hashes": sorted(set(dataset_profile_hashes)),
-        "grounding_trace_content_hash": trace_content_hash,
+        "grounding_trace_projection_hash": trace_projection_hash,
         "dependency_content_hashes": sorted(set(dependency_content_hashes)),
         "validation_rule_content_hashes": sorted(set(validation_rule_content_hashes)),
         "read_scope_rule_content_hashes": sorted(set(read_scope_rule_content_hashes)),
@@ -280,6 +344,7 @@ def suggestion_revision_id(*, suggestion_id: str,
     return contract_hash_v1(SUGGESTION_REVISION_CONTRACT, SUGGESTION_CONTRACT_VERSION, payload)
 
 
+register_contract_version(TRACE_PROJECTION_CONTRACT, SUGGESTION_CONTRACT_VERSION, owner=_OWNER)
 register_contract_version(SUGGESTION_ID_CONTRACT, SUGGESTION_CONTRACT_VERSION, owner=_OWNER)
 register_contract_version(SUGGESTION_REVISION_CONTRACT, SUGGESTION_CONTRACT_VERSION, owner=_OWNER)
 register_contract_version(READ_SCOPE_CONTRACT, READ_SCOPE_CONTRACT_VERSION, owner=_OWNER)

@@ -66,6 +66,7 @@ __all__ = [
     "SuggestionDependencyClass",
     "SuggestionRelationshipDependencyV1",
     "build_trace",
+    "build_universe_independent_content",
     "column_dependency_key",
     "dependency_pin",
     "join_path_pin_content",
@@ -445,6 +446,72 @@ def build_trace(*, candidate_key: str,
         validation_rule_content_hashes=tuple(validation_rule_content_hashes),
         read_scope_rule_content_hashes=tuple(read_scope_rule_content_hashes),
         trace_content_hash=contract_hash_v1(TRACE_CONTRACT, CONTRACT_VERSION, payload))
+
+
+#: Dependency pins whose CONTENT describes the CALLER rather than the candidate. The read-scope pin
+#: carries ``{"allowed_classes": …}`` — the visibility classes THIS run could see — which is exactly
+#: what ``SuggestionReadScopeV1.scope_key`` carries at the PAGE level (0F-8). It is a real,
+#: deliberately-pinned dependency of the build and stays in ``trace_content_hash``; it is projected
+#: out of a suggestion revision, which the plan requires to be read-scope-independent. The RULE that
+#: was evaluated is not lost with it: ``read_scope_rule_content_hashes`` carries it, and that field
+#: is inside the projection.
+BUILD_SCOPE_DEPENDENCY_KINDS: frozenset[str] = frozenset({READ_SCOPE})
+
+
+def build_universe_independent_pins(trace: GroundingDecisionTraceV1
+                                    ) -> tuple[GroundingDependencyPinV1, ...]:
+    """This trace's dependency pins minus the ones that describe the caller's visibility rather than
+    the candidate (:data:`BUILD_SCOPE_DEPENDENCY_KINDS`)."""
+    return tuple(pin for pin in trace.dependency_pins
+                 if pin.dependency_kind not in BUILD_SCOPE_DEPENDENCY_KINDS)
+
+
+def build_universe_independent_content(trace: GroundingDecisionTraceV1) -> dict[str, Any]:
+    """The trace's content MINUS ``candidate_key`` and MINUS the caller-scoped dependency pins —
+    everything the decision rested on that does not depend on WHICH COLUMNS WERE IN SCOPE WHEN IT
+    WAS BUILT.
+
+    ``candidate_key`` is ``recipe_grounding_context``'s ``recipe_candidate_key``, and one of its
+    inputs is ``binding_resolution_hash``, which folds in each role's ``tied_candidate_set_hash`` —
+    the set of columns that TIED for that role. That set is a property of the grounding universe,
+    not of the candidate: the same winning binding sits in a one-element tie set when grounded from
+    a two-table neighbourhood and a two-element one when a third table with an equally-fitting
+    column is in reach. So the same logical candidate, opened from a different anchor table, under a
+    different ``max_hops``, or by a caller with a different read scope, carries a different
+    ``candidate_key`` and therefore a different ``trace_content_hash``.
+
+    That is CORRECT for the trace, whose hash is the identity of one build and is pinned as such.
+    It is wrong for a SUGGESTION revision, which the plan requires to be anchor-independent. This
+    projection is what an identity builder hashes instead (see
+    :func:`~featuregen.overlay.upload.suggestion_identity.build_universe_independent_trace_hash`).
+
+    Nothing meaning-bearing is lost by dropping the key: every other input to ``candidate_key`` —
+    the recipe id, the template content hash, the semantic-parameter binding hash, the aggregation
+    label and the ordered ``(role, logical_ref)`` bindings — is a pure function of material the
+    suggestion revision already hashes (``recipe_revision_id``, ``suggestion_id``'s template id,
+    bound params and operands) or of the ``ordered_operand_roles`` carried below it.
+
+    **And the read-scope pin.** ``_validate_idea`` pins ``{"allowed_classes": …}`` up front, so two
+    callers with different visibility classes hold different pin content for the same candidate.
+    Withholding is TOTAL — a suggestion with an operand this caller cannot see is not rendered at
+    all — so every caller who receives a card received the same card, and the classes that let them
+    receive it belong to the page's ``read_scope_key``, not to the card's revision. See
+    :data:`BUILD_SCOPE_DEPENDENCY_KINDS`.
+
+    Derived from :func:`_trace_payload` rather than re-listing the fields, so a field added to the
+    trace enters this projection automatically and cannot be silently omitted from a revision.
+    """
+    payload = _trace_payload(
+        candidate_key=trace.candidate_key,
+        ordered_operand_roles=trace.ordered_operand_roles,
+        ordered_relationship_path=trace.ordered_relationship_path,
+        validation_status=trace.validation_status,
+        requirements=trace.requirements,
+        dependency_pins=build_universe_independent_pins(trace),
+        validation_rule_content_hashes=trace.validation_rule_content_hashes,
+        read_scope_rule_content_hashes=trace.read_scope_rule_content_hashes)
+    payload.pop("candidate_key")
+    return payload
 
 
 def recompute_trace_content_hash(trace: GroundingDecisionTraceV1) -> str:

@@ -436,14 +436,17 @@ def join_catalog(overlay_conn):
     return _Catalog(source=_JOIN_SOURCE, table=_MEASURE_TABLE)
 
 
-def _join_edge(conn, *, fact_key: str | None, status: str | None) -> None:
+def _join_edge(conn, *, fact_key: str | None, status: str | None,
+               cardinality: str | None = "N:1") -> None:
     """One operational `joins` edge between the two tables. ``fact_key=None`` is a FILE-DECLARED edge;
-    a fact key with ``VERIFIED`` is a governed-verified one — `join_path` treats both as CLEARING."""
+    a fact key with ``VERIFIED`` is a governed-verified one — `join_path` treats both as CLEARING.
+    ``cardinality=None`` is an edge that declared none, which the traversed leg reports as
+    ``unknown`` (never guessed at 1:1) — reachability does not depend on it."""
     conn.execute(
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority, "
         "approved_join_fact_key, approved_join_status) "
-        "VALUES (%s, 'joins', %s, %s, 'N:1', 'operational', %s, %s)",
-        (_JOIN_SOURCE, _JOIN_FROM, _JOIN_TO, fact_key, status))
+        "VALUES (%s, 'joins', %s, %s, %s, 'operational', %s, %s)",
+        (_JOIN_SOURCE, _JOIN_FROM, _JOIN_TO, cardinality, fact_key, status))
 
 
 def _screen(conn, table: str = _MEASURE_TABLE, roles=()) -> dict:

@@ -68,6 +68,7 @@ from featuregen.overlay.upload.read_scope import allowed_classes
 from featuregen.overlay.upload.suggestion_identity import (
     UnresolvableRelationshipPath,
     build_read_scope,
+    build_universe_independent_trace_hash,
     dependency_content_hashes,
     join_path_assignment,
     suggestion_id,
@@ -282,7 +283,14 @@ class SuggestionSourceDatasetV1:
 @dataclass(frozen=True, slots=True)
 class SuggestionWarningV1:
     """One limitation, as a CLOSED code plus the operands it concerns. ``detail`` renders the code;
-    a reader never parses truth out of it."""
+    a reader never parses truth out of it.
+
+    ``operand_refs`` has ONE arity for EVERY code: a flat sequence of ``(catalog_source, ref)``
+    pairs. Both the published response model (``list[list[str]]``) and the card
+    (``operand_refs.map(r => r[1])``) read it that way, so a code that emitted a deeper shape —
+    endpoint PAIRS, say — would fail response validation and crash the render. The arity is checked
+    here rather than trusted, because every suite downstream can pass while the shape is wrong.
+    """
 
     code: str
     operand_refs: tuple[tuple[str, str], ...]
@@ -293,6 +301,13 @@ class SuggestionWarningV1:
             raise ValueError(
                 f"unknown suggestion warning code {self.code!r}; the closed vocabulary is "
                 f"{sorted(WARNING_CODES)}")
+        for ref in self.operand_refs:
+            if not (isinstance(ref, tuple) and len(ref) == 2
+                    and all(isinstance(part, str) for part in ref)):
+                raise TypeError(
+                    f"suggestion warning {self.code!r} carries operand ref {ref!r}; every entry of "
+                    f"operand_refs is a flat (catalog_source, ref) pair of strings — a nested or "
+                    f"ragged shape breaks the wire model and the card that maps over it")
 
 
 @dataclass(frozen=True, slots=True)
@@ -821,6 +836,26 @@ def _evidence_refs(trace: GroundingDecisionTraceV1 | None, ref: tuple[str, str],
     return _bounded(sorted(found), MAX_EVIDENCE_REFS, omitted, "evidence_refs")
 
 
+def _leg_endpoint_refs(legs: Sequence[SuggestionRelationshipDependencyV1]
+                       ) -> tuple[tuple[str, str], ...]:
+    """The columns a relationship warning is ABOUT: both endpoints of every named leg, FLAT and
+    deduplicated in traversal order.
+
+    ``SuggestionWarningV1.operand_refs`` is ONE arity — a sequence of ``(catalog_source, ref)``
+    pairs — for every code in the closed vocabulary, because every consumer reads it that way: the
+    wire model declares ``list[list[str]]``, and the card renders ``operand_refs.map(r => r[1])``.
+    Emitting endpoint PAIRS here (``(from_ref, to_ref)`` where each is already a pair) nested the
+    shape one level deeper and put two arities under one field — which the response model rejects
+    and the card turns into a crash. A leg's direction is not lost by this projection: it travels,
+    typed, on ``relationship_dependencies``, which is where a reader gets traversal detail.
+    """
+    seen: dict[tuple[str, str], None] = {}
+    for leg in legs:
+        seen.setdefault(leg.from_ref, None)
+        seen.setdefault(leg.to_ref, None)
+    return tuple(seen)
+
+
 def _warnings(idea, template, trace: GroundingDecisionTraceV1 | None,
               operands: Sequence[SuggestionOperandV1]) -> tuple[SuggestionWarningV1, ...]:
     """Every warning derived from a TYPED input: a requirement code, an authored template
@@ -851,14 +886,14 @@ def _warnings(idea, template, trace: GroundingDecisionTraceV1 | None,
             detail="the gauntlet raised the matching typed requirement"))
     legs = () if trace is None else trace.ordered_relationship_path
     join_needed = any(r.code == "JOIN_CONNECTIVITY" for r in idea.requirements)
-    unconfirmed = tuple((leg.from_ref, leg.to_ref) for leg in legs
-                        if leg.review_status == REVIEW_FILE_DECLARED)
+    unconfirmed = _leg_endpoint_refs([leg for leg in legs
+                                      if leg.review_status == REVIEW_FILE_DECLARED])
     if unconfirmed:
         warnings.append(SuggestionWarningV1(
             code="RELATIONSHIP_UNCONFIRMED", operand_refs=unconfirmed,
             detail="a traversed relationship was declared by an upload and confirmed by nobody"))
-    unproven = tuple((leg.from_ref, leg.to_ref) for leg in legs
-                     if leg.safety_status != SAFETY_CLEARING)
+    unproven = _leg_endpoint_refs([leg for leg in legs
+                                   if leg.safety_status != SAFETY_CLEARING])
     if unproven or join_needed:
         # When the gauntlet raised JOIN_CONNECTIVITY but retained no non-clearing leg, the
         # requirement's own operand is what the warning is ABOUT — an empty ref list would leave a
@@ -868,8 +903,8 @@ def _warnings(idea, template, trace: GroundingDecisionTraceV1 | None,
             operand_refs=unproven or tuple(r.operand for r in idea.requirements
                                            if r.code == "JOIN_CONNECTIVITY"),
             detail="a traversed relationship has no governed-verified safety evidence"))
-    unknown_cardinality = tuple((leg.from_ref, leg.to_ref) for leg in legs
-                                if leg.cardinality == CARDINALITY_UNKNOWN)
+    unknown_cardinality = _leg_endpoint_refs([leg for leg in legs
+                                              if leg.cardinality == CARDINALITY_UNKNOWN])
     if unknown_cardinality:
         warnings.append(SuggestionWarningV1(
             code="DIRECTIONAL_CARDINALITY_UNAVAILABLE", operand_refs=unknown_cardinality,
@@ -1101,7 +1136,7 @@ def _build_suggestion(idea, *, entity_ref: str, entity_label_id: str, context, t
         suggestion_id=identity, recipe_revision_id=recipe_revision,
         discovery_metadata_revision_id=discovery_revision,
         semantic_context_hashes=(), dataset_profile_hashes=(),
-        trace_content_hash=trace.trace_content_hash,
+        trace_projection_hash=build_universe_independent_trace_hash(trace),
         dependency_content_hashes=dependency_content_hashes(trace),
         validation_rule_content_hashes=trace.validation_rule_content_hashes,
         read_scope_rule_content_hashes=trace.read_scope_rule_content_hashes,

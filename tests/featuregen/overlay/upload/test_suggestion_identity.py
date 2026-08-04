@@ -46,6 +46,7 @@ from featuregen.overlay.upload.suggestion_identity import (
     SuggestionReadScopeV1,
     UnresolvableRelationshipPath,
     build_read_scope,
+    build_universe_independent_trace_hash,
     dependency_content_hashes,
     join_path_assignment,
     suggestion_id,
@@ -98,7 +99,7 @@ def _revision(**overrides) -> dict:
         discovery_metadata_revision_id="discovery-hash",
         semantic_context_hashes=(),
         dataset_profile_hashes=(),
-        trace_content_hash="trace-hash",
+        trace_projection_hash="trace-projection-hash",
         dependency_content_hashes=("dep-a", "dep-b"),
         validation_rule_content_hashes=("rule-a",),
         read_scope_rule_content_hashes=("scope-a",),
@@ -254,24 +255,64 @@ def test_a_pin_naming_a_realization_the_path_lacks_fails_closed():
         join_path_assignment_of(pins, ())          # the path lost the leg the pin names
 
 
+def _scope_pin(*classes: str):
+    return dependency_pin(
+        dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY, dependency_kind=READ_SCOPE,
+        dependency_key="read-scope", content={"allowed_classes": list(classes)},
+        current_revision_id="rev-1")
+
+
+def _trace(*, candidate_key: str = "k", scope_classes: tuple[str, ...] = (), leg=None,
+           validation_status: str = "DESIGN_CHECKED"):
+    leg = _leg(_G, _A) if leg is None else leg
+    pin = _join_pin("txn.amt", from_table="cust", to_table="txn", legs=(leg,))
+    return build_trace(
+        candidate_key=candidate_key, ordered_operand_roles=(), ordered_relationship_path=(leg,),
+        validation_status=validation_status, requirements=(),
+        dependency_pins=(pin, _scope_pin(*scope_classes)),
+        validation_rule_content_hashes=(), read_scope_rule_content_hashes=("r",))
+
+
 def test_the_dependency_content_hashes_are_content_only_and_order_independent():
-    """The revision's dependency input covers EVERY read plus every selected realization — as a
-    sorted set, because the gauntlet's check order is not meaning, and as CONTENT, because
+    """The revision's dependency input covers every CANDIDATE read plus every selected realization —
+    as a sorted set, because the gauntlet's check order is not meaning, and as CONTENT, because
     ``current_revision_id`` and evidence occurrence ids are provenance."""
     leg = _leg(_G, _A)
     pin = _join_pin("txn.amt", from_table="cust", to_table="txn", legs=(leg,))
-    scope = dependency_pin(
-        dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY, dependency_kind=READ_SCOPE,
-        dependency_key="scope", content={"classes": []}, current_revision_id="rev-1")
-    trace = build_trace(
-        candidate_key="k", ordered_operand_roles=(), ordered_relationship_path=(leg,),
-        validation_status="DESIGN_CHECKED", requirements=(), dependency_pins=(pin, scope),
-        validation_rule_content_hashes=(), read_scope_rule_content_hashes=("r",))
+    trace = _trace(leg=leg)
     hashes = dependency_content_hashes(trace)
-    assert hashes == tuple(sorted(hashes)) and len(hashes) == 3
+    assert hashes == tuple(sorted(hashes)) and len(hashes) == 2
     assert leg.realization_content_hash in hashes and pin.content_hash in hashes
     assert "rev-1" not in hashes
     assert dependency_content_hashes(None) == ()
+
+
+def test_the_callers_own_visibility_classes_are_not_a_dependency_of_the_candidate():
+    """The read-scope pin's content is the CALLER's allowed classes, so hashing it gave one logical
+    candidate a different revision per reader. Withholding is total — a card a caller receives is
+    the same card every caller receives — so the classes belong to the page's ``read_scope_key``,
+    not to the card. The RULE that was evaluated still travels, as
+    ``read_scope_rule_content_hashes``."""
+    narrow, wide = _trace(scope_classes=()), _trace(scope_classes=("pii", "restricted"))
+    assert narrow.trace_content_hash != wide.trace_content_hash          # the TRACE still says so
+    assert dependency_content_hashes(narrow) == dependency_content_hashes(wide)
+    assert build_universe_independent_trace_hash(narrow) == build_universe_independent_trace_hash(
+        wide)
+
+
+def test_the_trace_projection_ignores_the_candidate_key_and_nothing_else():
+    """``candidate_key`` folds in each role's tie set, which is a property of the grounding UNIVERSE
+    (anchor + neighbourhood + ``max_hops`` + read scope), not of the candidate — so the revision
+    hashes a projection without it. Everything else the trace says still moves the projection."""
+    here, there = _trace(candidate_key="k"), _trace(candidate_key="k-from-the-other-anchor")
+    assert here.trace_content_hash != there.trace_content_hash
+    assert build_universe_independent_trace_hash(here) == build_universe_independent_trace_hash(
+        there)
+    # ...and the projection is not a constant: a different decision is a different projection.
+    assert build_universe_independent_trace_hash(here) != build_universe_independent_trace_hash(
+        _trace(validation_status="NEEDS_EXTERNAL_VALIDATION"))
+    assert build_universe_independent_trace_hash(here) != build_universe_independent_trace_hash(
+        _trace(leg=_leg(_A, _G)))
 
 
 # ── suggestion_revision_id: exact content ───────────────────────────────────────────────────────
@@ -286,7 +327,7 @@ def test_the_same_content_always_yields_the_same_revision():
     ("discovery_metadata_revision_id", None),
     ("semantic_context_hashes", ("sem-a",)),
     ("dataset_profile_hashes", ("prof-a",)),
-    ("trace_content_hash", "trace-hash-2"),
+    ("trace_projection_hash", "trace-projection-hash-2"),
     ("dependency_content_hashes", ("dep-a", "dep-c")),
     ("validation_rule_content_hashes", ("rule-b",)),
     ("read_scope_rule_content_hashes", ("scope-b",)),
