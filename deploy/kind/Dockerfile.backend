@@ -48,14 +48,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # the cluster. The generated project does not pin itself to anything written here: `_render_requirements`
 # and `_render_pyproject` (`render/project.py:1005-1017`, `:969-997`) take every pin from the mounted
 # inventory's `ClusterInventoryV1.engine_versions`, so what the artifact DECLARES is whatever a human
-# captured from the target cluster. **Nothing compares the two.** `_BUILD_PROBE` imports the project
-# and calls `register_pipelines()`; it never bootstraps, so `kedro_init_version` — the one mechanism
-# that enforces the declared pin — is never consulted, and L0 returns PASSED for a project pinned to
-# engines this interpreter does not have. The moment a real inventory is mounted, an
-# `engine_versions` that differs from these three lines still produces a "the build was proven"
-# verdict. That gap is DEFERRED-WORK A.42; closing it is an engine-version check in L0 carrying its
-# own refusal code, which is a §14 vocabulary decision. Until then: whoever captures the inventory is
-# also deciding whether these pins are right, and will get no warning if they are not.
+# captured from the target cluster. THESE THREE LINES AND THAT DECLARATION CAN DISAGREE, and if they
+# do, this interpreter cannot prove anything about that artifact.
+#
+# THAT DISAGREEMENT IS NOW LOUD, which it was not (DEFERRED-WORK A.42, closed). `_BUILD_PROBE` reads
+# the rendered project's own `requirements.lock` and compares it to `importlib.metadata` in THIS
+# venv, before it puts the project on `sys.path` or imports a byte of it, and `run_l0` reports
+# `FAILED` with one `ENGINE_VERSION_MISMATCH` per disagreeing distribution — each naming the package,
+# the pin and what is installed here. It no longer returns PASSED for a project pinned to engines
+# this interpreter does not have; it refuses, and the chain stops with the reason on the record.
+#
+# So whoever captures the inventory is still deciding whether these three lines are right — but a
+# wrong answer now surfaces as a governed refusal naming the exact versions, instead of a silent
+# "the build was proven". If it fires, the fix is to rebuild this image against the captured
+# `engine_versions` (or to correct the capture), not to weaken the check.
 #
 # NO JVM, established empirically rather than assumed. The probe imports the package and constructs
 # the pipeline; it never starts a SparkSession, and `pyspark`/`kedro`/`kedro-datasets` import

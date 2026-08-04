@@ -61,6 +61,7 @@ from featuregen.materialize.ir import (
 
 __all__ = [
     "GENERATED_LOCK_FILENAME",
+    "REQUIREMENTS_LOCK_FILENAME",
     "CompilationIdentity",
     "RenderedArtifactIdentity",
     "SealedProject",
@@ -76,6 +77,17 @@ __all__ = [
 #: file that carries it. Named once, so the renderer, L0 and the rendered assembly node (§10.2)
 #: cannot disagree about which file to read.
 GENERATED_LOCK_FILENAME = "GENERATED.lock"
+
+#: The artifact's DECLARED runtime environment (§0/§7): the three engine pins
+#: :func:`~featuregen.materialize.render.project._render_requirements` takes from
+#: ``ClusterInventoryV1.engine_versions``. Unlike the manifest above it IS inside
+#: :func:`generated_project_hash`, so what it says is sealed rather than advisory.
+#:
+#: Named here, beside the manifest, for the identical reason: the renderer WRITES it and L0's build
+#: probe READS it back to check the proving interpreter against it (DEFERRED-WORK A.42). A literal
+#: on each side would be two spellings of one filename, and a renamed file would silently turn that
+#: comparison into "the project declares nothing".
+REQUIREMENTS_LOCK_FILENAME = "requirements.lock"
 
 
 def derive_namespace() -> str:

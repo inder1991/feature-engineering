@@ -34,6 +34,18 @@ generated project imports ``kedro`` and ``pyspark``, which are **not** dependenc
 (``src/`` never imports either); the L0 gate runs it against the environment that has them, and the
 suite runs the same code against ``sys.executable`` and hand-authored stdlib-only projects, which is
 what keeps this module's behaviour proved without a pyspark import.
+
+**A build proof is a proof about ONE environment, and the artifact names which.** The project pins
+itself — ``requirements.lock``, rendered from ``ClusterInventoryV1.engine_versions`` and inside
+``generated_project_hash`` — and until DEFERRED-WORK A.42 nothing compared those pins to the
+interpreter doing the proving, so a project declaring engines the prover did not have came back
+``PASSED``. That was the one failure in this chain that failed OPEN. The probe therefore reads the
+declared pins and compares them to ``importlib.metadata`` **in its own interpreter**, and reports
+``ENGINE_VERSION_MISMATCH`` — one finding per disagreeing distribution, naming the package, the pin
+and what is installed — before it imports anything. Before, because the check must not be
+answerable by code the artifact ships, and because a build that failed *because* the engines are
+wrong would otherwise be filed as ``RENDERER_DEFECT`` and send an operator to fix a renderer that
+did nothing wrong.
 """
 from __future__ import annotations
 
@@ -51,6 +63,7 @@ from featuregen.contracts.db import DbConn
 from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
+    REQUIREMENTS_LOCK_FILENAME,
     RenderedArtifactIdentity,
     generated_project_hash,
     read_lock,
@@ -138,10 +151,23 @@ class FindingSeverity(StrEnum):
 #: must therefore not be blocked. The three L1 read-set findings are all governed facts the
 #: compilation relied on (a column, its type, and Gate 2's read authorization); a partition is the
 #: one L1 checks that nobody attests, so it alone is data.
+#:
+#: ``ENGINE_VERSION_MISMATCH`` is a GOVERNED_FACT_MISMATCH on this table's own criterion, and the
+#: reasoning is worth stating because two other classes look plausible. The pins are not the
+#: renderer's opinion — it copied them faithfully out of §0's captured
+#: ``ClusterInventoryV1.engine_versions`` — so ``RENDERER_DEFECT`` would send a reader to fix code
+#: that is correct. And it is not ``ENVIRONMENT_OR_DATA``, which that class is reserved for by the
+#: test that pins ``PROJECT_HASH_MISMATCH`` there: regeneration must be a legitimate remedy. Here it
+#: is not. Re-rendering from the same mounted inventory produces the same three pins and the same
+#: disagreement — "rebuilding from the same wrong facts produces the same wrong project faster",
+#: which is precisely GOVERNED_FACT_MISMATCH. The remedy is to re-capture the inventory or to point
+#: L0 at the environment the artifact declares, and a later L0 that passes supersedes this one
+#: through :func:`may_regenerate_for`, so blocking is a hold rather than a dead end.
 FINDING_CLASSES: Mapping[ValidationFindingCode, FindingClass] = {
     ValidationFindingCode.PROJECT_DOES_NOT_BUILD: FindingClass.RENDERER_DEFECT,
     ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE: FindingClass.RENDERER_DEFECT,
     ValidationFindingCode.PROJECT_HASH_MISMATCH: FindingClass.ENVIRONMENT_OR_DATA,
+    ValidationFindingCode.ENGINE_VERSION_MISMATCH: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.COLUMN_ABSENT: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.COLUMN_TYPE_MISMATCH: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.READ_DENIED: FindingClass.GOVERNED_FACT_MISMATCH,
@@ -422,22 +448,84 @@ def _verdict_marker() -> str:
     """
     return f"{_VERDICT_MARKER_PREFIX}{uuid.uuid4().hex} "
 
+#: The probe's stage for the declared-pin comparison. Bound INTO the probe's source below rather
+#: than spelled a second time inside it: :func:`run_l0` dispatches on this exact value, and a stage
+#: the two sides spelled differently would silently route an engine mismatch to
+#: ``PIPELINE_NOT_CONSTRUCTIBLE`` — a wrong code that still fails, which is the kind of drift no
+#: test notices.
+_ENGINE_STAGE = "engines"
+
 #: The probe. Stdlib ONLY and run in ANOTHER interpreter, which is what lets the suite exercise it
 #: against ``sys.executable`` and hand-authored projects while the gate runs the identical code
 #: against the environment that has ``kedro`` and ``pyspark``. It duck-types the registry's answer
 #: rather than importing ``kedro.pipeline.Pipeline``: importing it here would put this platform's
 #: control plane one dependency away from the artifact it validates.
-_BUILD_PROBE = r'''
-import importlib, json, sys, traceback
+#:
+#: **The engine comparison is IN HERE rather than around this call, and it is FIRST.** In here,
+#: because ``importlib.metadata`` answers for the interpreter it is executed by: the alternative —
+#: a second ``subprocess`` from :func:`run_l0` asking the same ``python_executable`` what it has —
+#: proves something about a second process that is merely BELIEVED to be the one that built, and a
+#: wrapper script, a re-pointed symlink or an install landing between the two launches makes that
+#: belief false. That is A.42's own defect at a smaller scale, and it would need a second "the
+#: interpreter never answered" channel besides :func:`_probe_verdict`'s ``None``.
+#:
+#: First, because everything after it is the artifact's. ``sys.path`` has not been widened with the
+#: project's ``src`` (``importlib.metadata`` SCANS ``sys.path``, so a tree shipping its own
+#: ``*.dist-info`` could otherwise answer for the pin it declares) and no module the artifact ships
+#: has executed — which is exactly the residual forgery :func:`_probe_verdict` documents and cannot
+#: close for the build verdict. This check is not subject to it.
+_BUILD_PROBE = f"ENGINE_STAGE = {_ENGINE_STAGE!r}\n" + r'''
+import importlib, importlib.metadata, json, os.path, sys, traceback
 
-MARKER, root, package = sys.argv[1], sys.argv[2], sys.argv[3]
-sys.path.insert(0, root + "/src")
+MARKER, root, package, lockfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 
-def emit(stage, ok, observed=""):
-    print(MARKER + json.dumps({"stage": stage, "ok": ok, "observed": observed}))
+def emit(stage, ok, observed="", pins=()):
+    print(MARKER + json.dumps(
+        {"stage": stage, "ok": ok, "observed": observed, "pins": [list(pin) for pin in pins]}))
     raise SystemExit(0)
 
+
+try:
+    with open(os.path.join(root, lockfile), encoding="utf-8") as handle:
+        lock_lines = handle.read().splitlines()
+except OSError:
+    emit(ENGINE_STAGE, False, lockfile + " could not be read")
+
+declared = []
+for lock_line in lock_lines:
+    requirement = lock_line.split("#", 1)[0].strip()
+    if "==" not in requirement:
+        continue
+    name, _, pinned = requirement.partition("==")
+    # The pin names a DISTRIBUTION, which is not an import name: `kedro-datasets` installs the
+    # module `kedro_datasets`. `importlib.metadata.version` is asked for the distribution and
+    # normalizes the spelling itself; importing the name would fail on the dash, and reading a
+    # module's `__version__` would trust an attribute the package may ship stale or not at all.
+    name = name.split(";", 1)[0].split("[", 1)[0].strip()          # drop markers and extras
+    pinned = pinned.split(";", 1)[0].strip()
+    if name and pinned:
+        declared.append((name, pinned))
+
+if not declared:
+    # Fails CLOSED. A project that declares no environment cannot have its prover checked against
+    # one, and "nothing to compare" must not read as "they agree" — that IS A.42.
+    emit(ENGINE_STAGE, False, lockfile + " pins no distribution")
+
+disagreements = []
+for name, pinned in sorted(set(declared)):
+    try:
+        installed = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        installed = None
+    if installed != pinned:
+        disagreements.append([name, pinned, installed])
+if disagreements:
+    emit(ENGINE_STAGE, False,
+         str(len(disagreements)) + " of " + str(len(set(declared))) + " declared pin(s) disagree",
+         disagreements)
+
+sys.path.insert(0, root + "/src")
 
 try:
     importlib.import_module(package)
@@ -479,12 +567,18 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
     matches nothing. It does NOT defeat an in-interpreter echo: the probe imports the project in its
     own interpreter, so module code that reads ``sys.argv[1]`` at import time can print the live
     marker and forge a verdict. Closing that would mean not importing the artifact in the process
-    that holds the marker, which is out of scope at this seam.
+    that holds the marker, which is out of scope at this seam. The ENGINE verdict is outside that
+    caveat by construction: the probe decides it before it puts the project on ``sys.path``.
+
+    The lock filename travels through argv rather than being spelled inside the probe's source, so
+    the file the renderer WRITES and the file the probe READS are one constant
+    (:data:`~featuregen.materialize.identity.REQUIREMENTS_LOCK_FILENAME`).
     """
     marker = _verdict_marker()
     try:
         completed = subprocess.run(                                       # noqa: S603 - fixed argv
-            [python_executable, "-c", _BUILD_PROBE, marker, str(root), package],
+            [python_executable, "-c", _BUILD_PROBE, marker, str(root), package,
+             REQUIREMENTS_LOCK_FILENAME],
             capture_output=True, text=True, timeout=timeout_seconds, check=False,
             cwd=str(root), env=None if env is None else {**os.environ, **env})
     except (OSError, subprocess.SubprocessError):
@@ -545,6 +639,46 @@ def _lock_of(root: pathlib.Path) -> RenderedArtifactIdentity:
     return read_lock(lock.read_text(encoding="utf-8"))
 
 
+def _engine_findings(verdict: Mapping[str, Any]) -> list[ValidationFinding]:
+    """The probe's engine verdict, as findings — ONE per disagreeing distribution.
+
+    Per distribution rather than one aggregate, because each field of a finding has to stay a fact
+    about one thing: an aggregate would have to write three pins into ``expected`` and three
+    installed versions into ``observed``, and the reader would be back to parsing prose. Each
+    finding names the package in all three of ``location``, ``expected`` and ``observed``, so no
+    single field of it reads as a bare "mismatch" — recreating A.42's own complaint one level up.
+
+    The fallback is not defensive padding. The probe emits this stage for two conditions that name
+    no package at all — the lock could not be read, and the lock pins nothing — and both must still
+    produce a finding, because ``FAILED`` with an empty findings tuple is refused by
+    :class:`ValidationReportV1` and would abort the validation with a ``ValueError`` instead of
+    reporting it. Any unrecognized payload lands there too, which is the fail-closed answer.
+    """
+    findings: list[ValidationFinding] = []
+    for entry in verdict.get("pins") or ():
+        if not isinstance(entry, list | tuple) or len(entry) != 3:
+            continue
+        name, pinned, installed = entry
+        if not isinstance(name, str) or not name.strip() or \
+                not isinstance(pinned, str) or not pinned.strip():
+            continue
+        findings.append(ValidationFinding(
+            code=ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+            location=f"{REQUIREMENTS_LOCK_FILENAME}:{name}",
+            expected=f"{name}=={pinned}",
+            observed=(f"{name} is not installed" if installed is None
+                      else f"{name}=={installed}"),
+            count=1))
+    if findings:
+        return findings
+    return [ValidationFinding(
+        code=ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+        location=REQUIREMENTS_LOCK_FILENAME,
+        expected="a <distribution>==<version> pin for every engine the project runs on",
+        observed=str(verdict.get("observed") or "unknown") or "unknown",
+        count=1)]
+
+
 def run_l0(
     root: str | os.PathLike[str],
     *,
@@ -556,7 +690,8 @@ def run_l0(
     env: Mapping[str, str] | None = None,
     timeout_seconds: float = 300.0,
 ) -> ValidationReportV1:
-    """L0 (§11.2): the project on disk hashes to its lock, imports, and yields a pipeline.
+    """L0 (§11.2): the project hashes to its lock, is proved in the environment it DECLARES, and
+    imports and yields a pipeline there.
 
     It takes a DIRECTORY, not a
     :class:`~featuregen.materialize.identity.SealedProject`. A sealed object's files are by
@@ -565,8 +700,12 @@ def run_l0(
     only exists on disk. Materializing a sealed project to a temporary directory is
     :func:`~featuregen.materialize.render.project.materialize_to`; L0 validates what that wrote.
 
-    Both checks always run: a project may be edited *and* fail to build, and reporting one of the
-    two would send an operator to fix the half that was visible.
+    The hash check and the probe always both run: a project may be edited *and* fail to build, and
+    reporting one of the two would send an operator to fix the half that was visible. Inside the
+    probe the ENGINE comparison is the exception — it short-circuits, because the build verdict
+    that would follow it is not a fact about the artifact but about the wrong environment, and this
+    module does not record verdicts nobody can act on. ``ENGINE_VERSION_MISMATCH`` is therefore the
+    only L0 code that appears without one of the build codes beside it.
 
     Args:
         root: the materialized project.
@@ -577,7 +716,10 @@ def run_l0(
         python_executable: the interpreter the project is imported in. It is a parameter because
             the generated project imports ``kedro`` and ``pyspark``, which this platform does not
             depend on; there is no default, so nothing can silently validate the artifact against
-            the validator's own environment.
+            the validator's own environment. It is also the interpreter whose INSTALLED
+            distributions the project's own ``requirements.lock`` is compared against, so handing
+            L0 an interpreter other than the declared one now yields ``ENGINE_VERSION_MISMATCH``
+            instead of a build proof about somewhere else.
         clock: read twice — once before the work and once after — so ``finished_at`` is the time
             the validation ended rather than a value the caller supplied in advance.
         env: variables OVERLAID on this process's environment for the probe. The environment that
@@ -625,7 +767,16 @@ def run_l0(
                 group_plan_hash=lock.compilation.group_plan_hash, level=ValidationLevel.L0,
                 environment_id=environment_id, status=ValidationStatus.ERROR,
                 started_at=started_at, finished_at=clock(), findings=())
-        if not verdict.get("ok"):
+        if verdict.get("stage") == _ENGINE_STAGE:
+            # The probe stopped BEFORE importing anything, so there is no build verdict to report
+            # and none is invented. A build attempted in an interpreter the artifact does not
+            # declare would fail for reasons that are not the renderer's, and filing that as
+            # PROJECT_DOES_NOT_BUILD (a RENDERER_DEFECT) is the mis-routing this ordering avoids.
+            # Dispatched on the STAGE and not on `ok`: the probe emits this stage only to refuse,
+            # so an "engines are fine" verdict is not one it can produce — and a forged one lands
+            # on `_engine_findings`' fallback and still FAILS, rather than skipping both checks.
+            findings.extend(_engine_findings(verdict))
+        elif not verdict.get("ok"):
             findings.append(ValidationFinding(
                 code=(ValidationFindingCode.PROJECT_DOES_NOT_BUILD
                       if verdict.get("stage") == "import"

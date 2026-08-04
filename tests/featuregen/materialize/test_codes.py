@@ -49,6 +49,7 @@ def test_gate_codes_are_exactly_the_spec_set():
 def test_finding_codes_are_exactly_the_spec_set():
     assert {c.value for c in ValidationFindingCode} == {
         "PROJECT_DOES_NOT_BUILD", "PROJECT_HASH_MISMATCH", "PIPELINE_NOT_CONSTRUCTIBLE",
+        "ENGINE_VERSION_MISMATCH",
         "COLUMN_ABSENT", "COLUMN_TYPE_MISMATCH", "PARTITION_ABSENT", "READ_DENIED",
         "UNKNOWN_FINDING"}
 

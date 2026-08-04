@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import importlib.metadata
 import inspect
+import os
 import subprocess
 import sys
 import time
@@ -34,6 +36,7 @@ from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.control_plane import MaterializationGeneration, record_generation
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
+    REQUIREMENTS_LOCK_FILENAME,
     CompilationIdentity,
     RenderedArtifactIdentity,
     read_lock,
@@ -146,6 +149,26 @@ def test_a_hand_edited_project_is_ENVIRONMENT_OR_DATA_and_may_be_regenerated() -
     assert classify(ValidationFindingCode.PROJECT_HASH_MISMATCH) is FindingClass.ENVIRONMENT_OR_DATA
     assert may_regenerate(_report(ValidationStatus.FAILED,
                                   (_finding(ValidationFindingCode.PROJECT_HASH_MISMATCH),)))
+
+
+def test_an_ENGINE_VERSION_MISMATCH_is_a_GOVERNED_FACT_MISMATCH_and_BLOCKS_regeneration() -> None:
+    """The three classes that look plausible here, and why only one survives.
+
+    Not ``RENDERER_DEFECT``: the renderer copied the pins faithfully out of §0's captured
+    ``ClusterInventoryV1.engine_versions``, so there is no renderer bug to fix. Not
+    ``ENVIRONMENT_OR_DATA``, which ``PROJECT_HASH_MISMATCH`` occupies precisely because
+    regeneration is its remedy — re-rendering from the same mounted inventory produces the same
+    three pins and the same disagreement, which is this table's own definition of a governed-fact
+    contradiction. The remedy is to re-capture the inventory or to prove the build in the
+    environment the artifact declares, and a later passing L0 supersedes this verdict through
+    ``may_regenerate_for``, so blocking is a hold rather than a dead end.
+    """
+    assert classify(ValidationFindingCode.ENGINE_VERSION_MISMATCH) is \
+        FindingClass.GOVERNED_FACT_MISMATCH
+    assert may_regenerate(_report(ValidationStatus.FAILED, (
+        _finding(ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+                 location="requirements.lock:kedro", expected="kedro==0.19.9",
+                 observed="kedro==1.5.0"),))) is False
 
 
 def test_the_unknown_code_is_UNCLASSIFIED() -> None:
@@ -334,11 +357,29 @@ _PIPELINE_STUB = (
     "    def __init__(self, nodes):\n"
     "        self.nodes = list(nodes)\n")
 
+#: The pin every project below DECLARES, and it is a true statement about the interpreter the probe
+#: is given (``sys.executable``) rather than a placeholder. L0 now refuses to prove a build in an
+#: environment the artifact does not declare, so a hand-authored project pinning `kedro` — which no
+#: suite interpreter has — would stop at the engine check and never reach the build codes these
+#: tests are about. `pytest` is the one distribution the suite interpreter certainly has, read from
+#: `importlib.metadata` rather than written down, so this cannot rot into a fiction.
+_SUITE_PIN = "pytest"
+_SUITE_LOCK = (f"# the environment this project declares\n"
+               f"{_SUITE_PIN}=={importlib.metadata.version(_SUITE_PIN)}\n")
 
-def _project_files(*, create_pipeline_body: str, registry_prelude: str = "") -> dict[str, str]:
-    """A project laid out exactly as the renderer lays one out — importable, stdlib only."""
+
+def _project_files(*, create_pipeline_body: str, registry_prelude: str = "",
+                   requirements_lock: str | None = _SUITE_LOCK) -> dict[str, str]:
+    """A project laid out exactly as the renderer lays one out — importable, stdlib only.
+
+    ``requirements_lock=None`` omits the file, which is a project that declares no environment at
+    all: L0 fails CLOSED on it rather than reading "nothing to compare" as "they agree".
+    """
     root = f"src/{PACKAGE}"
+    files = {} if requirements_lock is None else {
+        REQUIREMENTS_LOCK_FILENAME: requirements_lock}
     return {
+        **files,
         "README.md": "# a project\n",
         f"{root}/__init__.py": "",
         f"{root}/pipeline_registry.py": (
@@ -372,9 +413,9 @@ def _on_disk(tmp_path, files: dict[str, str]):
     return materialize_to(seal_project(_identity(), files), tmp_path / "generated")
 
 
-def _l0(root, *, python_executable: str = sys.executable) -> ValidationReportV1:
+def _l0(root, *, python_executable: str = sys.executable, env=None) -> ValidationReportV1:
     return run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-l0",
-                  python_executable=python_executable, clock=_clock())
+                  python_executable=python_executable, clock=_clock(), env=env)
 
 
 def _clock():
@@ -498,6 +539,174 @@ def test_the_report_names_the_hash_the_LOCK_records(tmp_path) -> None:
 
 def test_L0_carries_no_run_id(tmp_path) -> None:
     assert _l0(_on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))).run_id is None
+
+
+# ── L0: the environment the artifact DECLARES ────────────────────────────────────────────────────
+#
+# DEFERRED-WORK **A.42**, and the reason it was 🔴 rather than 🟡. The project pins itself in
+# `requirements.lock` — lines the renderer copies out of `ClusterInventoryV1.engine_versions` and
+# seals inside `generated_project_hash` — and nothing compared them with the interpreter doing the
+# proving. `run_l0` answered PASSED and the chain recorded "the build was proven" for a project
+# pinned to engines the prover did not have: the one Phase G failure that failed OPEN.
+#
+# These tests need no kedro and no JVM. They install a REAL distribution with no code in it — a
+# bare `*.dist-info` directory on the probe's `PYTHONPATH`, which is exactly what
+# `importlib.metadata` reads — so the comparison is exercised against genuine installed metadata,
+# under genuine distribution names, in the interpreter the probe actually runs in.
+
+_KEDRO_DATASETS = "kedro-datasets"            # the DISTRIBUTION; the module is `kedro_datasets`
+
+
+def _installed(tmp_path, *distributions: tuple[str, str]) -> dict[str, str]:
+    """An `env` overlay under which these distributions are installed, and nothing is importable.
+
+    A `.dist-info` directory and a `METADATA` file is the whole of what makes a distribution
+    discoverable to `importlib.metadata`; no module is written, which is the point of
+    :func:`test_the_pin_names_a_DISTRIBUTION_which_is_not_the_import_name`.
+    """
+    site = tmp_path / "site-packages"
+    for name, version in distributions:
+        info = site / f"{name.replace('-', '_')}-{version}.dist-info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n", encoding="utf-8")
+    return {"PYTHONPATH": str(site)}
+
+
+def _engine_project(tmp_path, lock: str | None, *, body: str = _BUILDS):
+    return _on_disk(tmp_path, _project_files(create_pipeline_body=body, requirements_lock=lock))
+
+
+def test_the_pin_names_a_DISTRIBUTION_which_is_not_the_import_name(tmp_path) -> None:
+    """`kedro-datasets` is the pin; `kedro_datasets` would be the module. The check asks
+    `importlib.metadata` for the DISTRIBUTION, so the dash is not a bug and the answer does not
+    depend on the package shipping a `__version__` attribute — or on it shipping any code at all.
+
+    The `find_spec` assertion is what makes the pass load-bearing rather than lucky: an
+    implementation that resolved the pin by importing it would have nothing to import here, so this
+    project could only be proved by an implementation that reads installed metadata.
+    """
+    env = _installed(tmp_path, (_KEDRO_DATASETS, "9.5.0"))
+    unimportable = subprocess.run(  # noqa: S603
+        [sys.executable, "-c",
+         "import importlib.metadata as m, importlib.util as u; "
+         "print(u.find_spec('kedro_datasets'), m.version('kedro-datasets'))"],
+        capture_output=True, text=True, check=False, env={**os.environ, **env})
+    assert unimportable.stdout.strip() == "None 9.5.0", (unimportable.stdout, unimportable.stderr)
+
+    report = _l0(_engine_project(tmp_path, f"{_KEDRO_DATASETS}==9.5.0\n{_SUITE_LOCK}"), env=env)
+    assert (report.status, report.findings) == (ValidationStatus.PASSED, ()), \
+        [finding.payload() for finding in report.findings]
+
+
+def test_a_pin_the_interpreter_does_not_MATCH_is_ENGINE_VERSION_MISMATCH(tmp_path) -> None:
+    """The finding names the PACKAGE, the PIN and what is INSTALLED — all three, and the package in
+    every field. A finding that said only "mismatch" would recreate A.42 one level up: the operator
+    would know a comparison failed and not which of three pins, nor against what.
+    """
+    report = _l0(_engine_project(tmp_path, f"{_KEDRO_DATASETS}==4.1.0\n"),
+                 env=_installed(tmp_path, (_KEDRO_DATASETS, "9.5.0")))
+
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    finding = report.findings[0]
+    assert finding.location == f"{REQUIREMENTS_LOCK_FILENAME}:{_KEDRO_DATASETS}"
+    assert finding.expected == f"{_KEDRO_DATASETS}==4.1.0"
+    assert finding.observed == f"{_KEDRO_DATASETS}==9.5.0"
+    assert all(_KEDRO_DATASETS in field
+               for field in (finding.location, finding.expected, finding.observed))
+
+
+def test_a_pin_for_something_NOT_INSTALLED_says_so_rather_than_naming_a_version(tmp_path) -> None:
+    """"Absent" and "present at another version" are different facts, and a finding may not blur
+    them: the first is fixed by installing, the second by agreeing on a version."""
+    report = _l0(_engine_project(tmp_path, "kedro==0.19.9\n"))
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert report.findings[0].expected == "kedro==0.19.9"
+    assert report.findings[0].observed == "kedro is not installed"
+
+
+def test_ONE_finding_per_disagreeing_pin_and_the_AGREEING_pin_is_silent(tmp_path) -> None:
+    """Three declared engines, two wrong: two findings, each about one package, and no finding at
+    all about the one that agrees. An aggregate would have to write three pins into `expected`."""
+    lock = f"kedro==0.19.9\n{_KEDRO_DATASETS}==4.1.0\n{_SUITE_LOCK}"
+    report = _l0(_engine_project(tmp_path, lock),
+                 env=_installed(tmp_path, (_KEDRO_DATASETS, "9.5.0")))
+
+    assert [(f.code, f.location) for f in report.findings] == [
+        (ValidationFindingCode.ENGINE_VERSION_MISMATCH, f"{REQUIREMENTS_LOCK_FILENAME}:kedro"),
+        (ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+         f"{REQUIREMENTS_LOCK_FILENAME}:{_KEDRO_DATASETS}")]
+    assert all(finding.count == 1 for finding in report.findings)
+
+
+def test_a_project_that_declares_NO_environment_fails_closed(tmp_path) -> None:
+    """No `requirements.lock` at all. "Nothing to compare" must not read as "they agree" — that is
+    A.42 restated, and it is the shape a renderer regression would take."""
+    report = _l0(_engine_project(tmp_path, None))
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert REQUIREMENTS_LOCK_FILENAME in report.findings[0].observed
+
+
+def test_a_lock_that_pins_NOTHING_fails_closed_too(tmp_path) -> None:
+    """The file exists and declares no version. Same verdict, different observed text — an empty
+    lock is a renderer regression, a missing one is a drifted tree."""
+    report = _l0(_engine_project(tmp_path, "# the renderer wrote no pins\n"))
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert "pins no distribution" in report.findings[0].observed
+
+
+def test_the_engine_check_runs_BEFORE_the_project_is_imported(tmp_path) -> None:
+    """A project that cannot import, under engines it does not declare, reports the ENGINES.
+
+    The pair is the test. With a wrong pin the report carries the engine finding and NOT
+    `PROJECT_DOES_NOT_BUILD`; with the pin corrected — the only change — the same project reports
+    `PROJECT_DOES_NOT_BUILD`. So the import really does fail, and the first report suppressed it
+    deliberately rather than by accident.
+
+    Why suppress it: `PROJECT_DOES_NOT_BUILD` classifies as `RENDERER_DEFECT`, i.e. *fix the
+    renderer and regenerate*. An import that failed because the interpreter has the wrong engines
+    is not the renderer's, and that advice would send an operator to rewrite correct code.
+    """
+    broken = dict(create_pipeline_body=_BUILDS,
+                  registry_prelude="import a_module_nobody_installed\n")
+
+    mismatched = _l0(_on_disk(tmp_path / "a", _project_files(
+        **broken, requirements_lock="kedro==0.19.9\n")))
+    assert _codes(mismatched) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert mismatched.findings[0].classification is FindingClass.GOVERNED_FACT_MISMATCH
+
+    agreeing = _l0(_on_disk(tmp_path / "b", _project_files(**broken)))
+    assert _codes(agreeing) == [ValidationFindingCode.PROJECT_DOES_NOT_BUILD]
+
+
+def test_a_dist_info_the_PROJECT_SHIPS_cannot_answer_for_the_projects_own_pin(tmp_path) -> None:
+    """The artifact ships `src/kedro_datasets-9.5.0.dist-info` and pins `kedro-datasets==9.5.0`.
+
+    `importlib.metadata` SCANS `sys.path`, and the probe puts the project's `src` on `sys.path` to
+    import it — so a check placed after that insert would let a tree vouch for its own pin. The
+    check is placed before it, and this is that placement asserted rather than described. The
+    directory is SEALED into the project, so there is no hash mismatch to hide behind: the engine
+    finding is the only signal.
+
+    The second half is the control. The same bytes, the same interpreter, the same lock — with
+    `src` on `PYTHONPATH` the shipped metadata IS found and the project is proved. The only
+    variable is whether that directory is on the metadata search path when the pins are read, which
+    is exactly what the ordering decides.
+    """
+    files = _project_files(create_pipeline_body=_BUILDS,
+                           requirements_lock=f"{_KEDRO_DATASETS}==9.5.0\n")
+    files[f"src/{_KEDRO_DATASETS.replace('-', '_')}-9.5.0.dist-info/METADATA"] = (
+        f"Metadata-Version: 2.1\nName: {_KEDRO_DATASETS}\nVersion: 9.5.0\n")
+    root = _on_disk(tmp_path, files)
+
+    report = _l0(root)
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert report.findings[0].observed == f"{_KEDRO_DATASETS} is not installed"
+
+    reachable = _l0(root, env={"PYTHONPATH": str(root / "src")})
+    assert (reachable.status, reachable.findings) == (ValidationStatus.PASSED, ())
 
 
 # ── L0: an environment that could not be reached ─────────────────────────────────────────────────

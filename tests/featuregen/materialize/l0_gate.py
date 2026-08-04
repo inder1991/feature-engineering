@@ -35,6 +35,15 @@ A third environment now exists and is NOT one of these: ``/opt/kedro-venv`` in t
 (``deploy/kind/Dockerfile.backend``), at kedro 1.5.0 / kedro-datasets 9.5.0 / pyspark 3.5.3. It is
 what ``FEATUREGEN_MATERIALIZE_L0_PYTHON`` points at in a deployment, so it is the environment that
 matters in production — and it matches neither venv above.
+
+**Only one of the three can carry a build proof, and since DEFERRED-WORK A.42 closed, `run_l0` is
+what says so.** The rendered project pins itself, L0 compares those pins against the probe
+interpreter's installed distributions, and a disagreement is
+``FAILED``/``ENGINE_VERSION_MISMATCH`` rather than a build verdict. So under ``.venv-l0-modern`` and
+under the kind image there is no build verdict for this file to assert, and the tests that assert
+one take :func:`the_declared_environment` and SKIP with the disagreement named.
+:func:`test_the_environment_really_has_the_engines_the_project_pins` never skips: it runs in every
+environment and asserts whichever verdict is correct there, so the gate always states the answer.
 """
 from __future__ import annotations
 
@@ -57,7 +66,7 @@ from tests.featuregen.materialize.test_resolve import no_dsn  # noqa: F401 - aut
 from featuregen.materialize.codes import PublicationRefusalCode, ValidationFindingCode
 from featuregen.materialize.compile.chain import ChainStage, L0Interpreter
 from featuregen.materialize.control_plane import RunEventKind
-from featuregen.materialize.identity import SealedProject
+from featuregen.materialize.identity import REQUIREMENTS_LOCK_FILENAME, SealedProject
 from featuregen.materialize.render.project import (
     PIPELINE_NAME,
     REQUIRED_RUN_PARAMETERS,
@@ -116,20 +125,88 @@ def l0_env(l0_python: str) -> dict[str, str]:
     return environment
 
 
+#: The artifact's declaration, read from the committed golden ``requirements.lock``.
+#: ``test_the_rendered_project_matches_its_GOLDENS`` (collected suite) holds that file byte-identical
+#: to what the renderer emits, so this IS the rendered declaration — available without a db round
+#: trip, which is what lets a session-scoped fixture decide whether this gate environment can carry
+#: a build proof at all.
+GOLDEN_LOCK = (pathlib.Path(__file__).parent / "goldens" / "cif_daily"
+               / REQUIREMENTS_LOCK_FILENAME)
+
 #: Ask the interpreter what it actually has, keyed by DISTRIBUTION name — which is what a lock file
-#: names, and what `kedro-datasets` vs the importable `kedro_datasets` would otherwise disagree about.
-#: `importlib.metadata` reads the installed distribution rather than a module's `__version__`
-#: attribute, so a package that ships a stale or absent `__version__` cannot make this answer wrong.
+#: names, and what `kedro-datasets` vs the importable `kedro_datasets` would otherwise disagree
+#: about. `importlib.metadata` reads the installed distribution rather than a module's
+#: `__version__`, so a package shipping a stale or absent `__version__` cannot make it wrong.
+#:
+#: This is NOT the comparison — production's probe owns that (`validation._BUILD_PROBE`). It only
+#: tells this file which verdict to demand of `run_l0`, and which environment the gate is in.
 _INSTALLED_VERSIONS = (
-    "import importlib.metadata as m, json\n"
+    "import importlib.metadata as m, json, sys\n"
     "out = {}\n"
-    "for dist in ('kedro', 'kedro-datasets', 'pyspark'):\n"
+    "for dist in sys.argv[1:]:\n"
     "    try:\n"
     "        out[dist] = m.version(dist)\n"
     "    except m.PackageNotFoundError:\n"
     "        out[dist] = None\n"
     "print(json.dumps(out))\n"
 )
+
+
+def _parse_pins(lock: str) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for line in lock.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "==" not in stripped:
+            continue
+        name, _, version = stripped.partition("==")
+        pins[name.strip()] = version.strip()
+    return pins
+
+
+def _disagreements(declared: dict[str, str], l0_python: str) -> dict[str, tuple[str, str | None]]:
+    """Which declared pins this interpreter does not satisfy — ``{}`` when it is the declared one.
+
+    This is NOT the production comparison and must never become a second copy of it: it decides
+    which verdict a gate test should DEMAND of `run_l0`, and which environment the gate is running
+    in. `validation._BUILD_PROBE` owns the comparison whose answer the platform acts on.
+    """
+    asked = subprocess.run(  # noqa: S603
+        [l0_python, "-c", _INSTALLED_VERSIONS, *sorted(declared)],
+        capture_output=True, text=True, check=False)
+    assert asked.returncode == 0, asked.stderr
+    installed = json.loads(asked.stdout.strip().splitlines()[-1])
+    return {dist: (want, installed.get(dist))
+            for dist, want in sorted(declared.items())
+            if installed.get(dist) != want}
+
+
+@pytest.fixture(scope="session")
+def engines_the_interpreter_lacks(l0_python: str) -> dict[str, tuple[str, str | None]]:
+    """The gate environment against the ARTIFACT's declaration, computed once."""
+    return _disagreements(_parse_pins(GOLDEN_LOCK.read_text(encoding="utf-8")), l0_python)
+
+
+@pytest.fixture
+def the_declared_environment(engines_the_interpreter_lacks) -> None:
+    """Skip unless this interpreter IS the environment the artifact pins itself to.
+
+    A build proof is a claim about ONE environment, and since DEFERRED-WORK **A.42** closed,
+    `run_l0` refuses to make it anywhere else: under `.venv-l0-modern` and under the kind image the
+    report is `FAILED` carrying `ENGINE_VERSION_MISMATCH`, and there is no build verdict inside it
+    for a test to assert. A skip is therefore the accurate reading — *nothing to check here* — and
+    not a tolerated red.
+
+    A skip cannot hide a regression, because
+    :func:`test_the_environment_really_has_the_engines_the_project_pins` takes no such fixture: it
+    runs in every environment and asserts the production verdict either way.
+    """
+    if engines_the_interpreter_lacks:
+        pytest.skip(
+            "not the environment this artifact declares, so `run_l0` refuses to prove a build "
+            "here (A.42): " + "; ".join(
+                f"{dist} pinned {want}, installed "
+                + ("NOTHING" if have is None else have)
+                for dist, (want, have) in engines_the_interpreter_lacks.items()))
 
 
 def _declared_pins(sealed: SealedProject) -> dict[str, str]:
@@ -139,9 +216,12 @@ def _declared_pins(sealed: SealedProject) -> dict[str, str]:
     fixture is what this suite happened to render with, and the lock is what the artifact SAYS. A
     test that compared the interpreter against the fixture would still pass if the renderer stopped
     writing the pins into the project at all.
+
+    This is now used only to WRITE the expected-value table of the assertions below. The comparison
+    itself is production's (`run_l0`), which is the whole of A.42's closure.
     """
     pins: dict[str, str] = {}
-    for line in sealed.files["requirements.lock"].splitlines():
+    for line in sealed.files[REQUIREMENTS_LOCK_FILENAME].splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "==" not in stripped:
             continue
@@ -151,71 +231,76 @@ def _declared_pins(sealed: SealedProject) -> dict[str, str]:
 
 
 def test_the_environment_really_has_the_engines_the_project_pins(
-        project: SealedProject, l0_python: str) -> None:  # noqa: F811
-    """The interpreter's INSTALLED engines must equal the ones the rendered project pins itself to.
+        project: SealedProject, tmp_path, l0_python: str, l0_env) -> None:  # noqa: F811
+    """The interpreter's INSTALLED engines must equal the ones the rendered project pins itself to —
+    and the thing that says so is now **`run_l0`**, not this test.
 
-    **This test used to lie.** It asserted `returncode == 0` and non-empty stdout on
-    `import kedro, pyspark` — it compared nothing at all, while its name promised the comparison
-    every other claim in this file leans on. It is the check that decides whether a passing L0 is
-    evidence about *this* artifact or about some other project that happens to share its source, and
-    for the whole of Phase G it was answering a different question (*is anything installed?*).
+    **This test has lied once and re-implemented production once.** It first asserted
+    `returncode == 0` on `import kedro, pyspark`, which compared nothing while its name promised the
+    comparison every other claim in this file leans on. It was then made honest by parsing the
+    rendered lock and diffing it against `importlib.metadata` here, in the test — true, but a second
+    implementation of a comparison production did not have, so a green here proved nothing about a
+    deployment. DEFERRED-WORK **A.42** is closed by moving that comparison into L0's build probe,
+    and this test's job is now to assert the PRODUCTION verdict.
 
-    **EXPECT THIS RED IN TWO OF THE THREE ENVIRONMENTS, AND DO NOT MAKE IT GREEN.**
+    So: one real `run_l0` against the real rendered artifact, and the pins decide the assertion.
+    When they agree the report must be `PASSED` (and the build was therefore proved in the
+    environment the artifact declares, which is the only environment a proof means anything in);
+    when they disagree it must be `FAILED` carrying one `ENGINE_VERSION_MISMATCH` per disagreeing
+    distribution, each naming its package, its pin and what is installed.
 
-    ===========================  ==========================  =============
-    environment                  engines                     verdict
-    ===========================  ==========================  =============
-    ``.venv-artifact``           0.19.9 / 4.1.0 / 3.5.1      **green**
-    ``.venv-l0-modern``          1.5.0 / 9.5.0 / 4.2.0       **red**
-    kind image ``/opt/kedro-venv``  1.5.0 / 9.5.0 / 3.5.3    **red**
-    ===========================  ==========================  =============
+    **This is consequently GREEN in all three environments now, and the red it replaces has not
+    been papered over — it has moved into the product.**
 
-    Red here is a true statement about the environment, not a broken test. The three ways to make it
-    green are all worse than the red: weakening the assertion restores the lie; ``xfail`` records
-    that we expect our own build proofs to be about the wrong project; and re-rendering the fixture
-    with the interpreter's versions (what
-    :func:`test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session` legitimately
-    does, because ``bootstrap_project`` forces its hand) would make the comparison tautological.
+    ==============================  ========================  ==========================
+    environment                     engines                   what `run_l0` now returns
+    ==============================  ========================  ==========================
+    ``.venv-artifact``              0.19.9 / 4.1.0 / 3.5.1    ``PASSED``
+    ``.venv-l0-modern``             1.5.0 / 9.5.0 / 4.2.0     ``ENGINE_VERSION_MISMATCH``
+    kind image ``/opt/kedro-venv``  1.5.0 / 9.5.0 / 3.5.3     ``ENGINE_VERSION_MISMATCH``
+    ==============================  ========================  ==========================
 
-    **What a reader should actually do about a red.** Nothing, in the gate. The finding belongs to
-    production, and it is recorded as DEFERRED-WORK **A.42**: `run_l0` never consults the declared
-    pins, because `_BUILD_PROBE` imports the project and calls `register_pipelines()` without
-    bootstrapping it, so `kedro_init_version` is never enforced. A deployment whose mounted inventory
-    declares engines its L0 interpreter does not have gets `PASSED` — "the build was proven" — with
-    no signal at all. Closing that needs an engine-version check in L0 carrying its own refusal code,
-    which is a §14 closed-vocabulary decision rather than a test change. Until it lands, this red is
-    the only place the platform says the disagreement out loud, so it is load-bearing precisely
-    because it is failing.
+    A disagreement is still a true and important statement about the environment — it says the L0
+    interpreter is not the one the artifact declares — but it is no longer a *failing test*, because
+    a deployment does not run this file. It is a governed finding on the report, classified
+    `GOVERNED_FACT_MISMATCH`, recorded in `pipeline_validation_report`, and it stops the chain.
     """
-    proved = subprocess.run(  # noqa: S603
-        [l0_python, "-c", _INSTALLED_VERSIONS], capture_output=True, text=True, check=False)
-    assert proved.returncode == 0, proved.stderr
-    installed = json.loads(proved.stdout.strip().splitlines()[-1])
-
     declared = _declared_pins(project)
     assert declared, "the rendered project shipped no parseable pins in requirements.lock"
 
-    disagreements = {
-        dist: (want, installed.get(dist))
-        for dist, want in sorted(declared.items())
-        if installed.get(dist) != want
-    }
-    assert not disagreements, (
-        "the L0 interpreter is not the environment this artifact declares, so a passing build proof "
-        "here would be a proof about a DIFFERENT project (DEFERRED-WORK A.42):\n"
-        + "\n".join(
-            f"  {dist}: the project pins {want!r}, the interpreter has "
-            + ("NOTHING INSTALLED" if have is None else repr(have))
-            for dist, (want, have) in disagreements.items())
-        + f"\n  interpreter: {l0_python}")
+    disagreements = _disagreements(declared, l0_python)
+
+    root = materialize_to(project, tmp_path / "generated")
+    report = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-engines",
+                    python_executable=l0_python, clock=_clock(), env=l0_env)
+
+    if not disagreements:
+        assert (report.status, report.findings) == (ValidationStatus.PASSED, ()), \
+            [finding.payload() for finding in report.findings]
+        return
+
+    assert report.status is ValidationStatus.FAILED, (
+        f"the L0 interpreter {l0_python} is not the environment this artifact declares, and "
+        f"`run_l0` did not say so — which is DEFERRED-WORK A.42 reopened: "
+        + "; ".join(f"{dist} pinned {want}, installed {have}"
+                    for dist, (want, have) in disagreements.items()))
+    assert [(f.code, f.location, f.expected, f.observed) for f in report.findings] == [
+        (ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+         f"{REQUIREMENTS_LOCK_FILENAME}:{dist}", f"{dist}=={want}",
+         f"{dist} is not installed" if have is None else f"{dist}=={have}")
+        for dist, (want, have) in sorted(disagreements.items())]
 
 
-def test_the_RENDERED_project_builds_its_kedro_pipeline(project: SealedProject, tmp_path,  # noqa: F811
-                                                        l0_python: str, l0_env) -> None:
+def test_the_RENDERED_project_builds_its_kedro_pipeline(
+        the_declared_environment, project: SealedProject, tmp_path,  # noqa: F811
+        l0_python: str, l0_env) -> None:
     """L0 over the real artifact: it hashes to its lock, imports, and yields a pipeline with nodes.
 
     This is the claim the main suite structurally cannot make, and the reason `PROJECT_DOES_NOT_BUILD`
     and `PIPELINE_NOT_CONSTRUCTIBLE` are not theoretical codes.
+
+    `the_declared_environment` first: a PASSED report means "the build was proven", and since A.42
+    closed that sentence is only available in the environment the artifact pins itself to.
     """
     root = materialize_to(project, tmp_path / "generated")
     report = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT, report_id="rep-gate",
@@ -225,8 +310,13 @@ def test_the_RENDERED_project_builds_its_kedro_pipeline(project: SealedProject, 
 
 
 def test_a_hand_edit_of_the_RENDERED_project_is_caught_in_the_real_environment(
-        project: SealedProject, tmp_path, l0_python: str, l0_env) -> None:  # noqa: F811
-    """The same artifact, one comment added. Everything else is held equal."""
+        the_declared_environment, project: SealedProject, tmp_path,  # noqa: F811
+        l0_python: str, l0_env) -> None:
+    """The same artifact, one comment added. Everything else is held equal.
+
+    Held equal includes the ENGINES: the assertion is that the drift finding is the ONLY one, which
+    is a statement about the hash check and is only readable where the engine check is silent.
+    """
     root = materialize_to(project, tmp_path / "generated")
     readme = root / "README.md"
     readme.write_text(readme.read_text(encoding="utf-8") + "\n<!-- drift -->\n", encoding="utf-8")
@@ -239,7 +329,7 @@ def test_a_hand_edit_of_the_RENDERED_project_is_caught_in_the_real_environment(
 
 
 def test_the_CHAIN_ITSELF_seals_a_project_whose_build_is_PROVED(
-        db, monkeypatch, tmp_path, l0_python: str, l0_env) -> None:
+        the_declared_environment, db, monkeypatch, tmp_path, l0_python: str, l0_env) -> None:
     """Phase G T6: L0 driven BY `compile_feature_group`, against a real kedro+pyspark interpreter.
 
     The collected suite proves the failing direction end to end — it runs the real `run_l0` against

@@ -792,7 +792,17 @@ def test_the_chain_calls_the_REAL_run_l0_and_an_interpreter_without_kedro_proves
     That is the whole point — it proves the chain's L0 call is the module's own function and not a
     seam every test replaces, and it proves a run whose build was not proven cannot reach the
     success-shaped terminal. It needs no venv, which is why it belongs in the collected suite;
-    proving that the project DOES build under a real kedro is `l0_gate.py`'s job."""
+    proving that the project DOES build under a real kedro is `l0_gate.py`'s job.
+
+    **The finding is ENGINE_VERSION_MISMATCH and not PROJECT_DOES_NOT_BUILD, which is the point of
+    DEFERRED-WORK A.42's closure.** The rendered project pins `kedro`, `kedro-datasets` and
+    `pyspark` in its own `requirements.lock`, from the inventory; `sys.executable` has none of the
+    three; and L0 now says exactly that, one finding per engine, before it tries an import that
+    could only fail. The old expectation here was the mis-routing A.42 describes — `RENDERER_DEFECT`
+    told a reader to go fix a renderer whose output was correct, when the real fault was that this
+    build was being proved in the wrong environment. `GOVERNED_FACT_MISMATCH` also BLOCKS
+    regeneration, which is the honest answer: re-rendering from the same inventory produces the
+    same three pins."""
     if importlib.util.find_spec("kedro") is not None:
         pytest.skip("this interpreter HAS kedro; the subject of this test is one that does not")
     request_id = _request(catalog, request_id="req-real-l0")
@@ -804,9 +814,16 @@ def test_the_chain_calls_the_REAL_run_l0_and_an_interpreter_without_kedro_proves
     assert outcome.stopped_at is ChainStage.VALIDATE_L0
     assert outcome.terminal_event is RunEventKind.RUN_FAILED
     assert outcome.validation_report.status is ValidationStatus.FAILED
-    assert [f.code for f in outcome.validation_report.findings] == \
-        [ValidationFindingCode.PROJECT_DOES_NOT_BUILD]
-    assert outcome.validation_report.findings[0].classification is FindingClass.RENDERER_DEFECT
+    assert [(f.code, f.location) for f in outcome.validation_report.findings] == [
+        (ValidationFindingCode.ENGINE_VERSION_MISMATCH, "requirements.lock:kedro"),
+        (ValidationFindingCode.ENGINE_VERSION_MISMATCH, "requirements.lock:kedro-datasets"),
+        (ValidationFindingCode.ENGINE_VERSION_MISMATCH, "requirements.lock:pyspark")]
+    assert all(f.classification is FindingClass.GOVERNED_FACT_MISMATCH
+               for f in outcome.validation_report.findings)
+    assert [f.expected for f in outcome.validation_report.findings] == [
+        f"kedro=={fixtures.ENGINE_VERSIONS.kedro}",
+        f"kedro-datasets=={fixtures.ENGINE_VERSIONS.kedro_datasets}",
+        f"pyspark=={fixtures.ENGINE_VERSIONS.pyspark}"]
 
 
 def test_a_build_proof_about_ANOTHER_ARTIFACT_is_refused_rather_than_recorded(
