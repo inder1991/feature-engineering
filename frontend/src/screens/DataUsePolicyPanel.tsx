@@ -89,15 +89,43 @@ return (
       </div>
       {state.description && <p className="hint dup-desc">{state.description}</p>}
 
+      {/* TWO PEOPLE, TWO QUESTIONS, TWO LABELS. `approved_by` is who first authored this content;
+          `declared_by` is who made it the concept's current answer. They differ routinely and for
+          a designed reason: the approver is OUTSIDE content identity, so re-approving an identical
+          purpose resolves back to the ORIGINAL revision — which means a policy can read
+          "approved by A" while B is the person who turned it back on this morning. The old row
+          rendered `declared_by ?? approved_by` under one label, so it showed ONE of them under a
+          word that was true of the other. The revision id is here for the same reason: it is what
+          a governed contract records, and an auditor tracing one needs to see it on the surface
+          that shows the decision. */}
       {state.status !== 'none' && (
         <dl className="dup-detail">
           <dt>Purpose</dt>
           <dd>{state.purpose}</dd>
-          <dt>{state.status === 'active' ? 'Approved by' : 'Last decided by'}</dt>
-          <dd>
-            {state.declared_by ?? state.approved_by}
-            {humanDate(state.updated_at) && ` · ${humanDate(state.updated_at)}`}
-          </dd>
+          {state.approved_by && (
+            <>
+              <dt>First approved by</dt>
+              <dd>
+                {state.approved_by}
+                {humanDate(state.approved_at) && ` · ${humanDate(state.approved_at)}`}
+              </dd>
+            </>
+          )}
+          {state.declared_by && (
+            <>
+              <dt>{state.status === 'active' ? 'Made current by' : 'Withdrawn by'}</dt>
+              <dd>
+                {state.declared_by}
+                {humanDate(state.updated_at) && ` · ${humanDate(state.updated_at)}`}
+              </dd>
+            </>
+          )}
+          {state.revision_id && (
+            <>
+              <dt>Revision</dt>
+              <dd className="mono dup-revision">{state.revision_id}</dd>
+            </>
+          )}
         </dl>
       )}
 
@@ -214,7 +242,26 @@ export function DataUsePolicyPanel() {
 
   useEffect(() => { void load() }, [load])
 
-  if (!listing) return null
+  // A FAILED LISTING MUST SAY SO. `if (!listing) return null` rendered nothing whether the request
+  // was in flight or had failed, so the notice the catch block sets was written to a component that
+  // never drew it — the one error path a reader of this panel most needs (they were sent here by a
+  // refusal that names it) was the one that showed a blank page. Absence of a listing plus a notice
+  // is a failure and is reported; absence of both is still "not here yet", which stays silent.
+  if (!listing) {
+    if (!notice) return null
+    return (
+      <section className="adg-section dup" data-testid="data-use-policies">
+        <h2>Data-use policies</h2>
+        <p role="status" className="callout callout--warn" data-testid="dup-notice">
+          {notice}
+        </p>
+        <p className="hint">
+          The list of personal-data concepts could not be loaded, so nothing here can be trusted to
+          be complete. Nothing has been approved or withdrawn by opening this page.
+        </p>
+      </section>
+    )
+  }
 
   const bounds = listing.purpose_bounds
   const declared = listing.concepts.filter(c => c.status !== 'none')

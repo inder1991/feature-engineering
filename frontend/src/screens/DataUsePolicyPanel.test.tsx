@@ -89,7 +89,7 @@ it('shows an active policy with its purpose, approver and date', async () => {
   await renderPanel(listing([
     state({ status: 'active', purpose: 'AML transaction monitoring', pointer_version: 1,
             approved_by: 'user:priya', declared_by: 'user:priya',
-            updated_at: '2026-08-04T09:00:00Z',
+            approved_at: '2026-08-04T09:00:00Z', updated_at: '2026-08-04T09:00:00Z',
             revision_id: `pup_${'a'.repeat(64)}` }),
   ]))
 
@@ -98,6 +98,40 @@ it('shows an active policy with its purpose, approver and date', async () => {
   expect(row).toHaveTextContent(/AML transaction monitoring/)
   expect(row).toHaveTextContent(/user:priya/)
   expect(within(row).getByRole('button', { name: /withdraw approval/i })).toBeInTheDocument()
+})
+
+it('shows BOTH who first approved the content and who made it current', async () => {
+  // The approver is OUTSIDE content identity, so re-approving an identical purpose resolves back
+  // to the ORIGINAL revision — a policy can truthfully read "approved by priya" while sam is the
+  // person who turned it back on. The row used to render `declared_by ?? approved_by` under ONE
+  // label, showing one person's name under a word that was true of the other.
+  await renderPanel(listing([
+    state({ status: 'active', purpose: 'AML transaction monitoring', pointer_version: 3,
+            approved_by: 'user:priya', approved_at: '2026-07-01T09:00:00Z',
+            declared_by: 'user:sam', updated_at: '2026-08-04T09:00:00Z',
+            revision_id: `pup_${'a'.repeat(64)}` }),
+  ]))
+
+  const row = screen.getByTestId('dup-pep_flag')
+  expect(row).toHaveTextContent(/first approved by/i)
+  expect(row).toHaveTextContent(/made current by/i)
+  expect(row).toHaveTextContent(/user:priya/)
+  expect(row).toHaveTextContent(/user:sam/)
+  // and the id a governed contract records, so an auditor tracing one can see it here
+  expect(row).toHaveTextContent(new RegExp(`pup_${'a'.repeat(64)}`))
+})
+
+it('labels the pointer honestly on a withdrawn policy', async () => {
+  await renderPanel(listing([
+    state({ status: 'revoked', purpose: 'AML transaction monitoring', pointer_version: 2,
+            approved_by: 'user:priya', declared_by: 'user:sam',
+            updated_at: '2026-08-04T09:00:00Z' }),
+  ]))
+
+  const row = screen.getByTestId('dup-pep_flag')
+  expect(row).toHaveTextContent(/withdrawn by/i)
+  expect(row).toHaveTextContent(/user:sam/)
+  expect(row).not.toHaveTextContent(/made current by/i)
 })
 
 it('approves with a purpose and echoes the CAS version exactly as it was read', async () => {
@@ -235,4 +269,18 @@ it('renders nothing until the listing arrives, and never a half-panel', async ()
   getDataUsePolicies.mockReturnValue(new Promise(() => {}))
   const { container } = render(<DataUsePolicyPanel />)
   expect(container).toBeEmptyDOMElement()
+})
+
+it('says so when the listing itself fails, instead of showing a blank page', async () => {
+  // The notice was previously written to a component that returned null whenever `listing` was
+  // unset — so the one error path a reader most needs (they were sent here by a refusal naming
+  // this page) was the one that rendered nothing at all.
+  getDataUsePolicies.mockRejectedValue(new api.ApiError(503, 'policy store unavailable'))
+  render(<DataUsePolicyPanel />)
+
+  expect(await screen.findByTestId('dup-notice')).toHaveTextContent(/policy store unavailable/i)
+  expect(screen.getByTestId('data-use-policies')).toHaveTextContent(/could not be loaded/i)
+  // and it does not imply the reader broke anything by arriving
+  expect(screen.getByTestId('data-use-policies'))
+    .toHaveTextContent(/nothing has been approved or withdrawn/i)
 })

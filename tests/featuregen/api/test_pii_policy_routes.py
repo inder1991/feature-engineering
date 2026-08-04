@@ -140,6 +140,15 @@ def test_a_non_personal_data_concept_is_refused_as_needing_no_policy(client):
 
 
 def test_the_purpose_is_required_and_bounded(client):
+    """ONE bound, BOTH ends, one status code and one readable sentence.
+
+    422 is reserved for a request there is nothing to normalize in — `purpose` absent, or empty.
+    Everything the bound itself refuses is a 400 that says what a purpose has to be, because the
+    caller is a governance surface reporting the server's own words to a human. The 422 that used
+    to answer an over-long purpose (a pydantic `max_length` on the RAW body) is DELIBERATELY
+    retired: it answered one end of one bound in a different voice from the other, and it measured
+    the text before whitespace collapse, so a purpose whose only excess was spaces was refused for
+    a length its declaration does not have."""
     assert client.post(f"{_PEP}/approve", headers=ADMIN,
                        json={"expected_pointer_version": 0}).status_code == 422
     assert client.post(f"{_PEP}/approve", headers=ADMIN,
@@ -148,9 +157,21 @@ def test_the_purpose_is_required_and_bounded(client):
                         json={"expected_pointer_version": 0, "purpose": "AML"})
     assert short.status_code == 400
     assert "at least" in short.json()["detail"]
-    assert client.post(f"{_PEP}/approve", headers=ADMIN,
-                       json={"expected_pointer_version": 0,
-                             "purpose": "x" * 5000}).status_code == 422
+
+    long = client.post(f"{_PEP}/approve", headers=ADMIN,
+                       json={"expected_pointer_version": 0, "purpose": "x" * 5000})
+    assert long.status_code == 400, long.text
+    assert "at most" in long.json()["detail"]
+
+
+def test_the_bound_is_measured_on_the_NORMALIZED_purpose_not_the_raw_body(client):
+    """Whitespace is collapsed before the length is taken — it is collapsed before the content hash
+    is taken too, so a purpose padded with spaces is the SAME declaration, not an over-long one."""
+    padded = "  AML   transaction    monitoring  " + " " * 400
+    res = client.post(f"{_PEP}/approve", headers=ADMIN,
+                      json={"expected_pointer_version": 0, "purpose": padded})
+    assert res.status_code == 200, res.text
+    assert _by_name(client.get(_BASE, headers=ADMIN).json())["pep_flag"]["purpose"] == AML
 
 
 def test_the_cas_version_is_required_and_fails_closed(client):

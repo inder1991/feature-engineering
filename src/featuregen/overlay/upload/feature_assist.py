@@ -1193,12 +1193,15 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
     #    first covered operand would let one approval license every other personal-data concept
     #    that happened to ride along beside it.
     #
-    #    ONE BULK READ per validation pass, whatever the operand count. `_validate_idea` runs on
-    #    every candidate from every producer (the menu, the confirm-time MCV, the recipe options,
-    #    the planner's cross-catalog proposals), so a per-operand query would turn a 157-recipe
-    #    grounding pass into a query storm for a question with a handful of distinct answers. The
-    #    read is skipped entirely when the candidate binds no personal data at all, which is most
-    #    of them.
+    #    ONE BULK READ PER CANDIDATE, whatever the operand count — not per validation PASS, which
+    #    is what this note used to claim. `_validate_idea` runs on every candidate from every
+    #    producer (the menu, the confirm-time MCV, the recipe options, the planner's cross-catalog
+    #    proposals) and each pii-binding candidate asks once; the read is skipped entirely when the
+    #    candidate binds no personal data at all, which is most of them. What that rules out is the
+    #    per-OPERAND query storm, and that is the whole claim. See the TODO seam on
+    #    `active_pii_use_policies` for the cross-candidate batching a 157-recipe grounding pass
+    #    would still benefit from — deliberately not plumbed, because the caching lifetime of a
+    #    licence is the entire design question and a stale one licenses a revoked concept.
     #
     #    ABSENCE, REVOCATION AND CORRUPTION ALL REFUSE. `active_pii_use_policies` returns only
     #    concepts whose CURRENT revision is `active` and content-verifies each one, so a concept
@@ -1209,12 +1212,25 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
     #    THE REFUSAL NAMES THE UNCOVERED CONCEPTS, not the covered ones and not the column: the
     #    reviewer's next action is approving a concept in Governance, so the message has to say
     #    WHICH. A partially-covered candidate is the case that makes this load-bearing. ──
-    personal_data = [(ref, meta.get(ref, {}).get("concept")) for _src, ref in pairs
-                     if is_personal_data(meta.get(ref, {}).get("concept"))]
+    # The `isinstance` narrowing is not decoration: `meta` is an untyped catalog projection, so
+    # every downstream use (the store call, the sort, the join, the dict index) was typed
+    # `Any | None`. `is_personal_data(None)` was already False, so the behaviour is identical —
+    # what changes is that the four values the refusal message and the licence lookup are built
+    # from are now KNOWN to be concept names.
+    personal_data: list[tuple[str, str]] = []
+    for _src, ref in pairs:
+        candidate_concept = meta.get(ref, {}).get("concept")
+        if isinstance(candidate_concept, str) and is_personal_data(candidate_concept):
+            personal_data.append((ref, candidate_concept))
     covering: tuple[str, ...] = ()
     if personal_data:
         needed = {concept_name for _ref, concept_name in personal_data}
-        licensed = active_pii_use_policies(conn, needed)     # ONE read; absence is a refusal
+        # ONE read per candidate; absence is a refusal. A `PolicyStoreConflict` from here is NOT
+        # caught: it propagates and 500s the whole recommendation pass, BY DESIGN — a store whose
+        # policy rows fail content or approver verification cannot be reasoned about candidate by
+        # candidate, and degrading to "no licence for this one" would turn tamper into a quiet
+        # refusal nobody investigates. Noted, not changed.
+        licensed = active_pii_use_policies(conn, needed)
         uncovered = sorted(needed - set(licensed))
         if uncovered:
             ref, concept_name = next((r, c) for r, c in personal_data if c in set(uncovered))

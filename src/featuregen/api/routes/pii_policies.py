@@ -58,6 +58,7 @@ from featuregen.overlay.upload.concepts import concept as concept_record
 from featuregen.overlay.upload.pii_policy import (
     MAX_PURPOSE_LEN,
     MIN_PURPOSE_LEN,
+    normalize_purpose,
     validate_policy_concept,
 )
 from featuregen.overlay.upload.pii_policy_store import (
@@ -118,11 +119,18 @@ def list_data_use_policies(conn: _RRConn) -> dict:
 
 class ApprovePolicyRequest(BaseModel):
     """``expected_pointer_version`` is REQUIRED (module docstring): 0 claims first-write, >= 1 names
-    the exact version read. ``purpose`` is bounded free text in v1 (D14); the server re-validates
-    the bound and normalizes whitespace before anything is written."""
+    the exact version read.
+
+    ``purpose`` CARRIES NO ``max_length``, DELIBERATELY. It is bounded free text in v1 (D14), but
+    the bound belongs on the NORMALIZED text and pydantic can only see the raw body. Two things went
+    wrong with the length constraint here: a purpose whose only excess was whitespace (" AML …   ")
+    was refused for being too long when the declaration it encodes is not, and the two ends of one
+    bound answered with two different status codes — 400 with a readable sentence when too short,
+    a 422 field error when too long. ``min_length=1`` stays: an ABSENT or empty ``purpose`` is a
+    malformed request (nothing to normalize), which is what 422 is for."""
 
     expected_pointer_version: int = Field(ge=0)
-    purpose: str = Field(min_length=1, max_length=MAX_PURPOSE_LEN)
+    purpose: str = Field(min_length=1)
 
 
 class RevokePolicyRequest(BaseModel):
@@ -139,6 +147,20 @@ def _concept(raw: str) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _purpose(raw: str) -> str:
+    """NORMALIZE, THEN BOUND — one 400 with the same readable sentence at both ends.
+
+    Whitespace is collapsed before the length is measured, because that is the text that becomes
+    the declaration and the text the content hash is taken over; measuring the raw body would refuse
+    a perfectly ordinary purpose for the spaces around it. The store normalizes again on the way in
+    (``PiiUsePolicyRevisionV1`` owns that), so this is not the enforcement — it is the enforcement
+    happening EARLY enough to answer in the route's own voice."""
+    try:
+        return normalize_purpose(raw)
+    except PolicyValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post(_BASE + "/{concept_name}/approve",
              dependencies=[Depends(require_catalog_read), Depends(require_confirmer)])
 def approve_data_use_policy(concept_name: str, body: ApprovePolicyRequest, conn: _Conn,
@@ -150,11 +172,12 @@ def approve_data_use_policy(concept_name: str, body: ApprovePolicyRequest, conn:
     operands of this concept.
 
     400 on a concept no policy can license (a protected characteristic) or a purpose outside the
-    bound; 409 when somebody else declared first."""
+    bound — BOTH ends of that bound, in the same words and the same status code."""
     name = _concept(concept_name)
+    purpose = _purpose(body.purpose)
     try:
         revision_id, version = approve_pii_use_policy(
-            conn, concept_name=name, purpose=body.purpose,
+            conn, concept_name=name, purpose=purpose,
             expected_pointer_version=body.expected_pointer_version, actor=identity.subject)
     # 400 covers `PolicyValidationError` too (it IS a `SelectionError`): a store-level refusal no
     # retry can fix is the request being wrong, not a race. 409 is reserved for the race.

@@ -942,9 +942,14 @@ def test_the_contract_detail_read_surfaces_the_licence_for_an_auditor(db):
 
 def test_the_policy_read_is_ONE_query_per_CANDIDATE_and_is_skipped_entirely_without_pii(db,
                                                                                         monkeypatch):
-    """`_validate_idea` runs on every candidate from every producer, so a per-operand query would
-    turn a 157-recipe grounding pass into a query storm. And a candidate that binds no personal
-    data must not pay for the question at all."""
+    """ONE read per CANDIDATE, and none at all without personal data — which is the honest claim.
+
+    The name used to say "per validation", which read as one read per PASS and is not what this
+    asserts: `_validate_idea` runs on every candidate from every producer and each pii-binding one
+    asks once. What is ruled out is the per-OPERAND query storm (a 157-recipe grounding pass issuing
+    a query per bound column), and what is proved beside it is that a candidate binding no personal
+    data does not pay for the question at all. Cross-candidate batching is a TODO-noted seam on
+    `active_pii_use_policies`, not something this test claims exists."""
     from featuregen.overlay.upload import feature_assist as fa
 
     _approve(db, "pep_flag")

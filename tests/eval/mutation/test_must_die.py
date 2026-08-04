@@ -91,6 +91,11 @@ def test_the_registry_covers_every_invariant_the_plans_named() -> None:
         "graph_projection_read_as_authority",
         "profile_hash_omits_business_context",
         "disable_the_feature_use_gate",
+        # D14's other half, and the one the whole allow-policy surface rests on: approving a policy
+        # is only safe because REVOKING it takes effect immediately. Pinned as REQUIRED because the
+        # gate-disabled entry above does not cover it — a gate that runs, reads the pointer and
+        # ignores the status passes every check `disable_the_feature_use_gate` makes.
+        "gate_ignores_policy_revocation",
     }
     registered = {m.mutation_id for m in mutations.REGISTRY}
     missing = required - registered
