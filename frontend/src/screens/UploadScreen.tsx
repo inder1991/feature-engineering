@@ -556,6 +556,11 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
   // The optional catalog narrative (Release-A profiles), authored as structured fields and
   // serialized into the multipart catalog_profile_json part; validated server-side before any
   // write and committed atomically with a successful ingest. All-empty = not sent; never required.
+  //
+  // NOTHING CLEARS THIS — not a failed upload, not a held or rejected one. The most likely reason
+  // to see the error callout is a problem with the FILE, and the retry is one click away; wiping
+  // the paragraph the author just wrote about their own catalog would charge them for a failure
+  // that had nothing to do with it. Same discipline as CatalogNarrativePanel's 409 path.
   const [narrative, setNarrative] = useState<NarrativeDraft>(EMPTY_NARRATIVE)
   // The result is stored with the source it was uploaded to, so the result panel and the
   // review-queue handoff never read the live input (which the user may already have edited

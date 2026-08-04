@@ -391,6 +391,34 @@ describe('catalog narrative section', () => {
     expect(screen.queryByText(/exceeds the 4000-character bound/)).toBeNull()
   })
 
+  it('survives a FAILED file upload, so the retry keeps the typing', async () => {
+    uploadFile.mockRejectedValue(new api.ApiError(400, 'unsupported file type'))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText('Name'), 'Funds transfers')
+    await userEvent.type(
+      screen.getByLabelText('Business context'), 'Core banking; Compliance-owned.')
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+    expect(await screen.findByRole('alert')).toHaveTextContent(/upload failed/i)
+
+    // The file is what failed. The paragraph about the catalog — which only this person could
+    // write, and only they have — is still there.
+    expect(screen.getByLabelText('Name')).toHaveValue('Funds transfers')
+    expect(screen.getByLabelText('Business context'))
+      .toHaveValue('Core banking; Compliance-owned.')
+    expect(screen.getByRole('button', { name: 'Remove domain Payments' })).toBeInTheDocument()
+
+    // …and the retry carries it, unchanged and unretyped.
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toEqual({
+      display_name: 'Funds transfers',
+      business_context: 'Core banking; Compliance-owned.',
+      business_domains: ['Payments'],
+    })
+  })
+
   it('an EMPTY section never blocks, however the bounds are set', async () => {
     uploadFile.mockResolvedValue(result({ asserted: 4 }))
     renderUpload()
