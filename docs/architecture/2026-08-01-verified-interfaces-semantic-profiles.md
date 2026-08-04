@@ -193,7 +193,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | 1052 | consumption step — `graph_node.data_role` display projection (derived from the normalized `table_role` at projection time; the facet mechanism requires a literal column; a rebuildable projection is NOT the duplicate store §4-correction-4 forbids) + table-node search-doc slots for `definition`/`business_context` (insert-time + rebuild parity — the read-time join cannot reach FTS matching) |
 | 1053-1055 | RESERVED BLOCK — Phase-G execution wiring (PARALLEL SESSION; run lifecycle / publish pointer / whatever its approved plan needs; unused numbers return to the pool when Phase G's plan finalizes). The 1048-1050 reservations above remain Release B/C's, unchanged. |
 
-New needs append 1056+ to this table FIRST (edit this doc in the same commit as the migration).
+| 1056 | PII allow-policy surface (user-directed 2026-08-04): `pii_use_policy` immutable revisions + CAS current pointer |
+
+New needs append 1057+ to this table FIRST (edit this doc in the same commit as the migration).
 
 ## D8. Flag matrix
 
@@ -353,3 +355,19 @@ changes domain precedence.
 - Closed-vocabulary option deliberately deferred: sub_domain v1 is free-text-constrained-by-prompt
   like `domain`; a curated sub-domain list becomes a `_KNOWN_VOCAB_VALIDATORS` entry later if the
   bank supplies one (record as a deferred item at the joint step, not silently).
+
+## D14. PII allow-policy surface (2026-08-04, user-directed)
+
+Closes the `PERSONAL_DATA_POLICY_REQUIRED` door the use-gate names. Bindings:
+- **SINGLE-PERSON approval, by explicit user decision** — one authorized approver (the
+  platform-admin claim) declares concept + bounded purpose text; ACTIVE immediately; revocation
+  is likewise one action. This deliberately deviates from the four-eyes convention for this
+  surface; the immutable who/when/purpose record is the control. Do not re-add a confirmer step
+  without a new user decision.
+- House store pattern: immutable revisions + CAS current pointer (migration 1056); revocation is
+  a new revision, never a delete.
+- The gate clears a PII operand iff EVERY pii-classed concept it uses has an ACTIVE policy;
+  protected characteristics NEVER clear (structurally_unsuitable is not policy-addressable).
+- Purpose is bounded free text in v1; a closed purpose taxonomy is a later refinement.
+- Acceptance: the five A.34 recipes light when their anchors are approved; revocation refuses
+  them again; the feature's provenance names the covering policy.
