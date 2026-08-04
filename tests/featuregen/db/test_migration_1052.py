@@ -5,9 +5,11 @@ so a column addition that trips over an existing row passes every test and fails
 database that matters ("migration audits are blind to legacy data"). These tests seed a PRE-1052
 shape first, then re-apply the migration SQL exactly as the runner does.
 
-They also pin the D7 reservation reality: on the fully integrated tree 1043-1049 and 1051 exist;
-1050 (Release C) and 1053-1055 (the Phase-G parallel block) do NOT — so 1052 may not depend on
-anything those numbers would create.
+They also pin the D7 reservation reality, and pin it to THIS stream's own claim: 1052 is the only
+number the consumption step allocated, and 1052 depends on nothing any neighbouring number would
+create. What a stream may NOT do is pin its neighbours' allocations — the Phase-G parallel block
+already carries 1053 and 1054, and a blanket "nothing exists above 1052" would fail the moment
+that session merges, for a stream that neither owns those numbers nor depends on them.
 """
 from __future__ import annotations
 
@@ -19,6 +21,10 @@ import featuregen.db.migrations as _migrations
 
 _MIGRATION_DIR = Path(_migrations.__file__).resolve().parent / "migrations"
 _NEW_COLUMNS = ("data_role", "business_context", "business_context_decision_id")
+#: Every migration filename THIS stream allocated. The full name, not the number: the ledger keys
+#: on name+checksum, and two streams reaching for 1052 with different filenames is precisely the
+#: collision the pin below has to see.
+_STREAM_MIGRATIONS = ("1052_graph_node_data_role_and_table_prose.sql",)
 
 
 def _migration_1052_sql() -> str:
@@ -104,16 +110,30 @@ def test_1052_data_role_check_refuses_an_off_vocabulary_value(db) -> None:
 def test_1052_applies_with_its_real_neighbours_and_none_of_the_unwritten_reservations() -> None:
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
-    assert {"1043", "1044", "1045", "1046", "1047", "1048", "1049", "1051", "1052"} <= present
-    # 1050 belongs to Release C and 1053-1055 to the Phase-G parallel session; none is written,
-    # so 1052 stands on what exists.
-    assert not ({"1050", "1053", "1054", "1055"} & present)
+    assert {"1043", "1044", "1045", "1046", "1047", "1048", "1049", "1050", "1051",
+            "1052"} <= present
+    # 1053-1055 belong to the Phase-G PARALLEL session and are deliberately not asserted either
+    # way: 1052 depends on nothing they would create, and pinning their absence would fail the
+    # moment that session merges.
 
 
 def test_1052_is_the_only_number_this_stream_allocated() -> None:
-    """The consumption step owns 1052 and nothing else (D7). A second file appearing at 1053+
-    from this stream would be an unrecorded allocation — the exact class of defect the
-    full-filename ledger rule exists to catch."""
-    names = sorted(p.name for p in _MIGRATION_DIR.glob("*.sql"))
-    beyond = [n for n in names if n.split("_", 1)[0].isdigit() and int(n.split("_", 1)[0]) > 1052]
-    assert beyond == []
+    """The consumption step owns 1052 and nothing else (D7) — asserted as THIS stream's claim.
+
+    Exactly the files it named, exactly once each, and nothing it does not own inside the range it
+    allocated. A SECOND `1052_*` file is the unrecorded allocation the full-filename ledger rule
+    exists to catch, and that is what this test catches.
+
+    It deliberately says nothing about 1053+. Those belong to the Phase-G parallel session, which
+    ALREADY carries `1053_materialization_request.sql` and
+    `1054_materialization_compiled_artifact.sql`; a blanket "nothing exists above 1052" is a pin on
+    a neighbour's allocation, and it would fail on the merge of a stream this one neither owns nor
+    depends on. What keeps each stream honest is its own list, not a fence around everyone else."""
+    numbered = [(p.name.split("_", 1)[0], p.name)
+                for p in _MIGRATION_DIR.glob("*.sql") if p.name.split("_", 1)[0].isdigit()]
+    owned = {name.split("_", 1)[0] for name in _STREAM_MIGRATIONS}
+    assert sorted(name for number, name in numbered if number in owned) == sorted(
+        _STREAM_MIGRATIONS)
+    low, high = min(owned), max(owned)
+    assert [name for number, name in numbered
+            if low <= number <= high and number not in owned] == []

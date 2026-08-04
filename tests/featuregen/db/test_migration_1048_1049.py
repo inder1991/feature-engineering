@@ -199,10 +199,12 @@ def test_1048_1049_apply_with_their_real_neighbours_and_none_of_the_unwritten_re
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
     assert {"1045", "1046", "1047", "1048", "1049", "1051", "1052"} <= present
-    # 1044 arrived with the Track-2 merge; 1050 is Release C's crosswalk store, and 1053-1055
-    # are the Phase-G RESERVED BLOCK owned by a PARALLEL session. None is on this tree; asserting
-    # their ABSENCE is what keeps this stream from silently claiming a number it does not own.
-    assert not ({"1050", "1053", "1054", "1055"} & present)
+    # 1044 arrived with the Track-2 merge; 1050 arrived with Release C Task 10's crosswalk store.
+    # 1053-1055 are the Phase-G RESERVED BLOCK owned by a PARALLEL session, so this file asserts
+    # NOTHING about whether they exist: pinning their absence made this test a landmine that would
+    # fail the moment Phase G merged, for a stream that neither owns those numbers nor depends on
+    # them. What keeps 1048/1049 honest is the allocation test below, which is about THIS stream.
+    assert "1050" in present
 
 
 def test_this_stream_allocated_exactly_two_numbers() -> None:

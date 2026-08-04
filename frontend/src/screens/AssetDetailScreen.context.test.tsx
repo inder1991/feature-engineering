@@ -171,6 +171,85 @@ it('renders a reviewed link WITHOUT implying it can be executed', async () => {
   expect(row).toHaveTextContent('scope scope-1')
 })
 
+function directRelationship(): api.ContextRelationship {
+  return {
+    relationship_ref: 'bfk_1', kind: 'direct_equality',
+    left_ref: 'deposits::public.accounts.id', right_ref: 'cards::public.cust.cif_id',
+    availability: 'available', review_status: 'unreviewed',
+    assessment_revision_id: 'bca_1', producer: 'taxonomy', strength: 'proposed',
+    lifecycle: 'active', current: true, evidence_ids: [], executable_now: false,
+    realizations: [],
+  }
+}
+
+function crosswalkRelationship(
+  over: Partial<api.ContextRelationship> = {},
+): api.ContextRelationship {
+  return {
+    relationship_ref: 'cwd_1', kind: 'crosswalk',
+    left_ref: 'deposits::public.accounts.id', right_ref: 'cards::public.cust.cif_id',
+    availability: 'available', review_status: 'unreviewed',
+    assessment_revision_id: null, producer: 'taxonomy', strength: 'proposed',
+    lifecycle: 'active', current: true, evidence_ids: ['ev-role'], executable_now: false,
+    realizations: [],
+    crosswalk: {
+      definition_id: 'cwd_1', definition_revision_id: 'cwd_2',
+      mapping_dataset_ref: 'deposits::public.acct_xref',
+      source_to_mapping_refs: ['deposits::public.acct_xref.acct_no'],
+      mapping_to_target_refs: ['deposits::public.acct_xref.cif_id'],
+      mapping_temporal_policy_revision_id: null, leg_pins: [],
+    },
+    ...over,
+  }
+}
+
+it('labels a crosswalk distinctly and never as a failure', async () => {
+  // A direct bridge AND a crosswalk between the SAME endpoints: both rows, distinct refs, distinct
+  // kinds. Collapsing them would lose the difference between "these ids are equal" and "these ids
+  // are related through this table" — and only one of those may turn out to be true.
+  await openContext(contextFixture({
+    relationships: [directRelationship(), crosswalkRelationship()],
+  }))
+  expect(screen.getByTestId('context-link-bfk_1')).toBeInTheDocument()
+  const cross = screen.getByTestId('context-link-cwd_1')
+  expect(within(cross).getByText('crosswalk')).toBeInTheDocument()
+  // The mapping table is what makes it readable AS a crosswalk, and both legs are named.
+  const detail = screen.getByTestId('context-crosswalk-cwd_1')
+  expect(detail).toHaveTextContent('deposits::public.acct_xref')
+  expect(detail).toHaveTextContent('deposits::public.acct_xref.acct_no')
+  expect(detail).toHaveTextContent('deposits::public.acct_xref.cif_id')
+  // NO-BLOCKED framing: unreviewed is a state, not a fault, and it is described as usable.
+  expect(detail).toHaveTextContent(/nobody has reviewed this mapping yet/i)
+  expect(detail).toHaveTextContent(/proposal you can act on/i)
+  expect(detail).not.toHaveTextContent(/blocked|failed|invalid|error/i)
+  // The runnability sentence rides on BOTH review branches — see the confirmed case below.
+  expect(detail).toHaveTextContent(/running a crosswalk is not available yet, whatever its review/i)
+  // And nothing on the row implies it can run.
+  expect(within(cross).getByText('not executable now')).toBeInTheDocument()
+})
+
+it('a CONFIRMED crosswalk is still not runnable, and says so in the same breath', async () => {
+  // The invariant, and the reason both sentences have to render together: a review is
+  // accountability, never permission. If confirming a crosswalk swapped the "not available yet"
+  // sentence for the reviewer hint, the badge would read as the thing that unlocked execution —
+  // which is exactly the misreading the whole release is built to prevent. Neither wording had a
+  // test before, because the fixture only ever carried an unreviewed crosswalk.
+  await openContext(contextFixture({
+    relationships: [
+      crosswalkRelationship({ review_status: 'human_verified', strength: 'confirmed' }),
+    ],
+  }))
+  const detail = screen.getByTestId('context-crosswalk-cwd_1')
+  expect(detail).toHaveTextContent(/a reviewer has confirmed this mapping/i)
+  expect(detail).toHaveTextContent(/running a crosswalk is not available yet, whatever its review/i)
+  // The unreviewed wording is GONE — confirmed is confirmed, not both at once.
+  expect(detail).not.toHaveTextContent(/nobody has reviewed this mapping yet/i)
+  // Still nothing that reads as permission.
+  const cross = screen.getByTestId('context-link-cwd_1')
+  expect(within(cross).getByText('not executable now')).toBeInTheDocument()
+  expect(detail).not.toHaveTextContent(/blocked|failed|invalid|error/i)
+})
+
 it('says no link is in view rather than asserting none exists', async () => {
   await openContext(contextFixture())
   expect(screen.getByTestId('context-links')).toHaveTextContent(/no cross-catalog link is in view/i)
