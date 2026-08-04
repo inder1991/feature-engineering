@@ -135,7 +135,7 @@ def test_the_gate_reads_the_CONCEPT_not_the_column_name(db):
     column whose concept is descriptive must not. A name-pattern implementation fails both ways.
     """
     innocent = _col(db, "txn", "cust_description_id", concept="customer_id", data_type="text")
-    disguised = _col(db, "txn", "fld_017", concept="free_text", data_type="text")
+    disguised = _col(db, "txn", "fld_017", concept="code_label", data_type="text")
 
     idea, rej = _validate(db, [innocent], aggregation="count")
     assert rej is None and idea is not None, (
@@ -186,6 +186,72 @@ def test_a_structurally_unsuitable_operand_outranks_the_policy_refusal(db):
     name = _col(db, "cust", "rm_nm", concept=concept_name, data_type="text")
     _idea, rej = _validate(db, [name])
     assert rej.code == RejectCode.DESCRIPTIVE_OPERAND
+
+
+def test_a_payment_narration_is_a_POLICY_refusal_and_is_never_sent_to_a_code_column(db):
+    """The `text` GROUP SWEEP, undone — the review finding this test exists for.
+
+    `DESCRIPTIVE_GROUPS = {"text"}` pulled six concepts into structurally_unsuitable without ever
+    asking them the question `descriptive` asks. `payment_narrative` is the sharpest case: the
+    registry's OWN description calls it "the single richest signal in transaction data — it drives
+    categorisation, merchant identification and AML screening", and the sweep answered a reviewer
+    with "no approval can ever help; use the CODE column beside it" — about a narration, which has
+    no code column beside it and which an AML policy is exactly what would unblock.
+    """
+    assert "AML screening" in CONCEPT_REGISTRY["payment_narrative"].description, (
+        "this test is anchored on the registry's own words; they changed")
+
+    narration = _col(db, "txn", "tran_rmks", concept="payment_narrative", data_type="text")
+    idea, rej = _validate(db, [narration])
+
+    assert idea is None
+    assert rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED
+    assert refusal_family(rej.code) == NEEDS_SETUP
+    assert "personal-data use policy" in rej.message
+    assert "governance owner must declare one" in rej.message
+    assert "CODE column" not in rej.message, (
+        "a narration has no code column beside it — the refusal named a fix that cannot exist")
+
+
+@pytest.mark.parametrize("concept_name", [
+    "payment_narrative", "free_text", "kyc_narrative", "unstructured_doc", "record_author"])
+def test_every_PII_text_concept_is_a_policy_question_not_a_structural_one(db, concept_name):
+    """The other four members of the old sweep, adjudicated the same way and for the same reason:
+    each is computable text that carries personal data, so the answer is a policy with an owner."""
+    assert CONCEPT_REGISTRY[concept_name].group == "text"
+    assert not is_descriptive(concept_name), (
+        f"{concept_name} is prose, not the label beside a code — it must not claim to be")
+
+    ref = _col(db, "cust", f"c_{concept_name}", concept=concept_name, data_type="text")
+    _idea, rej = _validate(db, [ref])
+    assert rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED, concept_name
+
+
+def test_the_one_text_concept_with_neither_property_is_left_alone(db):
+    """`document_reference` — "Reference/pointer to a stored document". No declared sensitivity, no
+    label-beside-a-code semantics, and counting documents per customer is an ordinary feature. The
+    sweep refused it structurally; the criterion says the gate has nothing to say about it."""
+    record = CONCEPT_REGISTRY["document_reference"]
+    assert record.group == "text" and record.sensitivity == "public" and not record.descriptive
+
+    ref = _col(db, "cust", "kyc_doc_ref", concept="document_reference", data_type="text")
+    idea, rej = _validate(db, [ref], aggregation="count")
+    assert rej is None and idea is not None, f"refused: {rej and rej.message}"
+
+
+def test_no_text_concept_claims_to_be_the_label_beside_a_code(db):
+    """The group sweep is gone, stated as a property rather than as six cases: `descriptive` is a
+    per-concept self-declaration, nothing in the `text` group makes it, and — the docstring's own
+    claim — every concept that DOES make it says so in its description."""
+    assert [c.name for c in CONCEPT_REGISTRY.values()
+            if c.group == "text" and c.descriptive] == []
+    assert {c.name for c in CONCEPT_REGISTRY.values() if c.descriptive} == {
+        "branch_name", "relationship_manager_name", "merchant_name", "account_name",
+        "instrument_name", "counterparty_name", "code_label"}
+    for c in CONCEPT_REGISTRY.values():
+        if c.descriptive:
+            assert "label beside" in c.description or "description of a coded value" in \
+                c.description, f"{c.name} sets `descriptive` without saying so in its description"
 
 
 def test_a_name_with_a_documented_computable_use_is_a_POLICY_refusal_not_a_structural_one(db):
@@ -334,8 +400,11 @@ def test_the_registry_predicates_answer_over_concepts_and_decline_the_unknown(db
     assert not is_protected_characteristic("customer_id")
     assert not is_protected_characteristic(None)
     assert not is_protected_characteristic("not_a_concept")
-    assert is_descriptive("free_text") and is_descriptive("branch_name")
+    assert is_descriptive("branch_name") and is_descriptive("code_label")
     assert not is_descriptive("branch_id")
+    assert not is_descriptive("free_text"), (
+        "`descriptive` means the label beside a CODE; a memo is not that")
+    assert not is_descriptive(None) and not is_descriptive("not_a_concept")
 
 
 def test_a_denomination_is_distinguished_from_a_conversion_rate(db):

@@ -1085,10 +1085,13 @@ def _use_gate(conn, pairs: list[tuple[str, str]],
                 f"input or a grouping key. No approval makes it one — use a legitimate business "
                 f"driver instead, or correct the concept if this column is not one")
 
-    # ── class 4 — a human-readable label as an operand or a join key. structurally_unsuitable:
-    #    two catalogs' branch names are text that may coincide, not a shared identifier, and no
-    #    setting makes prose computable. The registry already said this in every such concept's
-    #    description; `descriptive` is that sentence as a field. ──
+    # ── class 4 — the LABEL THAT STANDS BESIDE A CODE, used as an operand. structurally_unsuitable:
+    #    no setting makes a display name a value, and the code that IS the value is right there.
+    #    The registry already said this in every such concept's description; `descriptive` is that
+    #    sentence as a field, SELF-DECLARED PER CONCEPT — there is no group sweep, because a group
+    #    is a taxonomy bucket and cannot make a claim about a specific column's semantics. Free
+    #    prose (`payment_narrative`, `free_text`) is deliberately NOT here: it is computable text
+    #    that carries personal data, so it lands in class 1, where a policy can license it. ──
     for _src, ref in pairs:
         concept_name = meta.get(ref, {}).get("concept")
         if is_descriptive(concept_name):

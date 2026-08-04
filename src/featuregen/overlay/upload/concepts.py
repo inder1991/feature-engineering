@@ -62,8 +62,16 @@ class Concept:
     #: policy answer — not a structural one. Marking them here would tell a reviewer "no approval
     #: can ever help" about a feature an approval is exactly what unblocks.
     #:
-    #: Every `group == "text"` concept is descriptive by construction (see :func:`is_descriptive`),
-    #: so only the label concepts living in other groups set it explicitly.
+    #: AND DELIBERATELY NOT every free-text column. The `text` GROUP was once swept in wholesale;
+    #: the sweep never applied the criterion above to its members, and the result told a reviewer
+    #: that `payment_narrative` — which the registry's own description calls "the single richest
+    #: signal in transaction data … it drives categorisation, merchant identification and AML
+    #: screening" — could never be built from, and sent them to "use the CODE column beside it"
+    #: when a narration has no code beside it and no approval could have helped. Every `text`
+    #: concept is now adjudicated on its OWN description (§3.9), and none of them sets this field:
+    #: they are PII-laden computable text, which is the policy class. The rule holds again in both
+    #: directions — every concept that sets `descriptive` says so in its own description, and every
+    #: concept whose description says so sets it.
     descriptive: bool = False
     description: str = ""
 
@@ -293,6 +301,28 @@ _ALL: tuple[Concept, ...] = (
                         "§D.8 derived intermediate — probabilistic PII entity-resolution)."),
 
     # ── §3.9 Text & documents ─────────────────────────────────────────────────────────────────────
+    # THE USE-GATE ADJUDICATION FOR THE WHOLE `text` GROUP, recorded once here because the members
+    # live in three sections (§3.9, §3.19 record_author, §3.20 payment_narrative + kyc_narrative).
+    # `descriptive` means ONE thing — the label that stands beside a CODE for the same thing — and
+    # not one of these six is that. A narration has no code column beside it, so the structural
+    # refusal ("use the CODE column beside it") names a column that does not exist, and the
+    # structural family says "no approval can ever help" about text the registry itself documents a
+    # computable use for. Each is therefore adjudicated on its own description:
+    #
+    #   payment_narrative  POLICY  — "drives categorisation, merchant identification and AML
+    #                                 screening"; the richest computable text in the catalog, and
+    #                                 pii because it carries names and account numbers.
+    #   free_text          POLICY  — memo / complaint text: complaint-driven features are ordinary
+    #                                 conduct and churn signals; pii because it may carry PII.
+    #   kyc_narrative      POLICY  — high-risk rationale prose; an AML/CDD input under a policy.
+    #   unstructured_doc   POLICY  — document bodies; pii, possibly special-category CONTENT, but
+    #                                 the content is not a declared special-category ATTRIBUTE.
+    #   record_author      POLICY  — a named member of staff; "rarely a legitimate feature" is a
+    #                                 judgement about usefulness, not a structural impossibility.
+    #   document_reference NEITHER — a pointer with no declared sensitivity and no label-beside-a-
+    #                                 code semantics. Counting documents per customer is an ordinary
+    #                                 feature, so the gate leaves it alone entirely — the same
+    #                                 "absence is not an assertion" rule the whole gate is built on.
     Concept("free_text", "text", sensitivity="pii",
             description="Memo, notes, complaint text. Tagged pii: may carry PII — read-scoped + screen "
                         "on egress (a deterministic gate, not just a prose warning)."),
@@ -1148,8 +1178,11 @@ def concept(name: str) -> Concept | None:
 # because its concept is `branch_name` and `branch_name.descriptive` is True, not because the string
 # ends in "_desc". A column with no concept answers False everywhere and is untouched.
 
-#: Concept GROUPS whose every member is a human-readable label rather than a computable value.
-DESCRIPTIVE_GROUPS: frozenset[str] = frozenset({"text"})
+#: THERE IS NO GROUP SWEEP, and the absence is the fix. `DESCRIPTIVE_GROUPS = {"text"}` used to
+#: pull six concepts into the structural class without ever asking them the question `descriptive`
+#: asks — see the §3.9 adjudication block for the per-concept answers. A group is a taxonomy
+#: bucket; `descriptive` is a claim about a specific column's semantics, and only a concept can
+#: make that claim about itself.
 
 #: The sensitivity classes a POLICY can never license as a model input. ECOA/fair-lending
 #: (`protected_attribute`) and GDPR Article 9 (`special_category`) do not have an "allow" switch —
@@ -1168,10 +1201,16 @@ CURRENCY_GROUP = "currency"
 
 
 def is_descriptive(name: str | None) -> bool:
-    """Is this concept a human-readable LABEL — prose that displays and groups, never a computable
-    value or a join key? Unknown / absent concepts answer False (absence is not an assertion)."""
+    """Is this concept THE LABEL THAT STANDS BESIDE A CODE for the same thing — a branch name beside
+    `branch_id`, a status description beside the status code?
+
+    Reads the `descriptive` FIELD and nothing else: one concept, one self-declaration. Unknown /
+    absent concepts answer False (absence is not an assertion). A concept that says only "this is
+    free prose" is NOT this — prose can be computed over, and the answer to PII-laden text is a
+    policy, which :func:`is_personal_data` routes to.
+    """
     record = CONCEPT_REGISTRY.get(name or "")
-    return record is not None and (record.descriptive or record.group in DESCRIPTIVE_GROUPS)
+    return record is not None and record.descriptive
 
 
 def is_protected_characteristic(name: str | None) -> bool:
