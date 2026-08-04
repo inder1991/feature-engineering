@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from tests.featuregen.materialize import fake_spark
@@ -16,12 +16,21 @@ from tests.featuregen.materialize.test_expression_ir import (
 )
 from tests.featuregen.materialize.test_group_plan import _contract
 from tests.featuregen.materialize.test_render_nodes_compute import BEFORE, BUSINESS_DT, _windowed
+from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
     _binding,
     _endpoint,
     _realization,
 )
 
+from featuregen.data_agent.physical import record_binding_revision
+from featuregen.data_agent.relationship_observation import (
+    EndpointTupleObservationV2,
+    RelationshipObservationV2,
+    RowCoverage,
+)
+from featuregen.data_agent.store import record_relationship_observation
+from featuregen.events.registry import event_registry
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.expression_ir import ExpressionExecutionIR, compile_expression
 from featuregen.materialize.inventory import (
@@ -31,10 +40,19 @@ from featuregen.materialize.inventory import (
 )
 from featuregen.materialize.joins import CrossCatalogJoinStepV1
 from featuregen.materialize.render.nodes_compute import render_projection_node
-from featuregen.overlay.upload.bridge_assessment import LinkReviewStatus
+from featuregen.overlay.facts import register_overlay_event_types
+from featuregen.overlay.projection import OverlayProjection
+from featuregen.overlay.upload.bridge_assessment import (
+    EvidenceKind,
+    EvidenceRefV1,
+    LinkReviewStatus,
+    read_overlay_identifier_link_state,
+)
 from featuregen.overlay.upload.bridge_realization import (
     AsOfIntervalRequirementV1,
+    BridgeJoinRealizationRevisionV1,
     BridgeRealizationCurrentV1,
+    CardinalityBasis,
     ColumnPairV1,
     ExecutionTier,
     FixedValueReferencePredicateV1,
@@ -42,7 +60,14 @@ from featuregen.overlay.upload.bridge_realization import (
     RealizationLifecycle,
     SafetyStatus,
 )
-from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
+from featuregen.overlay.upload.bridge_store import (
+    BridgeDependencyRefV1,
+    CurrentBridgeRealizationV1,
+    bridge_dependency_snapshot_id,
+    executable_bridge_realizations,
+    record_realization_revision,
+)
+from featuregen.projections.runner import run_projection
 
 CRM_CUSTOMERS = "crm::public.customer_master"
 CRM_CIF = f"{CRM_CUSTOMERS}.customer_id"
@@ -164,6 +189,239 @@ def _realization_current(
     )
 
 
+#: The one purpose `materialize/ir.py` reads bridges for, and the scope every seed below is admitted
+#: under. Stated once so a drift between the seed and `_BRIDGE_PURPOSE` is one edit, not two.
+BRIDGE_PURPOSE = "feature_generation"
+
+
+def seed_executable_bridge_realization(
+    db,
+    inventory: ClusterInventoryV1,
+    *,
+    composite: bool = False,
+    predicates=(),
+) -> BridgeJoinRealizationRevisionV1:
+    """Make :func:`_realization_current`'s realization DURABLE — through the real writers.
+
+    Every cross-catalog test in the tree hands ``compile_ir`` a ``CurrentBridgeRealizationV1`` built
+    in Python, so nothing has ever exercised the read ``chain.py`` actually performs: ``compile_ir``
+    is called there with no ``bridge_realizations`` argument at all, which means an HTTP- or
+    lane-driven bridged run loads its joins from the DATABASE through
+    ``executable_bridge_realizations``. That reader is not a SELECT — it is
+    ``revalidate_bridge_realization`` over every current pointer, and it fails closed on fifteen
+    separate facts. A fixture that INSERTed rows would satisfy none of them.
+
+    So this writes the same shape production writes, in the same order, through the same functions
+    (nothing under ``overlay/upload/`` is modified — it is only called):
+
+    1. ``record_binding_revision`` for both endpoints, because revalidation re-reads the stored
+       binding revision and refuses an endpoint whose physical address nothing recorded;
+    2. ``govern_bridge_fact`` — the identifier link's own overlay event stream, which is where
+       ``LinkAvailability`` and the ``overlay_head_event_id`` the bridge dependency must name come
+       from. A ledger row alone is a shape the platform cannot produce;
+    3. ``record_realization_revision`` for the PRE-ADMISSION revision at ``UNASSESSED`` safety —
+       the revision the exact observation names. It has to exist first and it has to be a different
+       revision: adding the observation to ``evidence_refs`` changes the content-addressed
+       ``realization_revision_id``, so an observation naming the admitted revision would be a cycle
+       (``bridge_store._current_exact_evidence_ids`` says exactly this);
+    4. ``record_relationship_observation`` — the complete, full-coverage, non-conflicting exact
+       profile that is the only thing that can discharge ``exact_relationship_evidence_missing``;
+    5. ``record_realization_revision`` again, CAS-advancing the current pointer to the admitted
+       revision at ``DETERMINISTICALLY_VALIDATED`` with the observation as evidence and its
+       dependency in the snapshot.
+
+    ``dependency_snapshot_id`` is recomputed at both steps rather than carried: revalidation
+    re-derives it from the dependency rows and refuses a mismatch, so a hand-written literal would
+    make the seed unexecutable in a way no reader would explain.
+
+    Returns the ADMITTED revision — the one a correct ``executable_bridge_realizations`` returns.
+    Its ``realization_revision_id`` is deliberately NOT the in-memory fixture's: the evidence and
+    the snapshot differ, so a test that finds this id in a compiled IR has proved the value came
+    from the database and could not have been the injected object.
+    """
+    base = _realization_current(
+        inventory, composite=composite, predicates=predicates).revision
+    source, target = base.from_endpoint, base.to_endpoint
+    assert source.physical_binding is not None and target.physical_binding is not None
+
+    # The overlay event schemas are registered per-test by `tests/featuregen/overlay/conftest.py`,
+    # which does not apply here — and the root harness resets the registry around every test, so
+    # this cannot be hoisted to import time. `register_schema` overwrites, so it is idempotent.
+    register_overlay_event_types(event_registry())
+
+    record_binding_revision(db, source.physical_binding)
+    record_binding_revision(db, target.physical_binding)
+    govern_bridge_fact(
+        db,
+        base.bridge_fact_key,
+        entity="customer",
+        left_source="hdfc",
+        left_ref="public.transactions.cif_id",
+        right_source="crm",
+        right_ref="public.customer_master.customer_id",
+        status="DRAFT",
+    )
+    # Those are REAL governance events, so they advance the global event head — and
+    # `read_operational_value` fails CLOSED on a LAGGED overlay projection (GATE 3,
+    # `operational_facts.py:441`). A seed that only appended would silently degrade every governed
+    # catalog read in the same test: the authoring lane would close NEEDS_REVIEW and the chain would
+    # stop at RESOLVE, with nothing pointing at the bridge as the cause. `seed_verified_bridge`
+    # advances the checkpoint for exactly this reason.
+    while run_projection(db, OverlayProjection()) >= 500:
+        pass
+    degraded = db.execute(
+        "SELECT aggregate, aggregate_id, reason FROM projection_degraded "
+        "WHERE projection_name = 'overlay' ORDER BY poison_seq").fetchall()
+    assert not degraded, f"the bridge seed degraded the overlay projection: {degraded!r}"
+
+    link_head = read_overlay_identifier_link_state(
+        db, base.bridge_fact_key).overlay_head_event_id
+    assert link_head is not None
+
+    dependencies = (
+        BridgeDependencyRefV1("bridge_fact", base.bridge_fact_key, link_head),
+        BridgeDependencyRefV1(
+            "physical_binding",
+            source.physical_binding.binding_id,
+            source.physical_binding.binding_revision_id,
+        ),
+        BridgeDependencyRefV1(
+            "physical_binding",
+            target.physical_binding.binding_id,
+            target.physical_binding.binding_revision_id,
+        ),
+    )
+    candidate = replace(
+        base,
+        cardinality_basis=CardinalityBasis.EXACT_PROFILE,
+        evidence_refs=(),
+        dependency_snapshot_id=bridge_dependency_snapshot_id(dependencies),
+    )
+    record_realization_revision(
+        db,
+        candidate,
+        BridgeRealizationCurrentV1(
+            candidate.realization_id,
+            candidate.realization_revision_id,
+            SafetyStatus.UNASSESSED,
+            LinkReviewStatus.UNREVIEWED,
+            RealizationLifecycle.ACTIVE,
+            1,
+        ),
+        dependencies=dependencies,
+    )
+
+    observation = _exact_observation(candidate)
+    assert record_relationship_observation(
+        db, observation, expected_pointer_version=0).became_current
+
+    admitted_dependencies = (
+        *dependencies,
+        BridgeDependencyRefV1(
+            "relationship_observation",
+            observation.observation_revision_id,
+            observation.plan_hash,
+        ),
+    )
+    admitted = replace(
+        candidate,
+        evidence_refs=(
+            EvidenceRefV1(
+                observation.observation_revision_id,
+                EvidenceKind.EXACT_PROFILE,
+                observation.producer,
+                content_hash=observation.plan_hash,
+                observed_at=observation.observed_at,
+            ),
+        ),
+        dependency_snapshot_id=bridge_dependency_snapshot_id(admitted_dependencies),
+    )
+    record_realization_revision(
+        db,
+        admitted,
+        BridgeRealizationCurrentV1(
+            admitted.realization_id,
+            admitted.realization_revision_id,
+            SafetyStatus.DETERMINISTICALLY_VALIDATED,
+            LinkReviewStatus.UNREVIEWED,
+            RealizationLifecycle.ACTIVE,
+            2,
+        ),
+        dependencies=admitted_dependencies,
+        expected_pointer_version=1,
+    )
+    return admitted
+
+
+def _exact_observation(
+    revision: BridgeJoinRealizationRevisionV1,
+) -> RelationshipObservationV2:
+    """The exact profile that structurally attests ``revision``.
+
+    ``bridge_store._current_exact_evidence_ids`` re-checks every execution-bearing field of this
+    object against the ADMITTED revision, so none of it is decoration: the ordered column tuples
+    are the realization's own ``column_pairs`` (bare column names, as the observation records them),
+    the binding revisions are the endpoints', the predicate ids are the closed predicates in
+    declaration order, and the right-hand endpoint must be observed unique with no nulls — that
+    zero fan-out is the whole claim a directional realization rests on.
+    """
+    columns = tuple(
+        (pair.from_logical_column_ref.rsplit(".", 1)[-1],
+         pair.to_logical_column_ref.rsplit(".", 1)[-1])
+        for pair in revision.column_pairs
+    )
+    from_binding = revision.from_endpoint.physical_binding
+    to_binding = revision.to_endpoint.physical_binding
+    assert from_binding is not None and to_binding is not None
+
+    def _endpoint_tuple(binding, endpoint, names) -> EndpointTupleObservationV2:
+        return EndpointTupleObservationV2(
+            binding.identity.table_id,
+            endpoint.binding_revision_id or "",
+            binding.content_hash,
+            names,
+            10,   # row_count
+            10,   # non_null_row_count — null_row_count is the difference, and must be 0
+            10,   # distinct_tuple_count — equal to row_count, so the tuple is observed unique
+            0,    # duplicate_tuple_count
+            0,    # duplicate_row_count
+            1,    # max_rows_per_tuple
+        )
+
+    return RelationshipObservationV2(
+        realization_revision_id=revision.realization_revision_id,
+        plan_hash="cross-catalog-exact-plan-hash",
+        scope_id=revision.applicability_scope.scope_id,
+        left=_endpoint_tuple(
+            from_binding, revision.from_endpoint, tuple(pair[0] for pair in columns)),
+        right=_endpoint_tuple(
+            to_binding, revision.to_endpoint, tuple(pair[1] for pair in columns)),
+        matched_left_distinct=10,
+        unmatched_left_distinct=0,
+        matched_right_distinct=10,
+        unmatched_right_distinct=0,
+        left_orphan_rows=0,
+        right_orphan_rows=0,
+        joined_row_count=10,
+        max_right_matches_per_left_row=1,
+        max_left_matches_per_right_row=1,
+        normalization_ids=("identity_v1",),
+        predicate_ids=tuple(
+            predicate.predicate_id for predicate in revision.predicates
+            if isinstance(
+                predicate,
+                FixedValueReferencePredicateV1 | AsOfIntervalRequirementV1)),
+        left_source_snapshot_id="hdfc-transactions-snapshot",
+        right_source_snapshot_id="crm-customer-master-snapshot",
+        snapshot_or_as_of="2026-07-27",
+        execution_principal="profile-service",
+        method="exact",
+        row_coverage=RowCoverage.FULL,
+        complete=True,
+        observed_at=datetime(2026, 7, 27, 10, tzinfo=UTC),
+    )
+
+
 def _seed_crm_catalog(db) -> None:
     for column in ("customer_id", "tenant_id", "effective_from", "effective_to"):
         db.execute(
@@ -172,6 +430,85 @@ def _seed_crm_catalog(db) -> None:
             "VALUES ('crm',%s,'column','customer_master',%s,'crm_banking')",
             (f"public.customer_master.{column}", column),
         )
+
+
+def test_the_durable_seed_is_what_the_PRODUCTION_reader_returns(catalog) -> None:
+    """The enabling proof for the bridged chain path (DEFERRED-WORK A.36).
+
+    ``executable_bridge_realizations`` is the reader ``compile_ir`` uses when no realization is
+    injected, and it re-derives every load-bearing fact rather than trusting the row. Asserting it
+    here — not merely that ``load_current_bridge_realizations`` finds something — is what makes the
+    seed a fixture the chain can genuinely consume: a seed that stored an unrevalidatable
+    realization would leave the chain test failing with ``0 current executable directional
+    realizations`` and no clue which of the fifteen checks it missed.
+    """
+    from tests.featuregen.materialize.test_expression_ir import INVENTORY
+
+    inventory = _inventory(INVENTORY)
+    admitted = seed_executable_bridge_realization(catalog, inventory)
+
+    executable = executable_bridge_realizations(
+        catalog, purpose=BRIDGE_PURPOSE, environment=inventory.environment_id)
+
+    assert [item.revision for item in executable] == [admitted]
+    assert executable[0].current.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
+    # and it is NOT the in-memory fixture: the evidence and dependency snapshot differ, so an IR
+    # carrying this revision id can only have come from the database.
+    assert admitted.realization_revision_id != \
+        _realization_current(inventory).revision.realization_revision_id
+
+
+def test_a_COMPOSITE_PREDICATED_realization_is_durable_and_executable_too(catalog) -> None:
+    """The seed's two parameters, exercised — and the sharpest case for the evidence check.
+
+    ``_current_exact_evidence_ids`` matches the observation's ORDERED column tuples and its
+    predicate ids against the admitted revision, so a composite, predicated realization is where a
+    seed that hard-coded a single ``customer_id`` pair or an empty predicate list would be silently
+    dropped by ``executable_bridge_realizations`` — leaving a caller with "no executable
+    realization" and nothing pointing at the fixture.
+    """
+    from tests.featuregen.materialize.test_expression_ir import INVENTORY
+
+    inventory = _inventory(INVENTORY)
+    admitted = seed_executable_bridge_realization(catalog, inventory, composite=True, predicates=(
+        FixedValueReferencePredicateV1("tenant-scope", CRM_TENANT, "tenant_id"),
+        AsOfIntervalRequirementV1("customer-as-of", CRM_EFFECTIVE_FROM, CRM_EFFECTIVE_TO,
+                                  "dimension_as_of")))
+
+    executable = executable_bridge_realizations(
+        catalog, purpose=BRIDGE_PURPOSE, environment=inventory.environment_id)
+
+    assert [item.revision for item in executable] == [admitted]
+    assert len(admitted.column_pairs) == 2
+    assert len(admitted.predicates) == 2
+
+
+def test_the_durable_seed_is_INVISIBLE_to_another_environment(catalog) -> None:
+    """Applicability is scoped, and the seed must not be a global switch: the same reader asked for
+    a different environment returns nothing, which is what keeps a bridged chain test from passing
+    on a realization approved for somewhere else.
+
+    BOTH reads are asserted, and that is the point. An emptiness assertion on its own is satisfied by
+    a seed that stored nothing at all — it would stay green against a helper neutered to a no-op, and
+    would then be testing nothing. The positive read beside it is what makes the empty one mean
+    "scoped away" rather than "absent".
+    """
+    from tests.featuregen.materialize.test_expression_ir import INVENTORY
+
+    inventory = _inventory(INVENTORY)
+    admitted = seed_executable_bridge_realization(catalog, inventory)
+
+    here = executable_bridge_realizations(
+        catalog, purpose=BRIDGE_PURPOSE, environment=inventory.environment_id)
+    elsewhere = executable_bridge_realizations(
+        catalog, purpose=BRIDGE_PURPOSE, environment="some-other-cluster")
+
+    assert [item.revision for item in here] == [admitted]
+    assert elsewhere == ()
+    # the same discrimination on the PURPOSE axis: a realization admitted for feature generation is
+    # not admitted for everything, and the scope carries exactly one purpose.
+    assert executable_bridge_realizations(
+        catalog, purpose="model_monitoring", environment=inventory.environment_id) == ()
 
 
 def test_cross_catalog_ir_carries_both_catalogs_and_exact_realization(

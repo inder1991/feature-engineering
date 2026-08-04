@@ -5,7 +5,7 @@ are not dependencies of this platform, and ``src/`` never imports either; a suit
 in would be pinning the validator to the versions of the artifact it validates, and would trade the
 whole suite's ~4s for a JVM-capable interpreter. Run it explicitly::
 
-    FEATUREGEN_L0_PYTHON=$PWD/.venv-l0/bin/python \\
+    FEATUREGEN_L0_PYTHON=$PWD/.venv-artifact/bin/python \\
     PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/featuregen/materialize/l0_gate.py -q
 
 pytest collects a file given by path regardless of its name, which is what makes the split work
@@ -18,10 +18,23 @@ a hand edit is ``PROJECT_HASH_MISMATCH``, that an unreachable environment invent
 hand-authored stdlib-only projects. What it cannot prove is that the RENDERED project is one of the
 ones that builds: that needs kedro, pyspark and a JVM, and it is what this file is.
 
-The environment is the one built for this task: ``.venv-l0`` (PySpark 4.2.0, kedro 1.5.0,
-kedro-datasets 9.5.0, Python 3.11) with Temurin 17. Both ``PYSPARK_PYTHON`` and
-``PYSPARK_DRIVER_PYTHON`` are exported below — without them Spark launches workers on the system
-Python and pyspark's own ``types.py`` dies on ``X | Y``.
+**The environments, and why there is more than one.** ``make l0-gate`` builds two and runs this file
+under both, because they answer different questions:
+
+* ``.venv-artifact`` — installed FROM the golden project's own ``requirements.lock``
+  (kedro 0.19.9, kedro-datasets 4.1.0, pyspark 3.5.1). This is *the artifact's declared environment*,
+  and it is the only one in which a passing build proof is a proof about **this** project.
+* ``.venv-l0-modern`` — kedro 1.5.0, kedro-datasets 9.5.0, pyspark 4.2.0. The forward-looking line.
+
+Both get ``hdfs`` (and ``s3fs`` on the 4.x line) as GATE-environment dependencies, for DEFERRED-WORK
+A.32's reason, plus Temurin 17. Both ``PYSPARK_PYTHON`` and ``PYSPARK_DRIVER_PYTHON`` are exported by
+the Makefile — without them Spark launches workers on the system Python and pyspark's own
+``types.py`` dies on ``X | Y``.
+
+A third environment now exists and is NOT one of these: ``/opt/kedro-venv`` in the kind backend image
+(``deploy/kind/Dockerfile.backend``), at kedro 1.5.0 / kedro-datasets 9.5.0 / pyspark 3.5.3. It is
+what ``FEATUREGEN_MATERIALIZE_L0_PYTHON`` points at in a deployment, so it is the environment that
+matters in production — and it matches neither venv above.
 """
 from __future__ import annotations
 
@@ -75,7 +88,13 @@ def l0_python() -> str:
     named = os.environ.get("FEATUREGEN_L0_PYTHON")
     candidates = [named] if named else []
     here = pathlib.Path(__file__).resolve()
-    candidates += [str(parent / ".venv-l0" / "bin" / "python") for parent in here.parents]
+    # The two names `make l0-gate` actually builds, artifact line FIRST — it is the environment the
+    # rendered project declares, so it is the one a bare `pytest l0_gate.py` should default to.
+    # `.venv-l0` is kept last because it is the name this file used to document and a developer may
+    # still have one lying around.
+    candidates += [str(parent / venv / "bin" / "python")
+                   for parent in here.parents
+                   for venv in (".venv-artifact", ".venv-l0-modern", ".venv-l0")]
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).is_file():
             return candidate
@@ -97,13 +116,98 @@ def l0_env(l0_python: str) -> dict[str, str]:
     return environment
 
 
-def test_the_environment_really_has_the_engines_the_project_pins(l0_python: str) -> None:
-    """A gate that ran against an environment without pyspark would pass vacuously as 'no build'."""
+#: Ask the interpreter what it actually has, keyed by DISTRIBUTION name — which is what a lock file
+#: names, and what `kedro-datasets` vs the importable `kedro_datasets` would otherwise disagree about.
+#: `importlib.metadata` reads the installed distribution rather than a module's `__version__`
+#: attribute, so a package that ships a stale or absent `__version__` cannot make this answer wrong.
+_INSTALLED_VERSIONS = (
+    "import importlib.metadata as m, json\n"
+    "out = {}\n"
+    "for dist in ('kedro', 'kedro-datasets', 'pyspark'):\n"
+    "    try:\n"
+    "        out[dist] = m.version(dist)\n"
+    "    except m.PackageNotFoundError:\n"
+    "        out[dist] = None\n"
+    "print(json.dumps(out))\n"
+)
+
+
+def _declared_pins(sealed: SealedProject) -> dict[str, str]:
+    """The artifact's OWN pins, parsed out of the file it ships them in.
+
+    Read from the rendered bytes rather than from ``fixtures.ENGINE_VERSIONS`` on purpose: the
+    fixture is what this suite happened to render with, and the lock is what the artifact SAYS. A
+    test that compared the interpreter against the fixture would still pass if the renderer stopped
+    writing the pins into the project at all.
+    """
+    pins: dict[str, str] = {}
+    for line in sealed.files["requirements.lock"].splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "==" not in stripped:
+            continue
+        name, _, version = stripped.partition("==")
+        pins[name.strip()] = version.strip()
+    return pins
+
+
+def test_the_environment_really_has_the_engines_the_project_pins(
+        project: SealedProject, l0_python: str) -> None:  # noqa: F811
+    """The interpreter's INSTALLED engines must equal the ones the rendered project pins itself to.
+
+    **This test used to lie.** It asserted `returncode == 0` and non-empty stdout on
+    `import kedro, pyspark` — it compared nothing at all, while its name promised the comparison
+    every other claim in this file leans on. It is the check that decides whether a passing L0 is
+    evidence about *this* artifact or about some other project that happens to share its source, and
+    for the whole of Phase G it was answering a different question (*is anything installed?*).
+
+    **EXPECT THIS RED IN TWO OF THE THREE ENVIRONMENTS, AND DO NOT MAKE IT GREEN.**
+
+    ===========================  ==========================  =============
+    environment                  engines                     verdict
+    ===========================  ==========================  =============
+    ``.venv-artifact``           0.19.9 / 4.1.0 / 3.5.1      **green**
+    ``.venv-l0-modern``          1.5.0 / 9.5.0 / 4.2.0       **red**
+    kind image ``/opt/kedro-venv``  1.5.0 / 9.5.0 / 3.5.3    **red**
+    ===========================  ==========================  =============
+
+    Red here is a true statement about the environment, not a broken test. The three ways to make it
+    green are all worse than the red: weakening the assertion restores the lie; ``xfail`` records
+    that we expect our own build proofs to be about the wrong project; and re-rendering the fixture
+    with the interpreter's versions (what
+    :func:`test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session` legitimately
+    does, because ``bootstrap_project`` forces its hand) would make the comparison tautological.
+
+    **What a reader should actually do about a red.** Nothing, in the gate. The finding belongs to
+    production, and it is recorded as DEFERRED-WORK **A.42**: `run_l0` never consults the declared
+    pins, because `_BUILD_PROBE` imports the project and calls `register_pipelines()` without
+    bootstrapping it, so `kedro_init_version` is never enforced. A deployment whose mounted inventory
+    declares engines its L0 interpreter does not have gets `PASSED` — "the build was proven" — with
+    no signal at all. Closing that needs an engine-version check in L0 carrying its own refusal code,
+    which is a §14 closed-vocabulary decision rather than a test change. Until it lands, this red is
+    the only place the platform says the disagreement out loud, so it is load-bearing precisely
+    because it is failing.
+    """
     proved = subprocess.run(  # noqa: S603
-        [l0_python, "-c", "import kedro, pyspark; print(kedro.__version__, pyspark.__version__)"],
-        capture_output=True, text=True, check=False)
+        [l0_python, "-c", _INSTALLED_VERSIONS], capture_output=True, text=True, check=False)
     assert proved.returncode == 0, proved.stderr
-    assert proved.stdout.strip(), "the environment answered nothing"
+    installed = json.loads(proved.stdout.strip().splitlines()[-1])
+
+    declared = _declared_pins(project)
+    assert declared, "the rendered project shipped no parseable pins in requirements.lock"
+
+    disagreements = {
+        dist: (want, installed.get(dist))
+        for dist, want in sorted(declared.items())
+        if installed.get(dist) != want
+    }
+    assert not disagreements, (
+        "the L0 interpreter is not the environment this artifact declares, so a passing build proof "
+        "here would be a proof about a DIFFERENT project (DEFERRED-WORK A.42):\n"
+        + "\n".join(
+            f"  {dist}: the project pins {want!r}, the interpreter has "
+            + ("NOTHING INSTALLED" if have is None else repr(have))
+            for dist, (want, have) in disagreements.items())
+        + f"\n  interpreter: {l0_python}")
 
 
 def test_the_RENDERED_project_builds_its_kedro_pipeline(project: SealedProject, tmp_path,  # noqa: F811

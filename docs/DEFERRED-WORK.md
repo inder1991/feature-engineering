@@ -676,7 +676,20 @@ operator cannot do today is close the old row.
 |---|---|---|
 | 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
 
-### A.36 🟡 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+### A.36 🟡 The bridged (cross-catalog) chain path — chain/lane row CLOSED, `execution_tier` row still OPEN (2026-08-04)
+
+🟡 rather than 🟢 **deliberately**: this entry carries two rows and only the first is done. A reader
+scanning headings must not take A.36 as finished while no triggered run can ask for a SANDBOX-scoped
+realization. The heading turns 🟢 when the second row does.
+
+**CLOSED for the chain/lane row (2026-08-04); the `execution_tier` row below remains OPEN.** The
+durable seed helper is `tests/featuregen/materialize/test_cross_catalog_ir.seed_executable_bridge_realization`
+and the fourth cross-catalog worked feature is `fixtures.BRIDGED_FEATURE_NAME`. A bridged group now
+runs through `compile_feature_group` (`test_chain.py`, five cases) and over HTTP through the worker
+tick (`test_materialization_e2e.py`, two cases), loading its realization from the database in both.
+The seed writes through `bridge_store`'s own writers, so the load exercises
+`executable_bridge_realizations`' full revalidation rather than a SELECT. Everything below is kept
+as the record of what the gap was.
 
 Flagged by Phase G T4's review and again by T11's, which is why it is here rather than in a task
 report: two independent reviews have now recorded the same gap, and neither had a tracked home for it.
@@ -702,7 +715,7 @@ graph nodes with a governed logical type.
 
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
-| 🟡 **No test drives a cross-catalog group through `compile_feature_group`, so the realization LOAD on the chain's own path is unexercised** | It is a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. G-1's acceptance criterion is the same-catalog path, and inventing the seed under acceptance-test pressure would have produced a fixture nobody had reviewed. | The first bridged group anybody triggers, or any change to how `compile_ir` resolves realizations. Closure: the durable seed helper above, then a fifth case in `tests/featuregen/api/test_materialization_e2e.py` driving the bridged group over HTTP — the harness already exists and takes one more fixture. |
+| 🟢 **CLOSED — a cross-catalog group now drives `compile_feature_group` AND the HTTP-triggered lane, loading the realization from the store** | Was a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. | Done as described: `seed_executable_bridge_realization` + `bridged_debit_amount_30d`. The discriminator is the `realization_revision_id`, content-addressed over the exact observation only the durable seed writes, asserted present in the sealed `nodes.py`; the control is a bridged run against an EMPTY store, which must refuse at `compile_ir` with `JOIN_CARDINALITY_UNKNOWN`. |
 | 🟡 **The trigger surface carries no `execution_tier`, so every HTTP-driven run compiles at `PRODUCTION`** | `MaterializationJobV1` and `MaterializationRunIn` have no such field, and adding one is a governance decision about who may widen the joins a compile may read — not a wiring change. Harmless today: the applicability tier only decides which joins are readable and forks no execution identity (pinned by `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity`). | Anyone needing a SANDBOX-scoped realization to reach a triggered run. Closure: a declared field on the job, argued the way `published_schema` was — no default, so a caller must state it. |
 
 ### A.37 🟡 A pre-seal governed refusal records no stage and no code anywhere queryable (2026-08-04)
@@ -814,3 +827,87 @@ table key has no `graph_node` row are quarantined and reported rather than guess
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🟡 **Phantom `public.public.<table>`-keyed field evidence/decisions are unreachable after the Task 0C key fix** | Zero known rows: the defect requires a table-anchored field correction issued on a deployed catalog before `89d78dc4`, and no such correction has been confirmed to exist. Writing a migration for a population that may be empty — against an append-only audit table — costs more than it returns until the population is measured. | Run the two detection queries above against the kind cluster (and any other deployed catalog) at the next deploy. Any non-zero count fires this item; so does the first user report of a confirmed table-level field that "went missing". |
+
+### A.41 🟡 A lagging overlay projection is reported as an authoring failure, and names itself nowhere (2026-08-04)
+
+Found while building A.36's durable bridge seed, and it is not a fixture problem — the fixture is
+only how it was met. The mis-attribution is real in a deployment.
+
+**The mechanism.** `read_operational_value` calls `check_projection_readiness` FIRST, before any read
+is trusted (`overlay/upload/operational_facts.py:441-451`), and that gate compares the overlay
+projection's checkpoint against the GLOBAL event head — `COALESCE(max(global_seq), 0) FROM events`,
+not a per-catalog watermark (`feature_metadata_snapshot.py:145,158-164`). So **any** event appended
+anywhere by anything — an identifier-link proposal, a bridge governance event, a field confirmation
+in an unrelated catalog — puts every governed read in the platform behind the head until the
+projection catches up. That is the correct fail-closed posture and is not the finding.
+
+**The finding is where the verdict surfaces.** `_fail_closed` returns `status="projection_unavailable"`
+carrying the projection's own detail, but nothing downstream keeps it. The authoring lane folds a
+degraded governed read into `NEEDS_AUTHORITY` and the run closes `NEEDS_REVIEW`; the chain's
+resolution seam then reports `NOT_RESOLVED: work item <id> names authoring run <id>, which closed
+NEEDS_REVIEW, not RESOLVED` and stops at `ChainStage.RESOLVE`. **Neither the refusal detail, the
+request row, nor the control plane contains the word `projection_unavailable`, a checkpoint, or a
+head sequence.** An operator holding that refusal is pointed squarely at the LLM authoring layer —
+the model, the critic, the proposal — which is not where the problem is. The problem is that a
+background projection is behind, is probably already catching up, and the run would succeed on
+retry.
+
+Compounded by A.37: a pre-seal refusal has nowhere in the plane to record a stage or a code at all,
+so this diagnosis is not merely absent from the refusal text — it is absent from everything
+queryable.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A governed refusal caused by a LAGGED overlay projection is reported as `NEEDS_REVIEW` authoring, and the lag is named nowhere an operator can read** | Surfacing it means threading a distinguishable state from `read_operational_value` through the authoring resolver's `NEEDS_AUTHORITY` fold and into the chain's refusal — three modules across two ownership boundaries (`overlay/upload/`, `formula/`), and the fold currently has one bucket for "a governed read did not answer" whether the cause is no decision, a conflict or a stale read model. Widening that vocabulary is a governed-authority decision, not a wiring change. Harmless to correctness: it fails CLOSED and a retry after the projection drains succeeds. | The first operator who debugs a `NEEDS_REVIEW` that had nothing to do with authoring — likely the first busy environment, since the gate is global rather than per-catalog and any concurrent upload can trip it. Closure: carry `projection_unavailable` (with the checkpoint and head) as its own reason through the fold, so the refusal says *the read model is behind* rather than *the model produced something needing review*; the retry advice follows for free. |
+| ⚪ **Test fixtures that append governance events must drain the projection themselves, and two copies of that drain now exist** | `_bridge_fixtures.seed_verified_bridge` and `test_cross_catalog_ir.seed_executable_bridge_realization` each run `run_projection(db, OverlayProjection())` to exhaustion and assert `projection_degraded` is empty, for exactly the reason above. A third copy is a third chance to get it subtly wrong (drain but not assert, assert but not drain). | The third fixture that needs it. Closure: one shared helper beside `_bridge_fixtures`, called by both. |
+
+### A.42 🔴 L0 proves the build in an interpreter it never compares against the artifact's own pins (2026-08-04)
+
+Found by the adversarial review of `e1d471a7`, which put a kedro/pyspark interpreter into the kind
+backend image so `FEATUREGEN_MATERIALIZE_L0_PYTHON` had something real to point at. The interpreter
+is correct and the image change stands; what the review could not establish is that a PASS from it
+means anything about the artifact that passed.
+
+**The mechanism, in one line: `_BUILD_PROBE` never bootstraps the project, so the one thing that
+enforces the declared pin is never consulted.**
+
+The generated project pins itself from the mounted inventory, not from anything in the image:
+`_render_requirements` and `_render_pyproject` (`render/project.py:1005-1017`, `:969-997`) take
+`kedro` / `kedro-datasets` / `pyspark` — and an EXACT `requires-python` — straight from
+`ClusterInventoryV1.engine_versions`. So the artifact declares whatever a human captured from the
+target cluster, while the L0 interpreter's versions were frozen when the image was built
+(`pyspark==3.5.3`, `kedro==1.5.0`, `kedro-datasets[spark]==9.5.0`).
+
+Nothing compares the two. `_BUILD_PROBE` (`materialize/validation.py:430-462`) inserts `<root>/src`
+on `sys.path`, imports the package and calls `register_pipelines()`. It never calls
+`bootstrap_project` and never creates a `KedroSession`, so `kedro_init_version` — the mechanism that
+would refuse a mismatched project — is never reached. `run_l0` (`:548-647`) compares the project hash
+against the lock and nothing else; `codes.py` ships no engine-version finding at all. The result is
+that L0 returns `PASSED`, and the chain records "the build was proven", for a project pinned to
+engines the prover does not have.
+
+**Why this is 🔴 and not 🟡.** It is a false PROOF, not a missing feature. Every other Phase G
+refusal fails closed; this one fails *open* and says the reassuring thing. It is also latent by
+construction rather than by luck: it becomes live the moment a real inventory is mounted, which is
+the single remaining blocker on turning `FEATUREGEN_MATERIALIZE_ENABLED` on
+(`20-backend.yaml:88-91`). Whoever captures that inventory is implicitly deciding whether the image's
+three pins are right, and will get no signal whatsoever if they are not.
+
+Distinct from **A.32**, which is its neighbour and worth reading beside it: A.32 says the lock is
+*incomplete* (kedro-datasets' spark module hard-imports `hdfs`/`s3fs`, which the lock cannot carry),
+so an environment installed FROM the lock cannot construct the catalog. A.42 says nothing ever checks
+the interpreter AGAINST the lock in the first place. A.32 is about the contents of the pins; A.42 is
+about the absence of the comparison.
+
+The gate now states the disagreement out loud:
+`l0_gate.py::test_the_environment_really_has_the_engines_the_project_pins` used to assert
+`returncode == 0` on `import kedro, pyspark` — it compared nothing while its name promised the
+comparison. It now parses the rendered project's own `requirements.lock` and compares it to the
+interpreter's installed distributions. It is consequently **RED** under `.venv-l0-modern` and under
+the kind image, and green only under `.venv-artifact` (which is installed from the artifact's lock).
+That red is the only place the platform currently says this, and it is deliberately not `xfail`ed.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`run_l0` reports `PASSED` for a project whose declared engines the L0 interpreter does not have** | Closing it needs a new finding code (an `ENGINE_VERSION_MISMATCH` beside `PROJECT_HASH_MISMATCH` / `PROJECT_DOES_NOT_BUILD` / `PIPELINE_NOT_CONSTRUCTIBLE`), and §14's failure vocabularies are CLOSED — widening one is a governance decision about what L0 is allowed to assert, not a fix a review wave may improvise. There is also a real design question underneath: whether a mismatch is a `FAILED` verdict about the artifact or an `ERROR` about the environment, which is exactly the distinction `_probe_verdict`'s `None` return already draws and would have to be drawn again here. | Mounting any real `FEATUREGEN_MATERIALIZE_INVENTORY` — i.e. the same act that unblocks the flag. Closure: have L0 read the three pins out of the project's `requirements.lock` (they are rendered bytes, already inside the hash) and compare them to `importlib.metadata` in the probe interpreter, emitting the new code when they disagree; the gate test above becomes its executable specification, and goes green in the artifact environment for the right reason. |
+| 🟡 **The kind image's pins are the SANDBOX's, and the sandbox is not the cluster** | `Dockerfile.backend` installs the same three versions as `sandbox/Dockerfile.spark` on the sandbox's ANSI-semantics reasoning, which is sound for choosing *a* Spark 3 line but says nothing about the target cluster. Left as-is because the alternative — deriving the image's pins from an inventory that does not yet exist — is circular, and because with the check above in place a wrong pin becomes loud instead of silent. | The inventory capture. If its `engine_versions` differ from 3.5.3 / 1.5.0 / 9.5.0, the image needs rebuilding against them, and that dependency belongs in the capture procedure rather than being discovered by a failing run. |

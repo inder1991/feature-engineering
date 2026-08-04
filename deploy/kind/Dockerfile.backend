@@ -1,6 +1,16 @@
 # FeatureGen backend — FastAPI on uvicorn. Editable install so the on-disk migration .sql
 # files (located via Path(__file__).parent/migrations) are found at runtime.
-FROM python:3.11-slim
+#
+# PINNED TO BOOKWORM, for `deploy/kind/sandbox/Dockerfile.spark`'s reason and not a new one: the
+# floating `python:3.11-slim` tag has already moved Debian release under this repo once, which is
+# what that file's header records. Two things here now depend on the base being stable rather than
+# merely being 3.11. The L0 venv below builds `pyspark` from an SDIST (3.5.x publishes no wheel), so
+# the base's toolchain and glibc are inputs to a 20-minute build that would otherwise be silently
+# irreproducible. And `render/project.py:_render_pyproject` writes the generated project's
+# `requires-python` as an EXACT pin taken from the captured inventory (`== 3.11.9`, not `>=`), so a
+# base whose patch version floats is a base that can silently disagree with what the artifact says
+# it needs.
+FROM python:3.11-slim-bookworm
 WORKDIR /app
 # NB: deliberately NO PIP_NO_CACHE_DIR here — the pip installs below use a BuildKit cache mount
 # (see the note on the install step). The cache lives outside the image, so keeping it costs no
@@ -14,6 +24,78 @@ ENV PYTHONUNBUFFERED=1 PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel
+
+# ── the L0 build-proof interpreter ───────────────────────────────────────────────────────────────
+# Phase G's L0 gate (`materialize/validation.py:run_l0`) launches a SUBPROCESS that imports the
+# rendered Kedro project and constructs its pipeline. That project imports `kedro.pipeline`,
+# `kedro.framework.hooks` and `pyspark.sql`; this platform depends on NEITHER (`src/` never imports
+# either, and `validation.py` takes the interpreter as a parameter precisely so it cannot validate
+# the artifact against the validator's own environment). Without an interpreter that has them,
+# `FEATUREGEN_MATERIALIZE_L0_PYTHON` has nothing to point at and every run honestly records "the
+# build was never proven" — which is why the flag could not simply be turned on.
+#
+# A SEPARATE VENV, not the app's environment. It exists only to be launched as a subprocess, and
+# merging ~500 MB of pyspark into the app's site-packages would put the control plane one `import`
+# away from the artifact it validates — the exact coupling `run_l0`'s interpreter parameter exists
+# to prevent. Nothing in `CMD` can reach it.
+#
+# THE PINS ARE THE SANDBOX'S (`deploy/kind/sandbox/Dockerfile.spark`), deliberately: Spark 3
+# defaults `spark.sql.ansi.enabled` FALSE and Spark 4 defaults it TRUE, and the rendered
+# `OVERFLOW_VIOLATION` gate is built for the FALSE (return-NULL) behaviour; kedro 1.5.0 is the API
+# Task 12 verified the renderer's emitted code against.
+#
+# READ THE NEXT PARAGRAPH BEFORE TRUSTING THOSE PINS. They are the SANDBOX's, and the sandbox is not
+# the cluster. The generated project does not pin itself to anything written here: `_render_requirements`
+# and `_render_pyproject` (`render/project.py:1005-1017`, `:969-997`) take every pin from the mounted
+# inventory's `ClusterInventoryV1.engine_versions`, so what the artifact DECLARES is whatever a human
+# captured from the target cluster. **Nothing compares the two.** `_BUILD_PROBE` imports the project
+# and calls `register_pipelines()`; it never bootstraps, so `kedro_init_version` — the one mechanism
+# that enforces the declared pin — is never consulted, and L0 returns PASSED for a project pinned to
+# engines this interpreter does not have. The moment a real inventory is mounted, an
+# `engine_versions` that differs from these three lines still produces a "the build was proven"
+# verdict. That gap is DEFERRED-WORK A.42; closing it is an engine-version check in L0 carrying its
+# own refusal code, which is a §14 vocabulary decision. Until then: whoever captures the inventory is
+# also deciding whether these pins are right, and will get no warning if they are not.
+#
+# NO JVM, established empirically rather than assumed. The probe imports the package and constructs
+# the pipeline; it never starts a SparkSession, and `pyspark`/`kedro`/`kedro-datasets` import
+# without Java (verified by running the real `_BUILD_PROBE` against a real rendered project inside
+# this image — see .superpowers/sdd/2026-08-03-phase-g-execution-wiring/task-enable-report.md).
+# `openjdk-17-jre-headless` would add ~200 MB to every backend pod to serve an import that does not
+# need it. NB: this makes the image able to PROVE a project builds, not to RUN one — an actual Spark
+# run needs the JVM, and that is the sandbox pod's job.
+#
+# ABOVE `COPY src` on purpose. That COPY invalidates every layer below it on any source change, and
+# this is the largest install in the file; below it, every backend rebuild would re-resolve pyspark.
+# `--no-build-isolation` for the reason the app install below already states in full: pyspark 3.5
+# publishes an SDIST ONLY, so pip BUILDS it here, and without this flag the PEP 517 build fetches its
+# own setuptools/wheel into a fresh environment — the isolated fetch that fails on a slow PyPI with
+# the misleading "No matching distribution ... (from versions: none)". The line above is what makes
+# the flag safe rather than merely faster: setuptools and wheel are installed into THIS venv
+# explicitly, so the build backend has them without reaching for the network.
+#
+# THE LAST LINE IS A SELF-CHECK, and it is the difference between a proof and a memory. Nothing else
+# in this repo builds this file — CI does not, and `deploy.sh` builds it without asserting anything
+# about it — so a venv that exists but cannot import is a failure `docker build` would otherwise exit
+# 0 on, leaving `FEATUREGEN_MATERIALIZE_L0_PYTHON` pointing at a broken interpreter and every run
+# recording RUN_FAILED. It asserts exactly what L0 needs and no more: `kedro.pipeline` and
+# `pyspark.sql` are the whole of the rendered project's third-party import graph at
+# `register_pipelines()` time. `kedro_datasets.spark` is checked too — it is not on that graph (the
+# catalog names `spark.SparkHiveDataset` as a STRING that Kedro resolves only when a catalog is
+# loaded, which the probe never does) but it is the import the no-JVM decision was least sure about,
+# so it is worth two seconds to keep proven. NB it imports the PACKAGE, which is lazy in
+# kedro-datasets 9.x; resolving `SparkDataset` from it would fail on an upstream packaging gap that
+# L0 does not care about (DEFERRED-WORK A.32).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/kedro-venv \
+ && /opt/kedro-venv/bin/pip install --upgrade pip setuptools wheel \
+ && /opt/kedro-venv/bin/pip install --timeout 120 --retries 10 --no-build-isolation \
+      "pyspark==3.5.3" "kedro==1.5.0" "kedro-datasets[spark]==9.5.0" \
+ && /opt/kedro-venv/bin/python -c \
+      "import kedro, pyspark, kedro_datasets.spark; from kedro.pipeline import Pipeline, node; \
+from pyspark.sql import DataFrame, Window, functions; \
+print('L0 interpreter OK:', kedro.__version__, pyspark.__version__)"
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 # The `llm` extra pulls the anthropic SDK — a PRODUCTION-only lazy import (CI uses FakeLLM), version-

@@ -180,9 +180,13 @@ incompatible units/currency is `InvalidOutput`. `resolve_formula_output_policy` 
 `_NO_PROOF` (`:194`), so no partition proof exists at resolve time — which is why the additivity
 table above collapses to `NON_ADDITIVE` for every first-slice feature.
 
-**Verified end to end in `tests/featuregen/materialize/test_fixtures.py`**: the three worked features
-are hand-authored AND re-derived by driving the real orchestrator, so a wrong fixture is a failing
-test rather than a silent forgery.
+**Verified end to end in `tests/featuregen/materialize/test_fixtures.py`**: the worked features are
+hand-authored AND re-derived by driving the real orchestrator, so a wrong fixture is a failing test
+rather than a silent forgery. There are **four** of them since DEFERRED-WORK A.36 — the three
+first-slice features plus `bridged_debit_amount_30d`, whose body is `total_debit_amount_30d`'s
+byte-for-byte and whose grain sits in a second catalog, which is the only thing that makes a
+compilation cross one. It resolves the same `NON_ADDITIVE` / `numeric` policy, because the policy is
+resolved from the OPERAND's governed facts and a plain SUM never consults the grain.
 
 ---
 
