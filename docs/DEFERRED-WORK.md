@@ -806,3 +806,54 @@ queryable.
 |---|---|---|
 | 🟡 **A governed refusal caused by a LAGGED overlay projection is reported as `NEEDS_REVIEW` authoring, and the lag is named nowhere an operator can read** | Surfacing it means threading a distinguishable state from `read_operational_value` through the authoring resolver's `NEEDS_AUTHORITY` fold and into the chain's refusal — three modules across two ownership boundaries (`overlay/upload/`, `formula/`), and the fold currently has one bucket for "a governed read did not answer" whether the cause is no decision, a conflict or a stale read model. Widening that vocabulary is a governed-authority decision, not a wiring change. Harmless to correctness: it fails CLOSED and a retry after the projection drains succeeds. | The first operator who debugs a `NEEDS_REVIEW` that had nothing to do with authoring — likely the first busy environment, since the gate is global rather than per-catalog and any concurrent upload can trip it. Closure: carry `projection_unavailable` (with the checkpoint and head) as its own reason through the fold, so the refusal says *the read model is behind* rather than *the model produced something needing review*; the retry advice follows for free. |
 | ⚪ **Test fixtures that append governance events must drain the projection themselves, and two copies of that drain now exist** | `_bridge_fixtures.seed_verified_bridge` and `test_cross_catalog_ir.seed_executable_bridge_realization` each run `run_projection(db, OverlayProjection())` to exhaustion and assert `projection_degraded` is empty, for exactly the reason above. A third copy is a third chance to get it subtly wrong (drain but not assert, assert but not drain). | The third fixture that needs it. Closure: one shared helper beside `_bridge_fixtures`, called by both. |
+
+### A.41 🔴 L0 proves the build in an interpreter it never compares against the artifact's own pins (2026-08-04)
+
+Found by the adversarial review of `e1d471a7`, which put a kedro/pyspark interpreter into the kind
+backend image so `FEATUREGEN_MATERIALIZE_L0_PYTHON` had something real to point at. The interpreter
+is correct and the image change stands; what the review could not establish is that a PASS from it
+means anything about the artifact that passed.
+
+**The mechanism, in one line: `_BUILD_PROBE` never bootstraps the project, so the one thing that
+enforces the declared pin is never consulted.**
+
+The generated project pins itself from the mounted inventory, not from anything in the image:
+`_render_requirements` and `_render_pyproject` (`render/project.py:1005-1017`, `:969-997`) take
+`kedro` / `kedro-datasets` / `pyspark` — and an EXACT `requires-python` — straight from
+`ClusterInventoryV1.engine_versions`. So the artifact declares whatever a human captured from the
+target cluster, while the L0 interpreter's versions were frozen when the image was built
+(`pyspark==3.5.3`, `kedro==1.5.0`, `kedro-datasets[spark]==9.5.0`).
+
+Nothing compares the two. `_BUILD_PROBE` (`materialize/validation.py:430-462`) inserts `<root>/src`
+on `sys.path`, imports the package and calls `register_pipelines()`. It never calls
+`bootstrap_project` and never creates a `KedroSession`, so `kedro_init_version` — the mechanism that
+would refuse a mismatched project — is never reached. `run_l0` (`:548-647`) compares the project hash
+against the lock and nothing else; `codes.py` ships no engine-version finding at all. The result is
+that L0 returns `PASSED`, and the chain records "the build was proven", for a project pinned to
+engines the prover does not have.
+
+**Why this is 🔴 and not 🟡.** It is a false PROOF, not a missing feature. Every other Phase G
+refusal fails closed; this one fails *open* and says the reassuring thing. It is also latent by
+construction rather than by luck: it becomes live the moment a real inventory is mounted, which is
+the single remaining blocker on turning `FEATUREGEN_MATERIALIZE_ENABLED` on
+(`20-backend.yaml:88-91`). Whoever captures that inventory is implicitly deciding whether the image's
+three pins are right, and will get no signal whatsoever if they are not.
+
+Distinct from **A.32**, which is its neighbour and worth reading beside it: A.32 says the lock is
+*incomplete* (kedro-datasets' spark module hard-imports `hdfs`/`s3fs`, which the lock cannot carry),
+so an environment installed FROM the lock cannot construct the catalog. A.41 says nothing ever checks
+the interpreter AGAINST the lock in the first place. A.32 is about the contents of the pins; A.41 is
+about the absence of the comparison.
+
+The gate now states the disagreement out loud:
+`l0_gate.py::test_the_environment_really_has_the_engines_the_project_pins` used to assert
+`returncode == 0` on `import kedro, pyspark` — it compared nothing while its name promised the
+comparison. It now parses the rendered project's own `requirements.lock` and compares it to the
+interpreter's installed distributions. It is consequently **RED** under `.venv-l0-modern` and under
+the kind image, and green only under `.venv-artifact` (which is installed from the artifact's lock).
+That red is the only place the platform currently says this, and it is deliberately not `xfail`ed.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`run_l0` reports `PASSED` for a project whose declared engines the L0 interpreter does not have** | Closing it needs a new finding code (an `ENGINE_VERSION_MISMATCH` beside `PROJECT_HASH_MISMATCH` / `PROJECT_DOES_NOT_BUILD` / `PIPELINE_NOT_CONSTRUCTIBLE`), and §14's failure vocabularies are CLOSED — widening one is a governance decision about what L0 is allowed to assert, not a fix a review wave may improvise. There is also a real design question underneath: whether a mismatch is a `FAILED` verdict about the artifact or an `ERROR` about the environment, which is exactly the distinction `_probe_verdict`'s `None` return already draws and would have to be drawn again here. | Mounting any real `FEATUREGEN_MATERIALIZE_INVENTORY` — i.e. the same act that unblocks the flag. Closure: have L0 read the three pins out of the project's `requirements.lock` (they are rendered bytes, already inside the hash) and compare them to `importlib.metadata` in the probe interpreter, emitting the new code when they disagree; the gate test above becomes its executable specification, and goes green in the artifact environment for the right reason. |
+| 🟡 **The kind image's pins are the SANDBOX's, and the sandbox is not the cluster** | `Dockerfile.backend` installs the same three versions as `sandbox/Dockerfile.spark` on the sandbox's ANSI-semantics reasoning, which is sound for choosing *a* Spark 3 line but says nothing about the target cluster. Left as-is because the alternative — deriving the image's pins from an inventory that does not yet exist — is circular, and because with the check above in place a wrong pin becomes loud instead of silent. | The inventory capture. If its `engine_versions` differ from 3.5.3 / 1.5.0 / 9.5.0, the image needs rebuilding against them, and that dependency belongs in the capture procedure rather than being discovered by a failing run. |
