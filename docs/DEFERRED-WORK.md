@@ -911,6 +911,28 @@ four placements — project root `.egg-info`, root `.dist-info`, `src/`, and an 
 directory — plus a `PYTHONPATH`-aimed-at-the-project case, plus a test that the restore is exact
 (a project whose registry imports a module living at the project root still builds).
 
+**And a second one, found by the re-review: the probe's OWN imports ran before its sanitization.**
+The first executable line was `import importlib, importlib.metadata, json, os.path, sys, traceback`,
+executed while `cwd=root` still had the project at `sys.path[0]` — so a tree shipping `<root>/json.py`
+executed arbitrary code with the live verdict nonce in `sys.argv[1]` and forged a passing build
+verdict: `passed`, zero findings, again. Strictly weaker than the first hole, and the row says so
+rather than dramatising it: `json.py` **is** inside `generated_project_hash` (it is not `*.egg-info`),
+so a dropped-in copy is `PROJECT_HASH_MISMATCH` and `_prove_the_build`'s identity check keeps the
+chain safe — the exploit needs an adversary-*sealed* tree, not a hand edit. But it falsified two
+sentences the fix's own comments made, and a false comment is worse than none.
+
+The probe now imports `sys` alone (a built-in: never resolved from `sys.path`, so unshadowable),
+drops the cwd entries with pure `sys` and no import at all, then imports `os.path`, then does the
+`realpath` pass, then imports the rest. Regression test ships a hostile module in a **sealed** tree
+so it exercises the probe's import order rather than the hash check. Reverting the import line kills
+the `json` / `traceback` / `importlib` parameters; the `os` / `encodings` parameters survive it,
+because CPython startup already has those in `sys.modules` — they are defence in depth against the
+import list growing, and the test says which is which.
+
+Deliberately NOT stripped: a `sys.path` entry that passes *through* the tree by symlink to a target
+outside it. `realpath` resolves to the target, the target is not the artifact, and a project cannot
+author a `sys.path` entry — only files under its own root. Recorded so it reads as a decision.
+
 The classification was contested and settled against the code: `status="error"` cannot carry a
 finding (`ValidationReportV1.__post_init__`), and A.42's whole complaint is that the condition names
 itself nowhere — so the verdict has to be the one that can carry a code.

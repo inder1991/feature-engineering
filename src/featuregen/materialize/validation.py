@@ -118,15 +118,24 @@ class ValidationStatus(StrEnum):
 
 
 class FindingClass(StrEnum):
-    """§11.2's routing: not how bad a finding is, but WHOSE problem it is."""
+    """§11.2's routing: not how bad a finding is, but WHOSE problem it is.
+
+    **"Blocks regeneration" below is a POLICY these classes declare, not a gate they currently
+    close.** :func:`may_regenerate` and :func:`may_regenerate_for` implement it correctly and are
+    called only by tests; as of G-1 the chain decides on ``report.status is PASSED`` alone and reads
+    no class. Stated here as well as at the two functions because a reader meets the vocabulary
+    first, and DEFERRED-WORK A.42 exists precisely because something claimed more than it did.
+    """
 
     #: The renderer emitted something that does not build. Fix the renderer, regenerate.
     RENDERER_DEFECT = "renderer_defect"
-    #: The catalog and the cluster disagree about a governed fact. Re-attest. BLOCKS regeneration.
+    #: The catalog and the cluster disagree about a governed fact. Re-attest. Declares that
+    #: regeneration is blocked (see the class docstring: declared, not yet enforced).
     GOVERNED_FACT_MISMATCH = "governed_fact_mismatch"
     #: The environment or the data is not in the state the run needs. The operator acts.
     ENVIRONMENT_OR_DATA = "environment_or_data"
-    #: Unrecognized. FAILS CLOSED — blocks regeneration, and is never silently environmental.
+    #: Unrecognized. FAILS CLOSED — declares regeneration blocked, and is never silently
+    #: environmental.
     UNCLASSIFIED = "unclassified"
 
 
@@ -340,6 +349,13 @@ def may_regenerate(report: ValidationReportV1) -> bool:
     ``False`` for ``error`` as well, with no findings to point at: an unreachable cluster is not
     evidence that regeneration is the right move, and treating "nothing was found" as "nothing is
     wrong" is exactly the confusion §11.2's zero-finding rule exists to prevent.
+
+    **NOTHING IN PRODUCTION CALLS THIS YET.** Its only callers are tests; the chain gates on
+    ``report.status is PASSED`` and never consults a class. So this function is the §11.2 rule
+    written down and proved, not a door that is currently shut — see DEFERRED-WORK A.42's 🟡 row.
+    The first code that regenerates a refused artifact (G-2's re-drive) should route through
+    :func:`may_regenerate_for`; until it does, do not describe a finding as "blocking regeneration"
+    without that qualification.
     """
     if not isinstance(report, ValidationReportV1):
         raise TypeError(
@@ -476,19 +492,31 @@ _ENGINE_STAGE = "engines"
 #: belief false. That is A.42's own defect at a smaller scale, and it would need a second "the
 #: interpreter never answered" channel besides :func:`_probe_verdict`'s ``None``.
 #:
-#: First, because no module the artifact ships has executed yet — which is exactly the residual
-#: forgery :func:`_probe_verdict` documents and cannot close for the build verdict. Ordering alone
-#: is NOT enough, and the first version of this fix wrongly claimed it was: ``importlib.metadata``
-#: SCANS ``sys.path``, and the probe is launched ``python -c`` with ``cwd=root``, so **the project
-#: root is already at ``sys.path[0]`` before the probe's first statement**. A tree shipping a
-#: root-level ``kedro.egg-info/`` therefore answered for its own pin — and because
-#: :func:`_files_on_disk` deliberately skips ``*.egg-info`` (an editable install writes one by
-#: *using* a project, so it is not drift), that forgery was invisible to ``PROJECT_HASH_MISMATCH``
-#: too: ``run_l0`` returned ``PASSED`` with zero findings. A.42, reproduced through its own fix.
+#: First, so that no module the artifact ships has executed when the pins are read — which is
+#: exactly the residual forgery :func:`_probe_verdict` documents and cannot close for the build
+#: verdict. **Ordering alone is not enough, and two successive reviews found that out the hard way;
+#: both holes are recorded because the reasoning that produced them is more instructive than the
+#: patch.**
 #:
-#: So the probe REMOVES every ``sys.path`` entry that lies inside the project before it asks, and
-#: restores the list exactly before it imports. Sanitizing inside the probe rather than launching it
-#: differently, deliberately:
+#: 1. ``importlib.metadata`` SCANS ``sys.path``, and the probe is launched ``python -c`` with
+#:    ``cwd=root``, so **the project root is already at ``sys.path[0]`` before the probe's first
+#:    statement**. A tree shipping a root-level ``kedro.egg-info/`` answered for its own pin — and
+#:    because :func:`_files_on_disk` deliberately skips ``*.egg-info`` (an editable install writes
+#:    one by *using* a project, so it is correctly not drift), that forgery was invisible to
+#:    ``PROJECT_HASH_MISMATCH`` too: ``PASSED``, zero findings. A.42 through its own fix.
+#: 2. The probe's own first line was
+#:    ``import importlib, importlib.metadata, json, os.path, sys, traceback`` — and it ran on that
+#:    same unsanitized path. A tree shipping ``<root>/json.py`` therefore executed arbitrary code
+#:    with the live verdict nonce in ``sys.argv[1]`` and forged a passing build verdict. Strictly
+#:    weaker than (1): ``json.py`` IS inside ``generated_project_hash``, so a dropped-in copy is
+#:    ``PROJECT_HASH_MISMATCH`` and :func:`~featuregen.materialize.compile.chain._prove_the_build`'s
+#:    identity check keeps the chain honest — it needs an adversary-SEALED tree, not a hand edit.
+#:    Weaker, but it falsified the sentence above, and a false comment is worse than none.
+#:
+#: So the probe imports ``sys`` alone (a built-in: unshadowable), REMOVES every ``sys.path`` entry
+#: that lies inside the project, imports everything else, asks, and restores the list exactly before
+#: it imports the artifact. Sanitizing inside the probe rather than launching it differently,
+#: deliberately:
 #:
 #: * it is COMPLETE — it does not matter how an entry under ``root`` got onto the path (the ``-c``
 #:   cwd entry, a caller's ``PYTHONPATH``, a future interpreter's own additions); ``-P`` /
@@ -503,9 +531,43 @@ _ENGINE_STAGE = "engines"
 #: project under precisely the path it always did, or the engine fix would have changed what
 #: ``PROJECT_DOES_NOT_BUILD`` means.
 _BUILD_PROBE = f"ENGINE_STAGE = {_ENGINE_STAGE!r}\n" + r'''
-import importlib, importlib.metadata, json, os.path, sys, traceback
+# `sys` ONLY, and nothing else yet. It is a built-in module (`sys.builtin_module_names`), so it can
+# never be loaded from `sys.path` and no tree can shadow it. Every other import waits until the
+# project is off the path: this probe's own first line used to be
+# `import importlib, importlib.metadata, json, os.path, sys, traceback`, executed while `cwd=root`
+# still had the project at `sys.path[0]`, so a tree shipping `<root>/json.py` ran arbitrary code —
+# with the live verdict nonce in `sys.argv[1]` — and forged a passing build verdict.
+import sys
 
 MARKER, root, package, lockfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+# Pass 1, with NOTHING imported: drop the cwd entries. `python -c` puts "" at `sys.path[0]` and
+# `_probe_verdict` launches with `cwd=root`, so those ARE the project. Done with pure `sys` because
+# importing anything at all — even `os` — is what pass 2 needs and pass 1 must therefore precede.
+whole_path = list(sys.path)
+sys.path[:] = [entry for entry in whole_path if entry not in ("", ".")]
+
+# Safe now: `os` cannot be resolved from the tree. (`os` is normally already in `sys.modules` from
+# `site`, but this does not rely on that.)
+import os.path
+
+# Pass 2: every remaining entry that RESOLVES inside the project — a caller's `PYTHONPATH=<root>`,
+# a relative entry (`cwd` is the project, so it resolves inside), `<root>/./`, `<root>/src/../`, a
+# symlink whose target is the tree, a nested directory. `realpath` collapses all of those and the
+# `+ os.sep` guard stops `<root>-sibling` matching as if it were inside.
+#
+# DELIBERATELY NOT stripped: an entry that merely passes THROUGH the tree by symlink to a target
+# outside it. `realpath` resolves to the target, the target is not the artifact, and the artifact
+# cannot create it — a project cannot author a `sys.path` entry, only files under its own root.
+inside = os.path.realpath(root)
+sys.path[:] = [entry for entry in sys.path
+               if os.path.realpath(entry) != inside
+               and not os.path.realpath(entry).startswith(inside + os.sep)]
+
+# The rest, resolved with the project off the path — so these are the interpreter's own modules.
+import importlib, importlib.metadata, json, traceback
+
+importlib.invalidate_caches()
 
 
 def emit(stage, ok, observed="", pins=()):
@@ -543,17 +605,6 @@ if not declared:
     # Fails CLOSED. A project that declares no environment cannot have its prover checked against
     # one, and "nothing to compare" must not read as "they agree" — that IS A.42.
     emit(ENGINE_STAGE, False, lockfile + " pins no distribution")
-
-# Ask the interpreter what it HAS, with the project taken off the search path first. `python -c`
-# puts the cwd at sys.path[0] and this probe is launched with cwd=root, so without this the tree
-# vouches for its own pin from a `kedro.egg-info/` the project hash is blind to. `''` and `'.'` are
-# spellings of the cwd; realpath also collapses a symlinked root and catches nested entries.
-inside = os.path.realpath(root)
-whole_path = list(sys.path)
-sys.path[:] = [entry for entry in whole_path
-               if os.path.realpath(entry or os.getcwd()) != inside
-               and not os.path.realpath(entry or os.getcwd()).startswith(inside + os.sep)]
-importlib.invalidate_caches()
 
 disagreements = []
 for name, pinned in sorted(set(declared)):
@@ -626,8 +677,14 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
     matches nothing. It does NOT defeat an in-interpreter echo: the probe imports the project in its
     own interpreter, so module code that reads ``sys.argv[1]`` at import time can print the live
     marker and forge a verdict. Closing that would mean not importing the artifact in the process
-    that holds the marker, which is out of scope at this seam. The ENGINE verdict is outside that
-    caveat by construction: the probe decides it before it puts the project on ``sys.path``.
+    that holds the marker, which is out of scope at this seam.
+
+    The ENGINE verdict is decided before that exposure begins, but "by construction" was too strong
+    a phrase and is not used here: it is true only because the probe now takes the project off
+    ``sys.path`` before importing anything but ``sys``. Until it did, its own
+    ``import … json …`` line ran off the artifact's root and could be answered by ``<root>/json.py``
+    — the marker forged from inside the probe's *own* imports rather than the project's. The
+    property is real; it rests on that ordering, not on the shape of the seam.
 
     The lock filename travels through argv rather than being spelled inside the probe's source, so
     the file the renderer WRITES and the file the probe READS are one constant

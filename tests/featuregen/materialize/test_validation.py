@@ -791,6 +791,55 @@ def test_the_ROOT_forgery_is_invisible_to_the_hash_so_the_engine_check_is_all_th
                                   ValidationFindingCode.ENGINE_VERSION_MISMATCH]
 
 
+#: A module that forges a PASSING build verdict at import time, using the live per-invocation nonce
+#: it finds in `sys.argv[1]`. It writes the verdict without importing anything, because the module
+#: it is impersonating is the one being imported.
+_HOSTILE_STDLIB_MODULE = (
+    "import os, sys\n"
+    "sys.stdout.write(sys.argv[1] + '{\"stage\": \"build\", \"ok\": true, "
+    "\"observed\": \"2 nodes\", \"pins\": []}' + chr(10))\n"
+    "sys.stdout.flush()\n"
+    "os._exit(0)\n"
+)
+
+
+@pytest.mark.parametrize("module", ["json", "traceback", "importlib", "os", "encodings"])
+def test_a_stdlib_module_the_PROJECT_SHIPS_cannot_run_before_the_pins_are_read(tmp_path, module):
+    """The project ships `<root>/json.py` (etc.) and the probe must not import ITS copy.
+
+    **Regression test for a real hole.** The probe's first executable line used to be
+    `import importlib, importlib.metadata, json, os.path, sys, traceback`, and it ran while
+    `cwd=root` still had the project at `sys.path[0]`. So the artifact executed arbitrary code
+    before a single line of the engine check — with the live verdict nonce sitting in `sys.argv[1]`,
+    which is all that is needed to forge a passing build verdict. `run_l0` returned `PASSED` with
+    zero findings for a project pinning `kedro==0.19.9` under an interpreter with no kedro.
+
+    **SEALED, which is the whole point of the test.** A dropped-in `json.py` is ordinary drift and
+    `PROJECT_HASH_MISMATCH` catches it — that is why this was weaker than the root `.egg-info` hole,
+    where the forging file was hash-invisible. Sealing it means the tree hashes to its own lock and
+    the hash check says nothing, so what is under test is the probe's import order and nothing else.
+
+    The probe now imports only `sys` — a built-in, unshadowable — before it takes the project off
+    the path, and `os.path` only after the cwd entries are gone.
+
+    **Which parameters are regression coverage and which are defence in depth**, because the two are
+    not the same and a test that blurred them would overstate itself. Reverting the probe to the old
+    single import line kills `json`, `traceback` and `importlib` — the modules that line actually
+    named. `os` and `encodings` survive that mutant: CPython's startup (`site`, and the codec
+    machinery) has already put them in `sys.modules`, so no tree can shadow them today. They are
+    here to hold that property if the probe's import list ever grows, not because they were the
+    hole.
+    """
+    files = _project_files(create_pipeline_body=_BUILDS,
+                           requirements_lock="kedro==0.19.9\n")
+    files[f"{module}.py"] = _HOSTILE_STDLIB_MODULE
+    report = _l0(_on_disk(tmp_path, files))
+
+    assert report.status is ValidationStatus.FAILED, "the artifact forged a passing verdict"
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert report.findings[0].observed == "kedro is not installed"
+
+
 def test_a_PYTHONPATH_aimed_at_the_project_cannot_answer_for_its_own_pin(tmp_path) -> None:
     """The door that `-P` / `PYTHONSAFEPATH` would leave open, and the reason the fix is in-probe.
 
