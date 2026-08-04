@@ -47,14 +47,23 @@ class Concept:
     near_label: bool = False        # True for funnel-tail signals that BORDER the label (forbearance,
     #                                 stage-3 impairment, 90+ DPD, CASS switch, filed SAR) — the 3-part
     #                                 leakage control must FLAG these (softer than leakage_anchor).
-    #: True for a HUMAN-READABLE LABEL that stands beside a code rather than being one: a branch
-    #: NAME beside the branch id, a status DESCRIPTION beside the status code, a party name. The
-    #: registry has always said this in prose ("never a join key", "the id joins, the name does
-    #: not", "conflates what you GROUP BY with what you DISPLAY"); this is the same statement as a
-    #: field the feature USE gate can read. It follows the `leakage_anchor` precedent exactly — a
-    #: behaviour-carrying boolean, not a name pattern. Every `group == "text"` concept is
-    #: descriptive by construction (see :func:`is_descriptive`), so only the label concepts that
-    #: live in other groups set it explicitly.
+    #: True for THE LABEL THAT STANDS BESIDE A CODE FOR THE SAME THING — a branch NAME beside
+    #: `branch_id`, a status DESCRIPTION beside the status code, a merchant's trading name beside
+    #: `merchant_id`. Every concept that sets it says so in its own description ("(the label beside
+    #: X)"), and each adds the same warning in prose: "never a join key", "the id joins, the name
+    #: does not", "conflates what you GROUP BY with what you DISPLAY". This field is that sentence
+    #: made readable by the feature USE gate. It follows the `leakage_anchor` precedent exactly — a
+    #: behaviour-carrying boolean, not a name pattern.
+    #:
+    #: DELIBERATELY NOT every name. `party_name`, `beneficiary_name` and `postal_address` are NOT
+    #: descriptive, because the registry documents a real computable use for each: a beneficiary
+    #: name is the match input of `external_own_transfer_trend` (§A9), and an address "generalises
+    #: to a region or distance feature". They are personal data, which is a POLICY question with a
+    #: policy answer — not a structural one. Marking them here would tell a reviewer "no approval
+    #: can ever help" about a feature an approval is exactly what unblocks.
+    #:
+    #: Every `group == "text"` concept is descriptive by construction (see :func:`is_descriptive`),
+    #: so only the label concepts living in other groups set it explicitly.
     descriptive: bool = False
     description: str = ""
 
@@ -150,7 +159,7 @@ _ALL: tuple[Concept, ...] = (
                         "number). Never joinable to internal account_id."),
     Concept("virtual_account_id", "identifier", namespace="virtual_account", entity_link="account",
             description="A virtual/shadow account identifier issued for reconciliation."),
-    Concept("party_name", "sensitive", sensitivity="pii", descriptive=True,
+    Concept("party_name", "sensitive", sensitivity="pii",
             description="A person or organisation NAME. Names display and group; they are "
                         "never identifiers and never join keys."),
     Concept("module_id", "categorical",
@@ -279,7 +288,6 @@ _ALL: tuple[Concept, ...] = (
     Concept("kyc_document", "sensitive", sensitivity="pii",
             description="KYC identity document — carries PII; read-scoped."),
     Concept("beneficiary_name", "sensitive", sensitivity="pii", entity_link="beneficiary",
-            descriptive=True,
             description="Payee name on a transfer — PII, read-scoped. Name-matched against the customer "
                         "name to DERIVE the own-account flag downstream (§A9 external_own_transfer_trend; "
                         "§D.8 derived intermediate — probabilistic PII entity-resolution)."),
@@ -1000,7 +1008,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("ultimate_creditor", "categorical", sensitivity="pii",
             description="ISO 20022 UltmtCdtr — the party the funds are ULTIMATELY for, behind any "
                         "intermediary or collection agent. The receiving mirror of ultimate_debtor."),
-    Concept("postal_address", "sensitive", sensitivity="pii", descriptive=True,
+    Concept("postal_address", "sensitive", sensitivity="pii",
             description="A physical or correspondence address. Kept distinct from the generic `pii` "
                         "because the handling differs: an address generalises to a region or "
                         "distance feature, where a raw identifier cannot be used at all."),

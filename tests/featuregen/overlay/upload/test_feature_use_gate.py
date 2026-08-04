@@ -179,12 +179,28 @@ def test_the_personal_data_class_comes_from_the_registry_sensitivity_not_a_hand_
 
 
 def test_a_structurally_unsuitable_operand_outranks_the_policy_refusal(db):
-    """`party_name` is BOTH personal data and a descriptive label. The reviewer must be told the
-    thing no policy can fix, not sent to a governance owner who could never help."""
-    assert is_personal_data("party_name") and is_descriptive("party_name")
-    name = _col(db, "cust", "full_nm", concept="party_name", data_type="text")
+    """`relationship_manager_name` is BOTH personal data and the label beside an id. The reviewer
+    must be told the thing no policy can fix, not sent to a governance owner who could never help."""
+    concept_name = "relationship_manager_name"
+    assert is_personal_data(concept_name) and is_descriptive(concept_name)
+    name = _col(db, "cust", "rm_nm", concept=concept_name, data_type="text")
     _idea, rej = _validate(db, [name])
     assert rej.code == RejectCode.DESCRIPTIVE_OPERAND
+
+
+def test_a_name_with_a_documented_computable_use_is_a_POLICY_refusal_not_a_structural_one(db):
+    """The adjudication that sharpened `descriptive`, kept as a test.
+
+    `beneficiary_name` is a name, but the registry documents it as the MATCH INPUT of the §A9
+    own-transfer recipe, and `postal_address` as generalising to a region or distance feature. A
+    structural refusal would tell a reviewer "no approval can ever help" about features an approval
+    is exactly what unblocks. They are personal data — a policy question with a policy answer.
+    """
+    for concept_name in ("beneficiary_name", "postal_address", "party_name"):
+        assert not is_descriptive(concept_name), concept_name
+        ref = _col(db, "cust", f"c_{concept_name}", concept=concept_name, data_type="text")
+        _idea, rej = _validate(db, [ref])
+        assert rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED, concept_name
 
 
 # ── class 3 · a currency-carrying amount with the dimension in plain sight ────────────────────────
