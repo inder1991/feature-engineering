@@ -118,3 +118,18 @@ def test_contract_hash_v1_distinguishes_contract_names():
     register_contract_version("task0s-other-probe", "1", owner="tests.featuregen.test_canonical")
     assert contract_hash_v1(_PROBE, "1", _PROBE_PAYLOAD) != contract_hash_v1(
         "task0s-other-probe", "1", _PROBE_PAYLOAD)
+
+
+def test_the_hashing_leaf_does_not_drag_a_database_driver_into_offline_importers():
+    """`featuregen.materialize.canonical` is a pure hashing leaf that renderers and offline tools
+    import. `contract_hash_v1`'s registry check used to be a MODULE-level import of
+    `featuregen.contracts.contract_versions`, which executes the `featuregen.contracts` package
+    `__init__` and therefore imports `contracts.db` and psycopg. The check is now function-local, so
+    the leaf stays a leaf while still running on every hash (pinned by the unregistered-version test
+    above). Asserted in a CLEAN interpreter — this process has psycopg loaded a hundred times over."""
+    import subprocess
+    import sys
+
+    probe = ("import sys; import featuregen.materialize.canonical; "
+             "sys.exit(1 if 'psycopg' in sys.modules else 0)")
+    assert subprocess.run([sys.executable, "-c", probe], check=False).returncode == 0

@@ -532,9 +532,16 @@ describe('SuggestedFeaturesScreen', () => {
       const buttons = screen.getAllByRole('button')
       expect(buttons).toHaveLength(2)
       for (const b of buttons) {
-        expect(b).toHaveAttribute('aria-expanded')
-        expect(b).toHaveAttribute('aria-controls')
+        expect(b).toHaveAttribute('aria-expanded', 'false')
+        // ...and NO `aria-controls` while collapsed: the drawer is not mounted, so the attribute
+        // would be a dangling IDREF. It appears the moment the element it names exists.
+        expect(b).not.toHaveAttribute('aria-controls')
       }
+      await userEvent.click(buttons[0])
+      expect(buttons[0]).toHaveAttribute('aria-expanded', 'true')
+      const controls = buttons[0].getAttribute('aria-controls')
+      expect(controls).toBeTruthy()
+      expect(document.getElementById(controls!)).toBeInTheDocument()
       expect(screen.getByText(/read-only/i)).toBeInTheDocument()
     })
 

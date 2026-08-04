@@ -615,7 +615,12 @@ export function SuggestionCard({
           type="button"
           className="sfc-toggle"
           aria-expanded={open}
-          aria-controls={detailId}
+          // Only while the drawer is actually mounted. `aria-controls` naming an id that is not in
+          // the document is an IDREF dangling reference — some AT announce nothing for it, some
+          // announce an error — and `aria-expanded={false}` already says the control is collapsed.
+          // Rendering the drawer permanently behind `hidden` would be the other valid answer; it
+          // costs a full detail subtree per card on a page of them, for no reading benefit.
+          aria-controls={open ? detailId : undefined}
           aria-label={`${open ? 'Hide' : 'Show'} full detail for ${bounded(s.display_name, 80)}`}
           onClick={() => setOpen(v => !v)}
         >

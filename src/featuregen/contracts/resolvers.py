@@ -10,7 +10,10 @@ baseline. This seam freezes what every consumer does about that:
 - an ID is **never invented** — not by lowercasing, not by slugging, not by a resolver
   returning a bare string (that fails loudly);
 - when the semantic plan lands its registry, it registers the real resolver here at
-  import and every consumer picks it up with zero suggestion-side change.
+  import and every consumer picks it up with zero suggestion-side change — including the
+  provenance the CALLER holds for the wording, which :func:`resolve_or_text` unions onto
+  the resolved label so that registering a resolver cannot silently launder an
+  ``llm``/``proposed`` catalog value into an attestation-looking facet.
 
 The two frozen axes are exactly the 0F-6 rows whose controlled owner is the semantic
 plan: ``business_domain`` and ``entity``. (``feature_category`` / ``recipe_family`` /
@@ -103,6 +106,15 @@ def resolve_controlled(axis: str, text: str) -> AttributedLabelV1 | None:
     return label
 
 
+def _merged(values: tuple, extra: tuple) -> tuple:
+    """Union, order-stable and duplicate-free, with the resolver's own entries FIRST."""
+    out = list(values)
+    for item in extra:
+        if item not in out:
+            out.append(item)
+    return tuple(out)
+
+
 def resolve_or_text(
     axis: str,
     text: str,
@@ -113,9 +125,32 @@ def resolve_or_text(
 ) -> AttributedLabelV1 | AttributedTextV1:
     """The frozen consumer behavior: a controlled label when a registered resolver maps the
     wording; otherwise the wording VERBATIM as attributed text with the caller's
-    provenance, ``operational_influence=None`` and no facet."""
+    provenance, ``operational_influence=None`` and no facet.
+
+    **The caller's provenance travels either way.** A resolver answers one question — which
+    controlled ID this WORDING maps to — with the registry's own attestation of that mapping.
+    It knows nothing about where the wording came from, and the caller does: which operands
+    contributed it, and what ``field_evidence`` says about how those values were asserted. A
+    ``graph_node.domain`` is typically an ``llm``/``proposed`` value, so returning the
+    resolver's label bare would make registering a resolver silently upgrade every proposed
+    domain into a facet that renders exactly like a human attestation — rule 4's failure mode,
+    arriving as a REGRESSION at the moment the semantic plan lands.
+
+    So the caller's evidence axes are unioned onto the label's (resolver's first, order-stable,
+    duplicate-free) and the caller's ``source_refs`` are appended the same way. ``id``,
+    ``display_name``, ``basis`` and ``operational_influence`` are the resolver's alone: they
+    describe how the LABEL was determined, which is the registry's business and not the
+    caller's. When the caller supplies neither axis nor ref the resolver's label is returned
+    unchanged, object identity included.
+    """
     label = resolve_controlled(axis, text)
     if label is not None:
-        return label
+        if not evidence and not source_refs:
+            return label
+        return AttributedLabelV1(
+            id=label.id, display_name=label.display_name, basis=label.basis,
+            evidence=_merged(label.evidence, tuple(evidence)),
+            operational_influence=label.operational_influence,
+            source_refs=_merged(label.source_refs, tuple(source_refs)))
     return AttributedTextV1(value=text, basis=basis, evidence=tuple(evidence),
                             operational_influence=None, source_refs=tuple(source_refs))

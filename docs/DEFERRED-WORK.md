@@ -588,3 +588,58 @@ as gate-environment dependencies, the same way it supplies Temurin 17.
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |
+
+### A.33 🟡 Phantom-keyed `field_evidence` / `field_decision_event` rows on deployed catalogs (2026-08-03)
+
+Recorded while remediating the final whole-branch review of Release A of the
+suggested-feature semantic-discovery plan (Task 0C minor, carried to the checkpoint).
+Task 0C (`89d78dc4`) changed how `column_authority.logical_ref_of` derives an object's
+logical key: it now reads `kind/schema_name/table_name/column_name` off the canonical
+`graph_node` row instead of guessing from the ref's dot count. Before that change a
+**two-part TABLE ref** — `public.accounts`, which is exactly how `graph.build_graph`
+stores a public-flattened table node — was read positionally as `table="public"`,
+`column="accounts"`, producing the phantom COLUMN key `<src>::public.public.accounts`.
+Any field decision or evidence row written against a table anchor under the old code
+therefore sits under a key nothing resolves to any more: `asset_detail` (`:694`),
+`read_field_cas` (`field_correction.py:196`), `apply_field_correction` (`:272`) and
+`column_readiness` (`:572`) all key off `logical_ref_of`, so they now compute
+`<src>::public.accounts` and find nothing. The rows are not corrupt and not lost —
+they are simply **unreachable from every read path**, and a curator who confirmed a
+table-level field before the fix sees their decision silently gone.
+
+This is invisible in CI and in every test fixture: fixtures are built after the fix, so
+they never write the phantom spelling. It can only exist on a catalog that was
+**deployed and curated before `89d78dc4`** — which today means the kind cluster, if a
+table-anchored field correction was ever issued there.
+
+**How to detect.** The phantom key is a three-part path whose schema and table segments
+are both `public`, with no matching `graph_node` column:
+
+```sql
+SELECT fe.logical_ref, fe.field_name, count(*)
+  FROM field_evidence fe
+ WHERE fe.logical_ref ~ '::public\.public\.[^.]+$'
+ GROUP BY 1, 2;
+-- and the decision side
+SELECT fde.logical_ref, fde.field_name, count(*)
+  FROM field_decision_event fde
+ WHERE fde.logical_ref ~ '::public\.public\.[^.]+$'
+ GROUP BY 1, 2;
+```
+
+Every hit is a table-anchored decision mis-keyed as a column. A real column named
+`public` under a schema named `public` would false-positive; confirm against
+`graph_node` (`kind='column' AND table_name='public'`) before treating a row as phantom.
+
+**What a remediation would look like.** A migration that, for each phantom row, derives
+the intended table key (`<src>::public.<parts[-1]>`), verifies a `graph_node` row exists
+with `kind='table'` and that `table_name`, and rewrites `logical_ref` — as a NEW appended
+evidence/decision row citing the original event, never an in-place UPDATE, because
+`field_decision_event` is an append-only audit table (the standing directive's
+"irreversible while deferred" exception does **not** apply: nothing is being overwritten,
+the rows are merely orphaned, so the fix stays available indefinitely). Rows whose derived
+table key has no `graph_node` row are quarantined and reported rather than guessed.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **Phantom `public.public.<table>`-keyed field evidence/decisions are unreachable after the Task 0C key fix** | Zero known rows: the defect requires a table-anchored field correction issued on a deployed catalog before `89d78dc4`, and no such correction has been confirmed to exist. Writing a migration for a population that may be empty — against an append-only audit table — costs more than it returns until the population is measured. | Run the two detection queries above against the kind cluster (and any other deployed catalog) at the next deploy. Any non-zero count fires this item; so does the first user report of a confirmed table-level field that "went missing". |

@@ -32,7 +32,6 @@ import hashlib
 from collections.abc import Mapping
 from typing import Any
 
-from featuregen.contracts.contract_versions import assert_contract_version
 from featuregen.formula._jcs import dumps as _jcs_dumps
 
 __all__ = ["contract_hash_v1", "jcs_sha256"]
@@ -82,6 +81,14 @@ def contract_hash_v1(contract_name: str, contract_version: str, payload: Mapping
             the loud failure the Task 0S brief requires for unregistered versions.
         TypeError / CanonicalizationError: as :func:`jcs_sha256`.
     """
+    # FUNCTION-LOCAL, deliberately. `featuregen.contracts.contract_versions` is itself a leaf, but
+    # importing it executes the `featuregen.contracts` package `__init__`, which imports
+    # `contracts.db` and therefore psycopg. A module-level import here dragged a database driver
+    # into `featuregen.materialize.canonical` — a pure hashing leaf that renderers and offline
+    # tools import — for no runtime benefit. The registry check itself is unchanged: it still runs
+    # on EVERY hash, so an unregistered (name, version) still fails loudly at the first hash.
+    from featuregen.contracts.contract_versions import assert_contract_version
+
     assert_contract_version(contract_name, contract_version)
     return jcs_sha256({
         "contract_name": contract_name,

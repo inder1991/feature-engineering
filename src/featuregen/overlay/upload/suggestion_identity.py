@@ -266,10 +266,27 @@ def suggestion_id(*, template_id: str | None,
                   ) -> str:
     """The stable logical-candidate identity (0F-10).
 
-    ``operands`` are ``(catalog_source, logical_ref, recipe_role)`` triples — the LOGICAL ref, read
-    off the engine's own ``need_bindings``, so a physical re-spelling of the same logical column
-    does not fork the candidate. Sorted: role bindings are a set. ``grain_refs`` is ORDERED (rule
-    25: composite grain is a sequence of key operands, and reordering it is a different grouping).
+    **Which refs are logical and which are physical — exactly.** ``operands`` are
+    ``(catalog_source, logical_ref, recipe_role)`` triples: the LOGICAL ref, read off the engine's
+    own ``need_bindings``, so a physical re-spelling of the same logical column does not fork the
+    OPERAND SET. That is NOT true of the identity as a whole, and claiming it would be a promise
+    this function does not keep:
+
+    * ``operands`` — LOGICAL (``GroundedNeedBinding.logical_ref``);
+    * ``grain_refs`` and ``time_ref`` — PHYSICAL ``graph_object_ref``s, passed by
+      ``suggestion_contract`` as ``(catalog_source, object_ref)``;
+    * ``relationship_path_assignment`` — PHYSICAL on both limbs: each entry is keyed by the
+      ``JOIN_PATH`` pin's ``dependency_key`` (built from the operand's physical ref) and its legs
+      carry the edge's physical endpoint refs.
+
+    So a physical re-spelling of a bound column DOES currently fork the id, through the grain/time
+    anchors and through the path assignment. Converting those to logical refs is a Release-B
+    decision — it re-keys every existing suggestion, and the logical mapping for a relationship
+    ENDPOINT (which is a graph edge, not a bound need) does not exist yet — so it is recorded in the
+    freeze doc's deviation log rather than taken here.
+
+    Sorted: role bindings are a set. ``grain_refs`` is ORDERED (rule 25: composite grain is a
+    sequence of key operands, and reordering it is a different grouping).
     ``relationship_path_assignment`` comes from :func:`join_path_assignment` and from nothing else.
 
     The requested anchor table, the join neighbourhood bounds, page truncation and cursors are

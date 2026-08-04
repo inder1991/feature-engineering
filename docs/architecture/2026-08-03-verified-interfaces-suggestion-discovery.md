@@ -128,10 +128,35 @@ Confirmed by reading the symbol, not by line-number or tuple-length assumption.
   semantic_parameter_binding_hash, template_definition, template_content_hash,
   canonicalization_version="recipe-grounding-v1"`. `template_content_hash` = sha256 over
   `{"version": "canonical-recipe-v1", "template": <every Template field, needs canonicalized>}`;
-  `recipe_candidate_key` = sha256 over the `recipe-candidate-v1` payload (recipe_id,
-  template_content_hash, semantic_parameter_binding_hash, aggregation, ordered
-  `[role, logical_ref]` bindings, binding_resolution_hash). Exhaustiveness is import-checked
+  `recipe_candidate_key` = sha256 over the payload transcribed **in full** below
+  (`recipe_grounding_context.py:151-162`). Exhaustiveness is import-checked
   (`assert_canonical_recipe_exhaustive`).
+
+  ```python
+  candidate_key = content_hash({
+      "version": "recipe-candidate-v1",
+      "generation_source": "recipe",
+      "recipe_id": template.id,
+      "template_content_hash": template_hash,
+      "semantic_parameter_binding_hash": parameter_hash,
+      "aggregation": feature.aggregation,
+      "ordered_bindings": [[b.role, b.logical_ref] for b in feature.role_bindings],
+      "binding_resolution_hash": resolution_hash,   # <- BUILD-UNIVERSE-SENSITIVE, see below
+  })
+  resolution_hash = content_hash([
+      [b.role, b.binding_resolution.value, b.tied_candidate_set_hash]
+      for b in feature.role_bindings])
+  ```
+
+  **`binding_resolution_hash` is not a property of the candidate.** `tied_candidate_set_hash`
+  (`templates.py:579-597`) hashes the set of columns that TIED for a role — every candidate whose
+  score equalled the winner's. That set is a property of the grounding UNIVERSE the pass ran over:
+  the anchor table plus its join neighbourhood, bounded by the caller's `max_hops` and filtered by
+  the caller's read scope. The same winning binding therefore carries a different
+  `recipe_candidate_key` — and so a different `trace_content_hash`, which covers `candidate_key` —
+  when the same logical candidate is opened from a different anchor table of an asymmetric join
+  graph. Any identity that must be anchor-independent has to project this out; see
+  [D16](#deviations).
 
 ### Join machinery
 
@@ -356,11 +381,20 @@ traversal `G→A→G→B` — no such walk happened. Consumers:
   trace alone a chain is **verifiable by recompute**, not directly readable; a consumer that must
   READ chains consumes the engine's `TemplateCandidatesResult` in the same call, which V2 assembly
   does by construction (persistence rule: it never consumes a reloaded snapshot).
-- **Identity (plan rule 23)** → the per-operand ASSIGNMENT is identity-bearing: each `JOIN_PATH`
-  pin's `(key, content_hash)` enters `trace_content_hash`, so two candidates with the same leg set
-  but different operand→chain assignments hash differently. An identity builder therefore derives
-  `suggestion_id` material from `trace_content_hash` (or from the pins), **never from
-  `ordered_relationship_path` alone** — being a set, it cannot distinguish them.
+- **Identity (plan rule 23)** → the per-operand ASSIGNMENT is identity-bearing, and
+  `ordered_relationship_path` alone cannot express it — being a set, it cannot tell two candidates
+  whose operands SWAPPED chains apart. An identity builder therefore derives `suggestion_id`
+  material from the per-operand **`(dependency_key, logical legs)` projection**: each `JOIN_PATH`
+  pin's key paired with that operand's ordered legs reduced to
+  `(relationship_kind, from_ref, to_ref)`, recovered by joining the pin's
+  `path_realization_hashes` against the path (`suggestion_identity.join_path_assignment`).
+  **Never the pin's `content_hash`** — that covers `approved_join_fact_key` /
+  `approved_join_status` / `edge_authority`, so an admin CONFIRMING a file-declared join would
+  re-key every suggestion crossing it — and **never `trace_content_hash`**, which additionally
+  covers the validation status, every governed read and the build-universe-sensitive
+  `candidate_key`. Full construction and its failure history: [D12](#deviations); the
+  `candidate_key` problem: [D16](#deviations). *(Amended 2026-08-03, Task 2 review; this bullet
+  previously named `trace_content_hash`/the pins, and one of those shipped as a defect.)*
 
 The cross-catalog counterpart (`plan_envelope.plan_relationship_dependencies`) IS a single ordered
 chain: a compiled plan has one path.
@@ -508,12 +542,27 @@ All new identities use `contract_hash_v1` (JCS). Frozen hash inputs:
 - **`suggestion_id`** := `contract_hash_v1("feature-suggestion-id", "2", {template_id,
   canonical bound params (the `semantic_parameters` sorted pairs), sorted operand tuples
   `(catalog_source, logical_ref, recipe_role)`, entity identity
-  `(entity_id | None, ordered grain_refs, time_ref | None)`, ordered logical relationship path
-  `[(kind, direction, from_ref, to_ref), ...]`})`. The **requested anchor table is excluded**;
-  the same cross-table candidate has one identity on table, column and global surfaces, and the
-  canonical payload is anchor-independent (anchor, neighbourhood limits, truncation and cursors
-  live only on `FeatureSuggestionPageV2` / `SuggestionCollectionContextV2`). Same columns over a
-  different ordered relationship path ⇒ different `suggestion_id` (rule 23).
+  `(entity_id | None, ordered grain_refs, time_ref | None)`, **the per-operand relationship-path
+  assignment**: `[[dependency_key, [(relationship_kind, from_source, from_ref, to_source, to_ref),
+  ...]], ...]` sorted by `dependency_key`})`. *(Amended 2026-08-03, Task 2 review: this bullet
+  previously said "ordered logical relationship path `[(kind, direction, from_ref, to_ref), ...]`".
+  That field — `GroundingDecisionTraceV1.ordered_relationship_path` — is a deduplicated leg SET, so
+  a literal reading builds an identity that fuses two candidates whose operands swapped chains, and
+  the alternatives the [0F-7 amendment](#trace) then offered re-keyed every suggestion whenever an
+  admin confirmed a file-declared join. Both failures and the frozen construction:
+  [D12](#deviations).)*
+
+  The **requested anchor table is excluded**; the same cross-table candidate has one identity on
+  table, column and global surfaces, and the canonical payload is anchor-independent (anchor,
+  neighbourhood limits, truncation and cursors live only on `FeatureSuggestionPageV2` /
+  `SuggestionCollectionContextV2`). Same columns over a different ordered relationship path ⇒
+  different `suggestion_id` (rule 23).
+
+  **Logical vs physical, exactly** (a source of two review findings, so it is stated rather than
+  implied): `operands` are LOGICAL refs; `grain_refs`, `time_ref`, the assignment's
+  `dependency_key` and the legs' endpoint refs are all PHYSICAL `graph_object_ref`s. A physical
+  re-spelling of a bound column therefore DOES fork the id through the anchors and the path
+  assignment. Converting them is a Release-B decision — [D17](#deviations).
 - **`recipe_revision_id`** := the existing
   `RecipeGroundingContextV1.template_content_hash` (`canonical-recipe-v1`). This is a reference
   to an existing verified content hash, not a new hash scheme — rule 11 permits referencing
@@ -524,10 +573,13 @@ All new identities use `contract_hash_v1` (JCS). Frozen hash inputs:
   `discovery_metadata_revision_id`, which never enters `recipe_revision_id`.
 - **`suggestion_revision_id`** := `contract_hash_v1("feature-suggestion-revision", "2",
   {suggestion_id, recipe_revision_id, discovery_metadata_revision_id | None, sorted referenced
-  semantic-context content hashes, sorted dataset-profile hashes, grounding
-  `trace_content_hash`, sorted relationship/dependency content hashes, sorted evaluated
-  validation-rule content hashes, sorted evaluated read-scope-rule content hashes,
-  validation_status, producer_contract_version})`.
+  semantic-context content hashes, sorted dataset-profile hashes, **the grounding trace's
+  build-universe-independent projection hash**, sorted relationship/dependency content hashes,
+  sorted evaluated validation-rule content hashes, sorted evaluated read-scope-rule content
+  hashes, validation_status, producer_contract_version})`. *(Amended 2026-08-03, final review:
+  this bullet previously said "grounding `trace_content_hash`", which folds in `candidate_key` and
+  the read-scope pin and therefore moved with the anchor, `max_hops` and the caller's scope —
+  [D16](#deviations).)*
 - **Excluded from all semantic hashes** (stored instead in `SuggestionBuildProvenanceV1`, the
   trace's `current_revision_id` pins and Release-B scope-dependency rows): raw catalog snapshot
   IDs, `metadata_snapshot_id`, evidence occurrence/event IDs, realization/observation revision
@@ -748,6 +800,69 @@ Recorded, never silently redesigned:
   semantic Task 1; this plan's Task 0S will land it first at
   `featuregen/contracts/evidence_axes.py`. Cross-plan rule frozen in [0F-4](#task0s): one
   definition, later plans import it. The shared ledger §12 cross-link records this.
+
+- **D16 — `suggestion_revision_id` hashes a build-universe-INDEPENDENT projection of the trace, not
+  `trace_content_hash`** (amended 2026-08-03, final whole-branch review). [0F-10](#identity)
+  originally froze the raw trace hash. That hash covers `candidate_key` = `recipe_candidate_key`,
+  one of whose inputs is `binding_resolution_hash`, a fold of each role's `tied_candidate_set_hash`
+  — the set of columns that TIED for that role in the universe the grounding pass ran over. It also
+  covers the `READ_SCOPE` dependency pin, whose content is the caller's own visibility classes. So
+  one logical candidate acquired **two revision bytes under one `suggestion_id`** depending on the
+  anchor table it was opened from, the client's `max_hops`, or the reader's scope — precisely what
+  the plan's Identity rules forbid ("the canonical suggestion payload is also anchor-independent…
+  otherwise opening the same candidate from two operand tables could create one logical ID with
+  conflicting revision bytes"). Invisible in Release A (one anchor, nothing persisted); in Release B
+  rule 26 / DoD 17 would withhold such a suggestion permanently.
+
+  **Frozen construction:** `suggestion_identity.build_universe_independent_trace_hash(trace)` =
+  `contract_hash_v1("grounding-decision-trace-projection", "2", …)` over
+  `grounding_trace.build_universe_independent_content(trace)` — the trace's own `_trace_payload`
+  minus `candidate_key` and minus every pin whose kind is in `BUILD_SCOPE_DEPENDENCY_KINDS`
+  (today `{READ_SCOPE}`). `dependency_content_hashes` drops the same pins. Derived FROM
+  `_trace_payload`, so a field added to the trace enters the projection automatically.
+  `trace_content_hash` itself is **unchanged** — it is the identity of one grounding decision made
+  in one universe, is correct as such, and is pinned by its own tests.
+
+  Nothing meaning-bearing is lost: the other `candidate_key` inputs are pure functions of material
+  the revision already hashes (`recipe_revision_id`, and `suggestion_id`'s template id, bound params
+  and operands) or of `ordered_operand_roles`; the read-scope RULE still travels as
+  `read_scope_rule_content_hashes`, and withholding is total, so a card one caller receives is the
+  card every caller receives. Test-pinned over an ASYMMETRIC three-table fixture (G–L–X) where the
+  two anchors provably ground over different universes, across anchors, `max_hops` values and read
+  scopes, each with a non-vacuity assertion.
+- **D17 — two payload fields and three ref positions remain build-/physically-keyed; both are
+  Release-B decisions** (recorded 2026-08-03, final whole-branch review).
+  1. **`FeatureSuggestionV2.binding_quality` and `.grounding_trace_content_hash` are still
+     anchor-sensitive.** `binding_quality` is `AMBIGUOUS` exactly when the pass saw a tie, so it
+     reports the universe it ran over; `grounding_trace_content_hash` is that build's trace
+     identity. Both are build OBSERVATIONS and belong on `SuggestionBuildProvenanceV1`, where the
+     other exact build ids already live — but relocating them is a wire + UI contract change
+     (response model, `api.ts`, the card's audit block, and the V1 adapter, which reads
+     `binding_quality` for its byte-stable card), so it is deferred rather than taken during a
+     final-review fix wave. Pinned by
+     `test_exactly_which_payload_fields_still_read_the_build_universe`, which fails if a THIRD
+     anchor-sensitive payload field appears. **Release-B prerequisite:** the durable projection
+     keys on `(suggestion_id, suggestion_revision_id)`, so it must either relocate these two or
+     accept that one revision can be published with two byte-renderings.
+  2. **`suggestion_id` mixes logical and physical refs.** `operands` are logical; `grain_refs`,
+     `time_ref`, the path assignment's `dependency_key` and the legs' endpoint refs are physical.
+     A physical re-spelling of a bound column forks the id through those positions. Converting
+     them re-keys every existing suggestion, and no logical mapping exists for a relationship
+     ENDPOINT (a graph edge, not a bound need), so it is a Release-B call. The `suggestion_id`
+     docstring now states which is which rather than claiming the whole identity is logical.
+- **D18 — `resolve_or_text` unions the CALLER's provenance onto a resolved controlled label**
+  (amended 2026-08-03, final whole-branch review). [0F-6](#axes) freezes the resolver seam as the
+  switch the semantic plan flips with "zero suggestion-side change". `resolve_controlled` returns
+  the resolver's label verbatim, which is right — the resolver attests the MAPPING — but the
+  consumer helper originally returned it bare, discarding the caller's `field_evidence` axes and
+  contributing operand refs. A `graph_node.domain` is typically an `llm`/`proposed` value, so
+  registering a `business_domain` resolver would have silently turned every proposed catalog
+  wording into a facet rendering exactly like a human attestation: rule 4's failure mode, arriving
+  as a regression at landing time. `resolve_or_text` now unions the caller's evidence axes and
+  `source_refs` onto the label (resolver's first, order-stable, duplicate-free) and returns the
+  resolver's own object unchanged when the caller has nothing to add. `id`, `display_name`, `basis`
+  and `operational_influence` stay the resolver's alone. The seam's zero-change promise is now
+  true; before this it was false.
 
 No discrepancy found that makes a Release-A task impossible as specified.
 

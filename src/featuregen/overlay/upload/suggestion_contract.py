@@ -31,7 +31,10 @@ are empty; every :class:`SuggestionSourceDatasetV1` field but catalog/table is `
 explicit ``profile_status='unavailable'``. Free-text catalog domain/entity wording travels as
 ``AttributedTextV1`` — displayable and searchable, never lowercased or slugged into a facet id.
 When the semantic plan registers its resolvers, the SAME call sites start yielding controlled
-labels with no change here.
+labels with no change here, and the provenance this module attaches survives the flip:
+``resolve_or_text`` unions the caller's ``field_evidence`` axes and contributing operand refs onto
+the resolved label, so a resolver cannot silently turn an ``llm``/``proposed`` catalog wording into
+a facet that renders like a human attestation (rule 4).
 """
 from __future__ import annotations
 
@@ -92,6 +95,7 @@ from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 __all__ = [
     "GENERATION_SOURCES",
+    "MAX_BUSINESS_DOMAINS",
     "MAX_CONTEXTUAL_DOMAIN_TERMS",
     "MAX_CONTEXTUAL_ENTITY_TERMS",
     "MAX_EVIDENCE_REFS",
@@ -924,9 +928,11 @@ def _domain_and_entity_context(operands: Sequence[SuggestionOperandV1],
     resolver seam.
 
     When the semantic plan registers a controlled ``business_domain``/``entity`` resolver, the same
-    call yields ``AttributedLabelV1`` facets and this adapter needs no change. Until then the seam
-    resolves nothing and the wording stays ``AttributedTextV1``: displayable, text-searchable, never
-    a facet id — never lowercased or slugged into one.
+    call yields ``AttributedLabelV1`` facets and this adapter needs no change — ``resolve_or_text``
+    carries the axes and refs assembled below onto the resolved label, so the flip cannot drop the
+    provenance this function exists to attach. Until then the seam resolves nothing and the wording
+    stays ``AttributedTextV1``: displayable, text-searchable, never a facet id — never lowercased or
+    slugged into one.
 
     **The provenance axes travel.** A ``graph_node.domain`` may be an LLM proposal or a human
     attestation, and rules 4/5 forbid rendering them identically — so each term carries the ACTIVE

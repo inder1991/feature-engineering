@@ -75,8 +75,45 @@ def test_registered_resolver_supplies_the_controlled_label():
                               operational_influence=None, source_refs=())
     register_resolver("business_domain", _StaticResolver({"Retail Lending": label}))
     assert resolve_controlled("business_domain", "Retail Lending") is label
+    # nothing of the caller's to add -> the resolver's own label, object identity included
     assert resolve_or_text("business_domain", "Retail Lending", basis="catalog_resolved",
                            evidence=()) is label
+
+
+_CALLER_AXES = (EvidenceAuthorityV1(
+    producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
+    lifecycle=EvidenceLifecycle.ACTIVE, producer_ref=None, evidence_id=None),)
+
+
+def test_the_callers_provenance_survives_the_resolution():
+    """RULE 4, at the moment the semantic plan lands. The resolver attests the MAPPING; the caller
+    holds the provenance of the WORDING, which for a ``graph_node.domain`` is typically
+    ``llm``/``proposed``. Dropping it would make registering a resolver silently upgrade every
+    proposed catalog value into a facet that renders like a human attestation."""
+    label = AttributedLabelV1(id="dom_retail_lending", display_name="Retail Lending",
+                              basis="catalog_resolved", evidence=_EVIDENCE,
+                              operational_influence="governed", source_refs=("registry:v3",))
+    register_resolver("business_domain", _StaticResolver({"Retail Lending": label}))
+    out = resolve_or_text("business_domain", "Retail Lending", basis="catalog_resolved",
+                          evidence=_CALLER_AXES, source_refs=("public.loans.product",))
+    assert isinstance(out, AttributedLabelV1)
+    # the registry's answer about the LABEL is untouched...
+    assert (out.id, out.display_name, out.basis, out.operational_influence) == (
+        label.id, label.display_name, label.basis, label.operational_influence)
+    # ...and both provenances travel, resolver's first, deduplicated
+    assert out.evidence == _EVIDENCE + _CALLER_AXES
+    assert out.source_refs == ("registry:v3", "public.loans.product")
+
+
+def test_a_provenance_the_resolver_already_holds_is_not_duplicated():
+    label = AttributedLabelV1(id="d", display_name="D", basis="catalog_resolved",
+                              evidence=_EVIDENCE, operational_influence=None,
+                              source_refs=("registry:v3",))
+    register_resolver("business_domain", _StaticResolver({"Retail Lending": label}))
+    out = resolve_or_text("business_domain", "Retail Lending", basis="catalog_resolved",
+                          evidence=_EVIDENCE, source_refs=("registry:v3",))
+    assert isinstance(out, AttributedLabelV1)
+    assert out.evidence == _EVIDENCE and out.source_refs == ("registry:v3",)
 
 
 def test_unknown_axis_fails_loudly():

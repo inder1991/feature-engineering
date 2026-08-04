@@ -480,6 +480,19 @@ def test_a_registered_controlled_resolver_turns_the_same_wording_into_a_facet(ov
         hit = _page(overlay_conn).hits[0].suggestion
         assert [d.id for d in hit.business_domains] == ["retail_payments"]
         assert hit.contextual_domain_terms == ()
+        # RULE 4 AT THE FLIP. The catalog wording is an `llm`/`proposed` value; the resolver
+        # attests only the MAPPING. Registering it must not launder the one into the other, so the
+        # operands' own `field_evidence` axes and contributing refs ride ON the facet.
+        facet = hit.business_domains[0]
+        axes = {(e.producer.value, e.strength.value) for e in facet.evidence}
+        assert ("taxonomy", "attested") in axes                        # the resolver's own
+        wording_axes = axes - {("taxonomy", "attested")}
+        recorded = {tuple(row) for row in overlay_conn.execute(
+            "SELECT DISTINCT producer, strength FROM field_evidence "
+            "WHERE field_name = 'domain' AND lifecycle = 'active'").fetchall()}
+        # the WORDING's own axes, asserted against the table rather than guessed
+        assert wording_axes and wording_axes <= recorded, (wording_axes, recorded)
+        assert facet.source_refs and all(ref.startswith("public.") for ref in facet.source_refs)
     finally:
         resolvers.reset_resolver("business_domain")
 
