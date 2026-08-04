@@ -147,6 +147,7 @@ __all__ = [
     "enqueue_materialization",
     "lane_config_from_env",
     "materialization_enabled",
+    "materialization_message_id",
     "process_materialization_once",
 ]
 
@@ -160,6 +161,22 @@ MATERIALIZATION_HANDLER = "materialization.compile.v1"
 #: (per GROUP — the serialization unit, because publication is atomic per group and §10.1 writes one
 #: binding per logical name).
 _NAMESPACE = "materialize"
+
+#: The prefix a request's message id is built from, exported so §3.3's reconciler can correlate the
+#: two records IN SQL (``queue.message_id = %s || materialization_request.request_id``) rather than
+#: by fetching every candidate's id and interpolating it. One definition, two readers.
+MATERIALIZATION_MESSAGE_PREFIX = f"{_NAMESPACE}:"
+
+
+def materialization_message_id(request_id: str) -> str:
+    """The queue message id one request's job is frozen under — ONE definition of the derivation.
+
+    A request is one message: this is the idempotency unit ``enqueue_checked`` refuses to see reused
+    for materially different work, and it is how §3.3's reconciler asks "can this request's message
+    still be delivered?". Spelled once because two spellings of a derived id are two ids, and the
+    second one silently finds nothing.
+    """
+    return f"{MATERIALIZATION_MESSAGE_PREFIX}{request_id}"
 
 #: The payload's shape version. Named and checked rather than assumed: the payload IS this lane's
 #: frozen work item, so a worker running older code must refuse a job it cannot read whole rather
@@ -472,7 +489,7 @@ def enqueue_materialization(
             f"these together would freeze one request's declarations under another's identity")
     return enqueue_checked(
         conn,
-        message_id=f"{_NAMESPACE}:{request.request_id}",
+        message_id=materialization_message_id(request.request_id),
         partition_key=f"{_NAMESPACE}:{request.logical_group_name}",
         handler=MATERIALIZATION_HANDLER,
         payload=encode_job(job),

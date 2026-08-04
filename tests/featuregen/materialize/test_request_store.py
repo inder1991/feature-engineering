@@ -19,14 +19,14 @@ import pytest
 
 import featuregen.materialize.request_store as request_store
 from featuregen.materialize.request_store import (
-    # The column list the reads are positional against, and the identity/non-identity split.
-    _COLUMNS,
     # The EXACT statement the reconciler issues — EXPLAINed below rather than re-typed, because a
     # look-alike query would prove nothing about the one that actually runs.
     _EXPIRED_REQUESTS_SQL,
     _NON_IDENTITY_FIELDS,
     IDEMPOTENT_IDENTITY_FIELDS,
     LEGAL_LIFECYCLE_TRANSITIONS,
+    # The column list the reads are positional against.
+    REQUEST_COLUMNS,
     MaterializationRequestV1,
     RequestLifecycle,
     accept_request,
@@ -104,7 +104,7 @@ def test_the_record_mirrors_the_selected_columns_field_for_field(conn) -> None:
     after it into the wrong field — types alone would not always catch it, since five of the
     fourteen columns are text."""
     assert [field.name for field in dataclasses.fields(MaterializationRequestV1)] == \
-        [column.strip() for column in _COLUMNS.split(",")]
+        [column.strip() for column in REQUEST_COLUMNS.split(",")]
 
 
 def test_the_idempotency_identity_split_partitions_the_record_exactly(conn) -> None:
@@ -437,11 +437,16 @@ def test_the_reconcilers_query_can_use_the_partial_index_under_a_GENERIC_plan(co
     accept_request(conn, request_id="req-a", lease_seconds=1)
     conn.execute("SET LOCAL enable_seqscan = off")
     conn.execute("SET LOCAL plan_cache_mode = force_generic_plan")
-    conn.execute("PREPARE reconciler_query (timestamptz) AS "
-                 + _EXPIRED_REQUESTS_SQL.replace("%s", "$1"))
+    # The placeholders are numbered POSITIONALLY from the shipped statement rather than counted by
+    # hand, so a parameter added to the query cannot leave this EXPLAINing a different one.
+    prepared = _EXPIRED_REQUESTS_SQL
+    for position in range(1, prepared.count("%s") + 1):
+        prepared = prepared.replace("%s", f"${position}", 1)
+    conn.execute(f"PREPARE reconciler_query (timestamptz, bigint) AS {prepared}")
     plan = "\n".join(
         row[0] for row in conn.execute(
-            "EXPLAIN EXECUTE reconciler_query('2099-01-01T00:00:00+00'::timestamptz)").fetchall())
+            "EXPLAIN EXECUTE reconciler_query('2099-01-01T00:00:00+00'::timestamptz, 50)"
+        ).fetchall())
     assert "materialization_request_expired_lease_idx" in plan, plan
 
 

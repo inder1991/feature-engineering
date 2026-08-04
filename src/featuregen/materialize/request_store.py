@@ -46,6 +46,8 @@ from featuregen.contracts.db import DbConn
 
 __all__ = [
     "LEGAL_LIFECYCLE_TRANSITIONS",
+    "NON_TERMINAL_PREDICATE",
+    "REQUEST_COLUMNS",
     "MaterializationRequestV1",
     "RequestLifecycle",
     "accept_request",
@@ -111,7 +113,13 @@ _LEASED_STATES: frozenset[RequestLifecycle] = frozenset(
 
 #: Column order, written once. The dataclass mirrors it field-for-field, so every read is
 #: ``MaterializationRequestV1(*row)`` and a column added to one side without the other fails loudly.
-_COLUMNS = (
+#:
+#: PUBLIC because §3.3's reconciler needs a SECOND query over this table — "which non-terminal
+#: requests have no deliverable message?" — which joins to the runtime ``queue`` and therefore lives
+#: in ``reconcile.py`` rather than here (this store knows nothing about a queue, and a query that
+#: taught it would make the coordination record depend on the runtime's schema). Sharing the column
+#: list is what keeps that query's rows constructible as ``MaterializationRequestV1(*row)``.
+REQUEST_COLUMNS = (
     "request_id, logical_group_name, requested_by, authorized_roles, idempotency_key, "
     "activation_state, lifecycle_state, generation_id, run_id, resolved_input_digest, "
     "requested_at, accepted_at, lease_expires_at, updated_at")
@@ -127,15 +135,26 @@ _COLUMNS = (
 #: `plan_cache_mode = force_generic_plan`: `lifecycle_state <> ALL($1)` plans a Seq Scan, while the
 #: literal form plans a Bitmap Index Scan on the partial index. The literals are enum members
 #: defined a few lines up, never caller input, so nothing here is interpolated from outside.
-_NON_TERMINAL_PREDICATE = "lifecycle_state NOT IN ({})".format(
+#:
+#: PUBLIC for the same reason as :data:`REQUEST_COLUMNS`: §3.3's reconciler's SECOND query must carry
+#: the SAME predicate to reach the SAME partial index, and a re-typed copy would drift into a
+#: sequential scan over every request ever made without failing anything.
+NON_TERMINAL_PREDICATE = "lifecycle_state NOT IN ({})".format(
     ", ".join(f"'{state.value}'" for state in RequestLifecycle if state.is_terminal()))
 
 #: The reconciler's statement, written once so the test suite can EXPLAIN the query that actually
 #: runs rather than a look-alike.
+#:
+#: ``LIMIT %s`` is always present and ``NULL`` means unbounded — PostgreSQL's own spelling for "no
+#: limit" — so there is ONE statement rather than a bounded variant and an unbounded one, and the
+#: statement the suite EXPLAINs stays the statement that runs. The bound exists because §3.3's sweep
+#: runs on the worker's single connection: the set this selects is the *stuck* set, and a deployment
+#: whose lane is failing accumulates one row in it per request in a backoff window — reading all of
+#: them, and validating each into a record, once a second is a cost with no ceiling.
 _EXPIRED_REQUESTS_SQL = (
-    f"SELECT {_COLUMNS} FROM materialization_request "
-    f"WHERE {_NON_TERMINAL_PREDICATE} AND lease_expires_at IS NOT NULL AND lease_expires_at < %s "
-    f"ORDER BY lease_expires_at, request_id")
+    f"SELECT {REQUEST_COLUMNS} FROM materialization_request "
+    f"WHERE {NON_TERMINAL_PREDICATE} AND lease_expires_at IS NOT NULL AND lease_expires_at < %s "
+    f"ORDER BY lease_expires_at, request_id LIMIT %s")
 
 
 def _text(value: object, *, field: str, why: str) -> str:
@@ -279,7 +298,7 @@ def _row(row: Sequence[Any] | None) -> MaterializationRequestV1 | None:
 
 def _current(conn: DbConn, request_id: str) -> MaterializationRequestV1 | None:
     return _row(conn.execute(
-        f"SELECT {_COLUMNS} FROM materialization_request WHERE request_id = %s",
+        f"SELECT {REQUEST_COLUMNS} FROM materialization_request WHERE request_id = %s",
         (request_id,)).fetchone())
 
 
@@ -339,7 +358,7 @@ def record_request(
         "resolved_input_digest) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
         # The arbiter is named: a conflict on the PRIMARY KEY (one request_id reused for a second
         # request) is a caller bug and still raises, rather than being swallowed as a retry.
-        f"ON CONFLICT (idempotency_key) DO NOTHING RETURNING {_COLUMNS}",
+        f"ON CONFLICT (idempotency_key) DO NOTHING RETURNING {REQUEST_COLUMNS}",
         (candidate.request_id, candidate.logical_group_name, candidate.requested_by,
          list(candidate.authorized_roles), candidate.idempotency_key,
          Jsonb(dict(candidate.activation_state)), candidate.lifecycle_state.value,
@@ -348,7 +367,7 @@ def record_request(
         return inserted
 
     existing = _row(conn.execute(
-        f"SELECT {_COLUMNS} FROM materialization_request WHERE idempotency_key = %s",
+        f"SELECT {REQUEST_COLUMNS} FROM materialization_request WHERE idempotency_key = %s",
         (candidate.idempotency_key,)).fetchone())
     if existing is None:
         # Not an impossibility, and not an `assert` (which `python -O` strips, turning this into an
@@ -391,7 +410,7 @@ def accept_request(conn: DbConn, *, request_id: str,
         "UPDATE materialization_request SET lifecycle_state = %s, "
         "accepted_at = statement_timestamp(), "
         "lease_expires_at = statement_timestamp() + make_interval(secs => %s) "
-        f"WHERE request_id = %s AND lifecycle_state = %s RETURNING {_COLUMNS}",
+        f"WHERE request_id = %s AND lifecycle_state = %s RETURNING {REQUEST_COLUMNS}",
         (RequestLifecycle.ACCEPTED.value, seconds, request_id,
          RequestLifecycle.REQUESTED.value)).fetchone())
     if accepted is None:
@@ -419,7 +438,7 @@ def renew_lease(conn: DbConn, *, request_id: str,
     renewed = _row(conn.execute(
         "UPDATE materialization_request "
         "SET lease_expires_at = statement_timestamp() + make_interval(secs => %s) "
-        f"WHERE request_id = %s AND lifecycle_state = ANY(%s) RETURNING {_COLUMNS}",
+        f"WHERE request_id = %s AND lifecycle_state = ANY(%s) RETURNING {REQUEST_COLUMNS}",
         (seconds, request_id,
          sorted(state.value for state in _LEASED_STATES))).fetchone())
     if renewed is None:
@@ -490,7 +509,7 @@ def advance_lifecycle(
     moved = _row(conn.execute(
         "UPDATE materialization_request SET lifecycle_state = %s, "
         "generation_id = COALESCE(%s, generation_id), run_id = COALESCE(%s, run_id) "
-        f"WHERE request_id = %s AND lifecycle_state = ANY(%s) RETURNING {_COLUMNS}",
+        f"WHERE request_id = %s AND lifecycle_state = ANY(%s) RETURNING {REQUEST_COLUMNS}",
         (target.value, generation, run, request_id,
          sorted(state.value for state in _LEGAL_FROM[target]))).fetchone())
     if moved is None:
@@ -510,19 +529,27 @@ def read_request(conn: DbConn, *, request_id: str) -> MaterializationRequestV1 |
     return _current(conn, request_id)
 
 
-def expired_requests(conn: DbConn, *,
-                     now: _datetime.datetime) -> tuple[MaterializationRequestV1, ...]:
-    """The reconciler's ONLY query: requests whose lease expired before ``now`` and which are not
-    terminal — the ones whose worker may be gone.
+def expired_requests(conn: DbConn, *, now: _datetime.datetime,
+                     limit: int | None = None) -> tuple[MaterializationRequestV1, ...]:
+    """Requests whose lease expired before ``now`` and which are not terminal — the ones whose
+    worker may be gone.
 
     ``now`` is supplied rather than read from a clock here, matching the rest of the package: a
     store that minted its own instant would decide staleness by when it was *asked*, and no test
     could pin the boundary. Ordered by lease expiry with ``request_id`` as the tie-break, so two
     reconcilers draining one backlog see the same order rather than the table's physical one.
 
+    ``limit`` bounds one read; ``None`` is every row. The bound is the CALLER's because it is a
+    property of where the sweep runs (the worker's tick, on its single connection), not of the
+    table.
+
     A request in ``requested`` holds no lease and so is never returned: nobody has claimed it, and
-    there is nothing to reconcile until somebody does.
+    there is nothing to reconcile until somebody does. **That is a blind spot, not a completeness
+    claim** — a request stranded at ``requested`` behind a dead-lettered message has nobody coming
+    for it either, and it is invisible here by construction. See
+    :func:`~featuregen.materialize.reconcile.reconcile_abandoned_requests`, which is why that module
+    issues a SECOND query rather than trusting this one to be the whole candidate set.
     """
     boundary = _instant(now, field="expired_requests now")
-    rows = conn.execute(_EXPIRED_REQUESTS_SQL, (boundary,)).fetchall()
+    rows = conn.execute(_EXPIRED_REQUESTS_SQL, (boundary, limit)).fetchall()
     return tuple(MaterializationRequestV1(*row) for row in rows)

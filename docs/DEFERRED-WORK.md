@@ -647,3 +647,30 @@ constructing the pipeline object — but bounded only by the caller's timeout).
 |---|---|---|
 | 🟡 **A PostgreSQL session sits "idle in transaction" for the duration of the L0 probe** | No deployment in this repo sets `idle_in_transaction_session_timeout` (grepped: zero occurrences in `src/`, tests and migrations), so nothing kills it today, and the alternative costs an atomicity guarantee that is worth more than the connection-hold. The bound is the caller's: `L0Interpreter.timeout_seconds` has no default precisely so a trigger surface must choose one. | Setting `idle_in_transaction_session_timeout` anywhere, or moving this chain onto a pooled/shared connection. Either makes the hold a real failure mode, and the closure is to run the probe before the transaction over the STAGED tree and re-read nothing from it — which is sound but needs the report's `location` (the staging path) to stop being operator-facing first. |
 | 🟡 **Two concurrent compiles of ONE `logical_group_name` serialize for the full probe duration** | The consequence that neither of the triggers above would surface, because it needs no timeout and no pool: the first compile to reach `record_group_binding` holds `group_binding`'s unique index until it commits, and it does not commit until its probe finishes — so a second request for the same group blocks on the row lock for seconds rather than milliseconds, however many workers are free. It is correct (one binding per logical name is the §10.1 invariant) and it is bounded by `timeout_seconds`, so it degrades throughput rather than truth. | Any queue lane that fans out several requests for one logical group, or a `lock_timeout` short enough to turn the wait into a spurious failure. Same closure as above — probing before the transaction removes the probe from the critical section entirely. |
+
+### A.35 🟡 A request stranded at `requested` has no legal terminal (2026-08-04)
+
+Found by Phase G T7's review and owned by T13's reconciler (`materialize/reconcile.py`), which
+**finds** the class, reports it and refuses to invent a verdict for it.
+
+The shape: an unconfigured deployment (or an undecodable payload) makes every delivery fail, and
+when the queue's attempt budget runs out the message is dead-lettered while the request is still at
+`requested`. It holds no lease — the lane deliberately does not accept before it has a configuration,
+because accepting first would burn every arriving request into a terminal no operator fix could
+recover. So nothing will ever deliver it again, and §3.2 ships no edge from `requested` to a terminal
+state (`LEGAL_LIFECYCLE_TRANSITIONS[REQUESTED] == {ACCEPTED}`, and migration 1053 carries the state
+vocabulary as a CHECK).
+
+The reconciler will not reach a terminal through `accepted` either: `accept_request` stamps
+`accepted_at` and grants a lease, so walking the row through it to reach `failed` would record that
+a worker claimed work nobody ever claimed — the same edge added quietly, in two hops. The sweep
+therefore returns `NO_LEGAL_TERMINAL`, gauges the standing count
+(`materialize.reconcile.no_legal_terminal`), and changes nothing.
+
+Nothing is lost while it stands: the request is durable, honest about its state, and re-runnable —
+§3.3's rule is that a re-run is a NEW request, and a fresh idempotency key produces one. What an
+operator cannot do today is close the old row.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |

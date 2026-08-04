@@ -136,13 +136,32 @@ def _tick(db, monkeypatch, *, flag: str | None) -> list[str]:
     return list(_RecordingCursor.sql)
 
 
+#: Every statement the materialization stages add to a tick, in order, with what each one is. The
+#: list is EXHAUSTIVE and the test below asserts it exhaustively: a stage that quietly starts issuing
+#: a fourth query per second in every enabled deployment fails here rather than shipping.
+#:
+#: T13 added the second and third. §3.3's reconciler needs TWO queries because the class it exists
+#: to find — a request stranded at ``requested`` behind a dead message — holds no lease and is
+#: structurally invisible to ``expired_requests``. Both are indexed reads over the non-terminal
+#: requests only (1053's partial index), and both are inside the same kill switch, which is what
+#: keeps the flag-OFF tick byte-identical to the tick that existed before any of this.
+_MATERIALIZATION_STATEMENTS = (
+    ("the lane's fenced claim", ("FROM queue", "status='leased'", "lease_fence")),
+    ("the reconciler's expired-lease query",
+     ("FROM materialization_request", "lease_expires_at IS NOT NULL")),
+    ("the reconciler's unreachable-message query",
+     ("FROM materialization_request", "NOT EXISTS", "queue.message_id")),
+)
+
+
 def test_flag_OFF_a_tick_issues_not_one_extra_STATEMENT(db, monkeypatch) -> None:
     """THE byte-identity proof.
 
     Three ticks over the same empty queue: a warm-up (so no first-call effect is mistaken for the
     flag), one with the switch OFF, one with it ON. The off-tick must be REPRODUCIBLE, and the
-    on-tick must differ from it by exactly one statement — the materialization claim. Removing that
-    statement from the on-tick must yield the off-tick back, byte for byte and in order.
+    on-tick must differ from it by exactly the statements :data:`_MATERIALIZATION_STATEMENTS` names
+    — contiguously, because the two stages run back to back. Removing them from the on-tick must
+    yield the off-tick back, byte for byte and in order.
 
     A weaker "no crash" assertion would pass for a stage that costs every deployment on the platform
     one query per second forever.
@@ -153,11 +172,13 @@ def test_flag_OFF_a_tick_issues_not_one_extra_STATEMENT(db, monkeypatch) -> None
     on = _tick(db, monkeypatch, flag="1")
 
     assert off == off_again, "the flag-off tick is not reproducible; the comparison below is void"
-    assert len(on) == len(off) + 1
+    extra = len(_MATERIALIZATION_STATEMENTS)
+    assert len(on) == len(off) + extra
     differs = next(i for i, (a, b) in enumerate(zip(on, off)) if a != b)
-    assert on[:differs] + on[differs + 1:] == off
-    claim = on[differs]
-    assert "FROM queue" in claim and "status='leased'" in claim and "lease_fence" in claim
+    assert on[:differs] + on[differs + extra:] == off
+    for statement, (what, fragments) in zip(on[differs:differs + extra],
+                                            _MATERIALIZATION_STATEMENTS, strict=True):
+        assert all(fragment in statement for fragment in fragments), (what, statement)
 
 
 def test_flag_OFF_the_stage_never_reaches_the_LANE_at_all(db, monkeypatch) -> None:
