@@ -335,9 +335,17 @@ def test_the_execution_shape_is_constructible_and_hash_stable() -> None:
     assert first.execution_tier is ExecutionTier.SANDBOX
 
 
-def test_the_execution_shape_has_no_producer_anywhere_in_the_tree() -> None:
-    """Task 10 builds the SHAPE only. If a producer or an admission path appears, this fails and the
-    task that added it owns declaring the gate — it does not arrive by accident."""
+def test_the_execution_shapes_producers_are_declared_and_there_is_still_no_executor() -> None:
+    """The tripwire Task 10 set, honoured by Task 11 rather than deleted by it.
+
+    Task 10 built the SHAPE with no producer, and asserted the file list so that whoever added one
+    would have to DECLARE it here instead of it arriving by accident. Task 11 added exactly one:
+    `crosswalk_admission.admitted_crosswalk_execution`, which turns a measured composition into a
+    pinned execution revision. The list below is that declaration.
+
+    What has NOT changed is the important half: no `materialize/**` file appears, so there is still
+    no compiler and no executor. Task 12 owns both, and this assertion is what will make it say so.
+    """
     import pathlib
     import subprocess
 
@@ -350,9 +358,11 @@ def test_the_execution_shape_has_no_producer_anywhere_in_the_tree() -> None:
         ["git", "grep", "-l", "--untracked", "CrosswalkExecutionRevisionV1", "--", "src", "tests"],
         cwd=root, capture_output=True, text=True).stdout.split()
     assert sorted(hits) == [
-        "src/featuregen/overlay/upload/crosswalk.py",
+        "src/featuregen/overlay/upload/crosswalk.py",            # the shape
+        "src/featuregen/overlay/upload/crosswalk_admission.py",  # its ONE producer (Task 11)
         "tests/featuregen/overlay/upload/test_crosswalk_contracts.py",
     ]
+    assert not [hit for hit in hits if hit.startswith("src/featuregen/materialize/")]
 
 
 def test_two_identical_legs_are_refused() -> None:

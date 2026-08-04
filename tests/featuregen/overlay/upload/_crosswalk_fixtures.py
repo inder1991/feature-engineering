@@ -173,7 +173,8 @@ def leg(db=None, *, which: str, endpoint_binding, mapping_binding, endpoint_colu
         endpoint_duplicate_tuple_count=0, endpoint_max_rows_per_tuple=1,
         matched_endpoint_distinct=3, unmatched_endpoint_distinct=1, endpoint_orphan_rows=1,
         joined_row_count=3, max_mapping_matches_per_endpoint_row=1,
-        max_endpoint_matches_per_mapping_row=1)
+        max_endpoint_matches_per_mapping_row=1,
+        normalization_ids=("identity_v1",))
     defaults.update(counts)
     return CrosswalkLegObservationV1(
         leg=which,
@@ -183,7 +184,6 @@ def leg(db=None, *, which: str, endpoint_binding, mapping_binding, endpoint_colu
         endpoint_binding_revision_id=endpoint_binding.binding_revision_id,
         endpoint_columns=(endpoint_column,),
         mapping_columns=(mapping_column,),
-        normalization_ids=("identity_v1",),
         endpoint_source_snapshot_id="endpoint-snapshot-1",
         mapping_source_snapshot_id="mapping-snapshot-1",
         as_of=as_of,

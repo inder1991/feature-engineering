@@ -473,6 +473,16 @@ class CrosswalkLegObservationV1:
             realization_revision_id=observation.realization_revision_id if persisted else None,
         )
 
+    @property
+    def leg_observation_id(self) -> str:
+        """This leg measurement's own content-addressed identity.
+
+        EVERY leg has one, whether or not the two-endpoint store could hold it — which is what lets
+        the execution revision satisfy its "an observation per leg" rule for the ordinary shape
+        (one same-catalog leg, one cross-catalog leg) without fabricating a bridge realization to
+        manufacture a second V2 row."""
+        return "clo_" + materialize_hash(self.identity_payload())
+
     def identity_payload(self) -> dict[str, object]:
         return {
             "leg": self.leg,
@@ -680,6 +690,12 @@ class CrosswalkExecutionObservationV1:
         return tuple(leg.v2_observation_revision_id
                      for leg in (self.source_leg, self.target_leg)
                      if leg.v2_observation_revision_id)
+
+    @property
+    def leg_measurement_ids(self) -> tuple[str, str]:
+        """Both legs' own identities, in leg order. ALWAYS two — see
+        :attr:`CrosswalkLegObservationV1.leg_observation_id`."""
+        return (self.source_leg.leg_observation_id, self.target_leg.leg_observation_id)
 
     @property
     def exact_and_complete(self) -> bool:
