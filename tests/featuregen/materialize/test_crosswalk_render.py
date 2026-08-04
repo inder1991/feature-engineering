@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import datetime as dt
+import json
 import os
 import re
 
@@ -193,12 +194,46 @@ def test_every_crosswalk_hop_is_a_LEFT_join_and_an_unmatched_row_keeps_a_null_ke
 
 
 def test_the_spine_reduction_is_still_a_LEFT_join_so_a_zero_event_entity_survives(
-        nodes, projection) -> None:
-    """The pilot acceptance, extended to a crosswalk: an FTR account that NO CIB account maps to
-    stays in the published population with a NULL value rather than disappearing from it."""
+        nodes, projection, tmp_path) -> None:
+    """The pilot acceptance, EXTENDED to a crosswalk and EXECUTED rather than read off the text.
+
+    An FTR account that no CIB account maps to through the mapping table stays in the published
+    population with a NULL value. That is the whole reason every hop and the spine reduction are
+    LEFT: the traversal says which entity a row belongs to, it does not decide which entities
+    exist, and an inner join anywhere on this path would silently shrink the population on a
+    referential-integrity fact nobody governed.
+    """
     calculation = next(node for node in nodes if node.name.startswith("calculate_"))
     joins = [line for line in _lines(calculation.source) if ".join(" in line]
     assert joins and all("how='left'" in line for line in joins), joins
+
+    projected = fake_spark.run_rendered(projection.source, projection.func_name)(
+        fake_spark.DataFrame([{"acct_no": "A1", "opened_dt": _BEFORE, "load_ts": _LONG_AGO}]),
+        fake_spark.DataFrame([{"acct_no": "A1", "ext_acct_ref": "X1",
+                               "valid_from": _LONG_AGO, "valid_to": _FAR_FUTURE}]),
+        fake_spark.DataFrame([{"counter_party_acct_no": "X1"}]),
+        {cf.REPORT_CUTOFF_REF: _CUTOFF},
+        _BUSINESS_DT,
+    ).rows
+
+    lock_root = tmp_path / "src" / "pkg" / "pipelines" / "materialize"
+    lock_root.mkdir(parents=True)
+    (lock_root / "nodes.py").write_text("", encoding="utf-8")
+    (tmp_path / GENERATED_LOCK_FILENAME).write_text(
+        json.dumps({"compilation": {}, "generated_project_hash": "project-hash-cwx"}),
+        encoding="utf-8")
+    staged, _manifest = fake_spark.run_rendered(
+        calculation.source, calculation.func_name,
+        module_file=str(lock_root / "nodes.py"))(
+        fake_spark.DataFrame(projected),
+        fake_spark.DataFrame(
+            # X1 is reachable through the mapping; X404 is the ZERO-EVENT entity.
+            [{"counter_party_acct_no": key, "business_dt": dt.date.fromisoformat(_BUSINESS_DT)}
+             for key in ("X1", "X404")],
+            columns=["counter_party_acct_no", "business_dt"]),
+        _BUSINESS_DT, "gen-cwx", "run-cwx", "exec-cwx", str(tmp_path / "staging"))
+    landed = {row["counter_party_acct_no"]: row[cf.FEATURE] for row in staged.rows}
+    assert landed == {"X1": 1, "X404": None}
 
 
 # ══ every pinned revision reaches the artifact ═══════════════════════════════════════════════════
