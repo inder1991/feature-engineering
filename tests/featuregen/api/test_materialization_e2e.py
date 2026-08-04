@@ -22,7 +22,18 @@ configuration from the ENVIRONMENT (``lane_config_from_env``), not from an injec
 every store is the real one. **The single injection is the L0 seam** (``chain.run_l0``, exactly as
 Tasks 6-9's suites inject it) so that this suite needs no kedro/pyspark venv — and even that seam is
 not free-floating: :func:`~tests.featuregen.materialize.test_chain._verdict` reads the sealed lock off
-the tree it is handed, so a chain that never wrote a project could not obtain a verdict at all.
+the tree it is handed, so a chain that never wrote a project could not obtain a verdict at all. And
+the artifact's identity is re-derived HERE from the bytes on disk (``generated_project_hash`` over
+the walked tree), so the seam cannot be the only thing that ever looks at the project.
+
+**Three harness substitutions are INHERITED from ``tests/featuregen/api/conftest.py``, and they are
+named so that "nothing else is injected" is precise rather than a slogan.** ``FEATUREGEN_AUTH_STUB=1``
+enables the ``X-User``/``X-Roles`` header identity — OFF in production, where only a Bearer session
+authenticates — which is what lets a test state the role claims ``record_request`` freezes and Gate 2
+is then judged against; and ``get_conn``/``get_feature_gen_conn`` are overridden to yield the suite's
+one rolled-back connection, so the route, the worker tick and the assertions all read a single
+transaction. Neither substitutes a materialization component: the routes, the lane, the chain, the
+stores and the renderers below them are the shipped ones.
 
 **Why the three probes are here.** A green happy path proves the flow reaches a terminal; it does not
 prove any particular gate was consulted on the way. Three cases make the green non-vacuous, and each
@@ -87,7 +98,11 @@ from featuregen.materialize.control_plane import (
     read_plan_revisions,
     read_run_events,
 )
-from featuregen.materialize.identity import GENERATED_LOCK_FILENAME, read_lock
+from featuregen.materialize.identity import (
+    GENERATED_LOCK_FILENAME,
+    generated_project_hash,
+    read_lock,
+)
 from featuregen.materialize.inventory import ClusterInventoryV1, load_inventory
 from featuregen.materialize.queue_lane import (
     MATERIALIZATION_FLAG,
@@ -308,6 +323,19 @@ def test_a_governed_feature_becomes_a_BUILD_VERIFIED_project_over_HTTP(
     assert f"def calculate_{_FEATURE}(" in nodes_py
     assert "def gate_and_publish(" in nodes_py
     assert "renders this body" not in nodes_py          # the REAL renderers, not a placeholder
+
+    # THE BYTES ARE THE ONES THE LOCK NAMES — re-derived here from the tree, not taken from the lock.
+    # Without this the injected L0 seam reads only `GENERATED.lock`, so a `materialize_to` that wrote
+    # different bytes in any file outside the four names asserted above would leave the lock, the
+    # generation row and the report perfectly self-consistent about an artifact nobody validated.
+    # `generated_project_hash` is a pure function over a path->text mapping and EXCLUDES the lock
+    # whether or not it is present (`identity.py:321`), so it answers the same value for the files
+    # that were sealed and for the complete project on disk. What still needs a real interpreter —
+    # that those bytes IMPORT and construct a pipeline — is `l0_gate.py`'s claim, and it makes it.
+    assert generated_project_hash({
+        path.relative_to(project).as_posix(): path.read_text(encoding="utf-8")
+        for path in project.rglob("*") if path.is_file()
+    }) == identity.generated_project_hash
 
     # Gate 1's verified hash IS the artifact's identity: `admit_artifacts` checks the supplied
     # formula's content hash against the immutable authoring trace, and `build_compilation_identity`

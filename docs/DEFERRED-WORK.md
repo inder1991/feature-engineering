@@ -674,3 +674,54 @@ operator cannot do today is close the old row.
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
 | 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
+
+### A.36 🟡 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+
+Flagged by Phase G T4's review and again by T11's, which is why it is here rather than in a task
+report: two independent reviews have now recorded the same gap, and neither had a tracked home for it.
+
+What IS proved: `compile/wiring.py` assembles join-gate nodes for a cross-catalog group
+(`test_wiring.py`), and `compile_ir` produces a cross-catalog IR carrying both catalogs and the exact
+realization (`test_cross_catalog_ir.py`). What is NOT proved is that the two **compose through
+`compile_feature_group`** — every cross-catalog test hands `compile_ir` a
+`CurrentBridgeRealizationV1` built in Python, and `chain.py:462` calls `compile_ir` with no
+realization argument at all. So an HTTP- or lane-driven bridged run must load its realizations from
+the database, and no test has ever made it do that. T11's acceptance test covers the same-catalog
+path end to end (the plan's §5 criterion) and deliberately stopped there.
+
+The enabling work is one fixture, and it is the reason this was scoped out rather than squeezed in: a
+**durable** bridge-realization seed helper beside `tests/featuregen/materialize/test_cross_catalog_ir.py`
+that writes through `bridge_store` — binding revisions, endpoints, column pairs, an `ACTIVE`
+lifecycle, a `DETERMINISTICALLY_VALIDATED` safety status and a PRODUCTION applicability scope.
+Nothing in the tree seeds one durably today. Three smaller pieces ride along: a fourth hand-authored
+`TypedFormulaV1` + matching `raw_proposal` in `tests/featuregen/materialize/fixtures.py` whose read
+set genuinely spans catalogs (all three worked features read `hdfc::public.transactions.*`), the
+`crm_banking.customer_master` layout and `logical_schema_map` entry in the inventory, and `crm`
+graph nodes with a governed logical type.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **No test drives a cross-catalog group through `compile_feature_group`, so the realization LOAD on the chain's own path is unexercised** | It is a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. G-1's acceptance criterion is the same-catalog path, and inventing the seed under acceptance-test pressure would have produced a fixture nobody had reviewed. | The first bridged group anybody triggers, or any change to how `compile_ir` resolves realizations. Closure: the durable seed helper above, then a fifth case in `tests/featuregen/api/test_materialization_e2e.py` driving the bridged group over HTTP — the harness already exists and takes one more fixture. |
+| 🟡 **The trigger surface carries no `execution_tier`, so every HTTP-driven run compiles at `PRODUCTION`** | `MaterializationJobV1` and `MaterializationRunIn` have no such field, and adding one is a governance decision about who may widen the joins a compile may read — not a wiring change. Harmless today: the applicability tier only decides which joins are readable and forks no execution identity (pinned by `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity`). | Anyone needing a SANDBOX-scoped realization to reach a triggered run. Closure: a declared field on the job, argued the way `published_schema` was — no default, so a caller must state it. |
+
+### A.37 🟡 A pre-seal governed refusal records no stage and no code anywhere queryable (2026-08-04)
+
+Found by Phase G T11 while writing the acceptance test, and the scoping decision it rests on is
+correct — this records the consequence, which had no tracked home.
+
+The plane cannot hold a refusal that happens before the project is sealed:
+`materialization_run_event.generation_id` is a foreign key to a generation row that only exists once
+a project has been rendered and hashed. So `_Stop.refused` (`compile/chain.py`) writes exactly one
+thing — the request's lifecycle, `failed` — and `materialization_run_detail` correctly reports
+`run_status: null` with a reason saying which silence it is.
+
+The consequence is diagnostic, not correctness. An operator holding a `failed` request cannot ask
+the database **which stage** refused it or **which `CompilationRefusalCode`** it carried: those exist
+only in the lane's returned `MaterializationLaneOutcome`, in one `materialize.lane.recorded` log line,
+and in a counter. T11's two refusal probes had to call `process_materialization_once` directly rather
+than drive `run_worker_once`, because through the worker tick the stage and the code are unobservable
+— which is the clearest available statement of the gap.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`ChainStage` and `CompilationRefusalCode` for a pre-seal refusal are unqueryable — log line and counter only** | Closing it means either a nullable-`generation_id` run event (which weakens the plane's "a run event is about a generation" invariant and its one-terminal index) or two new columns on `materialization_request` (a migration Phase G may not add — 1053/1054 are used, 1055 is reserved for G-3). Both are §3.2 decisions rather than a test or lane detail. | The first operator triaging a refused request from the database rather than from logs, or any UI that lists refusals with a reason. Closure: prefer the two write-once columns on `materialization_request` (`refused_at_stage`, `refusal_code`), written by `_Stop.refused` in the same conditional UPDATE that terminalizes the row, so they cannot disagree with the lifecycle; then `materialization_run_detail` reports them beside `run_status_reason` and the acceptance suite's probes can drive `run_worker_once` like every other case. |
