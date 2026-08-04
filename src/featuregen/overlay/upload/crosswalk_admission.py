@@ -559,8 +559,16 @@ def admitted_crosswalk_execution(
     no producer. It is still not executable: nothing compiles or runs one, and Task 12 owns both.
 
     The combined safety status is the WEAKEST direction's, and the contract's own rule then applies
-    — deterministic validation is impossible without an observation per leg AND one composed
+    — deterministic validation is impossible without a measurement per leg AND one composed
     observation after temporal filtering.
+
+    BOTH evidence fields are carried, each naming what actually exists: ``leg_measurement_ids`` are
+    the two ``clo_`` content-addressed leg measurements (always present, they live inside the
+    composed observation), and ``leg_observation_revision_ids`` are the ``rob_`` rows in the shipped
+    two-endpoint store — present for exactly the legs that have one, which for the ordinary
+    one-same-catalog/one-cross-catalog shape is one leg. Putting the measurement hashes under the
+    row-id name, as the first draft did, made the contract's gate satisfiable with values no store
+    holds.
     """
     if decision.observation_revision_id is not None and (
             observation is None
@@ -568,7 +576,8 @@ def admitted_crosswalk_execution(
         raise ValueError(
             "the execution revision must pin the SAME composed observation the decision was taken "
             "on; a revision naming another measurement records a verdict nobody reached")
-    leg_ids = () if observation is None else observation.leg_measurement_ids
+    measurement_ids = () if observation is None else observation.leg_measurement_ids
+    persisted_ids = () if observation is None else observation.leg_observation_revision_ids
     return CrosswalkExecutionRevisionV1(
         crosswalk_definition_revision_id=decision.crosswalk_definition_revision_id,
         mapping_binding_revision_id=mapping_binding_revision_id,
@@ -578,7 +587,8 @@ def admitted_crosswalk_execution(
         combined_cardinality=decision.forward.cardinality,
         safety_status=decision.combined_safety_status,
         mapping_temporal_policy_revision_id=mapping_temporal_policy_revision_id,
-        leg_observation_revision_ids=leg_ids,
+        leg_measurement_ids=measurement_ids,
+        leg_observation_revision_ids=persisted_ids,
         composition_observation_revision_id=(
             None if observation is None else observation.observation_revision_id),
     )

@@ -448,9 +448,47 @@ def test_admission_produces_a_pinned_execution_revision():
     assert execution.execution_revision_id.startswith("cwx_")
     assert execution.crosswalk_definition_revision_id == DEFINITION
     assert execution.composition_observation_revision_id == observation.observation_revision_id
-    assert len(execution.leg_observation_revision_ids) == 2
     assert execution.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
     assert execution.execution_tier is ExecutionTier.SANDBOX
+    # The gate is satisfied by the two leg MEASUREMENTS — which always exist and are content
+    # addressed — and not by persisted rows that only a realization-bearing leg can have.
+    assert execution.leg_measurement_ids == observation.leg_measurement_ids
+    assert len(execution.leg_measurement_ids) == 2
+    assert all(item.startswith("clo_") for item in execution.leg_measurement_ids)
+
+
+def test_the_execution_revision_names_the_persisted_rows_that_ACTUALLY_exist():
+    """The two fields say two different true things. This fixture is the ordinary shape: a
+    same-catalog source leg that CANNOT be in the two-endpoint store, and a cross-catalog target leg
+    that is — so one `rob_` id, not two, and not a `clo_` hash wearing the name of a stored row."""
+    persisted = ("rob_" + "1" * 64, "realization-1")
+    observation = _observation(target={"v2_observation_revision_id": persisted[0],
+                                       "realization_revision_id": persisted[1]})
+    decision = _admit(observation)
+    source_pin, target_pin = _pins()
+    execution = admitted_crosswalk_execution(
+        decision, source_leg=source_pin, target_leg=target_pin,
+        mapping_binding_revision_id=MAP.binding_revision_id, scope=SCOPE,
+        observation=observation, mapping_temporal_policy_revision_id="dtp_" + "b" * 64)
+    assert execution.leg_observation_revision_ids == (persisted[0],)
+    assert observation.source_leg.v2_observation_revision_id is None
+    assert len(execution.leg_measurement_ids) == 2
+    assert execution.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
+
+
+def test_a_composition_with_no_persisted_leg_row_still_validates():
+    """The fixture's default: NEITHER leg was written to the two-endpoint store. Under the old
+    single-field shape this either failed the gate or passed it on unpersisted values; now it
+    passes on the measurements and says plainly that no `rob_` row exists."""
+    observation = _observation()
+    decision = _admit(observation)
+    source_pin, target_pin = _pins()
+    execution = admitted_crosswalk_execution(
+        decision, source_leg=source_pin, target_leg=target_pin,
+        mapping_binding_revision_id=MAP.binding_revision_id, scope=SCOPE,
+        observation=observation, mapping_temporal_policy_revision_id="dtp_" + "b" * 64)
+    assert execution.leg_observation_revision_ids == ()
+    assert execution.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
 
 
 def test_an_unmeasured_crosswalk_cannot_produce_a_validated_execution_revision():
@@ -462,6 +500,7 @@ def test_an_unmeasured_crosswalk_cannot_produce_a_validated_execution_revision()
         mapping_binding_revision_id=MAP.binding_revision_id, scope=SCOPE, observation=None)
     assert execution.safety_status is SafetyStatus.UNASSESSED
     assert execution.composition_observation_revision_id is None
+    assert execution.leg_measurement_ids == ()
     assert execution.leg_observation_revision_ids == ()
 
 

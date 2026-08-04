@@ -699,19 +699,28 @@ class CrosswalkExecutionObservationV1:
 
     @property
     def leg_observation_revision_ids(self) -> tuple[str, ...]:
-        """The shipped two-endpoint rows this composition names, in leg order.
+        """The PERSISTED two-endpoint rows (``rob_``) this composition names, in leg order.
 
         SHORTER THAN TWO is a legitimate answer, not a gap: only a leg backed by a governed bridge
-        realization can be stored there (module docstring). The crosswalk execution revision
-        consumes this for its own ``leg_observation_revision_ids``."""
+        realization can be stored there (module docstring), so the ordinary
+        one-same-catalog/one-cross-catalog shape yields exactly one.
+
+        CONSUMED BY ``crosswalk_admission.admitted_crosswalk_execution`` for the execution
+        revision's field of the same name — which is the field's real meaning, and is deliberately
+        NOT what that revision's deterministic-validation gate keys on. That gate reads
+        :attr:`leg_measurement_ids`, because requiring two persisted rows would demand a fabricated
+        bridge realization for a leg that has none."""
         return tuple(leg.v2_observation_revision_id
                      for leg in (self.source_leg, self.target_leg)
                      if leg.v2_observation_revision_id)
 
     @property
     def leg_measurement_ids(self) -> tuple[str, str]:
-        """Both legs' own identities, in leg order. ALWAYS two — see
-        :attr:`CrosswalkLegObservationV1.leg_observation_id`."""
+        """Both legs' own content-addressed identities, in leg order. ALWAYS two — see
+        :attr:`CrosswalkLegObservationV1.leg_observation_id`.
+
+        CONSUMED BY ``crosswalk_admission.admitted_crosswalk_execution`` for the execution
+        revision's ``leg_measurement_ids``, which its deterministic-validation gate keys on."""
         return (self.source_leg.leg_observation_id, self.target_leg.leg_observation_id)
 
     @property

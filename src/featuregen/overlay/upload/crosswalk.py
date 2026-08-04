@@ -517,7 +517,22 @@ class CrosswalkExecutionRevisionV1:
     ``RealizationApplicabilityScopeV1`` and ``DirectionalCardinalityVerdictV1``. This is a
     composition carrier, not a competing safety model — the one structural rule it enforces is that
     deterministic safety cannot be CLAIMED without the observations that could establish it. Human
-    review is intentionally absent from the identity, as it is everywhere else in this family."""
+    review is intentionally absent from the identity, as it is everywhere else in this family.
+
+    **WHAT THE EVIDENCE FIELDS NAME, and why there are two of them.** Task 10 froze a single
+    ``leg_observation_revision_ids`` and Task 11's producer filled it with ``clo_`` measurement
+    hashes — content-addressed identities that no table anywhere holds. The gate below was therefore
+    satisfiable with values a reader could not look up, which is the opposite of what pinning is
+    for. The two facts are now recorded separately and honestly:
+
+    * :attr:`leg_measurement_ids` — the ``clo_`` identity of each leg's FULL measurement, always two
+      for a measured crosswalk, living inside the composed observation's own content. This is what
+      deterministic validation is gated on, because it is the thing that always exists.
+    * :attr:`leg_observation_revision_ids` — the ``rob_`` rows in the shipped two-endpoint store
+      (migration 1038), present exactly for the legs that HAVE one. Persisted V2 rows exist only for
+      realization-bearing (cross-catalog) legs; for the ordinary crosswalk shape that is one leg,
+      not two, and the store verifies the embedded copy against the stored row wherever both exist
+      (``crosswalk_observation_store._assert_legs_agree_with_the_two_endpoint_store``)."""
 
     crosswalk_definition_revision_id: str
     mapping_binding_revision_id: str
@@ -527,6 +542,19 @@ class CrosswalkExecutionRevisionV1:
     combined_cardinality: DirectionalCardinalityVerdictV1
     safety_status: SafetyStatus
     mapping_temporal_policy_revision_id: str | None = None
+    #: Both legs' own content-addressed MEASUREMENT identities (``clo_``), in leg order — see
+    #: :attr:`CrosswalkLegObservationV1.leg_observation_id`. Always two for a measured crosswalk,
+    #: because every leg is measured whether or not the two-endpoint store can hold it. This is what
+    #: the deterministic-validation gate keys on.
+    leg_measurement_ids: tuple[str, ...] = ()
+    #: The PERSISTED two-endpoint rows (``rob_``, migration 1038) the legs were ALSO written as,
+    #: present exactly where a leg has one — which is a subset, not a shortfall.
+    #: ``relationship_observation_revision.realization_revision_id`` is NOT NULL with a foreign key
+    #: to ``bridge_join_realization_revision`` (1038:7-8), so only a leg backed by a governed bridge
+    #: realization can live there; a same-catalog leg resolving through ``plan_join`` cannot, and
+    #: fabricating a realization to give it one is the "pretend every leg is an entity bridge"
+    #: defect ``JoinLegPinV1`` refuses structurally. The ordinary shape (one same-catalog leg, one
+    #: cross-catalog leg) therefore carries exactly ONE id here, and an empty tuple is honest.
     leg_observation_revision_ids: tuple[str, ...] = ()
     composition_observation_revision_id: str | None = None
     execution_revision_id: str = field(init=False, default="")
@@ -541,20 +569,37 @@ class CrosswalkExecutionRevisionV1:
                 CROSSWALK_EXECUTION_SHAPE_INVALID,
                 "the two legs of a crosswalk execution must be distinct; one leg rendered twice is "
                 "the 'render endpoint equality' mutation Task 13 must kill")
-        observations = tuple(str(v).strip() for v in self.leg_observation_revision_ids)
-        if any(not v for v in observations):
-            raise CrosswalkContractError(
-                CROSSWALK_EXECUTION_SHAPE_INVALID,
-                "leg_observation_revision_ids must not contain a blank id")
-        object.__setattr__(self, "leg_observation_revision_ids", observations)
+        # TWO fields, because there are two different facts and one of them is not always there.
+        # A single list forced them together, and what filled it decided what the gate below meant:
+        # filled with `clo_` measurement hashes the gate passed on values no store holds, and filled
+        # with `rob_` row ids it could never pass for the ordinary one-same-catalog/one-cross-catalog
+        # shape at all. Both are recorded, each under its own name.
+        for name in ("leg_measurement_ids", "leg_observation_revision_ids"):
+            values = tuple(str(v).strip() for v in getattr(self, name))
+            if any(not v for v in values):
+                raise CrosswalkContractError(
+                    CROSSWALK_EXECUTION_SHAPE_INVALID, f"{name} must not contain a blank id")
+            if len(values) > 2:
+                raise CrosswalkContractError(
+                    CROSSWALK_EXECUTION_SHAPE_INVALID,
+                    f"a crosswalk has exactly two legs, so {name} cannot name {len(values)}")
+            if len(set(values)) != len(values):
+                raise CrosswalkContractError(
+                    CROSSWALK_EXECUTION_SHAPE_INVALID,
+                    f"{name} names one id twice; two legs are two records, and one counted twice "
+                    "is the 'omit one leg' mutation reaching the gate below")
+            object.__setattr__(self, name, values)
         if self.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED and not (
-                self.composition_observation_revision_id and len(observations) >= 2):
+                self.composition_observation_revision_id
+                and len(self.leg_measurement_ids) >= 2):
             raise CrosswalkContractError(
                 CROSSWALK_EXECUTION_SHAPE_INVALID,
-                "deterministic validation requires an observation per leg AND one composed "
+                "deterministic validation requires a MEASUREMENT per leg AND one composed "
                 "observation after temporal filtering; two safe legs do not compose into a safe "
                 "crosswalk (§6.6). Claiming it without them is inference wearing a measurement's "
-                "name")
+                "name. The gate keys on `leg_measurement_ids` and not on the persisted two-endpoint "
+                "rows, because only a realization-bearing leg can have one of those — requiring two "
+                "would demand a fabricated bridge realization for the ordinary shape")
         object.__setattr__(self, "execution_revision_id", "cwx_" + materialize_hash({
             "contract_version": CROSSWALK_CONTRACT_VERSION,
             "crosswalk_definition_revision_id": self.crosswalk_definition_revision_id,
@@ -563,7 +608,8 @@ class CrosswalkExecutionRevisionV1:
             "target_leg": self.target_leg.identity_payload(),
             "mapping_temporal_policy_revision_id": self.mapping_temporal_policy_revision_id,
             "applicability_scope": self.applicability_scope.identity_payload(),
-            "leg_observation_revision_ids": list(observations),
+            "leg_measurement_ids": list(self.leg_measurement_ids),
+            "leg_observation_revision_ids": list(self.leg_observation_revision_ids),
             "composition_observation_revision_id": self.composition_observation_revision_id,
             "combined_cardinality": self.combined_cardinality.identity_payload(),
             "safety_status": self.safety_status.value,

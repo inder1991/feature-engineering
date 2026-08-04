@@ -374,17 +374,60 @@ def test_two_identical_legs_are_refused() -> None:
 def test_deterministic_safety_cannot_be_claimed_without_a_composed_observation() -> None:
     with pytest.raises(CrosswalkContractError) as exc:
         _execution(safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
-                   leg_observation_revision_ids=("obs_1", "obs_2"))
+                   leg_measurement_ids=("clo_1", "clo_2"))
     assert exc.value.code == CROSSWALK_EXECUTION_SHAPE_INVALID
     with pytest.raises(CrosswalkContractError):
         _execution(safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
-                   leg_observation_revision_ids=("obs_1",),
+                   leg_measurement_ids=("clo_1",),
                    composition_observation_revision_id="obs_c")
     validated = _execution(
         safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
-        leg_observation_revision_ids=("obs_1", "obs_2"),
+        leg_measurement_ids=("clo_1", "clo_2"),
         composition_observation_revision_id="obs_c")
     assert validated.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
+
+
+def test_the_gate_keys_on_MEASUREMENTS_and_not_on_the_persisted_two_endpoint_rows() -> None:
+    """The field names have to mean what they say. `relationship_observation_revision` can only
+    hold a leg backed by a governed bridge realization (1038:7-8), so the ordinary crosswalk shape
+    — one same-catalog leg, one cross-catalog leg — has exactly ONE persisted row. A gate demanding
+    two of those would be unsatisfiable without fabricating a realization; a gate that accepted
+    measurement hashes UNDER that name (the first draft) was satisfiable with values no table
+    holds. Two fields, and the gate on the one that always exists."""
+    with pytest.raises(CrosswalkContractError) as exc:
+        _execution(safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
+                   leg_observation_revision_ids=("rob_1", "rob_2"),
+                   composition_observation_revision_id="obs_c")
+    assert exc.value.code == CROSSWALK_EXECUTION_SHAPE_INVALID
+    assert "leg_measurement_ids" in str(exc.value)
+
+    # …and the honest shape: two measurements, ONE persisted row, deterministic validation.
+    validated = _execution(
+        safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
+        leg_measurement_ids=("clo_1", "clo_2"),
+        leg_observation_revision_ids=("rob_1",),
+        composition_observation_revision_id="obs_c")
+    assert validated.leg_measurement_ids == ("clo_1", "clo_2")
+    assert validated.leg_observation_revision_ids == ("rob_1",)
+
+
+def test_the_two_evidence_fields_are_separately_identity_bearing() -> None:
+    """Both are in the hash, and neither can stand in for the other: a revision that swapped which
+    list an id sat in would be a different execution revision, not the same one described twice."""
+    measured = _execution(leg_measurement_ids=("clo_1", "clo_2"))
+    persisted = _execution(leg_observation_revision_ids=("clo_1", "clo_2"))
+    plain = _execution()
+    assert len({measured.execution_revision_id, persisted.execution_revision_id,
+                plain.execution_revision_id}) == 3
+
+
+def test_a_crosswalk_has_two_legs_so_neither_evidence_list_may_name_more() -> None:
+    for field_name in ("leg_measurement_ids", "leg_observation_revision_ids"):
+        with pytest.raises(CrosswalkContractError) as exc:
+            _execution(**{field_name: ("a", "b", "c")})
+        assert exc.value.code == CROSSWALK_EXECUTION_SHAPE_INVALID
+        with pytest.raises(CrosswalkContractError):
+            _execution(**{field_name: ("a", "a")})
 
 
 def test_a_same_catalog_leg_may_not_pretend_to_be_an_entity_bridge() -> None:
