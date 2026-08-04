@@ -40,19 +40,22 @@ takes the token cannot be entered by a caller who skipped the gate.
 **Read scope is the shipped predicate over BOTH sensitivity axes (migration 1032).** Gate 2 checks
 ``graph_node.visible_requires`` — the GENERATED column folding the raw file tag AND the governed
 ``effective_restriction`` floor into the classes a reader must hold — against
-``allowed_classes(roles)``, via ``read_scope.anchor_visibility_predicate``. So a governed-
-``restricted`` column whose file attested nothing refuses here, and a ``prohibited`` floor is
-ungrantable at this gate. §5.2 classification still owns the contract-time answer: it re-reads the
-catalog and refuses a ``prohibited`` input with ``PROHIBITED_INPUT`` even for a group authorized
-before the ruling.
+``allowed_classes(roles)``, via ``read_scope.materialization_anchor_visibility_predicate``. So a
+governed-``restricted`` column whose file attested nothing refuses here, and a ``prohibited`` floor
+is ungrantable at this gate — on a TABLE element as well as on a column one. §5.2 classification
+still owns the contract-time answer: it re-reads the catalog and refuses a ``prohibited`` input with
+``PROHIBITED_INPUT`` even for a group authorized before the ruling.
 
-The ANCHOR predicate and not the plain column one, because this read set is not all columns: it
-carries the spine's own TABLE and every relation a traversal reads, and ``build_graph`` writes no
-sensitivity on a table node — so under the column predicate the table half of this gate passed for
-every caller on every real catalog. D11's derived rule (a table is visible iff the caller can see
-at least one of its columns) is the one that answers it, and it branches on ``graph_node.kind``
-itself, so ONE predicate covers both element kinds without minting a second rule here. See
-:func:`_hidden`.
+A TABLE-AWARE predicate and not the plain column one, because this read set is not all columns: it
+carries the spine's own TABLE, and ``build_graph`` writes no sensitivity on a table node — so under
+the column predicate the table half of this gate passed for every caller on every real catalog.
+D11's derived rule (a table is visible iff the caller can see at least one of its columns) answers
+that half. It is not the whole answer at THIS gate: D11's shared predicate SUBSTITUTES the derived
+answer for the table row's own ``visible_requires``, and naming a table in a generated project is a
+grant to SCAN it, so a governed floor set on the table itself would be discarded by exactly the
+element class it was set on. Gate 2 therefore binds the conjunctive variant — the table's own
+requirement AND a visible column — which branches on ``graph_node.kind`` itself, so ONE predicate
+still covers both element kinds without minting a second rule here. See :func:`_hidden`.
 """
 from __future__ import annotations
 
@@ -99,7 +102,10 @@ from featuregen.overlay.upload.bridge_store import (
 )
 from featuregen.overlay.upload.crosswalk_admission import AdmittedCrosswalkV1
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.read_scope import allowed_classes, anchor_visibility_predicate
+from featuregen.overlay.upload.read_scope import (
+    allowed_classes,
+    materialization_anchor_visibility_predicate,
+)
 
 __all__ = [
     "AuthorizedCompilation",
@@ -686,18 +692,25 @@ def _hidden(
     ``visible_requires = '{}'``, contained in every allowed list, and stays visible to everyone;
     ``prohibited`` appears in no role map and fails CLOSED for every caller.
 
-    **The predicate is the ANCHOR one (D11), and that is a fix.** This gate's read set contains
-    TABLE elements as well as column ones — ``SPINE_SOURCE`` always, and every relation a traversal
-    reads — and ``build_graph`` never writes sensitivity on a table node, so a table row's
-    ``visible_requires`` is ``'{}'`` on every real catalog. Under the plain column predicate the
-    table half of this gate therefore passed for everybody, on every catalog, always: a
-    fully-restricted spine source authorized cleanly for a principal who could not read one of its
-    columns. ``read_scope.anchor_visibility_predicate`` is the one that already answers this — a
-    table is visible iff the caller can see at least one of its columns, the
-    ``catalogs.py:50-59`` shape D11 adopted — and it branches on ``graph_node.kind`` itself, so
-    ONE predicate serves both element kinds here and no second rule is minted. It binds
-    ``allowed_classes(roles)`` TWICE, which is the shape of the predicate rather than a call-site
-    choice.
+    **The predicate is TABLE-AWARE (D11), and that is a fix.** This gate's read set contains
+    exactly ONE table element — ``SPINE_SOURCE``, the population's own relation (:func:`_union_of`)
+    — alongside its columns. Every other relation a traversal touches enters as COLUMNS: a join
+    step contributes its endpoint columns, and a crosswalk's mapping dataset contributes its join
+    keys and its row-rule columns, each scope-checked individually. So the table branch below is
+    about the spine source, and the spine source is precisely where ``build_graph`` never writes
+    sensitivity: a table row's ``visible_requires`` is ``'{}'`` on every real catalog. Under the
+    plain column predicate the table half of this gate therefore passed for everybody, on every
+    catalog, always — a fully-restricted spine source authorized cleanly for a principal who could
+    not read one of its columns.
+
+    ``read_scope.materialization_anchor_visibility_predicate`` answers BOTH halves: the table's own
+    ``visible_requires`` must be contained in the allowed list AND at least one of its columns must
+    be visible (the ``catalogs.py:50-59`` derived shape D11 adopted). Conjunctive rather than
+    D11's substitutive form because this gate grants a SCAN — see that function's own docstring for
+    why the shared predicate is deliberately left alone. It branches on ``graph_node.kind`` itself,
+    so ONE predicate serves both element kinds here and no second rule is minted, and it binds
+    ``allowed_classes(roles)`` THREE times, which is the shape of the predicate rather than a
+    call-site choice.
 
     A ref with no ``graph_node`` row at all is returned as MISSING (Task 12). The doctrine used to
     be the reverse — pass it through and let §11's L1 validation report ``COLUMN_ABSENT`` against
@@ -719,10 +732,10 @@ def _hidden(
     for catalog_source, indexed in by_source.items():
         rows = conn.execute(
             "SELECT lower(object_ref), "
-            f"(NOT ({anchor_visibility_predicate('graph_node')})) AS hidden "
+            f"(NOT ({materialization_anchor_visibility_predicate('graph_node')})) AS hidden "
             "FROM graph_node "
             "WHERE catalog_source = %s AND lower(object_ref) = ANY(%s)",
-            (allowed, allowed, catalog_source, list(indexed))).fetchall()
+            (allowed, allowed, allowed, catalog_source, list(indexed))).fetchall()
         # Fail CLOSED across duplicates: should the catalog ever hold two rows for one folded
         # object_ref, one hidden row hides the node — mirroring the old shape, where the query
         # returned hidden rows directly and any one of them sufficed.

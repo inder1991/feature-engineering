@@ -84,10 +84,50 @@ def anchor_visibility_predicate(alias: str = "gn", param: str = "%s") -> str:
     (e.g. ``"%(allowed)s"``) binds it once by name.
     """
     return (
-        f"(CASE WHEN {alias}.kind = 'table' THEN EXISTS("
-        f"SELECT 1 FROM graph_node c WHERE c.catalog_source = {alias}.catalog_source "
+        f"(CASE WHEN {alias}.kind = 'table' THEN {_visible_column_exists(alias, param)} "
+        f"ELSE COALESCE({alias}.visible_requires, '{{}}') <@ {param} END)")
+
+
+def _visible_column_exists(alias: str, param: str) -> str:
+    """D11's derived half: does this table row have AT LEAST ONE column the caller may see?
+
+    Factored out so the substitutive predicate above and the conjunctive one below are the SAME
+    EXISTS probe rather than two spellings of it — a correlated subquery copied twice is a
+    correlation that gets fixed once.
+    """
+    return (
+        f"EXISTS(SELECT 1 FROM graph_node c WHERE c.catalog_source = {alias}.catalog_source "
         f"AND c.kind = 'column' AND c.table_name = {alias}.table_name "
-        f"AND COALESCE(c.visible_requires, '{{}}') <@ {param}) "
+        f"AND COALESCE(c.visible_requires, '{{}}') <@ {param})")
+
+
+def materialization_anchor_visibility_predicate(alias: str = "gn", param: str = "%s") -> str:
+    """Gate 2's table anchor: the derived rule AND the table's OWN requirement, CONJUNCTIVELY.
+
+    **Deliberately not :func:`anchor_visibility_predicate`, and deliberately not a replacement for
+    it.** That predicate SUBSTITUTES the derived answer for the table row's own
+    ``visible_requires``, so a table whose governed floor is ``restricted`` — or ``prohibited`` —
+    is authorized the moment any ONE of its columns is visible. On a display surface that is a
+    defensible reading of D11 (the table is listed because there is something on it you may see,
+    and every column still filters on its own account). At compile time it is not: naming a table
+    in a generated project is a grant to SCAN it, and the governed floor on the table is the one
+    statement about the table AS A WHOLE that nothing else in the read set repeats. ``restricted``
+    in particular is caught NOWHERE else — §5.2's contract-time classification re-reads the catalog
+    and refuses only a ``prohibited`` input — so under the substitutive rule a principal without
+    ``restricted_reader`` compiled and authorized over a table the governance floor restricts.
+
+    So Gate 2 requires BOTH: the table's own classes must be contained in the caller's allowed list
+    AND at least one of its columns must be visible. Changing the SHARED predicate instead would
+    change five read/visibility surfaces at once and is a controlling-doc-level decision about D11
+    (recorded in ``docs/DEFERRED-WORK.md``); this one is scoped to the gate that grants a scan.
+
+    ``param`` appears THREE times (the table's own clause, the EXISTS probe, the column branch), so
+    a positional call site binds ``allowed_classes(roles)`` three times.
+    """
+    return (
+        f"(CASE WHEN {alias}.kind = 'table' THEN "
+        f"(COALESCE({alias}.visible_requires, '{{}}') <@ {param} "
+        f"AND {_visible_column_exists(alias, param)}) "
         f"ELSE COALESCE({alias}.visible_requires, '{{}}') <@ {param} END)")
 
 
