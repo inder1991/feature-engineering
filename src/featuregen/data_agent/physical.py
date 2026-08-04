@@ -249,14 +249,21 @@ class PhysicalDatasetBindingV1:
 
 # ── the ONE derivation of a DERIVED binding's identity (Release C Task 11 scope 0) ──────────────
 #
-# Two resolvers used to derive the same table's address two ways: `resolve_dataset_binding` took
-# `database` from `ClusterInventoryV1.environment_id` and named the stream
-# `identifier-endpoint:<env>:<ref>`, while `binding_store.resolve_table` took `database` from the
-# connection registry and named the stream `derived-<catalog>-<table>`. Both feed
-# `PhysicalObjectIdentityV1.table_id` and `binding_revision_id`, so ONE physical table acquired two
-# addresses and two binding streams — and a relationship observation recorded against one was
-# invisible to every reader holding the other (the observation store keys its current pointer on
-# `left/right_binding_revision_id`, `store.py:440-455`).
+# Two resolvers used to derive the same table's address two ways, and between them there were
+# THREE stream spellings, not two:
+#
+# * `resolve_dataset_binding` took `database` from `ClusterInventoryV1.environment_id` and its OWN
+#   default stream name was `<env>:<catalog>:<schema>.<table>`;
+# * `bridge_assessment.resolve_and_record_endpoint_binding` called that same resolver but OVERRODE
+#   `binding_id` with `identifier-endpoint:<env>:<ref>` — so the inventory path's spelling depended
+#   on which caller reached it;
+# * `binding_store.resolve_table` took `database` from the connection registry and named the stream
+#   `derived-<catalog>-<table>`.
+#
+# All three feed `PhysicalObjectIdentityV1.table_id` and `binding_revision_id`, so ONE physical
+# table acquired two addresses and three binding streams — and a relationship observation recorded
+# against one was invisible to every reader holding another (the observation store keys its current
+# pointer on `left/right_binding_revision_id`, `store.py:440-455`).
 #
 # WHICH SOURCE IS HONEST FOR AN ADDRESS. `PhysicalObjectIdentityV1.database` "addresses the thing
 # holding" the Hive schema — WHICH engine instance, so two clusters carrying the same schema name
@@ -275,12 +282,17 @@ class PhysicalDatasetBindingV1:
 # a FALLBACK consulted only where the registry is silent — which is exactly the case that must stay
 # addressable rather than become a refusal.
 #
-# LIVE ROWS. Nothing is re-addressed by this choice: `binding_store.record_binding` (reached from
-# `source_selector._pin_binding` -> `select_table_binding`) is the ONLY `src/` writer of
-# `physical_dataset_binding_revision`, and it already derives `database` from the connection.
-# `bridge_assessment.resolve_and_record_endpoint_binding` — the inventory-derived writer — has zero
-# `src/` callers (tests only). So no stored revision changes and migration 1057 carries no
-# re-addressing; it is spent on the crosswalk observation store instead.
+# LIVE ROWS, and what makes that safe. A unification like this converges only the rows written
+# AFTER it: `binding_revision_id` is a content hash of what a revision declared, and nothing
+# rewrites a stored one, so a derived row already sitting under an old stream name would keep it
+# forever. The reasoning here is therefore "no such row was ever written", not "old rows converge".
+# `binding_store.record_binding` (reached from `source_selector._pin_binding` ->
+# `select_table_binding`) is the ONLY `src/` writer of `physical_dataset_binding_revision`, and it
+# already derives `database` from the connection. `bridge_assessment.resolve_and_record_endpoint_binding`
+# — the inventory-derived writer whose spellings changed — has NEVER had a `src/` caller: at the
+# commit that introduced it (4275d81f) and at every commit since, `src/` contains its definition and
+# nothing that calls it. So no stored revision changes and migration 1057 carries no re-addressing;
+# it is spent on the crosswalk observation store instead.
 
 def derived_binding_id(*, catalog_source: str, table: str) -> str:
     """The stream name for a binding DERIVED from configuration — one computation, both writers.
@@ -293,6 +305,15 @@ def derived_binding_id(*, catalog_source: str, table: str) -> str:
 
     An EXPLICIT binding keeps whatever `binding_id` its author gave it: an operator's per-table
     declaration is the documented exception mechanism, not a derivation.
+
+    WHAT "the same answer" MEANS, precisely. Where the connection registry is silent, the inventory
+    path falls back to `environment_id` — but through `address_database`, which `_norm`s it, while
+    the previous derivation took it RAW. The two are therefore identical modulo whitespace- and
+    case-bearing names, NOT byte-identical: an `environment_id` of ` EDP_Cluster ` used to address
+    one thing and now addresses `edp_cluster`. That is the intended direction (Hive identifiers are
+    case-insensitive, and this module's whole rule is that two spellings of one table must be one
+    object), and no stored row is affected — see the LIVE ROWS paragraph above — but the claim is
+    "converges", not "byte-for-byte".
     """
     return f"derived-{_norm(catalog_source)}-{_norm(table)}"
 
@@ -397,7 +418,8 @@ def resolve_dataset_binding(
         # ONE derivation, shared with `binding_store.resolve_table` (see the block comment above
         # `derived_binding_id`). The inventory's environment is the FALLBACK, used only where the
         # connection registry declares no instance — which preserves this path's answer wherever
-        # nothing else can speak.
+        # nothing else can speak, modulo the `_norm` that a whitespace- or case-bearing
+        # `environment_id` now goes through (argued at `derived_binding_id`).
         database=address_database(
             conn, connection_id=connection_id, fallback=inventory.environment_id),
         schema=requirement.schema,
