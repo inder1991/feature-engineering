@@ -351,3 +351,150 @@ def test_a_crosswalk_context_must_name_both_legs() -> None:
             definition_id="cwd_a", definition_revision_id="cwd_b", mapping_dataset_ref=MAP,
             source_to_mapping_refs=("cib::public.cust_xref.cust_num",),
             mapping_to_target_refs=())
+
+
+# ── Release C Task 11: measurement + admission state on the read models ─────────────────────────
+
+def test_an_unmeasured_crosswalk_reads_as_discoverable_unmeasured_not_as_a_failure(db):
+    """The no-blocked rule, at the surface. `measurement=None` and no directions is a STATE."""
+    from tests.featuregen.overlay.upload._crosswalk_fixtures import definition
+
+    from featuregen.overlay.upload.bridge_assessment import LinkReviewStatus
+    from featuregen.overlay.upload.crosswalk_store import (
+        CrosswalkDefinitionCurrentV1,
+        CurrentCrosswalkV1,
+    )
+    from featuregen.overlay.upload.semantic_context import relationship_context_from_crosswalk
+
+    revision = definition()
+    current = CurrentCrosswalkV1(
+        revision=revision,
+        current=CrosswalkDefinitionCurrentV1(
+            definition_id=revision.definition_id, revision_id=revision.revision_id,
+            review_status=LinkReviewStatus.UNREVIEWED, pointer_version=1, declared_by="t"))
+    link = relationship_context_from_crosswalk(current)
+    assert link.crosswalk is not None
+    assert link.crosswalk.measured is False
+    assert link.crosswalk.measurement is None
+    assert link.crosswalk.directions == ()
+    assert link.availability == "available"          # discoverable, and it says so
+    assert link.crosswalk.executable_now is False
+
+
+def test_a_measured_crosswalk_shows_its_per_direction_verdicts_and_the_numbers_behind_them(db):
+    from datetime import UTC, datetime
+
+    from tests.featuregen.overlay.upload._crosswalk_fixtures import (
+        CIB_TABLE,
+        FTR_TABLE,
+        MAP_TABLE,
+        binding,
+        definition,
+        leg,
+        mapping_observation,
+    )
+
+    from featuregen.overlay.upload.bridge_assessment import LinkReviewStatus
+    from featuregen.overlay.upload.bridge_realization import (
+        ExecutionTier,
+        RealizationApplicabilityScopeV1,
+    )
+    from featuregen.overlay.upload.crosswalk_admission import (
+        CrosswalkAdmissionPolicyV1,
+        evaluate_crosswalk_admission,
+    )
+    from featuregen.overlay.upload.crosswalk_observation import (
+        MAPPING_TO_TARGET,
+        SOURCE_TO_MAPPING,
+        SOURCE_TO_TARGET,
+        TARGET_TO_SOURCE,
+        compose_crosswalk_observation,
+    )
+    from featuregen.overlay.upload.crosswalk_store import (
+        CrosswalkDefinitionCurrentV1,
+        CurrentCrosswalkV1,
+    )
+    from featuregen.overlay.upload.semantic_context import relationship_context_from_crosswalk
+
+    now = datetime(2026, 8, 4, 13, tzinfo=UTC)
+    cib, ftr, mapping = (binding("cib", CIB_TABLE), binding("ftr", FTR_TABLE, schema="dpl_ftr"),
+                         binding("cib", MAP_TABLE))
+    scope = RealizationApplicabilityScopeV1(
+        scope_id="crosswalk-sandbox-scope", execution_tier=ExecutionTier.SANDBOX,
+        purposes=("crosswalk_probe",), environment="dev")
+    revision = definition()
+    observation = compose_crosswalk_observation(
+        crosswalk_definition_revision_id=revision.revision_id,
+        source_leg=leg(which=SOURCE_TO_MAPPING, endpoint_binding=cib, mapping_binding=mapping,
+                       endpoint_column="acct_no", mapping_column="acct_no"),
+        target_leg=leg(which=MAPPING_TO_TARGET, endpoint_binding=ftr, mapping_binding=mapping,
+                       endpoint_column="counter_party_acct_no", mapping_column="ext_acct_ref",
+                       cross_catalog=True),
+        # A 1:1 forward with an N:1 reverse — the shape the surface must not flatten.
+        mapping=mapping_observation(mapping, duplicate_source_tuple_count=1,
+                                    max_rows_per_source_tuple=2, distinct_source_tuple_count=2),
+        scope_id=scope.scope_id,
+        matched_source_distinct=3, unmatched_source_distinct=0,
+        matched_target_distinct=3, unmatched_target_distinct=0,
+        composed_row_count=3, source_to_target_max_matches=1, target_to_source_max_matches=2,
+        observed_at=now, mapping_temporal_policy_revision_id="dtp_" + "b" * 64,
+        mapping_row_selection_hash="c" * 64)
+    decision = evaluate_crosswalk_admission(
+        crosswalk_definition_revision_id=revision.revision_id, scope=scope,
+        policy=CrosswalkAdmissionPolicyV1(), now=now, observation=observation)
+    current = CurrentCrosswalkV1(
+        revision=revision,
+        current=CrosswalkDefinitionCurrentV1(
+            definition_id=revision.definition_id, revision_id=revision.revision_id,
+            review_status=LinkReviewStatus.UNREVIEWED, pointer_version=1, declared_by="t"))
+
+    link = relationship_context_from_crosswalk(
+        current, observation=observation, decision=decision)
+    extension = link.crosswalk
+    assert extension is not None and extension.measured is True
+    assert extension.measurement.observation_revision_id == observation.observation_revision_id
+    assert extension.measurement.source_to_target_max_matches == 1
+    assert extension.measurement.target_to_source_max_matches == 2
+    # BOTH directions, with DIFFERENT verdicts. One of them alone would read as a verdict about the
+    # pair, which is what the whole two-direction record exists to prevent.
+    assert {d.direction for d in extension.directions} == {SOURCE_TO_TARGET, TARGET_TO_SOURCE}
+    forward = next(d for d in extension.directions if d.direction == SOURCE_TO_TARGET)
+    reverse = next(d for d in extension.directions if d.direction == TARGET_TO_SOURCE)
+    assert forward.production_admissible is True
+    assert reverse.production_admissible is False and reverse.sandbox_admissible is False
+    assert extension.admission_policy_version == decision.policy_version
+    # AND STILL NOT RUNNABLE. Task 12 wires execution; no verdict substitutes for it.
+    assert extension.executable_now is False
+
+
+def test_a_direction_cannot_claim_production_without_deterministic_validation():
+    import pytest as _pytest
+
+    from featuregen.overlay.upload.semantic_context import (
+        CrosswalkDirectionContextV1,
+        SemanticContextError,
+    )
+
+    with _pytest.raises(SemanticContextError, match="deterministic validation"):
+        CrosswalkDirectionContextV1(
+            direction="source_to_target", safety_status="unassessed", cardinality=None,
+            sandbox_admissible=True, production_admissible=True)
+
+
+def test_a_crosswalk_carries_both_directions_or_neither():
+    import pytest as _pytest
+
+    from featuregen.overlay.upload.semantic_context import (
+        CrosswalkContextV1,
+        CrosswalkDirectionContextV1,
+        SemanticContextError,
+    )
+
+    one = CrosswalkDirectionContextV1(
+        direction="source_to_target", safety_status="unassessed", cardinality=None,
+        sandbox_admissible=True, production_admissible=False)
+    with _pytest.raises(SemanticContextError, match="BOTH named directions"):
+        CrosswalkContextV1(
+            definition_id="cwd_1", definition_revision_id="cwd_2",
+            mapping_dataset_ref="cib::public.m", source_to_mapping_refs=("a",),
+            mapping_to_target_refs=("b",), directions=(one,))

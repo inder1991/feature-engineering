@@ -37,12 +37,41 @@ The reconciliation, deliberately chosen and recorded here:
   the same binding twice — once derived, once through the explicit branch that now finds the row —
   yields the SAME revision id and a single revision row. That is pinned by test.
 
-**What is NOT reconciled here, and why.** `physical.resolve_dataset_binding` derives the address
-component `database` from `ClusterInventoryV1.environment_id`, while this module derives it from
-`data_source_connection.database_name`. Those are two derivations of the ADDRESS, not two
-computations of the id — and unifying them would re-address every binding a materialization run has
-already recorded. That belongs to Release C Task 11 (assigned 2026-08-04 at the Phase-G unification: the split makes observations invisible across derivations, which is Task 11's own seam), not to
-Task 7; it is named in the Release-B report rather than silently left as a surprise.
+**RESOLVED (Release C Task 11, 2026-08-04) — the address derivation is now ONE function.**
+
+What was open: `physical.resolve_dataset_binding` derived the address component `database` from
+`ClusterInventoryV1.environment_id` and named its stream `<env>:<catalog>:<schema>.<table>` — which
+`bridge_assessment.resolve_and_record_endpoint_binding` then OVERRODE with
+`identifier-endpoint:<env>:<ref>`, so that one resolver produced two spellings depending on its
+caller — while this module derived `database` from `data_source_connection.database_name` and named
+its stream `derived-<catalog>-<table>`. One physical table therefore had two addresses and THREE
+binding streams, and a relationship observation recorded under one was invisible to a reader holding
+another (the observation store keys its current pointer on the side-specific `binding_revision_id`).
+
+The decision, argued in full at `physical.derived_binding_id`: **the CONNECTION's declared
+`database_name` is the honest source for a physical address** — it is the operator's durable,
+environment-matched declaration of which instance this deployment reads, and it is the same record
+that AUTHORIZES the read. A captured inventory's `environment_id` labels one capture artifact, not
+the instance, so two captures of an unmoved table would fork its address; it survives as the
+FALLBACK the materialization path passes when the registry declares nothing. Both writers now call
+`physical.address_database` and `physical.derived_binding_id`.
+
+**No stored row is re-addressed, so no migration was needed — and the reason is "there are no old
+rows", not "old rows converge".** A unification like this only ever converges the rows written
+AFTER it: a derived revision already sitting in `physical_dataset_binding_revision` under the old
+stream name keeps that name forever, because `binding_revision_id` is a content hash of what was
+declared and nothing rewrites it. That would have needed a migration. It does not here, and the
+reason is a fact about history rather than a property of the change: `record_binding` below (reached
+from `source_selector._pin_binding`) is the ONLY `src/` writer of that table and it already took
+`database` from the connection, while the inventory-derived writer
+(`bridge_assessment.resolve_and_record_endpoint_binding`) has NEVER had a `src/` caller — verified
+against the history, tests only — so no row was ever written under the spellings that changed.
+
+Where both inputs exist the two derivations now agree by construction; where only the inventory can
+speak, the fallback reproduces the previous answer for every name that was already lower-case and
+stripped, and normalizes the rest (`physical.derived_binding_id` argues the difference). An EXPLICIT
+per-table binding still wins over both — an operator's declaration is the exception mechanism, not a
+third derivation.
 """
 
 from __future__ import annotations
@@ -56,6 +85,8 @@ from featuregen.data_agent.connection import (
 from featuregen.data_agent.physical import (
     PhysicalDatasetBindingV1,
     PhysicalObjectIdentityV1,
+    address_database,
+    derived_binding_id,
     record_binding_revision,
 )
 
@@ -252,14 +283,19 @@ def resolve_table(conn, *, catalog_source: str,
         return None
 
     binding = PhysicalDatasetBindingV1(
-        binding_id=f"derived-{catalog_source}-{table}".lower(),
+        binding_id=derived_binding_id(catalog_source=catalog_source, table=table),
         catalog_logical_ref=f"{catalog_source}::{schema}.{table}",
         connection_id=connection.connection_id,
         identity=PhysicalObjectIdentityV1(
             catalog_source=catalog_source,
             # Identity only — never rendered into SQL by either dialect. It says WHICH cluster, so
-            # two environments holding the same schema name are distinguishable.
-            database=database_name or connection.connection_id,
+            # two environments holding the same schema name are distinguishable. ONE derivation,
+            # shared with `physical.resolve_dataset_binding` (module docstring): the routing row's
+            # `database_name` IS what `address_database` reads, so passing it as the fallback keeps
+            # this branch's answer identical while removing the second computation.
+            database=address_database(
+                conn, connection_id=connection.connection_id,
+                fallback=database_name or connection.connection_id),
             schema=schema, table=table, object_kind="table"))
     # Derived, but still not self-authorizing: the connection's allowlist and active flag decide,
     # exactly as they do for a stored binding.

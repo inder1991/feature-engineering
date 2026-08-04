@@ -48,6 +48,12 @@ def _tables(db) -> set[str]:
 
 
 def _drop(db) -> None:
+    # Task 11's observation tables (1057) reference the definition revision, and pre-1050 neither
+    # existed — so dropping back to a pre-release-C shape means dropping them too. Added when 1057
+    # landed rather than reaching for CASCADE: a cascade would silently absorb the NEXT dependent
+    # somebody adds, which is precisely the surprise this legacy-shape suite exists to catch.
+    db.execute("DROP TABLE IF EXISTS crosswalk_observation_current")
+    db.execute("DROP TABLE IF EXISTS crosswalk_observation_revision")
     # The pointer carries the FK onto the revision table, so it goes first.
     db.execute("DROP TABLE IF EXISTS crosswalk_definition_current")
     db.execute("DROP TABLE IF EXISTS crosswalk_definition_revision")

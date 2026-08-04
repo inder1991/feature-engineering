@@ -2280,10 +2280,44 @@ export interface ContextRealization {
   executable_now: boolean
 }
 
+// What a composed measurement of a crosswalk FOUND. Numbers only — verdicts live per direction.
+// `caveats` rides on the same object as the counts deliberately: a reader who sees "3 rows, 1:1"
+// without "measured over unfiltered history" has been told something true and understood something
+// false.
+export interface ContextCrosswalkMeasurement {
+  observation_revision_id: string
+  scope_id: string
+  observed_at: string
+  as_of: string | null
+  method: string
+  row_coverage: string
+  complete: boolean
+  composed_row_count: number
+  source_to_target_max_matches: number
+  target_to_source_max_matches: number
+  mapping_row_count: number
+  mapping_temporal_policy_revision_id: string | null
+  caveats: string[]
+  failures: string[]
+}
+
+// One NAMED direction's verdict. The two are SIDES of the definition, never traversal order, and
+// they are independent: 1:1 forward with N:1 reverse is ordinary and admits forward only.
+export interface ContextCrosswalkDirection {
+  direction: string
+  safety_status: string
+  cardinality: string | null
+  sandbox_admissible: boolean
+  production_admissible: boolean
+  reason_codes: string[]
+}
+
 // The Release-C crosswalk extension. It says what the crosswalk IS — which mapping dataset, which
-// revision, both legs — and deliberately nothing about whether it can run: there is no safety
-// status, no tier and no eligibility here to misread, because a crosswalk has no execution path.
-// `leg_pins` is empty at discovery by contract; a leg is pinned by resolving it.
+// revision, both legs — plus, since Task 11, what a measurement found and what admission concluded
+// per direction. `executable_now` is ALWAYS false until Task 12 wires execution, and it is carried
+// explicitly rather than derived from `production_admissible`: that predicate labels history, not a
+// live capability. `measurement: null` with empty `directions` is "discoverable, unmeasured" — a
+// state, never a failure.
 export interface ContextCrosswalk {
   definition_id: string
   definition_revision_id: string
@@ -2292,6 +2326,10 @@ export interface ContextCrosswalk {
   mapping_to_target_refs: string[]
   mapping_temporal_policy_revision_id: string | null
   leg_pins: unknown[]
+  measurement?: ContextCrosswalkMeasurement | null
+  directions?: ContextCrosswalkDirection[]
+  admission_policy_version?: string | null
+  executable_now?: boolean
 }
 
 export interface ContextRelationship {

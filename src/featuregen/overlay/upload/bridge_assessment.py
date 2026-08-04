@@ -330,9 +330,13 @@ def resolve_and_record_endpoint_binding(
         conn,
         inventory,
         logical_table_ref=endpoint.logical_table_ref,
+        # NO bespoke `binding_id`. This path used to name its stream
+        # `identifier-endpoint:<env>:<ref>` while the selection path named the SAME table's stream
+        # `derived-<catalog>-<table>` — two binding streams for one physical table, so an
+        # observation recorded through one was invisible to a reader holding the other (Release C
+        # Task 11 scope 0; the argument is at `physical.derived_binding_id`). The resolver's shared
+        # default is now the one name.
         connection_id=connection_id,
-        binding_id=(
-            f"identifier-endpoint:{inventory.environment_id}:{endpoint.logical_table_ref}"),
         business_time_column=business_time_column,
         purposes=purposes,
     )

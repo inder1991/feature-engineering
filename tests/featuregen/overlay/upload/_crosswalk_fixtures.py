@@ -120,3 +120,93 @@ def definition(**over) -> CrosswalkDefinitionRevisionV1:
     )
     kwargs.update(over)
     return CrosswalkDefinitionRevisionV1(**kwargs)
+
+
+# ── Task 11: observation fixtures ───────────────────────────────────────────────────────────────
+#
+# Everything below is measurement-shaped and lives here for the same reason the catalog does: three
+# suites (store, measurement, admission) need one bank, and three hand-rolled copies is how two of
+# them end up asserting against two different banks and both passing.
+
+MAP_VALID_FROM = normalize_ref("cib", "public", MAP_TABLE, "valid_from")
+
+
+def binding(source: str, table: str, *, database: str = "edp_cluster",
+            schema: str = "dpl_eib", partition_columns: tuple[str, ...] = ()):
+    """One physical binding for a fixture table. Addresses only — nothing here opens a cursor."""
+    from featuregen.data_agent.physical import (
+        PhysicalDatasetBindingV1,
+        PhysicalObjectIdentityV1,
+    )
+
+    return PhysicalDatasetBindingV1(
+        binding_id=f"derived-{source}-{table}",
+        catalog_logical_ref=normalize_ref(source, schema, table),
+        connection_id="route-1",
+        identity=PhysicalObjectIdentityV1(
+            catalog_source=source, database=database, schema=schema, table=table,
+            object_kind="table"),
+        partition_columns=partition_columns,
+        business_time_column=partition_columns[0] if partition_columns else None)
+
+
+def record_bindings(db, *bindings) -> None:
+    from featuregen.data_agent.physical import record_binding_revision
+
+    for item in bindings:
+        record_binding_revision(db, item, recorded_by="task11-fixture")
+
+
+def leg(db=None, *, which: str, endpoint_binding, mapping_binding, endpoint_column: str,
+        mapping_column: str, as_of: str | None = "2026-08-04",
+        principal: str = "crosswalk-profiler", cross_catalog: bool = False,
+        v2_observation_revision_id: str | None = None,
+        realization_revision_id: str | None = None, complete: bool = True,
+        method: str = "exact", row_coverage=None, **counts):
+    """One measured leg with sane, internally-consistent default counts."""
+    from featuregen.data_agent.relationship_observation import RowCoverage
+    from featuregen.overlay.upload.crosswalk import JoinLegKind
+    from featuregen.overlay.upload.crosswalk_observation import CrosswalkLegObservationV1
+
+    defaults = dict(
+        endpoint_row_count=4, endpoint_non_null_row_count=4, endpoint_distinct_tuple_count=4,
+        endpoint_duplicate_tuple_count=0, endpoint_max_rows_per_tuple=1,
+        matched_endpoint_distinct=3, unmatched_endpoint_distinct=1, endpoint_orphan_rows=1,
+        joined_row_count=3, max_mapping_matches_per_endpoint_row=1,
+        max_endpoint_matches_per_mapping_row=1,
+        normalization_ids=("identity_v1",))
+    defaults.update(counts)
+    return CrosswalkLegObservationV1(
+        leg=which,
+        leg_kind=(JoinLegKind.CROSS_CATALOG if cross_catalog
+                  else JoinLegKind.SAME_CATALOG).value,
+        endpoint_dataset_ref=endpoint_binding.identity.table_id,
+        endpoint_binding_revision_id=endpoint_binding.binding_revision_id,
+        endpoint_columns=(endpoint_column,),
+        mapping_columns=(mapping_column,),
+        endpoint_source_snapshot_id="endpoint-snapshot-1",
+        mapping_source_snapshot_id="mapping-snapshot-1",
+        as_of=as_of,
+        execution_principal=principal,
+        method=method,
+        row_coverage=row_coverage or RowCoverage.FULL,
+        complete=complete,
+        v2_observation_revision_id=v2_observation_revision_id,
+        realization_revision_id=realization_revision_id,
+        **defaults)
+
+
+def mapping_observation(mapping_binding, **counts):
+    from featuregen.overlay.upload.crosswalk_observation import MappingTupleObservationV1
+
+    defaults = dict(
+        row_count=3, non_null_row_count=3, distinct_source_tuple_count=3,
+        distinct_target_tuple_count=3, distinct_pair_count=3,
+        duplicate_source_tuple_count=0, duplicate_target_tuple_count=0,
+        max_rows_per_source_tuple=1, max_rows_per_target_tuple=1)
+    defaults.update(counts)
+    return MappingTupleObservationV1(
+        physical_id=mapping_binding.identity.table_id,
+        binding_revision_id=mapping_binding.binding_revision_id,
+        binding_content_hash=mapping_binding.content_hash,
+        source_columns=("acct_no",), target_columns=("ext_acct_ref",), **defaults)

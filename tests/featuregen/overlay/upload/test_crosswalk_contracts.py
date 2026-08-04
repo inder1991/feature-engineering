@@ -335,9 +335,17 @@ def test_the_execution_shape_is_constructible_and_hash_stable() -> None:
     assert first.execution_tier is ExecutionTier.SANDBOX
 
 
-def test_the_execution_shape_has_no_producer_anywhere_in_the_tree() -> None:
-    """Task 10 builds the SHAPE only. If a producer or an admission path appears, this fails and the
-    task that added it owns declaring the gate — it does not arrive by accident."""
+def test_the_execution_shapes_producers_are_declared_and_there_is_still_no_executor() -> None:
+    """The tripwire Task 10 set, honoured by Task 11 rather than deleted by it.
+
+    Task 10 built the SHAPE with no producer, and asserted the file list so that whoever added one
+    would have to DECLARE it here instead of it arriving by accident. Task 11 added exactly one:
+    `crosswalk_admission.admitted_crosswalk_execution`, which turns a measured composition into a
+    pinned execution revision. The list below is that declaration.
+
+    What has NOT changed is the important half: no `materialize/**` file appears, so there is still
+    no compiler and no executor. Task 12 owns both, and this assertion is what will make it say so.
+    """
     import pathlib
     import subprocess
 
@@ -350,9 +358,11 @@ def test_the_execution_shape_has_no_producer_anywhere_in_the_tree() -> None:
         ["git", "grep", "-l", "--untracked", "CrosswalkExecutionRevisionV1", "--", "src", "tests"],
         cwd=root, capture_output=True, text=True).stdout.split()
     assert sorted(hits) == [
-        "src/featuregen/overlay/upload/crosswalk.py",
+        "src/featuregen/overlay/upload/crosswalk.py",            # the shape
+        "src/featuregen/overlay/upload/crosswalk_admission.py",  # its ONE producer (Task 11)
         "tests/featuregen/overlay/upload/test_crosswalk_contracts.py",
     ]
+    assert not [hit for hit in hits if hit.startswith("src/featuregen/materialize/")]
 
 
 def test_two_identical_legs_are_refused() -> None:
@@ -364,17 +374,60 @@ def test_two_identical_legs_are_refused() -> None:
 def test_deterministic_safety_cannot_be_claimed_without_a_composed_observation() -> None:
     with pytest.raises(CrosswalkContractError) as exc:
         _execution(safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
-                   leg_observation_revision_ids=("obs_1", "obs_2"))
+                   leg_measurement_ids=("clo_1", "clo_2"))
     assert exc.value.code == CROSSWALK_EXECUTION_SHAPE_INVALID
     with pytest.raises(CrosswalkContractError):
         _execution(safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
-                   leg_observation_revision_ids=("obs_1",),
+                   leg_measurement_ids=("clo_1",),
                    composition_observation_revision_id="obs_c")
     validated = _execution(
         safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
-        leg_observation_revision_ids=("obs_1", "obs_2"),
+        leg_measurement_ids=("clo_1", "clo_2"),
         composition_observation_revision_id="obs_c")
     assert validated.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
+
+
+def test_the_gate_keys_on_MEASUREMENTS_and_not_on_the_persisted_two_endpoint_rows() -> None:
+    """The field names have to mean what they say. `relationship_observation_revision` can only
+    hold a leg backed by a governed bridge realization (1038:7-8), so the ordinary crosswalk shape
+    — one same-catalog leg, one cross-catalog leg — has exactly ONE persisted row. A gate demanding
+    two of those would be unsatisfiable without fabricating a realization; a gate that accepted
+    measurement hashes UNDER that name (the first draft) was satisfiable with values no table
+    holds. Two fields, and the gate on the one that always exists."""
+    with pytest.raises(CrosswalkContractError) as exc:
+        _execution(safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
+                   leg_observation_revision_ids=("rob_1", "rob_2"),
+                   composition_observation_revision_id="obs_c")
+    assert exc.value.code == CROSSWALK_EXECUTION_SHAPE_INVALID
+    assert "leg_measurement_ids" in str(exc.value)
+
+    # …and the honest shape: two measurements, ONE persisted row, deterministic validation.
+    validated = _execution(
+        safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED,
+        leg_measurement_ids=("clo_1", "clo_2"),
+        leg_observation_revision_ids=("rob_1",),
+        composition_observation_revision_id="obs_c")
+    assert validated.leg_measurement_ids == ("clo_1", "clo_2")
+    assert validated.leg_observation_revision_ids == ("rob_1",)
+
+
+def test_the_two_evidence_fields_are_separately_identity_bearing() -> None:
+    """Both are in the hash, and neither can stand in for the other: a revision that swapped which
+    list an id sat in would be a different execution revision, not the same one described twice."""
+    measured = _execution(leg_measurement_ids=("clo_1", "clo_2"))
+    persisted = _execution(leg_observation_revision_ids=("clo_1", "clo_2"))
+    plain = _execution()
+    assert len({measured.execution_revision_id, persisted.execution_revision_id,
+                plain.execution_revision_id}) == 3
+
+
+def test_a_crosswalk_has_two_legs_so_neither_evidence_list_may_name_more() -> None:
+    for field_name in ("leg_measurement_ids", "leg_observation_revision_ids"):
+        with pytest.raises(CrosswalkContractError) as exc:
+            _execution(**{field_name: ("a", "b", "c")})
+        assert exc.value.code == CROSSWALK_EXECUTION_SHAPE_INVALID
+        with pytest.raises(CrosswalkContractError):
+            _execution(**{field_name: ("a", "a")})
 
 
 def test_a_same_catalog_leg_may_not_pretend_to_be_an_entity_bridge() -> None:
