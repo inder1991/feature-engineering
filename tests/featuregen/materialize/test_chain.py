@@ -1206,5 +1206,10 @@ def test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identit
     production = _run(catalog, _request(catalog), work_items, tmp_path / "a")
     sandbox = _run(catalog, _request(catalog, request_id="req-0002"), work_items, tmp_path / "b",
                    execution_tier=ExecutionTier.SANDBOX)
+    # Both hashes are `str | None` — `None` for a run that stopped before RENDER. Asserting they
+    # EXIST before asserting they agree is what keeps this from degrading into `None == None` if a
+    # later change makes both runs stop early: this is the repo's only structural guard on §3.4.
+    assert production.generated_project_hash is not None
+    assert production.materialization_contract_hash is not None
     assert production.generated_project_hash == sandbox.generated_project_hash
     assert production.materialization_contract_hash == sandbox.materialization_contract_hash
