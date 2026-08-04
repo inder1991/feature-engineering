@@ -3,9 +3,9 @@
 // The connection itself (URL, token, scope) is configured upstream in Integrations, so this path
 // is now just a sync picker. The gates strip at the top names who holds each step of the sync
 // path only — the file path's single-shot flow is untouched and needs no strip.
-import { useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { CSSProperties, DragEvent, FormEvent, KeyboardEvent } from 'react'
-import { ApiError, listCatalogs, uploadFile } from '../api'
+import { ApiError, getCatalogProfile, listCatalogs, uploadFile } from '../api'
 import type { IngestResult } from '../api'
 import { ConnectorPanel } from './ConnectorPanel'
 import type { ConnectorStage } from './ConnectorPanel'
@@ -213,6 +213,10 @@ function serializeNarrative(draft: NarrativeDraft): string | undefined {
   return Object.keys(payload).length === 0 ? undefined : JSON.stringify(payload)
 }
 
+// How long after the last keystroke in the source box the catalog is looked up. One lookup per
+// name, not one per letter.
+const NARRATIVE_PREFILL_DEBOUNCE_MS = 300
+
 // The server's bounds, mirrored: MAX_* in overlay/upload/catalog_profiles.py plus the 64 KiB part
 // bound in api/routes/uploads.py. Client-side PRE-FLIGHT only — the server stays the authority
 // (same discipline as the 25 MiB file check above) — and it must not refuse what the server would
@@ -290,10 +294,12 @@ function FieldBound({
 }
 
 function CatalogNarrativeFields({
+  source,
   value,
   onChange,
   problems,
 }: {
+  source: string
   value: NarrativeDraft
   onChange: (next: NarrativeDraft) => void
   problems: NarrativeProblems
@@ -302,6 +308,61 @@ function CatalogNarrativeFields({
   const [domainInput, setDomainInput] = useState('')
   const [suggestions, setSuggestions] = useState<string[]>([])
   const suggestionsLoaded = useRef(false)
+  // The catalog's CURRENT words, when the typed source names one that already exists. Kept beside
+  // the draft (never merged into it) so "did this person change anything?" stays answerable.
+  const [current, setCurrent] = useState<NarrativeDraft | null>(null)
+  // Set by any edit the AUTHOR makes. A ref, not state: it must not re-run the lookup, and it is
+  // read inside an async callback that would otherwise close over a stale value.
+  const authored = useRef(false)
+
+  // RE-UPLOAD PREFILL. Uploading again into a catalog someone has already described should show
+  // what it says, not an empty form the author has to retype from memory. Debounced on the source
+  // name, and it NEVER writes over words this person has already typed — the CatalogNarrativePanel
+  // 409 discipline: a reload may refresh what the server says, never the draft only they have.
+  useEffect(() => {
+    const src = source.trim()
+    if (!src) {
+      setCurrent(null)
+      return
+    }
+    let cancelled = false
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const got = await getCatalogProfile(src)
+          if (cancelled) return
+          const described: NarrativeDraft = {
+            displayName: got.profile?.display_name ?? '',
+            description: got.profile?.description ?? '',
+            businessContext: got.profile?.business_context ?? '',
+            businessDomains: got.profile?.business_domains ?? [],
+          }
+          // An undescribed catalog has nothing to prefill — and nothing to call unchanged.
+          if (serializeNarrative(described) === undefined) {
+            setCurrent(null)
+            return
+          }
+          setCurrent(described)
+          if (!authored.current) onChange(described)
+        } catch {
+          // SILENT. The narrative routes 404 while FEATUREGEN_DATASET_PROFILES is off, and 404 for
+          // a catalog this caller cannot see; neither is a problem the uploader caused or can fix,
+          // and neither is a reason to put error styling on an optional section. Degrade to the
+          // empty form, which is exactly what a first upload sees.
+          if (!cancelled) setCurrent(null)
+        }
+      })()
+    }, NARRATIVE_PREFILL_DEBOUNCE_MS)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [source, onChange])
+
+  // Truthful, not decorative: the profile store keys a revision by a content hash over these exact
+  // values, so re-authoring the same words resolves to the SAME revision id and no new version is
+  // written. Comparing the serialized parts is comparing precisely what would be sent.
+  const unchanged = current !== null && serializeNarrative(value) === serializeNarrative(current)
 
   // Suggested domain chips are the catalogs this caller can ALREADY see — the only vocabulary this
   // system can honestly offer (there is no domain taxonomy anywhere in it). Loaded lazily on first
@@ -324,6 +385,7 @@ function CatalogNarrativeFields({
   }
 
   function edit(next: Partial<NarrativeDraft>) {
+    authored.current = true
     onChange({ ...value, ...next })
   }
 
@@ -367,6 +429,11 @@ function CatalogNarrativeFields({
           Shown as the catalog&#39;s name and description; used by search and by the AI when it
           interprets tables.
         </p>
+        {unchanged && (
+          <p className="hint" style={{ margin: 0 }} data-testid="narrative-unchanged">
+            These are this catalog&#39;s current words, unchanged — nothing will be re-versioned.
+          </p>
+        )}
         <div className="field">
           {/* "Name", not "display name": same label as the post-upload editor. No label in here
               may contain the substring "file" — getByLabelText(/file/i) must keep matching only
@@ -645,6 +712,7 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
             )}
           </div>
           <CatalogNarrativeFields
+            source={source}
             value={narrative}
             onChange={setNarrative}
             problems={problems}

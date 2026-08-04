@@ -15,6 +15,7 @@ vi.mock('../api', async importOriginal => {
     importSync: vi.fn(),
     getIngestionRun: vi.fn(),
     listCatalogs: vi.fn(),
+    getCatalogProfile: vi.fn(),
   }
 })
 const uploadFile = vi.mocked(api.uploadFile)
@@ -24,6 +25,7 @@ const previewSync = vi.mocked(api.previewSync)
 const importSync = vi.mocked(api.importSync)
 const getIngestionRun = vi.mocked(api.getIngestionRun)
 const listCatalogs = vi.mocked(api.listCatalogs)
+const getCatalogProfile = vi.mocked(api.getCatalogProfile)
 
 // Block body (not `() => uploadFile.mockReset()`): mockReset() returns the mock fn, and Vitest
 // treats a function returned from beforeEach as a per-test teardown — it would then call the mock
@@ -36,9 +38,14 @@ beforeEach(() => {
   importSync.mockReset()
   getIngestionRun.mockReset()
   listCatalogs.mockReset()
+  getCatalogProfile.mockReset()
   listIntegrations.mockResolvedValue([])
   listSyncs.mockResolvedValue([])
   listCatalogs.mockResolvedValue({ catalogs: [] })
+  // The default is the flag-off / unknown-catalog answer: the narrative routes 404 while
+  // FEATUREGEN_DATASET_PROFILES is off, and 404 for a catalog the caller cannot see. Every test
+  // that is not ABOUT the prefill therefore runs against a screen that found nothing to prefill.
+  getCatalogProfile.mockRejectedValue(new api.ApiError(404, 'Not Found'))
 })
 
 const result = (over: Partial<api.IngestResult>): api.IngestResult => ({
@@ -401,6 +408,133 @@ describe('catalog narrative section', () => {
     await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
     await submit()
     expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
+  })
+})
+
+// ---------------------------------------------------------------- re-upload prefill
+
+const DESCRIBED: api.CatalogProfile = {
+  source: 'ftr',
+  pointer_version: 3,
+  profile: {
+    catalog_source: 'ftr',
+    display_name: 'FTR compliance glossary',
+    description: 'Financial transaction reporting terms.',
+    business_context: 'Owned by financial crime operations.',
+    business_domains: ['Compliance'],
+    producer: 'human',
+    strength: 'confirmed',
+    lifecycle: 'active',
+    producer_ref: 'user:priya',
+    ingestion_run_id: null,
+    content_hash: 'a'.repeat(64),
+    revision_id: `cpr_${'a'.repeat(64)}`,
+  },
+}
+
+describe('re-uploading into a catalog somebody has already described', () => {
+  it('prefills the current narrative, and says so without claiming a change', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+
+    expect(await screen.findByDisplayValue('FTR compliance glossary')).toBeInTheDocument()
+    expect(screen.getByLabelText('Description'))
+      .toHaveValue('Financial transaction reporting terms.')
+    expect(screen.getByLabelText('Business context'))
+      .toHaveValue('Owned by financial crime operations.')
+    expect(screen.getByRole('button', { name: 'Remove domain Compliance' })).toBeInTheDocument()
+    // TRUTHFUL: the store keys a revision by a content hash over these values, so re-sending the
+    // identical words resolves to the same revision id and writes no new version.
+    expect(screen.getByTestId('narrative-unchanged'))
+      .toHaveTextContent(/unchanged — nothing will be re-versioned/i)
+  })
+
+  it('drops the unchanged note the moment a single word changes', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+
+    await userEvent.type(screen.getByLabelText('Description'), ' Updated.')
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+  })
+
+  it('is debounced: one lookup for a typed name, not one per keystroke', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalled())
+    expect(getCatalogProfile).toHaveBeenCalledExactlyOnceWith('ftr')
+  })
+
+  it('never writes over words the author has already typed', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText('Description'), 'My own words.')
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('ftr'))
+
+    // The draft only this person has survives the lookup — the CatalogNarrativePanel 409 rule.
+    expect(screen.getByLabelText('Description')).toHaveValue('My own words.')
+    expect(screen.getByLabelText('Name')).toHaveValue('')
+    // …and nothing claims their words are the catalog's current ones.
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+  })
+
+  it('degrades silently to an empty form when the narrative cannot be read', async () => {
+    // 404 while the profiles flag is off, 404 for a catalog outside this caller's scope, 500 for a
+    // broken read: none is the uploader's fault, and none may put error styling on an optional
+    // section (the no-blocked rule).
+    getCatalogProfile.mockRejectedValue(new api.ApiError(500, 'boom'))
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('ftr'))
+
+    expect(screen.getByLabelText('Name')).toHaveValue('')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+    // The upload is exactly as available as it is on a first upload of a brand-new catalog.
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'ftr', undefined)
+  })
+
+  it('treats an existing-but-undescribed catalog as nothing to prefill', async () => {
+    getCatalogProfile.mockResolvedValue({ source: 'ftr', pointer_version: 0, profile: null })
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('ftr'))
+    expect(screen.getByLabelText('Name')).toHaveValue('')
+    // An empty form is not "unchanged": there is nothing there to be unchanged from.
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+  })
+
+  it('sends the prefilled narrative back unchanged rather than dropping it', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+    expect(JSON.parse(sentPart() as string)).toEqual({
+      display_name: 'FTR compliance glossary',
+      description: 'Financial transaction reporting terms.',
+      business_context: 'Owned by financial crime operations.',
+      business_domains: ['Compliance'],
+    })
   })
 })
 
