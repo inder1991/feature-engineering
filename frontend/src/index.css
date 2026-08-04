@@ -4741,3 +4741,86 @@ button.stat:hover {
   display: grid;
   gap: 4px;
 }
+
+/* ── Data-use policies (D14) — the PII allow-policy panel on the governance review screen ──────
+   Quiet by construction. Every tone here is INK, not alarm: a concept nobody has decided about is
+   an ordinary row, and only a WITHDRAWN approval gets a warn tone — because that one records a
+   decision somebody made, and a reviewer should be able to find it. "Not approved for feature use"
+   must never look like a failure, so it carries no colour at all. */
+.dup-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.dup-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.dup-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.dup-concept {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.dup-state {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.dup-state[data-status='active'] {
+  color: var(--ok, var(--ink));
+}
+
+.dup-state[data-status='revoked'] {
+  color: var(--warn, var(--ink));
+}
+
+.dup-desc {
+  margin: 0;
+}
+
+.dup-detail {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.dup-detail dt {
+  font-weight: 600;
+  color: var(--ink-faint);
+}
+
+.dup-detail dd {
+  margin: 0;
+}
+
+.dup-form {
+  display: grid;
+  gap: 6px;
+}
+
+.dup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.dup-confirm {
+  margin: 4px 0 0;
+}
