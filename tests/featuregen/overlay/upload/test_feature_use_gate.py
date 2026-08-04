@@ -43,6 +43,7 @@ from featuregen.overlay.upload.concepts import (
 from featuregen.overlay.upload.feature_assist import (
     FEATURE_REFUSAL_FAMILIES,
     RejectCode,
+    _mixes_currency_values,
     _validate_idea,
     feature_use_gate_enabled,
     refusal_family,
@@ -299,6 +300,78 @@ def test_a_declared_currency_on_the_column_clears_it(db):
 
     idea, rej = _validate(db, [amount], aggregation="sum")
     assert rej is None and idea is not None
+
+
+@pytest.mark.parametrize("aggregation", ["count", "count_distinct", "distinct_count"])
+def test_COUNTING_an_amount_is_currency_agnostic_and_is_not_refused(db, aggregation):
+    """How many is the same number in dollars and in fils. The refusal says "the result would
+    silently mix currencies", which is simply false about a count, and it hands the reviewer a
+    setup task that could not change their answer."""
+    amount = _col(db, "txn", "amt", concept="monetary_flow")
+    _currency = _col(db, "txn", "crncy", concept="currency_code", data_type="text")
+
+    idea, rej = _validate(db, [amount], aggregation=aggregation)
+    assert rej is None and idea is not None, f"{aggregation}: {rej and rej.message}"
+
+
+@pytest.mark.parametrize("aggregation", ["sum", "avg", "max", "min", "latest", "sum_90d",
+                                         "mean", "median", "not_a_known_operation"])
+def test_every_VALUE_returning_aggregation_stays_gated(db, aggregation):
+    """The other polarity, including the two adjudications that are not obvious.
+
+    `max` / `min` / `latest` PICK rather than combine — and they still hand back a number
+    denominated in something the caller was never told, so the wrong-number problem moves one row
+    along rather than disappearing. And an UNRECOGNISED aggregation is gated: it is free text from a
+    model, so the exemption has to be EARNED by matching a counting word, never granted by failing
+    to match a value-mixing one.
+    """
+    amount = _col(db, "txn", "amt", concept="monetary_flow")
+    currency = _col(db, "txn", "crncy", concept="currency_code", data_type="text")
+
+    _idea, rej = _validate(db, [amount], aggregation=aggregation)
+    assert rej is not None and rej.code == RejectCode.CURRENCY_POLICY_REQUIRED, aggregation
+    assert currency in rej.message
+
+
+@pytest.mark.parametrize("aggregation", ["count_90d", "COUNT_DISTINCT_30d", "count 12 months"])
+def test_a_WINDOWED_count_is_still_a_count_for_this_class(db, aggregation):
+    """A window narrows WHICH rows are counted and never makes counting currency-sensitive, so a
+    trailing window is stripped before the operation is recognised.
+
+    Asserted as "not THIS refusal" rather than "accepted", because a windowed aggregation trips the
+    pre-existing point-in-time gate on a table with no as-of column — a different gate, correctly
+    firing, that this slice did not touch and must not be credited with.
+    """
+    amount = _col(db, "txn", "amt", concept="monetary_flow")
+    _currency = _col(db, "txn", "crncy", concept="currency_code", data_type="text")
+
+    _idea, rej = _validate(db, [amount], aggregation=aggregation)
+    assert rej is None or rej.code != RejectCode.CURRENCY_POLICY_REQUIRED, aggregation
+
+
+def test_the_counting_predicate_reads_the_operation_and_fails_closed_on_the_unknown(db):
+    """The exemption as a unit, so the window forms and the fail-closed default are stated where
+    the point-in-time gate cannot obscure them."""
+    for counting in ("count", "count_distinct", "COUNT", "count_90d", "count_distinct_30d",
+                     "distinct_count", "count 12 months"):
+        assert not _mixes_currency_values(counting), counting
+    for mixing in ("sum", "avg", "max", "min", "latest", "sum_90d", "median", "amount",
+                   "count_ratio", "discount_avg", "", None, "who_knows"):
+        assert _mixes_currency_values(mixing), mixing
+
+
+def test_the_counting_exemption_does_not_leak_into_the_other_three_classes(db):
+    """A count is currency-agnostic; it is not PII-agnostic, protected-characteristic-agnostic or
+    prose-agnostic. Counting distinct citizenships is exactly as unusable as averaging them."""
+    protected = _col(db, "cust", "ctzn_ctry_cd", concept="protected_attribute", data_type="text")
+    dob = _col(db, "cust", "dob", concept="pii", data_type="date")
+    label = _col(db, "txn", "sol_desc", concept="branch_name", data_type="text")
+
+    for ref, code in ((protected, RejectCode.PROTECTED_CHARACTERISTIC),
+                      (dob, RejectCode.PERSONAL_DATA_POLICY_REQUIRED),
+                      (label, RejectCode.DESCRIPTIVE_OPERAND)):
+        _idea, rej = _validate(db, [ref], aggregation="count_distinct")
+        assert rej is not None and rej.code == code, ref
 
 
 def test_an_amount_on_a_table_with_NO_currency_column_is_left_to_the_existing_machinery(db):

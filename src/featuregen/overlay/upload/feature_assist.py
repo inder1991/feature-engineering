@@ -919,9 +919,38 @@ _NUMERIC_OP_WORDS = ("sum", "total", "avg", "average", "mean", "ratio", "rate", 
                      "percent", "pct", "std", "variance", "median")
 
 
+#: Aggregations that COUNT ROWS and never touch the amounts themselves. Mirrors
+#: `analysis.grounding._COUNTING_OPS`, which draws the same line for the same reason.
+_COUNTING_OPS = frozenset({"count", "count_distinct", "distinct_count"})
+
+
 def _needs_numeric(aggregation: str | None) -> bool:
     a = (aggregation or "").lower()
     return any(w in a for w in _NUMERIC_OP_WORDS)
+
+
+def _mixes_currency_values(aggregation: str | None) -> bool:
+    """Would this aggregation COMBINE OR RETURN the amounts themselves — the only case in which a
+    missing denomination can produce a wrong number?
+
+    `count(amount)` and `count_distinct(amount)` answer "how many", and how many is the same number
+    in dollars and in fils: no currency policy could change the result, so demanding one would be a
+    refusal with nothing behind it — and a refusal a reviewer cannot act on teaches them to ignore
+    the whole class. Everything else stays gated. Two adjudications are worth stating because they
+    are not obvious:
+
+    * `latest` / `max` / `min` are GATED. They pick rather than combine, but they hand back a value
+      that IS denominated in something the caller was never told, so the wrong-number problem simply
+      moves one row along.
+    * an UNRECOGNISED aggregation is GATED. The aggregation is free text from a model, so failing
+      closed on the unknown is the only safe direction: the exemption has to be EARNED by matching a
+      counting word, never granted by failing to match a value-mixing one.
+
+    A trailing window is stripped first (`count_90d`, `count_distinct 30 days`), because a window
+    narrows WHICH rows are counted and never makes counting currency-sensitive.
+    """
+    stem = _WINDOW_RE.sub(" ", (aggregation or "").strip().lower())
+    return re.sub(r"[^a-z]+", "_", stem).strip("_") not in _COUNTING_OPS
 
 
 def _window_of(aggregation: str | None) -> str | None:
@@ -1040,8 +1069,8 @@ def _denomination_siblings(conn, tables: set[tuple[str, str]]) -> dict[tuple[str
     return {(src, table): ref for src, table, ref in rows}
 
 
-def _use_gate(conn, pairs: list[tuple[str, str]],
-              meta: dict[str, dict]) -> Rejection | None:
+def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
+              aggregation: str | None = None) -> Rejection | None:
     """May a feature be BUILT from these operands? Four refusals, or None.
 
     THE FINDING THIS CLOSES (Release-A evaluation, 2026-08-03). ``sensitivity`` controls who may SEE
@@ -1069,6 +1098,9 @@ def _use_gate(conn, pairs: list[tuple[str, str]],
     ORDER. Structurally-unsuitable classes first, then the ones a policy could license, then
     operands in the order the model proposed them. Deterministic, and it means a candidate that is
     both PII and a protected characteristic reports the refusal no policy can ever lift.
+
+    ``aggregation`` is read by exactly ONE class (currency): whether the operation combines or
+    returns the amounts decides whether a missing denomination can produce a wrong number at all.
     """
     if not feature_use_gate_enabled():
         return None
@@ -1116,13 +1148,23 @@ def _use_gate(conn, pairs: list[tuple[str, str]],
                 f"can be built")
 
     # ── class 3 — a currency-carrying amount whose denomination is neither declared on the column
-    #    nor bound as an operand, while the currency column sits on the SAME table. needs_setup:
-    #    the fix is a decision (bind the dimension, or declare a conversion policy), and the
-    #    refusal names the exact column that supplies it. ──
+    #    nor bound as an operand, while the currency column sits on the SAME table, AND the
+    #    aggregation actually combines or returns the amounts. needs_setup: the fix is a decision
+    #    (bind the dimension, or declare a conversion policy), and the refusal names the exact
+    #    column that supplies it.
+    #
+    #    THE COUNTING EXEMPTION. `count` / `count_distinct` over an amount are currency-agnostic —
+    #    how many is the same number in dollars and in fils — so "the result would silently mix
+    #    currencies" is simply FALSE about them, and the reviewer is handed a setup task that could
+    #    not change their answer. `latest` / `max` / `min` stay gated: they return a denominated
+    #    value, and so does the problem. See :func:`_mixes_currency_values`, which fails closed on
+    #    an aggregation it does not recognise. ──
     bound = {ref for _src, ref in pairs}
-    amounts = [(src, ref) for src, ref in pairs
-               if carries_currency(meta.get(ref, {}).get("concept"))
-               and not meta.get(ref, {}).get("currency")]
+    amounts: list[tuple[str, str]] = []
+    if _mixes_currency_values(aggregation):
+        amounts = [(src, ref) for src, ref in pairs
+                   if carries_currency(meta.get(ref, {}).get("concept"))
+                   and not meta.get(ref, {}).get("currency")]
     if amounts:
         siblings = _denomination_siblings(
             conn, {(src, meta[ref]["table_name"]) for src, ref in amounts
@@ -1183,7 +1225,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    freshness — a leaky or stale candidate is refused for the reason it has always been
     #    refused, so no existing rejection changes code — and BEFORE any requirement is minted,
     #    because a refused feature must never reach the tri-state at all. ──
-    use_rejection = _use_gate(conn, pairs, meta)
+    use_rejection = _use_gate(conn, pairs, meta, raw.get("aggregation"))
     if use_rejection is not None:
         return None, use_rejection
 
