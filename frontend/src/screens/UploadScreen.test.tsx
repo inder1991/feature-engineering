@@ -14,6 +14,8 @@ vi.mock('../api', async importOriginal => {
     previewSync: vi.fn(),
     importSync: vi.fn(),
     getIngestionRun: vi.fn(),
+    listCatalogs: vi.fn(),
+    getCatalogProfile: vi.fn(),
   }
 })
 const uploadFile = vi.mocked(api.uploadFile)
@@ -22,6 +24,8 @@ const listSyncs = vi.mocked(api.listSyncs)
 const previewSync = vi.mocked(api.previewSync)
 const importSync = vi.mocked(api.importSync)
 const getIngestionRun = vi.mocked(api.getIngestionRun)
+const listCatalogs = vi.mocked(api.listCatalogs)
+const getCatalogProfile = vi.mocked(api.getCatalogProfile)
 
 // Block body (not `() => uploadFile.mockReset()`): mockReset() returns the mock fn, and Vitest
 // treats a function returned from beforeEach as a per-test teardown — it would then call the mock
@@ -33,8 +37,15 @@ beforeEach(() => {
   previewSync.mockReset()
   importSync.mockReset()
   getIngestionRun.mockReset()
+  listCatalogs.mockReset()
+  getCatalogProfile.mockReset()
   listIntegrations.mockResolvedValue([])
   listSyncs.mockResolvedValue([])
+  listCatalogs.mockResolvedValue({ catalogs: [] })
+  // The default is the flag-off / unknown-catalog answer: the narrative routes 404 while
+  // FEATUREGEN_DATASET_PROFILES is off, and 404 for a catalog the caller cannot see. Every test
+  // that is not ABOUT the prefill therefore runs against a screen that found nothing to prefill.
+  getCatalogProfile.mockRejectedValue(new api.ApiError(404, 'Not Found'))
 })
 
 const result = (over: Partial<api.IngestResult>): api.IngestResult => ({
@@ -130,22 +141,6 @@ describe('upload screen', () => {
     expect(onReviewQueue).toHaveBeenCalledWith('deposits')
   })
 
-  it('attaches the optional catalog narrative JSON to the upload, and omits it when blank', async () => {
-    uploadFile.mockResolvedValue(result({ asserted: 4 }))
-    renderUpload()
-    // Blank attach: uploadFile is called WITHOUT a profile part (a missing profile never blocks).
-    await submit()
-    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
-
-    // `{`/`}` are userEvent key-descriptor syntax, so paste the literal JSON instead of typing.
-    const json = '{"display_name": "Deposits"}'
-    const area = screen.getByLabelText(/catalog narrative json/i)
-    await userEvent.click(area)
-    await userEvent.paste(json)
-    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
-    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', json)
-  })
-
   it('rejects a dropped file with an unsupported extension before any request', async () => {
     renderUpload()
     const dropZone = screen.getByLabelText(/file/i).closest('label')
@@ -212,6 +207,496 @@ describe('upload screen', () => {
     expect(panel).toHaveTextContent('FACT_ASSERTION_ERROR')
     await userEvent.click(screen.getByRole('button', { name: 'Hide run details' }))
     expect(screen.queryByRole('region', { name: /ingestion run details/i })).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------- the catalog narrative section
+
+// The narrative used to be a raw-JSON textarea. It is now structured fields, and the ONE thing
+// that must not have changed is the wire: the multipart `catalog_profile_json` part the server
+// parses (overlay/upload/catalog_profiles.parse_narrative_payload).
+
+async function openNarrative() {
+  await userEvent.click(screen.getByText('Describe this catalog (recommended)'))
+}
+
+// The part `uploadFile` was last called with — the third argument, exactly as it goes on the wire.
+function sentPart(): string | undefined {
+  return uploadFile.mock.calls.at(-1)?.[2]
+}
+
+describe('catalog narrative section', () => {
+  it('is closed by default, is framed as recommended, and never gates the upload button', async () => {
+    renderUpload()
+    const summary = screen.getByText('Describe this catalog (recommended)')
+    expect(summary.closest('details')).not.toHaveAttribute('open')
+    // Nothing is fetched for a section nobody opened.
+    expect(listCatalogs).not.toHaveBeenCalled()
+
+    await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+    await openNarrative()
+    // Opening it — and leaving it untouched — changes nothing about the upload.
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+    expect(screen.getByText(/shown as the catalog's name and description/i)).toBeInTheDocument()
+    expect(listCatalogs).toHaveBeenCalledTimes(1)
+  })
+
+  it('serializes the fields to the SAME part the raw-JSON textarea used to send', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText('Name'), 'Funds transfers')
+    await userEvent.type(screen.getByLabelText('Description'), 'Outbound payments.')
+    await userEvent.type(
+      screen.getByLabelText('Business context'), 'Core banking; Compliance-owned.')
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+
+    // SERIALIZATION EQUIVALENCE. `legacy` is what a person hand-wrote into the old textarea for
+    // this same content and what the old screen posted verbatim. The comparison is on the parsed
+    // objects because JSON.stringify emits no whitespace: the server json.loads() the part, so
+    // equal parses are the same request — same keys, same values, same types, nothing extra.
+    const legacy = '{"display_name": "Funds transfers", "description": "Outbound payments.", '
+      + '"business_context": "Core banking; Compliance-owned.", "business_domains": ["Payments"]}'
+    expect(JSON.parse(sentPart() as string)).toEqual(JSON.parse(legacy))
+  })
+
+  it('omits the part entirely when every field is empty — absence stays absence', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    // Whitespace is not authorship: a present-but-empty `{}` part would make the server write a
+    // narrative revision made of nothing, so it must never be sent.
+    await userEvent.type(screen.getByLabelText('Name'), '   ')
+    await submit()
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
+  })
+
+  it('adds typed and suggested domains as chips, and removes them', async () => {
+    listCatalogs.mockResolvedValue({ catalogs: [
+      { source: 'cust', tables: 2, columns: 9, display_name: 'Customer', has_profile: true },
+      { source: 'compliance', tables: 1, columns: 4, display_name: null, has_profile: false },
+    ] })
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+
+    // Suggestions are the catalogs this caller can already see: a described one by its name, an
+    // undescribed one by its upper-cased slug (there is no per-catalog label to invent).
+    await screen.findByRole('button', { name: 'Add domain Customer' })
+    await userEvent.click(screen.getByRole('button', { name: 'Add domain COMPLIANCE' }))
+    // A chosen suggestion stops being offered, and is now a removable chip.
+    expect(screen.queryByRole('button', { name: 'Add domain COMPLIANCE' })).toBeNull()
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+    expect(JSON.parse(sentPart() as string))
+      .toEqual({ business_domains: ['COMPLIANCE', 'Payments'] })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Remove domain COMPLIANCE' }))
+    expect(screen.getByRole('button', { name: 'Add domain COMPLIANCE' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
+  })
+
+  it('keeps text typed into the domain box that was never Entered', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    // No Enter: the box is blurred by moving on to the rest of the form. Dropping it silently
+    // would lose a domain the author watched themselves type.
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments')
+    await submit()
+    expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
+  })
+
+  it('counts characters against the server bound and refuses the upload once over it', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await openNarrative()
+
+    const name = screen.getByLabelText('Name')
+    // Paste, not type: 201 keystrokes is 201 renders.
+    await userEvent.click(name)
+    await userEvent.paste('n'.repeat(200))
+    expect(screen.getByText('200 / 200')).toBeInTheDocument()
+    // Exactly AT the bound is fine — a mirror that refuses what the server takes is worse than
+    // no mirror at all.
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+    await userEvent.paste('n')
+    // The server's own wording, so the text a person fixes is the text the 400 would have carried.
+    expect(screen.getByText('display_name exceeds the 200-character bound')).toBeInTheDocument()
+    expect(name).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeDisabled()
+    expect(screen.getByText(/shorten the catalog description above/i)).toBeInTheDocument()
+    expect(uploadFile).not.toHaveBeenCalled()
+
+    // Back under the bound: nothing is left blocked.
+    await userEvent.clear(name)
+    await userEvent.paste('Deposits')
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toEqual({ display_name: 'Deposits' })
+  })
+
+  it('blocks on the 64 KiB whole-part bound while every field is under its own', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await openNarrative()
+
+    // Text pasted out of a mainframe extract, field separators and all. U+0001 is one character to
+    // both bounds checks, but JSON escapes it to the six ASCII bytes \u0001 — so 4000 + 4000
+    // IN-BOUND characters already serialize to ~48 KiB, and a dozen domains carry it over 64 KiB.
+    // No per-field counter can see this; only the whole-part check can.
+    const SEP = '\u0001'
+    await userEvent.click(screen.getByLabelText('Description'))
+    await userEvent.paste(SEP.repeat(4000))
+    await userEvent.click(screen.getByLabelText('Business context'))
+    await userEvent.paste(SEP.repeat(4000))
+    const overBound = () => screen.queryByText('catalog_profile_json exceeds the 64 KiB bound')
+    const domains = screen.getByLabelText('Business domains')
+    // Up to the 32-item bound, so this loop can never run away — and stops the moment the whole
+    // part crosses, which is the thing being asserted.
+    for (let i = 0; i < 32 && !overBound(); i++) {
+      await userEvent.click(domains)
+      await userEvent.paste(`${i}${SEP.repeat(199)}`)
+      await userEvent.keyboard('{Enter}')
+    }
+    expect(overBound()).toBeInTheDocument()
+    // Every individual field is still inside its own bound: this is the only failing check.
+    expect(screen.queryByText(/exceeds the 4000-character bound/)).toBeNull()
+    expect(screen.queryByText(/exceeds the 32-item bound/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeDisabled()
+    expect(uploadFile).not.toHaveBeenCalled()
+  })
+
+  it('counts CODE POINTS, as the server does, not UTF-16 units', async () => {
+    renderUpload()
+    await openNarrative()
+    // 2000 astral characters are 4000 UTF-16 units but 2000 characters to Python's len() — the
+    // naive .length mirror would refuse here what the server accepts.
+    await userEvent.click(screen.getByLabelText('Description'))
+    await userEvent.paste('\u{1F3E6}'.repeat(2000))
+    expect(screen.getByText('2000 / 4000')).toBeInTheDocument()
+    expect(screen.queryByText(/exceeds the 4000-character bound/)).toBeNull()
+  })
+
+  it('survives a FAILED file upload, so the retry keeps the typing', async () => {
+    uploadFile.mockRejectedValue(new api.ApiError(400, 'unsupported file type'))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText('Name'), 'Funds transfers')
+    await userEvent.type(
+      screen.getByLabelText('Business context'), 'Core banking; Compliance-owned.')
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+    expect(await screen.findByRole('alert')).toHaveTextContent(/upload failed/i)
+
+    // The file is what failed. The paragraph about the catalog — which only this person could
+    // write, and only they have — is still there.
+    expect(screen.getByLabelText('Name')).toHaveValue('Funds transfers')
+    expect(screen.getByLabelText('Business context'))
+      .toHaveValue('Core banking; Compliance-owned.')
+    expect(screen.getByRole('button', { name: 'Remove domain Payments' })).toBeInTheDocument()
+
+    // …and the retry carries it, unchanged and unretyped.
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toEqual({
+      display_name: 'Funds transfers',
+      business_context: 'Core banking; Compliance-owned.',
+      business_domains: ['Payments'],
+    })
+  })
+
+  it('an EMPTY section never blocks, however the bounds are set', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await submit()
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
+  })
+
+  it('a suggestion list that cannot be read leaves free-text entry working, with no error', async () => {
+    listCatalogs.mockRejectedValue(new api.ApiError(500, 'boom'))
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    expect(screen.queryByRole('alert')).toBeNull()
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+    expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
+  })
+})
+
+// ---------------------------------------------------------------- re-upload prefill
+
+const DESCRIBED: api.CatalogProfile = {
+  source: 'ftr',
+  pointer_version: 3,
+  profile: {
+    catalog_source: 'ftr',
+    display_name: 'FTR compliance glossary',
+    description: 'Financial transaction reporting terms.',
+    business_context: 'Owned by financial crime operations.',
+    business_domains: ['Compliance'],
+    producer: 'human',
+    // 'proposed', not 'confirmed': both writers (uploads.py and the catalogs PUT) take
+    // build_catalog_profile_revision's HUMAN/PROPOSED/ACTIVE defaults, and no confirm path exists.
+    // It matters here because `strength` is INSIDE the hashed content — a confirm would mint a new
+    // content_hash for identical words, which is exactly the "nothing will be re-versioned" note's
+    // premise. Whoever lands a confirm path must revisit that note.
+    strength: 'proposed',
+    lifecycle: 'active',
+    producer_ref: 'user:priya',
+    ingestion_run_id: null,
+    content_hash: 'a'.repeat(64),
+    revision_id: `cpr_${'a'.repeat(64)}`,
+  },
+}
+
+describe('re-uploading into a catalog somebody has already described', () => {
+  it('prefills the current narrative, and says so without claiming a change', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+
+    expect(await screen.findByDisplayValue('FTR compliance glossary')).toBeInTheDocument()
+    expect(screen.getByLabelText('Description'))
+      .toHaveValue('Financial transaction reporting terms.')
+    expect(screen.getByLabelText('Business context'))
+      .toHaveValue('Owned by financial crime operations.')
+    expect(screen.getByRole('button', { name: 'Remove domain Compliance' })).toBeInTheDocument()
+    // TRUTHFUL: the store keys a revision by a content hash over these values, so re-sending the
+    // identical words resolves to the same revision id and writes no new version.
+    expect(screen.getByTestId('narrative-unchanged'))
+      .toHaveTextContent(/unchanged — nothing will be re-versioned/i)
+  })
+
+  it('drops the unchanged note the moment a single word changes', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+
+    await userEvent.type(screen.getByLabelText('Description'), ' Updated.')
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+  })
+
+  it('is debounced: one lookup for a typed name, not one per keystroke', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalled())
+    expect(getCatalogProfile).toHaveBeenCalledExactlyOnceWith('ftr')
+  })
+
+  it('never writes over words the author has already typed', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText('Description'), 'My own words.')
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('ftr'))
+
+    // The draft only this person has survives the lookup — the CatalogNarrativePanel 409 rule.
+    expect(screen.getByLabelText('Description')).toHaveValue('My own words.')
+    expect(screen.getByLabelText('Name')).toHaveValue('')
+    // …and nothing claims their words are the catalog's current ones.
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+  })
+
+  it('degrades silently to an empty form when the narrative cannot be read', async () => {
+    // 404 while the profiles flag is off, 404 for a catalog outside this caller's scope, 500 for a
+    // broken read: none is the uploader's fault, and none may put error styling on an optional
+    // section (the no-blocked rule).
+    getCatalogProfile.mockRejectedValue(new api.ApiError(500, 'boom'))
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('ftr'))
+
+    expect(screen.getByLabelText('Name')).toHaveValue('')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+    // The upload is exactly as available as it is on a first upload of a brand-new catalog.
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'ftr', undefined)
+  })
+
+  it('treats an existing-but-undescribed catalog as nothing to prefill', async () => {
+    getCatalogProfile.mockResolvedValue({ source: 'ftr', pointer_version: 0, profile: null })
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('ftr'))
+    expect(screen.getByLabelText('Name')).toHaveValue('')
+    // An empty form is not "unchanged": there is nothing there to be unchanged from.
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+  })
+
+  // Only 'ftr' is described. Every other name is the flag-off / unknown-catalog answer, which is
+  // what "the source stopped matching" looks like from the screen.
+  function onlyFtrIsDescribed() {
+    getCatalogProfile.mockImplementation(async (src: string) => {
+      if (src === 'ftr') return DESCRIBED
+      throw new api.ApiError(404, 'Not Found')
+    })
+  }
+
+  it('withdraws the prefill when the source stops naming a described catalog', async () => {
+    onlyFtrIsDescribed()
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    const sourceBox = screen.getByLabelText(/source name/i)
+    await userEvent.type(sourceBox, 'ftr')
+    expect(await screen.findByDisplayValue('FTR compliance glossary')).toBeInTheDocument()
+
+    // Retargeted at a catalog nobody has described. FTR's words must not follow: the section is
+    // collapsed by default, so nothing would say they had, and the server commits what it is sent.
+    await userEvent.clear(sourceBox)
+    await userEvent.type(sourceBox, 'payments')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('payments'))
+    await vi.waitFor(() => expect(screen.getByLabelText('Name')).toHaveValue(''))
+    expect(screen.getByLabelText('Description')).toHaveValue('')
+    expect(screen.getByLabelText('Business context')).toHaveValue('')
+    expect(screen.queryByRole('button', { name: 'Remove domain Compliance' })).toBeNull()
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+
+    // The wire is the proof: an empty form is no part at all, so payments keeps whatever it has.
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'payments', undefined)
+  })
+
+  it('withdraws only what the prefill wrote — a draft the author changed survives the switch', async () => {
+    onlyFtrIsDescribed()
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    const sourceBox = screen.getByLabelText(/source name/i)
+    await userEvent.type(sourceBox, 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+    await userEvent.type(screen.getByLabelText('Description'), ' Updated by me.')
+
+    await userEvent.clear(sourceBox)
+    await userEvent.type(sourceBox, 'payments')
+    await vi.waitFor(() => expect(getCatalogProfile).toHaveBeenCalledWith('payments'))
+
+    // Words this person has touched are theirs. A source edit is not a reason to throw them away
+    // — the same discipline that keeps the draft through a failed upload.
+    expect(screen.getByLabelText('Description'))
+      .toHaveValue('Financial transaction reporting terms. Updated by me.')
+    expect(screen.getByLabelText('Name')).toHaveValue('FTR compliance glossary')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toMatchObject({
+      description: 'Financial transaction reporting terms. Updated by me.',
+    })
+  })
+
+  // EMPTYING A PREFILLED BOX IS A DELETION. Only non-empty fields ride, and the server reads a key
+  // it did not receive as an explicit null — so clearing ONE field nulls it on the next revision,
+  // while clearing them ALL sends no part and preserves everything. The screen has to say which
+  // of the two is about to happen; neither is a warning, and neither blocks the upload.
+  async function prefilledFtr() {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+  }
+
+  it('names the field an emptied box will clear from the catalog', async () => {
+    await prefilledFtr()
+    await userEvent.clear(screen.getByLabelText('Description'))
+
+    expect(screen.queryByTestId('narrative-unchanged')).toBeNull()
+    expect(screen.getByTestId('narrative-clearing')).toHaveTextContent(
+      "This will clear Description from the catalog's current description.")
+    // Nothing about it is an error: the section still uploads exactly as it did.
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+    // …and the note is telling the truth about the wire: the key is gone, which is the null.
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).not.toHaveProperty('description')
+  })
+
+  it('names every emptied field, in the order the boxes are read', async () => {
+    await prefilledFtr()
+    await userEvent.clear(screen.getByLabelText('Name'))
+    await userEvent.click(screen.getByRole('button', { name: 'Remove domain Compliance' }))
+    expect(screen.getByTestId('narrative-clearing')).toHaveTextContent(
+      "This will clear Name and Business domains from the catalog's current description.")
+  })
+
+  it('drops the clearing note the moment the field is typed back', async () => {
+    await prefilledFtr()
+    const description = screen.getByLabelText('Description')
+    await userEvent.clear(description)
+    await screen.findByTestId('narrative-clearing')
+
+    await userEvent.type(description, 'Financial transaction reporting terms.')
+    expect(screen.queryByTestId('narrative-clearing')).toBeNull()
+    // Back to the catalog's own words: the same value comparison puts the unchanged note back.
+    expect(screen.getByTestId('narrative-unchanged')).toBeInTheDocument()
+  })
+
+  it('emptying EVERY field clears nothing — no part rides, and it says so', async () => {
+    await prefilledFtr()
+    await userEvent.clear(screen.getByLabelText('Name'))
+    await userEvent.clear(screen.getByLabelText('Description'))
+    await userEvent.clear(screen.getByLabelText('Business context'))
+    await userEvent.click(screen.getByRole('button', { name: 'Remove domain Compliance' }))
+
+    // An empty section is absence, not erasure. Naming fields to clear here would be a lie.
+    expect(screen.queryByTestId('narrative-clearing')).toBeNull()
+    expect(screen.getByTestId('narrative-nothing-sent'))
+      .toHaveTextContent(/no description rides with this upload/i)
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'ftr', undefined)
+  })
+
+  it('sends the prefilled narrative back unchanged rather than dropping it', async () => {
+    getCatalogProfile.mockResolvedValue(DESCRIBED)
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'ftr')
+    await screen.findByTestId('narrative-unchanged')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+
+    expect(JSON.parse(sentPart() as string)).toEqual({
+      display_name: 'FTR compliance glossary',
+      description: 'Financial transaction reporting terms.',
+      business_context: 'Owned by financial crime operations.',
+      business_domains: ['Compliance'],
+    })
   })
 })
 
