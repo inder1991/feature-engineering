@@ -167,6 +167,18 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(analysis.router)
     # `/data-sources/...` — which engine each catalog lives on, and the routes to reach it.
     app.include_router(data_sources.router)
+    # Phase G §3.1 — `POST /materialization-runs` (enqueue, never compile) + its status read.
+    # Registered UNCONDITIONALLY and gated per-request by FEATUREGEN_MATERIALIZE_ENABLED, which is
+    # read on every call: a router included behind a boot-time flag read would capture the switch at
+    # import and make flipping it a code path nobody could exercise. Flag off, both paths answer
+    # Starlette's own 404 and touch no connection.
+    #
+    # Imported HERE rather than added to the module-level `from featuregen.api.routes import (...)`
+    # block: that block is being edited by a concurrent session, and this task is additive-only in
+    # this file. `create_app` already uses local imports for the same reason elsewhere.
+    from featuregen.api.routes import materialization_runs
+
+    app.include_router(materialization_runs.router)
 
     @app.get("/health")
     def health() -> dict:
