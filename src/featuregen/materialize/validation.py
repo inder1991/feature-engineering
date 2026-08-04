@@ -3,8 +3,9 @@
 **A finding's CODE says what was seen; its CLASS says who fixes it, and the class is what routes a
 decision.** §11 names four: ``RENDERER_DEFECT`` (fix the renderer and regenerate),
 ``GOVERNED_FACT_MISMATCH`` (the code is right and the catalog is wrong — re-attest, and
-**regeneration is blocked**), ``ENVIRONMENT_OR_DATA`` (the operator acts) and ``UNCLASSIFIED``
-(**fails closed**, and never silently environmental).
+**regeneration is declared blocked**: see :class:`FindingClass`, the policy is written down and
+proved but no production caller consults it yet), ``ENVIRONMENT_OR_DATA`` (the operator acts) and
+``UNCLASSIFIED`` (**fails closed**, and never silently environmental).
 
 The asymmetry is the design. A missing partition is data that has not landed; nobody attests that a
 partition exists, and the fix is upstream. A type contradiction, an absent column or a denied read
@@ -660,6 +661,44 @@ emit("build", True, str(max(counts.values())) + " nodes")
 '''
 
 
+def _probe_environment(root: pathlib.Path, env: Mapping[str, str] | None) -> dict[str, str]:
+    """The child's environment, with ``PYTHONPATH`` entries INSIDE the project removed.
+
+    The one sanitization the probe cannot do for itself, because it happens before the probe exists.
+    ``PYTHONPATH`` is on ``sys.path`` during **site initialization**, so a project shipping
+    ``<root>/sitecustomize.py`` runs at interpreter startup — ahead of ``import sys``, ahead of
+    everything — and can print a forged verdict using the nonce in ``sys.argv[1]``. No ordering
+    inside the probe reaches earlier than that, and ``-P`` / ``PYTHONSAFEPATH`` do not help: they
+    drop the cwd entry and honour ``PYTHONPATH`` regardless. ``-S`` would stop it and would also
+    take ``site-packages`` away, leaving the probe unable to see the engines it exists to check.
+
+    Entries are resolved against ``root`` because that is the child's cwd, so a relative
+    ``PYTHONPATH`` entry means a directory in the project.
+
+    **This knowingly amends ``run_l0``'s "``env=None`` inherits this process's environment
+    unchanged".** It is now *unchanged except for project-internal ``PYTHONPATH`` entries*, and the
+    amendment is deliberate: the contract existed so a caller could reach the probe with what the
+    interpreter needs, not so an artifact could be handed a way to execute before it is inspected.
+    Nothing in ``src/`` or ``deploy/`` sets ``PYTHONPATH``, and an entry pointing INTO the tree
+    being validated is never load-bearing — the probe puts ``<root>/src`` on ``sys.path`` itself and
+    the cwd still supplies ``<root>``, so the build imports exactly what it always did.
+    """
+    merged = dict(os.environ) if env is None else {**os.environ, **env}
+    declared = merged.get("PYTHONPATH")
+    if not declared:
+        return merged
+    inside = os.path.realpath(root)
+    kept = [entry for entry in declared.split(os.pathsep)
+            if entry and os.path.realpath(os.path.join(str(root), entry)) != inside
+            and not os.path.realpath(
+                os.path.join(str(root), entry)).startswith(inside + os.sep)]
+    if kept:
+        merged["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        merged.pop("PYTHONPATH", None)
+    return merged
+
+
 def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
                    timeout_seconds: float,
                    env: Mapping[str, str] | None) -> dict[str, Any] | None:
@@ -684,7 +723,9 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
     ``sys.path`` before importing anything but ``sys``. Until it did, its own
     ``import … json …`` line ran off the artifact's root and could be answered by ``<root>/json.py``
     — the marker forged from inside the probe's *own* imports rather than the project's. The
-    property is real; it rests on that ordering, not on the shape of the seam.
+    property is real; it rests on that ordering **and** on :func:`_probe_environment`, which closes
+    the one door earlier than any line the probe can execute: ``sitecustomize`` off a
+    ``PYTHONPATH`` that names the tree, run during site initialization.
 
     The lock filename travels through argv rather than being spelled inside the probe's source, so
     the file the renderer WRITES and the file the probe READS are one constant
@@ -696,7 +737,7 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
             [python_executable, "-c", _BUILD_PROBE, marker, str(root), package,
              REQUIREMENTS_LOCK_FILENAME],
             capture_output=True, text=True, timeout=timeout_seconds, check=False,
-            cwd=str(root), env=None if env is None else {**os.environ, **env})
+            cwd=str(root), env=_probe_environment(root, env))
     except (OSError, subprocess.SubprocessError):
         return None
     for line in reversed(completed.stdout.splitlines()):
@@ -842,7 +883,12 @@ def run_l0(
             has ``pyspark`` needs several of them, and the one that costs a debugging cycle is that
             ``PYSPARK_PYTHON`` and ``PYSPARK_DRIVER_PYTHON`` must BOTH name the same interpreter —
             without them Spark launches workers on the system Python and its own ``types.py`` dies
-            on ``X | Y``. ``None`` inherits this process's environment unchanged.
+            on ``X | Y``. ``None`` inherits this process's environment — unchanged **except** that
+            ``PYTHONPATH`` entries resolving inside ``root`` are dropped, whether they came from
+            here or from this process. That exception is not incidental: ``PYTHONPATH`` is live
+            during site initialization, so a tree naming itself there executes
+            ``<root>/sitecustomize.py`` before the probe's first statement and can forge a verdict.
+            :func:`_probe_environment` states the full reasoning.
         timeout_seconds: after which the probe is *unreachable*, not failing.
 
     Raises:

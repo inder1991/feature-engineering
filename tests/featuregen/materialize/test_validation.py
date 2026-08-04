@@ -840,6 +840,56 @@ def test_a_stdlib_module_the_PROJECT_SHIPS_cannot_run_before_the_pins_are_read(t
     assert report.findings[0].observed == "kedro is not installed"
 
 
+@pytest.mark.parametrize("spelling", [
+    "{root}",                # the plain case
+    "{root}/./",             # a spelling `realpath` has to collapse
+    ".",                     # relative — and the child's cwd IS the project
+    "{root}/src/../",        # via a subdirectory and back out
+    "{outside}:{root}",      # one legitimate entry and one hostile one
+])
+def test_a_PYTHONPATH_naming_the_project_cannot_run_its_code_at_SITE_INIT(tmp_path, spelling):
+    """A sealed `<root>/sitecustomize.py` under `PYTHONPATH=<root>` forged a passing verdict.
+
+    **The one door no ordering inside the probe can reach.** `PYTHONPATH` is on `sys.path` during
+    SITE INITIALIZATION, so `sitecustomize` executes before the interpreter runs a line of `-c`
+    source — before `import sys`, before pass 1, before anything the probe could possibly do. It
+    read the live nonce from `sys.argv[1]` and printed `{"stage": "build", "ok": true}`; `run_l0`
+    returned `PASSED` with zero findings for a project pinning `kedro==0.19.9` with no kedro.
+
+    `-P` / `PYTHONSAFEPATH` do not close it (they drop the cwd entry and honour `PYTHONPATH`
+    anyway), and `-S` would close it by also removing `site-packages`, leaving the probe blind to
+    the engines it exists to check. So it is closed parent-side, in `_probe_environment`, which
+    drops `PYTHONPATH` entries resolving inside the project before the interpreter is launched.
+
+    Two non-default conditions had to hold together — an adversary-SEALED tree (a dropped-in file is
+    `PROJECT_HASH_MISMATCH`) and a `PYTHONPATH` naming the root, which nothing in `src/` or
+    `deploy/` sets. Closed anyway: the A.42 row says CLOSED, and a known forgery path under that
+    word is the exact failure this whole item exists to stop.
+    """
+    outside = tmp_path / "legitimate-site"
+    outside.mkdir()
+    files = _project_files(create_pipeline_body=_BUILDS, requirements_lock="kedro==0.19.9\n")
+    files["sitecustomize.py"] = _HOSTILE_STDLIB_MODULE
+    root = _on_disk(tmp_path, files)
+
+    report = _l0(root, env={"PYTHONPATH": spelling.format(root=root, outside=outside)})
+    assert report.status is ValidationStatus.FAILED, "the artifact forged a passing verdict"
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+
+
+def test_a_PYTHONPATH_pointing_OUTSIDE_the_project_is_still_honoured(tmp_path) -> None:
+    """The control for the test above, and the reason it is a filter and not a blanket unset.
+
+    `_probe_environment` drops only entries that resolve INSIDE the tree. A caller's genuine
+    `PYTHONPATH` — the gate's own way of putting an interpreter's distributions in view — must
+    survive, or the fix would have quietly disabled the mechanism the engine check runs on.
+    """
+    report = _l0(_engine_project(tmp_path, f"{_KEDRO_DATASETS}==9.5.0\n"),
+                 env=_installed(tmp_path, (_KEDRO_DATASETS, "9.5.0")))
+    assert (report.status, report.findings) == (ValidationStatus.PASSED, ()), \
+        [finding.payload() for finding in report.findings]
+
+
 def test_a_PYTHONPATH_aimed_at_the_project_cannot_answer_for_its_own_pin(tmp_path) -> None:
     """The door that `-P` / `PYTHONSAFEPATH` would leave open, and the reason the fix is in-probe.
 

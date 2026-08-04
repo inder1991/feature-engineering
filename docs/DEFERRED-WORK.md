@@ -929,9 +929,41 @@ the `json` / `traceback` / `importlib` parameters; the `os` / `encodings` parame
 because CPython startup already has those in `sys.modules` — they are defence in depth against the
 import list growing, and the test says which is which.
 
+**And a third, one layer earlier again: `PYTHONPATH` is live during SITE INITIALIZATION.** A sealed
+`<root>/sitecustomize.py` under `PYTHONPATH=<root>` executes before the interpreter runs a line of
+`-c` source — before `import sys`, before any pass the probe could add — and forged `passed []` off
+the nonce in `sys.argv[1]`. Not fixable inside the probe by construction, so it is closed
+parent-side: `_probe_environment` drops `PYTHONPATH` entries resolving inside the project before the
+subprocess is launched (`realpath`, resolved against `root` because that is the child's cwd, so
+`.`, `<root>/./` and `<root>/src/../` all collapse). `-P`/`PYTHONSAFEPATH` do not close it — they
+drop the cwd entry and honour `PYTHONPATH` regardless; `-S` would, by also removing `site-packages`
+and blinding the probe to the engines it exists to check.
+
+This **knowingly amends** `run_l0`'s documented "`env=None` inherits this process's environment
+unchanged" to "unchanged except for project-internal `PYTHONPATH` entries" — the same contract cited
+when rejecting `PYTHONSAFEPATH`, so the amendment is written down at `_probe_environment`, at the
+`env` argument and here. The contract existed so a caller could give the probe what the interpreter
+needs, not so an artifact could be handed a way to execute before it is inspected; an entry pointing
+into the tree under validation is never load-bearing, since the probe puts `<root>/src` on the path
+itself and the cwd still supplies `<root>`. A `PYTHONPATH` pointing OUTSIDE the tree is untouched,
+and a test pins that — it is the mechanism the engine check's own fixtures run on.
+
+It needed two non-default conditions together (an adversary-**sealed** tree, since a dropped-in file
+is `PROJECT_HASH_MISMATCH`, **and** a `PYTHONPATH` naming the root, which nothing in `src/` or
+`deploy/` sets). Fixed rather than documented as an exception, because this row says ✅ CLOSED and a
+known forgery path under that word is the precise failure A.42 exists to stop.
+
 Deliberately NOT stripped: a `sys.path` entry that passes *through* the tree by symlink to a target
 outside it. `realpath` resolves to the target, the target is not the artifact, and a project cannot
 author a `sys.path` entry — only files under its own root. Recorded so it reads as a decision.
+
+**Adversarial-review score across three rounds**, since the shape is the lesson: round 1 shipped the
+check with a false sufficiency claim (root on `sys.path` via cwd); round 2 fixed that and left the
+probe's own import line exposed; round 3 fixed that and left site initialization exposed. Each hole
+was one layer earlier in interpreter startup than the last, and each was found by attacking the
+comment rather than the code. The three are closed by three different mechanisms — in-probe path
+sanitization, import ordering, and parent-side environment filtering — and each has its own mutant
+recorded above.
 
 The classification was contested and settled against the code: `status="error"` cannot carry a
 finding (`ValidationReportV1.__post_init__`), and A.42's whole complaint is that the condition names
