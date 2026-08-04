@@ -319,6 +319,7 @@ _CTXGRAPH = "tests/featuregen/overlay/upload/test_context_graph.py"
 _V4 = "tests/featuregen/overlay/upload/test_feature_context_v4.py"
 _BARS = "tests/eval/test_release_a_bars.py"
 _USEGATE = "tests/featuregen/overlay/upload/test_feature_use_gate.py"
+_PIIACCEPT = "tests/featuregen/overlay/upload/test_pii_policy_acceptance.py"
 
 
 REGISTRY: tuple[Mutation, ...] = (
@@ -543,6 +544,7 @@ REGISTRY: tuple[Mutation, ...] = (
         target="feature_assist:active_pii_use_policies",
         victims=(
             f"{_USEGATE}::test_a_REVOKED_policy_refuses_again",
+            f"{_PIIACCEPT}::test_revoking_one_anchor_kills_exactly_the_recipes_that_use_it",
         ),
         apply=_m_gate_ignores_policy_revocation,
         expect_failure_contains="assert rej is not None",
