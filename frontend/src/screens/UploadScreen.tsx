@@ -213,12 +213,90 @@ function serializeNarrative(draft: NarrativeDraft): string | undefined {
   return Object.keys(payload).length === 0 ? undefined : JSON.stringify(payload)
 }
 
+// The server's bounds, mirrored: MAX_* in overlay/upload/catalog_profiles.py plus the 64 KiB part
+// bound in api/routes/uploads.py. Client-side PRE-FLIGHT only — the server stays the authority
+// (same discipline as the 25 MiB file check above) — and it must not refuse what the server would
+// take, so the numbers and the wording are copied, not paraphrased. Lengths are measured on the
+// TRIMMED text because `_bounded_text` strips before it measures.
+const NARRATIVE_CAPS = {
+  displayName: 200,
+  description: 4000,
+  businessContext: 4000,
+  domains: 32,
+  domainLength: 200,
+} as const
+const MAX_PROFILE_JSON_BYTES = 64 * 1024
+
+type NarrativeField = 'displayName' | 'description' | 'businessContext' | 'businessDomains'
+type NarrativeProblems = Partial<Record<NarrativeField | 'total', string>>
+
+// The server measures with Python's len(), which counts CODE POINTS; JS `.length` counts UTF-16
+// units, so one astral character (an emoji in a business context, a rarer CJK ideograph) counts 2
+// here and 1 there. Left alone, the mirror would refuse at 2 000 emoji what the server takes at
+// 4 000 — a client-side bound stricter than the real one, which is the one failure mode a
+// pre-flight is not allowed to have.
+function charCount(text: string): number {
+  return [...text.trim()].length
+}
+
+// Verbatim server wording (CatalogProfileError messages), so the inline text a person fixes is the
+// text they would otherwise have met as a 400 that failed the whole upload.
+function narrativeProblems(draft: NarrativeDraft): NarrativeProblems {
+  const problems: NarrativeProblems = {}
+  if (charCount(draft.displayName) > NARRATIVE_CAPS.displayName) {
+    problems.displayName = `display_name exceeds the ${NARRATIVE_CAPS.displayName}-character bound`
+  }
+  if (charCount(draft.description) > NARRATIVE_CAPS.description) {
+    problems.description = `description exceeds the ${NARRATIVE_CAPS.description}-character bound`
+  }
+  if (charCount(draft.businessContext) > NARRATIVE_CAPS.businessContext) {
+    problems.businessContext =
+      `business_context exceeds the ${NARRATIVE_CAPS.businessContext}-character bound`
+  }
+  const domains = trimmedDomains(draft)
+  if (domains.length > NARRATIVE_CAPS.domains) {
+    problems.businessDomains = `business_domains exceeds the ${NARRATIVE_CAPS.domains}-item bound`
+  } else if (domains.some(d => charCount(d) > NARRATIVE_CAPS.domainLength)) {
+    problems.businessDomains =
+      `business_domains item exceeds the ${NARRATIVE_CAPS.domainLength}-character bound`
+  }
+  // The whole part, measured the way the route measures it: UTF-8 BYTES of the serialized JSON,
+  // not characters. The per-field caps do NOT imply this one — JSON escapes a control character
+  // (a field separator pasted out of a mainframe extract) to six ASCII bytes, so 10 600 in-bound
+  // characters can still serialize past 64 KiB. This is the only check that sees the whole part.
+  const json = serializeNarrative(draft)
+  if (json !== undefined && new TextEncoder().encode(json).length > MAX_PROFILE_JSON_BYTES) {
+    problems.total = 'catalog_profile_json exceeds the 64 KiB bound'
+  }
+  return problems
+}
+
+// One counter + one error under a field. The counter appears only once there is something to
+// count: an empty optional field is not a thing to report on.
+function FieldBound({
+  errorId, text, max, problem,
+}: { errorId: string; text: string; max: number; problem?: string }) {
+  const used = charCount(text)
+  return (
+    <>
+      {used > 0 && (
+        <p className="hint tabular-nums" style={{ margin: 0 }}>
+          {used} / {max}
+        </p>
+      )}
+      {problem && <p className="field-error" id={errorId}>{problem}</p>}
+    </>
+  )
+}
+
 function CatalogNarrativeFields({
   value,
   onChange,
+  problems,
 }: {
   value: NarrativeDraft
   onChange: (next: NarrativeDraft) => void
+  problems: NarrativeProblems
 }) {
   const uid = useId()
   const [domainInput, setDomainInput] = useState('')
@@ -293,14 +371,21 @@ function CatalogNarrativeFields({
           {/* "Name", not "display name": same label as the post-upload editor. No label in here
               may contain the substring "file" — getByLabelText(/file/i) must keep matching only
               the file input (which is why the old textarea said "narrative", not "profile"). */}
+          {/* No maxLength on any of these. A cap the browser silently enforces cannot be
+              explained, cannot cover the 64 KiB whole-part bound, and would make the inline
+              error below dead code — an inert mechanism. The counter and the error carry it. */}
           <label>
             Name
             <input
               value={value.displayName}
               onChange={e => edit({ displayName: e.target.value })}
               placeholder="e.g. Funds transfers"
+              aria-invalid={problems.displayName ? true : undefined}
+              aria-describedby={problems.displayName ? `${uid}-name-error` : undefined}
             />
           </label>
+          <FieldBound errorId={`${uid}-name-error`} text={value.displayName}
+                      max={NARRATIVE_CAPS.displayName} problem={problems.displayName} />
         </div>
         <div className="field">
           <label>
@@ -310,8 +395,12 @@ function CatalogNarrativeFields({
               onChange={e => edit({ description: e.target.value })}
               rows={2}
               placeholder="One or two lines: what this catalog holds."
+              aria-invalid={problems.description ? true : undefined}
+              aria-describedby={problems.description ? `${uid}-description-error` : undefined}
             />
           </label>
+          <FieldBound errorId={`${uid}-description-error`} text={value.description}
+                      max={NARRATIVE_CAPS.description} problem={problems.description} />
         </div>
         <div className="field">
           <label>
@@ -325,8 +414,12 @@ function CatalogNarrativeFields({
                 + '\'Funds-transfer records from the core banking system; all outbound '
                 + 'SWIFT/RTGS payments; Compliance-owned\''
               }
+              aria-invalid={problems.businessContext ? true : undefined}
+              aria-describedby={problems.businessContext ? `${uid}-context-error` : undefined}
             />
           </label>
+          <FieldBound errorId={`${uid}-context-error`} text={value.businessContext}
+                      max={NARRATIVE_CAPS.businessContext} problem={problems.businessContext} />
         </div>
         <div className="field">
           <label htmlFor={`${uid}-domains`}>Business domains</label>
@@ -355,7 +448,12 @@ function CatalogNarrativeFields({
             onKeyDown={onDomainKey}
             onBlur={commitDomain}
             placeholder="Type a domain, then press Enter"
+            aria-invalid={problems.businessDomains ? true : undefined}
+            aria-describedby={problems.businessDomains ? `${uid}-domains-error` : undefined}
           />
+          {problems.businessDomains && (
+            <p className="field-error" id={`${uid}-domains-error`}>{problems.businessDomains}</p>
+          )}
           {offered.length > 0 && (
             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
               <span className="micro-label">Suggested</span>
@@ -376,6 +474,7 @@ function CatalogNarrativeFields({
             </div>
           )}
         </div>
+        {problems.total && <p className="field-error">{problems.total}</p>}
       </div>
     </details>
   )
@@ -405,10 +504,21 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
   const [focus, setFocus] = useState(false)
   const [dragging, setDragging] = useState(false)
 
+  // ADJUDICATED: an over-cap narrative BLOCKS the upload. An EMPTY section never can — absence is
+  // valid and rides as no part at all — but a non-empty one that breaks a bound would be posted,
+  // rejected by the route BEFORE any write, and 400 the WHOLE upload: the file would not land
+  // either. Letting the click through would mean spending an upload to deliver a message the
+  // screen already knows how to say, next to the field that has to change. So the section shows
+  // the error inline, the button is disabled, and the reason sits beside it (the section can be
+  // collapsed, and a disabled button with no visible cause is its own defect).
+  const problems = narrativeProblems(narrative)
+  const narrativeBlocks = Object.keys(problems).length > 0
+
   async function submit(e: FormEvent) {
     e.preventDefault()
     const submittedSource = source.trim()
-    if (!file || !submittedSource) return
+    // Guarded here as well as on the button: a form can be submitted by Enter in a text field.
+    if (!file || !submittedSource || narrativeBlocks) return
     setBusy(true)
     setError(null)
     setShowFailedRun(false)
@@ -534,15 +644,27 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
               </div>
             )}
           </div>
-          <CatalogNarrativeFields value={narrative} onChange={setNarrative} />
-          <button
-            type="submit"
-            className="btn btn--primary"
-            style={{ justifySelf: 'start' }}
-            disabled={busy || !file || !source.trim()}
-          >
-            {busy ? 'Uploading…' : 'Upload'}
-          </button>
+          <CatalogNarrativeFields
+            value={narrative}
+            onChange={setNarrative}
+            problems={problems}
+          />
+          <div style={{ display: 'grid', gap: 6, justifyItems: 'start' }}>
+            <button
+              type="submit"
+              className="btn btn--primary"
+              disabled={busy || !file || !source.trim() || narrativeBlocks}
+              aria-describedby={narrativeBlocks ? 'upload-narrative-blocked' : undefined}
+            >
+              {busy ? 'Uploading…' : 'Upload'}
+            </button>
+            {narrativeBlocks && (
+              <p className="field-error" id="upload-narrative-blocked" style={{ margin: 0 }}>
+                Shorten the catalog description above — the server refuses the upload while it is
+                over the bound, and the file would not land either.
+              </p>
+            )}
+          </div>
         </form>
       </div>
       {error && (

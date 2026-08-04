@@ -306,6 +306,92 @@ describe('catalog narrative section', () => {
     expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
   })
 
+  it('counts characters against the server bound and refuses the upload once over it', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await openNarrative()
+
+    const name = screen.getByLabelText('Name')
+    // Paste, not type: 201 keystrokes is 201 renders.
+    await userEvent.click(name)
+    await userEvent.paste('n'.repeat(200))
+    expect(screen.getByText('200 / 200')).toBeInTheDocument()
+    // Exactly AT the bound is fine — a mirror that refuses what the server takes is worse than
+    // no mirror at all.
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+    await userEvent.paste('n')
+    // The server's own wording, so the text a person fixes is the text the 400 would have carried.
+    expect(screen.getByText('display_name exceeds the 200-character bound')).toBeInTheDocument()
+    expect(name).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeDisabled()
+    expect(screen.getByText(/shorten the catalog description above/i)).toBeInTheDocument()
+    expect(uploadFile).not.toHaveBeenCalled()
+
+    // Back under the bound: nothing is left blocked.
+    await userEvent.clear(name)
+    await userEvent.paste('Deposits')
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toEqual({ display_name: 'Deposits' })
+  })
+
+  it('blocks on the 64 KiB whole-part bound while every field is under its own', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    await openNarrative()
+
+    // Text pasted out of a mainframe extract, field separators and all. U+0001 is one character to
+    // both bounds checks, but JSON escapes it to the six ASCII bytes \u0001 — so 4000 + 4000
+    // IN-BOUND characters already serialize to ~48 KiB, and a dozen domains carry it over 64 KiB.
+    // No per-field counter can see this; only the whole-part check can.
+    const SEP = '\u0001'
+    await userEvent.click(screen.getByLabelText('Description'))
+    await userEvent.paste(SEP.repeat(4000))
+    await userEvent.click(screen.getByLabelText('Business context'))
+    await userEvent.paste(SEP.repeat(4000))
+    const overBound = () => screen.queryByText('catalog_profile_json exceeds the 64 KiB bound')
+    const domains = screen.getByLabelText('Business domains')
+    // Up to the 32-item bound, so this loop can never run away — and stops the moment the whole
+    // part crosses, which is the thing being asserted.
+    for (let i = 0; i < 32 && !overBound(); i++) {
+      await userEvent.click(domains)
+      await userEvent.paste(`${i}${SEP.repeat(199)}`)
+      await userEvent.keyboard('{Enter}')
+    }
+    expect(overBound()).toBeInTheDocument()
+    // Every individual field is still inside its own bound: this is the only failing check.
+    expect(screen.queryByText(/exceeds the 4000-character bound/)).toBeNull()
+    expect(screen.queryByText(/exceeds the 32-item bound/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeDisabled()
+    expect(uploadFile).not.toHaveBeenCalled()
+  })
+
+  it('counts CODE POINTS, as the server does, not UTF-16 units', async () => {
+    renderUpload()
+    await openNarrative()
+    // 2000 astral characters are 4000 UTF-16 units but 2000 characters to Python's len() — the
+    // naive .length mirror would refuse here what the server accepts.
+    await userEvent.click(screen.getByLabelText('Description'))
+    await userEvent.paste('\u{1F3E6}'.repeat(2000))
+    expect(screen.getByText('2000 / 4000')).toBeInTheDocument()
+    expect(screen.queryByText(/exceeds the 4000-character bound/)).toBeNull()
+  })
+
+  it('an EMPTY section never blocks, however the bounds are set', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await submit()
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
+  })
+
   it('a suggestion list that cannot be read leaves free-text entry working, with no error', async () => {
     listCatalogs.mockRejectedValue(new api.ApiError(500, 'boom'))
     uploadFile.mockResolvedValue(result({ asserted: 4 }))
