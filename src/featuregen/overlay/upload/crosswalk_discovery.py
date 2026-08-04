@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from featuregen.contracts import DbConn
 from featuregen.overlay.upload.bridge_assessment import (
@@ -586,27 +586,59 @@ def discover_crosswalk_candidates(
         reason_counts=dict(reasons), truncation_counts=dict(truncation))
 
 
+def _merge_evidence(
+    definitions: Sequence[CrosswalkDefinitionRevisionV1],
+) -> CrosswalkDefinitionRevisionV1:
+    """One definition carrying the DEDUPED evidence of every origin that proposed it.
+
+    The merge is over ``identity_payload``, not object identity, so the same evidence arriving from
+    two readers collapses to one ref. Order is not fixed here on purpose: the revision constructor
+    canonically sorts evidence, which is what makes the merged revision re-derive byte-identically
+    on the next pass."""
+    base = definitions[0]
+    merged: dict[tuple, EvidenceRefV1] = {}
+    for definition in definitions:
+        for ref in definition.evidence_refs:
+            merged.setdefault(tuple(sorted(ref.identity_payload().items())), ref)
+    evidence = tuple(merged.values())
+    if len(evidence) == len(base.evidence_refs):
+        return base
+    return replace(base, evidence_refs=evidence)
+
+
 def persist_crosswalk_candidates(
     conn: DbConn, report: CrosswalkDiscoveryReportV1, *, actor: str,
     roles: Iterable[str] = (),
 ) -> tuple[str, ...]:
-    """Publish every crosswalk candidate as a PROPOSED definition revision; return their ids.
+    """Publish every discovered crosswalk as a PROPOSED definition revision; return their ids.
 
     ``unreviewed`` is the honest state and a USABLE one — an unreviewed crosswalk is a discovery
     somebody can act on, never a failure. Nothing published here is executable: there is no
     execution revision, no safety verdict and no plan, and confirming one later changes only who
     is accountable for it.
 
-    Idempotent: re-running a pass over an unchanged catalog re-publishes the same revision ids and
-    leaves the pointers where they are."""
+    **ONE PASS, ONE REVISION PER CROSSWALK.** Candidates are grouped by ``definition_id`` BEFORE
+    anything is published and their evidence is merged into a single revision. Publishing them
+    separately is publishing two revisions of the same crosswalk from one pass: the pointer walked
+    twice per pass (2, 4, 6...), and — because the revision that landed LAST decided what the
+    surface displayed — the authority chip flipped taxonomy/llm every run with nothing in the
+    catalog having changed. It also lost half the story: a crosswalk both the structural rule and
+    an LLM found is better evidenced than either alone, and the merged revision says so.
+
+    Idempotent: re-running a pass over an unchanged catalog re-derives the same merged revision id
+    and leaves the pointers exactly where they are."""
     from featuregen.overlay.upload.crosswalk_store import current_crosswalk_definition
 
-    published: list[str] = []
+    grouped: dict[str, list[CrosswalkDefinitionRevisionV1]] = {}
     for candidate in report.candidates:
-        definition = candidate.definition
-        if definition is None:
+        if candidate.definition is None:
             continue        # transformed / semantic-only: discoverable, nothing to define
-        current = current_crosswalk_definition(conn, definition.definition_id)
+        grouped.setdefault(candidate.definition.definition_id, []).append(candidate.definition)
+
+    published: list[str] = []
+    for definition_id in sorted(grouped):
+        definition = _merge_evidence(grouped[definition_id])
+        current = current_crosswalk_definition(conn, definition_id)
         if current is not None and current.revision.revision_id == definition.revision_id:
             published.append(definition.revision_id)
             continue

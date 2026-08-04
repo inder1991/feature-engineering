@@ -200,12 +200,60 @@ def test_a_structured_suggestion_becomes_a_candidate_with_llm_evidence(db) -> No
 
 
 def test_a_suggestion_and_the_structural_rule_agree_on_ONE_crosswalk(db) -> None:
-    """Both sources may propose the same crosswalk; the pass must not emit it twice."""
+    """Both sources may propose the same crosswalk. ONE PASS PUBLISHES ONE REVISION FOR IT.
+
+    Unique revision ids is not the guard that matters — two origins produce two DIFFERENT revision
+    ids for the SAME crosswalk (their evidence differs), which is exactly how a single pass
+    published two revisions, walked the pointer twice and left the displayed authority flipping
+    taxonomy/llm every run. The guard is the DEFINITION count."""
     build_catalog(db)
     _suggest(db, crosswalks=[_good_suggestion()])
     report = discover_crosswalk_candidates(db)
-    revision_ids = [c.definition.revision_id for c in report.candidates if c.definition]
-    assert len(revision_ids) == len(set(revision_ids))
+    assert {c.origin for c in report.candidates} == {"dataset_role", "llm_suggestion"}
+    definition_ids = {c.definition.definition_id for c in report.candidates if c.definition}
+    assert len(definition_ids) == 1
+
+    published = persist_crosswalk_candidates(db, report, actor=ACTOR)
+    assert len(published) == 1
+    assert db.execute(
+        "SELECT count(*) FROM crosswalk_definition_revision").fetchone()[0] == 1
+    stored = visible_crosswalk_definitions(db)
+    assert len(stored) == 1
+    assert stored[0].current.pointer_version == 1
+    # The ONE revision carries BOTH origins' evidence — merged, not one origin's overwriting the
+    # other's. Losing the structural half would leave the crosswalk looking purely LLM-derived.
+    kinds = {ref.kind.value for ref in stored[0].revision.evidence_refs}
+    assert kinds == {"structural_metadata", "llm_recommendation"}
+
+
+def test_re_running_an_unchanged_catalog_leaves_the_pointer_where_it_is(db) -> None:
+    """The docstring's existing idempotence claim, made true for the two-origin case: the merged
+    revision is re-derived byte-identically, so the pointer is not touched."""
+    build_catalog(db)
+    _suggest(db, crosswalks=[_good_suggestion()])
+    first = persist_crosswalk_candidates(db, discover_crosswalk_candidates(db), actor=ACTOR)
+    second = persist_crosswalk_candidates(db, discover_crosswalk_candidates(db), actor=ACTOR)
+    third = persist_crosswalk_candidates(db, discover_crosswalk_candidates(db), actor=ACTOR)
+    assert first == second == third
+    assert [c.current.pointer_version for c in visible_crosswalk_definitions(db)] == [1]
+    assert db.execute(
+        "SELECT count(*) FROM crosswalk_definition_revision").fetchone()[0] == 1
+
+
+def test_the_displayed_authority_does_not_flip_between_passes(db) -> None:
+    """A pointer that alternated between a taxonomy revision and an LLM one made the crosswalk's
+    authority chip change every pass, with nothing in the catalog having changed."""
+    from featuregen.overlay.upload.semantic_context import relationship_context_from_crosswalk
+
+    build_catalog(db)
+    _suggest(db, crosswalks=[_good_suggestion()])
+    producers = []
+    for _pass in range(3):
+        persist_crosswalk_candidates(db, discover_crosswalk_candidates(db), actor=ACTOR)
+        producers.append(
+            relationship_context_from_crosswalk(visible_crosswalk_definitions(db)[0]).producer)
+    # `producer=llm` only when ALL evidence is LLM — the unchanged rule, now over stable evidence.
+    assert producers == ["taxonomy", "taxonomy", "taxonomy"]
 
 
 @pytest.mark.parametrize("mutation,reason", [

@@ -16,9 +16,12 @@ from tests.featuregen.overlay.upload._crosswalk_fixtures import (
     FTR,
     FTR_TABLE,
     MAP,
+    MAP_CIB,
+    MAP_FTR,
     MAP_TABLE,
     build_catalog,
     definition,
+    endpoint,
     wide_endpoint,
 )
 
@@ -30,6 +33,7 @@ from featuregen.overlay.upload.bridge_assessment import (
 from featuregen.overlay.upload.crosswalk import (
     CROSSWALK_WRITE_INVALID,
     CrosswalkContractError,
+    CrosswalkDefinitionRevisionV1,
     LogicalMappingPairV1,
 )
 from featuregen.overlay.upload.crosswalk_store import (
@@ -120,16 +124,12 @@ def _tamper(db, revision_id: str) -> None:
 
 
 def _second_crosswalk():
-    """A DIFFERENT crosswalk through the same mapping table: CIB customer -> FTR legal entity."""
-    from tests.featuregen.overlay.upload._crosswalk_fixtures import (
-        FTR_TABLE,
-        MAP_CIB,
-        MAP_FTR,
-        endpoint,
-    )
+    """A DIFFERENT crosswalk through the same mapping table: CIB customer -> FTR legal entity.
 
-    from featuregen.overlay.upload.crosswalk import CrosswalkDefinitionRevisionV1
-
+    Every name here comes from this module's own imports: `test_crosswalk_contracts` RELOADS
+    `crosswalk` to prove the bridge fact key survives the import, which leaves two distinct
+    `LogicalMappingPairV1` classes in a combined run — mixing a fresh one with a stale one is a
+    contract refusal that looks like a fixture bug."""
     return CrosswalkDefinitionRevisionV1(
         source_endpoint=endpoint("cib", CIB_TABLE, "cust_num", concept="customer_id",
                                  entity="customer"),
