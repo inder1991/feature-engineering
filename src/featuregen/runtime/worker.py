@@ -27,6 +27,11 @@ import psycopg
 from psycopg.rows import dict_row
 
 from featuregen.contracts import Command, Projection
+from featuregen.materialize.queue_lane import (
+    materialization_enabled,
+    process_materialization_once,
+)
+from featuregen.materialize.reconcile import reconcile_abandoned_requests
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
@@ -123,6 +128,11 @@ class WorkerTick:
     errors: int
     external_dispatched: int = 0
     formula_processed: int = 0
+    materialization_processed: int = 0
+    #: Phase G §3.3 — how many stranded materialization requests this tick gave a terminal verdict.
+    #: Candidates LEFT ALONE (a deliverable message, a live claim, a class with no legal terminal)
+    #: are not counted here: this is the number of durable state changes, not the sweep's size.
+    materialization_reconciled: int = 0
 
 
 def _control_actor():
@@ -445,6 +455,68 @@ def run_worker_once(
 
     formula_processed = _stage("recipe_formula_shadow")(_drain_formula, 0)
 
+    def _drain_materialization() -> int:
+        # THE KILL SWITCH (T9), read from the environment EVERY tick and BEFORE the claim. Nothing
+        # caches it, so the first tick after this process's environment says otherwise obeys — and
+        # stopping materialization is never the same act as stopping the WORKER, which would also
+        # stop the relay, the timers, the projections and every poller below.
+        #
+        # Off is SILENT, not loud. A tick is a second: a stage that announced "disabled" every tick
+        # would write ~86k lines a day saying nothing happened, and the next real signal would have
+        # to be found inside it. Nothing is lost by the silence — an undrained job stays `ready` and
+        # is counted by the `queue.depth` gauge two stages below, which is the number an operator
+        # already watches. Off is therefore byte-identical to the tick that existed before this lane
+        # did: no claim query, no counter, no log.
+        #
+        # It stops the NEXT claim; it never interrupts one in flight. A leased message cannot be
+        # un-claimed, and abandoning a compile mid-transaction would leave a leased row, a
+        # non-terminal request and a half-written tree — to save the seconds until that transaction
+        # ends anyway.
+        if not materialization_enabled():
+            return 0
+        # Phase G §3.1's fenced lane. Its own dedicated claim (the rows are excluded from
+        # `claim_one` by `MATERIALIZATION_QUEUE_HANDLERS`), its own lease and fence, and its own
+        # configuration — resolved inside the handler only once a job is claimed, so a deployment
+        # that configures no materialization costs exactly one idle query per tick and never a
+        # counted stage error.
+        #
+        # ONE job per tick, deliberately NOT `batch`. A tick is documented as one bounded
+        # non-blocking pass, and a compile is minutes: it renders a project, hashes a tree and runs
+        # an L0 subprocess bounded only by the deployment's configured timeout. Draining a backlog
+        # of `batch` compiles inside one tick would hold the timers, the relay, the projections and
+        # every poller for the sum of them. A queued backlog still drains — one per tick, on ticks
+        # that are a second apart — which costs nothing next to a compile's own duration.
+        outcome = process_materialization_once(conn, owner=f"{owner}:materialize")
+        return 0 if outcome.status == "idle" else 1
+
+    materialization_processed = _stage("materialization")(_drain_materialization, 0)
+
+    def _reconcile_materialization() -> int:
+        # Phase G §3.3. It runs HERE — beside the lane, on the tick — because the alternative was a
+        # function with no scheduler, and a reconciler nothing runs is a deferral wearing a costume.
+        # Three classes of request can now strand with nothing left to drain them (see
+        # `materialize/reconcile.py`), and every one of them is produced by this very lane.
+        #
+        # THE SAME KILL SWITCH, read the same way. T9's property is a property of the TICK — flag
+        # off is byte-identical to the tick that existed before this lane did — and a sweep that ran
+        # anyway would cost every deployment two queries a second to adjudicate requests that a
+        # deployment with materialization OFF cannot be creating. It also would not FIND anything a
+        # switched-off deployment has: an undrained job stays a `ready` queue row, which this sweep
+        # reads as a live owner and leaves alone.
+        #
+        # IT CANNOT STALL THE TICK, and that is structural rather than hopeful. The sweep writes
+        # only requests whose queue message is unreachable, and a compile holds its message `leased`
+        # for its whole duration — so the rows `_commit`'s transaction locks (for up to the L0
+        # timeout) are exactly the rows this sweep never touches. What remains is two indexed reads
+        # plus at most `DEFAULT_SWEEP_LIMIT` single-row updates, and no enclosing transaction to
+        # hold a lock across them.
+        if not materialization_enabled():
+            return 0
+        return reconcile_abandoned_requests(conn, now=now).terminalized
+
+    materialization_reconciled = _stage("materialization_reconcile")(
+        _reconcile_materialization, 0)
+
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
         # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).
@@ -536,6 +608,8 @@ def run_worker_once(
         errors=errors,
         external_dispatched=external_dispatched,
         formula_processed=formula_processed,
+        materialization_processed=materialization_processed,
+        materialization_reconciled=materialization_reconciled,
     )
 
 

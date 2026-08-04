@@ -8,11 +8,43 @@ LEGITIMATE ``authoring_run_id``. Every field of such an object agrees with every
 in-memory consistency check proves exactly nothing.
 
 So nothing here trusts the supplied object. Every check is against the run's **immutable terminal
-trace event** (``formula.trace.read_terminal_event``) and its **write-once manifest**
-(``read_run_intent_hash``) — rows migration 1020 physically forbids updating, deleting or
+trace event** (``materialize.authoring_trace.read_terminal_event``) and its **write-once manifest**
+(``read_run_intent_hash``) — rows migration **1022** physically forbids updating, deleting or
 truncating, carrying a canonical payload and the sha256 ``payload_hash`` that makes it
-tamper-evident. The supplied result contributes exactly one thing the trace does not hold: the
-formula OBJECT itself, whose content hash must equal the one the run recorded.
+tamper-evident.
+
+⚠️ **WHAT THE SUPPLIED RESULT CONTRIBUTES CHANGED WITH THE LANE.** Against 1020 it contributed
+exactly one thing the trace did not hold — the formula OBJECT itself — and every other field of it
+was checked against a record written from somewhere else. **1022's terminal payload holds the
+result material too**: ``_terminal_payload`` writes ``"result": _plain(result)`` alongside the
+dispositions and axes (``replay_authoring.py:151-162``). Two consequences, and neither is a
+loophole, but both must be stated rather than implied:
+
+* against a FORGING CALLER — the attack in the paragraph above — nothing weakens. Such a caller
+  supplies an object from thin air, and checks 3/4/5 compare it field by field against a WORM row
+  it did not write.
+* against ``materialize.resolve``, which rebuilds its object FROM that same payload, check 5 is an
+  intra-payload consistency check: the axes it compares were written from one object, in one row, by
+  one statement, so for a genuine row they cannot disagree. What is load-bearing on that path is
+  **check 2** (the payload is authentic against its own ``payload_hash``, on a row 1022 forbids
+  updating) and **check 6** (the intent comes from migration 1023's work item — a DIFFERENT store —
+  and must re-hash to the manifest). Check 4 also stays a genuine cross-EVENT derivation: the
+  restorer rebuilds the formula from the ``AUTHOR_PROPOSAL_PARSED`` and ``OUTPUT_POLICY_RESOLVED``
+  events, so its digest is re-derived from material the TERMINAL event does not contain.
+
+This is inherent to the lane: 1022's terminal payload is the only durable source of the result
+material there is, so any resolution path must read it. It is bounded by check 2's threat model —
+altering it requires the same out-of-band write that would defeat 1020.
+
+⚠️ **THE EVIDENCE LANE MOVED (Phase G).** These checks read migration 1022's
+``formula_authoring_run`` / ``formula_authoring_trace_event``, not migration 1020's
+``authoring_run`` / ``authoring_trace_event``. 1020 is the store this gate was built against and
+**nothing in ``src/`` has ever written it**: the live authoring worker calls
+``formula.replay_authoring.run_authoring`` (``overlay/upload/recipe_formula_worker.py:35``), which
+writes 1022. A gate reading 1020 therefore refused every real governed feature at check 1. The
+reasoning, the borrowed-hasher discipline and the deliberate refusal to accept EITHER store are all
+in ``materialize.authoring_trace``; the orphaned lane is recorded in ``docs/DEFERRED-WORK.md``
+A.33. The move STRENGTHENS check 6 — see ``_verify_intent_hash``.
 
 THE SIX CHECKS, IN THIS ORDER (spec §1.2). Order is load-bearing — each later check is meaningful
 only once the earlier ones have established that there IS an authoritative record and that it says
@@ -27,10 +59,12 @@ what it appears to say:
 6. ``authoring_intent_hash(intent)`` equals the run's recorded ``intent_hash``
                                                  → else ``INTENT_HASH_MISMATCH``
 
-⚠️ **CHECK 3 READS THE PAYLOAD, NOT THE EVENT KIND.** ``authoring._TERMINAL_FOR_DISPOSITION`` maps
-ONLY ``TECHNICAL_FAILURE`` to ``FAILED``, so ``REJECTED`` and ``UNSUPPORTED`` runs ALSO write a
-``COMPLETED`` event. Admitting on "a COMPLETED event exists" would admit rejected formulas — the
-single highest-consequence mistake available at this boundary.
+⚠️ **CHECK 3 READS THE PAYLOAD, NOT THE EVENT KIND.** The 1022 orchestrator's normal terminal
+append writes ``completed`` for every disposition that reaches the §F fold — ``RESOLVED``,
+``NEEDS_REVIEW``, ``UNSUPPORTED`` and an ``invalid_output`` ``REJECTED`` alike
+(``replay_authoring.py:674-683``); only its technical/parse/validator arms write ``failed``.
+Admitting on "a completed event exists" would admit a feature whose human review is still
+outstanding — the single highest-consequence mistake available at this boundary.
 
 ⚠️ **CHECK 4 RE-DERIVES THE HASH.** ``result.candidate_formula_hash`` is a field on the forgeable
 object and is never read here; the digest is recomputed from ``result.candidate_formula`` with the
@@ -46,7 +80,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from featuregen.contracts.db import DbConn
@@ -57,13 +91,12 @@ from featuregen.contracts.db import DbConn
 # re-exported helper would be swept into that check, so an unrelated rename upstream could turn the
 # gate's bypass guard red — or, worse, a helper that really did take a bare formula could be
 # re-exported here and quietly become a public entry point.
-from featuregen.formula import trace as _trace
-from featuregen.formula.authoring import authoring_intent_hash as _authoring_intent_hash
 from featuregen.formula.canonical import formula_content_hash as _formula_content_hash
 from featuregen.formula.result import AuthoringResult
 from featuregen.formula.schema import SchemaError, TypedFormulaV1
 from featuregen.formula.turns import AuthoringIntent
-from featuregen.materialize.canonical import materialize_hash as _materialize_hash
+from featuregen.materialize import authoring_trace as _trace
+from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 
 __all__ = [
@@ -198,22 +231,44 @@ def _terminal_event(conn: DbConn, run_id: str) -> _trace.TerminalEvent:
 # ── 2. the payload validates against its hash ────────────────────────────────────────────────────
 
 def _verify_payload_hash(event: _trace.TerminalEvent, run_id: str) -> None:
-    """Recompute the sha256 over the payload's RFC 8785 bytes and compare (``TERMINAL_PAYLOAD_TAMPERED``).
+    """Recompute the payload's sha256 and compare it (``TERMINAL_PAYLOAD_TAMPERED``).
 
-    ``materialize_hash`` is byte-identical in construction to what ``trace.append_event`` computed
-    (``sha256`` of ``_jcs.dumps`` over the plain payload dict) — the equality is pinned by
-    ``tests/featuregen/formula/test_trace_reader.py``. Using the package's ONE hasher here rather
-    than a private second copy is what keeps that equality checkable.
+    ``authoring_trace.payload_digest`` is the writer's OWN hasher, borrowed rather than
+    re-implemented, so the two sides of this check cannot drift; ``test_admission.py`` pins the
+    equality against a real, unaltered run. Note it is NOT ``materialize.canonical.materialize_hash``
+    (RFC 8785), because 1022 hashes with ``json.dumps`` — a second copy that guessed wrong would
+    make this gate refuse every genuine feature, which is as broken as admitting a forged one.
 
-    Migration 1020 makes the row physically immutable, so a mismatch means the stored bytes were
+    Migration 1022 makes the row physically immutable, so a mismatch means the stored bytes were
     altered out of band (a direct write as a superuser, a restore from doctored bytes). Refusing is
-    the only safe reading: every later check reads this same payload."""
-    if _materialize_hash(event.payload) != event.payload_hash:
+    the only safe reading: every later check reads this same payload.
+
+    A NULL ``payload_hash`` FAILS CLOSED. 1026 added the column to an existing table, so a row can
+    carry no tamper evidence at all; reading that as "nothing to compare against, therefore fine"
+    would make check 2 opt-out, and an unverifiable payload is exactly what a tamper produces."""
+    if event.payload_hash is None:
         raise MaterializationRefused(
             CompilationRefusalCode.TERMINAL_PAYLOAD_TAMPERED,
-            f"the terminal {event.kind.value} event of authoring run {run_id} does not match its "
+            f"the terminal {event.kind} event of authoring run {run_id} records no payload_hash, "
+            "so its payload cannot be authenticated",
+        )
+    if _trace.payload_digest(event.payload) != event.payload_hash:
+        raise MaterializationRefused(
+            CompilationRefusalCode.TERMINAL_PAYLOAD_TAMPERED,
+            f"the terminal {event.kind} event of authoring run {run_id} does not match its "
             "recorded payload_hash",
         )
+
+
+def _payload_field(event: _trace.TerminalEvent, key: str) -> object:
+    """One field of the terminal payload, or ``None`` when the payload is not an object at all.
+
+    1022's ``payload`` column carries no ``jsonb_typeof = 'object'`` CHECK (1020's did), so a
+    directly-written row may hold an array or a scalar. Every caller of this helper treats ``None``
+    as a refusal, so an unreadable record fails CLOSED rather than raising ``AttributeError`` out of
+    a governed gate — the same reading ``_require_resolved`` gives a missing disposition."""
+    payload = event.payload
+    return payload.get(key) if isinstance(payload, Mapping) else None
 
 
 # ── 3. the PAYLOAD's disposition is RESOLVED ─────────────────────────────────────────────────────
@@ -221,15 +276,16 @@ def _verify_payload_hash(event: _trace.TerminalEvent, run_id: str) -> None:
 def _require_resolved(event: _trace.TerminalEvent, run_id: str) -> None:
     """``NOT_RESOLVED`` unless the payload says ``RESOLVED``.
 
-    ⚠️ The event KIND is not consulted, and must not be: only ``TECHNICAL_FAILURE`` writes
-    ``FAILED``, so a ``REJECTED`` or ``UNSUPPORTED`` run also closes with ``COMPLETED``. A missing
+    ⚠️ The event KIND is not consulted, and must not be: 1022's normal terminal append writes
+    ``completed`` for every disposition that reaches the §F fold, so a ``NEEDS_REVIEW``,
+    ``UNSUPPORTED`` or ``invalid_output`` ``REJECTED`` run closes with ``completed`` too. A missing
     or non-string disposition is refused for the same reason — an unreadable verdict is not a
     permissive one."""
-    disposition = event.payload.get("authoring_disposition")
+    disposition = _payload_field(event, "authoring_disposition")
     if disposition != _RESOLVED:
         raise MaterializationRefused(
             CompilationRefusalCode.NOT_RESOLVED,
-            f"the terminal {event.kind.value} event of authoring run {run_id} records "
+            f"the terminal {event.kind} event of authoring run {run_id} records "
             f"authoring_disposition={disposition!r}, not {_RESOLVED}",
         )
 
@@ -249,7 +305,7 @@ def _verify_formula_hash(
     artifact that run produced), a formula that cannot be canonicalized (``SchemaError`` — an
     uncanonicalizable object has no content identity, so it cannot be the recorded one, and §14
     forbids letting that surface as a bare exception), and a formula whose digest simply differs."""
-    recorded = event.payload.get("candidate_formula_hash")
+    recorded = _payload_field(event, "candidate_formula_hash")
     formula = result.candidate_formula
     if formula is None:
         raise MaterializationRefused(
@@ -283,15 +339,20 @@ def _verify_axes(event: _trace.TerminalEvent, result: AuthoringResult, run_id: s
     the fold was performed over, and a result whose axes were rewritten under a genuine RESOLVED
     disposition is misreporting WHY the feature was admitted (a ``blocking`` critic quietly relabelled
     ``clean``, say). Everything a later stage records about this feature's provenance comes from the
-    supplied object, so the two records must be the same record."""
+    supplied object, so the two records must be the same record.
+
+    ⚠️ STRENGTH DEPENDS ON WHO SUPPLIED THE OBJECT, and the module docstring says why: against a
+    forging caller this is a real comparison against a WORM row; against ``materialize.resolve``,
+    whose object is rebuilt from this very payload's nested ``result``, it is an intra-payload
+    consistency check and checks 2 and 6 are what carry that path."""
     differing = tuple(
         field for field in _AXIS_FIELDS
-        if getattr(result, field) != event.payload.get(field)
+        if getattr(result, field) != _payload_field(event, field)
     )
     if differing:
         detail = ", ".join(
             f"{field}: supplied {getattr(result, field)!r} != recorded "
-            f"{event.payload.get(field)!r}"
+            f"{_payload_field(event, field)!r}"
             for field in differing
         )
         raise MaterializationRefused(
@@ -310,11 +371,14 @@ def _verify_intent_hash(conn: DbConn, intent: AuthoringIntent, run_id: str) -> N
     record of what was asked. An absent manifest fails CLOSED: a run whose intent nothing recorded
     cannot have its intent proven.
 
-    ⚠️ SCOPE, VERIFIED (``authoring.authoring_intent_hash``, ``authoring.py:253``): the digest covers
-    ``name``, ``hypothesis``, ``target_entity`` and ``target_grain_keys`` ONLY. It does NOT cover
-    ``AuthoringIntent.recipe_authoring_context``, so this check cannot tell two intents apart when
-    they differ only in that field. Recorded rather than worked around — narrowing what a governed
-    check proves would be a change to ``authoring``'s identity contract, not to this gate."""
+    ⚠️ SCOPE, VERIFIED — and WIDER than it was. ``authoring_trace.authoring_intent_hash`` re-derives
+    by the recipe the 1022 manifest was stamped with (``replay_authoring.py:82-89``, ``:307``):
+    ``name``, ``hypothesis``, ``target_entity``, ``target_grain_keys`` **and
+    ``recipe_authoring_context``** — all FIVE fields of ``AuthoringIntent``. Against migration 1020
+    the fifth was outside the digest and this docstring recorded that as a standing limit; moving
+    lanes closed it. That field carries the authoring prompt's whole catalog context
+    (``formula/author.py:98-99``), so an intent claiming a context the author never saw is a
+    different authoring request, and is now refused rather than admitted."""
     recorded = _trace.read_run_intent_hash(conn, run_id)
     supplied = _authoring_intent_hash(intent)
     if recorded != supplied:

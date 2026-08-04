@@ -15,8 +15,10 @@ constant in the same file as the chain would close that loop, and the failure wo
 module inside this package (``compile.chain``), which may import ``identity`` freely, and this file
 stays free of imports. A test pins exactly that, as it does for ``render``.
 
-Nothing else lives here yet: §2's orchestrator is not built, and inventing a shell for it would be
-a second place the chain is described.
+Nothing else lives in THIS FILE, and the two modules beside it are why the rule above matters:
+:mod:`~featuregen.materialize.compile.chain` (Phase G T3) runs §2's chain from a durable request to
+a sealed project, and :mod:`~featuregen.materialize.compile.wiring` (T4) assembles the Kedro node
+sequence that chain renders. Both import ``identity``; neither is imported from here.
 """
 from __future__ import annotations
 

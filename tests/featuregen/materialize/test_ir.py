@@ -72,6 +72,7 @@ from featuregen.materialize.spine import (
     PopulationSemantics,
     SpineSourceDeclarationV1,
 )
+from featuregen.overlay.upload.bridge_realization import ExecutionTier
 
 _SRC = "hdfc"
 _ROLES = ("feature_engineer",)
@@ -326,9 +327,9 @@ def _admitted(name, *, formula=None, run_id="run-0001") -> AdmittedFeature:
 
 
 def _compile(db, name="total_debit_amount_30d", *, formula=None, roles=_ROLES,
-             spine_decl=DECLARATION, inventory=INVENTORY, run_id="run-0001"):
+             spine_decl=DECLARATION, inventory=INVENTORY, run_id="run-0001", **kwargs):
     return compile_ir(db, _admitted(name, formula=formula, run_id=run_id),
-                      roles=roles, spine_decl=spine_decl, inventory=inventory)
+                      roles=roles, spine_decl=spine_decl, inventory=inventory, **kwargs)
 
 
 def _ok(value):
@@ -1205,3 +1206,45 @@ def test_an_expression_ir_is_reused_verbatim_never_rebuilt(catalog):
     assert isinstance(expr, ExpressionExecutionIR)
     assert RefRole.SOURCE_TABLE in next(
         r.roles for r in expr.physical_read_set if r.logical_ref == TXN)
+
+
+# ══ P2 — the realization APPLICABILITY tier is passed through, never asserted ═════════════════════
+#
+# `ExecutionTier` (`overlay/upload/bridge_realization.py:81`) scopes whether a directional bridge
+# realization is approved for SANDBOX or PRODUCTION data. It is NOT a run execution tier: plan §3.4
+# decided Phase G introduces none, because the sandbox namespace is baked into
+# `sandbox_execution_hash` and a production namespace would fork execution identity. Nothing here
+# names a namespace, a run tier or an execution hash — only which realizations this module can SEE.
+#
+# Before this fix `compile_ir` asserted PRODUCTION by omission: it called
+# `executable_bridge_realizations`, which pins the tier internally, so a SANDBOX-scoped realization
+# was invisible to compilation with no parameter anywhere to change it. What the tier does to the
+# READ is proved against the real store in `tests/featuregen/overlay/upload/test_bridge_store.py`,
+# where the fixture that can put a backed realization on disk lives; what is proved here is that
+# `compile_ir` asks for the tier it was given, and still asks for PRODUCTION when it was given none.
+
+
+def test_compile_ir_defaults_to_the_PRODUCTION_tier_and_forwards_what_it_is_GIVEN(
+        catalog, monkeypatch) -> None:
+    """The read set is empty either way for this same-catalog group — what is asserted is which
+    tier was ASKED for, which is the whole of the bug."""
+    asked: list[ExecutionTier] = []
+
+    def _spy(conn, *, environment_id, execution_tier):
+        asked.append(execution_tier)
+        return ()
+
+    monkeypatch.setattr(ir_module, "_executable_realizations_for_tier", _spy)
+    _ok(_compile(catalog, PUBLIC_FEATURE))
+    _ok(_compile(catalog, PUBLIC_FEATURE, execution_tier=ExecutionTier.SANDBOX))
+    assert asked == [ExecutionTier.PRODUCTION, ExecutionTier.SANDBOX]
+
+
+def test_an_INJECTED_realization_set_still_bypasses_the_reader_entirely(catalog, monkeypatch):
+    """The tier is a parameter of the READ, not a second filter over what a caller injected —
+    `bridge_realizations=` remains the deterministic-unit-test seam it always was."""
+    def _never(conn, *, environment_id, execution_tier):
+        raise AssertionError("the typed reader must not be consulted for an injected set")
+
+    monkeypatch.setattr(ir_module, "_executable_realizations_for_tier", _never)
+    _ok(_compile(catalog, PUBLIC_FEATURE, bridge_realizations=()))

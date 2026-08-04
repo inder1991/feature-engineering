@@ -71,6 +71,31 @@ data:
   # FAIL-CLOSED (D8): flipping this to "1" while the line above is "0" leaves the feature DISABLED
   # (routes still 404) and logs a loud startup warning — the dependency is enforced, not assumed.
   FEATUREGEN_SOURCE_TEMPORAL_SELECTION: "0"
+  # ── Materialization / code-gen (Phase G) — OFF on this cluster ────────────────────────────────
+  # THE KILL SWITCH for the whole materialization lane. A compile runs inside the worker tick on the
+  # worker's one connection, so while it runs the relay, the timers, the projections and every
+  # poller wait for it. `kubectl -n featuregen edit configmap backend-config` + a pod restart is the
+  # supported way to stop materialization WITHOUT stopping the worker; queued jobs stay `ready` and
+  # drain when it comes back on. OFF here because this image has no kedro environment and no
+  # captured cluster inventory, so every compile would honestly record "the build was never
+  # proven". Truthy: 1/true/yes/on.
+  FEATUREGEN_MATERIALIZE_ENABLED: "0"
+  # The four settings a deployment that turns the switch ON must also supply. Deliberately left
+  # UNSET rather than pointed at paths this image does not contain: the lane resolves them only when
+  # a job is claimed, names the missing one, and leaves the request queued for the fix — but that
+  # patience is FINITE. A missing setting is treated as retryable, so the job is redelivered on the
+  # queue's ordinary budget (12 attempts) and then DEAD-LETTERED, and because the lane never claimed
+  # the request it writes no lifecycle: the request is left stranded at `requested` with nothing
+  # queued behind it. Past that point re-triggering needs a FRESH idempotency key (the old one names
+  # the stranded request, and the API answers 409). So turn the switch on and these four together.
+  #   the directory each sealed project tree is written under (one subdirectory per generation)
+  # FEATUREGEN_MATERIALIZE_PROJECT_ROOT: "/var/lib/featuregen/materialize"
+  #   the YAML of captured cluster facts every compilation reads (§0's typed input)
+  # FEATUREGEN_MATERIALIZE_INVENTORY: "/etc/featuregen/cluster-inventory.yaml"
+  #   the interpreter the L0 build proof runs in; unset means no run is ever proven to build
+  # FEATUREGEN_MATERIALIZE_L0_PYTHON: "/opt/kedro-venv/bin/python"
+  #   that proof's bound in seconds; required with L0_PYTHON, and the worker's lease derives from it
+  # FEATUREGEN_MATERIALIZE_L0_TIMEOUT_SECONDS: "900"
 ---
 apiVersion: apps/v1
 kind: Deployment
