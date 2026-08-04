@@ -1046,7 +1046,7 @@ function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
       <span className="mono">
         {link.left_ref} ↔ {link.right_ref}
       </span>{' '}
-      <span className="badge">{link.kind}</span>{' '}
+      <span className="badge">{humanizeCode(link.kind)}</span>{' '}
       {/* Three SEPARATE facts, never collapsed into one badge: whether the link is available at
           all, whether a human reviewed it, and whether it can be executed right now. A review is
           not permission — the server answers executability from a revalidating reader, and this
@@ -1058,6 +1058,22 @@ function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
       <span className="badge" title="revalidated against live dependencies">
         {link.executable_now ? 'executable now' : 'not executable now'}
       </span>
+      {link.crosswalk && (
+        // A crosswalk reads as a crosswalk only if the mapping table is on the row: without it,
+        // "these ids are equal" and "these ids are related through this table" render identically.
+        // Both legs are named — showing one would make a two-hop relationship look like a direct
+        // one. An unreviewed crosswalk is a usable discovery, so it is described, never styled as
+        // a failure: nobody has checked it yet is a state, not a fault.
+        <p className="hint" data-testid={`context-crosswalk-${link.relationship_ref}`}>
+          Related through <span className="mono">{link.crosswalk.mapping_dataset_ref}</span>{' '}
+          ({link.crosswalk.source_to_mapping_refs.join(', ')} ·{' '}
+          {link.crosswalk.mapping_to_target_refs.join(', ')}).{' '}
+          {link.review_status === 'human_verified'
+            ? 'A reviewer has confirmed this mapping.'
+            : 'Nobody has reviewed this mapping yet — it is a proposal you can act on.'}{' '}
+          Running a crosswalk is not available yet, whatever its review says.
+        </p>
+      )}
       {link.realizations.length > 0 && (
         <ul className="rows">
           {link.realizations.map(r => (

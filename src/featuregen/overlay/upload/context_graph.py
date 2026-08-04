@@ -163,6 +163,13 @@ def _executable_realization_ids(conn: DbConn, relationship_ref: str) -> frozense
     answer rather than the first casualty of a dossier-wide failure."""
     from featuregen.overlay.upload.bridge_store import executable_bridge_realizations
 
+    if relationship_ref.startswith("cwd_"):
+        # A CROSSWALK, not a bridge. It has no realization to revalidate and no execution path on
+        # this tree at all (Release C Task 10 builds representation + discovery only), so the
+        # answer is "nothing", stated rather than arrived at by a bridge lookup that happens to
+        # miss. Asking the bridge reader for a crosswalk id would also be a wrong question that
+        # silently returns the right answer — the kind of accident that stops being right later.
+        return frozenset()
     try:
         with conn.transaction():
             realizations = executable_bridge_realizations(
@@ -180,8 +187,23 @@ def _relationship_dict(conn: DbConn, link: RelationshipContextV1) -> dict:
     ``production_eligible`` stays on each realization as what it is — a statement about the stored
     record. A caller that renders the review badge as permission is contradicted by the payload."""
     executable = _executable_realization_ids(conn, link.relationship_ref)
+    crosswalk = None if link.crosswalk is None else {
+        "definition_id": link.crosswalk.definition_id,
+        "definition_revision_id": link.crosswalk.definition_revision_id,
+        "mapping_dataset_ref": link.crosswalk.mapping_dataset_ref,
+        # Both legs, always. Rendering one would be the "omit one leg" mutation Task 13 must kill,
+        # and a crosswalk shown with a single leg reads exactly like a direct link.
+        "source_to_mapping_refs": list(link.crosswalk.source_to_mapping_refs),
+        "mapping_to_target_refs": list(link.crosswalk.mapping_to_target_refs),
+        "mapping_temporal_policy_revision_id":
+            link.crosswalk.mapping_temporal_policy_revision_id,
+        # EMPTY at discovery, by contract: a leg is pinned by resolving it (Task 11), and nothing
+        # in this release resolves anything.
+        "leg_pins": [pin.identity_payload() for pin in link.crosswalk.leg_pins],
+    }
     return {
         "relationship_ref": link.relationship_ref,
+        "crosswalk": crosswalk,
         "kind": link.kind,
         "left_ref": link.left_ref,
         "right_ref": link.right_ref,
@@ -213,9 +235,15 @@ def _relationship_dict(conn: DbConn, link: RelationshipContextV1) -> dict:
 
 
 def _link_why(link: RelationshipContextV1) -> str:
-    """A concise, non-committal explanation of a link — never a claim of executability."""
+    """A concise, non-committal explanation of a link — never a claim of executability.
+
+    A crosswalk names its mapping dataset, because "related through this table" is the whole
+    difference between it and a direct link, and a reader who cannot see which table cannot tell
+    the two apart."""
     review = link.review_status or "unreviewed"
-    return (f"{link.kind} link between {link.left_ref} and {link.right_ref}; "
+    through = ("" if link.crosswalk is None
+               else f" through {link.crosswalk.mapping_dataset_ref}")
+    return (f"{link.kind} link between {link.left_ref} and {link.right_ref}{through}; "
             f"availability {link.availability}, review {review}")
 
 
@@ -458,9 +486,15 @@ def build_context_section(
         semantic_nodes.append(ContextNodeV1(
             id=node_id, kind="relationship", label=link.relationship_ref,
             detail={"kind": link.kind, "availability": link.availability,
-                    "review_status": link.review_status}))
+                    "review_status": link.review_status,
+                    # The mapping dataset is what makes a crosswalk node readable AS a crosswalk;
+                    # without it the graph draws two identical-looking edges for two different
+                    # kinds of relationship.
+                    **({} if link.crosswalk is None
+                       else {"mapping_dataset_ref": link.crosswalk.mapping_dataset_ref})}))
         semantic_edges.append(ContextEdgeV1(
-            from_id=anchor_id, to_id=node_id, kind="identifier_link",
+            from_id=anchor_id, to_id=node_id,
+            kind="crosswalk_link" if link.crosswalk is not None else "identifier_link",
             authority=link.producer, status=link.review_status, why=_link_why(link),
             producer=link.producer, strength=link.strength, lifecycle=link.lifecycle,
             current=link.current, evidence_ids=link.evidence_ids))

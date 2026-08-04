@@ -2280,9 +2280,26 @@ export interface ContextRealization {
   executable_now: boolean
 }
 
+// The Release-C crosswalk extension. It says what the crosswalk IS — which mapping dataset, which
+// revision, both legs — and deliberately nothing about whether it can run: there is no safety
+// status, no tier and no eligibility here to misread, because a crosswalk has no execution path.
+// `leg_pins` is empty at discovery by contract; a leg is pinned by resolving it.
+export interface ContextCrosswalk {
+  definition_id: string
+  definition_revision_id: string
+  mapping_dataset_ref: string
+  source_to_mapping_refs: string[]
+  mapping_to_target_refs: string[]
+  mapping_temporal_policy_revision_id: string | null
+  leg_pins: unknown[]
+}
+
 export interface ContextRelationship {
   relationship_ref: string
   kind: string
+  // Present only on a crosswalk. A direct bridge and a crosswalk between the same two endpoints
+  // are different records answering different questions, and both appear.
+  crosswalk?: ContextCrosswalk | null
   left_ref: string
   right_ref: string
   // available | unavailable, and nothing else — availability never encodes safety.

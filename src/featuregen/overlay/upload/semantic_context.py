@@ -90,6 +90,7 @@ from featuregen.overlay.upload.bridge_store import (
 )
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept_path, display_entity
+from featuregen.overlay.upload.crosswalk import JoinLegPinV1
 from featuregen.overlay.upload.field_resolution import _RETIRED_EVENTS
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord
 from featuregen.overlay.upload.identifier_scope import resolve_identifier_issuer
@@ -408,12 +409,48 @@ class DirectionalRealizationContextV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CrosswalkContextV1:
+    """The D3 ADDITIVE crosswalk extension (Release C Task 10).
+
+    It says what the crosswalk IS — which mapping dataset, which revision, which temporal policy —
+    and it deliberately says NOTHING about whether it can run. There is no safety_status here to
+    fabricate, no tier, no eligibility: a crosswalk on this tree has no execution path at all, and
+    a field that could be misread as one would be the lie this whole release is built to avoid.
+
+    `leg_pins` is D3's shape and is EMPTY at discovery, always. A leg is pinned by RESOLVING it
+    (Task 11: same-catalog legs through `plan_join`, cross-catalog legs through one governed bridge
+    realization); nothing in Task 10 resolves anything, so an empty tuple is the honest value and
+    the contract does not have to change when Task 11 fills it."""
+
+    definition_id: str
+    definition_revision_id: str
+    mapping_dataset_ref: str
+    source_to_mapping_refs: tuple[str, ...]
+    mapping_to_target_refs: tuple[str, ...]
+    mapping_temporal_policy_revision_id: str | None = None
+    leg_pins: tuple[JoinLegPinV1, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("definition_id", "definition_revision_id", "mapping_dataset_ref"):
+            if not getattr(self, name).strip():
+                raise SemanticContextError(f"crosswalk context {name} must not be blank")
+        if not self.source_to_mapping_refs or not self.mapping_to_target_refs:
+            raise SemanticContextError(
+                "a crosswalk context names both legs; one leg alone is the 'omit one leg' mutation")
+
+
+@dataclass(frozen=True, slots=True)
 class RelationshipContextV1:
     """One link + its 0..N current directional realizations (D3 verbatim).
 
     `availability` carries ONLY the `LinkAvailability` values — availability never encodes
-    safety. `relationship_ref` is the bridge fact_key today; Release C extends this contract
-    additively with a `crosswalk` field for crosswalk definitions."""
+    safety. `relationship_ref` is the bridge fact_key for a direct-equality link and the crosswalk
+    DEFINITION id for a crosswalk; the two are distinct records that coexist between the same
+    endpoints, and both are shown.
+
+    The Release-C `crosswalk` extension is ADDITIVE and mutually exclusive with the bridge shape:
+    a crosswalk carries no directional bridge realizations (it has none — a realization is a
+    bridge-family record), and no non-crosswalk kind may carry the extension."""
 
     relationship_ref: str
     kind: str
@@ -428,6 +465,7 @@ class RelationshipContextV1:
     lifecycle: str
     current: bool
     evidence_ids: tuple[str, ...]
+    crosswalk: CrosswalkContextV1 | None = None
 
     def __post_init__(self) -> None:
         if self.availability not in {a.value for a in LinkAvailability}:
@@ -436,6 +474,18 @@ class RelationshipContextV1:
                 "four-way availability/safety merge is deleted (D3)")
         if self.kind not in {k.value for k in RelationshipKind}:
             raise SemanticContextError(f"unknown relationship kind {self.kind!r}")
+        is_crosswalk = self.kind == RelationshipKind.CROSSWALK.value
+        if self.crosswalk is not None and not is_crosswalk:
+            raise SemanticContextError(
+                f"a {self.kind!r} relationship cannot carry a crosswalk extension")
+        if is_crosswalk and self.crosswalk is None:
+            raise SemanticContextError(
+                "a crosswalk relationship must carry its crosswalk extension — the mapping dataset "
+                "is what makes it a crosswalk rather than a direct link")
+        if is_crosswalk and self.realizations:
+            raise SemanticContextError(
+                "a crosswalk has no directional bridge realizations; presenting one would borrow "
+                "the bridge family's safety verdicts for a relationship nothing has measured")
         EvidenceProducer(self.producer)
         AssertionStrength(self.strength)
         EvidenceLifecycle(self.lifecycle)
@@ -744,6 +794,57 @@ def relationship_context_from_link(
         lifecycle=EvidenceLifecycle.ACTIVE.value,
         current=True,
         evidence_ids=tuple(ref.evidence_id for ref in assessment.evidence_refs),
+    )
+
+
+def relationship_context_from_crosswalk(current) -> RelationshipContextV1:
+    """Project one CURRENT crosswalk (`crosswalk_store.CurrentCrosswalkV1`) into the D3 shape.
+
+    Three things this projection refuses to do, each of them a way the surface could lie:
+
+    * it never fabricates a `safety_status`. A crosswalk has no realization, so there is no
+      directional record to carry one, and `realizations` stays empty by construction;
+    * `availability` is `available` and nothing else — the two-word vocabulary. A crosswalk the
+      caller may not see is WITHHELD WHOLE by the store, never listed as "unavailable", because a
+      row saying "there is something here you cannot see" is itself the disclosure;
+    * review status rides alongside, never inside, availability. `human_verified` raises the
+      assertion strength to CONFIRMED (somebody is accountable for it) and changes nothing else.
+
+    The authority triple is the discovery's honest axis: a candidate derived from the table role
+    plus the identifier namespaces is `producer=taxonomy`; one that exists only because an LLM
+    suggested it is `producer=llm`. A crosswalk nobody has reviewed is a usable discovery in the
+    PROPOSED state, never a failure."""
+    from featuregen.overlay.upload.bridge_assessment import EvidenceKind
+
+    revision = current.revision
+    confirmed = current.review_status is LinkReviewStatus.HUMAN_VERIFIED
+    llm_only = bool(revision.evidence_refs) and all(
+        ref.kind is EvidenceKind.LLM_RECOMMENDATION for ref in revision.evidence_refs)
+    return RelationshipContextV1(
+        relationship_ref=revision.definition_id,
+        kind=RelationshipKind.CROSSWALK.value,
+        left_ref=revision.source_ref,
+        right_ref=revision.target_ref,
+        availability=LinkAvailability.AVAILABLE.value,
+        review_status=current.review_status.value,
+        assessment_revision_id=None,     # a crosswalk has no bridge candidate assessment
+        realizations=(),
+        producer=(EvidenceProducer.LLM.value if llm_only else EvidenceProducer.TAXONOMY.value),
+        strength=(AssertionStrength.CONFIRMED.value if confirmed
+                  else AssertionStrength.PROPOSED.value),
+        lifecycle=EvidenceLifecycle.ACTIVE.value,
+        current=True,
+        evidence_ids=tuple(ref.evidence_id for ref in revision.evidence_refs),
+        crosswalk=CrosswalkContextV1(
+            definition_id=revision.definition_id,
+            definition_revision_id=revision.revision_id,
+            mapping_dataset_ref=revision.mapping_dataset_ref,
+            source_to_mapping_refs=tuple(
+                pair.mapping_member_ref for pair in revision.source_to_mapping_pairs),
+            mapping_to_target_refs=tuple(
+                pair.mapping_member_ref for pair in revision.mapping_to_target_pairs),
+            mapping_temporal_policy_revision_id=revision.mapping_temporal_policy_revision_id,
+        ),
     )
 
 
@@ -1221,7 +1322,8 @@ def bundle_from_store(
                 resolution_status="current" if value is not None else
                 UNRESOLVED_PENDING_REVIEW))
 
-    relationship = _scoped_relationship_context(conn, flat_ref, allowed)
+    relationship = _scoped_relationship_context(
+        conn, flat_ref, allowed, logical_ref=logical_ref, roles=roles)
     path = concept_path(concept_name)
     # The ISSUER axis (Task 2): the same `identifier_scope` production the grounded bridge path
     # consumes — one seam, no third namespace surface. Unresolved stays honest (basis
@@ -1289,15 +1391,31 @@ def bundle_from_store(
 
 
 def _scoped_relationship_context(
-    conn: DbConn, flat_ref: str, allowed: list[str]
+    conn: DbConn, flat_ref: str, allowed: list[str], *, logical_ref: str = "",
+    roles: Iterable[str] = (),
 ) -> tuple[RelationshipContextV1, ...]:
     """The anchor's available links through the ONE shipped reader, then read-scoped (D11): a
     link is shown only when EVERY member column of both endpoints is itself visible — a
     restricted column's name never enters another column's context. Fail-closed: an endpoint
-    column absent from the graph is not provably visible, so its link is omitted."""
+    column absent from the graph is not provably visible, so its link is omitted.
+
+    Release C adds the anchor's CROSSWALKS beside its direct-equality links. A direct bridge and a
+    crosswalk between the same two endpoints are DIFFERENT records answering different questions
+    ("these ids are equal" vs "these ids are related through this table"), so both appear, each
+    with its own ref and kind. The crosswalk half is read-scoped by its own store, which withholds
+    a crosswalk WHOLE rather than trimming it — a redacted crosswalk still discloses that two
+    identifier schemes are connected."""
+    crosswalks: tuple[RelationshipContextV1, ...] = ()
+    if logical_ref:
+        from featuregen.overlay.upload.crosswalk_store import crosswalks_for_column
+
+        crosswalks = tuple(
+            relationship_context_from_crosswalk(current)
+            for current in crosswalks_for_column(
+                conn, column_logical_ref=logical_ref, roles=roles))
     links = available_identifier_links(conn, object_ref=flat_ref)
     if not links:
-        return ()
+        return tuple(sorted(crosswalks, key=lambda link: link.relationship_ref))
     member_keys: set[tuple[str, str]] = set()
     for link in links:
         for endpoint in (link.assessment.left_endpoint, link.assessment.right_endpoint):
@@ -1321,7 +1439,8 @@ def _scoped_relationship_context(
         }
         if members <= visible:
             out.append(relationship_context_from_link(conn, link))
-    out.sort(key=lambda link: link.relationship_ref)
+    out.extend(crosswalks)
+    out.sort(key=lambda link: (link.kind, link.relationship_ref))
     return tuple(out)
 
 
