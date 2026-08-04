@@ -546,3 +546,20 @@ def test_a_pointer_advance_that_loses_the_race_reports_the_concept(db):
             db, concept_name="pep_flag", revision_id=revision.revision_id,
             expected_pointer_version=7, declared_by=ADMIN)
     assert "pep_flag" in str(exc.value)
+
+
+def test_a_forged_producer_ref_in_the_provenance_json_is_caught_on_read(db):
+    """Review residual R2: the provenance JSON duplicates the actor as producer_ref, outside the
+    content hash. The revision attestation now seals the whole provenance payload, so the
+    duplicate can no longer silently disagree with the sealed approved_by."""
+    import pytest
+    from featuregen.overlay.upload.pii_policy_store import PolicyStoreConflict
+    revision_id, _version = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose="AML screening exposure features",
+        expected_pointer_version=0, actor="alice@bank")
+    db.execute(
+        "UPDATE pii_use_policy_revision "
+        "SET provenance = jsonb_set(provenance, '{evidence,0,producer_ref}', '\"forged@bank\"') "
+        "WHERE revision_id = %s", (revision_id,))
+    with pytest.raises(PolicyStoreConflict):
+        active_pii_use_policies(db, ["pep_flag"])

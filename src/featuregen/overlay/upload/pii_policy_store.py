@@ -66,18 +66,22 @@ from featuregen.overlay.upload.source_selection import (
 
 
 def revision_attestation_hash(*, revision_id: str, approved_by: str,
-                              approved_at: datetime) -> str:
+                              approved_at: datetime, provenance_payload: object) -> str:
     """The tamper-evidence seal over the revision's PROVENANCE — never over its content.
 
-    Exactly the three fields the §6.2 split keeps out of identity, and no domain tag: the two
-    attestation payloads in this module have disjoint key sets, so neither can ever be mistaken for
+    The fields the §6.2 split keeps out of identity, and no domain tag: the two attestation
+    payloads in this module have disjoint key sets, so neither can ever be mistaken for
     the other. ``approved_at`` is normalized to UTC before it is rendered, because a timestamptz
     read back under a different session timezone is the SAME instant written differently, and an
-    attestation that broke on a session setting would be a false alarm rather than a control."""
+    attestation that broke on a session setting would be a false alarm rather than a control.
+    ``provenance_payload`` (the stored provenance JSON, which duplicates the actor as
+    ``producer_ref``) is sealed too — review residual R2: a second, unsealed copy of the actor
+    could otherwise silently disagree with the sealed ``approved_by``."""
     return materialize_hash({
         "revision_id": revision_id,
         "approved_by": approved_by,
         "approved_at": approved_at.astimezone(UTC).isoformat(),
+        "provenance": provenance_payload,
     })
 
 
@@ -156,6 +160,7 @@ def record_pii_use_policy_revision(conn: DbConn, revision: PiiUsePolicyRevisionV
         (revision.revision_id, revision.concept_name, revision.purpose, revision.status.value,
          Jsonb(revision.provenance.payload()), revision.content_hash, approver, approved_at,
          revision_attestation_hash(revision_id=revision.revision_id, approved_by=approver,
+                                   provenance_payload=revision.provenance.payload(),
                                    approved_at=approved_at)))
     # READ-BACK VERIFY (the house rule): the loader recomputes BOTH hashes, so this proves the row
     # that landed is the row we meant, not merely that INSERT returned.
@@ -317,7 +322,8 @@ def _verified(concept_name: str, purpose: str, status: object, provenance: objec
         raise PolicyStoreConflict(
             f"data-use policy revision {revision_id} fails content verification")
     expected = revision_attestation_hash(
-        revision_id=revision_id, approved_by=approved_by, approved_at=approved_at)
+        revision_id=revision_id, approved_by=approved_by, approved_at=approved_at,
+        provenance_payload=provenance)
     if expected != attestation_hash:
         raise PolicyStoreConflict(
             f"data-use policy revision {revision_id} fails APPROVER verification: the recorded "
