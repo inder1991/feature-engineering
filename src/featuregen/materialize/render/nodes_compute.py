@@ -1772,6 +1772,10 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
             "that is not there."),
     ]
     crosswalk_hops = tuple(hop for hop in plan.hops if hop.crosswalk is not None)
+    # The leg the composed amplification gate CLOSES on, resolved once. `crosswalk_hops` is already
+    # filtered on `crosswalk is not None`, and re-reading the attribute at the closing site makes
+    # that invariant something both a reader and a type checker have to re-derive.
+    closing_leg = crosswalk_hops[-1].crosswalk if crosswalk_hops else None
     for hop in plan.hops:
         if hop.crosswalk is not None:
             leg = hop.crosswalk
@@ -1888,14 +1892,13 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
                 "            ': observed row amplification for directional realization ' +",
                 f"            {hop.realization_revision_id!r})",
             ])
-        if crosswalk_hops and hop is crosswalk_hops[-1]:
-            leg = hop.crosswalk
+        if closing_leg is not None and hop is crosswalk_hops[-1]:
             lines.extend([
                 "    if rows.count() > rows_before_crosswalk:",
                 "        raise RuntimeError(",
                 f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} +",
                 "            ': observed row amplification across the two-leg crosswalk ' +",
-                f"            {leg.crosswalk_execution_revision_id!r})",
+                f"            {closing_leg.crosswalk_execution_revision_id!r})",
             ])
     lines.append("")
     lines.extend(_comment(

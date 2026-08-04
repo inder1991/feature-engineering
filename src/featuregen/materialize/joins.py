@@ -44,6 +44,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TypedDict
 
 from featuregen.contracts.db import DbConn
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
@@ -118,7 +119,11 @@ class JoinPlan:
     them could not be re-checked.
     """
 
-    steps: tuple[JoinStep | CrossCatalogJoinStepV1, ...]
+    #: The THREE governed step kinds this module produces — a same-catalog hop, a directional
+    #: cross-catalog bridge, and one leg of a two-leg crosswalk. All three are in the union because
+    #: consumers narrow on it: with a kind missing, `isinstance` narrowing silently stopped working
+    #: and every attribute read on the narrowed value was unchecked.
+    steps: tuple[JoinStep | CrossCatalogJoinStepV1 | CrosswalkJoinStepV1, ...]
     outcome_kind: str
     roles_used: tuple[str, ...]
     fans_out: bool
@@ -350,6 +355,39 @@ class CrosswalkJoinStepV1:
             "composed_observation_revision_id": self.composed_observation_revision_id,
             "leg_measurement_ids": list(self.leg_measurement_ids),
         }
+
+
+class _SharedLegFields(TypedDict):
+    """The step fields BOTH legs of one crosswalk carry identically — execution-level pins.
+
+    Typed rather than a bare ``dict``: the two steps are built by splatting this into
+    :class:`CrosswalkJoinStepV1`, and under ``dict[str, object]`` a type checker can say nothing
+    about the result — a key renamed on the step and not here, or a ``str`` where a tuple belongs,
+    would land at run time inside a generated project.
+    """
+
+    direction: str
+    cardinality: str
+    crosswalk_definition_revision_id: str
+    crosswalk_execution_revision_id: str
+    mapping_dataset_ref: str
+    mapping_binding_revision_id: str
+    mapping_temporal_policy_revision_id: str | None
+    mapping_row_selection_hash: str | None
+    composed_observation_revision_id: str | None
+    leg_measurement_ids: tuple[str, ...]
+
+
+class _LegPinFields(TypedDict):
+    """One ``JoinLegPinV1`` flattened onto a step — PER LEG, and so never shared."""
+
+    leg_kind: str
+    leg_plan_hash: str
+    leg_read_set_hash: str
+    leg_binding_revision_ids: tuple[str, ...]
+    leg_fact_keys: tuple[str, ...]
+    leg_realization_revision_ids: tuple[str, ...]
+    leg_dependency_snapshot_ids: tuple[str, ...]
 
 
 def _cardinality_verdict(cardinality: str | None) -> _CardinalityVerdict:
@@ -738,18 +776,18 @@ def plan_crosswalk_join(
 
     mapping_catalog = definition.mapping_dataset_ref.split("::", 1)[0]
     cardinality = _DIRECTIONAL_CARDINALITY[composed]
-    shared = {
-        "direction": direction,
-        "cardinality": cardinality,
-        "crosswalk_definition_revision_id": definition.revision_id,
-        "crosswalk_execution_revision_id": execution.execution_revision_id,
-        "mapping_dataset_ref": definition.mapping_dataset_ref,
-        "mapping_binding_revision_id": execution.mapping_binding_revision_id,
-        "mapping_temporal_policy_revision_id": pinned_policy,
-        "mapping_row_selection_hash": None if selection is None else selection.content_hash,
-        "composed_observation_revision_id": execution.composition_observation_revision_id,
-        "leg_measurement_ids": tuple(execution.leg_measurement_ids),
-    }
+    shared = _SharedLegFields(
+        direction=direction,
+        cardinality=cardinality,
+        crosswalk_definition_revision_id=definition.revision_id,
+        crosswalk_execution_revision_id=execution.execution_revision_id,
+        mapping_dataset_ref=definition.mapping_dataset_ref,
+        mapping_binding_revision_id=execution.mapping_binding_revision_id,
+        mapping_temporal_policy_revision_id=pinned_policy,
+        mapping_row_selection_hash=None if selection is None else selection.content_hash,
+        composed_observation_revision_id=execution.composition_observation_revision_id,
+        leg_measurement_ids=tuple(execution.leg_measurement_ids),
+    )
     steps = (
         CrosswalkJoinStepV1(
             leg=first_leg,
@@ -779,17 +817,17 @@ def plan_crosswalk_join(
                     roles_used=roles_used, fans_out=False)
 
 
-def _leg_pin_fields(pin: JoinLegPinV1) -> dict[str, object]:
+def _leg_pin_fields(pin: JoinLegPinV1) -> _LegPinFields:
     """One ``JoinLegPinV1`` flattened onto a step — the pin's own values, never re-derived."""
-    return {
-        "leg_kind": pin.kind.value,
-        "leg_plan_hash": pin.plan_hash,
-        "leg_read_set_hash": pin.read_set_hash,
-        "leg_binding_revision_ids": tuple(pin.binding_revision_ids),
-        "leg_fact_keys": tuple(pin.fact_keys),
-        "leg_realization_revision_ids": tuple(pin.realization_revision_ids),
-        "leg_dependency_snapshot_ids": tuple(pin.dependency_snapshot_ids),
-    }
+    return _LegPinFields(
+        leg_kind=pin.kind.value,
+        leg_plan_hash=pin.plan_hash,
+        leg_read_set_hash=pin.read_set_hash,
+        leg_binding_revision_ids=tuple(pin.binding_revision_ids),
+        leg_fact_keys=tuple(pin.fact_keys),
+        leg_realization_revision_ids=tuple(pin.realization_revision_ids),
+        leg_dependency_snapshot_ids=tuple(pin.dependency_snapshot_ids),
+    )
 
 
 def _refuse_unpinned_physical(
