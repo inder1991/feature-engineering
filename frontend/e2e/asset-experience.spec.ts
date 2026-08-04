@@ -144,6 +144,10 @@ test.describe('suggested features — desktop, real backend, hostile-length cata
     // The anchor line always carries the unbounded table ref and catalog source as mono text, so
     // there is always at least one hostile string on the page for the assertions to bite on.
     await expect(page.getByText(WIDE_TABLE).first()).toBeVisible()
+    // ...and at least one CARD. The summary group also renders on a page with zero suggestions,
+    // which would leave the `.sfc` block this case exists to guard entirely absent from the DOM —
+    // the assertions below would then pass without ever testing the rules under test.
+    await expect(page.locator('.sfc').first()).toBeVisible()
 
     await expectNoHorizontalOverflow(page, 'suggested features (default desktop)')
 

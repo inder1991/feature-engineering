@@ -683,7 +683,11 @@ function ColumnSuggestions({
   // Read scope decides which suggestions exist at all, so a result read under other claims is not
   // an answer here. Keyed on principal + claims, never on the URL alone.
   const identityKey = useIdentityKey()
-  const requestKey = `${identityKey} ${source} ${table}`
+  // The separator is an escaped NUL: it is the one character that cannot occur in a principal,
+  // a catalog source or a table ref, so no pair of different scopes can collide into the same
+  // key. Written as an ESCAPE, never as a literal byte — a raw NUL in the source makes git treat
+  // the file as binary (diffs vanish) and hides it from every plain grep.
+  const requestKey = `${identityKey}\u0000${source}\u0000${table}`
   // Stored WITH the key it was read under, and trusted below only while the two still match. An
   // effect cannot give that guarantee — it runs AFTER the render the session-store update triggers,
   // so clearing there would paint the previous scope's cards once first.
