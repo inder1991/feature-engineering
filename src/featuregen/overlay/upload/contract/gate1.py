@@ -772,6 +772,13 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
         d["metadata_input_fingerprint"] = f.metadata_input_fingerprint
     if f.binding_fact_keys:
         d["binding_fact_keys"] = list(f.binding_fact_keys)
+    # D14 (review F2): only-when-non-empty, exactly like `binding_fact_keys` above. This dict is
+    # hashed into `option_id` and `considered_content_hash`, so a candidate that licensed nothing —
+    # every pre-D14 snapshot and the overwhelming majority of candidates — keeps byte-identical
+    # bytes. A candidate that DID need a policy could not have existed before the gate could clear
+    # one, so there are no pre-existing bytes for the non-empty case to break.
+    if f.personal_data_policy_revision_ids:
+        d["personal_data_policy_revision_ids"] = list(f.personal_data_policy_revision_ids)
     if f.planner_applicability != "not_applicable_nonrecipe":
         d["planner_applicability"] = f.planner_applicability
     if f.physical_plan_id is not None:
@@ -1012,6 +1019,8 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         metadata_snapshot_id=d.get("metadata_snapshot_id"),
         metadata_input_fingerprint=d.get("metadata_input_fingerprint"),
         binding_fact_keys=tuple(str(k) for k in d.get("binding_fact_keys", ())),
+        personal_data_policy_revision_ids=tuple(
+            str(r) for r in d.get("personal_data_policy_revision_ids", ())),
         planner_applicability=d.get("planner_applicability", "not_applicable_nonrecipe"),
         physical_plan_id=d.get("physical_plan_id"),
         planner_declaration_id=d.get("planner_declaration_id"))
