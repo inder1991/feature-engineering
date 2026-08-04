@@ -147,6 +147,15 @@ class ValidationFindingCode(StrEnum):
     PROJECT_DOES_NOT_BUILD = "PROJECT_DOES_NOT_BUILD"
     PROJECT_HASH_MISMATCH = "PROJECT_HASH_MISMATCH"
     PIPELINE_NOT_CONSTRUCTIBLE = "PIPELINE_NOT_CONSTRUCTIBLE"
+    #: The interpreter that proved the build is not the environment the artifact PINS ITSELF to
+    #: (``requirements.lock``, rendered from ``ClusterInventoryV1.engine_versions`` and inside the
+    #: project hash). Added for DEFERRED-WORK A.42: without it the one Phase G failure that fails
+    #: OPEN had no name — L0 imported the project in whatever interpreter it was handed, never
+    #: compared the two, and reported ``PASSED``, so "the build was proven" could be a proof about
+    #: a different environment than the one the artifact declares. It is a FINDING rather than a
+    #: refusal because L0 reports; and it is a finding rather than ``status="error"`` because
+    #: something WAS observed and a report that carries no findings cannot name what.
+    ENGINE_VERSION_MISMATCH = "ENGINE_VERSION_MISMATCH"
 
     # L1 — the physical inputs the run will actually read.
     COLUMN_ABSENT = "COLUMN_ABSENT"

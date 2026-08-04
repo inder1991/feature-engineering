@@ -861,12 +861,140 @@ queryable.
 | 🟡 **A governed refusal caused by a LAGGED overlay projection is reported as `NEEDS_REVIEW` authoring, and the lag is named nowhere an operator can read** | Surfacing it means threading a distinguishable state from `read_operational_value` through the authoring resolver's `NEEDS_AUTHORITY` fold and into the chain's refusal — three modules across two ownership boundaries (`overlay/upload/`, `formula/`), and the fold currently has one bucket for "a governed read did not answer" whether the cause is no decision, a conflict or a stale read model. Widening that vocabulary is a governed-authority decision, not a wiring change. Harmless to correctness: it fails CLOSED and a retry after the projection drains succeeds. | The first operator who debugs a `NEEDS_REVIEW` that had nothing to do with authoring — likely the first busy environment, since the gate is global rather than per-catalog and any concurrent upload can trip it. Closure: carry `projection_unavailable` (with the checkpoint and head) as its own reason through the fold, so the refusal says *the read model is behind* rather than *the model produced something needing review*; the retry advice follows for free. |
 | ⚪ **Test fixtures that append governance events must drain the projection themselves, and two copies of that drain now exist** | `_bridge_fixtures.seed_verified_bridge` and `test_cross_catalog_ir.seed_executable_bridge_realization` each run `run_projection(db, OverlayProjection())` to exhaustion and assert `projection_degraded` is empty, for exactly the reason above. A third copy is a third chance to get it subtly wrong (drain but not assert, assert but not drain). | The third fixture that needs it. Closure: one shared helper beside `_bridge_fixtures`, called by both. |
 
-### A.42 🔴 L0 proves the build in an interpreter it never compares against the artifact's own pins (2026-08-04)
+### A.42 ✅ CLOSED — L0 proved the build in an interpreter it never compared against the artifact's own pins (raised 2026-08-04, closed 2026-08-04)
+
+**Closed by the engine-version check in L0's build probe.** The row is kept because the reasoning
+below is the design record for `ENGINE_VERSION_MISMATCH`, and because one 🟡 under it is still open.
+
+What landed: `ValidationFindingCode.ENGINE_VERSION_MISMATCH` (§14's finding vocabulary, widened by
+one), classified `GOVERNED_FACT_MISMATCH`. `_BUILD_PROBE` now reads the rendered project's own
+`requirements.lock`, parses every `<distribution>==<version>` pin out of it, and compares each to
+`importlib.metadata` **in the probe's own interpreter** — the one that does the proving — emitting
+one finding per disagreeing distribution, each naming the package, the pin and what is installed. A
+lock that is missing, unreadable or pin-less FAILS CLOSED on the same code: "nothing to compare"
+must not read as "they agree", which is this defect restated.
+
+Three placement decisions carry the fix, and all are asserted by tests rather than described:
+
+* **In the probe, not around it.** A second `subprocess` from `run_l0` asking the same
+  `python_executable` what it has would prove something about a second process merely *believed* to
+  be the one that built — a wrapper script, a re-pointed symlink or an install landing between the
+  two launches makes that belief false, which is this very defect at a smaller scale. It would also
+  need its own "the interpreter never answered" channel beside `_probe_verdict`'s `None`.
+* **First, before `sys.path.insert(0, root + "/src")` and before any import**, so nothing the
+  artifact ships has executed when the pins are read. Short-circuiting is also correct routing: a
+  build that fails *because* the engines are wrong would otherwise be filed
+  `PROJECT_DOES_NOT_BUILD`, a `RENDERER_DEFECT`, sending an operator to fix a renderer that did
+  nothing wrong.
+* **With every `sys.path` entry inside the project REMOVED for the query, and restored before the
+  import.** The first attempt at this fix shipped without it and *reopened the defect it closed* —
+  see below; it is recorded rather than quietly amended, because the reasoning that produced the
+  hole is more instructive than the patch.
+
+**The fix's own regression, found by adversarial review and closed in the same branch.** Ordering
+alone was claimed to be sufficient and is not: `_probe_verdict` launches the probe as `python -c`
+with `cwd=root`, and `python -c` puts the cwd at `sys.path[0]` — so the project root was on the
+metadata search path *before the probe's first statement*. Because `_files_on_disk` deliberately
+skips `*.egg-info` from `generated_project_hash` (an editable install writes one by *using* a
+project, so it is correctly not drift), a root-level `kedro.egg-info/PKG-INFO` was **invisible to
+`PROJECT_HASH_MISMATCH` and authoritative for `importlib.metadata` at the same time**: `run_l0`
+returned `passed` with zero findings for a project pinning `kedro==0.19.9` under an interpreter with
+no kedro. The original test missed it because it only ever forged metadata under `src/`.
+
+The probe now strips every `sys.path` entry resolving inside the project before the query and
+restores the list exactly before the import. In-probe rather than `-P` / `PYTHONSAFEPATH`, on three
+grounds: those close only the cwd door and leave `PYTHONPATH=<root>` open (tested); `-P` is 3.11+
+and would fail the launch of an older L0 interpreter, reported as "the environment did not answer";
+and `PYTHONSAFEPATH=1` in the overlay would silently break `run_l0`'s documented contract that
+`env=None` inherits this process's environment unchanged. The regression test is parametrized over
+four placements — project root `.egg-info`, root `.dist-info`, `src/`, and an arbitrary nested
+directory — plus a `PYTHONPATH`-aimed-at-the-project case, plus a test that the restore is exact
+(a project whose registry imports a module living at the project root still builds).
+
+**And a second one, found by the re-review: the probe's OWN imports ran before its sanitization.**
+The first executable line was `import importlib, importlib.metadata, json, os.path, sys, traceback`,
+executed while `cwd=root` still had the project at `sys.path[0]` — so a tree shipping `<root>/json.py`
+executed arbitrary code with the live verdict nonce in `sys.argv[1]` and forged a passing build
+verdict: `passed`, zero findings, again. Strictly weaker than the first hole, and the row says so
+rather than dramatising it: `json.py` **is** inside `generated_project_hash` (it is not `*.egg-info`),
+so a dropped-in copy is `PROJECT_HASH_MISMATCH` and `_prove_the_build`'s identity check keeps the
+chain safe — the exploit needs an adversary-*sealed* tree, not a hand edit. But it falsified two
+sentences the fix's own comments made, and a false comment is worse than none.
+
+The probe now imports `sys` alone (a built-in: never resolved from `sys.path`, so unshadowable),
+drops the cwd entries with pure `sys` and no import at all, then imports `os.path`, then does the
+`realpath` pass, then imports the rest. Regression test ships a hostile module in a **sealed** tree
+so it exercises the probe's import order rather than the hash check. Reverting the import line kills
+the `json` / `traceback` / `importlib` parameters; the `os` / `encodings` parameters survive it,
+because CPython startup already has those in `sys.modules` — they are defence in depth against the
+import list growing, and the test says which is which.
+
+**And a third, one layer earlier again: `PYTHONPATH` is live during SITE INITIALIZATION.** A sealed
+`<root>/sitecustomize.py` under `PYTHONPATH=<root>` executes before the interpreter runs a line of
+`-c` source — before `import sys`, before any pass the probe could add — and forged `passed []` off
+the nonce in `sys.argv[1]`. Not fixable inside the probe by construction, so it is closed
+parent-side: `_probe_environment` drops `PYTHONPATH` entries resolving inside the project before the
+subprocess is launched (`realpath`, resolved against `root` because that is the child's cwd, so
+`.`, `<root>/./` and `<root>/src/../` all collapse). `-P`/`PYTHONSAFEPATH` do not close it — they
+drop the cwd entry and honour `PYTHONPATH` regardless; `-S` would, by also removing `site-packages`
+and blinding the probe to the engines it exists to check.
+
+This **knowingly amends** `run_l0`'s documented "`env=None` inherits this process's environment
+unchanged" to "unchanged except for project-internal `PYTHONPATH` entries" — the same contract cited
+when rejecting `PYTHONSAFEPATH`, so the amendment is written down at `_probe_environment`, at the
+`env` argument and here. The contract existed so a caller could give the probe what the interpreter
+needs, not so an artifact could be handed a way to execute before it is inspected; an entry pointing
+into the tree under validation is never load-bearing, since the probe puts `<root>/src` on the path
+itself and the cwd still supplies `<root>`. A `PYTHONPATH` pointing OUTSIDE the tree is untouched,
+and a test pins that — it is the mechanism the engine check's own fixtures run on.
+
+It needed two non-default conditions together (an adversary-**sealed** tree, since a dropped-in file
+is `PROJECT_HASH_MISMATCH`, **and** a `PYTHONPATH` naming the root, which nothing in `src/` or
+`deploy/` sets). Fixed rather than documented as an exception, because this row says ✅ CLOSED and a
+known forgery path under that word is the precise failure A.42 exists to stop.
+
+Deliberately NOT stripped: a `sys.path` entry that passes *through* the tree by symlink to a target
+outside it. `realpath` resolves to the target, the target is not the artifact, and a project cannot
+author a `sys.path` entry — only files under its own root. Recorded so it reads as a decision.
+
+**Adversarial-review score across three rounds**, since the shape is the lesson: round 1 shipped the
+check with a false sufficiency claim (root on `sys.path` via cwd); round 2 fixed that and left the
+probe's own import line exposed; round 3 fixed that and left site initialization exposed. Each hole
+was one layer earlier in interpreter startup than the last, and each was found by attacking the
+comment rather than the code. The three are closed by three different mechanisms — in-probe path
+sanitization, import ordering, and parent-side environment filtering — and each has its own mutant
+recorded above.
+
+The classification was contested and settled against the code: `status="error"` cannot carry a
+finding (`ValidationReportV1.__post_init__`), and A.42's whole complaint is that the condition names
+itself nowhere — so the verdict has to be the one that can carry a code.
+
+`tests/featuregen/materialize/l0_gate.py::test_the_environment_really_has_the_engines_the_project_pins`
+is no longer a second implementation of the comparison: it drives a real `run_l0` and asserts the
+PRODUCTION verdict — `PASSED` under `.venv-artifact`, `ENGINE_VERSION_MISMATCH` naming each package
+under `.venv-l0-modern` and under the kind image. It is consequently GREEN in all three, and the red
+it replaces has moved into the product. The gate's three build-proof tests take a
+`the_declared_environment` fixture and SKIP outside the artifact line, naming the disagreement: L0
+refuses to prove a build there, so there is no build verdict for them to assert. That fixture
+decides from **one real session-scoped `run_l0`** over a sealed copy of the golden tree, not from a
+parse — an earlier draft decided it from a second pin parser that stripped neither inline comments,
+extras nor environment markers where the probe strips all three, which is how a gate goes quiet
+instead of red. The gate retains one parser, used ONLY to write an expected-value table; if it
+drifts, the test it feeds fails loudly rather than skipping.
+
+Also corrected here, because A.42 is about claiming more than was true: `chain._unproven_detail` no
+longer tells an operator "this project does not build" on the engine path. The probe stops at the
+pin comparison and never imports, so the build is UNPROVEN, and the detail says which.
+
+---
 
 Found by the adversarial review of `e1d471a7`, which put a kedro/pyspark interpreter into the kind
 backend image so `FEATUREGEN_MATERIALIZE_L0_PYTHON` had something real to point at. The interpreter
 is correct and the image change stands; what the review could not establish is that a PASS from it
 means anything about the artifact that passed.
+
+**Everything from here to the table is the defect AS RAISED**, kept verbatim because it is the
+argument for why the check exists. Line references are to the pre-fix code.
 
 **The mechanism, in one line: `_BUILD_PROBE` never bootstraps the project, so the one thing that
 enforces the declared pin is never consulted.**
@@ -897,17 +1025,14 @@ Distinct from **A.32**, which is its neighbour and worth reading beside it: A.32
 *incomplete* (kedro-datasets' spark module hard-imports `hdfs`/`s3fs`, which the lock cannot carry),
 so an environment installed FROM the lock cannot construct the catalog. A.42 says nothing ever checks
 the interpreter AGAINST the lock in the first place. A.32 is about the contents of the pins; A.42 is
-about the absence of the comparison.
+about the absence of the comparison. **A.32 remains open**; closing A.42 did not touch it.
 
-The gate now states the disagreement out loud:
-`l0_gate.py::test_the_environment_really_has_the_engines_the_project_pins` used to assert
-`returncode == 0` on `import kedro, pyspark` — it compared nothing while its name promised the
-comparison. It now parses the rendered project's own `requirements.lock` and compares it to the
-interpreter's installed distributions. It is consequently **RED** under `.venv-l0-modern` and under
-the kind image, and green only under `.venv-artifact` (which is installed from the artifact's lock).
-That red is the only place the platform currently says this, and it is deliberately not `xfail`ed.
+| Item | Status | Notes |
+|---|---|---|
+| ✅ **`run_l0` reported `PASSED` for a project whose declared engines the L0 interpreter does not have** | **CLOSED.** `ENGINE_VERSION_MISMATCH` added to `ValidationFindingCode`; the comparison lives in `_BUILD_PROBE`, ahead of the `sys.path` insert and the import, with every path inside the project stripped for the query and restored before it; one finding per disagreeing distribution, naming package, pin and installed version; a missing, unreadable or pin-less lock fails closed on the same code. | Proved by `test_validation.py`'s engine section (agreement → `PASSED`; per-package mismatch; not-installed vs wrong-version; four forgery placements incl. the project root; `PYTHONPATH` aimed at the tree; the path restore; non-UTF-8 lock; the fail-closed degenerate cases) and by the real chain in `test_chain.py::test_the_chain_calls_the_REAL_run_l0_...`, whose finding is now `ENGINE_VERSION_MISMATCH` rather than the mis-routed `PROJECT_DOES_NOT_BUILD`/`RENDERER_DEFECT`. Mutants "the comparison always agrees" and "run the check after the import" kill 8 and 3 tests respectively. |
 
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
-| 🔴 **`run_l0` reports `PASSED` for a project whose declared engines the L0 interpreter does not have** | Closing it needs a new finding code (an `ENGINE_VERSION_MISMATCH` beside `PROJECT_HASH_MISMATCH` / `PROJECT_DOES_NOT_BUILD` / `PIPELINE_NOT_CONSTRUCTIBLE`), and §14's failure vocabularies are CLOSED — widening one is a governance decision about what L0 is allowed to assert, not a fix a review wave may improvise. There is also a real design question underneath: whether a mismatch is a `FAILED` verdict about the artifact or an `ERROR` about the environment, which is exactly the distinction `_probe_verdict`'s `None` return already draws and would have to be drawn again here. | Mounting any real `FEATUREGEN_MATERIALIZE_INVENTORY` — i.e. the same act that unblocks the flag. Closure: have L0 read the three pins out of the project's `requirements.lock` (they are rendered bytes, already inside the hash) and compare them to `importlib.metadata` in the probe interpreter, emitting the new code when they disagree; the gate test above becomes its executable specification, and goes green in the artifact environment for the right reason. |
-| 🟡 **The kind image's pins are the SANDBOX's, and the sandbox is not the cluster** | `Dockerfile.backend` installs the same three versions as `sandbox/Dockerfile.spark` on the sandbox's ANSI-semantics reasoning, which is sound for choosing *a* Spark 3 line but says nothing about the target cluster. Left as-is because the alternative — deriving the image's pins from an inventory that does not yet exist — is circular, and because with the check above in place a wrong pin becomes loud instead of silent. | The inventory capture. If its `engine_versions` differ from 3.5.3 / 1.5.0 / 9.5.0, the image needs rebuilding against them, and that dependency belongs in the capture procedure rather than being discovered by a failing run. |
+| 🟡 **`may_regenerate` / `may_regenerate_for` have NO production callers, so a finding's CLASS gates nothing** | Found while closing A.42, and it is why this row says the classification is *declared*. `GOVERNED_FACT_MISMATCH` is documented as blocking regeneration, and `may_regenerate` correctly returns `False` — but the only callers are tests, and the chain's decision is `built = report.status is ValidationStatus.PASSED` (`chain.py`), which never reads a class. Not fixed here because G-1 has no regeneration path to gate: wiring it means deciding when regeneration is attempted at all, which is a governed-authority call and not a review-wave change. | The first code that regenerates a refused artifact — i.e. G-2's re-drive. Closure: route it through `may_regenerate_for(conn, generation_id=…)` so `GOVERNED_FACT_MISMATCH` and `UNCLASSIFIED` actually hold, and the §11.2 asymmetry stops being documentation. Until then, do not write "so it blocks regeneration" anywhere; it does not yet. |
+| ⚪ **The version comparison is exact string equality — false positives only, never false negatives** | Distribution NAMES are normalized (`importlib.metadata`, PEP 503, so `kedro-datasets` == `kedro_datasets`); VERSIONS are not, so a capture writing `kedro: "1.5"` against an installed `1.5.0` is reported as a disagreement though PEP 440 calls them equal, as is `1.5.0RC1` vs `1.5.0rc1`. Deliberate: a pin that is not byte-exact is a pin nobody can reproduce, and importing `packaging` into a stdlib-only probe is the worse trade. Nothing can slip through by being merely equivalent. | An operator confused by `expected kedro==1.5 / observed kedro==1.5.0`. Cheapest closure is validating full versions at capture (`EngineVersions.__post_init__` checks only non-blank today), not loosening the comparison. Documented in the probe. |
+| 🟡 **The kind image's pins are the SANDBOX's, and the sandbox is not the cluster** | `Dockerfile.backend` installs the same three versions as `sandbox/Dockerfile.spark` on the sandbox's ANSI-semantics reasoning, which is sound for choosing *a* Spark 3 line but says nothing about the target cluster. Left as-is because the alternative — deriving the image's pins from an inventory that does not yet exist — is circular, and because the check above **is now in place**, so a wrong pin is loud instead of silent: L0 refuses with `ENGINE_VERSION_MISMATCH` naming each package rather than reporting a build it proved somewhere else. | The inventory capture. If its `engine_versions` differ from 3.5.3 / 1.5.0 / 9.5.0, the image needs rebuilding against them, and that dependency belongs in the capture procedure rather than being discovered by a failing run — which is now what would happen, loudly. |
