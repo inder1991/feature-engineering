@@ -266,6 +266,34 @@ def test_a_partition_scoped_mapping_says_so(bank):
         ObservedPartitionPinV1(mapping.identity.table_id, "valid_from", ("2026-08-01",)),))
     observation = _compose(revision, cib, ftr, mapping, mapping=scoped)
     assert CrosswalkObservationCaveat.MAPPING_PARTITION_SCOPED.value in observation.caveats
+    assert observation.partition_scoped is True
+
+
+def test_a_partition_scoped_ENDPOINT_says_so_on_its_own_side(bank):
+    """Three tables, three places a subset can enter. The mapping was the only side that raised a
+    caveat, so an endpoint read over one region proved uniqueness over that region and reported it
+    as though it had read the bank."""
+    _db, revision, cib, ftr, mapping = bank
+    source_pinned = _compose(revision, cib, ftr, mapping, source={
+        "partitions_read": (ObservedPartitionPinV1(
+            cib.identity.table_id, "region", ("eu",)),)})
+    assert CrosswalkObservationCaveat.SOURCE_PARTITION_SCOPED.value in source_pinned.caveats
+    assert CrosswalkObservationCaveat.MAPPING_PARTITION_SCOPED.value not in source_pinned.caveats
+    assert source_pinned.partition_scoped is True
+
+    target_pinned = _compose(revision, cib, ftr, mapping, target={
+        "partitions_read": (ObservedPartitionPinV1(
+            ftr.identity.table_id, "region", ("eu",)),)})
+    assert CrosswalkObservationCaveat.TARGET_PARTITION_SCOPED.value in target_pinned.caveats
+    assert target_pinned.partition_scoped is True
+
+
+def test_an_unrestricted_measurement_is_not_partition_scoped(bank):
+    _db, revision, cib, ftr, mapping = bank
+    observation = _compose(revision, cib, ftr, mapping)
+    assert observation.partition_scoped is False
+    assert not {caveat for caveat in observation.caveats
+                if caveat.endswith("partition_scoped")}
 
 
 # ── leg shape ───────────────────────────────────────────────────────────────────────────────────

@@ -23,6 +23,14 @@ answered. Production requires CURRENT deterministic safety for BOTH legs AND the
 two safe legs do not compose into a safe crosswalk, which is why the composed measurement is a
 separate requirement rather than a formality.
 
+**Evidence has to COVER the scope it is offered against.** ``bridge_admission`` has enforced both
+halves of that since it shipped (``bridge_admission.py:509-517``) and both are carried here, over
+three tables instead of two: partition-scoped evidence cannot validate an UNRESTRICTED applicability
+scope, and a partition-RESTRICTED scope requires partition evidence. A crosswalk gives a subset three
+places to enter — the mapping and either endpoint — and a subset anywhere scopes the composed
+coverage, the composed fan-out and both uniqueness verdicts alike, which is why the question is asked
+of :attr:`CrosswalkExecutionObservationV1.partition_scoped` (the content) rather than of one caveat.
+
 **Nothing here executes.** The decision's output is a :class:`CrosswalkExecutionRevisionV1` — the
 composition carrier Task 10 froze, which this module is the first producer of. There is still no
 compiler and no executor; Task 12 owns those, and a pinned execution revision is what it will
@@ -87,6 +95,12 @@ class CrosswalkAdmissionReason(StrEnum):
     MAPPING_ROWS_NOT_TEMPORALLY_FILTERED = "mapping_rows_not_temporally_filtered"
     MAPPING_TEMPORAL_POLICY_UNRESOLVED = "mapping_temporal_policy_unresolved"
     MAPPING_NULL_ROWS = "mapping_null_rows"
+    #: The two halves of ``bridge_admission``'s partition rule (``bridge_admission.py:509-517``),
+    #: carried across to three tables. Named for the crosswalk rather than the realization because
+    #: that is what the reader is looking at; the RULE is the bridge family's, unchanged.
+    PARTITION_SCOPED_EVIDENCE_CANNOT_VALIDATE_UNRESTRICTED = (
+        "partition_scoped_evidence_cannot_validate_unrestricted_crosswalk")
+    SCOPE_REQUIRES_PARTITION_EVIDENCE = "crosswalk_scope_requires_partition_evidence"
     # ── per direction ───────────────────────────────────────────────────────────────────────────
     DIRECTIONAL_FANOUT = "directional_crosswalk_fanout"
     DIRECTIONAL_UNIQUENESS_NOT_PROVED = "directional_uniqueness_not_proved"
@@ -307,7 +321,7 @@ def evaluate_crosswalk_admission(
             display_tier=BridgeDisplayTier.DISCOVERED, reason_codes=tuple(reasons),
             evidence_refs=evidence, policy_version=policy.policy_version)
 
-    shared = _shared_reasons(observation, policy=policy, now=now)
+    shared = _shared_reasons(observation, policy=policy, now=now, scope=scope)
     forward = _direction_verdict(
         observation, SOURCE_TO_TARGET, policy=policy, shared=shared)
     reverse = _direction_verdict(
@@ -327,8 +341,14 @@ def evaluate_crosswalk_admission(
 def _shared_reasons(
     observation: CrosswalkExecutionObservationV1, *,
     policy: CrosswalkAdmissionPolicyV1, now: datetime,
+    scope: RealizationApplicabilityScopeV1,
 ) -> list[str]:
-    """Everything that disqualifies BOTH directions — evidence quality, not shape."""
+    """Everything that disqualifies BOTH directions — evidence quality, not shape.
+
+    ``scope`` is here for the partition rule and only for it: the question "does this evidence
+    cover what this scope claims?" cannot be answered from the measurement alone, and the two are
+    fused nowhere else.
+    """
     reasons: list[str] = []
     if not observation.complete:
         reasons.append(CrosswalkAdmissionReason.OBSERVATION_INCOMPLETE.value)
@@ -356,6 +376,27 @@ def _shared_reasons(
                 CrosswalkAdmissionReason.MAPPING_ROWS_NOT_TEMPORALLY_FILTERED.value)
         if CrosswalkObservationCaveat.MAPPING_TEMPORAL_POLICY_UNRESOLVED.value in caveats:
             reasons.append(CrosswalkAdmissionReason.MAPPING_TEMPORAL_POLICY_UNRESOLVED.value)
+    # ── the partition rule, BOTH halves (bridge_admission.py:509-517) ───────────────────────────
+    #
+    # This is not a policy knob and has no opt-out, exactly as in the bridge family. Uniqueness
+    # proved over one partition of one of three tables is a statement about that partition; a scope
+    # that restricts nothing is a claim about all of them, and the gap between the two is where a
+    # crosswalk silently multiplies a population. The mirror error is as real: a scope that DOES
+    # restrict to partitions, validated by a measurement that read everything, was proved on rows
+    # the scope does not cover.
+    #
+    # V1 compares PRESENCE and not values, deliberately and identically to the bridge rule:
+    # `partition_scope_ref` is an opaque governed reference with no resolver in this repo, so a
+    # value-level match would have to invent one — and an invented match that returned True would
+    # be worse than no check at all. Sandbox stays admissible throughout (UNASSESSED, via the
+    # shared-reason path): the evidence is real, it is DATA for Task 12's exact runtime gate, and
+    # calling it a failure is the thing the no-blocked rule forbids.
+    partition_scoped = observation.partition_scoped
+    if scope.partition_scope_ref is None and partition_scoped:
+        reasons.append(
+            CrosswalkAdmissionReason.PARTITION_SCOPED_EVIDENCE_CANNOT_VALIDATE_UNRESTRICTED.value)
+    if scope.partition_scope_ref is not None and not partition_scoped:
+        reasons.append(CrosswalkAdmissionReason.SCOPE_REQUIRES_PARTITION_EVIDENCE.value)
     if observation.source_distinct_containment_ratio < (
             policy.minimum_source_distinct_containment):
         reasons.append(CrosswalkAdmissionReason.LOW_SOURCE_CONTAINMENT.value)

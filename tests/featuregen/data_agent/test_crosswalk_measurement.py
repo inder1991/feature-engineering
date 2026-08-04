@@ -342,6 +342,31 @@ def test_partitions_are_pinned_with_their_column(tables):
     assert observation.source_leg.endpoint_row_count == 3
 
 
+def test_a_partition_pin_on_ANY_side_scopes_the_whole_measurement(tables):
+    """The probe SQL knows exactly which partitions it pinned, so the record it produces must say
+    so on the side it pinned them — for all three tables, not only the mapping. Downstream this is
+    what stops partition-scoped evidence validating an unrestricted crosswalk."""
+    source_scoped = _measure(
+        tables,
+        _plan(source_binding=_binding("cib", "cib_accounts", partition_columns=("region",)),
+              source_partitions=PartitionSelector(column="region", values=("eu",))),
+        row_rule=_unfiltered_rule()).observation
+    assert (CrosswalkObservationCaveat.SOURCE_PARTITION_SCOPED.value
+            in source_scoped.caveats)
+    assert source_scoped.partition_scoped is True
+
+    target_scoped = _measure(
+        tables,
+        _plan(target_binding=_binding("ftr", "ftr_tran", partition_columns=("region",)),
+              target_partitions=PartitionSelector(column="region", values=("eu",))),
+        row_rule=_unfiltered_rule()).observation
+    assert (CrosswalkObservationCaveat.TARGET_PARTITION_SCOPED.value
+            in target_scoped.caveats)
+
+    unrestricted = _measure(tables, _plan(), row_rule=_unfiltered_rule()).observation
+    assert unrestricted.partition_scoped is False
+
+
 def test_an_engine_failure_becomes_typed_coverage_that_is_still_storable(tables):
     plan = _plan(source_columns=("no_such_column",))
     result = _measure(tables, plan, row_rule=_unfiltered_rule())

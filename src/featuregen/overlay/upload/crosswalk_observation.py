@@ -117,9 +117,26 @@ class CrosswalkObservationCaveat(StrEnum):
     #: The mapping dataset is partitioned and the measurement read a subset of its partitions, so
     #: every count below is a statement about that subset.
     MAPPING_PARTITION_SCOPED = "mapping_partition_scoped"
+    #: The SOURCE endpoint was read over a subset of its partitions. Named separately from the
+    #: mapping's because a crosswalk reads three tables and a subset on ANY of them scopes every
+    #: composed number — the endpoint sides had no caveat at all until this was found, so a probe
+    #: over one region's accounts reported its uniqueness as though it had read the bank.
+    SOURCE_PARTITION_SCOPED = "source_partition_scoped"
+    #: The TARGET endpoint was read over a subset of its partitions.
+    TARGET_PARTITION_SCOPED = "target_partition_scoped"
     #: At least one leg was observed with sampled/partial coverage or an approximate method, so the
     #: composition may DISPROVE uniqueness but can never establish it.
     LEG_EVIDENCE_NOT_EXACT = "leg_evidence_not_exact"
+
+
+#: Every caveat that means "these numbers describe a partition SUBSET". A reader asks
+#: :attr:`CrosswalkExecutionObservationV1.partition_scoped` rather than testing three names, and
+#: admission asks the same question of the CONTENT so a missing caveat cannot widen a claim.
+PARTITION_SCOPE_CAVEATS: frozenset[str] = frozenset({
+    CrosswalkObservationCaveat.MAPPING_PARTITION_SCOPED.value,
+    CrosswalkObservationCaveat.SOURCE_PARTITION_SCOPED.value,
+    CrosswalkObservationCaveat.TARGET_PARTITION_SCOPED.value,
+})
 
 
 #: Operators whose CONTENT is the operator itself — "the row the source flags as current" binds no
@@ -698,6 +715,24 @@ class CrosswalkExecutionObservationV1:
         return (self.source_leg.leg_observation_id, self.target_leg.leg_observation_id)
 
     @property
+    def partition_scoped(self) -> bool:
+        """Did ANY side read a partition SUBSET? Then every number here describes that subset.
+
+        Read from the CONTENT — the composed pins and all three tables' own pins — and not only
+        from :attr:`caveats`, because a record assembled by hand (or by a future writer that forgot
+        the caveat) would otherwise be admitted as though it had read everything. The caveats are
+        consulted too, so a record that says it was scoped is believed even where the pins it
+        carried were not preserved.
+
+        This is what ``crosswalk_admission`` fuses with the applicability scope's
+        ``partition_scope_ref``; the bridge family has kept the same rule since it shipped."""
+        return bool(self.partitions
+                    or self.mapping.partitions_read
+                    or self.source_leg.partitions_read
+                    or self.target_leg.partitions_read
+                    or (set(self.caveats) & PARTITION_SCOPE_CAVEATS))
+
+    @property
     def exact_and_complete(self) -> bool:
         return (self.complete
                 and self.row_coverage is RowCoverage.FULL
@@ -794,8 +829,15 @@ def compose_crosswalk_observation(
     all_caveats = set(caveats)
     if method != RelationshipMethod.EXACT.value or coverage is not RowCoverage.FULL:
         all_caveats.add(CrosswalkObservationCaveat.LEG_EVIDENCE_NOT_EXACT.value)
+    # EVERY side, not just the mapping. A crosswalk reads three tables, and a partition subset on
+    # any one of them scopes the composed coverage, the composed fan-out and both uniqueness
+    # verdicts alike. The endpoint sides raised nothing at all until this was found.
     if mapping.partitions_read:
         all_caveats.add(CrosswalkObservationCaveat.MAPPING_PARTITION_SCOPED.value)
+    if source_leg.partitions_read:
+        all_caveats.add(CrosswalkObservationCaveat.SOURCE_PARTITION_SCOPED.value)
+    if target_leg.partitions_read:
+        all_caveats.add(CrosswalkObservationCaveat.TARGET_PARTITION_SCOPED.value)
     if mapping_temporal_policy_revision_id is None and not (
             all_caveats & {CrosswalkObservationCaveat.MAPPING_TEMPORAL_POLICY_ABSENT.value,
                            CrosswalkObservationCaveat.MAPPING_TEMPORAL_POLICY_UNRESOLVED.value}):

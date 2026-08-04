@@ -42,6 +42,7 @@ from featuregen.overlay.upload.crosswalk_observation import (
     SOURCE_TO_TARGET,
     TARGET_TO_SOURCE,
     CrosswalkObservationCaveat,
+    ObservedPartitionPinV1,
     compose_crosswalk_observation,
 )
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
@@ -206,6 +207,95 @@ def test_a_null_in_the_mapping_refuses_both_directions():
 def test_a_free_form_normalization_can_never_pass_the_closed_vocabulary():
     decision = _admit(_observation(source={"normalization_ids": ("strip_leading_zeros_v9",)}))
     assert (CrosswalkAdmissionReason.NORMALIZATION_NOT_ADMITTED.value
+            in decision.reason_codes)
+    assert decision.any_production_admissible is False
+
+
+# ── partition scope: the bridge family's rule, carried across ───────────────────────────────────
+#
+# `bridge_admission` has kept both halves since it shipped (`bridge_admission.py:509-517`): evidence
+# read from a partition subset cannot validate an UNRESTRICTED realization, and a partition-
+# RESTRICTED scope requires partition evidence. A crosswalk reads three tables instead of two, so
+# there are three places a subset can enter — and any one of them scopes every number the
+# composition reports.
+
+PARTITION_SCOPE = replace(SCOPE, scope_id="crosswalk-partition-scope",
+                          partition_scope_ref="valid_from=2026-08-01")
+
+
+def _pin(binding, column="valid_from", values=("2026-08-01",)):
+    return ObservedPartitionPinV1(binding.identity.table_id, column, values)
+
+
+def _partition_scoped_mapping():
+    return mapping_observation(MAP, partitions_read=(_pin(MAP),))
+
+
+def test_partition_scoped_mapping_evidence_cannot_validate_an_unrestricted_crosswalk():
+    """The reviewer's first probe. The measurement DID raise `mapping_partition_scoped`, and
+    admission read straight past it: a subset of the mapping's partitions proved uniqueness over
+    that subset only, and the scope it was offered against restricts nothing."""
+    observation = _observation(mapping=_partition_scoped_mapping())
+    assert CrosswalkObservationCaveat.MAPPING_PARTITION_SCOPED.value in observation.caveats
+    decision = _admit(observation)
+    assert (CrosswalkAdmissionReason.PARTITION_SCOPED_EVIDENCE_CANNOT_VALIDATE_UNRESTRICTED.value
+            in decision.reason_codes)
+    assert decision.any_production_admissible is False
+    # Sandbox still admits it AS DATA for Task 12's exact runtime gate — adjudicated honestly, not
+    # rewritten into a failure (the no-blocked rule).
+    assert decision.forward.sandbox_admissible is True
+    assert decision.forward.safety_status is SafetyStatus.UNASSESSED
+
+
+def test_a_source_side_partition_subset_also_refuses_production():
+    """The reviewer's second probe, and the worse half: a SOURCE-side subset raised no caveat at
+    all, so nothing downstream could even have noticed. Every side scopes the evidence."""
+    observation = _observation(source={"partitions_read": (_pin(CIB, "region", ("eu",)),)})
+    assert CrosswalkObservationCaveat.SOURCE_PARTITION_SCOPED.value in observation.caveats
+    decision = _admit(observation)
+    assert (CrosswalkAdmissionReason.PARTITION_SCOPED_EVIDENCE_CANNOT_VALIDATE_UNRESTRICTED.value
+            in decision.reason_codes)
+    assert decision.any_production_admissible is False
+
+
+def test_a_target_side_partition_subset_refuses_production_too():
+    observation = _observation(target={"partitions_read": (_pin(FTR, "region", ("eu",)),)})
+    assert CrosswalkObservationCaveat.TARGET_PARTITION_SCOPED.value in observation.caveats
+    decision = _admit(observation)
+    assert (CrosswalkAdmissionReason.PARTITION_SCOPED_EVIDENCE_CANNOT_VALIDATE_UNRESTRICTED.value
+            in decision.reason_codes)
+    assert decision.any_production_admissible is False
+
+
+def test_a_partition_restricted_scope_admits_partition_scoped_evidence():
+    """The other side of the rule: evidence read over the partitions the scope restricts to is
+    exactly the right evidence, and admits as before."""
+    observation = _observation(mapping=_partition_scoped_mapping(),
+                               scope_id=PARTITION_SCOPE.scope_id)
+    decision = _admit(observation, scope=PARTITION_SCOPE)
+    assert decision.forward.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
+    assert decision.reverse.safety_status is SafetyStatus.DETERMINISTICALLY_VALIDATED
+    assert decision.any_production_admissible is True
+    assert decision.reason_codes == ()
+
+
+def test_a_partition_restricted_scope_without_partition_evidence_refuses():
+    """A scope that restricts to partitions, validated by a measurement that read everything, is
+    the mirror error: the numbers describe rows the scope does not cover."""
+    observation = _observation(scope_id=PARTITION_SCOPE.scope_id)
+    decision = _admit(observation, scope=PARTITION_SCOPE)
+    assert (CrosswalkAdmissionReason.SCOPE_REQUIRES_PARTITION_EVIDENCE.value
+            in decision.reason_codes)
+    assert decision.any_production_admissible is False
+    assert decision.forward.sandbox_admissible is True
+
+
+def test_a_composed_partition_pin_alone_scopes_the_evidence():
+    """Admission reads the CONTENT, not only the caveat list: a hand-built record that pinned
+    partitions and forgot to say so is still partition-scoped evidence."""
+    observation = _observation(partitions=(_pin(MAP),))
+    decision = _admit(observation)
+    assert (CrosswalkAdmissionReason.PARTITION_SCOPED_EVIDENCE_CANNOT_VALIDATE_UNRESTRICTED.value
             in decision.reason_codes)
     assert decision.any_production_admissible is False
 
