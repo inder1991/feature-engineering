@@ -64,7 +64,12 @@ data:
   FEATUREGEN_MATERIALIZE_ENABLED: "0"
   # The four settings a deployment that turns the switch ON must also supply. Deliberately left
   # UNSET rather than pointed at paths this image does not contain: the lane resolves them only when
-  # a job is claimed, names the missing one, and leaves the request queued for the fix.
+  # a job is claimed, names the missing one, and leaves the request queued for the fix — but that
+  # patience is FINITE. A missing setting is treated as retryable, so the job is redelivered on the
+  # queue's ordinary budget (12 attempts) and then DEAD-LETTERED, and because the lane never claimed
+  # the request it writes no lifecycle: the request is left stranded at `requested` with nothing
+  # queued behind it. Past that point re-triggering needs a FRESH idempotency key (the old one names
+  # the stranded request, and the API answers 409). So turn the switch on and these four together.
   #   the directory each sealed project tree is written under (one subdirectory per generation)
   # FEATUREGEN_MATERIALIZE_PROJECT_ROOT: "/var/lib/featuregen/materialize"
   #   the YAML of captured cluster facts every compilation reads (§0's typed input)

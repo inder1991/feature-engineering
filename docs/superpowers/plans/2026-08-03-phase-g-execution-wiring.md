@@ -2,7 +2,7 @@
 
 **Status: PLAN, awaiting user approval. No implementation has started.**
 Baseline: `feature/phase-g` @ `3b0b7b01` (branched from `worktree-codegen-review-remediation`).
-Charter: `docs/superpowers/plans/2026-08-03-phase-g-handoff.md`.
+Charter: handed over out-of-band and not committed to this branch. What survived verification of it is recorded in `docs/superpowers/plans/phase-g-scouting/charter-corrections.md`, which is the citable record — read that, not a file this repo does not contain.
 Evidence: four Opus scout reports, `/Users/ascoe/.claude/jobs/f47dd051/tmp/scout-{chain,lifecycle,trigger,track1}.md`, to be committed into the repo as an appendix before implementation.
 
 ---

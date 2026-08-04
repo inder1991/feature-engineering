@@ -814,6 +814,14 @@ def _retryable(
     The status reports WHAT HAPPENED, which is not the same as what was attempted: when the budget
     is gone and this call never held the request, the message is dead and the request is untouched —
     ``dead_letter``, not ``failed``.
+
+    The terminalizing write is NARROWED to ``accepted``, the state :func:`_still_ours` just re-read
+    and required. Without ``expected_from`` the UPDATE matches every state ``failed`` is legal from,
+    ``running`` included — so a request that moved on between that re-read and this write would be
+    failed on evidence gathered about a different state. It is unreachable in G-1 (``running``
+    exists only inside ``_commit``'s transaction, which holds this row's lock) and durable the
+    moment G-2's ``prepare_run`` lands; ``reconcile.py:541`` closed the same hole for the same
+    reason, and this is its twin.
     """
     exhausted = claim.attempts >= claim.max_attempts
     ended = False
@@ -821,7 +829,8 @@ def _retryable(
             if fail_materialization(conn, claim, error=error, permanent=False) else None)
     if ours is not None:
         if exhausted:
-            advance_lifecycle(conn, request_id=ours, to_state=RequestLifecycle.FAILED)
+            advance_lifecycle(conn, request_id=ours, to_state=RequestLifecycle.FAILED,
+                              expected_from=RequestLifecycle.ACCEPTED)
             ended = True
         else:
             renew_lease(conn, request_id=ours, lease_seconds=_RELEASED_LEASE_SECONDS)
@@ -915,11 +924,14 @@ def _deterministic_failure(
     this worker's to terminalize.
 
     The state is RE-READ rather than assumed (:func:`_still_ours`), and the write is skipped unless
-    it is still ``accepted``.
+    it is still ``accepted`` — then NARROWED to that same state, so the re-read is a precondition of
+    the UPDATE rather than merely a check that preceded it. See :func:`_retryable` for the argument;
+    it is ``reconcile.py:541``'s, applied to the lane.
     """
     ours = _still_ours(conn, request_id, accepted=accepted)
     if ours is not None:
-        advance_lifecycle(conn, request_id=ours, to_state=RequestLifecycle.FAILED)
+        advance_lifecycle(conn, request_id=ours, to_state=RequestLifecycle.FAILED,
+                          expected_from=RequestLifecycle.ACCEPTED)
     fail_materialization(conn, claim, error=error, permanent=True)
     counters.incr(f"materialize.lane.{status}")
     log("materialize.lane.failed", level="error", status=status, request_id=request_id,

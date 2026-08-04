@@ -757,8 +757,14 @@ def _publish_tree(staging: pathlib.Path, root: pathlib.Path) -> None:
     set. It is recorded because the invariant is narrower than it looks: a future probe with richer
     side effects (a ``.lock``, a log, a compiled extension) would publish those too, and anything
     outside that shared skip list becomes drift the integrity gate reports against the operator.
+
+    No ``mkdir`` here, and that is not an omission. ``staging`` is ``root``'s SIBLING
+    (``root.parent / f".{root.name}.partial"``), and ``_commit`` already wrote the whole project
+    into it through ``materialize_to``, which mkdirs every file's parent with ``parents=True``
+    (``render/project.py:1300``). So ``root.parent`` provably exists by the time this runs — it is
+    ``staging``'s parent too, and ``staging`` is populated. A ``mkdir`` here could only re-assert
+    what the write it follows already proved.
     """
-    root.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, root)
 
 
@@ -769,6 +775,13 @@ class _Stop:
     docstring), so what it records is the request's own terminal state. Recording it here rather
     than at each stage is what makes "every governed refusal is recorded and returned, never
     swallowed" a property of the chain rather than of nine call sites.
+
+    The write is NARROWED to ``accepted``. Every refusal this class records was reached from a stage
+    that ran on an ``accepted`` request — ``_claim`` requires that state and raises otherwise — and
+    an unnarrowed UPDATE would also match ``running``, terminalizing a request that had moved on
+    against a verdict about the state it left. Unreachable in G-1 (nothing outside ``_commit``'s
+    transaction can produce ``running``) and durable the moment G-2's ``prepare_run`` lands, which
+    is ``reconcile.py:541``'s argument applied to the chain's own refusal path.
     """
 
     __slots__ = ("conn", "request")
@@ -779,7 +792,8 @@ class _Stop:
 
     def refused(self, stage: ChainStage, refusal: MaterializationRefused) -> CompiledGroup:
         moved = advance_lifecycle(self.conn, request_id=self.request.request_id,
-                                  to_state=RequestLifecycle.FAILED)
+                                  to_state=RequestLifecycle.FAILED,
+                                  expected_from=RequestLifecycle.ACCEPTED)
         return CompiledGroup(
             request_id=self.request.request_id,
             logical_group_name=self.request.logical_group_name,

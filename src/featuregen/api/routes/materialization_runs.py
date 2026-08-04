@@ -402,9 +402,14 @@ def _record(conn: psycopg.Connection, request_id: str, body: MaterializationRunI
     a different set of features is REFUSED by the store; without it, the store would happily answer
     the second caller with the first caller's request and both would believe their group was queued.
 
-    ``activation_state`` records the switch that was observed at the moment of asking. It is
-    evidence about the world the decision was made in, and the store is deliberately opaque to its
-    content.
+    ``activation_state`` records the switch that was OBSERVED at the moment of asking. It is
+    evidence about the world the decision was made in (``request_store.py:203-206``), and the store
+    is deliberately opaque to its content — which is exactly why the value must be read rather than
+    asserted. ``require_materialization_enabled`` proved the switch was on to admit this request,
+    but that reading happened at a different instant on a value nothing caches, and a literal
+    ``True`` here would record a claim this function never made: an operator reading the row back
+    could not tell an observation from a constant. So the flag is consulted again, and what is
+    stored is whatever it said.
     """
     try:
         return record_request(
@@ -414,7 +419,8 @@ def _record(conn: psycopg.Connection, request_id: str, body: MaterializationRunI
             requested_by=identity.subject,
             authorized_roles=identity.role_claims,
             idempotency_key=body.idempotency_key,
-            activation_state={"flag": MATERIALIZATION_FLAG, "enabled": True, "surface": "http"},
+            activation_state={"flag": MATERIALIZATION_FLAG,
+                              "enabled": materialization_enabled(), "surface": "http"},
             resolved_input_digest=materialize_hash({
                 "logical_group_name": body.logical_group_name,
                 "work_item_ids": list(members)}),

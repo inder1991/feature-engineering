@@ -186,6 +186,27 @@ def _boom_once(exc: Exception):
     return _maybe
 
 
+def _running_before_the_write(run_id: str):
+    """Stage the ONE race ``expected_from`` closes: the row moves to ``running`` after this handler
+    re-read it as ``accepted`` and before its terminalizing UPDATE lands.
+
+    Wrapping ``advance_lifecycle`` is how the window is made observable at all. In G-1 ``running``
+    exists only inside ``_commit``'s transaction, which holds this row's lock for its whole life, so
+    no arrangement of REAL calls can produce it here — which is precisely the reviewer's point:
+    unreachable today, durable the moment G-2's ``prepare_run`` writes ``running`` from outside that
+    lock. The wrapper moves the row through the real ``advance_lifecycle`` (a legal
+    ``accepted → running`` edge, run id and all) and then lets the handler's own call proceed
+    untouched, so what is under test is the handler's ARGUMENTS, not a stub's idea of them.
+    """
+    real = queue_lane.advance_lifecycle
+
+    def _advance(conn, *, request_id, **kwargs):
+        real(conn, request_id=request_id, to_state=RequestLifecycle.RUNNING, run_id=run_id)
+        return real(conn, request_id=request_id, **kwargs)
+
+    return _advance
+
+
 _FINDING = ValidationFinding(
     code=ValidationFindingCode.PROJECT_DOES_NOT_BUILD, location="pipeline_registry",
     expected=None, observed=None, count=1)
@@ -501,6 +522,44 @@ def test_an_exhausted_budget_this_worker_never_CLAIMED_is_a_dead_letter_not_a_fa
     assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
         RequestLifecycle.REQUESTED
     assert _queue_row(catalog, request.request_id)[0] == "dead"
+
+
+@pytest.mark.parametrize(("exhaust_budget", "error"), [
+    (False, KeyError("a call assembled wrongly")),
+    (True, ConnectionError("gone")),
+], ids=["_deterministic_failure", "_retryable_with_the_budget_gone"])
+def test_a_request_that_became_RUNNING_is_not_FAILED_by_a_verdict_about_ACCEPTED(
+        enqueued, catalog, monkeypatch, exhaust_budget, error) -> None:
+    """Both of the lane's terminalizing writes, narrowed — `reconcile.py`'s argument, applied here.
+
+    Every verdict these two paths reach is EVIDENCE ABOUT AN `accepted` REQUEST: `_still_ours`
+    literally re-reads the row and requires that state before either will write. An unnarrowed
+    `advance_lifecycle` UPDATE matches every state `failed` is legal from, `running` included — so a
+    request that moved on between that re-read and the write would be terminalized on a finding
+    gathered about the state it had left, and `failed` is not a state anything walks back from.
+
+    `expected_from` makes the row's own state a PRECONDITION of the UPDATE rather than a fact that
+    merely preceded it. The refusal is the honest outcome: nothing is written, and the raise says
+    the row moved rather than pretending this worker's verdict still applies to it. The assertion
+    that matters is the last line — the request is still `running`, holding whatever the writer that
+    moved it there is doing.
+
+    Unreachable in G-1 and asserted anyway, for the reason `reconcile.py:541` gives: G-2's
+    `prepare_run` writes `running` from outside `_commit`'s lock, and on that day this is a live
+    hazard rather than a latent one.
+    """
+    request, _, config = enqueued
+    if exhaust_budget:
+        catalog.execute("UPDATE queue SET attempts = max_attempts - 1 WHERE message_id = %s",
+                        (f"materialize:{request.request_id}",))
+    monkeypatch.setattr(queue_lane, "compile_feature_group", _boom(error))
+    monkeypatch.setattr(queue_lane, "advance_lifecycle", _running_before_the_write("run-moved-on"))
+
+    with pytest.raises(ValueError, match="moved to 'running'"):
+        _drain(catalog, config)
+
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.RUNNING
 
 
 def test_an_ABANDONED_claim_is_ADOPTED_once_its_lease_has_demonstrably_expired(

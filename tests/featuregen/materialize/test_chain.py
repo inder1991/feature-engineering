@@ -53,6 +53,7 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
     no_dsn,
 )
 
+from featuregen.materialize import control_plane
 from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import (
@@ -776,6 +777,72 @@ def test_the_chain_can_never_append_PUBLISHED() -> None:
     assert indirect == []
 
 
+def _calls_append_run_event(tree: ast.AST) -> bool:
+    """Any CALL of that name in the module — attribute (``control_plane.append_run_event``) or bare
+    (the ``from … import`` form ``chain.py`` uses). The name is what matters, not how it was
+    reached: an alias binds a different name to the same function, and the src-wide sweep below is
+    what catches that — a module that aliased it would still have to import it from
+    ``control_plane``, and that import is asserted too."""
+    return any(
+        (isinstance(node.func, ast.Name) and node.func.id == "append_run_event")
+        or (isinstance(node.func, ast.Attribute) and node.func.attr == "append_run_event")
+        for node in ast.walk(tree) if isinstance(node, ast.Call))
+
+
+def _imports_append_run_event(tree: ast.AST) -> bool:
+    """The module binds the name at all — including under an alias (``as _append``), which is the
+    one route a call-site scan on its own would miss."""
+    return any(alias.name == "append_run_event"
+               for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+               for alias in node.names)
+
+
+def test_only_the_chain_may_append_a_RUN_EVENT_anywhere_in_src() -> None:
+    """The truthfulness guard, widened from one FILE to the whole PLANE.
+
+    ``test_the_chain_can_never_append_PUBLISHED`` reads ``chain.py`` and nothing else, so it proves
+    a property of one module rather than of the append-only stream. ``append_run_event`` is public
+    and exported (``control_plane.py:77``), and a future module that called it — a submit lane, a
+    run-status mirror — would pass every other test on this branch while writing a terminal event
+    the plane can never retract. That the chain is the only caller TODAY is a fact about the tree,
+    and a fact about the tree is exactly what a test can pin.
+
+    Two assertions, and they are different claims. The SET equality says who may call it: one
+    module, named here, so a second caller is a deliberate edit to this line rather than a silent
+    addition. The per-file check then applies ``chain.py``'s own permitted-member rule to every
+    caller, so widening the caller set does not smuggle in a ``PUBLISHED`` write with it.
+
+    The import scan is what makes the aliasing route (recorded as a minor against the per-file
+    test) reachable at all: ``from … import append_run_event as _append`` renames the call, but the
+    IMPORT still spells the name, and a module that imports it and never calls it is a loaded gun.
+
+    The substring pre-filter is not an optimization detail worth hiding: parsing all ~470 modules
+    costs tens of seconds against this suite's per-test timeout, and no module can call or import a
+    name whose TEXT it does not contain. Every file is still READ — the sweep's claim is about the
+    tree, so a file it never opened would be a hole in it — only the AST work is narrowed.
+    """
+    source_root = pathlib.Path(chain.__file__).parent.parent.parent   # src/featuregen
+    definition = pathlib.Path(control_plane.__file__).resolve()       # where it is DECLARED
+    permitted = {"PUBLICATION_REFUSED", "RUN_FAILED"}
+    members = {member.name for member in RunEventKind}
+
+    callers = {}
+    for path in sorted(source_root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "append_run_event" not in source or path.resolve() == definition:
+            continue
+        tree = ast.parse(source)
+        if _calls_append_run_event(tree) or _imports_append_run_event(tree):
+            callers[str(path.relative_to(source_root))] = tree
+
+    assert set(callers) == {"materialize/compile/chain.py"}, sorted(callers)
+    for name, tree in callers.items():
+        attributes = {node.attr for node in ast.walk(tree)
+                      if isinstance(node, ast.Attribute) and _is_run_event_kind(node.value)}
+        assert attributes <= permitted, (name, attributes)
+        assert _code_strings(tree) & members <= permitted, name
+
+
 def test_no_path_records_a_published_generation(ready, catalog) -> None:
     """The behavioural half. `published_generation_ids` is what §10.1's "current plan" derivation
     reads, so a generation that appeared there would become a group's current plan on the strength
@@ -882,6 +949,43 @@ def test_an_admission_refusal_is_recorded_at_ADMIT(catalog, monkeypatch, tmp_pat
     assert outcome.stopped_at is ChainStage.ADMIT
     assert outcome.refusal is refusal
     _assert_nothing_was_written(catalog, tmp_path, request_id)
+
+
+def test_a_request_that_became_RUNNING_is_not_FAILED_by_a_verdict_about_ACCEPTED(
+        catalog, monkeypatch, tmp_path) -> None:
+    """`_Stop.refused`'s write, narrowed — the lane's twin, and `reconcile.py:541`'s argument.
+
+    Every refusal `_Stop` records was reached by a stage that ran on an `accepted` request: `_claim`
+    requires that state and raises otherwise. An unnarrowed `advance_lifecycle` UPDATE matches every
+    state `failed` is legal from, `running` included, so a request that moved on between the claim
+    and the refusal would be terminalized on a verdict about the state it left — and `failed` is
+    terminal, with no path back.
+
+    The wrapper is how a window that G-1 cannot open is made observable. `running` exists here only
+    inside `_commit`'s transaction, which holds this row's lock, so no arrangement of real calls
+    reaches this state — and that is exactly why it is closed now: G-2's `prepare_run` writes
+    `running` from outside that lock. The row is moved through the REAL `advance_lifecycle` along a
+    legal edge, and `_Stop`'s own call then proceeds untouched, so what is under test is its
+    arguments.
+    """
+    request_id = _request(catalog, request_id="req-moved-on")
+    work_item_id = _authored(catalog, monkeypatch, suffix="movedon")
+    real = chain.advance_lifecycle
+
+    def _running_first(conn, *, request_id, **kwargs):
+        real(conn, request_id=request_id, to_state=RequestLifecycle.RUNNING, run_id="run-moved-on")
+        return real(conn, request_id=request_id, **kwargs)
+
+    def _raise(*_args, **_kwargs):
+        raise MaterializationRefused(CompilationRefusalCode.TERMINAL_PAYLOAD_TAMPERED, "not mine")
+
+    monkeypatch.setattr(chain, "admit_artifacts", _raise)
+    monkeypatch.setattr(chain, "advance_lifecycle", _running_first)
+
+    with pytest.raises(ValueError, match="moved to 'running'"):
+        _run(catalog, request_id, [work_item_id], tmp_path)
+
+    assert read_request(catalog, request_id=request_id).lifecycle_state is RequestLifecycle.RUNNING
 
 
 def test_an_undeclared_spine_stops_the_chain_at_COMPILE(catalog, monkeypatch, tmp_path) -> None:
