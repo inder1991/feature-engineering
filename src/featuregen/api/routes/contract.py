@@ -1077,10 +1077,18 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # DESIGN_CHECKED. They are taken ONLY from the server-reconstructed chosen candidate (restored from
     # the revision's private grounding context) — `DraftIn` has no such field, so a client can never
     # declare a role and suppress a unit check.
+    # D14 (review F2): `personal_data_policy_revision_ids` joins the same server-authoritative
+    # overwrite for the same reason — `DraftIn` has no such field, so a client can never DECLARE a
+    # licence it was not granted. What lands on the contract is not even this value: the confirm-time
+    # MCV below re-consults the gate against the LIVE policy store and `confirm_contract` persists
+    # THAT answer, so a revocation (or a re-approval, which mints a different revision id) between
+    # Gate #1 and confirm is recorded rather than papered over. This carries Gate #1's reading only
+    # so the pre-MCV draft is honest about what it was drafted under.
     draft = replace(draft, grain_table=chosen.grain_table,
                     derives_from=list(chosen.derives_from),
                     as_of_column=_as_of_column(conn, chosen.grain_table, _grain_catalog),
-                    operand_roles=chosen.operand_roles)
+                    operand_roles=chosen.operand_roles,
+                    personal_data_policy_revision_ids=chosen.personal_data_policy_revision_ids)
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
     # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The

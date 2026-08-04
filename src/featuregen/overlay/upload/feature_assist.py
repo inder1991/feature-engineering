@@ -57,6 +57,7 @@ from featuregen.overlay.upload.join_path import (
 )
 from featuregen.overlay.upload.need_metadata import is_measure_need_role
 from featuregen.overlay.upload.operational_facts import read_operational_value
+from featuregen.overlay.upload.pii_policy_store import active_pii_use_policies
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.semantic_context import (
@@ -892,6 +893,21 @@ class FeatureIdea:
     #
     #    Purely carried here — nothing reads it yet; no disposition, requirement or status depends on it.
     operand_roles: tuple[tuple[str, str], ...] = ()
+    # ── D14: the governed `pii_use_policy` revisions that LICENSED this feature's personal-data
+    #    operands. EMPTY for the overwhelming majority of features, which bind no personal data at
+    #    all — empty means "nothing needed licensing here", never "we did not check": a candidate
+    #    that DID need a policy and lacked one was refused and never became a FeatureIdea.
+    #
+    #    THIS IS PROVENANCE, NOT A REQUIREMENT. A `Requirement` names an external CHECK somebody
+    #    must run against the data before the feature can be trusted; a policy revision is a
+    #    decision that was already taken, so putting it in `requirements` would ask a reviewer to
+    #    re-verify an approval. It rides beside `binding_fact_keys` for the same reason those do:
+    #    the immutable, content-addressed ids of the governed facts this candidate leaned on, so
+    #    "who allowed this feature, and under what purpose" is answerable from the feature itself
+    #    rather than by re-deriving the gate's reasoning later.
+    #
+    #    Sorted + deduped so the frozen dataclass stays deterministic and hashable.
+    personal_data_policy_revision_ids: tuple[str, ...] = ()
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
@@ -1069,9 +1085,23 @@ def _denomination_siblings(conn, tables: set[tuple[str, str]]) -> dict[tuple[str
     return {(src, table): ref for src, table, ref in rows}
 
 
+@dataclass(frozen=True, slots=True)
+class UseGateOutcome:
+    """The USE gate's answer: the refusal (or its absence) AND what licensed the clearing.
+
+    Two fields rather than a bare ``Rejection | None`` because a personal-data operand can now be
+    CLEARED, and a clearing that names nothing is indistinguishable from a gate that never asked.
+    ``personal_data_policy_revision_ids`` are the immutable, content-addressed policy revisions that
+    covered this candidate's pii-classed concepts — the answer to "who allowed this feature, and
+    under what purpose", carried onto the accepted idea so it survives past the validator."""
+
+    rejection: Rejection | None = None
+    personal_data_policy_revision_ids: tuple[str, ...] = ()
+
+
 def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
-              aggregation: str | None = None) -> Rejection | None:
-    """May a feature be BUILT from these operands? Four refusals, or None.
+              aggregation: str | None = None) -> UseGateOutcome:
+    """May a feature be BUILT from these operands? Four refusals, or a clearing.
 
     THE FINDING THIS CLOSES (Release-A evaluation, 2026-08-03). ``sensitivity`` controls who may SEE
     a column and nothing controlled whether a visible column may be USED. Of five unsafe gold
@@ -1101,9 +1131,17 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
 
     ``aggregation`` is read by exactly ONE class (currency): whether the operation combines or
     returns the amounts decides whether a missing denomination can produce a wrong number at all.
+
+    THE ONE CLASS THAT CAN NOW BE CLEARED (D14). ``PERSONAL_DATA_POLICY_REQUIRED`` was the only
+    refusal here that named an artifact which did not exist. It exists now — a governed
+    ``pii_use_policy`` revision per CONCEPT — and this gate is its only operational reader. The
+    clearing rule is deliberately ALL-OR-NOTHING: every pii-classed concept the candidate uses must
+    have an ACTIVE policy, because a feature that mixes one licensed and one unlicensed personal-data
+    operand is an unlicensed feature. Protected characteristics are untouched by any of it — class 2
+    runs FIRST and is `structurally_unsuitable`, so no policy can ever reach them.
     """
     if not feature_use_gate_enabled():
-        return None
+        return UseGateOutcome()
 
     # ── class 2 — a protected characteristic as an operand or a grouping key. structurally_
     #    unsuitable: ECOA/fair-lending and GDPR Article 9 have no "allow" switch, so there is no
@@ -1118,11 +1156,11 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
     for _src, ref in pairs:
         concept_name = meta.get(ref, {}).get("concept")
         if is_protected_characteristic(concept_name):
-            return Rejection(
+            return UseGateOutcome(rejection=Rejection(
                 RejectCode.PROTECTED_CHARACTERISTIC,
                 f"{ref} is a protected characteristic ({concept_name}) and cannot be a model "
                 f"input or a grouping key. No approval makes it one — use a legitimate business "
-                f"driver instead, or correct the concept if this column is not one")
+                f"driver instead, or correct the concept if this column is not one"))
 
     # ── class 4 — the LABEL THAT STANDS BESIDE A CODE, used as an operand. structurally_unsuitable:
     #    no setting makes a display name a value, and the code that IS the value is right there.
@@ -1142,24 +1180,68 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
     for _src, ref in pairs:
         concept_name = meta.get(ref, {}).get("concept")
         if is_descriptive(concept_name):
-            return Rejection(
+            return UseGateOutcome(rejection=Rejection(
                 RejectCode.DESCRIPTIVE_OPERAND,
                 f"{ref} is a descriptive label ({concept_name}), not a computable value — it "
-                f"displays and groups but can never be a measure. Use the CODE column beside it")
+                f"displays and groups but can never be a measure. Use the CODE column beside it"))
 
-    # ── class 1 — personal data as a model input. needs_setup: a lawful-basis / purpose policy
-    #    COULD license this (AML use of a sanctions or PEP signal is the standing example), and no
-    #    such policy surface exists yet. So the refusal names the missing artifact rather than
-    #    blaming the column, and it must not read as "this is forbidden forever". ──
+    # ── class 1 — personal data as a model input. needs_setup, and the ONE class with an artifact
+    #    that can now answer it: a governed `pii_use_policy` revision per CONCEPT (D14, migration
+    #    1056). The rule is EVERY pii-classed concept this candidate uses must have an ACTIVE
+    #    policy, and the reasoning is that a partially-licensed feature is an unlicensed feature —
+    #    a purpose declared for `pep_flag` says nothing about `geolocation`, and clearing on the
+    #    first covered operand would let one approval license every other personal-data concept
+    #    that happened to ride along beside it.
+    #
+    #    ONE BULK READ PER CANDIDATE, whatever the operand count — not per validation PASS, which
+    #    is what this note used to claim. `_validate_idea` runs on every candidate from every
+    #    producer (the menu, the confirm-time MCV, the recipe options, the planner's cross-catalog
+    #    proposals) and each pii-binding candidate asks once; the read is skipped entirely when the
+    #    candidate binds no personal data at all, which is most of them. What that rules out is the
+    #    per-OPERAND query storm, and that is the whole claim. See the TODO seam on
+    #    `active_pii_use_policies` for the cross-candidate batching a 157-recipe grounding pass
+    #    would still benefit from — deliberately not plumbed, because the caching lifetime of a
+    #    licence is the entire design question and a stale one licenses a revoked concept.
+    #
+    #    ABSENCE, REVOCATION AND CORRUPTION ALL REFUSE. `active_pii_use_policies` returns only
+    #    concepts whose CURRENT revision is `active` and content-verifies each one, so a concept
+    #    nobody declared, a concept whose policy was revoked, and a policy row somebody edited are
+    #    indistinguishable here — none of them clears. That is the property the whole surface rests
+    #    on, and the mutation harness has an entry that kills the bar if revocation stops mattering.
+    #
+    #    THE REFUSAL NAMES THE UNCOVERED CONCEPTS, not the covered ones and not the column: the
+    #    reviewer's next action is approving a concept in Governance, so the message has to say
+    #    WHICH. A partially-covered candidate is the case that makes this load-bearing. ──
+    # The `isinstance` narrowing is not decoration: `meta` is an untyped catalog projection, so
+    # every downstream use (the store call, the sort, the join, the dict index) was typed
+    # `Any | None`. `is_personal_data(None)` was already False, so the behaviour is identical —
+    # what changes is that the four values the refusal message and the licence lookup are built
+    # from are now KNOWN to be concept names.
+    personal_data: list[tuple[str, str]] = []
     for _src, ref in pairs:
-        concept_name = meta.get(ref, {}).get("concept")
-        if is_personal_data(concept_name):
-            return Rejection(
+        candidate_concept = meta.get(ref, {}).get("concept")
+        if isinstance(candidate_concept, str) and is_personal_data(candidate_concept):
+            personal_data.append((ref, candidate_concept))
+    covering: tuple[str, ...] = ()
+    if personal_data:
+        needed = {concept_name for _ref, concept_name in personal_data}
+        # ONE read per candidate; absence is a refusal. A `PolicyStoreConflict` from here is NOT
+        # caught: it propagates and 500s the whole recommendation pass, BY DESIGN — a store whose
+        # policy rows fail content or approver verification cannot be reasoned about candidate by
+        # candidate, and degrading to "no licence for this one" would turn tamper into a quiet
+        # refusal nobody investigates. Noted, not changed.
+        licensed = active_pii_use_policies(conn, needed)
+        uncovered = sorted(needed - set(licensed))
+        if uncovered:
+            ref, concept_name = next((r, c) for r, c in personal_data if c in set(uncovered))
+            missing = ", ".join(uncovered)
+            return UseGateOutcome(rejection=Rejection(
                 RejectCode.PERSONAL_DATA_POLICY_REQUIRED,
-                f"{ref} is personal data ({concept_name}) and this catalog declares no "
-                f"personal-data use policy, so nothing authorizes it as a model input. A "
-                f"governance owner must declare one (lawful basis + purpose) before this feature "
-                f"can be built")
+                f"{ref} is personal data ({concept_name}) and no active personal-data use policy "
+                f"covers {missing}, so nothing authorizes it as a model input. A governance owner "
+                f"must declare one (purpose) under Governance -> Data-use policies before this "
+                f"feature can be built"))
+        covering = tuple(sorted(licensed[concept_name] for concept_name in needed))
 
     # ── class 3 — a currency-carrying amount whose denomination is neither declared on the column
     #    nor bound as an operand, while the currency column sits on the SAME table, AND the
@@ -1190,13 +1272,13 @@ def _use_gate(conn, pairs: list[tuple[str, str]], meta: dict[str, dict],
                 # MIXED_CURRENCY / CURRENCY_CONSISTENT machinery owns that case and nothing here
                 # can name a fix), or the feature already binds it — which is the safe shape.
                 continue
-            return Rejection(
+            return UseGateOutcome(rejection=Rejection(
                 RejectCode.CURRENCY_POLICY_REQUIRED,
                 f"{ref} carries no declared currency and the feature does not bind {dimension}, "
                 f"the currency dimension on its own table — the result would silently mix "
                 f"currencies. Bind that column, declare the column's currency, or record a "
-                f"conversion policy")
-    return None
+                f"conversion policy"))
+    return UseGateOutcome(personal_data_policy_revision_ids=covering)
 
 
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
@@ -1239,9 +1321,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     #    freshness — a leaky or stale candidate is refused for the reason it has always been
     #    refused, so no existing rejection changes code — and BEFORE any requirement is minted,
     #    because a refused feature must never reach the tri-state at all. ──
-    use_rejection = _use_gate(conn, pairs, meta, raw.get("aggregation"))
-    if use_rejection is not None:
-        return None, use_rejection
+    use = _use_gate(conn, pairs, meta, raw.get("aggregation"))
+    if use.rejection is not None:
+        return None, use.rejection
 
     # C2-C3: every requirement below is minted through the SANCTIONED, registry-validated factory
     # (validation_requirements.build_requirement) — the deterministic code picks code + typed params
@@ -1440,7 +1522,10 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         derives_pairs=tuple(pairs), rationale=str(raw.get("rationale", "")),
         operation_kind=_norm_agg(aggregation), measure_refs=tuple(pairs),
         grain_ref=grain_operand, time_ref=time_operand, window=_window_of(aggregation),
-        grouping_refs=(), validation_status=status, requirements=tuple(requirements)), None
+        grouping_refs=(), validation_status=status, requirements=tuple(requirements),
+        # PROVENANCE, from the gate that already ran above: the policy revisions that licensed this
+        # candidate's personal-data operands, or () when it binds none.
+        personal_data_policy_revision_ids=use.personal_data_policy_revision_ids), None
 
 
 def _governed_read(conn, logical_ref: str, field_name: str):

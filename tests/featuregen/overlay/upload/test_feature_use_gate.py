@@ -611,3 +611,363 @@ def test_the_menu_path_and_the_contract_path_agree_on_every_class(db, concept_na
     assert check.ok is False
     assert check.reasons == [rej.message], (
         "the two consumers disagree — one of them is running a different gauntlet")
+
+
+# ── class 1, second half (D14) · the policy the refusal names now EXISTS ─────────────────────────
+#
+# `PERSONAL_DATA_POLICY_REQUIRED` was the one refusal here whose wording promised an artifact — "a
+# governance owner must declare one" — with nowhere to declare it. These tests are the other side of
+# that promise: an ACTIVE `pii_use_policy` revision per concept CLEARS the operand, and every way of
+# not having one (never declared, revoked, only partially declared) still refuses.
+
+
+def _approve(db, concept_name, purpose="AML transaction monitoring", version=0, actor="admin@bank"):
+    from featuregen.overlay.upload.pii_policy_store import approve_pii_use_policy
+
+    return approve_pii_use_policy(db, concept_name=concept_name, purpose=purpose,
+                                  expected_pointer_version=version, actor=actor)
+
+
+def test_an_ACTIVE_policy_clears_the_personal_data_operand(db):
+    """The clearing this whole slice exists for. `pep_flag` is the registry's standing example: a
+    PEP marker is personal data AND the anchor of a shipped AML recipe, and until a purpose was
+    declared for it the platform refused every feature built from it."""
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    _idea, rej = _validate(db, [pep])
+    assert rej is not None and rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED
+
+    revision_id, _v = _approve(db, "pep_flag")
+
+    idea, rej = _validate(db, [pep])
+    assert rej is None, rej
+    assert idea.validation_status == "DESIGN_CHECKED"
+    assert idea.personal_data_policy_revision_ids == (revision_id,)
+
+
+def test_the_accepted_feature_NAMES_the_policy_that_licensed_it(db):
+    """Provenance, not a requirement: the decision was already taken, so a reviewer must be able to
+    read WHICH one off the feature rather than re-deriving the gate's reasoning."""
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    device = _col(db, "cust", "dev_fp", concept="device_fingerprint", data_type="text")
+    pep_rev, _v = _approve(db, "pep_flag")
+    device_rev, _v = _approve(db, "device_fingerprint", purpose="account takeover detection")
+
+    idea, rej = _validate(db, [pep, device])
+    assert rej is None, rej
+    assert idea.personal_data_policy_revision_ids == tuple(sorted((pep_rev, device_rev)))
+    assert all(r.startswith("pup_") for r in idea.personal_data_policy_revision_ids)
+    # and it is NOT smuggled in as a requirement a human is asked to re-check
+    assert all(r.code != "PERSONAL_DATA_POLICY" for r in idea.requirements)
+
+
+def test_a_feature_that_binds_no_personal_data_names_no_policy(db):
+    """EMPTY means "nothing needed licensing", and it has to stay distinguishable from "licensed"."""
+    amount = _col(db, "txn", "amt", concept="monetary_flow", currency="AED")
+    idea, rej = _validate(db, [amount], aggregation="sum")
+    assert rej is None and idea.personal_data_policy_revision_ids == ()
+
+
+def test_a_PARTIALLY_covered_candidate_is_refused_and_names_the_UNCOVERED_concepts(db):
+    """The case that makes the all-or-nothing rule load-bearing. A purpose declared for `pep_flag`
+    says nothing about `geolocation`; clearing on the first covered operand would let one approval
+    license every other personal-data concept riding along beside it."""
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    geo = _col(db, "cust", "last_geo", concept="geolocation", data_type="text")
+    _approve(db, "pep_flag")
+
+    _idea, rej = _validate(db, [pep, geo])
+    assert rej is not None and rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED
+    assert "geolocation" in rej.message
+    assert "pep_flag" not in rej.message, (
+        "the refusal named a concept that IS covered — the reviewer's next action is approving the "
+        "missing one, so the message must name only those")
+    assert refusal_family(rej.code) == NEEDS_SETUP
+
+
+def test_a_REVOKED_policy_refuses_again(db):
+    """Revocation is the half of the loop that has to keep working: a policy that stops mattering
+    the moment it is withdrawn is the only thing that makes approving one safe."""
+    from featuregen.overlay.upload.pii_policy_store import revoke_pii_use_policy
+
+    geo = _col(db, "cust", "last_geo", concept="geolocation", data_type="text")
+    _rev, version = _approve(db, "geolocation", purpose="impossible travel detection")
+    idea, rej = _validate(db, [geo])
+    assert rej is None and idea.personal_data_policy_revision_ids
+
+    revoke_pii_use_policy(db, concept_name="geolocation", expected_pointer_version=version,
+                          actor="admin@bank")
+
+    _idea, rej = _validate(db, [geo])
+    assert rej is not None and rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED
+    assert "geolocation" in rej.message
+
+
+def test_a_policy_on_one_concept_does_not_license_another(db):
+    """Policies are per CONCEPT. Approving `pep_flag` must not quietly license `phone_number`."""
+    _approve(db, "pep_flag")
+    phone = _col(db, "cust", "mob", concept="phone_number", data_type="text")
+    _idea, rej = _validate(db, [phone])
+    assert rej is not None and rej.code == RejectCode.PERSONAL_DATA_POLICY_REQUIRED
+    assert "phone_number" in rej.message
+
+
+def test_NO_policy_can_clear_a_protected_characteristic(db):
+    """The class that must stay unreachable. There is no policy to approve — the store refuses to
+    mint one — and even if a row existed the gate never consults it, because class 2 runs first and
+    is `structurally_unsuitable`. Both halves are asserted."""
+    from featuregen.overlay.upload.pii_policy_store import approve_pii_use_policy
+    from featuregen.overlay.upload.source_selection import PolicyValidationError
+
+    for concept_name in ("protected_attribute", "special_category", "vulnerability_flag"):
+        with pytest.raises(PolicyValidationError):
+            approve_pii_use_policy(db, concept_name=concept_name, purpose="credit scoring",
+                                   expected_pointer_version=0, actor="admin@bank")
+
+    # The hand-forged row a store refuses to write, written anyway — the gate still refuses. The
+    # attestation hashes are placeholders of the right SHAPE (1056 CHECKs them): this row is never
+    # read, because class 2 refuses the operand before any policy is consulted, and that is exactly
+    # the property being asserted.
+    db.execute(
+        "INSERT INTO pii_use_policy_revision (revision_id, concept_name, purpose, status, "
+        "content_hash, approved_by, attestation_hash) "
+        "VALUES (%s, 'protected_attribute', 'credit scoring', 'active', %s, 'rogue', %s)",
+        ("pup_" + "9" * 64, "9" * 64, "9" * 64))
+    db.execute(
+        "INSERT INTO pii_use_policy_current (concept_name, revision_id, pointer_version, "
+        "declared_by, attestation_hash) VALUES ('protected_attribute', %s, 1, 'rogue', %s)",
+        ("pup_" + "9" * 64, "9" * 64))
+
+    protected = _col(db, "cust", "ctzn_ctry_cd", concept="protected_attribute", data_type="text")
+    _idea, rej = _validate(db, [protected])
+    assert rej.code == RejectCode.PROTECTED_CHARACTERISTIC
+    assert refusal_family(rej.code) == STRUCTURALLY_UNSUITABLE
+
+
+def test_the_descriptive_and_currency_classes_are_untouched_by_a_policy(db):
+    """A data-use policy answers the personal-data question and nothing else. Approving every pii
+    concept in the registry must not move the other three classes one inch."""
+    from featuregen.overlay.upload.pii_policy import policy_eligible_concepts
+
+    for concept_name in policy_eligible_concepts():
+        _approve(db, concept_name, purpose=f"licensed for {concept_name} testing")
+
+    label = _col(db, "txn", "sol_desc", concept="branch_name", data_type="text")
+    _idea, rej = _validate(db, [label])
+    assert rej.code == RejectCode.DESCRIPTIVE_OPERAND
+
+    amount = _col(db, "txn2", "amt", concept="monetary_flow")
+    _code = _col(db, "txn2", "crncy", concept="currency_code", data_type="text")
+    _idea, rej = _validate(db, [amount], aggregation="sum")
+    assert rej.code == RejectCode.CURRENCY_POLICY_REQUIRED
+
+
+def test_the_refusal_points_at_the_screen_that_fixes_it(db):
+    """The honest pointer. The refusal used to name an artifact with no home; it now names the
+    place the reviewer goes, and the wording still says a governance OWNER declares it — this is
+    not a self-service switch."""
+    dob = _col(db, "cust", "dob", concept="pii", data_type="date")
+    _idea, rej = _validate(db, [dob])
+    assert "Governance -> Data-use policies" in rej.message
+    assert "governance owner must declare one" in rej.message
+    assert "personal-data use policy" in rej.message
+
+
+# ── the covering policy rides the CONTRACT, not just the idea (review F2) ───────────────────────
+#
+# `personal_data_policy_revision_ids` used to die on the in-memory FeatureIdea: the governed
+# artifact recorded no trace of what licensed it, so "who allowed this feature, and under what
+# purpose" was answerable at Gate #1 and unanswerable forever after. It now rides ContractDraft ->
+# the confirm-time MCV -> the persisted contract row, and what lands is the CONFIRM-TIME re-consult's
+# answer rather than Gate #1's.
+
+
+def _pii_draft(db, ref, *, name="pep_exposure"):
+    from featuregen.overlay.upload.contract.author import ContractDraft
+
+    return ContractDraft(
+        feature_name=name, definition="Whether the customer is a PEP.", grain_table=None,
+        aggregation="latest", as_of_column=None, derives_from=[ref],
+        derives_pairs=((SOURCE, ref),))
+
+
+def _persisted_ids(db, contract_id):
+    return db.execute("SELECT personal_data_policy_revision_ids FROM contract "
+                      "WHERE contract_id = %s", (contract_id,)).fetchone()[0]
+
+
+def test_the_confirmed_contract_NAMES_the_policy_revisions_that_covered_it(db):
+    """The governed artifact records the decision that allowed it. Without this the only place the
+    licence ever existed was a dataclass that stopped existing when the request ended."""
+    from featuregen.overlay.upload.contract.govern import confirm_contract
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    revision_id, _v = _approve(db, "pep_flag")
+
+    contract = confirm_contract(db, _pii_draft(db, pep), actor="ds1", now=NOW)
+    assert _persisted_ids(db, contract.contract_id) == [revision_id]
+
+
+def test_a_contract_that_binds_no_personal_data_records_an_EMPTY_licence_not_a_missing_one(db):
+    """`[]` has to keep meaning "nothing needed licensing" — the state most contracts are honestly
+    in — and stay distinguishable from a licence somebody failed to record."""
+    from featuregen.overlay.upload.contract.author import ContractDraft
+    from featuregen.overlay.upload.contract.govern import confirm_contract
+
+    amount = _col(db, "txn", "amt", concept="monetary_flow", currency="AED")
+    draft = ContractDraft(
+        feature_name="avg_amount", definition="Average amount.", grain_table=None,
+        aggregation="avg", as_of_column=None, derives_from=[amount],
+        derives_pairs=((SOURCE, amount),))
+    contract = confirm_contract(db, draft, actor="ds1", now=NOW)
+    assert _persisted_ids(db, contract.contract_id) == []
+
+
+def test_the_contract_carries_the_revision_in_force_AT_CONFIRM_not_the_one_drafted_at_gate_1(db):
+    """The refresh, and why it is not pedantry. Revoking and re-approving mints a content-DISTINCT
+    revision (status is content), so a draft authored under the first approval and confirmed after a
+    revoke-then-re-approve cycle would otherwise name a revision that was not in force when the
+    governing write happened — a governed artifact citing an approval nobody was operating under."""
+    from featuregen.overlay.upload.contract.govern import confirm_contract
+    from featuregen.overlay.upload.pii_policy_store import revoke_pii_use_policy
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    gate1_revision, v1 = _approve(db, "pep_flag", purpose="AML transaction monitoring")
+    draft = _pii_draft(db, pep)
+    assert draft.personal_data_policy_revision_ids == ()   # a hand-built draft carries none...
+
+    # ...and the draft the AUTHORING path builds carries Gate #1's reading
+    idea, rej = _validate(db, [pep])
+    assert rej is None and idea.personal_data_policy_revision_ids == (gate1_revision,)
+
+    # between Gate #1 and confirm: withdrawn, then re-declared for a DIFFERENT purpose
+    _revoked, v2 = revoke_pii_use_policy(db, concept_name="pep_flag",
+                                         expected_pointer_version=v1, actor="admin@bank")
+    confirm_revision, _v3 = _approve(db, "pep_flag", purpose="sanctions screening exposure",
+                                     version=v2)
+    assert confirm_revision != gate1_revision
+
+    from dataclasses import replace
+    contract = confirm_contract(
+        db, replace(draft, personal_data_policy_revision_ids=(gate1_revision,)),
+        actor="ds1", now=NOW)
+    assert _persisted_ids(db, contract.contract_id) == [confirm_revision]
+
+
+def test_a_policy_REVOKED_between_gate_1_and_confirm_refuses_the_governing_write(db):
+    """The other side of the refresh: if nothing licenses it at confirm, nothing is governed. The
+    MCV re-run is what makes the licence a live question rather than a drafted claim."""
+    from dataclasses import replace
+
+    from featuregen.overlay.upload.contract.govern import ContractValidationError, confirm_contract
+    from featuregen.overlay.upload.pii_policy_store import revoke_pii_use_policy
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    gate1_revision, v1 = _approve(db, "pep_flag")
+    draft = replace(_pii_draft(db, pep),
+                    personal_data_policy_revision_ids=(gate1_revision,))
+    revoke_pii_use_policy(db, concept_name="pep_flag", expected_pointer_version=v1,
+                          actor="admin@bank")
+
+    with pytest.raises(ContractValidationError) as exc:
+        confirm_contract(db, draft, actor="ds1", now=NOW)
+    assert "personal data" in str(exc.value)
+
+
+def test_the_draft_and_the_MCV_both_carry_the_licence_forward(db):
+    """The plumbing between the two, asserted where it can break: `draft_contract` reads it off the
+    chosen idea and `validate_minimum` re-derives it from the live store."""
+    from featuregen.overlay.upload.contract.review import validate_minimum
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    revision_id, _v = _approve(db, "pep_flag")
+
+    check = validate_minimum(db, _pii_draft(db, pep), now=NOW)
+    assert check.ok is True
+    assert check.personal_data_policy_revision_ids == (revision_id,)
+
+
+def test_the_licence_survives_the_gate_1_considered_set_round_trip(db):
+    """`_idea_json` is hashed into `option_id` and `considered_content_hash`, so the field is emitted
+    only when non-empty — a candidate that licensed nothing keeps byte-identical bytes, and one that
+    did keeps its licence across the reload the confirm path reconstructs from."""
+    from featuregen.overlay.upload.contract.gate1 import _idea_from_json, _idea_json
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    revision_id, _v = _approve(db, "pep_flag")
+    idea, rej = _validate(db, [pep])
+    assert rej is None
+
+    wire = _idea_json(idea)
+    assert wire["personal_data_policy_revision_ids"] == [revision_id]
+    assert _idea_from_json(wire).personal_data_policy_revision_ids == (revision_id,)
+
+    plain = _col(db, "txn", "amt", concept="monetary_flow", currency="AED")
+    unlicensed, _rej = _validate(db, [plain], aggregation="sum")
+    assert "personal_data_policy_revision_ids" not in _idea_json(unlicensed)
+
+
+def test_the_v2_serializer_carries_the_licence_and_v1_stays_byte_identical(db):
+    """v1 emits EXACTLY the pre-Slice-3 field set — a flag-OFF response depends on it — so the
+    licence is a v2-only addition, and there only when it says something."""
+    from featuregen.api.feature_serialize import (
+        serialize_feature_idea_v1,
+        serialize_feature_idea_v2,
+    )
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    revision_id, _v = _approve(db, "pep_flag")
+    idea, _rej = _validate(db, [pep])
+
+    assert "personal_data_policy_revision_ids" not in serialize_feature_idea_v1(idea)
+    assert serialize_feature_idea_v2(idea)["personal_data_policy_revision_ids"] == [revision_id]
+
+
+def test_the_contract_detail_read_surfaces_the_licence_for_an_auditor(db):
+    """The audit answer has to be readable off the governed contract, and the ids alone are not the
+    whole answer — `resolve_policy_provenance` is what tells an auditor whether each one is still
+    the concept's current word."""
+    from featuregen.overlay.upload.contract.govern import confirm_contract, get_contract_detail
+    from featuregen.overlay.upload.pii_policy_store import resolve_policy_provenance
+
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    revision_id, _v = _approve(db, "pep_flag")
+    contract = confirm_contract(db, _pii_draft(db, pep), actor="ds1", now=NOW)
+
+    detail = get_contract_detail(db, contract.contract_id)
+    assert detail["personal_data_policy_revision_ids"] == [revision_id]
+    resolved = resolve_policy_provenance(db, detail["personal_data_policy_revision_ids"])
+    assert [(r.concept_name, r.status, r.is_current) for r in resolved] == [
+        ("pep_flag", "active", True)]
+
+
+def test_the_policy_read_is_ONE_query_per_CANDIDATE_and_is_skipped_entirely_without_pii(db,
+                                                                                        monkeypatch):
+    """ONE read per CANDIDATE, and none at all without personal data — which is the honest claim.
+
+    The name used to say "per validation", which read as one read per PASS and is not what this
+    asserts: `_validate_idea` runs on every candidate from every producer and each pii-binding one
+    asks once. What is ruled out is the per-OPERAND query storm (a 157-recipe grounding pass issuing
+    a query per bound column), and what is proved beside it is that a candidate binding no personal
+    data does not pay for the question at all. Cross-candidate batching is a TODO-noted seam on
+    `active_pii_use_policies`, not something this test claims exists."""
+    from featuregen.overlay.upload import feature_assist as fa
+
+    _approve(db, "pep_flag")
+    _approve(db, "device_fingerprint", purpose="account takeover detection")
+    pep = _col(db, "cust", "pep_ind", concept="pep_flag", data_type="text")
+    device = _col(db, "cust", "dev_fp", concept="device_fingerprint", data_type="text")
+    plain = _col(db, "cust", "seg_cd", concept="segment", data_type="text")
+
+    calls: list[tuple] = []
+    real = fa.active_pii_use_policies
+    monkeypatch.setattr(fa, "active_pii_use_policies",
+                        lambda conn, names: (calls.append(tuple(sorted(names))),
+                                             real(conn, names))[1])
+
+    _idea, rej = _validate(db, [pep, device])
+    assert rej is None
+    assert calls == [("device_fingerprint", "pep_flag")], calls
+
+    calls.clear()
+    _validate(db, [plain])
+    assert calls == [], "a candidate with no personal data asked the policy store anyway"

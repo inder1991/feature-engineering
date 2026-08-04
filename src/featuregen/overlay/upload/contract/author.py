@@ -66,6 +66,23 @@ class ContractDraft:
     # server-reconstructed chosen feature, exactly as it does grain_table / derives_from. Empty for an
     # LLM candidate (and for any pre-E4b draft), which falls back to the E4a structural rule.
     operand_roles: tuple[tuple[str, str], ...] = ()
+    # ── D14 (review F2): the governed `pii_use_policy` revisions that LICENSED this feature's
+    #    personal-data operands, carried from the chosen FeatureIdea for the same reason
+    #    `binding_fact_keys` rides its own artifacts — the immutable, content-addressed ids of the
+    #    governed facts a candidate leaned on, so "who allowed this, and under what purpose" is
+    #    answerable from the artifact rather than by re-deriving the gate's reasoning later.
+    #
+    #    WHAT THE DRAFT CARRIES IS GATE #1's ANSWER, AND IT IS NOT WHAT GETS PERSISTED. The
+    #    confirm-time MCV re-consults the gate against the LIVE store (`review.validate_minimum` ->
+    #    `_validate_idea` -> `_use_gate`) and `govern.confirm_contract` persists THAT re-run's ids.
+    #    A policy revoked and re-approved between Gate #1 and confirm mints a content-distinct
+    #    revision, and the contract must record the revision that covered it AT CONFIRMATION —
+    #    recording the drafted one would name a decision that was not in force when the governing
+    #    write happened. SERVER-SIDE ONLY: `DraftIn` carries no such field.
+    #
+    #    Empty means "this feature bound no personal data", never "we did not check": a candidate
+    #    that needed a policy and lacked one was REFUSED and never became a draft.
+    personal_data_policy_revision_ids: tuple[str, ...] = ()
 
 
 def _as_of_column(conn, grain_table: str | None, catalog_source: str | None) -> str | None:
@@ -218,4 +235,5 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
         derives_from=list(feature.derives_from), target_ref=target_ref,
         derives_pairs=feature.derives_pairs, join_path=join_path,
         validation_status=feature.validation_status, requirements=feature.requirements,
-        operand_roles=feature.operand_roles)
+        operand_roles=feature.operand_roles,
+        personal_data_policy_revision_ids=feature.personal_data_policy_revision_ids)

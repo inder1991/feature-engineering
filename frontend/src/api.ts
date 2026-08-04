@@ -3104,3 +3104,49 @@ export function putTemporalPolicy(
     }),
   })
 }
+
+// ── data-use policies (D14) — the PII allow-policy surface the feature use gate reads ───────────
+//
+// `status` is a CLOSED three-value vocabulary and NOT a boolean, deliberately: "nobody has decided
+// yet" and "somebody withdrew a decision" are different facts, and only the GATE may collapse them.
+export type DataUsePolicyStatus = 'none' | 'active' | 'revoked'
+
+export interface DataUsePolicyState {
+  concept_name: string
+  description: string
+  group: string
+  status: DataUsePolicyStatus
+  pointer_version: number          // 0 == never declared; the version a first approve must carry
+  purpose: string | null
+  revision_id: string | null
+  approved_by: string | null       // who first authored this revision's content
+  approved_at: string | null
+  declared_by: string | null       // who made it current (the two differ after a re-declaration)
+  updated_at: string | null
+}
+
+export interface DataUsePolicyListing {
+  concepts: DataUsePolicyState[]
+  purpose_bounds: { min: number; max: number }
+}
+
+export function getDataUsePolicies(): Promise<DataUsePolicyListing> {
+  return request('/governance/data-use-policies')
+}
+
+export function approveDataUsePolicy(
+  conceptName: string, req: { expectedPointerVersion: number; purpose: string },
+): Promise<{ concept_name: string; revision_id: string; pointer_version: number; status: string }> {
+  return post(`/governance/data-use-policies/${encodeURIComponent(conceptName)}/approve`, {
+    expected_pointer_version: req.expectedPointerVersion,
+    purpose: req.purpose,
+  })
+}
+
+export function revokeDataUsePolicy(
+  conceptName: string, req: { expectedPointerVersion: number },
+): Promise<{ concept_name: string; revision_id: string; pointer_version: number; status: string }> {
+  return post(`/governance/data-use-policies/${encodeURIComponent(conceptName)}/revoke`, {
+    expected_pointer_version: req.expectedPointerVersion,
+  })
+}

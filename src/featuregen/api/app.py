@@ -36,6 +36,7 @@ from featuregen.api.routes import (
     integrations,
     learning,
     lineage,
+    pii_policies,
     profiles,
     quarantine,
     readiness,
@@ -186,6 +187,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # Release-B serving/temporal policies (flag-gated 404 while
     # FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off OR its DATASET_PROFILES dependency is unmet).
     app.include_router(dataset_policies.router)
+    app.include_router(pii_policies.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
     app.include_router(readiness.router)

@@ -38,6 +38,13 @@ class MinimumCheck:
     reasons: list[str]
     validation_status: str
     requirements: tuple[Requirement, ...]
+    # D14 (review F2): the `pii_use_policy` revisions that licensed this draft's personal-data
+    # operands AS OF THIS RE-RUN. The gate is re-consulted here against the LIVE store, so these are
+    # the ids `govern.confirm_contract` persists — never the ones Gate #1 drafted. A policy revoked
+    # and re-approved in between is a content-distinct revision, and a governed contract must name
+    # what covered it at the GOVERNING WRITE. Empty on a REJECTED draft (nothing was licensed) and
+    # on every draft that binds no personal data, which is most of them.
+    personal_data_policy_revision_ids: tuple[str, ...] = ()
 
 
 def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = None,
@@ -70,8 +77,11 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     if idea is None:
         return MinimumCheck(ok=False, reasons=[reason.message],
                             validation_status="REJECTED", requirements=())
-    return MinimumCheck(ok=True, reasons=[], validation_status=idea.validation_status,
-                        requirements=idea.requirements)
+    return MinimumCheck(
+        ok=True, reasons=[], validation_status=idea.validation_status,
+        requirements=idea.requirements,
+        # D14: the confirm-time gate re-consult's OWN answer, not the draft's carried one.
+        personal_data_policy_revision_ids=idea.personal_data_policy_revision_ids)
 
 
 def critique_contract(conn, draft: ContractDraft, client: LLMClient, *, actor=None) -> list[str]:

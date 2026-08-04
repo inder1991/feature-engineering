@@ -20,6 +20,7 @@ vi.mock('../api', async importOriginal => {
     confirmTableFact: vi.fn(),
     rejectTableFact: vi.fn(),
     reviewBridgeRealization: vi.fn(),
+    getDataUsePolicies: vi.fn(),
   }
 })
 const getGovernanceQueue = vi.mocked(api.getGovernanceQueue)
@@ -29,6 +30,7 @@ const bulkRejectEntityBridges = vi.mocked(api.bulkRejectEntityBridges)
 const reviewBridgeRealization = vi.mocked(api.reviewBridgeRealization)
 const confirmJoin = vi.mocked(api.confirmJoin)
 const confirmTableFact = vi.mocked(api.confirmTableFact)
+const getDataUsePolicies = vi.mocked(api.getDataUsePolicies)
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
 // Shaped exactly as overlay/upload/governance_queue.py emits them, including the two INDEPENDENT
@@ -1214,4 +1216,27 @@ describe('governance review — state travels as an attribute, never as colour a
     expect(confirm).toBeDisabled()
     expect(confirm).toHaveAttribute('aria-describedby', withheld.getByTestId('gq-action-why').id)
   })
+})
+
+// ── the destination the feature flow's refusal names (D14) ──────────────────────────────────────
+
+it('carries the data-use policy panel the feature refusal points at', async () => {
+  // `feature_assist._use_gate` refuses a personal-data operand with "... must declare one (purpose)
+  // under Governance -> Data-use policies ...". This is the assertion that the pointer LANDS: the
+  // heading a reader is sent to has to exist on the screen the refusal names, and it has to be
+  // the DECIDING screen rather than the read-only dashboard.
+  getGovernanceQueue.mockResolvedValue(FULL)
+  getDataUsePolicies.mockResolvedValue({
+    concepts: [{
+      concept_name: 'pep_flag', description: 'Politically exposed person marker.', group: 'flag',
+      status: 'none', pointer_version: 0, purpose: null, revision_id: null, approved_by: null,
+      approved_at: null, declared_by: null, updated_at: null,
+    }],
+    purpose_bounds: { min: 8, max: 300 },
+  })
+  render(<GovernanceReviewScreen />)
+
+  const panel = await screen.findByTestId('data-use-policies')
+  expect(within(panel).getByRole('heading', { name: 'Data-use policies' })).toBeInTheDocument()
+  expect(within(panel).getByTestId('dup-pep_flag')).toBeInTheDocument()
 })

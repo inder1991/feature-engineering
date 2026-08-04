@@ -275,6 +275,40 @@ def _m_disable_the_feature_use_gate() -> None:
     feature_assist.feature_use_gate_enabled = lambda: False
 
 
+def _m_gate_ignores_policy_revocation() -> None:
+    """The USE gate stops asking whether a data-use policy is still ACTIVE.
+
+    The half of the D14 loop that makes approving one safe. A policy that goes on licensing a
+    personal-data operand after it is withdrawn is worse than no policy at all: the governance
+    screen would show `revoked`, the feature flow would go on building, and the two surfaces would
+    disagree about the same decision with nobody able to see which one was lying.
+
+    Broken by REPLACING the gate's reader with one that resolves the current pointer and returns
+    whatever revision it names, status and content verification alike unread — the shape of a
+    "simplification" somebody could plausibly write, not a syntax break. Everything else is
+    untouched: absence still refuses, so a concept nobody declared is unaffected, and the ONLY
+    behavioural difference is that a revoked policy keeps clearing.
+
+    Patched on the CONSUMER's own module: `feature_assist` binds the reader by name at import and
+    calls it through its own globals, so this setattr genuinely changes what the code under test
+    does. Patching `pii_policy_store` would mutate nothing.
+    """
+    from featuregen.overlay.upload import feature_assist
+
+    def _any_current(conn, concept_names):
+        names = sorted({n.strip().lower() for n in concept_names
+                        if isinstance(n, str) and n.strip()})
+        if not names:
+            return {}
+        rows = conn.execute(
+            "SELECT r.concept_name, r.revision_id FROM pii_use_policy_current c "
+            "JOIN pii_use_policy_revision r ON r.revision_id = c.revision_id "
+            "WHERE c.concept_name = ANY(%s)", (names,)).fetchall()
+        return dict(rows)
+
+    feature_assist.active_pii_use_policies = _any_current
+
+
 _SUPERSESSION = "tests/featuregen/overlay/upload/test_supersession_consistency.py"
 _REPLAY = "tests/featuregen/overlay/upload/test_enrichment_replay_identity.py"
 _SCOPE = "tests/featuregen/overlay/upload/test_identifier_scope.py"
@@ -285,6 +319,7 @@ _CTXGRAPH = "tests/featuregen/overlay/upload/test_context_graph.py"
 _V4 = "tests/featuregen/overlay/upload/test_feature_context_v4.py"
 _BARS = "tests/eval/test_release_a_bars.py"
 _USEGATE = "tests/featuregen/overlay/upload/test_feature_use_gate.py"
+_PIIACCEPT = "tests/featuregen/overlay/upload/test_pii_policy_acceptance.py"
 
 
 REGISTRY: tuple[Mutation, ...] = (
@@ -501,6 +536,21 @@ REGISTRY: tuple[Mutation, ...] = (
         notes="Bar 4 was a STRICT XFAIL against exactly this state until the gate landed — of five "
               "unsafe gold classes the platform refused one. The mutation restores the finding, so "
               "the bar has to die on it or the bar is passing for some other reason.",
+    ),
+    Mutation(
+        mutation_id="gate_ignores_policy_revocation",
+        kind=MUST_DIE,
+        invariant="a WITHDRAWN data-use policy stops licensing the operand it licensed",
+        target="feature_assist:active_pii_use_policies",
+        victims=(
+            f"{_USEGATE}::test_a_REVOKED_policy_refuses_again",
+            f"{_PIIACCEPT}::test_revoking_one_anchor_kills_exactly_the_recipes_that_use_it",
+        ),
+        apply=_m_gate_ignores_policy_revocation,
+        expect_failure_contains="assert rej is not None",
+        notes="D14's other half. Approving a policy is only safe because revoking it takes effect "
+              "immediately; a gate that reads the pointer but not the status would let the "
+              "governance screen say `revoked` while the feature flow kept building.",
     ),
     Mutation(
         mutation_id="noop_reorder_registry_declarations",

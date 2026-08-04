@@ -642,9 +642,10 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
         "join_path, intent_id, verification, validation_status, requirements, "
         "metadata_snapshot_id, metadata_content_hash, metadata_input_fingerprint, "
         "initial_validation_status, initial_verification, "
-        "generation_source, recipe_id, physical_plan_id, planner_declaration_id) "
+        "generation_source, recipe_id, physical_plan_id, planner_declaration_id, "
+        "personal_data_policy_revision_ids) "
         "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, "
-        "%s, %s, %s, %s)",
+        "%s, %s, %s, %s, %s::jsonb)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
          json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
          "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
@@ -660,7 +661,14 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
          check.validation_status,    # 1011 initial_validation_status — the at-confirm INITIAL axis, same
          #                             value the ASSESSED event stamps (SEPARATE from the mutable 1003 col)
          "DESIGN-CHECKED",           # 1011 initial_verification — the at-confirm INITIAL verification
-         gen_source, recipe_id, physical_plan_id, planner_declaration_id))   # H3c planner provenance
+         gen_source, recipe_id, physical_plan_id, planner_declaration_id,   # H3c planner provenance
+         # D14 (review F2): the `pii_use_policy` revisions that licensed this feature's personal-data
+         # operands, from the CONFIRM-TIME gate re-consult above — the same discipline
+         # `check.validation_status` follows one line up, and for the same reason. Gate #1's answer
+         # is a draft-time reading; a policy revoked and re-approved in between is a content-distinct
+         # revision, and the governed artifact has to name what covered it at the GOVERNING WRITE.
+         # `[]` means the feature bound no personal data, never that nothing was checked.
+         json.dumps(list(check.personal_data_policy_revision_ids))))
     # H2b STEP 4 — insert the immutable, write-once contract_input_column lineage: one role-labelled row
     # per reconciled input (derives + grain + as_of + governed join). This + the pointer (STEP 5) are the
     # AUTHORITATIVE write; feature/feature_derives_from (STEP 7) are the current-pointer compat projection.
@@ -980,7 +988,8 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
     row = conn.execute(
         "SELECT contract_id, feature_id, feature_name, definition, version, verification, intent_id, "
         "created_at, initial_validation_status, initial_verification, metadata_input_fingerprint, "
-        "physical_plan_id, planner_declaration_id FROM contract WHERE contract_id = %s",
+        "physical_plan_id, planner_declaration_id, personal_data_policy_revision_ids "
+        "FROM contract WHERE contract_id = %s",
         (contract_id,)).fetchone()
     if row is None:
         return None
@@ -1006,6 +1015,11 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
             "initial_validation_status": row[8], "initial_verification": row[9],
             "metadata_input_fingerprint": row[10],
             "physical_plan_id": row[11], "planner_declaration_id": row[12],
+            # D14: the policy revisions that licensed this contract's personal-data operands at the
+            # governing write. `[]` == bound no personal data. `pii_policy_store.
+            # resolve_policy_provenance` is what turns these ids into an auditor's answer — a
+            # revision's own `active` status is NOT the same question as whether it is still current.
+            "personal_data_policy_revision_ids": list(row[13] or []),
             "requirements": _contract_requirements(conn, contract_id),
             "invalidation_reasons": _invalidation_reasons(conn, contract_id),
             "history": _contract_history(conn, row[1], contract_id)}
