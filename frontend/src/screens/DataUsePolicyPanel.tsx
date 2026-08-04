@@ -12,10 +12,13 @@
 //     three states are rendered as three states: not approved for feature use / approved, with its
 //     purpose and approver / withdrawn. "Withdrawn" is never collapsed into "not approved",
 //     because somebody decided that, and the record of who is the whole control.
-//   * SINGLE APPROVER, and the panel says so. One platform-admin declares purpose and the policy
-//     is live; there is no second signature to wait for and no pending state to render. That is an
-//     explicit user decision (D14), so the UI states it rather than leaving it to be inferred from
-//     the absence of a confirm button.
+//   * SINGLE APPROVER, and the panel says so — TOGETHER WITH THE SCOPE, because the two decisions
+//     compound. One platform-admin declares purpose and the policy is live; there is no second
+//     signature to wait for and no pending state to render (an explicit user decision, D14). And a
+//     policy licenses a CONCEPT for the whole platform, so that one signature covers every catalog
+//     that exists and every catalog uploaded afterwards. Either decision is defensible on its own;
+//     their product is a fact the approver has to be told at the moment they decide, which is why
+//     it is in the approve form and not only in the panel's introduction.
 //   * CAS IN THE BODY. `pointer_version` is echoed back exactly as it was read (0 claims the first
 //     declaration). A 409 means someone else decided first — the panel reloads and asks for a
 //     re-read rather than silently retrying over their decision.
@@ -111,9 +114,16 @@ return (
             placeholder="AML transaction monitoring"
             onChange={e => onPurposeChange(e.target.value)}
           />
-          <p className="hint">
-            Recorded permanently with your name. One approval is enough — there is no second
-            signature to wait for.
+          {/* THE BLAST RADIUS, WHERE THE CLICK HAPPENS. A policy licenses a CONCEPT for the whole
+              platform, and one signature is the whole control (D14). Those two decisions are
+              defensible separately and compound into something a person has to be told at the
+              moment they decide: this approval covers every catalog that exists and every catalog
+              uploaded afterwards, and nobody else will be asked. Stating it in the panel's prose
+              or in a design doc is not the same as stating it here. */}
+          <p className="callout callout--warn dup-scope" data-testid="dup-scope-warning">
+            This allows <span className="mono">{state.concept_name}</span> in features across{' '}
+            <strong>all catalogs, now and in future uploads</strong> — one approval is sufficient.
+            It is recorded permanently with your name, and there is no second signature to wait for.
           </p>
           <div className="dup-actions">
             <button type="submit" className="btn" disabled={busy || purpose.trim().length < bounds.min}>

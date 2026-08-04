@@ -125,9 +125,29 @@ it('approves with a purpose and echoes the CAS version exactly as it was read', 
 it('says a single approval is enough, because that is a deliberate decision (D14)', async () => {
   await renderPanel(listing([state()]))
   await userEvent.click(screen.getByRole('button', { name: /approve for feature use/i }))
-  expect(screen.getByText(/one approval is enough/i)).toBeInTheDocument()
-  expect(screen.getByText(/no second signature/i)).toBeInTheDocument()
+  expect(screen.getByTestId('dup-scope-warning')).toHaveTextContent(/one approval is sufficient/i)
+  expect(screen.getByTestId('dup-scope-warning')).toHaveTextContent(/no second signature/i)
   expect(screen.queryByRole('button', { name: /confirm|second approver/i })).toBeNull()
+})
+
+it('states the BLAST RADIUS in the approve dialog, not only in the panel prose', async () => {
+  // Concept scope and single approver are each defensible; their PRODUCT is what the approver has
+  // to be told while deciding — one signature, every catalog, including ones that do not exist yet.
+  await renderPanel(listing([state()]))
+  await userEvent.click(screen.getByRole('button', { name: /approve for feature use/i }))
+
+  const warning = screen.getByTestId('dup-scope-warning')
+  expect(warning).toHaveTextContent(/pep_flag/)
+  expect(warning).toHaveTextContent(/all catalogs/i)
+  expect(warning).toHaveTextContent(/future uploads/i)
+  expect(warning).toHaveTextContent(/one approval is sufficient/i)
+})
+
+it('does not shout the blast radius at somebody who is only reading', async () => {
+  // It is a decision-time statement. Rendered on every row at rest it would become wallpaper, and
+  // an undecided concept would start looking like a hazard rather than an open question.
+  await renderPanel(listing([state()]))
+  expect(screen.queryByTestId('dup-scope-warning')).toBeNull()
 })
 
 it('will not submit a purpose shorter than the server would accept', async () => {

@@ -646,6 +646,19 @@ revision id and make the refusal name the change.
 >   immutable who/when/purpose record plus the platform-admin gate. Do not re-add a confirmer
 >   without a new user decision — the migration has no `confirmed_by` column and a route-shape test
 >   pins its absence.
+> * **THE SCOPE AND THE SINGLE APPROVER COMPOUND, and the product is the thing to state.** The two
+>   decisions are argued separately above and below — a policy licenses a CONCEPT for the whole
+>   platform (never a column, never a catalog), and ONE platform-admin signature makes it live —
+>   and each is defensible on its own terms. Multiplied, they mean: **one signature licenses that
+>   personal-data meaning in features across EVERY catalog, present and future, with no second
+>   approval and no per-catalog re-approval.** A catalog uploaded next year inherits the decision
+>   silently, because there is no upload-time re-consult and no catalog axis for a policy to be
+>   scoped to. That is not an accident and it is not a defect of either decision; it is what they
+>   add up to, and it is the sentence a reviewer needs before they click. It is stated at the
+>   click (`DataUsePolicyPanel`'s approve form, `dup-scope-warning`) rather than only here,
+>   because a blast radius recorded in a deferral document is a blast radius nobody reads. If a
+>   later slice wants to narrow it, the axis to add is a catalog scope on the pointer — NOT a
+>   second approver, which would address the wrong half.
 > * **The clearing is ALL-OR-NOTHING per candidate**, and the refusal names the UNCOVERED concepts.
 >   A purpose declared for `pep_flag` licenses nothing about `geolocation`.
 > * **The escape hatch is no longer the only aim.** `FEATUREGEN_FEATURE_USE_GATE=0` still drops all

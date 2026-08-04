@@ -4824,3 +4824,12 @@ button.stat:hover {
 .dup-confirm {
   margin: 4px 0 0;
 }
+
+/* The blast-radius statement inside the approve form. It sits at decision time only, so it may
+   carry the warn treatment without turning the resting list into a wall of hazard. */
+.dup-scope {
+  margin: 2px 0 0;
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.45;
+}
