@@ -590,10 +590,10 @@ describe('rejections panel', () => {
     // has to carry that difference — the fallback would word PERSONAL_DATA_POLICY_REQUIRED as a
     // verdict on the column, sending the reviewer to abandon an idea a policy would allow.
     await renderAndGenerate([IDEA], {}, [
-      { name: 'citizenship_propensity', reason: 'protected characteristic', code: 'PROTECTED_CHARACTERISTIC' },
-      { name: 'branch_desc_key', reason: 'a descriptive label, not a computable value', code: 'DESCRIPTIVE_OPERAND' },
-      { name: 'dob_bucket', reason: 'no personal-data use policy is declared', code: 'PERSONAL_DATA_POLICY_REQUIRED' },
-      { name: 'total_all_currencies', reason: 'the currency dimension is not bound', code: 'CURRENCY_POLICY_REQUIRED' },
+      { name: 'citizenship_propensity', reason: 'cust_ctzn_ctry_cd cannot be a model input', code: 'PROTECTED_CHARACTERISTIC' },
+      { name: 'branch_desc_key', reason: 'sol_desc displays and groups; use the code beside it', code: 'DESCRIPTIVE_OPERAND' },
+      { name: 'dob_bucket', reason: 'this catalog declares no personal-data use policy', code: 'PERSONAL_DATA_POLICY_REQUIRED' },
+      { name: 'total_all_currencies', reason: 'the feature does not bind tran_crncy', code: 'CURRENCY_POLICY_REQUIRED' },
     ])
     await userEvent.click(await screen.findByRole('button', { name: 'Show' }))
     expect(screen.getByText('protected characteristic')).toBeInTheDocument()

@@ -643,8 +643,22 @@ and a review trail; building it inside a validator would produce a bypass flag w
 governance word, which is the failure mode the "a review badge is never a permission" bar already
 exists to prevent.
 
+**A THIRD idea producer does not run the gauntlet at all, and it is not the gate's to fix.** Every
+proposed feature converges on `_validate_idea` — `_vet` (the menu), `contract.review.
+validate_minimum` (the confirm-time MCV), `contract.gate1._template_candidates` (the recipe
+options) and `planner.b_gauntlet` (cross-catalog proposals) — with ONE exception found while
+wiring this: `gate1._governed_cross_catalog_options` builds a `FeatureIdea` straight from a
+compiled binding plan (`_governed_idea_from_result`) and never calls the gauntlet. Its refusals
+speak the planner's closed `ReasonCode` vocabulary, not `RejectCode`, so emitting a USE refusal
+there would mix two closed vocabularies owned by different streams. The CONSEQUENCE is bounded and
+worth stating exactly: such an option can be DISPLAYED as choosable at Gate #1, and is then refused
+at confirm by the MCV — so nothing unsafe is ever persisted, but a reviewer can be shown a choice
+the platform will not honour. Recorded as a defect of the 3C.2b governed-planner surface, not of
+this gate.
+
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
+| 🟡 **`gate1._governed_cross_catalog_options` shows options the confirm-time MCV will refuse** | Gating it means adjudicating whether a `RejectCode` may appear in the planner's `ReasonCode`-shaped rejection dicts — a cross-vocabulary decision belonging to 3C.2b, and the wrong thing to settle inside a validator slice. Nothing unsafe persists: `validate_minimum` runs the same gate at confirm. | The next 3C.2b governed-planner change, or the first reviewer report of a Gate-#1 option that will not confirm. Fix shape: run `_use_gate` over `_plan_read_set_pairs(plan)` inside `_governed_idea_from_result` and map its code onto the planner's own reason vocabulary. |
 | 🟡 **A personal-data USE policy (lawful basis + purpose), and the confirmed override that consumes it** | The refusal deliberately names the missing policy rather than blaming the column, so the wording is already correct for the day it lands. Building the store now would ship a policy with one writer and no reader — the inert-mechanism class this register has recorded seven times. The registry's own descriptions anticipate it (`pep_flag` / `sanctions_hit_flag` are tagged `pii` and annotated "usable for AML"), so those two concepts are the acceptance cases. | The first real feature request that legitimately needs a `pii`-classed operand — an AML model over `pep_flag` or `sanctions_hit_flag` is the expected first one. Fix shape: a governed policy revision scoped to (catalog, purpose), read by `_use_gate` exactly as `_governed_read` reads an operational value, so an ABSENT policy still refuses. |
 | 🟡 **A currency CONVERSION policy** — the third way through `CURRENCY_POLICY_REQUIRED`, beside binding the dimension and declaring the column's currency | The refusal message already offers it as an option, so the wording is forward-compatible, but no store exists. Conversion is not a validator decision: it needs a base currency, a point-in-time FX source and a governed rate, which is a materialization concern (`fx_conversion_rate` is already in the registry with nothing reading it). | The first cross-currency aggregate a customer actually asks for. Fix shape: a governed policy naming base currency + rate source; `_use_gate` clears on its presence, and the requirement rides to materialization rather than being dropped. |
 | 🟡 **`sensitivity="proxy"` concepts (`country_code`, `geographic`, `corridor`, `alternative_data`, `fatca_crs_classification`) are NOT gated** | A proxy is context-dependent in a way the other four classes are not: `country_code` is a national-origin proxy for CREDIT and an ordinary risk dimension for AML, and the platform has no use-case axis to tell them apart. Refusing every proxy would refuse legitimate AML features today; refusing none is the honest state until the axis exists. The registry already flags them, so nothing is lost. | The first credit/pricing use case, or the arrival of a declared model PURPOSE on the feature request. Fix shape: gate proxies on purpose, not on the concept alone. |
