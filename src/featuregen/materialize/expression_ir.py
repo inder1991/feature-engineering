@@ -82,9 +82,11 @@ from featuregen.materialize.inputs import PhysicalInputRequirement, derive_requi
 from featuregen.materialize.inventory import ClusterInventoryV1
 from featuregen.materialize.joins import (
     CrossCatalogJoinStepV1,
+    CrosswalkJoinStepV1,
     JoinPlan,
     PhysicalIdentity,
     plan_cross_catalog_join,
+    plan_crosswalk_join,
     plan_join,
 )
 from featuregen.overlay.facts import AVAILABILITY_TIME, FactValidationError, validate_fact_value
@@ -92,9 +94,13 @@ from featuregen.overlay.identity import fact_key as _fact_key_of
 from featuregen.overlay.upload.bridge_realization import (
     AdditionalKeyRequirementV1,
     AsOfIntervalRequirementV1,
+    ExecutionTier,
     FixedValueReferencePredicateV1,
 )
 from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
+from featuregen.overlay.upload.crosswalk_admission import AdmittedCrosswalkV1
+from featuregen.overlay.upload.crosswalk_flag import crosswalk_execution_enabled
+from featuregen.overlay.upload.crosswalk_observation import SOURCE_TO_TARGET, TARGET_TO_SOURCE
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.upload_catalog import table_ref as _catalog_table_ref
@@ -354,10 +360,15 @@ class ExpressionExecutionIR:
         return {
             "expr_path": self.expr_path,
             "physical_read_set": [ref.identity_payload() for ref in self.physical_read_set],
+            # A typed step contributes its OWN payload; the single-catalog planner's step is a bare
+            # triple. Both crosswalk legs land here, so every crosswalk pin the execution revision
+            # is content-addressed over — the definition, the mapping binding, the temporal policy,
+            # the composed observation, both leg pins — is inside `ir_hash` by the one field that
+            # names it. A single-hop plan's bytes are untouched: no key was added, no branch reached.
             "join_steps": [
                 (
                     step.identity_payload()
-                    if isinstance(step, CrossCatalogJoinStepV1)
+                    if isinstance(step, CrossCatalogJoinStepV1 | CrosswalkJoinStepV1)
                     else [step.from_ref, step.to_ref, step.cardinality]
                 )
                 for step in self.join_plan.steps
@@ -827,6 +838,8 @@ def compile_expression(
     roles: Iterable[str] = (),
     inventory: ClusterInventoryV1,
     bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] = (),
+    crosswalks: tuple[AdmittedCrosswalkV1, ...] = (),
+    execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
 ) -> ExpressionExecutionIR | MaterializationRefused:
     """Compile ONE ``AggregateExpression`` into its executable plan, or refuse it (§3).
 
@@ -845,6 +858,13 @@ def compile_expression(
     The operand's governed type is then READ and CARRIED as :class:`OperandTypeEvidence`. It is not
     a fifth check: §6's exact-numeric rule is ``physical_types``', and a compiler that refused a type
     here would hold two opinions about one question.
+
+    ``crosswalks`` are ADMITTED two-leg mapping-table traversals (Release C Task 12) this
+    compilation may plan through, supplied by the caller exactly as ``bridge_realizations`` are —
+    this module reads no store. An empty tuple is the shipped state and every byte of a
+    direct-equality plan is unchanged by their presence in the signature.
+    ``execution_tier`` is the applicability scope both kinds are read at (see
+    ``ir._executable_realizations_for_tier``); it is not a run tier and changes no identity.
 
     Raises:
         ValueError: ``expr_path`` is outside Child-1's body-path vocabulary, or ``grain_keys`` is
@@ -868,6 +888,16 @@ def compile_expression(
     # spelling must never become a `_Tables` cache key or reach `identity_payload()`.
     expr = _normalized_expression(expr)
     grain = tuple(_canonical_ref(key) for key in grain)
+
+    # FEATUREGEN_CROSSWALK_EXECUTION=0 keeps crosswalks discoverable and STRUCTURALLY
+    # NON-EXECUTABLE (profile plan §9 Task 13). Dropped here rather than refused, and that is what
+    # "structurally non-executable" MEANS: with the flag off this compilation plans exactly what it
+    # planned before crosswalks existed and answers with exactly the refusal it answered then —
+    # there is no crosswalk-shaped code path to reach and no crosswalk-shaped error to read. The
+    # gate sits at THIS entry point rather than at `compile_ir`'s because this is the function that
+    # consumes them, so a caller who reaches the planner some other way cannot bypass it.
+    if crosswalks and not crosswalk_execution_enabled():
+        crosswalks = ()
 
     roles_used = tuple(roles)
     tables = _Tables(conn, inventory)
@@ -917,8 +947,10 @@ def compile_expression(
     read_set.add(availability_ref, RefRole.AVAILABILITY, source_identity, availability.column)
 
     planned = _plan_to_grain(conn, tables, read_set, source_identity=source_identity,
+                             source_table_ref=source_table_ref,
                              source_catalog=source_catalog, grain=grain, roles=roles_used,
-                             bridge_realizations=bridge_realizations)
+                             bridge_realizations=bridge_realizations,
+                             crosswalks=crosswalks, execution_tier=execution_tier)
     if isinstance(planned, MaterializationRefused):
         return planned
     join, joined_tables = planned
@@ -972,16 +1004,54 @@ def _filter_left_refs(node: object) -> Iterator[tuple[str, str]]:
             yield location, ref
 
 
+def _match_crosswalk(
+    crosswalks: tuple[AdmittedCrosswalkV1, ...], source_table_ref: str, target_table_ref: str,
+) -> tuple[AdmittedCrosswalkV1, str] | MaterializationRefused | None:
+    """The ONE admitted crosswalk relating these two datasets, and WHICH WAY this traversal runs.
+
+    A definition's two sides are canonically ordered (``A -> map -> B`` and ``B -> map -> A`` are
+    one record), so which side the expression starts from is what names the direction — and the
+    direction is what decides which measured verdict gates the plan. Nothing here reads a stored
+    orientation, because there is none to read.
+
+    More than one match REFUSES. §6.6's V1 conflict behaviour is ``refuse_on_multiple`` and
+    ``crosswalk_admission`` already refuses two active mappings for one endpoint pair; a compiler
+    that picked one anyway would make the answer depend on which definition it happened to read
+    first, which is the same defect one layer down.
+    """
+    source, target = _fold(source_table_ref), _fold(target_table_ref)
+    matched: list[tuple[AdmittedCrosswalkV1, str]] = []
+    for admitted in crosswalks:
+        left, right = (_fold(ref) for ref in admitted.endpoint_refs())
+        if (source, target) == (left, right):
+            matched.append((admitted, SOURCE_TO_TARGET))
+        elif (source, target) == (right, left):
+            matched.append((admitted, TARGET_TO_SOURCE))
+    if not matched:
+        return None
+    if len(matched) > 1:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"{len(matched)} admitted crosswalks relate {source_table_ref} and {target_table_ref}: "
+            f"with more than one active mapping the answer depends on which definition a compiler "
+            f"happened to read, and no deduplication, first-row pick or tie-break is permitted to "
+            f"make that go away (§6.6, refuse_on_multiple)")
+    return matched[0]
+
+
 def _plan_to_grain(
     conn: DbConn,
     tables: _Tables,
     read_set: _ReadSet,
     *,
     source_identity: PhysicalIdentity,
+    source_table_ref: str,
     source_catalog: str,
     grain: tuple[str, ...],
     roles: tuple[str, ...],
     bridge_realizations: tuple[CurrentBridgeRealizationV1, ...],
+    crosswalks: tuple[AdmittedCrosswalkV1, ...] = (),
+    execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
 ) -> tuple[JoinPlan, tuple[str, ...]] | MaterializationRefused:
     """The governed traversal from the source relation to the grain, and the reads it implies.
 
@@ -990,7 +1060,8 @@ def _plan_to_grain(
 
     Returns the plan together with every OTHER table ref the plan makes this expression read, in
     traversal order — the intermediate hops included, since those are precisely the tables the
-    caller never named and whose declared layout nobody else would check.
+    caller never named and whose declared layout nobody else would check. For a crosswalk that
+    includes the MAPPING dataset, which no formula ever names.
     """
     grain_tables: dict[str, None] = {}
     for key in grain:
@@ -999,6 +1070,11 @@ def _plan_to_grain(
     off_source = [table_ref for table_ref in grain_tables
                   if not _is_source_relation(table_ref, source_identity)]
     if len(off_source) > 1:
+        # STILL REFUSED, and for its original reason. The rule this states is about INDEPENDENT
+        # joins: two of them need two fan-out verdicts and nothing measures the pair, so no single
+        # plan can state what the combination does to row counts. A crosswalk is the case where
+        # something does — see the three-way branch below, which is why that refusal moved and this
+        # one did not.
         return _refuse(
             CompilationRefusalCode.GRAIN_PATH_NOT_GOVERNED,
             f"the grain keys sit on {len(off_source) + 1} different tables: this slice governs ONE "
@@ -1015,8 +1091,47 @@ def _plan_to_grain(
             return resolved
         target_identity = resolved
 
+    # ── the traversal, in THREE kinds (Release C Task 12) ────────────────────────────────────────
+    #
+    # WHAT REPLACED THE EITHER/OR, AND WHY IT IS NOT A BYPASS. Until this task there were exactly
+    # two branches — one same-catalog traversal OR one cross-catalog realization — and a mapping
+    # table between two schemes fell through both. The adversarial review named the reason the
+    # third was impossible, in this module's own words: a grain assembled from two joins "would
+    # need two [fan-out verdicts], which no single plan can state". That was a true statement about
+    # two INDEPENDENT joins and it is still true of them (the refusal above is unchanged).
+    #
+    # It is false about a crosswalk, and Task 11 is what made it false. A composed observation
+    # measures the composition ITSELF — `source_to_target_max_matches` over the JOINED shape,
+    # explicitly "never the product of the leg maxima (which is a bound)" — and admission turns
+    # that measurement into ONE directional verdict per direction. So a two-leg traversal IS
+    # plannable exactly when the admitted execution carries the requested direction's verdict and
+    # the composed fan-out behind it: the plan then states one fan-out verdict for the traversal it
+    # is planning, which is precisely the condition the old refusal demanded and could not meet.
+    # The refusal's reason is satisfied here, not routed around.
+    crosswalk: tuple[AdmittedCrosswalkV1, str] | None = None
+    if target_table_ref is not None and crosswalks:
+        matched = _match_crosswalk(crosswalks, source_table_ref, target_table_ref)
+        if isinstance(matched, MaterializationRefused):
+            return matched
+        crosswalk = matched
+
     cross_catalog = _fold(target_identity.catalog_source) != _fold(source_catalog)
-    if cross_catalog:
+    if crosswalk is not None:
+        admitted, direction = crosswalk
+        mapping_table_ref = admitted.definition.mapping_dataset_ref
+        mapping_identity = tables.resolve(mapping_table_ref)
+        if isinstance(mapping_identity, MaterializationRefused):
+            return mapping_identity
+        plan = plan_crosswalk_join(
+            admitted,
+            direction=direction,
+            from_identity=source_identity,
+            to_identity=target_identity,
+            mapping_identity=mapping_identity,
+            execution_tier=execution_tier,
+            roles=roles,
+        )
+    elif cross_catalog:
         matches = tuple(
             realization
             for realization in bridge_realizations
@@ -1048,8 +1163,11 @@ def _plan_to_grain(
     read_order: dict[str, None] = {}
     for step in plan.steps:
         step_refs = (
+            # A cross-catalog step and a crosswalk leg both carry FULL governed logical refs, which
+            # already name their own catalog. Only the single-catalog planner's steps carry bare
+            # graph-side addresses that have to be qualified with the catalog that planned them.
             tuple(ref for pair in step.column_pairs for ref in pair)
-            if isinstance(step, CrossCatalogJoinStepV1)
+            if isinstance(step, CrossCatalogJoinStepV1 | CrosswalkJoinStepV1)
             else tuple(
                 join_key_ref(source_catalog, ref)
                 for ref in (step.from_ref, step.to_ref)
@@ -1091,6 +1209,22 @@ def _plan_to_grain(
                         _column_of(predicate_ref),
                     )
                     read_order.setdefault(predicate_table_ref, None)
+        if isinstance(step, CrosswalkJoinStepV1):
+            # THE MAPPING ROW RULE'S OWN COLUMNS ARE READS. The filter that decides which mapping
+            # rows take part is applied on the cluster, so its effective-from / effective-to /
+            # snapshot / current-flag columns are columns this group reads — and Gate 2 must
+            # authorize them, or the traversal would filter on a column nobody was granted.
+            # Named apart from the bridge loop's `predicate` above: they are different vocabularies
+            # (a structured BRIDGE predicate vs a mapping ROW rule), and one name for both makes
+            # the second one's attribute reads unchecked.
+            for row_predicate in step.mapping_row_predicates:
+                predicate_table_ref = _table_ref_of(row_predicate.column_ref)
+                identity = tables.resolve(predicate_table_ref)
+                if isinstance(identity, MaterializationRefused):
+                    return identity
+                read_set.add(row_predicate.column_ref, RefRole.FILTER_LEFT, identity,
+                             _column_of(row_predicate.column_ref))
+                read_order.setdefault(predicate_table_ref, None)
 
     for key in grain:
         key_table_ref = _table_ref_of(key)

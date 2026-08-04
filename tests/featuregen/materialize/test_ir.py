@@ -65,6 +65,7 @@ from featuregen.materialize.ir import (
     authorize_compilation,
     compile_ir,
     ir_hash,
+    physical_read_set,
 )
 from featuregen.materialize.spine import (
     CurrentSnapshot,
@@ -215,6 +216,19 @@ def _floor(db, table, column, restriction):
         "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
         "AND object_ref = %s",
         (restriction, _SRC, f"public.{table}.{column}"))
+
+
+def _table_floor(db, table, restriction):
+    """The governed floor on the TABLE row itself — the same writer `field_resolution` uses.
+
+    `field_resolution.apply_sensitivity_floor` UPDATEs `graph_node.effective_restriction` keyed on
+    `lower(object_ref)`, and a table ref is a valid logical ref, so this is a reachable catalog
+    state and not a hand-forged one. The raw tag stays NULL, which is the shipped shape:
+    `build_graph` never writes sensitivity on a table node.
+    """
+    db.execute(
+        "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
+        "AND object_ref = %s AND kind = 'table'", (restriction, _SRC, f"public.{table}"))
 
 
 def seed_catalog(db):
@@ -611,15 +625,115 @@ def test_a_read_scope_tag_in_ANOTHER_CATALOG_does_not_deny_this_group(catalog):
 
 
 def test_the_union_covers_the_spine_SOURCE_TABLE_node(catalog):
-    """The table node carries its own read-scope tag, and the population's table is a read."""
+    """The population's TABLE is a read, and its scope is DERIVED from its columns (D11).
+
+    THE PRODUCTION SHAPE, deliberately. The earlier version of this test set
+    ``graph_node.sensitivity`` on the TABLE row and asserted the refusal — which passed, and proved
+    nothing that could ever happen: ``build_graph`` never writes sensitivity on a table node, so on
+    every real catalog a table row's ``visible_requires`` is ``'{}'`` and the table half of Gate 2
+    passed for everybody, always. Here the restriction is put where a catalog actually carries it —
+    on the COLUMNS — and the spine source is hidden because the caller can see none of them, which
+    is ``read_scope.anchor_visibility_predicate``'s rule and the one five other surfaces use.
+    """
     ir = _ok(_compile(catalog, PUBLIC_FEATURE))
-    catalog.execute(
-        "UPDATE graph_node SET sensitivity = 'restricted' WHERE catalog_source = %s "
-        "AND object_ref = %s AND kind = 'table'", (_SRC, "public.customers"))
+    assert CUSTOMERS in physical_read_set((ir,), ir.spine)
+    for column in ("cif_id", "load_ts", "status_cd", "effective_from", "version_seq"):
+        _floor(catalog, "customers", column, "restricted")
     refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
     assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
     assert CUSTOMERS in refused.detail
     assert ReadElementKind.SPINE_SOURCE.value in refused.detail
+
+
+def test_one_visible_column_is_enough_to_see_the_spine_source_table(catalog):
+    """The other half of D11's derived rule, so the test above cannot pass by hiding everything.
+
+    A caller who can see AT LEAST ONE of the table's columns sees the table anchor. The columns
+    they cannot see still refuse on their own account — which is why this asserts the TABLE ref is
+    absent from the refusal rather than asserting the group is authorized.
+    """
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _floor(catalog, "customers", "cif_id", "restricted")
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert CUSTOMERS_CIF in refused.detail
+    assert ReadElementKind.SPINE_SOURCE.value not in refused.detail
+
+
+# ── the TABLE-level governed floor, which the derived rule alone discards ─────────────────────────
+#
+# D11's shared predicate SUBSTITUTES the derived answer for the table row's own `visible_requires`,
+# so with every column visible a table's own governed floor decided nothing. On a display surface
+# that is defensible; at Gate 2 it is a grant to SCAN, and `restricted` is caught NOWHERE else —
+# §5.2's contract-time classification refuses only a `prohibited` input. These three tests pin the
+# conjunctive rule Gate 2 binds instead: the floor refuses, and the floor's own reader role clears
+# it. Against the substitutive predicate the first two AUTHORIZE.
+
+
+@pytest.mark.parametrize("floor", ["restricted", "prohibited"])
+def test_a_governed_floor_on_the_spine_TABLE_refuses_even_when_every_column_is_visible(
+        catalog, floor):
+    """The table row's OWN requirement, which nothing else in the read set repeats.
+
+    Every column of `customers` stays world-visible here, so D11's derived half is satisfied and
+    the substitutive predicate authorizes. What must not be discarded is the floor governance set
+    on the TABLE — the one statement about the relation as a whole.
+    """
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    assert CUSTOMERS in physical_read_set((ir,), ir.spine)
+    _table_floor(catalog, "customers", floor)
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert f"{CUSTOMERS} ({ReadElementKind.SPINE_SOURCE.value})" in refused.detail
+
+
+def test_the_restricted_readers_role_clears_a_restricted_TABLE_floor(catalog):
+    """The GRANT path — otherwise the refusal above could be "table floors always refuse"."""
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _table_floor(catalog, "customers", "restricted")
+    assert isinstance(
+        authorize_compilation(catalog, (ir,), ir.spine,
+                              roles=(*_ROLES, "restricted_reader")), AuthorizedCompilation)
+
+
+def test_a_PROHIBITED_table_floor_is_ungrantable_at_this_gate(catalog):
+    """`prohibited` is in no role map, so no role a caller can hold unlocks it (migration 1032)."""
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _table_floor(catalog, "customers", "prohibited")
+    for roles in ((*_ROLES, "restricted_reader"), (*_ROLES, "confidential_reader", "pii_reader")):
+        refused = authorize_compilation(catalog, (ir,), ir.spine, roles=roles)
+        assert isinstance(refused, MaterializationRefused), roles
+        assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+
+
+def test_gate_2_binds_a_CONJUNCTIVE_anchor_and_leaves_the_shared_D11_predicate_alone():
+    """The scoping of the fix, pinned as SQL: five other surfaces still bind the shared rule.
+
+    Making `anchor_visibility_predicate` conjunctive would change field corrections, asset detail,
+    crosswalk discovery, the crosswalk store and source selection in one move — a
+    controlling-doc-level decision about D11, recorded in `docs/DEFERRED-WORK.md` rather than taken
+    here. So the two predicates must genuinely be two.
+    """
+    from featuregen.overlay.upload.read_scope import (
+        anchor_visibility_predicate,
+        materialization_anchor_visibility_predicate,
+    )
+
+    def table_branch(predicate: str) -> str:
+        return predicate.split("THEN", 1)[1].split("ELSE", 1)[0]
+
+    shared, gate = anchor_visibility_predicate("gn"), materialization_anchor_visibility_predicate(
+        "gn")
+    assert shared != gate
+    # SUBSTITUTIVE: the shared table branch never mentions the table row's own requirement.
+    assert "gn.visible_requires" not in table_branch(shared)
+    # CONJUNCTIVE: Gate 2's does, AND keeps the derived EXISTS probe.
+    assert "gn.visible_requires" in table_branch(gate)
+    assert "EXISTS(" in table_branch(gate)
+    # The bind count is the shape of each predicate, and the call sites depend on it.
+    assert (shared.count("%s"), gate.count("%s")) == (2, 3)
 
 
 def test_the_union_covers_every_JOIN_STEP_ENDPOINT(catalog):

@@ -71,6 +71,12 @@ data:
   # FAIL-CLOSED (D8): flipping this to "1" while the line above is "0" leaves the feature DISABLED
   # (routes still 404) and logs a loud startup warning — the dependency is enforced, not assumed.
   FEATUREGEN_SOURCE_TEMPORAL_SELECTION: "0"
+  # Release-C generated two-leg crosswalk execution. DEPENDS ON the line above being ENABLED, and
+  # unlike that dependency this one is a TRUE BOOT REFUSAL (D8): flipping this to "1" while the
+  # line above is "0" makes the backend REFUSE TO START with a message naming both flags — it does
+  # not degrade to a warning, because a crosswalk's mapping rows are chosen by the Release-B
+  # temporal policy. Off ⟹ crosswalks stay discoverable and structurally non-executable.
+  FEATUREGEN_CROSSWALK_EXECUTION: "0"
   # ── Materialization / code-gen (Phase G) — OFF on this cluster ────────────────────────────────
   # THE KILL SWITCH for the whole materialization lane. A compile runs inside the worker tick on the
   # worker's one connection, so while it runs the relay, the timers, the projections and every

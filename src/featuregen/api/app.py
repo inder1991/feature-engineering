@@ -54,6 +54,11 @@ from featuregen.overlay.config import overlay_config_from_env, register_overlay_
 from featuregen.overlay.facts import register_overlay_event_types
 from featuregen.overlay.upload.contract.live_activation import startup_artifact_check
 from featuregen.overlay.upload.contract.scope_mode import scope_mode_status
+from featuregen.overlay.upload.crosswalk_flag import (
+    CROSSWALK_EXECUTION_FLAG,
+    crosswalk_execution_status,
+    require_valid_crosswalk_configuration,
+)
 from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
 from featuregen.overlay.upload.source_selection import (
     SOURCE_TEMPORAL_SELECTION_FLAG,
@@ -119,6 +124,29 @@ def _startup_flag_dependency_check(app: FastAPI) -> None:
             SOURCE_TEMPORAL_SELECTION_FLAG)
 
 
+def _startup_crosswalk_flag_refusal(app: FastAPI) -> None:
+    """D8's Release-C row: `FEATUREGEN_CROSSWALK_EXECUTION` REFUSES TO BOOT on an unmet dependency.
+
+    Deliberately NOT the function above. That one records and warns because Release B's flag-off
+    state is a valid running configuration; this one raises, because a deployment that asked for
+    generated crosswalk execution while source/temporal selection is disabled would run a two-leg
+    traversal whose mapping-row rule nobody resolved. The verified-interfaces D8 note (2026-08-03)
+    is explicit that Release C must not inherit the log-only precedent, so the two checks sit side
+    by side with different verdicts rather than one being reused for both.
+
+    The state is still recorded on `app.state` for the legal combinations, so `/health` and the
+    Release-C surfaces read one posture rather than each re-deriving it.
+    """
+    require_valid_crosswalk_configuration()
+    status = crosswalk_execution_status()
+    app.state.crosswalk_execution_enabled = status.enabled
+    if status.enabled:
+        logger.warning(
+            "%s is ON: governed two-leg mapping-table crosswalks may be compiled and rendered. "
+            "Discovery is unaffected by this flag; EXECUTION is what it gates.",
+            CROSSWALK_EXECUTION_FLAG)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The same process bootstrap the worker and the test suite use: event schemas (idempotent)
@@ -130,6 +158,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_overlay_config(overlay_config_from_env())
     _startup_migration_check(app)
     _startup_flag_dependency_check(app)
+    # RAISES on the one illegal combination — see the function's own docstring for why this is a
+    # refusal where the line above is a warning. It runs BEFORE the diagnostic checks below so a
+    # refused configuration never reaches anything that touches a cluster or an artifact.
+    _startup_crosswalk_flag_refusal(app)
     # H3c — the lightweight 3C.2 signed-gate posture signal at boot (log-only, never blocks startup): a
     # loud warning when the live cross-catalog flag is ON but the signed artifact is absent/stale/invalid,
     # so a mis-provisioned gate is visible early. The per-request admission check still enforces fail-closed.
