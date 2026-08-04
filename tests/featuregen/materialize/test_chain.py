@@ -35,6 +35,15 @@ import sys
 import psycopg
 import pytest
 from tests.featuregen.materialize import fixtures
+from tests.featuregen.materialize.test_cross_catalog_ir import (
+    CRM_CIF,
+    _realization_current,
+    _seed_crm_catalog,
+    seed_executable_bridge_realization,
+)
+from tests.featuregen.materialize.test_cross_catalog_ir import (
+    _inventory as _cross_catalog_inventory,
+)
 from tests.featuregen.materialize.test_ir import (
     DECLARATION,
     INVENTORY,
@@ -52,6 +61,7 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
     _seed_work_item,
     no_dsn,
 )
+from tests.featuregen.materialize.test_wiring import CRM_PHYSICAL, CROSS_CATALOG_DECLARATION
 
 from featuregen.materialize import control_plane
 from featuregen.materialize.admission import FeatureNamePlanError
@@ -89,6 +99,8 @@ from featuregen.materialize.control_plane import (
     run_status,
 )
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME, read_lock
+from featuregen.materialize.inventory import ClusterInventoryV1
+from featuregen.materialize.joins import CrossCatalogJoinStepV1
 from featuregen.materialize.publish import (
     ProbeObservation,
     PublishMechanism,
@@ -239,6 +251,207 @@ def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schem
         contract_overrides=overrides, mechanism=PublishMechanism.VERSIONED_POINTER,
         published_schema=published_schema, assemble_nodes=assemble, project_root=root, l0=l0,
         clock=_clock, **kwargs)
+
+
+# ── the BRIDGED group: the chain's OWN realization load (DEFERRED-WORK A.36) ─────────────────────
+#
+# Everything above compiles inside `hdfc`. Two independent Phase G reviews recorded the same gap:
+# `compile/wiring.py` assembles join-gate nodes for a cross-catalog group and `compile_ir` produces
+# a cross-catalog IR — but every one of those tests HANDS `compile_ir` a realization built in
+# Python, while `chain.py:462` calls it with no realization argument at all. So the read a real
+# lane-driven bridged run performs, `executable_bridge_realizations` against the database, had never
+# executed. The fixtures below close that: the realization is DURABLE (written through
+# `bridge_store`'s own writers) and the feature identity is durable too.
+
+
+def _seed_bridge(db):
+    """The crm side of the catalog, and the population key a bridged grain can land on.
+
+    Mirrors ``test_wiring._cross_catalog``'s catalog work, and for its reasons: the three tables
+    have to be distinct (projection source ``banking.transactions``, bridge target
+    ``crm_banking.customer_master``, spine ``banking.customers``), and the grain key column must not
+    be a column of the source relation — hence ``customer_id`` on the crm target and the spine, and
+    ``cif_id`` demoted so the declared key is the WHOLE governed grain.
+    """
+    _seed_crm_catalog(db)
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, schema_name) "
+        "VALUES ('crm','public.customer_master','table','customer_master','crm_banking')")
+    _col(db, "customers", "customer_id")
+    _govern_grain(db, "customers", "customer_id")
+    _govern_entity(db, "customers", "customer_id")
+    db.execute("UPDATE graph_node SET is_grain = false WHERE catalog_source = 'hdfc' "
+               "AND table_name = 'customers' AND kind = 'column' AND column_name = 'cif_id'")
+
+
+def _bridged_inventory() -> ClusterInventoryV1:
+    """``INVENTORY`` plus the crm table and the spine's crm-shaped key — captured facts, not seeds."""
+    customers = INVENTORY.tables["banking.customers"]
+    return _cross_catalog_inventory(dataclasses.replace(INVENTORY, tables={
+        **INVENTORY.tables,
+        "banking.customers": dataclasses.replace(
+            customers, columns=(*customers.columns, ("customer_id", "string")))}))
+
+
+BRIDGED_INVENTORY = _bridged_inventory()
+
+
+class _Watched:
+    """The REAL assembly, wrapped so a test can read what the CHAIN handed it.
+
+    Not a stub: ``compile.wiring.assemble_nodes`` does the assembling and its output is what gets
+    rendered. The seam is a parameter precisely so the chain does not become the second place the
+    wiring is described, and observing the frozen ``NodeAssemblyInputs`` that crossed it is the only
+    way to assert on the datasets and nodes of a run that went all the way through — the sealed
+    files carry the same facts, but as text.
+    """
+
+    def __init__(self) -> None:
+        self.inputs = None
+        self.nodes: tuple = ()
+
+    def __call__(self, inputs):
+        self.inputs = inputs
+        self.nodes = tuple(assemble_nodes(inputs))
+        return self.nodes
+
+    def the_step(self) -> CrossCatalogJoinStepV1:
+        steps = [step for ir in self.inputs.authorized.irs for expression in ir.expressions
+                 for step in expression.join_plan.steps
+                 if isinstance(step, CrossCatalogJoinStepV1)]
+        assert len(steps) == 1, steps
+        return steps[0]
+
+
+@pytest.fixture
+def bridged(catalog, monkeypatch, l0_passes, tmp_path):
+    """An accepted request naming ONE durably-authored feature whose grain is in another catalog,
+    over a catalog carrying ONE durable, executable bridge realization."""
+    _seed_bridge(catalog)
+    realization = seed_executable_bridge_realization(catalog, BRIDGED_INVENTORY)
+    request_id = _request(catalog)
+    work_item = _authored(catalog, monkeypatch, name=fixtures.BRIDGED_FEATURE_NAME, suffix="x")
+    return request_id, [work_item], tmp_path, realization
+
+
+def _run_bridged(db, bridged, *, assemble=None) -> CompiledGroup:
+    request_id, work_items, root, _realization = bridged
+    return _run(db, request_id, work_items, root, spine=CROSS_CATALOG_DECLARATION,
+                inventory=BRIDGED_INVENTORY,
+                assemble=_assemble if assemble is None else assemble)
+
+
+def test_the_chain_LOADS_the_bridge_realization_from_the_DATABASE(bridged, catalog) -> None:
+    """THE property A.36 names. Nothing is injected: the chain calls ``compile_ir`` without a
+    realization, so the only way a ``CrossCatalogJoinStepV1`` can exist in this run is that
+    ``executable_bridge_realizations`` found the seeded revision and revalidated it.
+
+    The discriminator is the revision ID. A realization's identity is content-addressed over its
+    evidence refs and dependency snapshot, and the durable seed's admitted revision carries an exact
+    relationship observation the in-memory fixture does not — so the two ids DIFFER, and finding the
+    durable one in a compiled step is proof the value came from the store rather than from a test.
+    """
+    watched = _Watched()
+
+    outcome = _run_bridged(catalog, bridged, assemble=watched)
+
+    step = watched.the_step()
+    assert step.realization_revision_id == bridged[3].realization_revision_id
+    assert step.dependency_snapshot_id == bridged[3].dependency_snapshot_id
+    assert step.to_catalog_source != step.from_catalog_source
+    # the in-memory fixture is NOT what was compiled
+    assert step.realization_revision_id != _realization_current(
+        BRIDGED_INVENTORY).revision.realization_revision_id
+    assert outcome.stopped_at is ChainStage.PUBLISHER
+
+
+def test_a_bridged_group_with_NO_durable_realization_is_refused_at_COMPILE(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The control that makes the test above load-bearing. Identical in every way except that the
+    store holds no realization — and the run must then be REFUSED rather than compiled, because
+    ``compile_ir`` reads the store and the store is the only authority for a cross-catalog hop.
+
+    Without this, a chain that had (say) fallen back to link availability would pass the test above
+    for the wrong reason and nothing would say so.
+    """
+    _seed_bridge(catalog)
+    request_id = _request(catalog)
+    work_item = _authored(catalog, monkeypatch, name=fixtures.BRIDGED_FEATURE_NAME, suffix="x")
+
+    outcome = _run(catalog, request_id, [work_item], tmp_path,
+                   spine=CROSS_CATALOG_DECLARATION, inventory=BRIDGED_INVENTORY)
+
+    assert outcome.stopped_at is ChainStage.COMPILE
+    assert outcome.refusal is not None
+    assert outcome.refusal.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+    assert outcome.lifecycle_state is RequestLifecycle.FAILED
+    assert outcome.generation_id is None
+
+
+def test_the_bridged_project_gates_the_join_and_SEALS(bridged, catalog) -> None:
+    """Task 3 and Task 4 composed, which is what had never run. The gate node is assembled, the
+    projection reads the frame whose uniqueness the gate PROVED rather than the raw target, and
+    ``render_project``'s wiring rules accept the whole thing — over a realization nobody handed in.
+    """
+    watched = _Watched()
+
+    outcome = _run_bridged(catalog, bridged, assemble=watched)
+
+    validated = watched.inputs.datasets.join_gates[watched.the_step().realization_revision_id]
+    raw_target = watched.inputs.datasets.raw[CRM_PHYSICAL]
+    (gate,) = [node for node in watched.nodes if "bridge_precondition" in node.tags]
+    (projection,) = [node for node in watched.nodes if "projection" in node.tags]
+
+    assert gate.outputs == (validated,)
+    assert raw_target in gate.inputs
+    assert validated in projection.inputs
+    assert raw_target not in projection.inputs
+
+    # …and the SEALED project on disk carries it: the pipeline names the gate, and the rendered
+    # compute names the exact durable revision it was authorized against.
+    project = pathlib.Path(outcome.project_root)
+    assert (project / GENERATED_LOCK_FILENAME).is_file()
+    pipeline = (project / "src" / f"sandbox_feature_{_GROUP}" / "pipelines" / "materialize" /
+                "pipeline.py").read_text()
+    nodes_py = (project / "src" / f"sandbox_feature_{_GROUP}" / "pipelines" / "materialize" /
+                "nodes.py").read_text()
+    assert validated in pipeline
+    assert bridged[3].realization_revision_id in nodes_py
+
+
+def test_a_bridged_run_reaches_the_SAME_truthful_terminal(bridged, catalog) -> None:
+    """G-1's terminal does not change because a catalog was crossed: the project was compiled,
+    rendered, sealed and PROVEN to build, and publication is still genuinely unproven. Asserting it
+    here is what says the bridged path is a first-class run rather than a shape that limps to a
+    different ending."""
+    outcome = _run_bridged(catalog, bridged)
+
+    assert outcome.stopped_at is ChainStage.PUBLISHER
+    assert outcome.refusal is not None
+    assert outcome.refusal.code is PublicationRefusalCode.CAPABILITY_UNPROVEN
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+    assert outcome.lifecycle_state is RequestLifecycle.COMMITTED
+    assert outcome.validation_report is not None
+    assert outcome.validation_report.status is ValidationStatus.PASSED
+    events = read_run_events(catalog, outcome.run_id)
+    assert [(event.seq, event.event_kind) for event in events] == [
+        (FIRST_RUN_EVENT_SEQ, RunEventKind.PUBLICATION_REFUSED)]
+    assert run_status(catalog, outcome.run_id) is RunStatus.REFUSED
+
+
+def test_the_bridged_read_set_spans_BOTH_catalogs_and_Gate_2_authorized_it(
+        bridged, catalog) -> None:
+    """§1.3 records every join endpoint as its own read, so a bridged group's authorized read set
+    must carry columns from both catalogs. A group authorized over one catalog's refs would be
+    joining on a column nobody granted — and would also mean the fixture never crossed anything."""
+    watched = _Watched()
+
+    _run_bridged(catalog, bridged, assemble=watched)
+
+    refs = watched.inputs.authorized.authorized_refs
+    assert {ref.split("::", 1)[0] for ref in refs} == {"hdfc", "crm"}
+    assert CRM_CIF in refs
+    assert fixtures.REF_AMT in refs
 
 
 # ── THE happy path: a governed feature becomes a sealed project ──────────────────────────────────

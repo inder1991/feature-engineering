@@ -676,7 +676,16 @@ operator cannot do today is close the old row.
 |---|---|---|
 | 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
 
-### A.36 🟡 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+### A.36 🟢 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+
+**CLOSED for the chain/lane row (2026-08-04); the `execution_tier` row below remains OPEN.** The
+durable seed helper is `tests/featuregen/materialize/test_cross_catalog_ir.seed_executable_bridge_realization`
+and the fourth cross-catalog worked feature is `fixtures.BRIDGED_FEATURE_NAME`. A bridged group now
+runs through `compile_feature_group` (`test_chain.py`, five cases) and over HTTP through the worker
+tick (`test_materialization_e2e.py`, two cases), loading its realization from the database in both.
+The seed writes through `bridge_store`'s own writers, so the load exercises
+`executable_bridge_realizations`' full revalidation rather than a SELECT. Everything below is kept
+as the record of what the gap was.
 
 Flagged by Phase G T4's review and again by T11's, which is why it is here rather than in a task
 report: two independent reviews have now recorded the same gap, and neither had a tracked home for it.
@@ -702,7 +711,7 @@ graph nodes with a governed logical type.
 
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
-| 🟡 **No test drives a cross-catalog group through `compile_feature_group`, so the realization LOAD on the chain's own path is unexercised** | It is a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. G-1's acceptance criterion is the same-catalog path, and inventing the seed under acceptance-test pressure would have produced a fixture nobody had reviewed. | The first bridged group anybody triggers, or any change to how `compile_ir` resolves realizations. Closure: the durable seed helper above, then a fifth case in `tests/featuregen/api/test_materialization_e2e.py` driving the bridged group over HTTP — the harness already exists and takes one more fixture. |
+| 🟢 **CLOSED — a cross-catalog group now drives `compile_feature_group` AND the HTTP-triggered lane, loading the realization from the store** | Was a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. | Done as described: `seed_executable_bridge_realization` + `bridged_debit_amount_30d`. The discriminator is the `realization_revision_id`, content-addressed over the exact observation only the durable seed writes, asserted present in the sealed `nodes.py`; the control is a bridged run against an EMPTY store, which must refuse at `compile_ir` with `JOIN_CARDINALITY_UNKNOWN`. |
 | 🟡 **The trigger surface carries no `execution_tier`, so every HTTP-driven run compiles at `PRODUCTION`** | `MaterializationJobV1` and `MaterializationRunIn` have no such field, and adding one is a governance decision about who may widen the joins a compile may read — not a wiring change. Harmless today: the applicability tier only decides which joins are readable and forks no execution identity (pinned by `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity`). | Anyone needing a SANDBOX-scoped realization to reach a triggered run. Closure: a declared field on the job, argued the way `published_schema` was — no default, so a caller must state it. |
 
 ### A.37 🟡 A pre-seal governed refusal records no stage and no code anywhere queryable (2026-08-04)

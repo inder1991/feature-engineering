@@ -67,19 +67,28 @@ from typing import Any
 import pytest
 import yaml
 from tests.featuregen.api.test_materialization_runs import _body
-from tests.featuregen.materialize.fixtures import authored_formula
+from tests.featuregen.materialize.fixtures import BRIDGED_FEATURE_NAME, authored_formula
 from tests.featuregen.materialize.test_chain import (
+    _CADENCE,
     _FEATURE,
     _GROUP,
+    _PROMISE,
+    BRIDGED_INVENTORY,
     _authored,
     _inject_l0,
     _seed,
+    _seed_bridge,
+)
+from tests.featuregen.materialize.test_cross_catalog_ir import (
+    BRIDGE_PURPOSE,
+    seed_executable_bridge_realization,
 )
 from tests.featuregen.materialize.test_ir import INVENTORY, _tag
 from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_dsn` is autouse
     _seed_work_item,
     no_dsn,
 )
+from tests.featuregen.materialize.test_wiring import CROSS_CATALOG_DECLARATION
 
 from featuregen.api.routes.materialization_runs import REQUEST_ID_HEADER
 from featuregen.formula.canonical import formula_content_hash
@@ -104,9 +113,12 @@ from featuregen.materialize.identity import (
     read_lock,
 )
 from featuregen.materialize.inventory import ClusterInventoryV1, load_inventory
+from featuregen.materialize.publish import PublishMechanism
 from featuregen.materialize.queue_lane import (
     MATERIALIZATION_FLAG,
     MATERIALIZATION_HANDLER,
+    MaterializationJobV1,
+    encode_job,
     process_materialization_once,
 )
 from featuregen.materialize.request_store import (
@@ -119,6 +131,7 @@ from featuregen.materialize.validation import (
     ValidationStatus,
     read_validation_reports,
 )
+from featuregen.overlay.upload.bridge_store import executable_bridge_realizations
 from featuregen.runtime.handlers import HandlerRegistry
 from featuregen.runtime.observability import counters
 from featuregen.runtime.worker import WorkerTick, run_worker_once
@@ -180,9 +193,13 @@ def _inventory_document(inventory: ClusterInventoryV1) -> dict[str, Any]:
     }
 
 
-def _inventory_file(directory: pathlib.Path) -> pathlib.Path:
-    path = directory / "hdfc-local-inventory.yml"
-    path.write_text(yaml.safe_dump(_inventory_document(INVENTORY), sort_keys=False),
+def _inventory_file(directory: pathlib.Path,
+                    inventory: ClusterInventoryV1 = INVENTORY) -> pathlib.Path:
+    """The captured facts this deployment declares. ``inventory`` is a parameter because a BRIDGED
+    group reads a second catalog's table, and an inventory that did not declare it would refuse the
+    physical resolution rather than the join — a green for the wrong reason."""
+    path = directory / f"{inventory.environment_id}-inventory.yml"
+    path.write_text(yaml.safe_dump(_inventory_document(inventory), sort_keys=False),
                     encoding="utf-8")
     return path
 
@@ -221,6 +238,50 @@ def governed_feature(conn, monkeypatch):
     return _authored(conn, monkeypatch, suffix="e2e")
 
 
+# ── the BRIDGED deployment (DEFERRED-WORK A.36) ──────────────────────────────────────────────────
+
+
+@pytest.fixture
+def bridged_deployment(monkeypatch, tmp_path):
+    """The same deployment, pointed at an inventory that declares the SECOND catalog's table."""
+    root = tmp_path / "projects"
+    root.mkdir()
+    monkeypatch.setenv(MATERIALIZATION_FLAG, "1")
+    monkeypatch.setenv(_PROJECT_ROOT_ENV, str(root))
+    monkeypatch.setenv(_INVENTORY_ENV, str(_inventory_file(tmp_path, BRIDGED_INVENTORY)))
+    monkeypatch.setenv(_L0_PYTHON_ENV, sys.executable)
+    monkeypatch.setenv(_L0_TIMEOUT_ENV, "60")
+    return root
+
+
+@pytest.fixture
+def bridged_feature(conn, monkeypatch):
+    """A catalog carrying BOTH sources and ONE durable, executable bridge realization, plus a
+    feature whose governed grain sits in the other catalog.
+
+    The realization is written through ``bridge_store``'s own writers, so the lane has to LOAD it:
+    nothing on this path may inject one, and ``chain.py`` calls ``compile_ir`` with no realization
+    argument at all.
+    """
+    _seed(conn)
+    _seed_bridge(conn)
+    seed_executable_bridge_realization(conn, BRIDGED_INVENTORY)
+    return _authored(conn, monkeypatch, name=BRIDGED_FEATURE_NAME, suffix="e2ex")
+
+
+def _cross_catalog_spine() -> dict:
+    """``CROSS_CATALOG_DECLARATION`` in the wire shape the trigger accepts.
+
+    Encoded through ``encode_job`` rather than hand-written: the declaration is a governed record
+    and a hand-built JSON twin here would be a second answer to what the caller declared.
+    """
+    return encode_job(MaterializationJobV1(
+        request_id="req-placeholder", work_item_ids=(),
+        spine_declaration=CROSS_CATALOG_DECLARATION, cadence=_CADENCE,
+        availability_promise=_PROMISE, mechanism=PublishMechanism.VERSIONED_POINTER,
+        published_schema=None, contract_overrides=None))["spine_declaration"]
+
+
 # ── reading the record ───────────────────────────────────────────────────────────────────────────
 
 
@@ -255,9 +316,12 @@ def _tick(conn) -> WorkerTick:
     return run_worker_once(conn, HandlerRegistry(), [], owner="e2e", now=_NOW)
 
 
-def _trigger(client, headers, work_item_ids, *, key: str) -> str:
-    """POST the trigger and return the request id, having checked the 202 says what it means."""
-    posted = client.post(_PATH, json=_body(work_item_ids, key=key), headers=headers)
+def _trigger(client, headers, work_item_ids, *, key: str, **overrides) -> str:
+    """POST the trigger and return the request id, having checked the 202 says what it means.
+
+    ``overrides`` reach ``_body`` unchanged; the bridged cases use it to declare a population keyed
+    for the crm bridge, which is a caller's declaration and not a harness setting."""
+    posted = client.post(_PATH, json=_body(work_item_ids, key=key, **overrides), headers=headers)
     assert posted.status_code == 202, posted.text
     body = posted.json()
     assert body["lifecycle_state"] == RequestLifecycle.REQUESTED.value
@@ -406,6 +470,80 @@ def test_a_governed_feature_becomes_a_BUILD_VERIFIED_project_over_HTTP(
     assert detail["logical_group_name"] == _GROUP
     assert detail["requested_by"] == "user:priya"
     assert detail["authorized_roles"] == ["platform-admin"]
+
+
+def test_a_BRIDGED_group_compiles_over_HTTP_from_a_realization_it_LOADED(
+        client, conn, admin_headers, bridged_feature, bridged_deployment, l0_passes) -> None:
+    """DEFERRED-WORK A.36: the cross-catalog path, driven the way a deployment drives it.
+
+    Everything above compiles inside one catalog. This feature's governed grain sits in ``crm``
+    while its body reads ``hdfc``, so the compilation cannot proceed without a directional bridge
+    realization — and NOTHING on this path hands one in. ``chain.py`` calls ``compile_ir`` with no
+    realization argument, so the lane's run must read the store through
+    ``executable_bridge_realizations`` and revalidate what it finds.
+
+    The proof that it did is the sealed artifact: the rendered compute names the exact
+    ``realization_revision_id`` of the durable revision, a value that is content-addressed over the
+    exact relationship observation this seed wrote and therefore exists nowhere in this process
+    except as something read back from the database.
+    """
+    request_id = _trigger(client, admin_headers, [bridged_feature], key="acceptance-bridged",
+                          spine_declaration=_cross_catalog_spine())
+
+    assert _tick(conn).materialization_processed == 1
+
+    stored = _stored(conn, request_id)
+    assert stored.lifecycle_state is RequestLifecycle.COMMITTED
+    assert stored.generation_id is not None
+
+    project = bridged_deployment / stored.generation_id
+    assert (project / GENERATED_LOCK_FILENAME).is_file()
+    pipeline = (project / "src" / _PACKAGE / "pipelines" / "materialize" /
+                "pipeline.py").read_text()
+    nodes_py = (project / "src" / _PACKAGE / "pipelines" / "materialize" / "nodes.py").read_text()
+
+    # the join GATE is in the pipeline, and the durable revision is what the compute was built for
+    (realization,) = executable_bridge_realizations(
+        conn, purpose=BRIDGE_PURPOSE, environment=BRIDGED_INVENTORY.environment_id)
+    revision_id = realization.revision.realization_revision_id
+    assert "validate_bridge_" in pipeline
+    assert revision_id in nodes_py
+    assert f"def calculate_{BRIDGED_FEATURE_NAME}(" in nodes_py
+
+    # and it reached the SAME truthful terminal the same-catalog acceptance test asserts
+    events = read_run_events(conn, stored.run_id)
+    assert [(event.seq, event.event_kind) for event in events] == \
+        [(FIRST_RUN_EVENT_SEQ, RunEventKind.PUBLICATION_REFUSED)]
+    assert (events[0].detail or "").startswith(
+        f"{PublicationRefusalCode.CAPABILITY_UNPROVEN.value}: ")
+    assert published_generation_ids(conn) == frozenset()
+    (report,) = read_validation_reports(conn, generation_id=stored.generation_id)
+    assert (report.level, report.status) == (ValidationLevel.L0, ValidationStatus.PASSED)
+
+    detail = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+    assert detail["run_status"] == RunStatus.REFUSED.value
+
+
+def test_the_SAME_bridged_trigger_with_NO_stored_realization_is_refused_at_COMPILE(
+        client, conn, monkeypatch, admin_headers, bridged_deployment, l0_passes) -> None:
+    """The control. Identical in every respect except that the store holds no realization, and the
+    run must then be refused at ``compile_ir`` — which is what makes the test above a statement
+    about a DATABASE READ rather than about a cross-catalog formula compiling somehow."""
+    _seed(conn)
+    _seed_bridge(conn)
+    work_item = _authored(conn, monkeypatch, name=BRIDGED_FEATURE_NAME, suffix="e2enone")
+
+    request_id = _trigger(client, admin_headers, [work_item], key="acceptance-bridged-none",
+                          spine_declaration=_cross_catalog_spine())
+    outcome = process_materialization_once(conn, owner="e2e:materialize")
+
+    assert outcome.status == "refused"
+    assert outcome.stopped_at == ChainStage.COMPILE.value
+    assert (outcome.detail or "").startswith(
+        f"{CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN.value}: ")
+    assert _stored(conn, request_id).lifecycle_state is RequestLifecycle.FAILED
+    assert _plane_counts(conn) == _EMPTY_PLANE
+    assert list(bridged_deployment.iterdir()) == []
 
 
 # ── the probes that keep the green above from being vacuous ──────────────────────────────────────
