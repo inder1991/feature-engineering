@@ -150,9 +150,12 @@ class PhysicalDatasetBindingV1:
     """
 
     binding_id: str
-    #: The catalog object this binding serves, as the catalog's own (flattened) logical ref. Kept as
-    #: a plain string: the binding's job is to CONNECT the two identity systems, so it must be able
-    #: to name a catalog object whose schema the catalog itself may have defaulted.
+    #: The catalog object this binding serves, as a normalized logical ref carrying the RESOLVED
+    #: schema. Kept as a plain string: the binding's job is to CONNECT the two identity systems.
+    #: Both resolvers derive it the same way (`resolve_dataset_binding`,
+    #: `binding_store.resolve_table`) — a ref spelled from the caller's input instead would fork the
+    #: content hash of one table bound through two paths, which is the identity split this module's
+    #: header forbids. The flat catalog key stays recoverable as `catalog_source` + the table name.
     catalog_logical_ref: str
     connection_id: str
     identity: PhysicalObjectIdentityV1
@@ -244,6 +247,80 @@ class PhysicalDatasetBindingV1:
         })
 
 
+# ── the ONE derivation of a DERIVED binding's identity (Release C Task 11 scope 0) ──────────────
+#
+# Two resolvers used to derive the same table's address two ways: `resolve_dataset_binding` took
+# `database` from `ClusterInventoryV1.environment_id` and named the stream
+# `identifier-endpoint:<env>:<ref>`, while `binding_store.resolve_table` took `database` from the
+# connection registry and named the stream `derived-<catalog>-<table>`. Both feed
+# `PhysicalObjectIdentityV1.table_id` and `binding_revision_id`, so ONE physical table acquired two
+# addresses and two binding streams — and a relationship observation recorded against one was
+# invisible to every reader holding the other (the observation store keys its current pointer on
+# `left/right_binding_revision_id`, `store.py:440-455`).
+#
+# WHICH SOURCE IS HONEST FOR AN ADDRESS. `PhysicalObjectIdentityV1.database` "addresses the thing
+# holding" the Hive schema — WHICH engine instance, so two clusters carrying the same schema name
+# stay distinguishable. Two records could answer that:
+#
+# * the CONNECTION registry (`data_source_connection.database_name`) — an operator's durable,
+#   governed declaration of the instance this deployment reads, written beside the host, port,
+#   principal and allowlist, and already hard-matched to `settings.environment`
+#   (`binding_store._connection_for`). It is also the record that AUTHORIZES the read, so the
+#   address and the permission come from one place rather than two that can disagree;
+# * a captured `ClusterInventoryV1.environment_id` — a label on ONE capture artifact, supplied per
+#   materialization run, saying which environment was looked at. Two captures of the same cluster
+#   labelled differently would fork the address of a table that never moved.
+#
+# The connection's declaration wins. The inventory (or, for the routing path, the connection id) is
+# a FALLBACK consulted only where the registry is silent — which is exactly the case that must stay
+# addressable rather than become a refusal.
+#
+# LIVE ROWS. Nothing is re-addressed by this choice: `binding_store.record_binding` (reached from
+# `source_selector._pin_binding` -> `select_table_binding`) is the ONLY `src/` writer of
+# `physical_dataset_binding_revision`, and it already derives `database` from the connection.
+# `bridge_assessment.resolve_and_record_endpoint_binding` — the inventory-derived writer — has zero
+# `src/` callers (tests only). So no stored revision changes and migration 1057 carries no
+# re-addressing; it is spent on the crosswalk observation store instead.
+
+def derived_binding_id(*, catalog_source: str, table: str) -> str:
+    """The stream name for a binding DERIVED from configuration — one computation, both writers.
+
+    Keyed on (catalog, table) and not on the schema, because that is the grammar the flat logical
+    ref speaks (`ftr::tran_repos` names no schema) and the grammar both resolvers look tables up
+    with. Ambiguity inside one catalog is refused at the seams that persist
+    (`binding_store._assert_one_addressable_table`; `AMBIGUOUS_TABLE_NAME` on the inventory path)
+    rather than papered over with a wider key here.
+
+    An EXPLICIT binding keeps whatever `binding_id` its author gave it: an operator's per-table
+    declaration is the documented exception mechanism, not a derivation.
+    """
+    return f"derived-{_norm(catalog_source)}-{_norm(table)}"
+
+
+def address_database(conn: DbConn, *, connection_id: str, fallback: str | None = None) -> str:
+    """The ``database`` component of a physical ADDRESS. See the block comment above.
+
+    ``fallback`` is the caller's remaining evidence when the connection registry declares nothing —
+    the inventory's ``environment_id`` on the materialization path, the connection id on the routing
+    path. A blank answer from every source raises :data:`UNKNOWN_DATABASE` rather than completing the
+    address by assumption, which is this module's whole rule.
+    """
+    declared = ""
+    if _norm(connection_id):
+        row = conn.execute(
+            "SELECT database_name FROM data_source_connection WHERE connection_id = %s",
+            (connection_id,)).fetchone()
+        declared = _norm(row[0]) if row and row[0] else ""
+    database = declared or _norm(fallback) or _norm(connection_id)
+    if not database:
+        raise UnknownSchema(
+            UNKNOWN_DATABASE,
+            f"no database for connection {connection_id!r}: neither the connection registry nor the "
+            "caller could name the instance holding this schema, and a physical address cannot be "
+            "completed by assumption")
+    return database
+
+
 def record_binding_revision(
     conn: DbConn,
     binding: PhysicalDatasetBindingV1,
@@ -299,17 +376,30 @@ def resolve_dataset_binding(
     if column is not None:
         raise ValueError(
             f"logical_table_ref must address a table, got {logical_table_ref!r}")
-    logical_ref = normalize_ref(source, schema, table)
-    requirement = derive_requirement(conn, inventory, table_ref=logical_ref)
+    requested_ref = normalize_ref(source, schema, table)
+    requirement = derive_requirement(conn, inventory, table_ref=requested_ref)
     if not isinstance(requirement, PhysicalInputRequirement):
         return requirement
+    # The RESOLVED ref, not the one the caller happened to spell. `derive_requirement` resolves the
+    # real schema from the catalog (the ref's `public` segment is never a Hive schema), and
+    # `binding_store.resolve_table` — the only `src/` writer of these revisions — has always
+    # composed the resolved schema here. Deriving it from the caller's spelling instead meant one
+    # table bound through the bridge path and through the selection path carried two different
+    # `catalog_logical_ref` values, hence two content hashes and two `pbr_` revisions for one
+    # address. One derivation, and it converges onto the live writer's value, so nothing stored
+    # moves (Release C Task 11 scope 0).
+    logical_ref = normalize_ref(
+        requirement.catalog_source, requirement.schema, requirement.table)
     partition_columns = tuple(
         column_name for column_name, _physical_type in (requirement.partition_columns or ()))
     identity = PhysicalObjectIdentityV1(
         catalog_source=requirement.catalog_source,
-        # In PhysicalObjectIdentityV1, database addresses the cluster/catalog holding the Hive
-        # schema. ClusterInventoryV1.environment_id is exactly that stable environment address.
-        database=inventory.environment_id,
+        # ONE derivation, shared with `binding_store.resolve_table` (see the block comment above
+        # `derived_binding_id`). The inventory's environment is the FALLBACK, used only where the
+        # connection registry declares no instance — which preserves this path's answer wherever
+        # nothing else can speak.
+        database=address_database(
+            conn, connection_id=connection_id, fallback=inventory.environment_id),
         schema=requirement.schema,
         table=requirement.table,
         object_kind="table",
@@ -317,8 +407,8 @@ def resolve_dataset_binding(
     return PhysicalDatasetBindingV1(
         binding_id=(
             binding_id
-            or f"{inventory.environment_id}:{requirement.catalog_source}:{requirement.schema}."
-               f"{requirement.table}"
+            or derived_binding_id(
+                catalog_source=requirement.catalog_source, table=requirement.table)
         ),
         catalog_logical_ref=logical_ref,
         connection_id=connection_id,
