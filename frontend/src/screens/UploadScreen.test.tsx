@@ -14,6 +14,7 @@ vi.mock('../api', async importOriginal => {
     previewSync: vi.fn(),
     importSync: vi.fn(),
     getIngestionRun: vi.fn(),
+    listCatalogs: vi.fn(),
   }
 })
 const uploadFile = vi.mocked(api.uploadFile)
@@ -22,6 +23,7 @@ const listSyncs = vi.mocked(api.listSyncs)
 const previewSync = vi.mocked(api.previewSync)
 const importSync = vi.mocked(api.importSync)
 const getIngestionRun = vi.mocked(api.getIngestionRun)
+const listCatalogs = vi.mocked(api.listCatalogs)
 
 // Block body (not `() => uploadFile.mockReset()`): mockReset() returns the mock fn, and Vitest
 // treats a function returned from beforeEach as a per-test teardown — it would then call the mock
@@ -33,8 +35,10 @@ beforeEach(() => {
   previewSync.mockReset()
   importSync.mockReset()
   getIngestionRun.mockReset()
+  listCatalogs.mockReset()
   listIntegrations.mockResolvedValue([])
   listSyncs.mockResolvedValue([])
+  listCatalogs.mockResolvedValue({ catalogs: [] })
 })
 
 const result = (over: Partial<api.IngestResult>): api.IngestResult => ({
@@ -130,22 +134,6 @@ describe('upload screen', () => {
     expect(onReviewQueue).toHaveBeenCalledWith('deposits')
   })
 
-  it('attaches the optional catalog narrative JSON to the upload, and omits it when blank', async () => {
-    uploadFile.mockResolvedValue(result({ asserted: 4 }))
-    renderUpload()
-    // Blank attach: uploadFile is called WITHOUT a profile part (a missing profile never blocks).
-    await submit()
-    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
-
-    // `{`/`}` are userEvent key-descriptor syntax, so paste the literal JSON instead of typing.
-    const json = '{"display_name": "Deposits"}'
-    const area = screen.getByLabelText(/catalog narrative json/i)
-    await userEvent.click(area)
-    await userEvent.paste(json)
-    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
-    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', json)
-  })
-
   it('rejects a dropped file with an unsupported extension before any request', async () => {
     renderUpload()
     const dropZone = screen.getByLabelText(/file/i).closest('label')
@@ -212,6 +200,121 @@ describe('upload screen', () => {
     expect(panel).toHaveTextContent('FACT_ASSERTION_ERROR')
     await userEvent.click(screen.getByRole('button', { name: 'Hide run details' }))
     expect(screen.queryByRole('region', { name: /ingestion run details/i })).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------- the catalog narrative section
+
+// The narrative used to be a raw-JSON textarea. It is now structured fields, and the ONE thing
+// that must not have changed is the wire: the multipart `catalog_profile_json` part the server
+// parses (overlay/upload/catalog_profiles.parse_narrative_payload).
+
+async function openNarrative() {
+  await userEvent.click(screen.getByText('Describe this catalog (recommended)'))
+}
+
+// The part `uploadFile` was last called with — the third argument, exactly as it goes on the wire.
+function sentPart(): string | undefined {
+  return uploadFile.mock.calls.at(-1)?.[2]
+}
+
+describe('catalog narrative section', () => {
+  it('is closed by default, is framed as recommended, and never gates the upload button', async () => {
+    renderUpload()
+    const summary = screen.getByText('Describe this catalog (recommended)')
+    expect(summary.closest('details')).not.toHaveAttribute('open')
+    // Nothing is fetched for a section nobody opened.
+    expect(listCatalogs).not.toHaveBeenCalled()
+
+    await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+
+    await openNarrative()
+    // Opening it — and leaving it untouched — changes nothing about the upload.
+    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled()
+    expect(screen.getByText(/shown as the catalog's name and description/i)).toBeInTheDocument()
+    expect(listCatalogs).toHaveBeenCalledTimes(1)
+  })
+
+  it('serializes the fields to the SAME part the raw-JSON textarea used to send', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    await userEvent.type(screen.getByLabelText('Name'), 'Funds transfers')
+    await userEvent.type(screen.getByLabelText('Description'), 'Outbound payments.')
+    await userEvent.type(
+      screen.getByLabelText('Business context'), 'Core banking; Compliance-owned.')
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+
+    // SERIALIZATION EQUIVALENCE. `legacy` is what a person hand-wrote into the old textarea for
+    // this same content and what the old screen posted verbatim. The comparison is on the parsed
+    // objects because JSON.stringify emits no whitespace: the server json.loads() the part, so
+    // equal parses are the same request — same keys, same values, same types, nothing extra.
+    const legacy = '{"display_name": "Funds transfers", "description": "Outbound payments.", '
+      + '"business_context": "Core banking; Compliance-owned.", "business_domains": ["Payments"]}'
+    expect(JSON.parse(sentPart() as string)).toEqual(JSON.parse(legacy))
+  })
+
+  it('omits the part entirely when every field is empty — absence stays absence', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    // Whitespace is not authorship: a present-but-empty `{}` part would make the server write a
+    // narrative revision made of nothing, so it must never be sent.
+    await userEvent.type(screen.getByLabelText('Name'), '   ')
+    await submit()
+    expect(uploadFile).toHaveBeenLastCalledWith(expect.any(File), 'deposits', undefined)
+  })
+
+  it('adds typed and suggested domains as chips, and removes them', async () => {
+    listCatalogs.mockResolvedValue({ catalogs: [
+      { source: 'cust', tables: 2, columns: 9, display_name: 'Customer', has_profile: true },
+      { source: 'compliance', tables: 1, columns: 4, display_name: null, has_profile: false },
+    ] })
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+
+    // Suggestions are the catalogs this caller can already see: a described one by its name, an
+    // undescribed one by its upper-cased slug (there is no per-catalog label to invent).
+    await screen.findByRole('button', { name: 'Add domain Customer' })
+    await userEvent.click(screen.getByRole('button', { name: 'Add domain COMPLIANCE' }))
+    // A chosen suggestion stops being offered, and is now a removable chip.
+    expect(screen.queryByRole('button', { name: 'Add domain COMPLIANCE' })).toBeNull()
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+    expect(JSON.parse(sentPart() as string))
+      .toEqual({ business_domains: ['COMPLIANCE', 'Payments'] })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Remove domain COMPLIANCE' }))
+    expect(screen.getByRole('button', { name: 'Add domain COMPLIANCE' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Upload' }))
+    expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
+  })
+
+  it('keeps text typed into the domain box that was never Entered', async () => {
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    // No Enter: the box is blurred by moving on to the rest of the form. Dropping it silently
+    // would lose a domain the author watched themselves type.
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments')
+    await submit()
+    expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
+  })
+
+  it('a suggestion list that cannot be read leaves free-text entry working, with no error', async () => {
+    listCatalogs.mockRejectedValue(new api.ApiError(500, 'boom'))
+    uploadFile.mockResolvedValue(result({ asserted: 4 }))
+    renderUpload()
+    await openNarrative()
+    expect(screen.queryByRole('alert')).toBeNull()
+    await userEvent.type(screen.getByLabelText('Business domains'), 'Payments{Enter}')
+    await submit()
+    expect(JSON.parse(sentPart() as string)).toEqual({ business_domains: ['Payments'] })
   })
 })
 

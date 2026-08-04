@@ -2906,6 +2906,24 @@ export function putAssetProfile(
   )
 }
 
+// One catalog the caller may see. `tables`/`columns` are READ-SCOPED counts (honest about the
+// caller's scope, never about the catalog). `display_name`/`has_profile` ride only while
+// FEATUREGEN_DATASET_PROFILES is on — optional, so a flag-off payload types identically.
+export interface VisibleCatalog {
+  source: string
+  tables: number
+  columns: number
+  display_name?: string | null
+  has_profile?: boolean
+}
+
+// The catalogs THIS caller may see (derived, column-level scope). Never 404s and never errors:
+// "no catalogs you may see" and "no catalogs at all" are deliberately the same answer, so the
+// response cannot be used to probe for hidden catalogs.
+export function listCatalogs(): Promise<{ catalogs: VisibleCatalog[] }> {
+  return request('/catalogs')
+}
+
 export interface CatalogProfileRevision {
   catalog_source: string
   display_name: string | null

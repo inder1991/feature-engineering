@@ -3,9 +3,9 @@
 // The connection itself (URL, token, scope) is configured upstream in Integrations, so this path
 // is now just a sync picker. The gates strip at the top names who holds each step of the sync
 // path only — the file path's single-shot flow is untouched and needs no strip.
-import { useState } from 'react'
-import type { CSSProperties, DragEvent, FormEvent } from 'react'
-import { ApiError, uploadFile } from '../api'
+import { useId, useRef, useState } from 'react'
+import type { CSSProperties, DragEvent, FormEvent, KeyboardEvent } from 'react'
+import { ApiError, listCatalogs, uploadFile } from '../api'
 import type { IngestResult } from '../api'
 import { ConnectorPanel } from './ConnectorPanel'
 import type { ConnectorStage } from './ConnectorPanel'
@@ -158,16 +158,239 @@ export function UploadScreen({
   )
 }
 
+// ---------------------------------------------------------------- the catalog narrative
+
+// The catalog's OWN words, authored at the moment of upload. Structured fields, NOT a raw-JSON
+// textarea: the person who has just been asked for a "source name" is the one person who knows
+// what this catalog is, and asking them for hand-written JSON asked them for the one thing they
+// could get syntactically wrong. Same field shapes, same wording and the same no-blocked framing
+// as CatalogNarrativePanel (the post-upload editor) — one language, not two.
+//
+// The wire format is unchanged: the form serializes to the exact `catalog_profile_json` part the
+// textarea used to carry, which `parse_narrative_payload` already accepts.
+
+interface NarrativeDraft {
+  displayName: string
+  description: string
+  businessContext: string
+  businessDomains: string[]
+}
+
+const EMPTY_NARRATIVE: NarrativeDraft = {
+  displayName: '',
+  description: '',
+  businessContext: '',
+  businessDomains: [],
+}
+
+function trimmedDomains(draft: NarrativeDraft): string[] {
+  return draft.businessDomains.map(d => d.trim()).filter(Boolean)
+}
+
+// The JSON object the multipart part carries. ONLY non-empty fields ride: `parse_narrative_payload`
+// reads every key with `.get(...)` and maps a missing key and an explicit null to the same None, so
+// omitting an empty field is byte-equivalent to sending it null — and it keeps the payload equal to
+// what a person would have hand-written in the old textarea.
+function narrativePayload(draft: NarrativeDraft): Record<string, unknown> {
+  const payload: Record<string, unknown> = {}
+  const displayName = draft.displayName.trim()
+  if (displayName) payload.display_name = displayName
+  const description = draft.description.trim()
+  if (description) payload.description = description
+  const businessContext = draft.businessContext.trim()
+  if (businessContext) payload.business_context = businessContext
+  const domains = trimmedDomains(draft)
+  if (domains.length > 0) payload.business_domains = domains
+  return payload
+}
+
+// ABSENCE MUST STAY ABSENCE. A present-but-empty part is NOT the same as no part: uploads.py treats
+// any parsed part as authored narrative and writes a revision for it, so an all-empty `{}` would
+// commit a catalog narrative made of nothing (and re-key every dataset profile under it). Every
+// field empty therefore means no part at all — `undefined`, which `uploadFile` never appends.
+function serializeNarrative(draft: NarrativeDraft): string | undefined {
+  const payload = narrativePayload(draft)
+  return Object.keys(payload).length === 0 ? undefined : JSON.stringify(payload)
+}
+
+function CatalogNarrativeFields({
+  value,
+  onChange,
+}: {
+  value: NarrativeDraft
+  onChange: (next: NarrativeDraft) => void
+}) {
+  const uid = useId()
+  const [domainInput, setDomainInput] = useState('')
+  const [suggestions, setSuggestions] = useState<string[]>([])
+  const suggestionsLoaded = useRef(false)
+
+  // Suggested domain chips are the catalogs this caller can ALREADY see — the only vocabulary this
+  // system can honestly offer (there is no domain taxonomy anywhere in it). Loaded lazily on first
+  // open, so a person who never describes a catalog issues no request; a failure leaves the chips
+  // empty and free-text entry untouched, because a suggestion nobody could fetch is not an error
+  // the uploader caused.
+  async function loadSuggestions() {
+    if (suggestionsLoaded.current) return
+    suggestionsLoaded.current = true
+    try {
+      const { catalogs } = await listCatalogs()
+      // `display_name` when the catalog has been described, else the upper-cased slug. NEVER an
+      // invented prose name: overlay/upload/catalogs.py has no per-catalog label to give.
+      setSuggestions([
+        ...new Set(catalogs.map(c => c.display_name?.trim() || c.source.toUpperCase())),
+      ])
+    } catch {
+      setSuggestions([])
+    }
+  }
+
+  function edit(next: Partial<NarrativeDraft>) {
+    onChange({ ...value, ...next })
+  }
+
+  function addDomain(domain: string) {
+    const text = domain.trim()
+    if (!text || value.businessDomains.includes(text)) return
+    edit({ businessDomains: [...value.businessDomains, text] })
+  }
+
+  // Committed on Enter, on a comma, and on blur. The blur path is not a nicety: without it, text
+  // typed into the box and never Entered would be silently dropped at submit — the author would
+  // watch a domain they typed fail to arrive.
+  function commitDomain() {
+    const text = domainInput.trim()
+    setDomainInput('')
+    addDomain(text)
+  }
+
+  function onDomainKey(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== 'Enter' && e.key !== ',') return
+    // Enter inside a form submits it; here it means "that is one domain".
+    e.preventDefault()
+    commitDomain()
+  }
+
+  const offered = suggestions.filter(s => !value.businessDomains.includes(s))
+
+  return (
+    <details
+      onToggle={e => {
+        if (e.currentTarget.open) void loadSuggestions()
+      }}
+    >
+      {/* RECOMMENDED, never required: closed by default, and nothing inside it can gate the
+          upload button for an empty section. */}
+      <summary className="hint" style={{ cursor: 'pointer' }}>
+        Describe this catalog (recommended)
+      </summary>
+      <div style={{ display: 'grid', gap: 12, marginTop: 8, maxWidth: 620 }}>
+        <p className="hint" style={{ margin: 0 }}>
+          Shown as the catalog&#39;s name and description; used by search and by the AI when it
+          interprets tables.
+        </p>
+        <div className="field">
+          {/* "Name", not "display name": same label as the post-upload editor. No label in here
+              may contain the substring "file" — getByLabelText(/file/i) must keep matching only
+              the file input (which is why the old textarea said "narrative", not "profile"). */}
+          <label>
+            Name
+            <input
+              value={value.displayName}
+              onChange={e => edit({ displayName: e.target.value })}
+              placeholder="e.g. Funds transfers"
+            />
+          </label>
+        </div>
+        <div className="field">
+          <label>
+            Description
+            <textarea
+              value={value.description}
+              onChange={e => edit({ description: e.target.value })}
+              rows={2}
+              placeholder="One or two lines: what this catalog holds."
+            />
+          </label>
+        </div>
+        <div className="field">
+          <label>
+            Business context
+            <textarea
+              value={value.businessContext}
+              onChange={e => edit({ businessContext: e.target.value })}
+              rows={4}
+              placeholder={
+                'What system produces this, what population it covers, who owns it — e.g. '
+                + '\'Funds-transfer records from the core banking system; all outbound '
+                + 'SWIFT/RTGS payments; Compliance-owned\''
+              }
+            />
+          </label>
+        </div>
+        <div className="field">
+          <label htmlFor={`${uid}-domains`}>Business domains</label>
+          {value.businessDomains.length > 0 && (
+            <ul className="q-chips">
+              {value.businessDomains.map(domain => (
+                <li key={domain} className="q-chip">
+                  <span>{domain}</span>
+                  <button
+                    type="button"
+                    className="q-chip-x"
+                    aria-label={`Remove domain ${domain}`}
+                    onClick={() =>
+                      edit({ businessDomains: value.businessDomains.filter(d => d !== domain) })}
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <input
+            id={`${uid}-domains`}
+            value={domainInput}
+            onChange={e => setDomainInput(e.target.value)}
+            onKeyDown={onDomainKey}
+            onBlur={commitDomain}
+            placeholder="Type a domain, then press Enter"
+          />
+          {offered.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+              <span className="micro-label">Suggested</span>
+              <ul className="q-chips">
+                {offered.map(s => (
+                  <li key={s}>
+                    <button
+                      type="button"
+                      className="q-chip"
+                      aria-label={`Add domain ${s}`}
+                      onClick={() => addDomain(s)}
+                    >
+                      {s}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      </div>
+    </details>
+  )
+}
+
 // ---------------------------------------------------------------- path 1: the file flow
 
 function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => void }) {
   const [source, setSource] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState('')
-  // Optional catalog-narrative JSON (Release-A profiles). Attached as the multipart
-  // catalog_profile_json part; validated server-side before any write and committed atomically
-  // with a successful ingest. Empty = not sent; never required.
-  const [profileJson, setProfileJson] = useState('')
+  // The optional catalog narrative (Release-A profiles), authored as structured fields and
+  // serialized into the multipart catalog_profile_json part; validated server-side before any
+  // write and committed atomically with a successful ingest. All-empty = not sent; never required.
+  const [narrative, setNarrative] = useState<NarrativeDraft>(EMPTY_NARRATIVE)
   // The result is stored with the source it was uploaded to, so the result panel and the
   // review-queue handoff never read the live input (which the user may already have edited
   // for the next upload).
@@ -192,7 +415,7 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
     setUploaded(null)
     try {
       setUploaded({
-        result: await uploadFile(file, submittedSource, profileJson.trim() || undefined),
+        result: await uploadFile(file, submittedSource, serializeNarrative(narrative)),
         source: submittedSource,
       })
     } catch (err) {
@@ -311,30 +534,7 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
               </div>
             )}
           </div>
-          <details>
-            <summary className="hint" style={{ cursor: 'pointer' }}>
-              Catalog narrative (optional)
-            </summary>
-            <div className="field" style={{ marginTop: 8 }}>
-              {/* "narrative", deliberately not "profile": getByLabelText(/file/i) must keep
-                  matching ONLY the file input (pro-FILE-…). */}
-              <label>
-                Catalog narrative JSON
-                <textarea
-                  value={profileJson}
-                  onChange={e => setProfileJson(e.target.value)}
-                  rows={4}
-                  placeholder={'{"display_name": "…", "description": "…", '
-                    + '"business_context": "…", "business_domains": ["…"]}'}
-                />
-              </label>
-              <p className="hint">
-                Describes the catalog itself (name, description, business context, domains). It is
-                validated before anything is written and saved atomically with a successful
-                ingest. Leaving it empty never blocks an upload.
-              </p>
-            </div>
-          </details>
+          <CatalogNarrativeFields value={narrative} onChange={setNarrative} />
           <button
             type="submit"
             className="btn btn--primary"
