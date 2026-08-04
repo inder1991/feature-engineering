@@ -89,6 +89,9 @@ CROSSWALK_LEG_MALFORMED = "crosswalk_leg_malformed"
 JOIN_LEG_PIN_MALFORMED = "join_leg_pin_malformed"
 #: An execution shape claimed deterministic safety without the observations that could establish it.
 CROSSWALK_EXECUTION_SHAPE_INVALID = "crosswalk_execution_shape_invalid"
+#: A STORE-level refusal no retry can fix: a blank actor, a negative expected pointer version, or a
+#: payload past a storage bound. Distinct from a CAS conflict, which means "try again".
+CROSSWALK_WRITE_INVALID = "crosswalk_write_invalid"
 
 CROSSWALK_REFUSAL_CODES: frozenset[str] = frozenset({
     ENDPOINT_PHYSICALLY_BOUND,
@@ -97,6 +100,7 @@ CROSSWALK_REFUSAL_CODES: frozenset[str] = frozenset({
     CROSSWALK_LEG_MALFORMED,
     JOIN_LEG_PIN_MALFORMED,
     CROSSWALK_EXECUTION_SHAPE_INVALID,
+    CROSSWALK_WRITE_INVALID,
 })
 
 

@@ -104,10 +104,11 @@ def test_1052_data_role_check_refuses_an_off_vocabulary_value(db) -> None:
 def test_1052_applies_with_its_real_neighbours_and_none_of_the_unwritten_reservations() -> None:
     names = {p.name for p in _MIGRATION_DIR.glob("*.sql")}
     present = {n.split("_", 1)[0] for n in names}
-    assert {"1043", "1044", "1045", "1046", "1047", "1048", "1049", "1051", "1052"} <= present
-    # 1050 belongs to Release C and 1053-1055 to the Phase-G parallel session; none is written,
-    # so 1052 stands on what exists.
-    assert not ({"1050", "1053", "1054", "1055"} & present)
+    assert {"1043", "1044", "1045", "1046", "1047", "1048", "1049", "1050", "1051",
+            "1052"} <= present
+    # 1053-1055 belong to the Phase-G PARALLEL session and are deliberately not asserted either
+    # way: 1052 depends on nothing they would create, and pinning their absence would fail the
+    # moment that session merges.
 
 
 def test_1052_is_the_only_number_this_stream_allocated() -> None:
