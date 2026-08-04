@@ -140,12 +140,22 @@ def test_the_illegal_combination_refuses_to_boot(clean_flags) -> None:
             pass
 
 
-@pytest.mark.parametrize("crosswalk", [None, "1"])
-def test_the_legal_combinations_boot(clean_flags, crosswalk) -> None:
+@pytest.mark.parametrize("dependency, crosswalk", [
+    # ALL THREE legal states, through the real lifespan — the module docstring names three and the
+    # earlier parametrization ran two, always with the dependency on. "Both off" is the DEFAULT
+    # deployment and the one a boot refusal must never touch, so it is the state whose absence
+    # mattered most.
+    (False, None),
+    (True, None),
+    (True, "1"),
+])
+def test_the_legal_combinations_boot(clean_flags, dependency, crosswalk) -> None:
     from featuregen.api.app import create_app
 
-    _enable_dependency(clean_flags)
+    if dependency:
+        _enable_dependency(clean_flags)
     if crosswalk is not None:
         clean_flags.setenv(CROSSWALK_EXECUTION_FLAG, crosswalk)
     with TestClient(create_app()) as client:
-        assert client.app.state.crosswalk_execution_enabled is (crosswalk is not None)
+        assert client.app.state.crosswalk_execution_enabled is (
+            dependency and crosswalk is not None)

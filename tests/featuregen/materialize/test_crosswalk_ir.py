@@ -30,7 +30,12 @@ from featuregen.materialize.joins import (
     CrossCatalogJoinStepV1,
     CrosswalkJoinStepV1,
 )
-from featuregen.overlay.upload.bridge_realization import ExecutionTier
+from featuregen.overlay.upload.bridge_realization import (
+    Cardinality,
+    DirectionalCardinalityVerdictV1,
+    ExecutionTier,
+    SafetyStatus,
+)
 from featuregen.overlay.upload.crosswalk_observation import MAPPING_TO_TARGET, SOURCE_TO_MAPPING
 
 _ROLES = ("feature_engineer",)
@@ -173,13 +178,47 @@ def test_the_reverse_direction_refuses_INDEPENDENTLY_on_its_own_verdict(catalog)
 
 
 def test_a_measured_composed_FANOUT_refuses_as_a_fan_out_and_is_never_deduplicated(catalog):
+    """The EXACT code the shipped path produces, and the reason behind it.
+
+    Not a set of two acceptable codes: a measured fan-out never reaches the planner's own fan-out
+    branch, because admission has already ruled the direction UNSAFE and inadmissible at both tiers
+    (`_direction_verdict`). So what the shipped path returns is the ADMISSIBILITY refusal — and the
+    thing worth pinning is that it still says fan-out rather than quietly de-duplicating, which is
+    what the reason code carries.
+    """
     fanning = cf.admitted(obs=cf.observation(source_to_target_max_matches=2))
+    assert fanning.decision.forward.production_admissible is False
     refused = _plan(catalog, crosswalks=(fanning,))
     assert isinstance(refused, MaterializationRefused)
-    assert refused.code in {
-        CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED,
-        CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
-    }
+    assert refused.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+    assert "directional_crosswalk_fanout" in refused.detail
+
+
+def test_the_planners_OWN_fanout_branch_refuses_when_a_verdict_ever_reaches_it(catalog):
+    """Defence in depth, reached directly with a hand-built verdict. KEPT rather than deleted.
+
+    Unreachable through shipped admission, and deliberately so — the test above is the proof.
+    Deleting it would nonetheless be wrong: `AdmittedCrosswalkV1` has no `src/` producer yet (see
+    `docs/DEFERRED-WORK.md` A.39; every construction today is a fixture's), so the first real
+    assembler is code that does not exist, and the branch is the planner's own answer to "may I
+    compute on this?" rather than a restatement of admission's. A plan that accepted a fanning
+    composed verdict multiplies the published population, which is the defect the whole release
+    exists to prevent, so the planner states its own refusal instead of inheriting one.
+
+    The verdict is doctored to the ONE state admission cannot produce: DETERMINISTICALLY_VALIDATED
+    (so both admissibility gates pass) carrying a ONE_TO_MANY composed cardinality.
+    """
+    real = cf.admitted()
+    fanning_but_admissible = replace(
+        real.decision,
+        forward=replace(
+            real.decision.forward,
+            cardinality=DirectionalCardinalityVerdictV1(Cardinality.ONE_TO_MANY),
+            safety_status=SafetyStatus.DETERMINISTICALLY_VALIDATED))
+    refused = _plan(catalog, crosswalks=(replace(real, decision=fanning_but_admissible),))
+    assert isinstance(refused, MaterializationRefused), getattr(refused, "join_plan", refused)
+    assert refused.code is CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED
+    assert "refused, not deduplicated" in refused.detail
 
 
 # ══ the three tables must be the three tables that were measured ═════════════════════════════════

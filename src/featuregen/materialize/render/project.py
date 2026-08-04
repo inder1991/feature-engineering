@@ -1017,6 +1017,68 @@ def _render_requirements(engine_versions: EngineVersions) -> str:
         f"pyspark=={engine_versions.pyspark}\n")
 
 
+def _render_crosswalk_pins(compilation: CompilationIdentity) -> str:
+    """The human-auditable crosswalk pins, or NOTHING when the group compiled none.
+
+    **Why the README needs its own block when identity already covers it.** Every pin here is
+    already inside ``ir_hash`` (through each step's ``identity_payload``) and inside
+    ``COMPILATION_IDENTITY``, so identity coverage is not what this adds. What it adds is that an
+    auditor holding the generated project can LOOK EACH ONE UP without re-deriving a hash: which
+    definition was joined, which execution revision's safety verdict admitted it, which mapping
+    table binding was measured, which temporal policy decided the mapping rows, and which composed
+    observation states the fan-out. A crosswalk's mapping table is the one relation on the path that
+    no formula names, so it is exactly the one whose provenance nobody can reconstruct from the
+    feature definition.
+
+    The per-leg values (``leg_plan_hash``, ``leg_read_set_hash``, ``leg_measurement_ids``,
+    ``mapping_row_selection_hash``) are deliberately NOT here: they are inside ``ir_hash`` via
+    ``identity_payload``, they are per-leg rather than per-traversal, and a README that listed every
+    leaf hash would bury the five values a human actually chases. The leg REALIZATIONS are here,
+    because a run revalidates them (``authorize_execution_realizations``) and an operator reading a
+    revalidation failure needs to find them somewhere other than a hash.
+
+    Emitted only when the group carries a crosswalk — same rule the identity payload keeps, and for
+    the same reason: a single-catalog project's bytes stay exactly what they were.
+    """
+    if not compilation.crosswalk_execution_pins:
+        return ""
+    rows = "\n".join(
+        f"| `{execution}` | `{definition}` | `{mapping_binding}` | "
+        f"{f'`{policy}`' if policy else '(none)'} | "
+        f"{f'`{observation}`' if observation else '(none)'} |"
+        for execution, definition, mapping_binding, policy, observation
+        in compilation.crosswalk_execution_pins)
+    block = (
+        "\n"
+        "## Governed crosswalk pins\n"
+        "\n"
+        "One row per two-leg mapping-table traversal. The traversal's fan-out verdict is the\n"
+        "COMPOSED one — measured over the joined shape, never multiplied out of the two legs — and\n"
+        "the composed observation named here is what states it.\n"
+        "\n"
+        "| Execution | Definition | Mapping binding | Mapping temporal policy | Composed"
+        " observation |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        f"{rows}\n")
+    if compilation.bridge_realization_dependencies:
+        realizations = "\n".join(
+            f"| `{revision_id}` | `{snapshot_id}` |"
+            for revision_id, snapshot_id in compilation.bridge_realization_dependencies)
+        block += (
+            "\n"
+            "### Directional realizations revalidated before every run\n"
+            "\n"
+            "This artifact's FULL set, not the crosswalk's alone: a cross-catalog crosswalk leg\n"
+            "and a direct entity bridge both resolve through a governed bridge realization and\n"
+            "both land here. Run preparation refuses if any current pointer moved after\n"
+            "compilation (§11.1) rather than substituting a newer revision nobody rendered.\n"
+            "\n"
+            "| Realization revision | Dependency snapshot |\n"
+            "| --- | --- |\n"
+            f"{realizations}\n")
+    return block
+
+
 def _render_readme(
     plan: FeatureGroupPlanV1,
     compilation: CompilationIdentity,
@@ -1033,6 +1095,7 @@ def _render_readme(
     sources = "\n".join(f"| `{physical}` | `{name}` |"
                         for physical, name in sorted(datasets.raw.items()))
     parameters = "\n".join(f"- `{name}`" for name in required_parameters)
+    crosswalks = _render_crosswalk_pins(compilation)
     return (
         f"# `{published_target}`\n"
         "\n"
@@ -1100,6 +1163,7 @@ def _render_readme(
         "\n"
         "Plus the three system columns §10.2 adds once at assembly: `__generation_id`,\n"
         "`__generated_project_hash`, `__sandbox_execution_hash`.\n"
+        f"{crosswalks}"
         "\n"
         "## Identity\n"
         "\n"

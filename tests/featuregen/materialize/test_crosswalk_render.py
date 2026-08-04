@@ -276,6 +276,48 @@ def test_the_lineage_names_the_row_rule_and_the_measurement_it_was_taken_under(
         assert measurement in projection.source
 
 
+def test_the_README_names_every_crosswalk_pin_a_human_would_have_to_chase(project) -> None:
+    """Identity coverage is not the question here; LOOKING THEM UP is.
+
+    Every value below is already inside `ir_hash` and `COMPILATION_IDENTITY`, so nothing about the
+    artifact's identity depends on this block. What depends on it is an auditor holding the
+    generated project being able to find which definition was joined, which execution revision's
+    verdict admitted it, which mapping binding was measured, which temporal policy decided the
+    mapping rows and which composed observation states the fan-out — without re-deriving a hash. A
+    crosswalk's mapping table is the one relation on the path that no formula names.
+    """
+    admitted = cf.admitted()
+    readme = project.files["README.md"]
+    assert "## Governed crosswalk pins" in readme
+    for pin in (admitted.execution.execution_revision_id,
+                cf.DEFINITION.revision_id,
+                cf.MAP_BINDING.binding_revision_id,
+                cf.TEMPORAL_POLICY,
+                admitted.execution.composition_observation_revision_id):
+        assert pin in readme, pin
+    # The leg realizations a run REVALIDATES, so a revalidation failure is traceable from the
+    # artifact rather than only from a hash.
+    for revision_id, snapshot_id in project.identity.compilation.bridge_realization_dependencies:
+        assert revision_id in readme and snapshot_id in readme
+
+
+def test_a_group_with_NO_crosswalk_renders_NO_crosswalk_block() -> None:
+    """The same "adds no key" rule the identity payload keeps.
+
+    A single-catalog project's README stays byte-for-byte what it was before crosswalks could be
+    compiled at all — `goldens/cif_daily` is the whole-project half of this proof, and this states
+    the rule that golden happens to satisfy.
+    """
+    from featuregen.materialize.identity import CompilationIdentity
+    from featuregen.materialize.render.project import _render_crosswalk_pins
+
+    plain = CompilationIdentity(
+        formula_content_hashes=("f" * 64,), ir_hashes=("i" * 64,),
+        materialization_contract_hash="c" * 64, group_plan_hash="g" * 64)
+    assert plain.crosswalk_execution_pins == ()
+    assert _render_crosswalk_pins(plain) == ""
+
+
 def test_the_run_parameter_for_the_row_rule_is_declared_everywhere_it_must_be(
         projection, project) -> None:
     assert f"params:{cf.REPORT_CUTOFF_REF}" not in projection.inputs
