@@ -55,11 +55,12 @@ was rejected, and why minting a fresh key on the caller's behalf is worse than e
 from __future__ import annotations
 
 import dataclasses
+import datetime as _datetime
 from typing import Annotated, Any
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_confirmer
@@ -94,6 +95,22 @@ _REQUEST_PREFIX = "mreq"
 #: it cannot: the first was drained, the second was dead-lettered.
 _CLAIMABLE = frozenset({"ready", "leased"})
 
+#: The largest group this route will accept, enforced by the MODEL so Pydantic refuses an oversized
+#: body before the handler touches it.
+#:
+#: **Why a cap at all.** ``work_item_ids`` is caller-controlled and nothing in this application caps
+#: a request body — there is no size middleware and ``deploy/kind/nginx.conf`` sets no
+#: ``client_max_body_size``. The pre-flight runs after ``get_conn`` has opened its transaction, so an
+#: unbounded member list would hold that transaction for as long as it took to scan: the exact
+#: failure mode this route exists to avoid, reintroduced at the check meant to prevent it.
+#:
+#: **Why this number.** A group is a published Hive table's column set (``build_group_plan`` requires
+#: the planned features to be EXACTLY the group's members, and ``expected_schema`` becomes the
+#: table's columns). Five hundred and twelve features in one table is already implausibly wide, so
+#: the cap refuses abuse without refusing any group anyone would author. It is a bound, not a policy
+#: about how many features a group SHOULD have — that decision belongs to whoever authors one.
+MAX_GROUP_MEMBERS = 512
+
 #: The single durable anchor a member id names — the only table from which BOTH the authoring run id
 #: and the authoring intent are recoverable (``materialize/resolve.py``). Read-only here.
 _MEMBERS_EXIST = (
@@ -125,14 +142,25 @@ class MaterializationRunIn(BaseModel):
     description of its shape at the trigger would be the first thing to drift from the shape the
     worker reads. Validating through the worker's reader means a body this route accepts is, by
     construction, a job that worker can decode whole.
+
+    ``extra="forbid"`` is LOAD-BEARING, not tidiness (the same argument ``integrations.py:160-162``
+    makes). ``published_schema=None`` means "no table is published yet"; ``adds_feature_for``
+    DERIVES §10.3's schema-evolution question from it; and ``select_publisher`` deliberately gives it
+    no default so that a caller must state what is published rather than "silently inherit the
+    lenient answer" (``publish.py:559-567``). Without this line a typo — ``publishedSchema`` — drops
+    the caller's answer and substitutes exactly that lenient default, reintroducing at the wire the
+    thing the chain's signature was shaped to make impossible.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     #: §10.1's publication unit. Publication is atomic per group and ``authorize_compilation``
     #: authorizes a group-wide read set, so the trigger is per-group and never per-feature.
     logical_group_name: str = Field(min_length=1)
     #: The group's members, as ``recipe_formula_shadow_work_item`` ids. SUPPLIED, because nothing
-    #: durable maps a group to its members — see the module docstring.
-    work_item_ids: list[str]
+    #: durable maps a group to its members — see the module docstring. Capped by the MODEL, so an
+    #: oversized body is refused before the handler scans it inside the request transaction.
+    work_item_ids: list[str] = Field(max_length=MAX_GROUP_MEMBERS)
     #: What stops one retried call from becoming two runs. The caller's, not this route's: a key
     #: minted here would make every retry a new run.
     idempotency_key: str = Field(min_length=1)
@@ -164,6 +192,7 @@ def trigger_materialization(
     is no window in which a request exists with nobody to drive it, and no window in which a queue
     row names a request that is not there.
     """
+    _require_usable_identifiers(body)
     members = _well_formed_group(body.work_item_ids)
     _require_every_member_exists(conn, members)
     minted = mint_id(_REQUEST_PREFIX)
@@ -253,6 +282,30 @@ def materialization_run_detail(request_id: str, conn: _Conn) -> dict[str, Any]:
 # ── the pre-flight ───────────────────────────────────────────────────────────────────────────────
 
 
+def _require_usable_identifiers(body: MaterializationRunIn) -> None:
+    """The two caller-supplied identifiers must be REAL, not merely present.
+
+    ``Field(min_length=1)`` admits ``" "``, and ``MaterializationRequestV1.__post_init__`` then
+    refuses it as blank with a ``ValueError``. Left to fall through, that ``ValueError`` would arrive
+    at :func:`_record`'s handler and be dressed up as a **409 Conflict** — which is the wrong answer
+    twice over: nothing conflicts, and the caller would go looking for the request their key
+    supposedly clashes with. Checked here, it is what it is: an unusable identifier, 422.
+
+    Deliberately NOT normalized. ``uploads.py`` strips and folds a catalog source with an argument
+    for why one name must be one catalog; the same argument has not been made for a logical group,
+    and quietly trimming one here would decide — from a route — that ``"cif_daily "`` and
+    ``"cif_daily"`` are the same ``group_binding``. That is a governance call, not a parse.
+    """
+    for field, value in (("logical_group_name", body.logical_group_name),
+                         ("idempotency_key", body.idempotency_key)):
+        if not value.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field} is {value!r}: a whitespace-only identifier is not a name, and "
+                       f"recording one would put a request in the table that nothing could name "
+                       f"back")
+
+
 def _well_formed_group(work_item_ids: list[str]) -> tuple[str, ...]:
     """The group's members, ordered and distinct, or a 422 that names the problem.
 
@@ -260,22 +313,32 @@ def _well_formed_group(work_item_ids: list[str]) -> tuple[str, ...]:
     and are legible — rather than inside the worker, where the only available outcome is a
     dead-lettered job an operator has to go and read. Ordered ascending because that is the order
     the resolver imposes anyway, so the payload records the membership the compile will see.
+
+    Duplicate detection uses a ``seen`` set — O(n), and the resolver's own idiom
+    (``resolve.py:142-150``). Written as ``work_item_ids.count(item)`` it would be O(n^2) over
+    caller-controlled input, burned inside the transaction ``get_conn`` has already opened;
+    :data:`MAX_GROUP_MEMBERS` bounds the input and this bounds the work per member.
     """
     if not work_item_ids:
         raise HTTPException(
             status_code=422,
             detail="a materialization group needs at least one work item: compilation is "
                    "authorized group-wide and there is nothing to authorize for an empty group")
-    duplicates = sorted({item for item in work_item_ids if work_item_ids.count(item) > 1})
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for item in work_item_ids:
+        if not item.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="a blank work item id names no durable feature identity")
+        if item in seen:
+            duplicates.append(item)
+        seen.add(item)
     if duplicates:
         raise HTTPException(
             status_code=422,
-            detail=f"work item(s) {duplicates} appear twice in the group; a duplicate member would "
-                   f"resolve to two features occupying one Hive column")
-    blank = [item for item in work_item_ids if not item.strip()]
-    if blank:
-        raise HTTPException(status_code=422,
-                            detail="a blank work item id names no durable feature identity")
+            detail=f"work item(s) {sorted(set(duplicates))} appear twice in the group; a duplicate "
+                   f"member would resolve to two features occupying one Hive column")
     return tuple(sorted(work_item_ids))
 
 
@@ -357,6 +420,12 @@ def _record(conn: psycopg.Connection, request_id: str, body: MaterializationRunI
                 "work_item_ids": list(members)}),
         )
     except ValueError as exc:
+        # By the time this runs, every ValueError `MaterializationRequestV1.__post_init__` could
+        # raise about the CALLER's input has already been refused as a 422 by the pre-flight (blank
+        # identifiers, blank members) or is unreachable (`authorized_roles` cannot be empty behind
+        # `require_confirmer`; `request_id` and `activation_state` are this module's own). What is
+        # left is the one refusal that really IS a conflict: this key already names a request that
+        # differs in group, actor or membership.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         # `record_request`'s one non-ValueError refusal, and it is deliberately not a 500: under an
@@ -384,10 +453,12 @@ def _refuse_if_nothing_will_run(request: MaterializationRequestV1, *,
     worker will ever claim. Nothing would surface it: the queue depth would not move, the counters
     would not advance, and the caller would be told their group was accepted.
 
-    **THE DECISION: refuse, name the state, and require a fresh idempotency key.** A 409 is exactly
-    what this is — the request conflicts with a durable record of the same name — and the remedy is
-    one the caller can act on, because a fresh key mints a fresh request id, which derives a fresh
-    message id, which is a fresh queue row (a named test proves that end to end).
+    **THE DECISION: refuse, and name the state.** A 409 is exactly what this is — the request
+    conflicts with a durable record of the same name. Where a fresh idempotency key IS the remedy,
+    the detail says so, and it genuinely works: a fresh key mints a fresh request id, which derives
+    a fresh message id, which is a fresh queue row (a named test proves that end to end). Where it
+    is NOT the remedy — a request another worker is compiling right now — the detail says that
+    instead. :func:`_unreachable_detail` is where the three cases are told apart, and why.
 
     **The two alternatives, and why they were rejected.**
 
@@ -420,13 +491,64 @@ def _refuse_if_nothing_will_run(request: MaterializationRequestV1, *,
         counters.incr("materialize.trigger.unreachable")
         log("materialize.trigger.unreachable", level="warning", request_id=request.request_id,
             queue_status=queue_status, lifecycle_state=request.lifecycle_state.value)
-        raise HTTPException(
-            status_code=409,
-            detail=f"materialization request {request.request_id!r} already exists and its queued "
-                   f"job is {queue_status!r}, so no worker will claim it again — answering 202 "
-                   f"would promise a run that cannot happen. The dead-lettered row is left as the "
-                   f"worker wrote it (it is the evidence of why the job failed); re-trigger with a "
-                   f"fresh idempotency key to mint a new request and a new queue row")
+        raise HTTPException(status_code=409, detail=_unreachable_detail(request, queue_status))
+
+
+def _unreachable_detail(request: MaterializationRequestV1, queue_status: str) -> str:
+    """WHY the queue row cannot be reached — and therefore what the caller should do instead.
+
+    A closed queue row does NOT always mean "nobody is working this", and the remedy differs so
+    sharply between the cases that one message cannot serve them. Three states, told apart by the
+    request's own lease rather than by the queue status alone:
+
+    * **A worker is compiling it right now.** ``queue_lane._unclaimable`` dead-letters a delivery it
+      may not drive while DELIBERATELY leaving the request non-terminal under a live lease — that is
+      its whole design ("the honest state is a non-terminal request with an expiring lease"). Telling
+      this caller to re-trigger with a fresh key would mint a SECOND request for a group already
+      being compiled; the two would derive different generation ids and collide on
+      ``record_group_binding``'s unique logical name, so one whole transaction would roll back.
+      Point at the status route and nothing else.
+    * **The job was drained** (``done``) and the request is somehow not terminal. The message was
+      PROCESSED, so dead-letter language would be a lie about what happened to it. Point at the
+      status route, where the request's own record is.
+    * **Genuinely dead-lettered, and nobody holds it.** Only here is a fresh idempotency key the
+      right advice, and only here is the dead row purely evidence.
+    """
+    reference = f"read GET /materialization-runs/{request.request_id}"
+    lease = request.lease_expires_at
+    if lease is not None and _is_being_worked(request):
+        return (
+            f"materialization request {request.request_id!r} is {request.lifecycle_state.value!r} "
+            f"under a LIVE lease (expires {lease.isoformat()}): a worker is "
+            f"compiling it now, and its queued message was closed as {queue_status!r} by a delivery "
+            f"that was not allowed to drive a claimed request. Do NOT re-trigger — a second request "
+            f"for a group already compiling would collide on its logical name. {reference}")
+    if queue_status == "done":
+        return (
+            f"materialization request {request.request_id!r} is "
+            f"{request.lifecycle_state.value!r} and its queued job was already drained "
+            f"({queue_status!r}), so nothing further will run for it and answering 202 would promise "
+            f"a run that cannot happen. {reference} for what that delivery decided before "
+            f"re-triggering anything")
+    return (
+        f"materialization request {request.request_id!r} already exists and its queued job is "
+        f"{queue_status!r} with no worker holding it, so no worker will claim it again — answering "
+        f"202 would promise a run that cannot happen. The dead-lettered row is left exactly as the "
+        f"worker wrote it (it is the evidence of why the job failed); re-trigger with a fresh "
+        f"idempotency key to mint a new request and a new queue row. {reference}")
+
+
+def _is_being_worked(request: MaterializationRequestV1) -> bool:
+    """Whether a worker demonstrably still holds this request — a live lease, and nothing else.
+
+    The exact inverse of ``queue_lane._adoptable``'s lease test, and for the same reason: a live
+    lease is the only evidence available that another worker has not gone away, and it is what
+    ``expired_requests`` reads too. Read here only to choose an ERROR MESSAGE — this route never
+    writes a lifecycle and never adopts anything.
+    """
+    return (not request.lifecycle_state.is_terminal()
+            and request.lease_expires_at is not None
+            and request.lease_expires_at > _datetime.datetime.now(tz=_datetime.UTC))
 
 
 def _queue_status(conn: psycopg.Connection, queue_id: int) -> str:

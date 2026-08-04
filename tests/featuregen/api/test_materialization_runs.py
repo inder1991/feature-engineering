@@ -33,6 +33,7 @@ from tests.featuregen.materialize.test_chain import _CADENCE, _GROUP, _PROMISE
 from tests.featuregen.materialize.test_resolve import _seed_work_item
 
 from featuregen.api.routes import materialization_runs
+from featuregen.api.routes.materialization_runs import MAX_GROUP_MEMBERS as _CAP
 from featuregen.materialize import queue_lane
 from featuregen.materialize.control_plane import (
     MaterializationGeneration,
@@ -55,7 +56,11 @@ from featuregen.materialize.request_store import (
     read_request,
 )
 from featuregen.materialize.spine import SpineSourceDeclarationV1
-from featuregen.runtime.queue import claim_materialization, fail_materialization
+from featuregen.runtime.queue import (
+    claim_materialization,
+    complete_materialization,
+    fail_materialization,
+)
 
 _PATH = "/materialization-runs"
 _KEY = "trigger-key-1"
@@ -418,6 +423,50 @@ def test_a_key_reused_for_DIFFERENT_DECLARATIONS_is_refused(client, admin_header
     assert _counts(db) == (1, 1, 0)
 
 
+def test_a_request_ANOTHER_WORKER_IS_COMPILING_never_advises_a_fresh_key(
+        client, admin_headers, work_items, db, on) -> None:
+    """A ``dead`` queue row does NOT always mean "nobody is working this".
+
+    ``queue_lane._unclaimable`` dead-letters a delivery it may not drive while DELIBERATELY leaving
+    the request non-terminal under a LIVE lease — another worker is compiling it right now. The 409
+    is still right, but "re-trigger with a fresh idempotency key" would be actively harmful there:
+    it would mint a SECOND request for a group already being compiled, and the two would collide on
+    ``record_group_binding``'s unique logical name. So the refusal is told apart by the request's own
+    lease, and this one points at the status route instead."""
+    request_id = client.post(_PATH, json=_body(work_items),
+                             headers=admin_headers).json()["request_id"]
+    accept_request(db, request_id=request_id, lease_seconds=3600)   # a worker holds it, live
+    claim = claim_materialization(db, owner="w2", lease_seconds=60)
+    fail_materialization(db, claim, error="this delivery may not drive a claimed request",
+                         permanent=True)
+
+    retry = client.post(_PATH, json=_body(work_items), headers=admin_headers)
+
+    assert retry.status_code == 409
+    detail = retry.json()["detail"]
+    assert "fresh idempotency key" not in detail
+    assert f"{_PATH}/{request_id}" in detail
+    assert "lease" in detail
+
+
+def test_a_DRAINED_job_whose_request_is_not_terminal_points_at_the_STATUS_route(
+        client, admin_headers, work_items, db, on) -> None:
+    """``done`` is not ``dead`` either: the message was processed. Whatever the request's state, the
+    dead-letter wording would be a lie about what happened to it."""
+    request_id = client.post(_PATH, json=_body(work_items),
+                             headers=admin_headers).json()["request_id"]
+    accept_request(db, request_id=request_id, lease_seconds=3600)
+    complete_materialization(db, claim_materialization(db, owner="w2", lease_seconds=60))
+    assert _queue_row(db, request_id)[0] == "done"
+
+    retry = client.post(_PATH, json=_body(work_items), headers=admin_headers)
+
+    assert retry.status_code == 409
+    detail = retry.json()["detail"]
+    assert "dead-letter" not in detail
+    assert f"{_PATH}/{request_id}" in detail
+
+
 def test_a_CONCURRENT_UNCOMMITTED_writer_is_a_RETRY_not_a_500(client, admin_headers, work_items,
                                                               monkeypatch, on) -> None:
     """``record_request``'s one non-``ValueError`` refusal: under an isolation level stricter than
@@ -464,6 +513,73 @@ def test_DUPLICATE_MEMBERS_are_refused(client, admin_headers, work_items, db, on
 
 def test_an_EMPTY_group_is_refused(client, admin_headers, db, on) -> None:
     response = client.post(_PATH, json=_body([]), headers=admin_headers)
+
+    assert response.status_code == 422
+    assert _counts(db) == (0, 0, 0)
+
+
+def test_a_group_LARGER_THAN_THE_CAP_is_refused_by_the_MODEL(client, admin_headers, db,
+                                                             on) -> None:
+    """The body is caller-controlled and NOTHING in this app caps a request body — there is no
+    size middleware and ``deploy/kind/nginx.conf`` sets no ``client_max_body_size``. The pre-flight
+    runs after ``get_conn`` has opened its transaction, so an unbounded member list would hold that
+    transaction open for as long as the scan took: the exact failure mode this route exists to
+    avoid, reintroduced at the pre-flight. The cap is declared on the MODEL so Pydantic refuses the
+    body before the handler does any work over it at all."""
+    response = client.post(_PATH, json=_body([f"work-{i}" for i in range(_CAP + 1)]),
+                           headers=admin_headers)
+
+    assert response.status_code == 422
+    assert _counts(db) == (0, 0, 0)
+
+
+def test_the_duplicate_check_is_LINEAR_like_the_resolver_it_mirrors(client, admin_headers, db,
+                                                                    on) -> None:
+    """``resolve._require_a_well_formed_group`` finds a duplicate with a ``seen`` set, in O(n). A
+    membership scan written as ``ids.count(item)`` is O(n^2) — measurably seconds at ten thousand
+    ids — and it would burn them inside the held transaction. A full group with ONE duplicate at the
+    very end must still be refused promptly, and the module must not contain the quadratic idiom."""
+    # Read off the AST, not the text: the module's own docstring EXPLAINS the quadratic idiom in
+    # order to rule it out, and a substring check would flag the explanation.
+    tree = ast.parse(pathlib.Path(inspect.getsourcefile(materialization_runs)).read_text())
+    assert not [node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "count"]
+
+    members = [f"work-{i}" for i in range(_CAP - 1)]
+    response = client.post(_PATH, json=_body([*members, members[0]]), headers=admin_headers)
+
+    assert response.status_code == 422
+    assert "appear twice" in response.json()["detail"]
+    assert _counts(db) == (0, 0, 0)
+
+
+def test_an_UNKNOWN_FIELD_cannot_silently_choose_the_LENIENT_answer(client, admin_headers,
+                                                                    work_items, db, on) -> None:
+    """``extra="forbid"``, and it is load-bearing rather than tidy.
+
+    ``published_schema=None`` means "no table is published yet", ``adds_feature_for`` derives §10.3's
+    schema-evolution question from it, and ``select_publisher`` deliberately gives it NO default so
+    that a caller must STATE what is published rather than "silently inherit the lenient answer by
+    omission" (``publish.py:559-567``). Without ``extra="forbid"`` a typo — ``publishedSchema`` —
+    drops the caller's answer and substitutes exactly that lenient default. The chain's signature was
+    shaped to make this impossible; the route must not reintroduce it at the wire."""
+    body = _body(work_items, published_schema=["cif_id", "some_existing_feature"])
+    body["publishedSchema"] = body.pop("published_schema")
+
+    response = client.post(_PATH, json=body, headers=admin_headers)
+
+    assert response.status_code == 422
+    assert _counts(db) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("field", ["logical_group_name", "idempotency_key"])
+def test_a_WHITESPACE_ONLY_identifier_is_422_not_409(client, admin_headers, work_items, db, field,
+                                                     on) -> None:
+    """``Field(min_length=1)`` admits ``" "``, and ``MaterializationRequestV1.__post_init__`` then
+    refuses it as blank — a ``ValueError`` that must NOT be dressed up as a 409 Conflict. Nothing
+    conflicts: the caller sent an unusable identifier, which is a 422."""
+    response = client.post(_PATH, json=_body(work_items, **{field: "   "}), headers=admin_headers)
 
     assert response.status_code == 422
     assert _counts(db) == (0, 0, 0)
