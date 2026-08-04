@@ -41,21 +41,58 @@ from tests.featuregen.overlay.upload._crosswalk_fixtures import (
     mapping_observation,
 )
 
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.formula.canonical import formula_content_hash
 from featuregen.formula.schema import (
+    CANONICALIZATION_VERSION,
+    FORMULA_SCHEMA_VERSION,
+    OPERATION_GRAMMAR_VERSION,
+    OUTPUT_POLICY_VERSION,
+    AdditivityClass,
     AggregateExpression,
     AggregateFunction,
+    DecimalPolicy,
     EmptyWindowResult,
+    FormulaOutputPolicyV1,
+    Grain,
     Inclusivity,
     NullInput,
+    OverflowBehavior,
+    RoundingMode,
     SourceRelation,
+    TypedFormulaV1,
+    UnaryBody,
     WindowBasis,
     WindowPolicy,
     WindowUnit,
 )
+from featuregen.materialize.admission import AdmittedFeature
+from featuregen.materialize.codes import MaterializationRefused
+from featuregen.materialize.compile.chain import NodeAssemblyInputs
+from featuregen.materialize.compile.wiring import assemble_nodes
+from featuregen.materialize.contract import (
+    AvailabilityPromiseV1,
+    CadenceDecl,
+    CadencePeriod,
+    CadenceTrigger,
+    ContractGroup,
+    derive_group_contract,
+)
+from featuregen.materialize.group_plan import PlannedFeature, build_group_plan
+from featuregen.materialize.identity import SealedProject
+from featuregen.materialize.inputs import derive_requirement
 from featuregen.materialize.inventory import (
     ClusterInventoryV1,
     TableLayout,
     VerifiedUnpartitioned,
+)
+from featuregen.materialize.ir import authorize_compilation, compile_ir, ir_hash
+from featuregen.materialize.physical_types import PhysicalType, resolve_physical_type
+from featuregen.materialize.render.project import project_datasets, render_project
+from featuregen.materialize.spine import (
+    CurrentSnapshot,
+    PopulationSemantics,
+    SpineSourceDeclarationV1,
 )
 from featuregen.overlay.identity import fact_key as _fact_key
 from featuregen.overlay.upload.bridge_realization import (
@@ -80,6 +117,11 @@ from featuregen.overlay.upload.upload_catalog import table_ref as _catalog_table
 
 NOW = datetime(2026, 8, 4, 12, tzinfo=UTC)
 TZ = "Asia/Kolkata"
+
+#: The population's entity. The FTR side is the correspondent's own account scheme, so a row of the
+#: published table is one correspondent account — reachable from the CIB rows the feature is
+#: computed over ONLY through the mapping table.
+ENTITY = "counterparty_account"
 
 #: The physical schemas the three tables resolve onto. Deliberately NOT ``public``: refs are
 #: schema-flattened (§3.5) and the resolved schema is what the generated project reads.
@@ -119,6 +161,11 @@ DATASET_PROFILE_HASH = "d" * 64
 #: The run parameter the mapping row rule binds its cutoff to. Never a literal date — the contract
 #: refuses one, because a literal would re-key the decision every day.
 REPORT_CUTOFF_REF = "report_cutoff"
+
+#: The published column's decimal policy. COUNT_ROWS publishes an integer, so this is carried only
+#: because `TypedFormulaV1` requires one.
+DECIMAL = DecimalPolicy(precision=38, scale=6, rounding=RoundingMode.HALF_EVEN,
+                        overflow=OverflowBehavior.ERROR)
 
 
 # ── the governed catalog ─────────────────────────────────────────────────────────────────────────
@@ -161,24 +208,46 @@ def govern_availability(db, source, table, column_name, *, event_id="ovf_evt_aso
          json.dumps({"column": column_name, "basis": "ingested_at"}), event_id))
 
 
+def govern_grain(db, source, table, column_name):
+    db.execute(
+        "UPDATE graph_node SET is_grain = true, grain_fact_event_id = 'ovf_evt_grain_cwx' "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' AND column_name = %s",
+        (source, table, column_name))
+
+
+def govern_entity(db, source, table, column_name, *, entity=ENTITY):
+    db.execute(
+        "UPDATE graph_node SET entity = %s, entity_status = 'VERIFIED', "
+        "entity_fact_key = 'sbf-entity-cwx', entity_fact_event_id = 'ovf_evt_entity_cwx' "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' AND column_name = %s",
+        (entity, source, table, column_name))
+
+
 def seed_catalog(db) -> None:
     """CIB (accounts + the cross-reference table) and FTR (the transaction repository).
 
     The mapping table carries BOTH validity columns, because the mapping row rule this task pins is
     a half-open ``[valid_from, valid_to)`` interval and a fixture without the second column could
     only ever exercise half of it.
+
+    FTR is the POPULATION here — the correspondent's own account scheme — so its key carries the
+    governed grain and entity facts the spine validator requires. That is what makes the crosswalk
+    load-bearing rather than decorative: the feature is computed over CIB rows and published one
+    row per FTR account, and the only route between the two is the mapping table.
     """
     for name in ("acct_no", "cust_num", "opened_dt", "load_ts"):
         column(db, "cib", CIB_TABLE, name, schema=CIB_SCHEMA)
     for name in ("acct_no", "ext_acct_ref", "valid_from", "valid_to"):
         column(db, "cib", MAP_TABLE, name, schema=CIB_SCHEMA)
-    for name in ("counter_party_acct_no", "party_lei"):
+    for name in ("counter_party_acct_no", "party_lei", "load_ts"):
         column(db, "ftr", FTR_TABLE, name, schema=FTR_SCHEMA)
     table_node(db, "cib", CIB_TABLE, schema=CIB_SCHEMA)
     table_node(db, "cib", MAP_TABLE, schema=CIB_SCHEMA)
     table_node(db, "ftr", FTR_TABLE, schema=FTR_SCHEMA)
     govern_availability(db, "cib", CIB_TABLE, "load_ts")
-    govern_availability(db, "ftr", FTR_TABLE, "party_lei", event_id="ovf_evt_asof_ftr")
+    govern_availability(db, "ftr", FTR_TABLE, "load_ts", event_id="ovf_evt_asof_ftr")
+    govern_grain(db, "ftr", FTR_TABLE, "counter_party_acct_no")
+    govern_entity(db, "ftr", FTR_TABLE, "counter_party_acct_no")
     watermark(db, "cib")
     watermark(db, "ftr")
 
@@ -201,7 +270,7 @@ INVENTORY = ClusterInventoryV1(
         f"{CIB_SCHEMA}.{MAP_TABLE}": _layout(
             CIB_SCHEMA, MAP_TABLE, ("acct_no", "ext_acct_ref", "valid_from", "valid_to")),
         f"{FTR_SCHEMA}.{FTR_TABLE}": _layout(
-            FTR_SCHEMA, FTR_TABLE, ("counter_party_acct_no", "party_lei")),
+            FTR_SCHEMA, FTR_TABLE, ("counter_party_acct_no", "party_lei", "load_ts")),
     },
     logical_schema_map={CIB: CIB_SCHEMA, MAP: CIB_SCHEMA, FTR: FTR_SCHEMA},
     engine_versions=fixtures.ENGINE_VERSIONS,
@@ -370,3 +439,96 @@ FORWARD_GRAIN = (f"{TARGET_REF}.counter_party_acct_no" if TARGET_REF == FTR
                  else f"{TARGET_REF}.acct_no",)
 REVERSE_GRAIN = (f"{SOURCE_REF}.acct_no" if SOURCE_REF == CIB
                  else f"{SOURCE_REF}.counter_party_acct_no",)
+
+
+# ── the whole group: one feature, compiled, authorized, planned and wired ────────────────────────
+
+FEATURE = "accounts_opened_30d"
+GROUP = "counterparty_account_daily"
+CADENCE = CadenceDecl(period=CadencePeriod.DAILY, timezone=TZ,
+                      business_date_cutoff="00:00:00", trigger=CadenceTrigger.SCHEDULED)
+DECLARER = IdentityEnvelope(
+    subject="user:asha", actor_kind="human", authenticated=False, auth_method="test",
+    role_claims=("feature_engineer",))
+
+SPINE_DECLARATION = SpineSourceDeclarationV1(
+    entity=ENTITY,
+    source_table_ref=FTR,
+    ordered_key_refs=(FTR_ACCT,),
+    population_semantics=PopulationSemantics.CURRENT_COMPLETE_POPULATION,
+    availability_ref=f"{FTR}.load_ts",
+    snapshot_policy=CurrentSnapshot(observed_snapshot_ref="2026-08-04"),
+    declared_by=DECLARER,
+    declaration_reason="the correspondent's own account scheme is the published population",
+    declaration_version=1,
+    recorded_at="2026-08-04T09:00:00+00:00",
+    declaration_record_id="spine-decl-cwx")
+
+
+def formula() -> TypedFormulaV1:
+    """COUNT_ROWS over CIB accounts, published one row per FTR account.
+
+    ``COUNT_ROWS`` deliberately: it has no operand, so the fixture needs no governed
+    ``logical_representation`` on a third table, and the traversal — not the arithmetic — is what
+    this acceptance is about.
+    """
+    return TypedFormulaV1(
+        formula_schema_version=FORMULA_SCHEMA_VERSION,
+        operation_grammar_version=OPERATION_GRAMMAR_VERSION,
+        output_policy_version=OUTPUT_POLICY_VERSION,
+        canonicalization_version=CANONICALIZATION_VERSION,
+        grain=Grain(entity=ENTITY, keys=FORWARD_GRAIN),
+        body=UnaryBody(expr=expression()),
+        parameters=(), decimal=DECIMAL,
+        output=FormulaOutputPolicyV1(
+            output_type="integer", unit=None, currency=None,
+            output_additivity=AdditivityClass.NON_ADDITIVE, external_type_required=False))
+
+
+def admitted_feature() -> AdmittedFeature:
+    resolved = formula()
+    return AdmittedFeature(
+        feature_name=FEATURE, formula=resolved,
+        formula_content_hash=formula_content_hash(resolved),
+        intent=fixtures.intent_for("distinct_merchant_count_90d"),
+        authoring_run_id="run-cwx-0001")
+
+
+def compiled_group(db, *, crosswalks=None, roles=("feature_engineer",),
+                   execution_tier=ExecutionTier.PRODUCTION) -> NodeAssemblyInputs:
+    """Every stage REAL: compile -> Gate 2 -> contract -> physical type -> plan -> datasets.
+
+    Returns the same ``NodeAssemblyInputs`` ``compile.chain`` hands to ``assemble_nodes``, so a
+    render test drives the shipped assembler rather than a hand-built node list.
+    """
+    artifact = admitted_feature()
+    ir = compile_ir(db, artifact, roles=roles, spine_decl=SPINE_DECLARATION, inventory=INVENTORY,
+                    crosswalks=(admitted(),) if crosswalks is None else crosswalks,
+                    execution_tier=execution_tier)
+    assert not isinstance(ir, MaterializationRefused), getattr(ir, "detail", ir)
+    authorized = authorize_compilation(db, (ir,), ir.spine, roles=roles)
+    assert not isinstance(authorized, MaterializationRefused), getattr(authorized, "detail",
+                                                                      authorized)
+    group = derive_group_contract(db, authorized, cadence=CADENCE,
+                                  availability_promise=AvailabilityPromiseV1(calendar_days=1))
+    assert isinstance(group, ContractGroup), group
+    physical = resolve_physical_type(
+        artifact.formula,
+        operand_types={e.expr_path: e.operand_type for e in ir.expressions})
+    assert isinstance(physical, PhysicalType), physical
+    plan = build_group_plan(group, (PlannedFeature(
+        column_name=ir.feature_name, ir_hash=ir_hash(ir), physical_type=physical),),
+        logical_group_name=GROUP)
+    spine_input = derive_requirement(db, INVENTORY, table_ref=FTR)
+    return NodeAssemblyInputs(
+        authorized=authorized, plan=plan, contract=group.contract,
+        admitted={FEATURE: artifact}, spine_input=spine_input,
+        datasets=project_datasets(authorized, plan, spine_input=spine_input))
+
+
+def render(inputs: NodeAssemblyInputs, *, publisher_selection=None) -> SealedProject:
+    """The sealed Kedro project, assembled by the SHIPPED node assembler."""
+    return render_project(
+        inputs.authorized, inputs.plan, environment_id=ENVIRONMENT,
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=inputs.spine_input,
+        nodes=assemble_nodes(inputs), publisher_selection=publisher_selection)

@@ -120,7 +120,13 @@ from featuregen.materialize.inventory import (
     StaticSnapshot,
 )
 from featuregen.materialize.ir import FormulaExecutionIRV1
-from featuregen.materialize.joins import CrossCatalogJoinStepV1
+from featuregen.materialize.joins import (
+    CROSSWALK_EXECUTION_AUTHORITY,
+    CROSSWALK_EXECUTION_OUTCOME,
+    RENDERED_OPERATORS,
+    CrossCatalogJoinStepV1,
+    CrosswalkJoinStepV1,
+)
 from featuregen.materialize.physical_types import PhysicalType
 from featuregen.materialize.render.project import (
     RenderedNode,
@@ -947,6 +953,7 @@ def render_projection_node(
         *_projection_docstring(expression, feature_column, plan),
         "    business_date = str(business_dt)",
         *_bridge_value_gate(plan.predicate_value_refs),
+        *_crosswalk_value_gate(plan.crosswalk_value_refs),
         "",
         *_read_set_lines(plan.source_columns),
         "",
@@ -966,12 +973,38 @@ def render_projection_node(
             source_dataset,
             *wired,
             *(("params:bridge_predicate_values",) if plan.predicate_value_refs else ()),
+            *((f"params:{CROSSWALK_ROW_VALUES_PARAMETER}",)
+              if plan.crosswalk_value_refs else ()),
             _BUSINESS_DT_PARAMETER,
         ),
         outputs=(projection_dataset,),
         imports=(_DATAFRAME_IMPORT, _FUNCTIONS_IMPORT),
         tags=("intermediate", "projection"),
     )
+
+
+def _crosswalk_value_gate(value_refs: tuple[str, ...]) -> list[str]:
+    """Refuse before reading rows when the pinned mapping row rule lacks its prepared value.
+
+    The bridge gate's shape, for the bridge gate's reason: an unbound row-rule parameter would
+    otherwise surface as a Spark error deep inside the traversal, or — worse, if a caller defaulted
+    it — as a mapping read as of an instant nobody chose.
+    """
+    if not value_refs:
+        return []
+    return [
+        f"    required_crosswalk_values = {value_refs!r}",
+        "    missing_crosswalk_values = sorted(",
+        f"        name for name in required_crosswalk_values "
+        f"if name not in {CROSSWALK_ROW_VALUES_PARAMETER})",
+        "    if missing_crosswalk_values:",
+        *_refuse(
+            ValidationGateCode.RUN_PARAMETERS_MISSING,
+            "the crosswalk's pinned mapping row rule requires prepared value reference(s) that "
+            "were not supplied:",
+            tail="repr(missing_crosswalk_values)",
+            indent="        "),
+    ]
 
 
 def _bridge_value_gate(value_refs: tuple[str, ...]) -> list[str]:
@@ -1046,6 +1079,8 @@ def _projection_signature(func_name: str, plan: _Traversal) -> list[str]:
     parameters = ["source: DataFrame", *(f"{hop.parameter}: DataFrame" for hop in plan.hops)]
     if plan.predicate_value_refs:
         parameters.append("bridge_predicate_values: dict[str, object]")
+    if plan.crosswalk_value_refs:
+        parameters.append(f"{CROSSWALK_ROW_VALUES_PARAMETER}: dict[str, object]")
     parameters.append("business_dt: str")
     return [
         f"def {func_name}(",
@@ -1089,6 +1124,13 @@ class _Hop:
     dependency_snapshot_id: str | None = None
     evidence_revision_ids: tuple[str, ...] = ()
     directional: bool = False
+    #: One LEG of a two-leg crosswalk. Distinct from ``directional`` because the amplification gate
+    #: is composed: a crosswalk's fan-out verdict describes the PAIR (that is what makes it
+    #: plannable at all — ``expression_ir._plan_to_grain``), so the row-count check spans the two
+    #: legs rather than being asserted twice about halves nobody measured.
+    crosswalk: CrosswalkJoinStepV1 | None = None
+    #: True on the leg that arrives at the mapping dataset, and on nothing else.
+    arrives_at_mapping: bool = False
 
     @property
     def key_of(self) -> tuple[str, str, str]:
@@ -1112,7 +1154,7 @@ class _Hop:
     @property
     def keys(self) -> tuple[str, ...]:
         """The temporary names both sides carry for this hop's composite equality."""
-        if len(self.left_names) == 1 and not self.directional:
+        if len(self.left_names) == 1 and not self.directional and self.crosswalk is None:
             return (f"{self.prefix}key",)
         return tuple(f"{self.prefix}key_{index}" for index in range(1, len(self.left_names) + 1))
 
@@ -1141,6 +1183,11 @@ class _Traversal:
     hops: tuple[_Hop, ...]
     reached: tuple[tuple[str, str], ...]
     predicate_value_refs: tuple[str, ...]
+    #: The run-parameter names a crosswalk's pinned mapping ROW RULE binds. Kept apart from
+    #: ``predicate_value_refs`` because the two answer different questions and reach the node under
+    #: different parameters: a bridge predicate value scopes a realization, a mapping row value is
+    #: the report cutoff the Release-B temporal policy reads rows as of.
+    crosswalk_value_refs: tuple[str, ...] = ()
 
 
 def _physical(ref: Any) -> tuple[str, str, str]:
@@ -1248,7 +1295,11 @@ def _projection_plan(expression: ExpressionExecutionIR) -> _Traversal:
         hops=hops,
         reached=tuple(sorted(carried.items())),
         predicate_value_refs=tuple(sorted({
-            value_ref for hop in hops for value_ref in hop.predicate_value_refs})))
+            value_ref for hop in hops
+            if hop.crosswalk is None for value_ref in hop.predicate_value_refs})),
+        crosswalk_value_refs=tuple(sorted({
+            value_ref for hop in hops
+            if hop.crosswalk is not None for value_ref in hop.predicate_value_refs})))
 
 
 def _hop_reaching(hops: tuple[_Hop, ...], table: tuple[str, str, str]) -> _Hop:
@@ -1276,10 +1327,12 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
     if plan.outcome_kind not in {
         _OPERATIONAL_OUTCOME,
         _DIRECTIONAL_REALIZATION_OUTCOME,
+        CROSSWALK_EXECUTION_OUTCOME,
     }:
         raise ValueError(
             f"the governed join plan's outcome is {plan.outcome_kind!r} and only "
-            f"{_OPERATIONAL_OUTCOME!r} or {_DIRECTIONAL_REALIZATION_OUTCOME!r} may be computed on: "
+            f"{_OPERATIONAL_OUTCOME!r}, {_DIRECTIONAL_REALIZATION_OUTCOME!r} or "
+            f"{CROSSWALK_EXECUTION_OUTCOME!r} may be computed on: "
             "every other outcome is a path governance "
             f"did not approve, and a hop rendered from one produces rows that look exactly like "
             f"governed ones")
@@ -1301,7 +1354,7 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
     hops: list[_Hop] = []
     for index, step in enumerate(plan.steps, start=1):
         _check_authority(step, index)
-        if isinstance(step, CrossCatalogJoinStepV1):
+        if isinstance(step, CrossCatalogJoinStepV1 | CrosswalkJoinStepV1):
             origins = tuple(
                 _full_endpoint(pair[0], by_ref, index, "from") for pair in step.column_pairs)
             targets = tuple(
@@ -1350,6 +1403,9 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
         if isinstance(step, CrossCatalogJoinStepV1):
             source_predicates, target_predicates, predicate_value_refs = _bridge_predicates(
                 step, by_ref, current, _physical(target), index)
+        elif isinstance(step, CrosswalkJoinStepV1):
+            target_predicates, predicate_value_refs = _mapping_row_filter(
+                step, by_ref, _physical(target), index)
         hop = _Hop(
             index=index, catalog_source=target.catalog_source, schema=target.schema,
             table=target.table,
@@ -1357,7 +1413,7 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
             from_key=_physical(origin),
             from_table=(
                 f"{origin.catalog_source}::{origin.schema}.{origin.table}"
-                if isinstance(step, CrossCatalogJoinStepV1)
+                if isinstance(step, CrossCatalogJoinStepV1 | CrosswalkJoinStepV1)
                 else f"{origin.schema}.{origin.table}"
             ),
             from_columns=tuple(candidate.column or "" for candidate in origins),
@@ -1371,10 +1427,17 @@ def _hops(expression: ExpressionExecutionIR, relation: Any,
             status=step.approved_join_status,
             source_predicates=source_predicates, target_predicates=target_predicates,
             predicate_value_refs=predicate_value_refs,
-            realization_revision_id=getattr(step, "realization_revision_id", None),
-            dependency_snapshot_id=getattr(step, "dependency_snapshot_id", None),
+            realization_revision_id=(
+                None if isinstance(step, CrosswalkJoinStepV1)
+                else getattr(step, "realization_revision_id", None)),
+            dependency_snapshot_id=(
+                None if isinstance(step, CrosswalkJoinStepV1)
+                else getattr(step, "dependency_snapshot_id", None)),
             evidence_revision_ids=tuple(getattr(step, "evidence_revision_ids", ())),
-            directional=isinstance(step, CrossCatalogJoinStepV1))
+            directional=isinstance(step, CrossCatalogJoinStepV1),
+            crosswalk=step if isinstance(step, CrosswalkJoinStepV1) else None,
+            arrives_at_mapping=(
+                isinstance(step, CrosswalkJoinStepV1) and step.arrives_at_mapping))
         for ref in expression.physical_read_set:
             if _physical(ref) == hop.key_of and ref.column is not None:
                 current[ref.logical_ref] = f"{hop.prefix}{ref.column}"
@@ -1388,6 +1451,8 @@ def _check_authority(step: Any, index: int) -> None:
     expected_authority = (
         _DIRECTIONAL_REALIZATION_AUTHORITY
         if isinstance(step, CrossCatalogJoinStepV1)
+        else CROSSWALK_EXECUTION_AUTHORITY
+        if isinstance(step, CrosswalkJoinStepV1)
         else _OPERATIONAL_AUTHORITY
     )
     if step.authority != expected_authority:
@@ -1423,6 +1488,18 @@ def _check_authority(step: Any, index: int) -> None:
                 raise ValueError(
                     f"hop {index}'s directional realization has no {name}: generated execution "
                     "must name the exact safety decision and dependencies it is reusing")
+    if isinstance(step, CrosswalkJoinStepV1):
+        # A crosswalk leg names its COMPOSITION's safety decision, not a per-leg one: the fan-out
+        # verdict above is the composed one and it is what the pair travels under. What has to be
+        # named exactly is the execution revision (which is content-addressed over both leg pins,
+        # the mapping binding and the temporal policy) and the composed observation behind it.
+        for name in ("crosswalk_execution_revision_id", "crosswalk_definition_revision_id",
+                     "mapping_binding_revision_id", "composed_observation_revision_id"):
+            if not str(getattr(step, name, "") or "").strip():
+                raise ValueError(
+                    f"hop {index}'s crosswalk leg has no {name}: generated execution must name the "
+                    "exact composed measurement and pins it is reusing, and a leg that cannot say "
+                    "which composition admitted it is a two-leg join nobody governed")
 
 
 def _endpoint(step_ref: str, catalog: str, by_ref: Mapping[str, Any], index: int,
@@ -1458,6 +1535,62 @@ def _full_endpoint(
             f"hop {index}'s {side} endpoint {logical_ref!r} is not in the expression's authorized "
             "physical read set")
     return found
+
+
+#: The run parameter a crosswalk's pinned mapping ROW RULE binds its values from — the
+#: ``bridge_predicate_values`` shape, for the same reason: a row rule names a PARAMETER
+#: (``DatasetRowSelectionV1`` refuses a literal date, because a literal would re-key the decision
+#: every day), so the value arrives with the run and never with the artifact.
+CROSSWALK_ROW_VALUES_PARAMETER = "crosswalk_row_values"
+
+
+def _mapping_row_filter(
+    step: CrosswalkJoinStepV1,
+    by_ref: Mapping[str, Any],
+    target_key: tuple[str, str, str],
+    index: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The pinned mapping ROW RULE as target-frame expressions, plus the values it binds.
+
+    Rendered ONLY onto the leg that arrives at the mapping dataset, and refused anywhere else: a
+    row rule for the mapping table applied to an endpoint frame would filter the wrong relation and
+    still produce rows. The expressions land in ``_Hop.target_predicates``, which
+    :func:`_traversal_lines` emits BEFORE the frame's uniqueness gate and therefore before the join
+    — so the rows whose uniqueness is checked are exactly the rows the join will use, which is the
+    ``render_join_precondition_node`` precedent applied to the mapping table.
+    """
+    if not step.mapping_row_predicates:
+        return (), ()
+    if not step.arrives_at_mapping:
+        raise ValueError(
+            f"hop {index} carries a mapping row rule and does not arrive at the mapping dataset "
+            f"{step.mapping_dataset_ref!r}: applying it to the endpoint frame would filter a "
+            "relation the rule says nothing about, and the join would still produce rows")
+    expressions: list[str] = []
+    values: list[str] = []
+    for predicate in step.mapping_row_predicates:
+        endpoint = _full_endpoint(predicate.column_ref, by_ref, index, "mapping row rule")
+        if _physical(endpoint) != target_key:
+            raise ValueError(
+                f"hop {index}'s mapping row rule names {predicate.column_ref!r}, which is not a "
+                f"column of the mapping dataset this hop arrives at")
+        column = endpoint.column
+        if predicate.operator == "is_true":
+            expressions.append(f"(F.col({column!r}) == F.lit(True))")
+            continue
+        if predicate.parameter_ref is None:
+            raise ValueError(
+                f"hop {index}'s mapping row rule compares {predicate.column_ref!r} with "
+                f"{predicate.operator!r} and names no run parameter to bind: a comparison with "
+                "nothing on the right would read rows as of no instant at all")
+        values.append(predicate.parameter_ref)
+        bound = f"F.lit({CROSSWALK_ROW_VALUES_PARAMETER}[{predicate.parameter_ref!r}])"
+        # The GOVERNED operator mapped to its Python spelling by the one table that holds the
+        # mapping; `joins.mapping_row_predicates` already refused anything absent from it, so this
+        # lookup cannot miss and a KeyError here would be a vocabulary that grew in one place only.
+        expressions.append(
+            f"(F.col({column!r}) {RENDERED_OPERATORS[predicate.operator]} {bound})")
+    return tuple(expressions), tuple(values)
 
 
 def _bridge_predicates(
@@ -1638,8 +1771,22 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
             "join keeps takes the LEFT side's value, which for an unmatched row names an entity "
             "that is not there."),
     ]
+    crosswalk_hops = tuple(hop for hop in plan.hops if hop.crosswalk is not None)
     for hop in plan.hops:
-        if hop.realization_revision_id is not None:
+        if hop.crosswalk is not None:
+            leg = hop.crosswalk
+            backing = (
+                f"crosswalk definition {leg.crosswalk_definition_revision_id}, execution "
+                f"{leg.crosswalk_execution_revision_id}, composed observation "
+                f"{leg.composed_observation_revision_id}, leg measurements "
+                f"{', '.join(leg.leg_measurement_ids) or 'none'}, mapping dataset "
+                f"{leg.mapping_dataset_ref} bound at {leg.mapping_binding_revision_id}, mapping "
+                f"row policy {leg.mapping_temporal_policy_revision_id or 'none'} "
+                f"(row selection {leg.mapping_row_selection_hash or 'none'}), leg pin "
+                f"{leg.leg_kind}/{leg.leg_plan_hash}"
+                + (f", leg realizations {', '.join(leg.leg_realization_revision_ids)}"
+                   if leg.leg_realization_revision_ids else ""))
+        elif hop.realization_revision_id is not None:
             backing = (
                 f"entity_bridge fact {hop.fact_key}, directional realization "
                 f"{hop.realization_revision_id}, dependency snapshot "
@@ -1651,7 +1798,17 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
                 if hop.fact_key is not None
                 else "a FILE-DECLARED edge, backed by no approved_join fact")
         lines.append("")
-        if hop.directional:
+        if hop.crosswalk is not None:
+            leg = hop.crosswalk
+            description = (
+                f"Hop {hop.index} — crosswalk leg {leg.leg} of the {leg.direction} traversal: "
+                f"{hop.from_table}({', '.join(hop.from_columns)}) -> "
+                f"{hop.catalog_source}::{hop.schema}.{hop.table}"
+                f"({', '.join(hop.to_columns)}). The cardinality {hop.cardinality} is the COMPOSED "
+                f"verdict for the whole two-leg traversal, measured over the joined shape — not a "
+                f"per-leg claim, because nothing measured the legs apart. Authorized by "
+                f"{backing}.")
+        elif hop.directional:
             description = (
                 f"Hop {hop.index}: {hop.from_table}({', '.join(hop.from_columns)}) -> "
                 f"{hop.catalog_source}::{hop.schema}.{hop.table}"
@@ -1666,6 +1823,15 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
         for predicate in hop.source_predicates:
             lines.append(f"    rows = rows.where({predicate})")
         target_frame = hop.parameter
+        if hop.arrives_at_mapping and hop.target_predicates:
+            lines.extend(_comment(
+                "THE MAPPING ROW RULE, applied FIRST. Everything below — the uniqueness gate, the "
+                "join, and the composed amplification check that spans both legs — runs on the "
+                "rows this filter leaves, which are the rows the composed measurement was taken "
+                "over. Filtering after the gate would prove uniqueness over a row set the "
+                "traversal does not use; on an SCD mapping table that is the difference between "
+                "'unique now' and 'unique across all history', and the second is not a claim "
+                "anybody made."))
         for predicate in hop.target_predicates:
             filtered = f"{hop.frame}_scoped"
             lines.append(f"    {filtered} = {target_frame}.where({predicate})")
@@ -1702,6 +1868,14 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
             # scanned twice (once by the gate, once by the join), so this post-join recheck is
             # what catches a target table that CHANGED between the two scans.
             lines.append(f"    rows_before_bridge_{hop.index} = rows.count()")
+        if crosswalk_hops and hop is crosswalk_hops[0]:
+            # THE COMPOSED GATE OPENS HERE. A crosswalk's fan-out verdict is a statement about the
+            # PAIR of legs — measured over the joined shape, never multiplied out of two per-leg
+            # bounds — so the runtime check that enforces it must span the pair too. One snapshot
+            # before the first leg, one comparison after the last: two half-checks would assert
+            # something nobody measured about each half and still miss a composition that
+            # multiplies only when both legs run.
+            lines.append("    rows_before_crosswalk = rows.count()")
         rendered_keys = ", ".join(repr(key) for key in hop.keys)
         lines.append(
             f"    rows = rows.join({hop.frame}, [{rendered_keys}], {_HOP_JOIN_HOW!r})"
@@ -1713,6 +1887,15 @@ def _traversal_lines(plan: _Traversal, roles_used: tuple[str, ...]) -> list[str]
                 f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} +",
                 "            ': observed row amplification for directional realization ' +",
                 f"            {hop.realization_revision_id!r})",
+            ])
+        if crosswalk_hops and hop is crosswalk_hops[-1]:
+            leg = hop.crosswalk
+            lines.extend([
+                "    if rows.count() > rows_before_crosswalk:",
+                "        raise RuntimeError(",
+                f"            {ValidationGateCode.JOIN_AMPLIFICATION.value!r} +",
+                "            ': observed row amplification across the two-leg crosswalk ' +",
+                f"            {leg.crosswalk_execution_revision_id!r})",
             ])
     lines.append("")
     lines.extend(_comment(
