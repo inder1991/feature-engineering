@@ -41,7 +41,7 @@ The reconciliation, deliberately chosen and recorded here:
 component `database` from `ClusterInventoryV1.environment_id`, while this module derives it from
 `data_source_connection.database_name`. Those are two derivations of the ADDRESS, not two
 computations of the id — and unifying them would re-address every binding a materialization run has
-already recorded. That belongs to the separately reviewed materialization-wiring slice, not to
+already recorded. That belongs to Release C Task 11 (assigned 2026-08-04 at the Phase-G unification: the split makes observations invisible across derivations, which is Task 11's own seam), not to
 Task 7; it is named in the Release-B report rather than silently left as a surprise.
 """
 

@@ -206,6 +206,10 @@ New needs append 1057+ to this table FIRST (edit this doc in the same commit as 
 | `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` | Release-B gate | `FEATUREGEN_DATASET_PROFILES=1` |
 | `FEATUREGEN_CROSSWALK_EXECUTION` | Release-C gate | `FEATUREGEN_SOURCE_TEMPORAL_SELECTION=1` — enforced fail-closed at startup, not by convention. NOTE (2026-08-03): Release B's flag dependency ships as fail-closed-at-every-call-site + loud boot log, which honors its row; Release C's row REQUIRES a true boot refusal and must NOT inherit the log-only precedent |
 
+- `FEATUREGEN_MATERIALIZE_ENABLED` (Phase G, recorded post-unification 2026-08-04): the
+  materialization-lane kill switch + its four companion settings (PROJECT_ROOT / INVENTORY /
+  L0_PYTHON / L0_TIMEOUT_SECONDS) — default off, conformant truthy set, in both manifests;
+  enabling it is part of a later deploy gate, never implicit.
 - All four use the widened truthy set `{"1","true","yes","on"}` (`feature_assist.py:193` pattern)
   and are added to `deploy/kind/k8s/20-backend.yaml` + `.env.example` (defaults off).
 - Feature-context versions: v4 ships REGISTERED alongside v2/v3 (D10). Rollback ladder:
