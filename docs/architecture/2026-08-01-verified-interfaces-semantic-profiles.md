@@ -194,8 +194,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | 1053-1055 | RESERVED BLOCK — Phase-G execution wiring (PARALLEL SESSION; run lifecycle / publish pointer / whatever its approved plan needs; unused numbers return to the pool when Phase G's plan finalizes). The 1048-1050 reservations above remain Release B/C's, unchanged. |
 
 | 1056 | PII allow-policy surface (user-directed 2026-08-04): `pii_use_policy` immutable revisions + CAS current pointer |
+| 1057 | Release C Task 11 — crosswalk observation store + (if its analysis requires) the database-derivation unification's re-addressing; unused returns to the pool |
 
-New needs append 1057+ to this table FIRST (edit this doc in the same commit as the migration).
+New needs append 1058+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
 
 ## D8. Flag matrix
 
