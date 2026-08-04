@@ -1214,13 +1214,16 @@ def _plan_to_grain(
             # rows take part is applied on the cluster, so its effective-from / effective-to /
             # snapshot / current-flag columns are columns this group reads — and Gate 2 must
             # authorize them, or the traversal would filter on a column nobody was granted.
-            for predicate in step.mapping_row_predicates:
-                predicate_table_ref = _table_ref_of(predicate.column_ref)
+            # Named apart from the bridge loop's `predicate` above: they are different vocabularies
+            # (a structured BRIDGE predicate vs a mapping ROW rule), and one name for both makes
+            # the second one's attribute reads unchecked.
+            for row_predicate in step.mapping_row_predicates:
+                predicate_table_ref = _table_ref_of(row_predicate.column_ref)
                 identity = tables.resolve(predicate_table_ref)
                 if isinstance(identity, MaterializationRefused):
                     return identity
-                read_set.add(predicate.column_ref, RefRole.FILTER_LEFT, identity,
-                             _column_of(predicate.column_ref))
+                read_set.add(row_predicate.column_ref, RefRole.FILTER_LEFT, identity,
+                             _column_of(row_predicate.column_ref))
                 read_order.setdefault(predicate_table_ref, None)
 
     for key in grain:
