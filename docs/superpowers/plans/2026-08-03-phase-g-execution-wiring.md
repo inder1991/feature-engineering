@@ -174,3 +174,60 @@ Merge any trees (Track 1 owns that). Touch `analysis/**`, `data_agent/**`, `over
 **Q2. Sequencing (D12.8).** Unanswered. The controlling doc still sequences Phase G after Release B; this handoff plausibly amends that, but the amendment is the Track-1 session's to record. Phase G proceeds on the handoff's authority and does not edit the controlling doc.
 
 **Q5. Ownership of the resolution seam (`formula/`).** Unanswered, so **T2 takes the ownership-safe route by default**: the new `materialize/resolve.py` *reads* the existing replay-lane restorer (`replay_authoring._restore_terminal_result`, `replay_authoring.py:179`) and the 1022 trace store; it does **not** modify anything under `formula/`. If the implementer finds that route cannot preserve admission's "THE intent, not a look-alike rebuilt from its parts" invariant (`admission.py:115-117`) without a `formula/`-side change, the task stops as BLOCKED and returns here rather than reaching across an unassigned ownership line.
+
+---
+
+## 8. What G-1 actually shipped (2026-08-04)
+
+Written at the close of G-1 as the handoff artifact for whoever picks up G-2. Everything below is on
+`feature/phase-g`; the flag is default-OFF, so none of it is reachable in any deployment yet.
+
+**Thirteen tasks landed** — §5's twelve, plus **T13 (the reconciler)**, which T7's review promoted
+from a deferral to a task on the grounds that three new code paths could mint a stuck request while
+`expired_requests` still had zero callers.
+
+| # | What landed | Commits |
+|---|---|---|
+| 1 | Migration **1053** `materialization_request` + store — durable identity before any work begins | `0381605e`, `bf4c9480` |
+| 2 | `materialize/resolve.py` + `materialize/authoring_trace.py` — a work-item id becomes a `ResolvedFeatureInput`; admission repointed to the **1022** lane (the live one), check 6 widened 4→5 fields | `2d16f926`, `1f2665c1` |
+| 3 | `materialize/compile/chain.py` — §2's orchestrator, one atomic `_commit`, `COMPILER_VERSION`'s home (A.24) | `45a2274c`, `486c15a0` |
+| 4 | `materialize/compile/wiring.py` — Kedro node assembly including the cross-catalog join gates | `331520ab` |
+| 5 | Migration **1054** `materialization_compiled_artifact` — the group plan and contract body survive the run | `06610bdb`, `874301e0` |
+| 6 | §11.2's **L0** inside the chain, and the truthful terminal | `5c8de285`, `ba8bacb8` |
+| 7 | `materialize/queue_lane.py` — the fenced lane (lease + monotonic fence), worker drain stage, outbox producer | `b21a794a`, `3bb7f962`, `4894a84a` |
+| 9 | `FEATUREGEN_MATERIALIZE_ENABLED` + the kill switch, default OFF | `51728229` |
+| 8 | `POST /materialization-runs` (202 + run-id header) and `GET /materialization-runs/{id}`, platform-admin | `d94c705e`, `d4aa18e7` |
+| 13 | `materialize/reconcile.py` — an abandoned run gets a verdict, never a retry | `e4bd0d41`, `122479cd` |
+| 10 | **P1** cross-catalog runs are submittable; **P2** the realization applicability tier is a parameter, not a hard-coded `PRODUCTION` | `eba33626`, `0c285cd4`, `6984bd89` |
+| 11 | `tests/featuregen/api/test_materialization_e2e.py` — the acceptance test, no production code | `ea01965f`, `22fdf4c9` |
+| 12 | Deferral bookkeeping — this section, `DEFERRED-WORK` A.38/A.39 and the §C row | this commit |
+
+**The acceptance outcome is a refusal, and that is the pass.** `POST` → 202 → the real worker tick
+claims it → resolve → admit → compile → Gate 2 → contract → plan → bind → render → seal → L0 green →
+exactly one terminal event: **`PUBLICATION_REFUSED` carrying `CAPABILITY_UNPROVEN`**. `GET` reports
+it. Nothing is published because publication does not exist (§3.5), and the chain is forbidden from
+saying otherwise — it never appends `RunEventKind.PUBLISHED`. A green G-1 run leaves a sealed,
+build-verified Kedro project on disk, a `materialization_request` row, a generation, the retained
+plan + contract, an L0 validation report, a group binding/plan revision and that one terminal event.
+
+**Preconditions this branch establishes for G-2 and G-3**
+
+- The four missing pieces §1 named are built: a durable path into admission (T2), a persisted
+  compile-side record (T5), a durable request anchor (T1) and an orchestrator (T3). G-2 starts from
+  a `CompiledGroup`, not from a scout report.
+- `prepare_run`, `run_l1` and `submit` are **still uncalled by `src/`** — G-2's whole scope.
+- **Prepared parameters need their own run-keyed table** (§3.6 amendment): 1054 cannot hold them.
+  1053/1054 used, **1055 reserved for G-3**, 1056 free but requires appending to Track 1's D7
+  reservation table in the same commit.
+- No run execution tier was introduced, by decision (§3.4). Adding one forks execution identity and
+  is a governance call, not a wiring one — `DEFERRED-WORK` A.38 states the two closures.
+- `/materialization-runs` is absent from `deploy/kind/nginx.conf` and `frontend/vite.config.ts`, so
+  turning the flag on is not by itself enough to make the route reachable through an ingress
+  (`DEFERRED-WORK` A.39).
+
+**What G-1 deliberately left**, each with its consequence stated rather than its name: `DEFERRED-WORK`
+**A.33** (the orphaned 1020 authoring lane), **A.34** (L0 probes inside the compile transaction),
+**A.35** (`requested → failed` is not a legal edge), **A.36** (the bridged path is inferred, never
+run end to end; the trigger carries no `execution_tier`), **A.37** (a pre-seal refusal's stage and
+code are unqueryable), **A.38** (§3.6's six + §3.4's identity note) and **A.39** (what execution
+accumulated).
