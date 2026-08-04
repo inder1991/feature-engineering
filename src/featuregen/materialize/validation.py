@@ -162,7 +162,14 @@ class FindingSeverity(StrEnum):
 #: disagreement — "rebuilding from the same wrong facts produces the same wrong project faster",
 #: which is precisely GOVERNED_FACT_MISMATCH. The remedy is to re-capture the inventory or to point
 #: L0 at the environment the artifact declares, and a later L0 that passes supersedes this one
-#: through :func:`may_regenerate_for`, so blocking is a hold rather than a dead end.
+#: through :func:`may_regenerate_for`, so the refusal is a hold rather than a dead end.
+#:
+#: **What "blocks regeneration" means here today: the classification is DECLARED, not enforced.**
+#: :func:`may_regenerate` and :func:`may_regenerate_for` have no production callers as of G-1 — the
+#: chain decides on ``report.status is PASSED`` alone (``chain.py``'s ``built``) and never consults
+#: a class. So this entry states the policy a regeneration path must honour when one is wired; it
+#: does not gate anything yet. Said explicitly because A.42 exists precisely because something
+#: claimed more than it did, and repeating that shape in its own fix would be the same defect.
 FINDING_CLASSES: Mapping[ValidationFindingCode, FindingClass] = {
     ValidationFindingCode.PROJECT_DOES_NOT_BUILD: FindingClass.RENDERER_DEFECT,
     ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE: FindingClass.RENDERER_DEFECT,
@@ -469,11 +476,32 @@ _ENGINE_STAGE = "engines"
 #: belief false. That is A.42's own defect at a smaller scale, and it would need a second "the
 #: interpreter never answered" channel besides :func:`_probe_verdict`'s ``None``.
 #:
-#: First, because everything after it is the artifact's. ``sys.path`` has not been widened with the
-#: project's ``src`` (``importlib.metadata`` SCANS ``sys.path``, so a tree shipping its own
-#: ``*.dist-info`` could otherwise answer for the pin it declares) and no module the artifact ships
-#: has executed — which is exactly the residual forgery :func:`_probe_verdict` documents and cannot
-#: close for the build verdict. This check is not subject to it.
+#: First, because no module the artifact ships has executed yet — which is exactly the residual
+#: forgery :func:`_probe_verdict` documents and cannot close for the build verdict. Ordering alone
+#: is NOT enough, and the first version of this fix wrongly claimed it was: ``importlib.metadata``
+#: SCANS ``sys.path``, and the probe is launched ``python -c`` with ``cwd=root``, so **the project
+#: root is already at ``sys.path[0]`` before the probe's first statement**. A tree shipping a
+#: root-level ``kedro.egg-info/`` therefore answered for its own pin — and because
+#: :func:`_files_on_disk` deliberately skips ``*.egg-info`` (an editable install writes one by
+#: *using* a project, so it is not drift), that forgery was invisible to ``PROJECT_HASH_MISMATCH``
+#: too: ``run_l0`` returned ``PASSED`` with zero findings. A.42, reproduced through its own fix.
+#:
+#: So the probe REMOVES every ``sys.path`` entry that lies inside the project before it asks, and
+#: restores the list exactly before it imports. Sanitizing inside the probe rather than launching it
+#: differently, deliberately:
+#:
+#: * it is COMPLETE — it does not matter how an entry under ``root`` got onto the path (the ``-c``
+#:   cwd entry, a caller's ``PYTHONPATH``, a future interpreter's own additions); ``-P`` /
+#:   ``PYTHONSAFEPATH`` close only the cwd door and leave ``PYTHONPATH=<root>`` wide open;
+#: * it does not depend on HOW the probe was launched, so it cannot be undone by a caller;
+#: * ``-P`` is 3.11+, and passing it to an older L0 interpreter would fail the launch and be
+#:   reported as "the environment did not answer" — a regression dressed as a hardening;
+#: * ``PYTHONSAFEPATH=1`` in the env would silently change ``run_l0``'s documented contract that
+#:   ``env=None`` inherits this process's environment unchanged, and still closes only one door.
+#:
+#: The restore is exact. This narrows the METADATA QUERY; the build that follows must import the
+#: project under precisely the path it always did, or the engine fix would have changed what
+#: ``PROJECT_DOES_NOT_BUILD`` means.
 _BUILD_PROBE = f"ENGINE_STAGE = {_ENGINE_STAGE!r}\n" + r'''
 import importlib, importlib.metadata, json, os.path, sys, traceback
 
@@ -489,7 +517,11 @@ def emit(stage, ok, observed="", pins=()):
 try:
     with open(os.path.join(root, lockfile), encoding="utf-8") as handle:
         lock_lines = handle.read().splitlines()
-except OSError:
+except (OSError, UnicodeDecodeError):
+    # UnicodeDecodeError is a ValueError, NOT an OSError. Uncaught it kills the probe, prints no
+    # verdict, and `run_l0` reports "the environment did not answer" — blaming the interpreter for
+    # a lock the ARTIFACT wrote unreadable, which is the mis-routing this whole change exists to
+    # stop. It is a finding about the project, and the tree's PROJECT_HASH_MISMATCH survives it.
     emit(ENGINE_STAGE, False, lockfile + " could not be read")
 
 declared = []
@@ -512,14 +544,41 @@ if not declared:
     # one, and "nothing to compare" must not read as "they agree" — that IS A.42.
     emit(ENGINE_STAGE, False, lockfile + " pins no distribution")
 
+# Ask the interpreter what it HAS, with the project taken off the search path first. `python -c`
+# puts the cwd at sys.path[0] and this probe is launched with cwd=root, so without this the tree
+# vouches for its own pin from a `kedro.egg-info/` the project hash is blind to. `''` and `'.'` are
+# spellings of the cwd; realpath also collapses a symlinked root and catches nested entries.
+inside = os.path.realpath(root)
+whole_path = list(sys.path)
+sys.path[:] = [entry for entry in whole_path
+               if os.path.realpath(entry or os.getcwd()) != inside
+               and not os.path.realpath(entry or os.getcwd()).startswith(inside + os.sep)]
+importlib.invalidate_caches()
+
 disagreements = []
 for name, pinned in sorted(set(declared)):
     try:
         installed = importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         installed = None
+    # EXACT string equality, on a name `importlib.metadata` has already normalized (PEP 503, so
+    # `kedro-datasets` and `kedro_datasets` are one distribution). Versions are NOT normalized:
+    # `1.5` vs `1.5.0` and `1.5.0RC1` vs `1.5.0rc1` are PEP 440-equal and are reported here as
+    # disagreements. That is FALSE POSITIVES ONLY — no version string can slip through by being
+    # merely equivalent — which is the direction to be wrong in, and the alternative is `packaging`
+    # inside a stdlib-only probe. A capture that writes `kedro: "1.5"` renders a lock that can
+    # never pass; the fix is to capture the full version. Note also that a `--hash=` annotation or
+    # an unevaluated environment marker rides along in `pinned` and always disagrees: today's
+    # `_render_requirements` emits bare `name==version`, and a pip-compile-style lock would need
+    # this parser widened rather than discovering it as a mystery refusal.
     if installed != pinned:
         disagreements.append([name, pinned, installed])
+
+# Restored EXACTLY, before anything is imported: the narrowing above is scoped to the metadata
+# query, and the build must run under the path it always did.
+sys.path[:] = whole_path
+importlib.invalidate_caches()
+
 if disagreements:
     emit(ENGINE_STAGE, False,
          str(len(disagreements)) + " of " + str(len(set(declared))) + " declared pin(s) disagree",

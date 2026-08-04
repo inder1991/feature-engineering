@@ -151,8 +151,15 @@ def test_a_hand_edited_project_is_ENVIRONMENT_OR_DATA_and_may_be_regenerated() -
                                   (_finding(ValidationFindingCode.PROJECT_HASH_MISMATCH),)))
 
 
-def test_an_ENGINE_VERSION_MISMATCH_is_a_GOVERNED_FACT_MISMATCH_and_BLOCKS_regeneration() -> None:
+def test_an_ENGINE_VERSION_MISMATCH_is_a_GOVERNED_FACT_MISMATCH_that_may_regenerate_REFUSES(
+) -> None:
     """The three classes that look plausible here, and why only one survives.
+
+    Named for what is actually asserted. `may_regenerate` returns `False` for this report — that is
+    real and executed below — but **no production code calls it** as of G-1: the chain gates on
+    `report.status is PASSED` and never reads a class. So this pins the policy the classification
+    declares, not a regeneration path it currently closes, and the docstring says so rather than
+    letting the test name imply a wiring that does not exist.
 
     Not ``RENDERER_DEFECT``: the renderer copied the pins faithfully out of §0's captured
     ``ClusterInventoryV1.engine_versions``, so there is no renderer bug to fix. Not
@@ -161,7 +168,7 @@ def test_an_ENGINE_VERSION_MISMATCH_is_a_GOVERNED_FACT_MISMATCH_and_BLOCKS_regen
     three pins and the same disagreement, which is this table's own definition of a governed-fact
     contradiction. The remedy is to re-capture the inventory or to prove the build in the
     environment the artifact declares, and a later passing L0 supersedes this verdict through
-    ``may_regenerate_for``, so blocking is a hold rather than a dead end.
+    ``may_regenerate_for``, so the refusal is a hold rather than a dead end.
     """
     assert classify(ValidationFindingCode.ENGINE_VERSION_MISMATCH) is \
         FindingClass.GOVERNED_FACT_MISMATCH
@@ -682,18 +689,19 @@ def test_the_engine_check_runs_BEFORE_the_project_is_imported(tmp_path) -> None:
 
 
 def test_a_dist_info_the_PROJECT_SHIPS_cannot_answer_for_the_projects_own_pin(tmp_path) -> None:
-    """The artifact ships `src/kedro_datasets-9.5.0.dist-info` and pins `kedro-datasets==9.5.0`.
+    """The artifact SEALS `src/kedro_datasets-9.5.0.dist-info` and pins `kedro-datasets==9.5.0`, so
+    there is no hash mismatch to hide behind: the engine finding is the only signal.
 
-    `importlib.metadata` SCANS `sys.path`, and the probe puts the project's `src` on `sys.path` to
-    import it — so a check placed after that insert would let a tree vouch for its own pin. The
-    check is placed before it, and this is that placement asserted rather than described. The
-    directory is SEALED into the project, so there is no hash mismatch to hide behind: the engine
-    finding is the only signal.
+    Sealed rather than written afterwards, which distinguishes this from the `.egg-info`
+    parametrization above — a tree may carry metadata legitimately, inside its own hash, and still
+    must not be believed about its own pin.
 
-    The second half is the control. The same bytes, the same interpreter, the same lock — with
-    `src` on `PYTHONPATH` the shipped metadata IS found and the project is proved. The only
-    variable is whether that directory is on the metadata search path when the pins are read, which
-    is exactly what the ordering decides.
+    **The control is what stops this being vacuous, and it deliberately lives OUTSIDE the project.**
+    Byte-identical metadata installed in a neutral directory IS found and the project IS proved — so
+    the first half is "metadata inside the artifact is disregarded", not "this distribution can
+    never resolve". An earlier draft used `PYTHONPATH=<root>/src` as that control and it passed; it
+    stopped passing the moment the probe began stripping every path inside the project, which is the
+    fix working: no location under the tree can answer for the tree, however it reaches `sys.path`.
     """
     files = _project_files(create_pipeline_body=_BUILDS,
                            requirements_lock=f"{_KEDRO_DATASETS}==9.5.0\n")
@@ -705,8 +713,131 @@ def test_a_dist_info_the_PROJECT_SHIPS_cannot_answer_for_the_projects_own_pin(tm
     assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
     assert report.findings[0].observed == f"{_KEDRO_DATASETS} is not installed"
 
-    reachable = _l0(root, env={"PYTHONPATH": str(root / "src")})
-    assert (reachable.status, reachable.findings) == (ValidationStatus.PASSED, ())
+    inside_the_tree = _l0(root, env={"PYTHONPATH": str(root / "src")})
+    assert _codes(inside_the_tree) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+
+    outside = _l0(root, env=_installed(tmp_path, (_KEDRO_DATASETS, "9.5.0")))
+    assert (outside.status, outside.findings) == (ValidationStatus.PASSED, ()), \
+        [finding.payload() for finding in outside.findings]
+
+
+def _forge(root, relative: str, *, name: str = "kedro", version: str = "0.19.9"):
+    """Write installed-distribution metadata into the project tree, AFTER it was materialized.
+
+    After, and never sealed, because that is what makes it dangerous: `_files_on_disk` skips
+    `*.egg-info` from `generated_project_hash` — deliberately and correctly, since an editable
+    install writes one by *using* a project — so an `.egg-info` here is invisible to
+    `PROJECT_HASH_MISMATCH` while being fully authoritative for `importlib.metadata`.
+    """
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+                      encoding="utf-8")
+
+
+@pytest.mark.parametrize("where", [
+    "kedro.egg-info/PKG-INFO",              # the project ROOT — `python -c` + cwd=root put it on
+                                            # sys.path[0] before the probe's first statement
+    "kedro-0.19.9.dist-info/METADATA",       # same place, the other metadata spelling
+    "src/kedro.egg-info/PKG-INFO",          # under `src`, which the probe adds later
+    "deep/nested/kedro.egg-info/PKG-INFO",   # anywhere else inside the tree
+])
+def test_metadata_the_PROJECT_SHIPS_cannot_answer_for_the_projects_own_pin(tmp_path, where) -> None:
+    """The project pins `kedro==0.19.9`, the interpreter has no kedro, and the tree tries to say
+    otherwise. Every placement must still be `ENGINE_VERSION_MISMATCH`.
+
+    **The root row is a REGRESSION TEST for a real hole, not a hypothetical.** The first version of
+    this check reasoned that putting the comparison ahead of `sys.path.insert(0, root + "/src")` was
+    enough. It was not: `_probe_verdict` launches `python -c` with `cwd=root`, and `python -c` puts
+    the cwd at `sys.path[0]`, so the project root was on the metadata search path before the probe's
+    first line ran. A root-level `kedro.egg-info` — invisible to the project hash by design — made
+    `run_l0` return `PASSED` with **zero findings** for a project pinned to engines the interpreter
+    did not have. That is A.42 reproduced through its own fix, and the old test missed it because it
+    only ever forged under `src/`.
+
+    So the probe now strips every `sys.path` entry inside the project before it asks. Ordering is
+    still load-bearing (nothing the artifact ships has EXECUTED yet); it is simply not sufficient on
+    its own, and this parametrization is what holds both halves.
+    """
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS,
+                                             requirements_lock="kedro==0.19.9\n"))
+    _forge(root, where)
+
+    report = _l0(root)
+    assert report.status is ValidationStatus.FAILED
+    assert ValidationFindingCode.ENGINE_VERSION_MISMATCH in _codes(report), report.findings
+    engine = next(f for f in report.findings
+                  if f.code is ValidationFindingCode.ENGINE_VERSION_MISMATCH)
+    assert (engine.expected, engine.observed) == ("kedro==0.19.9", "kedro is not installed")
+
+
+def test_the_ROOT_forgery_is_invisible_to_the_hash_so_the_engine_check_is_all_there_is(tmp_path):
+    """The `.egg-info` placement specifically: `PROJECT_HASH_MISMATCH` does NOT fire.
+
+    Asserted because it is the reason the root hole returned `PASSED` rather than merely a
+    misattributed failure — nothing else was watching. The `.dist-info` spelling IS caught by the
+    hash, which is why the exploit is written with `.egg-info`, and pinning the difference here
+    stops someone "fixing" this by putting `*.egg-info` back into `generated_project_hash`.
+    """
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS,
+                                             requirements_lock="kedro==0.19.9\n"))
+    _forge(root, "kedro.egg-info/PKG-INFO")
+    assert _codes(_l0(root)) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+
+    other = _on_disk(tmp_path / "b", _project_files(create_pipeline_body=_BUILDS,
+                                                    requirements_lock="kedro==0.19.9\n"))
+    _forge(other, "kedro-0.19.9.dist-info/METADATA")
+    assert _codes(_l0(other)) == [ValidationFindingCode.PROJECT_HASH_MISMATCH,
+                                  ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+
+
+def test_a_PYTHONPATH_aimed_at_the_project_cannot_answer_for_its_own_pin(tmp_path) -> None:
+    """The door that `-P` / `PYTHONSAFEPATH` would leave open, and the reason the fix is in-probe.
+
+    Those flags drop the cwd entry only. Sanitizing inside the probe drops every entry that resolves
+    inside the project however it got there, so this closes too — and it cannot be undone by
+    changing how the probe is launched.
+    """
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS,
+                                             requirements_lock="kedro==0.19.9\n"))
+    _forge(root, "kedro.egg-info/PKG-INFO")
+    report = _l0(root, env={"PYTHONPATH": str(root)})
+    assert _codes(report) == [ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+
+
+def test_the_sanitized_path_is_RESTORED_so_the_build_still_imports_what_it_always_did(tmp_path):
+    """The narrowing is scoped to the metadata query. This is the other half of that sentence.
+
+    The project's registry imports a module that lives at the project ROOT — importable only because
+    `cwd=root` puts it on `sys.path`, which is exactly the entry the engine check removes. If the
+    probe restored the path sloppily this project would stop importing and L0 would report
+    `PROJECT_DOES_NOT_BUILD`: a hardening that quietly changed what a build failure means.
+    """
+    files = _project_files(create_pipeline_body=_BUILDS,
+                           registry_prelude="import a_module_beside_the_project\n")
+    files["a_module_beside_the_project.py"] = "MARKER = 1\n"
+    report = _l0(_on_disk(tmp_path, files))
+    assert (report.status, report.findings) == (ValidationStatus.PASSED, ()), \
+        [finding.payload() for finding in report.findings]
+
+
+def test_a_lock_that_is_not_UTF_8_is_a_FINDING_not_an_unanswered_environment(tmp_path) -> None:
+    """`UnicodeDecodeError` is a `ValueError`, not an `OSError`.
+
+    Uncaught it killed the probe, printed no verdict, and `run_l0` reported `status=error` with ZERO
+    findings — which `_unproven_detail` renders to an operator as "the configured interpreter did
+    not answer". That blames the environment for bytes the artifact wrote, the same mis-routing this
+    change exists to eliminate, and it silently DISCARDED the `PROJECT_HASH_MISMATCH` such a tree
+    genuinely has (the `error` path returns early with `findings=()`). Both findings, now.
+    """
+    root = _on_disk(tmp_path, _project_files(create_pipeline_body=_BUILDS))
+    (root / REQUIREMENTS_LOCK_FILENAME).write_bytes(b"kedro==0.19.9\n\xff\xfe\x00binary\n")
+
+    report = _l0(root)
+    assert report.status is ValidationStatus.FAILED
+    assert _codes(report) == [ValidationFindingCode.PROJECT_HASH_MISMATCH,
+                              ValidationFindingCode.ENGINE_VERSION_MISMATCH]
+    assert "could not be read" in report.findings[1].observed
 
 
 # ── L0: an environment that could not be reached ─────────────────────────────────────────────────

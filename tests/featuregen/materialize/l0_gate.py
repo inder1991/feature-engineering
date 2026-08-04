@@ -42,8 +42,14 @@ interpreter's installed distributions, and a disagreement is
 ``FAILED``/``ENGINE_VERSION_MISMATCH`` rather than a build verdict. So under ``.venv-l0-modern`` and
 under the kind image there is no build verdict for this file to assert, and the tests that assert
 one take :func:`the_declared_environment` and SKIP with the disagreement named.
-:func:`test_the_environment_really_has_the_engines_the_project_pins` never skips: it runs in every
-environment and asserts whichever verdict is correct there, so the gate always states the answer.
+:func:`test_the_environment_really_has_the_engines_the_project_pins` takes no such fixture: it runs
+under every interpreter and asserts whichever verdict is correct there.
+
+One caveat, because the fixture is honest about it and this docstring previously was not: when NO
+L0 interpreter resolves at all — no ``FEATUREGEN_L0_PYTHON`` and none of the three venvs on disk —
+:func:`l0_python` skips the whole file and the gate states nothing whatsoever. That is the right
+behaviour (it must never fake an environment), but "the gate always states the answer" is true only
+once an interpreter is found.
 """
 from __future__ import annotations
 
@@ -66,7 +72,12 @@ from tests.featuregen.materialize.test_resolve import no_dsn  # noqa: F401 - aut
 from featuregen.materialize.codes import PublicationRefusalCode, ValidationFindingCode
 from featuregen.materialize.compile.chain import ChainStage, L0Interpreter
 from featuregen.materialize.control_plane import RunEventKind
-from featuregen.materialize.identity import REQUIREMENTS_LOCK_FILENAME, SealedProject
+from featuregen.materialize.identity import (
+    REQUIREMENTS_LOCK_FILENAME,
+    CompilationIdentity,
+    SealedProject,
+    seal_project,
+)
 from featuregen.materialize.render.project import (
     PIPELINE_NAME,
     REQUIRED_RUN_PARAMETERS,
@@ -125,13 +136,11 @@ def l0_env(l0_python: str) -> dict[str, str]:
     return environment
 
 
-#: The artifact's declaration, read from the committed golden ``requirements.lock``.
-#: ``test_the_rendered_project_matches_its_GOLDENS`` (collected suite) holds that file byte-identical
-#: to what the renderer emits, so this IS the rendered declaration — available without a db round
-#: trip, which is what lets a session-scoped fixture decide whether this gate environment can carry
-#: a build proof at all.
-GOLDEN_LOCK = (pathlib.Path(__file__).parent / "goldens" / "cif_daily"
-               / REQUIREMENTS_LOCK_FILENAME)
+#: The committed golden project — the renderer's own output, held byte-identical to it by
+#: ``test_the_rendered_project_matches_its_GOLDENS`` in the collected suite. Sealing a copy of it
+#: gives this file a real artifact to ask production about WITHOUT a db round trip, which is what
+#: lets the skip decision below be a session-scoped `run_l0` rather than a parse.
+GOLDENS = pathlib.Path(__file__).parent / "goldens" / "cif_daily"
 
 #: Ask the interpreter what it actually has, keyed by DISTRIBUTION name — which is what a lock file
 #: names, and what `kedro-datasets` vs the importable `kedro_datasets` would otherwise disagree
@@ -152,23 +161,15 @@ _INSTALLED_VERSIONS = (
 )
 
 
-def _parse_pins(lock: str) -> dict[str, str]:
-    pins: dict[str, str] = {}
-    for line in lock.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "==" not in stripped:
-            continue
-        name, _, version = stripped.partition("==")
-        pins[name.strip()] = version.strip()
-    return pins
-
-
 def _disagreements(declared: dict[str, str], l0_python: str) -> dict[str, tuple[str, str | None]]:
     """Which declared pins this interpreter does not satisfy — ``{}`` when it is the declared one.
 
-    This is NOT the production comparison and must never become a second copy of it: it decides
-    which verdict a gate test should DEMAND of `run_l0`, and which environment the gate is running
-    in. `validation._BUILD_PROBE` owns the comparison whose answer the platform acts on.
+    **Used to WRITE an expectation, never to decide whether a test asserts.** That distinction is
+    the whole of why this may exist beside production's parser: if it drifts from
+    `validation._BUILD_PROBE`, the single test it feeds goes RED against the real report. It cannot
+    turn a test into a silent skip — which is what an earlier draft did, by deciding
+    `the_declared_environment` from a parse that stripped neither inline comments, extras nor
+    environment markers where the probe strips all three.
     """
     asked = subprocess.run(  # noqa: S603
         [l0_python, "-c", _INSTALLED_VERSIONS, *sorted(declared)],
@@ -181,9 +182,30 @@ def _disagreements(declared: dict[str, str], l0_python: str) -> dict[str, tuple[
 
 
 @pytest.fixture(scope="session")
-def engines_the_interpreter_lacks(l0_python: str) -> dict[str, tuple[str, str | None]]:
-    """The gate environment against the ARTIFACT's declaration, computed once."""
-    return _disagreements(_parse_pins(GOLDEN_LOCK.read_text(encoding="utf-8")), l0_python)
+def engines_the_interpreter_lacks(l0_python: str, l0_env, tmp_path_factory) -> tuple:
+    """What PRODUCTION says about this gate environment — one real `run_l0`, computed once.
+
+    Not a parse. The golden tree is sealed and materialized into a real project and handed to the
+    real `run_l0`; the answer is whichever `ENGINE_VERSION_MISMATCH` findings it reports. So the
+    decision to skip a build proof is made by the same code that would refuse the build, and there
+    is no second implementation of the comparison for it to drift from.
+
+    Fails LOUD in every degenerate direction: if the interpreter cannot be launched the report is
+    `ERROR` with no findings, so this returns `()` and nothing skips — the build tests then run and
+    fail against the real environment rather than quietly reporting success by absence.
+    """
+    files = {str(path.relative_to(GOLDENS)): path.read_text(encoding="utf-8")
+             for path in GOLDENS.rglob("*") if path.is_file()}
+    identity = CompilationIdentity(
+        formula_content_hashes=("f" * 64,), ir_hashes=("e" * 64,),
+        materialization_contract_hash="c" * 64, group_plan_hash="1" * 64)
+    root = materialize_to(seal_project(identity, files),
+                          tmp_path_factory.mktemp("declared-environment") / "generated")
+    report = run_l0(root, generation_id=GEN, environment_id=ENVIRONMENT,
+                    report_id="rep-declared", python_executable=l0_python, clock=_clock(),
+                    env=l0_env)
+    return tuple(finding for finding in report.findings
+                 if finding.code is ValidationFindingCode.ENGINE_VERSION_MISMATCH)
 
 
 @pytest.fixture
@@ -204,9 +226,8 @@ def the_declared_environment(engines_the_interpreter_lacks) -> None:
         pytest.skip(
             "not the environment this artifact declares, so `run_l0` refuses to prove a build "
             "here (A.42): " + "; ".join(
-                f"{dist} pinned {want}, installed "
-                + ("NOTHING" if have is None else have)
-                for dist, (want, have) in engines_the_interpreter_lacks.items()))
+                f"{finding.location} expected {finding.expected}, observed {finding.observed}"
+                for finding in engines_the_interpreter_lacks))
 
 
 def _declared_pins(sealed: SealedProject) -> dict[str, str]:
