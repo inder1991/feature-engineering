@@ -486,13 +486,29 @@ def test_a_COMPOSITE_PREDICATED_realization_is_durable_and_executable_too(catalo
 def test_the_durable_seed_is_INVISIBLE_to_another_environment(catalog) -> None:
     """Applicability is scoped, and the seed must not be a global switch: the same reader asked for
     a different environment returns nothing, which is what keeps a bridged chain test from passing
-    on a realization approved for somewhere else."""
+    on a realization approved for somewhere else.
+
+    BOTH reads are asserted, and that is the point. An emptiness assertion on its own is satisfied by
+    a seed that stored nothing at all — it would stay green against a helper neutered to a no-op, and
+    would then be testing nothing. The positive read beside it is what makes the empty one mean
+    "scoped away" rather than "absent".
+    """
     from tests.featuregen.materialize.test_expression_ir import INVENTORY
 
-    seed_executable_bridge_realization(catalog, _inventory(INVENTORY))
+    inventory = _inventory(INVENTORY)
+    admitted = seed_executable_bridge_realization(catalog, inventory)
 
+    here = executable_bridge_realizations(
+        catalog, purpose=BRIDGE_PURPOSE, environment=inventory.environment_id)
+    elsewhere = executable_bridge_realizations(
+        catalog, purpose=BRIDGE_PURPOSE, environment="some-other-cluster")
+
+    assert [item.revision for item in here] == [admitted]
+    assert elsewhere == ()
+    # the same discrimination on the PURPOSE axis: a realization admitted for feature generation is
+    # not admitted for everything, and the scope carries exactly one purpose.
     assert executable_bridge_realizations(
-        catalog, purpose=BRIDGE_PURPOSE, environment="some-other-cluster") == ()
+        catalog, purpose="model_monitoring", environment=inventory.environment_id) == ()
 
 
 def test_cross_catalog_ir_carries_both_catalogs_and_exact_realization(

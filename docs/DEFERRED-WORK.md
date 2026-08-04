@@ -676,7 +676,11 @@ operator cannot do today is close the old row.
 |---|---|---|
 | 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
 
-### A.36 🟢 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+### A.36 🟡 The bridged (cross-catalog) chain path — chain/lane row CLOSED, `execution_tier` row still OPEN (2026-08-04)
+
+🟡 rather than 🟢 **deliberately**: this entry carries two rows and only the first is done. A reader
+scanning headings must not take A.36 as finished while no triggered run can ask for a SANDBOX-scoped
+realization. The heading turns 🟢 when the second row does.
 
 **CLOSED for the chain/lane row (2026-08-04); the `execution_tier` row below remains OPEN.** The
 durable seed helper is `tests/featuregen/materialize/test_cross_catalog_ir.seed_executable_bridge_realization`
@@ -769,3 +773,36 @@ rediscover it, and three of the five are met in G-2's first week.
 | ⚪ **The reconciler's three recorded follow-ups** | **(a) Metric-name collision** — `materialize.reconcile.<verdict>` is emitted both as a gauge (this sweep's standing count) and as a counter (cumulative terminalizations) at `reconcile.py:585-587`, so a dashboard globbing the prefix shows two series under one name; the fix is two namespaces (`…verdict.<name>` gauge, `…terminalized.<name>` counter). **(b) No `EXPLAIN` test for the query the sweep depends on** — the plan assertion covers `_EXPIRED_REQUESTS_SQL` (`test_request_store.py:483-491`), while the *sufficient* query is `_UNREACHABLE_MESSAGE_SQL`'s correlated `NOT EXISTS` over `queue.message_id` (`reconcile.py:265-271`), which has none: an index change on `queue` could turn each candidate's lookup into a scan with nothing red. **(c) N+1** — one `_message` read per candidate (`reconcile.py:305`), bounded by the sweep's `limit`, collapsible into a single `= ANY(...)`. | A deployment whose sweep is large enough to measure, or the first dashboard built on the `materialize.reconcile` prefix. All three are cosmetic at G-1 volumes: with the flag off nothing enqueues materialization work at all. |
 | 🟡 **G-2's prepared parameters need their OWN run-keyed table — 1054 can never hold them** | Plan §3.6's amendment, restated here because it is a G-2 precondition and a migration author looks in this file rather than in a plan. Two independent proofs: `prepare_run` is keyed on `run_id`/`business_dt` (`runprep.py:831`) so the parameter set is RUN-scoped while `materialization_compiled_artifact` is `generation_id PRIMARY KEY` — one row could hold only one run's set; and 1054 takes 1034's append-only guards, whose function has no escape branch, so a nullable column reserved today could never be filled by a later `UPDATE`. Numbering consequence: **1053 and 1054 are used; 1055 stays reserved for G-3's active-revision pointer; 1056 is numerically free but claiming it requires appending to the Track-1-owned D7 reservation table in the same commit** — `docs/architecture/2026-08-01-verified-interfaces-semantic-profiles.md`, which is not on this branch. A coordination step, not a unilateral one. | G-2's first migration. Taking 1056 without the D7 append repeats the 1032/1033 double-allocation A.22 records. |
 | 🟡 **`/materialization-runs` is absent from both ingress prefix lists** | `deploy/kind/nginx.conf:16`'s `location ~ ^/(uploads\|search\|…\|data-sources)(/\|$)` and `frontend/vite.config.ts:15-19`'s `API_PATHS` both omit it, so a `POST` through the ingress falls through to the SPA location and answers 405 without ever reaching the API. Harmless today — the flag is default-OFF, both routes 404 while it is off, and no frontend code calls them — but the consequence is precise and easy to lose: **enabling `FEATUREGEN_MATERIALIZE_ENABLED` in a deployed environment is not sufficient to make the trigger reachable.** Not fixed on this branch by decision: both files are shared with a parallel session holding an in-flight `/data-sources` change, and a two-line edit there buys a merge conflict in exchange for a route nothing calls. | Before the flag is turned on in ANY environment reached through the ingress. Closure is one prefix in each list, and it belongs in the same change that enables the flag so the two cannot disagree. |
+
+### A.40 🟡 A lagging overlay projection is reported as an authoring failure, and names itself nowhere (2026-08-04)
+
+Found while building A.36's durable bridge seed, and it is not a fixture problem — the fixture is
+only how it was met. The mis-attribution is real in a deployment.
+
+**The mechanism.** `read_operational_value` calls `check_projection_readiness` FIRST, before any read
+is trusted (`overlay/upload/operational_facts.py:441-451`), and that gate compares the overlay
+projection's checkpoint against the GLOBAL event head — `COALESCE(max(global_seq), 0) FROM events`,
+not a per-catalog watermark (`feature_metadata_snapshot.py:145,158-164`). So **any** event appended
+anywhere by anything — an identifier-link proposal, a bridge governance event, a field confirmation
+in an unrelated catalog — puts every governed read in the platform behind the head until the
+projection catches up. That is the correct fail-closed posture and is not the finding.
+
+**The finding is where the verdict surfaces.** `_fail_closed` returns `status="projection_unavailable"`
+carrying the projection's own detail, but nothing downstream keeps it. The authoring lane folds a
+degraded governed read into `NEEDS_AUTHORITY` and the run closes `NEEDS_REVIEW`; the chain's
+resolution seam then reports `NOT_RESOLVED: work item <id> names authoring run <id>, which closed
+NEEDS_REVIEW, not RESOLVED` and stops at `ChainStage.RESOLVE`. **Neither the refusal detail, the
+request row, nor the control plane contains the word `projection_unavailable`, a checkpoint, or a
+head sequence.** An operator holding that refusal is pointed squarely at the LLM authoring layer —
+the model, the critic, the proposal — which is not where the problem is. The problem is that a
+background projection is behind, is probably already catching up, and the run would succeed on
+retry.
+
+Compounded by A.37: a pre-seal refusal has nowhere in the plane to record a stage or a code at all,
+so this diagnosis is not merely absent from the refusal text — it is absent from everything
+queryable.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A governed refusal caused by a LAGGED overlay projection is reported as `NEEDS_REVIEW` authoring, and the lag is named nowhere an operator can read** | Surfacing it means threading a distinguishable state from `read_operational_value` through the authoring resolver's `NEEDS_AUTHORITY` fold and into the chain's refusal — three modules across two ownership boundaries (`overlay/upload/`, `formula/`), and the fold currently has one bucket for "a governed read did not answer" whether the cause is no decision, a conflict or a stale read model. Widening that vocabulary is a governed-authority decision, not a wiring change. Harmless to correctness: it fails CLOSED and a retry after the projection drains succeeds. | The first operator who debugs a `NEEDS_REVIEW` that had nothing to do with authoring — likely the first busy environment, since the gate is global rather than per-catalog and any concurrent upload can trip it. Closure: carry `projection_unavailable` (with the checkpoint and head) as its own reason through the fold, so the refusal says *the read model is behind* rather than *the model produced something needing review*; the retry advice follows for free. |
+| ⚪ **Test fixtures that append governance events must drain the projection themselves, and two copies of that drain now exist** | `_bridge_fixtures.seed_verified_bridge` and `test_cross_catalog_ir.seed_executable_bridge_realization` each run `run_projection(db, OverlayProjection())` to exhaustion and assert `projection_degraded` is empty, for exactly the reason above. A third copy is a third chance to get it subtly wrong (drain but not assert, assert but not drain). | The third fixture that needs it. Closure: one shared helper beside `_bridge_fixtures`, called by both. |

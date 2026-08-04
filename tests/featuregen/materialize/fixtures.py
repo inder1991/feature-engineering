@@ -1,4 +1,10 @@
-"""Spec A — the three worked features, hand-authored, and the governed catalog they author over.
+"""Spec A — the four worked features, hand-authored, and the governed catalog they author over.
+
+FOUR, not the spec's three. The fourth (:data:`BRIDGED_FEATURE_NAME`) reduces onto a key in ANOTHER
+catalog, and exists because no durable feature identity in the tree could otherwise drive a
+CROSS-CATALOG compilation (DEFERRED-WORK A.36). Its body is the first feature's byte-for-byte; only
+the grain moves. The three first-slice features are unchanged, and everything below holds for all
+four.
 
 Two halves that MUST agree, and a test that proves they do
 (``test_fixtures.py::test_every_fixture_is_what_child1_really_resolves``):

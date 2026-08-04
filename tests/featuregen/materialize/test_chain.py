@@ -373,6 +373,12 @@ def test_a_bridged_group_with_NO_durable_realization_is_refused_at_COMPILE(
 
     Without this, a chain that had (say) fallen back to link availability would pass the test above
     for the wrong reason and nothing would say so.
+
+    The DETAIL is pinned, not only the code. ``JOIN_CARDINALITY_UNKNOWN`` is emitted from fourteen
+    places across seven modules — five in ``joins.py`` alone — so the code by itself would also be
+    satisfied by a same-catalog traversal refusing for something entirely unrelated. Only
+    ``expression_ir._plan_to_grain`` says "resolved to N current executable directional
+    realizations", and only the STORE READ can make N zero.
     """
     _seed_bridge(catalog)
     request_id = _request(catalog)
@@ -384,6 +390,8 @@ def test_a_bridged_group_with_NO_durable_realization_is_refused_at_COMPILE(
     assert outcome.stopped_at is ChainStage.COMPILE
     assert outcome.refusal is not None
     assert outcome.refusal.code is CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN
+    assert "resolved to 0 current executable directional realizations" in outcome.refusal.detail
+    assert "hdfc -> crm" in outcome.refusal.detail
     assert outcome.lifecycle_state is RequestLifecycle.FAILED
     assert outcome.generation_id is None
 

@@ -541,6 +541,10 @@ def test_the_SAME_bridged_trigger_with_NO_stored_realization_is_refused_at_COMPI
     assert outcome.stopped_at == ChainStage.COMPILE.value
     assert (outcome.detail or "").startswith(
         f"{CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN.value}: ")
+    # WHICH refusal, not just which code: that code is emitted from fourteen places across seven
+    # modules, and only `expression_ir._plan_to_grain`'s cross-catalog branch counts realizations.
+    assert "resolved to 0 current executable directional realizations" in (outcome.detail or "")
+    assert "hdfc -> crm" in (outcome.detail or "")
     assert _stored(conn, request_id).lifecycle_state is RequestLifecycle.FAILED
     assert _plane_counts(conn) == _EMPTY_PLANE
     assert list(bridged_deployment.iterdir()) == []
