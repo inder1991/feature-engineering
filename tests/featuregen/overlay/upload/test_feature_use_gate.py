@@ -723,14 +723,19 @@ def test_NO_policy_can_clear_a_protected_characteristic(db):
             approve_pii_use_policy(db, concept_name=concept_name, purpose="credit scoring",
                                    expected_pointer_version=0, actor="admin@bank")
 
-    # the hand-forged row a store refuses to write, written anyway — the gate still refuses
+    # The hand-forged row a store refuses to write, written anyway — the gate still refuses. The
+    # attestation hashes are placeholders of the right SHAPE (1056 CHECKs them): this row is never
+    # read, because class 2 refuses the operand before any policy is consulted, and that is exactly
+    # the property being asserted.
     db.execute(
         "INSERT INTO pii_use_policy_revision (revision_id, concept_name, purpose, status, "
-        "content_hash, approved_by) VALUES (%s, 'protected_attribute', 'credit scoring', "
-        "'active', %s, 'rogue')", ("pup_" + "9" * 64, "9" * 64))
+        "content_hash, approved_by, attestation_hash) "
+        "VALUES (%s, 'protected_attribute', 'credit scoring', 'active', %s, 'rogue', %s)",
+        ("pup_" + "9" * 64, "9" * 64, "9" * 64))
     db.execute(
         "INSERT INTO pii_use_policy_current (concept_name, revision_id, pointer_version, "
-        "declared_by) VALUES ('protected_attribute', %s, 1, 'rogue')", ("pup_" + "9" * 64,))
+        "declared_by, attestation_hash) VALUES ('protected_attribute', %s, 1, 'rogue', %s)",
+        ("pup_" + "9" * 64, "9" * 64))
 
     protected = _col(db, "cust", "ctzn_ctry_cd", concept="protected_attribute", data_type="text")
     _idea, rej = _validate(db, [protected])

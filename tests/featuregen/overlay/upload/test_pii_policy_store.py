@@ -29,6 +29,7 @@ from featuregen.overlay.upload.pii_policy_store import (
     current_pii_use_policy,
     load_pii_use_policy_revision,
     pii_use_policy_states,
+    resolve_policy_provenance,
     revoke_pii_use_policy,
     set_current_pii_use_policy,
 )
@@ -39,6 +40,15 @@ from featuregen.overlay.upload.source_selection import (
 
 ADMIN = "admin@bank"
 AML = "AML transaction monitoring"
+
+#: The composite FK migration 1056 puts on the pointer. Dropping it is how a test reaches the
+#: corrupt shapes the database now refuses outright — the probes below have to construct a state no
+#: supported write path can produce, and saying so out loud is the point of naming the constraint.
+_POINTER_FK = "pii_use_policy_current_concept_revision_fk"
+
+
+def _unbolt_the_pointer_fk(db) -> None:
+    db.execute(f"ALTER TABLE pii_use_policy_current DROP CONSTRAINT {_POINTER_FK}")
 
 
 # ── what may be licensed at all ─────────────────────────────────────────────────────────────────
@@ -203,11 +213,14 @@ def test_a_pointer_at_a_missing_revision_raises_rather_than_serving_nothing(db):
     a store that silently forgets a declaration, and the forgetting would look like a refusal."""
     approve_pii_use_policy(
         db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
-    db.execute("ALTER TABLE pii_use_policy_current DROP CONSTRAINT "
-               "pii_use_policy_current_revision_id_fkey")
+    _unbolt_the_pointer_fk(db)
     db.execute("UPDATE pii_use_policy_current SET revision_id = %s", ("pup_" + "0" * 64,))
     with pytest.raises(PolicyStoreConflict):
         current_pii_use_policy(db, "pep_flag")
+    # and the GATE's reader agrees — a dangling pointer used to drop out of the bulk read silently,
+    # which meant one surface shouted about corruption while the other quietly said "no policy"
+    with pytest.raises(PolicyStoreConflict):
+        active_pii_use_policies(db, ["pep_flag"])
 
 
 def test_an_edited_revision_fails_content_verification(db):
@@ -344,6 +357,186 @@ def test_the_state_listing_tells_never_declared_apart_from_revoked(db):
     assert by_name["geolocation"].revision.purpose == "impossible travel detection"
     assert by_name["device_fingerprint"].status == "none"
     assert by_name["device_fingerprint"].revision is None
+
+
+# ── a pointer cannot license across concepts (review F1) ────────────────────────────────────────
+#
+# THE PROBE, in the reviewer's own shape: approve concept A, approve concept B, revoke A — then aim
+# A's pointer at B's still-ACTIVE revision. Before the fix the gate's bulk reader joined on
+# `revision_id` alone and keyed its answer off the REVISION's concept, so the corrupt pointer
+# licensed B a second time while A — the concept somebody deliberately withdrew — went on being
+# refused, and nothing anywhere said a word. Three layers refuse it now and all three are driven.
+
+
+def _cross_concept_probe(db) -> tuple[str, str]:
+    """Approve `pep_flag` and `geolocation`, revoke `pep_flag`. Returns (pep_rev, geo_rev)."""
+    pep, v1 = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    geo, _v = approve_pii_use_policy(
+        db, concept_name="geolocation", purpose="impossible travel detection",
+        expected_pointer_version=0, actor=ADMIN)
+    revoke_pii_use_policy(db, concept_name="pep_flag", expected_pointer_version=v1, actor=ADMIN)
+    return pep, geo
+
+
+def test_the_STORE_refuses_to_point_one_concept_at_another_concepts_revision(db):
+    """Layer 1: the write path names what is wrong, in words a reviewer can act on."""
+    _pep, geo = _cross_concept_probe(db)
+    with pytest.raises(PolicyValidationError) as exc:
+        set_current_pii_use_policy(db, concept_name="pep_flag", revision_id=geo,
+                                   expected_pointer_version=2, declared_by=ADMIN)
+    assert "geolocation" in str(exc.value) and "pep_flag" in str(exc.value)
+    # nothing moved: pep_flag is still revoked and still unlicensed
+    assert active_pii_use_policies(db, ["pep_flag", "geolocation"]) == {"geolocation": geo}
+
+
+def test_the_DATABASE_refuses_the_same_shape_even_with_the_store_out_of_the_way(db):
+    """Layer 2: the composite FK. The store guard and the reader guard are both code somebody can
+    later 'simplify'; this one is not, which is why it exists as well as them."""
+    _pep, geo = _cross_concept_probe(db)
+    with pytest.raises(Exception) as exc:   # psycopg ForeignKeyViolation, driver-typed
+        db.execute("UPDATE pii_use_policy_current SET revision_id = %s "
+                   "WHERE concept_name = 'pep_flag'", (geo,))
+    assert "foreign key" in str(exc.value).lower() or _POINTER_FK in str(exc.value)
+
+
+def test_BOTH_surfaces_refuse_the_corrupt_pointer_loudly_and_neither_licenses_it(db):
+    """Layer 3, and the property that matters most: the governance listing and the gate's reader
+    give the SAME verdict on the same corrupt record.
+
+    A silent drop in the bulk reader would be safe-but-divergent — the panel would raise while the
+    feature flow quietly said "no policy", and nobody reading either could tell which surface was
+    describing reality. Both refuse, and the refusal names the concept."""
+    _pep, geo = _cross_concept_probe(db)
+    _unbolt_the_pointer_fk(db)                    # the shape no supported write path can produce
+    db.execute("UPDATE pii_use_policy_current SET revision_id = %s "
+               "WHERE concept_name = 'pep_flag'", (geo,))
+
+    with pytest.raises(PolicyStoreConflict) as gate:
+        active_pii_use_policies(db, ["pep_flag", "geolocation"])
+    assert "pep_flag" in str(gate.value)
+    with pytest.raises(PolicyStoreConflict):
+        pii_use_policy_states(db)
+    with pytest.raises(PolicyStoreConflict):
+        current_pii_use_policy(db, "pep_flag")
+
+
+# ── the approver record is tamper-evident (review F3) ───────────────────────────────────────────
+
+
+def test_a_FORGED_approver_is_caught_on_every_read_path(db):
+    """The reviewer's forge probe. `approved_by` is outside the content hash BY DESIGN (that is what
+    makes re-approval resolve back to the original revision id), which left the one field the
+    single-approver deviation rests on rewritable by a plain UPDATE. The attestation closes it
+    without touching identity."""
+    revision_id, _v = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    db.execute("UPDATE pii_use_policy_revision SET approved_by = 'someone-else@bank' "
+               "WHERE revision_id = %s", (revision_id,))
+
+    for read in (lambda: load_pii_use_policy_revision(db, revision_id),
+                 lambda: current_pii_use_policy(db, "pep_flag"),
+                 lambda: pii_use_policy_states(db),
+                 lambda: active_pii_use_policies(db, ["pep_flag"])):
+        with pytest.raises(PolicyStoreConflict) as exc:
+            read()
+        assert "APPROVER verification" in str(exc.value)
+
+
+def test_a_FORGED_declarer_on_the_POINTER_is_caught_too(db):
+    """"Who approved this content" and "who made it current" are two records and both are the
+    control. Backdating `pointer_version` into the seal is what stops an older, legitimately
+    attested declarer being replayed onto a later pointer state."""
+    approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    db.execute("UPDATE pii_use_policy_current SET declared_by = 'someone-else@bank' "
+               "WHERE concept_name = 'pep_flag'")
+
+    for read in (lambda: current_pii_use_policy(db, "pep_flag"),
+                 lambda: pii_use_policy_states(db),
+                 lambda: active_pii_use_policies(db, ["pep_flag"])):
+        with pytest.raises(PolicyStoreConflict) as exc:
+            read()
+        assert "DECLARER verification" in str(exc.value)
+
+
+def test_a_REPLAYED_pointer_version_does_not_rescue_a_forged_declarer(db):
+    """The seal covers the version, so a v1 attestation cannot be pasted onto a v2 pointer."""
+    _a, v1 = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    first = db.execute("SELECT attestation_hash FROM pii_use_policy_current "
+                       "WHERE concept_name = 'pep_flag'").fetchone()[0]
+    revoke_pii_use_policy(db, concept_name="pep_flag", expected_pointer_version=v1, actor="sam")
+    db.execute("UPDATE pii_use_policy_current SET declared_by = %s, attestation_hash = %s "
+               "WHERE concept_name = 'pep_flag'", (ADMIN, first))
+    with pytest.raises(PolicyStoreConflict):
+        current_pii_use_policy(db, "pep_flag")
+
+
+def test_the_attestation_does_NOT_move_content_identity(db):
+    """The property the whole fix had to preserve: approve -> revoke -> re-approve still resolves to
+    the ORIGINAL revision id. Tamper-evidence rides beside identity, never inside it."""
+    approved, v1 = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    _revoked, v2 = revoke_pii_use_policy(
+        db, concept_name="pep_flag", expected_pointer_version=v1, actor=ADMIN)
+    again, v3 = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=v2, actor="third@bank")
+
+    assert again == approved and v3 == 3
+    # the FIRST approver's attestation survives the re-approval untouched — ON CONFLICT DO NOTHING
+    # means the revision row (and its seal) is the one the first declaration wrote
+    assert load_pii_use_policy_revision(db, approved) is not None
+    assert db.execute("SELECT approved_by FROM pii_use_policy_revision WHERE revision_id = %s",
+                      (approved,)).fetchone() == (ADMIN,)
+    # ...while the POINTER records the third person, verifiably
+    _revision, pointer = current_pii_use_policy(db, "pep_flag")
+    assert pointer.declared_by == "third@bank"
+
+
+def test_an_unknown_stored_status_is_store_corruption_not_a_bad_request(db):
+    """The 1056 CHECK forbids it, so a status this store has no meaning for can only have arrived by
+    a route nothing supports — and the only safe reading of it is to refuse the read."""
+    from featuregen.overlay.upload.pii_policy_store import _verified
+
+    revision_id, _v = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    row = db.execute(
+        "SELECT concept_name, purpose, provenance, content_hash, approved_by, approved_at, "
+        "attestation_hash FROM pii_use_policy_revision WHERE revision_id = %s",
+        (revision_id,)).fetchone()
+    with pytest.raises(PolicyStoreConflict) as exc:
+        _verified(row[0], row[1], "pending", row[2], row[3], revision_id, row[4], row[5], row[6])
+    assert "unknown status" in str(exc.value)
+
+
+# ── resolving a contract's recorded revision ids (review F11) ───────────────────────────────────
+
+
+def test_resolve_policy_provenance_separates_the_revisions_STATUS_from_its_CURRENCY(db):
+    """The convenience that stops `.active` being read as "still in force". An `active` revision that
+    is no longer current is the NORMAL outcome of approve -> revoke -> re-approve, so a governed
+    contract can truthfully name an `active` revision that licenses nothing right now."""
+    approved, v1 = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose=AML, expected_pointer_version=0, actor=ADMIN)
+    revoked, _v2 = revoke_pii_use_policy(
+        db, concept_name="pep_flag", expected_pointer_version=v1, actor=ADMIN)
+
+    by_id = {p.revision_id: p for p in resolve_policy_provenance(db, [approved, revoked])}
+    assert by_id[approved].status == "active"        # its OWN declaration, forever
+    assert by_id[approved].is_current is False       # ...and not what the concept says today
+    assert by_id[approved].current_revision_id == revoked
+    assert by_id[approved].approved_by == ADMIN
+    assert by_id[revoked].status == "revoked" and by_id[revoked].is_current is True
+    assert by_id[approved].concept_name == "pep_flag"
+    assert resolve_policy_provenance(db, []) == ()
+
+
+def test_resolve_policy_provenance_raises_on_an_id_the_store_cannot_produce(db):
+    """Revisions are immutable and are never deleted, so an id a governed artifact recorded and the
+    store cannot produce is corruption, not an empty answer."""
+    with pytest.raises(PolicyStoreConflict):
+        resolve_policy_provenance(db, ["pup_" + "7" * 64])
 
 
 def test_a_pointer_advance_that_loses_the_race_reports_the_concept(db):

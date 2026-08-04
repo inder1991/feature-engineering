@@ -37,6 +37,23 @@
 -- declared, under what class of authority"; `approved_by` / `approved_at` are "who filed it". A
 -- second admin declaring identical content reuses the revision, and the pointer records who made
 -- it current.
+--
+-- ...AND WHY THAT SPLIT NEEDS A SECOND HASH (review F3). Keeping the approver OUT of identity is
+-- correct — it is what makes approve -> revoke -> re-approve resolve back to the ORIGINAL revision
+-- id — but it left the ONE field the single-approver deviation rests on with nothing protecting
+-- it: a plain UPDATE could rewrite `approved_by` and the content hash would still verify, so the
+-- record that IS the control could be forged in place. `attestation_hash` closes that WITHOUT
+-- touching content identity: it covers {revision_id, approved_by, approved_at} only, is written at
+-- insert, and is re-derived on EVERY read path. The pointer row gets the same treatment over
+-- {concept_name, revision_id, declared_by, pointer_version} because "who made it current" is the
+-- other half of the same record. Identity is unchanged; only tamper-evidence is added.
+--
+-- A POINTER CANNOT LICENSE ACROSS CONCEPTS (review F1). The pointer's FK is COMPOSITE
+-- (concept_name, revision_id), not revision_id alone. With the single-column FK a pointer for
+-- concept A could legally name concept B's revision, and the gate's bulk reader — which joined on
+-- revision_id and keyed off the REVISION's concept — would then license B while A's own policy was
+-- revoked. The database is the layer that has to refuse that shape, because the store guard and
+-- the reader guard are both code somebody can later "simplify"; a composite FK is not.
 
 CREATE TABLE IF NOT EXISTS pii_use_policy_revision (
     revision_id   text        PRIMARY KEY
@@ -51,18 +68,57 @@ CREATE TABLE IF NOT EXISTS pii_use_policy_revision (
     provenance    jsonb       NOT NULL DEFAULT '{}'
         CHECK (jsonb_typeof(provenance) = 'object'),
     content_hash  text        NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
-    -- Provenance, OUTSIDE content identity (module header).
+    -- Provenance, OUTSIDE content identity (module header) — and TAMPER-EVIDENT because of it.
     approved_by   text        NOT NULL,
     approved_at   timestamptz NOT NULL DEFAULT now(),
-    created_at    timestamptz NOT NULL DEFAULT now()
+    -- materialize_hash({revision_id, approved_by, approved_at}) — NOT NULL because a nullable one
+    -- would have to be read as "unverifiable", and an unverifiable approver record is exactly the
+    -- state this column exists to make impossible.
+    attestation_hash text     NOT NULL CHECK (attestation_hash ~ '^[0-9a-f]{64}$'),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    -- The composite the pointer's FK targets. Redundant with the primary key for uniqueness (the
+    -- revision id already implies its concept); it exists ONLY so `(concept_name, revision_id)` is
+    -- a referenceable key, which is what lets the pointer be constrained to its OWN concept.
+    CONSTRAINT pii_use_policy_revision_concept_revision_unique
+        UNIQUE (concept_name, revision_id)
 );
 CREATE INDEX IF NOT EXISTS pii_use_policy_revision_concept_idx
     ON pii_use_policy_revision (concept_name);
 
 CREATE TABLE IF NOT EXISTS pii_use_policy_current (
     concept_name    text        PRIMARY KEY,
-    revision_id     text        NOT NULL REFERENCES pii_use_policy_revision(revision_id),
+    revision_id     text        NOT NULL,
     pointer_version integer     NOT NULL CHECK (pointer_version >= 1),
     declared_by     text        NOT NULL,
-    updated_at      timestamptz NOT NULL DEFAULT now()
+    -- materialize_hash({concept_name, revision_id, declared_by, pointer_version}) — the same
+    -- tamper-evidence over WHO made this revision current. `updated_at` is deliberately NOT covered:
+    -- it is a clock reading, not a decision, and folding it in would make the attestation unstable
+    -- across a timestamp round-trip for no gain in what it proves.
+    attestation_hash text      NOT NULL CHECK (attestation_hash ~ '^[0-9a-f]{64}$'),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    -- COMPOSITE, not `REFERENCES pii_use_policy_revision(revision_id)` (header): the pointer may
+    -- only name a revision OF ITS OWN CONCEPT.
+    CONSTRAINT pii_use_policy_current_concept_revision_fk
+        FOREIGN KEY (concept_name, revision_id)
+        REFERENCES pii_use_policy_revision (concept_name, revision_id)
 );
+
+-- ── the contract-side half of the same surface (review F2) ──────────────────────────────────────
+-- The gate resolves WHICH policy revisions licensed a candidate's personal-data operands, but until
+-- now that answer died on the in-memory FeatureIdea: the governed artifact recorded no trace of what
+-- allowed it. This column carries it, written at CONFIRM from the confirm-time gate re-consult (not
+-- from Gate #1), so a contract records the revisions that covered it AT the governing write. Rides
+-- on `contract` beside the other at-confirm provenance columns (1011) rather than in a table of its
+-- own: it is a property of one immutable contract version, never a relationship with a life of its
+-- own. `[]` means "this feature bound no personal data", which is the overwhelming majority and is
+-- NOT the same as "we did not check" — a candidate that needed a policy and lacked one was refused
+-- and never reached a contract.
+--
+-- This ALTER is why 1056 is still the only number this stream allocates (D7): the column belongs to
+-- the D14 surface, and splitting it into a 1057 would allocate a second number for one half of one
+-- decision.
+ALTER TABLE contract ADD COLUMN IF NOT EXISTS
+    personal_data_policy_revision_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE contract DROP CONSTRAINT IF EXISTS contract_pii_policy_ids_ck;
+ALTER TABLE contract ADD CONSTRAINT contract_pii_policy_ids_ck
+    CHECK (jsonb_typeof(personal_data_policy_revision_ids) = 'array');
