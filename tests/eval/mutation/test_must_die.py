@@ -90,6 +90,7 @@ def test_the_registry_covers_every_invariant_the_plans_named() -> None:
         "retrieval_drops_profile_context",
         "graph_projection_read_as_authority",
         "profile_hash_omits_business_context",
+        "disable_the_feature_use_gate",
     }
     registered = {m.mutation_id for m in mutations.REGISTRY}
     missing = required - registered
@@ -153,7 +154,9 @@ RELEASE_GATE_BASELINE = 273  # rebaselined 2026-08-03: the Track-2 merge added 4
 EVAL_SUITES: dict[str, int] = {
     "tests/eval/test_gold_sets_are_consistent.py": 63,
     "tests/eval/test_release_a_eval.py": 4,
-    "tests/eval/test_release_a_bars.py": 16,        # 15 passed + 1 strict xfail (bar 4, see there)
+    # 16 passed. It was 15 passed + 1 strict xfail until the USE gate landed and promoted bar 4 to
+    # a real bar; the COUNT is unchanged because a strict xfail was always collected.
+    "tests/eval/test_release_a_bars.py": 16,
 }
 
 

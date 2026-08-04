@@ -256,6 +256,25 @@ def _m_noop_reorder_registry() -> None:
     enrich._CONCEPT_VOCABULARY = list(concepts_mod.classification_vocabulary())
 
 
+def _m_disable_the_feature_use_gate() -> None:
+    """The USE gate stops asking, and a visible column is a usable one again.
+
+    This is the Release-A finding restored in one line: `_validate_idea` calls `_use_gate`, which
+    returns None immediately when the flag is off, so flipping the reader reproduces exactly the
+    state bar 4 was a strict xfail against — a PII column, a protected characteristic, a
+    currency-blind amount and a free-text label all accepted as DESIGN_CHECKED with zero
+    requirements. Nothing else changes: leakage, staleness, numeric type, additivity, units,
+    point-in-time, grain and join authority all run unaltered.
+
+    Patched on the CONSUMER's own module, which is also the producer here (`feature_assist` reads
+    its own `feature_use_gate_enabled` through module globals at call time), so the setattr
+    genuinely changes what the code under test does.
+    """
+    from featuregen.overlay.upload import feature_assist
+
+    feature_assist.feature_use_gate_enabled = lambda: False
+
+
 _SUPERSESSION = "tests/featuregen/overlay/upload/test_supersession_consistency.py"
 _REPLAY = "tests/featuregen/overlay/upload/test_enrichment_replay_identity.py"
 _SCOPE = "tests/featuregen/overlay/upload/test_identifier_scope.py"
@@ -265,6 +284,7 @@ _CONSUME = "tests/featuregen/overlay/upload/test_profile_consumption.py"
 _CTXGRAPH = "tests/featuregen/overlay/upload/test_context_graph.py"
 _V4 = "tests/featuregen/overlay/upload/test_feature_context_v4.py"
 _BARS = "tests/eval/test_release_a_bars.py"
+_USEGATE = "tests/featuregen/overlay/upload/test_feature_use_gate.py"
 
 
 REGISTRY: tuple[Mutation, ...] = (
@@ -466,6 +486,21 @@ REGISTRY: tuple[Mutation, ...] = (
         notes="SURVIVED. The pre-existing hash-sensitivity test walks definition, authority_role, "
               "a governed fact head and the narrative revision — every meaning-bearing input "
               "EXCEPT business_context.",
+    ),
+    Mutation(
+        mutation_id="disable_the_feature_use_gate",
+        kind=MUST_DIE,
+        invariant="sensitivity says who may SEE a column; the USE gate says who may BUILD from it",
+        target="feature_assist:feature_use_gate_enabled",
+        victims=(
+            f"{_BARS}::test_bar_zero_unsafe_gold_features_accepted",
+            f"{_USEGATE}::test_personal_data_is_refused_naming_the_MISSING_POLICY_not_the_column",
+        ),
+        apply=_m_disable_the_feature_use_gate,
+        expect_failure_contains="unsafe gold features accepted:",
+        notes="Bar 4 was a STRICT XFAIL against exactly this state until the gate landed — of five "
+              "unsafe gold classes the platform refused one. The mutation restores the finding, so "
+              "the bar has to die on it or the bar is passing for some other reason.",
     ),
     Mutation(
         mutation_id="noop_reorder_registry_declarations",

@@ -189,7 +189,19 @@ const FEEDBACK_ROUNDS = 3
 
 // Human labels for gauntlet rejection codes. STALE reads "stale source"; every other code
 // lowercases with spaces so even an unknown code from a newer backend reads as words.
-const REJECT_LABELS: Record<string, string> = { STALE: 'stale source' }
+//
+// The four USE-gate codes are spelled out rather than left to the fallback, because the fallback
+// would render "personal data policy required" as a verdict on the COLUMN when it is a statement
+// about a policy nobody has written yet. Two of the four are things no approval can change and two
+// are things somebody has to set up; the label says which, so a reviewer knows whether to abandon
+// the idea or to go and ask someone. The backend's `reason` carries the specifics beside it.
+const REJECT_LABELS: Record<string, string> = {
+  STALE: 'stale source',
+  PROTECTED_CHARACTERISTIC: 'protected characteristic',
+  DESCRIPTIVE_OPERAND: 'descriptive column',
+  PERSONAL_DATA_POLICY_REQUIRED: 'needs a personal-data policy',
+  CURRENCY_POLICY_REQUIRED: 'needs a currency decision',
+}
 
 function rejectLabel(code: string): string {
   return REJECT_LABELS[code] ?? code.toLowerCase().replace(/_/g, ' ')

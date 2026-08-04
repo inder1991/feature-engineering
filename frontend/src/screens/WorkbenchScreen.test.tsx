@@ -584,6 +584,27 @@ describe('rejections panel', () => {
     expect(screen.queryByText('NO_REVISION')).not.toBeInTheDocument()
   })
 
+  it('says which USE-gate refusals a person can act on and which are final', async () => {
+    // The four Bar-4 codes. Two are things no approval can change ("protected characteristic",
+    // "descriptive column"); two name something nobody has set up yet ("needs a ..."). The label
+    // has to carry that difference — the fallback would word PERSONAL_DATA_POLICY_REQUIRED as a
+    // verdict on the column, sending the reviewer to abandon an idea a policy would allow.
+    await renderAndGenerate([IDEA], {}, [
+      { name: 'citizenship_propensity', reason: 'protected characteristic', code: 'PROTECTED_CHARACTERISTIC' },
+      { name: 'branch_desc_key', reason: 'a descriptive label, not a computable value', code: 'DESCRIPTIVE_OPERAND' },
+      { name: 'dob_bucket', reason: 'no personal-data use policy is declared', code: 'PERSONAL_DATA_POLICY_REQUIRED' },
+      { name: 'total_all_currencies', reason: 'the currency dimension is not bound', code: 'CURRENCY_POLICY_REQUIRED' },
+    ])
+    await userEvent.click(await screen.findByRole('button', { name: 'Show' }))
+    expect(screen.getByText('protected characteristic')).toBeInTheDocument()
+    expect(screen.getByText('descriptive column')).toBeInTheDocument()
+    expect(screen.getByText('needs a personal-data policy')).toBeInTheDocument()
+    expect(screen.getByText('needs a currency decision')).toBeInTheDocument()
+    // Never the raw enum token.
+    expect(screen.queryByText('PERSONAL_DATA_POLICY_REQUIRED')).not.toBeInTheDocument()
+    expect(screen.queryByText('personal data policy required')).not.toBeInTheDocument()
+  })
+
   it('omits the panel when the gauntlet rejected nothing', async () => {
     await renderAndGenerate([IDEA])
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()

@@ -626,3 +626,26 @@ show a diff the way the six revision-anchored pins can, and 1038 keeps only the 
 `proposed_by`, so the previous definition is gone entirely. Inherent to the 1038 shape, not to the
 seal. **Trigger:** when eligibility gets a revision store, replace the derived hash with the
 revision id and make the refusal name the change.
+
+### A.34 🟡 The feature USE gate — the two surfaces it deliberately does not build (2026-08-04)
+
+Recorded while landing the Bar-4 USE gate (`feature_assist._use_gate`), which closes the Release-A
+finding that sensitivity gated VISIBILITY and nothing gated USE. The gate refuses four classes
+outright. Two things a complete answer needs are deliberately NOT in it, and both are governance
+surfaces rather than validator work.
+
+**There is no human-confirmed override path.** A `PROTECTED_CHARACTERISTIC` or
+`DESCRIPTIVE_OPERAND` refusal is structurally_unsuitable and needs none. But
+`PERSONAL_DATA_POLICY_REQUIRED` and `CURRENCY_POLICY_REQUIRED` are `needs_setup` refusals — they
+name an artifact that does not exist yet — and today the only way past them is to fix the concept
+or bind the currency column. An override is a governed decision with an actor, a reason, a scope
+and a review trail; building it inside a validator would produce a bypass flag wearing a
+governance word, which is the failure mode the "a review badge is never a permission" bar already
+exists to prevent.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A personal-data USE policy (lawful basis + purpose), and the confirmed override that consumes it** | The refusal deliberately names the missing policy rather than blaming the column, so the wording is already correct for the day it lands. Building the store now would ship a policy with one writer and no reader — the inert-mechanism class this register has recorded seven times. The registry's own descriptions anticipate it (`pep_flag` / `sanctions_hit_flag` are tagged `pii` and annotated "usable for AML"), so those two concepts are the acceptance cases. | The first real feature request that legitimately needs a `pii`-classed operand — an AML model over `pep_flag` or `sanctions_hit_flag` is the expected first one. Fix shape: a governed policy revision scoped to (catalog, purpose), read by `_use_gate` exactly as `_governed_read` reads an operational value, so an ABSENT policy still refuses. |
+| 🟡 **A currency CONVERSION policy** — the third way through `CURRENCY_POLICY_REQUIRED`, beside binding the dimension and declaring the column's currency | The refusal message already offers it as an option, so the wording is forward-compatible, but no store exists. Conversion is not a validator decision: it needs a base currency, a point-in-time FX source and a governed rate, which is a materialization concern (`fx_conversion_rate` is already in the registry with nothing reading it). | The first cross-currency aggregate a customer actually asks for. Fix shape: a governed policy naming base currency + rate source; `_use_gate` clears on its presence, and the requirement rides to materialization rather than being dropped. |
+| 🟡 **`sensitivity="proxy"` concepts (`country_code`, `geographic`, `corridor`, `alternative_data`, `fatca_crs_classification`) are NOT gated** | A proxy is context-dependent in a way the other four classes are not: `country_code` is a national-origin proxy for CREDIT and an ordinary risk dimension for AML, and the platform has no use-case axis to tell them apart. Refusing every proxy would refuse legitimate AML features today; refusing none is the honest state until the axis exists. The registry already flags them, so nothing is lost. | The first credit/pricing use case, or the arrival of a declared model PURPOSE on the feature request. Fix shape: gate proxies on purpose, not on the concept alone. |
+| ⚪ **The refusal FAMILY is server-side only; the wire still carries `{name, reason, code}`** | `FEATURE_REFUSAL_FAMILIES` maps every `RejectCode` to a D5 family and an import-time validator refuses a code without one, but the family is not on the `/features/recommend` payload. Putting it there means adjudicating `GOVERNED_CROSS_CATALOG_PLAN_REQUIRED` — a rejection code `gate1` emits that is NOT a `RejectCode` member — and that code belongs to the cross-catalog stream, not this slice. The actionable wording is in `reason` today, and the frontend labels the four new codes. | The rejections-panel reframe (render the family, not a red "rejected" badge). Fix shape: one `_rejection` factory in `feature_assist`, `gate1`'s two non-`RejectCode` sites adjudicated with it, then the field on the wire and `api.ts`. |
