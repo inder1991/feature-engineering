@@ -62,6 +62,7 @@ from featuregen.overlay.upload.bridge_assessment import (
     LinkReviewStatus,
     TypeBasis,
 )
+from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
 from featuregen.overlay.upload.concepts import concept as registry_concept
 from featuregen.overlay.upload.crosswalk import (
     CrosswalkContractError,
@@ -189,28 +190,69 @@ class CrosswalkDiscoveryReportV1:
 
 # ── reads ───────────────────────────────────────────────────────────────────────────────────────
 
+#: The two raw ``table_role`` spellings the ONE adapter maps onto :attr:`DataRole.CROSSWALK` — the
+#: canonical ``bridge`` and the input alias ``crosswalk`` (``table_vocab._ROLE_ALIASES``). They are
+#: named here so the DISCRIMINATING filter can live in the SQL; the adapter stays the post-read
+#: authority, so a vocabulary change is still caught rather than silently widening this list.
+_CROSSWALK_TABLE_ROLES: tuple[str, ...] = ("bridge", "crosswalk")
+
+#: The mapping-dataset population, as a WHERE clause. Everything that DISCRIMINATES is in it, which
+#: is what makes ``LIMIT`` a cap on the right set (see :func:`_mapping_datasets`).
+_MAPPING_DATASET_WHERE = (
+    "gn.kind = 'table' "
+    "AND (lower(btrim(gn.table_role)) = ANY(%s) OR gn.data_role = %s) "
+    f"AND {anchor_visibility_predicate('gn')}")
+
+#: The identifier-column population, likewise.
+_IDENTIFIER_COLUMN_WHERE = (
+    "kind = 'column' AND concept = ANY(%s) AND COALESCE(visible_requires, '{}') <@ %s")
+
+
+def _identifier_namespace_concepts() -> list[str]:
+    """The registry's identifier-group concepts that declare a namespace — the pool's SQL filter.
+
+    A bounded list (~50 names today) built ONCE per pass, deliberately FROM the live registry
+    rather than hand-typed: a new identifier concept joins discovery by being registered, and one
+    that loses its namespace leaves, with no second list to forget."""
+    return sorted(
+        name for name, registered in CONCEPT_REGISTRY.items()
+        if registered.group == "identifier" and registered.namespace)
+
+
+def _true_count(conn: DbConn, *, table: str, where: str, params: Sequence[object]) -> int:
+    """How many rows the capped read WOULD have returned. Issued only when a cap actually bit —
+    honesty about a truncation is worth one extra aggregate; a second scan on every clean pass is
+    not."""
+    row = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}", list(params)).fetchone()
+    return int(row[0]) if row else 0
+
+
 def _mapping_datasets(conn: DbConn, *, roles: Iterable[str], source: str | None,
                       truncation: Counter[str]) -> list[tuple[str, str]]:
     """The visible tables whose role reads crosswalk/bridge — bounded, ordered, truncation counted.
 
-    The role is re-derived through the ONE adapter (``data_role_from_table_role``) from the node's
-    own ``table_role``, not read from the ``data_role`` display projection: that projection is
-    rebuildable and can be NULL between an ingest and its reprojection, and a discovery pass that
-    silently saw fewer mapping tables because a cache was cold is exactly the kind of quiet
-    incompleteness this catalog exists to avoid."""
+    **The filter is in the SQL, so the LIMIT caps the crosswalk-family population** and not "every
+    table carrying any role at all". Capping the wider set and filtering afterwards in Python is a
+    cap on the WRONG population: sixty ordinary dimension tables sorting first is a small catalog,
+    not an exotic one, and under that shape the one mapping table never survives the read — a pass
+    that reports zero candidates, truncates nothing, and is wrong.
+
+    The role is still re-derived through the ONE adapter (``data_role_from_table_role``) after the
+    read, as the authority check: the SQL names the two spellings that adapter maps, and the adapter
+    remains the thing that decides. A `data_role` disjunct is included because that projection is
+    the only surviving signal for a row whose raw ``table_role`` was never written."""
     allowed = allowed_classes(roles)
-    params: list[object] = [allowed, allowed]
-    where = ""
+    where = _MAPPING_DATASET_WHERE
+    params: list[object] = [
+        list(_CROSSWALK_TABLE_ROLES), DataRole.CROSSWALK.value, allowed, allowed]
     if source is not None:
-        where = "AND gn.catalog_source = %s "
+        where += " AND gn.catalog_source = %s"
         params.append(source)
-    params.append(MAX_MAPPING_DATASETS + 1)
     rows = conn.execute(
         "SELECT gn.catalog_source, gn.object_ref, gn.table_role, gn.data_role, "
         "       gn.event_or_snapshot FROM graph_node gn "
-        "WHERE gn.kind = 'table' AND (gn.table_role IS NOT NULL OR gn.data_role IS NOT NULL) "
-        f"AND {anchor_visibility_predicate('gn')} {where}"
-        "ORDER BY gn.catalog_source, gn.object_ref LIMIT %s", params).fetchall()
+        f"WHERE {where} ORDER BY gn.catalog_source, gn.object_ref LIMIT %s",
+        [*params, MAX_MAPPING_DATASETS + 1]).fetchall()
     out: list[tuple[str, str]] = []
     for catalog_source, object_ref, table_role, data_role, event_or_snapshot in rows:
         derived = data_role_from_table_role(table_role, event_or_snapshot=event_or_snapshot)
@@ -219,7 +261,11 @@ def _mapping_datasets(conn: DbConn, *, roles: Iterable[str], source: str | None,
         schema, table = object_ref.split(".", 1)
         out.append((catalog_source, normalize_ref(catalog_source, schema, table, None)))
     if len(rows) > MAX_MAPPING_DATASETS:
-        truncation[TRUNCATION_MAPPING_DATASETS] += len(rows) - MAX_MAPPING_DATASETS
+        # The TRUE omitted count, not the "at least one more row existed" that a LIMIT n+1 read
+        # can tell you: a truncation report whose number is always 1 is a flag wearing a count's
+        # name, and the operator reading it cannot tell 1 missing mapping table from 400.
+        total = _true_count(conn, table="graph_node gn", where=where, params=params)
+        truncation[TRUNCATION_MAPPING_DATASETS] += total - MAX_MAPPING_DATASETS
         out = out[:MAX_MAPPING_DATASETS]
     return out
 
@@ -230,15 +276,23 @@ def _identifier_columns(conn: DbConn, *, roles: Iterable[str],
 
     A column counts only when its concept is registered, is in the ``identifier`` group and declares
     a namespace — the same three conditions ``bridge_candidates._identifier_columns`` applies, for
-    the same reason: an unregistered concept grounds nothing."""
+    the same reason: an unregistered concept grounds nothing.
+
+    Those three conditions are answered by the REGISTRY, so the concept names they admit are pushed
+    into the query as a bounded ``= ANY`` list. The cap then bounds the identifier pool rather than
+    "every column carrying any concept" — a limit spent on two thousand amount columns leaves an
+    empty identifier pool and a silently candidate-free pass. The registry re-check below stays as
+    the post-read authority."""
+    concepts = _identifier_namespace_concepts()
+    where = _IDENTIFIER_COLUMN_WHERE
+    params: list[object] = [concepts, allowed_classes(roles)]
     rows = conn.execute(
         "SELECT catalog_source, object_ref, column_name, concept, entity FROM graph_node "
-        "WHERE kind = 'column' AND concept IS NOT NULL "
-        "AND COALESCE(visible_requires, '{}') <@ %s "
-        "ORDER BY catalog_source, object_ref LIMIT %s",
-        (allowed_classes(roles), MAX_IDENTIFIER_COLUMNS_PER_PASS + 1)).fetchall()
+        f"WHERE {where} ORDER BY catalog_source, object_ref LIMIT %s",
+        [*params, MAX_IDENTIFIER_COLUMNS_PER_PASS + 1]).fetchall()
     if len(rows) > MAX_IDENTIFIER_COLUMNS_PER_PASS:
-        truncation[TRUNCATION_IDENTIFIER_COLUMNS] += len(rows) - MAX_IDENTIFIER_COLUMNS_PER_PASS
+        total = _true_count(conn, table="graph_node", where=where, params=params)
+        truncation[TRUNCATION_IDENTIFIER_COLUMNS] += total - MAX_IDENTIFIER_COLUMNS_PER_PASS
         rows = rows[:MAX_IDENTIFIER_COLUMNS_PER_PASS]
     out: list[_IdentifierColumn] = []
     for catalog_source, object_ref, column_name, concept_name, entity in rows:

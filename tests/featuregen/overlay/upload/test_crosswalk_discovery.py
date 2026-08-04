@@ -26,6 +26,8 @@ from tests.featuregen.overlay.upload._crosswalk_fixtures import (
 from featuregen.overlay.upload.crosswalk_discovery import (
     CROSSWALK_SUGGESTION_RESULT_TYPE,
     MAX_ENDPOINT_COLUMNS_PER_NAMESPACE,
+    MAX_IDENTIFIER_COLUMNS_PER_PASS,
+    MAX_MAPPING_DATASETS,
     REASON_SINGLE_NAMESPACE,
     REASON_SUGGESTION_MALFORMED,
     REASON_SUGGESTION_NAMESPACE_MISMATCH,
@@ -34,6 +36,8 @@ from featuregen.overlay.upload.crosswalk_discovery import (
     REASON_TOO_FEW_IDENTIFIERS,
     SUBJECT_DATASET,
     TRUNCATION_ENDPOINT_COLUMNS,
+    TRUNCATION_IDENTIFIER_COLUMNS,
+    TRUNCATION_MAPPING_DATASETS,
     discover_crosswalk_candidates,
     persist_crosswalk_candidates,
 )
@@ -289,3 +293,110 @@ def test_a_clean_pass_reports_no_truncation(db) -> None:
     report = discover_crosswalk_candidates(db)
     assert report.truncated is False
     assert report.truncation_counts == {}
+
+
+# ── the bounds cap the FILTERED population, and the counts are real ─────────────────────────────
+#
+# A LIMIT over "every table carrying ANY role" (or "every column carrying ANY concept") followed by
+# a Python filter is a cap on the WRONG population: the discriminating filter has to be in the SQL,
+# or an ordinary catalog's ordinary tables push the one mapping table past the limit and discovery
+# reports a clean, empty, WRONG pass. These are the reviewer's two probe shapes.
+
+def _decoy_tables(db, count: int, *, role: str = "dimension", prefix: str = "aa_decoy") -> None:
+    """`count` VISIBLE tables carrying `role`, named so they sort BEFORE the real mapping table.
+
+    Each gets one column, because a table node's read scope is DERIVED from its columns — a table
+    with none is invisible and would never reach the limit in the first place."""
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, table_role) "
+        "SELECT 'cib', 'public.' || %s || '_' || lpad(i::text, 4, '0'), 'table', "
+        "       %s || '_' || lpad(i::text, 4, '0'), %s FROM generate_series(1, %s) AS i",
+        (prefix, prefix, role, count))
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name) "
+        "SELECT 'cib', 'public.' || %s || '_' || lpad(i::text, 4, '0') || '.filler', 'column', "
+        "       %s || '_' || lpad(i::text, 4, '0'), 'filler' FROM generate_series(1, %s) AS i",
+        (prefix, prefix, count))
+
+
+def _decoy_columns(db, count: int, *, concept: str, table: str = "aa_amounts") -> None:
+    """`count` visible columns carrying `concept`, in one table, sorting before the real ones."""
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "                        concept) "
+        "SELECT 'cib', 'public.' || %s || '.c' || lpad(i::text, 5, '0'), 'column', %s, "
+        "       'c' || lpad(i::text, 5, '0'), %s FROM generate_series(1, %s) AS i",
+        (table, table, concept, count))
+
+
+def test_sixty_roled_but_non_crosswalk_tables_do_not_hide_the_real_crosswalk(db) -> None:
+    """PROBE 1. Sixty ordinary dimension tables sorting first is not an exotic catalog — it is a
+    small one. If the LIMIT caps "tables carrying ANY role" the mapping table never survives the
+    read, and the pass reports zero candidates without reporting that it truncated anything."""
+    build_catalog(db)
+    _decoy_tables(db, 60)
+    report = discover_crosswalk_candidates(db)
+    assert report.mapping_datasets_considered == 1
+    assert len(report.candidates) == 1
+    assert report.candidates[0].mapping_dataset_ref == MAP
+    # And nothing was cut: the sixty were never in the mapping-table population to begin with.
+    assert report.truncation_counts.get(TRUNCATION_MAPPING_DATASETS) is None
+
+
+def test_two_thousand_non_identifier_columns_do_not_hide_the_identifier_pool(db) -> None:
+    """PROBE 2. The same defect one level down: a LIMIT over "every column carrying ANY concept"
+    is spent on amounts, dates and names long before it reaches an identifier."""
+    build_catalog(db)
+    _decoy_columns(db, 2010, concept="amount")
+    report = discover_crosswalk_candidates(db)
+    assert len(report.candidates) == 1
+    assert report.candidates[0].definition is not None
+    assert report.truncation_counts.get(TRUNCATION_IDENTIFIER_COLUMNS) is None
+
+
+def test_the_mapping_dataset_truncation_count_is_the_TRUE_omitted_number(db) -> None:
+    """A cap that bites must say how much it cut. `len(rows) - LIMIT` over a `LIMIT n+1` read can
+    only ever say "1", which is a truncation flag wearing a count's name."""
+    omitted = 7
+    build_catalog(db)
+    # + the one real mapping table from the fixture, so the population is exactly MAX + omitted.
+    _decoy_tables(db, MAX_MAPPING_DATASETS + omitted - 1, role="bridge", prefix="aa_map")
+    report = discover_crosswalk_candidates(db)
+    assert report.truncation_counts[TRUNCATION_MAPPING_DATASETS] == omitted
+    assert report.mapping_datasets_considered == MAX_MAPPING_DATASETS
+
+
+def test_the_identifier_column_truncation_count_is_the_TRUE_omitted_number(db) -> None:
+    omitted = 9
+    build_catalog(db)
+    # The fixture carries SIX identifier columns with a namespace: the two mapping-table sides,
+    # `acct_no` + `cust_num` on CIB, and `counter_party_acct_no` + `party_lei` on FTR.
+    _decoy_columns(db, MAX_IDENTIFIER_COLUMNS_PER_PASS + omitted - 6,
+                   concept="account_id", table="zz_ids")
+    report = discover_crosswalk_candidates(db)
+    assert report.truncation_counts[TRUNCATION_IDENTIFIER_COLUMNS] == omitted
+
+
+class _CountingConn:
+    """A pass-through connection that records the SQL it was asked to run."""
+
+    def __init__(self, inner) -> None:
+        self.inner, self.statements = inner, []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        return self.inner.execute(sql, params) if params is not None else self.inner.execute(sql)
+
+
+def test_the_true_count_query_runs_only_when_a_cap_actually_bit(db) -> None:
+    """Honesty is not worth a second full scan on every clean pass."""
+    build_catalog(db)
+    clean = _CountingConn(db)
+    discover_crosswalk_candidates(clean)
+    assert not [s for s in clean.statements if "count(*)" in s.lower()]
+
+    _decoy_tables(db, MAX_MAPPING_DATASETS, role="bridge", prefix="aa_map")
+    truncated = _CountingConn(db)
+    report = discover_crosswalk_candidates(truncated)
+    assert report.truncation_counts[TRUNCATION_MAPPING_DATASETS] == 1
+    assert [s for s in truncated.statements if "count(*)" in s.lower()]
