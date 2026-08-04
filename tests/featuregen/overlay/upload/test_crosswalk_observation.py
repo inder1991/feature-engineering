@@ -475,6 +475,130 @@ def test_a_leg_naming_a_two_endpoint_row_that_does_not_exist_is_refused(bank):
         record_crosswalk_observation(db, observation)
 
 
+# ── the agreement check, against a REAL 1038 row (both branches) ────────────────────────────────
+#
+# A bridge-backed leg exists in two places: embedded here in full, and as an ordinary row in the
+# shipped two-endpoint store. Two places holding one truth is two places that can disagree. The
+# "row is missing" branch above needs no stored row; the two below do, and only they can pin the
+# JSON KEY NAMES the check reads out of `observation_json` — rename one upstream and, without
+# these, the comparison silently stops comparing.
+
+
+def _seed_realization(db):
+    """One governed bridge realization, so a two-endpoint observation has something to hang off.
+
+    `relationship_observation_revision.realization_revision_id` is NOT NULL with an FK to
+    `bridge_join_realization_revision` (1038:7-8) — the same constraint that makes the crosswalk
+    leg's row id optional in the first place."""
+    from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+        _executable_pair,
+    )
+    from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+        _realization as build_realization,
+    )
+
+    from featuregen.data_agent.physical import record_binding_revision
+    from featuregen.overlay.upload.bridge_assessment import LinkReviewStatus
+    from featuregen.overlay.upload.bridge_realization import (
+        BridgeRealizationCurrentV1,
+        RealizationLifecycle,
+        SafetyStatus,
+    )
+    from featuregen.overlay.upload.bridge_store import (
+        BridgeDependencyRefV1,
+        record_realization_revision,
+    )
+
+    left, right = _executable_pair()
+    revision = build_realization(left, right)
+    record_binding_revision(db, left.physical_binding)
+    record_binding_revision(db, right.physical_binding)
+    record_realization_revision(
+        db, revision,
+        BridgeRealizationCurrentV1(
+            revision.realization_id, revision.realization_revision_id,
+            SafetyStatus.UNASSESSED, LinkReviewStatus.UNREVIEWED,
+            RealizationLifecycle.ACTIVE, 1),
+        dependencies=(BridgeDependencyRefV1(
+            "bridge_fact", revision.bridge_fact_key, "bridge-head-1"),))
+    return revision
+
+
+def _persisted_target_leg_row(db, ftr, mapping, revision):
+    """A REAL `rob_` row for the cross-catalog target leg, carrying the leg fixture's own numbers.
+
+    Endpoint side = FTR (4 rows, 4 distinct tuples), mapping side = the cross-reference table, and
+    `joined_row_count` 3 — exactly what `_crosswalk_fixtures.leg` embeds by default, so the two
+    copies agree and the store's check has something true to confirm."""
+    from featuregen.data_agent.store import record_relationship_observation
+
+    observation = RelationshipObservationV2(
+        realization_revision_id=revision.realization_revision_id,
+        plan_hash="crosswalk-leg-plan", scope_id=revision.applicability_scope.scope_id,
+        left=EndpointTupleObservationV2(
+            ftr.identity.table_id, ftr.binding_revision_id, ftr.content_hash,
+            ("counter_party_acct_no",), 4, 4, 4, 0, 0, 1),
+        right=EndpointTupleObservationV2(
+            mapping.identity.table_id, mapping.binding_revision_id, mapping.content_hash,
+            ("ext_acct_ref",), 3, 3, 3, 0, 0, 1),
+        matched_left_distinct=3, unmatched_left_distinct=1,
+        matched_right_distinct=3, unmatched_right_distinct=0,
+        left_orphan_rows=1, right_orphan_rows=0, joined_row_count=3,
+        max_right_matches_per_left_row=1, max_left_matches_per_right_row=1,
+        normalization_ids=("identity_v1",), predicate_ids=(),
+        left_source_snapshot_id="endpoint-snapshot-1",
+        right_source_snapshot_id="mapping-snapshot-1",
+        snapshot_or_as_of="2026-08-04", execution_principal="crosswalk-profiler",
+        method="exact", row_coverage=RowCoverage.FULL, complete=True, observed_at=NOW)
+    record_relationship_observation(db, observation)
+    return observation
+
+
+def test_a_leg_that_AGREES_with_its_stored_two_endpoint_row_is_recorded(bank):
+    """The happy branch, against a real 1038 row rather than an absence. This is also what pins the
+    JSON key names (`left`/`right`, `binding_revision_id`, `columns`, `row_count`,
+    `distinct_tuple_count`, `joined_row_count`) that the agreement check reads."""
+    db, revision, cib, ftr, mapping = bank
+    realization = _seed_realization(db)
+    stored = _persisted_target_leg_row(db, ftr, mapping, realization)
+
+    observation = _compose(
+        revision, cib, ftr, mapping,
+        target={"v2_observation_revision_id": stored.observation_revision_id,
+                "realization_revision_id": realization.realization_revision_id})
+    outcome = record_crosswalk_observation(db, observation)
+    assert outcome.became_current is True
+    # The composition's `rob_` id is a real, resolvable row — the FK holds it there.
+    assert observation.leg_observation_revision_ids == (stored.observation_revision_id,)
+    assert db.execute(
+        "SELECT target_leg_observation_revision_id, source_leg_observation_revision_id "
+        "FROM crosswalk_observation_revision WHERE observation_revision_id = %s",
+        (observation.observation_revision_id,)).fetchone() == (
+            stored.observation_revision_id, None)
+
+
+def test_a_leg_that_DIVERGES_from_its_stored_two_endpoint_row_is_corruption(bank):
+    """One truth in two places is two places that can disagree, and a disagreement is not a caller
+    error to be tolerated: one of the two is not what was measured, and nothing downstream can say
+    which. Nothing is written — the check runs before the insert."""
+    from featuregen.data_agent.store import RelationshipObservationStoreCorruption
+
+    db, revision, cib, ftr, mapping = bank
+    realization = _seed_realization(db)
+    stored = _persisted_target_leg_row(db, ftr, mapping, realization)
+    assert stored.left.row_count == 4
+
+    tampered = _compose(
+        revision, cib, ftr, mapping,
+        target={"v2_observation_revision_id": stored.observation_revision_id,
+                "realization_revision_id": realization.realization_revision_id,
+                "endpoint_row_count": 99})
+    with pytest.raises(RelationshipObservationStoreCorruption, match=MAPPING_TO_TARGET):
+        record_crosswalk_observation(db, tampered)
+    assert db.execute(
+        "SELECT count(*) FROM crosswalk_observation_revision").fetchone()[0] == 0
+
+
 def test_current_measurements_are_listed_per_definition_revision(bank):
     db, revision, cib, ftr, mapping = bank
     unscoped = _compose(revision, cib, ftr, mapping)
