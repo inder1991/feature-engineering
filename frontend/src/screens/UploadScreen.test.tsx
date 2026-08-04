@@ -451,7 +451,12 @@ const DESCRIBED: api.CatalogProfile = {
     business_context: 'Owned by financial crime operations.',
     business_domains: ['Compliance'],
     producer: 'human',
-    strength: 'confirmed',
+    // 'proposed', not 'confirmed': both writers (uploads.py and the catalogs PUT) take
+    // build_catalog_profile_revision's HUMAN/PROPOSED/ACTIVE defaults, and no confirm path exists.
+    // It matters here because `strength` is INSIDE the hashed content — a confirm would mint a new
+    // content_hash for identical words, which is exactly the "nothing will be re-versioned" note's
+    // premise. Whoever lands a confirm path must revisit that note.
+    strength: 'proposed',
     lifecycle: 'active',
     producer_ref: 'user:priya',
     ingestion_run_id: null,

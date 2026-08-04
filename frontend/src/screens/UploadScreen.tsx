@@ -464,6 +464,8 @@ function CatalogNarrativeFields({
 
   function addDomain(domain: string) {
     const text = domain.trim()
+    // The ONLY add path (typed, Entered, blurred, chip), and it dedupes on exact text — which is
+    // what keeps `key={domain}` and the remove-by-value filter below unambiguous downstream.
     if (!text || value.businessDomains.includes(text)) return
     edit({ businessDomains: [...value.businessDomains, text] })
   }
