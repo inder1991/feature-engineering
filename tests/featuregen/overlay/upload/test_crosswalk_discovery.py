@@ -28,6 +28,7 @@ from featuregen.overlay.upload.crosswalk_discovery import (
     MAX_ENDPOINT_COLUMNS_PER_NAMESPACE,
     MAX_IDENTIFIER_COLUMNS_PER_PASS,
     MAX_MAPPING_DATASETS,
+    REASON_CANDIDATE_DROPPED,
     REASON_SINGLE_NAMESPACE,
     REASON_SUGGESTION_MALFORMED,
     REASON_SUGGESTION_NAMESPACE_MISMATCH,
@@ -258,7 +259,7 @@ def test_the_displayed_authority_does_not_flip_between_passes(db) -> None:
 
 @pytest.mark.parametrize("mutation,reason", [
     ({"source_column_ref": normalize_ref("cib", "public", CIB_TABLE, "ghost")},
-     REASON_SUGGESTION_UNREADABLE_REF),
+     REASON_CANDIDATE_DROPPED),
     ({"target_column_ref": CIB_KEY}, REASON_SUGGESTION_SAME_NAMESPACE),
     ({"mapping_target_column_ref": MAP_CIB}, REASON_SUGGESTION_NAMESPACE_MISMATCH),
 ])
@@ -285,15 +286,34 @@ def test_a_malformed_suggestion_never_ends_the_pass(db) -> None:
 
 
 def test_a_suggestion_naming_a_restricted_column_is_invisible_to_an_unprivileged_caller(db) -> None:
-    """The read-scope answer must not become an existence oracle: the unreadable and the
-    nonexistent produce the SAME reason code."""
+    """The read-scope answer must not become an existence oracle — and the REASON CODE must not
+    become a suggestion-existence oracle either. A caller who cannot read what the suggestion
+    named gets a generic dropped count: telling them "a suggestion here named a ref you may not
+    see" is the disclosure, whichever way it is phrased."""
     build_catalog(db, ftr_columns=(("counter_party_acct_no", "external_account_ref", "restricted"),
                                    ("party_lei", "lei", "")))
     _suggest(db, crosswalks=[_good_suggestion()])
     unprivileged = discover_crosswalk_candidates(db, roles=())
-    assert unprivileged.reason_counts.get(REASON_SUGGESTION_UNREADABLE_REF) == 1
+    assert unprivileged.reason_counts.get(REASON_CANDIDATE_DROPPED) == 1
+    assert REASON_SUGGESTION_UNREADABLE_REF not in unprivileged.reason_counts
+    assert not any(key.startswith("suggestion") for key in unprivileged.reason_counts)
     privileged = discover_crosswalk_candidates(db, roles=("restricted_reader",))
     assert [c for c in privileged.candidates if c.origin == "llm_suggestion"]
+
+
+def test_a_readable_ref_that_is_not_an_identifier_keeps_the_named_reason(db) -> None:
+    """The generic bucket is for what the caller may not SEE, not for everything that went wrong.
+    A caller who can read every ref the suggestion named is entitled to know a suggestion existed
+    and why it was refused — there is nothing left to protect."""
+    build_catalog(db, cib_columns=(("acct_no", "account_id", ""),
+                                   ("cust_num", "customer_id", ""),
+                                   ("opened_on", "effective_from", "")))
+    readable_but_not_an_identifier = normalize_ref("cib", "public", CIB_TABLE, "opened_on")
+    _suggest(db, crosswalks=[
+        _good_suggestion() | {"source_column_ref": readable_but_not_an_identifier}])
+    report = discover_crosswalk_candidates(db)
+    assert report.reason_counts.get(REASON_SUGGESTION_UNREADABLE_REF) == 1
+    assert REASON_CANDIDATE_DROPPED not in report.reason_counts
 
 
 @pytest.mark.parametrize("kind", ["transformed", "semantic_only"])

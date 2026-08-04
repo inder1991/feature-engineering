@@ -276,6 +276,27 @@ def test_a_column_of_the_mapping_dataset_still_gets_its_dossier(db) -> None:
     assert bundle.relationship_context == ()
 
 
+def test_a_crosswalk_ref_never_reaches_the_bridge_reader(db, monkeypatch) -> None:
+    """`_executable_realization_ids` SAYS no for a crosswalk rather than asking the bridge reader a
+    question that happens to miss. Deleting that short-circuit survives every other test, because
+    the reader's fail-closed `except` returns the same empty answer — so the guard has to be that
+    the reader was never CONSULTED, not that the answer was right."""
+    from featuregen.overlay.upload import bridge_store, context_graph
+
+    consulted: list[object] = []
+
+    def _poisoned(_conn, **kwargs):
+        consulted.append(kwargs.get("bridge_fact_key"))
+        raise AssertionError("the bridge reader was asked about a crosswalk")
+
+    monkeypatch.setattr(bridge_store, "executable_bridge_realizations", _poisoned)
+    assert context_graph._executable_realization_ids(db, "cwd_" + "a" * 64) == frozenset()
+    assert consulted == []
+    # And a BRIDGE ref does reach it — otherwise the guard could be "never ask anyone anything".
+    assert context_graph._executable_realization_ids(db, "bfk_1") == frozenset()
+    assert consulted == ["bfk_1"]
+
+
 def test_the_point_read_of_the_corrupt_revision_still_refuses(db) -> None:
     """Omitting from a LISTING and refusing a POINT read are different answers to different
     questions: "show me what is here" versus "give me THIS crosswalk"."""

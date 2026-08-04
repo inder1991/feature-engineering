@@ -506,6 +506,13 @@ class CrosswalkExecutionRevisionV1:
     class exists so the identity Task 11 observes against and Task 12 compiles from is frozen while
     it is still cheap to get right.
 
+    **Where it lives, and why there is no table under it.** The plan's Task-10 filename promised
+    execution and observation TABLES; this task ships the definition store (migration 1050) and
+    this class as a contract only. That split is deliberate, not an omission: an execution row is a
+    claim that something can run, and Task 11 is what MEASURES whether it can. Task 11 must read
+    the split rather than the plan's filename — the tables it needs do not exist yet, and the
+    identity they will store is frozen here.
+
     It REUSES the bridge family's ``SafetyStatus``, ``ExecutionTier`` (via the scope),
     ``RealizationApplicabilityScopeV1`` and ``DirectionalCardinalityVerdictV1``. This is a
     composition carrier, not a competing safety model — the one structural rule it enforces is that

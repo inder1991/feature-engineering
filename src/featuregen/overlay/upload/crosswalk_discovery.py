@@ -70,7 +70,7 @@ from featuregen.overlay.upload.crosswalk import (
     LogicalMappingPairV1,
 )
 from featuregen.overlay.upload.crosswalk_store import publish_crosswalk_definition
-from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.profile_vocab import DataRole, data_role_from_table_role
 from featuregen.overlay.upload.read_scope import allowed_classes, anchor_visibility_predicate
 from featuregen.overlay.upload.semantic_context import RelationshipKind
@@ -106,8 +106,15 @@ REASON_SINGLE_NAMESPACE = "single_identifier_namespace"
 REASON_NO_ENDPOINT_FOR_NAMESPACE = "no_endpoint_for_namespace"
 #: The pair could not be expressed as a definition (a non-public mapping dataset, a malformed leg).
 REASON_UNREPRESENTABLE = "unrepresentable_definition"
-#: A suggestion named a ref this caller cannot see, or that does not exist.
+#: A suggestion named a ref this caller CAN read but which is not a registered identifier column.
+#: Safe to name as a suggestion: the caller can see everything the suggestion named, so saying one
+#: existed discloses nothing they could not already read.
 REASON_SUGGESTION_UNREADABLE_REF = "suggestion_unreadable_ref"
+#: A candidate was dropped because a ref it named is not readable by THIS caller — restricted or
+#: nonexistent, deliberately indistinguishable. The code is generic on purpose: a
+#: ``suggestion_*`` code here would tell a caller who may not read the refs that an LLM suggestion
+#: about them exists, which is a suggestion-EXISTENCE oracle wearing an honest count's clothes.
+REASON_CANDIDATE_DROPPED = "candidate_dropped"
 #: A suggestion named a column whose concept is absent from the registry or is not an identifier.
 REASON_SUGGESTION_UNGROUNDED = "suggestion_not_grounded_in_identifiers"
 #: A suggestion's two sides draw on the SAME namespace, so it is not a crosswalk.
@@ -119,9 +126,9 @@ REASON_SUGGESTION_MALFORMED = "suggestion_malformed"
 
 DISCOVERY_REASON_CODES: frozenset[str] = frozenset({
     REASON_TOO_FEW_IDENTIFIERS, REASON_SINGLE_NAMESPACE, REASON_NO_ENDPOINT_FOR_NAMESPACE,
-    REASON_UNREPRESENTABLE, REASON_SUGGESTION_UNREADABLE_REF, REASON_SUGGESTION_UNGROUNDED,
-    REASON_SUGGESTION_SAME_NAMESPACE, REASON_SUGGESTION_NAMESPACE_MISMATCH,
-    REASON_SUGGESTION_MALFORMED,
+    REASON_UNREPRESENTABLE, REASON_SUGGESTION_UNREADABLE_REF, REASON_CANDIDATE_DROPPED,
+    REASON_SUGGESTION_UNGROUNDED, REASON_SUGGESTION_SAME_NAMESPACE,
+    REASON_SUGGESTION_NAMESPACE_MISMATCH, REASON_SUGGESTION_MALFORMED,
 })
 
 #: Which cap bit, when one did. Reported, never silent.
@@ -237,10 +244,17 @@ def _mapping_datasets(conn: DbConn, *, roles: Iterable[str], source: str | None,
     not an exotic one, and under that shape the one mapping table never survives the read — a pass
     that reports zero candidates, truncates nothing, and is wrong.
 
-    The role is still re-derived through the ONE adapter (``data_role_from_table_role``) after the
-    read, as the authority check: the SQL names the two spellings that adapter maps, and the adapter
-    remains the thing that decides. A `data_role` disjunct is included because that projection is
-    the only surviving signal for a row whose raw ``table_role`` was never written."""
+    The role is re-derived through the ONE adapter (``data_role_from_table_role``) from the node's
+    own ``table_role`` after the read, as the authority check: the SQL names the two spellings that
+    adapter maps, and the adapter remains the thing that decides.
+
+    **And the ``data_role`` display projection IS consulted, as a fallback** — both here and in the
+    post-read check. Earlier prose claimed it was not, which was simply untrue of the code, and the
+    code is the half that is right: a row whose raw ``table_role`` was never written (an ingest
+    that only ever produced the projection) has no other surviving signal, and dropping it would be
+    the quiet incompleteness this catalog exists to avoid. The projection is rebuildable and can be
+    NULL between an ingest and its reprojection, which is why it is a FALLBACK and not the source:
+    ``table_role`` is asked first, every time."""
     allowed = allowed_classes(roles)
     where = _MAPPING_DATASET_WHERE
     params: list[object] = [
@@ -449,9 +463,31 @@ def _suggestion_kind(raw: object) -> RelationshipKind | None:
         return None
 
 
+def _readable_columns(conn: DbConn, refs: Iterable[str], *, roles: Iterable[str]) -> set[str]:
+    """Which of ``refs`` name a column THIS caller may read — read-scoped, so an invisible column
+    and a nonexistent one come back the same way.
+
+    It exists only to choose between a generic drop and a named suggestion reason, and it runs
+    only when a suggestion actually named something outside the identifier pool."""
+    wanted = list(refs)
+    if not wanted:
+        return set()
+    keys: dict[tuple[str, str], str] = {}
+    for ref in wanted:
+        catalog_source, schema, table, column = parse_ref(ref)
+        keys[(catalog_source, f"{schema}.{table}.{column}")] = ref
+    rows = conn.execute(
+        "SELECT catalog_source, lower(object_ref) FROM graph_node "
+        "WHERE kind = 'column' AND lower(object_ref) = ANY(%s) "
+        "AND COALESCE(visible_requires, '{}') <@ %s",
+        (sorted({key[1] for key in keys}), allowed_classes(roles))).fetchall()
+    seen = {(row[0], row[1]) for row in rows}
+    return {ref for key, ref in keys.items() if key in seen}
+
+
 def _candidates_from_suggestions(
     conn: DbConn, *, mapping_dataset_ref: str, pool: Sequence[_IdentifierColumn],
-    reasons: Counter[str], truncation: Counter[str],
+    reasons: Counter[str], truncation: Counter[str], roles: Iterable[str] = (),
 ) -> list[CrosswalkCandidateV1]:
     """Ingest crosswalk suggestions already recorded for this mapping dataset. NO LLM CALL.
 
@@ -503,13 +539,24 @@ def _candidates_from_suggestions(
         evidence_id=pointer.structured_result_id, kind=EvidenceKind.LLM_RECOMMENDATION,
         producer="llm"),)
     out: list[CrosswalkCandidateV1] = []
+    # Only consulted when a suggestion named something outside the identifier pool — which of the
+    # three causes (restricted, nonexistent, readable-but-not-an-identifier) applies decides
+    # whether the caller may be told a SUGGESTION was involved at all.
+    outside_pool = sorted(named_refs - set(visible))
+    readable = _readable_columns(conn, outside_pool, roles=roles) if outside_pool else set()
     for refs, kind in parsed:
         columns = {key: visible.get(ref) for key, ref in refs.items()}
         if any(column is None for column in columns.values()):
-            # Unreadable OR unregistered-as-identifier are BOTH answered here, so a suggestion that
-            # named a restricted column is never distinguishable from one that named a nonexistent
-            # one — the read-scope answer must not become an existence oracle.
-            reasons[REASON_SUGGESTION_UNREADABLE_REF] += 1
+            missing = [ref for key, ref in refs.items() if columns[key] is None]
+            if all(ref in readable for ref in missing):
+                # The caller can READ every ref this suggestion named; they are simply not
+                # registered identifier columns. Nothing is protected by hiding the reason.
+                reasons[REASON_SUGGESTION_UNREADABLE_REF] += 1
+            else:
+                # A ref this caller may not read — restricted or nonexistent, deliberately the
+                # SAME answer, and reported without the word "suggestion": naming one would tell a
+                # caller who may not read the refs that an LLM proposed something about them.
+                reasons[REASON_CANDIDATE_DROPPED] += 1
             continue
         source = columns["source_column_ref"]
         target = columns["target_column_ref"]
@@ -568,7 +615,7 @@ def discover_crosswalk_candidates(
                 reasons=reasons, truncation=truncation),
             *_candidates_from_suggestions(
                 conn, mapping_dataset_ref=mapping_dataset_ref, pool=pool,
-                reasons=reasons, truncation=truncation),
+                reasons=reasons, truncation=truncation, roles=roles),
         ]
         for candidate in found:
             key = (candidate.relationship_kind.value,
