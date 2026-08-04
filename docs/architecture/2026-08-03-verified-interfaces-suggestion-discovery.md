@@ -826,13 +826,23 @@ Recorded, never silently redesigned:
   Nothing meaning-bearing is lost: the other `candidate_key` inputs are pure functions of material
   the revision already hashes (`recipe_revision_id`, and `suggestion_id`'s template id, bound params
   and operands) or of `ordered_operand_roles`; the read-scope RULE still travels as
-  `read_scope_rule_content_hashes`, and withholding is total, so a card one caller receives is the
-  card every caller receives. Test-pinned over an ASYMMETRIC three-table fixture (G–L–X) where the
-  two anchors provably ground over different universes, across anchors, `max_hops` values and read
-  scopes, each with a non-vacuity assertion.
-- **D17 — two payload fields and three ref positions remain build-/physically-keyed; both are
-  Release-B decisions** (recorded 2026-08-03, final whole-branch review).
-  1. **`FeatureSuggestionV2.binding_quality` and `.grounding_trace_content_hash` are still
+  `read_scope_rule_content_hashes`, and withholding is total over the refs it covers (operands and
+  relationship endpoints), so a card one caller receives is a card every caller receives, with the
+  same identity and the same bound operands. It is NOT byte-identical across scopes: the
+  domain-term PROVENANCE can still differ, the third channel of [D17](#deviations).1. Test-pinned
+  over an ASYMMETRIC three-table fixture (G–L–X) where the two anchors provably ground over
+  different universes, across anchors, `max_hops` values and read scopes, each with a non-vacuity
+  assertion.
+- **D17 — THREE payload channels remain build-universe-sensitive, and `suggestion_id`'s
+  non-operand ref positions remain physical; all are Release-B decisions** (recorded 2026-08-03,
+  final whole-branch review; third channel added 2026-08-03, final whole-branch RE-review). The
+  count is stated because it moved: D17.1 named two channels until the re-review found the third,
+  and a stale count is exactly what misled the next reader once already ([D12](#deviations)).
+  1. **The canonical payload still reads the build universe in three places — two on the ANCHOR
+     axis, one on the READ-SCOPE axis.** They are separate axes, not one residual; a test that
+     walks one says nothing about the other.
+
+     **(a) `FeatureSuggestionV2.binding_quality` and `.grounding_trace_content_hash` are
      anchor-sensitive.** `binding_quality` is `AMBIGUOUS` exactly when the pass saw a tie, so it
      reports the universe it ran over; `grounding_trace_content_hash` is that build's trace
      identity. Both are build OBSERVATIONS and belong on `SuggestionBuildProvenanceV1`, where the
@@ -844,6 +854,109 @@ Recorded, never silently redesigned:
      anchor-sensitive payload field appears. **Release-B prerequisite:** the durable projection
      keys on `(suggestion_id, suggestion_revision_id)`, so it must either relocate these two or
      accept that one revision can be published with two byte-renderings.
+
+     **(b) The domain-term PROVENANCE on a visible card is read-scope-sensitive.** A column's
+     `domain` wording is INHERITED from its table by design: `enrich._write_domain_evidence`
+     writes the table default's evidence at the TABLE ref and writes a column row only where the
+     classifier OVERRODE that default, because "inheritance is a read-time relationship"
+     (`overlay/upload/enrich.py:833`, the two-level contract at `:843-851`, the quoted rule at
+     `:850`). So
+     `_domain_term_evidence` (`overlay/upload/suggestion_contract.py:740-752`) returns the column's
+     OWN `domain` `field_evidence`, else its TABLE's, else `_UNATTRIBUTED`. The inherited read is
+     visibility-gated: `_read_context_evidence` (`:711-717`) asks for a table's ref ONLY when that
+     table's own node came back from the scope-filtered `_read_node_facts` read. That read always
+     REQUESTS the table ref (`:668-670`, derived from the column ref so it costs no extra
+     statement) and filters it by the migration-1032 predicate (`:679`) — so a missing table node
+     is PURELY a scope outcome, never an omission. Withholding, by contrast, is total only over
+     `build_page_v2`'s `required` set (`:1290`) — `_operand_refs | _endpoint_refs`. **Table nodes
+     are not in it**, and `visible_requires` is per-row with no
+     column→table inheritance (migration 1032: a GENERATED column over that row's own
+     `sensitivity`/`effective_restriction`).
+
+     *The divergence.* Two callers, one card, one revision. Operand `L.bal_amt` is world-visible
+     and its `domain` is inherited from table `L`, whose `visible_requires` is `{restricted}`.
+     The privileged caller's `facts` contains `L`, so the card's `business_domains` term carries
+     the table's real axes — say `llm`/`proposed` with its `evidence_id`. The public caller's does
+     not, so the SAME term on the SAME card carries `_UNATTRIBUTED` (`legacy`/`proposed`, no ids).
+     Rules 4/5 exist precisely so a proposal and an attestation do not render alike, and here the
+     rendering is a function of the reader. Before [D16](#deviations) the `READ_SCOPE` dependency
+     pin gave the two readings different `suggestion_revision_id` bytes; after it they share one
+     revision and still render different provenance.
+
+     *The DIRECT writers are all closed — traced one by one.* Both table-node INSERTs write no
+     `sensitivity` (`overlay/upload/graph.py:250-255` and `:325-330`); the glossary table-term
+     SOURCE writer's field list carries neither `sensitivity` nor `sensitivity_floor`
+     (`overlay/upload/ingest.py:1275-1283`; the dedicated table-term pass at `:1725-1786` calls
+     only that writer, the revalidation flag and the semantic-terms projection); `GlossaryRecord`
+     has no sensitivity field at all (`glossary_reader.py:68-104`); the INGEST taxonomy cascade
+     sits inside the loop that `continue`s on `rec.is_table` (`ingest.py:1629-1631`, cascade call
+     at `:1690`); and `sensitivity` is not `human_editable`
+     (`overlay/upload/field_policies.py:110-118`), so the generic field-correction command refuses
+     to correct it DIRECTLY
+     (`overlay/upload/field_correction.py:253-256`). Note what this is NOT: table refs DO reach the
+     shared resolver at ingest (`ingest.py:1792` passes them in `attachable_refs`), so what holds
+     ingest closed is purely the ABSENCE of floor evidence at those refs — never a structural
+     table/column guard. That distinction is what the next paragraph turns on.
+
+     *But the INDIRECT path is open, and it is shipped.* (Corrected 2026-08-03 while freezing this
+     entry: the first draft read the list above and concluded the channel was latent. It is not —
+     the list only covers writers of `sensitivity` ITSELF.) `effective_restriction` is written in
+     exactly ONE place, `field_resolution._resolve_sensitivity`
+     (`overlay/upload/field_resolution.py:308-361`, the `UPDATE` at `:356-361`), and it fires
+     whenever `sensitivity` **or** `sensitivity_floor` evidence is active at that ref (`:404-405`).
+     `sensitivity_floor` has a SECOND writer. `concept` IS `human_editable`
+     (`field_policies.py:80-83`), a PROJECTING `concept` correction re-derives the taxonomy cascade
+     in the SAME transaction (`field_correction.py:336-369`, cascade call at `:359`), and the
+     cascade always emits `sensitivity_floor` from the resolved concept's registry sensitivity
+     (`overlay/upload/taxonomy_evidence.py:92`). Nothing on that path restricts the target to a
+     COLUMN: the route takes an arbitrary `{object_ref:path}` (`api/routes/assets.py:97`), its only
+     anchor check is that the `graph_node` row exists and is visible
+     (`field_correction.py:266-272`), `logical_ref_of` resolves a table node to a TABLE ref BY
+     DESIGN (`overlay/upload/column_authority.py:84-87`; the "phantom COLUMN" defect it fixed was
+     precisely a mis-keyed TABLE field decision, `:64-70`), and neither
+     `derive_and_write_concept_cascade` (`ingest.py:1487-1537`) nor `_resolve_sensitivity` carries
+     a kind guard. The floor is not strength-gated either — EVERY active `sensitivity_floor` row
+     raises it, `taxonomy/proposed` included (`field_resolution.py:318-319`). So a four-eyes
+     `concept` correction on a TABLE node, naming a registry concept whose sensitivity is `pii` /
+     `protected_attribute` / `special_category` (-> `restricted`) or `proxy` (-> `confidential`)
+     (`field_resolution.py:77-83`), sets `effective_restriction` on the TABLE's row, and migration
+     1032's GENERATED `visible_requires` then restricts it. A table-grain classification is exactly
+     that shape.
+
+     What is NOT claimed: that any deployed catalog has done this, or that a test exercises it. The
+     path is shipped and unguarded, not observed. A test can open the channel in one statement
+     regardless, since `visible_requires` is GENERATED and
+     `test_the_revision_does_not_move_with_the_callers_read_scope` already flips a node's
+     `sensitivity` by direct UPDATE
+     (`tests/featuregen/overlay/upload/test_suggestion_contract.py:887-890`).
+
+     *Why this is NOT a Release-A defect.* It is the plan's own model. Visibility travels as
+     `read_scope_key` at PAGE level ([0F-8](#read-scope)): the payload is what THIS caller may
+     see, which is correct, and the scope that produced it is named on the page. Release A
+     persists nothing, so no reader ever meets another reader's bytes. Reachability does not
+     change that ruling — a per-caller payload is the CONTRACT here, not an accident — but it does
+     mean Release B cannot treat the obligation below as hypothetical.
+
+     *Release-B prerequisite.* The durable projection keys on `(suggestion_id,
+     suggestion_revision_id)`, so it inherits a payload whose provenance is not fully determined
+     by that key. Release B must choose DELIBERATELY between (a) including the scope key in what
+     distinguishes a stored payload, and (b) making table-node visibility part of the withholding
+     `required` set so the provenance cannot differ by reader at all. Either is defensible;
+     inheriting the ambiguity silently is not.
+
+     *What pins this axis today: nothing.*
+     `test_the_revision_does_not_move_with_the_callers_read_scope`
+     (`test_suggestion_contract.py:883-900`) reads one catalog under two scopes but asserts only
+     `suggestion_id` and `suggestion_revision_id` equality, never payload equality.
+     `test_exactly_which_payload_fields_still_read_the_build_universe` (`:903-924`) does diff the
+     payload field by field, but over `_asym_pages` (`:823-828`) — the two ANCHORS, not two
+     scopes — so its `{binding_quality, grounding_trace_content_hash}` assertion is exactly right
+     for the axis it walks and silent on this one. Its docstring is likewise correct as scoped and
+     is left alone. **The natural pin for Release B** is to extend that second test to the SCOPE
+     axis: the same field-by-field dataclass diff over a public and a privileged read of a fixture
+     whose table node is restricted, asserting the divergent set is empty modulo the two
+     known-divergent fields of (a). That fails the moment a scope-sensitive payload field appears,
+     and gives Release B a starting point that is executable rather than prose.
   2. **`suggestion_id` mixes logical and physical refs.** `operands` are logical; `grain_refs`,
      `time_ref`, the path assignment's `dependency_key` and the legs' endpoint refs are physical.
      A physical re-spelling of a bound column forks the id through those positions. Converting
