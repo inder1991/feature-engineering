@@ -15,6 +15,7 @@ import ast
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -292,10 +293,22 @@ def test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter(tmp_path) -> 
     stub = tmp_path / "python"
     grandchild_pid_file = tmp_path / "grandchild.pid"
     stub.write_text("#!/bin/sh\n"
+                    'if [ -n "$STUB_WARMUP" ]; then exit 0; fi\n'
                     "( sleep 120 ) &\n"
                     f'echo $! > "{grandchild_pid_file}"\n'
                     "sleep 120\n", encoding="utf-8")
     stub.chmod(0o755)
+    # WARM THE EXEC PATH FIRST, or this test is a coin toss under load. The host's malware scanner
+    # charges the FIRST exec of a freshly written executable a synchronous scan — measured on an
+    # idle box at ~215ms per new file against every later exec of the SAME file at ~4ms, and it
+    # stretches into whole seconds when the machine is busy. `submit`'s budget here is 1.0s, so on a
+    # loaded box the process group is killed before the stub's own body ever runs: `grandchild.pid`
+    # is never written and the read below fails with FileNotFoundError, which is a fact about the
+    # scanner rather than about the process-group kill this test exists to assert.
+    # The warm-up execs the SAME file, so the scan is paid outside the timed window and the real run
+    # starts in ~4ms. The early exit is what keeps the warm-up from leaving a 120s sleeper behind.
+    subprocess.run([str(stub)], env={**os.environ, "STUB_WARMUP": "1"}, check=True, timeout=60.0)
+
     submitter = LocalClusterSubmitter(python_executable=str(stub), timeout_seconds=1.0,
                                       env=_PYSPARK_ENV)
     started = time.monotonic()
@@ -304,7 +317,21 @@ def test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter(tmp_path) -> 
 
         assert time.monotonic() - started < 40.0      # old code: ~120s pipe-drain hang (Windows)
         assert outcome.completed is False and outcome.returncode is None
-        grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+        # POLLED, not read once: the shell creates the file with the redirect and writes into it a
+        # moment later, so a single read can land on "absent" or on "" even when the stub started
+        # in time. Same shape as the liveness poll below.
+        deadline = time.monotonic() + 10.0
+        while True:
+            recorded = (grandchild_pid_file.read_text(encoding="utf-8").strip()
+                        if grandchild_pid_file.exists() else "")
+            if recorded:
+                break
+            if time.monotonic() > deadline:
+                pytest.fail("the stub never recorded a grandchild pid, so this test cannot say "
+                            "whether the group was killed — the warm-up above exists to stop the "
+                            "first-exec security scan from eating the 1.0s budget")
+            time.sleep(0.05)
+        grandchild_pid = int(recorded)
         deadline = time.monotonic() + 10.0            # a killed orphan may be a zombie briefly
         while True:
             try:
