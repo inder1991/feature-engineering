@@ -196,8 +196,10 @@ def join_path_assignment(trace: GroundingDecisionTraceV1 | None
 
 
 def build_universe_independent_trace_hash(trace: GroundingDecisionTraceV1) -> str:
-    """The grounding decision as the REVISION hashes it: the trace's content with the build-universe
-    -sensitive ``candidate_key`` projected out.
+    """The grounding decision as the REVISION hashes it: the trace's content with everything that
+    depends on WHICH COLUMNS WERE IN SCOPE WHEN IT WAS BUILT projected out — the ``candidate_key``
+    and the caller-scoped dependency pins (see
+    :func:`~featuregen.overlay.upload.grounding_trace.build_universe_independent_content`).
 
     **Why the revision cannot hash ``trace_content_hash`` directly.** That hash covers
     ``candidate_key``, i.e. ``recipe_candidate_key``, one of whose inputs is
@@ -220,12 +222,13 @@ def build_universe_independent_trace_hash(trace: GroundingDecisionTraceV1) -> st
     ("which content produced this rendering of this logical candidate"), so it gets its own
     projection and its own contract name rather than redefining the trace's.
 
-    The tie set is not discarded, it is RECLASSIFIED: it remains readable as build provenance on
-    ``SuggestionBuildProvenanceV1`` / ``FeatureSuggestionV2.grounding_trace_content_hash``, which is
-    where a reader compares two builds. Everything the plan requires the revision to move on still
-    moves: the ordered relationship path, the dependency pins, the requirements, the validation
-    status and the evaluated rule hashes are all inside this projection, and the recipe/discovery/
-    semantic/profile content is hashed alongside it by :func:`suggestion_revision_id`.
+    The tie set is not discarded, it is RECLASSIFIED as BUILD provenance: it still reaches a reader
+    through ``FeatureSuggestionV2.grounding_trace_content_hash``, the unprojected trace hash, which
+    is how two builds of the same candidate are compared. Everything the plan requires the revision
+    to move on still moves: the ordered relationship path, the candidate's dependency pins, the
+    requirements, the validation status and the evaluated rule hashes are all inside this
+    projection, and the recipe/discovery/semantic/profile content is hashed alongside it by
+    :func:`suggestion_revision_id`.
     """
     return contract_hash_v1(TRACE_PROJECTION_CONTRACT, SUGGESTION_CONTRACT_VERSION,
                             build_universe_independent_content(trace))
