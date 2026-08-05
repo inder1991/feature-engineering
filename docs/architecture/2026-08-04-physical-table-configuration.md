@@ -212,9 +212,10 @@ Not a new capability — an extension of that one. (`MetastoreInventoryAdapter` 
 
 "A table becomes blocking only when a governed feature reads it" requires feature → table.
 
-**Feature → LOGICAL table is derivable today, no compile needed.** `lineage.py:528-543` already emits
-a `feature → ("table", catalog_source, table_name)` edge; `feature_current_contract` ⋈
-`contract_metadata_dependency` (`1011_contract_pointer_model.sql:127-140,162-169`) is the same query.
+**Feature → LOGICAL table is derivable today, no compile needed.** `lineage.py` already models
+`("table", catalog_source, table_name)` nodes (`:87`) and walks `feature_derives_from` from column to
+feature (`:571`); `feature_current_contract` ⋈ `contract_metadata_dependency`
+(`1011_contract_pointer_model.sql:127-140,162-169`) is the same query from the contract side.
 **The queue is buildable now on logical `(catalog_source, table_name)`.**
 
 Three limits, all open:
