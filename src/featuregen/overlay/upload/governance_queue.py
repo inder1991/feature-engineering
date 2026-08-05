@@ -164,7 +164,19 @@ FORBIDDEN_PHRASES = (
     #: Both spellings of the same claim — that somebody's signature is what makes a thing usable.
     "sign-off",
     "awaiting sign-off",
+    #: THE FALSE ZERO, SPELLED OUT. "not tracked yet" is the honest answer when no store records
+    #: dependants; these two assert the opposite — that the absence of a record is an absence of
+    #: dependants — in words, where no digit scan can see them.
+    "no features depend",
+    "nothing depends",
 )
+
+#: WHAT A LITERAL LIST CANNOT HOLD, recorded so nobody assumes the list is the whole rule. The other
+#: family the crosswalk-row review found is "a reviewer verifies it and it BECOMES runnable": three
+#: ordinary words in one sentence, none forbidden alone, and unbounded in how they can be spelled.
+#: Catching it needs an ADJACENCY pattern, which a substring scan cannot express — so it lives as a
+#: regex in the surface that renders sentences (``AssetDetailScreen.context.test.tsx``,
+#: ``FORBIDDEN_ON_A_CROSSWALK_ROW``) rather than being half-added here where it would look covered.
 
 # ── The human axis ───────────────────────────────────────────────────────────────────────────────
 # Keyed by the folded status the sibling listings already display. Each label states the human

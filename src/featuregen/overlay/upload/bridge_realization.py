@@ -19,6 +19,7 @@ from featuregen.overlay.upload.bridge_assessment import (
     LinkReviewStatus,
     strongest_evidence_label,
 )
+from featuregen.overlay.upload.crosswalk_observation import SCOPE_BINDING_SEPARATOR
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 
@@ -214,6 +215,20 @@ class RealizationApplicabilityScopeV1:
     def __post_init__(self) -> None:
         if not self.scope_id.strip():
             raise BridgeContractError("realization scope_id must not be blank")
+        # A SCOPE ID IS A NAME, AND A NAME MAY NOT SPELL A BINDING. `crosswalk_observation`
+        # distinguishes a measurement that declared its whole scope identity from one that recorded
+        # only a name by the presence of `#scope:` in the persisted `scope_id`, so a scope
+        # legitimately CALLED `crosswalk-production-scope#scope:ec94a641e86b4053` would make a BARE
+        # measurement under it read as bound against the real production scope — the name IS the
+        # forgery, with nobody having to write a hash. (Review ATTACK-2. The double-bound
+        # `name#scope:h1#scope:h2` shape is the same defect wearing two hats.) Refused at
+        # construction, where a scope is first spelled, so no reader has to distrust its own
+        # separator.
+        if SCOPE_BINDING_SEPARATOR in self.scope_id:
+            raise BridgeContractError(
+                f"realization scope_id must not contain {SCOPE_BINDING_SEPARATOR!r}: that sequence "
+                "is how a composed crosswalk measurement records a scope-BOUND id, and a scope "
+                "named with it would let a measurement that bound nothing pass as one that did")
         if not self.environment.strip():
             raise BridgeContractError("realization environment must not be blank")
         purposes = tuple(sorted(set(purpose.strip() for purpose in self.purposes if purpose.strip())))

@@ -105,8 +105,9 @@ class CrosswalkAssemblyReason(StrEnum):
     #: The execution's pinned mapping row rule is not the one the measurement was taken under. A
     #: DERIVATION guard — see :func:`pinned_mapping_temporal_policy`.
     MEASUREMENT_TEMPORAL_POLICY_MISMATCH = "crosswalk_measurement_temporal_policy_mismatch"
-    #: A PRODUCTION-tier scope resolved a measurement that cannot prove which scope it ran under.
-    #: Not a statement about the crosswalk: the numbers may be perfect and the tier is unknowable.
+    #: A PRODUCTION-tier scope resolved a measurement that DECLARED no scope identity — it recorded
+    #: a name and nothing else. Not a statement about the crosswalk: the numbers may be perfect and
+    #: the tier is simply not in the record.
     OBSERVATION_SCOPE_IDENTITY_UNPROVED = "crosswalk_observation_scope_identity_unproved"
     #: Two CURRENT measurements answer to one scope. ``refuse_on_multiple``, applied to evidence:
     #: picking the newer one would make the verdict depend on which row a reader happened to sort
@@ -199,10 +200,13 @@ def _observations_for_scope(
     wording here claimed the pick was "scope-exact by construction"; it is not, and the difference
     matters: the stored row carries ``scope_id`` and no tier, no environment and no purposes, so a
     SANDBOX probe and a PRODUCTION run that were given the same ``scope_id`` string resolve to the
-    same row. ``crosswalk_observation.scope_binding_id`` is how a measurement makes its scope
-    provable, :func:`observation_scope_is_proved` is how this module asks, and
-    :meth:`CrosswalkAssemblyReason.OBSERVATION_SCOPE_IDENTITY_UNPROVED` is what production does
-    about an answer it cannot prove.
+    same row. ``crosswalk_observation.scope_binding_id`` is how a measurement DECLARES the whole
+    scope it ran under, :func:`observation_scope_is_proved` is how this module asks whether it did,
+    and :meth:`CrosswalkAssemblyReason.OBSERVATION_SCOPE_IDENTITY_UNPROVED` is what production does
+    about a measurement that declared nothing. That is a check on the WRITER, not a proof about the
+    run — the binding is a pure function of a public value, so it closes accidental collision and
+    not forgery (``observation_scope_is_proved``'s docstring argues why nothing available here
+    would close forgery either).
 
     What IS true is that the newest measurement across DIFFERENT scopes is never picked:
     :func:`current_crosswalk_observations_for_revision` returns one row per measured scope, and this
@@ -297,10 +301,11 @@ def assemble_admitted_crosswalk(
     **What "against this scope" is worth, exactly.** Migration 1057 persists a measurement's
     ``scope_id`` and nothing else about the scope it ran under, so a name match is a NAME match. A
     production assembly therefore additionally requires the recorded id to be scope-BOUND
-    (``crosswalk_observation.scope_binding_id``) and refuses an unprovable one outright; a sandbox
+    (``crosswalk_observation.scope_binding_id``) and refuses one that declared nothing; a sandbox
     assembly accepts a bare name, because reading a probe's own measurement at the probe tier is the
     question that was asked. Two current measurements answering to one scope refuse rather than
-    resolve by recency.
+    resolve by recency. The binding attests the WRITER's declaration, never the run itself — it
+    closes accidental collision, not forgery.
 
     The mapping row rule this execution pins comes from the MEASUREMENT
     (:func:`pinned_mapping_temporal_policy`) and never from ``mapping_row_selection`` — which is the
@@ -370,10 +375,10 @@ def assemble_admitted_crosswalk(
             code=CrosswalkAssemblyReason.OBSERVATION_SCOPE_IDENTITY_UNPROVED,
             detail=(
                 f"the composed measurement {observation.observation_revision_id} records scope "
-                f"{observation.scope_id!r}, which names this scope but does not prove it: the "
-                "execution tier, the environment and the purposes of the scope it ran under were "
-                "never persisted, so a SANDBOX probe of the same name is indistinguishable from a "
-                "production run. Re-measure with a scope-bound id "
+                f"{observation.scope_id!r}, which NAMES this scope and declares nothing else about "
+                "it: the execution tier, the environment and the purposes of the scope it ran "
+                "under were never persisted, so a SANDBOX probe of the same name is "
+                "indistinguishable from a production run. Re-measure with a scope-bound id "
                 "(`crosswalk_observation.scope_binding_id`) before reading this as production "
                 "evidence"),
             definition_id=definition_id)

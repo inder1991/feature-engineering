@@ -591,6 +591,20 @@ const FORBIDDEN_ON_A_CROSSWALK_ROW = [
   /\bunblocks?\b/i,
   /approve to (unblock|run)/i,
   /pending approval/i,
+  // TWO FAMILIES, not two more sentences. The list above is a list of PHRASES, and a phrase list is
+  // beaten by rephrasing: "Not yet usable: once a reviewer verifies this mapping it becomes
+  // runnable, and no features currently depend on it" contains none of them and asserts both lies
+  // at once. These match the SHAPE instead.
+  //
+  // (a) any review verb wired to a capability verb wired to a capability adjective, within one
+  //     sentence. The sentence bound (`[^.!?]`) is what keeps the honest copy legal: "A reviewer
+  //     has confirmed this mapping." and "Running a crosswalk is not available yet, whatever its
+  //     review says." are two sentences, and the row is allowed to say both.
+  /\b(review\w*|verif\w*|endorse\w*|accept\w*|approv\w*|confirm\w*|sign-?off)\b[^.!?]{0,80}\b(becomes?|makes?|enables?|unlocks?|turns?)\b[^.!?]{0,40}\b(runnable|usable|available|executable|live)\b/i,
+  // (b) the false zero SPELLED OUT. The numeric guard below catches "0 features"; this catches the
+  //     same claim in words, which no digit scan can see. "What already depends on this: not
+  //     tracked yet" is the honest render and matches neither half.
+  /\b(no|zero)\s+(\w+\s+){0,2}features?\b[^.!?]{0,25}\bdepend|\bnothing\b[^.!?]{0,25}\bdepends?\b/i,
 ]
 
 // A 0 is EARNED only where a store actually counted one: `state === 'counted'` renders through the

@@ -15,6 +15,7 @@ THE TWO PRODUCT RULES THIS SUITE OWNS, each written so a wrong implementation fa
 """
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -34,6 +35,7 @@ from tests.featuregen.overlay.upload._crosswalk_fixtures import (
 )
 
 from featuregen.overlay.upload.bridge_assessment import (
+    BridgeContractError,
     ConceptAuthority,
     IdentifierColumnMemberV1,
     IdentifierEndpointV1,
@@ -74,6 +76,7 @@ from featuregen.overlay.upload.crosswalk_assembly import (
 )
 from featuregen.overlay.upload.crosswalk_observation import (
     MAPPING_TO_TARGET,
+    SCOPE_BINDING_SEPARATOR,
     SOURCE_TO_MAPPING,
     SOURCE_TO_TARGET,
     TARGET_TO_SOURCE,
@@ -453,6 +456,43 @@ def test_a_sandbox_tier_reads_a_bare_measurement_because_that_is_the_question_as
     assert isinstance(admitted, AdmittedCrosswalkV1)
     assert admitted.observation is not None
     assert sandbox_plannable(admitted, direction=SOURCE_TO_TARGET) is True
+
+
+def test_a_scope_may_not_be_NAMED_as_though_it_were_bound(bank):
+    """Review ATTACK-2: the forgery that needs no hash — just a scope with the right name.
+
+    A measurement declares the whole scope it ran under by recording `<scope_id>#scope:<digest>`,
+    and a reader tells "declared" from "named only" by that separator. So a scope legitimately
+    CALLED `crosswalk-production-scope#scope:ec94a641e86b4053` breaks the distinction from the other
+    end: a BARE measurement under that scope records exactly the string the real production scope's
+    binding produces, and `observation_scope_is_proved` answers True for a measurement that bound
+    nothing. The double-bound `name#scope:h1#scope:h2` shape is the same defect with one more hat.
+
+    Refused where a scope is first SPELLED, so no reader downstream has to distrust its own
+    separator — and refused again in `scope_binding_id`, which is duck-typed and therefore reachable
+    without ever passing through the dataclass.
+    """
+    db, revision, cib, ftr, mapping, realization = bank
+    forged_name = scope_binding_id(PRODUCTION_SCOPE)
+    assert SCOPE_BINDING_SEPARATOR in forged_name, "the fixture must carry a real bound id"
+
+    with pytest.raises(BridgeContractError, match=re.escape(SCOPE_BINDING_SEPARATOR)):
+        RealizationApplicabilityScopeV1(
+            scope_id=forged_name, execution_tier=ExecutionTier.SANDBOX,
+            purposes=("crosswalk_probe",), environment="dev")
+
+    # And the minter refuses the same name, for a caller that never went through the dataclass.
+    class _DuckTypedScope:
+        scope_id = forged_name
+
+        def identity_payload(self):
+            return {"scope_id": self.scope_id, "execution_tier": "sandbox"}
+
+    with pytest.raises(ValueError, match=re.escape(SCOPE_BINDING_SEPARATOR)):
+        scope_binding_id(_DuckTypedScope())
+
+    # The real production scope still binds, so the refusal is about the NAME and not the mechanism.
+    assert scope_binding_id(PRODUCTION_SCOPE) == forged_name
 
 
 def test_two_current_measurements_of_one_scope_refuse_rather_than_take_the_newest(bank):
