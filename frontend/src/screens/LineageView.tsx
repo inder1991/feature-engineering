@@ -897,7 +897,10 @@ export function LineageView({
     // both ends made it onto the canvas.
     const contain = matchId !== null && placedIds.has(matchId) && placedIds.has(anchorUnitId)
     const g = new dagre.graphlib.Graph()
-    g.setGraph({ rankdir: 'LR', nodesep: 36, ranksep: 110, marginx: 24, marginy: 24 })
+    // The artifact's cards sit clearly apart; at nodesep 36 / ranksep 110 they crowded and the
+    // edge labels had nowhere to sit without covering a card. Widened both, and the margin
+    // with them so the outermost card is never flush against the canvas edge.
+    g.setGraph({ rankdir: 'LR', nodesep: 64, ranksep: 160, marginx: 40, marginy: 40 })
     g.setDefaultEdgeLabel(() => ({}))
     for (const p of placed) g.setNode(p.node.id, { width: p.w, height: p.h })
     if (contain && matchId) g.setEdge(matchId, anchorUnitId)

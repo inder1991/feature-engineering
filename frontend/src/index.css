@@ -2360,8 +2360,12 @@ section > h2:first-child {
   border-color: var(--warn);
 }
 
-/* Border only. Filling the head as well stated the same fact a third time (chip + head + band)
-   and made a routine snapshot age read as an alert. */
+/* A PALE head tint, as the artifact draws it — not the full warn-soft fill that made a routine
+   snapshot age read as an alert. Mixed most of the way back to the surface so it reads as a
+   tint, not a state. */
+.ln-card--stale .ln-head {
+  background: color-mix(in oklch, var(--warn-soft) 55%, var(--surface));
+}
 
 .ln-card--pending {
   border-style: dashed;
