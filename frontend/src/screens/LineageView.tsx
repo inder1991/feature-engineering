@@ -527,7 +527,13 @@ function RelationshipBlock({
 
 // ---- the view --------------------------------------------------------------------------------
 
-export function LineageView({ anchor }: { anchor: SearchHit }) {
+export function LineageView({
+  anchor,
+  onBackToResults,
+}: {
+  anchor: SearchHit
+  onBackToResults?: () => void
+}) {
   const { navigate } = useHashRoute()
   const [graph, setGraph] = useState<LineageGraph | null>(null)
   const [loading, setLoading] = useState(true)
@@ -1062,30 +1068,111 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           implementation." The layers fieldset and the why-empty note were ReactFlow <Panel>s
           drawn ON the canvas, and the drawer was position:absolute over its right edge, so
           all three covered nodes and labels. They are columns now. */}
+      {/* The artifact's context bar: the graph is anchored on something, and the anchor was only
+          named in a hint sentence above the canvas. Kind chip, full ref, the human wording under
+          it, and the two actions the artifact keeps — back to results, and the asset dossier. */}
+      <section className="ln-contextbar" aria-label="Graph anchor">
+        <div className="ln-context-main">
+          <span className="ln-context-kind">{anchor.column ? 'COL' : 'TBL'}</span>
+          <div className="ln-context-name">
+            <strong>{anchor.object_ref}</strong>
+            <small>
+              {[anchor.concept, anchor.catalog_source, anchor.table]
+                .filter(Boolean).join(' · ')}
+            </small>
+          </div>
+          {/* Only badges backed by a field the search hit actually carried. */}
+          {anchor.entity && <span className="badge gj-proposed">{anchor.entity}</span>}
+          {anchor.is_grain && <span className="badge grain">grain</span>}
+          {anchor.is_as_of && <span className="badge asof">as-of</span>}
+        </div>
+        <div className="ln-context-actions">
+          {onBackToResults && (
+            <button type="button" className="btn btn--ghost" onClick={onBackToResults}>
+              ← Results
+            </button>
+          )}
+          <a
+            className="btn btn--ghost"
+            href={`#/asset?${new URLSearchParams({
+              source: anchor.catalog_source, object_ref: anchor.object_ref,
+            }).toString()}`}
+          >
+            View details
+          </a>
+        </div>
+      </section>
+
       <div className="ln-wrap">
         <aside className="ln-tools" aria-label="Graph controls">
-            <fieldset className="ln-layers">
-              <legend className="micro-label">Layers</legend>
+            {/* The artifact's four tool sections. A layer is a name AND what it means: a bare
+                "Joins" checkbox assumes the reader already knows what the platform counts as one. */}
+            <section className="ln-tool-section ln-tool-section--first">
+              <h3 className="ln-micro">Relationship layers</h3>
               {(
                 [
-                  ['joins', 'Joins', 'var(--ln-join)'],
-                  ['entity', 'Entity bridges', 'var(--warn)'],
-                  ['features', 'Feature lineage', 'var(--proposal)'],
+                  ['joins', 'Governed joins', 'Approved structural joins', 'var(--ln-join)'],
+                  ['entity', 'Entity mappings', 'Same business entity across catalogs',
+                    'var(--warn)'],
+                  ['features', 'Registered features', 'Existing production lineage',
+                    'var(--proposal)'],
                 ] as const
-              ).map(([layer, title, swatch]) => (
+              ).map(([layer, title, blurb, swatch]) => (
                 <label key={layer} className="ln-layer">
                   <input
                     type="checkbox"
+                    /* The visible label is two lines (name + meaning); the accessible name stays
+                       the layer name alone so it is announced as a control, not a paragraph. */
+                    aria-label={title}
                     checked={layersOn[layer]}
                     onChange={e => {
                       setLayersOn(prev => ({ ...prev, [layer]: e.target.checked }))
                     }}
                   />
                   <span className="ln-swatch" style={{ background: swatch }} aria-hidden="true" />
-                  {title}
+                  <span><strong>{title}</strong><small>{blurb}</small></span>
                 </label>
               ))}
-            </fieldset>
+            </section>
+
+            {/* Line meaning: the canvas draws three different strokes and nothing said which was
+                which. The samples are aria-hidden — the adjacent text IS the meaning. */}
+            <section className="ln-tool-section">
+              <h3 className="ln-micro">Line meaning</h3>
+              <div className="ln-legend">
+                <div className="ln-legend-row">
+                  <span className="ln-line-sample" aria-hidden="true" /><span>Verified join</span>
+                </div>
+                <div className="ln-legend-row">
+                  <span className="ln-line-sample ln-line-sample--dashed" aria-hidden="true" />
+                  <span>Entity mapping</span>
+                </div>
+                <div className="ln-legend-row">
+                  <span className="ln-line-sample ln-line-sample--dotted" aria-hidden="true" />
+                  <span>Containment</span>
+                </div>
+              </div>
+            </section>
+
+            {/* Scope: what the map currently covers, so a sparse graph reads as "one hop" rather
+                than "this column has nothing". */}
+            <section className="ln-tool-section">
+              <h3 className="ln-micro">Current scope</h3>
+              <div className="ln-scope-note">
+                One hop around <span className="mono">{anchor.column ?? anchor.table}</span>.
+                Expand a table to fetch its next neighborhood.
+              </div>
+            </section>
+
+            {/* Read scope is enforced server-side, so an absent object is absent from the wire.
+                Saying so is the difference between "nothing exists" and "nothing you may see". */}
+            <section className="ln-tool-section">
+              <h3 className="ln-micro">Visibility</h3>
+              <div className="ln-scope-note">
+                Only objects permitted for the current session are shown. Hidden objects are not
+                counted.
+              </div>
+            </section>
           {showWhyEmpty && (
               <aside className="ln-empty" aria-label="Why nothing is drawn">
                 <h3 className="micro-label">Nothing to draw yet</h3>

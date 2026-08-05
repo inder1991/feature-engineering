@@ -425,7 +425,7 @@ describe('search screen — impact and graph', () => {
       'public.accounts.balance', 'deposits',
       expect.objectContaining({ direction: 'both', depth: 1 }),
     )
-    expect(await screen.findByText('Layers')).toBeInTheDocument()
+    expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Impact for public.accounts.balance' }),
     ).not.toBeInTheDocument()
@@ -434,7 +434,7 @@ describe('search screen — impact and graph', () => {
     expect(
       await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
     ).toBeInTheDocument()
-    expect(screen.queryByText('Layers')).not.toBeInTheDocument()
+    expect(screen.queryByText('Relationship layers')).not.toBeInTheDocument()
   })
 
   it('Details action navigates to the asset route with the hit\'s source and object_ref', async () => {
@@ -474,7 +474,7 @@ describe('search screen — impact and graph', () => {
       'public.accounts.opened_at', 'deposits',
       expect.objectContaining({ direction: 'both', depth: 1 }),
     )
-    expect(await screen.findByText('Layers')).toBeInTheDocument()
+    expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
   })
 
   // The unfiltered browse lists the TABLE itself as the first hit; its card title looks exactly
@@ -488,9 +488,11 @@ describe('search screen — impact and graph', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    const caption = await screen.findByText(/Graph of:/)
-    expect(caption).toHaveTextContent('public.accounts.opened_at')
-    expect(caption).toHaveTextContent('column')
+    // The hint sentence was replaced by the graph's own context bar, which names the anchor with
+    // its kind chip, full ref and wording rather than a parenthetical.
+    const bar = await screen.findByRole('region', { name: /graph anchor/i })
+    expect(bar).toHaveTextContent('public.accounts.opened_at')
+    expect(bar).toHaveTextContent('COL')
   })
 
   it('table hits carry a table badge so they cannot read as columns', async () => {
@@ -515,10 +517,10 @@ describe('search screen — impact and graph', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
     // Re-search (same result set): the anchor must NOT silently reset to the first hit (the table).
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
   })
 
   it('a re-search falls back to the first hit only when the anchor left the result set', async () => {
@@ -528,9 +530,9 @@ describe('search screen — impact and graph', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.balance')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.balance')
   })
 })

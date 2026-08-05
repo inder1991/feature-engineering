@@ -130,7 +130,7 @@ describe('lineage view', () => {
   it('renders table cards with source lines, column flags, and the anchor match highlight', async () => {
     lineageGraph.mockResolvedValue(BASE)
     render(<LineageView anchor={ANCHOR} />)
-    expect(await screen.findByText('accounts')).toBeInTheDocument()
+    expect((await screen.findAllByText('accounts')).length).toBeGreaterThan(0)
     expect(lineageGraph).toHaveBeenCalledWith(
       'public.accounts.balance', 'deposits',
       // objectContaining: the view also threads a `signal` (AbortController) we do not pin here.
@@ -208,26 +208,26 @@ describe('lineage view', () => {
   it('filters layers client-side, dropping nodes only reachable through a toggled-off layer', async () => {
     lineageGraph.mockResolvedValue(WITH_CARDS)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     expect(screen.getByText('avg_eod_balance_30d')).toBeInTheDocument()
 
-    await userEvent.click(screen.getByLabelText('Feature lineage'))
+    await userEvent.click(screen.getByLabelText('Registered features'))
     expect(screen.queryByText('avg_eod_balance_30d')).not.toBeInTheDocument()
     expect(screen.queryByText('churn_risk_model')).not.toBeInTheDocument()
     const list = screen.getByRole('region', { name: 'Links in this view, as text' })
     expect(within(list).queryByText(/derives feature/)).not.toBeInTheDocument()
 
-    await userEvent.click(screen.getByLabelText('Entity bridges'))
+    await userEvent.click(screen.getByLabelText('Entity mappings'))
     expect(screen.queryByText('card_holders')).not.toBeInTheDocument()
 
-    await userEvent.click(screen.getByLabelText('Feature lineage'))
+    await userEvent.click(screen.getByLabelText('Registered features'))
     expect(await screen.findByText('avg_eod_balance_30d')).toBeInTheDocument()
   })
 
   it('traces a column through its feature to its consumer and opens the drawer', async () => {
     lineageGraph.mockResolvedValue(BASE)
     const { container } = render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     await userEvent.click(screen.getByRole('button', { name: 'balance' }))
 
     const drawer = screen.getByRole('complementary', { name: 'Details' })
@@ -270,7 +270,7 @@ describe('lineage view', () => {
     }
     lineageGraph.mockResolvedValueOnce(expansion)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     expect(screen.queryByText('card_holders')).not.toBeInTheDocument()
 
     await userEvent.click(screen.getByRole('button', { name: 'Expand neighbors of customers' }))
@@ -303,7 +303,7 @@ describe('lineage view', () => {
       truncated: false,
     })
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     await userEvent.click(
       screen.getByRole('button', { name: 'Expand neighbors of transactions' }),
     )
@@ -318,7 +318,7 @@ describe('lineage view', () => {
   it('lists every visible edge as plain text for assistive tech', async () => {
     lineageGraph.mockResolvedValue(WITH_CARDS)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     const list = screen.getByRole('region', { name: 'Links in this view, as text' })
     const lines = within(list)
       .getAllByRole('listitem')
@@ -343,7 +343,7 @@ describe('lineage view', () => {
   it('closes the drawer on Escape and returns focus to the opening column button', async () => {
     lineageGraph.mockResolvedValue(BASE)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     const balance = screen.getByRole('button', { name: 'balance' })
     await userEvent.click(balance)
     expect(screen.getByRole('complementary', { name: 'Details' })).toBeInTheDocument()
@@ -357,7 +357,7 @@ describe('lineage view', () => {
   it('opens the feature drawer with a registry link from the node payload alone', async () => {
     lineageGraph.mockResolvedValue(BASE)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     await userEvent.click(screen.getByRole('button', { name: /avg_eod_balance_30d/ }))
     const drawer = screen.getByRole('complementary', { name: 'Details' })
     expect(within(drawer).getByText('feat_01HZX')).toBeInTheDocument()
@@ -379,7 +379,7 @@ describe('lineage view', () => {
   it('reports a truncated map', async () => {
     lineageGraph.mockResolvedValue({ ...BASE, truncated: true })
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     expect(screen.getByText(/cut at the node limit/i)).toBeInTheDocument()
   })
 
@@ -399,7 +399,7 @@ describe('lineage view', () => {
     }
     lineageGraph.mockResolvedValue(META)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     await userEvent.click(screen.getByRole('button', { name: 'balance' }))
     const drawer = screen.getByRole('complementary', { name: 'Details' })
     expect(within(drawer).getByText('concept')).toBeInTheDocument()
@@ -425,7 +425,7 @@ describe('lineage view', () => {
     }
     lineageGraph.mockResolvedValue(stamped)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     await userEvent.click(screen.getByRole('button', { name: /avg_eod_balance_30d/ }))
     const drawer = screen.getByRole('complementary', { name: 'Details' })
     expect(within(drawer).getByText('DESIGN-CHECKED')).toBeInTheDocument()
@@ -444,7 +444,7 @@ describe('lineage view', () => {
     }
     lineageGraph.mockResolvedValue(prov)
     render(<LineageView anchor={ANCHOR} />)
-    await screen.findByText('accounts')
+    await screen.findAllByText('accounts')
     // the header chip shows the pending count at a glance (label carries the number, not color alone)
     expect(screen.getByText('3 queued')).toBeInTheDocument()
     // the table's details drawer (opened from the title) carries the provenance
@@ -492,7 +492,7 @@ describe('lineage view', () => {
     it('renders a column anchor as its own node with a containment edge and a compact table card', async () => {
       lineageGraph.mockResolvedValue(WIDE)
       const { container } = render(<LineageView anchor={ANCHOR} />)
-      await screen.findByText('accounts')
+      await screen.findAllByText('accounts')
 
       // the anchored column is a distinct node: kind chip, name (the match), and its concept
       const anchorCard = container.querySelector('.ln-card--anchor') as HTMLElement
@@ -529,11 +529,15 @@ describe('lineage view', () => {
     it('caps an expanded table card at 8 rows with a "+N more columns" scroll expander', async () => {
       lineageGraph.mockResolvedValue(WIDE)
       const { container } = render(<LineageView anchor={TABLE_ANCHOR} />)
-      await screen.findByText('accounts')
+      await screen.findAllByText('accounts')
 
       // table anchors keep the table-card-centric layout: no anchor-column node
       expect(container.querySelector('.ln-card--anchor')).toBeNull()
-      const card = screen.getByText('accounts').closest('.ln-card') as HTMLElement
+      // The anchor's table name also appears in the context bar now, so pick the occurrence
+      // that is actually a canvas card.
+      const card = screen.getAllByText('accounts')
+        .map(el => el.closest('.ln-card'))
+        .find((el): el is HTMLElement => el !== null) as HTMLElement
       expect(within(card).getAllByRole('listitem').length).toBe(8)
       // edge-endpoint columns rank into the capped head of the list
       expect(within(card).getByRole('button', { name: 'cust_id' })).toBeInTheDocument()
@@ -571,7 +575,7 @@ describe('lineage view', () => {
       }
       lineageGraph.mockResolvedValue(LEAN)
       const { unmount } = render(<LineageView anchor={ANCHOR} />)
-      await screen.findByText('accounts')
+      await screen.findAllByText('accounts')
 
       expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
       expect(
@@ -583,10 +587,10 @@ describe('lineage view', () => {
       expect(screen.getByRole('link', { name: 'Workbench' })).toBeInTheDocument()
 
       // the lines respect the layer toggles
-      await userEvent.click(screen.getByLabelText('Joins'))
+      await userEvent.click(screen.getByLabelText('Governed joins'))
       expect(screen.queryByText(/No joins proposed or approved yet/)).not.toBeInTheDocument()
       expect(screen.getByText(/No entity relationship is visible yet/)).toBeInTheDocument()
-      await userEvent.click(screen.getByLabelText('Joins'))
+      await userEvent.click(screen.getByLabelText('Governed joins'))
       expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
 
       // links use the app's hash routes
@@ -602,7 +606,7 @@ describe('lineage view', () => {
         truncated: false,
       })
       render(<LineageView anchor={TABLE_ANCHOR} />)
-      await screen.findByText('accounts')
+      await screen.findAllByText('accounts')
       expect(screen.getByText(/No joins proposed or approved yet/)).toBeInTheDocument()
       expect(screen.getByText(/No features are derived from this table yet/)).toBeInTheDocument()
     })
@@ -632,7 +636,7 @@ describe('lineage view', () => {
       }
       lineageGraph.mockResolvedValue(PENDING)
       render(<LineageView anchor={ANCHOR} />)
-      await screen.findByText('accounts')
+      await screen.findAllByText('accounts')
       expect(screen.getByText(/declared join target; not uploaded yet/i)).toBeInTheDocument()
       expect(screen.queryByText(/No joins proposed or approved yet/)).not.toBeInTheDocument()
       expect(screen.queryByText(/No verified entity bridge yet/)).not.toBeInTheDocument()

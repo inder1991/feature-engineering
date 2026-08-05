@@ -428,14 +428,12 @@ export function SearchScreen() {
             // a table-anchored graph from a column-anchored one (the unfiltered browse lists the
             // table itself first, and its Graph action was mistaken for a column's).
             <>
-              <p className="hint" role="status">
-                Graph of: <code>{graphAnchor.object_ref}</code> (
-                {graphAnchor.column ? 'column' : 'table'}). Click Graph on any result row to
-                re-anchor.
-              </p>
+              {/* The anchor used to be named in this sentence; the graph's own context bar names
+                  it properly now, with its kind, wording and actions. */}
               <LineageView
                 key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
                 anchor={graphAnchor}
+                onBackToResults={() => setView('list')}
               />
             </>
           )}

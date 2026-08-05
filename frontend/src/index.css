@@ -1640,26 +1640,184 @@ section > h2:first-child {
 /* the canvas */
 /* The graph workspace: three dedicated columns, per the reviewed concept. Nothing is positioned
    over the canvas any more, so no control can cover a node or an edge label. */
+/* The graph anchor bar. Joined to the workspace below it — one object, one border — exactly as
+   the artifact draws it (radius top-only here, bottom-only there, no border between). */
+.ln-contextbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  min-height: 47px;
+  margin-top: 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel) var(--radius-panel) 0 0;
+  background: var(--surface);
+}
+
+.ln-context-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.ln-context-kind {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  flex: none;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.ln-context-name { min-width: 0; }
+
+.ln-context-name strong {
+  display: block;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ln-context-name small {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink-faint);
+}
+
+.ln-context-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
 .ln-wrap {
   display: grid;
   grid-template-columns: 205px minmax(540px, 1fr) 328px;
   height: 680px;
-  margin-block: 16px;
+  margin-block: 0 16px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-panel) var(--radius-panel);
   background: var(--surface);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
 
 .ln-tools {
-  display: grid;
-  align-content: start;
-  gap: 14px;
   overflow: auto;
-  padding: 14px;
+  padding: 14px 13px;
   border-right: 1px solid var(--line);
+  /* A step back from the canvas: the map is the subject, the controls are chrome. */
+  background: var(--surface-2);
+}
+
+.ln-tool-section {
+  margin-top: 18px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+
+.ln-tool-section--first {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.ln-micro {
+  margin: 0 0 8px;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* A layer is a name AND what it means, so the row is three columns: box, swatch, wording. */
+.ln-layer {
+  display: grid;
+  grid-template-columns: 16px 8px 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 6px 0;
+}
+
+.ln-layer input {
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.ln-swatch {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+}
+
+.ln-layer strong {
+  display: block;
+  font-size: 11.5px;
+}
+
+.ln-layer small {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.ln-legend {
+  display: grid;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.ln-legend-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+/* The stroke itself, so the legend shows the line rather than describing it. */
+.ln-line-sample {
+  height: 0;
+  border-top: 2px solid var(--ln-join);
+}
+
+.ln-line-sample--dashed {
+  border-top-style: dashed;
+  border-top-color: var(--warn);
+}
+
+.ln-line-sample--dotted {
+  border-top-style: dotted;
+  border-top-color: var(--line-strong);
+}
+
+.ln-scope-note {
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 /* In a column now, so it drops the floating-panel affordance it needed over the canvas. */
