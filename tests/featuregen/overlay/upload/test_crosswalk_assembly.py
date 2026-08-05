@@ -78,6 +78,7 @@ from featuregen.overlay.upload.crosswalk_observation import (
     SOURCE_TO_TARGET,
     TARGET_TO_SOURCE,
     compose_crosswalk_observation,
+    scope_binding_id,
 )
 from featuregen.overlay.upload.crosswalk_observation_store import (
     crosswalk_observation_history,
@@ -203,13 +204,24 @@ def row_selection(**over) -> DatasetRowSelectionV1:
     return DatasetRowSelectionV1(**kwargs)
 
 
-def measure(revision, cib, ftr, mapping, *, scope_id: str, selection=None, **over):
-    """A CLEAN composed measurement — 1:1 forward, fanning 2:1 in reverse (the ordinary shape)."""
+def measure(revision, cib, ftr, mapping, *, scope=None, scope_id: str | None = None,
+            selection=None, as_of: str = "2026-08-04", **over):
+    """A CLEAN composed measurement — 1:1 forward, fanning 2:1 in reverse (the ordinary shape).
+
+    ``scope`` records a SCOPE-BOUND id (``crosswalk_observation.scope_binding_id``), which is what a
+    measurement that can prove which scope it ran under looks like. ``scope_id`` records a bare
+    string — every 1057 row written before the binding existed, and the shape the assembler refuses
+    to read as production evidence. Exactly one of the two is supplied, so no test is ever vague
+    about which kind of evidence it is standing on.
+    """
+    if (scope is None) == (scope_id is None):
+        raise AssertionError("measure() takes EITHER a bound scope OR a bare scope_id")
+    scope_id = scope_id if scope is None else scope_binding_id(scope)
     source_leg = leg(which=SOURCE_TO_MAPPING, endpoint_binding=cib, mapping_binding=mapping,
-                     endpoint_column="acct_no", mapping_column="acct_no")
+                     endpoint_column="acct_no", mapping_column="acct_no", as_of=as_of)
     target_leg = leg(which=MAPPING_TO_TARGET, endpoint_binding=ftr, mapping_binding=mapping,
                      endpoint_column="counter_party_acct_no", mapping_column="ext_acct_ref",
-                     cross_catalog=True)
+                     cross_catalog=True, as_of=as_of)
     kwargs = dict(
         crosswalk_definition_revision_id=revision.revision_id,
         source_leg=source_leg, target_leg=target_leg,
@@ -244,7 +256,7 @@ def test_a_stored_crosswalk_assembles_into_the_bundle_a_compilation_plans_on(ban
     selection = row_selection()
     record_crosswalk_observation(
         db, measure(revision, cib, ftr, mapping,
-                    scope_id=SANDBOX_SCOPE.scope_id, selection=selection))
+                    scope=SANDBOX_SCOPE, selection=selection))
 
     admitted = assemble(db, revision, cib, ftr, mapping, realization, selection=selection)
 
@@ -264,7 +276,7 @@ def test_the_two_directions_are_admitted_independently_from_the_measured_shape(b
     """1:1 forward, 2:1 reverse — one usable direction and one refused, from ONE measurement."""
     db, revision, cib, ftr, mapping, realization = bank
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id,
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE,
                     target_to_source_max_matches=2))
 
     admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
@@ -300,7 +312,7 @@ def test_an_llm_only_unreviewed_crosswalk_is_sandbox_plannable_without_approval(
     """DoD 16. Nobody has reviewed it and the sandbox may still plan through it."""
     db, revision, cib, ftr, mapping, realization = bank
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=SANDBOX_SCOPE.scope_id))
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE))
 
     admitted = assemble(db, revision, cib, ftr, mapping, realization)
 
@@ -321,7 +333,7 @@ def test_confirming_a_crosswalk_changes_no_admission_answer_at_all(bank):
     db, revision, cib, ftr, mapping, realization = bank
     # Fanning in reverse and 1:1 forward, so there IS a refused direction for a review to "fix".
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id,
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE,
                     target_to_source_max_matches=2))
     before = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
 
@@ -343,7 +355,7 @@ def test_withholding_review_withholds_no_capability(bank):
     """The mirror: an unreviewed crosswalk with clean evidence IS production-admissible."""
     db, revision, cib, ftr, mapping, realization = bank
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id))
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE))
 
     admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
 
@@ -352,7 +364,86 @@ def test_withholding_review_withholds_no_capability(bank):
 
 
 def test_a_sandbox_scoped_measurement_is_never_production_admissible(bank):
-    """A mapping proved safe on sandbox data is not thereby proved safe on production data."""
+    """THE NAMED INVARIANT, tested at last: ONE scope_id string, TWO tiers.
+
+    The earlier version of this test passed for a reason that had nothing to do with tiers — the
+    sandbox and production fixtures happened to carry different ``scope_id`` strings, so the
+    production assembly found no measurement at all. Migration 1057 persists the scope's NAME and
+    not its tier, so the real question is what happens when the names AGREE and the tiers do not:
+    the review's probe recorded under ``scope_id="probe-scope"`` at SANDBOX, read it back under a
+    PRODUCTION scope of the same name, and got a clean production-admissible bundle.
+
+    Both spellings of the recorded scope are checked, in that order, because they fail in different
+    places and only the second is the probe verbatim:
+
+    * a scope-BOUND id does not match the production scope at all, because the tier is inside the
+      binding — a sandbox measurement and a production one are two different questions and the
+      store now says so, which leaves the production read honestly UNMEASURED;
+    * a BARE id (every 1057 row written before the binding existed) still matches by NAME, and is
+      refused as production evidence because nothing in the store can prove which tier it ran at.
+    """
+    db, revision, cib, ftr, mapping, realization = bank
+    shared_name = "probe-scope"
+    sandbox = RealizationApplicabilityScopeV1(
+        scope_id=shared_name, execution_tier=ExecutionTier.SANDBOX,
+        purposes=("crosswalk_probe",), environment="dev")
+    production = RealizationApplicabilityScopeV1(
+        scope_id=shared_name, execution_tier=ExecutionTier.PRODUCTION,
+        purposes=("crosswalk_probe",), environment="dev")
+
+    # ── the bound shape: the tier is INSIDE the recorded id ─────────────────────────────────────
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=sandbox))
+
+    at_sandbox = assemble(db, revision, cib, ftr, mapping, realization, scope=sandbox)
+    assert isinstance(at_sandbox, AdmittedCrosswalkV1), (
+        "the measurement is real and its own tier may read it — otherwise everything below is "
+        "just a broken fixture")
+    assert at_sandbox.verdict_for(SOURCE_TO_TARGET).production_admissible is True, (
+        "the measurement's NUMBERS are clean; the SCOPE is what production cannot accept")
+
+    bound = assemble(db, revision, cib, ftr, mapping, realization, scope=production)
+    assert isinstance(bound, AdmittedCrosswalkV1)
+    assert bound.observation is None, (
+        "a SANDBOX measurement answered a production question because the two scopes share a name")
+    assert production_admissible(bound, direction=SOURCE_TO_TARGET) is False
+    assert CrosswalkAdmissionReason.NOT_MEASURED.value in bound.decision.reason_codes
+
+    # ── the bare, unprovable shape: the review's probe verbatim ─────────────────────────────────
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope_id=shared_name, as_of="2026-08-03"))
+
+    at_production = assemble(db, revision, cib, ftr, mapping, realization, scope=production)
+    assert isinstance(at_production, CrosswalkAssemblyRefusalV1), (
+        "a sandbox measurement was served as production evidence because the two scopes share a "
+        "name and nothing persists the tier")
+    assert at_production.code is CrosswalkAssemblyReason.OBSERVATION_SCOPE_IDENTITY_UNPROVED
+
+
+def test_a_scope_bound_production_measurement_is_the_one_shape_production_reads(bank):
+    """The mirror of the refusal above: proving the scope is what makes production evidence real.
+
+    Without this, "refuse the unprovable" would be indistinguishable from "refuse everything", and
+    every DoD-17 assertion in this file would be passing for the wrong reason.
+    """
+    db, revision, cib, ftr, mapping, realization = bank
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE))
+
+    admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
+
+    assert isinstance(admitted, AdmittedCrosswalkV1)
+    assert admitted.observation is not None
+    assert admitted.observation.scope_id == scope_binding_id(PRODUCTION_SCOPE)
+    assert production_admissible(admitted, direction=SOURCE_TO_TARGET) is True
+
+
+def test_a_sandbox_tier_reads_a_bare_measurement_because_that_is_the_question_asked(bank):
+    """A bare id is not a defect at the sandbox tier — refusing it there would delete real evidence.
+
+    The rule is asymmetric on purpose: production must PROVE the scope its verdict rests on, and a
+    probe reading its own probe's numbers has nothing to prove to anybody.
+    """
     db, revision, cib, ftr, mapping, realization = bank
     record_crosswalk_observation(
         db, measure(revision, cib, ftr, mapping, scope_id=SANDBOX_SCOPE.scope_id))
@@ -360,9 +451,33 @@ def test_a_sandbox_scoped_measurement_is_never_production_admissible(bank):
     admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=SANDBOX_SCOPE)
 
     assert isinstance(admitted, AdmittedCrosswalkV1)
-    assert admitted.verdict_for(SOURCE_TO_TARGET).production_admissible is True, (
-        "the measurement itself is clean — the tier is what refuses")
-    assert production_admissible(admitted, direction=SOURCE_TO_TARGET) is False
+    assert admitted.observation is not None
+    assert sandbox_plannable(admitted, direction=SOURCE_TO_TARGET) is True
+
+
+def test_two_current_measurements_of_one_scope_refuse_rather_than_take_the_newest(bank):
+    """`refuse_on_multiple`, applied to EVIDENCE (§6.6) — the discipline mapping definitions keep.
+
+    Two current rows can share a scope: migration 1057 keys the pointer on `current_scope_key`,
+    which carries the as-of instant and the principal as well as the scope, so re-measuring the same
+    scope at a different instant advances a DIFFERENT pointer. Sorting them by `observed_at` and
+    taking the first makes a safety verdict depend on a tie-break.
+    """
+    db, revision, cib, ftr, mapping, realization = bank
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE, as_of="2026-08-04"))
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE, as_of="2026-08-05",
+                    observed_at=NOW + timedelta(days=1), composed_row_count=99))
+
+    current = current_crosswalk_observations_for_revision(db, revision.revision_id)
+    assert len({item.scope_id for item in current}) == 1 and len(current) == 2, (
+        "the fixture must produce TWO current rows under ONE scope for this test to mean anything")
+
+    refusal = assemble(db, revision, cib, ftr, mapping, realization, scope=SANDBOX_SCOPE)
+
+    assert isinstance(refusal, CrosswalkAssemblyRefusalV1)
+    assert refusal.code is CrosswalkAssemblyReason.MULTIPLE_OBSERVATIONS_FOR_SCOPE
 
 
 # ── duplicates refuse, they are never deduplicated ──────────────────────────────────────────────
@@ -387,7 +502,7 @@ def test_two_active_mappings_for_one_endpoint_pair_refuse_rather_than_pick_one(b
 
     assert active_mapping_count(db, revision) == 2
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id))
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE))
     admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
 
     assert isinstance(admitted, AdmittedCrosswalkV1)
@@ -466,7 +581,7 @@ def test_a_measurement_of_another_mapping_table_refuses_instead_of_lending_its_v
     other_map = binding("cib", MAP_TABLE, schema="dpl_eib_v2")
     record_bindings(db, other_map)
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, other_map, scope_id=SANDBOX_SCOPE.scope_id))
+        db, measure(revision, cib, ftr, other_map, scope=SANDBOX_SCOPE))
 
     refusal = assemble(db, revision, cib, ftr, mapping, realization)
 
@@ -491,16 +606,16 @@ def test_the_measurement_is_picked_by_SCOPE_and_never_by_recency(bank):
     """A production assembly must not pick up a newer SANDBOX measurement."""
     db, revision, cib, ftr, mapping, realization = bank
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id))
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE))
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=SANDBOX_SCOPE.scope_id,
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE,
                     observed_at=NOW + timedelta(days=1), composed_row_count=99))
 
     admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
 
     assert isinstance(admitted, AdmittedCrosswalkV1)
     assert admitted.observation is not None
-    assert admitted.observation.scope_id == PRODUCTION_SCOPE.scope_id
+    assert admitted.observation.scope_id == scope_binding_id(PRODUCTION_SCOPE)
     assert admitted.observation.composed_row_count == 3
 
 
@@ -514,9 +629,9 @@ def test_a_sandbox_measurement_stays_readable_after_a_production_one_is_recorded
     keeps every measurement in `crosswalk_observation_revision`, so both survive with no new table.
     """
     db, revision, cib, ftr, mapping, realization = bank
-    sandbox = measure(revision, cib, ftr, mapping, scope_id=SANDBOX_SCOPE.scope_id)
+    sandbox = measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE)
     record_crosswalk_observation(db, sandbox)
-    production = measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id,
+    production = measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE,
                          observed_at=NOW + timedelta(days=2))
     record_crosswalk_observation(db, production)
 
@@ -525,7 +640,7 @@ def test_a_sandbox_measurement_stays_readable_after_a_production_one_is_recorded
 
     # BOTH are current — one per measured scope, never merged and never displaced.
     assert {item.scope_id for item in current} == {
-        SANDBOX_SCOPE.scope_id, PRODUCTION_SCOPE.scope_id}
+        scope_binding_id(SANDBOX_SCOPE), scope_binding_id(PRODUCTION_SCOPE)}
     assert sandbox.observation_revision_id in {item.observation_revision_id for item in history}
     # And the production assembly still refuses to READ the sandbox one as its evidence.
     admitted = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
@@ -545,7 +660,7 @@ def test_demoting_the_legs_realization_withdraws_the_crosswalk_it_carried(bank):
     """
     db, revision, cib, ftr, mapping, realization = bank
     record_crosswalk_observation(
-        db, measure(revision, cib, ftr, mapping, scope_id=PRODUCTION_SCOPE.scope_id))
+        db, measure(revision, cib, ftr, mapping, scope=PRODUCTION_SCOPE))
     healthy = assemble(db, revision, cib, ftr, mapping, realization, scope=PRODUCTION_SCOPE)
     assert isinstance(healthy, AdmittedCrosswalkV1)
     assert production_admissible(healthy, direction=SOURCE_TO_TARGET) is True
@@ -557,6 +672,134 @@ def test_demoting_the_legs_realization_withdraws_the_crosswalk_it_carried(bank):
     assert (CrosswalkAdmissionReason.LEG_NOT_CURRENTLY_EXECUTABLE.value
             in withdrawn.decision.reason_codes)
     assert production_admissible(withdrawn, direction=SOURCE_TO_TARGET) is False
+
+
+# ── the mapping row rule is pinned from the MEASUREMENT, never from the caller ──────────────────
+
+def test_a_row_selection_resolved_under_a_MOVED_policy_pointer_refuses(bank):
+    """The drift refusal, made reachable. Measured under one row rule, resolved under another.
+
+    `AdmittedCrosswalkV1.__post_init__` has always carried this refusal — "the current policy
+    pointer moved after the crosswalk was measured, so the rows this traversal would read are not
+    the rows its uniqueness was proved over" — and through this assembler it could never fire,
+    because the pin it compares the selection against was DERIVED FROM THAT SELECTION. Both sides of
+    the comparison were one value.
+
+    `mapping_row_selection_hash` is deliberately absent from the measurement here: the content-hash
+    backstop below the policy check would otherwise mask the defect, and `compose_crosswalk_
+    observation` allows None, so a real measurement can arrive in exactly this shape.
+    """
+    db, revision, cib, ftr, mapping, realization = bank
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE))   # under POLICY_REVISION
+
+    drifted = row_selection(temporal_policy_revision_id="dtp_" + "7" * 64)
+    refusal = assemble(db, revision, cib, ftr, mapping, realization, selection=drifted)
+
+    assert isinstance(refusal, CrosswalkAssemblyRefusalV1), (
+        "a selection resolved under a policy that had since advanced assembled clean: the "
+        "execution's pin followed the caller instead of the measurement")
+    assert refusal.code is CrosswalkAssemblyReason.BUNDLE_INCONSISTENT
+    assert "policy pointer moved" in refusal.detail
+
+
+def test_a_row_selection_under_the_MEASURED_policy_assembles(bank):
+    """The other direction, so the refusal above is a rule and not a wall.
+
+    Without this the drift test would be satisfied by an assembler that refused every selection.
+    """
+    db, revision, cib, ftr, mapping, realization = bank
+    selection = row_selection()
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE, selection=selection))
+
+    admitted = assemble(db, revision, cib, ftr, mapping, realization, selection=selection)
+
+    assert isinstance(admitted, AdmittedCrosswalkV1)
+    assert admitted.execution.mapping_temporal_policy_revision_id == POLICY_REVISION
+    assert admitted.mapping_row_selection == selection
+
+
+def test_the_pin_is_the_MEASURED_row_rule_even_when_the_definition_declares_none(bank):
+    """The second face: an execution that pinned None over a measurement taken WITH a filter.
+
+    The fixture definition declares no mapping temporal policy and the measurement was taken under
+    one, which is the ordinary shape — the row policy lives on the dataset, and a crosswalk
+    published before anybody declared it says nothing. Pinning the DEFINITION's None there left
+    `joins.plan_crosswalk_join` with nothing to require: its "pins a policy and no resolved row
+    selection was supplied" refusal never fired, so the traversal read the mapping table UNFILTERED
+    under a uniqueness verdict measured over the filtered rows.
+
+    Proved through the real planner, not by inspecting the pin: the refusal is what the pin is for.
+    """
+    from featuregen.materialize.joins import MaterializationRefused, plan_crosswalk_join
+
+    db, revision, cib, ftr, mapping, realization = bank
+    assert revision.mapping_temporal_policy_revision_id is None, "the fixture declares no policy"
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE))
+
+    admitted = assemble(db, revision, cib, ftr, mapping, realization)   # NO row selection supplied
+
+    assert isinstance(admitted, AdmittedCrosswalkV1)
+    assert admitted.execution.mapping_temporal_policy_revision_id == POLICY_REVISION
+
+    outcome = plan_crosswalk_join(
+        admitted, direction=SOURCE_TO_TARGET,
+        from_identity=_identity(cib), to_identity=_identity(ftr),
+        mapping_identity=_identity(mapping), execution_tier=ExecutionTier.SANDBOX)
+
+    assert isinstance(outcome, MaterializationRefused), (
+        "the traversal planned against UNFILTERED mapping rows under a verdict measured with a "
+        "filter, because the execution pinned the definition's absent policy")
+    assert "no resolved row selection was supplied" in outcome.detail
+
+
+def test_an_unmeasured_crosswalk_pins_the_definitions_own_declaration(bank):
+    """Nothing measured it, so the crosswalk's own declaration is the only recorded answer."""
+    db, _revision, cib, ftr, mapping, realization = bank
+    declared = definition(mapping_temporal_policy_revision_id=POLICY_REVISION)
+    publish_crosswalk_definition(
+        db, declared, expected_pointer_version=1, actor=ACTOR, roles=ROLES)
+
+    admitted = assemble(db, declared, cib, ftr, mapping, realization)
+
+    assert isinstance(admitted, AdmittedCrosswalkV1)
+    assert admitted.observation is None
+    assert admitted.execution.mapping_temporal_policy_revision_id == POLICY_REVISION
+
+
+def test_a_pin_that_stops_following_the_measurement_is_refused_not_assembled(bank, monkeypatch):
+    """The DERIVATION guard, exercised by breaking the derivation it guards.
+
+    Unreachable while `pinned_mapping_temporal_policy` is right — which is the point. The shipped
+    defect was a pin derived from the caller's row selection, and anything that re-points the
+    derivation at the caller lands here, with both policies named, instead of assembling a bundle
+    whose verdict describes another row set.
+    """
+    from featuregen.overlay.upload import crosswalk_assembly
+
+    db, revision, cib, ftr, mapping, realization = bank
+    record_crosswalk_observation(
+        db, measure(revision, cib, ftr, mapping, scope=SANDBOX_SCOPE))
+    monkeypatch.setattr(
+        crosswalk_assembly, "pinned_mapping_temporal_policy",
+        lambda definition, observation: "dtp_" + "7" * 64)
+
+    refusal = assemble(db, revision, cib, ftr, mapping, realization)
+
+    assert isinstance(refusal, CrosswalkAssemblyRefusalV1)
+    assert refusal.code is CrosswalkAssemblyReason.MEASUREMENT_TEMPORAL_POLICY_MISMATCH
+    assert POLICY_REVISION in refusal.detail
+
+
+def _identity(bind):
+    """The binding's address, in the planner's own shape."""
+    from featuregen.materialize.joins import PhysicalIdentity
+
+    return PhysicalIdentity(
+        catalog_source=bind.identity.catalog_source, schema=bind.identity.schema,
+        table=bind.identity.table)
 
 
 # ── the binding loader ──────────────────────────────────────────────────────────────────────────

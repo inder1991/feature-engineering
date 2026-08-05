@@ -150,12 +150,20 @@ def reconcile_crosswalk(
             f"counted against {read} and the measurement pinned {pinned}: every number below "
             "describes a different table")
 
-    expected_rule = admitted.execution.mapping_temporal_policy_revision_id
+    # THE ROW RULE THE MEASUREMENT WAS TAKEN UNDER, read from the measurement itself wherever there
+    # is one. The execution's pin is DERIVED (`crosswalk_assembly.pinned_mapping_temporal_policy`),
+    # and an independent check that compares an operator's count against a derived value is only as
+    # independent as the derivation: this comparison exists to catch a wrong measurement, so it asks
+    # the measurement. They agree for anything this repository can assemble; where they cannot both
+    # be asked — an UNMEASURED crosswalk — the pin is the only recorded answer and is used.
+    expected_rule = (admitted.execution.mapping_temporal_policy_revision_id if observation is None
+                     else observation.mapping_temporal_policy_revision_id)
     if counts.row_rule_applied != expected_rule:
         findings.append(ReconciliationFinding.ROW_RULE_DISAGREES)
         detail.append(
-            f"counted under mapping row rule {counts.row_rule_applied!r} and the execution pins "
-            f"{expected_rule!r}: uniqueness over one row set says nothing about the other")
+            f"counted under mapping row rule {counts.row_rule_applied!r} and the measurement was "
+            f"taken under {expected_rule!r}: uniqueness over one row set says nothing about the "
+            "other")
 
     if observation is None:
         # NOT a disagreement. There is simply nothing recorded to reconcile against, and saying so

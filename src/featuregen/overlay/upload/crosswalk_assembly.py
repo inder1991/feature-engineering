@@ -62,6 +62,8 @@ from featuregen.overlay.upload.crosswalk_admission import (
 )
 from featuregen.overlay.upload.crosswalk_observation import (
     CrosswalkExecutionObservationV1,
+    observation_scope_is_proved,
+    observation_scope_matches,
 )
 from featuregen.overlay.upload.crosswalk_observation_store import (
     current_crosswalk_observations_for_revision,
@@ -78,6 +80,7 @@ __all__ = [
     "assemble_admitted_crosswalk",
     "active_mapping_count",
     "load_binding_revision",
+    "pinned_mapping_temporal_policy",
     "production_admissible",
     "sandbox_plannable",
     "unreviewed_reason_codes",
@@ -99,6 +102,16 @@ class CrosswalkAssemblyReason(StrEnum):
     #: Construction of the bundle raised — every cross-check in ``AdmittedCrosswalkV1.__post_init__``
     #: surfaces here rather than as an exception escaping a read path.
     BUNDLE_INCONSISTENT = "crosswalk_bundle_inconsistent"
+    #: The execution's pinned mapping row rule is not the one the measurement was taken under. A
+    #: DERIVATION guard — see :func:`pinned_mapping_temporal_policy`.
+    MEASUREMENT_TEMPORAL_POLICY_MISMATCH = "crosswalk_measurement_temporal_policy_mismatch"
+    #: A PRODUCTION-tier scope resolved a measurement that cannot prove which scope it ran under.
+    #: Not a statement about the crosswalk: the numbers may be perfect and the tier is unknowable.
+    OBSERVATION_SCOPE_IDENTITY_UNPROVED = "crosswalk_observation_scope_identity_unproved"
+    #: Two CURRENT measurements answer to one scope. ``refuse_on_multiple``, applied to evidence:
+    #: picking the newer one would make the verdict depend on which row a reader happened to sort
+    #: first, which is the same defect ``active_mapping_count`` refuses for mapping definitions.
+    MULTIPLE_OBSERVATIONS_FOR_SCOPE = "crosswalk_multiple_observations_for_scope"
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,22 +190,56 @@ def active_mapping_count(
     return max(counted, 1)
 
 
-def _observation_for_scope(
-    conn: DbConn, revision_id: str, scope_id: str,
-) -> CrosswalkExecutionObservationV1 | None:
-    """The CURRENT composed measurement for ONE applicability scope, or None.
+def _observations_for_scope(
+    conn: DbConn, revision_id: str, scope: RealizationApplicabilityScopeV1,
+) -> tuple[CrosswalkExecutionObservationV1, ...]:
+    """EVERY current composed measurement whose recorded scope names this one. Usually 0 or 1.
 
-    Scope-exact by construction. A crosswalk measured under a partition-restricted sandbox probe
-    and one measured unrestricted are different questions, and
-    :func:`current_crosswalk_observations_for_revision` returns one row per measured scope precisely
-    so a consumer picks rather than merges. Picking the newest across scopes would answer a
-    production question with a sandbox measurement — and admission's own
-    ``OBSERVATION_SCOPE_MISMATCH`` would then have to catch a mistake made upstream of it.
+    **Scope-exact only up to what migration 1057 persists, which is the scope's NAME.** The earlier
+    wording here claimed the pick was "scope-exact by construction"; it is not, and the difference
+    matters: the stored row carries ``scope_id`` and no tier, no environment and no purposes, so a
+    SANDBOX probe and a PRODUCTION run that were given the same ``scope_id`` string resolve to the
+    same row. ``crosswalk_observation.scope_binding_id`` is how a measurement makes its scope
+    provable, :func:`observation_scope_is_proved` is how this module asks, and
+    :meth:`CrosswalkAssemblyReason.OBSERVATION_SCOPE_IDENTITY_UNPROVED` is what production does
+    about an answer it cannot prove.
+
+    What IS true is that the newest measurement across DIFFERENT scopes is never picked:
+    :func:`current_crosswalk_observations_for_revision` returns one row per measured scope, and this
+    filters rather than sorts. ALL matches are returned — the caller refuses on more than one rather
+    than taking the first, because two current measurements of one scope make the verdict depend on
+    a sort order (§6.6 ``refuse_on_multiple``, the discipline ``active_mapping_count`` already keeps
+    for rival mapping definitions).
     """
-    for observation in current_crosswalk_observations_for_revision(conn, revision_id):
-        if observation.scope_id == scope_id:
-            return observation
-    return None
+    return tuple(
+        observation
+        for observation in current_crosswalk_observations_for_revision(conn, revision_id)
+        if observation_scope_matches(observation.scope_id, scope))
+
+
+def pinned_mapping_temporal_policy(
+    definition: CrosswalkDefinitionRevisionV1,
+    observation: CrosswalkExecutionObservationV1 | None,
+) -> str | None:
+    """WHICH mapping row rule an assembled execution pins — from the MEASUREMENT when there is one.
+
+    **Never from the caller's row selection**, which is what shipped and which made the drift
+    refusal unreachable. ``AdmittedCrosswalkV1.__post_init__`` compares
+    ``mapping_row_selection.temporal_policy_revision_id`` against this pin and refuses when the
+    "policy pointer moved after the crosswalk was measured"; deriving the pin FROM the selection
+    made the two sides of that comparison one value, so a caller who resolved rows under a policy
+    that had since advanced simply carried the pin along with it and the bundle assembled clean.
+    Reviewer's probe: measured under ``dtp_999``, assembled with a selection resolved under
+    ``dtp_777`` — production-admissible, with no reason code anywhere.
+
+    The measurement is the right source because the pin's whole job is to name the row set the
+    uniqueness verdict was proved over. An UNMEASURED crosswalk has no such row set, so it falls
+    back to the definition's own declaration — which is what the crosswalk CLAIMS its rows are, and
+    the only governed answer available before anybody measures.
+    """
+    if observation is None:
+        return definition.mapping_temporal_policy_revision_id
+    return observation.mapping_temporal_policy_revision_id
 
 
 def _legs_currently_executable(conn: DbConn, pins: Sequence[JoinLegPinV1], *,
@@ -242,10 +289,23 @@ def assemble_admitted_crosswalk(
     """Assemble ONE stored crosswalk into the bundle a compilation may plan a traversal on.
 
     Everything that CAN be read is read: the definition through its CURRENT pointer, the composed
-    measurement for this exact scope, all three physical bindings by the revision ids the pins name,
-    the number of active mappings for the endpoint pair, and whether each pinned realization still
-    stands. The admission decision and the execution revision are then RE-DERIVED — see the module
-    docstring for why neither may be stored.
+    measurement recorded against this scope, all three physical bindings by the revision ids the
+    pins name, the number of active mappings for the endpoint pair, and whether each pinned
+    realization still stands. The admission decision and the execution revision are then RE-DERIVED
+    — see the module docstring for why neither may be stored.
+
+    **What "against this scope" is worth, exactly.** Migration 1057 persists a measurement's
+    ``scope_id`` and nothing else about the scope it ran under, so a name match is a NAME match. A
+    production assembly therefore additionally requires the recorded id to be scope-BOUND
+    (``crosswalk_observation.scope_binding_id``) and refuses an unprovable one outright; a sandbox
+    assembly accepts a bare name, because reading a probe's own measurement at the probe tier is the
+    question that was asked. Two current measurements answering to one scope refuse rather than
+    resolve by recency.
+
+    The mapping row rule this execution pins comes from the MEASUREMENT
+    (:func:`pinned_mapping_temporal_policy`) and never from ``mapping_row_selection`` — which is the
+    object ``AdmittedCrosswalkV1.__post_init__`` then validates against the pin, and which therefore
+    cannot also be its source without making that refusal unreachable.
 
     The two leg pins are passed IN, and that is the same seam ``crosswalk_admission`` draws for
     ``leg_pin_from_join_plan``: pinning a same-catalog leg requires a real ``JoinPlan``, and planning
@@ -280,7 +340,44 @@ def assemble_admitted_crosswalk(
             definition_id=definition_id)
     mapping_binding_revision_id = source_leg.to_binding_revision_id
 
-    observation = _observation_for_scope(conn, definition.revision_id, scope.scope_id)
+    # PRODUCTION eligibility is asked of the pinned realizations whenever the scope is a production
+    # one. A sandbox scope asks the sandbox predicate — an UNASSESSED realization is usable as
+    # sandbox data and refusing it here would make the sandbox tier stricter than production
+    # admission, which is not a safety property, only a broken ladder.
+    require_production = scope.execution_tier is ExecutionTier.PRODUCTION
+
+    matched = _observations_for_scope(conn, definition.revision_id, scope)
+    if len(matched) > 1:
+        return CrosswalkAssemblyRefusalV1(
+            code=CrosswalkAssemblyReason.MULTIPLE_OBSERVATIONS_FOR_SCOPE,
+            detail=(
+                f"{len(matched)} current composed measurements answer to scope "
+                f"{scope.scope_id!r} ("
+                + ", ".join(sorted(item.observation_revision_id for item in matched))
+                + "): which verdict this crosswalk carries would depend on which row was read "
+                "first, and §6.6 refuses on multiple rather than picking one"),
+            definition_id=definition_id)
+    observation = matched[0] if matched else None
+
+    # A PRODUCTION question answered by evidence that cannot say which scope it came from. Migration
+    # 1057 persists the scope's NAME and not its tier, so "recorded under a sandbox probe called
+    # `probe-scope`" and "recorded under a production scope called `probe-scope`" are the same row —
+    # and the review's probe walked straight through it. Refused rather than verdicted, because the
+    # crosswalk is not what is wrong: nobody can tell what this measurement measured.
+    if (observation is not None and require_production
+            and not observation_scope_is_proved(observation.scope_id, scope)):
+        return CrosswalkAssemblyRefusalV1(
+            code=CrosswalkAssemblyReason.OBSERVATION_SCOPE_IDENTITY_UNPROVED,
+            detail=(
+                f"the composed measurement {observation.observation_revision_id} records scope "
+                f"{observation.scope_id!r}, which names this scope but does not prove it: the "
+                "execution tier, the environment and the purposes of the scope it ran under were "
+                "never persisted, so a SANDBOX probe of the same name is indistinguishable from a "
+                "production run. Re-measure with a scope-bound id "
+                "(`crosswalk_observation.scope_binding_id`) before reading this as production "
+                "evidence"),
+            definition_id=definition_id)
+
     if (observation is not None
             and observation.mapping_binding_revision_id != mapping_binding_revision_id):
         # Admission would ALSO catch this (MAPPING_BINDING_MISMATCH) and return an UNSAFE verdict.
@@ -311,11 +408,6 @@ def assemble_admitted_crosswalk(
                 definition_id=definition_id)
         bindings[slot] = binding
 
-    # PRODUCTION eligibility is asked of the pinned realizations whenever the scope is a production
-    # one. A sandbox scope asks the sandbox predicate — an UNASSESSED realization is usable as
-    # sandbox data and refusing it here would make the sandbox tier stricter than production
-    # admission, which is not a safety property, only a broken ladder.
-    require_production = scope.execution_tier is ExecutionTier.PRODUCTION
     decision = evaluate_crosswalk_admission(
         crosswalk_definition_revision_id=definition.revision_id,
         scope=scope,
@@ -328,6 +420,24 @@ def assemble_admitted_crosswalk(
             conn, (source_leg, target_leg), require_production=require_production),
         mapping_binding_revision_id=mapping_binding_revision_id,
     )
+    pinned_policy = pinned_mapping_temporal_policy(definition, observation)
+    # THE DERIVATION GUARD. Unreachable while the line above is right, and that is exactly what it
+    # is for: the shipped bug was a pin derived from `mapping_row_selection`, and the only thing
+    # `__post_init__`'s drift refusal needs in order to be real is that this pin comes from
+    # somewhere the caller does not control. Anything that re-points the derivation at the caller
+    # (the mutation `crosswalk_policy_pin_follows_the_caller`) makes these two disagree and lands
+    # here with a message naming the two policies, instead of assembling a clean bundle whose
+    # verdict describes another row set.
+    if observation is not None and (
+            observation.mapping_temporal_policy_revision_id != pinned_policy):
+        return CrosswalkAssemblyRefusalV1(
+            code=CrosswalkAssemblyReason.MEASUREMENT_TEMPORAL_POLICY_MISMATCH,
+            detail=(
+                f"the composed measurement {observation.observation_revision_id} was taken under "
+                f"mapping row rule {observation.mapping_temporal_policy_revision_id!r} and this "
+                f"execution would pin {pinned_policy!r}: uniqueness proved over one row set says "
+                "nothing about the other"),
+            definition_id=definition_id)
     execution = admitted_crosswalk_execution(
         decision,
         source_leg=source_leg,
@@ -335,10 +445,7 @@ def assemble_admitted_crosswalk(
         mapping_binding_revision_id=mapping_binding_revision_id,
         scope=scope,
         observation=observation,
-        mapping_temporal_policy_revision_id=(
-            definition.mapping_temporal_policy_revision_id
-            if mapping_row_selection is None
-            else mapping_row_selection.temporal_policy_revision_id),
+        mapping_temporal_policy_revision_id=pinned_policy,
     )
     try:
         return AdmittedCrosswalkV1(

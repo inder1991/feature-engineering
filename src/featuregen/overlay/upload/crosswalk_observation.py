@@ -326,6 +326,61 @@ MAPPING_TO_TARGET = "mapping_to_target"
 CROSSWALK_LEGS: tuple[str, str] = (SOURCE_TO_MAPPING, MAPPING_TO_TARGET)
 
 
+# ── which applicability scope a measurement was taken under ─────────────────────────────────────
+#
+# MIGRATION 1057 PERSISTS `scope_id` AND NOTHING ELSE ABOUT THE SCOPE. The execution TIER, the
+# environment and the purposes live on the caller's `RealizationApplicabilityScopeV1`, which is a
+# value object nobody writes down — so two scopes that share a `scope_id` string and differ in TIER
+# are indistinguishable in the store, and a measurement taken under a SANDBOX probe answers a
+# PRODUCTION question with no check anywhere able to notice. (Proved by review: recorded under
+# scope_id="probe-scope"/SANDBOX, read back under the same scope_id at PRODUCTION, attached and
+# admitted.)
+#
+# The fix that needs no DDL: bind the scope's WHOLE identity into the one value that IS persisted.
+# A measurement composed with :func:`scope_binding_id` records `<scope_id>#scope:<hash>`, and a
+# reader can then PROVE that the scope it is asking about is the scope that was measured. A bare
+# `scope_id` still matches — Release C's own rows and any pre-existing 1057 row carry one — but it
+# matches UNPROVED, and `crosswalk_assembly` refuses to serve an unproved measurement as production
+# evidence. Persisting tier/environment/purposes as their own columns is the durable answer and is
+# recorded in DEFERRED-WORK; this is what is available without a migration.
+
+#: Separates the human-readable scope name from the scope-identity digest. `#` cannot appear in a
+#: hash and is not used by any scope_id in the repository, so a bound id is unambiguous.
+SCOPE_BINDING_SEPARATOR = "#scope:"
+
+
+def scope_binding_id(scope) -> str:
+    """The ``scope_id`` a measurement records when the SCOPE it ran under is to be PROVABLE.
+
+    ``scope`` is a :class:`~featuregen.overlay.upload.bridge_realization.
+    RealizationApplicabilityScopeV1`; it is taken structurally (only ``identity_payload()`` and
+    ``scope_id`` are read) so the observation contract does not have to import the bridge family.
+    """
+    digest = materialize_hash(scope.identity_payload())[:16]
+    return f"{scope.scope_id}{SCOPE_BINDING_SEPARATOR}{digest}"
+
+
+def observation_scope_matches(recorded_scope_id: str, scope) -> bool:
+    """Does a RECORDED ``scope_id`` name this applicability scope — bound or bare?
+
+    Both spellings match, because a bare id is what every measurement recorded before the binding
+    existed and dropping those rows on the floor would turn a real measurement into "unmeasured",
+    which is a worse lie than the one being fixed. What the two spellings do NOT share is
+    provability — see :func:`observation_scope_is_proved`.
+    """
+    return recorded_scope_id in (scope.scope_id, scope_binding_id(scope))
+
+
+def observation_scope_is_proved(recorded_scope_id: str, scope) -> bool:
+    """Can the store PROVE the measurement ran under this exact scope — tier, environment and all?
+
+    True only for a bound id. A bare ``scope_id`` match proves the two share a NAME and nothing
+    else: the tier is not persisted, so a sandbox probe and a production run that were both called
+    ``"probe-scope"`` are the same row as far as any reader can tell.
+    """
+    return recorded_scope_id == scope_binding_id(scope)
+
+
 @dataclass(frozen=True, slots=True)
 class CrosswalkLegObservationV1:
     """One measured LEG — the endpoint tuple against the mapping tuple.

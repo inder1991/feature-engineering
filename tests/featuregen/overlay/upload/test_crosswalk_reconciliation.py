@@ -10,6 +10,7 @@ artifacts the platform already holds, which is exactly why it is testable here.
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 
 import pytest
@@ -227,6 +228,31 @@ def test_an_unmeasured_crosswalk_reports_ABSENCE_and_not_a_disagreement() -> Non
     assert ReconciliationFinding.NOT_MEASURED in report.findings
     assert ReconciliationFinding.COMPOSED_ROW_COUNT_DISAGREES not in report.findings
     assert "profile it first" in " | ".join(report.detail)
+
+
+def test_the_row_rule_compared_against_is_the_MEASUREMENTS_and_not_a_derived_pin() -> None:
+    """The independent check asks the measurement, because the pin is derived from it.
+
+    `crosswalk_assembly.pinned_mapping_temporal_policy` fills the execution's pin FROM the composed
+    measurement, so on anything this repository assembles the two agree. What must not happen is
+    the reconciliation quietly resting on the derived value: this check exists to catch a wrong
+    MEASUREMENT, and an operator who counted under the rule the measurement records has counted the
+    right rows however the pin was computed.
+    """
+    other_rule = "dtp_" + "0" * 64
+    bundle = admitted()
+    drifted_pin = dataclasses.replace(
+        bundle.execution, mapping_temporal_policy_revision_id=other_rule)
+    bundle = dataclasses.replace(bundle, execution=drifted_pin)
+
+    report = reconcile_crosswalk(bundle, counts(row_rule_applied=POLICY_REVISION))
+
+    assert ReconciliationFinding.ROW_RULE_DISAGREES not in report.findings, (
+        "the operator counted under the rule the MEASUREMENT was taken under and the report "
+        "compared them against a pin instead")
+    assert reconcile_crosswalk(
+        bundle, counts(row_rule_applied=other_rule)).findings, (
+        "counting under the pin rather than the measurement must still be a finding")
 
 
 def test_the_report_never_frames_a_divergence_as_the_crosswalks_fault() -> None:
