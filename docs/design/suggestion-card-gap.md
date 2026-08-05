@@ -116,3 +116,45 @@ Options:
 3. Accept the concept exactly and lose the qualifier. Not recommended.
 
 An attempt at option 3 was reverted rather than shipped.
+
+## AGREED APPROACH (user decision, 2026-08-05) — supersedes options 1-3 above
+
+Name both states on the badge, and drop the per-card paragraph.
+
+The badge today appears only when things are good (`DESIGN CHECKED`, solid green), so the card
+has to carry a sentence explaining what it does NOT mean. Naming the opposite state makes the
+axis self-evident from the vocabulary: a reader who sees `design checked` on one card and
+`design not checked` on another understands the badge is answering one narrow question about
+DESIGN, not declaring readiness. A label that is always present beats a sentence that stops
+being read by the third card.
+
+Implement exactly this:
+
+1. **Badge names both states** — `design checked` / `design not checked`. Today only the
+   positive state renders a badge.
+2. **Delete the per-card explanation** ("Design checked means the inputs pass the catalog's
+   design rules. Predictive usefulness and production execution are not proven.").
+3. **One explanation in the panel header**, beside "Suggested features using this column",
+   read once instead of once per card.
+4. **Tone the badge down.** Solid green reads as "good to go", which is the exact over-trust
+   the paragraph existed to prevent. Use the quiet outlined chip treatment (see
+   `.ln-trustline .badge` for the pattern). Reserve solid green for something verified end to
+   end, which a design check is not.
+
+Then the remaining trim from "What to change" above is safe: category, business domains and
+use cases move into `Full recommendation detail`, which already renders all three
+(`SuggestionCard.tsx` ~909-928).
+
+### Test to update, not delete
+
+`SuggestedFeaturesScreen.test.tsx` — `repeats the design-checked limit on the card itself,
+where the badge could mislead`. Its guarantee is "a reader cannot mistake the badge for
+proof". Re-express it as: both states render as badges, the badge is not the success tone,
+and the explanation appears exactly once in the panel header. Same guarantee, new mechanism.
+
+### Why this is better than what it replaces
+
+The paragraph was a workaround for a badge that only spoke when the news was good. Fixing the
+badge removes the need for the workaround, so the cards reach the concept's proportions
+*without* trading away the honesty guard — which is what the three reverted attempts kept
+getting wrong.
