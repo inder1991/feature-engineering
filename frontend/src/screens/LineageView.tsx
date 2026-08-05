@@ -215,9 +215,15 @@ function TableNode({ data }: NodeProps<TableNT>) {
           </span>
         </button>
       </div>
+      {/* One condensed meta row, as the artifact draws it: where the table lives and how wide it
+          is, with freshness as a quiet dot at the end rather than a chip of its own line. */}
       <div className="ln-src">
-        {node.catalog_source} ·{' '}
-        {node.stale ? <Flag tone="stale">stale</Flag> : <span className="ln-fresh">fresh</span>}
+        <span className="ln-src-text">
+          {[node.catalog_source,
+            data.total ? `${data.total} ${data.total === 1 ? 'column' : 'columns'}` : null]
+            .filter(Boolean).join(' · ')}
+        </span>
+        {node.stale && <Flag tone="stale">stale</Flag>}
       </div>
       {/* No stale band: the src line above already carries a STALE chip, and a 58px amber
           restatement was the biggest element on the card and mostly empty space. Freshness is

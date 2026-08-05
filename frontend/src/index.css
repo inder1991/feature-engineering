@@ -2183,6 +2183,13 @@ section > h2:first-child {
   flex: none;
 }
 
+.ln-src-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .ln-src {
   display: flex;
   align-items: center;
@@ -2368,13 +2375,15 @@ section > h2:first-child {
 }
 
 /* the +N expander chip on units with unfetched neighbors */
+/* Inside the card, not hanging 14px off its right edge. A control that overlaps the object it
+   acts on obscures the edge, the port and any label near it. */
 .ln-expander {
   position: absolute;
-  right: -14px;
+  right: 8px;
   top: 50%;
   transform: translateY(-50%);
-  width: 32px;
-  height: 32px;
+  width: 22px;
+  height: 22px;
   min-height: 0;
   padding: 0;
   border-radius: 999px;
@@ -3206,14 +3215,25 @@ main:has(.ln-wrap) .page-head > p {
   font-size: 8.5px;
 }
 
+/* The tone classes carry a SOLID fill. Setting only the text colour to the same hue painted
+   the label onto its own background and the badge rendered as a blank coloured bar. Override
+   the fill too, so these are outlined chips with readable text. */
 .ln-trustline .badge.gj-verified {
   border-color: var(--ok);
+  background: var(--ok-soft);
   color: var(--ok);
 }
 
 .ln-trustline .badge.gj-partial {
   border-color: var(--warn);
+  background: var(--warn-soft);
   color: var(--warn);
+}
+
+.ln-trustline .badge.gj-none {
+  border-color: var(--line);
+  background: var(--surface-2);
+  color: var(--ink-soft);
 }
 
 /* B7: the recipe is a formula, not a description. Clamp it so a long expression cannot dominate

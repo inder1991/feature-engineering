@@ -139,7 +139,9 @@ describe('lineage view', () => {
     expect(screen.getByText('customers')).toBeInTheDocument()
     expect(screen.getByText('transactions')).toBeInTheDocument()
     // fresh sources say so on every card
-    expect(screen.getAllByText('fresh').length).toBeGreaterThanOrEqual(3)
+    // Freshness is stated only when it is NOT fresh: the artifact marks a stale snapshot with
+    // a dot and says nothing on a healthy one, so "fresh" is no longer printed on every card.
+    expect(screen.queryByText('fresh')).toBeNull()
     // column flags: grain, as-of, pii (visible because the wire included the column)
     expect(screen.getAllByText('grain').length).toBeGreaterThanOrEqual(2)
     expect(screen.getByText('as-of')).toBeInTheDocument()
