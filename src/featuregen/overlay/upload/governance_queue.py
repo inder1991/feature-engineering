@@ -146,12 +146,37 @@ KIND_ORDER = (ENTITY_BRIDGE, APPROVED_JOIN, "grain", "availability_time")
 #: Wordings that must NEVER appear anywhere in this payload — not in a value, a key, or a comment.
 #: Every one of them asserts that human review gates use, which is false: review is accountability,
 #: availability is automatic. Pinned by a test that scans the rendered response for each phrase.
+#:
+#: THE SCAN IS LITERAL AND CASE-INSENSITIVE, and the list is what it can see. That is why the last
+#: three are single WORDS rather than sentences: the four originals are whole assertions, and a
+#: surface that grows its own phrasing — "blocked until a reviewer signs off" — matched none of
+#: them and passed silently on every consumer of this list, including the crosswalk payload scan
+#: that shares it. A word is coarser than a sentence and that is the point: there is no honest
+#: sentence in this product containing "blocked", and a false positive costs a rewording.
 FORBIDDEN_PHRASES = (
     "Blocks N features",
     "Approve to enable",
     "Waiting to become usable",
     "Production approval required",
+    #: Catches every inflection a literal scan can reach: "blocked", "blocked by review", "blocked
+    #: until…". Availability is automatic, so nothing here is ever blocked BY anything.
+    "blocked",
+    #: Both spellings of the same claim — that somebody's signature is what makes a thing usable.
+    "sign-off",
+    "awaiting sign-off",
+    #: THE FALSE ZERO, SPELLED OUT. "not tracked yet" is the honest answer when no store records
+    #: dependants; these two assert the opposite — that the absence of a record is an absence of
+    #: dependants — in words, where no digit scan can see them.
+    "no features depend",
+    "nothing depends",
 )
+
+#: WHAT A LITERAL LIST CANNOT HOLD, recorded so nobody assumes the list is the whole rule. The other
+#: family the crosswalk-row review found is "a reviewer verifies it and it BECOMES runnable": three
+#: ordinary words in one sentence, none forbidden alone, and unbounded in how they can be spelled.
+#: Catching it needs an ADJACENCY pattern, which a substring scan cannot express — so it lives as a
+#: regex in the surface that renders sentences (``AssetDetailScreen.context.test.tsx``,
+#: ``FORBIDDEN_ON_A_CROSSWALK_ROW``) rather than being half-added here where it would look covered.
 
 # ── The human axis ───────────────────────────────────────────────────────────────────────────────
 # Keyed by the folded status the sibling listings already display. Each label states the human
@@ -425,6 +450,76 @@ def _usage_for(cat: _Category, state: str, counts: Mapping[str, int] | None,
     n = counts.get(fact_key, 0)
     return Usage(category=cat.name, state=_COUNTED, count=n, display=str(n), store=cat.store,
                  basis=cat.basis)
+
+
+#: WHAT ALREADY DEPENDS ON A CROSSWALK. Release C Task 13, and ALL FIVE are `not_tracked_yet` BY
+#: CONSTRUCTION today — deliberately, and stated rather than hidden.
+#:
+#: Every store that records "something used a relationship" anchors on a bridge `fact_key`: the
+#: shadow assembly store keys `crossings[].bridge_fact_key`, `contract_metadata_dependency` carries
+#: the typed `bridgefact:<key>` marker, and the materialization control plane identifies a
+#: generation by hash alone. NONE of them has a crosswalk anchor, so no probe could license a count
+#: and a 0 here would be a lie in the most expensive direction — it would read as "nothing uses
+#: this", inviting exactly the "approve it and things become usable" story this surface exists to
+#: refuse.
+#:
+#: The machinery is shared with :data:`_CATEGORIES` rather than special-cased so that the day a
+#: crosswalk anchor lands in ANY of these stores, one `count_sql` turns its row into a real number
+#: with no other change — and until then the honest answer is the one that renders.
+_CROSSWALK_CATEGORIES: tuple[_Category, ...] = (
+    _Category(
+        name="planned_candidates", store="multisource_assembly_shadow_operand_obs.crossings[]",
+        basis="an assembled candidate plan whose operand path traversed this crosswalk",
+        by_construction=("the crossings record anchors on a bridge fact_key; a two-leg crosswalk "
+                         "traversal has no fact key and is not recorded there")),
+    _Category(
+        name="generated_artifacts", store="materialization control plane (migration 1034)",
+        basis="a rendered generation whose provenance names this crosswalk",
+        by_construction=("the control plane identifies a generation by group/project HASH only; "
+                         "the rendered project names its crosswalk pins in provenance text, which "
+                         "no table indexes")),
+    _Category(
+        name="published_features",
+        store="feature_current_contract + contract_metadata_dependency.logical_ref",
+        basis="a registered feature whose CURRENT governed contract depends on this crosswalk",
+        by_construction=("`contract_metadata_dependency` carries the typed `bridgefact:<key>` "
+                         "marker and no crosswalk equivalent exists, so a crosswalk dependency is "
+                         "not expressible in that column")),
+    _Category(
+        name="data_agent_analyses", store="none",
+        basis="an analysis whose plan traversed this crosswalk",
+        by_construction=("AnalysisPlan is never persisted and there is no analysis-run store; "
+                         "analysis_learning_event records only DECISIONS owed about a mapping "
+                         "dataset and is blind to a crosswalk that raised no finding")),
+    _Category(
+        name="sandbox_plans", store="none",
+        basis="a sandbox plan compiled through this crosswalk",
+        by_construction=("sandbox planning is compile-time and leaves no durable record keyed on "
+                         "a crosswalk definition")),
+)
+
+
+def crosswalk_usage(
+    conn: DbConn, definition_ids: Sequence[str]
+) -> dict[str, tuple[Usage, ...]]:
+    """``definition_id -> (Usage, …)`` — the SAME tri-state contract bridges use.
+
+    Shared with :func:`bridge_usage` on purpose: two implementations of "what already depends on
+    this" is two chances for one of them to render a 0 it has not earned. Every category resolves
+    through :func:`_usage_for`, so the type itself keeps "unmeasured" unrepresentable as a number.
+
+    A crosswalk's answer is currently ``not_tracked yet`` in all five categories, each carrying the
+    reason. That is a fact about this platform's lineage stores, NOT about the crosswalk, and the
+    ``reason`` string says which store would have to change.
+    """
+    if not definition_ids:
+        return {}
+    keys = list(dict.fromkeys(definition_ids))
+    return {
+        key: tuple(
+            _usage_for(cat, _NOT_TRACKED, None, key) for cat in _CROSSWALK_CATEGORIES)
+        for key in keys
+    }
 
 
 def bridge_usage(conn: DbConn, fact_keys: Sequence[str]) -> dict[str, tuple[Usage, ...]]:

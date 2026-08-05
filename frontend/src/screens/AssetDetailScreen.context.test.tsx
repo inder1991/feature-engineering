@@ -212,7 +212,12 @@ it('labels a crosswalk distinctly and never as a failure', async () => {
   }))
   expect(screen.getByTestId('context-link-bfk_1')).toBeInTheDocument()
   const cross = screen.getByTestId('context-link-cwd_1')
-  expect(within(cross).getByText('crosswalk')).toBeInTheDocument()
+  // The LABEL names the claim, not the machine word: "crosswalk" alone is only distinct to someone
+  // who already knows the model, and the two kinds differ in whether a third table is needed at all.
+  expect(within(cross).getByText('crosswalk (mapping-mediated)')).toBeInTheDocument()
+  expect(
+    within(screen.getByTestId('context-link-bfk_1')).getByText('direct equality'),
+  ).toBeInTheDocument()
   // The mapping table is what makes it readable AS a crosswalk, and both legs are named.
   const detail = screen.getByTestId('context-crosswalk-cwd_1')
   expect(detail).toHaveTextContent('deposits::public.acct_xref')
@@ -412,4 +417,301 @@ it('renders a table anchor with an honest note instead of fabricated column mean
 it('degrades to an explicit unavailable message rather than a blank tab', async () => {
   await openContext(undefined)
   expect(screen.getByTestId('context-unavailable')).toHaveTextContent(/not available/i)
+})
+
+// ── Release C Task 13: the four kinds, the framing rules and lineage on the row ─────────────────
+
+it('names all four relationship kinds distinctly, each by the claim it makes', async () => {
+  // The plan's first checkbox. Four kinds that must not read alike: whether a join needs a third
+  // table, whether it needs a value transform, and whether it is a join at all are three different
+  // questions, and a shared machine-word badge answers none of them.
+  await openContext(contextFixture({
+    relationships: [
+      directRelationship(),
+      crosswalkRelationship(),
+      crosswalkRelationship({ relationship_ref: 'tr_1', kind: 'transformed', crosswalk: null }),
+      crosswalkRelationship({ relationship_ref: 'so_1', kind: 'semantic_only', crosswalk: null }),
+    ],
+  }))
+  // `getByText` THROWS on a miss and on a duplicate, so this loop is the whole assertion: four
+  // labels, each rendered exactly once. (The line that used to sit here asserted that a literal
+  // array of four distinct strings had four distinct members, which is a fact about the array.)
+  const labels = ['direct equality', 'crosswalk (mapping-mediated)', 'transformed', 'semantic-only']
+  for (const label of labels) {
+    expect(screen.getByText(label)).toBeInTheDocument()
+  }
+})
+
+it('shows what already depends on a crosswalk, and never a zero it has not earned', async () => {
+  // The user-ratified rule. "Nothing uses this" and "no store records who uses this" are different
+  // claims; rendering the second as 0 is what invites the "approve it and it becomes usable" story.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        already_depended_on_by: [
+          {
+            category: 'published_features', state: 'not_tracked_yet', count: null,
+            display: 'not tracked yet', store: 'contract_metadata_dependency',
+            basis: 'a registered feature whose contract depends on this crosswalk',
+            reason: 'no crosswalk marker exists in that column',
+          },
+        ],
+      },
+    })],
+  }))
+  const depends = screen.getByTestId('crosswalk-depends-cwd_1')
+  expect(depends).toHaveTextContent(/what already depends on this/i)
+  expect(depends).toHaveTextContent(/not tracked yet/i)
+  expect(depends).not.toHaveTextContent(/\b0\b/)
+  expect(depends).not.toHaveTextContent(/approv|unblock|enable/i)
+})
+
+it('renders every unresolved reason as one of the three families, never as a fault', async () => {
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        unresolved_families: {
+          directional_crosswalk_fanout: 'structurally_unsuitable',
+          crosswalk_not_measured: 'needs_data_check',
+          mapping_temporal_policy_unresolved: 'undecided',
+        },
+      },
+    })],
+  }))
+  const families = screen.getByTestId('crosswalk-families-cwd_1')
+  expect(families).toHaveTextContent('Structurally unsuitable')
+  expect(families).toHaveTextContent('Needs a data check')
+  expect(families).toHaveTextContent('Nobody has decided yet')
+  expect(families).not.toHaveTextContent(/blocked|failed|rejected|error/i)
+})
+
+it('says the deployment switch is off in its own sentence, not as a verdict', async () => {
+  // Flag off keeps a crosswalk discoverable and structurally non-executable, and that is a fact
+  // about this installation. Saying "not safe" instead would blame the evidence for a switch.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: { ...crosswalkRelationship().crosswalk!, execution_enabled: false },
+    })],
+  }))
+  const detail = screen.getByTestId('context-crosswalk-cwd_1')
+  expect(detail).toHaveTextContent(/switched off in this deployment/i)
+  expect(detail).toHaveTextContent(/structurally cannot run here/i)
+  expect(detail).not.toHaveTextContent(/unsafe|failed|blocked/i)
+})
+
+it('names the mapping row policy a crosswalk was measured under', async () => {
+  // Uniqueness over unfiltered SCD history and uniqueness over the rows a traversal reads are
+  // different claims, and the reader cannot tell them apart without seeing whether a policy exists.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        mapping_temporal_policy_revision_id: 'dtp_abc123',
+      },
+    })],
+  }))
+  expect(screen.getByTestId('context-crosswalk-cwd_1')).toHaveTextContent('dtp_abc123')
+})
+
+it('says nobody has declared a mapping row policy, without calling it a fault', async () => {
+  await openContext(contextFixture({ relationships: [crosswalkRelationship()] }))
+  const undeclared = screen.getByTestId('context-crosswalk-cwd_1')
+  expect(undeclared).toHaveTextContent(/nobody has declared which rows/i)
+  expect(undeclared).not.toHaveTextContent(/blocked|invalid/i)
+})
+
+it('lists every pinned revision the traversal would carry, including both legs', async () => {
+  // Lineage's own question on the row: WHICH revisions was this computed under. The same set Task
+  // 12 seals into the generated project's provenance — one leg shown would read as a direct link.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        pinned_revisions: {
+          crosswalk_definition_revision: 'cwd_rev_1',
+          composed_observation_revision: 'cwo_obs_1',
+        },
+        leg_pins: [
+          {
+            kind: 'same_catalog', plan_hash: 'plan-1',
+            from_dataset_ref: 'deposits::public.accounts',
+            to_dataset_ref: 'deposits::public.acct_xref',
+            from_binding_revision_id: 'pbr_a', to_binding_revision_id: 'pbr_b',
+            read_set_hash: 'read-1',
+          },
+          {
+            kind: 'cross_catalog', plan_hash: 'plan-2',
+            from_dataset_ref: 'deposits::public.acct_xref',
+            to_dataset_ref: 'cards::public.cust',
+            from_binding_revision_id: 'pbr_b', to_binding_revision_id: 'pbr_c',
+            read_set_hash: 'read-2', realization_revision_ids: ['bjr_1'],
+          },
+        ],
+      },
+    })],
+  }))
+  const pins = screen.getByTestId('crosswalk-pins-cwd_1')
+  expect(pins).toHaveTextContent('cwd_rev_1')
+  expect(pins).toHaveTextContent('cwo_obs_1')
+  // BOTH legs, with the mapping table appearing as the destination of one and the origin of the
+  // other — which is what makes it readable as two hops rather than one.
+  expect(pins).toHaveTextContent('deposits::public.accounts → deposits::public.acct_xref')
+  expect(pins).toHaveTextContent('deposits::public.acct_xref → cards::public.cust')
+  expect(pins).toHaveTextContent('bjr_1')
+})
+
+// ── the vocabulary that must never appear on a crosswalk row ────────────────────────────────────
+//
+// WHY A DOM-WIDE SCAN AND NOT THREE MORE `not.toHaveTextContent` LINES. The three negatives this
+// file already carries (`/blocked|failed|invalid|error/i` and friends) are each pinned to one
+// element and each catches a SUBSTITUTION — a sentence replaced by a worse one. None of them
+// catches an ADDITION, which is the way this row will actually regress: appending "Approval
+// unblocks it: confirm to enable, and 0 features depend on it today" to the crosswalk hint left
+// every assertion in this file green, because every sentence they check for was still there.
+//
+// The list MIRRORS `overlay/upload/governance_queue.FORBIDDEN_PHRASES` (the server scans the
+// payload with the same words; this scans what the screen renders out of it) plus the softer forms
+// a crosswalk row is likeliest to grow. Two copies of a prohibition is one copy going stale, and
+// the copy is unavoidable across the language boundary — so it is named here, in one place, rather
+// than spread across the assertions.
+const FORBIDDEN_ON_A_CROSSWALK_ROW = [
+  // The server list, verbatim in meaning.
+  /blocks\s+(n|\d+)\s+features?/i,
+  /approve to enable/i,
+  /waiting to become usable/i,
+  /production approval required/i,
+  /\bblocked\b/i,
+  /sign-?off/i,
+  // The softer forms. Each joins approval to capability, which is the one claim this row exists to
+  // refuse: a review is accountability, and availability is automatic.
+  /approval unblocks/i,
+  /confirm to enable/i,
+  /\bunblocks?\b/i,
+  /approve to (unblock|run)/i,
+  /pending approval/i,
+  // TWO FAMILIES, not two more sentences. The list above is a list of PHRASES, and a phrase list is
+  // beaten by rephrasing: "Not yet usable: once a reviewer verifies this mapping it becomes
+  // runnable, and no features currently depend on it" contains none of them and asserts both lies
+  // at once. These match the SHAPE instead.
+  //
+  // (a) any review verb wired to a capability verb wired to a capability adjective, within one
+  //     sentence. The sentence bound (`[^.!?]`) is what keeps the honest copy legal: "A reviewer
+  //     has confirmed this mapping." and "Running a crosswalk is not available yet, whatever its
+  //     review says." are two sentences, and the row is allowed to say both.
+  /\b(review\w*|verif\w*|endorse\w*|accept\w*|approv\w*|confirm\w*|sign-?off)\b[^.!?]{0,80}\b(becomes?|makes?|enables?|unlocks?|turns?)\b[^.!?]{0,40}\b(runnable|usable|available|executable|live)\b/i,
+  // (b) the false zero SPELLED OUT. The numeric guard below catches "0 features"; this catches the
+  //     same claim in words, which no digit scan can see. "What already depends on this: not
+  //     tracked yet" is the honest render and matches neither half.
+  /\b(no|zero)\s+(\w+\s+){0,2}features?\b[^.!?]{0,25}\bdepend|\bnothing\b[^.!?]{0,25}\bdepends?\b/i,
+]
+
+// A 0 is EARNED only where a store actually counted one: `state === 'counted'` renders through the
+// `gq-usage-counted` class, and that is the single place a literal zero may legitimately appear.
+// Everything else — "not tracked yet" rendered as 0, a fabricated dependency count — is the exact
+// invitation to "approve it and things become usable" that the tri-state exists to remove.
+function textOutsideCountedUsage(row: HTMLElement): string {
+  const clone = row.cloneNode(true) as HTMLElement
+  clone.querySelectorAll('.gq-usage-counted').forEach(node => node.remove())
+  return clone.textContent ?? ''
+}
+
+it('renders no forbidden phrase anywhere on a crosswalk row, in any state', async () => {
+  // EVERYTHING AT ONCE, so the scan covers every branch the row can take: measured with one
+  // refused direction, all three families, an untracked dependency, both leg pins, the deployment
+  // switch off. A phrase added to any of those blocks lands in this string.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        mapping_temporal_policy_revision_id: 'dtp_abc123',
+        execution_enabled: false,
+        admission_policy_version: 'crosswalk-admission-v1:abc',
+        measurement: {
+          observation_revision_id: 'cwo_1', scope_id: 'sandbox',
+          observed_at: '2026-08-04T13:00:00Z', as_of: '2026-08-04', method: 'exact',
+          row_coverage: 'full', complete: true, composed_row_count: 7,
+          source_to_target_max_matches: 1, target_to_source_max_matches: 2,
+          mapping_row_count: 3, mapping_temporal_policy_revision_id: 'dtp_abc123',
+          caveats: ['mapping_temporal_policy_absent'], failures: [],
+        },
+        directions: [
+          { direction: 'source_to_target', safety_status: 'deterministically_validated',
+            cardinality: 'many_to_one', sandbox_admissible: true, production_admissible: true,
+            reason_codes: ['deterministic_crosswalk_policy_satisfied'] },
+          { direction: 'target_to_source', safety_status: 'unsafe', cardinality: 'one_to_many',
+            sandbox_admissible: false, production_admissible: false,
+            reason_codes: ['directional_crosswalk_fanout'] },
+        ],
+        unresolved_families: {
+          directional_crosswalk_fanout: 'structurally_unsuitable',
+          crosswalk_not_measured: 'needs_data_check',
+          mapping_temporal_policy_unresolved: 'undecided',
+        },
+        already_depended_on_by: [{
+          category: 'published_features', state: 'not_tracked_yet', count: null,
+          display: 'not tracked yet', store: 'contract_metadata_dependency',
+          basis: 'a registered feature whose contract depends on this crosswalk',
+          reason: 'no crosswalk marker exists in that column',
+        }],
+        pinned_revisions: {
+          crosswalk_definition_revision: 'cwd_rev_1', composed_observation_revision: 'cwo_obs_1',
+        },
+        leg_pins: [
+          {
+            kind: 'same_catalog', plan_hash: 'plan-1',
+            from_dataset_ref: 'deposits::public.accounts',
+            to_dataset_ref: 'deposits::public.acct_xref',
+            from_binding_revision_id: 'pbr_a', to_binding_revision_id: 'pbr_b',
+            read_set_hash: 'read-1',
+          },
+          {
+            kind: 'cross_catalog', plan_hash: 'plan-2',
+            from_dataset_ref: 'deposits::public.acct_xref',
+            to_dataset_ref: 'cards::public.cust',
+            from_binding_revision_id: 'pbr_b', to_binding_revision_id: 'pbr_c',
+            read_set_hash: 'read-2', realization_revision_ids: ['bjr_1'],
+          },
+        ],
+      },
+    })],
+  }))
+  const row = screen.getByTestId('context-link-cwd_1')
+  // The lineage block is a <details>: its contents are in the DOM whether or not it is open, and
+  // `textContent` reads them — which is what makes this a scan of the whole row.
+  const rendered = row.textContent ?? ''
+  expect(rendered).toContain('acct_xref')          // the fixture actually rendered
+
+  for (const forbidden of FORBIDDEN_ON_A_CROSSWALK_ROW) {
+    expect(rendered).not.toMatch(forbidden)
+  }
+  // And no zero anybody has not earned. "Nothing uses this" and "no store records who uses this"
+  // are different claims, and only the second is true here.
+  expect(textOutsideCountedUsage(row)).not.toMatch(/\b0\b/)
+})
+
+it('keeps the scan honest when a store HAS counted a dependency', async () => {
+  // The other side of the zero guard: a counted 0 is a real answer from a real store, and refusing
+  // to render it would make the guard a rule about digits rather than about unearned claims. Also
+  // proves the exemption is scoped — the forbidden-phrase scan still runs over the whole row.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        already_depended_on_by: [{
+          category: 'published_features', state: 'counted', count: 0,
+          display: '0', store: 'contract_metadata_dependency',
+          basis: 'a registered feature whose contract depends on this crosswalk',
+          reason: '',
+        }],
+      },
+    })],
+  }))
+  const row = screen.getByTestId('context-link-cwd_1')
+  expect(screen.getByTestId('crosswalk-depends-cwd_1')).toHaveTextContent('0')
+  expect(textOutsideCountedUsage(row)).not.toMatch(/\b0\b/)
+  for (const forbidden of FORBIDDEN_ON_A_CROSSWALK_ROW) {
+    expect(row.textContent ?? '').not.toMatch(forbidden)
+  }
 })

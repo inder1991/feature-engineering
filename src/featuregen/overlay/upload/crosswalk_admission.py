@@ -70,6 +70,7 @@ from featuregen.overlay.upload.crosswalk_observation import (
     TARGET_TO_SOURCE,
     CrosswalkExecutionObservationV1,
     CrosswalkObservationCaveat,
+    observation_scope_matches,
 )
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 from featuregen.overlay.upload.temporal_policy import DatasetRowSelectionV1
@@ -296,7 +297,13 @@ def evaluate_crosswalk_admission(
         if observation.crosswalk_definition_revision_id != crosswalk_definition_revision_id:
             hard.append(
                 CrosswalkAdmissionReason.OBSERVATION_NOT_FOR_DEFINITION_REVISION.value)
-        if observation.scope_id != scope.scope_id:
+        # NAME-level, and it says so. `observation_scope_matches` accepts the scope-BOUND spelling
+        # as well as the bare one (`crosswalk_observation.scope_binding_id`), but neither spelling
+        # makes this a tier check: migration 1057 persists no tier, so a measurement whose recorded
+        # scope_id merely SHARES A NAME with a production scope passes here. Refusing to serve an
+        # unproved measurement as production evidence is `crosswalk_assembly`'s job, because it is
+        # the layer that knows which row it read; this function is handed the observation already.
+        if not observation_scope_matches(observation.scope_id, scope):
             hard.append(CrosswalkAdmissionReason.OBSERVATION_SCOPE_MISMATCH.value)
         if (mapping_binding_revision_id is not None
                 and observation.mapping_binding_revision_id != mapping_binding_revision_id):

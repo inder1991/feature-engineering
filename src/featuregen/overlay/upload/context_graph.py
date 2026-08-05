@@ -52,7 +52,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from featuregen.contracts import DbConn
+from featuregen.overlay.upload.crosswalk_flag import crosswalk_execution_enabled
+from featuregen.overlay.upload.crosswalk_learning import reason_families
 from featuregen.overlay.upload.feature_metadata_snapshot import CatalogProjectionUnavailable
+from featuregen.overlay.upload.governance_queue import crosswalk_usage
 from featuregen.overlay.upload.lineage import TruncationReportV1, lineage_graph
 from featuregen.overlay.upload.semantic_context import (
     RelationshipContextV1,
@@ -240,6 +243,50 @@ def _relationship_dict(conn: DbConn, link: RelationshipContextV1) -> dict:
         # STILL FALSE, always, and read from the extension's single source rather than derived here:
         # Task 12 wires compilation and execution, and no measurement or verdict substitutes.
         "executable_now": link.crosswalk.executable_now,
+        # ── Release C Task 13 ────────────────────────────────────────────────────────────────────
+        #
+        # WHY THIS CROSSWALK IS NOT AVAILABLE, in the three families the rest of the page already
+        # uses (D5): nobody-decided-yet / needs-a-data-check / structurally-unsuitable. A reason
+        # code alone renders as a machine word and reads as a fault; the family is what makes
+        # "unmeasured" and "fans out" different sentences instead of two shades of failure.
+        #
+        # Read from the extension's own `unresolved_reason_codes`, which carries the DECISION-level
+        # answer as well as the per-direction ones. Built from the directions alone this map was
+        # empty for every unmeasured crosswalk — which is every crosswalk this listing serves, since
+        # nothing on the listing path takes an admission decision — so the default product state was
+        # the one state that rendered no explanation at all.
+        "unresolved_families": {
+            code: family.value for code, family in reason_families(
+                link.crosswalk.unresolved_reason_codes).items()},
+        # THE DEPLOYMENT'S OWN ANSWER, kept apart from the evidence's. With the flag off a
+        # crosswalk is discoverable and structurally non-executable, and that is a fact about this
+        # installation — folding it into `executable_now` would let a reader mistake a switch for a
+        # measurement, and folding it into the reason codes would put it in a vocabulary that
+        # describes evidence.
+        "execution_enabled": crosswalk_execution_enabled(),
+        # WHAT ALREADY DEPENDS ON THIS — never what approving it would unblock. Every category is
+        # `not_tracked_yet` today and says which store would have to record a crosswalk anchor; a 0
+        # is unrepresentable here by construction.
+        "already_depended_on_by": [
+            {"category": u.category, "state": u.state, "count": u.count,
+             "display": u.display, "store": u.store, "basis": u.basis, "reason": u.reason}
+            for u in crosswalk_usage(
+                conn, (link.crosswalk.definition_id,)).get(
+                    link.crosswalk.definition_id, ())],
+        # EVERY PINNED REVISION this traversal would carry, in one place, mirroring what Task 12
+        # seals into the rendered project's provenance. Empty values are OMITTED rather than
+        # rendered blank: a crosswalk with no declared temporal policy has no policy revision, and
+        # an empty string beside five real ids reads as a pin that failed to resolve.
+        "pinned_revisions": {
+            name: value for name, value in (
+                ("crosswalk_definition_revision", link.crosswalk.definition_revision_id),
+                ("mapping_temporal_policy_revision",
+                 link.crosswalk.mapping_temporal_policy_revision_id),
+                ("composed_observation_revision",
+                 None if link.crosswalk.measurement is None
+                 else link.crosswalk.measurement.observation_revision_id),
+                ("admission_policy_version", link.crosswalk.admission_policy_version),
+            ) if value},
     }
     return {
         "relationship_ref": link.relationship_ref,

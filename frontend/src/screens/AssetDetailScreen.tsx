@@ -1009,6 +1009,34 @@ const FAMILY_WORDS: Record<string, string> = {
   structurally_unsuitable: 'Structurally unsuitable',
 }
 
+// THE FOUR RELATIONSHIP KINDS, each named for the CLAIM it makes rather than for its machine word.
+// "direct equality" and "crosswalk" are the difference between "these two ids are the same value"
+// and "these two ids are connected by a third table", and a reader who cannot tell them apart
+// cannot tell whether a join needs that third table at all. The one-line meaning rides beside the
+// label because the labels alone are only distinct to somebody who already knows the model.
+const KIND_WORDS: Record<string, { label: string; meaning: string }> = {
+  direct_equality: {
+    label: 'direct equality',
+    meaning: 'the same identifier value on both sides — joined directly, no third table',
+  },
+  crosswalk: {
+    label: 'crosswalk (mapping-mediated)',
+    meaning: 'two different identifier schemes, connected through a mapping table',
+  },
+  transformed: {
+    label: 'transformed',
+    meaning: 'related only after a value transform — execution of these is not built yet',
+  },
+  semantic_only: {
+    label: 'semantic-only',
+    meaning: 'the same meaning, with no identifier equality — never a join',
+  },
+}
+
+function kindWords(kind: string): { label: string; meaning: string } {
+  return KIND_WORDS[kind] ?? { label: humanizeCode(kind), meaning: '' }
+}
+
 // Codes are machine words; the tab shows them as readable phrases and keeps the code as the title
 // so anyone tracing one still has it.
 function humanizeCode(code: string): string {
@@ -1040,13 +1068,109 @@ function ContextValueRow({ value }: { value: ContextValue }) {
   )
 }
 
+// Categories, in presentation order, named for what a reader is actually asking.
+const USAGE_WORDS: Record<string, string> = {
+  planned_candidates: 'Planned candidates',
+  selected_plans: 'Selected plans',
+  sandbox_plans: 'Sandbox plans',
+  generated_artifacts: 'Generated artifacts',
+  published_features: 'Published features',
+  data_agent_analyses: 'Analyses',
+}
+
+function CrosswalkFraming({
+  crosswalk,
+  anchor,
+}: {
+  crosswalk: NonNullable<ContextRelationship['crosswalk']>
+  anchor: string
+}) {
+  const families = Object.entries(crosswalk.unresolved_families ?? {})
+  const usage = crosswalk.already_depended_on_by ?? []
+  const pins = Object.entries(crosswalk.pinned_revisions ?? {})
+  const legPins = crosswalk.leg_pins ?? []
+  return (
+    <>
+      {families.length > 0 && (
+        // WHY, in the three families the rest of this page already uses. None of them is a
+        // failure: "nobody has decided yet" is a state, "needs a data check" is a job, and
+        // "structurally unsuitable" is an answer. The machine code stays as the title so anyone
+        // tracing one still has it.
+        <p className="hint" data-testid={`crosswalk-families-${anchor}`}>
+          {families.map(([code, family]) => (
+            <span key={code} className="badge" title={code}>
+              {FAMILY_WORDS[family] ?? family}: {humanizeCode(code)}
+            </span>
+          ))}
+        </p>
+      )}
+      <p className="hint" data-testid={`crosswalk-depends-${anchor}`}>
+        {/* WHAT ALREADY DEPENDS ON THIS. Never what approving it would unblock — a review is
+            accountability and availability is automatic, so there is no number here that a
+            confirmation would move. A category nobody records is reported as "not tracked yet",
+            NEVER as 0: "nothing uses this" and "no store knows who uses this" are different
+            claims and only one of them is true. */}
+        <span className="micro-label">What already depends on this</span>{' '}
+        {usage.length === 0 ? (
+          <span className="badge">not tracked yet</span>
+        ) : (
+          usage.map(u => (
+            <span
+              key={u.category}
+              className={`badge gq-usage-${u.state}`}
+              title={u.reason || u.basis}
+            >
+              {USAGE_WORDS[u.category] ?? humanizeCode(u.category)}:{' '}
+              {u.state === 'counted' ? u.count : u.display}
+            </span>
+          ))
+        )}
+      </p>
+      {(pins.length > 0 || legPins.length > 0) && (
+        // LINEAGE, on the row. Every revision this traversal would stand on, the same set Task 12
+        // seals into the generated project's provenance — so "which revisions was this computed
+        // under" is answerable from the screen and not only from a rendered artifact.
+        <details className="hint" data-testid={`crosswalk-pins-${anchor}`}>
+          <summary>Pinned revisions ({pins.length + legPins.length})</summary>
+          <ul className="rows">
+            {pins.map(([name, value]) => (
+              <li key={name} className="row">
+                <span className="micro-label">{humanizeCode(name)}</span>{' '}
+                <span className="mono">{value}</span>
+              </li>
+            ))}
+            {legPins.map(pin => (
+              <li key={pin.plan_hash} className="row">
+                <span className="micro-label">{humanizeCode(pin.kind)} leg</span>{' '}
+                <span className="mono">
+                  {pin.from_dataset_ref} → {pin.to_dataset_ref}
+                </span>{' '}
+                <span className="mono" title="read set">
+                  {pin.read_set_hash}
+                </span>{' '}
+                {(pin.realization_revision_ids ?? []).map(id => (
+                  <span key={id} className="badge" title="bridge realization revision">
+                    {id}
+                  </span>
+                ))}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </>
+  )
+}
+
 function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
   return (
     <li className="row" data-testid={`context-link-${link.relationship_ref}`}>
       <span className="mono">
         {link.left_ref} ↔ {link.right_ref}
       </span>{' '}
-      <span className="badge">{humanizeCode(link.kind)}</span>{' '}
+      <span className="badge" title={kindWords(link.kind).meaning}>
+        {kindWords(link.kind).label}
+      </span>{' '}
       {/* Three SEPARATE facts, never collapsed into one badge: whether the link is available at
           all, whether a human reviewed it, and whether it can be executed right now. A review is
           not permission — the server answers executability from a revalidating reader, and this
@@ -1068,12 +1192,50 @@ function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
           Related through <span className="mono">{link.crosswalk.mapping_dataset_ref}</span>{' '}
           ({link.crosswalk.source_to_mapping_refs.join(', ')} ·{' '}
           {link.crosswalk.mapping_to_target_refs.join(', ')}).{' '}
+          {/* THE MAPPING ROW RULE, on the row. Uniqueness measured over unfiltered SCD history is a
+              different claim from uniqueness over the rows a traversal reads, and the reader cannot
+              tell the two apart without knowing whether a row policy exists at all. */}
+          {link.crosswalk.mapping_temporal_policy_revision_id ? (
+            <>
+              Mapping rows are chosen by policy{' '}
+              <span className="mono">
+                {link.crosswalk.mapping_temporal_policy_revision_id}
+              </span>
+              .{' '}
+            </>
+          ) : (
+            <>
+              Nobody has declared which rows of this mapping table serve a question, so anything
+              measured over it describes the whole table.{' '}
+            </>
+          )}
           {link.review_status === 'human_verified'
             ? 'A reviewer has confirmed this mapping.'
             : 'Nobody has reviewed this mapping yet — it is a proposal you can act on.'}{' '}
-          Running a crosswalk is not available yet, whatever its review says.
+          {/* THE DEPLOYMENT SWITCH AND THE EVIDENCE ARE TWO SENTENCES. With the flag off nothing
+              here runs regardless of what was measured, and saying so is different from saying the
+              crosswalk is unsafe. Neither sentence is ever "approval would change this". */}
+          {link.crosswalk.execution_enabled === false
+            ? 'Crosswalk execution is switched off in this deployment, so this is discoverable and structurally cannot run here.'
+            : 'Running a crosswalk is not available yet, whatever its review says.'}
         </p>
       )}
+      {link.crosswalk && link.evidence_ids.length > 0 && (
+        // THE EVIDENCE THIS RELATIONSHIP STANDS ON, named. A crosswalk with no evidence ids shown
+        // is a claim with no visible basis, and the plan lists evidence beside the legs for that
+        // reason.
+        <p className="hint" data-testid={`crosswalk-evidence-${link.relationship_ref}`}>
+          Evidence:{' '}
+          <span className="mono">{link.evidence_ids.join(', ')}</span>
+          {link.crosswalk.admission_policy_version && (
+            <>
+              {' '}· admitted under{' '}
+              <span className="mono">{link.crosswalk.admission_policy_version}</span>
+            </>
+          )}
+        </p>
+      )}
+      {link.crosswalk && <CrosswalkFraming crosswalk={link.crosswalk} anchor={link.relationship_ref} />}
       {link.crosswalk && (
         // MEASUREMENT AND ADMISSION (Release C Task 11). Unmeasured is a STATE, described as
         // "discoverable, unmeasured" and never as a failure or a blocker. When it HAS been

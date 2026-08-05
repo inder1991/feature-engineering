@@ -326,6 +326,87 @@ MAPPING_TO_TARGET = "mapping_to_target"
 CROSSWALK_LEGS: tuple[str, str] = (SOURCE_TO_MAPPING, MAPPING_TO_TARGET)
 
 
+# ── which applicability scope a measurement was taken under ─────────────────────────────────────
+#
+# MIGRATION 1057 PERSISTS `scope_id` AND NOTHING ELSE ABOUT THE SCOPE. The execution TIER, the
+# environment and the purposes live on the caller's `RealizationApplicabilityScopeV1`, which is a
+# value object nobody writes down — so two scopes that share a `scope_id` string and differ in TIER
+# are indistinguishable in the store, and a measurement taken under a SANDBOX probe answers a
+# PRODUCTION question with no check anywhere able to notice. (Proved by review: recorded under
+# scope_id="probe-scope"/SANDBOX, read back under the same scope_id at PRODUCTION, attached and
+# admitted.)
+#
+# The fix that needs no DDL: bind the scope's WHOLE identity into the one value that IS persisted.
+# A measurement composed with :func:`scope_binding_id` records `<scope_id>#scope:<hash>`, so a
+# reader can tell that the writer DECLARED which scope it ran under rather than only naming one. A
+# bare `scope_id` still matches — Release C's own rows and any pre-existing 1057 row carry one —
+# but it matches with no declared identity, and `crosswalk_assembly` refuses to serve such a
+# measurement as production evidence.
+#
+# WHAT THIS DOES AND DOES NOT ESTABLISH. It closes accidental COLLISION: two scopes that share a
+# name and differ in tier stop being one row. It does NOT close FORGERY, and cannot: the binding is
+# a pure function of a public value object, so a producer can compute one for a scope it never
+# executed under. Neither would the durable fix — a persisted `execution_tier` column is written by
+# the same caller and is exactly as forgeable — which is why that fix (DEFERRED-WORK A.43) is
+# justified by READABILITY and audit rather than by trust. Closing forgery needs a trusted
+# execution attestation, which nothing in this repository produces.
+
+#: Separates the human-readable scope name from the scope-identity digest. `#` cannot appear in a
+#: hash and is not used by any scope_id in the repository, so a bound id is unambiguous.
+SCOPE_BINDING_SEPARATOR = "#scope:"
+
+
+def scope_binding_id(scope) -> str:
+    """The ``scope_id`` a measurement records when it DECLARES the whole scope it ran under.
+
+    ``scope`` is a :class:`~featuregen.overlay.upload.bridge_realization.
+    RealizationApplicabilityScopeV1`; it is taken structurally (only ``identity_payload()`` and
+    ``scope_id`` are read) so the observation contract does not have to import the bridge family.
+    Structural typing is also why the separator is re-checked here rather than left to
+    ``RealizationApplicabilityScopeV1.__post_init__``: a duck-typed caller never passes through it,
+    and a scope whose NAME already spells a binding would mint ``name#scope:h1#scope:h2`` — a
+    double-bound id whose prefix is itself a valid-looking bound id for another scope (ATTACK-2).
+    """
+    if SCOPE_BINDING_SEPARATOR in scope.scope_id:
+        raise ValueError(
+            f"scope_id {scope.scope_id!r} already contains {SCOPE_BINDING_SEPARATOR!r}: a scope "
+            "NAME may not spell a binding, because a bare measurement recorded under that name "
+            "would read as one that declared its whole scope identity")
+    digest = materialize_hash(scope.identity_payload())[:16]
+    return f"{scope.scope_id}{SCOPE_BINDING_SEPARATOR}{digest}"
+
+
+def observation_scope_matches(recorded_scope_id: str, scope) -> bool:
+    """Does a RECORDED ``scope_id`` name this applicability scope — bound or bare?
+
+    Both spellings match, because a bare id is what every measurement recorded before the binding
+    existed and dropping those rows on the floor would turn a real measurement into "unmeasured",
+    which is a worse lie than the one being fixed. What the two spellings do NOT share is a
+    declared scope identity — see :func:`observation_scope_is_proved`.
+    """
+    return recorded_scope_id in (scope.scope_id, scope_binding_id(scope))
+
+
+def observation_scope_is_proved(recorded_scope_id: str, scope) -> bool:
+    """Did the WRITER bind a full scope identity into what it recorded, matching this scope?
+
+    **This is a claim about the writer, not a proof about the run, and the distinction is the whole
+    honest reading of the mechanism.** :func:`scope_binding_id` is a public pure function, so any
+    producer can compute the binding for a scope it never actually executed under and record it —
+    the mechanism closes accidental COLLISION (two scopes sharing a name and differing in tier, the
+    defect that let a sandbox probe answer a production question), not FORGERY. Nothing available
+    without a trusted execution attestation would close forgery either: a persisted
+    ``execution_tier`` column would be written by the same caller and be exactly as forgeable, which
+    is why the durable fix in DEFERRED-WORK A.43 is about READABILITY and audit rather than about
+    trust.
+
+    False for a bare ``scope_id`` match, which establishes only that the two share a NAME: the tier
+    is not persisted, so a sandbox probe and a production run both called ``"probe-scope"`` are one
+    row as far as any reader can tell.
+    """
+    return recorded_scope_id == scope_binding_id(scope)
+
+
 @dataclass(frozen=True, slots=True)
 class CrosswalkLegObservationV1:
     """One measured LEG — the endpoint tuple against the mapping tuple.

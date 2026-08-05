@@ -345,6 +345,16 @@ def test_the_execution_shapes_producers_are_declared_and_there_is_still_no_execu
 
     What has NOT changed is the important half: no `materialize/**` file appears, so there is still
     no compiler and no executor. Task 12 owns both, and this assertion is what will make it say so.
+
+    Release C Task 13 added one entry and it is a TEST, not a producer:
+    `tests/eval/mutation/mutations.py` rebuilds `execution_revision_id` from a payload with the
+    mapping binding revision removed, which is the `crosswalk_identity_omits_mapping_revision`
+    must-die mutation. It names the class because it patches the class; nothing in `src/`
+    constructs a `CrosswalkExecutionRevisionV1` that did not already.
+
+    Task 13's own `src/` addition — `crosswalk_assembly.py` — deliberately does NOT appear here:
+    it reaches the shape only through `admitted_crosswalk_execution`, the one declared producer, so
+    the "one producer" property this tripwire protects is unchanged by the assembler existing.
     """
     import pathlib
     import subprocess
@@ -360,6 +370,7 @@ def test_the_execution_shapes_producers_are_declared_and_there_is_still_no_execu
     assert sorted(hits) == [
         "src/featuregen/overlay/upload/crosswalk.py",            # the shape
         "src/featuregen/overlay/upload/crosswalk_admission.py",  # its ONE producer (Task 11)
+        "tests/eval/mutation/mutations.py",                      # the Task-13 identity mutation
         "tests/featuregen/overlay/upload/test_crosswalk_contracts.py",
     ]
     assert not [hit for hit in hits if hit.startswith("src/featuregen/materialize/")]
@@ -525,3 +536,23 @@ def test_a_leg_pin_binding_tuple_that_names_a_blank_id_is_refused() -> None:
     assert exc.value.code == JOIN_LEG_PIN_MALFORMED
     with pytest.raises(CrosswalkContractError):
         _leg(JoinLegKind.SAME_CATALOG, predicate_content_hashes=("  ",))
+
+
+@pytest.mark.parametrize("field_name,value", [
+    ("mapping_binding_revision_id", "pbr_other_map"),
+    ("mapping_temporal_policy_revision_id", "dtp_other"),
+    ("composition_observation_revision_id", "cwo_other"),
+])
+def test_every_mapping_pin_moves_the_execution_revision_id(field_name, value) -> None:
+    """Release C Task 13. WHICH mapping table, under WHICH row rule, proved by WHICH measurement.
+
+    Drop any of the three out of the identity and two executions reading different tables — or the
+    same table under different row rules — collapse onto one id. Everything downstream keys on that
+    id: the render's pin tables, the artifact lock, the drift refusals. A collision there is not a
+    wrong answer that shows up as an error; it is a verdict measured over one table being served
+    for a traversal that reads another.
+    """
+    base = _execution()
+    moved = _execution(**{field_name: value})
+    assert moved.execution_revision_id != base.execution_revision_id, (
+        f"{field_name} is not inside the execution identity")

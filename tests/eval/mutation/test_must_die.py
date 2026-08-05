@@ -96,6 +96,18 @@ def test_the_registry_covers_every_invariant_the_plans_named() -> None:
         # gate-disabled entry above does not cover it — a gate that runs, reads the pointer and
         # ignores the status passes every check `disable_the_feature_use_gate` makes.
         "gate_ignores_policy_revocation",
+        # Release C Task 13 names these eight by hand. Every one of them produces a silently WRONG
+        # NUMBER rather than an error — a mapping table joined without its row rule, one leg
+        # dropped, a direction gated on the other direction's evidence — so a pipeline that runs
+        # and publishes is the failure mode, not a stack trace.
+        "crosswalk_label_treated_as_executable",
+        "crosswalk_renders_endpoint_equality",
+        "crosswalk_leg_omitted_from_read_authorization",
+        "uniqueness_measured_before_time_filtering",
+        "crosswalk_cardinality_inverted",
+        "crosswalk_deduplicates_instead_of_refusing",
+        "review_substitutes_for_crosswalk_safety",
+        "crosswalk_identity_omits_mapping_revision",
     }
     registered = {m.mutation_id for m in mutations.REGISTRY}
     missing = required - registered
@@ -150,8 +162,12 @@ RELEASE_GATE_SUITES: tuple[str, ...] = (
 #: Measured on this branch, 2026-08-03. The Task-0 record put the same seventeen at 238; the
 #: Release-A integration added 31. A DROP here is a deleted guard and must be explained, not
 #: rebaselined silently.
-RELEASE_GATE_BASELINE = 273  # rebaselined 2026-08-03: the Track-2 merge added 4 first-hop
-# cardinality tests to test_joins.py (one of the seventeen); a deliberate rise, per the gate's contract
+RELEASE_GATE_BASELINE = 277  # rebaselined 2026-08-05 (Release C Task 13): +4 crosswalk adapter
+# tests in test_joins.py — `plan_crosswalk_join` lives in that module and had NO test there at all
+# (its coverage was entirely in test_crosswalk_ir.py, which drives it THROUGH the IR). The four go
+# at the adapter directly and are the victims for three of Task 13's eight required mutations:
+# endpoint-equality collapse, inverted directional cardinality, and refuse-rather-than-deduplicate.
+# A deliberate rise, per the gate's contract. Previous: 273 (2026-08-03), 238 (Task-0 baseline).
 
 #: The suites this evaluation step owns, and their literal counts. Asserted below, like
 #: RELEASE_GATE_BASELINE — an unread literal in a test module is a claim nobody checks, and this one

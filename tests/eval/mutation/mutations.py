@@ -309,6 +309,271 @@ def _m_gate_ignores_policy_revocation() -> None:
     feature_assist.active_pii_use_policies = _any_current
 
 
+# ── Release C Task 13: the eight crosswalk mutations the plan names ─────────────────────────────
+#
+# A crosswalk is the shape where every one of these produces a SILENTLY WRONG NUMBER rather than an
+# error: a mapping table joined without its row rule, one leg dropped, a direction gated on the
+# other direction's evidence — each yields a pipeline that runs, publishes and is wrong. That is
+# why the plan enumerates them by hand and why they are registered as REQUIRED.
+
+
+def _m_crosswalk_label_treated_as_executable() -> None:
+    """A crosswalk's `executable_now` is answered from its KIND instead of from execution wiring.
+
+    The oldest and most tempting error on this surface: the row already says "crosswalk", the
+    mapping table is named, both legs are shown — so it looks like something the platform can run.
+    It is not, and the extension carries `executable_now` explicitly rather than deriving it from
+    any verdict for exactly this reason.
+
+    Patched on `context_graph`'s own `_relationship_dict`, which the section builder calls through
+    module globals at request time.
+    """
+    from featuregen.overlay.upload import context_graph
+
+    original = context_graph._relationship_dict
+
+    def _label_is_capability(conn, link):
+        payload = original(conn, link)
+        if payload.get("crosswalk") is not None:
+            payload["crosswalk"]["executable_now"] = True
+            payload["executable_now"] = True
+        return payload
+
+    context_graph._relationship_dict = _label_is_capability
+
+
+def _m_crosswalk_renders_endpoint_equality() -> None:
+    """The two legs collapse into ONE direct endpoint-to-endpoint join.
+
+    "These ids are related through this table" becomes "these ids are equal". The mapping table
+    disappears from the plan, and `cib.acct_no` is joined straight onto
+    `ftr.counter_party_acct_no` — two identifier schemes that were never the same value space. The
+    result is empty or nonsense and nothing raises.
+
+    Patched on the CONSUMER (`expression_ir` binds `plan_crosswalk_join` by name at import) AND on
+    the producer module, so both the IR path and a direct adapter call see it.
+    """
+    from dataclasses import replace
+
+    from featuregen.materialize import expression_ir, joins
+    from featuregen.materialize.codes import MaterializationRefused
+
+    original = joins.plan_crosswalk_join
+
+    def _one_direct_step(admitted, **kwargs):
+        plan = original(admitted, **kwargs)
+        if isinstance(plan, MaterializationRefused) or len(plan.steps) != 2:
+            return plan
+        first, second = plan.steps
+        # ONE step, straight from the source endpoint to the target endpoint — the mapping table's
+        # own columns dropped out of the pairs entirely.
+        collapsed = replace(
+            first,
+            to_catalog_source=second.to_catalog_source,
+            to_ref=second.to_ref,
+            column_pairs=((first.column_pairs[0][0], second.column_pairs[0][1]),))
+        return replace(plan, steps=(collapsed,))
+
+    joins.plan_crosswalk_join = _one_direct_step
+    if hasattr(expression_ir, "plan_crosswalk_join"):
+        expression_ir.plan_crosswalk_join = _one_direct_step
+
+
+def _m_crosswalk_leg_omitted_from_read_authorization() -> None:
+    """The PLAN keeps both legs; the READ SET loses the second one.
+
+    The asymmetric failure, and the reason it is the hardest of the eight to notice: the plan is
+    intact, the render emits both joins, and the generated run really does read the mapping table's
+    second column and the target endpoint — but §1.3's read set, which is the thing Gate 2
+    authorizes, never heard about them. So the run reads more than anyone was authorized to see, and
+    every visible symptom (a shorter read set, fewer authorized nodes, one less catalog on the gate)
+    looks like a tidier plan rather than a hole.
+
+    Two-part, deliberately: `plan_crosswalk_join` is wrapped only to RECORD which refs belong to the
+    second leg, and `_ReadSet.add` then drops exactly those. Nothing about the plan changes, which
+    is what makes this the read-authorization mutation rather than a plan mutation.
+
+    Scoped to the second leg's MAPPING-side column only. Dropping its endpoint side as well takes
+    the grain key out of the read set, the compile refuses outright, and the victim then dies of a
+    refusal rather than of the missing authorization — the `retrieval_drops_profile_context` mistake
+    this registry already learned once. With just the mapping column gone the IR compiles cleanly
+    and the read set is simply short one column the generated join really does read.
+    """
+    from featuregen.materialize import expression_ir
+    from featuregen.materialize.codes import MaterializationRefused
+
+    dropped: set[str] = set()
+    original_plan = expression_ir.plan_crosswalk_join
+
+    def _record_second_leg(admitted, **kwargs):
+        plan = original_plan(admitted, **kwargs)
+        if not isinstance(plan, MaterializationRefused) and len(plan.steps) == 2:
+            mapping_ref = admitted.definition.mapping_dataset_ref + "."
+            dropped.update(
+                ref for pair in plan.steps[1].column_pairs for ref in pair
+                if ref.startswith(mapping_ref))
+        return plan
+
+    original_add = expression_ir._ReadSet.add
+
+    def _blind_to_the_second_leg(self, logical_ref, role, identity, column, *args, **kwargs):
+        if logical_ref in dropped:
+            return None
+        return original_add(self, logical_ref, role, identity, column, *args, **kwargs)
+
+    expression_ir.plan_crosswalk_join = _record_second_leg
+    expression_ir._ReadSet.add = _blind_to_the_second_leg
+
+
+def _m_uniqueness_measured_before_time_filtering() -> None:
+    """The mapping row filter moves AFTER the uniqueness gate instead of before it.
+
+    On an SCD mapping table this is the whole difference between "unique now" and "unique across
+    all history" — and history is never unique, so the gate either refuses a correct pipeline or,
+    worse, is satisfied by rows the traversal will not use. Nobody made the second claim.
+
+    Implemented by REORDERING the emitted lines: the filtered frame is computed after the gate has
+    already scanned the unfiltered one, which is a shape a "tidy the frame assignments" edit could
+    plausibly produce.
+    """
+    from featuregen.materialize.render import nodes_compute
+
+    original = nodes_compute._traversal_lines
+
+    def _gate_then_filter(plan, roles_used):
+        lines = original(plan, roles_used)
+        out: list[str] = []
+        pending: list[str] = []
+        for line in lines:
+            if "_scoped = " in line and ".where(" in line:
+                pending.append(line)          # hold the mapping row filter back
+                continue
+            if pending and "duplicate_" in line:
+                out.append(line)
+                continue
+            if pending and line.strip().startswith("rows = rows.join("):
+                out.extend(pending)           # ... and only apply it at the join
+                pending = []
+            out.append(line)
+        return out + pending
+
+    nodes_compute._traversal_lines = _gate_then_filter
+
+
+def _m_crosswalk_cardinality_inverted() -> None:
+    """A traversal is gated on the OTHER direction's verdict.
+
+    1:1 forward with N:1 reverse is the ordinary mapping-table shape, so inverting the lookup
+    refuses every legal forward plan AND admits the illegal reverse one. The refusal half looks like
+    a conservative bug; the admission half multiplies the population.
+
+    Patched on the decision contract's own accessor, which `AdmittedCrosswalkV1.verdict_for` and
+    the planner both reach at call time.
+    """
+    from featuregen.overlay.upload.crosswalk_admission import CrosswalkAdmissionDecisionV1
+    from featuregen.overlay.upload.crosswalk_observation import SOURCE_TO_TARGET
+
+    def _inverted(self, direction: str):
+        return self.reverse if direction == SOURCE_TO_TARGET else self.forward
+
+    CrosswalkAdmissionDecisionV1.verdict = _inverted
+
+
+def _m_crosswalk_deduplicates_instead_of_refusing() -> None:
+    """Two ACTIVE mappings for one endpoint pair are counted as one, so admission never refuses.
+
+    §6.6's `refuse_on_multiple` in one line: with two active mappings the answer depends on which
+    row a compiler happened to read, and reporting 1 makes that choice invisible rather than absent.
+    Every downstream verdict then describes whichever mapping the query returned first.
+
+    Patched on `crosswalk_assembly`'s own module global, which `assemble_admitted_crosswalk` reads
+    at call time.
+    """
+    from featuregen.overlay.upload import crosswalk_assembly
+
+    crosswalk_assembly.active_mapping_count = lambda conn, definition: 1
+
+
+def _m_review_substitutes_for_crosswalk_safety() -> None:
+    """Production admissibility becomes "somebody has looked at it" instead of "it was validated".
+
+    The rule the whole release rests on (DoD 17): production execution depends on CURRENT
+    deterministic, direction-specific evidence and never on review. Broken by widening the
+    predicate from DETERMINISTICALLY_VALIDATED to "anything that is not UNASSESSED" — the shape a
+    reviewer's sign-off would take in a vocabulary that has no review field, and a change somebody
+    could plausibly justify as "we know about this one now".
+
+    Patched on the class property, which every caller reaches through the instance at call time.
+    """
+    from featuregen.overlay.upload.bridge_realization import SafetyStatus
+    from featuregen.overlay.upload.crosswalk_admission import CrosswalkDirectionVerdictV1
+
+    CrosswalkDirectionVerdictV1.production_admissible = property(
+        lambda self: self.safety_status is not SafetyStatus.UNASSESSED)
+
+
+def _m_crosswalk_policy_pin_leaves_the_measurement() -> None:
+    """The execution's mapping row rule stops being the one the measurement was taken under.
+
+    THE SHIPPED DEFECT, verbatim in effect. `assemble_admitted_crosswalk` derived the pin from the
+    caller's `mapping_row_selection` — the object `AdmittedCrosswalkV1.__post_init__` then validates
+    AGAINST that pin — so the "policy pointer moved after the crosswalk was measured" refusal had
+    the same value on both sides of its comparison and could never fire. Measured under one rule,
+    resolved under another: a clean, production-admissible bundle.
+
+    Reinstated here in its other half: the pin follows the DEFINITION's declaration and ignores the
+    measurement, which is the shape that made the second face possible — an execution pinning None
+    over a measurement taken WITH a filter, leaving `joins.plan_crosswalk_join` nothing to require
+    and the traversal reading the mapping table unfiltered under a verdict measured over the
+    filtered rows.
+
+    Patched on the module attribute, which `assemble_admitted_crosswalk` reads through module
+    globals at call time — the same seam the fix introduced so this could be a REPLACEABLE
+    derivation rather than an expression buried in a constructor call.
+    """
+    from featuregen.overlay.upload import crosswalk_assembly
+
+    crosswalk_assembly.pinned_mapping_temporal_policy = (
+        lambda definition, observation: definition.mapping_temporal_policy_revision_id)
+
+
+def _m_crosswalk_identity_omits_mapping_revision() -> None:
+    """`execution_revision_id` stops covering the mapping binding revision.
+
+    Two executions reading two DIFFERENT mapping tables then collapse onto one id — and everything
+    downstream keys on that id: the render's pin tables, the artifact lock, the physical-binding
+    drift refusals. The collision does not surface as an error; it serves a verdict measured over
+    one table to a traversal that reads another.
+
+    Patched by rebuilding the id from a payload with the field removed, on the contract itself.
+    """
+    from featuregen.materialize.canonical import materialize_hash
+    from featuregen.overlay.upload.crosswalk import (
+        CROSSWALK_CONTRACT_VERSION,
+        CrosswalkExecutionRevisionV1,
+    )
+
+    original = CrosswalkExecutionRevisionV1.__post_init__
+
+    def _blind_to_the_mapping(self) -> None:
+        original(self)
+        object.__setattr__(self, "execution_revision_id", "cwx_" + materialize_hash({
+            "contract_version": CROSSWALK_CONTRACT_VERSION,
+            "crosswalk_definition_revision_id": self.crosswalk_definition_revision_id,
+            "source_leg": self.source_leg.identity_payload(),
+            "target_leg": self.target_leg.identity_payload(),
+            "mapping_temporal_policy_revision_id": self.mapping_temporal_policy_revision_id,
+            "applicability_scope": self.applicability_scope.identity_payload(),
+            "leg_measurement_ids": list(self.leg_measurement_ids),
+            "leg_observation_revision_ids": list(self.leg_observation_revision_ids),
+            "composition_observation_revision_id": self.composition_observation_revision_id,
+            "combined_cardinality": self.combined_cardinality.identity_payload(),
+            "safety_status": self.safety_status.value,
+        }))
+
+    CrosswalkExecutionRevisionV1.__post_init__ = _blind_to_the_mapping
+
+
 _SUPERSESSION = "tests/featuregen/overlay/upload/test_supersession_consistency.py"
 _REPLAY = "tests/featuregen/overlay/upload/test_enrichment_replay_identity.py"
 _SCOPE = "tests/featuregen/overlay/upload/test_identifier_scope.py"
@@ -320,6 +585,13 @@ _V4 = "tests/featuregen/overlay/upload/test_feature_context_v4.py"
 _BARS = "tests/eval/test_release_a_bars.py"
 _USEGATE = "tests/featuregen/overlay/upload/test_feature_use_gate.py"
 _PIIACCEPT = "tests/featuregen/overlay/upload/test_pii_policy_acceptance.py"
+# Release C Task 13
+_CWVIS = "tests/featuregen/overlay/upload/test_crosswalk_visibility.py"
+_CWASSEM = "tests/featuregen/overlay/upload/test_crosswalk_assembly.py"
+_CWCONTRACT = "tests/featuregen/overlay/upload/test_crosswalk_contracts.py"
+_CWIR = "tests/featuregen/materialize/test_crosswalk_ir.py"
+_CWRENDER = "tests/featuregen/materialize/test_crosswalk_render.py"
+_JOINS = "tests/featuregen/materialize/test_joins.py"
 
 
 REGISTRY: tuple[Mutation, ...] = (
@@ -551,6 +823,139 @@ REGISTRY: tuple[Mutation, ...] = (
         notes="D14's other half. Approving a policy is only safe because revoking it takes effect "
               "immediately; a gate that reads the pointer but not the status would let the "
               "governance screen say `revoked` while the feature flow kept building.",
+    ),
+    # ── Release C Task 13 ───────────────────────────────────────────────────────────────────────
+    Mutation(
+        mutation_id="crosswalk_label_treated_as_executable",
+        kind=MUST_DIE,
+        invariant="a crosswalk's LABEL is never its capability; executable_now is wiring, not kind",
+        target="context_graph:_relationship_dict",
+        # `test_no_safety_verdict_is_fabricated_anywhere_on_a_crosswalk_payload` was listed here and
+        # CANNOT die: this mutation adds `executable_now`, and that test asserts the ABSENCE of
+        # `safety_status` and the eligibility keys. Two different lies, and only one of them is
+        # being told — so the second victim is dropped rather than overstating the kill.
+        victims=(
+            f"{_CWVIS}::test_the_context_graph_never_reports_a_crosswalk_as_executable",
+        ),
+        apply=_m_crosswalk_label_treated_as_executable,
+        expect_failure_contains='assert cross["executable_now"] is False',
+    ),
+    Mutation(
+        mutation_id="crosswalk_renders_endpoint_equality",
+        kind=MUST_DIE,
+        invariant="two legs never collapse into one endpoint-to-endpoint join",
+        target="joins:plan_crosswalk_join",
+        victims=(
+            f"{_JOINS}::test_a_crosswalk_plans_TWO_steps_and_never_collapses_to_endpoint_equality",
+            f"{_CWIR}::test_an_admitted_crosswalk_compiles_to_TWO_governed_join_steps",
+            f"{_CWIR}::test_the_first_leg_reaches_the_mapping_and_the_second_leaves_it",
+        ),
+        apply=_m_crosswalk_renders_endpoint_equality,
+        expect_failure_contains="assert len(plan.steps) == 2",
+        notes="the mapping table leaves the plan entirely, so the two identifier schemes are "
+              "joined as if they were one value space",
+    ),
+    Mutation(
+        mutation_id="crosswalk_leg_omitted_from_read_authorization",
+        kind=MUST_DIE,
+        invariant="both legs' tables enter §1.3's read set, so Gate 2 authorizes everything read",
+        target="ir:_union_of",
+        victims=(
+            f"{_CWIR}::test_the_mapping_dataset_and_its_row_rule_columns_enter_the_read_set",
+        ),
+        apply=_m_crosswalk_leg_omitted_from_read_authorization,
+        expect_failure_contains="assert {cf.MAP_ACCT, cf.MAP_EXT} <= _refs(ir)",
+        notes="ASYMMETRIC: dropping a leg makes the plan look smaller and tidier while the run "
+              "still reads the table",
+    ),
+    Mutation(
+        mutation_id="uniqueness_measured_before_time_filtering",
+        kind=MUST_DIE,
+        invariant="the mapping row rule is applied BEFORE the uniqueness gate and the join",
+        target="render.nodes_compute:_traversal_lines",
+        victims=(
+            f"{_CWRENDER}::test_the_mapping_row_filter_precedes_the_uniqueness_gate_and_the_join",
+        ),
+        apply=_m_uniqueness_measured_before_time_filtering,
+        expect_failure_contains="assert filter_line < gate_line < join_line",
+        notes="on an SCD mapping table this is 'unique now' versus 'unique across all history', "
+              "and nobody made the second claim",
+    ),
+    Mutation(
+        mutation_id="crosswalk_cardinality_inverted",
+        kind=MUST_DIE,
+        invariant="each direction is gated on its OWN measured verdict, never on the other's",
+        target="crosswalk_admission:CrosswalkAdmissionDecisionV1.verdict",
+        victims=(
+            f"{_JOINS}::test_the_reverse_direction_is_gated_on_its_OWN_measured_cardinality",
+            f"{_CWIR}::test_the_reverse_direction_refuses_INDEPENDENTLY_on_its_own_verdict",
+        ),
+        apply=_m_crosswalk_cardinality_inverted,
+        expect_failure_contains=(
+            "the source_to_target direction of crosswalk "),
+        notes="refuses every legal forward plan AND admits the illegal reverse one",
+    ),
+    Mutation(
+        mutation_id="crosswalk_deduplicates_instead_of_refusing",
+        kind=MUST_DIE,
+        invariant="two active mappings for one endpoint pair refuse; nothing picks between them",
+        target="crosswalk_assembly:active_mapping_count",
+        victims=(
+            f"{_CWASSEM}::test_two_active_mappings_for_one_endpoint_pair_refuse_rather_than_pick_one",
+        ),
+        apply=_m_crosswalk_deduplicates_instead_of_refusing,
+        expect_failure_contains="assert active_mapping_count(db, revision) == 2",
+    ),
+    Mutation(
+        mutation_id="review_substitutes_for_crosswalk_safety",
+        kind=MUST_DIE,
+        invariant="production admissibility is deterministic validation, never a human sign-off",
+        target="crosswalk_admission:CrosswalkDirectionVerdictV1.production_admissible",
+        # `test_a_direction_cannot_claim_production_without_deterministic_validation` was listed
+        # here and CANNOT die: it constructs a `CrosswalkDirectionContextV1` (a display projection)
+        # directly and never reaches `CrosswalkDirectionVerdictV1`, which is what this mutation
+        # patches. A victim that cannot die makes a kill list read stronger than it is, so it is
+        # dropped rather than kept as decoration.
+        victims=(
+            f"{_CWASSEM}::test_the_two_directions_are_admitted_independently_from_the_measured_shape",
+            f"{_CWASSEM}::test_confirming_a_crosswalk_changes_no_admission_answer_at_all",
+        ),
+        apply=_m_review_substitutes_for_crosswalk_safety,
+        expect_failure_contains=(
+            "a reviewer confirmed a crosswalk and a measured fan-out became executable"),
+        notes="DoD 17. Widened from DETERMINISTICALLY_VALIDATED to 'anything not UNASSESSED' — the "
+              "shape a sign-off takes in a vocabulary with no review field",
+    ),
+    Mutation(
+        mutation_id="crosswalk_policy_pin_leaves_the_measurement",
+        kind=MUST_DIE,
+        invariant=(
+            "the mapping row rule an execution pins is the one the MEASUREMENT was taken under, "
+            "never one the caller supplied or the definition merely declares"),
+        target="crosswalk_assembly:pinned_mapping_temporal_policy",
+        victims=(
+            f"{_CWASSEM}::test_the_pin_is_the_MEASURED_row_rule_even_when_the_definition_declares_none",
+            f"{_CWASSEM}::test_a_row_selection_resolved_under_a_MOVED_policy_pointer_refuses",
+        ),
+        apply=_m_crosswalk_policy_pin_leaves_the_measurement,
+        expect_failure_contains=(
+            "the execution's mapping row rule stopped following the measurement"),
+        notes="the shipped Task-13 defect: the pin was derived from the very row selection "
+              "`AdmittedCrosswalkV1.__post_init__` validates against it, so the drift refusal had "
+              "one value on both sides and could never fire",
+    ),
+    Mutation(
+        mutation_id="crosswalk_identity_omits_mapping_revision",
+        kind=MUST_DIE,
+        invariant="which mapping table was measured is INSIDE the execution revision identity",
+        target="crosswalk:CrosswalkExecutionRevisionV1.__post_init__",
+        victims=(
+            f"{_CWCONTRACT}::test_every_mapping_pin_moves_the_execution_revision_id",
+        ),
+        apply=_m_crosswalk_identity_omits_mapping_revision,
+        expect_failure_contains="is not inside the execution identity",
+        notes="a collision here serves a verdict measured over one table to a traversal that reads "
+              "another, and every downstream pin keys on that id",
     ),
     Mutation(
         mutation_id="noop_reorder_registry_declarations",
