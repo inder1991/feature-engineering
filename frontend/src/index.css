@@ -2711,6 +2711,13 @@ section > h2:first-child {
   align-items: start;
 }
 
+/* Graph mode is a different investigation, not another result card. The faceted rail leaves, and
+   the canvas takes the width it was losing to it — the reviewed concept's decision 6. */
+.facet-cols--graph {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
 .facet-panel {
   position: sticky;
   top: 20px;

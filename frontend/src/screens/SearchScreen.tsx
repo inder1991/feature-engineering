@@ -289,7 +289,8 @@ export function SearchScreen() {
         )}
       </div>
 
-      <div className="facet-cols">
+      <div className={effectiveView === 'graph' ? 'facet-cols facet-cols--graph' : 'facet-cols'}>
+        {effectiveView === 'list' && (
         <aside className="facet-panel" aria-label="Filters">
           {FACET_GROUPS.map(group => {
             const buckets = result?.facets[group.key] ?? []
@@ -343,6 +344,7 @@ export function SearchScreen() {
             </fieldset>
           )}
         </aside>
+        )}
 
         <div className="search-results">
           {error && (
