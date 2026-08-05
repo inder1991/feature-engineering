@@ -1,255 +1,395 @@
-# Physical table configuration — making the §0 inventory a UI, not a YAML file
+# Physical table configuration — what it would take to stop hand-editing the §0 inventory
 
-**Status: design note. Nothing here is built.** Written 2026-08-04 from a design dialogue, so the
-reasoning survives the conversation. Every claim about current behaviour carries a `file:line` and
-was verified by reading the code; everything else is explicitly marked as proposed.
+**Status: FINAL. Design note, v2. Nothing here is built.** See §0 for what is resolved and what
+still blocks. Three further design directions were raised after review — carrying partition facts on
+the catalog upload, turning compile refusals into clarification questions, and the same for
+aggregation semantics — and were **deliberately excluded** to close this note. They are recorded in
+§12 as successors, not folded in.
+
+v1 (commit `a3f0123c`) was reviewed adversarially on 2026-08-05 and graded **materially flawed —
+7 Critical**. Three of its load-bearing claims were wrong in the codebase's own terms, and two of the
+things it proposed to build already exist. This rewrite is driven by that review
+(`.superpowers/sdd/2026-08-03-phase-g-execution-wiring/design-note-review.md`).
+
+**What v1 got wrong, recorded so it is not re-derived:**
+
+1. It claimed `as_of_basis` *is* `partition_mapping.kind`. **It is inverted.** Both CSV-expressible
+   values mean *arrival*; see §3.
+2. It proposed adding `source_type` with a new migration. **`catalog_engine` (migration 1041) already
+   is `(source_type, source)`,** wired and API-exposed; see §4.
+3. It proposed a queue as "catalog LEFT JOIN inventory". **The inventory has no database
+   representation at all;** see §2, which is now the note's central finding.
+
+---
+
+## 0. Where this stands — FINAL
+
+Reviewed twice, corrected twice, re-verified against `origin/main` after it moved 220 commits. This
+section is the summary; the rest is the evidence. **No further design scope is being added.**
+
+### Resolved — these were thought to be work and are not
+
+| Was believed | Actually |
+|---|---|
+| `(source_type, source)` needs a CSV column + a migration | **Already exists** as `catalog_engine(engine, tier)`, migration 1041 — wired through `binding_store` and exposed at `PUT /data-sources`. No migration, no CSV column. Adding one would collide with `ingestion_run.source_type` (1004) and quarantine rows on a `source` mismatch. |
+| "Declare per feed, not per table" is a design proposal | **Already a shipped decision**, with this note's own argument written in 1041's header. Per-table binding survives as the exception mechanism. |
+| Schema translation needs a capture + a UI | **Mostly solved** — the glossary populates `graph_node.schema_name`. `logical_schema_map` is needed only for technical-CSV catalogs, and a *wrong* entry hard-refuses, so it is not zero-risk — but it needs no capture where a glossary attests. |
+| Knowing which features read which tables needs new plumbing | **Derivable today** — `lineage.py` models `("table", catalog_source, table_name)` nodes and walks `feature_derives_from`. The queue is buildable now on logical refs. |
+| Sampling is a new capability | **`data_agent/` already has it** — Hive and Postgres dialects, sample-vs-census honesty, declared partition scope, connection authorization. Extend it; do not build one. |
+| Code generation is blocked on all of this | **It is not.** Hand-written entries drive trigger→compile→render→seal→L0 end to end, and the table need not exist on any cluster. This plan is about scale, not about unblocking today. |
+
+### Remaining — the real blockers, in order
+
+1. **The inventory has no persistence and no API** (§2). It is a YAML file read by path inside the
+   compile worker. Nothing else in this plan can start, because a UI writing to Postgres while
+   `load_inventory` reads a file *is* the drift the design exists to remove. **This is the one
+   blocker that is purely engineering.**
+2. **Does `partition_mapping` get an exception to "proposals are usable before confirmation"?**
+   (§10.2) It is identity-bearing, so correcting it invalidates sealed artifacts, and its wrong
+   direction is silent. Every other proposal in the system is usable unconfirmed. **User decision.**
+3. **Who may confirm a late-arrival SLA?** (§10.3) A claim about a feed's contract, not its data —
+   plausibly a role the RBAC model does not have. **User decision.**
+4. **The metastore read is not built.** `MetastoreInventoryAdapter.capture()` is written and
+   callerless; its `MetastoreTableMetadata` is a Protocol with **no implementation**. `data_agent`
+   reads schema only. Engineering, and smaller than blocker 1.
+5. **Composite partition keys compile silently under-specified** (§10.5) —
+   `_refuse_incoherent_layout` requires only a subset, so a `(year, month, day)` table passes against
+   a mapping naming one column. A defect to fix, not a blocker to the plan.
+
+Blockers 2 and 3 gate only the *proposal* work (§11 step 6). Blockers 1 and 4 gate everything else.
+**Nothing here gates hand-written entries for the tables you have today.**
 
 ---
 
 ## 1. The problem
 
-Spec A's §0 cluster inventory (`conf/environments/*-inventory.yml`) is hand-edited YAML. Its
-`tables:` block needs, per governed table: ordered partition columns, physical column types, storage
-location, a `partition_mapping`, and `rewritten_in_place`.
+Spec A's §0 inventory (`conf/environments/*-inventory.yml`) is hand-edited YAML. Its `tables:` block
+needs, per governed table: ordered partition columns, physical column types, storage location, a
+`partition_mapping`, and `rewritten_in_place`.
 
-For the two or three tables of the first slice that is fine. For a real rollout it is not, and the
-failure mode is worse than tedium: **a wrong `partition_mapping` does not error.** It silently reads
-the wrong partitions and the feature is quietly incorrect. A block that is boring to fill in and
-catastrophic to get wrong is the exact shape that gets filled in carelessly.
+For two or three tables that is fine. At rollout scale it is not, and the failure mode is worse than
+tedium: **a wrong `partition_mapping` does not error.** It reads the wrong partitions and the feature
+is quietly incorrect — `inventory.py:199-201` and `hdfc-local-inventory.yml:80-88` say exactly this.
+A block that is boring to fill in and catastrophic to get wrong is the shape that gets filled in
+carelessly.
 
-The user's steer, already recorded for attestation, applies unchanged here: per-item human
-confirmation at catalog scale is a non-starter; the answer is proposal + bulk by-exception review.
+The standing steer for attestation applies unchanged: per-item human confirmation at catalog scale is
+a non-starter; the answer is proposal plus by-exception review.
 
-## 2. What is already solved (and must not be rebuilt)
+## 2. The blocker nobody had named: the inventory has no persistence
 
-Two things came out of the dialogue that materially shrink the problem. Both were initially
-mis-stated by the assistant and corrected against the source; they are recorded here so the same
-mistakes are not made again.
+**This is the finding that reorders everything else.**
 
-### 2.1 The real schema already arrives — via the GLOSSARY, not the column CSV
+The inventory has **no database table and no API surface.** It is a YAML file whose path arrives via
+`FEATUREGEN_MATERIALIZE_INVENTORY` (`queue_lane.py:205,585`), read by `load_inventory(path)`
+(`queue_lane.py:599`) — an `open()` plus `yaml.safe_load` (`inventory.py:593-646`) — inside the
+compile worker. There is no `inventory` table in `src/featuregen/db/migrations/`, no route under
+`src/featuregen/api/`, and the only frontend matches for "inventory" are the unrelated *feature*
+registry.
 
-The column CSV's accepted headers (`overlay/upload/_headers.py:13-29`) carry `source`, `table`,
-`column`, `type` and eleven others. There is **no schema header**, and graph object refs are built as
-`public.{table}.{column}` from a fixed constant `_SCHEMA = "public"`
-(`overlay/upload/graph.py:20,159-163`).
+So a UI cannot be built on top of it as things stand. A screen writing to Postgres while
+`load_inventory` keeps reading a file from disk **is** a second list, and file-versus-database is
+precisely the drift such a design claims to abolish.
 
-That `public` is a **uniform internal key prefix, not a schema claim.** Nothing resolves a physical
-table by reading it.
+**Closing this is a subsystem, not a screen:** persistence for captured entries, plus either a
+render-to-YAML step or a `load_inventory` that accepts a `DbConn`. Everything else in this note is
+downstream of that decision, and no queue can be a join until it exists.
 
-The real schema comes from the **glossary / FTR upload**: `schema_by_ref()`
-(`overlay/upload/graph.py:166-189`) parses each glossary record's `logical_ref`, extracts the declared
-schema, and populates `graph_node.schema_name`. A worked example from the running system:
+## 3. `partition_mapping` cannot be seeded from `as_of_basis` — v1 had this backwards
 
-| ref | value |
-|---|---|
-| object ref / graph ref | `public.bo_cib_customer.cust_num` |
-| logical ref | `cib::bo_dpl_cib.bo_cib_customer.cust_num` |
+v1 claimed `posted_at` → `event_time_partition` and `ingested_at` → `availability_partition`. The
+renderer that consumes the basis says the opposite (`render/nodes_compute.py:54-57`):
 
-`bo_dpl_cib` is the real schema, and it is there because the glossary declared it.
+> `posted_at` and `ingested_at` **name the arrival instant itself**; under `event_time_plus_lag` the
+> column holds the EVENT time and the declared `lag_hours` is when it could first have been read.
 
-**Consequence:** the inventory's `logical_schema_map` is consulted **only** when
-`graph_node.schema_name` is NULL. For a catalog with a schema-bearing glossary it stays `{}`
-permanently. It needs no UI and no capture. Do not build one.
+Corroborated at `expression_ir.py:47-49` ("which column carries **knowledge time**"). So:
 
-### 2.2 The hardest declared fact is already collected — as `as_of_basis`
+* both CSV-expressible values denote **arrival** — `posted_at` is ledger-posting time, not
+  transaction time;
+* the only basis under which the `as_of` column holds event time is **`event_time_plus_lag`**
+  (`expression_ir.py:227-233`, `overlay/facts.py:56-68`) — and `overlay/upload/canonical.py:18-19`
+  states plainly that it **"is not expressible via the CSV basis column"**.
 
-The CSV accepts `as_of` and `as_of_basis` (aliases include `availabilitybasis`), and ingest folds
-them into a governed **table-level** fact (`overlay/upload/ingest.py:344-360`):
+v1 therefore seeded `event_time_partition` — which reads only the window's own partitions
+(`inventory.py:99-101`), the **data-dropping** direction — from the value most strongly indicating
+the column is *not* event time.
 
-```python
-yield table, "availability_time", {"column": as_of_row.column, "basis": basis}
+They are also facts about different objects. `as_of_basis` describes *a column's semantics*;
+`partition_mapping.kind` describes *how a physical partition relates to an event*. The shipped
+template is the counterexample: `hdfc-local-inventory.yml:98-105` declares `availability_partition`
+with `time_ref: …tran_dt` **and** `partition_column: load_dt`.
+
+And the arities do not match: `PartitionMappingKind` (`inventory.py:72-79`) has five members —
+`EVENT_TIME_PARTITION`, `AVAILABILITY_PARTITION`, `STATIC_SNAPSHOT`, `FULL_SCAN`,
+`VERIFIED_UNPARTITIONED`. A two-valued column cannot seed a five-member closed union, and none of its
+values means "not a time-partitioned table at all".
+
+`time_ref` cannot be seeded from the `as_of` column either (`inventory.py:102-105`): `time_ref` is the
+**event** column, and the `as_of` column is the availability column.
+
+**Also false in v1: "governed, already confirmed."** Two independent defects:
+
+* **the basis is silently defaulted.** A blank `as_of_basis` passes validation
+  (`canonical.py:198` guards with `elif r.as_of_basis and …`) and then defaults to `posted_at`
+  (`ingest.py:357-359`, and again at `:3396`). Any table declaring `as_of` without a basis gets a
+  value nobody wrote.
+* **nothing confirms it.** `_assert_fact` (`ingest.py:401-411`) appends PROPOSED then immediately
+  CONFIRMED with `authority_basis=AUTHORITY_SOURCE_DECLARED`; its own docstring (`:377-381`) says it
+  "never fabricates a confirmer". v1's citation for a confirmation flow (`ingest.py:2532,2593`) is
+  the **Pass B LLM-synthesis** path, a different producer the CSV never traverses.
+
+**What survives:** `as_of_basis` may be *one input to a proposal* for `time_ref`. It determines
+nothing.
+
+## 4. `(source_type, source)` already exists — do not add a CSV column for it
+
+Migration **`1041_catalog_engine.sql:27-33`** already ships:
+
+```sql
+CREATE TABLE IF NOT EXISTS catalog_engine (
+    catalog_source text PRIMARY KEY,
+    engine         text        NOT NULL CHECK (engine IN ('hive', 'oracle', 'postgres')),
+    tier           text        NOT NULL, …);
 ```
 
-where `basis ∈ {"posted_at", "ingested_at"}` (`ingest.py:358,3396`).
+`tier` is `edp`/`ods`, deliberately open-vocabulary (`1041:24-26`); `engine` is what the inventory's
+`engines: edp/hive: kind: hive` declares. It is wired end to end — `declare_catalog_engine` /
+`read_catalog_engine` (`data_agent/binding_store.py:127-147`), consumed by `resolve_table`
+(`:183-220`), exposed at `api/routes/data_sources.py:144,163`.
 
-That is precisely the distinction `partition_mapping.kind` needs:
+**Per-feed declaration is already a decision made and shipped**, with this note's own argument in its
+header (`1041:6-8`): *"Migration 1037 gave every table its own binding row, which is correct and
+unmaintainable: 126 FTR columns across one table is fine, a real EDP is thousands."* The per-table
+binding survives as the exception mechanism.
 
-| `as_of_basis` | meaning | `partition_mapping.kind` |
+Three traps in adding CSV columns instead:
+
+* **`source_type` is a taken name.** `1004_ingestion_run_source_profile.sql:14` already defines
+  `ingestion_run.source_type` as the `SourceCapabilityProfile` identity —
+  `technical_csv`/`ftr_glossary`/`connector`.
+* **A per-row `source` that disagrees with the upload quarantines the row**
+  (`canonical.py:169-172`), and `catalog_source` is always supplied (`ingest.py:1988`). A file
+  carrying `source=hive` uploaded under any other catalog source quarantines **every row**.
+* **Accepted rows carry it nowhere queryable** — `build_graph` inserts `catalog_source` only
+  (`graph.py:250-254,267-272`), so per-row `source` survives only in `quarantine_row.raw`.
+
+**So the change is much smaller than v1 said, and migration-free:** declare `(engine, tier)` through
+the existing `PUT /data-sources` surface, and teach `load_inventory` to consume its `engines:` block —
+which today sits in `_DECLARED_FOR_LATER` (`inventory.py:363`), tolerated by the key allowlist
+(`:618`) and consumed by nothing. That is also what would finally let `SOURCE_ENGINE_UNSUPPORTED`
+fire; it is currently defined (`codes.py:74`) and **never raised** anywhere in the repo.
+
+*(Unrelated but worth one line: unknown CSV headers are silently ignored by design —
+`_headers.py:41,52-55` — but on the **FTR/glossary** path `_source_attributes`
+(`ftr_adapter.py:186-210`) captures every unrecognised header as free text and forwards it to the
+enrichment LLM (`enrich.py:531-532`). That is an egress consideration. A `unrecognised_headers()`
+helper exists at `ftr_adapter.py:241-256` with **no production caller**.)*
+
+## 5. Schema resolution — mostly solved, but not "no UI needed"
+
+The real schema arrives via the **glossary**, not the column CSV. `schema_by_ref()`
+(`graph.py:166-189`) parses each glossary record's `logical_ref` and populates
+`graph_node.schema_name`. `public` in an object ref is a fixed internal prefix (`_SCHEMA`,
+`graph.py:20`), **not** a schema claim — nothing resolves a physical table by reading it.
+
+v1 concluded "`logical_schema_map` needs no UI. Do not build one." **That is too strong.**
+`resolve_physical_identity` (`inputs.py:155`) reads `inventory.declared_schema_for(table_ref)`
+**every time**, and when the catalog attests one schema and the map declares a different one it
+**hard-refuses** with `AMBIGUOUS_TABLE_NAME` (`inputs.py:167-173`). A stale entry blocks compilation.
+
+And the map is genuinely required where a glossary does not cover the catalog: technical-CSV uploads
+attest no schema at all (`1000_graph_node_schema_declared.sql:8-9`); partial glossary coverage leaves
+the rest NULL (`graph.py:166-189` skips schema-less records); reader-quarantined columns never graph
+(`glossary_reader.py:112,224-228`).
+
+**Correct statement:** no capture is needed where the glossary attests a schema; the map remains
+required for technical-CSV catalogs, and a wrong entry refuses compilation.
+
+## 6. Sampling can propose the mapping — with failure modes that decide the design
+
+Inside one partition, comparing the event column to the partition value distinguishes event-time from
+arrival partitioning, and the spread estimates the late-arrival window. The clean case works. These
+do not:
+
+1. **Zero spread is the unsafe direction.** One day of history, a partition still being written, or a
+   feed that has had no late rows yet all propose `event_time_partition` — the narrow read.
+   `inventory.py:132-134`: *"an inferred widening is a guess about a specific bank's specific feed,
+   and the failure mode of guessing low is invisible."*
+2. **Backfill and reprocessing** put historic events in a current partition; the spread is the
+   backfill span, not the SLA. `rewritten_in_place: true` (`inventory.py:235`) destroys the evidence
+   entirely.
+3. **Null event columns** bias the sample — and are exactly the rows an event-time predicate drops.
+4. **Timezone skew.** If the partition value is cluster-local and the event column UTC, a true
+   `event_time_partition` shows ±1 day and is proposed as `availability_partition`.
+5. **Three kinds where the question is meaningless.** `static_snapshot` partitions are declared
+   vintages (`inventory.py:155-161`) and would sample as a wide spread; `full_scan` and
+   `verified_unpartitioned` have nothing to sample.
+6. **Composite partition keys are silently under-specified — which is worse than unrepresentable.**
+   Both time-partition variants name exactly one `partition_column` (`inventory.py:119-120,152-153`)
+   while `partition_columns` is an ordered list, and `_refuse_incoherent_layout`
+   (`inputs.py:259-267`) only requires the named column to be a **subset**. So a `(year, month, day)`
+   table compiles happily against a mapping naming just `day`. Nothing refuses; the sampling
+   comparison is simply undefined. (`StaticSnapshot` does name many columns, so the type system is
+   not the limit here — the two time-partition variants are.)
+
+**The consequence v1 missed entirely.** `partition_mapping` is **identity-bearing**:
+`TableLayout.semantic_payload` (`inventory.py:245-251`) → `layout_fingerprint` (`inputs.py:319`) →
+`PhysicalInputRequirement.identity_payload` (`inputs.py:92-102`) → `ir_hash`. As
+`inventory.py:133-135` puts it, *"two widenings read two different partition sets, so they are two
+different computations."* **So correcting a proposal invalidates every artifact sealed against it.**
+
+**This breaks the "proposed values are usable before confirmation" rule — for this field only.** A
+wrong `unit` is visible; a wrong partition set is not, and it silently drops rows. This field needs a
+human gate before compilation, unlike every other proposal in the system. That is a genuine exception
+to a standing principle and should be decided deliberately.
+
+**The sampling home already exists.** `data_agent/` ships a governed profiling subsystem with Hive
+and Postgres dialects (`sql_hive.py`, `sql_postgres.py`), sample-vs-census honesty
+(`sql_hive.py:82-96`), declared partition scope and `RowCoverage`
+(`relationship_observation.py:220-224`), and connection authorization (`binding_store.py:118-121`).
+Not a new capability — an extension of that one. (`MetastoreInventoryAdapter` is "Metadata only",
+`inventory.py:717-718`, and has **no caller in `src/`**.)
+
+## 7. Scoping by use — derivable logically, circular physically
+
+"A table becomes blocking only when a governed feature reads it" requires feature → table.
+
+**Feature → LOGICAL table is derivable today, no compile needed.** `lineage.py` already models
+`("table", catalog_source, table_name)` nodes (`:87`) and walks `feature_derives_from` from column to
+feature (`:571`); `feature_current_contract` ⋈ `contract_metadata_dependency`
+(`1011_contract_pointer_model.sql:127-140,162-169`) is the same query from the contract side.
+**The queue is buildable now on logical `(catalog_source, table_name)`.**
+
+Three limits, all open:
+
+* **Feature → PHYSICAL `(schema, table)` is circular for schema-less catalogs.** Blocking is a
+  physical predicate (`inputs.py:301-307`), and resolving the pair needs `graph_node.schema_name` or
+  `logical_schema_map` — which lives in the same document as `tables`. For a technical CSV you need
+  an inventory entry to learn which tables need inventory entries. It is also not total: two attested
+  schemas for one bare name refuses `AMBIGUOUS_TABLE_NAME` (`inputs.py:158-163`).
+* **Persisted lineage is incomplete for direct confirms** — `contract/govern.py:296-299`:
+  *"Lineage based only on the draft's derives/grain/as_of/join is INCOMPLETE."* The full read set
+  persists only when `plan_envelope is not None` (`:576-579`). A direct-confirm feature can read a
+  join-key table appearing in no lineage row: listed as quiet, then refusing at compile.
+* **Materialize-lane features have no persisted per-feature READ SET** — inputs come from the formula
+  AST at compile time (`expression_ir.py:782-802`). The sealed artifact is not empty of table refs
+  (`contract.py:549` and `spine.py:322-324` put `source_table_ref` and `ordered_key_refs` into the
+  contract hash stored at `1054:65-67`), but there is no queryable "which tables does this feature
+  read" to drive a queue from.
+
+## 8. What each fact can come from
+
+Corrected from v1. "Fact" means read, not inferred.
+
+| Field | Source | Status |
 |---|---|---|
-| `posted_at` | when it happened | `event_time_partition` |
-| `ingested_at` | when it landed | `availability_partition` |
+| `columns`, `partition_columns`, `location` | metastore — **but the reader is not built**: `MetastoreInventoryAdapter.capture()` exists and is callerless, and its `MetastoreTableMetadata` is a Protocol with **no implementation**. `data_agent` reads schemas with plain `DESCRIBE` only (`sql_hive.py:161-163`), which does not yield partitions or location. | fact **once something implements the Protocol** |
+| `transform` (`date_iso`/`date_compact`) | actual partition values | fact |
+| cadence, retention, gaps | partition listing | **observation, not fact** — a gap is a bank holiday or a missed load |
+| `kind` | **sampling proposal only** (§6) | not derivable from the catalog |
+| `time_ref` | proposal; `as_of` column is an input, not an answer (§3) | needs confirmation |
+| `late_arrival_days` | sampling | proposal; guessing low is invisible |
+| `timezone` | **per-mapping required field** (`inventory.py:111,142`) | per-environment is a *default to propose*, not where it lives — an overseas branch breaks it |
+| `rewritten_in_place` | human | declared |
 
-So the field previously described as "a human must declare it" is, for the *kind*, **already in the
-catalog**, already governed, and already has a confirmation flow around it (Pass B synthesises
-grain/availability as PROPOSED-only, with an author-cannot-self-confirm rule at
-`ingest.py:2532,2593`).
+**v1 claimed "the expected number of typed fields is zero."** That was a claim about a proposed
+future presented as arithmetic. Today `MetastoreInventoryAdapter._declaration`
+(`inventory.py:762-772`) **refuses** any table with no `TableDeclaration` — which is exactly
+`partition_mapping` + `rewritten_in_place` (`:690-695`). Zero depends entirely on feed-level
+inheritance, which is not built.
 
-## 3. Correction to an earlier claim: the mapping IS measurable
+## 9. What this does not block — corrected
 
-It has been stated in several places that `partition_mapping` "is declared by a human, never
-captured". **That is true of metadata and false of data.**
+**Code generation needs no cluster.** Verified: nothing on the **trigger→seal path** contacts a
+metastore, and that path imports no metastore, Thrift, JDBC, Spark or Kedro client. (Scoped
+deliberately: `submit.py:93-94` *does* import a Kedro client — but `submit` has no importer in `src/`
+at all, it is G-2 code, so it sits off the shipped path.) `PARTITION_IDENTITY_UNKNOWN` is a
+*CompilationRefusalCode* raised on a missing inventory **entry** (`inputs.py:301-307`), not a missing
+cluster table.
 
-Inside one partition (`load_dt=2026-08-05`), compare the event column on the rows it contains:
+But v1's "needs" column was materially incomplete:
 
-* every row `tran_dt = 2026-08-05` → **event-time** partition;
-* rows spread across the 2nd–5th → **arrival** partition, and the observed spread *is* the
-  late-arrival window.
-
-So `kind` and `late_arrival_days` are **measurable by sampling**. The honest limit: sampling measures
-what has happened, not what is contracted. Six quiet months then a quarter-end batch lands five days
-late, and a feature built on the measured "3" silently drops rows. **The measurement is evidence, not
-authority** — a human still confirms the SLA. This is the same propose-then-confirm split already
-used for units.
-
-Note this requires reading *data*; `MetastoreInventoryAdapter.capture()` is documented "Metadata
-only" (`materialize/inventory.py:708-722`), so sampling is a new capability with a read-scope
-implication, not an extension of the existing adapter.
-
-## 4. Where each fact comes from
-
-| Field | Source | Confidence |
+| | needs | cluster? |
 |---|---|---|
-| `columns` (names, physical types) | metastore | fact |
-| `partition_columns` (ordered) | metastore | fact |
-| `location`, file format, MANAGED/EXTERNAL | metastore | fact |
-| `transform` (`date_iso` / `date_compact`) | **read off actual partition values** | fact |
-| cadence, retention window, gaps, staleness | partition listing | fact |
-| `kind` (event vs availability) | **catalog `as_of_basis`** (§2.2) | governed, already confirmed |
-| `time_ref` (event column) | catalog `as_of` column | governed |
-| `late_arrival_days` | **sampling** (§3) | measured — proposal |
-| `timezone` | human, **once per environment** | declared |
-| `rewritten_in_place` | human, **once per feed** | declared |
+| compile + render | the declared layout **plus a fully governed catalog** — `graph_node` rows for the table and every declared column (`spine.py:587-602`), a governed `entity_assignment` (`:640-653`), governed `GRAIN` facts (`:670-700`), a governed `availability_time` fact with C1 `status == "resolved"` (`:728-740`; an upload flag is explicitly rejected at `:660-663`), and one governed `is_as_of` column per expression (`expression_ir.py:505-527`). Gate 2 refuses any ref with no `graph_node` row (`ir.py:661-673`). | no |
+| L0 | **plus a local interpreter matching `engine_versions` by exact string equality** (`validation.py:610-627`) — `validation.py:621`: *"A capture that writes `kedro: "1.5"` renders a lock that can never pass."* | no |
+| L1 | the table and columns actually exist | yes |
 
-**Per newly-catalogued table, the expected number of typed fields is zero.** Everything is either
-inherited from the feed, read from the cluster, or already in the catalog. Human input collapses to
-confirming a proposal and to two settings that live above the table level.
+**And the terminal was wrong.** `compile/chain.py:633-644`: `PUBLICATION_REFUSED` when L0 **passes**,
+`RUN_FAILED` otherwise. The project is still sealed either way (`chain.py:583-587`: "A FAILING L0 IS
+NOT A ROLLBACK").
 
-## 5. Proposed design
+**Trapdoor:** if a *passing* capability attestation is ever recorded, `select_publisher` returns a
+selection and the chain raises `PublishStepMissing` (`chain.py:509-516`) **before** `render_project`
+(`:518`) — no project is sealed at all. "Moot for G-1" holds only while publication capability stays
+unproven.
 
-### 5.1 The queue is DERIVED, never synced
+**The consequence worth drawing:** `run_l1` has **zero call sites in `src/`**, and `ir.py:578-581,625`
+say three times that "L1 sits on no production path". So on the shipped path **nothing ever checks a
+hand-written entry against reality.** `TableLayout.columns` is read only by unreached G-2 code
+(`runprep.py:808`); declared physical types are never compared to anything; `location` is validated
+non-blank (`inventory.py:579`) and read by nothing. A fabricated inventory is confronted with a real
+system in exactly one place: L0's engine-version comparison.
 
-The configuration list is a view over *catalog tables* LEFT JOIN *inventory entries*. There is no
-second list to maintain, so it cannot drift. Uploading a CSV puts a table in the catalog and
-therefore in the queue; nothing has to be remembered.
+## 10. Open decisions — for the user, not an implementer
 
-### 5.2 Listed automatically, configuration demanded only ON USE
+1. **Where does a captured inventory live?** (§2) Nothing else proceeds without this.
+2. **Does `partition_mapping` get an exception to "proposals are usable before confirmation"?** (§6)
+   It is identity-bearing and its wrong direction is silent. Every other proposal in the system is
+   usable unconfirmed.
+3. **Who may confirm a late-arrival SLA?** A claim about a feed's contract, not its data — the feed
+   owner or a steward, which may need a role the RBAC model lacks.
+4. **What happens when a confirmed mapping is later contradicted by sampling?** It invalidates sealed
+   artifacts (§6), so this is not merely a notification.
+5. **Composite partition keys** (§6.6) compile against a mapping that names only one of them, with
+   nothing refusing. Extend the time-partition variants to an ordered list, or refuse a layout whose
+   mapping does not name every partition column?
+6. **Engine coverage.** Narrower gap than v1 stated: the *render* path is Hive-only
+   (`render/project.py:440` emits `spark.SparkHiveDataset`), but `data_agent` already ships a Postgres
+   dialect and `catalog_engine`'s CHECK admits `oracle` and `postgres` (`1041:29`). Oracle
+   partitioning is not Hive's folders, so `partition_mapping` would still need a second dialect.
 
-**This is the constraint that keeps the design from collapsing.** If 400 uploaded tables all start
-demanding partition mappings, this recreates the 150K-column confirmation problem already rejected.
+## 11. Suggested sequence
 
-A table becomes *blocking* only when a governed feature reads it. Everything else is listed and
-quiet.
+1. **Decide §10.1 and build inventory persistence.** Everything else is downstream.
+2. **The read-only queue on logical `(catalog_source, table_name)`**, using `lineage.py:528-543`.
+   Shows what is blocking; needs no capture.
+3. **Declare `(engine, tier)` via the existing `PUT /data-sources`**, and teach `load_inventory` to
+   consume `engines:`. Migration-free; lets `SOURCE_ENGINE_UNSUPPORTED` fire.
+4. **Metastore capture** into that persistence — facts tier only. **Partly built:**
+   `MetastoreInventoryAdapter.capture()` is written and callerless, but its `MetastoreTableMetadata`
+   Protocol has no implementation, so the actual cluster read (partitions, location) does not exist
+   yet. `data_agent`'s `DESCRIBE` (`sql_hive.py:161-163`) covers schema only.
+5. **Feed-level declaration inheritance** — the step that changes the arithmetic.
+6. **Sampling proposals**, as an extension of `data_agent/`, after §10.2 is answered.
 
-```
-Needs configuring — 2 features are waiting
-  🔵 COMP_FINANCIAL_TRAN_REPOS_DLY   used by "avg txn amt 30d"
-  ⚪ BO_CIB_CUSTOMER                  used by "avg txn amt 30d"
+## 12. Successors — raised, deliberately not folded in
 
-Catalogued, nothing reads it yet — 398   [show]
-```
+Three directions came out of the review dialogue after this note was corrected. Each is plausible and
+each would change the plan materially, so they are recorded rather than merged — folding live design
+into a note being finalised is how v1 went wrong.
 
-### 5.3 Declare per FEED, not per table
+1. **Carry partition and business-date facts on the catalog upload** instead of a separate inventory.
+   The catalog already has the database, upload path, UI and confirm flow that §2 says the inventory
+   lacks, so this could shrink blocker 1 from a subsystem to catalog fields plus a translation step.
+   It would also derive the mapping directly: partition column and business-date column the same →
+   event-time; different → arrival. **Open question it must answer:** the inventory is keyed by
+   `environment_id` because one logical table can be laid out differently per environment; the
+   catalog is not, so this asserts one physical layout everywhere.
+2. **Turn compile refusals into clarification questions.** `analysis/clarify.py` already implements
+   this pattern with the right guarantees — options drawn from a bounded candidate set never
+   generated by a model, a human's answer re-validated exactly as a model's would be, one question
+   per raised code. The generator's refusal vocabulary is already closed, so each code either gets a
+   template or is declared unanswerable. Compile runs in a worker with no user attached, so the shape
+   is refuse → record → ask → retry, never a blocking prompt.
+3. **The same for aggregation semantics.** `additivity`
+   (`additive`/`semi_additive`/`non_additive`) already governs whether a SUM is legal, and
+   `formula_additivity` already isolates what it cannot derive from the body — disjointness, carried
+   as `PartitionProof`. That residue is the clarification candidate, not additivity itself.
 
-Tables from one extract almost always share arrival behaviour. The declaration belongs on the
-`(source_type, source)` feed, with per-table overrides for genuine exceptions. Forty tables becomes
-one declaration plus the handful that differ — which matches how a bank negotiates interfaces rather
-than tables.
-
-### 5.4 States, following the existing "AI-proposed is usable" rule
-
-| | |
-|---|---|
-| ✅ | a person confirmed it |
-| 🔵 | **proposed — usable now**, not yet confirmed |
-| 🟡 | needs a data check (cannot tell without sampling) |
-| ⚪ | nobody has looked / not found on the cluster |
-| 🔴 | conflict, or structurally unsupported |
-
-A proposal is usable before confirmation — features compile against it. Confirming records that a
-human took responsibility. A proposal later found wrong is **corrected, never silently cleared**.
-
-### 5.5 Screens
-
-**Queue**, grouped by feed, with a capture trigger. **Table detail** — a section on the existing
-asset-detail screen, not a new app — showing observed / proposed / decide, with the evidence visible:
-
-```
-How dates map                                     🔵 proposed
-  Partitioned by ARRIVAL date, not event date.
-  Because
-   • catalog says tran_dt is `ingested_at`, not `posted_at`
-   • sampled 90 days: 12% of rows arrived after their event date
-   • largest gap observed: 3 days
-  ⚠ We measured 3 days. The feed owner may have agreed a different SLA.
-         [Confirm]   [Change]   [Ask the feed owner]
-```
-
-**Feed detail** — the defaults, plus the exceptions surfaced for review.
-
-## 6. `source_type` — the enabling change
-
-The user intends to add `source_type` (and `source`) to their CSV.
-
-* `source` is **already accepted** (`_headers.py:14`, aliases `source`/`system`). Nothing to do.
-* `source_type` is **not**, and unknown headers are **silently ignored by design**
-  (`_headers.py:41,54-55` — *"a repeated unrecognized column is harmless"*). **A CSV carrying
-  `source_type` today produces no error, no warning, and no data.** The CSV change must land with the
-  code change, not before it.
-
-Note `_norm` strips underscores and lower-cases (`_headers.py:34-37`), so `source_type` normalises to
-`sourcetype` — no collision with `source`.
-
-### Three loose threads that are one piece of work
-
-1. the inventory's `engines:` block is keyed by `(source_type, source)` but sits in
-   `_DECLARED_FOR_LATER` — read past and never consumed (`materialize/inventory.py:363`);
-2. `SOURCE_ENGINE_UNSUPPORTED` is **defined and never raised** — it appears only at its enum
-   definition (`materialize/codes.py:74`) and in a comment (`inventory.py:359`);
-3. the user wants configuration driven by `(source_type, source)`.
-
-All three are "make `(source_type, source)` a concept the system consumes". Today an Oracle source
-would **not** be refused at load; it would fail later and less clearly.
-
-**Steps:** (1) alias entry; (2) carry through the parsed row; (3) persist on the catalog node —
-**likely needs a migration, and migration numbers are coordinated across tracks, so the number must
-be reserved rather than picked**; (4) wire the guard so `SOURCE_ENGINE_UNSUPPORTED` can fire.
-Steps 1–3 make the column real; step 4 makes it useful.
-
-## 7. What this does NOT block — verified
-
-**Code generation does not require the table to exist on a cluster.**
-
-| | needs | when |
-|---|---|---|
-| compile + render | the **declared layout** (inventory entry) | no cluster |
-| L0 build proof | builds the project | no cluster |
-| L1 | table/columns **actually exist** | cluster |
-| run | cluster + data | — |
-
-`PARTITION_IDENTITY_UNKNOWN` is a **CompilationRefusalCode** (`materialize/inputs.py:221,254,304`)
-raised because the inventory has no *entry*, not because the cluster has no *table* — `runprep.py:215`
-confirms such a run "refuses at compilation … and never reaches here". Whether the table exists is an
-L1 finding (`COLUMN_ABSENT` / `PARTITION_ABSENT`, `codes.py:161-163`), after the project is sealed.
-
-**And for G-1 it is moot:** the chain terminates at `PUBLICATION_REFUSED` after L0 and never reaches
-L1. So hand-written inventory entries for tables that exist nowhere still produce a complete, sealed,
-build-verified Kedro project. **A filled-in file, not a running cluster, is the short road to
-exercising the whole generation path.**
-
-## 8. Open decisions — for the user, not for an implementer
-
-1. **Who may confirm a late-arrival SLA?** It is a claim about a feed's contract, not about data. It
-   belongs to the feed owner or a data steward, not whoever is building the feature. This may require
-   a role that does not exist in the current RBAC model.
-2. **What happens when measurement and confirmation diverge?** Somebody confirms 3 days; a month
-   later sampling observes 5. That is the system noticing its own governance has gone stale. Same
-   shape as the existing drift concept — it must neither silently stand nor silently vanish.
-3. **Capture trigger** — scheduled, or a button someone presses?
-4. **Cluster tables absent from every CSV** — surface as "discovered, not governed"? A real metastore
-   may hold thousands, so on request rather than in the main queue.
-5. **Re-upload after a confirmed mapping.** Most column changes do not affect partitioning and the
-   confirmation should survive; but if the `as_of` column itself changes, the mapping's event column
-   is stale.
-6. **Hive is the only supported engine.** ODS/Oracle needs a metastore adapter, a renderer that emits
-   something Oracle executes (or Spark JDBC), and — the awkward part — Oracle partitioning is not
-   Hive's folder partitioning, so `partition_mapping` would need a second dialect.
-
-## 9. Suggested sequence
-
-1. `source_type` steps 1–3 (self-contained, no cluster; needs a reserved migration number).
-2. The derived queue with use-triggered scoping (§5.1–5.2) — read-only, no capture, immediately
-   shows what is actually blocking.
-3. Metastore capture wired to the queue (facts tier only).
-4. Feed-level declarations (§5.3) — the step that changes the arithmetic.
-5. Sampling and the proposal loop (§3) — needs the read-scope decision first.
-6. `(source_type, source)` guard wiring (§6 step 4).
+A design principle common to 2 and 3, worth carrying forward: **ask the question the person can
+answer, not the one the system needs answered.** "Can a transaction dated the 1st appear in the 5th's
+load?" rather than "event-time or availability partition?". And the failure mode to design against is
+asking too much — a system that prompts on every uncertainty trains people to click through, and then
+the question that mattered gets clicked through with the rest.
