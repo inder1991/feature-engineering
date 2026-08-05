@@ -92,8 +92,8 @@ body {
   background: var(--ground);
   color: var(--ink);
   font-family: var(--font-sans);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -290,11 +290,13 @@ table,
 .shell > main {
   flex: 1;
   min-width: 0;
-  padding: 36px 32px 64px;
+  padding: 20px 28px 48px;
 }
 
 .shell > main > * {
-  max-width: 1120px;
+  width: min(1240px, 100%);
+  max-width: 1240px;
+  margin-inline: auto;
 }
 
 /* ---------------------------------------------------------------- page head */
@@ -1890,6 +1892,11 @@ section > h2:first-child {
   gap: 7px;
 }
 
+/* One fact should not sit at half width with a hole beside it. */
+.ln-fact-grid > .ln-fact:only-child {
+  grid-column: 1 / -1;
+}
+
 .ln-fact {
   padding: 8px;
   border: 1px solid var(--line);
@@ -2062,7 +2069,10 @@ section > h2:first-child {
   margin: 3px 0 8px;
   color: var(--ink-soft);
   font-size: 10.5px;
-  overflow-wrap: anywhere;
+  /* break-word, not anywhere: a ref should wrap at a boundary, not split "cif_id" into
+     "cif_i" and "d". */
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 /* Three independent axes, never collapsed into one word. */
@@ -2596,16 +2606,36 @@ section > h2:first-child {
   z-index: 6;
 }
 
+/* The dismiss control sits in the corner and costs no row of its own. */
 .ln-drawer-header {
   display: flex;
   justify-content: flex-end;
-  margin-bottom: 6px;
+  height: 0;
+  margin: 0;
 }
 
 /* Was float:right, which reserves no space in the flow — a long object ref ran underneath the
    button and collided with it. */
 .ln-drawer-close {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  min-height: 0;
   flex: none;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-faint);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.ln-drawer-close:hover {
+  color: var(--ink);
 }
 
 .ln-drawer-title {

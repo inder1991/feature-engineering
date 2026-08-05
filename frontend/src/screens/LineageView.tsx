@@ -1403,7 +1403,12 @@ export function LineageView({
               ? <p className="ln-selected-def">{anchor.definition}</p>
               : <p className="ln-selected-def hint">No definition is held for this column.</p>}
             <div className="ln-pillrow">
-              {anchor.data_type && <span className="badge gj-none">{anchor.data_type}</span>}
+              {(() => {
+                const t = drawerNode?.data_type ?? anchor.data_type
+                return t && t.toLowerCase() !== 'unknown'
+                  ? <span className="badge gj-none">{t}</span>
+                  : null
+              })()}
               {anchor.is_grain && <span className="badge grain">grain</span>}
               {anchor.is_as_of && <span className="badge asof">as-of</span>}
             </div>
@@ -1411,10 +1416,10 @@ export function LineageView({
                 not passed to this component, so they are absent rather than guessed. */}
             <div className="ln-fact-grid">
               {([
-                ['Domain', anchor.domain],
-                ['Entity', anchor.entity],
+                ['Domain', drawerNode?.domain ?? anchor.domain],
+                ['Entity', drawerNode?.entity ?? anchor.entity],
                 ['Unit', anchor.unit],
-                ['Sensitivity', anchor.sensitivity],
+                ['Sensitivity', drawerNode?.sensitivity ?? anchor.sensitivity],
               ] as const).filter(([, v]) => !!v).map(([label, value]) => (
                 <div className="ln-fact" key={label}>
                   <span>{label}</span>
@@ -1592,8 +1597,17 @@ function Drawer({
       {/* Its own row rather than a float: a floated button reserves no space, so a long object ref
           ran underneath it and the two collided. */}
       <div className="ln-drawer-header">
-        <button type="button" className="ln-drawer-close" ref={closeRef} onClick={onClose}>
-          Close
+        <button
+          type="button"
+          className="ln-drawer-close"
+          ref={closeRef}
+          onClick={onClose}
+          aria-label="Close details"
+          title="Close details"
+        >
+          {/* An icon, not a word on its own row. The accessible name still says "Close details";
+              only the pixels shrink. */}
+          <span aria-hidden="true">×</span>
         </button>
       </div>
       {node.kind === 'column' && (
