@@ -1638,15 +1638,62 @@ section > h2:first-child {
 }
 
 /* the canvas */
+/* The graph workspace: three dedicated columns, per the reviewed concept. Nothing is positioned
+   over the canvas any more, so no control can cover a node or an edge label. */
 .ln-wrap {
-  position: relative;
-  height: 640px;
+  display: grid;
+  grid-template-columns: 205px minmax(540px, 1fr) 328px;
+  height: 680px;
   margin-block: 16px;
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   background: var(--surface);
   box-shadow: var(--shadow);
   overflow: hidden;
+}
+
+.ln-tools {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  overflow: auto;
+  padding: 14px;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+}
+
+/* In a column now, so it drops the floating-panel affordance it needed over the canvas. */
+.ln-tools .ln-layers {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ln-canvas {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ln-inspector {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: auto;
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.ln-inspector-empty {
+  padding: 15px;
+}
+
+@media (max-width: 1400px) {
+  .ln-wrap {
+    grid-template-columns: 185px minmax(440px, 1fr) 300px;
+  }
 }
 
 .ln-wrap--placeholder {
@@ -2102,15 +2149,12 @@ section > h2:first-child {
 
 /* detail drawer (right, inside the canvas) */
 .ln-drawer {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 300px;
-  padding: 16px;
+  position: static;
+  width: auto;
+  padding: 15px;
   background: var(--surface);
-  border-left: 1px solid var(--line);
-  box-shadow: var(--shadow);
+  border-left: 0;
+  box-shadow: none;
   overflow: auto;
   z-index: 6;
 }

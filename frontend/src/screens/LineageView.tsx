@@ -15,7 +15,6 @@ import {
   Controls,
   Handle,
   MiniMap,
-  Panel,
   Position,
   ReactFlow,
   type Edge,
@@ -984,24 +983,13 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
 
   return (
     <>
+      {/* Concept decision 2: "Panels never float over the map — Layers, empty states and the
+          inspector occupy dedicated columns, preventing the overlap visible in the latest
+          implementation." The layers fieldset and the why-empty note were ReactFlow <Panel>s
+          drawn ON the canvas, and the drawer was position:absolute over its right edge, so
+          all three covered nodes and labels. They are columns now. */}
       <div className="ln-wrap">
-        <ReactFlow
-          nodes={flow.nodes}
-          edges={flow.edges}
-          nodeTypes={NODE_TYPES}
-          onInit={inst => {
-            rf.current = inst
-          }}
-          fitView
-          minZoom={0.3}
-          maxZoom={2}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          nodesFocusable
-          edgesFocusable={false}
-        >
-          <Background gap={22} size={1} color="oklch(0.88 0.01 212)" />
-          <Panel position="top-left">
+        <aside className="ln-tools" aria-label="Graph controls">
             <fieldset className="ln-layers">
               <legend className="micro-label">Layers</legend>
               {(
@@ -1024,9 +1012,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
                 </label>
               ))}
             </fieldset>
-          </Panel>
           {showWhyEmpty && (
-            <Panel position="top-right">
               <aside className="ln-empty" aria-label="Why nothing is drawn">
                 <h3 className="micro-label">Nothing to draw yet</h3>
                 {layersOn.joins && (
@@ -1078,8 +1064,26 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
                   </p>
                 )}
               </aside>
-            </Panel>
           )}
+        </aside>
+
+        <div className="ln-canvas">
+        <ReactFlow
+          nodes={flow.nodes}
+          edges={flow.edges}
+          nodeTypes={NODE_TYPES}
+          onInit={inst => {
+            rf.current = inst
+          }}
+          fitView
+          minZoom={0.3}
+          maxZoom={2}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          nodesFocusable
+          edgesFocusable={false}
+        >
+          <Background gap={22} size={1} color="oklch(0.88 0.01 212)" />
           <Controls showInteractive={false} position="bottom-right" />
           {/* Only when there is something to navigate. On a pruned neighbourhood the minimap was
               a large panel rendering three grey blocks — cost with no information. */}
@@ -1093,6 +1097,12 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           />
           )}
         </ReactFlow>
+        </div>
+
+        {/* A layout column, not a landmark: the Drawer inside already carries
+            role/aria-label="Details", and nesting a second identical landmark makes the
+            region ambiguous to assistive tech. */}
+        <div className="ln-inspector">
         {drawerNode && (
           <Drawer
             node={drawerNode}
@@ -1103,6 +1113,13 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             onClose={closeDrawer}
           />
         )}
+          {!drawerNode && (
+            <p className="hint ln-inspector-empty">
+              Select a node to see its identity, relationship trust and the features it can
+              support.
+            </p>
+          )}
+        </div>
       </div>
 
       {graph.truncated && (
