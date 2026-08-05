@@ -74,3 +74,40 @@ leave it out — do not fabricate a count.
 Nine deploys in this session were "verified" by grepping the served bundle for strings. That
 cannot see layout, spacing, colour or overlap, and it missed every defect on this page. Verify
 graph changes with a rendered screenshot before reporting them as done.
+
+
+## Backend constraint found 2026-08-05 (not a frontend gap)
+
+`LineageNode` (`/graph/lineage`) carries: `id kind object_ref table column catalog_source
+feature_id name grain as_of sensitivity entity concept domain as_of_basis verification
+rationale`.
+
+It does **not** carry a declared/operational type or a business term. So the artifact's anchor
+card line —
+
+    Customer Number · customer_id varchar(150) · source declared
+
+cannot be rendered from the graph payload. `Customer Number` is a glossary business term and
+`varchar(150) · source declared` is a type plus its attestation basis; the endpoint sends
+neither. The same is true of the table card's `BO_DPL_CIB` schema segment — there is no
+`schema_name` on the node.
+
+Three honest options, in order of preference:
+
+1. Extend the lineage node payload with `business_term`, `declared_type` and `type_basis`
+   (and `schema_name` for tables). The asset-detail read model already computes all of them.
+2. For the ANCHOR node only, thread the values through from the `SearchHit` the view already
+   receives — it has `data_type`, `concept`, `domain`. This fixes one card, not the others,
+   and makes the anchor inconsistent with its neighbours.
+3. Render only what the payload holds (`concept`, `domain`) and accept a shorter line.
+
+Do NOT synthesise the missing values. The same rule already applied to the `2 CHECKS REQUIRED`
+badge and the inspector's Grain-use / Join-use facts, both of which need readiness data this
+component is not passed.
+
+## Remaining frontend work
+
+- Canvas centring: cards crowd right with dead space at left; the artifact centres the anchor.
+- Column-row chips (`ANCHOR`, `MAPPED`) are not rendered.
+- Context bar badges: `CUSTOMER IDENTIFIER` needs `entity` (null on this column in the live
+  catalog); `2 CHECKS REQUIRED` needs readiness.
