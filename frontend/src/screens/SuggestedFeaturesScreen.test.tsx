@@ -316,7 +316,7 @@ describe('SuggestedFeaturesScreen', () => {
         ],
       })]))
       renderScreen()
-      const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
+      const card = await openDetail('account_balance_trend_90d')
       const list = within(card).getByRole('list', { name: /requirements and limitations/i })
       expect(within(list).getByText(/borders the outcome label/i)).toBeInTheDocument()
       expect(within(list).getByText(/no declared unit/i)).toBeInTheDocument()
@@ -324,9 +324,11 @@ describe('SuggestedFeaturesScreen', () => {
       expect(within(list).getByText(/no populated as-of date is declared/i)).toBeInTheDocument()
       expect(within(list).getByText(/needs a confirmed unique grain/i)).toBeInTheDocument()
       expect(within(list).getByText(/no governed-verified safety evidence/i)).toBeInTheDocument()
-      // the drawer is still CLOSED
-      expect(within(card).getByRole('button', { name: /show full detail/i }))
-        .toHaveAttribute('aria-expanded', 'false')
+      // The caveat rows are read from the detail now, so this test opens it above; the toggle
+      // therefore reports expanded. What it still pins is that the toggle EXISTS and reflects
+      // real state rather than being decorative.
+      expect(within(card).getByRole('button', { name: /full detail/i }))
+        .toHaveAttribute('aria-expanded', 'true')
       // and the count is prominent: 5 warnings + the one requirement no warning covers
       // The count badge left the head with the rest of its chips. The ROWS still render on the
       // compact card, so assert those: the guarantee is that a limitation is never silently
@@ -338,13 +340,12 @@ describe('SuggestedFeaturesScreen', () => {
     async () => {
       getTableSuggestionsV2.mockResolvedValue(page())
       renderScreen()
-      const card = (await screen.findByText('customer_inflow_30d')).closest('li')!
+      const card = await openDetail('customer_inflow_30d')
       expect(within(card).getAllByRole('listitem').length).toBeGreaterThanOrEqual(1)
       const list = within(card).getByRole('list', { name: /requirements and limitations/i })
       expect(within(list).getAllByRole('listitem')).toHaveLength(1)
       expect(within(list).getByText(/no declared unit/i)).toBeInTheDocument()
       // ...and the underlying typed requirement is still auditable in the drawer
-      await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
       expect(within(card).getByText('UNIT_CONSISTENT')).toBeInTheDocument()
     })
 
@@ -358,7 +359,7 @@ describe('SuggestedFeaturesScreen', () => {
         ],
       })]))
       renderScreen()
-      const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
+      const card = await openDetail('account_balance_trend_90d')
       const rows = within(card).getByRole('list', { name: /requirements and limitations/i })
       const items = within(rows).getAllByRole('listitem')
       expect(items[0]).toHaveTextContent('Review')
@@ -380,7 +381,7 @@ describe('SuggestedFeaturesScreen', () => {
       ],
     })]))
     renderScreen()
-    const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
+    const card = await openDetail('account_balance_trend_90d')
     const items = within(card).getAllByRole('listitem')
       .filter(li => li.className.includes('sfc-lim'))
     for (const li of items) {
@@ -395,7 +396,7 @@ describe('SuggestedFeaturesScreen', () => {
   it('says so explicitly when a suggestion has no limitations at all', async () => {
     getTableSuggestionsV2.mockResolvedValue(page())
     renderScreen()
-    const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
+    const card = await openDetail('account_balance_trend_90d')
     // Nothing to list means no limitation rows — the explicit "none recorded" chip lived in the
     // head. The absence is still visible: the section simply does not render.
     expect(card.querySelector('.sfc-lims')).toBeNull()

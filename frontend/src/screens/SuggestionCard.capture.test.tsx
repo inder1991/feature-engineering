@@ -64,13 +64,18 @@ describe('SuggestionCard over a captured server body', () => {
     }
   })
 
-  it('names the columns an unconfirmed-join warning is about, as column names', () => {
+  it('names the columns an unconfirmed-join warning is about, as column names', async () => {
     // THE REGRESSION, said positively. `refWords` runs `columnOf` over each ref's second element,
     // so a nested shape crashed here; a flat one reads out the endpoint column names.
     const hit = cardWithCode('RELATIONSHIP_UNCONFIRMED')
     const { container } = render(<ul><SuggestionCard hit={hit} /></ul>)
     const card = container.querySelector('li.sfc') as HTMLElement
-    const row = within(card).getByText(/declared by an upload and confirmed by nobody/i)
+    // Caveat rows live in Full detail now — the card carries only their count, so the panel
+    // reads as a hint to pursue rather than a defect list.
+    await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
+    // Scoped to the limitations list: the phrase also appears in the relationship section.
+    const lims = within(card).getByRole('list', { name: /requirements and limitations/i })
+    const row = within(lims).getByText(/declared by an upload and confirmed by nobody/i)
       .closest('li') as HTMLElement
     const warning = hit.suggestion.warnings.find(w => w.code === 'RELATIONSHIP_UNCONFIRMED')!
     expect(warning.operand_refs.length).toBeGreaterThan(0)

@@ -564,10 +564,16 @@ export function SuggestionCard({
           <span className="sfc-clamp">{s.point_in_time_declaration.value}</span>
         </div>
       )}
+      {/* A caveat COUNT, not a defect list. This panel exists to hand a data scientist a
+          candidate worth pursuing; two amber blocks per card reading MISSING_CURRENCY made it
+          read as a validation report. The caveats still change whether the feature is
+          trustworthy, so they are never dropped — they move into Full detail and the card
+          carries one quiet chip saying how many there are. */}
       {limitations.length > 0 && (
-        <ul className="sfc-lims" aria-label="Requirements and limitations">
-          {limitations.map(item => <LimitationRow key={item.key} item={item} />)}
-        </ul>
+        <p className="sfc-caveats">
+          {limitations.length} {limitations.length === 1 ? 'caveat' : 'caveats'} to check before
+          {' '}using this — see full detail.
+        </p>
       )}
 
       <div className="sfc-foot">
@@ -1041,7 +1047,7 @@ function SuggestionDetail({
           <p className="hint">Nothing was raised against this suggestion.</p>
         ) : (
           <>
-            <ul className="sfc-lims">
+            <ul className="sfc-lims" aria-label="Requirements and limitations">
               {limitationsOf(s).map(item => <LimitationRow key={item.key} item={item} />)}
             </ul>
             <ul className="sfc-reqs">

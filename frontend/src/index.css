@@ -6026,6 +6026,37 @@ button.stat:hover {
   font-size: 10.5px;
 }
 
+/* A caveat count, not a defect list. Quiet: it points at the detail, it does not shout. */
+.sfc-caveats {
+  margin: 0;
+  color: var(--warn);
+  font-size: 11px;
+}
+
+/* The status pair must read as ONE axis at ONE weight. `design not checked` inherits
+   .gj-partial, whose solid warn fill made the not-checked state far louder than the checked
+   one -- the exact inversion this product forbids: a card waiting on a declared fact is honest
+   output, not a failure. Outline both. */
+.sfc-status .badge {
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--ink-soft);
+}
+
+.sfc-status .badge.gj-partial {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* Long identifiers wrap at a boundary, not mid-token: "cust_smart_cust_pk / g_cd" is not a
+   column anyone can search for. */
+.sfc-lims,
+.sfc-lim-words {
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
 .sfc-recipe {
   margin: 0;
   padding: 6px 8px;
