@@ -433,11 +433,13 @@ it('names all four relationship kinds distinctly, each by the claim it makes', a
       crosswalkRelationship({ relationship_ref: 'so_1', kind: 'semantic_only', crosswalk: null }),
     ],
   }))
+  // `getByText` THROWS on a miss and on a duplicate, so this loop is the whole assertion: four
+  // labels, each rendered exactly once. (The line that used to sit here asserted that a literal
+  // array of four distinct strings had four distinct members, which is a fact about the array.)
   const labels = ['direct equality', 'crosswalk (mapping-mediated)', 'transformed', 'semantic-only']
   for (const label of labels) {
     expect(screen.getByText(label)).toBeInTheDocument()
   }
-  expect(new Set(labels).size).toBe(4)
 })
 
 it('shows what already depends on a crosswalk, and never a zero it has not earned', async () => {
@@ -558,4 +560,144 @@ it('lists every pinned revision the traversal would carry, including both legs',
   expect(pins).toHaveTextContent('deposits::public.accounts → deposits::public.acct_xref')
   expect(pins).toHaveTextContent('deposits::public.acct_xref → cards::public.cust')
   expect(pins).toHaveTextContent('bjr_1')
+})
+
+// ── the vocabulary that must never appear on a crosswalk row ────────────────────────────────────
+//
+// WHY A DOM-WIDE SCAN AND NOT THREE MORE `not.toHaveTextContent` LINES. The three negatives this
+// file already carries (`/blocked|failed|invalid|error/i` and friends) are each pinned to one
+// element and each catches a SUBSTITUTION — a sentence replaced by a worse one. None of them
+// catches an ADDITION, which is the way this row will actually regress: appending "Approval
+// unblocks it: confirm to enable, and 0 features depend on it today" to the crosswalk hint left
+// every assertion in this file green, because every sentence they check for was still there.
+//
+// The list MIRRORS `overlay/upload/governance_queue.FORBIDDEN_PHRASES` (the server scans the
+// payload with the same words; this scans what the screen renders out of it) plus the softer forms
+// a crosswalk row is likeliest to grow. Two copies of a prohibition is one copy going stale, and
+// the copy is unavoidable across the language boundary — so it is named here, in one place, rather
+// than spread across the assertions.
+const FORBIDDEN_ON_A_CROSSWALK_ROW = [
+  // The server list, verbatim in meaning.
+  /blocks\s+(n|\d+)\s+features?/i,
+  /approve to enable/i,
+  /waiting to become usable/i,
+  /production approval required/i,
+  /\bblocked\b/i,
+  /sign-?off/i,
+  // The softer forms. Each joins approval to capability, which is the one claim this row exists to
+  // refuse: a review is accountability, and availability is automatic.
+  /approval unblocks/i,
+  /confirm to enable/i,
+  /\bunblocks?\b/i,
+  /approve to (unblock|run)/i,
+  /pending approval/i,
+]
+
+// A 0 is EARNED only where a store actually counted one: `state === 'counted'` renders through the
+// `gq-usage-counted` class, and that is the single place a literal zero may legitimately appear.
+// Everything else — "not tracked yet" rendered as 0, a fabricated dependency count — is the exact
+// invitation to "approve it and things become usable" that the tri-state exists to remove.
+function textOutsideCountedUsage(row: HTMLElement): string {
+  const clone = row.cloneNode(true) as HTMLElement
+  clone.querySelectorAll('.gq-usage-counted').forEach(node => node.remove())
+  return clone.textContent ?? ''
+}
+
+it('renders no forbidden phrase anywhere on a crosswalk row, in any state', async () => {
+  // EVERYTHING AT ONCE, so the scan covers every branch the row can take: measured with one
+  // refused direction, all three families, an untracked dependency, both leg pins, the deployment
+  // switch off. A phrase added to any of those blocks lands in this string.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        mapping_temporal_policy_revision_id: 'dtp_abc123',
+        execution_enabled: false,
+        admission_policy_version: 'crosswalk-admission-v1:abc',
+        measurement: {
+          observation_revision_id: 'cwo_1', scope_id: 'sandbox',
+          observed_at: '2026-08-04T13:00:00Z', as_of: '2026-08-04', method: 'exact',
+          row_coverage: 'full', complete: true, composed_row_count: 7,
+          source_to_target_max_matches: 1, target_to_source_max_matches: 2,
+          mapping_row_count: 3, mapping_temporal_policy_revision_id: 'dtp_abc123',
+          caveats: ['mapping_temporal_policy_absent'], failures: [],
+        },
+        directions: [
+          { direction: 'source_to_target', safety_status: 'deterministically_validated',
+            cardinality: 'many_to_one', sandbox_admissible: true, production_admissible: true,
+            reason_codes: ['deterministic_crosswalk_policy_satisfied'] },
+          { direction: 'target_to_source', safety_status: 'unsafe', cardinality: 'one_to_many',
+            sandbox_admissible: false, production_admissible: false,
+            reason_codes: ['directional_crosswalk_fanout'] },
+        ],
+        unresolved_families: {
+          directional_crosswalk_fanout: 'structurally_unsuitable',
+          crosswalk_not_measured: 'needs_data_check',
+          mapping_temporal_policy_unresolved: 'undecided',
+        },
+        already_depended_on_by: [{
+          category: 'published_features', state: 'not_tracked_yet', count: null,
+          display: 'not tracked yet', store: 'contract_metadata_dependency',
+          basis: 'a registered feature whose contract depends on this crosswalk',
+          reason: 'no crosswalk marker exists in that column',
+        }],
+        pinned_revisions: {
+          crosswalk_definition_revision: 'cwd_rev_1', composed_observation_revision: 'cwo_obs_1',
+        },
+        leg_pins: [
+          {
+            kind: 'same_catalog', plan_hash: 'plan-1',
+            from_dataset_ref: 'deposits::public.accounts',
+            to_dataset_ref: 'deposits::public.acct_xref',
+            from_binding_revision_id: 'pbr_a', to_binding_revision_id: 'pbr_b',
+            read_set_hash: 'read-1',
+          },
+          {
+            kind: 'cross_catalog', plan_hash: 'plan-2',
+            from_dataset_ref: 'deposits::public.acct_xref',
+            to_dataset_ref: 'cards::public.cust',
+            from_binding_revision_id: 'pbr_b', to_binding_revision_id: 'pbr_c',
+            read_set_hash: 'read-2', realization_revision_ids: ['bjr_1'],
+          },
+        ],
+      },
+    })],
+  }))
+  const row = screen.getByTestId('context-link-cwd_1')
+  // The lineage block is a <details>: its contents are in the DOM whether or not it is open, and
+  // `textContent` reads them — which is what makes this a scan of the whole row.
+  const rendered = row.textContent ?? ''
+  expect(rendered).toContain('acct_xref')          // the fixture actually rendered
+
+  for (const forbidden of FORBIDDEN_ON_A_CROSSWALK_ROW) {
+    expect(rendered).not.toMatch(forbidden)
+  }
+  // And no zero anybody has not earned. "Nothing uses this" and "no store records who uses this"
+  // are different claims, and only the second is true here.
+  expect(textOutsideCountedUsage(row)).not.toMatch(/\b0\b/)
+})
+
+it('keeps the scan honest when a store HAS counted a dependency', async () => {
+  // The other side of the zero guard: a counted 0 is a real answer from a real store, and refusing
+  // to render it would make the guard a rule about digits rather than about unearned claims. Also
+  // proves the exemption is scoped — the forbidden-phrase scan still runs over the whole row.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        already_depended_on_by: [{
+          category: 'published_features', state: 'counted', count: 0,
+          display: '0', store: 'contract_metadata_dependency',
+          basis: 'a registered feature whose contract depends on this crosswalk',
+          reason: '',
+        }],
+      },
+    })],
+  }))
+  const row = screen.getByTestId('context-link-cwd_1')
+  expect(screen.getByTestId('crosswalk-depends-cwd_1')).toHaveTextContent('0')
+  expect(textOutsideCountedUsage(row)).not.toMatch(/\b0\b/)
+  for (const forbidden of FORBIDDEN_ON_A_CROSSWALK_ROW) {
+    expect(row.textContent ?? '').not.toMatch(forbidden)
+  }
 })

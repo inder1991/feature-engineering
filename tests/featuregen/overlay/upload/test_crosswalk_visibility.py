@@ -521,6 +521,16 @@ def test_no_crosswalk_payload_ever_claims_that_approval_unblocks_anything(db) ->
         assert phrase not in rendered, (
             f"the crosswalk payload says {phrase!r}: review is accountability, and availability is "
             f"automatic")
+    # THE SHARED LIST HAS TO CATCH A SENTENCE NOBODY WROTE YET. Four whole assertions caught four
+    # whole assertions and nothing else: "blocked until a reviewer signs off" matched none of them
+    # and would have passed this scan silently. The list now carries the WORDS, and this is the
+    # positive control that says so — without it, "the list is shared" is a claim about plumbing
+    # rather than about what the plumbing stops.
+    for invented in ("blocked until a reviewer signs off",
+                     "awaiting sign-off from the data owner"):
+        assert any(phrase.lower() in invented for phrase in FORBIDDEN_PHRASES), (
+            f"the forbidden list would let {invented!r} through: it asserts that a signature is "
+            "what makes this usable, which is the one thing the whole surface refuses to say")
 
 
 def test_what_already_depends_on_this_never_renders_a_zero(db) -> None:
@@ -568,6 +578,30 @@ def test_every_direction_reason_is_rendered_as_one_of_the_three_families(db) -> 
     # The refused direction is the one the plan names, and it is STRUCTURALLY UNSUITABLE — not a
     # failure, and not something a decision or another measurement could change.
     assert families["directional_crosswalk_fanout"] == "structurally_unsuitable"
+
+
+def test_the_UNMEASURED_state_says_it_needs_a_data_check_rather_than_saying_nothing(db) -> None:
+    """The DEFAULT product state, which had no family at all.
+
+    `unresolved_families` was derived from the per-direction reason codes, and an unmeasured
+    crosswalk carries no directions — so the map was `{}` for every crosswalk this listing serves
+    (nothing on the listing path takes an admission decision), and the screen's families block
+    simply did not render. The one state a reader actually meets was the one state with no
+    explanation, which is how "nobody has profiled this yet" ends up looking like a fault by
+    omission: the row says the crosswalk is not runnable and offers no reading of why.
+
+    `crosswalk_not_measured` is `needs_data_check` — a job somebody can do, not a decision anybody
+    owes and not a verdict about the data.
+    """
+    _assessment, _revision, _crosswalk = _bank(db)
+    cross = _crosswalk_payload(db)
+
+    assert cross["measurement"] is None and cross["directions"] == [], "the fixture is unmeasured"
+    families = cross["unresolved_families"]
+    assert families.get("crosswalk_not_measured") == "needs_data_check", (
+        "an unmeasured crosswalk rendered no family at all, so the screen said nothing about why")
+    # And nothing in the vocabulary reads as a fault or as a withheld approval.
+    assert set(families.values()) == {"needs_data_check"}
 
 
 def test_the_deployment_switch_is_a_separate_field_from_the_evidence(db) -> None:

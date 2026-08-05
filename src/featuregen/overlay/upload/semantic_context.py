@@ -512,6 +512,29 @@ class CrosswalkContextV1:
         return self.measurement is not None
 
     @property
+    def unresolved_reason_codes(self) -> tuple[str, ...]:
+        """WHY this crosswalk is not available for use, as reason codes, deduplicated and sorted.
+
+        Both levels, because a crosswalk has two and the DEFAULT product state only has one. The
+        per-direction codes are the measured answers, and `unresolved_families` was built from them
+        alone — so an UNMEASURED crosswalk, which carries no directions at all, rendered an EMPTY
+        families map and the screen said nothing about why. That is every crosswalk on this tree
+        today: `relationship_context_from_crosswalk` is called with no decision from the listing
+        path, so the state a reader actually meets was the one state with no explanation.
+
+        `crosswalk_not_measured` is what `evaluate_crosswalk_admission` states for exactly this
+        input (`observation is None`), and it is classified `needs_data_check` — a job, not a fault
+        and not anybody's decision. Deriving it from `measurement is None` is the same predicate
+        that function branches on, not a second opinion about it.
+        """
+        from featuregen.overlay.upload.crosswalk_admission import CrosswalkAdmissionReason
+
+        codes = {code for direction in self.directions for code in direction.reason_codes}
+        if self.measurement is None:
+            codes.add(CrosswalkAdmissionReason.NOT_MEASURED.value)
+        return tuple(sorted(codes))
+
+    @property
     def executable_now(self) -> bool:
         """ALWAYS FALSE on this tree, and stated in ONE place rather than inferred at each surface.
 

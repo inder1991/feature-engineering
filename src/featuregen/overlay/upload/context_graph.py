@@ -245,15 +245,19 @@ def _relationship_dict(conn: DbConn, link: RelationshipContextV1) -> dict:
         "executable_now": link.crosswalk.executable_now,
         # ── Release C Task 13 ────────────────────────────────────────────────────────────────────
         #
-        # WHY THIS DIRECTION IS NOT AVAILABLE, in the three families the rest of the page already
+        # WHY THIS CROSSWALK IS NOT AVAILABLE, in the three families the rest of the page already
         # uses (D5): nobody-decided-yet / needs-a-data-check / structurally-unsuitable. A reason
         # code alone renders as a machine word and reads as a fault; the family is what makes
         # "unmeasured" and "fans out" different sentences instead of two shades of failure.
+        #
+        # Read from the extension's own `unresolved_reason_codes`, which carries the DECISION-level
+        # answer as well as the per-direction ones. Built from the directions alone this map was
+        # empty for every unmeasured crosswalk — which is every crosswalk this listing serves, since
+        # nothing on the listing path takes an admission decision — so the default product state was
+        # the one state that rendered no explanation at all.
         "unresolved_families": {
             code: family.value for code, family in reason_families(
-                code
-                for d in link.crosswalk.directions
-                for code in d.reason_codes).items()},
+                link.crosswalk.unresolved_reason_codes).items()},
         # THE DEPLOYMENT'S OWN ANSWER, kept apart from the evidence's. With the flag off a
         # crosswalk is discoverable and structurally non-executable, and that is a fact about this
         # installation — folding it into `executable_now` would let a reader mistake a switch for a

@@ -146,11 +146,24 @@ KIND_ORDER = (ENTITY_BRIDGE, APPROVED_JOIN, "grain", "availability_time")
 #: Wordings that must NEVER appear anywhere in this payload — not in a value, a key, or a comment.
 #: Every one of them asserts that human review gates use, which is false: review is accountability,
 #: availability is automatic. Pinned by a test that scans the rendered response for each phrase.
+#:
+#: THE SCAN IS LITERAL AND CASE-INSENSITIVE, and the list is what it can see. That is why the last
+#: three are single WORDS rather than sentences: the four originals are whole assertions, and a
+#: surface that grows its own phrasing — "blocked until a reviewer signs off" — matched none of
+#: them and passed silently on every consumer of this list, including the crosswalk payload scan
+#: that shares it. A word is coarser than a sentence and that is the point: there is no honest
+#: sentence in this product containing "blocked", and a false positive costs a rewording.
 FORBIDDEN_PHRASES = (
     "Blocks N features",
     "Approve to enable",
     "Waiting to become usable",
     "Production approval required",
+    #: Catches every inflection a literal scan can reach: "blocked", "blocked by review", "blocked
+    #: until…". Availability is automatic, so nothing here is ever blocked BY anything.
+    "blocked",
+    #: Both spellings of the same claim — that somebody's signature is what makes a thing usable.
+    "sign-off",
+    "awaiting sign-off",
 )
 
 # ── The human axis ───────────────────────────────────────────────────────────────────────────────
