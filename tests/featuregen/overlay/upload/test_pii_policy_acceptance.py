@@ -102,10 +102,10 @@ def _recipe_path(db):
 
     `now=None` skips the freshness check only — nothing else is relaxed, and the USE gate does not
     read it."""
-    ideas, rejections, _grounded, _rejected, *_rest = _template_candidates(
+    result = _template_candidates(
         db, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None)
-    return ({idea.name for idea in ideas},
-            {r["name"]: r["code"] for r in rejections})
+    return ({idea.name for idea in result.ideas},
+            {r["name"]: r["code"] for r in result.rejections})
 
 
 def _approve_anchors(db, *concepts: str) -> dict[str, str]:
@@ -163,8 +163,8 @@ def test_each_lit_recipe_names_the_policy_revisions_that_licensed_it(catalog):
     """Provenance the reviewer can read off the feature: which decision, taken when, allowed this.
     `external_own_transfer_trend_90d` is the sharp case — it needs TWO approvals and names both."""
     revisions = _approve_anchors(catalog)
-    ideas, _rejections, *_rest = _template_candidates(
-        catalog, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None)
+    ideas = _template_candidates(
+        catalog, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None).ideas
     by_name = {idea.name: idea for idea in ideas}
 
     for name, concepts in A34_RECIPES.items():
@@ -218,8 +218,8 @@ def test_a_partially_licensed_recipe_stays_refused_and_the_refusal_names_what_is
     is still undeclared rather than being sent to re-read the whole list."""
     _approve_anchors(catalog, "pii", "pep_flag", "device_fingerprint", "geolocation")
 
-    _ideas, rejections, *_rest = _template_candidates(
-        catalog, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None)
+    rejections = _template_candidates(
+        catalog, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None).rejections
     by_name = {r["name"]: r for r in rejections}
 
     refusal = by_name["external_own_transfer_trend_90d"]
@@ -229,7 +229,7 @@ def test_a_partially_licensed_recipe_stays_refused_and_the_refusal_names_what_is
     # the four fully-licensed recipes are unaffected
     assert set(A34_RECIPES) - {"external_own_transfer_trend_90d"} <= {
         idea.name for idea in _template_candidates(
-            catalog, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None)[0]}
+            catalog, catalog_source=SOURCE, roles=ROLES, target_ref=None, now=None).ideas}
 
 
 def test_the_gate_kill_switch_is_no_longer_the_only_way_through(catalog):

@@ -174,6 +174,10 @@ _STRUCTURAL_META_KEYS = frozenset({
     "target", "candidates", "sets", "table_context",
     # formula authoring/critic (formula/author.py, formula/critic.py)
     "authoring_intent", "tool_trail", "recipe_authoring_context", "proposal", "operand_columns",
+    # Suggestion-discovery Task 1 (classified at the main merge): REPO-AUTHORED recipe labels and
+    # legacy tags — SME-authored closed-vocabulary values, never uploader/source-file data. The one
+    # prose-shaped sibling (`recipe_intent`) is deliberately NOT here — see _ROUNDTRIP_PROSE_KEYS.
+    "recipe_family", "recipe_aggregation", "funnel_stage", "legacy_use_case_tags",
 })
 
 # ROUND-TRIP PROSE: free text that is DELIBERATELY egressed unscanned because it is the caller's
@@ -189,6 +193,11 @@ _STRUCTURAL_META_KEYS = frozenset({
 _ROUNDTRIP_PROSE_KEYS = frozenset({
     "definition", "findings",            # model round-trip (contract critique/refine)
     "objective", "feedback", "fix", "avoid",   # human round-trip (feature assist)
+    # Outbound-only SME-authored prose (suggestion-discovery Task 1, classified at the main
+    # merge): a recipe's intent sentence is repo-authored and length-bounded (400), never
+    # uploader/source-file data — but it IS prose, and calling it structural would misdocument
+    # the egress surface for exactly the reason this class's charter names.
+    "recipe_intent",
 })
 
 

@@ -15,10 +15,20 @@ _SRC = Path(__file__).resolve().parents[3] / "src" / "featuregen"
 
 # Symbols with exactly ONE permitted defining module at this baseline (Task 0S owners).
 _SINGLE_OWNER_CLASSES = {
-    "EvidenceAuthorityV1": "contracts/evidence_axes.py",
-    "SemanticValueV1": "contracts/evidence_axes.py",
     "AttributedLabelV1": "contracts/evidence_axes.py",
     "AttributedTextV1": "contracts/evidence_axes.py",
+}
+
+# The 2026-08-05 main merge landed the semantic/profile plans' OWN homes for two of the Task 0S
+# names: both trains had implemented the same D2/§2 concept in parallel (this plan's enum-coerced
+# shape in contracts/evidence_axes.py; the semantic train's string-validated wire shape in
+# overlay/upload/semantic_context.py), each with its own live consumer set. Neither could adopt
+# the other in a merge commit without silently changing one train's wire or comparison semantics,
+# so the split is RECORDED (docs/DEFERRED-WORK.md A.48) and pinned here: exactly these two homes,
+# never a third, until the unification A.48 commits to.
+_KNOWN_DUAL_HOME_CLASSES = {
+    "EvidenceAuthorityV1": ("contracts/evidence_axes.py", "overlay/upload/semantic_context.py"),
+    "SemanticValueV1": ("contracts/evidence_axes.py", "overlay/upload/semantic_context.py"),
 }
 
 # Symbols owned by the UNLANDED semantic/profile plans (freeze D3/D9; ledger §2). This plan
@@ -42,6 +52,14 @@ def test_task0s_contracts_have_exactly_one_defining_module():
         files = _defining_files(class_name)
         assert files == [_SRC / owner_rel], (
             f"{class_name} must be defined ONLY in {owner_rel}; found {files}")
+
+
+def test_the_dual_home_classes_have_exactly_their_two_recorded_homes_and_never_a_third():
+    for class_name, homes in _KNOWN_DUAL_HOME_CLASSES.items():
+        files = _defining_files(class_name)
+        assert files == sorted(_SRC / rel for rel in homes), (
+            f"{class_name} is dual-homed by the recorded A.48 split ({homes}); found {files} — "
+            f"a third definition (or a silent removal) changes a recorded contract split")
 
 
 def test_foreign_owned_contracts_are_never_defined_twice():
