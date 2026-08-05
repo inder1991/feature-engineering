@@ -2299,6 +2299,16 @@ section > h2:first-child {
   color: var(--chip-ink);
 }
 
+.ln-flag--anchor {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.ln-flag--mapped {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .ln-flag--stale {
   display: inline-flex;
   align-items: center;
@@ -2527,6 +2537,10 @@ section > h2:first-child {
   right: 15px;
   bottom: auto;
   left: auto;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
   box-shadow: var(--shadow);
   box-shadow: var(--shadow);
   border-radius: var(--radius);
@@ -2534,6 +2548,12 @@ section > h2:first-child {
 }
 
 .ln-wrap .react-flow__controls-button {
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-soft);
   width: 32px;
   height: 32px;
   border: none;

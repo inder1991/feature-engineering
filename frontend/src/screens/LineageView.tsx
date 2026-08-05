@@ -48,7 +48,9 @@ const W_FEATURE = 250
 const W_CONSUMER = 230
 const HEAD_H = 40
 const SRC_H = 24
-const ROW_H = 32 // column rows are real buttons: hit targets >= 32px (PRODUCT.md)
+const ROW_H = 40 // column rows are real buttons: hit targets >= 32px (PRODUCT.md).
+// 40 rather than the minimum: the artifact's rows breathe, and a name plus a right-aligned
+// chip at 32px left no vertical air between them.
 const PAD_H = 8
 const MORE_H = 32 // the "+N more columns" row, same hit-target height as a column row
 const COL_CAP = 8 // an expanded card caps its visible rows; the rest sits behind "+N more"
@@ -116,6 +118,8 @@ type TableData = {
   onColumn: (col: LineageNode) => void
   onOpen: (node: LineageNode) => void
   onExpand: (node: LineageNode) => void
+  // Column ids that are an endpoint of a visible cross-catalog mapping.
+  mapped: Set<string>
 }
 type AnchorColData = {
   node: LineageNode
@@ -250,6 +254,11 @@ function TableNode({ data }: NodeProps<TableNT>) {
                 onClick={() => data.onColumn(col)}
               >
                 <span className="ln-col-name">{col.column}</span>
+                {/* The artifact names WHY a row is called out: the anchor row is the column the
+                    map is built around, a mapped row is an endpoint of a cross-catalog link.
+                    Highlighting alone left the reader to infer the reason from colour. */}
+                {col.id === matchId && <Flag tone="anchor">anchor</Flag>}
+                {col.id !== matchId && data.mapped.has(col.id) && <Flag tone="mapped">mapped</Flag>}
                 {col.grain && <Flag tone="grain">grain</Flag>}
                 {col.as_of && <Flag tone="asof">as-of</Flag>}
                 {col.sensitivity && <Flag tone="pii">{col.sensitivity}</Flag>}
@@ -690,6 +699,18 @@ export function LineageView({
     [drawnEdges, visibleUnits, unitOf],
   )
 
+  // Endpoints of every visible entity bridge, so a column row can say it is mapped rather than
+  // leaving the reader to trace the line back to it.
+  const mappedIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const e of visibleEdges) {
+      if (e.kind !== 'entity_bridge') continue
+      ids.add(e.from)
+      ids.add(e.to)
+    }
+    return ids
+  }, [visibleEdges])
+
   // Counts for the map label and the canvas summary, derived from the graph already in memory.
   // The artifact's decision 14 is explicit: "The UI derives simple counts locally; it does not
   // require a dashboard-summary endpoint."
@@ -935,6 +956,7 @@ export function LineageView({
             onColumn: openColumn,
             onOpen: openNode,
             onExpand: expand,
+            mapped: mappedIds,
           } satisfies TableData,
         }
       }
@@ -1295,7 +1317,7 @@ export function LineageView({
           nodesFocusable
           edgesFocusable={false}
         >
-          <Background gap={22} size={1} color="oklch(0.88 0.01 212)" />
+          <Background gap={22} size={1} color="oklch(0.84 0.014 212)" />
           <Controls showInteractive={false} position="bottom-right" />
           {/* Only when there is something to navigate. On a pruned neighbourhood the minimap was
               a large panel rendering three grey blocks — cost with no information. */}
