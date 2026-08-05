@@ -26,7 +26,7 @@ needs, per governed table: ordered partition columns, physical column types, sto
 
 For two or three tables that is fine. At rollout scale it is not, and the failure mode is worse than
 tedium: **a wrong `partition_mapping` does not error.** It reads the wrong partitions and the feature
-is quietly incorrect — `inventory.py:205-208` and `hdfc-local-inventory.yml:80-88` say exactly this.
+is quietly incorrect — `inventory.py:199-201` and `hdfc-local-inventory.yml:80-88` say exactly this.
 A block that is boring to fill in and catastrophic to get wrong is the shape that gets filled in
 carelessly.
 
@@ -182,9 +182,13 @@ do not:
 5. **Three kinds where the question is meaningless.** `static_snapshot` partitions are declared
    vintages (`inventory.py:155-161`) and would sample as a wide spread; `full_scan` and
    `verified_unpartitioned` have nothing to sample.
-6. **Composite partition keys.** `partition_columns` is an ordered list, but both time-partition
-   variants name exactly one `partition_column` (`inventory.py:119-120,152-153`). The comparison is
-   undefined for `(year, month, day)`.
+6. **Composite partition keys are silently under-specified — which is worse than unrepresentable.**
+   Both time-partition variants name exactly one `partition_column` (`inventory.py:119-120,152-153`)
+   while `partition_columns` is an ordered list, and `_refuse_incoherent_layout`
+   (`inputs.py:259-267`) only requires the named column to be a **subset**. So a `(year, month, day)`
+   table compiles happily against a mapping naming just `day`. Nothing refuses; the sampling
+   comparison is simply undefined. (`StaticSnapshot` does name many columns, so the type system is
+   not the limit here — the two time-partition variants are.)
 
 **The consequence v1 missed entirely.** `partition_mapping` is **identity-bearing**:
 `TableLayout.semantic_payload` (`inventory.py:245-251`) → `layout_fingerprint` (`inputs.py:319`) →
@@ -224,9 +228,11 @@ Three limits, all open:
   *"Lineage based only on the draft's derives/grain/as_of/join is INCOMPLETE."* The full read set
   persists only when `plan_envelope is not None` (`:576-579`). A direct-confirm feature can read a
   join-key table appearing in no lineage row: listed as quiet, then refusing at compile.
-* **Materialize-lane features have no persisted table lineage at all** — inputs come from the formula
-  AST at compile time (`expression_ir.py:782-802`); the sealed artifact stores no table refs
-  (`1054_materialization_compiled_artifact.sql:50-69`).
+* **Materialize-lane features have no persisted per-feature READ SET** — inputs come from the formula
+  AST at compile time (`expression_ir.py:782-802`). The sealed artifact is not empty of table refs
+  (`contract.py:549` and `spine.py:322-324` put `source_table_ref` and `ordered_key_refs` into the
+  contract hash stored at `1054:65-67`), but there is no queryable "which tables does this feature
+  read" to drive a queue from.
 
 ## 8. What each fact can come from
 
@@ -234,7 +240,7 @@ Corrected from v1. "Fact" means read, not inferred.
 
 | Field | Source | Status |
 |---|---|---|
-| `columns`, `partition_columns`, `location` | metastore | fact |
+| `columns`, `partition_columns`, `location` | metastore — **but the reader is not built**: `MetastoreInventoryAdapter.capture()` exists and is callerless, and its `MetastoreTableMetadata` is a Protocol with **no implementation**. `data_agent` reads schemas with plain `DESCRIBE` only (`sql_hive.py:161-163`), which does not yield partitions or location. | fact **once something implements the Protocol** |
 | `transform` (`date_iso`/`date_compact`) | actual partition values | fact |
 | cadence, retention, gaps | partition listing | **observation, not fact** — a gap is a bank holiday or a missed load |
 | `kind` | **sampling proposal only** (§6) | not derivable from the catalog |
@@ -251,10 +257,12 @@ inheritance, which is not built.
 
 ## 9. What this does not block — corrected
 
-**Code generation needs no cluster.** Verified: nothing between trigger and seal contacts a
-metastore; no metastore, Thrift, JDBC, Spark or Kedro client is imported anywhere in
-`src/featuregen/materialize/`. `PARTITION_IDENTITY_UNKNOWN` is a *CompilationRefusalCode* raised on a
-missing inventory **entry** (`inputs.py:301-307`), not a missing cluster table.
+**Code generation needs no cluster.** Verified: nothing on the **trigger→seal path** contacts a
+metastore, and that path imports no metastore, Thrift, JDBC, Spark or Kedro client. (Scoped
+deliberately: `submit.py:93-94` *does* import a Kedro client — but `submit` has no importer in `src/`
+at all, it is G-2 code, so it sits off the shipped path.) `PARTITION_IDENTITY_UNKNOWN` is a
+*CompilationRefusalCode* raised on a missing inventory **entry** (`inputs.py:301-307`), not a missing
+cluster table.
 
 But v1's "needs" column was materially incomplete:
 
@@ -290,8 +298,9 @@ system in exactly one place: L0's engine-version comparison.
    owner or a steward, which may need a role the RBAC model lacks.
 4. **What happens when a confirmed mapping is later contradicted by sampling?** It invalidates sealed
    artifacts (§6), so this is not merely a notification.
-5. **Composite partition keys** (§6.6) are unrepresentable in the current mapping types. Extend the
-   types, or refuse them explicitly?
+5. **Composite partition keys** (§6.6) compile against a mapping that names only one of them, with
+   nothing refusing. Extend the time-partition variants to an ordered list, or refuse a layout whose
+   mapping does not name every partition column?
 6. **Engine coverage.** Narrower gap than v1 stated: the *render* path is Hive-only
    (`render/project.py:440` emits `spark.SparkHiveDataset`), but `data_agent` already ships a Postgres
    dialect and `catalog_engine`'s CHECK admits `oracle` and `postgres` (`1041:29`). Oracle
@@ -304,6 +313,9 @@ system in exactly one place: L0's engine-version comparison.
    Shows what is blocking; needs no capture.
 3. **Declare `(engine, tier)` via the existing `PUT /data-sources`**, and teach `load_inventory` to
    consume `engines:`. Migration-free; lets `SOURCE_ENGINE_UNSUPPORTED` fire.
-4. **Metastore capture** into that persistence — facts tier only.
+4. **Metastore capture** into that persistence — facts tier only. **Partly built:**
+   `MetastoreInventoryAdapter.capture()` is written and callerless, but its `MetastoreTableMetadata`
+   Protocol has no implementation, so the actual cluster read (partitions, location) does not exist
+   yet. `data_agent`'s `DESCRIBE` (`sql_hive.py:161-163`) covers schema only.
 5. **Feed-level declaration inheritance** — the step that changes the arithmetic.
 6. **Sampling proposals**, as an extension of `data_agent/`, after §10.2 is answered.
