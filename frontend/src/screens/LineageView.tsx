@@ -1322,6 +1322,41 @@ export function LineageView({
             onClose={closeDrawer}
           />
         )}
+          <section className="ln-selected" aria-label="Selected asset">
+            <div className="ln-selected-label">
+              <span className="ln-micro">
+                {anchor.column ? 'Selected column' : 'Selected table'}
+              </span>
+              {anchor.concept && <span className="badge gj-proposed">{anchor.concept}</span>}
+            </div>
+            {/* The SHORT name, as the artifact does. The full object ref is already on the
+                context bar above the workspace; repeating it here spent the widest line in the
+                column on something the reader has already been told. */}
+            <h2 className="ln-selected-name">{anchor.column ?? anchor.table}</h2>
+            {anchor.definition
+              ? <p className="ln-selected-def">{anchor.definition}</p>
+              : <p className="ln-selected-def hint">No definition is held for this column.</p>}
+            <div className="ln-pillrow">
+              {anchor.data_type && <span className="badge gj-none">{anchor.data_type}</span>}
+              {anchor.is_grain && <span className="badge grain">grain</span>}
+              {anchor.is_as_of && <span className="badge asof">as-of</span>}
+            </div>
+            {/* Only axes the search hit actually carries. Grain-use and join-use readiness are
+                not passed to this component, so they are absent rather than guessed. */}
+            <div className="ln-fact-grid">
+              {([
+                ['Domain', anchor.domain],
+                ['Entity', anchor.entity],
+                ['Unit', anchor.unit],
+                ['Sensitivity', anchor.sensitivity],
+              ] as const).filter(([, v]) => !!v).map(([label, value]) => (
+                <div className="ln-fact" key={label}>
+                  <span>{label}</span>
+                  <strong>{value}</strong>
+                </div>
+              ))}
+            </div>
+          </section>
           {drawerNode && (() => {
             const mine = visibleEdges.filter(e => e.from === drawerNode.id || e.to === drawerNode.id)
             if (mine.length === 0) return null
@@ -1346,8 +1381,12 @@ export function LineageView({
                       source: anchor.catalog_source, table: anchor.table,
                     }).toString()}`}
                   >
-                    <strong>{hit.suggestion.name}</strong>
-                    <span>{hit.suggestion.recipe}</span>
+                    <strong>{hit.suggestion.display_name || hit.suggestion.name}</strong>
+                    <span>
+                      {hit.suggestion.business_interpretation?.value
+                        ?? hit.suggestion.business_value?.value
+                        ?? hit.suggestion.recipe}
+                    </span>
                     <em>Open recommendation →</em>
                   </a>
                 ))}
