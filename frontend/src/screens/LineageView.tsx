@@ -1083,10 +1083,16 @@ export function LineageView({
   // the table card otherwise) at a readable zoom: fitView over a big graph pins the anchor to the
   // viewport edge. Later node-set changes (expansion merges, layer toggles) refit around
   // everything so freshly placed nodes come into view. duration 0 keeps it reduced-motion safe.
-  const nodeCount = flow.nodes.length
+  // Reframe when the LAYOUT changes, not merely when the node COUNT does. Toggling a layer
+  // re-runs dagre and moves every card without changing how many there are, so keying on the
+  // count alone left the view fitted to a frame the graph had since outgrown — cards ran off
+  // the canvas and under the inspector.
+  const layoutKey = flow.nodes
+    .map(n => `${n.id}:${Math.round(n.position.x)}:${Math.round(n.position.y)}`)
+    .join('|')
   useEffect(() => {
     const inst = rf.current
-    if (!inst || nodeCount === 0) return
+    if (!inst || flow.nodes.length === 0) return
     // FIT, do not centre-at-zoom-1. The centring existed because fitView over a 188-node graph
     // pinned the anchor to the viewport edge; now that a neighbourhood is the participating columns
     // only, centring instead leaves a small cluster marooned in a large empty canvas. `maxZoom`
@@ -1094,7 +1100,7 @@ export function LineageView({
     inst.fitView({ padding: 0.18, maxZoom: 1.1, duration: 0 })
     centered.current = true
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reframe only when the node set changes
-  }, [nodeCount])
+  }, [layoutKey])
 
   const drawerNode = drawerId ? byId.get(drawerId) : undefined
 
@@ -1503,8 +1509,16 @@ export function LineageView({
       {/* A readable text equivalent of the canvas. It exists for screen readers, but it is the
           clearer view for everyone when edges overlap — so it gets a name that means something to a
           banker rather than "accessible parallel list", which describes the MECHANISM. */}
+      {/* A disclosure so it can be folded away, but OPEN by default. The artifact collapses it;
+          this list is the canvas's only non-visual reading, and four tests failed the moment it
+          was hidden — which is exactly what a screen reader would have experienced. Tidiness
+          does not outrank the text equivalent. */}
+      {/* The <section> keeps the region landmark the tests and screen readers rely on; the
+          <details> inside it adds the fold. Replacing the section outright turned the landmark
+          into a plain group and the text equivalent stopped being findable. */}
       <section className="ln-a11y" aria-label="Links in this view, as text">
-        <h3 className="micro-label">Links in this view</h3>
+      <details open>
+        <summary className="micro-label">Links in this view</summary>
         {layout.contain && matchId && (
           // The structural containment tie, kept out of the relationship list so the list
           // stays a faithful mirror of the drawn lineage edges.
@@ -1521,6 +1535,7 @@ export function LineageView({
             ))}
           </ul>
         )}
+      </details>
       </section>
     </>
   )

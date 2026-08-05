@@ -2549,7 +2549,11 @@ section > h2:first-child {
 .ln-wrap .react-flow__controls {
   top: 13px;
   right: 15px;
-  width: 26px;
+  /* Hug the buttons. Without an explicit height the panel stretched down the whole canvas as a
+     tall white strip; the artifact's is a small pill that hugs its three controls. */
+  width: 30px;
+  height: auto;
+  max-height: max-content;
   bottom: auto;
   left: auto;
   overflow: hidden;
@@ -2564,8 +2568,8 @@ section > h2:first-child {
 
 .ln-wrap .react-flow__controls-button {
   /* Small, as the artifact draws them: a map control should not compete with the map. */
-  width: 26px;
-  height: 26px;
+  width: 30px;
+  height: 28px;
   padding: 0;
   border: 0;
   border-bottom: 1px solid var(--line);
