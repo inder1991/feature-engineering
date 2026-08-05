@@ -158,3 +158,51 @@ The paragraph was a workaround for a badge that only spoke when the news was goo
 badge removes the need for the workaround, so the cards reach the concept's proportions
 *without* trading away the honesty guard — which is what the three reverted attempts kept
 getting wrong.
+
+## Full diff against the artifact (2026-08-05, from a side-by-side)
+
+### A. On the compact card that should not be
+
+1. `suggested · recipe` + "no limitations recorded" row — provenance, belongs in the detail.
+2. The whole tinted **CATEGORY block**: category chip, "derived from recipe family",
+   "partly classified", **Business domains** ("not supplied: no controlled domain vocabulary
+   is registered here"), **Use cases** ("not supplied"). Six lines of absence before one fact.
+3. `WHAT IT MEASURES` / `WHY IT IS USEFUL` as LABELLED rows — the artifact runs the
+   description as bare prose with no label.
+4. The sources line (`tenure · 1 table, 3 columns · data roles not supplied…`).
+5. `INPUTS` chips — the artifact keeps every input column in the detail.
+6. A SECOND safety note (pink "Eligibility and leakage"). The artifact shows one amber note.
+
+### B. Order
+
+7. Taxonomy pills are 7th; they must be 2nd, directly under the name.
+8. Status chips are 2nd; they must come AFTER the fact grid.
+9. Description must be 3rd, as prose.
+
+### C. Styling
+
+10. Status chips are plain grey. The artifact uses an outlined green pill and an outlined
+    amber pill, uppercase mono — readable as a pair.
+11. Card title is mono; the artifact's is sans-bold.
+12. Fact values are not bold; the artifact's are bold dark against a grey uppercase label.
+13. Value casing: ours "customer per cust_num", artifact "Customer · per cust_num".
+14. Window: ours "365d", artifact "Trailing 365 days"; ours "no rolling window", artifact
+    "No rolling window".
+15. Safety note carries an uppercase "POINT-IN-TIME" label column; the artifact has none —
+    just the sentence on an amber field with a left rail.
+16. Missing the italic "Business value has not been documented for this recipe."
+17. `Full detail` is a boxed button bottom-right; the artifact has a `▸ Full recommendation
+    detail` text disclosure, left-aligned.
+18. Missing the footer row entirely: `USES BUSINESS_DT` left, `OPEN RECOMMENDATION →` right.
+19. Card is roughly 2.5x the artifact's height.
+
+### D. Raw values leaking into the UI
+
+20. `non_additive` renders raw — should be "Non-additive".
+21. `n/a` alone — the artifact says "Not summable · n/a".
+22. `tenure` as the operation, unlabelled and merged into the sources line.
+
+### Order of work
+
+D first (one mapping table, immediate legibility win), then A (deleting six blocks is what
+collapses the height), then B (three moves), then C (chip and type styling).
