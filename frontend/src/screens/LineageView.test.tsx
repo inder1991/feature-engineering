@@ -156,15 +156,17 @@ describe('lineage view', () => {
     expect(screen.getByText(/declared join target; not uploaded yet/i)).toBeInTheDocument()
   })
 
-  it('shows stale sources greyed with a stale marker and not-vouched guidance', async () => {
+  it('states stale snapshot as quiet node status, with no remediation workflow', async () => {
     lineageGraph.mockResolvedValue(WITH_CARDS)
     const { container } = render(<LineageView anchor={ANCHOR} />)
     expect(await screen.findByText('card_holders')).toBeInTheDocument()
     expect(screen.getByText('stale')).toBeInTheDocument()
-    // Card note is generic (fixed height, never clips); the source name lives on the src line.
-    expect(
-      screen.getByText(/not currently vouched\. re-upload this source/i),
-    ).toBeInTheDocument()
+    // Freshness is a FACT about the node, not a task. The reviewed concept removes the re-vouch /
+    // re-upload workflow from the graph entirely: a read surface must not read as a remediation
+    // queue, and re-uploading a catalog is not an action anyone performs from a graph node.
+    expect(screen.getByText('Stale snapshot')).toBeInTheDocument()
+    expect(screen.queryByText(/re-upload/i)).toBeNull()
+    expect(screen.queryByText(/re-vouch/i)).toBeNull()
     expect(container.querySelector('.ln-card--stale')).not.toBeNull()
   })
 

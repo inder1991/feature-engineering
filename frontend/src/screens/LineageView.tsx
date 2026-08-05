@@ -221,11 +221,9 @@ function TableNode({ data }: NodeProps<TableNT>) {
         {node.stale ? <Flag tone="stale">stale</Flag> : <span className="ln-fresh">fresh</span>}
       </div>
       {node.stale && (
-        // Generic phrasing (no source name) so the fixed-height note never clips: the source is
-        // named on the src line right above, and the drawer carries the fully named guidance.
-        <div className="ln-note">
-          Not currently vouched. Re-upload this source to serve its facts.
-        </div>
+        // Quiet, factual node status — no workflow. The source is named on the src line right
+        // above, so the badge does not repeat it and the fixed-height note never clips.
+        <div className="ln-note">Stale snapshot</div>
       )}
       {rows.length > 0 && (
         <ul className={data.scroll ? 'ln-cols ln-cols--scroll' : 'ln-cols'}>
@@ -1277,9 +1275,8 @@ function Drawer({
             </p>
           )}
           {node.stale && (
-            <p className="ln-drawer-note">
-              Not currently vouched. Re-upload the {node.catalog_source} source to serve its
-              facts.
+            <p className="ln-drawer-sub">
+              Stale snapshot: <code>{node.catalog_source}</code> is not currently vouched.
             </p>
           )}
           {showTrace && (
@@ -1343,9 +1340,8 @@ function Drawer({
             </p>
           ) : null}
           {node.stale && (
-            <p className="ln-drawer-note">
-              Not currently vouched. Re-upload the {node.catalog_source} source to serve its
-              facts.
+            <p className="ln-drawer-sub">
+              Stale snapshot: <code>{node.catalog_source}</code> is not currently vouched.
             </p>
           )}
         </>
