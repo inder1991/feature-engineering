@@ -22,16 +22,16 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
-    getTableSuggestions: vi.fn(),
+    getTableSuggestionsV2: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
-const getTableSuggestions = vi.mocked(api.getTableSuggestions)
+const getTableSuggestionsV2 = vi.mocked(api.getTableSuggestionsV2)
 
 beforeEach(() => {
   getAssetDetail.mockReset()
-  getTableSuggestions.mockReset()
-  getTableSuggestions.mockResolvedValue(suggestionsFixture())
+  getTableSuggestionsV2.mockReset()
+  getTableSuggestionsV2.mockResolvedValue(suggestionsFixture())
 })
 
 function contextFixture(over: Partial<api.ContextSection> = {}): api.ContextSection {
