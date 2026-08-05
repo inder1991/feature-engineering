@@ -1690,6 +1690,47 @@ section > h2:first-child {
   padding: 15px;
 }
 
+.ln-inspector-section {
+  margin: 0 15px 15px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+/* One relationship, stated as a capability first and evidence second. */
+.ln-relationship {
+  margin-top: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.ln-relationship strong {
+  display: block;
+  font-size: 11px;
+}
+
+.ln-relationship p {
+  margin: 3px 0 8px;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+/* Three independent axes, never collapsed into one word. */
+.ln-trustline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.ln-trust-na,
+.ln-why {
+  margin: 6px 0 0;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 @media (max-width: 1400px) {
   .ln-wrap {
     grid-template-columns: 185px minmax(440px, 1fr) 300px;

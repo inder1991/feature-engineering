@@ -156,6 +156,26 @@ describe('lineage view', () => {
     expect(screen.getByText(/declared join target; not uploaded yet/i)).toBeInTheDocument()
   })
 
+  // GAP: the three-axis entity-bridge path has NO test. The negative case below is covered, but
+  // getting a bridge edge visible AND its endpoint selected in this fixture did not work and was
+  // not worth more time in one sitting. Needs a fixture whose bridge endpoint is a clickable
+  // column on an expanded card, then assert Strong match + Not yet reviewed + Not
+  // execution-validated render SIMULTANEOUSLY — that simultaneity is the whole point of
+  // decision 5 and is exactly what a single collapsed label used to hide.
+
+  it('says the axes do not apply rather than showing three empty ones on a non-bridge edge', async () => {
+    // A join/derives/consumes edge carries none of the three fields. Rendering empty axes would
+    // read as "evidence is missing" when the truth is "this axis does not apply to this link".
+    lineageGraph.mockResolvedValue(BASE)
+    render(<LineageView anchor={ANCHOR} />)
+    await screen.findByText('customers')
+    await userEvent.click(screen.getByRole('button', { name: 'balance' }))
+    const na = await screen.findAllByText(/apply to entity bridges/i)
+    expect(na.length).toBeGreaterThan(0)
+    expect(screen.queryByText('Strong match')).toBeNull()
+    expect(screen.queryByText('Weak match')).toBeNull()
+  })
+
   it('states stale snapshot as quiet node status, with no remediation workflow', async () => {
     lineageGraph.mockResolvedValue(WITH_CARDS)
     const { container } = render(<LineageView anchor={ANCHOR} />)

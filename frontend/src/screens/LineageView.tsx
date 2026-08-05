@@ -451,6 +451,80 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
   return `${shortRef(from, e.from)} is read by ${shortRef(to, e.to)} · consumer`
 }
 
+
+// ---- decomposed relationship trust (concept decisions 3 and 5) --------------------------------
+// "Match strength, human review and execution validation are separate ideas. A single ambiguous
+// 'governed' label cannot conceal missing execution evidence."
+//
+// Every badge below maps to a field the server actually sent. The three axes exist ONLY on
+// entity_bridge edges (`strength`/`trust_kind`, `link_review_status`, `execution_eligible` +
+// `realization_safety_status`); a join, derives or consumes edge carries none of them. For those we
+// say so rather than render three empty axes, which would read as "evidence is missing" when the
+// truth is "this axis does not apply to this kind of link".
+function TrustAxes({ edge }: { edge: LineageEdge }) {
+  if (edge.kind !== 'entity_bridge') {
+    return (
+      <p className="ln-trust-na hint">
+        Match, review and execution axes apply to entity bridges. A {edge.kind} link carries
+        {edge.cardinality ? ` cardinality ${edge.cardinality}` : ' no cardinality'} and
+        {edge.resolved ? ' resolved endpoints' : ' unresolved endpoints'}.
+      </p>
+    )
+  }
+  const strong = (edge.strength ?? 0) >= 10
+  const review = edge.link_review_status
+  const reviewed = review === 'human_verified'
+  return (
+    <div className="ln-trustline" aria-label="Relationship trust">
+      <span className={`badge ${strong ? 'gj-verified' : 'gj-partial'}`}>
+        {strong ? 'Strong match' : 'Weak match'}
+      </span>
+      <span className={`badge ${reviewed ? 'gj-verified' : 'gj-none'}`}>
+        {reviewed
+          ? 'Reviewed by a person'
+          : review === 'not_governed' ? 'Advisory, not governed' : 'Not yet reviewed'}
+      </span>
+      <span className={`badge ${edge.execution_eligible ? 'gj-verified' : 'gj-partial'}`}>
+        {edge.execution_eligible
+          ? 'Execution-validated'
+          : `Not execution-validated${edge.realization_safety_status
+            ? ` · ${edge.realization_safety_status}` : ''}`}
+      </span>
+    </div>
+  )
+}
+
+// Decision 3: "Capability is the narrative." The heading says what the link LETS YOU DO; the line
+// under it names the two columns and the entity, and `why` (the server's own rationale) explains
+// the rank rather than leaving "weak" unexplained.
+function RelationshipBlock({
+  edge,
+  byId,
+}: {
+  edge: LineageEdge
+  byId: Map<string, LineageNode>
+}) {
+  const from = byId.get(edge.from)
+  const to = byId.get(edge.to)
+  const entity = edge.entity_id ?? 'shared'
+  const capability = edge.kind === 'entity_bridge'
+    ? `Connect ${entity} records across catalogs`
+    : edge.kind === 'join'
+      ? 'Join these tables in a feature'
+      : edge.kind === 'derives' ? 'Feeds a registered feature' : 'Read by a consumer'
+  return (
+    <div className="ln-relationship">
+      <strong>{capability}</strong>
+      <p>
+        <span className="mono">{shortRef(from, edge.from)}</span> maps to{' '}
+        <span className="mono">{shortRef(to, edge.to)}</span> for the {entity} entity.
+      </p>
+      <TrustAxes edge={edge} />
+      {edge.why && <p className="ln-why hint">{edge.why}</p>}
+    </div>
+  )
+}
+
 // ---- the view --------------------------------------------------------------------------------
 
 export function LineageView({ anchor }: { anchor: SearchHit }) {
@@ -1113,6 +1187,18 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             onClose={closeDrawer}
           />
         )}
+          {drawerNode && (() => {
+            const mine = visibleEdges.filter(e => e.from === drawerNode.id || e.to === drawerNode.id)
+            if (mine.length === 0) return null
+            return (
+              <section className="ln-inspector-section" aria-label="Relationship trust">
+                <h3 className="micro-label">Relationships</h3>
+                {mine.map(e => (
+                  <RelationshipBlock key={`${e.kind}|${e.from}|${e.to}`} edge={e} byId={byId} />
+                ))}
+              </section>
+            )
+          })()}
           {!drawerNode && (
             <p className="hint ln-inspector-empty">
               Select a node to see its identity, relationship trust and the features it can
