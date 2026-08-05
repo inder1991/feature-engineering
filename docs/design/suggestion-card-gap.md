@@ -206,3 +206,31 @@ getting wrong.
 
 D first (one mapping table, immediate legibility win), then A (deleting six blocks is what
 collapses the height), then B (three moves), then C (chip and type styling).
+
+## The restructure was built and reverted — here is exactly what blocks it (2026-08-05)
+
+Groups A, B and D of the diff above were implemented in full: head reduced to the name,
+category block and meaning rows cut, sources line and INPUTS chips cut, second safety note
+cut, status chips moved below the fact grid, and `windowWords` / `additivityWords` added so
+"365d" reads "Trailing 365 days" and "non_additive" reads "Non-additive".
+
+It typechecks and builds. It fails **eight** tests, every one of them asserting content on the
+COMPACT card that the restructure moves into `Full recommendation detail`. None is a real
+regression, but each needs its assertion re-pointed deliberately, not deleted:
+
+| Missing string | Where it went | How to re-assert |
+| --- | --- | --- |
+| `Business domains`, `no controlled domain vocabulary is registered here` | detail | open the detail first, then assert |
+| `Domain 0`, `Attrition`, `+N more` | detail | same |
+| `no category mapped yet` | detail | same |
+| `1 limitation` / `6 limitations` / `no limitations recorded` | head badge, removed | assert the limitation ROWS in the detail instead |
+| `suggested · recipe` | head badge, removed | assert in the detail's provenance section |
+| `n/a` | now `Not summable · n/a` | update the expected string |
+| XSS fixture (`<img src=x onerror=…>`) | detail | open the detail; the escaping guarantee is unchanged |
+
+**The one to be careful with** is the limitation count. It was a badge in the head saying "6
+limitations"; the rows themselves still render. Re-assert the ROWS, so the guarantee "a
+limitation is never silently dropped" survives — do not simply delete the assertion.
+
+Estimated one focused pass: apply the diff again (it is mechanical), then walk the eight tests
+in order. Suite must return to 603.
