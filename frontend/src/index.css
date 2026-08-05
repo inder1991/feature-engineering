@@ -1938,6 +1938,7 @@ section > h2:first-child {
   right: 15px;
   bottom: 13px;
   left: 15px;
+  max-width: calc(100% - 30px);
   z-index: 1;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -2026,6 +2027,15 @@ section > h2:first-child {
   padding: 12px 15px;
   border-top: 1px solid var(--line);
   background: var(--surface-2);
+}
+
+.ln-inspector-actions .btn {
+  min-height: 34px;
+  height: auto;
+  padding: 7px 10px;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.25;
 }
 
 .ln-inspector-section {
@@ -2539,6 +2549,7 @@ section > h2:first-child {
 .ln-wrap .react-flow__controls {
   top: 13px;
   right: 15px;
+  width: 26px;
   bottom: auto;
   left: auto;
   overflow: hidden;
@@ -2552,8 +2563,10 @@ section > h2:first-child {
 }
 
 .ln-wrap .react-flow__controls-button {
-  width: 34px;
-  height: 34px;
+  /* Small, as the artifact draws them: a map control should not compete with the map. */
+  width: 26px;
+  height: 26px;
+  padding: 0;
   border: 0;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
@@ -6292,4 +6305,14 @@ button.stat:hover {
     margin-left: 0;
     width: 100%;
   }
+}
+
+.ln-wrap .react-flow__controls-button svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+.ln-wrap .react-flow__controls-button:last-child {
+  border-bottom: 0;
 }

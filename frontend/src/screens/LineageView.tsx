@@ -973,7 +973,8 @@ export function LineageView({
             // payload does not carry. Preferring the hit would overwrite what the graph said
             // about this column with what the search index said about the anchor.
             meta: [n.concept ?? anchor.concept,
-              anchor.data_type && `${anchor.data_type} · source declared`]
+              anchor.data_type && anchor.data_type.toLowerCase() !== 'unknown'
+                && `${anchor.data_type} · source declared`]
               .filter(Boolean).join(' · ') || null,
           } satisfies AnchorColData,
         }
@@ -1368,18 +1369,26 @@ export function LineageView({
             onClose={closeDrawer}
           />
         )}
-          {!drawerNode && (
           <section className="ln-selected" aria-label="Selected asset">
             <div className="ln-selected-label">
               <span className="ln-micro">
-                {anchor.column ? 'Selected column' : 'Selected table'}
+                {(drawerNode ?? { kind: anchor.column ? 'column' : 'table' }).kind === 'column'
+                  ? 'Selected column' : 'Selected table'}
               </span>
-              {anchor.concept && <span className="badge gj-proposed">{anchor.concept}</span>}
+              {(drawerNode?.concept ?? anchor.concept) && (
+                <span className="badge gj-proposed">
+                  {drawerNode?.concept ?? anchor.concept}
+                </span>
+              )}
             </div>
             {/* The SHORT name, as the artifact does. The full object ref is already on the
                 context bar above the workspace; repeating it here spent the widest line in the
                 column on something the reader has already been told. */}
-            <h2 className="ln-selected-name">{anchor.column ?? anchor.table}</h2>
+            <h2 className="ln-selected-name">
+              {drawerNode
+                ? (drawerNode.column ?? drawerNode.table ?? drawerNode.name ?? drawerNode.id)
+                : (anchor.column ?? anchor.table)}
+            </h2>
             {anchor.definition
               ? <p className="ln-selected-def">{anchor.definition}</p>
               : <p className="ln-selected-def hint">No definition is held for this column.</p>}
@@ -1404,7 +1413,6 @@ export function LineageView({
               ))}
             </div>
           </section>
-          )}
           {drawerNode && (() => {
             const mine = visibleEdges.filter(e => e.from === drawerNode.id || e.to === drawerNode.id)
             if (mine.length === 0) return null
