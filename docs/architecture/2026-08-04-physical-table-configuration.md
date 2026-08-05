@@ -1,6 +1,10 @@
 # Physical table configuration — what it would take to stop hand-editing the §0 inventory
 
-**Status: design note, v2. Nothing here is built.**
+**Status: FINAL. Design note, v2. Nothing here is built.** See §0 for what is resolved and what
+still blocks. Three further design directions were raised after review — carrying partition facts on
+the catalog upload, turning compile refusals into clarification questions, and the same for
+aggregation semantics — and were **deliberately excluded** to close this note. They are recorded in
+§12 as successors, not folded in.
 
 v1 (commit `a3f0123c`) was reviewed adversarially on 2026-08-05 and graded **materially flawed —
 7 Critical**. Three of its load-bearing claims were wrong in the codebase's own terms, and two of the
@@ -15,6 +19,45 @@ things it proposed to build already exist. This rewrite is driven by that review
    is `(source_type, source)`,** wired and API-exposed; see §4.
 3. It proposed a queue as "catalog LEFT JOIN inventory". **The inventory has no database
    representation at all;** see §2, which is now the note's central finding.
+
+---
+
+## 0. Where this stands — FINAL
+
+Reviewed twice, corrected twice, re-verified against `origin/main` after it moved 220 commits. This
+section is the summary; the rest is the evidence. **No further design scope is being added.**
+
+### Resolved — these were thought to be work and are not
+
+| Was believed | Actually |
+|---|---|
+| `(source_type, source)` needs a CSV column + a migration | **Already exists** as `catalog_engine(engine, tier)`, migration 1041 — wired through `binding_store` and exposed at `PUT /data-sources`. No migration, no CSV column. Adding one would collide with `ingestion_run.source_type` (1004) and quarantine rows on a `source` mismatch. |
+| "Declare per feed, not per table" is a design proposal | **Already a shipped decision**, with this note's own argument written in 1041's header. Per-table binding survives as the exception mechanism. |
+| Schema translation needs a capture + a UI | **Mostly solved** — the glossary populates `graph_node.schema_name`. `logical_schema_map` is needed only for technical-CSV catalogs, and a *wrong* entry hard-refuses, so it is not zero-risk — but it needs no capture where a glossary attests. |
+| Knowing which features read which tables needs new plumbing | **Derivable today** — `lineage.py` models `("table", catalog_source, table_name)` nodes and walks `feature_derives_from`. The queue is buildable now on logical refs. |
+| Sampling is a new capability | **`data_agent/` already has it** — Hive and Postgres dialects, sample-vs-census honesty, declared partition scope, connection authorization. Extend it; do not build one. |
+| Code generation is blocked on all of this | **It is not.** Hand-written entries drive trigger→compile→render→seal→L0 end to end, and the table need not exist on any cluster. This plan is about scale, not about unblocking today. |
+
+### Remaining — the real blockers, in order
+
+1. **The inventory has no persistence and no API** (§2). It is a YAML file read by path inside the
+   compile worker. Nothing else in this plan can start, because a UI writing to Postgres while
+   `load_inventory` reads a file *is* the drift the design exists to remove. **This is the one
+   blocker that is purely engineering.**
+2. **Does `partition_mapping` get an exception to "proposals are usable before confirmation"?**
+   (§10.2) It is identity-bearing, so correcting it invalidates sealed artifacts, and its wrong
+   direction is silent. Every other proposal in the system is usable unconfirmed. **User decision.**
+3. **Who may confirm a late-arrival SLA?** (§10.3) A claim about a feed's contract, not its data —
+   plausibly a role the RBAC model does not have. **User decision.**
+4. **The metastore read is not built.** `MetastoreInventoryAdapter.capture()` is written and
+   callerless; its `MetastoreTableMetadata` is a Protocol with **no implementation**. `data_agent`
+   reads schema only. Engineering, and smaller than blocker 1.
+5. **Composite partition keys compile silently under-specified** (§10.5) —
+   `_refuse_incoherent_layout` requires only a subset, so a `(year, month, day)` table passes against
+   a mapping naming one column. A defect to fix, not a blocker to the plan.
+
+Blockers 2 and 3 gate only the *proposal* work (§11 step 6). Blockers 1 and 4 gate everything else.
+**Nothing here gates hand-written entries for the tables you have today.**
 
 ---
 
@@ -320,3 +363,33 @@ system in exactly one place: L0's engine-version comparison.
    yet. `data_agent`'s `DESCRIBE` (`sql_hive.py:161-163`) covers schema only.
 5. **Feed-level declaration inheritance** — the step that changes the arithmetic.
 6. **Sampling proposals**, as an extension of `data_agent/`, after §10.2 is answered.
+
+## 12. Successors — raised, deliberately not folded in
+
+Three directions came out of the review dialogue after this note was corrected. Each is plausible and
+each would change the plan materially, so they are recorded rather than merged — folding live design
+into a note being finalised is how v1 went wrong.
+
+1. **Carry partition and business-date facts on the catalog upload** instead of a separate inventory.
+   The catalog already has the database, upload path, UI and confirm flow that §2 says the inventory
+   lacks, so this could shrink blocker 1 from a subsystem to catalog fields plus a translation step.
+   It would also derive the mapping directly: partition column and business-date column the same →
+   event-time; different → arrival. **Open question it must answer:** the inventory is keyed by
+   `environment_id` because one logical table can be laid out differently per environment; the
+   catalog is not, so this asserts one physical layout everywhere.
+2. **Turn compile refusals into clarification questions.** `analysis/clarify.py` already implements
+   this pattern with the right guarantees — options drawn from a bounded candidate set never
+   generated by a model, a human's answer re-validated exactly as a model's would be, one question
+   per raised code. The generator's refusal vocabulary is already closed, so each code either gets a
+   template or is declared unanswerable. Compile runs in a worker with no user attached, so the shape
+   is refuse → record → ask → retry, never a blocking prompt.
+3. **The same for aggregation semantics.** `additivity`
+   (`additive`/`semi_additive`/`non_additive`) already governs whether a SUM is legal, and
+   `formula_additivity` already isolates what it cannot derive from the body — disjointness, carried
+   as `PartitionProof`. That residue is the clarification candidate, not additivity itself.
+
+A design principle common to 2 and 3, worth carrying forward: **ask the question the person can
+answer, not the one the system needs answered.** "Can a transaction dated the 1st appear in the 5th's
+load?" rather than "event-time or availability partition?". And the failure mode to design against is
+asking too much — a system that prompts on every uncertainty trains people to click through, and then
+the question that mattered gets clicked through with the rest.
