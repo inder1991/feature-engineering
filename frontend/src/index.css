@@ -2229,8 +2229,23 @@ section > h2:first-child {
 }
 
 .ln-flag--stale {
-  background: var(--warn-solid);
-  color: var(--chip-ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1.5px 0;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.ln-flag--stale::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
 }
 
 .ln-flag--feat {
@@ -2380,14 +2395,18 @@ section > h2:first-child {
    so both the 10px edge labels and the 9px .ln-kind micro-labels conform without change. */
 .ln-wrap .react-flow__edge-text {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  fill: var(--ink-faint);
+  letter-spacing: 0.04em;
+  fill: var(--ink-soft);
 }
 
 .ln-wrap .react-flow__edge-textbg {
   fill: var(--surface);
+  stroke: var(--line);
+  stroke-width: 1px;
+  rx: 9px;
+  ry: 9px;
 }
 
 .ln-wrap .ln-edge--trace .react-flow__edge-text {
@@ -2422,15 +2441,20 @@ section > h2:first-child {
 }
 
 .ln-swatch {
-  width: 14px;
-  height: 3px;
-  border-radius: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
   display: inline-block;
   flex: none;
 }
 
 /* xyflow built-in controls + minimap, restyled onto the tokens */
 .ln-wrap .react-flow__controls {
+  top: 13px;
+  right: 15px;
+  bottom: auto;
+  left: auto;
+  box-shadow: var(--shadow);
   box-shadow: var(--shadow);
   border-radius: var(--radius);
   overflow: hidden;
