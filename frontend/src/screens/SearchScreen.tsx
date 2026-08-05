@@ -387,7 +387,10 @@ export function SearchScreen() {
             </p>
           )}
 
-          {!error && hasHits && (offset > 0 || offset + result.hits.length < result.total) && (
+          {/* A1: paging the RESULT LIST while a graph is on screen is chrome for a view that is
+              not showing. It cost ~90px directly above the workspace. */}
+          {!error && hasHits && effectiveView === 'list'
+            && (offset > 0 || offset + result.hits.length < result.total) && (
             <nav className="pager" aria-label="Result pages">
               <button
                 type="button"

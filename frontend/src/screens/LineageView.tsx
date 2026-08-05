@@ -972,12 +972,10 @@ export function LineageView({
         // unlabelled, so "no marker" had to be read as "good" — an absence is a poor way to state
         // a verdict, and it is invisible when only one link is on screen.
         const keyed = (e.strength ?? 0) >= 10
-        const trust = e.execution_eligible
-          ? 'executable'
-          : e.trust_kind === 'governed_identifier_link'
-            ? 'governed'
-            : 'advisory'
-        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'} · ${trust}`
+        // C8: two segments, not three. The third ("governed"/"advisory"/"executable") is now the
+        // inspector's own review axis, so on the canvas it only made the label long enough to clip
+        // mid-word over a node. The artifact labels this edge "customer · strong".
+        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'}`
       } else {
         stroke = 'var(--proposal)'
         label = e.kind

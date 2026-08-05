@@ -3093,6 +3093,51 @@ main:has(.ln-wrap) .page-head-eyebrow::after {
   content: ' · Relationship intelligence';
 }
 
+/* A2/A3: the workspace is the subject in graph mode, so the page heading and the search row stop
+   competing for the top of the screen. Measured at ~470px of chrome before the canvas began. */
+main:has(.ln-wrap) .page-head {
+  margin-bottom: 10px;
+}
+
+main:has(.ln-wrap) .page-head > h1 {
+  font-size: 20px;
+}
+
+main:has(.ln-wrap) .page-head > p {
+  display: none;
+}
+
+/* B5: a trust axis is a reading, not an alarm. Solid green and solid brown pills read as alerts;
+   the artifact uses small quiet chips and lets the WORDS carry the verdict. */
+.ln-trustline .badge {
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-soft);
+  font-size: 8.5px;
+}
+
+.ln-trustline .badge.gj-verified {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.ln-trustline .badge.gj-partial {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* B7: the recipe is a formula, not a description. Clamp it so a long expression cannot dominate
+   the card; the full text is on the suggestions page the card links to. */
+.ln-recommendation span {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .facet-panel {
   position: sticky;
   top: 20px;
