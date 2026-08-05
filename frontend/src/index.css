@@ -3266,16 +3266,30 @@ button.stat:hover {
 /* ---- the dossier hero: tier 1, the verdict ----
    Answers "what is this?" before any section is read. The business term leads at a size that wins
    against everything below it; the physical ref is demoted, not lost. */
+/* The hero and its verdict strip are one object, so they must not be separated by the .adg grid
+   gap — a seam between two halves that share a border reads as a rendering fault. */
+.adg-header {
+  display: block;
+}
+
+/* A crumb-only page head: the screen's own hero states the title, so this is wayfinding, not a
+   heading block. */
+.page-head--crumb {
+  margin-bottom: 10px;
+}
+
+/* The hero and the verdict strip are ONE object: the strip is the hero's readout, so they share a
+   border and meet without a seam. Splitting them (or putting the tabs between them) is what made
+   the page read as a pile of separate slabs. */
 .adg-hero {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 24px;
   align-items: start;
-  padding: 20px 22px;
+  padding: 19px 20px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
+  border-radius: var(--radius-panel) var(--radius-panel) 0 0;
   background: var(--surface);
-  box-shadow: var(--shadow);
 }
 
 .adg-hero-main { min-width: 0; }
@@ -3292,7 +3306,7 @@ button.stat:hover {
 
 .adg-title {
   margin: 0;
-  font-size: 25px;
+  font-size: 24px;
   letter-spacing: -0.025em;
   line-height: 1.15;
 }
@@ -3341,10 +3355,19 @@ button.stat:hover {
    Extends the app-wide .stat rather than importing a private one, so the dossier reads as the same
    system as every other screen. The qualifier line is the point: a bare `0` is a verdict, `0` with
    "the parent table still provides context" is a fact. */
+/* One container with hairline dividers, joined to the hero above it — not four floating tiles.
+   Four shadowed cards in a row read as four things to evaluate; one strip reads as one readout. */
 .adg-stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  gap: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-panel) var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
 }
 
 .adg-stat {
@@ -3352,6 +3375,14 @@ button.stat:hover {
   align-content: start;
   gap: 1px;
   padding: 11px 15px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.adg-stat + .adg-stat {
+  border-left: 1px solid var(--line);
 }
 
 .adg-stat-label {
@@ -3370,10 +3401,10 @@ button.stat:hover {
    Two columns on wide screens; cards that carry a full-width payload span both. */
 .adg-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.15fr) minmax(350px, 0.85fr);
   align-items: start;
   gap: 12px;
-  margin-top: 14px;
+  margin-top: 15px;
 }
 
 .adg-card {
@@ -3385,7 +3416,9 @@ button.stat:hover {
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   background: var(--surface);
-  box-shadow: var(--shadow);
+  /* Deliberately not var(--shadow): the border does the separating here, and ten full drop shadows
+     stacked down the page is the difference between "structured" and "busy". */
+  box-shadow: 0 1px 1px oklch(0.25 0.025 225 / 0.03);
 }
 
 .adg-card--full { grid-column: 1 / -1; }
@@ -3399,30 +3432,31 @@ button.stat:hover {
    knowing who asserted what, that sentence is the feature, not decoration. */
 .adg-card-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 15px;
+  min-height: 46px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--line);
 }
 
 .adg-card-head h3 {
   margin: 0;
-  font-size: 13.5px;
+  font-size: 13px;
 }
 
 .adg-card-head p {
-  margin: 3px 0 0;
-  max-width: 62ch;
+  margin: 2px 0 0;
+  max-width: 68ch;
   color: var(--ink-faint);
-  font-size: 10.5px;
-  line-height: 1.45;
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .adg-card-head .adg-count,
 .adg-card-head .btn { flex: none; }
 
-.adg-card-body { padding: 13px 15px; }
+.adg-card-body { padding: 14px; }
 
 /* `.rows` is the app's standalone list panel: it carries its own border, radius, surface, shadow
    and 16px block margin. Inside a card body that makes a bordered, shadowed box within a bordered,
@@ -3603,9 +3637,9 @@ button.stat:hover {
    carries enough facts that a single column wastes the width. */
 .adg-suggestion-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
-  align-items: stretch;
-  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  gap: 9px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -3617,10 +3651,13 @@ button.stat:hover {
   align-content: start;
   min-width: 0;
   height: 100%;
+  padding: 12px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
-  background: var(--surface);
-  box-shadow: var(--shadow);
+  border-radius: 9px;
+  /* An INSET, not a floating card: tinted a step darker than the card it sits in, and no shadow.
+     That is what keeps a panel-inside-a-card from reading as a card-inside-a-card. */
+  background: var(--surface-2);
+  box-shadow: none;
 }
 
 .adg-suggestion-grid .sfc-name { flex-basis: 100%; }
@@ -3628,6 +3665,14 @@ button.stat:hover {
 /* An opened card needs the full width for its detail drawer, so it spans the grid. */
 .adg-suggestion-grid:has(.sfc-detail) > .sfc:has(.sfc-detail) {
   grid-column: 1 / -1;
+}
+
+@media (max-width: 1400px) {
+  .adg-suggestion-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .adg-suggestion-grid { grid-template-columns: 1fr; }
 }
 
 .adg-tabs {

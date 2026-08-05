@@ -176,7 +176,7 @@ const ICONS: Record<Route, ReactElement> = {
   ),
 }
 
-const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
+const PAGES: PageHead[] = [
   {
     route: 'overview',
     label: 'Overview',
@@ -302,6 +302,9 @@ const ASSET_PAGE = {
     'One catalog asset opened to its sections — identity, metadata & evidence, relationships, '
     + 'readiness, and history. Every value comes from the catalog; corrections stage a new '
     + 'evidence layer, they never rewrite the source.',
+  // The screen opens with its own hero (business term, physical ref, definition, authority chips),
+  // so the page-head would restate it at lower quality. Render the eyebrow as a breadcrumb only.
+  crumbOnly: true,
 }
 
 // The suggested-features sheet's page-head (P4 v1). Kept OUT of PAGES for the same reason as the
@@ -316,8 +319,19 @@ const SUGGESTED_PAGE = {
     + 'are proposals with the engine’s own statuses, and nothing here changes the catalog.',
 }
 
+// A page head. `crumbOnly` suppresses the title + description for screens that open with their own
+// hero, leaving the eyebrow as a breadcrumb.
+type PageHead = {
+  route: Route
+  label: string
+  eyebrow: string
+  title: string
+  description: string
+  crumbOnly?: boolean
+}
+
 // The detail sheets, keyed by route: reached from an action elsewhere, never from the left rail.
-const DETAIL_PAGES: Partial<Record<Route, typeof ASSET_PAGE>> = {
+const DETAIL_PAGES: Partial<Record<Route, PageHead>> = {
   asset: ASSET_PAGE,
   suggested: SUGGESTED_PAGE,
 }
@@ -380,10 +394,14 @@ export default function App() {
         </div>
       </aside>
       <main>
-        <header className="page-head">
+        <header className={page.crumbOnly ? 'page-head page-head--crumb' : 'page-head'}>
           <p className="page-head-eyebrow">{page.eyebrow}</p>
-          <h1>{page.title}</h1>
-          <p>{page.description}</p>
+          {!page.crumbOnly && (
+            <>
+              <h1>{page.title}</h1>
+              <p>{page.description}</p>
+            </>
+          )}
         </header>
         {route === 'overview' && <OverviewScreen navigate={navigate} />}
         {route === 'upload' && (

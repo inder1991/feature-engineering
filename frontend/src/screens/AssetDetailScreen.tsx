@@ -21,7 +21,8 @@ import {
   getAssetDetail,
   postFieldDecision,
 } from '../api'
-import { OverviewTab } from './AssetDetailOverview'
+import { OverviewTab, SummaryStrip } from './AssetDetailOverview'
+import { useColumnSuggestions } from './columnSuggestions'
 import { AuthorityBadge } from './AuthorityBadge'
 import {
   attestedByLabel,
@@ -151,6 +152,11 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
   // Out-of-order guard: only the latest load may apply its result.
   const loadSeq = useRef(0)
 
+  // ONE suggestions read for the whole screen. It lives here, above the early returns, because the
+  // verdict strip is part of the page HEADER (it describes the asset, not the Overview tab) while
+  // the cards that consume the same read live inside the tab.
+  const suggestions = useColumnSuggestions(source, detail?.identity ?? null)
+
   const load = useCallback(async (opts: { keepNotice?: boolean } = {}) => {
     const id = ++loadSeq.current
     setLoading(true)
@@ -243,6 +249,7 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
 
   return (
     <section className="adg">
+      <div className="adg-header">
       {/* The hero answers "what is this?" before any section is read: the BUSINESS term leads, the
           physical ref is demoted beneath it, and the source definition is body prose rather than a
           label/value row — a definition is a sentence, and a sentence in a <dd> gets scanned past.
@@ -298,6 +305,14 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
         </div>
       </header>
 
+      <SummaryStrip
+        detail={detail}
+        matching={suggestions.matching}
+        page={suggestions.page}
+        isColumn={identity.kind === 'column' && !!identity.table}
+      />
+      </div>
+
       {notice && (
         <p role="alert" className="error">
           {notice}
@@ -324,6 +339,7 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
             source={source}
             isUnavailable={isUnavailable}
             onOpenReadiness={() => setTab('readiness')}
+            suggestions={suggestions}
           />
         )}
         {tab === 'metadata' && (
