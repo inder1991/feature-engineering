@@ -805,9 +805,12 @@ REGISTRY: tuple[Mutation, ...] = (
         kind=MUST_DIE,
         invariant="a crosswalk's LABEL is never its capability; executable_now is wiring, not kind",
         target="context_graph:_relationship_dict",
+        # `test_no_safety_verdict_is_fabricated_anywhere_on_a_crosswalk_payload` was listed here and
+        # CANNOT die: this mutation adds `executable_now`, and that test asserts the ABSENCE of
+        # `safety_status` and the eligibility keys. Two different lies, and only one of them is
+        # being told — so the second victim is dropped rather than overstating the kill.
         victims=(
             f"{_CWVIS}::test_the_context_graph_never_reports_a_crosswalk_as_executable",
-            f"{_CWVIS}::test_no_safety_verdict_is_fabricated_anywhere_on_a_crosswalk_payload",
         ),
         apply=_m_crosswalk_label_treated_as_executable,
         expect_failure_contains='assert cross["executable_now"] is False',
@@ -883,10 +886,14 @@ REGISTRY: tuple[Mutation, ...] = (
         kind=MUST_DIE,
         invariant="production admissibility is deterministic validation, never a human sign-off",
         target="crosswalk_admission:CrosswalkDirectionVerdictV1.production_admissible",
+        # `test_a_direction_cannot_claim_production_without_deterministic_validation` was listed
+        # here and CANNOT die: it constructs a `CrosswalkDirectionContextV1` (a display projection)
+        # directly and never reaches `CrosswalkDirectionVerdictV1`, which is what this mutation
+        # patches. A victim that cannot die makes a kill list read stronger than it is, so it is
+        # dropped rather than kept as decoration.
         victims=(
             f"{_CWASSEM}::test_the_two_directions_are_admitted_independently_from_the_measured_shape",
             f"{_CWASSEM}::test_confirming_a_crosswalk_changes_no_admission_answer_at_all",
-            f"{_CWVIS}::test_a_direction_cannot_claim_production_without_deterministic_validation",
         ),
         apply=_m_review_substitutes_for_crosswalk_safety,
         expect_failure_contains=(
