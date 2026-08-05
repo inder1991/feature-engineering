@@ -141,6 +141,48 @@ it('names coverage the platform does not hold, and never invents a value for it'
     .not.toHaveTextContent(/\d+(\.\d+)?\s*%/)
 })
 
+it('does not invent an eight-axis vacancy on a table asset', async () => {
+  // The server answers a table anchor with `{fields:{}, note:…}` — a table has no per-COLUMN
+  // semantic axes at all. Listing all eight as "nothing known yet" would report a vacancy that
+  // cannot exist, which is the mirror image of the omission bug the axis list exists to prevent.
+  await renderOverview(detail(d => {
+    d.kind = 'table'
+    d.identity = { ...d.identity, kind: 'table', column: null }
+    d.effective_metadata = { fields: {}, note: 'table asset — no per-field metadata' }
+  }))
+  await screen.findByRole('group', { name: /asset sections/i })
+  expect(screen.queryByTestId('attested-metadata')).toBeNull()
+  expect(screen.queryByTestId('axis-unit')).toBeNull()
+  expect(screen.queryByText(/populated ·/i)).toBeNull()
+  expect(screen.getByText(/table asset — no per-field metadata/i)).toBeInTheDocument()
+})
+
+it('does not fetch column suggestions for a table anchor', async () => {
+  // Suggestions bind COLUMN operands, so a table anchor's match set is empty by construction.
+  await renderOverview(detail(d => {
+    d.kind = 'table'
+    d.identity = { ...d.identity, kind: 'table', column: null }
+  }))
+  await screen.findByRole('group', { name: /asset sections/i })
+  expect(getTableSuggestions).not.toHaveBeenCalled()
+  // ...and the strip does not claim anything about "this column" on a page that has none.
+  const strip = screen.queryByRole('region', { name: /asset decision summary/i })
+  if (strip) expect(strip).not.toHaveTextContent(/use this column/i)
+})
+
+it('reports audit as unread — not as zero — when the response never carried the section', async () => {
+  // `audit` reaches unavailable_sections only when it was REQUESTED and refused. Absent-and-unrefused
+  // means the question was never asked, and "0 recorded" would answer it anyway.
+  await renderOverview(detail(d => {
+    d.audit = undefined
+    d.unavailable_sections = d.unavailable_sections.filter(s => s !== 'audit')
+    d.included_sections = d.included_sections.filter(s => s !== 'audit')
+  }))
+  const row = await screen.findByTestId('coverage-audit')
+  expect(row).toHaveTextContent(/not requested/i)
+  expect(row).not.toHaveTextContent(/0 recorded/i)
+})
+
 it('says audit is role-gated rather than implying nothing was ever recorded', async () => {
   await renderOverview(detail(d => {
     d.audit = undefined

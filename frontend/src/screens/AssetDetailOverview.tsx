@@ -81,7 +81,10 @@ const SCOPE_SEP = String.fromCharCode(0)
 // Two components each calling getTableSuggestionsV2 would double the request and could disagree
 // with each other on screen while one of them was still in flight.
 function useColumnSuggestions(source: string, identity: AssetIdentity) {
-  const table = identity.table ?? ''
+  // A table asset has `table` set too, but suggestions bind COLUMN operands, so the match set is
+  // empty by construction. Gate on the anchor being a column: otherwise the table page pays for a
+  // request it cannot use and reports "0 · use this column" on a page that has no column.
+  const table = identity.kind === 'column' ? (identity.table ?? '') : ''
   const objectRef = identity.object_ref
   // Read scope decides which suggestions exist at all, so a result read under other claims is not
   // an answer here. Keyed on principal + claims, never on the URL alone.
@@ -153,14 +156,22 @@ function Stat({
   )
 }
 
+// "a", "a and b", "a, b and c" — a bare join(' and ') reads as "a and b and c".
+function listWords(items: string[]): string {
+  if (items.length <= 1) return items[0] ?? ''
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+}
+
 function SummaryStrip({
   detail,
   matching,
   page,
+  isColumn,
 }: {
   detail: AssetDetail
   matching: unknown[]
   page: FeatureSuggestionPageV2 | null
+  isColumn: boolean
 }) {
   const usability = detail.readiness?.usability
   const evidence = detail.evidence
@@ -172,6 +183,9 @@ function SummaryStrip({
   const needChecks = (usability?.roles ?? [])
     .filter(r => r.state === 'needs_data_check')
     .map(r => r.label.toLowerCase())
+  const checksQualifier = needChecks.length === 0
+    ? 'No role is waiting on a data check'
+    : `${listWords(needChecks)} ${needChecks.length === 1 ? 'needs' : 'need'} a data check`
 
   return (
     <section className="stats adg-stats" aria-label="Asset decision summary">
@@ -179,17 +193,20 @@ function SummaryStrip({
         <Stat
           value={`${usability.usable_roles} of ${usability.total_roles}`}
           label="Potential uses"
-          tone={usability.usable_roles > 0 ? 'ok' : undefined}
-          qualifier={needChecks.length > 0
-            ? `${needChecks.join(' and ')} need a data check`
-            : 'No role is waiting on a data check'}
+          tone={usability.usable_roles === usability.total_roles ? 'ok' : undefined}
+          qualifier={checksQualifier}
         />
       )}
-      {page && (
+      {isColumn && (
+        // Rendered while the read is still in flight so the strip does not grow from three tiles to
+        // four under the reader's eye. Vocabulary matches the section below: suggested, not
+        // recommended.
         <Stat
-          value={String(matching.length)}
-          label="Recommended features"
-          qualifier={`Use this column · ${page.collection.summary.suggested} available for the table`}
+          value={page ? String(matching.length) : '—'}
+          label="Suggested features"
+          qualifier={page
+            ? `Use this column · ${page.collection.summary.suggested} available for the table`
+            : 'Reading the table\u2019s suggestions\u2026'}
         />
       )}
       {decided !== null && (
@@ -387,24 +404,29 @@ function AxisRow({
 function SemanticsCard({
   metadata,
   isUnavailable,
+  isColumn,
 }: {
   metadata: EffectiveMetadataSection | undefined
   isUnavailable: (name: string) => boolean
+  isColumn: boolean
 }) {
   const unavailable = isUnavailable('effective_metadata')
+  // The axes are per-COLUMN. A table anchor carries `{fields:{}, note:…}`, so listing all eight as
+  // unknown would assert a vacancy that cannot exist rather than reporting one that does.
+  const axesApply = isColumn && !unavailable
   // EVERY axis renders whether or not the response carried it. Filtering to present keys made a
   // server that omits an axis indistinguishable from an axis nobody has an opinion on — the one
   // thing this list may not say is nothing at all.
-  const known = unavailable
-    ? 0
-    : AXIS_FIELDS.filter(([name]) => axisIsKnown(metadata?.fields[name])).length
+  const known = axesApply
+    ? AXIS_FIELDS.filter(([name]) => axisIsKnown(metadata?.fields[name])).length
+    : 0
   const unknown = AXIS_FIELDS.length - known
   return (
     <DossierCard
       full
       title="Operational semantics"
       subtitle="Every supported axis is shown; “not known” is different from hidden."
-      aside={!unavailable && (
+      aside={axesApply && (
         <span className="badge gj-proposed adg-count">
           {known} populated · {unknown} unknown
         </span>
@@ -412,17 +434,14 @@ function SemanticsCard({
     >
       {unavailable ? (
         <p className="adg-unavailable" role="status">Not available to your roles.</p>
-      ) : !metadata ? (
-        <p className="hint">No per-field metadata on this asset.</p>
+      ) : !axesApply ? (
+        <p className="hint">{metadata?.note ?? 'No per-field metadata on this asset.'}</p>
       ) : (
-        <>
-          {metadata.note && <p className="hint">{metadata.note}</p>}
-          <ul className="rows adg-fieldsum adg-axes" data-testid="attested-metadata">
-            {AXIS_FIELDS.map(([name, label]) => (
-              <AxisRow key={name} name={name} label={label} field={metadata.fields[name]} />
-            ))}
-          </ul>
-        </>
+        <ul className="rows adg-fieldsum adg-axes" data-testid="attested-metadata">
+          {AXIS_FIELDS.map(([name, label]) => (
+            <AxisRow key={name} name={name} label={label} field={metadata?.fields[name]} />
+          ))}
+        </ul>
       )}
     </DossierCard>
   )
@@ -444,6 +463,9 @@ const USABILITY_TONE: Record<string, string> = {
 // Lifted onto Overview because it answers the question the page exists for — can I use this
 // column? — without a tab change. The evidence ids and the run-a-check actions stay on Readiness;
 // this is the verdict and the reason, nothing more.
+//
+// The jump moves FOCUS as well as the tab: this button unmounts with the Overview panel, so leaving
+// focus where it was drops a keyboard or screen-reader user onto <body> with no place in the page.
 function CapabilitiesCard({
   roles,
   onOpenReadiness,
@@ -456,7 +478,20 @@ function CapabilitiesCard({
       title="What can the system use it for?"
       subtitle="Role verdicts, each with the evidence still required."
       aside={
-        <button type="button" className="btn btn--ghost" onClick={onOpenReadiness}>
+        <button
+          type="button"
+          className="btn btn--ghost"
+          onClick={() => {
+            onOpenReadiness()
+            // After the tab swap the Overview panel is gone; put the caret on the tab that now owns
+            // the content rather than letting it fall to the document body.
+            requestAnimationFrame(() => {
+              const tab = document.querySelector<HTMLButtonElement>(
+                '[aria-label="Asset sections"] button[aria-pressed="true"]')
+              tab?.focus()
+            })
+          }}
+        >
           Full readiness
         </button>
       }
@@ -466,11 +501,10 @@ function CapabilitiesCard({
           <li className="row adg-cap" key={role.role} data-testid={`cap-${role.role}`}>
             <span className="adg-cap-role mono">{role.label}</span>
             <span className="adg-cap-copy">
-              <strong>{role.headline}</strong>
               <small>{role.detail}</small>
             </span>
             <span className={`badge ${USABILITY_TONE[role.state] ?? 'gj-none'}`}>
-              {role.state.replaceAll('_', ' ')}
+              {role.headline}
             </span>
           </li>
         ))}
@@ -516,6 +550,14 @@ const UNWIRED_COVERAGE: readonly CoverageRow[] = [
   },
 ]
 
+// A timestamp a person can read. Falls back to the raw value rather than rendering "Invalid Date"
+// if the server ever sends something Date cannot parse.
+function readableAt(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
 function coverageRows(detail: AssetDetail, isUnavailable: (name: string) => boolean): CoverageRow[] {
   const rows: CoverageRow[] = []
   const latest = detail.history?.runs[0]
@@ -523,7 +565,7 @@ function coverageRows(detail: AssetDetail, isUnavailable: (name: string) => bool
     rows.push({
       key: 'ingestion',
       label: 'Catalog ingestion',
-      headline: latest.completed_at ?? latest.at,
+      headline: readableAt(latest.completed_at ?? latest.at),
       detail: `${latest.stages.length} recorded stages · ${latest.status.toLowerCase()}.`,
       badge: 'last observed',
     })
@@ -531,21 +573,33 @@ function coverageRows(detail: AssetDetail, isUnavailable: (name: string) => bool
   rows.push(...UNWIRED_COVERAGE)
   // Audit is separately gated by audit:read; when it is withheld the page says so rather than
   // implying nothing was ever recorded.
-  rows.push(isUnavailable('audit')
-    ? {
+  if (isUnavailable('audit')) {
+    rows.push({
       key: 'audit',
       label: 'LLM audit summaries',
       headline: 'Restricted',
       detail: 'This session’s roles do not include audit:read.',
       badge: 'role gated',
-    }
-    : {
+    })
+  } else if (detail.audit) {
+    rows.push({
       key: 'audit',
       label: 'LLM audit summaries',
-      headline: `${detail.audit?.summaries.length ?? 0} recorded`,
+      headline: `${detail.audit.summaries.length} recorded`,
       detail: 'Task, stage, provider and outcome are readable under your roles.',
       badge: 'available',
     })
+  } else {
+    // Neither returned nor refused: this response was not asked for the section. Saying "0" here
+    // would report an absence of records when the truth is an absence of a question.
+    rows.push({
+      key: 'audit',
+      label: 'LLM audit summaries',
+      headline: 'Not requested',
+      detail: 'This response did not ask for the audit section, so nothing is known either way.',
+      badge: 'not read',
+    })
+  }
   return rows
 }
 
@@ -726,12 +780,12 @@ export function OverviewTab({
 
   return (
     <>
-      <SummaryStrip detail={detail} matching={matching} page={page} />
+      <SummaryStrip detail={detail} matching={matching} page={page} isColumn={isColumn} />
 
       <div className="adg-grid">
         <MeaningCard metadata={metadata} isUnavailable={isUnavailable} />
         <SourceGlossaryCard detail={detail} />
-        <SemanticsCard metadata={metadata} isUnavailable={isUnavailable} />
+        <SemanticsCard metadata={metadata} isUnavailable={isUnavailable} isColumn={isColumn} />
         {roles.length > 0 && !isUnavailable('readiness') && (
           <CapabilitiesCard roles={roles} onOpenReadiness={onOpenReadiness} />
         )}

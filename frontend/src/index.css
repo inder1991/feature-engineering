@@ -3300,6 +3300,11 @@ button.stat:hover {
 /* A definition is a sentence. Body prose at a readable measure, never a label/value row, which is
    how a sentence ends up scanned past. */
 .adg-hero-definition {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   max-width: 68ch;
   margin: 11px 0 0;
   color: var(--ink-soft);
@@ -3385,6 +3390,11 @@ button.stat:hover {
 
 .adg-card--full { grid-column: 1 / -1; }
 
+/* A half-width card with no sibling beside it strands dead space; let a lone one take the row. */
+.adg-card:not(.adg-card--full):last-child:nth-child(odd) {
+  grid-column: 1 / -1;
+}
+
 /* The head's second line names which authority governs the card. In a product whose value is
    knowing who asserted what, that sentence is the feature, not decoration. */
 .adg-card-head {
@@ -3414,11 +3424,42 @@ button.stat:hover {
 
 .adg-card-body { padding: 13px 15px; }
 
+/* `.rows` is the app's standalone list panel: it carries its own border, radius, surface, shadow
+   and 16px block margin. Inside a card body that makes a bordered, shadowed box within a bordered,
+   shadowed box — a card inside a card, and the margin fights the body padding. Strip the panel
+   affordance here and keep only the list. */
+.adg-card-body > .rows {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.adg-card-body > .rows > .row {
+  padding-inline: 0;
+}
+
 /* Semantics: two axis columns on wide screens so eight rows read as one block, not a long scroll. */
 .adg-axes {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 18px;
+  gap: 0 22px;
+}
+
+/* `.row + .row` draws its divider in DOM order, which in a two-column grid puts a top border on the
+   second cell of the FIRST row and leaves the dividers unaligned across columns. Drive the rule off
+   grid position instead: every axis gets a top border except the first row of each column. */
+.adg-axes > .row + .row {
+  border-top: 0;
+}
+
+.adg-axes > .adg-axis {
+  border-top: 1px solid var(--line);
+}
+
+.adg-axes > .adg-axis:nth-child(-n + 2) {
+  border-top: 0;
 }
 
 /* ---- capability + coverage rows: label, copy, verdict ---- */
@@ -3437,7 +3478,10 @@ button.stat:hover {
 }
 
 .adg-cap-copy,
-.adg-cov-copy { min-width: 0; }
+.adg-cov-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .adg-cap-copy strong,
 .adg-cov-copy strong {
@@ -5561,6 +5605,11 @@ button.stat:hover {
   .adg-grid,
   .adg-axes {
     grid-template-columns: 1fr;
+  }
+
+  /* One column now, so only the FIRST axis is a top-of-column row. */
+  .adg-axes > .adg-axis:nth-child(2) {
+    border-top: 1px solid var(--line);
   }
 }
 
