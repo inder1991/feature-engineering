@@ -345,6 +345,16 @@ def test_the_execution_shapes_producers_are_declared_and_there_is_still_no_execu
 
     What has NOT changed is the important half: no `materialize/**` file appears, so there is still
     no compiler and no executor. Task 12 owns both, and this assertion is what will make it say so.
+
+    Release C Task 13 added one entry and it is a TEST, not a producer:
+    `tests/eval/mutation/mutations.py` rebuilds `execution_revision_id` from a payload with the
+    mapping binding revision removed, which is the `crosswalk_identity_omits_mapping_revision`
+    must-die mutation. It names the class because it patches the class; nothing in `src/`
+    constructs a `CrosswalkExecutionRevisionV1` that did not already.
+
+    Task 13's own `src/` addition — `crosswalk_assembly.py` — deliberately does NOT appear here:
+    it reaches the shape only through `admitted_crosswalk_execution`, the one declared producer, so
+    the "one producer" property this tripwire protects is unchanged by the assembler existing.
     """
     import pathlib
     import subprocess
@@ -360,6 +370,7 @@ def test_the_execution_shapes_producers_are_declared_and_there_is_still_no_execu
     assert sorted(hits) == [
         "src/featuregen/overlay/upload/crosswalk.py",            # the shape
         "src/featuregen/overlay/upload/crosswalk_admission.py",  # its ONE producer (Task 11)
+        "tests/eval/mutation/mutations.py",                      # the Task-13 identity mutation
         "tests/featuregen/overlay/upload/test_crosswalk_contracts.py",
     ]
     assert not [hit for hit in hits if hit.startswith("src/featuregen/materialize/")]
