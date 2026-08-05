@@ -427,6 +427,76 @@ def _usage_for(cat: _Category, state: str, counts: Mapping[str, int] | None,
                  basis=cat.basis)
 
 
+#: WHAT ALREADY DEPENDS ON A CROSSWALK. Release C Task 13, and ALL FIVE are `not_tracked_yet` BY
+#: CONSTRUCTION today — deliberately, and stated rather than hidden.
+#:
+#: Every store that records "something used a relationship" anchors on a bridge `fact_key`: the
+#: shadow assembly store keys `crossings[].bridge_fact_key`, `contract_metadata_dependency` carries
+#: the typed `bridgefact:<key>` marker, and the materialization control plane identifies a
+#: generation by hash alone. NONE of them has a crosswalk anchor, so no probe could license a count
+#: and a 0 here would be a lie in the most expensive direction — it would read as "nothing uses
+#: this", inviting exactly the "approve it and things become usable" story this surface exists to
+#: refuse.
+#:
+#: The machinery is shared with :data:`_CATEGORIES` rather than special-cased so that the day a
+#: crosswalk anchor lands in ANY of these stores, one `count_sql` turns its row into a real number
+#: with no other change — and until then the honest answer is the one that renders.
+_CROSSWALK_CATEGORIES: tuple[_Category, ...] = (
+    _Category(
+        name="planned_candidates", store="multisource_assembly_shadow_operand_obs.crossings[]",
+        basis="an assembled candidate plan whose operand path traversed this crosswalk",
+        by_construction=("the crossings record anchors on a bridge fact_key; a two-leg crosswalk "
+                         "traversal has no fact key and is not recorded there")),
+    _Category(
+        name="generated_artifacts", store="materialization control plane (migration 1034)",
+        basis="a rendered generation whose provenance names this crosswalk",
+        by_construction=("the control plane identifies a generation by group/project HASH only; "
+                         "the rendered project names its crosswalk pins in provenance text, which "
+                         "no table indexes")),
+    _Category(
+        name="published_features",
+        store="feature_current_contract + contract_metadata_dependency.logical_ref",
+        basis="a registered feature whose CURRENT governed contract depends on this crosswalk",
+        by_construction=("`contract_metadata_dependency` carries the typed `bridgefact:<key>` "
+                         "marker and no crosswalk equivalent exists, so a crosswalk dependency is "
+                         "not expressible in that column")),
+    _Category(
+        name="data_agent_analyses", store="none",
+        basis="an analysis whose plan traversed this crosswalk",
+        by_construction=("AnalysisPlan is never persisted and there is no analysis-run store; "
+                         "analysis_learning_event records only DECISIONS owed about a mapping "
+                         "dataset and is blind to a crosswalk that raised no finding")),
+    _Category(
+        name="sandbox_plans", store="none",
+        basis="a sandbox plan compiled through this crosswalk",
+        by_construction=("sandbox planning is compile-time and leaves no durable record keyed on "
+                         "a crosswalk definition")),
+)
+
+
+def crosswalk_usage(
+    conn: DbConn, definition_ids: Sequence[str]
+) -> dict[str, tuple[Usage, ...]]:
+    """``definition_id -> (Usage, …)`` — the SAME tri-state contract bridges use.
+
+    Shared with :func:`bridge_usage` on purpose: two implementations of "what already depends on
+    this" is two chances for one of them to render a 0 it has not earned. Every category resolves
+    through :func:`_usage_for`, so the type itself keeps "unmeasured" unrepresentable as a number.
+
+    A crosswalk's answer is currently ``not_tracked yet`` in all five categories, each carrying the
+    reason. That is a fact about this platform's lineage stores, NOT about the crosswalk, and the
+    ``reason`` string says which store would have to change.
+    """
+    if not definition_ids:
+        return {}
+    keys = list(dict.fromkeys(definition_ids))
+    return {
+        key: tuple(
+            _usage_for(cat, _NOT_TRACKED, None, key) for cat in _CROSSWALK_CATEGORIES)
+        for key in keys
+    }
+
+
 def bridge_usage(conn: DbConn, fact_keys: Sequence[str]) -> dict[str, tuple[Usage, ...]]:
     """``fact_key -> (Usage, …)`` for every category, measured ONCE for the whole batch.
 
