@@ -280,6 +280,9 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
   }
 
   const { identity } = detail
+  const businessTerm = detail.source_glossary?.fields.business_term?.value
+  const headlineType = typeDisplay(identity)
+  const headlineConcept = detail.effective_metadata?.fields.concept
   const editingAction = editing ? fieldActions.get(editing) : undefined
   const editingMeta = editing ? detail.effective_metadata?.fields[editing] : undefined
 
@@ -287,17 +290,26 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
     <section className="adg">
       <header className="adg-id-head">
         <div>
-          <h2 className="adg-title mono">
-            {identity.column
+          <h2 className="adg-title">
+            {businessTerm ?? (identity.column
               ? `${identity.table}.${identity.column}`
-              : (identity.table ?? identity.object_ref)}
+              : (identity.table ?? identity.object_ref))}
           </h2>
+          <p className="adg-fqn mono">{identity.object_ref}</p>
           <p className="hint">
             {identity.source} · {identity.kind}
             {identity.schema_name ? ` · ${identity.schema_name}` : ''}
           </p>
         </div>
         <div className="adg-id-flags">
+          <span className="badge">
+            {headlineType.value}{headlineType.basis ? ` · ${headlineType.basis}` : ''}
+          </span>
+          {headlineConcept && (headlineConcept.value != null || headlineConcept.proposed_value != null) && (
+            <span className={`badge ${authorityTone(headlineConcept.authority)}`}>
+              {fieldValueText(headlineConcept)} · {attestedByLabel(headlineConcept)}
+            </span>
+          )}
           {identity.is_grain && <span className="badge grain">grain</span>}
           {identity.is_as_of && <span className="badge asof">as-of</span>}
         </div>
@@ -678,7 +690,7 @@ function ColumnSuggestions({
   source: string
   identity: AssetIdentity
 }) {
-  const table = identity.table
+  const table = identity.table ?? ''
   const objectRef = identity.object_ref
   // Read scope decides which suggestions exist at all, so a result read under other claims is not
   // an answer here. Keyed on principal + claims, never on the URL alone.
@@ -727,7 +739,28 @@ function ColumnSuggestions({
 
   return (
     <section className="adg-section" data-testid="column-suggestions">
-      <h3 className="micro-label">Suggested features using this column</h3>
+      <div className="adg-section-head adg-suggestion-head">
+        <div>
+          <h3 className="micro-label">Suggested features using this column</h3>
+          {data && matching.length > 0 && (
+            <p className="hint">
+              {matching.length} of {data.collection.summary.suggested} table suggestions use{' '}
+              <code>{identity.column}</code>.
+            </p>
+          )}
+        </div>
+        {/* The handoff needs a table to land on. `table` is '' when identity.table is null (the
+            same sentinel the fetch effect guards on), and '#/suggested?source=X&table=' is a dead
+            destination — so withhold the action rather than offer one that goes nowhere. */}
+        {table && (
+          <a
+            className="btn btn--ghost"
+            href={`#/suggested?${new URLSearchParams({ source, table }).toString()}`}
+          >
+            View all table recommendations
+          </a>
+        )}
+      </div>
       {outcome.kind === 'loading' ? (
         <p className="hint" role="status">Reading what the catalog can build with this column…</p>
       ) : outcome.kind === 'forbidden' ? (
@@ -753,7 +786,7 @@ function ColumnSuggestions({
               + 'this column.'}
         </p>
       ) : (
-        <ul className="rows">
+        <ul className="rows adg-suggestion-grid">
           {matching.map(hit => (
             <SuggestionCard
               key={hit.suggestion.suggestion_id} hit={hit} headingLevel={4}

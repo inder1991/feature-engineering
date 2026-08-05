@@ -3268,9 +3268,73 @@ button.stat:hover {
   font-size: 18px;
 }
 
+/* The headline is the business term; the fully-qualified ref rides underneath it so the physical
+   identity is never lost, only demoted. */
+.adg-fqn {
+  margin: 3px 0 4px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .adg-id-flags {
   display: inline-flex;
   gap: 6px;
+}
+
+/* A section heading that carries an action on its right. Defined here because the JSX applies it
+   as the layout contract — without it the title and the action stack vertically. */
+.adg-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.adg-suggestion-head {
+  align-items: flex-end;
+}
+
+.adg-suggestion-head p { margin: 4px 0 0; }
+
+.adg-suggestion-head a {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  color: var(--ink-soft);
+  text-decoration: none;
+}
+
+/* Suggestion cards on the asset surface read as a card grid, not the flat `.rows` list — each one
+   carries enough facts that a single column wastes the width. */
+.adg-suggestion-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
+  align-items: stretch;
+  gap: 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.adg-suggestion-grid > .sfc {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  height: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.adg-suggestion-grid .sfc-name { flex-basis: 100%; }
+
+/* An opened card needs the full width for its detail drawer, so it spans the grid. */
+.adg-suggestion-grid:has(.sfc-detail) > .sfc:has(.sfc-detail) {
+  grid-column: 1 / -1;
 }
 
 .adg-tabs {
@@ -4900,6 +4964,77 @@ button.stat:hover {
   overflow: hidden;
 }
 
+/* Decision-critical recommendation facts stay visible on the compact card. Raw evidence and
+   revision identifiers remain in the existing full-detail disclosure. */
+.sfc-inputs {
+  display: grid;
+  grid-template-columns: fit-content(160px) 1fr;
+  gap: 8px 16px;
+  align-items: start;
+}
+
+.sfc-inputs-label {
+  padding-top: 5px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sfc-inputs ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sfc-inputs li {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.sfc-inputs li small {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
+/* Point-in-time and eligibility are leakage-shaped truths: they get a tinted rail so they read as
+   a caution, not as one more fact in the list. */
+.sfc-safety-note {
+  display: grid;
+  grid-template-columns: fit-content(150px) 1fr;
+  gap: 8px 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+.sfc-safety-note strong {
+  color: var(--warn);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sfc-safety-note--eligibility {
+  border-left-color: var(--danger);
+  background: color-mix(in oklch, var(--danger-soft) 68%, var(--paper));
+}
+
+.sfc-safety-note--eligibility strong { color: var(--danger); }
+
 .sfc-recipe {
   margin: 0;
   padding: 6px 8px;
@@ -5173,6 +5308,26 @@ button.stat:hover {
 /* ---- narrow layout: the label columns collapse before anything scrolls sideways ---- */
 
 @media (max-width: 720px) {
+  .adg-id-head,
+  .adg-section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .adg-id-flags {
+    justify-content: flex-start;
+  }
+
+  .adg-suggestion-head a {
+    width: 100%;
+    text-align: center;
+  }
+
+  .sfc-inputs,
+  .sfc-safety-note {
+    grid-template-columns: 1fr;
+  }
+
   .sfc-meaning,
   .sfc-facts {
     grid-template-columns: 1fr;

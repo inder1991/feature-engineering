@@ -444,8 +444,18 @@ describe('SuggestedFeaturesScreen', () => {
         expect(within(card).getByText(/recipe slot comparison/i)).toBeInTheDocument()
         const operands = card.querySelector('.sfc-operands') as HTMLElement
         expect(within(operands).getAllByText('bal_amt')).toHaveLength(2)
-        expect(within(card).getAllByText('balance')).toHaveLength(2)
+        // Scoped to the keyword chiprow, not the whole card: the compact Inputs list also renders
+        // the word 'balance' as a recipe role, and that is a different fact from the keyword.
+        const keywordRow = within(card).getByText('Keywords').parentElement as HTMLElement
+        expect(within(keywordRow).getAllByText('balance')).toHaveLength(2)
         expect(within(card).getAllByText('check the sign')).toHaveLength(2)
+        // The compact Inputs list reports BOTH slots the one column is bound to — the same
+        // under-reporting risk this test exists for, on the surface that is read without opening
+        // the drawer.
+        const inputs = card.querySelector('.sfc-inputs') as HTMLElement
+        expect(within(inputs).getAllByText('bal_amt')).toHaveLength(2)
+        expect(within(inputs).getByText('balance')).toBeInTheDocument()
+        expect(within(inputs).getByText('comparison')).toBeInTheDocument()
         // ...and React never warned about a duplicate key
         const warned = errors.mock.calls.some(args =>
           args.some(a => typeof a === 'string' && /same key/i.test(a)))
