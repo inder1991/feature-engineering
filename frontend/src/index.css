@@ -2474,13 +2474,22 @@ section > h2:first-child {
   z-index: 6;
 }
 
+.ln-drawer-header {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+/* Was float:right, which reserves no space in the flow — a long object ref ran underneath the
+   button and collided with it. */
 .ln-drawer-close {
-  float: right;
+  flex: none;
 }
 
 .ln-drawer-title {
+  min-width: 0;
   font-family: var(--font-mono);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   margin: 0 0 2px;
   overflow-wrap: anywhere;
@@ -3075,6 +3084,14 @@ section > h2:first-child {
 .facet-cols--graph {
   grid-template-columns: minmax(0, 1fr);
   gap: 0;
+}
+
+/* Graph mode names itself in the crumb, exactly as the artifact does
+   ("Catalog · Search · Relationship intelligence"). An earlier pass hid the heading and the
+   description outright to reclaim vertical space; that removed the page's identity, which was
+   worse than the space it saved. */
+main:has(.ln-wrap) .page-head-eyebrow::after {
+  content: ' · Relationship intelligence';
 }
 
 .facet-panel {

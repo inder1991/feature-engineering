@@ -486,10 +486,7 @@ function TrustAxes({ edge }: { edge: LineageEdge }) {
           : review === 'not_governed' ? 'Advisory, not governed' : 'Not yet reviewed'}
       </span>
       <span className={`badge ${edge.execution_eligible ? 'gj-verified' : 'gj-partial'}`}>
-        {edge.execution_eligible
-          ? 'Execution-validated'
-          : `Not execution-validated${edge.realization_safety_status
-            ? ` · ${edge.realization_safety_status}` : ''}`}
+        {edge.execution_eligible ? 'Execution-validated' : 'Not execution-validated'}
       </span>
     </div>
   )
@@ -521,6 +518,11 @@ function RelationshipBlock({
         <span className="mono">{shortRef(to, edge.to)}</span> for the {entity} entity.
       </p>
       <TrustAxes edge={edge} />
+      {!edge.execution_eligible && edge.realization_safety_status && (
+        <p className="ln-why hint">
+          Execution safety: {edge.realization_safety_status.replaceAll('_', ' ')}.
+        </p>
+      )}
       {edge.why && <p className="ln-why hint">{edge.why}</p>}
     </div>
   )
@@ -1477,9 +1479,13 @@ function Drawer({
 
   return (
     <aside className="ln-drawer" aria-label="Details">
-      <button type="button" className="ln-drawer-close" ref={closeRef} onClick={onClose}>
-        Close
-      </button>
+      {/* Its own row rather than a float: a floated button reserves no space, so a long object ref
+          ran underneath it and the two collided. */}
+      <div className="ln-drawer-header">
+        <button type="button" className="ln-drawer-close" ref={closeRef} onClick={onClose}>
+          Close
+        </button>
+      </div>
       {node.kind === 'column' && (
         <>
           <h3 className="ln-drawer-title">{node.object_ref}</h3>

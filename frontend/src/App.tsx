@@ -214,7 +214,8 @@ const PAGES: PageHead[] = [
     label: 'Search',
     eyebrow: 'CATALOG · SEARCH',
     title: 'Search',
-    description: 'Find columns you can trust',
+    description:
+      'Find trusted data, then understand what the system can do with it.',
   },
   {
     // Entity map v0, behind VITE_ENTITY_MAP — filtered out of the rendered nav in App() when the

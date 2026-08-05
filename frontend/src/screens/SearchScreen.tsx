@@ -270,7 +270,8 @@ export function SearchScreen() {
       </form>
 
       <div className="active-filters">
-        <span className="active-filters-label">{hasFilters ? 'Filters' : 'No filters'}</span>
+        {/* "No filters" labels an empty row with the fact that it is empty. Say nothing instead. */}
+        {hasFilters && <span className="active-filters-label">Filters</span>}
         {chips.map(chip => (
           <span
             key={chip.id}
@@ -368,7 +369,10 @@ export function SearchScreen() {
             </div>
           )}
 
-          {!error && hasHits && (
+          {/* The result slice is list-mode information. In graph mode it is chrome above a
+              workspace that has its own anchor bar, and it was a third of the 300px of dead space
+              before the canvas began. */}
+          {!error && hasHits && effectiveView === 'list' && (
             <p className="micro-label tabular-nums result-count" role="status">
               <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
               {result.total === 1 ? 'result' : 'results'}
