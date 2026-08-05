@@ -6027,6 +6027,57 @@ button.stat:hover {
 }
 
 /* A caveat count, not a defect list. Quiet: it points at the detail, it does not shout. */
+/* The description leads the card, as prose, so it says what the feature IS before listing its
+   parameters. */
+.sfc-lead {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.sfc-novalue {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* A deliberate ending: which inputs it uses, and nothing to click. */
+.sfc-usesrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  color: var(--proposal);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* The formula is a quoted artefact, so it sits in its own inset rather than running as body
+   text against the prose above it. */
+.sfc-recipe {
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+/* Fact VALUES carry the weight; their labels are the quiet part. */
+.sfc-factgrid .sfc-fact dd {
+  font-weight: 650;
+}
+
+/* Cards size to their content. Stretching every card to the tallest left ~400px of dead white
+   under the short ones — the row equalises height and the shortest card pays for it. */
+.sfc-grid,
+.rows:has(> .sfc) {
+  align-items: start;
+}
+
 .sfc-caveats {
   margin: 0;
   color: var(--warn);

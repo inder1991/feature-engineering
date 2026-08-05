@@ -512,6 +512,10 @@ export function SuggestionCard({
   const s = hit.suggestion
   const [open, setOpen] = useState(false)
   const detailId = useId()
+  // The column this card is anchored on, for the footer. First operand carrying an as-of role,
+  // else the first operand — the artifact's "USES BUSINESS_DT".
+  const usesColumn = (s.operands.find(o => o.recipe_role === 'asof') ?? s.operands[0])
+    ?.graph_object_ref.split('.').pop()
   const limitations = limitationsOf(s)
   const Heading = headingLevel === 4 ? 'h4' : 'h3'
 
@@ -534,6 +538,10 @@ export function SuggestionCard({
       {/* Four boxed parameters a reader actually compares between candidates, two per row —
           not six label/value rows stacked down the card. Sources and data roles drop to the
           quiet line below, and everything absent stays in the detail disclosure. */}
+      {s.business_interpretation !== null && (
+        <p className="sfc-lead sfc-clamp">{s.business_interpretation.value}</p>
+      )}
+
       <dl className="sfc-facts sfc-factgrid">
         <Fact label="Entity & grain">{entityWords(s)}</Fact>
         <Fact label="Time binding">{timeBindingWords(s)}</Fact>
@@ -576,6 +584,10 @@ export function SuggestionCard({
         </p>
       )}
 
+      {s.business_value === null && (
+        <p className="sfc-novalue">Business value has not been documented for this recipe.</p>
+      )}
+
       <div className="sfc-foot">
         <button
           type="button"
@@ -590,8 +602,23 @@ export function SuggestionCard({
           aria-label={`${open ? 'Hide' : 'Show'} full detail for ${bounded(s.display_name, 80)}`}
           onClick={() => setOpen(v => !v)}
         >
-          {open ? 'Hide full detail' : 'Full detail'}
+          {open ? '▾ Full recommendation detail' : '▸ Full recommendation detail'}
         </button>
+      </div>
+
+      {/* The artifact ends every card deliberately: which column it uses on the left, the way
+          onward on the right. Ours trailed off after the toggle. */}
+      <div className="sfc-usesrow">
+        <span className="sfc-uses">
+          {usesColumn ? `Uses ${usesColumn}` : `${s.operands.length} input columns`}
+        </span>
+        {/* NOT a second control. The artifact's "OPEN RECOMMENDATION →" links to a separate
+            page; ours has the detail inline, so an action here would both duplicate the
+            disclosure and break this card's read-only guarantee (exactly one control, pinned
+            by two tests). The count is the ending instead. */}
+        <span className="sfc-open">
+          {s.operands.length} {s.operands.length === 1 ? 'input' : 'inputs'}
+        </span>
       </div>
 
       {open && (

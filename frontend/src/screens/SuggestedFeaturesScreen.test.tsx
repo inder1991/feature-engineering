@@ -143,7 +143,9 @@ describe('SuggestedFeaturesScreen', () => {
         .toBeInTheDocument()
       expect(within(card).getByText('design checked')).toBeInTheDocument()
       expect(within(card).getAllByText('Trend & Trajectory').length).toBeGreaterThan(0)
-      expect(within(card).getByText(/balance has trended over the last 90 days/i)).toBeInTheDocument()
+      // The description leads the card AND is restated in the detail's 'What it measures'.
+      expect(within(card).getAllByText(/balance has trended over the last 90 days/i).length)
+        .toBeGreaterThan(0)
       expect(within(card).getByText(/leads attrition and hardship/i)).toBeInTheDocument()
       expect(within(card).getByText('What it measures')).toBeInTheDocument()
       expect(within(card).getByText('Why it is useful')).toBeInTheDocument()
@@ -735,7 +737,9 @@ describe('SuggestedFeaturesScreen', () => {
     })]))
     renderScreen()
     const card = await openDetail('account_balance_trend_90d')
-    expect(within(card).getByText(hostile)).toBeInTheDocument()
+    // Rendered on the card AND in the detail; both must be TEXT. The escaping guarantee is
+    // what matters, and it now has two render sites to hold.
+    expect(within(card).getAllByText(hostile).length).toBeGreaterThan(0)
     expect(card.querySelector('img')).toBeNull()
     expect(card.querySelector('b')).toBeNull()
   })
