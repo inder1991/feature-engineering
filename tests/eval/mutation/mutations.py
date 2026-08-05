@@ -512,6 +512,31 @@ def _m_review_substitutes_for_crosswalk_safety() -> None:
         lambda self: self.safety_status is not SafetyStatus.UNASSESSED)
 
 
+def _m_crosswalk_policy_pin_leaves_the_measurement() -> None:
+    """The execution's mapping row rule stops being the one the measurement was taken under.
+
+    THE SHIPPED DEFECT, verbatim in effect. `assemble_admitted_crosswalk` derived the pin from the
+    caller's `mapping_row_selection` — the object `AdmittedCrosswalkV1.__post_init__` then validates
+    AGAINST that pin — so the "policy pointer moved after the crosswalk was measured" refusal had
+    the same value on both sides of its comparison and could never fire. Measured under one rule,
+    resolved under another: a clean, production-admissible bundle.
+
+    Reinstated here in its other half: the pin follows the DEFINITION's declaration and ignores the
+    measurement, which is the shape that made the second face possible — an execution pinning None
+    over a measurement taken WITH a filter, leaving `joins.plan_crosswalk_join` nothing to require
+    and the traversal reading the mapping table unfiltered under a verdict measured over the
+    filtered rows.
+
+    Patched on the module attribute, which `assemble_admitted_crosswalk` reads through module
+    globals at call time — the same seam the fix introduced so this could be a REPLACEABLE
+    derivation rather than an expression buried in a constructor call.
+    """
+    from featuregen.overlay.upload import crosswalk_assembly
+
+    crosswalk_assembly.pinned_mapping_temporal_policy = (
+        lambda definition, observation: definition.mapping_temporal_policy_revision_id)
+
+
 def _m_crosswalk_identity_omits_mapping_revision() -> None:
     """`execution_revision_id` stops covering the mapping binding revision.
 
@@ -900,6 +925,24 @@ REGISTRY: tuple[Mutation, ...] = (
             "a reviewer confirmed a crosswalk and a measured fan-out became executable"),
         notes="DoD 17. Widened from DETERMINISTICALLY_VALIDATED to 'anything not UNASSESSED' — the "
               "shape a sign-off takes in a vocabulary with no review field",
+    ),
+    Mutation(
+        mutation_id="crosswalk_policy_pin_leaves_the_measurement",
+        kind=MUST_DIE,
+        invariant=(
+            "the mapping row rule an execution pins is the one the MEASUREMENT was taken under, "
+            "never one the caller supplied or the definition merely declares"),
+        target="crosswalk_assembly:pinned_mapping_temporal_policy",
+        victims=(
+            f"{_CWASSEM}::test_the_pin_is_the_MEASURED_row_rule_even_when_the_definition_declares_none",
+            f"{_CWASSEM}::test_a_row_selection_resolved_under_a_MOVED_policy_pointer_refuses",
+        ),
+        apply=_m_crosswalk_policy_pin_leaves_the_measurement,
+        expect_failure_contains=(
+            "the execution's mapping row rule stopped following the measurement"),
+        notes="the shipped Task-13 defect: the pin was derived from the very row selection "
+              "`AdmittedCrosswalkV1.__post_init__` validates against it, so the drift refusal had "
+              "one value on both sides and could never fire",
     ),
     Mutation(
         mutation_id="crosswalk_identity_omits_mapping_revision",

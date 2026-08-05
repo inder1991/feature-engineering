@@ -425,7 +425,7 @@ def assemble_admitted_crosswalk(
     # is for: the shipped bug was a pin derived from `mapping_row_selection`, and the only thing
     # `__post_init__`'s drift refusal needs in order to be real is that this pin comes from
     # somewhere the caller does not control. Anything that re-points the derivation at the caller
-    # (the mutation `crosswalk_policy_pin_follows_the_caller`) makes these two disagree and lands
+    # (the mutation `crosswalk_policy_pin_leaves_the_measurement`) makes these two disagree and lands
     # here with a message naming the two policies, instead of assembling a clean bundle whose
     # verdict describes another row set.
     if observation is not None and (

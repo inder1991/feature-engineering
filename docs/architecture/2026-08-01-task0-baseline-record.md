@@ -75,6 +75,13 @@ explained; a RISE is legitimate but must be recorded here in the same commit tha
 | 273 | 2026-08-03 | Release-A integration added 31; the Track-2 merge added 4 first-hop cardinality tests to `test_joins.py`. |
 | **277** | **2026-08-05** | **Release C Task 13: +4 crosswalk adapter tests in `test_joins.py`.** `joins.plan_crosswalk_join` lives in that module and had NO test there at all — its entire coverage was in `tests/featuregen/materialize/test_crosswalk_ir.py`, which drives it THROUGH the IR and therefore cannot pin the adapter's own answers. The four go at it directly: two steps rather than one endpoint-equality collapse; both legs' column pairs reaching the plan so neither escapes Gate 2; each direction gated on its OWN measured cardinality; and a fanning direction refused rather than deduplicated. Three of Task 13's eight required mutations (`crosswalk_renders_endpoint_equality`, `crosswalk_cardinality_inverted`, `crosswalk_deduplicates_instead_of_refusing`) name them as victims, so the rise buys real kill coverage rather than count. |
 
+**Mutation-registry size (a different number, recorded here so the two are not confused).**
+`pytest -m eval tests/eval/mutation/` collected **34** on 2026-08-05 and collects **35** after the
+Task-13 review fixes: one added must-die entry, `crosswalk_policy_pin_leaves_the_measurement`, which
+reinstates the shipped defect the review found (an execution pinning a mapping row rule that did not
+come from the measurement). `RELEASE_GATE_BASELINE` is **unchanged at 277** — no test was added to
+any of the seventeen files, and the registry size is not gated on a literal.
+
 **Repo-wide suite status at baseline (recorded 2026-08-01, Task 0.6 review):** 2 pre-existing
 failures in `tests/featuregen/api/test_nginx_proxy_covers_frontend_calls.py` — the nginx proxy
 location list is missing `/data-sources`; both failures are present at `fa9a20b0` and unrelated to

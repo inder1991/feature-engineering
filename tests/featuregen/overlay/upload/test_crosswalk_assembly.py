@@ -741,7 +741,9 @@ def test_the_pin_is_the_MEASURED_row_rule_even_when_the_definition_declares_none
 
     admitted = assemble(db, revision, cib, ftr, mapping, realization)   # NO row selection supplied
 
-    assert isinstance(admitted, AdmittedCrosswalkV1)
+    assert isinstance(admitted, AdmittedCrosswalkV1), (
+        "the execution's mapping row rule stopped following the measurement, so the assembler's "
+        "own derivation guard refused the bundle")
     assert admitted.execution.mapping_temporal_policy_revision_id == POLICY_REVISION
 
     outcome = plan_crosswalk_join(
