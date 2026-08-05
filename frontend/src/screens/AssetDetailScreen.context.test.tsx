@@ -212,7 +212,12 @@ it('labels a crosswalk distinctly and never as a failure', async () => {
   }))
   expect(screen.getByTestId('context-link-bfk_1')).toBeInTheDocument()
   const cross = screen.getByTestId('context-link-cwd_1')
-  expect(within(cross).getByText('crosswalk')).toBeInTheDocument()
+  // The LABEL names the claim, not the machine word: "crosswalk" alone is only distinct to someone
+  // who already knows the model, and the two kinds differ in whether a third table is needed at all.
+  expect(within(cross).getByText('crosswalk (mapping-mediated)')).toBeInTheDocument()
+  expect(
+    within(screen.getByTestId('context-link-bfk_1')).getByText('direct equality'),
+  ).toBeInTheDocument()
   // The mapping table is what makes it readable AS a crosswalk, and both legs are named.
   const detail = screen.getByTestId('context-crosswalk-cwd_1')
   expect(detail).toHaveTextContent('deposits::public.acct_xref')
@@ -412,4 +417,145 @@ it('renders a table anchor with an honest note instead of fabricated column mean
 it('degrades to an explicit unavailable message rather than a blank tab', async () => {
   await openContext(undefined)
   expect(screen.getByTestId('context-unavailable')).toHaveTextContent(/not available/i)
+})
+
+// ── Release C Task 13: the four kinds, the framing rules and lineage on the row ─────────────────
+
+it('names all four relationship kinds distinctly, each by the claim it makes', async () => {
+  // The plan's first checkbox. Four kinds that must not read alike: whether a join needs a third
+  // table, whether it needs a value transform, and whether it is a join at all are three different
+  // questions, and a shared machine-word badge answers none of them.
+  await openContext(contextFixture({
+    relationships: [
+      directRelationship(),
+      crosswalkRelationship(),
+      crosswalkRelationship({ relationship_ref: 'tr_1', kind: 'transformed', crosswalk: null }),
+      crosswalkRelationship({ relationship_ref: 'so_1', kind: 'semantic_only', crosswalk: null }),
+    ],
+  }))
+  const labels = ['direct equality', 'crosswalk (mapping-mediated)', 'transformed', 'semantic-only']
+  for (const label of labels) {
+    expect(screen.getByText(label)).toBeInTheDocument()
+  }
+  expect(new Set(labels).size).toBe(4)
+})
+
+it('shows what already depends on a crosswalk, and never a zero it has not earned', async () => {
+  // The user-ratified rule. "Nothing uses this" and "no store records who uses this" are different
+  // claims; rendering the second as 0 is what invites the "approve it and it becomes usable" story.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        already_depended_on_by: [
+          {
+            category: 'published_features', state: 'not_tracked_yet', count: null,
+            display: 'not tracked yet', store: 'contract_metadata_dependency',
+            basis: 'a registered feature whose contract depends on this crosswalk',
+            reason: 'no crosswalk marker exists in that column',
+          },
+        ],
+      },
+    })],
+  }))
+  const depends = screen.getByTestId('crosswalk-depends-cwd_1')
+  expect(depends).toHaveTextContent(/what already depends on this/i)
+  expect(depends).toHaveTextContent(/not tracked yet/i)
+  expect(depends).not.toHaveTextContent(/\b0\b/)
+  expect(depends).not.toHaveTextContent(/approv|unblock|enable/i)
+})
+
+it('renders every unresolved reason as one of the three families, never as a fault', async () => {
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        unresolved_families: {
+          directional_crosswalk_fanout: 'structurally_unsuitable',
+          crosswalk_not_measured: 'needs_data_check',
+          mapping_temporal_policy_unresolved: 'undecided',
+        },
+      },
+    })],
+  }))
+  const families = screen.getByTestId('crosswalk-families-cwd_1')
+  expect(families).toHaveTextContent('Structurally unsuitable')
+  expect(families).toHaveTextContent('Needs a data check')
+  expect(families).toHaveTextContent('Nobody has decided yet')
+  expect(families).not.toHaveTextContent(/blocked|failed|rejected|error/i)
+})
+
+it('says the deployment switch is off in its own sentence, not as a verdict', async () => {
+  // Flag off keeps a crosswalk discoverable and structurally non-executable, and that is a fact
+  // about this installation. Saying "not safe" instead would blame the evidence for a switch.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: { ...crosswalkRelationship().crosswalk!, execution_enabled: false },
+    })],
+  }))
+  const detail = screen.getByTestId('context-crosswalk-cwd_1')
+  expect(detail).toHaveTextContent(/switched off in this deployment/i)
+  expect(detail).toHaveTextContent(/structurally cannot run here/i)
+  expect(detail).not.toHaveTextContent(/unsafe|failed|blocked/i)
+})
+
+it('names the mapping row policy a crosswalk was measured under', async () => {
+  // Uniqueness over unfiltered SCD history and uniqueness over the rows a traversal reads are
+  // different claims, and the reader cannot tell them apart without seeing whether a policy exists.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        mapping_temporal_policy_revision_id: 'dtp_abc123',
+      },
+    })],
+  }))
+  expect(screen.getByTestId('context-crosswalk-cwd_1')).toHaveTextContent('dtp_abc123')
+})
+
+it('says nobody has declared a mapping row policy, without calling it a fault', async () => {
+  await openContext(contextFixture({ relationships: [crosswalkRelationship()] }))
+  const undeclared = screen.getByTestId('context-crosswalk-cwd_1')
+  expect(undeclared).toHaveTextContent(/nobody has declared which rows/i)
+  expect(undeclared).not.toHaveTextContent(/blocked|invalid/i)
+})
+
+it('lists every pinned revision the traversal would carry, including both legs', async () => {
+  // Lineage's own question on the row: WHICH revisions was this computed under. The same set Task
+  // 12 seals into the generated project's provenance — one leg shown would read as a direct link.
+  await openContext(contextFixture({
+    relationships: [crosswalkRelationship({
+      crosswalk: {
+        ...crosswalkRelationship().crosswalk!,
+        pinned_revisions: {
+          crosswalk_definition_revision: 'cwd_rev_1',
+          composed_observation_revision: 'cwo_obs_1',
+        },
+        leg_pins: [
+          {
+            kind: 'same_catalog', plan_hash: 'plan-1',
+            from_dataset_ref: 'deposits::public.accounts',
+            to_dataset_ref: 'deposits::public.acct_xref',
+            from_binding_revision_id: 'pbr_a', to_binding_revision_id: 'pbr_b',
+            read_set_hash: 'read-1',
+          },
+          {
+            kind: 'cross_catalog', plan_hash: 'plan-2',
+            from_dataset_ref: 'deposits::public.acct_xref',
+            to_dataset_ref: 'cards::public.cust',
+            from_binding_revision_id: 'pbr_b', to_binding_revision_id: 'pbr_c',
+            read_set_hash: 'read-2', realization_revision_ids: ['bjr_1'],
+          },
+        ],
+      },
+    })],
+  }))
+  const pins = screen.getByTestId('crosswalk-pins-cwd_1')
+  expect(pins).toHaveTextContent('cwd_rev_1')
+  expect(pins).toHaveTextContent('cwo_obs_1')
+  // BOTH legs, with the mapping table appearing as the destination of one and the origin of the
+  // other — which is what makes it readable as two hops rather than one.
+  expect(pins).toHaveTextContent('deposits::public.accounts → deposits::public.acct_xref')
+  expect(pins).toHaveTextContent('deposits::public.acct_xref → cards::public.cust')
+  expect(pins).toHaveTextContent('bjr_1')
 })

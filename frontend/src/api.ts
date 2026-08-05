@@ -2312,12 +2312,46 @@ export interface ContextCrosswalkDirection {
   reason_codes: string[]
 }
 
+// ONE leg of a crosswalk, as its real owner pinned it. A same-catalog leg resolves through the
+// join planner and carries NO fact key or realization revision; a cross-catalog leg resolves
+// through one governed bridge realization and carries both. Empty at discovery by contract — a leg
+// is pinned by RESOLVING it, which admission does.
+export interface ContextCrosswalkLegPin {
+  kind: string
+  plan_hash: string
+  from_dataset_ref: string
+  to_dataset_ref: string
+  from_binding_revision_id: string
+  to_binding_revision_id: string
+  read_set_hash: string
+  binding_revision_ids?: string[]
+  fact_keys?: string[]
+  realization_revision_ids?: string[]
+  dependency_snapshot_ids?: string[]
+  predicate_content_hashes?: string[]
+}
+
+// One category's answer to "what already depends on this". Reuses the governance-queue tri-state:
+// `count` is null unless `state === 'counted'`, so the type itself makes "unmeasured" impossible to
+// render as 0. Never show a number this does not carry.
+export interface ContextCrosswalkUsage {
+  category: string
+  state: 'counted' | 'not_tracked_yet' | 'unreadable'
+  count: number | null
+  display: string
+  store: string
+  basis: string
+  reason: string
+}
+
 // The Release-C crosswalk extension. It says what the crosswalk IS — which mapping dataset, which
 // revision, both legs — plus, since Task 11, what a measurement found and what admission concluded
-// per direction. `executable_now` is ALWAYS false until Task 12 wires execution, and it is carried
-// explicitly rather than derived from `production_admissible`: that predicate labels history, not a
-// live capability. `measurement: null` with empty `directions` is "discoverable, unmeasured" — a
-// state, never a failure.
+// per direction, and since Task 13 the three-family reading of every reason code, whether this
+// DEPLOYMENT enables crosswalk execution at all, what already depends on it, and every pinned
+// revision a traversal would carry. `executable_now` is carried explicitly rather than derived
+// from `production_admissible`: that predicate labels history, not a live capability.
+// `measurement: null` with empty `directions` is "discoverable, unmeasured" — a state, never a
+// failure.
 export interface ContextCrosswalk {
   definition_id: string
   definition_revision_id: string
@@ -2325,11 +2359,19 @@ export interface ContextCrosswalk {
   source_to_mapping_refs: string[]
   mapping_to_target_refs: string[]
   mapping_temporal_policy_revision_id: string | null
-  leg_pins: unknown[]
+  leg_pins: ContextCrosswalkLegPin[]
   measurement?: ContextCrosswalkMeasurement | null
   directions?: ContextCrosswalkDirection[]
   admission_policy_version?: string | null
   executable_now?: boolean
+  // code -> undecided | needs_data_check | structurally_unsuitable. The UI renders the FAMILY;
+  // a bare reason code reads as a fault.
+  unresolved_families?: Record<string, string>
+  // This installation's switch, separate from the evidence. False means every crosswalk is
+  // discoverable and structurally non-executable here — a deployment fact, not a verdict.
+  execution_enabled?: boolean
+  already_depended_on_by?: ContextCrosswalkUsage[]
+  pinned_revisions?: Record<string, string>
 }
 
 export interface ContextRelationship {
