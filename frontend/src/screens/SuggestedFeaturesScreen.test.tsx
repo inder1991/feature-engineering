@@ -138,7 +138,11 @@ describe('SuggestedFeaturesScreen', () => {
       expect(within(card).getByText(/leads attrition and hardship/i)).toBeInTheDocument()
       expect(within(card).getByText('What it measures')).toBeInTheDocument()
       expect(within(card).getByText('Why it is useful')).toBeInTheDocument()
-      expect(within(card).getByText('Entity and grain')).toBeInTheDocument()
+      // The compact card's four boxed parameters, renamed with the concept's labels.
+      expect(within(card).getByText('Entity & grain')).toBeInTheDocument()
+      expect(within(card).getByText('Time binding')).toBeInTheDocument()
+      expect(within(card).getByText('Window')).toBeInTheDocument()
+      expect(within(card).getByText('Aggregation')).toBeInTheDocument()
       expect(within(card).getByText('acct_id')).toBeInTheDocument()
       expect(within(card).getByText('trend_90d')).toBeInTheDocument()
       expect(within(card).getByText('90d')).toBeInTheDocument()
@@ -148,15 +152,20 @@ describe('SuggestedFeaturesScreen', () => {
         .toBeInTheDocument()
     })
 
-  it('keeps the fine-grained recipe family OFF the compact card and inside the detail', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
-    renderScreen()
-    const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
-    expect(within(card).queryByText('Balance trend')).toBeNull()
-    await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
-    expect(within(card).getByText('Balance trend')).toBeInTheDocument()
-    expect(within(card).getByText('Recipe family')).toBeInTheDocument()
-  })
+  it('leads the compact card with the recipe family, and keeps its attribution in the detail',
+    async () => {
+      // REVERSES an earlier decision that kept the fine-grained family off the compact card.
+      // The reviewed concept leads with it, and the family is what a reader scans candidates
+      // by — "is this a duration feature or a ratio?" is the first question, not a footnote.
+      // What stays in the detail is the family's ATTRIBUTION (who said so), which is the part
+      // that was really too fine-grained for a card.
+      getTableSuggestionsV2.mockResolvedValue(page())
+      renderScreen()
+      const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
+      expect(within(card).getByText('Balance trend')).toBeInTheDocument()
+      await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
+      expect(within(card).getByText('Recipe family')).toBeInTheDocument()
+    })
 
   it('lists the first domains and counts the rest rather than growing the card', async () => {
     const many = Array.from({ length: 5 }, (_u, i) =>

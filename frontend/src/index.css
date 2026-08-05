@@ -5964,6 +5964,57 @@ button.stat:hover {
 
 .sfc-safety-note--eligibility strong { color: var(--danger); }
 
+/* Taxonomy first: what KIND of feature this is, before any of its parameters. */
+.sfc-taxonomy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.sfc-tax {
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: color-mix(in oklch, var(--proposal) 12%, var(--surface));
+  color: var(--proposal);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sfc-factgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.sfc-factgrid .sfc-fact {
+  display: block;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.sfc-factgrid .sfc-fact dt {
+  color: var(--ink-faint);
+  font-size: 8px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sfc-factgrid .sfc-fact dd {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+}
+
+.sfc-sources {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
 .sfc-recipe {
   margin: 0;
   padding: 6px 8px;

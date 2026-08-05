@@ -485,19 +485,6 @@ function entityWords(s: FeatureSuggestionV2): ReactNode {
   )
 }
 
-function familyAndStageWords(s: FeatureSuggestionV2): ReactNode {
-  return (
-    <>
-      {s.recipe_family === null
-        ? <Absent>no recipe family</Absent>
-        : s.recipe_family.display_name}
-      {' · '}
-      {s.recipe_stage === null
-        ? <Absent>journey stage not authored</Absent>
-        : s.recipe_stage.value}
-    </>
-  )
-}
 
 // A recipe may bind an `asof` operand without resolving the governed `time_ref`. Those are different
 // truths: the former explains the computation, while the latter is the time authority downstream
@@ -612,27 +599,40 @@ export function SuggestionCard({
         </Fact>
       </dl>
 
-      <dl className="sfc-facts">
-        <Fact label="Entity and grain">{entityWords(s)}</Fact>
-        <Fact label="Family and stage">{familyAndStageWords(s)}</Fact>
-        <Fact label="Operation and window">
-          <span className="mono">{s.operation_kind}</span>
-          {' over '}
-          {s.window ? <span className="mono">{s.window}</span> : <Absent>no window</Absent>}
+      {/* Family and journey stage lead as pills: they say what KIND of feature this is before
+          any of its parameters. This REVERSES an earlier decision that kept the fine-grained
+          family off the compact card (SuggestedFeaturesScreen.test.tsx) — the reviewed concept
+          puts it here, and the family is what a reader scans candidates by. The detail still
+          carries it with its attribution. */}
+      <div className="sfc-taxonomy">
+        {s.recipe_family && <span className="sfc-tax">{s.recipe_family.display_name}</span>}
+        {s.recipe_stage && <span className="sfc-tax">{s.recipe_stage.value} stage</span>}
+      </div>
+
+      {/* Four boxed parameters a reader actually compares between candidates, two per row —
+          not six label/value rows stacked down the card. Sources and data roles drop to the
+          quiet line below, and everything absent stays in the detail disclosure. */}
+      <dl className="sfc-facts sfc-factgrid">
+        <Fact label="Entity & grain">{entityWords(s)}</Fact>
+        <Fact label="Time binding">{timeBindingWords(s)}</Fact>
+        <Fact label="Window">
+          {s.window ? <span className="mono">{s.window}</span> : <Absent>no rolling window</Absent>}
         </Fact>
-        <Fact label="As-of binding">{timeBindingWords(s)}</Fact>
-        <Fact label="Output additivity">
+        <Fact label="Aggregation">
           {s.output_additivity === null
             ? <Absent>not authored</Absent>
             : s.output_additivity.value}
         </Fact>
-        <Fact label="Sources">
-          {tables} {tables === 1 ? 'table' : 'tables'}, {s.operands.length}{' '}
-          {s.operands.length === 1 ? 'column' : 'columns'}
-          {' · '}
-          {roles ?? <Absent>data roles not supplied: dataset profiles are unavailable</Absent>}
-        </Fact>
       </dl>
+
+      <p className="sfc-sources">
+        <span className="mono">{s.operation_kind}</span>
+        {' · '}
+        {tables} {tables === 1 ? 'table' : 'tables'}, {s.operands.length}{' '}
+        {s.operands.length === 1 ? 'column' : 'columns'}
+        {' · '}
+        {roles ?? <Absent>data roles not supplied: dataset profiles are unavailable</Absent>}
+      </p>
 
       <div className="sfc-inputs" aria-label="Input columns and recipe roles">
         <span className="sfc-inputs-label">Inputs</span>

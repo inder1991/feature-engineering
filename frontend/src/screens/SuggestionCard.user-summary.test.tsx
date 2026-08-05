@@ -44,10 +44,13 @@ describe('SuggestionCard end-user summary', () => {
     const card = screen.getByRole('heading', { name: 'tenure_days' }).closest('.sfc') as HTMLElement
     expect(card).not.toBeNull()
     expect(within(card).getByText('binding ambiguous')).toBeInTheDocument()
-    expect(within(card).getByText('Family and stage')).toBeInTheDocument()
-    expect(within(card).getByText((_, element) =>
-      element?.tagName === 'DD' && element.textContent === 'Tenure · context')).toBeInTheDocument()
-    expect(within(card).getByText('Output additivity')).toBeInTheDocument()
+    // Family and stage lead the card as pills now, rather than a "Family and stage" dd two
+    // thirds of the way down. Both facts are still on the compact card; only the shape moved.
+    const taxonomy = card.querySelector('.sfc-taxonomy') as HTMLElement
+    expect(within(taxonomy).getByText('Tenure')).toBeInTheDocument()
+    expect(within(taxonomy).getByText(/context stage/i)).toBeInTheDocument()
+    // Additivity is one of the four boxed parameters now, under the concept's label.
+    expect(within(card).getByText('Aggregation')).toBeInTheDocument()
     expect(within(card).getByText('n/a')).toBeInTheDocument()
 
     const asOf = within(card).getByText((_, element) =>
