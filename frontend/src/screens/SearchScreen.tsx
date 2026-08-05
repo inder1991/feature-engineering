@@ -269,9 +269,12 @@ export function SearchScreen() {
         )}
       </form>
 
+      {/* The row reserved 26px + 14px whether or not it had anything in it. Removing the
+          "No filters" text left the empty container behind, which is most of the dead band
+          between the search bar and the workspace. Render the row only when it has chips. */}
+      {hasFilters && (
       <div className="active-filters">
-        {/* "No filters" labels an empty row with the fact that it is empty. Say nothing instead. */}
-        {hasFilters && <span className="active-filters-label">Filters</span>}
+        <span className="active-filters-label">Filters</span>
         {chips.map(chip => (
           <span
             key={chip.id}
@@ -289,6 +292,7 @@ export function SearchScreen() {
           </button>
         )}
       </div>
+      )}
 
       <div className={effectiveView === 'graph' ? 'facet-cols facet-cols--graph' : 'facet-cols'}>
         {effectiveView === 'list' && (
