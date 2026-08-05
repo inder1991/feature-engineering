@@ -121,6 +121,9 @@ type AnchorColData = {
   node: LineageNode
   traceId: string | null
   onColumn: (col: LineageNode) => void
+  // From the SearchHit, not the graph payload: LineageNode carries no declared type and no
+  // business term, so the artifact's meta line is unbuildable from /graph/lineage alone.
+  meta: string | null
 }
 type StubData = { node: LineageNode }
 type FeatureData = { node: LineageNode; onOpen: (node: LineageNode) => void }
@@ -311,7 +314,11 @@ function AnchorColNode({ data }: NodeProps<AnchorColNT>) {
         {node.as_of && <Flag tone="asof">as-of</Flag>}
         {node.sensitivity && <Flag tone="pii">{node.sensitivity}</Flag>}
       </div>
-      {node.concept && <div className="ln-src">{node.concept}</div>}
+      {(data.meta ?? node.concept) && (
+        <div className="ln-src">
+          <span className="ln-src-text">{data.meta ?? node.concept}</span>
+        </div>
+      )}
     </div>
   )
 }
@@ -935,7 +942,15 @@ export function LineageView({
         return {
           ...base,
           type: 'lnAnchorCol',
-          data: { node: n, traceId, onColumn: openColumn } satisfies AnchorColData,
+          data: {
+            node: n, traceId, onColumn: openColumn,
+            // The NODE's own concept wins; the SearchHit only supplies the type the graph
+            // payload does not carry. Preferring the hit would overwrite what the graph said
+            // about this column with what the search index said about the anchor.
+            meta: [n.concept ?? anchor.concept,
+              anchor.data_type && `${anchor.data_type} · source declared`]
+              .filter(Boolean).join(' · ') || null,
+          } satisfies AnchorColData,
         }
       }
       if (p.type === 'lnStub') {
@@ -1328,6 +1343,7 @@ export function LineageView({
             onClose={closeDrawer}
           />
         )}
+          {!drawerNode && (
           <section className="ln-selected" aria-label="Selected asset">
             <div className="ln-selected-label">
               <span className="ln-micro">
@@ -1363,6 +1379,7 @@ export function LineageView({
               ))}
             </div>
           </section>
+          )}
           {drawerNode && (() => {
             const mine = visibleEdges.filter(e => e.from === drawerNode.id || e.to === drawerNode.id)
             if (mine.length === 0) return null

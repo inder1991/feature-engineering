@@ -505,7 +505,10 @@ describe('lineage view', () => {
       expect(within(anchorCard).getByRole('button', { name: 'balance' })).toHaveAttribute(
         'aria-current', 'true',
       )
-      expect(within(anchorCard).getByText('money_amount')).toBeInTheDocument()
+      // The anchor card's meta line is now concept + type + basis on one row, as the artifact
+      // draws it, so the concept is a substring rather than the whole text node.
+      expect(within(anchorCard).getByText(/money_amount/)).toBeInTheDocument()
+      expect(within(anchorCard).getByText(/source declared/)).toBeInTheDocument()
 
       // a quiet structural containment edge ties the column node to its table card
       expect(container.querySelector('.ln-edge--contain')).not.toBeNull()
